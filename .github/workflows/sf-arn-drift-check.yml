@@ -96,7 +96,14 @@ jobs:
           echo "${{ steps.changed-deploys.outputs.files }}" | while IFS= read -r f; do
             [ -z "$f" ] && continue
             echo "::group::check-schedule-drift --source-file $f"
-            python3 infrastructure/scheduler/check-schedule-drift.py --source-file "$f"
+            # --ignore-kind missing-in-aws: on a PR, schedules that do not exist
+            # live yet (because the PR that declares them hasn't merged) are
+            # expected — the deploy workflow's own post-deploy assertion catches
+            # them after merge.  The daily fleet-wide sweep (which does NOT pass
+            # this flag) still hard-fails on every kind, so real drift (a rule
+            # deleted or disabled in the console post-deploy) is still caught.
+            python3 infrastructure/scheduler/check-schedule-drift.py \
+              --source-file "$f" --ignore-kind missing-in-aws
             echo "::endgroup::"
           done
 

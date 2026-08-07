@@ -31,12 +31,29 @@
 #   14:45 daily   cron(45 14 * * ? *)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers/probes
-# (narrow OIDC blast radius, operator-deployed only). Merging the PR has ZERO
-# live effect until an operator runs this with --bootstrap.
+# (narrow OIDC blast radius). CODE, and (since alpha-engine-config-I5815)
+# SCHEDULES, auto-deploy on merge to main via
+# `.github/workflows/deploy-sf-watch-reclaim-sweep-handler.yml`, which runs
+# this script twice: flagless (Lambda code) and then `--reconcile-schedules`
+# (EventBridge Scheduler upsert + prune), both under the
+# github-actions-lambda-deploy OIDC role.
+#
+# alpha-engine-config-I5815 is why the schedule half is here at all. It used to
+# sit inside --bootstrap next to the IAM-role creation, so the OIDC role —
+# which deliberately lacks iam:CreateRole/iam:PutRolePolicy (fleet single-writer
+# rule after 4 IAM-clobber incidents in 2 months) — could not run it, and both
+# daily schedules were never created. Splitting on the IAM boundary rather than
+# on "first time vs not" is what makes the schedule half CI-runnable.
+#
+# What still needs an operator: --bootstrap-iam, i.e. creating the IAM roles
+# and their inline policies, plus first-ever creation of the Lambda and the
+# EventBridge reclaim rules. That is genuinely first-time-only.
 #
 # Usage:
-#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh             # update code only
-#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --bootstrap # first-time create + wire schedules + EC2 reclaim rules (config#2270)
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh             # code only (the CI path, step 1)
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --reconcile-schedules  # + upsert/prune Scheduler rules (the CI path, step 2)
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --bootstrap-iam        # operator-only: create IAM roles, Lambda, reclaim rules
+#   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --bootstrap            # both of the above (unchanged meaning)
 #   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --dry-run   # show actions, do not apply
 #   bash .../sf-watch-reclaim-sweep-handler/deploy.sh --smoke     # invoke once (read-only check; pings only on a real problem)
@@ -76,18 +93,48 @@ case "${DRY_RUN:-false}" in
   true|1|yes|TRUE|YES) DRY_RUN=true ;;
   *) DRY_RUN=false ;;
 esac
-BOOTSTRAP=false
+# alpha-engine-config-I5815 splits the old monolithic --bootstrap in two, along
+# the line that actually matters: which grants the caller needs.
+#
+#   BOOTSTRAP_IAM       creates IAM roles and puts inline policies. Needs
+#                       iam:CreateRole + iam:PutRolePolicy, which the GHA OIDC
+#                       role deliberately does NOT have (fleet single-writer
+#                       rule after 4 IAM-clobber incidents). Operator-only, and
+#                       first-time-only in practice.
+#   RECONCILE_SCHEDULES upserts + prunes the EventBridge Scheduler rules. Needs
+#                       ONLY scheduler:{Get,List,Create,Update,Delete}Schedule
+#                       and a scoped iam:PassRole — all of which
+#                       github-actions-lambda-deploy already holds. Safe to run
+#                       on every merge, and now does.
+#
+# --bootstrap keeps its old meaning (both) so every runbook, every comment and
+# every operator habit that predates the split still does what it says.
+BOOTSTRAP_IAM=false
+RECONCILE_SCHEDULES=false
 APPLY_IAM=false
 SMOKE=false
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
-    --bootstrap) BOOTSTRAP=true ;;
+    --bootstrap) BOOTSTRAP_IAM=true; RECONCILE_SCHEDULES=true ;;
+    --bootstrap-iam) BOOTSTRAP_IAM=true ;;
+    --reconcile-schedules) RECONCILE_SCHEDULES=true ;;
     --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
+
+# `--reconcile-schedules` ALONE is a schedules-only run: it skips packaging
+# (docker pip + handler tests) and the code push. The CI deploy therefore
+# invokes this script twice without paying for the ~2min package build twice,
+# and an operator repairing live schedule drift does not have to redeploy code
+# to do it. Combined with --bootstrap or run flagless, everything happens as
+# before.
+CODE_DEPLOY=true
+if $RECONCILE_SCHEDULES && ! $BOOTSTRAP_IAM && ! $APPLY_IAM && ! $SMOKE; then
+  CODE_DEPLOY=false
+fi
 
 run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
@@ -95,6 +142,7 @@ run() {
 
 # ----- 0. Validate handler + run unit tests ----------------------------------
 
+if $CODE_DEPLOY; then
 python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print('index.py syntax OK')"
 
 # ----- Preflight handler unit tests (shared gate — config#2381) -------------
@@ -117,8 +165,9 @@ cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
+fi
 
-# ----- 2. Bootstrap (first-time only) ---------------------------------------
+# ----- 2. Bootstrap IAM (operator-only — first-time only) -------------------
 
 # ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
 if $APPLY_IAM; then
@@ -128,8 +177,8 @@ if $APPLY_IAM; then
   echo "  ✓ IAM applied."
 fi
 
-if $BOOTSTRAP; then
-  echo "Bootstrapping ${FUNCTION_NAME}..."
+if $BOOTSTRAP_IAM; then
+  echo "Bootstrapping IAM for ${FUNCTION_NAME}..."
 
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
@@ -175,39 +224,6 @@ if $BOOTSTRAP; then
 
   if ! $DRY_RUN; then echo "  Waiting 10s for Scheduler role propagation..."; sleep 10; fi
 
-  for i in "${!SCHED_NAMES[@]}"; do
-    name="${SCHED_NAMES[$i]}"
-    cron="${SCHED_CRONS[$i]}"
-    target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
-    if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
-      echo "  Updating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \
-        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
-        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
-    else
-      echo "  Creating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler create-schedule --name "${name}" --schedule-expression "${cron}" \
-        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
-        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
-    fi
-    if ! $DRY_RUN; then
-      aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null \
-        || { echo "ERROR: Scheduler rule ${name} not found after create/update" >&2; exit 1; }
-    fi
-  done
-
-  # Prune reconciliation: delete any live rule under SCHED_PREFIX not in SCHED_NAMES.
-  echo "  Pruning orphaned Scheduler rules under prefix ${SCHED_PREFIX}..."
-  LIVE_RULES=$(aws scheduler list-schedules --name-prefix "${SCHED_PREFIX}" --region "${REGION}" --query 'Schedules[].Name' --output text 2>/dev/null || echo "")
-  for live in ${LIVE_RULES}; do
-    keep=false
-    for want in "${SCHED_NAMES[@]}"; do [ "${live}" = "${want}" ] && { keep=true; break; }; done
-    if ! $keep; then
-      echo "    Deleting orphaned Scheduler rule: ${live}"
-      run aws scheduler delete-schedule --name "${live}" --region "${REGION}"
-    fi
-  done
-
   # EventBridge rules for the mid-run spot-reclaim checker (config#2270).
   # NOTE: neither EC2 event type can be TAG-scoped in the rule pattern (the
   # events carry only instance-id) — the handler filters by the box's
@@ -250,13 +266,53 @@ if $BOOTSTRAP; then
   done
 fi
 
+# ----- 2bis. Reconcile EventBridge Scheduler rules (CI-safe, every merge) ---
+
+if $RECONCILE_SCHEDULES; then
+  echo "Reconciling EventBridge Scheduler rules for ${FUNCTION_NAME}..."
+
+  for i in "${!SCHED_NAMES[@]}"; do
+    name="${SCHED_NAMES[$i]}"
+    cron="${SCHED_CRONS[$i]}"
+    target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
+    if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
+      echo "  Updating Scheduler rule: ${name} → ${cron}"
+      run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \
+        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
+        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
+    else
+      echo "  Creating Scheduler rule: ${name} → ${cron}"
+      run aws scheduler create-schedule --name "${name}" --schedule-expression "${cron}" \
+        --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
+        --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
+    fi
+    if ! $DRY_RUN; then
+      aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null \
+        || { echo "ERROR: Scheduler rule ${name} not found after create/update" >&2; exit 1; }
+    fi
+  done
+
+  # Prune reconciliation: delete any live rule under SCHED_PREFIX not in SCHED_NAMES.
+  echo "  Pruning orphaned Scheduler rules under prefix ${SCHED_PREFIX}..."
+  LIVE_RULES=$(aws scheduler list-schedules --name-prefix "${SCHED_PREFIX}" --region "${REGION}" --query 'Schedules[].Name' --output text 2>/dev/null || echo "")
+  for live in ${LIVE_RULES}; do
+    keep=false
+    for want in "${SCHED_NAMES[@]}"; do [ "${live}" = "${want}" ] && { keep=true; break; }; done
+    if ! $keep; then
+      echo "    Deleting orphaned Scheduler rule: ${live}"
+      run aws scheduler delete-schedule --name "${live}" --region "${REGION}"
+    fi
+  done
+fi
+
 # ----- 3. Update function code (always, idempotent) -------------------------
 
+if $CODE_DEPLOY; then
 BOOTSTRAPPED=true
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
   --zip-file "fileb://${ZIP}" --region "${REGION}" --query 'LastUpdateStatus' --output text \
-  || { echo "WARNING: Function ${FUNCTION_NAME} not found — not bootstrapped yet (run --bootstrap). Skipping code update."; BOOTSTRAPPED=false; }
+  || { echo "WARNING: Function ${FUNCTION_NAME} not found — not bootstrapped yet (run --bootstrap-iam). Skipping code update."; BOOTSTRAPPED=false; }
 
 if $BOOTSTRAPPED; then
   if ! $DRY_RUN; then
@@ -277,11 +333,12 @@ if $BOOTSTRAPPED; then
 else
   # Function hasn't been bootstrapped yet (config-I3111 first-merge pattern:
   # the OIDC role can't CREATE the Lambda — only an operator running
-  # --bootstrap from their own AWS creds can). Gracefully skip everything
+  # --bootstrap-iam from their own AWS creds can). Gracefully skip everything
   # after the update step so the workflow job reports success and the report
   # step shows "(function not bootstrapped yet)". CI-watch then sees a green
   # main instead of filing extra deploy-failure issues every push.
   echo "✓ (not bootstrapped — skipping environment update and smoke test)"
+fi
 fi
 
 # ----- 4. Smoke (synthetic invoke; read-only — only pings on a REAL problem) -
