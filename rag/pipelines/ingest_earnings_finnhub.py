@@ -241,7 +241,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest earnings transcripts from Finnhub into RAG")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.attractiveness_top_60)")
     parser.add_argument("--max-per-ticker", type=int, default=8, help="Max transcripts per ticker")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

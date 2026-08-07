@@ -48,11 +48,21 @@ def _mock_s3(holdings=None, signals_universe=None):
         if Key == "universe_membership/latest.json":
             return {"Body": BytesIO(json.dumps({
                 "run_date": "2026-07-29",
-                "cuts": {"scanner_candidates": {
-                    "basis": "scanner_gate",
-                    "size": len(signals_universe or []),
-                    "tickers": list(signals_universe or []),
-                }},
+                "predictor_universe_cut": "attractiveness_top_20",
+                "cuts": {
+                    # config-I6630: the attractiveness RANK cut, not the
+                    # tech_score momentum gate cut.
+                    "attractiveness_top_60": {
+                        "basis": "attractiveness_rank",
+                        "size": len(signals_universe or []),
+                        "tickers": list(signals_universe or []),
+                    },
+                    "attractiveness_top_20": {
+                        "basis": "attractiveness_rank",
+                        "size": len(signals_universe or []),
+                        "tickers": list(signals_universe or []),
+                    },
+                },
             }).encode())}
         raise RuntimeError(f"unexpected key {Key}")
 

@@ -288,7 +288,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest SEC filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.attractiveness_top_60)")
     parser.add_argument("--lookback-years", type=int, default=2, help="Years of filings to backfill")
     parser.add_argument("--dry-run", action="store_true", help="Print what would be ingested without writing")
     args = parser.parse_args()

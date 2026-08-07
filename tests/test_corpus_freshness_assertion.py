@@ -25,7 +25,12 @@ def _s3(marks: dict):
     payloads = {
         "universe_membership/latest.json": {
             "run_date": "2026-07-31",
-            "cuts": {"scanner_candidates": {"size": len(SCOPE), "tickers": SCOPE}},
+            "predictor_universe_cut": "attractiveness_top_20",
+            # config-I6630: the attractiveness RANK cut, not the gate cut.
+            "cuts": {
+                "attractiveness_top_60": {"size": len(SCOPE), "tickers": SCOPE},
+                "attractiveness_top_20": {"size": 1, "tickers": SCOPE[:1]},
+            },
         },
         "metron/holdings_universe.json": {"as_of": "2026-07-31", "tickers": []},
         "rag/watermarks/v1/news.json": {"marks": marks},

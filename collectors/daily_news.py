@@ -97,7 +97,7 @@ def assemble_universe(bucket: str, s3_client: Any) -> list[str]:
     """Union Metron held tickers ∪ the AE decision set.
 
     config-I5700: the AE slice now resolves through ``_rag_scope`` (the
-    scanner's ``cuts.scanner_candidates``) rather than ``signals.json``'s
+    scanner's ``cuts.attractiveness_top_60``) rather than ``signals.json``'s
     ``universe`` array — a 903-row SIZING envelope that was never a scope.
     The daily and weekly paths therefore resolve ONE identical set, which is
     what ``rag-corpus-policy.md`` §2.3's one-fetch-one-corpus corollary needs
