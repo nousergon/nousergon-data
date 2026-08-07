@@ -74,9 +74,32 @@ def paused_entries(manifest: dict | None = None) -> list[tuple[str, str, str]]:
     return out
 
 
+def pending_names(manifest: dict | None = None) -> set[str]:
+    """Triggers that must be BORN disabled but do not exist live yet.
+
+    Separate from ``paused`` because ``check()`` requires every paused entry to
+    exist live — a not-yet-created name there would be a permanent
+    ``missing-in-aws`` finding. Keys prefixed ``_`` are prose, not triggers.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    return {k for k in m.get("pending", {}) if not k.startswith("_")}
+
+
 def paused_names(manifest: dict | None = None) -> set[str]:
-    """Every intentionally-paused trigger name, both surfaces."""
-    return {name for _, name, _ in paused_entries(manifest)}
+    """Every name for which DISABLED is the INTENDED live state.
+
+    Includes ``pending``. This is the question the drift checkers ask — "is a
+    DISABLED trigger drift, or deliberate?" — and the answer is the same for
+    both blocks. It is NOT the question ``check()`` asks, which is "does this
+    exist live and is it off"; that one iterates ``paused_entries()`` and so
+    still ignores ``pending``.
+
+    Getting this wrong cost a red deploy on 2026-08-07: the pending block was
+    wired into the bash helper but not here, so expense-collector correctly
+    created its schedule DISABLED and its own post-deploy assertion then failed
+    the deploy for the state it had just been told to write.
+    """
+    return {name for _, name, _ in paused_entries(manifest)} | pending_names(manifest)
 
 
 def _aws(args: list[str]) -> tuple[int, str, str]:

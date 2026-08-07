@@ -370,8 +370,12 @@ def test_pending_entries_are_paused_at_write_time_but_not_required_live(manifest
     pending = {k for k in manifest.get("pending", {}) if not k.startswith("_")}
     assert pending, "the pending block is empty; if #1207's schedules now exist live, move them to paused"
 
-    # --check must NOT require them to exist live.
-    assert not (pending & module.paused_names(manifest)), (
+    # --check must NOT require them to exist live. That obligation is carried
+    # by paused_entries(), NOT by paused_names() — the latter deliberately
+    # includes pending so the drift checkers do not flag a correctly-pending
+    # trigger. See test_paused_names_includes_pending_but_check_does_not.
+    entry_names = {name for _, name, _ in module.paused_entries(manifest)}
+    assert not (pending & entry_names), (
         "a name is in BOTH pending and paused — --check would demand it exist "
         "live while the pending block exists precisely because it does not"
     )
@@ -394,3 +398,34 @@ def test_pending_notes_are_not_treated_as_trigger_names():
         capture_output=True, text=True, check=True,
     )
     assert out.stdout.strip() == "ENABLED"
+
+
+def test_paused_names_includes_pending_but_check_does_not(manifest, module):
+    """The two questions differ, and conflating them failed a deploy.
+
+    2026-08-07: `pending` was wired into the bash helper but not here, so
+    expense-collector correctly created its schedule DISABLED and its own
+    post-deploy assertion (check-schedule-drift.py, which reads paused_names)
+    then failed the deploy for the state it had just been told to write.
+
+      paused_names()   -> "is DISABLED deliberate?"  MUST include pending
+      paused_entries() -> "does it exist live and is it off?"  MUST NOT
+    """
+    pending = module.pending_names(manifest)
+    assert pending, "pending is empty; this test guards a block that must exist"
+
+    names = module.paused_names(manifest)
+    assert pending <= names, (
+        "paused_names() excludes pending, so every drift checker will report a "
+        "correctly-pending trigger as drift and fail the deploy that created it"
+    )
+
+    entry_names = {name for _, name, _ in module.paused_entries(manifest)}
+    assert not (pending & entry_names), (
+        "paused_entries() includes a pending name — automation_pause.py --check "
+        "would demand it exist live, which is exactly why pending is separate"
+    )
+
+
+def test_pending_notes_are_not_returned_as_names(module, manifest):
+    assert not any(n.startswith("_") for n in module.pending_names(manifest))
