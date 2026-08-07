@@ -3,11 +3,32 @@ name: Gitleaks scan
 # Thin caller — all scan behavior lives in the reusable workflow. Edit it
 # there, not here: nousergon/nousergon-lib/.github/workflows/gitleaks-scan.yml
 #
-# GATED on nousergon-lib PR#228 merging first (config-I3005) — until then,
-# `uses:` below resolves against nousergon-lib@main which doesn't have the
-# file yet, so this check will fail/error. That is EXPECTED and BY DESIGN
-# (gate:dependency). Once PR#228 merges, re-run this workflow (Actions tab
-# -> re-run failed jobs, or push a new commit) to pick it up and go green.
+# A RED RUN HERE IS NEVER EXPECTED. Read it.
+#
+# This block used to say the opposite. It carried a dependency-gate note
+# claiming a red run was normal until nousergon-lib PR#228 landed. The note
+# outlived the gate: PR#228 merged, `uses:` below was pinned to a real SHA,
+# and the note stayed. Between 2026-08-04 and 2026-08-07 the job
+# then failed on eight consecutive pushes to main, across six merges, for an
+# entirely different and real reason (alpha-engine-config-I6622), and nobody
+# looked. A stale "expected to be red" note attached to a security gate is
+# indistinguishable from the gate working, and it is the likeliest reason
+# three days of unscanned merges went unnoticed.
+#
+# If this job is red: the scan found something. The detect step's exit status
+# IS the findings signal. Download the `gitleaks-sarif` run artifact and read
+# it before assuming tooling.
+#
+# To accept a triaged false positive, APPEND its single record to
+# `.gitleaks-baseline.json` — never regenerate that file. Regeneration accepts
+# every finding present at that moment by fingerprint, so one housekeeping
+# commit can grandfather in a real secret nobody read. A one-record append is
+# reviewable in the diff; a regeneration is not.
+#
+# A repo-local `.gitleaks.toml` is NOT the mechanism here and will not work:
+# `.gitignore` excludes it (it is a local symlink for the pre-commit hook), so
+# it never reaches the CI checkout. `tests/test_gitleaks_config.py` pins that,
+# because the file looks like exactly the right place to put an allowlist.
 
 on:
   push:
