@@ -35,12 +35,32 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_INFRA_SCRIPTS = sorted((_REPO_ROOT / "infrastructure").glob("*.sh"))
+# alpha-engine-config-I6620: the scope AND the loop shape below are both
+# widened. This guard existed, was correct, and caught nothing when
+# `expense-collector/deploy.sh` shipped the exact bug it exists for on
+# 2026-08-07 — because the bug was in a `lambdas/*/deploy.sh` (outside the
+# glob) using `for arg in "$@"` (outside the regex). Detection blindness
+# outranks the defect it hides: a guard that covers one directory and one
+# loop syntax is a guard that reads as green for every script it cannot see.
+_INFRA_SCRIPTS = sorted(
+    list((_REPO_ROOT / "infrastructure").glob("*.sh"))
+    + list((_REPO_ROOT / "infrastructure" / "lambdas").glob("*/deploy.sh"))
+    + list((_REPO_ROOT / "infrastructure" / "lambdas" / "_shared").glob("*.sh"))
+)
 
 _SET_U_RE = re.compile(r"^\s*set\s+-[a-z]*u[a-z]*\b", re.MULTILINE)
 _LOOP_RE = re.compile(
     r'while\s*\[\[?\s*\$#\s*-gt\s*0\s*\]\]?\s*;?\s*do\s*\n'
     r'\s*case\s+"\$1"\s+in\n(.*?)\n\s*esac\s*\ndone',
+    re.DOTALL,
+)
+# The second arg-parse idiom in this repo, and the one the I6620 bug used.
+# `for arg in "$@"` has the SAME zero-flag property as the while-shift form:
+# with no arguments the body never runs, so a variable assigned only in a case
+# arm is unbound at the first read under `set -u`.
+_FOR_LOOP_RE = re.compile(
+    r'for\s+\w+\s+in\s+"\$@"\s*;?\s*do\s*\n'
+    r'\s*case\s+"\$\w+"\s+in\n(.*?)\n\s*esac\s*\ndone',
     re.DOTALL,
 )
 _ARM_ASSIGN_RE = re.compile(r'\b([A-Z][A-Z0-9_]*)=')
@@ -51,7 +71,7 @@ def _find_unguarded_loop_vars(text: str) -> list[tuple[str, int]]:
     case-arm-only variable read after the loop with no prior default-init."""
     if not _SET_U_RE.search(text):
         return []
-    loop_m = _LOOP_RE.search(text)
+    loop_m = _LOOP_RE.search(text) or _FOR_LOOP_RE.search(text)
     if not loop_m:
         return []
     loop_start, loop_end = loop_m.start(), loop_m.end()
@@ -63,10 +83,30 @@ def _find_unguarded_loop_vars(text: str) -> list[tuple[str, int]]:
         read_m = re.search(rf'\$\{{?{var}\b', after)
         if not read_m:
             continue  # never read outside the loop -> not this bug class
-        default_re = re.compile(rf'^{var}=', re.MULTILINE)
-        already_defaulted = default_re.search(
-            text[:loop_start]
-        ) or default_re.search(after[: read_m.start()])
+        # Two accepted default-init forms. Recognising only the first was a
+        # 34-of-35 false-positive rate when this guard was widened to the
+        # lambda deploy scripts (I6620) — and a guard that cries wolf 34 times
+        # gets switched off, which is how coverage returns to zero.
+        #   1. column-0 assignment:  VAR="${VAR:-false}"
+        #   2. the fleet's ambient-env idiom, which assigns INSIDE case arms:
+        #        case "${VAR:-false}" in
+        #          true|1|yes) VAR=true ;;
+        #          *)          VAR=false ;;
+        #        esac
+        #      Established by the I2752 incident (2026-07-16) so DRY_RUN=1 from
+        #      a caller's shell actually no-ops. The `${VAR:-` expansion is what
+        #      makes it safe under `set -u`, wherever it sits.
+        # `^VAR=` alone misses `BOOTSTRAP=0; SMOKE=0; CUTOVER=0` — one line,
+        # three initialisers, two of them not at column 0. Accept a
+        # semicolon-separated assignment as top-level too.
+        default_re = re.compile(rf'(?:^|;\s*){var}=', re.MULTILINE)
+        expansion_re = re.compile(rf'\$\{{{var}:-')
+        already_defaulted = (
+            default_re.search(text[:loop_start])
+            or default_re.search(after[: read_m.start()])
+            or expansion_re.search(text[:loop_start])
+            or expansion_re.search(after[: read_m.start()])
+        )
         if already_defaulted:
             continue
         line_no = text.count("\n", 0, loop_end + read_m.start()) + 1

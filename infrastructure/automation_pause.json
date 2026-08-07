@@ -18,6 +18,13 @@
     "non-eventbridge": "DLM policy-0047cfbfb7070a3b7 (nightly dashboard-box snapshot, 14d) and the two SSM associations (ae-patch-scan-only, ae-software-inventory, rate(1 day)) are kept: they are read-only or protective hygiene for the 24/7 box, not autonomous processes."
   },
 
+  "pending": {
+    "_why": "Triggers that do not exist live yet but MUST be created DISABLED when they first appear. Brian's ruling covers 'everything else', which includes automation that lands after 2026-08-07 — but automation_pause.py --check requires every `paused` entry to exist live, so a not-yet-created name cannot go there without turning the check red. pause_state() reads BOTH blocks; --check requires existence only for `paused`. Move an entry up to `paused` once it exists live. Found by alpha-engine-config-I6620: nousergon-data#1207 declares three schedules that its (currently broken) deploy would have created ENABLED mid-pause.",
+    "alpha-engine-expense-collector-reconcile-monthly": "nousergon-data#1207; codified in expense-collector/deploy.sh, never created live",
+    "alpha-engine-sf-watch-reclaim-sweep-0645-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live",
+    "alpha-engine-sf-watch-reclaim-sweep-1445-daily": "nousergon-data#1207; codified in sf-watch-reclaim-sweep-handler/deploy.sh, never created live"
+  },
+
   "paused": {
     "events_rules": {
       "alpha-engine-canary-replay-liveness-probe-tick": "overseer canary-replay liveness probe",

@@ -1,3 +1,8 @@
+
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-sf-watch-reclaim-sweep-handler Lambda
 # and wire its EventBridge Scheduler rules.
@@ -247,7 +252,7 @@ if $BOOTSTRAP_IAM; then
     rule="${RECLAIM_RULE_NAMES[$i]}"
     echo "  Creating/updating EventBridge rule: ${rule}"
     run aws events put-rule \
-      --name "${rule}" \
+      --name "${rule}" --state "$(pause_state "${rule}")" \
       --event-pattern "${RECLAIM_RULE_PATTERNS[$i]}" \
       --description "${RECLAIM_RULE_DESCRIPTIONS[$i]}" \
       --region "${REGION}" \
@@ -277,12 +282,12 @@ if $RECONCILE_SCHEDULES; then
     target="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     else
       echo "  Creating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler create-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler create-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     fi

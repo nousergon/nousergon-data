@@ -59,6 +59,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-expense-collector"
@@ -106,6 +111,19 @@ BOOTSTRAP_IAM=false
 RECONCILE_SCHEDULES=false
 APPLY_IAM=false
 SMOKE=false
+# alpha-engine-config-I6620. DRY_RUN was the ONE flag here with no default-init,
+# so `run()` below died 'DRY_RUN: unbound variable' under `set -u` on every
+# zero-flag invocation — which is every CI deploy. Observed 2026-08-07: the
+# Deploy expense-collector job failed AFTER packaging, so it looked like it had
+# got far enough to have worked, and the Lambda code was never updated.
+#
+# Same ambient-env idiom as every sibling deploy.sh, established by the I2752
+# incident (2026-07-16): DRY_RUN=1 from a caller's shell must actually no-op,
+# not silently run the real deploy path.
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
@@ -241,12 +259,12 @@ if $RECONCILE_SCHEDULES; then
       "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     else
       echo "  Creating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler create-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler create-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     fi

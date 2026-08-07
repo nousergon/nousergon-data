@@ -32,6 +32,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import subprocess
 import sys
 from pathlib import Path
 
@@ -238,3 +239,158 @@ def test_scheduler_disable_round_trips_the_full_spec():
     )
     for derived in ("Arn", "CreationDate", "LastModificationDate"):
         assert derived in src, f"{derived} is not stripped before update-schedule"
+
+
+# ── deploy-time enforcement (alpha-engine-config-I6619) ──────────────────────
+#
+# The manifest records the pause and automation_pause.py --check verifies it,
+# but until 2026-08-07 nothing stopped a redeploy from lifting it: neither
+# `aws events put-rule` nor `aws scheduler create-schedule|update-schedule`
+# has a "leave the state alone" option, and BOTH default to ENABLED when
+# --state is omitted. Every deploy.sh reconciling its own triggers therefore
+# silently re-enabled whatever it owned.
+#
+# Two shapes had to be fixed, and the second is the one worth a test: an
+# OMITTED --state (defaults ENABLED) and a HARDCODED --state literal. The
+# hardcoded ones were worse — `eod-backstop/deploy.sh` pinned `--state
+# DISABLED` for a rule Brian explicitly KEPT, so redeploying it would have
+# silently turned off the postclose SF backstop.
+
+_WRITE_VERBS = (
+    "aws events put-rule",
+    "aws scheduler create-schedule",
+    "aws scheduler update-schedule",
+)
+PAUSE_LIB = INFRA / "lambdas" / "_shared" / "pause.sh"
+
+
+def _deploy_scripts() -> list[Path]:
+    return sorted(INFRA.glob("lambdas/*/deploy.sh")) + sorted(INFRA.glob("*.sh"))
+
+
+def _statements(text: str):
+    """Yield whole logical statements, backslash continuations joined.
+
+    Load-bearing: `--name` and `--state` routinely sit on different physical
+    lines, so a line-at-a-time check would pass a statement that omits --state.
+    """
+    lines = text.splitlines(keepends=True)
+    i = 0
+    while i < len(lines):
+        if any(v in lines[i] for v in _WRITE_VERBS) and not lines[i].lstrip().startswith("#"):
+            j = i
+            while lines[j].rstrip().endswith("\\") and j + 1 < len(lines):
+                j += 1
+            yield i + 1, "".join(lines[i:j + 1])
+            i = j + 1
+        else:
+            i += 1
+
+
+def test_pause_helper_exists():
+    assert PAUSE_LIB.is_file(), (
+        "infrastructure/lambdas/_shared/pause.sh is gone — every deploy.sh "
+        "sourcing it will fail at deploy time"
+    )
+
+
+def test_every_trigger_write_derives_state_from_the_manifest():
+    """No omitted --state (defaults ENABLED) and no hardcoded literal."""
+    offenders = []
+    for script in _deploy_scripts():
+        for lineno, stmt in _statements(script.read_text(encoding="utf-8")):
+            if "pause_state" in stmt:
+                continue
+            rel = script.relative_to(REPO_ROOT)
+            reason = "hardcoded --state" if "--state" in stmt else "no --state (defaults ENABLED)"
+            offenders.append(f"{rel}:{lineno} — {reason}")
+    assert not offenders, (
+        "these EventBridge writes do not derive --state from "
+        "automation_pause.json, so a redeploy silently changes a trigger's "
+        "state:\n  " + "\n  ".join(offenders)
+    )
+
+
+def test_every_script_that_calls_pause_state_also_sources_the_helper():
+    missing = []
+    for script in _deploy_scripts():
+        text = script.read_text(encoding="utf-8")
+        if "pause_state" in text and "_shared/pause.sh" not in text:
+            missing.append(str(script.relative_to(REPO_ROOT)))
+    assert not missing, (
+        f"{missing} call pause_state without sourcing the helper — the deploy "
+        "fails at runtime, after the Lambda code has already been pushed"
+    )
+
+
+def test_pause_helper_fails_open_not_closed():
+    """A missing manifest must yield ENABLED, never DISABLED.
+
+    The asymmetry is deliberate. A pause that silently SPREADS would stop the
+    weekly SF with no signal that a config file caused it; a pause that
+    silently LIFTS is caught by automation_pause.py --check the next morning.
+    Only one of those failure modes has a detector.
+    """
+    src = PAUSE_LIB.read_text(encoding="utf-8")
+    assert 'echo "ENABLED"' in src, "no fail-open branch for an unreadable manifest"
+    marker = src.index("if [ ! -r")
+    assert 'echo "ENABLED"' in src[marker:marker + 200], (
+        "the unreadable-manifest branch does not return ENABLED"
+    )
+
+
+def test_pause_helper_resolves_both_surfaces():
+    """Live behaviour, not just source inspection."""
+    manifest = json.loads((INFRA / "automation_pause.json").read_text(encoding="utf-8"))
+    paused_rule = sorted(manifest["paused"]["events_rules"])[0]
+    paused_sched = sorted(manifest["paused"]["scheduler_schedules"])[0]
+
+    def _state(name: str) -> str:
+        out = subprocess.run(
+            ["bash", "-c", f'source "{PAUSE_LIB}"; pause_state "{name}"'],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+
+    assert _state(paused_rule) == "DISABLED", paused_rule
+    assert _state(paused_sched) == "DISABLED", paused_sched
+    for kept in ("alpha-engine-saturday", "alpha-engine-weekday",
+                 "alpha-engine-eod-backstop-daily"):
+        assert _state(kept) == "ENABLED", f"{kept} is kept by the ruling"
+    assert _state("a-rule-nobody-has-heard-of") == "ENABLED"
+
+
+def test_pending_entries_are_paused_at_write_time_but_not_required_live(manifest, module):
+    """`pending` = paused, for triggers that do not exist live yet.
+
+    alpha-engine-config-I6620. nousergon-data#1207 declares three schedules its
+    deploy would create ENABLED mid-pause. They cannot go in `paused` — the
+    check requires those to exist live — but they must still be born DISABLED.
+    """
+    pending = {k for k in manifest.get("pending", {}) if not k.startswith("_")}
+    assert pending, "the pending block is empty; if #1207's schedules now exist live, move them to paused"
+
+    # --check must NOT require them to exist live.
+    assert not (pending & module.paused_names(manifest)), (
+        "a name is in BOTH pending and paused — --check would demand it exist "
+        "live while the pending block exists precisely because it does not"
+    )
+
+    def _state(name: str) -> str:
+        out = subprocess.run(
+            ["bash", "-c", f'source "{PAUSE_LIB}"; pause_state "{name}"'],
+            capture_output=True, text=True, check=True,
+        )
+        return out.stdout.strip()
+
+    for name in sorted(pending):
+        assert _state(name) == "DISABLED", f"{name} would be created ENABLED"
+
+
+def test_pending_notes_are_not_treated_as_trigger_names():
+    """`_`-prefixed keys are prose, not triggers."""
+    out = subprocess.run(
+        ["bash", "-c", f'source "{PAUSE_LIB}"; pause_state "_why"'],
+        capture_output=True, text=True, check=True,
+    )
+    assert out.stdout.strip() == "ENABLED"

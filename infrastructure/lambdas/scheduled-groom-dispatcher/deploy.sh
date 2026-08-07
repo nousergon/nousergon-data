@@ -1,3 +1,8 @@
+
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-scheduled-groom-dispatcher Lambda,
 # the alpha-engine-groom-dispatch Step Function that wraps it, and wire the
@@ -428,7 +433,7 @@ EOF
         --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
       run aws scheduler update-schedule \
-        --name "${name}" \
+        --name "${name}" --state "$(pause_state "${name}")" \
         --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" \
         --flexible-time-window '{"Mode":"OFF"}' \
@@ -438,7 +443,7 @@ EOF
     else
       echo "  Creating Scheduler rule: ${name} → ${cron}"
       run aws scheduler create-schedule \
-        --name "${name}" \
+        --name "${name}" --state "$(pause_state "${name}")" \
         --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" \
         --flexible-time-window '{"Mode":"OFF"}' \
@@ -483,7 +488,7 @@ EOF
       --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
     run aws scheduler update-schedule \
-      --name "${RECON_SCHED_NAME}" \
+      --name "${RECON_SCHED_NAME}" --state "$(pause_state "${RECON_SCHED_NAME}")" \
       --schedule-expression "${RECON_SCHED_CRON}" \
       --flexible-time-window '{"Mode":"OFF"}' \
       --target "${recon_target}" \
@@ -492,7 +497,7 @@ EOF
   else
     echo "  Creating reconciler rule: ${RECON_SCHED_NAME} → ${RECON_SCHED_CRON}"
     run aws scheduler create-schedule \
-      --name "${RECON_SCHED_NAME}" \
+      --name "${RECON_SCHED_NAME}" --state "$(pause_state "${RECON_SCHED_NAME}")" \
       --schedule-expression "${RECON_SCHED_CRON}" \
       --flexible-time-window '{"Mode":"OFF"}' \
       --target "${recon_target}" \
@@ -555,13 +560,13 @@ EOF
     if aws scheduler get-schedule --name "${sname}" --region "${REGION}" \
         --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating sweep rule: ${sname} → ${scron}"
-      run aws scheduler update-schedule --name "${sname}" \
+      run aws scheduler update-schedule --name "${sname}" --state "$(pause_state "${sname}")" \
         --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
         --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
         --region "${REGION}" --query 'ScheduleArn' --output text
     else
       echo "  Creating sweep rule: ${sname} → ${scron}"
-      run aws scheduler create-schedule --name "${sname}" \
+      run aws scheduler create-schedule --name "${sname}" --state "$(pause_state "${sname}")" \
         --schedule-expression "${scron}" --schedule-expression-timezone "UTC" \
         --flexible-time-window '{"Mode":"OFF"}' --target "${sweep_target}" \
         --region "${REGION}" --query 'ScheduleArn' --output text
