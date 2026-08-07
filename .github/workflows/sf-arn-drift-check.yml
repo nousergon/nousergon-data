@@ -33,6 +33,8 @@ on:
       - 'infrastructure/deploy-infrastructure.sh'
       - 'infrastructure/step_function*.json'
       - 'infrastructure/scheduler/**'
+      - 'infrastructure/automation_pause.json'
+      - 'infrastructure/automation_pause.py'
       - '.github/workflows/sf-arn-drift-check.yml'
   schedule:
     - cron: '30 9 * * *'   # daily, alongside the IAM sweep
@@ -55,6 +57,17 @@ jobs:
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
           aws-region: us-east-1
+
+      # Brian ruling 2026-08-07: all scheduled automation paused except the
+      # weekly/preopen/postclose SFs and the 24/7 box. This asserts the pause
+      # still holds — the opposite direction from every other check here, and
+      # the only surface that would notice a redeploy quietly switching a
+      # paused trigger back on. Runs unconditionally (not PR-scoped): the
+      # invariant is about live AWS, not about which files a PR touched.
+      # Read-only; needs nothing beyond the events:DescribeRule +
+      # scheduler:GetSchedule this role already holds.
+      - name: Scheduled-automation pause still holds (live)
+        run: python3 infrastructure/automation_pause.py --check
 
       - name: EventBridge SF-ARN drift (codified vs live)
         run: python3 infrastructure/eventbridge/check-drift.py

@@ -36,7 +36,10 @@ Drift cases (all exit non-zero):
     stated reason" + §4.8 "irreversible actions carry a declared window"
     obligation, checked mechanically.
   * ``live-mismatch`` (``--live`` only) — the manifest's cron differs from the
-    live AWS schedule, or the live rule is not ENABLED.
+    live AWS schedule, or the live rule is not ENABLED. EXEMPT from the state
+    half: a trigger listed in ``infrastructure/automation_pause.json`` is off by
+    ruling, and ``automation_pause.py --check`` asserts the opposite direction
+    (paused-but-ENABLED) for it.
 
 Usage:
   ./infrastructure/scheduler/check-manifest-drift.py             # AWS-free
@@ -155,6 +158,7 @@ def check(
 
     # ── Manifest vs live AWS (optional) ─────────────────────────────────────
     if live:
+        paused = checker.automation_pause.paused_names()
         for name, t in manifest_by_name.items():
             live_rule = checker._live_schedule(name)
             if live_rule is None:
@@ -168,7 +172,13 @@ def check(
                     "rule": name, "kind": "live-mismatch",
                     "detail": f"manifest={t['cron']!r} live={live_rule['expression']!r}",
                 })
-            if live_rule["state"] != "ENABLED":
+            # A trigger listed in infrastructure/automation_pause.json is off by
+            # ruling (Brian 2026-08-07), so DISABLED is not drift for it. Same
+            # exemption as check-schedule-drift.py, and for the same reason: the
+            # invariant is not dropped, automation_pause.py --check asserts the
+            # opposite direction. Cron mismatch above is still checked, so a
+            # paused entry's manifest cron cannot rot while nobody is looking.
+            if live_rule["state"] != "ENABLED" and name not in paused:
                 findings.append({
                     "rule": name, "kind": "live-mismatch",
                     "detail": f"live state is {live_rule['state']}, expected ENABLED",

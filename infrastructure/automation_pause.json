@@ -1,0 +1,67 @@
+{
+  "ruling": {
+    "by": "Brian",
+    "date": "2026-08-07",
+    "statement": "Shut down all automatic AWS processes except the weekly Step Function (Saturday morning), the daily preopen and postclose Step Functions (Monday-Friday), and the 24/7 dashboard box. Everything else has its schedule removed - manual invocation only.",
+    "duration": "indefinite-but-temporary ('for now'). Un-pausing is per-entry: delete the entry, run automation_pause.py --enforce is NOT needed to re-enable - re-enable explicitly with the AWS CLI or a deploy.sh reconcile.",
+    "region": "us-east-1 - the only region in this account carrying EventBridge rules or Scheduler schedules (us-west-2 / us-east-2 / eu-west-1 verified empty 2026-08-07)"
+  },
+
+  "not_paused": {
+    "alpha-engine-saturday": "weekly SF trigger (ne-weekly-freshness-pipeline) - explicitly kept",
+    "alpha-engine-weekday": "preopen SF trigger (ne-preopen-trading-pipeline) - explicitly kept",
+    "alpha-engine-eod-backstop-daily": "postclose SF backstop trigger - the scheduled half of the kept postclose pipeline (its primary trigger is the daemon shutdown, which is on-box)",
+    "alpha-engine-stop-trading": "stops the trading EC2 box Mon-Fri 22:00 PT. Cost-safety backstop for the kept daily cycle: without it a failed postclose leaves a t3.large running indefinitely",
+    "alpha-engine-spot-orphan-reaper-hourly": "terminates spot instances orphaned by a dead SF. Cost-safety backstop for the kept weekly + preopen pipelines, both of which launch spot",
+    "reactive-notifier-rules": "alpha-engine-sf-status-change, alpha-engine-groom-sf-failure, alpha-engine-spot-interruption-warning-record, alpha-engine-sf-watch-instance-terminated, alpha-engine-sf-watch-spot-interruption, overseer-intake-cw-alarm-state - EventPattern rules with no schedule to remove. They carry the failure signal for the kept pipelines; with the drain and dispatchers paused they only notify and record.",
+    "DO-NOT-DELETE-AmazonInspectorEcrManagedRule": "AWS-managed",
+    "non-eventbridge": "DLM policy-0047cfbfb7070a3b7 (nightly dashboard-box snapshot, 14d) and the two SSM associations (ae-patch-scan-only, ae-software-inventory, rate(1 day)) are kept: they are read-only or protective hygiene for the 24/7 box, not autonomous processes."
+  },
+
+  "paused": {
+    "events_rules": {
+      "alpha-engine-canary-replay-liveness-probe-tick": "overseer canary-replay liveness probe",
+      "alpha-engine-canary-replay-thursday": "canary-replay drill dispatcher (spawns work)",
+      "alpha-engine-daily-heal": "data-spot heal dispatcher (launches spot). CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
+      "alpha-engine-eod-success-friday-shell-trigger": "Friday shell-run trigger (spawns work)",
+      "alpha-engine-freshness-monitor-cron": "artifact freshness monitor - daily",
+      "alpha-engine-freshness-monitor-historical-cron": "artifact freshness monitor - historical",
+      "alpha-engine-freshness-monitor-intraday-cron": "artifact freshness monitor - intraday",
+      "alpha-engine-friday-shell-run-report": "Friday shell-run report",
+      "alpha-engine-pipeline-watchdog-daily": "pipeline watchdog",
+      "alpha-engine-predictor-drift-check": "predictor drift check. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
+      "alpha-engine-predictor-health-check": "predictor health check. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
+      "alpha-engine-router-exposure-probe-15min": "model-router exposure probe. Codified in nous-ergon-ops/infrastructure/lambdas/router-exposure-probe/deploy.sh, NOT this repo - paused live and recorded here because this manifest checks live AWS, not source ownership",
+      "alpha-engine-saturday-integrity-monday": "Saturday-run integrity sentinel",
+      "alpha-engine-saturday-sf-watch-failed": "EventPattern rule, but its target dispatches an autonomous remediation agent on weekly-SF failure - paused with the rest of the response plane",
+      "alpha-engine-spot-interruption-recorder-tick": "spot-interruption recorder poll (the EventPattern half stays enabled - it records real interruptions on the kept pipelines)",
+      "alpha-engine-ssm-reachability-probe-5min": "SSM reachability probe",
+      "alpha-engine-sweep-artifact-monitor": "EventPattern rule whose target monitors sweep artifacts; the sweep itself is paused",
+      "alpha-research-alerts": "intraday research alerts. CloudFormation-managed - State: DISABLED in alpha-engine-orchestration.yaml",
+      "alpha-research-thinktank-daily": "Think Tank spot dispatcher (launches spot)"
+    },
+    "scheduler_schedules": {
+      "alpha-engine-alert-drain-0400utc": "overseer alert drain",
+      "alpha-engine-alert-drain-1000utc": "overseer alert drain",
+      "alpha-engine-alert-drain-1600utc": "overseer alert drain",
+      "alpha-engine-alert-drain-2200utc": "overseer alert drain",
+      "alpha-engine-ci-watch-canary-drill-weekly": "ci-watch canary drill",
+      "alpha-engine-config-runner-reconcile": "config-runner reconcile, rate(1 minute). Its target Lambda alpha-engine-config-runner-dispatcher DOES NOT EXIST - this schedule has been failing every minute (~1,440 invocations/day). Root cause + the missing target-existence guard: alpha-engine-config-I6618",
+      "alpha-engine-crypto-balances-15min": "crypto balance collector",
+      "alpha-engine-expense-collector-twicedaily": "expense collector",
+      "alpha-engine-groom-lane-reconciler-5min": "groom lane reconciler",
+      "alpha-engine-groom-sweep-0000-daily": "PR sweep",
+      "alpha-engine-groom-sweep-0800-daily": "PR sweep",
+      "alpha-engine-groom-sweep-1600-daily": "PR sweep",
+      "alpha-engine-overseer-liveness-0650-daily": "overseer liveness probe",
+      "alpha-engine-overseer-liveness-1450-daily": "overseer liveness probe",
+      "alpha-engine-scheduled-groom-0400-daily": "backlog groom cycle",
+      "alpha-engine-scheduled-groom-1200-daily": "backlog groom cycle",
+      "alpha-engine-scheduled-groom-2000-daily": "backlog groom cycle",
+      "alpha-engine-scheduled-groom-sun0900-weekly": "backlog groom cycle",
+      "alpha-engine-sf-watch-canary-drill-weekly": "sf-watch canary drill",
+      "alpha-engine-sf-watch-liveness-0645-daily": "sf-watch liveness probe",
+      "alpha-engine-sf-watch-liveness-1445-daily": "sf-watch liveness probe"
+    }
+  }
+}

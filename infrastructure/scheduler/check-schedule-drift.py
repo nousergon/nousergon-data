@@ -30,7 +30,10 @@ Drift cases (all exit non-zero):
   * ``expression-drift``  — live ``ScheduleExpression`` differs from source.
   * ``disabled``          — rule exists but ``State != ENABLED``. A disabled
                             schedule is indistinguishable from a working one in
-                            every surface except this check.
+                            every surface except this check. EXEMPT: a rule
+                            listed in ``infrastructure/automation_pause.json``
+                            is off by ruling, and the opposite assertion (found
+                            ENABLED) is made by ``automation_pause.py --check``.
   * ``orphaned``          — a live rule under a declared ``SCHED_PREFIX`` that
                             source no longer declares. The prune loop in
                             deploy.sh should have removed it; if one survives,
@@ -63,6 +66,9 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
 LAMBDAS_DIR = REPO_ROOT / "infrastructure" / "lambdas"
+
+sys.path.insert(0, str(REPO_ROOT / "infrastructure"))
+import automation_pause  # noqa: E402  (path must be set first)
 
 # Bash array literals: NAME=(\n  "a"\n  "b"\n). The leading \s* is load-bearing,
 # not defensive: SWEEP_SCHED_NAMES is declared INSIDE an `if` block and so is
@@ -229,6 +235,14 @@ def check(
 
     codified_names = {r["name"] for r in rules}
 
+    # A schedule listed in infrastructure/automation_pause.json is DISABLED on
+    # purpose (Brian ruling 2026-08-07), so `disabled` is not drift for it. The
+    # invariant is not dropped, it MOVES: automation_pause.py --check asserts
+    # the opposite direction — a paused schedule found ENABLED is a finding
+    # there. Expression drift is still checked for paused schedules, so the
+    # codified cron stays true and un-pausing is a state flip, not a rewrite.
+    paused = automation_pause.paused_names()
+
     for rule in rules:
         live = _live_schedule(rule["name"])
         if live is None:
@@ -244,7 +258,7 @@ def check(
                 "source_file": rule["source_file"],
                 "detail": f"source={rule['expression']} live={live['expression']}",
             })
-        if live["state"] != "ENABLED":
+        if live["state"] != "ENABLED" and rule["name"] not in paused:
             findings.append({
                 "rule": rule["name"], "kind": "disabled",
                 "source_file": rule["source_file"],

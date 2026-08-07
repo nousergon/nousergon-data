@@ -372,7 +372,11 @@ Resources:
       Name: alpha-research-alerts
       Description: Intraday price alerts every 30 min during market hours
       ScheduleExpression: 'cron(0/30 13-21 ? * MON-FRI *)'
-      State: ENABLED
+      # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
+      # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
+      # this stack on EVERY push to main, so a console-only disable comes back on the
+      # next merge. Flip to ENABLED and drop the manifest entry to un-pause.
+      State: DISABLED
       Targets:
         - Id: alerts-lambda
           Arn: !Ref AlertsLambdaArn
@@ -401,7 +405,11 @@ Resources:
       Name: alpha-engine-daily-heal
       Description: Weekday 09:00 UTC — standalone universe-gap + chronic-polygon-gap data heal (alpha-engine-config-I2717), off the preopen critical path
       ScheduleExpression: 'cron(0 9 ? * MON-FRI *)'
-      State: ENABLED
+      # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
+      # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
+      # this stack on EVERY push to main, so a console-only disable comes back on the
+      # next merge. Flip to ENABLED and drop the manifest entry to un-pause.
+      State: DISABLED
       Targets:
         # SINGLE TARGET PER RULE — see SaturdayTrigger's Targets comment for
         # the 2026-05-26 duplicate-target incident that codified this
@@ -434,7 +442,11 @@ Resources:
       Name: alpha-engine-predictor-health-check
       Description: Weekday 13:40 UTC — daily predictor model health (IC, hit rate, calibration, retrain triggers), re-homed off the preopen SF (alpha-engine-config-I2722)
       ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
-      State: ENABLED
+      # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
+      # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
+      # this stack on EVERY push to main, so a console-only disable comes back on the
+      # next merge. Flip to ENABLED and drop the manifest entry to un-pause.
+      State: DISABLED
       Targets:
         - Id: predictor-health-check
           Arn: !Ref PredictorHealthCheckLambdaArn
@@ -462,7 +474,11 @@ Resources:
       Name: alpha-engine-predictor-drift-check
       Description: Weekday 13:40 UTC — daily prediction-drift producer (config#1853), re-homed off the preopen SF (alpha-engine-config-I2722)
       ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
-      State: ENABLED
+      # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
+      # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
+      # this stack on EVERY push to main, so a console-only disable comes back on the
+      # next merge. Flip to ENABLED and drop the manifest entry to un-pause.
+      State: DISABLED
       Targets:
         - Id: predictor-drift-check
           Arn: !Ref PredictorLambdaArn
