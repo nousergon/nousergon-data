@@ -148,6 +148,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # means the assertion itself stopped running — nobody is checking whether
     # the corpus is warm — and nothing else surfaces that.
     "rag/pipelines/assert_corpus_freshness.py": 1,
+    # health/rag_ingestion_progress/{run_date}.json — per-step progress telemetry
+    # written by the weekly RAG ingestion pipeline (alpha-engine-config-I2966).
+    # OPERATIONAL TELEMETRY, not a freshness-SLA artifact — the data it carries
+    # (step, label, timestamp) is a live progress readout for the Fleet Status
+    # console, not a durability-guaranteed artifact; the Publish contract is
+    # fire-and-forget (fail-soft `|| echo WARN`) so no SLA to monitor. Grandfathered
+    # out of ARTIFACT_REGISTRY.yaml per the watermarks/store-level precedent above.
+    "rag/pipelines/emit_progress.py": 1,
     "builders/migrate_universe_vwap.py": 1,
     "builders/prune_delisted_tickers.py": 1,
     # builders/backfill_delisted_audit/{date}-{HHMMSSZ}.json — per-run audit record for
