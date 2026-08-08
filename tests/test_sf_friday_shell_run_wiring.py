@@ -866,18 +866,19 @@ class TestByteIdenticalAbsentPath:
 
 class TestConsolidatedNotify:
     def test_substrate_check_routes_to_notify_gate(self, states):
-        # The substrate check flows into two non-fatal advisory states (evaluator
+        # The substrate check flows into two advisory states (evaluator
         # Report Card v2, then the Director) before the notify gate. ReportCard's
         # SUCCESS Next feeds the Director; its Catch routes to
         # PublishReportCardDegraded (config#2302: a WARNING page — advisory grading
         # failed silently for 9 days pre-fix) which then continues to
-        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify;
-        # its Catch routes to PublishDirectorDegraded (same config#2302 shape) which
-        # then continues to CheckShellRunNotify. The path to the notify gate is
-        # preserved whether grading/advisory succeed or fail. On the Friday preflight
-        # the states still RUN (dry, see test_advisory_tail_runs_dry_on_preflight) —
-        # they are not skipped — so the success edge is identical on real + preflight
-        # runs.
+        # CheckShellRunNotify. The Director's own Next lands on CheckShellRunNotify
+        # on success. config#6408 (Brian's 2026-08-04 operator ruling): Director's
+        # Catch now routes to NormalizeFailureContext — a Director failure
+        # terminates the execution FAILED.
+        # The path to the notify gate is preserved when grading succeeds and
+        # advisory succeeds. On the Friday preflight the states still RUN (dry,
+        # see test_advisory_tail_runs_dry_on_preflight) — they are not skipped —
+        # so the success edge is identical on real + preflight runs.
         # config#2276: the substrate poll resolves to a terminal status
         # first; its Success edge is what feeds ReportCard.
         assert (
@@ -896,8 +897,8 @@ class TestConsolidatedNotify:
         assert states["PublishReportCardDegraded"]["Next"] == "CheckShellRunNotify"
         director = states["Director"]
         assert director["Next"] == "CheckShellRunNotify"
-        assert all(c["Next"] == "PublishDirectorDegraded" for c in director["Catch"])
-        assert states["PublishDirectorDegraded"]["Next"] == "CheckShellRunNotify"
+        assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
+        assert all(c["ResultPath"] == "$.error" for c in director["Catch"])
 
     def test_advisory_tail_runs_dry_on_preflight(self, states):
         """ROADMAP L4504: ReportCard + Director were added after the shell-run

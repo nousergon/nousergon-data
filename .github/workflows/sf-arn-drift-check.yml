@@ -78,7 +78,19 @@ jobs:
       - name: SF lambda:invoke Lambda-existence check (codified vs live)
         run: python3 infrastructure/step-functions/check-lambda-existence.py
 
+      # PR-time only, this check compares the PR BRANCH's bytes against
+      # live/S3 — but a PR that changes infrastructure/step_function*.json
+      # (the legitimate change mechanism) IS the divergence, and the
+      # restamp only happens at deploy, post-merge (config#2273). It can
+      # never pass on such PRs and blocked the Director-terminal-failure PR
+      # through three escalation cycles (alpha-engine-config-I6591). The
+      # invariant this check enforces is "deployed truth == repo source",
+      # which only exists on the pushed branch: fleet-wide runs happen on
+      # every merge (deploy-infrastructure.yml, right after the deploy
+      # applies) and daily via the schedule below — same shape as the
+      # scheduler checks.
       - name: SF definition drift (codified vs live vs S3-staged)
+        if: github.event_name != 'pull_request'
         run: python3 infrastructure/step-functions/check-definition-drift.py
 
       # alpha-engine-config-I5805. The out-of-band half of schedule coverage.

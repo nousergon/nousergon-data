@@ -14,11 +14,12 @@ history's event vocabulary):
 - ``director_degraded``: the REAL watch-rerun-2026-08-01-4 history (the
   "permanent fixture" for alpha-engine-config-I6055 — see its test) — the
   Director hard-failed (ModuleNotFoundError: openai, event 858),
-  PublishDirectorDegraded absorbed it, the tail's health checks degraded
-  too, and the run only failed terminally at WriteCompletionMarker
-  (S3.AccessDeniedException). Its tail states are real events, filtered
-  from the live Step Functions history to the event types this script
-  consumes.
+  PublishDirectorDegraded absorbed it (PRE-FIX behavior — config#6408 now
+  routes Director failure to terminal FailExecution), the tail's health
+  checks degraded too, and the run only failed terminally at
+  WriteCompletionMarker (S3.AccessDeniedException). PublishDirectorDegraded
+  is RETAINED in the degraded_witness set for backward compatibility with
+  pre-fix execution histories.
 
 Plus the config#2280 mutex-steal decision matrix and the role-gating
 verification (config#2277 deliverable 2).
@@ -205,14 +206,19 @@ class TestDerivePlan:
         the Director hard-fail its rerun was started for. This fixture IS
         the real watch-rerun-2026-08-01-4 history: Director failed with
         'No module named openai' (event 858), PublishDirectorDegraded
-        absorbed it, the health checks degraded too, and the run only
-        failed terminally at WriteCompletionMarker."""
+        absorbed it (PRE-FIX behavior — config#6408 now routes Director
+        failure to terminal FailExecution), the health checks degraded too,
+        and the run only failed terminally at WriteCompletionMarker.
+        PublishDirectorDegraded is retained in degraded_witness for
+        backward compatibility with pre-fix execution histories — new
+        executions never enter it."""
         plan = mod.derive_plan(_events("director_degraded"))
         # the degraded tail must re-run — never skipped, never "completed"
         assert "post_eval" in plan.degraded
         assert "post_eval" not in plan.completed
         assert "skip_post_eval" not in plan.skip_flags
         # the degradation must be surfaced in the derivation notes
+        # (PublishDirectorDegraded retained in degraded_witness for backward compat)
         assert any("DEGRADED" in n and "PublishDirectorDegraded" in n for n in plan.notes)
         # stages that genuinely completed cleanly keep their skip flags
         # (evaluator and parity really ran to completion on this execution)
@@ -473,8 +479,11 @@ class TestStageTableLockstep:
         EMAIL surface, not a stage degrading, so it is deliberately
         unmapped."""
         mapped: dict = {}
+        historical = getattr(mod, "HISTORICAL_DEGRADED_WITNESS", frozenset())
         for stage in mod.STAGES:
             for d in stage.degraded_witness:
+                if d in historical:
+                    continue  # retained for backward compat (pre-fix histories)
                 assert d in all_states, (
                     f"{stage.name}: degraded witness {d} is not a state in "
                     f"infrastructure/step_function.json — update STAGES"
