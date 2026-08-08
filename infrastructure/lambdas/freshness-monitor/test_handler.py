@@ -1718,7 +1718,7 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery, critical_arms, _esc, _rem = index.load_registry_with_recovery(
+    specs, recovery, critical_arms, _esc, _rem, _pt = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
@@ -1773,7 +1773,7 @@ def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
 def test_load_registry_parses_critical_while_champion_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    _specs, _recovery, critical_arms, _esc, _rem = index.load_registry_with_recovery(
+    _specs, _recovery, critical_arms, _esc, _rem, _pt = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
 
@@ -1781,7 +1781,7 @@ def test_load_registry_parses_critical_while_champion_arm(fake_s3):
 def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
@@ -1797,7 +1797,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
 def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
@@ -1812,7 +1812,7 @@ def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
     fail toward paging, never toward silence."""
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -1960,7 +1960,7 @@ artifacts:
     created_at: 2025-01-01
 """
     import index
-    _specs, _recovery, _arms, escalate, _rem = index.load_registry_with_recovery(
+    _specs, _recovery, _arms, escalate, _rem, _pt = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert escalate == {"config_scoring_weights": True}
 
@@ -2299,7 +2299,7 @@ def test_load_registry_parses_remediation_map(monkeypatch, fake_s3):
     undeclared rows are simply absent."""
     import index
     fake_s3._registry_body = _DRAIN_REGISTRY
-    _s, _r, _a, _e, remediation = index.load_registry_with_recovery(
+    _s, _r, _a, _e, remediation, _pt = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert remediation == {
@@ -2418,3 +2418,251 @@ def test_drain_dispatch_failure_does_not_sink_pass(
     put_keys = [k for (_, k, _) in fake_s3._put_calls]
     assert "_freshness_monitor/heartbeat.json" in put_keys
     assert "_freshness_monitor/check_results.json" in put_keys
+
+
+# ── Producer-trigger suppression (alpha-engine-config-I6570) ────────────────
+#
+# The property under test is narrow and load-bearing: a deliberately-disabled
+# producer must remove the PAGE and nothing else. The row's state, its
+# severity, and its presence on the console surface are all unchanged, and any
+# failure to establish that the producer is off leaves the page intact.
+
+_PRODUCER_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  calendar_aware: true
+  severity: warning
+artifacts:
+  - artifact_id: paused_producer
+    s3_key_template: "thinktank/challenger_selection/latest.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 720
+    severity: critical
+    producer_trigger: "events:alpha-research-thinktank-daily"
+    owner_repo: crucible-research
+    created_at: 2025-01-01
+  - artifact_id: scheduler_producer
+    s3_key_template: "overseer/drain/latest.json"
+    cadence: continuous
+    interval_minutes: 360
+    sla_minutes_after_cron: 60
+    severity: critical
+    producer_trigger: "scheduler:alpha-engine-alert-drain-0400utc"
+    owner_repo: nousergon-data
+    created_at: 2025-01-01
+  - artifact_id: malformed_producer
+    s3_key_template: "staging/x/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    producer_trigger: "alpha-research-thinktank-daily"
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+  - artifact_id: no_producer
+    s3_key_template: "staging/y/{trading_day}.parquet"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 30
+    owner_repo: alpha-engine-data
+    created_at: 2025-01-01
+"""
+
+
+def _events(state):
+    c = mock.Mock()
+    c.describe_rule.return_value = {"State": state}
+    return c
+
+
+def _scheduler(state):
+    c = mock.Mock()
+    c.get_schedule.return_value = {"State": state}
+    return c
+
+
+def test_parse_producer_trigger_grammar():
+    import index
+    assert index.parse_producer_trigger("events:r") == ("events", "r")
+    assert index.parse_producer_trigger("scheduler:s") == ("scheduler", "s")
+    assert index.parse_producer_trigger(" events : r ") == ("events", "r")
+    # Anything that is not the declared grammar must not suppress.
+    for bad in (None, "", "r", "lambda:r", "events:", ":r", 42, ["events:r"]):
+        assert index.parse_producer_trigger(bad) is None
+
+
+def test_loader_parses_producer_trigger_and_drops_malformed(fake_s3):
+    """A well-formed trigger is carried; a malformed one is dropped rather
+    than raising — the field's job is to REMOVE a page, so a typo degrades to
+    today's alerting behaviour instead of taking the registry down."""
+    import index
+    fake_s3._registry_body = _PRODUCER_REGISTRY
+    specs, _r, _a, _e, _rem, producer = index.load_registry_with_recovery(
+        fake_s3, "b", "k"
+    )
+    assert {s.artifact_id for s in specs} == {
+        "paused_producer", "scheduler_producer", "malformed_producer", "no_producer",
+    }
+    assert producer == {
+        "paused_producer": "events:alpha-research-thinktank-daily",
+        "scheduler_producer": "scheduler:alpha-engine-alert-drain-0400utc",
+    }
+
+
+def test_resolve_disabled_producers_reads_live_state():
+    import index
+    assert index.resolve_disabled_producers(
+        {"events:r"}, events_client=_events("DISABLED")
+    ) == {"events:r": "EventBridge rule r is DISABLED"}
+    assert index.resolve_disabled_producers(
+        {"events:r"}, events_client=_events("ENABLED")
+    ) == {}
+    assert index.resolve_disabled_producers(
+        {"scheduler:s"}, scheduler_client=_scheduler("DISABLED")
+    ) == {"scheduler:s": "Scheduler schedule s is DISABLED"}
+
+
+def test_resolve_disabled_producers_fails_toward_paging():
+    """An unresolvable trigger — denied, throttled, renamed, absent — is
+    treated as ENABLED. A suppression path that fails open is a monitor that
+    an IAM regression can silence."""
+    import index
+    boom = mock.Mock()
+    boom.describe_rule.side_effect = RuntimeError("AccessDeniedException")
+    assert index.resolve_disabled_producers({"events:r"}, events_client=boom) == {}
+
+
+def test_apply_producer_suppression_stamps_first_observation(fake_s3, fixed_now):
+    import index
+    fake_s3._registry_body = b"not json"  # disabled_since store absent/unreadable
+    out = index.apply_producer_suppression(
+        fake_s3,
+        {"paused_producer": "events:r"},
+        fixed_now,
+        events_client=_events("DISABLED"),
+    )
+    assert out["paused_producer"]["suppressed"] is True
+    assert out["paused_producer"]["disabled_since"] == fixed_now.date().isoformat()
+    assert out["paused_producer"]["days_disabled"] == 0
+    # First observation is persisted so the expiry clock survives the invocation.
+    assert any(
+        key == index.PRODUCER_DISABLED_SINCE_KEY
+        for _bucket, key, _body in fake_s3._put_calls
+    )
+
+
+def test_apply_producer_suppression_lapses_past_max_days(fake_s3, fixed_now, monkeypatch):
+    """A pause that becomes permanent must not become a permanent blindfold:
+    past the ceiling the row is still annotated but pages again."""
+    import index
+    monkeypatch.setattr(index, "PRODUCER_SUPPRESSION_MAX_DAYS", 14)
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s3: {"events:r": "2026-05-01"},   # 29 days before fixed_now
+    )
+    out = index.apply_producer_suppression(
+        fake_s3, {"a": "events:r"}, fixed_now, events_client=_events("DISABLED")
+    )
+    assert out["a"]["days_disabled"] == 29
+    assert out["a"]["suppressed"] is False
+
+
+def test_apply_producer_suppression_clears_a_re_enabled_trigger(fake_s3, fixed_now, monkeypatch):
+    import index
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since", lambda _s3: {"events:r": "2026-05-01"}
+    )
+    monkeypatch.setattr(
+        index, "_save_producer_disabled_since",
+        lambda _s3, mapping: saved.append(mapping),
+    )
+    out = index.apply_producer_suppression(
+        fake_s3, {"a": "events:r"}, fixed_now, events_client=_events("ENABLED")
+    )
+    assert out == {}            # enabled producer ⇒ no annotation at all
+    assert saved == [{}]        # and the clock is reset, not carried forward
+
+
+def test_maybe_alert_suppressed_when_producer_disabled(monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="paused_producer", s3_bucket="b", s3_key_template="k",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="missing", sla_violated_by_minutes=999)
+    publish_mock = mock.Mock()
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock())
+
+    suppression = {
+        "trigger": "events:r", "reason": "EventBridge rule r is DISABLED",
+        "disabled_since": "2026-05-29", "days_disabled": 1, "suppressed": True,
+    }
+    assert index._maybe_alert(
+        spec, result, fixed_now, producer_suppression=suppression) is False
+    assert publish_mock.call_count == 0
+
+    # Same critical row, same miss — suppression lapsed ⇒ it pages.
+    assert index._maybe_alert(
+        spec, result, fixed_now,
+        producer_suppression={**suppression, "suppressed": False}) is True
+    assert publish_mock.call_count == 1
+
+
+def test_check_results_row_records_suppression_without_hiding_the_state(fixed_now):
+    """A suppressed row keeps its TRUE state on the console surface. The
+    console must be able to render 'stale — producer disabled'; it must never
+    render green and the row must never be omitted (principles.md §2.7)."""
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="paused_producer", s3_bucket="b", s3_key_template="k",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="stale", sla_violated_by_minutes=4320)
+    payload = index._serialize_check_results(
+        [(spec, result)], fixed_now,
+        suppression_by_id={
+            "paused_producer": {
+                "trigger": "events:alpha-research-thinktank-daily",
+                "reason": "EventBridge rule alpha-research-thinktank-daily is DISABLED",
+                "disabled_since": "2026-05-20", "days_disabled": 10,
+                "suppressed": True,
+            }
+        },
+    )
+    row = payload["results"][0]
+    assert row["state"] == "stale"                     # not rewritten
+    assert row["severity"] == "critical"               # not downgraded
+    assert row["sla_violated_by_minutes"] == 4320      # not zeroed
+    assert row["producer_disabled"] is True
+    assert row["alert_suppressed"] is True
+    assert row["producer_trigger"] == "events:alpha-research-thinktank-daily"
+    assert row["producer_disabled_since"] == "2026-05-20"
+
+
+def test_check_results_row_defaults_are_inert_without_suppression(fixed_now):
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="no_producer", s3_bucket="b", s3_key_template="k",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="warning", owner_repo="ae-test", created_at=date(2025, 1, 1),
+    )
+    row = index._serialize_check_results(
+        [(spec, CheckResult(state="fresh"))], fixed_now
+    )["results"][0]
+    assert row["producer_disabled"] is False
+    assert row["alert_suppressed"] is False
+    assert row["producer_trigger"] is None
+    assert row["producer_disabled_since"] is None

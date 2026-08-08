@@ -317,13 +317,13 @@ def load_registry(s3_client: Any, bucket: str, key: str) -> list[ArtifactSpec]:
 def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
 ) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
-           dict[str, bool], dict[str, str]]:
+           dict[str, bool], dict[str, str], dict[str, str]]:
     """Like :func:`load_registry`, but also returns the per-artifact
     ``recovery:`` spec map (config#1240), the
     ``critical_while_champion_arm`` map (config-I3086), the
-    ``escalate_to_issue`` map (config#2055 Gap 2), and the
-    ``remediation:`` declared-response-lane map (config-I3282), all keyed
-    by ``artifact_id``.
+    ``escalate_to_issue`` map (config#2055 Gap 2), the
+    ``remediation:`` declared-response-lane map (config-I3282), and the
+    ``producer_trigger`` map (config-I6570), all keyed by ``artifact_id``.
 
     ``ArtifactSpec`` is a frozen lib dataclass without a ``recovery``
     field (the monitor's dispatch concern is not the substrate's
@@ -347,6 +347,7 @@ def load_registry_with_recovery(
     critical_arms_by_id: dict[str, list[str]] = {}
     escalate_to_issue_by_id: dict[str, bool] = {}
     remediation_by_id: dict[str, str] = {}
+    producer_trigger_by_id: dict[str, str] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -365,8 +366,22 @@ def load_registry_with_recovery(
         remediation = merged.get("remediation")
         if isinstance(remediation, str) and remediation:
             remediation_by_id[spec.artifact_id] = remediation
+        # config-I6570 — only a well-formed trigger is carried. A malformed
+        # value is dropped here rather than raising: the field's whole job is
+        # to REMOVE a page, so a typo must degrade to today's behaviour, not
+        # to a registry that fails to load. The PR-time validator in
+        # alpha-engine-config is the chokepoint that catches the typo.
+        producer_trigger = merged.get("producer_trigger")
+        if parse_producer_trigger(producer_trigger) is not None:
+            producer_trigger_by_id[spec.artifact_id] = producer_trigger
+        elif producer_trigger is not None:
+            logger.warning(
+                "registry row %s carries a malformed producer_trigger %r — "
+                "expected '<events|scheduler>:<name>'; row keeps alerting",
+                spec.artifact_id, producer_trigger,
+            )
     return (specs, recovery_by_id, critical_arms_by_id,
-            escalate_to_issue_by_id, remediation_by_id)
+            escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -434,6 +449,194 @@ def apply_dynamic_severity(
         else:
             out.append(spec)
     return out, coerced
+
+
+# ── Producer-trigger suppression (alpha-engine-config-I6570) ────────────────
+#
+# A registry row's miss means "this artifact is late". It does NOT distinguish
+# "the producer ran and failed" from "the producer was deliberately switched
+# off" — and after the 2026-08-07 automation-pause ruling (config-I6617)
+# disabled 40 triggers, most of the registry is in the second state. Paging on
+# a deliberately-off producer trains the operator to ignore the monitor, which
+# is the same outcome as not having one.
+#
+# The authority is LIVE AWS, never the pause manifest. `automation_pause.json`
+# is the record of the ruling; a rule can also be off for reasons that ruling
+# never covered, and the manifest can drift from reality in both directions.
+# Asking EventBridge whether the producing rule is ENABLED answers the actual
+# question and needs no second source to stay in sync.
+#
+# THREE properties this must not lose:
+#   1. It fails toward PAGING. Any error resolving a trigger's state — denied,
+#      throttled, renamed, absent — leaves the row alerting exactly as today.
+#      A suppression path that fails open is a monitor that can be silenced by
+#      an IAM regression.
+#   2. It is never silent. A suppressed row still lands in check_results.json
+#      with its true state and `alert_suppressed: true` + the trigger name, so
+#      the console renders "stale — producer disabled", never green.
+#      principles.md §2.7: no data is never rendered as green, and neither is
+#      deliberately-off.
+#   3. It EXPIRES. A pause that becomes permanent must not become a permanent
+#      blindfold. First-observed-disabled is persisted, and past
+#      PRODUCER_SUPPRESSION_MAX_DAYS the suppression lapses and the row pages
+#      again — the page then reads as "this has been off for N days", which is
+#      the decision the operator actually owes.
+PRODUCER_SUPPRESSION_MAX_DAYS = int(
+    os.environ.get("PRODUCER_SUPPRESSION_MAX_DAYS", "14")
+)
+PRODUCER_DISABLED_SINCE_KEY = "_freshness_monitor/producer_disabled_since.json"
+
+_PRODUCER_SURFACES = ("events", "scheduler")
+
+
+def parse_producer_trigger(value: Any) -> tuple[str, str] | None:
+    """Parse a registry ``producer_trigger`` scalar into ``(surface, name)``.
+
+    Grammar is ``"<surface>:<name>"`` where surface is ``events`` (an
+    EventBridge rule) or ``scheduler`` (an EventBridge Scheduler schedule) —
+    different APIs, not aliases, exactly as ``automation_pause.py`` splits
+    them. Anything else returns ``None`` and the row keeps today's behaviour;
+    a malformed field must never suppress.
+    """
+    if not isinstance(value, str) or ":" not in value:
+        return None
+    surface, _, name = value.partition(":")
+    surface, name = surface.strip(), name.strip()
+    if surface not in _PRODUCER_SURFACES or not name:
+        return None
+    return surface, name
+
+
+def resolve_disabled_producers(
+    triggers: set[str],
+    events_client: Any = None,
+    scheduler_client: Any = None,
+) -> dict[str, str]:
+    """Return ``{trigger: reason}`` for triggers LIVE-confirmed disabled.
+
+    A trigger absent from the result is treated as enabled, which is the
+    fail-toward-paging direction: an unresolvable trigger must not suppress
+    its artifact's page. Each lookup is trapped individually so one denied or
+    renamed trigger cannot blind the rest of the pass.
+    """
+    disabled: dict[str, str] = {}
+    if not triggers:
+        return disabled
+    for trigger in sorted(triggers):
+        parsed = parse_producer_trigger(trigger)
+        if parsed is None:
+            continue
+        surface, name = parsed
+        try:
+            if surface == "events":
+                client = events_client or boto3.client("events")
+                state = client.describe_rule(Name=name).get("State", "")
+                if state == "DISABLED":
+                    disabled[trigger] = f"EventBridge rule {name} is DISABLED"
+            else:
+                client = scheduler_client or boto3.client("scheduler")
+                state = client.get_schedule(Name=name).get("State", "")
+                if state == "DISABLED":
+                    disabled[trigger] = f"Scheduler schedule {name} is DISABLED"
+        except Exception as exc:  # noqa: BLE001 — fail toward paging, never toward silence
+            logger.warning(
+                "producer-trigger state unresolved for %s (%s: %s) — treating "
+                "as ENABLED so its artifacts keep alerting",
+                trigger, type(exc).__name__, exc,
+            )
+    return disabled
+
+
+def _load_producer_disabled_since(s3_client: Any) -> dict[str, str]:
+    """First-observed-disabled dates, keyed by trigger. Unreadable ⇒ empty,
+    which means today becomes the first observation — the conservative
+    direction, since a shorter observed pause expires sooner."""
+    try:
+        obj = s3_client.get_object(
+            Bucket=REGISTRY_BUCKET, Key=PRODUCER_DISABLED_SINCE_KEY
+        )
+        data = json.loads(obj["Body"].read())
+        if isinstance(data, dict):
+            return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}
+    except Exception as exc:  # noqa: BLE001 — absent on first run; never fatal
+        logger.info(
+            "producer_disabled_since unreadable (%s) — treating every currently "
+            "disabled trigger as first observed today", type(exc).__name__,
+        )
+    return {}
+
+
+def _save_producer_disabled_since(s3_client: Any, mapping: dict[str, str]) -> None:
+    try:
+        s3_client.put_object(
+            Bucket=REGISTRY_BUCKET,
+            Key=PRODUCER_DISABLED_SINCE_KEY,
+            Body=json.dumps(mapping, indent=2, sort_keys=True).encode(),
+            ContentType="application/json",
+        )
+    except Exception as exc:  # noqa: BLE001 — bookkeeping; the pass's deliverables stand
+        logger.warning(
+            "could not persist producer_disabled_since (%s: %s) — suppression "
+            "ages from today on the next pass instead of from first observation",
+            type(exc).__name__, exc,
+        )
+
+
+def apply_producer_suppression(
+    s3_client: Any,
+    producer_trigger_by_id: dict[str, str],
+    now: datetime,
+    events_client: Any = None,
+    scheduler_client: Any = None,
+) -> dict[str, dict[str, Any]]:
+    """Resolve which artifacts have a deliberately-disabled producer.
+
+    Returns ``{artifact_id: {"trigger", "reason", "disabled_since",
+    "days_disabled", "suppressed"}}`` for every artifact whose producer is
+    live-confirmed DISABLED. ``suppressed`` is False once the pause has run
+    past :data:`PRODUCER_SUPPRESSION_MAX_DAYS` — the row is still annotated
+    (so the console can explain the page) but it pages again.
+    """
+    if not producer_trigger_by_id:
+        return {}
+    disabled = resolve_disabled_producers(
+        set(producer_trigger_by_id.values()), events_client, scheduler_client
+    )
+    since = _load_producer_disabled_since(s3_client)
+    today = now.date().isoformat()
+    # Drop triggers that came back — a re-enabled producer restarts the clock.
+    next_since = {k: v for k, v in since.items() if k in disabled}
+    for trigger in disabled:
+        next_since.setdefault(trigger, today)
+    if next_since != since:
+        _save_producer_disabled_since(s3_client, next_since)
+
+    out: dict[str, dict[str, Any]] = {}
+    for artifact_id, trigger in producer_trigger_by_id.items():
+        reason = disabled.get(trigger)
+        if reason is None:
+            continue
+        first_seen = next_since.get(trigger, today)
+        try:
+            days = (now.date() - date.fromisoformat(first_seen)).days
+        except ValueError:
+            days = 0
+        suppressed = days < PRODUCER_SUPPRESSION_MAX_DAYS
+        if not suppressed:
+            logger.warning(
+                "producer-suppression LAPSED for %s: %s has been disabled %d "
+                "days (limit %d) — paging again, a pause this long is a "
+                "decision, not a state",
+                artifact_id, trigger, days, PRODUCER_SUPPRESSION_MAX_DAYS,
+            )
+        out[artifact_id] = {
+            "trigger": trigger,
+            "reason": reason,
+            "disabled_since": first_seen,
+            "days_disabled": days,
+            "suppressed": suppressed,
+        }
+    return out
 
 
 def _load_prev_miss_counts(s3_client: Any) -> dict[str, int]:
@@ -521,6 +724,7 @@ def _serialize_check_results(
     miss_counts: dict[str, int] | None = None,
     coerced_ids: set[str] | None = None,
     issue_filed_by_id: dict[str, str | None] | None = None,
+    suppression_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Build the ``check_results.json`` payload — one row per spec for
     the dashboard surface (Phase 5). ``miss_counts``/``coerced_ids``
@@ -530,14 +734,33 @@ def _serialize_check_results(
     ``issue_filed_by_id`` (config#2055 Gap 2) persists the extended-
     staleness escalation's dedup marker — the URL of the P1 filed for
     this artifact's current incident, or ``None``/absent if none is
-    in flight."""
+    in flight.
+
+    ``suppression_by_id`` (config-I6570) annotates rows whose producing
+    trigger is live-confirmed DISABLED. The row keeps its TRUE state — a
+    stale artifact behind a paused producer is still stale — and gains the
+    trigger, the date it was first observed off, and whether the page was
+    suppressed. The console must render these as "producer disabled", never
+    as green and never as a silent omission."""
     miss_counts = miss_counts or {}
     coerced_ids = coerced_ids or set()
     issue_filed_by_id = issue_filed_by_id or {}
+    suppression_by_id = suppression_by_id or {}
     rows = []
     for spec, result in pairs:
+        suppression = suppression_by_id.get(spec.artifact_id)
         rows.append(
             {
+                "producer_trigger": (
+                    suppression["trigger"] if suppression else None
+                ),
+                "producer_disabled": suppression is not None,
+                "producer_disabled_since": (
+                    suppression["disabled_since"] if suppression else None
+                ),
+                "alert_suppressed": bool(
+                    suppression and suppression["suppressed"]
+                ),
                 "artifact_id": spec.artifact_id,
                 "owner_repo": spec.owner_repo,
                 "severity": spec.severity,
@@ -1024,7 +1247,8 @@ _ALERTING_STATES = frozenset({"missing", "stale", "probe_failed"})
 
 
 def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
-                 consecutive_miss_runs: int = 0) -> bool:
+                 consecutive_miss_runs: int = 0,
+                 producer_suppression: dict[str, Any] | None = None) -> bool:
     """Route an alert for a non-fresh probe result. Returns True if
     publish was attempted (OBSERVE-mode short-circuit returns False).
 
@@ -1043,6 +1267,24 @@ def _maybe_alert(spec: ArtifactSpec, result: CheckResult, now: datetime,
     how many 15min probes have already fired in this window.
     """
     if result.state not in _ALERTING_STATES:
+        return False
+
+    # config-I6570 — the producing trigger is live-confirmed DISABLED, so this
+    # miss is a deliberate switch-off rather than a producer failure. Placed
+    # BEFORE the SLA and severity gates on purpose: severity describes what
+    # the artifact's absence costs downstream, and that cost is unchanged by
+    # WHY it is absent — only the page is. The row still reaches
+    # check_results.json with its true state and `alert_suppressed: true`
+    # (see `_serialize_check_results`), so this removes a page, never a fact.
+    # Suppression lapses past PRODUCER_SUPPRESSION_MAX_DAYS.
+    if producer_suppression and producer_suppression.get("suppressed"):
+        logger.info(
+            "producer-suppressed (config-I6570): %s state=%s — %s "
+            "(disabled since %s, %d days); console-only, no SNS/Telegram",
+            spec.artifact_id, result.state, producer_suppression["reason"],
+            producer_suppression["disabled_since"],
+            producer_suppression["days_disabled"],
+        )
         return False
 
     # Substrate already filters fresh/grace; the SLA-grace filter
@@ -1601,7 +1843,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     )
 
     (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
-     remediation_by_id) = (
+     remediation_by_id, producer_trigger_by_id) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
@@ -1613,9 +1855,20 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
             sorted(missing_ids),
         )
 
+    # config-I6570 — restricted to the two intraday rows, so the mini-rule
+    # makes at most two extra describe calls per 30min.
+    intraday_triggers = {
+        aid: t for aid, t in producer_trigger_by_id.items()
+        if aid in INTRADAY_ARTIFACT_IDS
+    }
+    suppression_by_id = apply_producer_suppression(
+        s3_client, intraday_triggers, now
+    )
+
     pairs, alerted, dispatched, per_spec_exceptions, _miss_counts = _run_probe_pass(
         s3_client, intraday_specs, recovery_by_id, now,
         remediation_by_id=remediation_by_id,
+        suppression_by_id=suppression_by_id,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -1646,6 +1899,7 @@ def _run_probe_pass(
     now: datetime,
     prev_miss_counts: dict[str, int] | None = None,
     remediation_by_id: dict[str, str] | None = None,
+    suppression_by_id: dict[str, dict[str, Any]] | None = None,
 ) -> tuple[list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int]]:
     """Walk ``specs``, probe each, dispatch confirmed-miss recoveries, and
     alert. Returns ``(pairs, alerted, dispatched, per_spec_exceptions)``.
@@ -1721,7 +1975,9 @@ def _run_probe_pass(
         )
         paged = False
         if not suppress_page and _maybe_alert(
-                spec, result, now, consecutive_miss_runs=miss_runs):
+                spec, result, now, consecutive_miss_runs=miss_runs,
+                producer_suppression=(suppression_by_id or {}).get(
+                    spec.artifact_id)):
             alerted += 1
             paged = True
 
@@ -1791,24 +2047,39 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
     (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
-     remediation_by_id) = (
+     remediation_by_id, producer_trigger_by_id) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     logger.info(
         "loaded %d specs from registry (%d with recovery specs, %d with "
         "champion-arm dynamic severity, %d flagged for issue escalation, "
-        "%d with declared remediation lanes)",
+        "%d with declared remediation lanes, %d with a declared producer "
+        "trigger)",
         len(specs), len(recovery_by_id), len(critical_arms_by_id),
         len(escalate_to_issue_by_id), len(remediation_by_id),
+        len(producer_trigger_by_id),
     )
 
     # config-I3086: dynamic severity + warning-escalation counters.
     specs, coerced_ids = apply_dynamic_severity(s3, specs, critical_arms_by_id)
     prev_miss_counts = _load_prev_miss_counts(s3)
+    # config-I6570: which producers are deliberately switched off right now.
+    suppression_by_id = apply_producer_suppression(s3, producer_trigger_by_id, now)
+    if suppression_by_id:
+        logger.info(
+            "producer-trigger suppression active for %d artifact(s): %s",
+            len(suppression_by_id),
+            sorted(
+                f"{a}({v['trigger']},{v['days_disabled']}d,"
+                f"{'suppressed' if v['suppressed'] else 'LAPSED'})"
+                for a, v in suppression_by_id.items()
+            ),
+        )
 
     pairs, alerted, dispatched, per_spec_exceptions, miss_counts = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
         remediation_by_id=remediation_by_id,
+        suppression_by_id=suppression_by_id,
     )
 
     # config#2055 Gap 2: extended-staleness -> Decision Queue P1. Runs after
@@ -1824,6 +2095,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     check_results = _serialize_check_results(
         pairs, now, miss_counts=miss_counts, coerced_ids=coerced_ids,
         issue_filed_by_id=issue_filed_by_id,
+        suppression_by_id=suppression_by_id,
     )
     heartbeat = _serialize_heartbeat(pairs, now, started_at)
 
