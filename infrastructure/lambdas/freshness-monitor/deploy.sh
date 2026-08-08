@@ -36,6 +36,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-freshness-monitor"
@@ -233,7 +238,7 @@ if $BOOTSTRAP; then
   # covered by the separate 30-min mini-rule below.
   echo "  Creating EventBridge cron: ${RULE_NAME}"
   run aws events put-rule \
-    --name "${RULE_NAME}" \
+    --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" \
     --schedule-expression "cron(0 12 * * ? *)" \
     --description "Daily 12:00 UTC probe of the artifact freshness registry" \
     --region "${REGION}" \
@@ -261,7 +266,7 @@ if $BOOTSTRAP; then
   # Lookback defaults: 12 saturday + 30 weekday/eod cycles.
   echo "  Creating EventBridge historical cron: ${HISTORICAL_RULE_NAME}"
   run aws events put-rule \
-    --name "${HISTORICAL_RULE_NAME}" \
+    --name "${HISTORICAL_RULE_NAME}" --state "$(pause_state "${HISTORICAL_RULE_NAME}")" \
     --schedule-expression "cron(0 4 * * ? *)" \
     --description "Daily 04:00 UTC historical-cycle probe (mode=historical)" \
     --region "${REGION}" \
@@ -305,7 +310,7 @@ EOF
   # check_results/heartbeat/cycle_verdict surfaces the daily sweep owns.
   echo "  Creating EventBridge intraday cron: ${INTRADAY_RULE_NAME}"
   run aws events put-rule \
-    --name "${INTRADAY_RULE_NAME}" \
+    --name "${INTRADAY_RULE_NAME}" --state "$(pause_state "${INTRADAY_RULE_NAME}")" \
     --schedule-expression "cron(0/30 14-21 ? * MON-FRI *)" \
     --description "30-min weekday 14-21 UTC intraday probe (mode=intraday)" \
     --region "${REGION}" \

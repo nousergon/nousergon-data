@@ -20,9 +20,9 @@ account-wide 5 req/min (12.5 s/ticker), was roughly half of ``RAGIngestion``'s
 
 The decision set is already published, canonically, by the scanner:
 
-    universe_membership/{date}/membership.json :: cuts.scanner_candidates
-        {"basis": "scanner_gate", "size": 60, "tickers": [...],
-         "source": "candidates/{date}/candidates.json::scanner_tickers"}
+    universe_membership/{date}/membership.json :: cuts.attractiveness_top_60
+        {"basis": "attractiveness_rank", "size": 60, "tickers": [...],
+         "source": "scanner/universe/{date}/universe.json::attractiveness_score"}
 
 ``champion-challenger-policy.md`` §2 names that artifact as the universe-cut
 registry. Reading it here means the corpus scope is **arm-independent**: it
@@ -33,12 +33,44 @@ Held names are unioned in from Metron's holdings artifact — a position needs
 evidence whether or not it ranks this week, and an EXIT still needs a
 rationale (§2.1).
 
-WHY NOT THE TOP-20 PREDICTOR CUT. ``predictor_universe_cut`` resolves to
-``attractiveness_top_20`` today, but the Think Tank challenger arm consumes the
-**top 60** and outputs 20 — RAG evidence is that arm's input. Scoping the
-corpus to 20 would starve the challenger and make the champion/challenger
+WHICH 60 (alpha-engine-config-I6630)
+------------------------------------
+This module originally scoped to ``cuts.scanner_candidates`` and justified it
+with "the Think Tank challenger arm consumes the top 60." The **width** was
+right and the **ranking was wrong**, because the scanner publishes two 60-wide
+cuts from two different rankings:
+
+* ``scanner_candidates`` — the momentum **gate** cut: ``tech_score`` top-60
+  plus the most oversold-by-RSI names. No fundamentals.
+* ``attractiveness_top_60`` — the top 60 of the 6-pillar attractiveness rank
+  over the whole ~905-name board.
+
+Think Tank's window (``thinktank/run.py::GAP_FILL_TOP_N``) is computed over
+``scoring/universe_board.py``, which ranks by **attractiveness**. The predictor
+scores ``attractiveness_top_20``. So the corpus was scoped to a 60 that was the
+decision set of *neither* arm. Measured on the live 2026-08-07 membership
+artifact: the old scope cut and the predictor's 20 overlapped on **2 names**,
+and 55 of Think Tank's 60 were outside it — evidence paid for, at Polygon's
+account-wide 5 req/min, for names no arm decides on.
+
+``attractiveness_top_60`` makes the funnel nest by construction:
+
+    attractiveness rank over the full board
+      → attractiveness_top_60   this scope, and Think Tank's window
+        → attractiveness_top_20 the predictor's scored cut
+
+``scanner_candidates`` is still emitted by the producer — it remains the
+incumbent challenger arm and the week-over-week churn baseline
+(alpha-engine-config-I4983). Only its role as the *corpus scope* changed.
+
+WHY NOT THE TOP-20 PREDICTOR CUT. Scoping the corpus to 20 would starve the
+Think Tank challenger, whose input is the 60, and make the champion/challenger
 comparison unfair on breadth (``champion-challenger-policy.md`` §4). 60 is the
-correct width; Brian ruled the same on 2026-07-30.
+correct width; Brian ruled the same on 2026-07-30 and again on 2026-08-07.
+
+The width and the cut name come from ``nousergon_lib.decision_set``, which is
+the single definition ``rag-corpus-policy.md`` §2.1 refers to as
+``ATTRACTIVENESS_FEED_TOP_N``.
 
 FAIL LOUD. A missing or empty cut raises. There is deliberately NO fallback to
 ``signals.json::universe`` — that fallback IS the defect this module exists to
@@ -51,6 +83,13 @@ import json
 import logging
 import re
 from typing import Any
+
+from nousergon_lib.decision_set import (
+    FEED_CUT_NAME,
+    DecisionSetContractError,
+    assert_cut_nests,
+    predictor_cut_name,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,8 +119,10 @@ MEMBERSHIP_DATED_TPL = "universe_membership/{date}/membership.json"
 # (rag-corpus-policy.md §2.3, one fetch one corpus).
 HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 
-# The cut that defines the corpus width. See "WHY NOT THE TOP-20" above.
-SCOPE_CUT = "scanner_candidates"
+# The cut that defines the corpus scope. See "WHICH 60" above. Derived from
+# nousergon_lib so this repo does not carry a second literal 60 that can drift
+# from the one the policy names.
+SCOPE_CUT = FEED_CUT_NAME
 
 
 class RagScopeUnavailable(RuntimeError):
@@ -124,7 +165,7 @@ def _load_holdings(s3_client: Any, bucket: str) -> list[str]:
     if not data:
         logger.warning(
             "[rag_scope] holdings artifact s3://%s/%s unavailable — HELD NAMES "
-            "WILL NOT BE COVERED this run (scanner cut only). Not fatal, but "
+            "WILL NOT BE COVERED this run (feed cut only). Not fatal, but "
             "positions go without fresh evidence until it returns.",
             bucket, HOLDINGS_UNIVERSE_KEY,
         )
@@ -148,8 +189,9 @@ def load_rag_scope(
     pipeline run, so a corpus fill and the run it serves cannot disagree about
     which week they are in.
 
-    Raises :class:`RagScopeUnavailable` when the scanner cut is missing or
-    empty — never widens.
+    Raises :class:`RagScopeUnavailable` when the feed cut is missing or
+    empty, or when the predictor's scored cut is not nested inside it — never
+    widens, never fills the wrong 60.
     """
     if s3_client is None:
         import boto3
@@ -179,6 +221,28 @@ def load_rag_scope(
             f"widen (rag-corpus-policy.md §2.1)."
         )
 
+    # The funnel invariant (alpha-engine-config-I6630). The corpus exists to
+    # give the scored names evidence, so a scope that does not contain the
+    # scored cut is filling the wrong 60 — the exact defect this cut change
+    # fixed, and it was invisible for weeks because nothing tied the two cuts
+    # together. FAIL LOUD rather than fill wrongly: ingestion is deliberately
+    # off every decision pipeline's critical path (rag-corpus-policy.md §2.3),
+    # so raising here costs a corpus fill, never a trading day.
+    #
+    # This also fires when an arm promotion moves ``predictor_universe_cut`` to
+    # a cut outside the attractiveness rank family. That is the correct
+    # outcome: a champion change that moves the decision set must move the
+    # corpus scope in the same change, and this is the coupling that was
+    # missing.
+    try:
+        assert_cut_nests(membership, inner=predictor_cut_name(membership), outer=SCOPE_CUT)
+    except DecisionSetContractError as exc:
+        raise RagScopeUnavailable(
+            f"membership artifact s3://{bucket}/{key} fails the funnel "
+            f"invariant: {exc} Refusing to fill a corpus that does not cover "
+            f"the cut the predictor scores (rag-corpus-policy.md §2.1)."
+        ) from exc
+
     held = _load_holdings(s3_client, bucket)
     candidates = sorted(set(cut_tickers) | set(held))
 
@@ -196,7 +260,7 @@ def load_rag_scope(
         )
 
     logger.info(
-        "[rag_scope] resolved %d ticker(s) for run_date=%s — scanner cut %r %d "
+        "[rag_scope] resolved %d ticker(s) for run_date=%s — feed cut %r %d "
         "∪ held %d (source: %s)",
         len(tickers), membership.get("run_date"), SCOPE_CUT, len(set(cut_tickers)),
         len(set(held)), cut.get("source") or key,

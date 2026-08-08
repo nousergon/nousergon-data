@@ -84,7 +84,7 @@ def main() -> int:
     )
     grp.add_argument(
         "--from-signals", action="store_true",
-        help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)",
+        help="Load tickers from the scanner decision set (universe-membership cuts.attractiveness_top_60)",
     )
     parser.add_argument(
         "--hours", type=int, default=168,

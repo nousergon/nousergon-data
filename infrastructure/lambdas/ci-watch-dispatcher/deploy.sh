@@ -44,6 +44,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-ci-watch-dispatcher"
@@ -208,13 +213,13 @@ if $BOOTSTRAP; then
   CANARY_TARGET="{\"Arn\":\"${OVERSEER_ROUTER_ARN}\",\"RoleArn\":\"${OVERSEER_SCHED_ROLE_ARN}\",\"Input\":\"{\\\"playbook\\\":\\\"ci-watch\\\",\\\"payload\\\":{\\\"is_drill\\\":\\\"true\\\"}}\",\"RetryPolicy\":{\"MaximumRetryAttempts\":0,\"MaximumEventAgeInSeconds\":60}}"
   if aws scheduler get-schedule --name "${CANARY_SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
-    run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" \
+    run aws scheduler update-schedule --name "${CANARY_SCHED_NAME}" --state "$(pause_state "${CANARY_SCHED_NAME}")" \
       --schedule-expression "${CANARY_CRON}" --schedule-expression-timezone "UTC" \
       --flexible-time-window '{"Mode":"OFF"}' --target "${CANARY_TARGET}" \
       --region "${REGION}" --query 'ScheduleArn' --output text
   else
     echo "  Creating Scheduler rule: ${CANARY_SCHED_NAME} → ${CANARY_CRON}"
-    run aws scheduler create-schedule --name "${CANARY_SCHED_NAME}" \
+    run aws scheduler create-schedule --name "${CANARY_SCHED_NAME}" --state "$(pause_state "${CANARY_SCHED_NAME}")" \
       --schedule-expression "${CANARY_CRON}" --schedule-expression-timezone "UTC" \
       --flexible-time-window '{"Mode":"OFF"}' --target "${CANARY_TARGET}" \
       --region "${REGION}" --query 'ScheduleArn' --output text

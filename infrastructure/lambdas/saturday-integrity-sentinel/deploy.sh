@@ -19,6 +19,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-saturday-integrity-sentinel"
@@ -109,7 +114,7 @@ if $BOOTSTRAP; then
   fi
 
   echo "  Creating EventBridge cron rule: ${RULE_NAME} (${SCHEDULE})"
-  run aws events put-rule --name "${RULE_NAME}" --schedule-expression "${SCHEDULE}" \
+  run aws events put-rule --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" --schedule-expression "${SCHEDULE}" \
     --description "Monday pre-open Saturday-integrity GO/NO-GO sentinel" --region "${REGION}" --query 'RuleArn' --output text
 
   FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"

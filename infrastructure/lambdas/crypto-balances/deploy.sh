@@ -20,6 +20,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
@@ -159,12 +164,12 @@ if $BOOTSTRAP; then
   TARGET="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
   if aws scheduler get-schedule --name "${SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${SCHED_NAME} → ${SCHED_CRON}"
-    run aws scheduler update-schedule --name "${SCHED_NAME}" \
+    run aws scheduler update-schedule --name "${SCHED_NAME}" --state "$(pause_state "${SCHED_NAME}")" \
       --schedule-expression "${SCHED_CRON}" --flexible-time-window '{"Mode":"OFF"}' \
       --target "${TARGET}" --region "${REGION}" --query 'ScheduleArn' --output text
   else
     echo "  Creating Scheduler rule: ${SCHED_NAME} → ${SCHED_CRON}"
-    run aws scheduler create-schedule --name "${SCHED_NAME}" \
+    run aws scheduler create-schedule --name "${SCHED_NAME}" --state "$(pause_state "${SCHED_NAME}")" \
       --schedule-expression "${SCHED_CRON}" --flexible-time-window '{"Mode":"OFF"}' \
       --target "${TARGET}" --region "${REGION}" --query 'ScheduleArn' --output text
   fi

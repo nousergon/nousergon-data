@@ -28,6 +28,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-saturday-sf-watch-dispatcher"
@@ -192,7 +197,7 @@ if $BOOTSTRAP; then
 EOF
 )
   run aws events put-rule \
-    --name "${RULE_NAME}" \
+    --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" \
     --event-pattern "${EVENT_PATTERN}" \
     --description "Fleet SF (weekly/preopen/postclose) terminal failure -> sf-watch-dispatcher" \
     --region "${REGION}" \

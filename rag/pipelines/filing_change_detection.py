@@ -18,6 +18,7 @@ Usage:
     python -m rag.pipelines.filing_change_detection --output-s3
     python -m rag.pipelines.filing_change_detection --output-local /tmp/filing_changes.json
     python -m rag.pipelines.filing_change_detection --sample-tickers 5 --output-local /tmp/probe.json
+    python -m rag.pipelines.filing_change_detection --from-parquet --output-s3  # zero Neon egress (config#2958)
 """
 
 from __future__ import annotations
@@ -178,6 +179,93 @@ def _load_filing_centroids(
     return dict(by_ticker)
 
 
+def _load_filing_centroids_from_parquet(
+    min_filings: int = 2,
+    sample_tickers: int | None = None,
+    *,
+    bucket: str = "alpha-engine-research",
+) -> dict[str, list[dict]]:
+    """Load per-filing embedding centroids from the S3 parquet batch tier.
+
+    Zero Neon egress — reads the partitioned parquet mirror written by
+    ``nousergon_lib.rag.parquet_mirror.mirror_document_to_parquet`` at
+    ingest time, then computes centroids locally (numpy groupby). Same
+    return shape as ``_load_filing_centroids`` so ``compute_filing_changes``
+    is agnostic to the data source.
+
+    This is deliverable 1 of config#2958 (S3-tiered corpus for batch
+    consumers): batch jobs read parquet + build local structures, leaving
+    Neon solely the live low-latency retrieval path for research agents.
+
+    Args:
+        min_filings: Same threshold as the Neon path.
+        sample_tickers: When set, restrict to the first N tickers
+            (canary/CI probe knob — same semantics as the Neon path).
+        bucket: S3 bucket holding the parquet mirror.
+
+    Returns:
+        Same shape as ``_load_filing_centroids``:
+        {ticker: [{ticker, doc_type, filed_date, centroid: np.ndarray,
+                   sections: {label: np.ndarray}, n_chunks: int}, ...]}
+    """
+    from nousergon_lib.rag.local_ann import list_parquet_keys, load_corpus_dataframe
+
+    doc_types = ["10-K", "10-Q"]
+    all_keys: list[str] = []
+    for dt in doc_types:
+        keys = list_parquet_keys(doc_type=dt, bucket=bucket)
+        all_keys.extend(keys)
+        logger.info(
+            "parquet tier: %d objects for doc_type=%s under s3://%s/rag/parquet/",
+            len(keys), dt, bucket,
+        )
+
+    if not all_keys:
+        logger.warning(
+            "parquet tier: no parquet objects found for 10-K/10-Q — "
+            "is the mirror populated? (config#2958 deliverable 1)"
+        )
+        return {}
+
+    df = load_corpus_dataframe(all_keys, bucket=bucket)
+    if df.empty:
+        return {}
+
+    df = df[df["doc_type"].isin(doc_types)]
+    if sample_tickers is not None:
+        tickers = sorted(df["ticker"].unique())[:sample_tickers]
+        df = df[df["ticker"].isin(tickers)]
+
+    grouped: dict[tuple, dict] = {}
+    for (ticker, dtype, fdate), group in df.groupby(["ticker", "doc_type", "filed_date"], sort=False):
+        key = (ticker, dtype, str(fdate))
+        stacks = np.stack(group["embedding"].to_numpy())
+        overall = stacks.mean(axis=0).astype(np.float32)
+        entry = {
+            "ticker": ticker,
+            "doc_type": dtype,
+            "filed_date": str(fdate),
+            "centroid": overall,
+            "sections": {},
+            "n_chunks": int(len(group)),
+        }
+        for section, sec_group in group.groupby("section_label", sort=False):
+            if not section:
+                continue
+            sec_stacks = np.stack(sec_group["embedding"].to_numpy())
+            entry["sections"][section] = sec_stacks.mean(axis=0).astype(np.float32)
+        grouped[key] = entry
+
+    by_ticker: dict[str, list[dict]] = {}
+    for entry in grouped.values():
+        by_ticker.setdefault(entry["ticker"], []).append(entry)
+
+    for ticker in by_ticker:
+        by_ticker[ticker].sort(key=lambda x: x["filed_date"])
+
+    return by_ticker
+
+
 def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity between two vectors."""
     norm_a = np.linalg.norm(a)
@@ -188,7 +276,10 @@ def _cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
 
 
 def compute_filing_changes(
-    min_filings: int = 2, sample_tickers: int | None = None
+    min_filings: int = 2,
+    sample_tickers: int | None = None,
+    *,
+    from_parquet: bool = False,
 ) -> list[dict]:
     """Compute filing change scores for all tickers with consecutive filings.
 
@@ -201,12 +292,23 @@ def compute_filing_changes(
         min_filings: Minimum same-type filings a ticker needs to be analyzed.
         sample_tickers: When set, analyze only the first N tickers — the
             canary/CI probe knob (config-I2780); production runs leave it None.
+        from_parquet: Read from S3 parquet batch tier instead of Neon (config#2958
+            deliverable 1). Zero Neon egress — loads the partitioned parquet
+            mirror, computes centroids locally, and runs the same similarity
+            comparison. Requires the parquet mirror to be populated (the mirror
+            is written at ingest time by ``nousergon_lib.rag.retrieval.ingest_document``
+            with ``mirror_to_parquet=True`` by default).
 
     Returns list of per-ticker change records.
     """
-    by_ticker = _load_filing_centroids(
-        min_filings=min_filings, sample_tickers=sample_tickers
-    )
+    if from_parquet:
+        by_ticker = _load_filing_centroids_from_parquet(
+            min_filings=min_filings, sample_tickers=sample_tickers,
+        )
+    else:
+        by_ticker = _load_filing_centroids(
+            min_filings=min_filings, sample_tickers=sample_tickers,
+        )
     results = []
 
     for ticker, filings in by_ticker.items():
@@ -316,9 +418,24 @@ def main():
             "clobbering the production pointer."
         ),
     )
+    parser.add_argument(
+        "--from-parquet",
+        action="store_true",
+        help=(
+            "Read the corpus from the S3 parquet batch tier instead of Neon "
+            "(config#2958 deliverable 1). Zero Neon egress — loads the "
+            "partitioned parquet mirror written at ingest time and computes "
+            "centroids locally. Requires the parquet mirror to be populated "
+            "(``nousergon_lib.rag.retrieval.ingest_document`` writes it by "
+            "default with ``mirror_to_parquet=True``)."
+        ),
+    )
     args = parser.parse_args()
 
-    results = compute_filing_changes(sample_tickers=args.sample_tickers)
+    results = compute_filing_changes(
+        sample_tickers=args.sample_tickers,
+        from_parquet=args.from_parquet,
+    )
 
     output = {
         "date": date.today().isoformat(),

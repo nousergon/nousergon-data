@@ -30,7 +30,10 @@ Drift cases (all exit non-zero):
   * ``expression-drift``  — live ``ScheduleExpression`` differs from source.
   * ``disabled``          — rule exists but ``State != ENABLED``. A disabled
                             schedule is indistinguishable from a working one in
-                            every surface except this check.
+                            every surface except this check. EXEMPT: a rule
+                            listed in ``infrastructure/automation_pause.json``
+                            is off by ruling, and the opposite assertion (found
+                            ENABLED) is made by ``automation_pause.py --check``.
   * ``orphaned``          — a live rule under a declared ``SCHED_PREFIX`` that
                             source no longer declares. The prune loop in
                             deploy.sh should have removed it; if one survives,
@@ -63,6 +66,9 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).parent.resolve()
 REPO_ROOT = SCRIPT_DIR.parent.parent
 LAMBDAS_DIR = REPO_ROOT / "infrastructure" / "lambdas"
+
+sys.path.insert(0, str(REPO_ROOT / "infrastructure"))
+import automation_pause  # noqa: E402  (path must be set first)
 
 # Bash array literals: NAME=(\n  "a"\n  "b"\n). The leading \s* is load-bearing,
 # not defensive: SWEEP_SCHED_NAMES is declared INSIDE an `if` block and so is
@@ -204,7 +210,11 @@ def _live_names_under(prefix: str) -> list[str]:
     return out.split() if out else []
 
 
-def check(rule_filter: str | None = None, source_file: str | None = None) -> tuple[list[dict], int]:
+def check(
+    rule_filter: str | None = None,
+    source_file: str | None = None,
+    ignore_kinds: set[str] | None = None,
+) -> tuple[list[dict], int]:
     rules, findings, prefixes = discover_codified_rules()
     if source_file:
         rules = [r for r in rules if r["source_file"] == source_file]
@@ -225,6 +235,14 @@ def check(rule_filter: str | None = None, source_file: str | None = None) -> tup
 
     codified_names = {r["name"] for r in rules}
 
+    # A schedule listed in infrastructure/automation_pause.json is DISABLED on
+    # purpose (Brian ruling 2026-08-07), so `disabled` is not drift for it. The
+    # invariant is not dropped, it MOVES: automation_pause.py --check asserts
+    # the opposite direction — a paused schedule found ENABLED is a finding
+    # there. Expression drift is still checked for paused schedules, so the
+    # codified cron stays true and un-pausing is a state flip, not a rewrite.
+    paused = automation_pause.paused_names()
+
     for rule in rules:
         live = _live_schedule(rule["name"])
         if live is None:
@@ -240,7 +258,7 @@ def check(rule_filter: str | None = None, source_file: str | None = None) -> tup
                 "source_file": rule["source_file"],
                 "detail": f"source={rule['expression']} live={live['expression']}",
             })
-        if live["state"] != "ENABLED":
+        if live["state"] != "ENABLED" and rule["name"] not in paused:
             findings.append({
                 "rule": rule["name"], "kind": "disabled",
                 "source_file": rule["source_file"],
@@ -273,16 +291,45 @@ def main() -> int:
         help="scope the check to rules declared in this deploy.sh (repo-relative path)",
     )
     ap.add_argument("--json", action="store_true", help="machine-readable output")
+    ap.add_argument(
+        "--ignore-kind",
+        help=(
+            "comma-separated drift kinds to downgrade from failure to warning "
+            "(still printed, but do not cause non-zero exit). "
+            "Useful on PRs where new schedules have not been deployed yet — "
+            "the daily fleet-wide sweep still hard-fails on all kinds."
+        ),
+    )
     args = ap.parse_args()
 
+    ignore_kinds: set[str] | None = None
+    if args.ignore_kind:
+        ignore_kinds = {k.strip() for k in args.ignore_kind.split(",") if k.strip()}
+
     try:
-        findings, checked = check(args.rule, source_file=args.source_file)
+        findings, checked = check(
+            args.rule, source_file=args.source_file, ignore_kinds=ignore_kinds,
+        )
     except RuntimeError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2
 
+    hard_findings = [
+        f for f in findings
+        if ignore_kinds is None or f["kind"] not in ignore_kinds
+    ]
+    ignored_findings = [
+        f for f in findings
+        if ignore_kinds is not None and f["kind"] in ignore_kinds
+    ]
+
     if args.json:
-        print(json.dumps({"checked": checked, "findings": findings}, indent=2))
+        print(json.dumps({
+            "checked": checked,
+            "findings": findings,
+            "ignored_kinds": sorted(ignore_kinds) if ignore_kinds else [],
+            "hard_findings": hard_findings,
+        }, indent=2))
     else:
         print(f"scheduler drift — {checked} codified rule(s) checked")
         if not findings:
@@ -290,12 +337,16 @@ def main() -> int:
                 "  ✓ every codified rule exists live, ENABLED, "
                 "with a matching expression"
             )
-        for f in findings:
+        for f in hard_findings:
             print(f"  ✗ [{f['kind']}] {f.get('rule', f['source_file'])}")
             print(f"      {f['detail']}")
             print(f"      source: {f['source_file']}")
+        for f in ignored_findings:
+            print(f"  ⚠ [{f['kind']}/WARN] {f.get('rule', f['source_file'])}")
+            print(f"      {f['detail']}")
+            print(f"      source: {f['source_file']}")
 
-    return 1 if findings else 0
+    return 1 if hard_findings else 0
 
 
 if __name__ == "__main__":

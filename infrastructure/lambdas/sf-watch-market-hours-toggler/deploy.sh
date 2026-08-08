@@ -31,6 +31,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="alpha-engine-sf-watch-market-hours-toggler"
 ROLE_NAME="alpha-engine-sf-watch-market-hours-toggler-role"
@@ -127,7 +132,7 @@ if $BOOTSTRAP; then
   fi
 
   echo "  Creating EventBridge rule: ${RULE_NAME} (${SCHEDULE})"
-  run aws events put-rule --name "${RULE_NAME}" --schedule-expression "${SCHEDULE}" \
+  run aws events put-rule --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" --schedule-expression "${SCHEDULE}" \
     --description "Poll NYSE market-hours state, toggle sf-watch-executor-role's trading-pipeline StartExecution grant (config#2932)" \
     --region "${REGION}" --query 'RuleArn' --output text
 

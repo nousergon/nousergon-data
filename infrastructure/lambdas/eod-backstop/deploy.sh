@@ -30,6 +30,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-eod-backstop"
@@ -162,8 +167,8 @@ if $BOOTSTRAP; then
   run aws events put-rule \
     --name "${RULE_NAME}" \
     --schedule-expression 'cron(30 22 ? * MON-FRI *)' \
-    --state DISABLED \
-    --description "EOD-pipeline backstop fire at 22:30 UTC MON-FRI (Lambda gates on trading-day + box-running + no-EOD-today). DISABLED until soak-reviewed." \
+    --state "$(pause_state "${RULE_NAME}")" \
+    --description "EOD-pipeline backstop fire at 22:30 UTC MON-FRI (Lambda gates on trading-day + box-running + no-EOD-today). State is derived from infrastructure/automation_pause.json, not pinned here (I6619); the soak this text referred to completed and the rule has been ENABLED since." \
     --region "${REGION}" \
     --query 'RuleArn' --output text
 
