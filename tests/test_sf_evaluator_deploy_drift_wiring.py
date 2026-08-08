@@ -97,7 +97,7 @@ def test_check_fails_open_via_catch(states, check):
     ("EvaluatorDeployDriftGate", "$.evaluator_deploy_drift_result",
      "ExtractEvaluatorDeployDriftError", "EvaluatorDirectorDeployDriftCheck"),
     ("EvaluatorDirectorDeployDriftGate", "$.evaluator_director_deploy_drift_result",
-     "ExtractEvaluatorDirectorDeployDriftError", "CheckMutexRole"),
+     "ExtractEvaluatorDirectorDeployDriftError", "WeeklyPreflight"),
 ])
 def test_gate_halts_only_on_confirmed_drift(states, gate, result_path, extract, default):
     g = states[gate]

@@ -332,6 +332,244 @@ def test_backfill_source_freshness_fails_when_source_regresses():
     assert "regression" in result.message.lower()
 
 
+# ── check_tool_contracts (I4494 Leg 2) ───────────────────────────────────────
+
+
+def test_tool_contracts_parse_checkout_repo():
+    """Extract the checkout name from a commands.$ path."""
+    parts = "/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id abc".split()
+    checkout = sfp._parse_checkout_repo(parts)
+    assert checkout == "alpha-engine-dashboard"
+
+    # Non-standard path — no .venv pattern
+    parts2 = "/usr/bin/python3 -m something".split()
+    assert sfp._parse_checkout_repo(parts2) is None
+
+
+def test_tool_contracts_resolve_governing_repo():
+    assert sfp._resolve_governing_repo("alpha-engine-dashboard") == "alpha-engine-dashboard"
+    assert sfp._resolve_governing_repo("alpha-engine-research") == "alpha-engine-research"
+    # Unknown checkout
+    assert sfp._resolve_governing_repo("unknown-repo") is None
+
+
+def test_tool_contracts_version_parsing():
+    assert sfp._parse_version("0.18.8") == (0, 18, 8)
+    assert sfp._parse_version("0.18.0") == (0, 18, 0)
+    assert sfp._parse_version("1.0.0rc1") == (1, 0, 0)
+
+
+def test_tool_contracts_version_comparison():
+    assert sfp._check_version_meets("0.18.8", "0.18.8") is True
+    assert sfp._check_version_meets("0.19.0", "0.18.8") is True
+    assert sfp._check_version_meets("0.18.0", "0.18.8") is False
+    assert sfp._check_version_meets("1.0.0", "0.18.8") is True
+
+
+def test_tool_contracts_read_pinned_version():
+    import tempfile
+    req = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+    req.write("krepis==0.18.8\nboto3>=1.28\n")
+    req.close()
+    from pathlib import Path
+    pinned = sfp._read_pinned_version(Path(req.name))
+    assert pinned == "0.18.8"
+
+
+def test_tool_contracts_read_pinned_version_none():
+    import tempfile
+    req = tempfile.NamedTemporaryFile(mode="w", suffix=".txt", delete=False)
+    req.write("boto3>=1.28\n")
+    req.close()
+    from pathlib import Path
+    pinned = sfp._read_pinned_version(Path(req.name))
+    assert pinned is None
+
+
+def test_tool_contracts_skips_non_venv_commands():
+    """Commands that don't match the .venv/bin/python pattern are skipped."""
+    ctx = _ctx()
+    from unittest.mock import patch, MagicMock
+
+    fake_sfn = MagicMock()
+    fake_sfn.describe_state_machine.return_value = {
+        "definition": '{"StartAt": "A", "States": {"A": {"Type": "Pass", "Next": "B"}, "B": {"Type": "Task", "Resource": "arn:aws:states:::lambda:invoke", "Parameters": {"commands.$": "$.shell_cmd"}}}}'
+    }
+    with patch("boto3.client", return_value=fake_sfn):
+        result = sfp.check_tool_contracts(ctx)
+    # commands.$ exists but has no .venv pattern — should skip gracefully
+    assert result.status == "ok"
+    assert result.details.get("checked", 0) == 0
+
+
+# ── check_definition_input_coherence (I4494 Leg 3) ─────────────────────────
+
+
+def test_collect_jsonpath_refs():
+    sf_def = {
+        "StartAt": "A",
+        "States": {
+            "A": {
+                "Type": "Pass",
+                "comment.$": "$.comment_text",
+                "Next": "B",
+            },
+            "B": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {
+                    "FunctionName": "my-func",
+                    "Payload": {
+                        "date.$": "$.run_date",
+                        "id.$": "$.execution_id",
+                    }
+                },
+                "Next": "C",
+            }
+        }
+    }
+    refs = sfp._collect_jsonpath_refs(sf_def)
+    ref_strings = {r[0] for r in refs}
+    assert "$.comment_text" in ref_strings
+    assert "$.run_date" in ref_strings
+    assert "$.execution_id" in ref_strings
+
+
+def test_build_proposed_input_has_all_skip_flags():
+    inp = sfp._build_proposed_input()
+    skip_flags = {k for k in inp if k.startswith("skip_")}
+    assert "skip_weekly_run_day_gate" in skip_flags
+    assert "skip_lib_pin_drift_check" in skip_flags
+    assert "skip_morning_enrich" in skip_flags
+    assert "skip_data_phase1" in skip_flags
+    assert "skip_scanner" in skip_flags
+    assert "skip_research" in skip_flags
+    assert "skip_eval_judge" in skip_flags
+    assert "skip_predictor_training" in skip_flags
+    assert "skip_parity" in skip_flags
+
+
+def test_build_proposed_input_with_override():
+    inp = sfp._build_proposed_input({"skip_morning_enrich": True})
+    assert inp["skip_morning_enrich"] is True
+    assert inp["skip_data_phase1"] is False  # default
+
+
+def test_definition_input_coherence_checks_refs():
+    """Test with a minimal SF definition that the check resolves JSONPaths."""
+    import json
+    ctx = _ctx()
+    from unittest.mock import patch, MagicMock
+
+    minimal_sf = {
+        "StartAt": "CheckInput",
+        "States": {
+            "CheckInput": {
+                "Type": "Pass",
+                "comment.$": "$.pipeline_role",
+                "Next": "Proceed",
+            },
+            "Proceed": {
+                "Type": "Pass",
+                "comment.$": "$.run_date",
+                "End": True,
+            }
+        }
+    }
+    fake_sfn = MagicMock()
+    fake_sfn.describe_state_machine.return_value = {
+        "definition": json.dumps(minimal_sf)
+    }
+    with patch("boto3.client", return_value=fake_sfn):
+        result = sfp.check_definition_input_coherence(ctx)
+    # Both $.pipeline_role and $.run_date exist in the proposed input
+    assert result.status == "ok"
+    assert result.details["checked"] >= 2
+
+
+def test_definition_input_coherence_fails_on_unresolvable_path():
+    """A JSONPath referencing a non-existent field must be flagged."""
+    import json
+    ctx = _ctx()
+    from unittest.mock import patch, MagicMock
+
+    bad_sf = {
+        "StartAt": "Bad",
+        "States": {
+            "Bad": {
+                "Type": "Pass",
+                "comment.$": "$.nonexistent_field_xyz",
+                "End": True,
+            }
+        }
+    }
+    fake_sfn = MagicMock()
+    fake_sfn.describe_state_machine.return_value = {
+        "definition": json.dumps(bad_sf)
+    }
+    with patch("boto3.client", return_value=fake_sfn):
+        result = sfp.check_definition_input_coherence(ctx)
+    assert result.status == "fail"
+    assert "unresolvable" in result.message.lower()
+
+
+# ── check_lambda_memory_headroom (I4494 Leg 4) ──────────────────────────────
+
+
+def test_walk_invoked_lambdas():
+    """_walk_invoked_lambdas collects FunctionName at any nesting."""
+    sf_def = {
+        "States": {
+            "A": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::lambda:invoke",
+                "Parameters": {"FunctionName": "my-func:live"},
+                "Next": "B",
+            },
+            "B": {
+                "Type": "Parallel",
+                "Branches": [
+                    {
+                        "StartAt": "C",
+                        "States": {
+                            "C": {
+                                "Type": "Task",
+                                "Resource": "arn:aws:states:::lambda:invoke",
+                                "Parameters": {"FunctionName": "other-func:prod"},
+                                "End": True,
+                            }
+                        }
+                    }
+                ],
+                "Next": "D",
+            }
+        }
+    }
+    found = sfp._walk_invoked_lambdas(sf_def)
+    assert "my-func:live" in found
+    assert "other-func:prod" in found
+
+
+def test_walk_invoked_lambdas_skips_non_lambda():
+    """ARNs that are not lambda:invoke resources should not be collected
+    by _walk_invoked_lambdas — it collects every FunctionName value it sees."""
+    sf_def = {
+        "States": {
+            "A": {
+                "Type": "Task",
+                "Resource": "arn:aws:states:::sns:publish",
+                "Parameters": {
+                    "FunctionName": "not-a-lambda",  # FunctionName key but SNS resource
+                    "Message": "hello",
+                },
+                "End": True,
+            }
+        }
+    }
+    found = sfp._walk_invoked_lambdas(sf_def)
+    assert "not-a-lambda" in found  # _walk_invoked_lambdas collects any FunctionName
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 

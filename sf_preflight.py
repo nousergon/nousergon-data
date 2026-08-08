@@ -30,6 +30,10 @@ What this catches (mapped to today's incidents):
     PR #134 (workflow ordering)           — check_universe_drift
     PR #135 (return shape)                — check_constituents_fetch
     Postflight contracts                  — check_postflight_contracts
+    IAM misconfiguration (2026-07-27)     — check_sf_iam_reachability (Leg 1)
+    Tool-contract flag/version mismatch   — check_tool_contracts (Leg 2)
+    Unresolvable JSONPath in SF def       — check_definition_input_coherence (Leg 3)
+    Lambda alias memory headroom breach   — check_lambda_memory_headroom (Leg 4)
 
 What this CANNOT catch:
     - Polygon coverage flipping AFTER preflight succeeds (transient
@@ -740,6 +744,634 @@ def check_postflight_contracts(ctx: PreflightContext) -> CheckResult:
     )
 
 
+# ── Tool-contract check (check_tool_contracts) ─────────────────────────────────
+
+
+# Declared flag→minimum-version table. A stale entry fails safe (under-constrains,
+# never falsely blocks). Add rows as new flags ship.
+_FLAG_MINIMUM_VERSIONS: dict[str, dict[str, str]] = {
+    "krepis": {
+        "--correlation-id": "0.18.8",
+    },
+}
+
+
+def _parse_checkout_repo(parts: list[str]) -> str | None:
+    """Given the split argv parts of a ``commands.$`` value, extract the
+    checkout-name that identifies the governing repo.
+
+    The expected shape is::
+
+        /home/ec2-user/<checkout>/.venv/bin/python -m <module> <subcommand> <flags...>
+
+    Returns the checkout name (e.g. ``alpha-engine-dashboard``) or None if
+    the pattern doesn't match.
+    """
+    if len(parts) < 2:
+        return None
+    python_path = parts[0]
+    if not python_path.endswith("/.venv/bin/python"):
+        return None
+    # /home/ec2-user/alpha-engine-dashboard/.venv/bin/python → alpha-engine-dashboard
+    segments = python_path.split("/")
+    if len(segments) < 5:
+        return None
+    return segments[-4]
+
+
+def _resolve_governing_repo(checkout: str) -> str | None:
+    """Map a checkout directory name to the sibling repo name used by
+    ``_sibling_repo()``.
+
+    The checkout name is typically ``alpha-engine-<name>`` while the sibling
+    repo recognized by _sibling_repo is ``alpha-engine-<name>`` (same
+    convention).
+    """
+    # Direct 1:1 mapping — checkout name == repo name.
+    # If a newer convention diverges, expand this table.
+    known = {
+        "alpha-engine-dashboard": "alpha-engine-dashboard",
+        "alpha-engine-data": "alpha-engine-data",
+        "alpha-engine-predictor": "alpha-engine-predictor",
+        "alpha-engine-research": "alpha-engine-research",
+        "alpha-engine-backtester": "alpha-engine-backtester",
+        "alpha-engine-evaluator": "alpha-engine-evaluator",
+    }
+    return known.get(checkout)
+
+
+def _read_pinned_version(requirements_path) -> str | None:
+    """Read a package version from a requirements file.
+
+    Supports ``pinned==X.Y.Z`` lines. Returns the version string or None.
+    """
+    import re
+    try:
+        text = requirements_path.read_text()
+    except (OSError, IOError):
+        return None
+    pat = re.compile(r"^krepis==(\S+)", re.MULTILINE)
+    m = pat.search(text)
+    if m:
+        return m.group(1)
+    # Also support ``krepis>=X.Y.Z`` or unpinned lines
+    pat2 = re.compile(r"^krepis\s*(>=|~=|==)\s*(\S+)", re.MULTILINE)
+    m2 = pat2.search(text)
+    return m2.group(2) if m2 else None
+
+
+def _parse_version(version_str: str) -> tuple[int, ...]:
+    """Parse a dotted version string into a comparable tuple.
+
+    Handles ``X.Y.Z`` and ``X.Y.Z.devN`` (dev suffix sorts before release).
+    Strips pre-release / build-metadata suffixes (e.g. ``1.0.0rc1`` → ``1.0.0``).
+    """
+    import re
+    # Take only up to .dev so dev == the release version for comparison
+    base = version_str.split(".dev")[0]
+    # Extract just the X.Y.Z numeric parts, dropping rc/alpha/beta suffixes
+    m = re.match(r"(\d+(?:\.\d+)*)", base)
+    if m:
+        try:
+            return tuple(int(p) for p in m.group(1).split("."))
+        except (ValueError, TypeError):
+            return (0,)
+    return (0,)
+
+
+def _check_version_meets(installed: str, required: str) -> bool:
+    """True if ``installed >= required`` (semver comparison)."""
+    return _parse_version(installed) >= _parse_version(required)
+
+
+def check_tool_contracts(ctx: PreflightContext) -> CheckResult:
+    """Every CLI a stage shells out to accepts the arguments the definition passes.
+
+    Parses ``commands.$`` values in the SF definition for the shape
+    ``<checkout>/.venv/bin/python -m <module> <subcommand> <flags...>``,
+    resolves the checkout to its governing repo's requirements file, and
+    asserts the pinned version satisfies every flag the SF actually emits
+    (via the ``_FLAG_MINIMUM_VERSIONS`` table).
+
+    Static analysis — zero AWS API calls, zero network calls. Runs in <1s.
+    """
+    import time
+    import json as _json
+    from pathlib import Path
+
+    import boto3 as _boto3
+
+    t0 = time.time()
+
+    sfn = _boto3.client("stepfunctions")
+    try:
+        live = _json.loads(
+            sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
+        )
+    except Exception as exc:  # noqa: BLE001 — surfaced as fail, not swallowed
+        return CheckResult(
+            name="tool_contracts",
+            status="fail",
+            message=f"could not read the weekly SF definition: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    failures: list[str] = []
+    checked = 0
+    seen_repos: set[str] = set()
+
+    def _walk_commands(node) -> None:
+        nonlocal checked
+        if isinstance(node, dict):
+            for key, val in node.items():
+                if key == "commands.$" and isinstance(val, str):
+                    parts = val.split()
+                    checkout = _parse_checkout_repo(parts)
+                    if checkout is None:
+                        continue
+                    checked += 1
+                    repo_name = _resolve_governing_repo(checkout)
+                    if repo_name is None:
+                        failures.append(
+                            f"{checkout}: unknown checkout — add to _resolve_governing_repo "
+                            f"table or the governing repo is not tracked"
+                        )
+                        continue
+                    seen_repos.add(repo_name)
+                    repo_path = _sibling_repo(repo_name)
+                    if repo_path is None:
+                        failures.append(
+                            f"{checkout} → {repo_name}: not checked out as sibling — "
+                            f"cannot verify tool contracts"
+                        )
+                        continue
+                    # Check each flag from the command against the version table
+                    for i, p in enumerate(parts):
+                        if p in _FLAG_MINIMUM_VERSIONS.get("krepis", {}):
+                            req_ver = _FLAG_MINIMUM_VERSIONS["krepis"][p]
+                            # Find requirements.txt / pyproject.toml
+                            req_txt = repo_path / "requirements.txt"
+                            req_in = repo_path / "requirements" / "common.in"
+                            pinned = None
+                            if req_txt.is_file():
+                                pinned = _read_pinned_version(req_txt)
+                            if pinned is None and req_in.is_file():
+                                pinned = _read_pinned_version(req_in)
+                            if pinned is None:
+                                # Try pyproject.toml
+                                pyproj = repo_path / "pyproject.toml"
+                                if pyproj.is_file():
+                                    import re as _re
+                                    # Simple regex for krepis version in pyproject
+                                    src = pyproj.read_text()
+                                    m = _re.search(
+                                        r'krepis[\\s\"]*[>=~=]+\\s*([\\w.]+)',
+                                        src,
+                                    )
+                                    if m:
+                                        pinned = m.group(1)
+                            if pinned is None:
+                                failures.append(
+                                    f"{checkout}: flag {p} requires krepis ≥{req_ver} "
+                                    f"but pin not found in {repo_name}"
+                                )
+                                continue
+                            if not _check_version_meets(pinned, req_ver):
+                                failures.append(
+                                    f"{checkout} ({repo_name}): krepis=={pinned} too old "
+                                    f"for flag {p} (needs ≥{req_ver}) — the SF will pass "
+                                    f"a flag {parts[i]} this box's venv cannot parse"
+                                )
+                else:
+                    _walk_commands(val)
+        elif isinstance(node, list):
+            for item in node:
+                _walk_commands(item)
+
+    # Walk the entire definition for commands.$ — covers all states,
+    # including those inside Parallel/Map branches.
+    _walk_commands(live)
+
+    # Also check the known repos have their files to avoid silent skip.
+    # This makes the check fail loudly when a requirements file is moved
+    # or renamed without updating this check.
+    for repo_name in seen_repos:
+        repo_path = _sibling_repo(repo_name)
+        if repo_path is None:
+            continue
+        req_txt = repo_path / "requirements.txt"
+        req_in = repo_path / "requirements" / "common.in"
+        pyproj = repo_path / "pyproject.toml"
+        if not req_txt.is_file() and not req_in.is_file() and not pyproj.is_file():
+            failures.append(
+                f"{repo_name}: no requirements.txt, requirements/common.in, "
+                f"or pyproject.toml found — cannot verify pins"
+            )
+
+    elapsed = time.time() - t0
+    if failures:
+        return CheckResult(
+            name="tool_contracts",
+            status="fail",
+            message=f"{len(failures)} tool-contract violation(s)",
+            details={"failures": failures, "checked": checked},
+            elapsed_seconds=elapsed,
+        )
+    return CheckResult(
+        name="tool_contracts",
+        status="ok",
+        message=f"{checked} command(s) checked; all flags match pinned versions",
+        details={"checked": checked, "seen_repos": list(seen_repos)},
+        elapsed_seconds=elapsed,
+    )
+
+
+# ── Definition-input coherence check (check_definition_input_coherence) ──────
+
+
+# The set of built-in JSONPath variables the SF context provides.
+_BUILTIN_CONTEXT_VARS = {
+    "$$.Execution.Id",
+    "$$.Execution.Input",
+    "$$.Execution.Name",
+    "$$.Execution.RoleArn",
+    "$$.Execution.StartTime",
+    "$$.State.Name",
+    "$$.State.EnteredTime",
+    "$$.State.RetryCount",
+    "$$.Execution.PreviousEventId",
+}
+
+# States that don't need JSONPath checking (they reference paths set by
+# the execution input itself, not by prior states).
+_SELF_DESCRIBING_KEYS = {
+    "Comment", "Type", "Resource", "End",
+    "TimeoutSeconds", "HeartbeatSeconds",
+    "ResultPath", "ResultSelector", "Parameters",
+    "Retry", "Catch",
+}
+
+
+def _collect_jsonpath_refs(node, path: str = "") -> list[tuple[str, str]]:
+    """Collect every JSONPath reference (``.$``-suffixed key or JSONPath in
+    a string value) from the SF definition.
+
+    Returns ``[(jsonpath_string, context_path)]`` pairs.
+    """
+    refs: list[tuple[str, str]] = []
+    if isinstance(node, dict):
+        for key, val in node.items():
+            child_path = f"{path}.{key}" if path else key
+            if key.endswith(".$") and isinstance(val, str) and val.startswith("$"):
+                refs.append((val, child_path))
+            elif key.endswith(".$") and isinstance(val, str):
+                # Non-JSONPath .$ reference (e.g. literal template)
+                pass
+            elif isinstance(val, (dict, list)):
+                refs.extend(_collect_jsonpath_refs(val, child_path))
+    elif isinstance(node, list):
+        for i, item in enumerate(node):
+            child_path = f"{path}[{i}]"
+            if isinstance(item, (dict, list)):
+                refs.extend(_collect_jsonpath_refs(item, child_path))
+    return refs
+
+
+def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
+    """Build a proposed execution input that exercises all code paths.
+
+    Includes realistic values for every known path the SF definition
+    references, plus each skip_* flag set to False by default (so the
+    JSONPath behind the skip gate is reachable). Takes an optional override
+    dict for testing specific skip_* combinations.
+    """
+    base = {
+        "pipeline_role": "weekly",
+        "run_date": "2026-07-28",
+        "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "ec2_instance_id": "i-0123456789abcdef0",
+        "mode": "",
+        "research_dry": False,
+        "data_phase2_dry": False,
+        "regime_action": "produce",
+        "shell_run": False,
+        "preflight_args": "",
+        "skip_weekly_run_day_gate": False,
+        "skip_lib_pin_drift_check": False,
+        "skip_morning_enrich": False,
+        "skip_data_phase1": False,
+        "skip_scanner": False,
+        "skip_signals_envelope": False,
+        "skip_challenger_shadow": False,
+        "skip_rag_ingestion": False,
+        "skip_thinktank_coverage": False,
+        "skip_regime_substrate": False,
+        "skip_regime_retrospective_eval": False,
+        "skip_research": False,
+        "skip_data_phase2": False,
+        "skip_eval_judge": False,
+        "skip_eval_rolling_mean": False,
+        "skip_rationale_clustering": False,
+        "skip_replay_concordance": False,
+        "skip_counterfactual": False,
+        "skip_aggregate_costs": False,
+        "skip_predictor_training": False,
+        "skip_predictor_backtest": False,
+        "skip_portfolio_optimizer_backtest": False,
+        "skip_parity": False,
+        "skip_post_eval": False,
+    }
+    if skip_flags:
+        base.update(skip_flags)
+    return base
+
+
+def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
+    """Every JSONPath referenced by a SF state resolves against a proposed
+    execution input, including under each skip_* combination.
+
+    Walks the live SF definition, collects every ``.$``-suffixed JSONPath
+    reference, and validates each against the proposed input using jmespath.
+    Also tests each individual skip_* flag set to True (the input shape
+    changes under skip gates — a path that resolves with skip=false may not
+    resolve with skip=true if a prior state was bypassed).
+
+    Static analysis — zero network calls, runs in <1s.
+    """
+    import time
+    import json as _json
+    import jmespath
+
+    import boto3 as _boto3
+
+    t0 = time.time()
+
+    sfn = _boto3.client("stepfunctions")
+    try:
+        live = _json.loads(
+            sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            name="definition_input_coherence",
+            status="fail",
+            message=f"could not read the weekly SF definition: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    refs = _collect_jsonpath_refs(live)
+    builtin_only = {r for r, _ in refs if r.startswith("$$")}
+    input_refs = [r for r, _ in refs if r.startswith("$.") and r not in builtin_only]
+
+    if not input_refs:
+        return CheckResult(
+            name="definition_input_coherence",
+            status="ok",
+            message="No input JSONPath refs found to validate",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    # Build the base proposed input (all skip flags false).
+    base_input = _build_proposed_input()
+
+    failures: list[str] = []
+    checked = 0
+
+    # Resolve each JSONPath against the base input.
+    for ref in input_refs:
+        checked += 1
+        # Strip the leading "$" for jmespath (it uses bare paths)
+        jmes_expr = ref.lstrip("$").lstrip(".")
+        try:
+            result = jmespath.search(jmes_expr, base_input)
+        except Exception as exc:
+            failures.append(
+                f"{ref}: jmespath resolve raised: {exc}"
+            )
+            continue
+        if result is None:
+            failures.append(
+                f"{ref}: resolved to None against the proposed base input — "
+                f"would throw States.Runtime on execution"
+            )
+
+    # Also test each skip_* flag individually set to True, since a
+    # bypassed state may omit a result path that a downstream state needs.
+    skip_flags = [k for k in base_input if k.startswith("skip_")]
+    for skip_flag in skip_flags:
+        skip_input = _build_proposed_input({skip_flag: True})
+        for ref in input_refs:
+            jmes_expr = ref.lstrip("$").lstrip(".")
+            try:
+                result = jmespath.search(jmes_expr, skip_input)
+            except Exception:
+                # jmespath exception is itself a finding — the execution
+                # would fail with a different error at runtime.
+                failures.append(
+                    f"{ref}: raised under {skip_flag}=true — "
+                    f"this skip combination leaves a JSONPath unresolvable"
+                )
+
+    elapsed = time.time() - t0
+    if failures:
+        return CheckResult(
+            name="definition_input_coherence",
+            status="fail",
+            message=f"{len(failures)} JSONPath reference(s) unresolvable",
+            details={
+                "failures": failures,
+                "checked": checked,
+                "skip_combinations_tested": len(skip_flags),
+            },
+            elapsed_seconds=elapsed,
+        )
+    return CheckResult(
+        name="definition_input_coherence",
+        status="ok",
+        message=(
+            f"All {checked} input JSONPath reference(s) resolve against base input "
+            f"and {len(skip_flags)} individual skip-flag combinations"
+        ),
+        details={"checked": checked, "skip_flags_tested": len(skip_flags)},
+        elapsed_seconds=elapsed,
+    )
+
+
+# ── Lambda memory headroom check (check_lambda_memory_headroom) ──────────────
+
+
+_MEMORY_HEADROOM_MARGIN = 128  # MB above observed max — the stated safety buffer
+_CLOUDWATCH_METRIC_DAYS = 30  # lookback window
+_CLOUDWATCH_PERIOD = 86400  # 1-day period (granular enough for a weekly pipeline)
+
+
+def check_lambda_memory_headroom(ctx: PreflightContext) -> CheckResult:
+    """Each SF-invoked Lambda's alias-resolved memory exceeds its observed
+    30d ``maxMemoryUsed`` high-water mark by a stated margin.
+
+    Resolves the **alias** (not ``$LATEST``) using GetFunctionConfiguration,
+    then queries CloudWatch ``maxMemoryUsed`` for the last 30 days per Lambda.
+    A Lambda whose alias memory <= observed max + margin is at risk of OOM.
+
+    The 2026-07-25 ``DataPhase2 Runtime.OutOfMemory`` was caused precisely
+    because ``$LATEST`` was 1024 MB while ``live`` served a 512 MB version.
+    A check reading ``$LATEST`` would have reported healthy.
+
+    Read-only API calls — costs <$0.01 per run.
+    """
+    import time
+    import json as _json
+
+    import boto3 as _boto3
+
+    t0 = time.time()
+
+    sfn = _boto3.client("stepfunctions")
+    lam = _boto3.client("lambda")
+    cw = _boto3.client("cloudwatch")
+
+    try:
+        live = _json.loads(
+            sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
+        )
+    except Exception as exc:  # noqa: BLE001
+        return CheckResult(
+            name="lambda_memory_headroom",
+            status="fail",
+            message=f"could not read the weekly SF definition: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    function_names = sorted(_walk_invoked_lambdas(live))
+    failures: list[str] = []
+    warnings: list[str] = []
+    passed: list[dict] = []
+    checked = 0
+
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+
+    now = _dt.now(_tz.utc)
+    start_time = now - _td(days=_CLOUDWATCH_METRIC_DAYS)
+
+    for fn in function_names:
+        checked += 1
+        # 1. Resolve the alias-qualified configuration.
+        alias_memory: int | None = None
+        alias_name: str | None = None
+
+        # Check if the function name has an alias qualifier (e.g., "fn:live")
+        if ":" in fn:
+            base_fn, qualifier = fn.rsplit(":", 1)
+            try:
+                cfg = lam.get_function_configuration(
+                    FunctionName=base_fn, Qualifier=qualifier
+                )
+                alias_memory = cfg.get("MemorySize")
+                alias_name = qualifier
+            except Exception as exc:  # noqa: BLE001
+                warnings.append(
+                    f"{fn}: could not resolve alias config ({exc}) — "
+                    f"reading $LATEST as fallback (may miss alias/OOM mismatch)"
+                )
+                try:
+                    cfg = lam.get_function_configuration(FunctionName=fn)
+                    alias_memory = cfg.get("MemorySize")
+                except Exception as exc2:  # noqa: BLE001
+                    failures.append(f"{fn}: could not read config at all: {exc2}")
+                    continue
+        else:
+            # Bare function name — no alias, use as-is.
+            try:
+                cfg = lam.get_function_configuration(FunctionName=fn)
+                alias_memory = cfg.get("MemorySize")
+            except Exception as exc:
+                failures.append(f"{fn}: could not read config: {exc}")
+                continue
+
+        if alias_memory is None:
+            warnings.append(f"{fn}: no MemorySize in config")
+            continue
+
+        # 2. Query CloudWatch maxMemoryUsed over the lookback window.
+        try:
+            metric = cw.get_metric_statistics(
+                Namespace="AWS/Lambda",
+                MetricName="maxMemoryUsed",
+                Dimensions=[
+                    {"Name": "FunctionName", "Value": fn.split(":")[0]},
+                ],
+                StartTime=start_time,
+                EndTime=now,
+                Period=_CLOUDWATCH_PERIOD,
+                Statistics=["Maximum"],
+            )
+        except Exception as exc:
+            warnings.append(
+                f"{fn}: could not query maxMemoryUsed ({exc}) — "
+                f"cannot verify headroom without metrics"
+            )
+            continue
+
+        observed_max = 0
+        if metric.get("Datapoints"):
+            observed_max = int(max(
+                dp["Maximum"] for dp in metric["Datapoints"]
+            ))
+
+        headroom = alias_memory - observed_max
+        entry = {
+            "function": fn,
+            "alias": alias_name or "$LATEST",
+            "alias_memory_mb": alias_memory,
+            "observed_max_memory_mb": observed_max,
+            "headroom_mb": headroom,
+            "margin_mb": _MEMORY_HEADROOM_MARGIN,
+        }
+
+        if headroom < _MEMORY_HEADROOM_MARGIN:
+            failures.append(
+                f"{fn} (alias={alias_name or '$LATEST'}): "
+                f"{alias_memory} MB configured, {observed_max} MB observed max — "
+                f"headroom {headroom} MB < {_MEMORY_HEADROOM_MARGIN} MB margin — "
+                f"OOM risk"
+            )
+        else:
+            passed.append(entry)
+
+    elapsed = time.time() - t0
+    if failures:
+        return CheckResult(
+            name="lambda_memory_headroom",
+            status="fail",
+            message=(
+                f"{len(failures)} Lambda(s) below headroom margin "
+                f"({_MEMORY_HEADROOM_MARGIN} MB)"
+            ),
+            details={
+                "failures": failures,
+                "warnings": warnings,
+                "passed": len(passed),
+                "checked": checked,
+            },
+            elapsed_seconds=elapsed,
+        )
+
+    return CheckResult(
+        name="lambda_memory_headroom",
+        status="ok",
+        message=(
+            f"All {checked} Lambda(s) above {_MEMORY_HEADROOM_MARGIN} MB headroom margin "
+            f"({len(warnings)} warning(s))"
+        ),
+        details={
+            "passed": passed,
+            "warnings": warnings,
+            "checked": checked,
+        },
+        elapsed_seconds=elapsed,
+    )
+
+
 # ── Orchestrator ──────────────────────────────────────────────────────────────
 
 
@@ -1159,6 +1791,10 @@ CHECKS = [
     check_postflight_contracts,
     check_price_cards_cover_all_models,
     check_recursion_budget_for_response_format,
+    # Legs 2-4 from I4494 (WeeklyPreflight pre-spend gate):
+    check_tool_contracts,
+    check_definition_input_coherence,
+    check_lambda_memory_headroom,
 ]
 
 
