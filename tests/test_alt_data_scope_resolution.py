@@ -297,3 +297,54 @@ def test_phase2_refuses_to_run_without_constituents(monkeypatch):
         wc._run_phase2({"bucket": "alpha-engine-research"}, _Args())
     assert "constituents.json" in str(exc.value)
     assert "signals.json" in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# collect() layer: explicit empty list ≠ unspecified (alpha-engine-config#6508)
+# ---------------------------------------------------------------------------
+
+
+def test_collect_empty_list_skips_without_deprecated_resolver(monkeypatch):
+    """`tickers=[]` means "no scope" — skip, never the signals fallback.
+
+    alpha-engine-config#6508: `if not tickers:` conflated "caller did not
+    specify" with "caller resolved no scope", silently re-entering the
+    deprecated signals.json::universe resolver from any caller that resolved
+    an empty list (the Lambda handler was exactly that caller). Only `None`
+    — the documented direct/ad-hoc path — reaches the deprecated resolver.
+    """
+    import collectors.alternative as alt
+
+    monkeypatch.setattr(alt.boto3, "client", lambda *a, **k: object())
+    resolver_calls: list[bool] = []
+    monkeypatch.setattr(
+        alt, "_load_promoted_tickers",
+        lambda *a, **k: resolver_calls.append(True) or ["T1"],
+    )
+
+    result = alt.collect(bucket="b", s3_prefix="p/", run_date="2026-08-06", tickers=[])
+
+    assert result["status"] == "skipped"
+    assert resolver_calls == [], "deprecated resolver must not be reached"
+
+
+def test_collect_none_tickers_keeps_deprecated_resolver_as_ad_hoc_path(monkeypatch):
+    """`tickers=None` still resolves via signals.json — the documented
+    direct/ad-hoc path, unchanged by the #6508 fix."""
+    import collectors.alternative as alt
+
+    monkeypatch.setattr(alt.boto3, "client", lambda *a, **k: object())
+    monkeypatch.setattr(alt, "_assert_scope_stable", lambda *a, **k: None)
+    resolver_calls: list[bool] = []
+    monkeypatch.setattr(
+        alt, "_load_promoted_tickers",
+        lambda *a, **k: resolver_calls.append(True) or ["T1"],
+    )
+
+    result = alt.collect(
+        bucket="b", s3_prefix="p/", run_date="2026-08-06",
+        tickers=None, dry_run=True,
+    )
+
+    assert resolver_calls == [True]
+    assert result["status"] == "ok_dry_run"

@@ -1,9 +1,14 @@
 """
 Lambda entry point — Phase 2 alternative data collector.
 
-Triggered by Step Functions after research produces signals.json.
-Fetches alternative data (analyst, revisions, options, insider, institutional,
-news) for promoted tickers (~25-30) and writes per-ticker JSON to S3.
+No longer invoked by the Step Function: the SF's DataPhase2 state was
+repointed to EC2-spot dispatch of `weekly_collector.py --phase 2` in PR
+#1186 (2026-07-31). This handler remains deployed for manual/ad-hoc
+invocation (`aws lambda invoke`), and MUST behave like the production entry
+point: it resolves the ticker list from constituents.json (the full board,
+~903 names) exactly as `weekly_collector._run_phase2` does, and never falls
+through to the deprecated signals.json::universe scope resolver
+(alpha-engine-config#6508, alpha-engine-config-I5814).
 
 Pass {"force": true} to bypass date checks (manual testing).
 Pass {"dry_run": true} to validate without writing to S3.
@@ -100,11 +105,45 @@ def handler(event, context):
         bucket = config.get("bucket", "alpha-engine-research")
         market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
 
+        # Resolve the ticker list exactly like the production entry point
+        # (weekly_collector._run_phase2, alpha-engine-config-I5814): the full
+        # constituent universe from constituents.json — NEVER the deprecated
+        # signals.json::universe fallback (alpha-engine-config#6508). The
+        # deprecated resolver is reachable only when `tickers` is None, and
+        # this handler always passes an explicit list.
+        from collectors import constituents
+
+        existing = constituents.load_from_s3(bucket, market_prefix)
+        tickers = list(existing.get("tickers") or []) if existing else []
+        if not tickers:
+            # Fail loud in production, mirroring _run_phase2's refusal to
+            # collect against an implicit ticker list. The canary (deploy.sh)
+            # invokes with dry_run=true, where "no constituents" says nothing
+            # about Lambda health — map to SKIPPED, the same canary-safe
+            # contract the post-collect skipped branch uses below.
+            if dry_run:
+                logger.info("Phase 2 dry_run skipped — no constituents (canary-safe)")
+                return {
+                    "status": "SKIPPED",
+                    "skip_reason": "no constituents",
+                    "dry_run": True,
+                }
+            return {
+                "status": "ERROR",
+                "error": (
+                    "constituents.json unreadable or empty at "
+                    f"{market_prefix}weekly/<latest>/constituents.json — "
+                    "refusing to collect alternative data against an implicit "
+                    "ticker list (alpha-engine-config-I5814)"
+                ),
+            }
+
         # Run Phase 2
         result = alternative.collect(
             bucket=bucket,
             s3_prefix=market_prefix,
             run_date=run_date,
+            tickers=tickers,
             dry_run=dry_run,
         )
 

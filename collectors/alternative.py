@@ -594,8 +594,15 @@ def collect(
         run_date = default_run_date()
     s3 = boto3.client("s3")
 
-    # Resolve ticker list
-    if not tickers:
+    # Resolve ticker list. `None` (caller did not specify) and `[]` (caller
+    # explicitly resolved no scope) are DIFFERENT claims, and only the first
+    # may fall through to the deprecated signals.json resolver
+    # (alpha-engine-config#6508): the production entry point
+    # (`weekly_collector._run_phase2`) refuses to collect against an implicit
+    # ticker list and raises when constituents.json is unreadable, so an
+    # empty list reaching here is an explicit "no scope" — skipping is the
+    # honest answer, never a silent re-narrowing of scope.
+    if tickers is None:
         tickers = _load_promoted_tickers(s3, bucket, signals_key, run_date)
     if not tickers:
         logger.warning("No promoted tickers found — skipping alternative data")
