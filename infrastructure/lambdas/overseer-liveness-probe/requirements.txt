@@ -3,7 +3,7 @@
 # forum-topic routing + bundled flow_doctor_telegram.py, so the same known-good
 # pin. (Routing this probe's OWN alerts onto the nousergon-alerts intake bus via
 # a krepis>=0.15.0 bump is alpha-engine-config-I2846's scope, not this refactor.)
-nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.36
+nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.37
 krepis>=0.10.2
 # Registry parsing (infrastructure/overseer/playbooks.yaml bundled at deploy).
 pyyaml>=6.0

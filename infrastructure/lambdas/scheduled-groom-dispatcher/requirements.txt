@@ -76,4 +76,4 @@ boto3>=1.34.0
 # post-merge tag against `git -C nousergon-lib tag --sort=-v:refname | head -1`
 # and correct this line if it drifted from .36, then bump this in lockstep
 # with the root pin.
-nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.36
+nousergon-lib[flow-doctor,github_app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.37

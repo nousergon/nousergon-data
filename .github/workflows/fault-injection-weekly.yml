@@ -38,9 +38,9 @@ jobs:
     name: fault-injection
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
 
@@ -71,7 +71,7 @@ jobs:
         id: creds
         if: github.event_name != 'pull_request'
         continue-on-error: true
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: arn:aws:iam::711398986525:role/github-actions-fault-injection
           aws-region: us-east-1

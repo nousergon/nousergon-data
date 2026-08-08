@@ -49,6 +49,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lambdas/_shared/pause.sh"
+
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -225,7 +230,7 @@ EOF
   fi
   echo "  scheduling auto re-enable: ${sched_name} → ${at_expr} UTC"
   run aws scheduler create-schedule \
-    --name "${sched_name}" \
+    --name "${sched_name}" --state "$(pause_state "${sched_name}")" \
     --schedule-expression "${at_expr}" \
     --schedule-expression-timezone "UTC" \
     --flexible-time-window '{"Mode":"OFF"}' \

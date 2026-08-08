@@ -21,6 +21,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-sf-telegram-notifier"
@@ -178,7 +183,7 @@ EVENT_PATTERN=$(cat <<EOF
 EOF
 )
 run aws events put-rule \
-  --name "${RULE_NAME}" \
+  --name "${RULE_NAME}" --state "$(pause_state "${RULE_NAME}")" \
   --event-pattern "${EVENT_PATTERN}" \
   --description "Fan SF status changes to alpha-engine-sf-telegram-notifier" \
   --region "${REGION}" \
@@ -234,7 +239,7 @@ GROOM_EVENT_PATTERN=$(cat <<EOF
 EOF
 )
 run aws events put-rule \
-  --name "${GROOM_RULE_NAME}" \
+  --name "${GROOM_RULE_NAME}" --state "$(pause_state "${GROOM_RULE_NAME}")" \
   --event-pattern "${GROOM_EVENT_PATTERN}" \
   --description "Fan groom-dispatch SF FAILURE transitions to alpha-engine-sf-telegram-notifier (successes are reported by the SF's own cycle roll-up)" \
   --region "${REGION}" \

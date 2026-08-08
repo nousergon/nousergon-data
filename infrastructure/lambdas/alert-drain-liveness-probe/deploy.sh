@@ -38,6 +38,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FUNCTION_NAME="alpha-engine-alert-drain-liveness-probe"
 ROLE_NAME="alpha-engine-alert-drain-liveness-probe-role"
@@ -144,7 +149,7 @@ if $BOOTSTRAP; then
     rule="${RECLAIM_RULE_NAMES[$i]}"
     echo "  Creating/updating EventBridge rule: ${rule}"
     run aws events put-rule \
-      --name "${rule}" \
+      --name "${rule}" --state "$(pause_state "${rule}")" \
       --event-pattern "${RECLAIM_RULE_PATTERNS[$i]}" \
       --description "${RECLAIM_RULE_DESCRIPTIONS[$i]}" \
       --region "${REGION}" \

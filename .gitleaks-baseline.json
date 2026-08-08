@@ -82,5 +82,26 @@
   "Message": "fix(daily_closes): scrub FRED api_key from error logs + retry FRED 5xx (#220)\n\nrequests.exceptions.HTTPError.str() embeds the full request URL —\nincluding ``api_key=\u003ccredential\u003e`` — in its message. The existing\n``_fetch_fred_closes`` except-block logged that raw via\n``logger.warning(\"FRED fetch failed for %s (%s): %s\", t, sid, e)`` so\nany FRED 5xx in production MorningEnrich / EOD dumped the credential\nto CloudWatch.\n\nSurfaced 2026-05-12 during the post-merge repair run for PR #219 — a\ntransient FRED 500 on VXVCLS during the operator step leaked the key\nto the conversation transcript. The FRED key is rotated separately;\nthis commit closes the leak class.\n\nChanges:\n- ``_scrub_api_key(msg) -\u003e str`` helper in ``collectors/daily_closes.py``\n  masks the ``api_key=...`` querystring fragment with ``api_key=***``\n- ``_fetch_fred_closes`` warn-log routes the exception through the\n  scrubber\n- Repair script's ``_fetch_fred_range`` already added retry+scrub in\n  the cherry-pick from the live-debug session; this commit consolidates\n  by importing the shared ``_scrub_api_key`` from ``daily_closes`` so\n  the regex doesn't drift across files\n\nTests (+7, suite 792 → 799):\n- ``_scrub_api_key`` masks URL-embedded keys, handles exception objects\n  directly, passthroughs when no key present, terminates at ``\u0026``\n- ``_fetch_fred_closes`` warn-log scrub regression\n- ``_fetch_fred_range`` retry-warn + final-error scrub regressions\n\nCo-authored-by: Claude Opus 4.7 (1M context) \u003cnoreply@anthropic.com\u003e",
   "Tags": [],
   "Fingerprint": "366c23265b90e06a43db4d74a8c79a0f09d8658c:tests/test_fred_api_key_scrub.py:generic-api-key:99"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 3392,
+  "EndLine": 3392,
+  "StartColumn": 2,
+  "EndColumn": 50,
+  "Match": "_HEX32_TOKEN = \"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "infrastructure/lambdas/scheduled-groom-dispatcher/test_handler.py",
+  "SymlinkFile": "",
+  "Commit": "7f5b49880ac3de419b271a236a097e88e404e2c5",
+  "Link": "https://github.com/nousergon/nousergon-data/blob/7f5b49880ac3de419b271a236a097e88e404e2c5/infrastructure/lambdas/scheduled-groom-dispatcher/test_handler.py#L3392",
+  "Entropy": 3.9528196,
+  "Author": "Brian McMahon",
+  "Email": "brian@nousergon.ai",
+  "Date": "2026-08-03T18:14:38Z",
+  "Message": "fix(groom-dispatcher): truncate run_token in alert bodies \u2014 it wedges the alert-drain (#1216)\n\nA bare `run_token=<32 lowercase hex>` in a lane-death / lane-reclaimed\nnotification body matches gitleaks' stock `generic-api-key` rule: the keyword\n`token` adjacent to a high-entropy 32-char value is exactly that rule's shape.\nIt is not a credential \u2014 it is a correlation id this Lambda mints per lane.\n\nWhere it hurts is downstream. `_notify_cycle` publishes onto the Overseer intake\nbus; alert-drain reads the queue into its LLM request; the DLP egress proxy\ngitleaks-scans that outbound body and returns HTTP 400. The drain agent exits\nrc=1, and because nothing is deleted from the queue without a ledger record\n(overseer-policy.md invariant 8) the same message is re-read by the next run.\n\nOne lane-death alert therefore wedges the entire response plane indefinitely \u2014\nand the SQS retry ladder (`maxReceiveCount: 5`) drags the queue's *other*\nmessages into the DLQ five receives at a time while it does.\n\nMeasured 2026-08-03, reproduced locally against the fleet's own\n`gitleaks-egress.toml` at gitleaks 8.30.1:\n\n  - 12 of 79 sampled intake messages matched `generic-api-key`\n  - every one of them from `flow-doctor:scheduled-groom-dispatcher`\n  - every one of them on the `run_token=` field, in `detail.body`\n  - four consecutive drain runs dead (alpha-engine-config-I6191, occurrence 4)\n  - truncating the body token clears the match; scanning the post-fix message\n    yields zero findings\n\n12 hex chars stays long enough to correlate a body against the dispatch ledger\nby eye. The FULL token is unchanged everywhere it is machine-read \u2014 `dedup_key`,\nthe `context` payload, and every log line \u2014 so truncation is a rendering change\nand nothing programmatic is affected.\n\nGuard observed failing (overseer-policy.md invariant 13): restoring the full\ntoken to the body turns `test_lane_death_body_truncates_the_run_token` red.\n\nDoes NOT clear the messages already queued \u2014 those are immutable. See\nalpha-engine-config-I6294 for the structural half.",
+  "Tags": [],
+  "Fingerprint": "7f5b49880ac3de419b271a236a097e88e404e2c5:infrastructure/lambdas/scheduled-groom-dispatcher/test_handler.py:generic-api-key:3392"
  }
 ]

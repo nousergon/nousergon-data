@@ -25,6 +25,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-spot-interruption-recorder"
@@ -147,7 +152,7 @@ if $BOOTSTRAP; then
 
   echo "  Creating EventBridge rule: ${TICK_RULE} (ENABLED, 5 min)"
   run aws events put-rule --name "${TICK_RULE}" \
-    --schedule-expression 'rate(5 minutes)' --state ENABLED \
+    --schedule-expression 'rate(5 minutes)' --state "$(pause_state "${TICK_RULE}")" \
     --description "Spot-interruption reconciler tick (alpha-engine-config-I5197) - sweeps CloudTrail BidEvictedEvent and records any eviction not already in overseer/interruptions/." \
     --region "${REGION}" --query 'RuleArn' --output text
   run aws events put-targets --rule "${TICK_RULE}" \
@@ -158,10 +163,10 @@ if $BOOTSTRAP; then
     --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${TICK_RULE}" \
     --region "${REGION}" 2>/dev/null || true
 
-  echo "  Creating EventBridge rule: ${WARN_RULE} (ENABLED)"
+  echo "  Creating EventBridge rule: ${WARN_RULE} ($(pause_state "${WARN_RULE}"))"
   run aws events put-rule --name "${WARN_RULE}" \
     --event-pattern '{"source":["aws.ec2"],"detail-type":["EC2 Spot Instance Interruption Warning"]}' \
-    --state ENABLED \
+    --state "$(pause_state "${WARN_RULE}")" \
     --description "Low-latency leg of the spot-interruption recorder (alpha-engine-config-I5197). NOT sufficient alone - AWS emits no warning for a box reclaimed during bootstrap, which is what the reconciler tick covers." \
     --region "${REGION}" --query 'RuleArn' --output text
   run aws events put-targets --rule "${WARN_RULE}" \

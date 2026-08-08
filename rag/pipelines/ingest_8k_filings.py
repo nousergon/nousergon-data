@@ -254,7 +254,7 @@ def main():
 
     parser = argparse.ArgumentParser(description="Ingest 8-K filings into RAG store")
     parser.add_argument("--tickers", type=str, help="Comma-separated ticker list")
-    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.scanner_candidates)")
+    parser.add_argument("--from-signals", action="store_true", help="Load tickers from the scanner decision set (universe-membership cuts.attractiveness_top_60)")
     parser.add_argument("--lookback-days", type=int, default=365, help="Days of filings to backfill")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()

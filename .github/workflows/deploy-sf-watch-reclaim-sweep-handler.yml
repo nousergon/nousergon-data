@@ -1,10 +1,21 @@
 name: Deploy sf-watch-reclaim-sweep-handler
 
-# Auto-deploy the alpha-engine-sf-watch-reclaim-sweep-handler Lambda CODE on merge to
-# main (alpha-engine-config-I3111). Same pattern as the sibling
-# deploy-*-liveness-probe / deploy-*-dispatcher workflows: this script's
-# default/flagless run is code-only (no aws iam/scheduler writes unless
-# --bootstrap is passed), so no new script flag is needed for safety.
+# Auto-deploy the alpha-engine-sf-watch-reclaim-sweep-handler Lambda on merge to
+# main. alpha-engine-config-I5815 closes the gap: deploy.sh's old monolithic
+# --bootstrap is now split into --bootstrap-iam (operator-only IAM creation) and
+# --reconcile-schedules (scheduler upsert + prune, CI-safe), so this workflow now
+# deploys both moving parts on merge:
+#
+#   1. Lambda code           flagless deploy.sh, step 3      (LambdaUpdate)
+#   2. Scheduler rules       --reconcile-schedules           (InfraDeployResourceCRUD)
+#
+# Why it mattered: both daily reclaim-sweep schedules were codified in deploy.sh
+# but never created in AWS — they sat behind --bootstrap and the OIDC role
+# (which deliberately lacks iam:CreateRole/iam:PutRolePolicy) couldn't run it.
+# The reclaim sweep never fired on a schedule.
+#
+# What remains operator-only: `deploy.sh --bootstrap-iam`, which creates the
+# IAM roles and puts their inline policies. That step is genuinely first-time-only.
 #
 # IAM: no new grant needed — LambdaUpdate already covers
 # arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-deploy/).
@@ -27,7 +38,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy sf-watch-reclaim-sweep-handler Lambda (code-only)
+    name: Deploy sf-watch-reclaim-sweep-handler Lambda (code + schedules)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -48,16 +59,22 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy sf-watch-reclaim-sweep-handler (code-only — no --bootstrap)
+      - name: Deploy sf-watch-reclaim-sweep-handler (code-only)
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh
+
+      # Separate step, not a flag on the one above, so the log makes it obvious
+      # which half failed. Both run under the same OIDC role; neither writes IAM.
+      - name: Reconcile EventBridge Scheduler rules (upsert + prune)
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh --reconcile-schedules
 
       - name: Report deployed version
         working-directory: alpha-engine-data
         run: |
           echo "Deployed commit: ${{ github.sha }}"
           # Tolerate a not-yet-bootstrapped function: deploy.sh gracefully skips
-          # the code update until an operator runs --bootstrap (the OIDC role
+          # the code update until an operator runs --bootstrap-iam (the OIDC role
           # can't create the Lambda), so this report must NOT hard-fail the job
           # when the function does not exist yet — matching the deploy step's
           # own guard (alpha-engine-config-I2831 first-merge red-main fix).
@@ -66,6 +83,15 @@ jobs:
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text \
             || echo "(function not bootstrapped yet — code deploy was skipped)"
+
+      # Assert the OUTCOME, not the exit status of the step that should have
+      # produced it. Every rule the source declares must exist live, in state
+      # ENABLED, after this workflow runs — a deploy that reports success while
+      # a schedule is missing is the failure mode this whole change exists to
+      # remove.
+      - name: Assert every declared schedule exists live
+        working-directory: alpha-engine-data
+        run: python3 infrastructure/scheduler/check-schedule-drift.py --source-file infrastructure/lambdas/sf-watch-reclaim-sweep-handler/deploy.sh
 
       - name: Append to system-wide deploy changelog
         if: always()

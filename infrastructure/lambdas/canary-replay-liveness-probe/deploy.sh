@@ -26,6 +26,11 @@
 
 set -euo pipefail
 
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-canary-replay-liveness-probe"
@@ -160,7 +165,7 @@ if $BOOTSTRAP; then
   run aws events put-rule \
     --name "${RULE_NAME}" \
     --schedule-expression 'rate(15 minutes)' \
-    --state ENABLED \
+    --state "$(pause_state "${RULE_NAME}")" \
     --description "Saturday-replay canary liveness probe tick (config#2246) - self-gates on its own check window + the dispatcher rule's live State." \
     --region "${REGION}" \
     --query 'RuleArn' --output text

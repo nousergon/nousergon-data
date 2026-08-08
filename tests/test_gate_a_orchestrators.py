@@ -20,29 +20,46 @@ import pytest
 # ── _rag_scope ────────────────────────────────────────────────────────
 #
 # config-I5700: the corpus fetch set is the scanner DECISION SET, resolved
-# from universe_membership/{date}/membership.json::cuts.scanner_candidates —
-# NOT signals.json::universe, which is a 903-row sizing envelope. The old
-# TestLoadSignalsTickers class pinned the defective behaviour (including that
-# `sorted(prefixes)[-1]` list_objects_v2 scan, which silently returns the
-# 1000th-oldest date once the partition count crosses a page) and is replaced
-# wholesale rather than adapted.
+# from universe_membership/{date}/membership.json — NOT signals.json::universe,
+# which is a 903-row sizing envelope. The old TestLoadSignalsTickers class
+# pinned the defective behaviour (including that `sorted(prefixes)[-1]`
+# list_objects_v2 scan, which silently returns the 1000th-oldest date once the
+# partition count crosses a page) and is replaced wholesale rather than
+# adapted.
+#
+# config-I6630: the cut is ``attractiveness_top_60``, not
+# ``scanner_candidates``. Both are 60 wide, but the latter is a tech_score
+# momentum GATE and the former is the attractiveness RANK the predictor's
+# scored cut is the head of. Scoping to the gate cut meant the corpus covered
+# 2 of the predictor's 20 names (measured live 2026-08-07).
 
 
 class TestLoadRagScope:
-    def _s3(self, *, cuts=None, holdings=("HELD",), membership=True):
+    def _s3(self, *, cuts=None, holdings=("HELD",), membership=True,
+            predictor_cut="attractiveness_top_20"):
         s3 = MagicMock()
         payloads = {}
         if membership:
             payloads["universe_membership/latest.json"] = {
                 "run_date": "2026-07-29",
+                "predictor_universe_cut": predictor_cut,
                 "cuts": cuts if cuts is not None else {
-                    "scanner_candidates": {
-                        "basis": "scanner_gate", "size": 2,
+                    "attractiveness_top_60": {
+                        "basis": "attractiveness_rank", "size": 2,
                         "tickers": ["msft", "AAPL"],
+                        "source": "scanner/universe/2026-07-29/universe.json::attractiveness_score",
+                    },
+                    # The predictor's scored cut — nested, as the funnel requires.
+                    "attractiveness_top_20": {
+                        "basis": "attractiveness_rank", "size": 1,
+                        "tickers": ["AAPL"],
+                    },
+                    # The momentum GATE cut is present and must NOT be picked up.
+                    "scanner_candidates": {
+                        "basis": "scanner_gate", "size": 3,
+                        "tickers": ["A", "B", "C"],
                         "source": "candidates/2026-07-29/candidates.json::scanner_tickers",
                     },
-                    # A wider cut is present and must NOT be picked up.
-                    "attractiveness_top_60": {"size": 3, "tickers": ["A", "B", "C"]},
                 },
             }
         if holdings is not None:
@@ -58,7 +75,7 @@ class TestLoadRagScope:
         s3.get_object.side_effect = _get
         return s3
 
-    def test_resolves_scanner_cut_union_holdings_uppercased_and_sorted(self):
+    def test_resolves_feed_cut_union_holdings_uppercased_and_sorted(self):
         from rag.pipelines._rag_scope import load_rag_scope_tickers
 
         assert load_rag_scope_tickers(s3_client=self._s3()) == ["AAPL", "HELD", "MSFT"]
@@ -88,12 +105,57 @@ class TestLoadRagScope:
             for c in s3.get_object.call_args_list
         )
 
-    def test_takes_only_the_scanner_cut_not_a_wider_one(self):
+    def test_takes_the_attractiveness_feed_cut_not_the_momentum_gate_cut(self):
+        # config-I6630. Both cuts are present and both are "the 60"; only the
+        # attractiveness rank cut is the decision set.
         from rag.pipelines._rag_scope import load_rag_scope
 
         scope = load_rag_scope(s3_client=self._s3())
-        assert scope["counts"]["scanner_candidates"] == 2
-        assert "B" not in scope["tickers"]
+        assert scope["counts"]["attractiveness_top_60"] == 2
+        assert "scanner_candidates" not in scope["counts"]
+        assert not {"A", "B", "C"} & set(scope["tickers"])
+
+    def test_scope_contains_the_cut_the_predictor_scores(self):
+        # The funnel invariant, consumer side. The corpus exists to give the
+        # SCORED names evidence; a scope that does not contain them is filling
+        # the wrong 60.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        scope = load_rag_scope(s3_client=self._s3())
+        assert {"AAPL"} <= set(scope["tickers"])
+
+    def test_scope_not_covering_the_predictor_cut_raises(self):
+        # The exact live 2026-08-07 shape: scored cut and scope cut drawn from
+        # different rankings. Ingestion is off every decision pipeline's
+        # critical path, so raising costs a corpus fill, never a trading day.
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
+
+        s3 = self._s3(cuts={
+            "attractiveness_top_60": {"tickers": ["ANF", "SN"]},
+            "attractiveness_top_20": {"tickers": ["ANF", "LULU", "ROKU"]},
+        })
+        with pytest.raises(RagScopeUnavailable, match="funnel invariant"):
+            load_rag_scope_tickers(s3_client=s3)
+
+    def test_an_arm_promotion_to_an_uncovered_cut_raises(self):
+        # A champion change that moves the decision set must move the corpus
+        # scope in the same change. This is the coupling that was missing.
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
+
+        s3 = self._s3(predictor_cut="thinktank_top_20", cuts={
+            "attractiveness_top_60": {"tickers": ["AAPL", "MSFT"]},
+            "thinktank_top_20": {"tickers": ["NVDA"]},
+        })
+        with pytest.raises(RagScopeUnavailable, match="funnel invariant"):
+            load_rag_scope_tickers(s3_client=s3)
+
+    def test_membership_without_a_named_predictor_cut_raises(self):
+        # A consumer guessing which cut is scored is how a cut change becomes
+        # invisible to half the fleet.
+        from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
+
+        with pytest.raises(RagScopeUnavailable, match="predictor_universe_cut"):
+            load_rag_scope_tickers(s3_client=self._s3(predictor_cut=None))
 
     def test_missing_membership_raises_never_widens(self):
         from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
@@ -101,11 +163,11 @@ class TestLoadRagScope:
         with pytest.raises(RagScopeUnavailable, match="903-ticker"):
             load_rag_scope_tickers(s3_client=self._s3(membership=False))
 
-    def test_empty_scanner_cut_raises_and_names_the_available_cuts(self):
+    def test_empty_feed_cut_raises_and_names_the_available_cuts(self):
         from rag.pipelines._rag_scope import RagScopeUnavailable, load_rag_scope_tickers
 
-        s3 = self._s3(cuts={"attractiveness_top_20": {"tickers": ["X"]}})
-        with pytest.raises(RagScopeUnavailable, match="attractiveness_top_20"):
+        s3 = self._s3(cuts={"scanner_candidates": {"tickers": ["X"]}})
+        with pytest.raises(RagScopeUnavailable, match="scanner_candidates"):
             load_rag_scope_tickers(s3_client=s3)
 
     def test_missing_holdings_degrades_loudly_but_does_not_fail(self, caplog):

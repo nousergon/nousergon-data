@@ -30,23 +30,39 @@
 #   cron(0 3 2 * ? *)
 #
 # Managed OUTSIDE CloudFormation — mirrors the sibling dispatchers (narrow OIDC
-# blast radius: the CI role deliberately lacks iam:CreateRole/iam:PutRolePolicy,
-# fleet-wide policy after 4 IAM-clobber incidents — infrastructure/iam/README.md).
+# blast radius). CODE, and (since alpha-engine-config-I5815) SCHEDULES, auto-deploy
+# on merge to main via `.github/workflows/deploy-expense-collector.yml`, which runs
+# this script twice: flagless (Lambda code) and then `--reconcile-schedules`
+# (EventBridge Scheduler upsert + prune), both under the
+# github-actions-lambda-deploy OIDC role.
 #
-# CODE auto-deploys on merge to main via
-# `.github/workflows/deploy-expense-collector.yml` (path-filtered to this
-# directory), which runs this script with NO flags (the default/flagless run
-# is already code-only). A SCHED_CRONS change still needs an operator to run
-# `--bootstrap` by hand — merging alone has ZERO live effect on it.
+# alpha-engine-config-I5815 is why the schedule half is here at all. It used to
+# sit inside --bootstrap next to the IAM-role creation, so the OIDC role —
+# which deliberately lacks iam:CreateRole/iam:PutRolePolicy (fleet single-writer
+# rule after 4 IAM-clobber incidents in 2 months) — could not run it, and the
+# monthly reconciliation schedule was never created. Splitting on the IAM
+# boundary rather than on "first time vs not" is what makes the schedule half
+# CI-runnable.
+#
+# What still needs an operator: --bootstrap-iam, i.e. creating the IAM roles
+# and their inline policies, plus first-ever creation of the Lambda.
+# That is genuinely first-time-only.
 #
 # Usage:
-#   bash .../expense-collector/deploy.sh              # update code only (same command CI runs)
-#   bash .../expense-collector/deploy.sh --bootstrap  # first-time create + wire schedule
+#   bash .../expense-collector/deploy.sh                        # code only (the CI path, step 1)
+#   bash .../expense-collector/deploy.sh --reconcile-schedules  # + upsert/prune Scheduler rules (the CI path, step 2)
+#   bash .../expense-collector/deploy.sh --bootstrap-iam        # operator-only: create IAM roles, Lambda
+#   bash .../expense-collector/deploy.sh --bootstrap            # both of the above (unchanged meaning)
 #   bash .../expense-collector/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash .../expense-collector/deploy.sh --dry-run    # show actions, do not apply
 #   bash .../expense-collector/deploy.sh --smoke      # invoke once and print the rollup summary
 
 set -euo pipefail
+
+# alpha-engine-config-I6619: --state must come from the automation-pause
+# manifest, not from the API default (ENABLED). See infrastructure/lambdas/_shared/pause.sh.
+# shellcheck source=infrastructure/lambdas/_shared/pause.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/../_shared/pause.sh"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
@@ -75,24 +91,67 @@ SCHED_INPUTS=(
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
-DRY_RUN=false
-BOOTSTRAP=false
+# alpha-engine-config-I5815 splits the old monolithic --bootstrap in two, along
+# the line that actually matters: which grants the caller needs.
+#
+#   BOOTSTRAP_IAM       creates IAM roles and puts inline policies. Needs
+#                       iam:CreateRole + iam:PutRolePolicy, which the GHA OIDC
+#                       role deliberately does NOT have (fleet single-writer
+#                       rule after 4 IAM-clobber incidents). Operator-only, and
+#                       first-time-only in practice.
+#   RECONCILE_SCHEDULES upserts + prunes the EventBridge Scheduler rules. Needs
+#                       ONLY scheduler:{Get,List,Create,Update,Delete}Schedule
+#                       and a scoped iam:PassRole — all of which
+#                       github-actions-lambda-deploy already holds. Safe to run
+#                       on every merge, and now does.
+#
+# --bootstrap keeps its old meaning (both) so every runbook, every comment and
+# every operator habit that predates the split still does what it says.
+BOOTSTRAP_IAM=false
+RECONCILE_SCHEDULES=false
 APPLY_IAM=false
 SMOKE=false
+# alpha-engine-config-I6620. DRY_RUN was the ONE flag here with no default-init,
+# so `run()` below died 'DRY_RUN: unbound variable' under `set -u` on every
+# zero-flag invocation — which is every CI deploy. Observed 2026-08-07: the
+# Deploy expense-collector job failed AFTER packaging, so it looked like it had
+# got far enough to have worked, and the Lambda code was never updated.
+#
+# Same ambient-env idiom as every sibling deploy.sh, established by the I2752
+# incident (2026-07-16): DRY_RUN=1 from a caller's shell must actually no-op,
+# not silently run the real deploy path.
+case "${DRY_RUN:-false}" in
+  true|1|yes|TRUE|YES) DRY_RUN=true ;;
+  *) DRY_RUN=false ;;
+esac
 for arg in "$@"; do
   case "$arg" in
     --dry-run) DRY_RUN=true ;;
-    --bootstrap) BOOTSTRAP=true ;;
+    --bootstrap) BOOTSTRAP_IAM=true; RECONCILE_SCHEDULES=true ;;
+    --bootstrap-iam) BOOTSTRAP_IAM=true ;;
+    --reconcile-schedules) RECONCILE_SCHEDULES=true ;;
     --apply-iam) APPLY_IAM=true ;;
     --smoke) SMOKE=true ;;
     -h|--help) sed -n '2,/^$/p' "$0"; exit 0 ;;
   esac
 done
 
+# `--reconcile-schedules` ALONE is a schedules-only run: it skips packaging
+# (docker pip + handler tests) and the code push. The CI deploy therefore
+# invokes this script twice without paying for the ~2min package build twice,
+# and an operator repairing live schedule drift does not have to redeploy code
+# to do it. Combined with --bootstrap or run flagless, everything happens as
+# before.
+CODE_DEPLOY=true
+if $RECONCILE_SCHEDULES && ! $BOOTSTRAP_IAM && ! $APPLY_IAM && ! $SMOKE; then
+  CODE_DEPLOY=false
+fi
+
 run() {
   if $DRY_RUN; then echo "DRY: $*"; else "$@"; fi
 }
 
+if $CODE_DEPLOY; then
 # ----- 0. Scratch dir + validate handler syntax ------------------------------
 
 PKG=$(mktemp -d)
@@ -127,8 +186,9 @@ cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
+fi
 
-# ----- 2. Bootstrap (first-time only) ---------------------------------------
+# ----- 2. Bootstrap IAM (operator-only — first-time only) -------------------
 
 # ----- Apply IAM only (config#2825, no bootstrap side effects) -------------
 if $APPLY_IAM; then
@@ -138,8 +198,8 @@ if $APPLY_IAM; then
   echo "  ✓ IAM applied."
 fi
 
-if $BOOTSTRAP; then
-  echo "Bootstrapping ${FUNCTION_NAME}..."
+if $BOOTSTRAP_IAM; then
+  echo "Bootstrapping IAM for ${FUNCTION_NAME}..."
 
   TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
   if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
@@ -184,6 +244,12 @@ if $BOOTSTRAP; then
     --policy-document "${SCHED_INVOKE_POLICY}"
 
   if ! $DRY_RUN; then echo "  Waiting 10s for Scheduler role propagation..."; sleep 10; fi
+fi
+
+# ----- 2bis. Reconcile EventBridge Scheduler rules (CI-safe, every merge) ---
+
+if $RECONCILE_SCHEDULES; then
+  echo "Reconciling EventBridge Scheduler rules for ${FUNCTION_NAME}..."
 
   for i in "${!SCHED_NAMES[@]}"; do
     name="${SCHED_NAMES[$i]}"
@@ -193,12 +259,12 @@ if $BOOTSTRAP; then
       "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler update-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     else
       echo "  Creating Scheduler rule: ${name} → ${cron}"
-      run aws scheduler create-schedule --name "${name}" --schedule-expression "${cron}" \
+      run aws scheduler create-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
         --schedule-expression-timezone "UTC" --flexible-time-window '{"Mode":"OFF"}' \
         --target "${target}" --region "${REGION}" --query 'ScheduleArn' --output text
     fi
@@ -223,6 +289,7 @@ fi
 
 # ----- 3. Update function code (always, idempotent) -------------------------
 
+if $CODE_DEPLOY; then
 echo "Updating Lambda function code: ${FUNCTION_NAME}"
 run aws lambda update-function-code --function-name "${FUNCTION_NAME}" \
   --zip-file "fileb://${ZIP}" --region "${REGION}" --query 'LastUpdateStatus' --output text
@@ -232,6 +299,7 @@ if ! $DRY_RUN; then
 fi
 
 echo "✓ Code deployed."
+fi
 
 # ----- 4. Smoke (real invoke — writes the day's rollup, safe to repeat) ------
 
