@@ -96,11 +96,19 @@ class TestQuartetPresence:
             "WaitForParity",
             "CheckParityStatus",
             "ParityWait",
-            "ExtractParityError",
+            # degrade-not-fail route (alpha-engine-config-I6025) — replaces
+            # the retired ExtractParityError → NormalizeFailureContext path
+            "ParityDegraded",
+            "PublishParityDegraded",
         ],
     )
     def test_state_exists(self, states, name):
         assert name in states, f"{name} missing from Saturday SF States"
+
+    def test_extract_parity_error_retired(self, states):
+        """alpha-engine-config-I6025: Parity no longer fails the SF, so its
+        error normalizer is gone — the degrade route owns the failure path."""
+        assert "ExtractParityError" not in states
 
     def test_no_standalone_backtest_state(self, states):
         """Lower-churn option chosen: there is intentionally NO separate
@@ -220,7 +228,10 @@ class TestChainOrdering:
         assert nexts["InProgress"] == "ParityWait"
         assert nexts["Pending"] == "ParityWait"
         assert states["ParityWait"]["Next"] == "WaitForParity"
-        assert states["CheckParityStatus"]["Default"] == "ExtractParityError"
+        # alpha-engine-config-I6025: terminal non-Success DEGRADES the run
+        # (ParityDegraded → PublishParityDegraded → CheckSkipEvaluator)
+        # instead of failing the SF through ExtractParityError.
+        assert states["CheckParityStatus"]["Default"] == "ParityDegraded"
 
     def test_backtest_reachable_strictly_before_parity(self, sf, states):
         """Walk the HAPPY path from StartAt and assert Backtester (backtest
@@ -381,19 +392,27 @@ class TestBudgetParity:
 
 
 class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → NormalizeFailureContext
-    (config#1819: the single chokepoint in front of HandleFailure, was
-    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
-    Backtester quartet (the SF halts on infra failure of these states)."""
+    """alpha-engine-config-I6025 degrade-not-fail split:
+
+    * Parity + WaitForParity Catch States.ALL → ParityDegraded (send/poll
+      infra failure degrades the run — parity is observability and must not
+      kill Evaluator/ReportCard/Director);
+    * the kept Backtester state keeps its NormalizeFailureContext Catch
+      (the backtest family still halts the SF on infra failure — the
+      anti-auto-promote-garbage rule).
+    """
 
     @pytest.mark.parametrize("name", ["Parity", "WaitForParity"])
-    def test_catch_routes_to_handle_failure(self, states, name):
+    def test_parity_catches_route_to_parity_degraded(self, states, name):
         catches = states[name]["Catch"]
         assert len(catches) >= 1
         for c in catches:
             assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "NormalizeFailureContext"
-            assert c["ResultPath"] == "$.error"
+            assert c["Next"] == "ParityDegraded", (
+                f"{name}'s Catch must route to ParityDegraded "
+                "(degrade-not-fail, alpha-engine-config-I6025)"
+            )
+            assert c["ResultPath"] == "$.parity_error"
 
     def test_backtester_still_catches_handle_failure(self, states):
         """Regression guard — the kept Backtester state must keep its
@@ -406,12 +425,13 @@ class TestCatchSemantics:
             for c in catches
         )
 
-    def test_parity_extract_error_routes_to_handle_failure(self, states):
-        st = states["ExtractParityError"]
-        assert st["Type"] == "Pass"
-        assert st["ResultPath"] == "$.error"
-        assert st["Next"] == "NormalizeFailureContext"
-        assert st["Parameters"]["phase"] == "Parity"
+    def test_parity_degraded_routes_to_publish_then_evaluator(self, states):
+        """The full degrade chain: ParityDegraded → PublishParityDegraded →
+        CheckSkipEvaluator — the SF CONTINUES (never HandleFailure)."""
+        assert states["ParityDegraded"]["Type"] == "Pass"
+        assert states["ParityDegraded"]["ResultPath"] == "$.parity_degraded"
+        assert states["ParityDegraded"]["Next"] == "PublishParityDegraded"
+        assert states["PublishParityDegraded"]["Next"] == "CheckSkipEvaluator"
 
 
 class TestResultPathIsolation:

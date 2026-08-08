@@ -464,6 +464,24 @@ class TestStageTableLockstep:
         assert all_states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
         assert all_states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
+    def test_parity_degraded_route_is_mapped_in_stages(self, mod, all_states):
+        """alpha-engine-config-I6025: the SF now routes every parity
+        non-success through ParityDegraded → PublishParityDegraded and
+        CONTINUES. A degraded parity must re-run on a mechanical rerun —
+        never be skipped as completed — so the STAGES row must map both
+        degraded-route states. (The full degraded-overrides-witness logic
+        ships with alpha-engine-config-I6055; this pins the mapping so the
+        guard can never miss it.)"""
+        parity = next(s for s in mod.STAGES if s.name == "parity")
+        assert parity.degraded_witness == frozenset(
+            {"ParityDegraded", "PublishParityDegraded"}
+        )
+        for d in parity.degraded_witness:
+            assert d in all_states, (
+                f"parity degraded witness {d} is not a state in "
+                f"infrastructure/step_function.json — update STAGES"
+            )
+
     def test_every_degraded_state_is_mapped(self, mod, all_states):
         """Completeness (alpha-engine-config-I6055): a NEW *Degraded /
         Publish*Degraded route in the SF without a STAGES degraded_witness

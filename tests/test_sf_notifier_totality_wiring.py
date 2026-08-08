@@ -176,11 +176,13 @@ class TestNormalizeFailureContextIsSoleChokepoint:
             "WaitForPredictorBacktest",
             "PortfolioOptimizerBacktest",
             "WaitForPortfolioOptimizerBacktest",
-            "Parity",
-            "WaitForParity",
             "Evaluator",
             "WaitForEvaluator",
         ]
+        # NOTE: Parity + WaitForParity are deliberately NOT in the list —
+        # alpha-engine-config-I6025: parity failures degrade (ParityDegraded →
+        # PublishParityDegraded → CheckSkipEvaluator), they never reach
+        # NormalizeFailureContext/HandleFailure.
         for name in expected_normalize_entrypoints:
             catches = weekly_states[name].get("Catch", [])
             assert catches, f"{name} has no Catch block"
@@ -196,11 +198,12 @@ class TestNormalizeFailureContextIsSoleChokepoint:
             "ExtractMorningEnrichError",
             "ExtractDataPhase1Error",
             "ExtractBacktesterError",
-            "ExtractParityError",
             "ExtractPredictorBacktestError",
             "ExtractPortfolioOptimizerBacktestError",
             "ExtractEvaluatorError",
         ]
+        # ExtractParityError removed with the degrade-not-fail route (I6025).
+        assert "ExtractParityError" not in weekly_states
         for name in expected_extract_normalizers:
             st = weekly_states[name]
             assert st["Type"] == "Pass"
