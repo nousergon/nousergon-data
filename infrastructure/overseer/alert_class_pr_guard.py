@@ -319,13 +319,36 @@ def class_name_for(source: str) -> str:
     return slug[:60].strip("_")
 
 
+#: Suggested tier for a newly-detected source, by the emitted severity. This
+#: is a STARTING POINT the author must justify, not a verdict: the tier is a
+#: statement about ACTIONABILITY (is something broken?), and severity is only
+#: the best evidence available before a human has read the call site
+#: (alpha-engine-config-I6751; observability-policy.md 7.1 — derived where
+#: derivable, declared where not). `dynamic` is suggested where the emitter
+#: picks its severity at runtime, which is exactly when it is not derivable
+#: here.
+_SUGGESTED_TIER: dict[str, str] = {
+    "critical": "page",
+    "alarm": "page",
+    "error": "notify-silent",
+    "warning": "tracked-only",
+    "info": "tracked-only",
+    "dynamic": "dynamic",
+}
+
+
 def row_yaml(source: str, severity: str) -> str:
+    tier = _SUGGESTED_TIER.get(severity, "page")
     return (
         f"  - class: {class_name_for(source)}\n"
         f"    source: {source}\n"
         f"    severities: [{severity}]\n"
         f"    intake: bus\n"
         f"    response: drain-queue\n"
+        f"    # tier suggested from severity={severity!r}; CONFIRM it against\n"
+        f"    # actionability -- page only if something is BROKEN and cannot\n"
+        f"    # wait for the next console look (alpha-engine-config-I6751).\n"
+        f"    tier: {tier}\n"
     )
 
 

@@ -1,0 +1,104 @@
+name: Sync alert tier registry to S3
+
+# Publishes the DELIVERY-TIER routing document distilled from
+# infrastructure/overseer/playbooks.yaml::alert_classes to the S3 object that
+# `krepis.alert_tiers` reads on every fleet alert.
+#
+# WHY THIS EXISTS
+#
+# alpha-engine-config-I6751 Phase 1. `krepis.alerts.publish` now resolves
+# delivery (page / notify-silent / tracked-only) from the alert CLASS keyed on
+# `source`, not from the severity string a call site picked. krepis is a PyPI
+# library imported by Lambdas, spot boxes and the laptop; none of them check
+# this repository out, and vendoring a copy of the tier table into krepis is
+# alpha-engine-config-I10121's bug class (iam-drift-check needed a hand-kept
+# twin of a source it could have read, and reddened `main` four times in three
+# days). So the table stays here and is PUBLISHED.
+#
+# TWO ARMS, ON PURPOSE — deliberately mirroring sync-llm-model-registry.yml and
+# sync-artifact-registry.yml in alpha-engine-config (shared-code-policy: third
+# adoption; all three remain thin wrappers over a validator plus a put, so
+# there is nothing yet worth lifting into a shared action).
+#
+#   push      publish on merge, then READ THE OBJECT BACK and compare the
+#             source digest. A put that exits 0 is an event; the read-back is
+#             the effect (principles.md 2.3 — a loop that does not verify its
+#             own action is not closed).
+#   schedule  assert repo == S3 with nothing to publish. This is the arm that
+#             survives what the push arm cannot see: a path filter that stops
+#             matching, a disabled workflow, a hand-edit straight to the
+#             bucket. Without it, "the publish never fired" and "the publish
+#             fired and worked" are the same shape on every surface
+#             (principles.md 2.7).
+#
+# WHAT FAILURE LOOKS LIKE, AND WHY IT IS SAFE
+#
+# A stale or absent object does not silence anything: `krepis.alert_tiers`
+# fails UPWARD, routing every source to `page` and marking each emission
+# `registry_drift`. That is today's behaviour (37 emails a day), which is loud
+# and recoverable — the opposite direction would be silent.
+#
+# IAM: `github-actions-lambda-deploy` already carries s3:PutObject/GetObject on
+# arn:aws:s3:::alpha-engine-research/* (the same grant the artifact-registry
+# and model-registry syncs use). No IAM change accompanies this workflow.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/overseer/playbooks.yaml'
+      - 'infrastructure/overseer/playbooks.schema.json'
+      - 'infrastructure/overseer/publish_alert_tier_registry.py'
+      - '.github/workflows/sync-alert-tier-registry.yml'
+  schedule:
+    # Daily 13:20 UTC. The registry gates every fleet notification, so the
+    # drift arm runs daily rather than weekly: a day of undetected drift is a
+    # day of alerts routed by a table nobody is looking at.
+    - cron: '20 13 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: sync-alert-tier-registry-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sync:
+    name: Publish + verify the alert tier registry
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install validator dependencies
+        run: python -m pip install --quiet 'pyyaml==6.0.2' 'jsonschema==4.23.0' 'boto3==1.35.99'
+
+      - name: Publish and verify (merge / manual)
+        if: github.event_name != 'schedule'
+        run: python infrastructure/overseer/publish_alert_tier_registry.py
+
+      - name: Assert the published registry still matches the repo (drift arm)
+        if: github.event_name == 'schedule'
+        run: python infrastructure/overseer/publish_alert_tier_registry.py --assert-in-sync
+
+  notify-main-failure:
+    needs: [sync]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

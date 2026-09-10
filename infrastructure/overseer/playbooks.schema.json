@@ -1,86 +1,140 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Nousergon Overseer playbook registry v1",
-  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump. The optional `liveness` (per-playbook) and `watch_plane_liveness` (top-level) blocks (alpha-engine-config-I2831) drive the registry-driven overseer-liveness-probe — added additively, schema_version unchanged. The optional `trigger_type` discriminant (alpha-engine-config-I2928 Phase 3) models a second trigger topology for `routed: false` inventory-only entries that have NO Lambda at all (pure GitHub Actions cron, e.g. the gate-due-sweep.yml daily job) — it defaults to `lambda_dispatch` when absent, so every entry written before this field existed remains valid unchanged; `github_actions_cron` entries require `workflow_file`/`repo` instead of the executor_*/kill_switch_env fields.",
+  "description": "Contract for infrastructure/overseer/playbooks.yaml (alpha-engine-config-I2823). Additive-only evolution: new fields must be optional; renames/removals require a schema_version bump. The optional `liveness` (per-playbook) and `watch_plane_liveness` (top-level) blocks (alpha-engine-config-I2831) drive the registry-driven overseer-liveness-probe \u2014 added additively, schema_version unchanged. The optional `trigger_type` discriminant (alpha-engine-config-I2928 Phase 3) models a second trigger topology for `routed: false` inventory-only entries that have NO Lambda at all (pure GitHub Actions cron, e.g. the gate-due-sweep.yml daily job) \u2014 it defaults to `lambda_dispatch` when absent, so every entry written before this field existed remains valid unchanged; `github_actions_cron` entries require `workflow_file`/`repo` instead of the executor_*/kill_switch_env fields.",
   "type": "object",
-  "required": ["schema_version", "playbooks"],
+  "required": [
+    "schema_version",
+    "playbooks"
+  ],
   "additionalProperties": false,
   "properties": {
-    "schema_version": { "const": 1 },
+    "schema_version": {
+      "const": 1
+    },
     "playbooks": {
       "type": "object",
       "minProperties": 1,
-      "propertyNames": { "pattern": "^[a-z0-9-]{1,40}$" },
+      "propertyNames": {
+        "pattern": "^[a-z0-9-]{1,40}$"
+      },
       "additionalProperties": {
         "type": "object",
         "required": [
-          "description", "tier", "routed", "enabled",
-          "concurrency_domain", "supports_drill"
+          "description",
+          "tier",
+          "routed",
+          "enabled",
+          "concurrency_domain",
+          "supports_drill"
         ],
         "additionalProperties": false,
         "properties": {
-          "description": { "type": "string", "minLength": 10 },
-          "tier": { "enum": ["T0", "T1", "T2", "T3"] },
-          "routed": { "type": "boolean" },
-          "enabled": { "type": "boolean" },
-          "trigger_type": {
-            "enum": ["lambda_dispatch", "github_actions_cron"],
-            "description": "Discriminant for the entry's trigger topology. Defaults to lambda_dispatch when absent — every entry written before this field existed stays valid unchanged (additive-only evolution). github_actions_cron marks entries with NO Lambda at all (pure GHA cron); those require workflow_file/repo instead of the executor_*/kill_switch_env fields."
+          "description": {
+            "type": "string",
+            "minLength": 10
           },
-          "executor_function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
-          "executor_lambda_dir": { "type": "string", "pattern": "^[a-z0-9-]+$" },
+          "tier": {
+            "enum": [
+              "T0",
+              "T1",
+              "T2",
+              "T3"
+            ]
+          },
+          "routed": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "trigger_type": {
+            "enum": [
+              "lambda_dispatch",
+              "github_actions_cron"
+            ],
+            "description": "Discriminant for the entry's trigger topology. Defaults to lambda_dispatch when absent \u2014 every entry written before this field existed stays valid unchanged (additive-only evolution). github_actions_cron marks entries with NO Lambda at all (pure GHA cron); those require workflow_file/repo instead of the executor_*/kill_switch_env fields."
+          },
+          "executor_function": {
+            "type": "string",
+            "pattern": "^alpha-engine-[a-z0-9-]+$"
+          },
+          "executor_lambda_dir": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+$"
+          },
           "benign_reasons": {
             "type": "array",
-            "items": { "type": "string", "pattern": "^[a-z_]+$" },
+            "items": {
+              "type": "string",
+              "pattern": "^[a-z_]+$"
+            },
             "minItems": 1
           },
-          "charter": { "type": "string" },
-          "concurrency_domain": { "type": "string" },
-          "supports_drill": { "type": "boolean" },
-          "triggers": { "$ref": "#/$defs/triggers" },
+          "charter": {
+            "type": "string"
+          },
+          "concurrency_domain": {
+            "type": "string"
+          },
+          "supports_drill": {
+            "type": "boolean"
+          },
+          "triggers": {
+            "$ref": "#/$defs/triggers"
+          },
           "on_concurrent": {
-            "enum": ["defer", "skip"],
-            "description": "config-#5286 — what the dispatcher does when a concurrency collision is detected. 'defer' schedules a delayed re-invoke (sf-watch defer-not-drop pattern); 'skip' returns concurrent_skip immediately (ci-watch, alert-drain pattern). Must match the executor's actual behavior; the registry test pins this to the executor's literals."
+            "enum": [
+              "defer",
+              "skip"
+            ],
+            "description": "config-#5286 \u2014 what the dispatcher does when a concurrency collision is detected. 'defer' schedules a delayed re-invoke (sf-watch defer-not-drop pattern); 'skip' returns concurrent_skip immediately (ci-watch, alert-drain pattern). Must match the executor's actual behavior; the registry test pins this to the executor's literals."
           },
           "attempt_ceiling": {
             "type": "integer",
             "minimum": 1,
-            "description": "config-#5286 — maximum number of dispatch attempts before the executor stops retrying. For 'defer' semantics, this is the defer generation cap (sf-watch: 3). For 'skip' semantics, this is 1 — skip on first collision with no retry. The overseer-dispatcher injects this into the executor payload; the executor's own hardcoded default is the fallback for non-router invocation paths."
+            "description": "config-#5286 \u2014 maximum number of dispatch attempts before the executor stops retrying. For 'defer' semantics, this is the defer generation cap (sf-watch: 3). For 'skip' semantics, this is 1 \u2014 skip on first collision with no retry. The overseer-dispatcher injects this into the executor payload; the executor's own hardcoded default is the fallback for non-router invocation paths."
           },
           "lease_seconds": {
             "type": "integer",
             "minimum": 1,
-            "description": "config-#5286 — duration in seconds for the concurrency lock lease. For tag-based instance locks (the fleet's standard pattern), this is the TTL before the lock is considered stale. Optional — absent means the lock is instance-lifetime-based (exists until the EC2 instance terminates)."
+            "description": "config-#5286 \u2014 duration in seconds for the concurrency lock lease. For tag-based instance locks (the fleet's standard pattern), this is the TTL before the lock is considered stale. Optional \u2014 absent means the lock is instance-lifetime-based (exists until the EC2 instance terminates)."
           },
           "drill_isolation": {
             "type": "boolean",
-            "description": "config-#5286 — whether drill runs are structurally isolated from real dispatch collisions. When true, a drill's effective dispatch key never collides with a real dispatch key (e.g. a 'drill-' prefix on run_date). When false or absent, drills share the same concurrency domain as real dispatches."
+            "description": "config-#5286 \u2014 whether drill runs are structurally isolated from real dispatch collisions. When true, a drill's effective dispatch key never collides with a real dispatch key (e.g. a 'drill-' prefix on run_date). When false or absent, drills share the same concurrency domain as real dispatches."
           },
           "custom_executor": {
             "type": "boolean",
-            "description": "config-#5286 — escape hatch for playbooks whose dispatch logic is genuinely bespoke and cannot be expressed through registry semantics. When true, the overseer-dispatcher skips injecting dispatch-semantics fields (the executor manages its own concurrency/attempts/lease/drill behavior entirely). Default: false when absent. Groom is the canonical permanent holdout (its pace/demand/tier logic predates and cannot be expressed through the instance-level dispatch primitives)."
+            "description": "config-#5286 \u2014 escape hatch for playbooks whose dispatch logic is genuinely bespoke and cannot be expressed through registry semantics. When true, the overseer-dispatcher skips injecting dispatch-semantics fields (the executor manages its own concurrency/attempts/lease/drill behavior entirely). Default: false when absent. Groom is the canonical permanent holdout (its pace/demand/tier logic predates and cannot be expressed through the instance-level dispatch primitives)."
           },
-          "kill_switch_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
+          "kill_switch_env": {
+            "type": "string",
+            "pattern": "^[A-Z0-9_]+$"
+          },
           "model": {
             "type": "string",
             "pattern": "^[a-z0-9][a-z0-9._-]{0,63}$",
-            "description": "config-I3293 — the model this playbook's agent runs (provider-agnostic since alpha-engine-config-I4478; was claude-only, which could not express the fleet's DeepSeek-primary policy). LIVE config, not documentation: the overseer-dispatcher injects it into the executor payload as `model`; executors thread it to the run script. The run script's inline default is the fallback only for non-router invocation paths. Required (via registry test, not schema) on every routed playbook whose executor launches a claude-CLI agent."
+            "description": "config-I3293 \u2014 the model this playbook's agent runs (provider-agnostic since alpha-engine-config-I4478; was claude-only, which could not express the fleet's DeepSeek-primary policy). LIVE config, not documentation: the overseer-dispatcher injects it into the executor payload as `model`; executors thread it to the run script. The run script's inline default is the fallback only for non-router invocation paths. Required (via registry test, not schema) on every routed playbook whose executor launches a claude-CLI agent."
           },
           "wake": {
             "type": "array",
-            "items": { "type": "string", "minLength": 10 },
+            "items": {
+              "type": "string",
+              "minLength": 10
+            },
             "minItems": 1,
-            "description": "config-I3293 — human-readable enumeration of everything that launches this playbook's agent (eventbridge rules, scheduler schedules, event-time dispatch paths). Names of scheduler:/eventbridge: resources mentioned here should also appear in a liveness check; the registry test pins the drain-schedule set."
+            "description": "config-I3293 \u2014 human-readable enumeration of everything that launches this playbook's agent (eventbridge rules, scheduler schedules, event-time dispatch paths). Names of scheduler:/eventbridge: resources mentioned here should also appear in a liveness check; the registry test pins the drain-schedule set."
           },
           "cadence": {
             "type": "string",
             "minLength": 5,
-            "description": "config-I3293 — one-line answer to 'is there a scheduled wake, and when' (e.g. 'event-driven only', '4x daily 04:00/10:00/16:00/22:00 UTC + event-time on freshness criticals')."
+            "description": "config-I3293 \u2014 one-line answer to 'is there a scheduled wake, and when' (e.g. 'event-driven only', '4x daily 04:00/10:00/16:00/22:00 UTC + event-time on freshness criticals')."
           },
           "workflow_file": {
             "type": "string",
             "pattern": "^\\.github/workflows/[a-z0-9_-]+\\.ya?ml$",
-            "description": "Path (in `repo`) to the GitHub Actions workflow file that IS this entry's trigger — only meaningful when trigger_type is github_actions_cron."
+            "description": "Path (in `repo`) to the GitHub Actions workflow file that IS this entry's trigger \u2014 only meaningful when trigger_type is github_actions_cron."
           },
           "repo": {
             "type": "string",
@@ -90,42 +144,77 @@
           "schedule_cron": {
             "type": "string",
             "minLength": 9,
-            "description": "Literal cron expression from the workflow_file's `on.schedule`, for humans reading the registry — not parsed/enforced by tooling."
+            "description": "Literal cron expression from the workflow_file's `on.schedule`, for humans reading the registry \u2014 not parsed/enforced by tooling."
           },
           "sibling_probe_function": {
             "type": "string",
             "pattern": "^alpha-engine-[a-z0-9-]+$",
-            "description": "config#4474 — name of a dedicated sibling Lambda probe that covers this playbook's liveness independently (e.g. canary-replay-liveness-probe). When set, the registry's cadence→liveness contract test accepts this as proof of alternative coverage instead of requiring a run_window or invocation-success check in this entry's liveness block."
+            "description": "config#4474 \u2014 name of a dedicated sibling Lambda probe that covers this playbook's liveness independently (e.g. canary-replay-liveness-probe). When set, the registry's cadence\u2192liveness contract test accepts this as proof of alternative coverage instead of requiring a run_window or invocation-success check in this entry's liveness block."
           },
           "execution_surface": {
-            "enum": ["spot", "lambda", "laptop-launchd"],
-            "description": "config-I4993 G17 — the execution substrate this playbook runs on. 'spot' (EC2 spot instance, the fleet default), 'lambda' (serverless function invocation), 'laptop-launchd' (local macOS launchd agent running from the working tree — the laptop janitor and usage-tracker agents). Absent defaults to 'spot' for backwards compatibility (every entry written before this field existed)."
+            "enum": [
+              "spot",
+              "lambda",
+              "laptop-launchd"
+            ],
+            "description": "config-I4993 G17 \u2014 the execution substrate this playbook runs on. 'spot' (EC2 spot instance, the fleet default), 'lambda' (serverless function invocation), 'laptop-launchd' (local macOS launchd agent running from the working tree \u2014 the laptop janitor and usage-tracker agents). Absent defaults to 'spot' for backwards compatibility (every entry written before this field existed)."
           },
-          "liveness": { "$ref": "#/$defs/liveness_block" }
+          "liveness": {
+            "$ref": "#/$defs/liveness_block"
+          }
         },
         "allOf": [
           {
-            "if": { "properties": { "routed": { "const": true } } },
-            "then": { "required": ["benign_reasons"] }
-          },
-          {
             "if": {
-              "not": {
-                "properties": { "trigger_type": { "const": "github_actions_cron" } },
-                "required": ["trigger_type"]
+              "properties": {
+                "routed": {
+                  "const": true
+                }
               }
             },
             "then": {
-              "required": ["executor_function", "executor_lambda_dir", "kill_switch_env"]
+              "required": [
+                "benign_reasons"
+              ]
             }
           },
           {
             "if": {
-              "properties": { "trigger_type": { "const": "github_actions_cron" } },
-              "required": ["trigger_type"]
+              "not": {
+                "properties": {
+                  "trigger_type": {
+                    "const": "github_actions_cron"
+                  }
+                },
+                "required": [
+                  "trigger_type"
+                ]
+              }
             },
             "then": {
-              "required": ["workflow_file", "repo"]
+              "required": [
+                "executor_function",
+                "executor_lambda_dir",
+                "kill_switch_env"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "trigger_type": {
+                  "const": "github_actions_cron"
+                }
+              },
+              "required": [
+                "trigger_type"
+              ]
+            },
+            "then": {
+              "required": [
+                "workflow_file",
+                "repo"
+              ]
             }
           }
         ]
@@ -134,13 +223,27 @@
     "t1_automations": {
       "type": "array",
       "minItems": 0,
-      "description": "T1 authority tier — named deterministic remediations for known-shape failures (overseer-policy.md §6). Each entry is a reviewed, non-agentic automation the alert-drain charter executes BEFORE T2 classification. Promotion requires ≥3 occurrences, deterministic remediation, verifiable success predicate, rollback path, and a reviewed authorizing issue. Demotion is automatic: ≥max_consecutive_failures predicate failures → entry disabled + finding filed. Runtime state (consecutive_failure count, demotion status) is tracked in the drain carryover ledger, NOT here — this file is the static registry.",
+      "description": "T1 authority tier \u2014 named deterministic remediations for known-shape failures (overseer-policy.md \u00a76). Each entry is a reviewed, non-agentic automation the alert-drain charter executes BEFORE T2 classification. Promotion requires \u22653 occurrences, deterministic remediation, verifiable success predicate, rollback path, and a reviewed authorizing issue. Demotion is automatic: \u2265max_consecutive_failures predicate failures \u2192 entry disabled + finding filed. Runtime state (consecutive_failure count, demotion status) is tracked in the drain carryover ledger, NOT here \u2014 this file is the static registry.",
       "items": {
         "type": "object",
-        "required": ["name", "description", "authorized_by", "added", "match", "remediation_steps", "success_predicate", "rollback", "max_consecutive_failures"],
+        "required": [
+          "name",
+          "description",
+          "authorized_by",
+          "added",
+          "match",
+          "remediation_steps",
+          "success_predicate",
+          "rollback",
+          "max_consecutive_failures"
+        ],
         "dependentRequired": {
-          "reauthorized_at": ["reauthorized_by"],
-          "reauthorized_by": ["reauthorized_at"]
+          "reauthorized_at": [
+            "reauthorized_by"
+          ],
+          "reauthorized_by": [
+            "reauthorized_at"
+          ]
         },
         "additionalProperties": false,
         "properties": {
@@ -152,12 +255,12 @@
           "description": {
             "type": "string",
             "minLength": 20,
-            "description": "What this automation handles — human-readable scope statement."
+            "description": "What this automation handles \u2014 human-readable scope statement."
           },
           "authorized_by": {
             "type": "string",
             "pattern": "^[a-z0-9-]+-I[0-9]+$",
-            "description": "Reviewed issue authorizing this T1 promotion (overseer-policy.md §6 requirement)."
+            "description": "Reviewed issue authorizing this T1 promotion (overseer-policy.md \u00a76 requirement)."
           },
           "added": {
             "type": "string",
@@ -166,7 +269,9 @@
           },
           "match": {
             "type": "object",
-            "required": ["alert_class"],
+            "required": [
+              "alert_class"
+            ],
             "additionalProperties": false,
             "properties": {
               "alert_class": {
@@ -177,8 +282,17 @@
               "severities": {
                 "type": "array",
                 "minItems": 1,
-                "items": { "enum": ["info", "warning", "error", "critical", "alarm", "dynamic"] },
-                "description": "Optional — limit to specific severities. When absent, matches all severities of the alert_class."
+                "items": {
+                  "enum": [
+                    "info",
+                    "warning",
+                    "error",
+                    "critical",
+                    "alarm",
+                    "dynamic"
+                  ]
+                },
+                "description": "Optional \u2014 limit to specific severities. When absent, matches all severities of the alert_class."
               },
               "key_contains": {
                 "type": "string",
@@ -191,7 +305,7 @@
             "type": "array",
             "minItems": 1,
             "maxItems": 10,
-            "description": "Deterministic steps the drain agent executes when this automation matches. Each step must be mechanical — no agent judgment, no branching. Steps are executed in order; any step that fails (cannot be completed mechanically) is a predicate failure.",
+            "description": "Deterministic steps the drain agent executes when this automation matches. Each step must be mechanical \u2014 no agent judgment, no branching. Steps are executed in order; any step that fails (cannot be completed mechanically) is a predicate failure.",
             "items": {
               "type": "string",
               "minLength": 10
@@ -199,7 +313,10 @@
           },
           "success_predicate": {
             "type": "object",
-            "required": ["description", "check"],
+            "required": [
+              "description",
+              "check"
+            ],
             "additionalProperties": false,
             "properties": {
               "description": {
@@ -216,7 +333,9 @@
           },
           "rollback": {
             "type": "object",
-            "required": ["description"],
+            "required": [
+              "description"
+            ],
             "additionalProperties": false,
             "properties": {
               "description": {
@@ -231,49 +350,148 @@
             "minimum": 1,
             "maximum": 10,
             "default": 2,
-            "description": "Number of consecutive FAILED outcomes before automatic demotion to T2 + finding filed (overseer-policy.md §6). config-I8686 (Brian ruling 2026-08-26): a run resolves to exactly one of verified / declined / failed, and ONLY `failed` — the automation could not EVALUATE its predicate (crash, timeout, unreadable input, malformed payload) — increments this counter. `declined` (the predicate was evaluated and is not satisfied) is the automation giving the CORRECT answer and is silent on the counter in both directions. Collapsing the two demotes an automation precisely when the fleet is broken, which is when its coverage is worth most."
+            "description": "Number of consecutive FAILED outcomes before automatic demotion to T2 + finding filed (overseer-policy.md \u00a76). config-I8686 (Brian ruling 2026-08-26): a run resolves to exactly one of verified / declined / failed, and ONLY `failed` \u2014 the automation could not EVALUATE its predicate (crash, timeout, unreadable input, malformed payload) \u2014 increments this counter. `declined` (the predicate was evaluated and is not satisfied) is the automation giving the CORRECT answer and is silent on the counter in both directions. Collapsing the two demotes an automation precisely when the fleet is broken, which is when its coverage is worth most."
           },
           "reauthorized_at": {
             "type": "string",
             "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
-            "description": "config-I8686 — the date this automation was re-authorized after a demotion. The drain voids any demotion recorded in the carryover ledger with `demoted_at` earlier than this date, resetting the counter. Re-authorization is therefore a reviewed, merged registry diff rather than a hand-edit of ledger state in S3, which is what §6's 'a reviewed issue authorizing it' actually requires. Requires `reauthorized_by`."
+            "description": "config-I8686 \u2014 the date this automation was re-authorized after a demotion. The drain voids any demotion recorded in the carryover ledger with `demoted_at` earlier than this date, resetting the counter. Re-authorization is therefore a reviewed, merged registry diff rather than a hand-edit of ledger state in S3, which is what \u00a76's 'a reviewed issue authorizing it' actually requires. Requires `reauthorized_by`."
           },
           "reauthorized_by": {
             "type": "string",
             "pattern": "^[a-z0-9-]+-I[0-9]+$",
-            "description": "config-I8686 — the reviewed issue carrying the re-authorization ruling. Required whenever `reauthorized_at` is set."
+            "description": "config-I8686 \u2014 the reviewed issue carrying the re-authorization ruling. Required whenever `reauthorized_at` is set."
           },
-          "triggers": { "$ref": "#/$defs/triggers" }
+          "triggers": {
+            "$ref": "#/$defs/triggers"
+          }
         }
       }
     },
-    "watch_plane_liveness": { "$ref": "#/$defs/liveness_block" },
+    "watch_plane_liveness": {
+      "$ref": "#/$defs/liveness_block"
+    },
     "alert_classes": {
       "type": "array",
       "minItems": 1,
-      "description": "config-I3211 — one row per distinct fleet notification class: which intake path the overseer sees it on and the declared response. intake:none rows MUST carry migration_issue or operator_reason (no undeclared drain-blind class).",
+      "description": "config-I3211 \u2014 one row per distinct fleet notification class: which intake path the overseer sees it on and the declared response. intake:none rows MUST carry migration_issue or operator_reason (no undeclared drain-blind class).",
       "items": {
         "type": "object",
-        "required": ["class", "source", "severities", "intake", "response"],
+        "required": [
+          "class",
+          "source",
+          "severities",
+          "intake",
+          "response",
+          "tier"
+        ],
         "additionalProperties": false,
         "properties": {
-          "class": { "type": "string", "pattern": "^[a-z0-9_]{3,60}$" },
-          "source": { "type": "string", "minLength": 3 },
+          "class": {
+            "type": "string",
+            "pattern": "^[a-z0-9_]{3,60}$"
+          },
+          "source": {
+            "type": "string",
+            "minLength": 3
+          },
           "severities": {
             "type": "array",
             "minItems": 1,
-            "items": { "enum": ["info", "warning", "error", "critical", "alarm", "dynamic"] }
+            "items": {
+              "enum": [
+                "info",
+                "warning",
+                "error",
+                "critical",
+                "alarm",
+                "dynamic"
+              ]
+            }
           },
-          "intake": { "enum": ["bus", "cw-alarm", "none"] },
-          "response": { "type": "string", "pattern": "^(drain-queue|operator|playbook:[a-z0-9-]+)$" },
-          "migration_issue": { "type": "string", "pattern": "^[a-z0-9-]+-I[0-9]+$" },
-          "operator_reason": { "type": "string", "minLength": 15 }
+          "intake": {
+            "enum": [
+              "bus",
+              "cw-alarm",
+              "none"
+            ]
+          },
+          "response": {
+            "type": "string",
+            "pattern": "^(drain-queue|operator|playbook:[a-z0-9-]+)$"
+          },
+          "migration_issue": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]+-I[0-9]+$"
+          },
+          "operator_reason": {
+            "type": "string",
+            "minLength": 15
+          },
+          "tier": {
+            "enum": [
+              "page",
+              "notify-silent",
+              "tracked-only",
+              "dynamic"
+            ],
+            "description": "alpha-engine-config-I6751 Phase 1 (subsumes I6293). The DELIVERY tier, decided by actionability, not by the severity string. `page` = broken now, email + Telegram buzz. `notify-silent` = degraded/suboptimal or a lifecycle notice \u2014 Telegram silent, no email. `tracked-only` = hygiene/conformance/drift \u2014 zero notification; the drain's disposition issue IS the remediation path (observability-policy.md 7.4). `dynamic` = resolved per emission from the runtime severity (critical->page, error->notify-silent, warning/info->tracked-only), for rows whose `severities` is [dynamic] or whose seriousness genuinely varies with the observed facts (7.1: derived where derivable). Suppression is a DELIVERY decision only: every tier still emits its full signal set, its console state and its bus event (7.2a)."
+          },
+          "page_after_consecutive": {
+            "type": "integer",
+            "minimum": 1,
+            "description": "alpha-engine-config-I6751. Consecutive detections of the SAME condition (same identity_key) required before a `page`-tier emission actually pages; earlier detections deliver at `notify-silent`. Default 1. DERIVED from the emitting job's cadence, never hand-listed per timer: 1 when the job's cadence exceeds the 60-minute operator-response floor, 2 when it does not \u2014 a job whose own next attempt lands before a human could act has not yet produced an actionable-now condition. Measured 2026-09-09: one failed run of the hourly metron-deploy-drift timer paged CRITICAL at 18:07 and INFO-RESOLVED at 19:07 for a condition that self-healed with no action available."
+          },
+          "episode_overrides": {
+            "type": "array",
+            "minItems": 1,
+            "description": "alpha-engine-config-I6751. Ordered per-EPISODE tier overrides for a class that is legitimately two conditions sharing one source -- the EOD reconciler's scheduled vendor substitution vs a genuinely bad provisional print (I10360), a crucible-v2 fault-injection replay vs a live failure (I10366). The FIRST entry whose every `when` key matches the emitter's `episode_attributes` exactly wins; nothing matching leaves the row's own `tier`. Adding an entry is a ROUTING DECISION -- no row declares one today, and both known candidates are on the Decision Queue.",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "when",
+                "tier"
+              ],
+              "properties": {
+                "when": {
+                  "type": "object",
+                  "minProperties": 1
+                },
+                "tier": {
+                  "enum": [
+                    "page",
+                    "notify-silent",
+                    "tracked-only"
+                  ]
+                },
+                "reason": {
+                  "type": "string",
+                  "minLength": 15
+                }
+              }
+            }
+          }
         },
-        "if": { "properties": { "intake": { "const": "none" } } },
+        "if": {
+          "properties": {
+            "intake": {
+              "const": "none"
+            }
+          }
+        },
         "then": {
           "anyOf": [
-            { "required": ["migration_issue"] },
-            { "required": ["operator_reason"] }
+            {
+              "required": [
+                "migration_issue"
+              ]
+            },
+            {
+              "required": [
+                "operator_reason"
+              ]
+            }
           ]
         }
       }
@@ -283,15 +501,24 @@
     "triggers": {
       "type": "array",
       "minItems": 1,
-      "description": "alpha-engine-config-I7056 — the machine-readable form of `wake`. `wake` is prose for a human and cannot be joined; this can. It is what lets infrastructure/overseer/arming.py join a playbook to infrastructure/automation_pause.json and to live AWS, which is the only way to tell a playbook DELIBERATELY paused (Brian ruling 2026-08-07, alpha-engine-config-I6617) from one that is simply broken — both emit nothing, and observability-policy.md §8.3 forbids reporting either as the other. Optional and additive: entries written before this field existed stay schema-valid, but arming.py reports any unit lacking it as `undeclared-no-triggers`, which is loud rather than blank.",
+      "description": "alpha-engine-config-I7056 \u2014 the machine-readable form of `wake`. `wake` is prose for a human and cannot be joined; this can. It is what lets infrastructure/overseer/arming.py join a playbook to infrastructure/automation_pause.json and to live AWS, which is the only way to tell a playbook DELIBERATELY paused (Brian ruling 2026-08-07, alpha-engine-config-I6617) from one that is simply broken \u2014 both emit nothing, and observability-policy.md \u00a78.3 forbids reporting either as the other. Optional and additive: entries written before this field existed stay schema-valid, but arming.py reports any unit lacking it as `undeclared-no-triggers`, which is loud rather than blank.",
       "items": {
         "type": "object",
-        "required": ["surface"],
+        "required": [
+          "surface"
+        ],
         "additionalProperties": false,
         "properties": {
           "surface": {
-            "enum": ["events", "scheduler", "github-actions", "event-time", "parent", "none"],
-            "description": "Which trigger plane this leg lives on. `events` (EventBridge rule) and `scheduler` (EventBridge Scheduler schedule) are DIFFERENT APIs, not aliases, and the two names match automation_pause.py's own vocabulary — they are the only surfaces whose live state arming.py can read. Every other value is reported `unjoinable` WITH its reason rather than silently assumed armed."
+            "enum": [
+              "events",
+              "scheduler",
+              "github-actions",
+              "event-time",
+              "parent",
+              "none"
+            ],
+            "description": "Which trigger plane this leg lives on. `events` (EventBridge rule) and `scheduler` (EventBridge Scheduler schedule) are DIFFERENT APIs, not aliases, and the two names match automation_pause.py's own vocabulary \u2014 they are the only surfaces whose live state arming.py can read. Every other value is reported `unjoinable` WITH its reason rather than silently assumed armed."
           },
           "name": {
             "type": "string",
@@ -315,14 +542,20 @@
           "depends_on": {
             "type": "array",
             "minItems": 1,
-            "description": "alpha-engine-config-I9045 — for a leg with no AWS trigger resource of its own (`surface: event-time`), the AWS resources whose live state IS this leg's arming. Measured 2026-08-28: alert-drain's four Scheduler schedules were all DISABLED and it ran every day off its event-time leg, which arming.py could only report `unjoinable` because `reason` said so in prose. With this, the leg resolves to `armed-via-dependency` or `dark-via-dependency`, and trigger_descriptions.py can stamp `[wakes: <playbook>]` onto the dispatching rule so the linkage is legible from `aws events list-rules` alone.",
+            "description": "alpha-engine-config-I9045 \u2014 for a leg with no AWS trigger resource of its own (`surface: event-time`), the AWS resources whose live state IS this leg's arming. Measured 2026-08-28: alert-drain's four Scheduler schedules were all DISABLED and it ran every day off its event-time leg, which arming.py could only report `unjoinable` because `reason` said so in prose. With this, the leg resolves to `armed-via-dependency` or `dark-via-dependency`, and trigger_descriptions.py can stamp `[wakes: <playbook>]` onto the dispatching rule so the linkage is legible from `aws events list-rules` alone.",
             "items": {
               "type": "object",
-              "required": ["surface", "name"],
+              "required": [
+                "surface",
+                "name"
+              ],
               "additionalProperties": false,
               "properties": {
                 "surface": {
-                  "enum": ["events", "scheduler"],
+                  "enum": [
+                    "events",
+                    "scheduler"
+                  ],
                   "description": "Only probeable surfaces may be depended on. A dependency whose own state cannot be read would move the blank rather than remove it."
                 },
                 "name": {
@@ -339,118 +572,238 @@
       "description": "A set of read-only liveness checks the overseer-liveness-probe runs for this playbook (or, at top level, for the cross-cutting intake/dispatcher plane). Each check is a discriminated union on `type`.",
       "type": "object",
       "additionalProperties": false,
-      "required": ["checks"],
+      "required": [
+        "checks"
+      ],
       "properties": {
         "checks": {
           "type": "array",
           "minItems": 1,
-          "items": { "$ref": "#/$defs/check" }
+          "items": {
+            "$ref": "#/$defs/check"
+          }
         }
       }
     },
     "check": {
       "type": "object",
-      "required": ["type"],
+      "required": [
+        "type"
+      ],
       "oneOf": [
         {
           "additionalProperties": false,
-          "required": ["type", "rule_name"],
+          "required": [
+            "type",
+            "rule_name"
+          ],
           "properties": {
-            "type": { "const": "eventbridge_rule" },
-            "rule_name": { "type": "string", "minLength": 1 },
-            "event_bus_name": { "type": "string", "minLength": 1 },
-            "expect_enabled": { "type": "boolean" },
-            "expect_target_function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
-            "expect_target_queue": { "type": "string", "minLength": 1 },
+            "type": {
+              "const": "eventbridge_rule"
+            },
+            "rule_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "event_bus_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expect_enabled": {
+              "type": "boolean"
+            },
+            "expect_target_function": {
+              "type": "string",
+              "pattern": "^alpha-engine-[a-z0-9-]+$"
+            },
+            "expect_target_queue": {
+              "type": "string",
+              "minLength": 1
+            },
             "expect_state_machines": {
               "type": "array",
               "minItems": 1,
-              "items": { "type": "string", "minLength": 1 }
-            }
-          }
-        },
-        {
-          "additionalProperties": false,
-          "required": ["type", "state_machines"],
-          "properties": {
-            "type": { "const": "state_machines_exist" },
-            "state_machines": {
-              "type": "array",
-              "minItems": 1,
-              "items": { "type": "string", "minLength": 1 }
-            }
-          }
-        },
-        {
-          "additionalProperties": false,
-          "required": ["type", "function"],
-          "properties": {
-            "type": { "const": "lambda_active" },
-            "function": { "type": "string", "pattern": "^alpha-engine-[a-z0-9-]+$" },
-            "report_kill_switch": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
-            "launch_config": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["ami_env", "security_group_env", "subnets_env"],
-              "properties": {
-                "ami_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
-                "security_group_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" },
-                "subnets_env": { "type": "string", "pattern": "^[A-Z0-9_]+$" }
+              "items": {
+                "type": "string",
+                "minLength": 1
               }
             }
           }
         },
         {
           "additionalProperties": false,
-          "required": ["type", "queue_name"],
+          "required": [
+            "type",
+            "state_machines"
+          ],
           "properties": {
-            "type": { "const": "sqs_queue_exists" },
-            "queue_name": { "type": "string", "minLength": 1 },
-            "expect_dlq": { "type": "string", "minLength": 1 }
-          }
-        },
-        {
-          "additionalProperties": false,
-          "required": ["type", "dlq_name", "report_prefix"],
-          "properties": {
-            "type": { "const": "sqs_dlq_content" },
-            "dlq_name": { "type": "string", "minLength": 1 },
-            "sample_max": { "type": "integer", "minimum": 1 },
-            "report_prefix": { "type": "string", "minLength": 1 }
+            "type": {
+              "const": "state_machines_exist"
+            },
+            "state_machines": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            }
           }
         },
         {
           "additionalProperties": false,
           "required": [
-            "type", "label", "artifact_prefix",
-            "ceiling_min", "margin_min", "lookback_hours", "schedule"
+            "type",
+            "function"
           ],
           "properties": {
-            "type": { "const": "run_window" },
-            "label": { "type": "string", "minLength": 1 },
-            "artifact_prefix": { "type": "string", "minLength": 1 },
-            "run_start_field": {
-              "description": "OPTIONAL, default 'run_start'. Name of the artifact field holding the run's start timestamp (ISO-8601). The fleet's run artifacts do NOT share one schema: the groom artifact carries 'run_start', the alert-drain ledger carries 'started_at'. An in-window artifact missing the DECLARED field raises rather than being skipped — the silent skip made 100% of mature alert-drain triggers read as silent deaths while the drain was running normally (false pages 2026-07-29). Retire once G16 (alpha-engine-config-I5284) unifies the execution artifact.",
+            "type": {
+              "const": "lambda_active"
+            },
+            "function": {
+              "type": "string",
+              "pattern": "^alpha-engine-[a-z0-9-]+$"
+            },
+            "report_kill_switch": {
+              "type": "string",
+              "pattern": "^[A-Z0-9_]+$"
+            },
+            "launch_config": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "ami_env",
+                "security_group_env",
+                "subnets_env"
+              ],
+              "properties": {
+                "ami_env": {
+                  "type": "string",
+                  "pattern": "^[A-Z0-9_]+$"
+                },
+                "security_group_env": {
+                  "type": "string",
+                  "pattern": "^[A-Z0-9_]+$"
+                },
+                "subnets_env": {
+                  "type": "string",
+                  "pattern": "^[A-Z0-9_]+$"
+                }
+              }
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "queue_name"
+          ],
+          "properties": {
+            "type": {
+              "const": "sqs_queue_exists"
+            },
+            "queue_name": {
               "type": "string",
               "minLength": 1
             },
-            "decision_record_prefix": { "type": "string", "minLength": 1 },
-            "ceiling_min": { "type": "integer", "minimum": 1 },
-            "margin_min": { "type": "integer", "minimum": 0 },
-            "lookback_hours": { "type": "integer", "minimum": 1 },
+            "expect_dlq": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "dlq_name",
+            "report_prefix"
+          ],
+          "properties": {
+            "type": {
+              "const": "sqs_dlq_content"
+            },
+            "dlq_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "sample_max": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "report_prefix": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        },
+        {
+          "additionalProperties": false,
+          "required": [
+            "type",
+            "label",
+            "artifact_prefix",
+            "ceiling_min",
+            "margin_min",
+            "lookback_hours",
+            "schedule"
+          ],
+          "properties": {
+            "type": {
+              "const": "run_window"
+            },
+            "label": {
+              "type": "string",
+              "minLength": 1
+            },
+            "artifact_prefix": {
+              "type": "string",
+              "minLength": 1
+            },
+            "run_start_field": {
+              "description": "OPTIONAL, default 'run_start'. Name of the artifact field holding the run's start timestamp (ISO-8601). The fleet's run artifacts do NOT share one schema: the groom artifact carries 'run_start', the alert-drain ledger carries 'started_at'. An in-window artifact missing the DECLARED field raises rather than being skipped \u2014 the silent skip made 100% of mature alert-drain triggers read as silent deaths while the drain was running normally (false pages 2026-07-29). Retire once G16 (alpha-engine-config-I5284) unifies the execution artifact.",
+              "type": "string",
+              "minLength": 1
+            },
+            "decision_record_prefix": {
+              "type": "string",
+              "minLength": 1
+            },
+            "ceiling_min": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "margin_min": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "lookback_hours": {
+              "type": "integer",
+              "minimum": 1
+            },
             "productive_when": {
-              "description": "OPTIONAL. An OR of clauses over the run artifact's own fields; an in-window artifact matching NONE of them is reported as a DEAD run (a box that booted and wrote an artifact while doing no work) — distinct from a MISSING artifact. Omit to keep existence-only semantics. Each clause is {field, <op>} with op in gt|ge|lt|le|eq; an operator outside that set RAISES in _rw_clause_holds rather than silently leaving the clause unsatisfied.",
+              "description": "OPTIONAL. An OR of clauses over the run artifact's own fields; an in-window artifact matching NONE of them is reported as a DEAD run (a box that booted and wrote an artifact while doing no work) \u2014 distinct from a MISSING artifact. Omit to keep existence-only semantics. Each clause is {field, <op>} with op in gt|ge|lt|le|eq; an operator outside that set RAISES in _rw_clause_holds rather than silently leaving the clause unsatisfied.",
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["field"],
+                "required": [
+                  "field"
+                ],
                 "minProperties": 2,
                 "maxProperties": 2,
                 "properties": {
-                  "field": { "type": "string", "minLength": 1 },
-                  "gt": {}, "ge": {}, "lt": {}, "le": {}, "eq": {}
+                  "field": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "gt": {},
+                  "ge": {},
+                  "lt": {},
+                  "le": {},
+                  "eq": {}
                 }
               }
             },
@@ -460,16 +813,34 @@
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["hour", "minute", "dows"],
+                "required": [
+                  "hour",
+                  "minute",
+                  "dows"
+                ],
                 "properties": {
-                  "hour": { "type": "integer", "minimum": 0, "maximum": 23 },
-                  "minute": { "type": "integer", "minimum": 0, "maximum": 59 },
+                  "hour": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 23
+                  },
+                  "minute": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "maximum": 59
+                  },
                   "dows": {
                     "type": "array",
                     "minItems": 1,
-                    "items": { "type": "integer", "minimum": 0, "maximum": 6 }
+                    "items": {
+                      "type": "integer",
+                      "minimum": 0,
+                      "maximum": 6
+                    }
                   },
-                  "label": { "type": "string" }
+                  "label": {
+                    "type": "string"
+                  }
                 }
               }
             }
@@ -477,74 +848,167 @@
         },
         {
           "additionalProperties": false,
-          "required": ["type", "schedule_name"],
+          "required": [
+            "type",
+            "schedule_name"
+          ],
           "properties": {
-            "type": { "const": "scheduler_schedule_exists" },
-            "schedule_name": { "type": "string", "minLength": 1 },
-            "expect_enabled": { "type": "boolean" }
+            "type": {
+              "const": "scheduler_schedule_exists"
+            },
+            "schedule_name": {
+              "type": "string",
+              "minLength": 1
+            },
+            "expect_enabled": {
+              "type": "boolean"
+            }
           }
         },
         {
           "additionalProperties": false,
-          "required": ["type", "pipelines", "response_window_min", "lookback_hours"],
+          "required": [
+            "type",
+            "pipelines",
+            "response_window_min",
+            "lookback_hours"
+          ],
           "properties": {
-            "type": { "const": "sf_watch_invocation_success" },
+            "type": {
+              "const": "sf_watch_invocation_success"
+            },
             "pipelines": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["state_machine", "watch_prefix"],
+                "required": [
+                  "state_machine",
+                  "watch_prefix"
+                ],
                 "properties": {
-                  "state_machine": { "type": "string", "minLength": 1 },
-                  "watch_prefix": { "type": "string", "minLength": 1 }
+                  "state_machine": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "watch_prefix": {
+                    "type": "string",
+                    "minLength": 1
+                  }
                 }
               }
             },
-            "response_window_min": { "type": "integer", "minimum": 1 },
-            "lookback_hours": { "type": "integer", "minimum": 1 }
+            "response_window_min": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lookback_hours": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         },
         {
           "additionalProperties": false,
-          "required": ["type", "family", "dispatch_prefix", "completion_prefix", "response_window_min", "lookback_hours"],
+          "required": [
+            "type",
+            "family",
+            "dispatch_prefix",
+            "completion_prefix",
+            "response_window_min",
+            "lookback_hours"
+          ],
           "properties": {
-            "type": { "const": "dispatch_invocation_success" },
-            "family": { "type": "string", "minLength": 1 },
-            "dispatch_prefix": { "type": "string", "minLength": 1 },
-            "completion_prefix": { "type": "string", "minLength": 1 },
-            "completion_key_field": { "type": "string", "minLength": 1 },
-            "response_window_min": { "type": "integer", "minimum": 1 },
-            "lookback_hours": { "type": "integer", "minimum": 1 }
+            "type": {
+              "const": "dispatch_invocation_success"
+            },
+            "family": {
+              "type": "string",
+              "minLength": 1
+            },
+            "dispatch_prefix": {
+              "type": "string",
+              "minLength": 1
+            },
+            "completion_prefix": {
+              "type": "string",
+              "minLength": 1
+            },
+            "completion_key_field": {
+              "type": "string",
+              "minLength": 1
+            },
+            "response_window_min": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lookback_hours": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         },
         {
           "additionalProperties": false,
-          "required": ["type", "dispatch_ledger_prefix", "response_window_min", "lookback_hours"],
+          "required": [
+            "type",
+            "dispatch_ledger_prefix",
+            "response_window_min",
+            "lookback_hours"
+          ],
           "properties": {
-            "type": { "const": "agent_dispatch_completeness" },
-            "dispatch_ledger_prefix": { "type": "string", "minLength": 1 },
-            "response_window_min": { "type": "integer", "minimum": 1 },
-            "lookback_hours": { "type": "integer", "minimum": 1 },
-            "ssm_retention_days": { "type": "integer", "minimum": 1, "maximum": 60 }
+            "type": {
+              "const": "agent_dispatch_completeness"
+            },
+            "dispatch_ledger_prefix": {
+              "type": "string",
+              "minLength": 1
+            },
+            "response_window_min": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "lookback_hours": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "ssm_retention_days": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 60
+            }
           }
         },
         {
           "additionalProperties": false,
-          "required": ["type", "alarms"],
+          "required": [
+            "type",
+            "alarms"
+          ],
           "properties": {
-            "type": { "const": "alarm_coverage" },
+            "type": {
+              "const": "alarm_coverage"
+            },
             "alarms": {
               "type": "array",
               "minItems": 1,
               "items": {
                 "type": "object",
                 "additionalProperties": false,
-                "required": ["name_pattern", "alarm_action_pattern"],
+                "required": [
+                  "name_pattern",
+                  "alarm_action_pattern"
+                ],
                 "properties": {
-                  "name_pattern": { "type": "string", "minLength": 1 },
-                  "alarm_action_pattern": { "type": "string", "minLength": 1 },
+                  "name_pattern": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "alarm_action_pattern": {
+                    "type": "string",
+                    "minLength": 1
+                  },
                   "max_insufficient_data_hours": {
                     "type": "integer",
                     "minimum": 1,
@@ -552,7 +1016,11 @@
                   },
                   "expect_state": {
                     "type": "string",
-                    "enum": ["OK", "ALARM", "INSUFFICIENT_DATA"],
+                    "enum": [
+                      "OK",
+                      "ALARM",
+                      "INSUFFICIENT_DATA"
+                    ],
                     "default": "ALARM"
                   }
                 }
