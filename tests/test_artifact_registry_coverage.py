@@ -97,6 +97,21 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # alpha-engine-config-PR7225; pinned here so this repo's guard is honest
     # about the new PUT site either way.
     "validators/stage_output_sweep.py": 1,
+    # alpha-engine-config-I6751 — the distilled alert-tier registry,
+    # s3://alpha-engine-research/overseer/alert_tier_registry.json. One PUT per
+    # publish run (on merge, plus the daily --assert-in-sync arm).
+    #
+    # Freshness-relevant, so it is a registry row rather than a grandfathered
+    # prefix, and this artifact is the sharpest case for that treatment in the
+    # whole table: `krepis.alerts` reads it to decide DELIVERY. A stale document
+    # does not degrade a report someone reads later — it silently routes live
+    # pages by an obsolete tier map, which is the failure this whole epic exists
+    # to end. The consumer's own posture is fail-loud-to-PAGE when the document
+    # cannot be read, so an ABSENT key is safe; a SILENTLY OLD one is not, and
+    # only freshness catches that. The row rides an alpha-engine-config PR;
+    # pinned here first so this repo's guard is honest about the new PUT site
+    # either way, per the I5718 and I7167 precedent above.
+    "infrastructure/overseer/publish_alert_tier_registry.py": 1,
     # alpha-engine-config-I8189 — the declared-pause lane set,
     # s3://alpha-engine-research/ops/checks/automation-pause-reconcile/paused_lanes.json.
     # One PUT per daily pause-reconcile.yml run (09:50 UTC), from
