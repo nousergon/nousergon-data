@@ -1,4 +1,4 @@
-boto3>=1.43.88
+boto3>=1.43.91
 pandas>=2.0
 openpyxl>=3.1.5
 pyarrow>=25.0.1

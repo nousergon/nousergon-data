@@ -20,13 +20,13 @@
 # run will fail loud on a missing import — the 2026-07-30 config-I5702 wiring
 # missed exactly this and every daily run's corpus ingest failed for days,
 # alpha-engine-config#6063).
-boto3>=1.43.88
+boto3>=1.43.91
 pandas>=2.0
 pyarrow>=25.0.1
 numpy>=2.4.6
 requests>=2.34.2
 feedparser>=6.0.14
-anyio>=4.15.0
+anyio>=4.15.1
 tenacity>=9.1.4
 pyyaml>=6.0.3
 voyageai>=0.5.0
