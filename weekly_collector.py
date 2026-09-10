@@ -136,6 +136,63 @@ def _load_chronic_polygon_gaps(config: dict) -> list[str]:
     return sorted(tickers.keys())
 
 
+# A recurring `status=degraded` collector must page with the SAME actionable
+# detail every day: which sub-defect, the issue tracking it, and the
+# condition that clears it — without these a human cannot tell today's page
+# from yesterday's (alpha-engine-config-I10359). Keyed by collector name;
+# extend when a new producer starts reporting `degraded`. Do NOT downgrade
+# severity or de-dupe this away while an entry's issue stays open — I7572's
+# own non-inferable gotcha forbids weakening the zero-variance guard's
+# visibility, and a recurring page for a genuinely still-broken producer
+# defect is the correct behavior until the tracked issue actually closes.
+_DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
+    "features": {
+        "tracked_issue": "alpha-engine-config-I7572",
+        "clears_when": (
+            "every named column shows non-zero cross-sectional std on a live "
+            "s3://alpha-engine-research/features/<date>/*.parquet snapshot, "
+            "or is removed from features/registry.py::CATALOG + SCHEMA.md §3"
+        ),
+    },
+}
+
+
+def _describe_degraded_defects(results: dict) -> str:
+    """Build the `Defect detail: ...` clause of the DEGRADED alert.
+
+    Pulled out of ``main()`` so it can be unit-tested without driving the
+    whole daily-collect entrypoint (alpha-engine-config-I10359): a recurring
+    ``degraded`` page must name, per degraded collector, the offending
+    columns, the tracked issue, and the condition that clears it — a human
+    (or the flow-doctor notifier that turns this exact string into a GitHub
+    issue body) must not have to re-derive that from source on the day it
+    pages. A collector missing from ``_DEGRADED_DEFECT_REGISTRY`` reads as
+    explicitly ``UNTRACKED``, never silently blended into the tracked shape.
+    """
+    degraded_names = results.get("degraded_collectors", [])
+    lines = []
+    for name in degraded_names:
+        info = results.get("collectors", {}).get(name, {}) or {}
+        cols = sorted({
+            *(info.get("zero_variance_columns") or {}).keys(),
+            *(info.get("all_null_columns") or []),
+        })
+        reg = _DEGRADED_DEFECT_REGISTRY.get(name)
+        if reg:
+            lines.append(
+                f"{name}: columns={cols or '?'} "
+                f"tracked={reg['tracked_issue']} "
+                f"clears_when={reg['clears_when']}"
+            )
+        else:
+            lines.append(
+                f"{name}: columns={cols or '?'} tracked=UNTRACKED — file an "
+                "alpha-engine-config issue and add a "
+                "_DEGRADED_DEFECT_REGISTRY entry for this collector"
+            )
+    return " | ".join(lines) or "no detail available"
+
+
 class _CollectorError(RuntimeError):
     """Raised inside a phase block when a collector returns ``status=error`` so the
     phase writes an ``error`` marker (→ a recovery RE-RUNS it) instead of a lying
@@ -3617,9 +3674,10 @@ def main() -> None:
         logger.error(
             "Collection finished DEGRADED — the artifact was produced and the "
             "pipeline continues, but %s reported a known defect. Exiting 0 so "
-            "the EOD SF still runs the ArcticDB append and EODReconcile; the "
-            "defect is tracked, not swallowed. Per-collector statuses: %s",
+            "the EOD SF still runs the ArcticDB append and EODReconcile. "
+            "Defect detail: %s. Per-collector statuses: %s",
             ", ".join(results.get("degraded_collectors", [])) or "a collector",
+            _describe_degraded_defects(results),
             {k: v.get("status", "?") for k, v in results.get("collectors", {}).items()},
         )
     if results["status"] not in ("ok", "skipped", "degraded"):
