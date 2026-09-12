@@ -1615,3 +1615,233 @@ class TestGatedRowBothPolarities:
             head=_head_from({key: "error:403 AccessDenied"}), cycle_date=RUN_DATE,
         )[0]
         assert f["verdict"] == sos.UNMEASURED
+
+
+# ---------------------------------------------------------------------------
+# The producer-chosen ``*`` segment (alpha-engine-config-I10200)
+# ---------------------------------------------------------------------------
+#
+# `crucible-predictor` rescoped `predictor/diagnostics/oos_rows/…` by the model
+# FAMILY under alpha-engine-config-I9378 so a parallel zoo spec could not
+# overwrite the champion's diagnostic. The registry's flat row then made this
+# sweep report `PredictorTraining` MISSING for the 2026-09-04 cycle while
+# `oos_rows/v3.0-meta/2026-09-04.parquet` had existed since 2026-09-05 — one of
+# the three findings holding `alpha-engine-stage-coverage-findings` in ALARM.
+#
+# A resolved key carrying `*` is a PATTERN and cannot be head-ed, so it is
+# resolved by listing. What these tests pin hardest is what the resolution must
+# NOT do: clear the row off the unscoped key (the shape I9378 removed), and
+# report a listing it could not complete as an absent artifact.
+
+_OOS_DATED = "predictor/diagnostics/oos_rows/*/{date}.parquet"
+_OOS_LATEST = "predictor/diagnostics/oos_rows/*/latest.parquet"
+
+
+def _find_from(mapping):
+    """Build a ``find`` callable from ``{key: last_modified | 'error:<why>'}``.
+
+    Matches the pattern the same way :func:`stage_output_sweep._newest_match`
+    does — compiled shape, newest survivor — without an S3 client, so the
+    verdict branches stay reachable. A mapping VALUE beginning ``error:``
+    makes the whole listing fail, which is the branch that must not render as
+    ``absent``.
+    """
+
+    def find(bucket, pattern):
+        compiled = sos._wildcard_support()["key_pattern"](pattern)
+        newest_key, newest_lm = "", None
+        for key, value in mapping.items():
+            if isinstance(value, str) and value.startswith("error:"):
+                return "error", value[len("error:"):], ""
+            if compiled.match(key) is None:
+                continue
+            if newest_lm is None or value > newest_lm:
+                newest_lm, newest_key = value, key
+        if newest_lm is None:
+            return "absent", None, ""
+        return "found", newest_lm, newest_key
+
+    return find
+
+
+class TestWildcardSegment:
+    def _one(self, template, objects, *, find=True, **kw):
+        decls = sos.declared_outputs(
+            [_row("a", template, "PredictorTraining")], pipeline=PIPELINE,
+        )
+        kw.setdefault("execution_start", EXEC_START)
+        kw.setdefault("cycle_date", RUN_DATE)
+        return sos.evaluate(
+            decls,
+            run_date=RUN_DATE,
+            head=_head_from({}),
+            find=_find_from(objects) if find else None,
+            **kw,
+        )[0]
+
+    def test_resolve_key_passes_the_wildcard_through(self):
+        assert sos.resolve_key(
+            _OOS_DATED, run_date=RUN_DATE, cycle_date=RUN_DATE,
+        ) == f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet"
+
+    def test_resolve_key_rejects_an_illegal_wildcard_shape(self):
+        """A malformed row is `unmeasured` with a reason naming the template —
+        not a pattern that silently matches the wrong set."""
+        for bad in (
+            "predictor/diagnostics/oos_rows/*",
+            "predictor/diagnostics/oos_rows/**/x.parquet",
+            "a/*/b/*/{date}.parquet",
+            "a/v*/{date}.parquet",
+        ):
+            assert sos.resolve_key(
+                bad, run_date=RUN_DATE, cycle_date=RUN_DATE,
+            ) is None, bad
+
+    def test_the_2026_09_04_shaped_case_reports_wrote(self):
+        """The Closes-when of I10200 on this side of the cascade."""
+        key = f"predictor/diagnostics/oos_rows/v3.0-meta/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {key: EXEC_START + timedelta(hours=2)})
+        assert f["verdict"] == sos.WROTE
+        # The pattern says where it was expected; `key` says which instance
+        # the verdict was taken over, so the verdict is verifiable by hand.
+        assert f["pattern"] == f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet"
+        assert f["key"] == key
+
+    def test_latest_pointer_row_resolves_too(self):
+        key = "predictor/diagnostics/oos_rows/v3.0-meta/latest.parquet"
+        f = self._one(_OOS_LATEST, {key: EXEC_START + timedelta(hours=2)})
+        assert f["verdict"] == sos.WROTE
+        assert f["key"] == key
+
+    def test_the_unscoped_key_does_not_clear_the_scoped_row(self):
+        """The flat key is the shape I9378 REMOVED, to stop a zoo run
+        overwriting the champion's diagnostic. Finding one must not be read as
+        the stage having written the scoped artifact."""
+        flat = f"predictor/diagnostics/oos_rows/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {flat: EXEC_START + timedelta(hours=2)})
+        assert f["verdict"] == sos.MISSING
+        assert f["key"] is None
+
+    def test_a_sibling_diagnostic_does_not_clear_the_row(self):
+        sibling = f"predictor/diagnostics/xsec_sd/v3.0-meta/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {sibling: EXEC_START + timedelta(hours=2)})
+        assert f["verdict"] == sos.MISSING
+
+    def test_another_cycles_instance_does_not_clear_this_run(self):
+        """The pattern is anchored to THIS run's cycle date — only the
+        producer's segment is free. A recency match would let last week's
+        instance clear this week's silent stage."""
+        other = "predictor/diagnostics/oos_rows/v3.0-meta/2026-07-04.parquet"
+        f = self._one(_OOS_DATED, {other: EXEC_START + timedelta(hours=2)})
+        assert f["verdict"] == sos.MISSING
+
+    def test_newest_matching_family_wins(self):
+        older = f"predictor/diagnostics/oos_rows/v3.0-meta/{RUN_DATE}.parquet"
+        newer = f"predictor/diagnostics/oos_rows/v4.0-zoo/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {
+            older: EXEC_START + timedelta(hours=1),
+            newer: EXEC_START + timedelta(hours=3),
+        })
+        assert f["verdict"] == sos.WROTE
+        assert f["key"] == newer
+
+    def test_stale_instance_is_still_stale(self):
+        key = f"predictor/diagnostics/oos_rows/v3.0-meta/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {key: EXEC_START - timedelta(days=30)})
+        assert f["verdict"] == sos.STALE
+
+    def test_listing_failure_is_unmeasured_not_missing(self):
+        key = f"predictor/diagnostics/oos_rows/v3.0-meta/{RUN_DATE}.parquet"
+        f = self._one(_OOS_DATED, {key: "error:AccessDenied"})
+        assert f["verdict"] == sos.UNMEASURED
+        assert "AccessDenied" in f["detail"]
+
+    def test_no_lister_supplied_is_unmeasured_not_missing(self):
+        """A caller that cannot list cannot answer these rows. Saying so is
+        the only honest option — head-ing a literal `*` would 404 and report a
+        confident, permanent, entirely false `missing`."""
+        f = self._one(_OOS_DATED, {}, find=False)
+        assert f["verdict"] == sos.UNMEASURED
+        assert "*" in f["detail"]
+
+    def test_fixed_key_rows_never_reach_the_lister(self):
+        """The wildcard path must not move a single existing row's verdict."""
+        decls = sos.declared_outputs(
+            [_row("a", "b/{date}.json", "Backtester")], pipeline=PIPELINE,
+        )
+
+        def _explode(bucket, pattern):  # pragma: no cover - must not be called
+            raise AssertionError("a fixed-key row must be head-ed, not listed")
+
+        f = sos.evaluate(
+            decls,
+            run_date=RUN_DATE,
+            head=_head_from({f"b/{RUN_DATE}.json": EXEC_START}),
+            find=_explode,
+            execution_start=EXEC_START,
+            cycle_date=RUN_DATE,
+        )[0]
+        assert f["verdict"] == sos.WROTE
+        assert f["pattern"] is None
+
+
+class TestNewestMatchAgainstS3:
+    """`_newest_match` itself, against a stubbed paginator."""
+
+    def _s3(self, objects, *, pages=None, raises=None):
+        class _Paginator:
+            def paginate(self, **kwargs):
+                if raises is not None:
+                    raise raises
+                contents = [
+                    {"Key": k, "LastModified": v}
+                    for k, v in objects.items()
+                    if k.startswith(kwargs["Prefix"])
+                ]
+                return iter(pages if pages is not None else [{"Contents": contents}])
+
+        class _S3:
+            def get_paginator(self, name):
+                assert name == "list_objects_v2"
+                return _Paginator()
+
+        return _S3()
+
+    def test_lists_the_prefix_before_the_star(self):
+        key = f"predictor/diagnostics/oos_rows/v3.0-meta/{RUN_DATE}.parquet"
+        state, lm, found = sos._newest_match(
+            self._s3({key: EXEC_START}),
+            "alpha-engine-research",
+            f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet",
+        )
+        assert (state, lm, found) == ("found", EXEC_START, key)
+
+    def test_empty_prefix_is_absent(self):
+        state, lm, found = sos._newest_match(
+            self._s3({}),
+            "alpha-engine-research",
+            f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet",
+        )
+        assert (state, lm, found) == ("absent", None, "")
+
+    def test_list_error_is_an_error_not_absent(self):
+        state, detail, found = sos._newest_match(
+            self._s3({}, raises=RuntimeError("boom")),
+            "alpha-engine-research",
+            f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet",
+        )
+        assert state == "error"
+        assert "boom" in detail
+
+    def test_truncated_scan_is_an_error_not_absent(self):
+        """S3 lists lexically, so the keys past the cap are not a random
+        sample — and 'I could not see the whole prefix' is not evidence the
+        artifact is missing (alpha-engine-config-I7617)."""
+        state, detail, found = sos._newest_match(
+            self._s3({}, pages=[{"Contents": []} for _ in range(5)]),
+            "alpha-engine-research",
+            f"predictor/diagnostics/oos_rows/*/{RUN_DATE}.parquet",
+            cap_pages=2,
+        )
+        assert state == "error"
+        assert "scan cap" in detail

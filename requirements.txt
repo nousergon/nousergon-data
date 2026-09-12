@@ -137,7 +137,7 @@ arcticdb>=6.25.0
 # unrelated feature ahead of v0.124.115 — nousergon-lib-PR399/I10230's LLM
 # endpoint probe lift) so this pin and the Lambda pins below stay in
 # lockstep with the rest of the repo's already-bumped v0.124.116 dependents.
-nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+nousergon-lib[arcticdb,flow-doctor,rag,contracts] @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

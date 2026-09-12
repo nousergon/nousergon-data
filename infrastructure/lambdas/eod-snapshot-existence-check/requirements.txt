@@ -6,4 +6,4 @@
 #     SNS fan-out to alpha-engine-watchdog-alerts
 # Pinned to match the current sibling-Lambda pin (config#1787-adjacent
 # lockstep discipline — keep sibling Lambdas' lib pin coherent).
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
