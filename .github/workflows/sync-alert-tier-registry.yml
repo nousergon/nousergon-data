@@ -38,9 +38,16 @@ name: Sync alert tier registry to S3
 # `registry_drift`. That is today's behaviour (37 emails a day), which is loud
 # and recoverable — the opposite direction would be silent.
 #
-# IAM: `github-actions-lambda-deploy` already carries s3:PutObject/GetObject on
-# arn:aws:s3:::alpha-engine-research/* (the same grant the artifact-registry
-# and model-registry syncs use). No IAM change accompanies this workflow.
+# IAM: a dedicated least-privilege role, `nousergon-data-registry-sync`
+# (nous-ergon-ops-PR<TBD>, alpha-engine-config-I10453). This workflow
+# previously assumed the fleet-wide `github-actions-lambda-deploy` and this
+# comment previously claimed that role "already carries s3:PutObject/GetObject
+# on arn:aws:s3:::alpha-engine-research/*" — that claim was FALSE, measured by
+# AccessDenied on every run since merge: the push arm denied s3:PutObject on
+# overseer/alert_tier_registry.json, and the schedule arm's GetObject on a
+# not-yet-published key came back AccessDenied on s3:ListBucket (no grant on
+# either action for this key existed on the shared role). The dedicated role
+# holds s3:PutObject + s3:GetObject on exactly this one key, nothing else.
 
 on:
   push:
@@ -78,7 +85,7 @@ jobs:
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-lambda-deploy
+          role-to-assume: arn:aws:iam::711398986525:role/nousergon-data-registry-sync
           aws-region: us-east-1
 
       - name: Set up Python 3.12
