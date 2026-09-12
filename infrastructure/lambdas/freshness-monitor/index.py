@@ -96,6 +96,10 @@ from nousergon_lib.artifact_freshness import (
     CheckResult,
     check_freshness,
     cycle_completion,
+    has_wildcard_segment,
+    key_pattern,
+    key_suffix,
+    listable_prefix,
     resolve_current_cycle,
 )
 from nousergon_lib.trading_calendar import last_closed_trading_day, previous_trading_day
@@ -1471,7 +1475,15 @@ def _prefix_has_ever_been_written(
     given up is the failure this whole function is shaped to avoid.
     """
     template = spec.s3_key_template
-    head = template.split("{", 1)[0]
+    # `listable_prefix` stops at the first `{` OR the producer-chosen `*`
+    # segment (alpha-engine-config-I10200). Deriving the head with a bare
+    # `split("{")` here got `oos_rows/*/` for the dated row and the WHOLE
+    # template — literal `*` and all — for `oos_rows/*/latest.parquet`, so the
+    # LIST ran against a prefix no object can start with, returned KeyCount 0,
+    # and this function answered "never written" about an artifact that had
+    # existed since 2026-09-05. Borrowed from the lib rather than re-derived:
+    # three resolvers must agree about this grammar (`policy-shared-code`).
+    head = listable_prefix(template)
     if head.endswith("/"):
         prefix = head
     elif "/" in head:
@@ -1479,16 +1491,28 @@ def _prefix_has_ever_been_written(
     else:
         prefix = head
     if not prefix:
-        prefix = result.canonical_key or template
+        prefix = result.observed_key or template
+
+    # The authoritative test for a wildcard template is the compiled shape —
+    # its coarse suffix (`.parquet`) would sweep in every sibling diagnostic
+    # under `predictor/diagnostics/`, which is the same over-match that made
+    # `research_self_test` read never_written=False off a populated
+    # `research/` prefix (config-I7622 follow-up).
+    pattern = key_pattern(template) if has_wildcard_segment(template) else None
 
     # Everything after the LAST placeholder — e.g. "/self_test.json" for
     # `research/{date}/self_test.json`. A template ending at a directory
     # boundary (`groom/{date}/`) has no distinguishing trailing segment, so
     # prefix membership IS the question there and the cheap MaxKeys=1 path is
     # the right one.
-    suffix = template.rsplit("}", 1)[-1] if "{" in template else ""
+    suffix = key_suffix(template) if "{" in template else ""
     if not suffix.strip("/"):
         suffix = ""
+    if pattern is not None:
+        # A wildcard row always needs the matching scan, never the MaxKeys=1
+        # prefix-membership shortcut: prefix membership is exactly the
+        # question it cannot answer.
+        suffix = suffix or "/"
 
     try:
         if not suffix:
@@ -1504,7 +1528,11 @@ def _prefix_has_ever_been_written(
                 kwargs["ContinuationToken"] = token
             resp = s3_client.list_objects_v2(**kwargs)
             for obj in resp.get("Contents") or []:
-                if str(obj.get("Key", "")).endswith(suffix):
+                key = str(obj.get("Key", ""))
+                if pattern is not None:
+                    if pattern.match(key) is not None:
+                        return True
+                elif key.endswith(suffix):
                     return True
             if not resp.get("IsTruncated"):
                 return False

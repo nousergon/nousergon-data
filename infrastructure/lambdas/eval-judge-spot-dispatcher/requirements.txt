@@ -5,7 +5,7 @@ boto3>=1.34.0
 # terminate_on_failure). Pinned in LOCKSTEP with this repo's root
 # requirements.txt (tests/test_lib_pin_lockstep.py) rather than carrying its own
 # exemption: this Lambda depends on no feature ahead of what root already pins.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.119
 # krepis.spot_bootstrap.render_bootstrap() renders this box's watchdog units,
 # hard-runtime timer, interpreter install and public clone. Same lockstep rule:
 # a floor 45 minors below what the handler imports is a pin that says nothing

@@ -16,7 +16,7 @@
 # only the LAMBDA_CAPABILITIES profile (AWS control plane), and every check
 # needing more is reported status="skip" rather than executed.
 aws-assume-role-lib
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.119
 # alpha-engine-config-I8155: this Lambda records its own coverage verdict via
 # krepis.stage_coverage. Pin the released contract that refuses a blank SF
 # execution run_date and uses no cycle-date fallback.
