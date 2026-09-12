@@ -1196,6 +1196,47 @@ alert_classes:
     # derived: error-capable, automated response declared
     tier: notify-silent
 
+  # ── crucible v2 (crucible/alerts.py) ──
+  # alpha-engine-config-I10593. `crucible.alerts` publishes the daily v2
+  # heartbeat through krepis with source="crucible-v2/heartbeat"
+  # (crucible/alerts.py ~line 2018; dedup_key=heartbeat:{trading_day}).
+  # severity is `info` on a normal proof-of-life beat and `error` when a
+  # prefix is unwatched, the subscriber set is empty, or the cost ledgers
+  # diverge — three distinct real findings, not a lifecycle notice. Until
+  # 2026-09-11 the write was swallowed by an IAM denial (I10093); the first
+  # delivery after the grant paged as an unregistered class (fail-upward
+  # default, correct behaviour for a source with no row — do not change the
+  # publisher). The matrix's derived tier->severity default (`dynamic`: info
+  # ->tracked-only, error->notify-silent, critical->page) does not fit here:
+  # this heartbeat's `error` case is a real actionable break and must PAGE,
+  # not just buzz silently, so the class is split into two rows keyed by
+  # severity rather than declared [dynamic] — mirroring the
+  # data_spot_quota_fallback / lib_spot_quota_fallback split-by-condition
+  # shape elsewhere in this file, applied here to severity instead of source.
+  - class: crucible_v2_heartbeat_info
+    # DECLARED: a normal daily beat is proof of life only — heartbeat/tracked-
+    # only tier, never a page. Same shape as groom_lifecycle_bus_events' info
+    # case (informational lifecycle heartbeat, zero defect surface).
+    source: "crucible-v2/heartbeat"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    tier: tracked-only
+  - class: crucible_v2_heartbeat_error
+    # DECLARED: `error` here names one of three real findings (unwatched
+    # prefix, empty subscriber set, or cost-ledger divergence) — each is
+    # actionable-now, so unlike the info case this PAGES.
+    source: "crucible-v2/heartbeat"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    tier: page
+    operator_reason: >-
+      Deliberate page-by-design (alpha-engine-config-I10593), not a tracked
+      gap: an unwatched prefix, an empty alert-subscriber set, or a diverged
+      cost ledger are each an actionable-now break in crucible v2's
+      observability surface, not a lifecycle notice like the info case above.
+
   # ── data plane (nousergon-data) ──
   - class: data_constituents_drift
     source: "alpha-engine-data/validators/constituents_drift_check.py"
