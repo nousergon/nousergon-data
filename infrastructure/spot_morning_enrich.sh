@@ -100,6 +100,7 @@ stage_config "$_CONFIG_SRC" "config.yaml"
 wait_ssm_agent
 bootstrap_spot
 install_deps
+install_gitleaks_dlp
 
 # ── Smoke-only ───────────────────────────────────────────────────────────────
 if [ "$MODE" = "smoke-only" ]; then

@@ -407,6 +407,59 @@ install_deps() {
   echo "  Deps installed."
 }
 
+# ── Gitleaks binary + DLP preflight gate ─────────────────────────────────────
+
+install_gitleaks_dlp() {
+  # krepis.session_dlp (LLMClient's DLP hook) shells out to the gitleaks
+  # BINARY on every LLM call and fails CLOSED when it is absent — a Go binary
+  # a wheel cannot carry, so `pip install -r requirements.txt` in install_deps()
+  # above never provides it. Every spot this repo boots makes LLM calls
+  # (flow-doctor diagnosis), so every one of them fails closed on first call
+  # without this (alpha-engine-config-I10370).
+  #
+  # Pin mirrors the fleet standard exactly — same version, same sha256, same
+  # release asset — so it moves in lockstep rather than being re-derived per
+  # substrate: nous-ergon-ops/alpha-engine-dashboard/infrastructure/
+  # provisioning/bootstrap.sh, nous-ergon-ops/infrastructure/cloudformation/
+  # crucible-v2.yaml (GitleaksVersion/GitleaksSha256X64), and
+  # alpha-engine-config/infrastructure/groom_spot_bootstrap.sh. Bump all four
+  # together, never independently.
+  #
+  # `python -m krepis.session_dlp preflight` (krepis-PR211) is run as a BOOT
+  # GATE, not deferred to the first LLM call — the same shape
+  # crucible-v2.yaml's inline preflight already uses. A gate that cannot pass
+  # aborts the boot (fail-closed stays; this makes the binary present so
+  # fail-closed no longer fires on every boot). KREPIS_DLP_DISABLED=1 is
+  # explicitly not read anywhere here — see the non-inferable gotcha in
+  # alpha-engine-config-I10370: it would silence the fleet's only DLP control.
+  echo "==> Installing gitleaks + running DLP preflight gate..."
+  local _script
+  read -r -d '' _script <<'GITLEAKS_DLP_SCRIPT' || true
+set -euo pipefail
+GITLEAKS_VERSION=8.30.1
+GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "installing gitleaks ${GITLEAKS_VERSION}..."
+  curl -fsSL -o /tmp/gitleaks.tar.gz \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+  echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+  sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+  sudo chmod +x /usr/local/bin/gitleaks
+  rm -f /tmp/gitleaks.tar.gz
+fi
+command -v gitleaks >/dev/null 2>&1 || { echo "FATAL: gitleaks binary unavailable after install (fail-closed)" >&2; exit 1; }
+command -v python3.12 >/dev/null 2>&1 || { echo "FATAL: python3.12 not found — cannot run the DLP preflight gate" >&2; exit 1; }
+PYTHON_BIN=python3.12
+if ! "$PYTHON_BIN" -m krepis.session_dlp preflight; then
+  echo "FATAL: DLP preflight failed (gitleaks binary/config not ready) — refusing to proceed, same fail-closed posture as the proxy's own missing-config guard" >&2
+  exit 1
+fi
+echo "DLP preflight OK."
+GITLEAKS_DLP_SCRIPT
+  run_ssm "gitleaks-dlp" "$_script" 300
+  echo "  Gitleaks installed, DLP preflight OK."
+}
+
 # ── Utilities ────────────────────────────────────────────────────────────────
 
 print_banner() {
