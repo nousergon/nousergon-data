@@ -5448,3 +5448,90 @@ def test_the_complete_line_publishes_the_phase_breakdown(
     for token in ("registry_load=", "producer_inventory=", "spec_loop=",
                   "post_loop=", "total=", "list_cache="):
         assert token in line, (token, line)
+
+
+# ── The producer-chosen `*` segment (alpha-engine-config-I10200) ─────────────
+#
+# A registry row may declare one path segment whose value the PRODUCER chooses
+# at write time — `predictor/diagnostics/oos_rows/*/{date}.parquet`, scoped by
+# the model FAMILY under alpha-engine-config-I9378 so a parallel zoo spec
+# cannot overwrite the champion's diagnostic.
+#
+# `_prefix_has_ever_been_written` derived its prefix with a bare
+# `template.split("{")`, which yields `oos_rows/*/` for the dated row and the
+# WHOLE template — literal `*` and all — for `oos_rows/*/latest.parquet`. Both
+# LIST against a prefix no object can start with, return nothing, and answer
+# "never written" about an artifact that has existed since 2026-09-05. A
+# never_written row does not page (see `_alert_decision`), so the wrong answer
+# here is the one that silences a real absence.
+
+
+def _wildcard_spec(index_mod, template="predictor/diagnostics/oos_rows/*/{date}.parquet"):
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+    spec = ArtifactSpec(
+        artifact_id="predictor_oos_rows_dated", s3_bucket="alpha-engine-research",
+        s3_key_template=template, cadence="saturday_sf",
+        sla_minutes_after_cron=240, severity="warning",
+        owner_repo="alpha-engine-predictor", created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(
+        state="missing", sla_violated_by_minutes=5771,
+        canonical_key="predictor/diagnostics/oos_rows/*/2026-09-04.parquet",
+        reason="no instance found",
+    )
+    return spec, result
+
+
+def test_wildcard_probe_lists_the_prefix_before_the_star(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _wildcard_spec(index)
+    stub = _ListStub(pages=[{"Contents": [], "IsTruncated": False}])
+    index._prefix_has_ever_been_written(stub, spec, result)
+    assert stub.calls[0]["Prefix"] == "predictor/diagnostics/oos_rows/"
+
+
+def test_wildcard_probe_lists_the_prefix_for_a_placeholderless_template(monkeypatch):
+    """`oos_rows/*/latest.parquet` carries no brace at all, so the old
+    `split("{")` head was the entire template including the literal `*`."""
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _wildcard_spec(
+        index, template="predictor/diagnostics/oos_rows/*/latest.parquet",
+    )
+    stub = _ListStub(pages=[{"Contents": [], "IsTruncated": False}])
+    index._prefix_has_ever_been_written(stub, spec, result)
+    assert stub.calls[0]["Prefix"] == "predictor/diagnostics/oos_rows/"
+
+
+def test_wildcard_probe_finds_the_live_instance(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _wildcard_spec(index)
+    stub = _ListStub(pages=[{
+        "Contents": [
+            {"Key": "predictor/diagnostics/oos_rows/v3.0-meta/2026-09-04.parquet"},
+        ],
+        "IsTruncated": False,
+    }])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is True
+
+
+def test_wildcard_probe_does_not_count_a_sibling_diagnostic(monkeypatch):
+    """A coarse `.parquet` suffix filter would sweep in every sibling under
+    `predictor/diagnostics/` — the config-I7622 over-match, one level down."""
+    import importlib
+    import index
+    importlib.reload(index)
+    spec, result = _wildcard_spec(index)
+    stub = _ListStub(pages=[{
+        "Contents": [
+            {"Key": "predictor/diagnostics/oos_rows/v3.0-meta/summary.json"},
+            {"Key": "predictor/diagnostics/oos_rows/2026-09-04.parquet"},
+        ],
+        "IsTruncated": False,
+    }])
+    assert index._prefix_has_ever_been_written(stub, spec, result) is False
