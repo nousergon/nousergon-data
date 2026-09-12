@@ -90,91 +90,91 @@
   "paused_alarms": {
     "_why": "alpha-engine-config-I7174. Nine watch-plane/liveness alarms fire `no datapoints were received ... treated as [Breaching]` for no reason other than that the component they watch is deliberately off under the 2026-08-07/2026-08-12 rulings above - the alarm has no input telling it 'gated off by declaration' from 'upstream died' (sf-pipeline-policy.md 2.6 rule 1). Each entry here names the alarm and the `watches` triggers whose presence in `paused`/`pending` (module.paused_names()) is what JUSTIFIES silencing it - never a free-text trigger name that no checker reads, the exact defect the `_reactive-notifier-rules` prose key already cost this file once. `pause_reconcile.py::alarm_entries()`/`automation_pause.py::alarm_entries()` compute justification live from `watches`, so un-pausing a trigger (removing/moving its entry out of `paused`) makes its alarm's entry here stop being justified on the VERY NEXT read - no second edit, no separate AWS CLI command. `automation_pause.py --enforce` then (a) disables actions on a justified-but-armed alarm and (b) RE-ENABLES actions on an alarm whose entry is no longer justified - (b) is deliberately NOT a mirror of the trigger-enforce asymmetry (`enforce()` never re-enables a paused TRIGGER, because that would restart scheduled work unattended); re-arming an alarm only resumes paging, so the same asymmetry does not apply. Silencing is `disable-alarm-actions`, never `delete-alarms`: history and config survive so coverage can be reconstructed later (property 1). `pause_reconcile.py --check` grades the same two directions read-only and its `--publish` row always lists every currently-justified entry as a declared, bounded gap (property 2) rather than omitting it. EVERY entry additionally carries `issue` and `re_exam` (alpha-engine-config-I8047, Brian ruling 2026-08-21 option (b)). The 14 alarms in this block were disabled BY HAND from the laptop on 2026-08-13/14 (CloudTrail `DisableAlarmActions`, principal `AWSReservedSSO_AdministratorAccess/cipher813`), following the 2026-08-12 groomer/Overseer pause. Brian ruled the mute stands and must be DECLARED and SELF-EXPIRING rather than undone. `watches` grades whether the RESOURCE condition still holds; `issue` + `re_exam` grade whether the REASON still holds, which is the condition that actually rots (alpha-engine-config-I8090). `issue` names the OPEN ruling whose closure ends the pause \u2014 a closed owning issue means either the pause ended (these must be re-armed) or it was closed without the work, and both are loud. `re_exam` is the date past which the suppression is no longer justified by anything. Neither field feeds `alarm_justified()` and neither can move live state: `enforce()` must never re-arm the response plane's own alarms unattended on a calendar tick \u2014 that is Brian's ruling to revisit (`principles.md` 2.5). `automation_pause.py` enforces that both fields are PRESENT and well-formed (offline, no credential); `alpha-engine-config`'s `suppression-declaration-sweep` grades them against the clock and the tracker, because only a job running in the tracker repo can resolve an issue's state. ADDENDUM (alpha-engine-config-I8712): this block may hold BOTH treat_missing_data values — a component's breaching and notBreaching sibling probes are commonly declared together, watching the same trigger — but the silencing requirement above (`--check` grading `alarm-unexpectedly-enabled`/`alarm-stale-disabled`, `--enforce` flipping actions) applies ONLY to the `breaching` population: only a breaching alarm can false-page from a paused trigger's silence, so only a breaching alarm has anything to be silenced FOR. A notBreaching entry's live ActionsEnabled is never graded here; whether a notBreaching mute is separately DECLARED still falls to `alarm_coverage_findings()`'s `alarm-undeclared-silence` scan, which covers every alarm regardless of missing-data treatment. `alpha-engine-ssm-reachability-probe-unreachable` below is the worked example: notBreaching, live ActionsEnabled=True, and that live state was never wrong.",
     "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor": {
-      "reason": "invocations-floor on the overseer canary-replay liveness probe; silenced while alpha-engine-canary-replay-liveness-probe-tick is paused.",
+      "reason": "invocations-floor on the overseer canary-replay liveness probe; silenced while alpha-engine-canary-replay-liveness-probe-tick is paused. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-canary-replay-liveness-probe-tick"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor": {
-      "reason": "invocations-floor on the ci-watch-liveness-probe reclaim leg (config#3173, mirrors sf-watch's two reclaim legs); silenced while both ci-watch reclaim rules are paused.",
+      "reason": "invocations-floor on the ci-watch-liveness-probe reclaim leg (config#3173, mirrors sf-watch's two reclaim legs); silenced while both ci-watch reclaim rules are paused. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-ci-watch-spot-interruption",
         "alpha-engine-ci-watch-instance-terminated"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-errors": {
-      "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand.",
+      "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-sf-watch-liveness-0645-daily",
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles": {
-      "reason": "sf-watch liveness-probe Throttles; same ruling and same watched triggers as alpha-engine-watch-plane-sf-watch-liveness-probe-errors.",
+      "reason": "sf-watch liveness-probe Throttles; same ruling and same watched triggers as alpha-engine-watch-plane-sf-watch-liveness-probe-errors. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-sf-watch-liveness-0645-daily",
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-ssm-reachability-probe-dead": {
-      "reason": "SSM reachability probe deadman; silenced while alpha-engine-ssm-reachability-probe-5min is paused.",
+      "reason": "SSM reachability probe deadman; silenced while alpha-engine-ssm-reachability-probe-5min is paused. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-ssm-reachability-probe-5min"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-ssm-reachability-probe-unreachable": {
-      "reason": "SSM reachability probe unreachable-count; same watched trigger as alpha-engine-ssm-reachability-probe-dead, but treat_missing_data=notBreaching (alpha-engine-ssm-reachability-probe-dead is the breaching sibling that actually needs silencing). Its ActionsEnabled state is not graded by --check/--enforce (alpha-engine-config-I8712); it is declared here only so the mute-or-not-mute of this alarm has a record, per the paused_alarms._why ADDENDUM above.",
+      "reason": "SSM reachability probe unreachable-count; same watched trigger as alpha-engine-ssm-reachability-probe-dead, but treat_missing_data=notBreaching (alpha-engine-ssm-reachability-probe-dead is the breaching sibling that actually needs silencing). Its ActionsEnabled state is not graded by --check/--enforce (alpha-engine-config-I8712); it is declared here only so the mute-or-not-mute of this alarm has a record, per the paused_alarms._why ADDENDUM above. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-ssm-reachability-probe-5min"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-errors": {
-      "reason": "overseer liveness-probe Errors. Period=28800 with treat_missing_data=breaching, so an 8h window with no invocation latches ALARM - and the probe's only two triggers are paused. Added 2026-08-14 (alpha-engine-config-I7023): this alarm and its two siblings were the four still paging Brian after the I7174 reconciler silenced the rest, because the I7174 entry list was built from the alarms observed in ALARM on 2026-08-13 and these read OK at that moment - the backstop responder was re-invoking the probe on every firing (alpha-engine-config-I7330), manufacturing the datapoint that cleared them.",
+      "reason": "overseer liveness-probe Errors. Period=28800 with treat_missing_data=breaching, so an 8h window with no invocation latches ALARM - and the probe's only two triggers are paused. Added 2026-08-14 (alpha-engine-config-I7023): this alarm and its two siblings were the four still paging Brian after the I7174 reconciler silenced the rest, because the I7174 entry list was built from the alarms observed in ALARM on 2026-08-13 and these read OK at that moment - the backstop responder was re-invoking the probe on every firing (alpha-engine-config-I7330), manufacturing the datapoint that cleared them. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-overseer-liveness-0650-daily",
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-throttles": {
-      "reason": "overseer liveness-probe Throttles; same shape, same window and same paused triggers as the Errors sibling above. Added 2026-08-14 (alpha-engine-config-I7023).",
+      "reason": "overseer liveness-probe Throttles; same shape, same window and same paused triggers as the Errors sibling above. Added 2026-08-14 (alpha-engine-config-I7023). Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-overseer-liveness-0650-daily",
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-invocations-floor": {
-      "reason": "invocations-floor on the overseer liveness probe. This is the alarm whose ENTIRE job is detecting a probe that stopped running, so while the probe is deliberately stopped it can only report the pause back to us. Added 2026-08-14 (alpha-engine-config-I7023).",
+      "reason": "invocations-floor on the overseer liveness probe. This is the alarm whose ENTIRE job is detecting a probe that stopped running, so while the probe is deliberately stopped it can only report the pause back to us. Added 2026-08-14 (alpha-engine-config-I7023). Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-overseer-liveness-0650-daily",
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor": {
-      "reason": "invocations-floor on the sf-watch liveness probe. Its -errors and -throttles siblings were declared under I7174 and this one was not, so it stayed armed on the same paused triggers - the family-completeness check added with this entry is what makes that shape impossible to repeat. Silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984); re-exam 2026-09-09, same predicate as the sf-watch entries it watches.",
+      "reason": "invocations-floor on the sf-watch liveness probe. Its -errors and -throttles siblings were declared under I7174 and this one was not, so it stayed armed on the same paused triggers - the family-completeness check added with this entry is what makes that shape impossible to repeat. Silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984); re-exam 2026-09-09, same predicate as the sf-watch entries it watches. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [
         "alpha-engine-sf-watch-liveness-0645-daily",
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-09-09"
+      "re_exam": "2026-10-12"
     },
     "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor": {
       "reason": "invocations-floor on the overseer alert-drain liveness probe; treat_missing_data=breaching is correct when alert-drain is supposed to run and wrong while it is declared off (Brian 2026-08-23: response-plane pause includes the drain; same watches as pre-I8110).",
