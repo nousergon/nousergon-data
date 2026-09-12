@@ -10,4 +10,4 @@
 # FLOOR, not a preference: coverage.py and completion_marker.py first exist in
 # v0.124.88. A lower pin makes this handler fail its import and return
 # outcome=unavailable every week — which pages honestly, but detects nothing.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.116
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.120

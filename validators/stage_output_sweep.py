@@ -105,6 +105,25 @@ always in the alarming direction. The verdict set keeps the two apart:
                   DID get written still reports ``wrote``: the downgrade only
                   ever applies to a would-be ``missing``/``stale``
 
+## The producer-chosen ``*`` segment
+
+A registry row may declare one path segment whose value the PRODUCER chooses
+at write time and no consumer can derive — a single literal ``*`` occupying
+one whole segment (alpha-engine-config-I10200). The live instance is
+``predictor/diagnostics/oos_rows/*/{date}.parquet``, scoped by the model
+FAMILY under alpha-engine-config-I9378 so a parallel zoo spec cannot
+overwrite the champion's diagnostic.
+
+Such a resolved key is a PATTERN and cannot be head-ed, so it is resolved by
+listing the fixed prefix before the ``*`` and taking the NEWEST instance
+matching the pattern — with the ordinary placeholders already substituted, so
+the match is anchored to this run's cycle date and only the producer's segment
+is free. The verdict logic then runs unchanged: the row is held to exactly the
+same standard as a fixed key. Zero matches is ``missing``; a listing that
+could not complete is ``unmeasured``; and **never** a fallback to the
+unscoped key, which would resurrect the overwrite hazard I9378 exists to
+prevent.
+
 ``unmeasured`` is deliberately NOT silent. Absence of a measurement is a
 first-class finding with its own exit code and its own alert, because the
 alternative — a sweep that reports 0 defects because it could not look — is the
@@ -472,6 +491,15 @@ def resolve_key(
     ``artifact_freshness._format_key``, the second being a semantic name for
     the same tick. ``{run_date}`` resolves to the SF's own ``$.run_date``.
 
+    A literal ``*`` segment — the producer-chosen segment, the registry's way
+    of declaring "one segment whose value the PRODUCER picks and no consumer
+    can derive" (alpha-engine-config-I10200) — passes through untouched. The
+    result is then a PATTERN, not a key, and :func:`evaluate` resolves it by
+    listing rather than head-ing; see :func:`_newest_match`. The grammar is
+    validated here (one whole segment, never the last) so a malformed row
+    reports ``unmeasured`` with a reason naming the template, rather than
+    producing a pattern that silently matches the wrong set.
+
     Returns ``None`` — meaning ``unmeasured``, never ``missing`` — when the
     template needs a cycle date that could not be resolved, or carries any
     OTHER placeholder (``{cycle_label}``, an hour bucket, anything added
@@ -479,6 +507,25 @@ def resolve_key(
     report a confident, permanent, entirely false ``missing``: the most
     convincing wrong finding this sweep could produce.
     """
+    support = _wildcard_support()
+    if "*" in template:
+        if support is None:
+            logger.error(
+                "Template %r carries the producer-chosen '*' segment but "
+                "nousergon_lib.artifact_freshness is unavailable — reporting "
+                "unmeasured rather than head-ing a literal '*', which would "
+                "404 and report a confident false missing",
+                template,
+            )
+            return None
+        try:
+            support["validate_key_template"](template)
+        except Exception as exc:  # noqa: BLE001 - any illegal shape is unmeasured
+            logger.error(
+                "Template %r has an unresolvable wildcard shape (%s) — "
+                "unmeasured, not missing", template, exc,
+            )
+            return None
     resolved = template
     for name in set(_PLACEHOLDER_RE.findall(template)):
         if name in ("date", "trading_day"):
@@ -635,6 +682,112 @@ def declared_outputs(
     return out
 
 
+def _wildcard_support() -> dict[str, Any] | None:
+    """The ``s3_key_template`` grammar, borrowed from ``nousergon_lib``.
+
+    The producer-chosen ``*`` segment is the REGISTRY's grammar, and three
+    independent resolvers have to agree about it: this sweep, the freshness
+    monitor, and ``alpha-engine-config``'s registry validator. A third
+    hand-rolled copy of "where does the prefix stop, what does the wildcard
+    match, which shapes are illegal" is ``policy-shared-code``'s duplication
+    failure, so the definition lives once in
+    :mod:`nousergon_lib.artifact_freshness` and is imported here.
+
+    Imported lazily and returned as ``None`` on failure, matching
+    :func:`resolve_cycle_date`: this module is deliberately import-light and
+    runs in contexts (a bare spot box, a unit test) where the lib may be
+    absent. ``None`` renders every wildcard row ``unmeasured`` — loud, and
+    never a head of a literal ``*``.
+    """
+    try:
+        from nousergon_lib.artifact_freshness import (  # noqa: PLC0415
+            has_wildcard_segment,
+            key_pattern,
+            listable_prefix,
+            validate_key_template,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.error(
+            "nousergon_lib.artifact_freshness unavailable (%s) — every "
+            "registry row carrying the producer-chosen '*' segment will "
+            "report unmeasured rather than be checked against a guess", exc,
+        )
+        return None
+    return {
+        "has_wildcard_segment": has_wildcard_segment,
+        "key_pattern": key_pattern,
+        "listable_prefix": listable_prefix,
+        "validate_key_template": validate_key_template,
+    }
+
+
+def _newest_match(
+    s3_client: Any, bucket: str, pattern: str, *, cap_pages: int = 64
+) -> tuple[str, Any, str]:
+    """Resolve a ``*``-bearing key PATTERN to its newest existing instance.
+
+    Returns ``(state, detail, key)`` with the same three-way state as
+    :func:`_head` — ``("found", last_modified, key)``,
+    ``("absent", None, "")``, ``("error", reason, "")`` — so
+    :func:`evaluate`'s verdict logic is identical either way and a wildcard
+    row is held to exactly the same standard as a fixed one.
+
+    The pattern is the template with the ordinary placeholders already
+    substituted, so the match is anchored to THIS run's cycle date and only
+    the producer-chosen segment is free. That is deliberately stricter than
+    the freshness monitor's recency model over the same rows: the monitor asks
+    "is any instance younger than the cadence clock", this sweep asks "did the
+    stage that ran in THIS EXECUTION write the key it declares", and answering
+    the second with the first would let last week's instance clear this week's
+    silent stage.
+
+    **A truncated listing is an error, never ``absent``.** S3 lists
+    lexically, so the keys past the cap are not a random sample — and
+    "I could not see the whole prefix" is not evidence the artifact is
+    missing (the class alpha-engine-config-I7617 was filed about).
+    """
+    support = _wildcard_support()
+    if support is None:
+        return "error", "nousergon_lib.artifact_freshness unavailable", ""
+    try:
+        compiled = support["key_pattern"](pattern)
+        prefix = support["listable_prefix"](pattern)
+    except Exception as exc:  # noqa: BLE001
+        return "error", f"unresolvable pattern {pattern!r}: {exc}", ""
+
+    newest_key = ""
+    newest_lm = None
+    try:
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page_index, page in enumerate(
+            paginator.paginate(Bucket=bucket, Prefix=prefix)
+        ):
+            if page_index >= cap_pages:
+                return (
+                    "error",
+                    f"LIST of {prefix!r} exceeded the {cap_pages}-page scan "
+                    f"cap; keys list lexically so the objects past the cap "
+                    f"are the newest — this is an unanswered question, not an "
+                    f"absent artifact (alpha-engine-config-I7617)",
+                    "",
+                )
+            for obj in page.get("Contents") or []:
+                key = obj.get("Key") or ""
+                if compiled.match(key) is None:
+                    continue
+                last_modified = obj.get("LastModified")
+                if last_modified is None:
+                    continue
+                if newest_lm is None or last_modified > newest_lm:
+                    newest_lm, newest_key = last_modified, key
+    except Exception as exc:  # noqa: BLE001
+        return "error", f"{type(exc).__name__}: {exc}", ""
+
+    if newest_lm is None:
+        return "absent", None, ""
+    return "found", newest_lm, newest_key
+
+
 def _head(s3_client: Any, bucket: str, key: str) -> tuple[str, Any]:
     """HEAD one key.
 
@@ -663,6 +816,7 @@ def evaluate(
     run_date: str,
     execution_start: datetime | None,
     head: Callable[[str, str], tuple[str, Any]],
+    find: Callable[[str, str], tuple[str, Any, str]] | None = None,
     entered_stages: frozenset[str] | None = None,
     cycle_date: str | None = None,
     run_mode: str | None = None,
@@ -680,6 +834,16 @@ def evaluate(
         head: ``(bucket, key) -> (state, detail)``, injected so the decision
             logic is testable without S3 and so the failing branch can actually
             be exercised.
+        find: ``(bucket, pattern) -> (state, detail, key)`` for a resolved key
+            carrying the producer-chosen ``*`` segment
+            (alpha-engine-config-I10200) — a pattern cannot be head-ed, so it
+            is resolved by listing the fixed prefix and taking the newest
+            instance matching the pattern. States mirror ``head``, so the
+            verdict logic below is identical either way. ``None`` (no lister
+            supplied) makes every wildcard row ``unmeasured``: a caller that
+            cannot list cannot answer those rows, and saying so is the only
+            honest option — head-ing a literal ``*`` would 404 and report a
+            confident, permanent, entirely false ``missing``.
         entered_stages: the stages that actually entered this execution, when
             known. ``None`` means unknown, and then NO stage is marked
             ``skipped`` — "I don't know which stages ran" must never become
@@ -714,6 +878,10 @@ def evaluate(
             "bucket": declaration["bucket"],
             "severity": declaration.get("severity", "warning"),
             "key": None,
+            # Non-None only for a row whose resolved key carries the
+            # producer-chosen '*' segment: the pattern that was matched,
+            # alongside `key`, which then names the instance actually found.
+            "pattern": None,
             "last_modified": None,
             "detail": None,
         }
@@ -760,7 +928,25 @@ def evaluate(
         ):
             continue
 
-        state, detail = head(declaration["bucket"], key)
+        if "*" in key:
+            if find is None:
+                finding["verdict"] = UNMEASURED
+                finding["detail"] = (
+                    f"resolved key {key!r} carries the producer-chosen '*' "
+                    f"segment and no object lister was supplied, so this row "
+                    f"cannot be resolved by a HEAD — unmeasured, not missing "
+                    f"(alpha-engine-config-I10200)"
+                )
+                findings.append(finding)
+                continue
+            state, detail, observed = find(declaration["bucket"], key)
+            # The pattern says where the artifact was expected; the observed
+            # key says which instance the verdict was taken over. Reporting
+            # only the pattern would leave the verdict unverifiable by hand.
+            finding["pattern"] = key
+            finding["key"] = observed or None
+        else:
+            state, detail = head(declaration["bucket"], key)
 
         if state == "error":
             finding["verdict"] = UNMEASURED
@@ -949,6 +1135,7 @@ def sweep(
         run_date=run_date,
         execution_start=execution_start,
         head=lambda b, k: _head(s3_client, b, k),
+        find=lambda b, k: _newest_match(s3_client, b, k),
         entered_stages=entered_stages,
         cycle_date=cycle_date,
         run_mode=run_mode,
