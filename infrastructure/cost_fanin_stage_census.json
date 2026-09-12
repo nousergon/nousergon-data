@@ -20,7 +20,7 @@
     "ReplayConcordance": {
       "disposition": "emits",
       "substrate": "crucible-backtester replay/runner.py (Lambda alpha-engine-replay-concordance)",
-      "reason": "Emits replay-concordance, declared under required_producers. Every replayed artifact is one paid cheap-model call, and the stage is wall-killed often enough that its budget cannot be sized while its spend is invisible (alpha-engine-config-I7176 item A2)."
+      "reason": "Emits replay-concordance, declared under required_producers. Every replayed artifact is one paid cheap-model call, and the stage is wall-killed often enough that its budget cannot be sized while its spend is invisible (alpha-engine-config-I7176 item A2). A zero-candidate corpus (agent_filter matched no artifact in the trailing window — measured 2026-09-12, the six-team agent_filter's last match was 2026-07-11) is a LEGITIMATE zero-call run, not a silent producer: replay/batch.py::_emit_zero_call_cost_record hand-builds one 'producer_ran_no_calls' cost record per target model so the fan-in check (which keys observed_producers off the S3 object NAME, not row content) still sees replay-concordance emit. required_producers stays correct either way — the stage always writes an object here, priced or zeroed."
     },
     "Director": {
       "disposition": "emits",

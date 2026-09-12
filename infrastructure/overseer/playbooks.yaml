@@ -847,6 +847,23 @@ alert_classes:
     response: drain-queue
     # DECLARED: input-quality degradation — suboptimal results, not a halt.
     tier: notify-silent
+  - class: backtester_replay_concordance_empty_corpus
+    # alpha-engine-config-I7183: ReplayConcordance's agent_filter matched
+    # zero decision_artifacts in the trailing window (measured 2026-09-12:
+    # the default six-team filter's last match was 2026-07-11). The stage
+    # still emits a "producer_ran_no_calls" cost record so the weekly SF's
+    # fan-in coverage check does not break on the legitimate zero-call run
+    # — this alert is the separate, human-actionable finding that the
+    # filter itself has gone stale and needs repointing (or the stage
+    # retiring). Mirrors backtester_empty_param_sweep's tier: a
+    # correctly-observed empty condition, not a halt.
+    source: "crucible-backtester/replay/batch.py::compute_and_emit_concordance"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: an empty-filter finding for an operator to act on, not a
+    # failure — mirrors backtester_empty_param_sweep's tracked-only tier.
+    tier: tracked-only
 
   # ── predictor (crucible-predictor) ──
   - class: predictor_risk_model_persist
