@@ -813,6 +813,46 @@ PIP="\$PYTHON_BIN -m pip"
 echo "Dependencies installed."
 DEPS
 
+# ── Gitleaks binary + DLP preflight gate ─────────────────────────────────────
+# krepis.session_dlp shells out to the gitleaks BINARY on every LLM call
+# (flow-doctor diagnosis runs on this box) and fails CLOSED when it is
+# absent — a Go binary `pip install -r requirements.txt` above cannot provide
+# (alpha-engine-config-I10370). Pin mirrors the fleet standard exactly (same
+# version, same sha256, same release asset) as nous-ergon-ops/
+# alpha-engine-dashboard/infrastructure/provisioning/bootstrap.sh,
+# nous-ergon-ops/infrastructure/cloudformation/crucible-v2.yaml, and
+# alpha-engine-config/infrastructure/groom_spot_bootstrap.sh — bump all in
+# lockstep, never independently. `python -m krepis.session_dlp preflight`
+# (krepis-PR211) runs as a BOOT GATE, not deferred to the first LLM call:
+# a scanner that cannot be verified aborts the boot loudly (fail-closed
+# stays; this makes the binary present so it no longer fires on every boot).
+# This file does not source _spot_common.sh (see the header), so the same
+# block lives here directly rather than via install_gitleaks_dlp().
+echo "==> Installing gitleaks + running DLP preflight gate..."
+run_ssm "gitleaks-dlp" 300 <<'GITLEAKS_DLP'
+set -euo pipefail
+GITLEAKS_VERSION=8.30.1
+GITLEAKS_SHA256=551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+if ! command -v gitleaks >/dev/null 2>&1; then
+  echo "installing gitleaks ${GITLEAKS_VERSION}..."
+  curl -fsSL -o /tmp/gitleaks.tar.gz \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+  echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -
+  sudo tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks
+  sudo chmod +x /usr/local/bin/gitleaks
+  rm -f /tmp/gitleaks.tar.gz
+fi
+command -v gitleaks >/dev/null 2>&1 || { echo "FATAL: gitleaks binary unavailable after install (fail-closed)" >&2; exit 1; }
+command -v python3.12 >/dev/null 2>&1 || { echo "FATAL: python3.12 not found — cannot run the DLP preflight gate" >&2; exit 1; }
+PYTHON_BIN=python3.12
+if ! "$PYTHON_BIN" -m krepis.session_dlp preflight; then
+  echo "FATAL: DLP preflight failed (gitleaks binary/config not ready) — refusing to proceed, same fail-closed posture as the proxy's own missing-config guard" >&2
+  exit 1
+fi
+echo "DLP preflight OK."
+GITLEAKS_DLP
+echo "  Gitleaks installed, DLP preflight OK."
+
 # ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
 # config#1807: the weekday pre-open data phase (MorningEnrich +
 # MorningArcticAppend) runs on this spot instead of the trading box, whose

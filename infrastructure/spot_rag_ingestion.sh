@@ -99,6 +99,7 @@ stage_config "$_CONFIG_SRC" "config.yaml"
 wait_ssm_agent
 bootstrap_spot
 install_deps
+install_gitleaks_dlp
 
 # ── RAG smoke-only (dry-run submodules) ──────────────────────────────────────
 if [ "$MODE" = "rag-smoke-only" ]; then
