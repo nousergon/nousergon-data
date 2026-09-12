@@ -67,8 +67,12 @@ ACCOUNT_ID = "711398986525"
 #: names in one list with no machine-readable split, so this module names the
 #: split explicitly rather than re-deriving it from comment boundaries.
 STATE_TO_STATE_MACHINE: Mapping[str, str] = {
-    "MorningEnrich": "ne-weekly-freshness-pipeline",
-    "DataPhase1": "ne-weekly-freshness-pipeline",
+    # alpha-engine-config-I10545: was "MorningEnrich" / "DataPhase1" (the
+    # always-~0s dispatch states) — renamed to match
+    # STATE_DURATION_FLOORS_SEC's move to the poll states that actually span
+    # the workload.
+    "WaitForMorningEnrich": "ne-weekly-freshness-pipeline",
+    "WaitForDataPhase1": "ne-weekly-freshness-pipeline",
     "RAGIngestion": "ne-weekly-freshness-pipeline",
     "PredictorTraining": "ne-weekly-freshness-pipeline",
     "Backtester": "ne-weekly-freshness-pipeline",
@@ -338,9 +342,21 @@ def render_report(recommendations: Sequence[FloorRecommendation]) -> str:
 
 
 def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
+    # alpha-engine-config-I10545: fetch_execution_history now returns
+    # (events, truncated) so callers can surface truncation; this adapter
+    # keeps collect_state_duration_samples' injected
+    # ``fetch_history(sf_client, execution_arn) -> List[dict]`` contract
+    # unchanged. Calibration is a batch/offline tool over many executions —
+    # a truncated sample here silently understates one execution's duration
+    # rather than corrupting a live alert, and floor_calibration.py's own
+    # min-based recommendation logic is naturally robust to an UNDERSTATED
+    # outlier (it would only pull the recommended floor down, not mask a
+    # genuinely broken run); a live truncation is caught where it matters,
+    # in execution_digest.build_execution_digest.
     from execution_digest import fetch_execution_history
 
-    return fetch_execution_history(sf_client, execution_arn)
+    events, _truncated = fetch_execution_history(sf_client, execution_arn)
+    return events
 
 
 def run_check(sf_client: Any) -> List[FloorRecommendation]:
