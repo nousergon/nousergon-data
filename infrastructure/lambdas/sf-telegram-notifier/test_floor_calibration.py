@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+import floor_calibration as fc
 from floor_calibration import (
     DEGENERATE_SPREAD_RATIO,
     MARGIN,
@@ -231,6 +232,302 @@ def test_collect_state_duration_samples_extracts_poll_status():
     sample = samples["PollMorningArcticAppendSpot"][0]
     assert sample["duration_sec"] == pytest.approx(930.0)
     assert sample["poll_status"] == "Failed"
+
+
+# ── the real weekly-execution fixture (alpha-engine-config-I10574) ──────
+
+
+import json as _json
+from datetime import datetime as _datetime
+from pathlib import Path as _Path
+
+_WEEKLY_FIXTURE = (
+    _Path(__file__).resolve().parents[3]
+    / "tests"
+    / "fixtures"
+    / "sf_history_weekly_canonical_2026-08-08.json"
+)
+
+
+def _weekly_canonical_history() -> list[dict]:
+    """The real 2026-08-08 ne-weekly-freshness-pipeline execution
+    (9b34ac0f-5e2f-f70b-d668-61b4c4751654_6fb6adf9-55fa-4426-6d06-79e4579bcaff),
+    redacted to TaskStateEntered/TaskStateExited events only (type, state
+    name, timestamp — no payload; the source history was fetched with
+    ``includeExecutionData=False``, so no payload was ever present).
+
+    This is the ONE genuine EventBridge-triggered SUCCEEDED execution in the
+    account's full history carrying RAGIngestion/PredictorTraining/Backtester
+    — the run alpha-engine-config-I10574's finding was measured against.
+    """
+    events = _json.loads(_WEEKLY_FIXTURE.read_text())
+    for e in events:
+        e["timestamp"] = _datetime.fromisoformat(e["timestamp"])
+    return events
+
+
+def test_real_weekly_history_dispatch_states_sample_to_zero():
+    """Reproduces the reported defect: sampling the DISPATCH state names
+    (the pre-fix STATE_TO_STATE_MACHINE keys) yields 0s for all three —
+    exactly the nonsense `min_genuine=0.0` alpha-engine-config-I10574 reported."""
+    events = _weekly_canonical_history()
+    durations = fc.parse_task_state_durations(events)
+    assert durations["RAGIngestion"] == 0
+    assert durations["PredictorTraining"] == 0
+    assert durations["Backtester"] == 0
+
+
+def test_real_weekly_history_poll_states_sample_to_the_genuine_multi_minute_span():
+    """The fix: sampling the companion WaitForX poll states (the corrected
+    STATE_TO_STATE_MACHINE keys) recovers the real workload span."""
+    events = _weekly_canonical_history()
+    durations = fc.parse_task_state_durations(events)
+    assert durations["WaitForRAGIngestion"] == 1057
+    assert durations["WaitForPredictorTraining"] == 421
+    assert durations["WaitForBacktester"] == 662
+    # WaitForMorningEnrich / WaitForDataPhase1 (already correctly named pre-
+    # I10574) are also genuinely multi-minute in this execution.
+    assert durations["WaitForMorningEnrich"] == 1662
+    assert durations["WaitForDataPhase1"] == 2417
+
+
+def test_collect_state_duration_samples_end_to_end_on_the_real_fixture():
+    """collect_state_duration_samples, driven end-to-end against the real
+    fixture through a canonical execution name, must recover the genuine
+    span for every renamed state and mark it as a non-zero sample."""
+    events = _weekly_canonical_history()
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {
+            "executions": [
+                {
+                    "executionArn": "arn:exec:1",
+                    "name": (
+                        "9b34ac0f-5e2f-f70b-d668-61b4c4751654_"
+                        "6fb6adf9-55fa-4426-6d06-79e4579bcaff"
+                    ),
+                }
+            ]
+        }
+    ]
+
+    def fake_fetch(_client, _arn):
+        return events
+
+    samples = fc.collect_state_duration_samples(
+        sf_client,
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        [
+            "WaitForRAGIngestion",
+            "WaitForPredictorTraining",
+            "WaitForBacktester",
+            "WaitForMorningEnrich",
+            "WaitForDataPhase1",
+        ],
+        fetch_history=fake_fetch,
+    )
+    for name, expected in (
+        ("WaitForRAGIngestion", 1057),
+        ("WaitForPredictorTraining", 421),
+        ("WaitForBacktester", 662),
+        ("WaitForMorningEnrich", 1662),
+        ("WaitForDataPhase1", 2417),
+    ):
+        assert len(samples[name]) == 1, name
+        sample = samples[name][0]
+        assert sample["duration_sec"] == expected, name
+        assert sample["exclusion_reason"] is None, name  # canonical name, non-zero
+
+
+# ── zero-duration exclusion (I10574 deliverable 1) ───────────────────────
+
+
+def test_zero_duration_sample_excluded_never_averaged_in():
+    """A 0-second sample (a dispatch Task, not the workload span) is
+    excluded with a named reason, never counted as genuine — regardless of
+    KNOWN_POLL_STATUS_KEYS, and even when it would otherwise clear
+    MIN_SAMPLES."""
+    genuine_durations = [600.0 + i for i in range(MIN_SAMPLES + 5)]
+    samples = [{"duration_sec": d, "poll_status": None, "exclusion_reason": None} for d in genuine_durations]
+    samples += [
+        {"duration_sec": 0.0, "poll_status": None, "exclusion_reason": None}
+        for _ in range(5)
+    ]
+    rec = compute_recommendation("SomeDispatchState", samples, current_floor_sec=500)
+    assert rec.n_genuine == len(genuine_durations)
+    assert rec.n_excluded == 5
+    assert rec.min_sec == pytest.approx(600.0)
+    assert "zero-duration" in rec.exclusion_breakdown
+
+
+def test_collect_state_duration_samples_tags_zero_duration_with_a_reason():
+    from datetime import datetime, timezone
+
+    base = datetime(2026, 8, 8, 10, 0, 0, tzinfo=timezone.utc)
+    events = [_entered("RAGIngestion", base), _exited("RAGIngestion", base, {})]
+
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {"executions": [{"executionArn": "arn:exec:1", "name": "exec-1"}]}
+    ]
+
+    def fake_fetch(_client, _arn):
+        return events
+
+    samples = collect_state_duration_samples(
+        sf_client,
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        ["RAGIngestion"],
+        fetch_history=fake_fetch,
+    )
+    sample = samples["RAGIngestion"][0]
+    assert sample["duration_sec"] == 0
+    assert "zero-duration" in sample["exclusion_reason"]
+
+
+# ── canonical-execution-name filter (I10574 deliverable "measure the same
+#    span"'s companion defect — averaging ad hoc reruns into "genuine") ───
+
+
+def test_non_canonical_weekly_execution_excluded_with_a_named_reason():
+    """watch-rerun-*/offcycle-shell-*/etc. executions of the weekly machine
+    are tagged non-canonical and excluded — their bootstrap/skip semantics
+    differ from the scheduled EventBridge-triggered run (I10574)."""
+    from datetime import datetime, timezone
+
+    base = datetime(2026, 8, 28, 10, 0, 0, tzinfo=timezone.utc)
+    events = [
+        _entered("WaitForMorningEnrich", base),
+        _exited("WaitForMorningEnrich", base, {}),
+    ]
+    # duration is 0 in this minimal fixture (same enter/exit timestamp) —
+    # give it a non-zero span so the zero-duration exclusion doesn't mask
+    # which reason actually fired.
+    from datetime import timedelta
+
+    events = [
+        _entered("WaitForMorningEnrich", base),
+        _exited("WaitForMorningEnrich", base + timedelta(seconds=151), {}),
+    ]
+
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {"executions": [{"executionArn": "arn:exec:1", "name": "watch-rerun-2026-08-28-13"}]}
+    ]
+
+    def fake_fetch(_client, _arn):
+        return events
+
+    samples = fc.collect_state_duration_samples(
+        sf_client,
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        ["WaitForMorningEnrich"],
+        fetch_history=fake_fetch,
+    )
+    sample = samples["WaitForMorningEnrich"][0]
+    assert sample["duration_sec"] == 151
+    assert "non-canonical" in sample["exclusion_reason"]
+
+
+def test_canonical_execution_name_not_excluded():
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 8, 8, 9, 0, 0, tzinfo=timezone.utc)
+    events = [
+        _entered("WaitForMorningEnrich", base),
+        _exited("WaitForMorningEnrich", base + timedelta(seconds=1662), {}),
+    ]
+
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {
+            "executions": [
+                {
+                    "executionArn": "arn:exec:1",
+                    "name": (
+                        "9b34ac0f-5e2f-f70b-d668-61b4c4751654_"
+                        "6fb6adf9-55fa-4426-6d06-79e4579bcaff"
+                    ),
+                }
+            ]
+        }
+    ]
+
+    def fake_fetch(_client, _arn):
+        return events
+
+    samples = fc.collect_state_duration_samples(
+        sf_client,
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        ["WaitForMorningEnrich"],
+        fetch_history=fake_fetch,
+    )
+    sample = samples["WaitForMorningEnrich"][0]
+    assert sample["exclusion_reason"] is None
+
+
+def test_canonical_name_filter_scoped_to_weekly_machine_only():
+    """The weekday machine (ne-preopen-trading-pipeline) is NOT subject to
+    the canonical-name filter — it is unmeasured there and scoping it
+    narrowly avoids silently changing PollMorningEnrichSpot/
+    PollMorningArcticAppendSpot's already-recalibrated (I10164) population."""
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 8, 8, 9, 0, 0, tzinfo=timezone.utc)
+    events = [
+        _entered("PollMorningEnrichSpot", base),
+        _exited("PollMorningEnrichSpot", base + timedelta(seconds=200), {}),
+    ]
+
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {"executions": [{"executionArn": "arn:exec:1", "name": "some-ad-hoc-name"}]}
+    ]
+
+    def fake_fetch(_client, _arn):
+        return events
+
+    samples = fc.collect_state_duration_samples(
+        sf_client,
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
+        ["PollMorningEnrichSpot"],
+        fetch_history=fake_fetch,
+    )
+    sample = samples["PollMorningEnrichSpot"][0]
+    assert sample["exclusion_reason"] is None
+
+
+# ── --check output names the event pair measured (I10574 deliverable 3) ──
+
+
+def test_recommendation_names_the_measured_event_pair():
+    samples = _samples([600.0 + i for i in range(MIN_SAMPLES + 5)])
+    rec = compute_recommendation("WaitForRAGIngestion", samples, current_floor_sec=600)
+    assert "WaitForRAGIngestion" in rec.event_pair
+    assert "TaskStateEntered" in rec.event_pair
+    assert "TaskStateExited" in rec.event_pair
+
+
+def test_render_report_includes_event_pair_and_exclusion_breakdown_columns():
+    report = render_report(
+        [
+            FloorRecommendation(
+                state_name="A",
+                status="ok",
+                current_floor_sec=90,
+                n_genuine=20,
+                n_excluded=2,
+                min_sec=100.0,
+                recommended_floor_sec=85,
+                basis="x",
+                event_pair="TaskStateEntered/TaskStateExited on 'A'",
+                exclusion_breakdown="2 zero-duration",
+            )
+        ]
+    )
+    assert "event_pair" in report and "exclusion_breakdown" in report
+    assert "TaskStateEntered/TaskStateExited on 'A'" in report
+    assert "2 zero-duration" in report
 
 
 def test_run_check_wires_every_state_machine():

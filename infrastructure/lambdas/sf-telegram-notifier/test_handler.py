@@ -438,7 +438,12 @@ def test_format_duration_handles_missing_timestamps():
 
 
 def test_succeeded_hollow_predictor_training_flags_loud(reset_send_message):
-    """config#1672: implausibly fast PredictorTraining → HOLLOW-SUSPECT + loud push."""
+    """config#1672: implausibly fast PredictorTraining → HOLLOW-SUSPECT + loud push.
+
+    alpha-engine-config-I10574: floored/rendered on "WaitForPredictorTraining"
+    (the poll state) — "PredictorTraining" is the dispatch state, never
+    floored, so a fast dispatch alone would not be an anomaly.
+    """
     from datetime import datetime, timezone
 
     base = datetime(2026, 7, 3, 12, 0, 0, tzinfo=timezone.utc)
@@ -447,19 +452,19 @@ def test_succeeded_hollow_predictor_training_flags_loud(reset_send_message):
             {
                 "type": "TaskStateEntered",
                 "timestamp": base,
-                "stateEnteredEventDetails": {"name": "PredictorTraining"},
+                "stateEnteredEventDetails": {"name": "WaitForPredictorTraining"},
             },
             {
                 "type": "TaskStateExited",
                 "timestamp": base.replace(minute=2),
-                "stateExitedEventDetails": {"name": "PredictorTraining"},
+                "stateExitedEventDetails": {"name": "WaitForPredictorTraining"},
             },
         ],
     }
     result = index.handler(_event("SUCCEEDED"), None)
     text = _telegram_mod.send_message.call_args.args[0]
     assert "HOLLOW-SUSPECT" in text
-    assert "PredictorTraining" in text
+    assert "WaitForPredictorTraining" in text
     assert "⚠️" in text
     assert result["hollow_suspect"] is True
     assert result["silent"] is False

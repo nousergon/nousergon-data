@@ -42,9 +42,12 @@ def test_parse_task_state_durations_computes_wall_clock():
 
 
 def test_floor_breach_detected_when_under_minimum():
+    # alpha-engine-config-I10574: "PredictorTraining" is the dispatch state
+    # (never floored — see STATE_DURATION_FLOORS_SEC); the floor sits on its
+    # companion poll state, "WaitForPredictorTraining".
     start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
     rows = build_state_durations(
-        {"PredictorTraining": 120},
+        {"WaitForPredictorTraining": 120},
         is_preflight=False,
         execution_start=start,
         run_date="2026-07-04",
@@ -58,7 +61,7 @@ def test_floor_breach_detected_when_under_minimum():
 def test_preflight_suppresses_floor_breach():
     start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
     rows = build_state_durations(
-        {"PredictorTraining": 30},
+        {"WaitForPredictorTraining": 30},
         is_preflight=True,
         execution_start=start,
         run_date=None,
@@ -205,6 +208,8 @@ def test_format_digest_sorts_anomalies_visually():
 
 
 def test_build_execution_digest_hollow_on_fast_predictor():
+    # alpha-engine-config-I10574: floored/attested on "WaitForPredictorTraining"
+    # (the poll state), not "PredictorTraining" (the dispatch state).
     start_ms = 1_700_000_000_000
     sf = MagicMock()
     base = datetime.fromtimestamp(start_ms / 1000, tz=timezone.utc)
@@ -213,12 +218,12 @@ def test_build_execution_digest_hollow_on_fast_predictor():
             {
                 "type": "TaskStateEntered",
                 "timestamp": base,
-                "stateEnteredEventDetails": {"name": "PredictorTraining"},
+                "stateEnteredEventDetails": {"name": "WaitForPredictorTraining"},
             },
             {
                 "type": "TaskStateExited",
                 "timestamp": _ts(base, 90),
-                "stateExitedEventDetails": {"name": "PredictorTraining"},
+                "stateExitedEventDetails": {"name": "WaitForPredictorTraining"},
             },
         ],
     }
@@ -232,8 +237,8 @@ def test_build_execution_digest_hollow_on_fast_predictor():
     )
     assert hollow is True
     assert detailed_cause is None
-    assert any("PredictorTraining" in line for line in lines)
-    assert STATE_DURATION_FLOORS_SEC["PredictorTraining"] == 20 * 60
+    assert any("WaitForPredictorTraining" in line for line in lines)
+    assert STATE_DURATION_FLOORS_SEC["WaitForPredictorTraining"] == 20 * 60
 
 
 def test_parse_run_date_from_execution_name_extracts_iso_date():
