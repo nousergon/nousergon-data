@@ -1576,6 +1576,23 @@ alert_classes:
     # DECLARED: a DRILL. A drill result is conformance evidence, never an
     # outage.
     tier: tracked-only
+  - class: router_spend_export_pricing_zero
+    # alpha-engine-config-I10548 (nous-ergon-ops-PR1212): new registry row
+    # for a previously-undeclared source. router-spend-export's daily export
+    # fires this at warning severity when it finds a model_served with
+    # tokens recorded but $0.0000 spend against a registry row that carries
+    # a non-zero price card (deployed-but-unpriced, e.g. glm-5.2-direct
+    # before alpha-engine-config-PR10549) -- invisible spend, not free usage.
+    source: "router-spend-export"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: a correctness/observability defect in the router's OWN price
+    # config, never an outage -- nothing is down, no call is failing. Worth a
+    # human's attention (it hides real spend from every cost surface) but not
+    # tonight's page; it clears on its own once the generator emits a price
+    # for the row (alpha-engine-config-PR10549 is exactly that fix).
+    tier: notify-silent
 
   # ── DRAIN-BLIND rows (every one carries its migration or declaration) ──
   - class: executor_emergency_shutdown
