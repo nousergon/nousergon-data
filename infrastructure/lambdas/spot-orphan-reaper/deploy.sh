@@ -95,7 +95,7 @@ print('index.py syntax OK')
 # import-guard pattern) — NOT the caller's global site-packages, not bundled
 # into the Lambda zip.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
 run_handler_tests "${SCRIPT_DIR}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Bootstrap (first-time only) ---------------------------------------

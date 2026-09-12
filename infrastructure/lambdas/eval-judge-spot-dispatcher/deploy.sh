@@ -122,7 +122,7 @@ source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 # minimal-set half of the helper's declared deploy.sh-vs-ci.yml contract. boto3
 # is deliberately absent: the helper never installs it implicitly, and index.py
 # reaches AWS only through the stubbed spot_dispatch chokepoint.
-KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" krepis)
 run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}"
 
 # ----- 1. Package: pip install deps (Lambda-safe) + zip handler --------------
