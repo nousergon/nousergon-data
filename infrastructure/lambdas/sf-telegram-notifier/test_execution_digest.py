@@ -12,6 +12,7 @@ from execution_digest import (
     STATE_DURATION_FLOORS_SEC,
     build_execution_digest,
     build_state_durations,
+    fetch_execution_history,
     format_digest_lines,
     parse_run_date_from_execution_name,
     parse_task_state_durations,
@@ -148,6 +149,51 @@ def test_poll_morning_arctic_append_spot_floor_still_catches_a_confirmed_broken_
     assert rows[0].anomaly is True
 
 
+def test_weekly_wait_floors_recalibrated_off_the_poll_states_not_dispatch():
+    # alpha-engine-config-I10545: the prior floors sat on "MorningEnrich" /
+    # "DataPhase1" (the SSM dispatch Task states), which enter+exit in well
+    # under a second every run (measured 0.22s / 0.24s on the 2026-09-12
+    # execution) — a floor there breaches unconditionally. Floors now sit on
+    # the poll states that actually span the workload, ~20% below the
+    # measured minimum across the last four canonical weekly runs (min
+    # WaitForMorningEnrich 31.7min=1902s, min WaitForDataPhase1 83.6min=5016s).
+    assert "MorningEnrich" not in STATE_DURATION_FLOORS_SEC
+    assert "DataPhase1" not in STATE_DURATION_FLOORS_SEC
+    assert STATE_DURATION_FLOORS_SEC["WaitForMorningEnrich"] == 25 * 60
+    assert STATE_DURATION_FLOORS_SEC["WaitForDataPhase1"] == 67 * 60
+
+
+def test_weekly_wait_floors_clear_the_measured_minimum_genuine_runs():
+    # The slowest-to-clear genuine minimums measured (31.7min / 83.6min) must
+    # not breach the new floors.
+    start = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"WaitForMorningEnrich": int(31.7 * 60), "WaitForDataPhase1": int(83.6 * 60)},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-09-12",
+        s3_client=None,
+    )
+    assert all(not r.floor_breach for r in rows)
+
+
+def test_dispatch_state_duration_still_renders_with_no_floor():
+    # The dispatch states are dropped from STATE_DURATION_FLOORS_SEC, not
+    # from the digest entirely — no whitelist filter (alpha-engine-config-
+    # I6857): a state absent from the floor mapping renders with no floor,
+    # it is never dropped.
+    start = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
+    rows = build_state_durations(
+        {"MorningEnrich": 0},
+        is_preflight=False,
+        execution_start=start,
+        run_date="2026-09-12",
+        s3_client=None,
+    )
+    assert rows[0].floor_sec is None
+    assert rows[0].floor_breach is False
+
+
 def test_format_digest_sorts_anomalies_visually():
     rows = [
         StateDuration("Backtester", 600, 600, False, False),
@@ -210,6 +256,101 @@ def test_parse_run_date_from_execution_name_returns_none_without_a_date():
 def test_parse_run_date_from_execution_name_returns_none_for_empty_input():
     assert parse_run_date_from_execution_name(None) is None
     assert parse_run_date_from_execution_name("") is None
+
+
+# ── History pagination must not silently truncate a re-entered state's span
+#   (alpha-engine-config-I10545) ───────────────────────────────────────────
+#
+# Live 2026-09-12: ne-weekly-freshness-pipeline's WaitForDataPhase1 (a Task
+# state re-entered every ~15s across a 103.35min poll loop) produced 8916
+# raw history events across 42 pages. The old max_pages=20 cap silently
+# dropped everything past page 20 — parse_task_state_durations is correctly
+# first-entry->last-exit, but fed a truncated event list it computes a real,
+# short, WRONG span (34m instead of 103.35m), and the digest rendered it with
+# a plain "✓". These tests guard both that a legitimately large history is no
+# longer truncated at the old cap, and that when the (much higher, but still
+# finite) new cap IS exhausted, the digest says so instead of asserting ✓.
+
+
+def _paged_history_client(total_pages: int, events_per_page: int = 3):
+    """A MagicMock sf_client whose get_execution_history hands back
+    `total_pages` pages before nextToken goes empty."""
+    sf = MagicMock()
+    pages = []
+    for i in range(total_pages):
+        page_events = [
+            {
+                "type": "TaskStateEntered",
+                "timestamp": _ts(datetime(2026, 9, 12, tzinfo=timezone.utc), i * events_per_page + j),
+                "stateEnteredEventDetails": {"name": f"Filler{i}-{j}"},
+            }
+            for j in range(events_per_page)
+        ]
+        resp = {"events": page_events}
+        if i < total_pages - 1:
+            resp["nextToken"] = f"token-{i}"
+        pages.append(resp)
+    sf.get_execution_history.side_effect = pages
+    return sf
+
+
+def test_fetch_execution_history_paginates_past_the_old_twenty_page_cap():
+    # 25 pages exceeds the OLD max_pages=20 cap but is well inside the new
+    # default (_MAX_HISTORY_PAGES=150, headroom over the measured 42-page
+    # need). Every event across every page must come back, untruncated.
+    sf = _paged_history_client(total_pages=25, events_per_page=3)
+    events, truncated = fetch_execution_history(sf, "arn:exec")
+    assert len(events) == 25 * 3
+    assert truncated is False
+    assert sf.get_execution_history.call_count == 25
+
+
+def test_fetch_execution_history_reports_truncation_when_pages_exhausted():
+    # More pages exist (nextToken never runs out) than the caller's max_pages
+    # budget — the exact shape of the real 2026-09-12 run under the old cap.
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {
+        "events": [{"type": "TaskStateEntered", "timestamp": datetime.now(timezone.utc),
+                     "stateEnteredEventDetails": {"name": "Filler"}}],
+        "nextToken": "always-more",
+    }
+    events, truncated = fetch_execution_history(sf, "arn:exec", max_pages=5)
+    assert truncated is True
+    assert sf.get_execution_history.call_count == 5
+
+
+def test_build_execution_digest_announces_truncation_and_forces_hollow(monkeypatch):
+    import execution_digest as ed
+
+    monkeypatch.setattr(ed, "_MAX_HISTORY_PAGES", 2)
+    base = datetime(2026, 9, 12, tzinfo=timezone.utc)
+    sf = MagicMock()
+    sf.get_execution_history.return_value = {
+        "events": [
+            {
+                "type": "TaskStateEntered",
+                "timestamp": base,
+                "stateEnteredEventDetails": {"name": "Backtester"},
+            },
+            {
+                "type": "TaskStateExited",
+                "timestamp": _ts(base, 600),
+                "stateExitedEventDetails": {"name": "Backtester"},
+            },
+        ],
+        "nextToken": "always-more",
+    }
+    lines, hollow, _cause = build_execution_digest(
+        execution_arn="arn:exec",
+        is_preflight=False,
+        execution_start_ms=int(base.timestamp() * 1000),
+        run_date="2026-09-12",
+        sf_client=sf,
+        s3_client=None,
+    )
+    # A truncated history can only understate — never a silent ✓.
+    assert hollow is True
+    assert any("truncated" in line for line in lines)
 
 
 def test_history_fetch_failure_surfaces_marker():

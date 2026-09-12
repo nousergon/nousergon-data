@@ -22,9 +22,30 @@ S3_BUCKET = "alpha-engine-research"
 # pipeline state names only, and not one preopen or postclose state appears
 # in either.
 STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
-    # Weekly — ne-weekly-freshness-pipeline
-    "MorningEnrich": 15 * 60,
-    "DataPhase1": 15 * 60,
+    # Weekly — ne-weekly-freshness-pipeline. Floors sit on the POLL states
+    # (WaitForMorningEnrich / WaitForDataPhase1), not the SSM sendCommand
+    # DISPATCH states (MorningEnrich / DataPhase1) — same defect class as the
+    # weekday PollMorningEnrichSpot/PollMorningArcticAppendSpot floors below:
+    # a dispatch Task returns in well under a second having only sent the
+    # command, so a floor there fires on every healthy run. RECALIBRATED
+    # 2026-09-12 (alpha-engine-config-I10545): the prior 15m floors sat on
+    # "MorningEnrich" / "DataPhase1" and breached on every run unconditionally
+    # — measured directly on the 09-12 execution
+    # (51f6aa74-939a-ba89-22a6-751c65d5f9e3_1067770b-6b63-aa1b-8b21-891b904fcdd0):
+    # MorningEnrich 0.22s, DataPhase1 0.24s, both always ~0s. The real
+    # workload is the poll loop; measured first-entry->last-exit span of the
+    # poll states across the last four canonical weekly runs (2026-08-22,
+    # 08-29, 09-05, 09-12):
+    #   WaitForMorningEnrich: 31.7 / 34.3 / 35.3 / 35.3 min (min 31.7min = 1902s)
+    #   WaitForDataPhase1:    83.6 / 87.2 / 88.2 / 103.4 min (min 83.6min = 5016s)
+    # New floors, ~20% below each measured minimum (n=4, smaller sample than
+    # the weekday recalibrations above, so the wider margin): WaitForMorningEnrich
+    # 1902*0.8=1521.6s -> 1500s (25m, ~21% below); WaitForDataPhase1
+    # 5016*0.8=4012.8s -> 4020s (67m, ~19.8% below). The dispatch states'
+    # floors are dropped entirely — an always-~0s state has no plausible
+    # non-zero floor to set.
+    "WaitForMorningEnrich": 25 * 60,
+    "WaitForDataPhase1": 67 * 60,
     "RAGIngestion": 10 * 60,
     "PredictorTraining": 20 * 60,
     "Backtester": 10 * 60,
@@ -107,9 +128,12 @@ STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
 # Display order for digest lines. States NOT listed here still render — they
 # sort after these, longest-running first. See _sort_key.
 DIGEST_STATE_ORDER: Tuple[str, ...] = (
-    # Weekly
-    "MorningEnrich",
-    "DataPhase1",
+    # Weekly. "MorningEnrich" / "DataPhase1" (the dispatch states) are
+    # deliberately NOT listed here (alpha-engine-config-I10545) — they carry
+    # no information, always ~0s. The poll states that actually span the
+    # workload lead the order instead.
+    "WaitForMorningEnrich",
+    "WaitForDataPhase1",
     "RAGIngestion",
     "ResearchPredictorParallel",
     "PredictorTraining",
@@ -478,14 +502,55 @@ def format_digest_lines(
     return lines
 
 
+# alpha-engine-config-I10545: a long weekly run's raw GetExecutionHistory is
+# NOT a handful of pages — the 2026-09-12 ne-weekly-freshness-pipeline
+# execution (51f6aa74-939a-ba89-22a6-751c65d5f9e3_1067770b-6b63-aa1b-8b21-
+# 891b904fcdd0) took 42 pages / 8916 events to reach its last event, because
+# the API pages by response SIZE (~1MB), not by a fixed event count — passing
+# maxResults=1000 does not guarantee anything close to 1000 events per page.
+# The old max_pages=20 cap silently truncated that execution's history well
+# before WaitForDataPhase1's true last exit, so parse_task_state_durations
+# (already first-entry->last-exit, not the bug) computed a real but WRONG
+# short span from a partial history — the digest rendered "WaitForDataPhase1
+# 34m ✓" against a true 103.35m span, a confidently-wrong number rather than
+# an honestly-incomplete one. 150 pages is ~3.6x the measured 42-page need,
+# generous headroom against a still-longer future run without letting a
+# truly runaway/malformed execution loop unbounded.
+_MAX_HISTORY_PAGES = 150
+
+# Rendered when fetch_execution_history exhausts _MAX_HISTORY_PAGES with more
+# history still unread. A truncated history can only UNDERSTATE durations for
+# any state whose last exit fell past the cutoff, so this must force the
+# digest into its anomaly path rather than let a partial computation render
+# a plain "✓" (alpha-engine-config-I10545) — the same "confidently wrong is
+# worse than honestly incomplete" standard last_workload_state_entered's own
+# docstring states for the HandleFailure exclusion.
+HISTORY_TRUNCATED_LINE = (
+    "_(history truncated at {pages} pages — durations below may be understated)_"
+)
+
+
 def fetch_execution_history(
     sf_client: Any,
     execution_arn: str,
     *,
-    max_pages: int = 20,
-) -> List[dict]:
+    max_pages: Optional[int] = None,
+) -> Tuple[List[dict], bool]:
+    """Returns ``(events, truncated)``. ``truncated`` is True only when
+    ``max_pages`` was exhausted with a ``nextToken`` still outstanding —
+    never inferred from event count, since a genuinely short execution's
+    history legitimately fits in one page.
+
+    ``max_pages`` defaults to the module-level ``_MAX_HISTORY_PAGES``,
+    resolved at CALL time rather than bound as a literal default — so tests
+    (and any future recalibration) can override the module constant without
+    also having to pass it through every call site.
+    """
+    if max_pages is None:
+        max_pages = _MAX_HISTORY_PAGES
     events: List[dict] = []
     token: Optional[str] = None
+    truncated = False
     for _ in range(max_pages):
         kwargs: dict[str, Any] = {
             "executionArn": execution_arn,
@@ -499,12 +564,14 @@ def fetch_execution_history(
         if not token:
             break
     else:
+        truncated = bool(token)
         logger.warning(
-            "execution history pagination capped at %s pages for %s",
+            "execution history pagination capped at %s pages for %s (truncated=%s)",
             max_pages,
             execution_arn,
+            truncated,
         )
-    return events
+    return events, truncated
 
 
 # The ssm-liveness-poller poll-result contract (README.md at
@@ -590,7 +657,7 @@ def build_execution_digest(
     if not execution_arn:
         return ["_(digest unavailable: missing executionArn)_"], False, None
     try:
-        events = fetch_execution_history(sf_client, execution_arn)
+        events, truncated = fetch_execution_history(sf_client, execution_arn)
     except Exception as exc:  # noqa: BLE001
         logger.error("get_execution_history failed for %s: %s", execution_arn, exc)
         return ["_(digest unavailable: history fetch failed)_"], False, None
@@ -605,9 +672,17 @@ def build_execution_digest(
         run_date=run_date,
         s3_client=s3_client,
     )
+    lines = format_digest_lines(rows, last_entered=last_workload_state_entered(events))
     hollow = any(r.anomaly for r in rows) if not is_preflight else False
+    if truncated:
+        # A truncated history can only understate a duration, never overstate
+        # one — so a truncated-but-otherwise-clean row set is still a
+        # confidently wrong "healthy" digest unless this forces the anomaly
+        # path (alpha-engine-config-I10545).
+        lines.append(HISTORY_TRUNCATED_LINE.format(pages=_MAX_HISTORY_PAGES))
+        hollow = True
     return (
-        format_digest_lines(rows, last_entered=last_workload_state_entered(events)),
+        lines,
         hollow,
         detailed_failure_cause,
     )
