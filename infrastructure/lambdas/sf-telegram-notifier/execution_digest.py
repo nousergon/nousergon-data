@@ -46,9 +46,33 @@ STATE_DURATION_FLOORS_SEC: Mapping[str, int] = {
     # non-zero floor to set.
     "WaitForMorningEnrich": 25 * 60,
     "WaitForDataPhase1": 67 * 60,
-    "RAGIngestion": 10 * 60,
-    "PredictorTraining": 20 * 60,
-    "Backtester": 10 * 60,
+    # RAGIngestion / PredictorTraining / Backtester RENAMED to their
+    # WaitForX poll companions 2026-09-12 (alpha-engine-config-I10574) — same
+    # defect class as WaitForMorningEnrich/WaitForDataPhase1 above, just not
+    # caught in the same pass. Each of these three names a DISPATCH Task
+    # (fires an SSM/spot command and returns) that measures 0.2-0.3s on every
+    # execution that reaches it; the real multi-minute-to-hour workload runs
+    # in a poll loop entered immediately after under "WaitForRAGIngestion" /
+    # "WaitForPredictorTraining" / "WaitForBacktester" — confirmed against the
+    # one genuine EventBridge-triggered SUCCEEDED execution in the account's
+    # full history carrying these states (9b34ac0f.../2026-08-08):
+    #   PredictorTraining 0.197s -> WaitForPredictorTraining 422s (7m2s)
+    #   RAGIngestion       0.189s -> WaitForRAGIngestion       1057s (17m37s)
+    #   Backtester         0.238s -> WaitForBacktester          663s (11m3s)
+    # The floor values below are UNCHANGED (not recalibrated) — only the key
+    # each floors now names is corrected. The account's SUCCEEDED-execution
+    # history for this state machine has exactly one canonical (EventBridge-
+    # triggered, name matching `<uuid>_<uuid>`) execution, below
+    # floor_calibration.MIN_SAMPLES — floor_calibration.py now filters
+    # ad hoc watch-rerun/offcycle-shell/friday-shell/recovery reruns out of
+    # the weekly machine's genuine population (they run a different,
+    # shorter bootstrap/skip path — see floor_calibration.py module
+    # docstring), so these three (and the two above) correctly report
+    # "unmeasurable" rather than a fabricated recommendation until more
+    # genuine canonical runs accumulate.
+    "WaitForRAGIngestion": 10 * 60,
+    "WaitForPredictorTraining": 20 * 60,
+    "WaitForBacktester": 10 * 60,
     # Was "ModelZooRotation", a state no definition has had for some time —
     # the rotation is ModelZooSelect -> ModelZooTrainMap ("ModelZooResolve"
     # is a phase LABEL in an error extractor, not a state),
@@ -134,11 +158,11 @@ DIGEST_STATE_ORDER: Tuple[str, ...] = (
     # workload lead the order instead.
     "WaitForMorningEnrich",
     "WaitForDataPhase1",
-    "RAGIngestion",
+    "WaitForRAGIngestion",
     "ResearchPredictorParallel",
-    "PredictorTraining",
+    "WaitForPredictorTraining",
     "DataPhase2",
-    "Backtester",
+    "WaitForBacktester",
     # "Parity" and "ModelZooRotation" were stale: the states were split into
     # the names below and this list was never updated, so both entries
     # ordered nothing for however long that has been true.
@@ -452,11 +476,18 @@ def build_state_durations(
         floor_breach = bool(floor is not None and secs < floor)
         attestation_failed = False
         if not is_preflight and s3_client is not None:
-            if name == "PredictorTraining" and name in durations_sec:
+            # alpha-engine-config-I10574: was "PredictorTraining" /
+            # "Backtester" (the dispatch states, renamed off
+            # STATE_DURATION_FLOORS_SEC above) — the attestation trigger
+            # must follow the same rename or it silently stops firing:
+            # dispatch names still appear in durations_sec (their own ~0.2s
+            # span), so a stale name here would attest against a row that
+            # completed before the real work even started.
+            if name == "WaitForPredictorTraining" and name in durations_sec:
                 attestation_failed = not _attest_predictor_training(
                     s3_client, execution_start=execution_start
                 )
-            elif name == "Backtester" and run_date and name in durations_sec:
+            elif name == "WaitForBacktester" and run_date and name in durations_sec:
                 attestation_failed = not _attest_backtester(
                     s3_client,
                     run_date=run_date,

@@ -44,12 +44,54 @@ broken run into the distribution. Where no companion key is declared, this
 module computes on raw duration and says so — DECLARED rather than inferred,
 same discipline ``execution_digest.py`` already applies to
 ``TERMINAL_ERROR_HANDLING_STATES`` / ``WORK_STATES_ON_TERMINAL_PATHS``.
+
+MEASURE THE SAME SPAN THE NOTIFIER FLOORS (alpha-engine-config-I10574). Every
+name in ``STATE_TO_STATE_MACHINE`` MUST be the exact state name that carries
+the workload span — never a dispatch Task that fires an SSM/spot command and
+returns in under a second while the real work runs in a polled child.
+``execution_digest.parse_task_state_durations`` (first-entry -> last-exit,
+the same function both this module and the live notifier call) is span-
+correct once pointed at the right name; pointed at a dispatch name it
+faithfully reports the dispatch's own ~0.2s duration, which is correct and
+useless. Measured live against the one genuine EventBridge-triggered
+SUCCEEDED ne-weekly-freshness-pipeline execution in the account's full
+history carrying these states (name
+9b34ac0f-5e2f-f70b-d668-61b4c4751654_6fb6adf9-55fa-4426-6d06-79e4579bcaff,
+2026-08-08): ``RAGIngestion``/``PredictorTraining``/``Backtester`` each enter
+and exit in 0.19-0.24s, immediately followed by
+``WaitForRAGIngestion``/``WaitForPredictorTraining``/``WaitForBacktester``
+poll loops spanning 1057s/422s/663s — the same dispatch-then-poll shape
+``WaitForMorningEnrich``/``WaitForDataPhase1`` were already renamed to track
+under alpha-engine-config-I10545. ``execution_digest.STATE_DURATION_FLOORS_SEC``
+carries the corresponding rename; see that file's comment for the measured
+values.
+
+CANONICAL EXECUTIONS ONLY, FOR THE WEEKLY MACHINE (alpha-engine-config-
+I10574). ``ne-weekly-freshness-pipeline``'s SUCCEEDED-execution history is
+NOT one population: alongside the daily EventBridge-triggered execution (name
+`<uuid>_<uuid>` — two UUID-shaped segments joined by "_", the only shape that
+trigger produces), the same history carries `watch-rerun-*`,
+`offcycle-shell-*`, `friday-shell-*`, `recovery-*` and bare-single-UUID ad hoc
+reruns/backfills. Measured across all 48 SUCCEEDED executions in the
+account's full history (2026-09-12): every ad hoc execution's
+WaitForMorningEnrich/WaitForDataPhase1 span was 30-151s (one to a handful of
+poll iterations — these reruns skip already-processed phases and their
+bootstrap legitimately returns fast), while the ONE canonical execution in
+that same history spans 1662s/2417s. Averaging the two populations together
+is exactly how ``min_genuine`` landed on 30.0s (the bare poll interval) for
+both states in the first `--check` run that had permission to reach live
+history (I10574) — a genuine value from a non-representative population, not
+a wrong measurement of the right one. ``_CANONICAL_EXECUTION_NAME_RE`` scopes
+this filter to the weekly machine only (``STATE_TO_STATE_MACHINE`` values in
+``_CANONICAL_NAME_SCOPED_MACHINES``); the weekday pipelines' own ad hoc-
+execution population, if any, is undocumented and out of scope here.
 """
 
 from __future__ import annotations
 
 import argparse
 import logging
+import re
 import statistics
 import sys
 from dataclasses import dataclass
@@ -73,14 +115,36 @@ STATE_TO_STATE_MACHINE: Mapping[str, str] = {
     # the workload.
     "WaitForMorningEnrich": "ne-weekly-freshness-pipeline",
     "WaitForDataPhase1": "ne-weekly-freshness-pipeline",
-    "RAGIngestion": "ne-weekly-freshness-pipeline",
-    "PredictorTraining": "ne-weekly-freshness-pipeline",
-    "Backtester": "ne-weekly-freshness-pipeline",
+    # alpha-engine-config-I10574: was "RAGIngestion" / "PredictorTraining" /
+    # "Backtester" — same dispatch-vs-poll defect as the two above, caught a
+    # PR later. See the module docstring's "MEASURE THE SAME SPAN" section.
+    "WaitForRAGIngestion": "ne-weekly-freshness-pipeline",
+    "WaitForPredictorTraining": "ne-weekly-freshness-pipeline",
+    "WaitForBacktester": "ne-weekly-freshness-pipeline",
     "ModelZooTrainMap": "ne-weekly-freshness-pipeline",
     "PollMorningEnrichSpot": "ne-preopen-trading-pipeline",
     "PollMorningArcticAppendSpot": "ne-preopen-trading-pipeline",
     "Scanner": "ne-preopen-trading-pipeline",
 }
+
+#: Weekly-machine executions whose NAME does not match this pattern are ad
+#: hoc reruns/backfills (`watch-rerun-*`, `offcycle-shell-*`,
+#: `friday-shell-*`, `recovery-*`, bare single UUIDs), not the daily
+#: EventBridge-triggered run — see the module docstring's "CANONICAL
+#: EXECUTIONS ONLY" section. The trigger names every execution it starts
+#: `<uuid>_<uuid>`: two UUID-shaped segments joined by "_".
+_CANONICAL_EXECUTION_NAME_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}_"
+    r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+)
+
+#: State machines whose SUCCEEDED-execution history mixes ad hoc reruns with
+#: the scheduled trigger (measured true for the weekly machine only —
+#: I10574). Scoped deliberately: applying an unmeasured filter to the
+#: weekday machines would silently change PollMorningEnrichSpot/
+#: PollMorningArcticAppendSpot's already-recalibrated (I10164) sample
+#: population for no measured reason.
+_CANONICAL_NAME_SCOPED_MACHINES = frozenset({"ne-weekly-freshness-pipeline"})
 
 #: States whose Task output carries a companion SSM-poll-result dict (the raw
 #: ssm:GetCommandInvocation shape: Status/ResponseCode/StatusDetails/
@@ -131,6 +195,14 @@ class FloorRecommendation:
     max_sec: Optional[float] = None
     recommended_floor_sec: Optional[int] = None
     basis: str = ""
+    #: Which HistoryEvent pair was measured (I10574 deliverable 3) — always
+    #: this shape today, named explicitly rather than left implicit so a
+    #: --check reader never has to open this module to know what a number
+    #: means.
+    event_pair: str = ""
+    #: Human-readable breakdown of WHY excluded samples were excluded (e.g.
+    #: "3 zero-duration, 5 non-canonical-execution") — "" when n_excluded==0.
+    exclusion_breakdown: str = ""
 
     @property
     def is_drift(self) -> bool:
@@ -150,15 +222,30 @@ def collect_state_duration_samples(
     *,
     fetch_history: Any,
 ) -> Dict[str, List[Dict[str, Any]]]:
-    """Per-state list of ``{"duration_sec": float, "poll_status": Optional[str]}``
-    samples across every SUCCEEDED execution of ``state_machine_arn``.
+    """Per-state list of ``{"duration_sec": float, "poll_status": Optional[str],
+    "exclusion_reason": Optional[str]}`` samples across every SUCCEEDED
+    execution of ``state_machine_arn``.
 
     ``fetch_history(sf_client, execution_arn) -> List[dict]`` is injected
     (rather than calling ``execution_digest.fetch_execution_history``
     directly) so tests can supply canned event lists without a live SF
     execution to point at — the same shape ``build_execution_digest`` already
     takes ``sf_client``/``s3_client`` as parameters for.
+
+    ``exclusion_reason`` is set here (never inferred later by
+    ``compute_recommendation`` alone) for the two reasons this function can
+    already see from one execution's events without needing the poll-status
+    cross-check: a zero-duration sample (a dispatch Task, not the poll span —
+    see module docstring "MEASURE THE SAME SPAN"), and a non-canonical
+    execution name on a machine in ``_CANONICAL_NAME_SCOPED_MACHINES`` (an ad
+    hoc rerun/backfill — see "CANONICAL EXECUTIONS ONLY"). A poll-status
+    exclusion (state has a ``KNOWN_POLL_STATUS_KEYS`` entry) is layered on
+    top by ``compute_recommendation``, which is the only place that already
+    special-cases it.
     """
+    machine_name = state_machine_arn.rsplit(":", 1)[-1]
+    canonical_only = machine_name in _CANONICAL_NAME_SCOPED_MACHINES
+
     samples: Dict[str, List[Dict[str, Any]]] = {name: [] for name in state_names}
     paginator = sf_client.get_paginator("list_executions")
     executions: List[dict] = []
@@ -166,20 +253,41 @@ def collect_state_duration_samples(
         executions.extend(page.get("executions", []))
 
     for execution in executions:
+        exec_name = execution.get("name") or ""
+        non_canonical = canonical_only and not _CANONICAL_EXECUTION_NAME_RE.match(exec_name)
         events = fetch_history(sf_client, execution["executionArn"])
         durations = parse_task_state_durations(events)
         last_outputs = _last_task_outputs(events, state_names)
         for name in state_names:
             if name not in durations:
                 continue
+            duration = durations[name]
             poll_status = None
             poll_key = KNOWN_POLL_STATUS_KEYS.get(name)
             if poll_key:
                 output = last_outputs.get(name)
                 if isinstance(output, dict):
                     poll_status = (output.get(poll_key) or {}).get("Status")
+            exclusion_reason: Optional[str] = None
+            if duration <= 0:
+                exclusion_reason = (
+                    "zero-duration sample — this Task fires a dispatch "
+                    "(SSM/spot command) and returns; the workload runs in a "
+                    "companion poll state, not here"
+                )
+            elif non_canonical:
+                exclusion_reason = (
+                    f"non-canonical execution name {exec_name!r} — an ad hoc "
+                    "rerun/backfill/offcycle-shell, not the scheduled "
+                    "EventBridge-triggered run; its bootstrap/skip semantics "
+                    "differ from a genuine weekly pass"
+                )
             samples[name].append(
-                {"duration_sec": durations[name], "poll_status": poll_status}
+                {
+                    "duration_sec": duration,
+                    "poll_status": poll_status,
+                    "exclusion_reason": exclusion_reason,
+                }
             )
     return samples
 
@@ -213,22 +321,59 @@ def compute_recommendation(
 ) -> FloorRecommendation:
     """One state's recommendation, from its collected samples.
 
-    ``samples`` items carry ``duration_sec`` and (when the state has a
-    ``KNOWN_POLL_STATUS_KEYS`` entry) ``poll_status``. GENUINE samples are
-    those with no companion key declared (raw duration is all there is) OR
-    ``poll_status == "Success"``. A companion key present with a non-Success
-    status is EXCLUDED from the genuine set, never averaged in.
+    ``samples`` items carry ``duration_sec``, an optional ``exclusion_reason``
+    set by ``collect_state_duration_samples`` (zero-duration or non-canonical
+    execution — see that function's docstring), and (when the state has a
+    ``KNOWN_POLL_STATUS_KEYS`` entry) ``poll_status``. A sample is GENUINE
+    only when it carries no ``exclusion_reason`` AND (no companion poll key
+    is declared OR ``poll_status == "Success"``). Every excluded sample keeps
+    its reason — never silently dropped, never averaged in.
     """
     has_poll_key = state_name in KNOWN_POLL_STATUS_KEYS
-    if has_poll_key:
-        genuine = [s["duration_sec"] for s in samples if s.get("poll_status") == "Success"]
-        excluded = [s for s in samples if s.get("poll_status") != "Success"]
-    else:
-        genuine = [s["duration_sec"] for s in samples]
-        excluded = []
+    genuine: List[float] = []
+    excluded: List[Mapping[str, Any]] = []
+    reason_counts: Dict[str, int] = {}
+
+    for s in samples:
+        reason = s.get("exclusion_reason")
+        bucket = "zero-duration" if reason and "zero-duration" in reason else (
+            "non-canonical-execution" if reason and "non-canonical" in reason else None
+        )
+        if reason is None and s.get("duration_sec", 0) <= 0:
+            # Defense in depth: collect_state_duration_samples already tags
+            # this, but compute_recommendation never trusts an upstream
+            # caller to have done so — a 0s sample is excluded here
+            # unconditionally (I10574 deliverable 1).
+            reason = (
+                "zero-duration sample — this Task fires a dispatch "
+                "(SSM/spot command) and returns; the workload runs in a "
+                "companion poll state, not here"
+            )
+            bucket = "zero-duration"
+        if reason is None and has_poll_key and s.get("poll_status") != "Success":
+            reason = (
+                f"poll_status={s.get('poll_status')!r} (not 'Success') — a "
+                "broken-but-SUCCEEDED run"
+            )
+            bucket = "poll-status-failure"
+        if reason is None:
+            genuine.append(s["duration_sec"])
+        else:
+            excluded.append(s)
+            reason_counts[bucket or "other"] = reason_counts.get(bucket or "other", 0) + 1
 
     n_genuine = len(genuine)
     n_excluded = len(excluded)
+    exclusion_breakdown = (
+        ", ".join(f"{count} {bucket}" for bucket, count in sorted(reason_counts.items()))
+        if reason_counts
+        else ""
+    )
+    event_pair = (
+        f"TaskStateEntered/TaskStateExited on '{state_name}' "
+        "(stateEnteredEventDetails.name / stateExitedEventDetails.name), "
+        "first entry -> last exit"
+    )
 
     if n_genuine < MIN_SAMPLES:
         return FloorRecommendation(
@@ -237,6 +382,8 @@ def compute_recommendation(
             current_floor_sec=current_floor_sec,
             n_genuine=n_genuine,
             n_excluded=n_excluded,
+            event_pair=event_pair,
+            exclusion_breakdown=exclusion_breakdown,
             basis=(
                 f"only {n_genuine} genuine sample(s), below MIN_SAMPLES={MIN_SAMPLES} — "
                 "no recommendation computed; floor left as-is and recorded unmeasurable, "
@@ -263,6 +410,8 @@ def compute_recommendation(
             median_sec=median_sec,
             p90_sec=p90_sec,
             max_sec=max_sec,
+            event_pair=event_pair,
+            exclusion_breakdown=exclusion_breakdown,
             basis=(
                 f"spread max/min = {max_sec / min_sec:.4f} < {DEGENERATE_SPREAD_RATIO} — "
                 "distribution implausibly tight (a synthetic/backfill-only sample set, or a "
@@ -292,6 +441,8 @@ def compute_recommendation(
         p90_sec=p90_sec,
         max_sec=max_sec,
         recommended_floor_sec=recommended,
+        event_pair=event_pair,
+        exclusion_breakdown=exclusion_breakdown,
         basis=(
             f"recommended = round(min_genuine * (1-{MARGIN})) = "
             f"round({min_sec:.1f} * {1 - MARGIN}) = {recommended}s; "
@@ -323,7 +474,10 @@ def compute_all_recommendations(
 
 
 def render_report(recommendations: Sequence[FloorRecommendation]) -> str:
-    lines = ["state,status,current_floor_sec,n_genuine,n_excluded,recommended_floor_sec,basis"]
+    lines = [
+        "state,status,current_floor_sec,n_genuine,n_excluded,recommended_floor_sec,"
+        "event_pair,exclusion_breakdown,basis"
+    ]
     for rec in recommendations:
         lines.append(
             ",".join(
@@ -334,6 +488,8 @@ def render_report(recommendations: Sequence[FloorRecommendation]) -> str:
                     str(rec.n_genuine),
                     str(rec.n_excluded),
                     "" if rec.recommended_floor_sec is None else str(rec.recommended_floor_sec),
+                    f'"{rec.event_pair}"',
+                    f'"{rec.exclusion_breakdown}"',
                     f'"{rec.basis}"',
                 ]
             )
