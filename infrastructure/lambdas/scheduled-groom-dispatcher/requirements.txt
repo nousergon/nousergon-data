@@ -83,4 +83,4 @@ boto3>=1.34.0
 # `flow-doctor` right: the sweep that fixed that symbol never looked for a
 # SECOND underscored extra, and scripts/lint_extras.py never opened this file
 # at all (it globbed the repo root only). Both are fixed in this PR.
-nousergon-lib[flow-doctor,github-app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.119
+nousergon-lib[flow-doctor,github-app] @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
