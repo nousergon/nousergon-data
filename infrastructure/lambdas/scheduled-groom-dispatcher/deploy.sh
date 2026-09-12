@@ -238,7 +238,7 @@ print('index.py syntax OK')
 # caller's global site-packages, not bundled into the Lambda zip. (krepis was
 # removed 2026-07-14 with the pace gate — usage pacing dismantled.)
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
 run_handler_tests "${SCRIPT_DIR}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------

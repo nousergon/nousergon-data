@@ -116,8 +116,8 @@ print('index.py syntax OK')
 # krepis are installed for real by the shared gate into its own scratch dir — NOT the
 # caller's global site-packages, not bundled into the Lambda zip.
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
+KREPIS_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" krepis)
 run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler ---------------------------

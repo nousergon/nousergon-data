@@ -111,8 +111,8 @@ source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 # requirements.txt and hand them to the shared runner — the shape
 # saturday-sf-watch-dispatcher/deploy.sh already uses, so the test venv
 # matches what the function actually ships rather than a subset of it.
-NOUSERGON_LIB_REQ=$(grep -E '^nousergon-lib' "${SCRIPT_DIR}/requirements.txt" | head -1)
-KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+NOUSERGON_LIB_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)
+KREPIS_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" krepis)
 run_handler_tests "${SCRIPT_DIR}" boto3 "${KREPIS_REQ}" "${NOUSERGON_LIB_REQ}"
 
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"

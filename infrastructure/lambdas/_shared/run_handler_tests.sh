@@ -74,6 +74,49 @@
 #     config against the REAL fleet spec — then fails on import. It passes
 #     alone and fails in a full run, i.e. the result depended on collection
 #     order. Separate processes make each file's answer its own.
+# requirement_pin REQUIREMENTS_FILE PACKAGE
+#   Prints the FIRST line of REQUIREMENTS_FILE matching ^PACKAGE, with any
+#   inline `# ...` comment and trailing whitespace stripped, so it is safe to
+#   hand to `pip install` as a command-line argument. Exits non-zero (and
+#   prints a message to stderr) if no line matches.
+#
+# WHY (alpha-engine-config-I10337, eval-judge-spot-dispatcher run 34711758231
+# and 34312894868): eight deploy.sh scripts each did
+#   KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+# and passed the WHOLE matched line — including a legitimate lockstep-bump
+# trailing comment like
+#   krepis==0.59.54  # bumped 0.59.41 -> 0.59.54: ... alpha-engine-config-I10226
+# — straight to `pip install` as an argument. A requirements FILE tolerates an
+# inline comment; a pip command-line ARGUMENT does not:
+#   ERROR: Invalid requirement: 'krepis==0.59.54  # bumped ... run 34309659890'
+# eval-judge-spot-dispatcher's pin happened to carry a comment on the day this
+# was found; the other seven sites carry the identical unguarded grep and
+# break the next time a lockstep bump annotates THEIR pin. One helper closes
+# the class instead of patching the one instance.
+#
+# Also fails loud on a missing pin: the old `grep | head -1` silently produced
+# an EMPTY string when nothing matched, which `run_handler_tests` would then
+# happily install as "pytest" with no extra requirement at all — a missing pin
+# read as "no extra deps needed" instead of as the config error it is.
+requirement_pin() {
+  local req_file="$1" pkg="$2"
+  local line
+  line="$(grep -E "^${pkg}" "${req_file}" | head -1)"
+  if [[ -z "${line}" ]]; then
+    echo "requirement_pin: no '${pkg}' requirement found in ${req_file}" >&2
+    return 1
+  fi
+  # Strip a trailing inline comment (the lockstep-bump annotation convention)
+  # and any whitespace left dangling before it.
+  line="${line%%#*}"
+  line="${line%"${line##*[![:space:]]}"}"
+  if [[ -z "${line}" ]]; then
+    echo "requirement_pin: '${pkg}' line in ${req_file} is comment-only after stripping" >&2
+    return 1
+  fi
+  echo "${line}"
+}
+
 run_handler_tests() {
   local script_dir="$1"; shift
   local test_file="${script_dir}/test_handler.py"

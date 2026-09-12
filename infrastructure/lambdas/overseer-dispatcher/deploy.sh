@@ -69,7 +69,7 @@ print('index.py syntax OK')
 
 # ----- 0b. Preflight handler unit tests --------------------------------------
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-KREPIS_REQ=$(grep -E '^krepis' "${SCRIPT_DIR}/requirements.txt" | head -1)
+KREPIS_REQ=$(requirement_pin "${SCRIPT_DIR}/requirements.txt" krepis)
 run_handler_tests "${SCRIPT_DIR}" "${KREPIS_REQ}"
 
 # ----- 1. Package: pip install deps + zip handler + bundle registry ---------
