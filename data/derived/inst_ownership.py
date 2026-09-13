@@ -18,7 +18,7 @@ Approach (per I2428 scope):
 
 1. Download current and prior quarter ZIPs.
 2. Parse INFOTABLE from both → aggregate per CUSIP.
-3. Resolve CUSIP → ticker via yfinance crosswalk.
+3. Resolve CUSIP → ticker via the OpenFIGI mapping API (cached in S3).
 4. Compute QoQ share/value deltas + top-N concentration per ticker.
 5. Write parquet to ``data/derived/inst_ownership/{quarter}/{ticker}.parquet``
    (one file per ticker for incremental reads, plus a quarterly aggregate).
@@ -45,12 +45,13 @@ import io
 import json
 import logging
 import os
+import tempfile
 import time
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date as Date
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Protocol
 
 import pandas as pd
 import requests
@@ -87,6 +88,16 @@ _SEC_HEADERS = {
 
 # Cache TTL for CUSIP→ticker crosswalk (days).
 _CUSIP_CACHE_TTL_DAYS = 30
+
+# OpenFIGI mapping API (alpha-engine-config-I10529). Keyless: 25 req/min,
+# 10 jobs/request. With ``OPENFIGI_API_KEY`` (X-OPENFIGI-APIKEY header):
+# 250 req/min, 100 jobs/request. https://www.openfigi.com/api
+OPENFIGI_MAPPING_URL = "https://api.openfigi.com/v3/mapping"
+OPENFIGI_KEYLESS_BATCH_SIZE = 10
+OPENFIGI_KEYLESS_RATE_PER_MIN = 25
+OPENFIGI_KEYED_BATCH_SIZE = 100
+OPENFIGI_KEYED_RATE_PER_MIN = 250
+OPENFIGI_API_KEY_ENV_VAR = "OPENFIGI_API_KEY"
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -209,24 +220,28 @@ def load_universe_from_membership(
 
 
 def _load_cusip_cache(s3_client: Any | None, bucket: str) -> dict[str, str]:
-    """Load cached CUSIP→ticker mapping from S3, if fresh.
+    """Load the persisted CUSIP→ticker mapping from S3.
 
-    Returns empty dict if no cache or stale.
+    Returns it regardless of ``_CUSIP_CACHE_TTL_DAYS`` age (CUSIP→ticker is
+    stable enough that a stale-but-present entry beats no entry — it is
+    still the substitutability fallback below when OpenFIGI is
+    unreachable); only logs when the cache has aged past the TTL, as a
+    signal a rebuild may be worth checking. Returns ``{}`` if there is no
+    S3 client, no cache object, or it fails to parse.
     """
     if s3_client is None:
         return {}
     try:
-        from datetime import date as _Date
         obj = s3_client.get_object(
             Bucket=bucket, Key="data/crosswalks/cusip_to_ticker.json"
         )
         payload = json.loads(obj["Body"].read().decode("utf-8"))
-        cached_date = _Date.fromiso_string(payload.get("as_of", "2000-01-01"))
-        if (_Date.today() - cached_date).days < _CUSIP_CACHE_TTL_DAYS:
-            return payload.get("mapping", {})
-        logger.info("cusip cache stale — will rebuild")
-    except Exception:
-        pass
+        cached_date = Date.fromisoformat(payload.get("as_of", "2000-01-01"))
+        if (Date.today() - cached_date).days >= _CUSIP_CACHE_TTL_DAYS:
+            logger.info("cusip cache is older than %d days", _CUSIP_CACHE_TTL_DAYS)
+        return payload.get("mapping", {})
+    except Exception as e:
+        logger.info("cusip cache unreadable (%s) — starting from empty cache", type(e).__name__)
     return {}
 
 
@@ -234,9 +249,8 @@ def _save_cusip_cache(
     mapping: dict[str, str], *, s3_client: Any, bucket: str,
 ) -> None:
     """Persist CUSIP→ticker mapping to S3."""
-    from datetime import date as _Date
     payload = {
-        "as_of": _Date.today().isoformat(),
+        "as_of": Date.today().isoformat(),
         "schema_version": 1,
         "mapping": mapping,
     }
@@ -249,56 +263,176 @@ def _save_cusip_cache(
     logger.info("cusip cache written (%d entries)", len(mapping))
 
 
+class IdentifierMapper(Protocol):
+    """Maps security identifiers (CUSIP) to tickers.
+
+    One vendor = one implementation behind this protocol — a different
+    mapping vendor is a new class, never a change to every call site
+    (principles.md #8, substitutability).
+    """
+
+    def map_cusips(self, cusips: list[str]) -> dict[str, str]:
+        """Return ``{cusip: ticker}`` for whichever cusips could be resolved.
+
+        Silently omits cusips it could not resolve — callers treat a
+        missing key as "unmapped", not an error.
+        """
+        ...
+
+
+class CachedMapper:
+    """Resolves CUSIPs against a preloaded mapping — no network.
+
+    This is the substitutability fallback for ``OpenFigiMapper``: when the
+    live API is down, rate-limited, or keyless-throttled, a run still
+    produces from whatever was already resolved on a prior run.
+    """
+
+    def __init__(self, cache: dict[str, str]) -> None:
+        self._cache = cache
+
+    def map_cusips(self, cusips: list[str]) -> dict[str, str]:
+        return {c: self._cache[c] for c in cusips if c in self._cache}
+
+
+class _TokenBucket:
+    """Token-bucket rate limiter: at most ``rate`` operations per
+    ``per_seconds``. ``time_fn``/``sleep_fn`` are injectable so tests don't
+    sleep on a real clock.
+    """
+
+    def __init__(
+        self,
+        rate: int,
+        per_seconds: float,
+        *,
+        time_fn: Any = time.monotonic,
+        sleep_fn: Any = time.sleep,
+    ) -> None:
+        self._rate = float(rate)
+        self._per_seconds = per_seconds
+        self._time_fn = time_fn
+        self._sleep_fn = sleep_fn
+        self._tokens = float(rate)
+        self._last = time_fn()
+
+    def acquire(self) -> None:
+        now = self._time_fn()
+        elapsed = now - self._last
+        self._last = now
+        self._tokens = min(self._rate, self._tokens + elapsed * (self._rate / self._per_seconds))
+        if self._tokens < 1.0:
+            wait = (1.0 - self._tokens) * (self._per_seconds / self._rate)
+            self._sleep_fn(wait)
+            self._tokens = 0.0
+            self._last = self._time_fn()
+        else:
+            self._tokens -= 1.0
+
+
+class OpenFigiMapper:
+    """CUSIP→ticker resolution via the OpenFIGI mapping API.
+
+    Keyless: 25 req/min, 10 jobs/request. With an API key
+    (``X-OPENFIGI-APIKEY`` header, read from ``OPENFIGI_API_KEY`` by the
+    caller): 250 req/min, 100 jobs/request. Keyless works, just slower —
+    this must never be a hard dependency on the key existing.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str | None = None,
+        http_post: Any = None,
+        batch_size: int | None = None,
+        rate_limit_per_min: int | None = None,
+        bucket: "_TokenBucket | None" = None,
+    ) -> None:
+        self.api_key = api_key
+        self._post = http_post or self._default_post
+        self.batch_size = batch_size or (
+            OPENFIGI_KEYED_BATCH_SIZE if api_key else OPENFIGI_KEYLESS_BATCH_SIZE
+        )
+        rate = rate_limit_per_min or (
+            OPENFIGI_KEYED_RATE_PER_MIN if api_key else OPENFIGI_KEYLESS_RATE_PER_MIN
+        )
+        self._bucket = bucket or _TokenBucket(rate, 60.0)
+
+    @staticmethod
+    def _default_post(url: str, *, json: Any, headers: dict[str, str], timeout: int):
+        return requests.post(url, json=json, headers=headers, timeout=timeout)
+
+    def map_cusips(self, cusips: list[str]) -> dict[str, str]:
+        mapping: dict[str, str] = {}
+        unique = list(dict.fromkeys(c for c in cusips if c))
+        for i in range(0, len(unique), self.batch_size):
+            batch = unique[i:i + self.batch_size]
+            self._bucket.acquire()
+            jobs = [{"idType": "ID_CUSIP", "idValue": c, "exchCode": "US"} for c in batch]
+            headers = {"Content-Type": "application/json"}
+            if self.api_key:
+                headers["X-OPENFIGI-APIKEY"] = self.api_key
+            try:
+                resp = self._post(OPENFIGI_MAPPING_URL, json=jobs, headers=headers, timeout=30)
+                resp.raise_for_status()
+                results = resp.json()
+            except Exception as e:
+                logger.warning(
+                    "OpenFIGI mapping request failed for batch of %d cusips: %s: %s",
+                    len(batch), type(e).__name__, e,
+                )
+                continue
+            for cusip, result in zip(batch, results):
+                data = (result or {}).get("data") or []
+                if data:
+                    ticker = data[0].get("ticker")
+                    if ticker:
+                        mapping[cusip] = str(ticker).upper()
+        return mapping
+
+
 def build_cusip_to_ticker(
-    universe_tickers: list[str],
+    cusips: set[str] | list[str],
     *,
     s3_client: Any | None = None,
     bucket: str = DEFAULT_S3_BUCKET,
     force_rebuild: bool = False,
+    api_key: str | None = None,
+    mapper: "IdentifierMapper | None" = None,
 ) -> dict[str, str]:
-    """Build ``{cusip: ticker}`` from universe tickers via yfinance.
+    """Resolve ``{cusip: ticker}`` for the given CUSIPs — the CUSIPs that
+    actually appear in the SEC INFOTABLE rows being processed, not the
+    universe tickers (the mapping direction the filings carry is
+    CUSIP→ticker, not the reverse).
 
-    Checks and updates an S3 cache to avoid re-querying yfinance on
-    every run. Skips tickers where yfinance has no CUSIP or the
-    CUSIP is malformed.
+    Reads the persisted S3 crosswalk cache first (``CachedMapper``,
+    ``force_rebuild`` bypasses it) and only queries OpenFIGI
+    (``OpenFigiMapper`` by default, or ``mapper`` for tests/other
+    vendors) for whatever the cache doesn't already have. The cache is the
+    substitutability fallback: a run with OpenFIGI down still produces
+    from cached mappings, and logs how many CUSIPs stayed unmapped.
     """
-    if not force_rebuild:
-        cached = _load_cusip_cache(s3_client, bucket)
-        if cached:
-            logger.info("using cached cusip→ticker mapping (%d entries)", len(cached))
-            return cached
+    cusip_list = sorted({c for c in cusips if c})
+    cache = {} if force_rebuild else _load_cusip_cache(s3_client, bucket)
+    mapping = dict(CachedMapper(cache).map_cusips(cusip_list))
+    missing = [c for c in cusip_list if c not in mapping]
 
-    try:
-        import yfinance as yf
-    except ImportError:
-        logger.warning("yfinance not available — cusip resolution disabled")
-        return {}
+    resolved_count = 0
+    if missing:
+        live_mapper = mapper or OpenFigiMapper(api_key=api_key)
+        resolved = live_mapper.map_cusips(missing)
+        mapping.update(resolved)
+        resolved_count = len(resolved)
 
-    mapping: dict[str, str] = {}
-    errors = 0
-    for i, ticker in enumerate(sorted(set(universe_tickers))):
-        try:
-            info = yf.Ticker(ticker).info or {}
-            cusip = info.get("cusip")
-            if cusip and isinstance(cusip, str) and len(cusip) == 9:
-                mapping[cusip] = ticker.upper()
-            if i > 0 and i % 50 == 0:
-                logger.info("cusip resolution: %d/%d tickers", i, len(universe_tickers))
-        except Exception:
-            errors += 1
-            if errors > 10:
-                logger.warning("too many cusip lookup errors — stopping early")
-                break
-            continue
-        time.sleep(0.1)  # yfinance rate limiter
-
+    unmapped = len(cusip_list) - len(mapping)
     logger.info(
-        "cusip→ticker built: %d mapped (%d errors)",
-        len(mapping), errors,
+        "cusip→ticker: %d total, %d from cache, %d resolved via OpenFIGI, %d unmapped",
+        len(cusip_list), len(cusip_list) - len(missing), resolved_count, unmapped,
     )
 
     if s3_client is not None and mapping:
-        _save_cusip_cache(mapping, s3_client=s3_client, bucket=bucket)
+        merged_cache = {**cache, **mapping}
+        _save_cusip_cache(merged_cache, s3_client=s3_client, bucket=bucket)
 
     return mapping
 
@@ -349,20 +483,40 @@ def _user_agent() -> dict[str, str]:
 def _download_sec_bulk_zip(quarter: str) -> zipfile.ZipFile | None:
     """Download the SEC quarterly Form 13F bulk ZIP from SEC.gov.
 
-    Returns an in-memory ZipFile, or None if the quarter's data isn't
-    available yet (typically 45+ days after quarter end).
+    Streams to a temp file rather than buffering in memory — these ZIPs
+    run ~100-400MB and a GitHub-hosted runner shouldn't hold that in RAM.
+    Returns a ``ZipFile`` opened on the temp path, or ``None`` if the
+    quarter's data isn't published yet (typically 45+ days after quarter
+    end, HTTP 404) or the request otherwise failed.
     """
     url = _sec_quarter_url(quarter)
     try:
-        resp = requests.get(url, headers=_SEC_HEADERS, timeout=60)
-        resp.raise_for_status()
-        logger.info("downloaded SEC 13F bulk for %s (%d bytes)", quarter, len(resp.content))
-        return zipfile.ZipFile(io.BytesIO(resp.content))
+        with requests.get(url, headers=_SEC_HEADERS, timeout=120, stream=True) as resp:
+            status = resp.status_code
+            if status == 404:
+                logger.info("SEC 13F bulk not yet published for %s (HTTP 404, %s)", quarter, url)
+                return None
+            resp.raise_for_status()
+            tmp = tempfile.NamedTemporaryFile(suffix=f"-{quarter}.zip", delete=False)
+            total = 0
+            try:
+                for chunk in resp.iter_content(chunk_size=1 << 20):
+                    if chunk:
+                        tmp.write(chunk)
+                        total += len(chunk)
+            finally:
+                tmp.close()
+        logger.info(
+            "downloaded SEC 13F bulk for %s: HTTP %d, %d bytes -> %s",
+            quarter, status, total, tmp.name,
+        )
+        return zipfile.ZipFile(tmp.name)
     except requests.HTTPError as e:
-        logger.warning("SEC 13F bulk not available for %s: %s", quarter, e)
+        status = e.response.status_code if e.response is not None else "unknown"
+        logger.warning("SEC 13F bulk not available for %s (HTTP %s): %s", quarter, status, e)
         return None
     except Exception as e:
-        logger.warning("SEC 13F bulk download failed for %s: %s", quarter, e)
+        logger.warning("SEC 13F bulk download failed for %s: %s: %s", quarter, type(e).__name__, e)
         return None
 
 
@@ -766,28 +920,23 @@ def compute_and_write_inst_ownership(
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
     force_rebuild_cusip: bool = False,
+    openfigi_api_key: str | None = None,
 ) -> list[InstOwnershipRow] | None:
     """Download, parse, aggregate, and write 13F institutional ownership.
 
     Full pipeline:
-    1. Build CUSIP→ticker crosswalk from universe tickers.
-    2. Download current and prior quarter SEC 13F bulk data.
-    3. Parse INFOTABLE from both.
-    4. Compute QoQ deltas per ticker.
+    1. Download current and prior quarter SEC 13F bulk data.
+    2. Parse INFOTABLE from both — this is where the CUSIPs actually
+       come from (the filings carry CUSIP, not ticker).
+    3. Resolve CUSIP→ticker for the CUSIPs seen in either quarter (cache
+       + OpenFIGI for the delta).
+    4. Compute QoQ deltas per ticker, filtered to the scanned universe.
     5. Write parquet.
 
-    Returns the list of rows, or None if no data could be processed.
+    Returns the list of rows, or ``None`` if no data could be processed
+    (nothing gets written in that case — callers must not treat a
+    non-exception return as success without checking for ``None``).
     """
-    cusip_to_ticker = build_cusip_to_ticker(
-        universe_tickers,
-        s3_client=s3_client,
-        bucket=bucket,
-        force_rebuild=force_rebuild_cusip,
-    )
-    if not cusip_to_ticker:
-        logger.warning("no cusip→ticker mapping — cannot build inst_ownership")
-        return None
-
     # Determine which quarters to process
     quarters = _current_and_prior_quarters()
     current_q = quarters[0]
@@ -828,11 +977,46 @@ def compute_and_write_inst_ownership(
         prior_q, len(prior_df) if prior_zip else 0,
     )
 
+    # Resolve CUSIP→ticker for the CUSIPs actually present in the filings
+    # (union of both quarters) — not the universe tickers, which is the
+    # wrong mapping direction (config#2428 / alpha-engine-config-I10529).
+    filing_cusips = set(current_df["cusip"].dropna().astype(str))
+    if len(prior_df) > 0:
+        filing_cusips |= set(prior_df["cusip"].dropna().astype(str))
+
+    cusip_to_ticker = build_cusip_to_ticker(
+        filing_cusips,
+        s3_client=s3_client,
+        bucket=bucket,
+        force_rebuild=force_rebuild_cusip,
+        api_key=openfigi_api_key,
+    )
+    if not cusip_to_ticker:
+        logger.warning(
+            "no cusip→ticker mapping resolved for %d filing cusips — cannot build inst_ownership",
+            len(filing_cusips),
+        )
+        return None
+
     # Compute QoQ deltas
     rows = _compute_qoq_deltas(current_df, prior_df, cusip_to_ticker, current_q)
     if not rows:
         logger.info("no tickers resolved from CUSIP mapping in %s", current_q)
-        return rows
+        return None
+
+    # Filter to the scanned universe (the mapping can resolve CUSIPs to
+    # tickers outside it — OpenFIGI isn't universe-scoped).
+    universe_set = {t.strip().upper() for t in universe_tickers if t.strip()}
+    if universe_set:
+        before = len(rows)
+        rows = [r for r in rows if r.ticker in universe_set]
+        logger.info(
+            "inst_ownership: %d/%d resolved tickers are in the %d-name scanned universe",
+            len(rows), before, len(universe_set),
+        )
+    if not rows:
+        logger.info("no resolved tickers fall within the scanned universe for %s", current_q)
+        return None
 
     logger.info("inst_ownership: %d tickers resolved for %s", len(rows), current_q)
 
@@ -849,18 +1033,44 @@ def compute_and_write_inst_ownership(
 # Command-line entry point
 # ═══════════════════════════════════════════════════════════════════
 
+# Well-known real CUSIPs used only for --dry-run's keyless OpenFIGI sanity
+# check — read-only, no S3, no SEC download.
+_DRY_RUN_SAMPLE_CUSIPS = [
+    "037833100",  # AAPL
+    "594918104",  # MSFT
+    "023135106",  # AMZN
+    "02079K305",  # GOOGL
+    "88160R101",  # TSLA
+]
+
+
+def _run_dry_run() -> int:
+    """Map a handful of real CUSIPs via keyless OpenFIGI and print the
+    count. Safe to run anywhere: read-only, public API, no S3 writes, no
+    SEC download. Exists so a PR touching the mapper carries a real
+    measurement rather than an untested claim about the keyless rate.
+    """
+    mapper = OpenFigiMapper()
+    mapping = mapper.map_cusips(_DRY_RUN_SAMPLE_CUSIPS)
+    print(
+        f"OpenFIGI keyless dry-run: {len(mapping)}/{len(_DRY_RUN_SAMPLE_CUSIPS)} "
+        "sample CUSIPs mapped"
+    )
+    for cusip in _DRY_RUN_SAMPLE_CUSIPS:
+        print(f"  {cusip} -> {mapping.get(cusip, '(unmapped)')}")
+    return 0 if mapping else 1
+
 
 def main() -> None:
     """CLI entry point: ``python -m data.derived.inst_ownership ...``."""
     import argparse
     import sys
 
-    # Bootstrap S3 access
-    try:
-        import boto3
-    except ImportError:
-        print("boto3 required for S3 access", file=sys.stderr)
-        sys.exit(1)
+    logging.basicConfig(
+        level=logging.INFO,
+        stream=sys.stdout,
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    )
 
     parser = argparse.ArgumentParser(
         description="Build 13F institutional-ownership derived table"
@@ -885,10 +1095,27 @@ def main() -> None:
         "--force-rebuild-cusip", action="store_true",
         help="Force rebuild CUSIP→ticker cache",
     )
+    parser.add_argument(
+        "--dry-run", action="store_true",
+        help=(
+            "Map a handful of well-known CUSIPs via keyless OpenFIGI and "
+            "print the count. No SEC download, no S3 reads/writes."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.dry_run:
+        sys.exit(_run_dry_run())
 
     if args.tickers_file and args.from_membership:
         print("--tickers-file and --from-membership are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
+    # Bootstrap S3 access
+    try:
+        import boto3
+    except ImportError:
+        print("boto3 required for S3 access", file=sys.stderr)
         sys.exit(1)
 
     s3 = boto3.client("s3")
@@ -906,19 +1133,25 @@ def main() -> None:
     else:
         print(
             "Usage: python -m data.derived.inst_ownership "
-            "(--tickers-file <path> | --from-membership)",
+            "(--tickers-file <path> | --from-membership | --dry-run)",
             file=sys.stderr,
         )
         sys.exit(1)
+
+    openfigi_api_key = os.environ.get(OPENFIGI_API_KEY_ENV_VAR) or None
 
     print(f"Processing {len(tickers)} tickers for 13F institutional ownership...")
     rows = compute_and_write_inst_ownership(
         tickers, s3_client=s3, bucket=args.bucket,
         force_rebuild_cusip=args.force_rebuild_cusip,
+        openfigi_api_key=openfigi_api_key,
     )
-    if rows is None:
-        print("No data processed (see logs for details).")
-        sys.exit(0)
+    # Fail-loud producer contract (AGENTS.md): a run that produced nothing
+    # exits non-zero. `sys.exit(0)` here previously masked every failure
+    # mode below main() as workflow success (alpha-engine-config-I10529).
+    if not rows:
+        print("No data processed (see logs for details).", file=sys.stderr)
+        sys.exit(1)
 
     print(f"Written: {len(rows)} rows for {rows[0].quarter}")
     print(f"Sample: {rows[0].ticker} — {rows[0].n_funds_holding} funds, "
