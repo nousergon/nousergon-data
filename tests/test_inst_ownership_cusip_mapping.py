@@ -324,3 +324,48 @@ class TestMainExitCodeContract:
         with pytest.raises(SystemExit) as exc:
             main()
         assert exc.value.code == 1
+
+
+import data.derived.inst_ownership as inst  # noqa: E402
+
+
+class TestOpenFigiQuotaExhaustion:
+    """Five consecutive 429s end the run with a named fix, not a 35-minute
+    burn to the job timeout (nousergon-data run 34773054198, 2026-09-13)."""
+
+    class _Resp:
+        def __init__(self, status_code):
+            self.status_code = status_code
+            self.ok = status_code < 400
+
+        def raise_for_status(self):
+            if self.status_code >= 400:
+                raise RuntimeError(f"HTTP {self.status_code}")
+
+        def json(self):
+            return [{"data": [{"ticker": "AAPL"}]}] * 10
+
+    def test_five_consecutive_429s_raise_quota_exhausted(self):
+        calls = []
+
+        def post(url, *, json, headers, timeout):
+            calls.append(len(json))
+            return self._Resp(429)
+
+        mapper = inst.OpenFigiMapper(api_key=None, http_post=post)
+        mapper._bucket.acquire = lambda: None
+        with pytest.raises(inst.OpenFigiQuotaExhausted) as ei:
+            mapper.map_cusips([f"{i:09d}" for i in range(100)])
+        assert len(calls) == inst.OPENFIGI_MAX_CONSECUTIVE_429
+        assert "/alpha-engine/OPENFIGI_API_KEY" in str(ei.value)
+
+    def test_a_success_resets_the_429_counter(self):
+        seq = iter([429, 429, 200, 429, 429, 429, 429, 200, 200, 200])
+
+        def post(url, *, json, headers, timeout):
+            return self._Resp(next(seq))
+
+        mapper = inst.OpenFigiMapper(api_key=None, http_post=post)
+        mapper._bucket.acquire = lambda: None
+        out = mapper.map_cusips([f"{i:09d}" for i in range(100)])
+        assert out  # never raised; mapped the 200 batches

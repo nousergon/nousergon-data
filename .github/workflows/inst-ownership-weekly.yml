@@ -55,7 +55,7 @@ name: Institutional ownership (13F) weekly
 # cache, s3:PutObject on the inst_ownership parquet + latest.json sidecar,
 # and s3:GetObject on the sidecar for the read-back verification step below.
 # NEEDS AN ADDITIONAL GRANT NOT YET APPLIED: ssm:GetParameter on
-# arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/openfigi/api_key
+# arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/OPENFIGI_API_KEY
 # for the "Read optional OpenFIGI API key from SSM" step — the step
 # tolerates the parameter (and the permission) being absent and falls back
 # to keyless OpenFIGI (25 req/min, 10 jobs/request vs. 250/100 with a key),
@@ -115,7 +115,7 @@ jobs:
       - name: Read optional OpenFIGI API key from SSM (keyless works if absent)
         id: openfigi
         run: |
-          KEY=$(aws ssm get-parameter --name /alpha-engine/openfigi/api_key --with-decryption --query Parameter.Value --output text 2>/dev/null || true)
+          KEY=$(aws ssm get-parameter --name /alpha-engine/OPENFIGI_API_KEY --with-decryption --query Parameter.Value --output text 2>/dev/null || true)
           if [ -n "$KEY" ] && [ "$KEY" != "None" ]; then
             echo "::add-mask::$KEY"
             echo "OPENFIGI_API_KEY=$KEY" >> "$GITHUB_ENV"

@@ -379,6 +379,23 @@ class _TokenBucket:
             self._tokens -= 1.0
 
 
+class OpenFigiQuotaExhausted(RuntimeError):
+    """OpenFIGI answered HTTP 429 for several consecutive batches.
+
+    MEASURED 2026-09-13 (nousergon-data run 34773054198): keyless from a
+    GitHub-hosted runner, EVERY batch answered 429 for 35 minutes until the
+    job timeout — OpenFIGI's keyless quota (25 req/min) is per source IP and
+    the runner egress IPs are shared across GitHub. A token bucket cannot
+    help with a quota someone else has spent. The honest outcome is to stop
+    after a few consecutive 429s and name the fix (an API key in SSM at
+    ``/alpha-engine/OPENFIGI_API_KEY``), not to burn the job's timeout.
+    """
+
+
+#: Consecutive HTTP 429 answers after which the mapper gives up.
+OPENFIGI_MAX_CONSECUTIVE_429 = 5
+
+
 class OpenFigiMapper:
     """CUSIP→ticker resolution via the OpenFIGI mapping API.
 
@@ -414,6 +431,7 @@ class OpenFigiMapper:
     def map_cusips(self, cusips: list[str]) -> dict[str, str]:
         mapping: dict[str, str] = {}
         unique = list(dict.fromkeys(c for c in cusips if c))
+        consecutive_429 = 0
         for i in range(0, len(unique), self.batch_size):
             batch = unique[i:i + self.batch_size]
             self._bucket.acquire()
@@ -423,8 +441,27 @@ class OpenFigiMapper:
                 headers["X-OPENFIGI-APIKEY"] = self.api_key
             try:
                 resp = self._post(OPENFIGI_MAPPING_URL, json=jobs, headers=headers, timeout=30)
+                if getattr(resp, "status_code", None) == 429:
+                    consecutive_429 += 1
+                    if consecutive_429 >= OPENFIGI_MAX_CONSECUTIVE_429:
+                        raise OpenFigiQuotaExhausted(
+                            f"OpenFIGI answered HTTP 429 for {consecutive_429} consecutive "
+                            f"batches ({'keyed' if self.api_key else 'keyless'} mode). The "
+                            f"keyless quota is per source IP and is exhausted on shared "
+                            f"egress; set an API key in SSM at /alpha-engine/OPENFIGI_API_KEY "
+                            f"(free at https://www.openfigi.com/api) and grant the role "
+                            f"ssm:GetParameter on it."
+                        )
+                    logger.warning(
+                        "OpenFIGI 429 for batch of %d cusips (%d consecutive)",
+                        len(batch), consecutive_429,
+                    )
+                    continue
                 resp.raise_for_status()
                 results = resp.json()
+                consecutive_429 = 0
+            except OpenFigiQuotaExhausted:
+                raise
             except Exception as e:
                 logger.warning(
                     "OpenFIGI mapping request failed for batch of %d cusips: %s: %s",
