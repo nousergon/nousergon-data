@@ -2050,6 +2050,41 @@ def test_event_driven_row_confirmed_written_is_not_flagged(fake_s3, monkeypatch,
     assert telemetry["never_written_by_id"] == {"thinktank_inst_ownership": False}
 
 
+def test_absence_expected_row_skips_the_never_written_probe(fake_s3, monkeypatch, fixed_now):
+    """alpha-engine-config-I10614 — a row whose producer writes ONLY on a
+    violation (e.g. predictor_commitment_window_state) declares
+    absence_expected=True: never-written is the healthy state, not a
+    producer-birth gap, so the I8810 probe must not run for it at all (no
+    S3 call, no `never_written_by_id` entry)."""
+    import index
+    spec, fresh_result = _event_driven_pair(
+        index, "predictor_commitment_window_state", "thinktank_coverage_ledger",
+        absence_expected=True,
+    )
+    monkeypatch.setattr(index, "_check_one",
+                        lambda s3c, sp, now, **_kw: (fresh_result, None))
+    fake_s3.list_objects_v2 = mock.Mock(return_value={"KeyCount": 0})
+    _pairs, _a, _d, _e, _counts, telemetry = index._run_probe_pass(
+        fake_s3, [spec], {}, fixed_now)
+    assert telemetry["never_written_by_id"] == {}
+    fake_s3.list_objects_v2.assert_not_called()
+
+
+def test_absence_expected_row_serialized_into_check_results(fixed_now):
+    """The console must render a never-written absence_expected row as
+    DECLARED-ABSENT, not as a bare fresh row — check_results.json carries
+    the flag on every row so it can."""
+    import index
+    spec, fresh_result = _event_driven_pair(
+        index, "predictor_commitment_window_state", "thinktank_coverage_ledger",
+        absence_expected=True,
+    )
+    payload = index._serialize_check_results([(spec, fresh_result)], fixed_now)
+    row = payload["results"][0]
+    assert row["absence_expected"] is True
+    assert row["never_written"] is None
+
+
 def test_prev_miss_counts_roundtrip_via_check_results(fake_s3, fixed_now):
     """_serialize_check_results persists consecutive_miss_runs and
     _load_prev_miss_counts reads them back — the counter needs no new
@@ -2107,7 +2142,7 @@ artifacts:
     assert escalate == {"config_scoring_weights": True}
 
 
-def _event_driven_pair(index, artifact_id, liveness_via):
+def _event_driven_pair(index, artifact_id, liveness_via, *, absence_expected=False):
     from nousergon_lib.artifact_freshness import CheckResult
     spec = index.ArtifactSpec(
         artifact_id=artifact_id,
@@ -2119,6 +2154,7 @@ def _event_driven_pair(index, artifact_id, liveness_via):
         severity="warning",
         owner_repo="alpha-engine-backtester",
         created_at=date(2025, 1, 1),
+        absence_expected=absence_expected,
     )
     # event_driven rows always short-circuit to fresh (see check_freshness) —
     # _escalate_stale_key_deliverables never reads this row's own state.
@@ -4698,10 +4734,13 @@ def test_probe_prefix_is_the_templates_fixed_head(monkeypatch):
     assert stub.calls[0]["Prefix"] == "backtest/"
 
 
-def test_never_written_rows_are_reported_in_the_digest_not_silenced(monkeypatch, fixed_now):
-    """Not paged is not the same as not said. The registry's debt stays on the
-    same surface as the real misses — an unproduced row that vanishes from every
-    surface is how one sits unnoticed for a year."""
+def test_a_never_written_only_sweep_publishes_nothing(monkeypatch, fixed_now):
+    """alpha-engine-config-I10614 — the regression itself: an empty decision
+    set with a non-empty never-written set must NOT publish. Every comment on
+    `_alert_decision`/the I8810 block says never-written 'does not page';
+    `if not decisions and not unproduced: return 0` contradicted that and
+    paged a `severity=warning` digest whose only content was the
+    never-written block (itself labelled 'Not paged')."""
     monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
     import importlib
     import index
@@ -4711,13 +4750,32 @@ def test_never_written_rows_are_reported_in_the_digest_not_silenced(monkeypatch,
     monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
 
     covered = index._publish_digest([], fixed_now, {"rag_corpus_scope_state": True})
+    publish_mock.assert_not_called()
+    assert covered == 0
+
+
+def test_never_written_rows_are_reported_in_a_real_digest_not_silenced(monkeypatch, fixed_now):
+    """Not paged ALONE is not the same as not said. Once a real digest is
+    publishing anyway (a genuine decision exists), the registry's
+    never-written debt still stays on the same surface as the real misses —
+    an unproduced row that vanishes from every surface is how one sits
+    unnoticed for a year."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish_mock)
+    monkeypatch.setattr(index, "notify_via_flow_doctor", mock.Mock(return_value=True))
+
+    decisions = _decide_all(index, [_weekly_spec(index, "weekly_a")], fixed_now)
+    covered = index._publish_digest(
+        decisions, fixed_now, {"rag_corpus_scope_state": True})
     publish_mock.assert_called_once()
     body = publish_mock.call_args.args[0]
     assert "1 registry row(s) never written" in body
     assert "artifact_id=rag_corpus_scope_state never_written=true" in body
-    # A never-written-only digest is never critical — nothing is failing.
-    assert publish_mock.call_args.kwargs["severity"] == "warning"
-    assert covered == 0
+    assert covered == len(decisions)
 
 
 def test_never_written_only_changes_the_dedup_key_when_the_set_moves(monkeypatch, fixed_now):

@@ -52,7 +52,7 @@ def test_strips_trailing_inline_comment(tmp_path: Path) -> None:
     """The exact eval-judge-spot-dispatcher shape: a lockstep-bump comment
     after two spaces must not survive into the printed pin."""
     body = """\
-        nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
+        nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.121
         krepis==0.59.54  # bumped 0.59.41 -> 0.59.54: nousergon-lib v0.124.116 (root requirements.txt) floors krepis>=0.59.52; alpha-engine-config-I10226 lockstep gap, run 34309659890
     """
     result = _run_requirement_pin(body, "krepis", tmp_path)
@@ -62,7 +62,7 @@ def test_strips_trailing_inline_comment(tmp_path: Path) -> None:
 
 def test_line_without_a_comment_is_unchanged(tmp_path: Path) -> None:
     body = """\
-        nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
+        nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.121
         krepis>=0.59.6
     """
     result = _run_requirement_pin(body, "krepis", tmp_path)
@@ -74,12 +74,12 @@ def test_matches_first_of_multiple_and_ignores_bracket_extras(tmp_path: Path) ->
     """`nousergon-lib[flow-doctor] @ git+...` (pipeline-watchdog's actual pin
     shape) must still match `^nousergon-lib` the way the old grep did."""
     body = """\
-        nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.120
+        nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.121
         krepis>=0.15.0
     """
     result = _run_requirement_pin(body, "nousergon-lib", tmp_path)
     assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.120"
+    assert result.stdout.strip() == "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.121"
 
 
 def test_missing_package_fails_loud(tmp_path: Path) -> None:
@@ -87,7 +87,7 @@ def test_missing_package_fails_loud(tmp_path: Path) -> None:
     match, which `run_handler_tests` would then install as nothing extra at
     all — a missing pin read as 'no deps needed'. The helper must exit
     non-zero instead."""
-    body = "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.120\n"
+    body = "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.121\n"
     result = _run_requirement_pin(body, "krepis", tmp_path)
     assert result.returncode != 0
     assert "no 'krepis' requirement found" in result.stderr
