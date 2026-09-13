@@ -4,23 +4,53 @@ Wave 1 PR B of the institutional data-revamp arc. Builds a per-ticker
 institutional-ownership snapshot from the SEC's official quarterly
 Form 13F bulk data sets (free, authoritative, no vendor dependency).
 
-SEC data source::
+SEC data source (corrected alpha-engine-config-I10529 — the old
+``.../dera/data/form-13f-data-sets/{YYYYq1}/{YYYYq1}.zip`` scheme 404s for
+every quarter; SEC moved this data set under ``structureddata`` and, from
+2024 onward, files by three-month FILING WINDOW rather than calendar
+quarter)::
 
-    https://www.sec.gov/files/dera/data/form-13f-data-sets/{YYYYQ1}/{YYYYQ1}.zip
+    Index:  https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets
+    File:   https://www.sec.gov/files/structureddata/data/form-13f-data-sets/{window}_form13f.zip
 
-Each quarterly ZIP contains:
+    where {window} is either a legacy calendar quarter (``2023q4``, through
+    2023) or, from 2024 on, a filing window: ``01dec{Y-1}-28feb{Y}``,
+    ``01mar{Y}-31may{Y}``, ``01jun{Y}-31aug{Y}``, ``01sep{Y}-30nov{Y}``
+    (``29feb`` in a leap year).
 
-  SUBMISSION.txt  — header info per filing (cik, filer name, period)
-  INFOTABLE.txt   — individual holdings rows (cusip, put_call, shares,
-                    market_value, shares_outstanding, etc.)
+The window filename is discovered from the index page rather than
+constructed blind (deterministic construction is only the fallback when
+the index page is unreachable) because a window's PUBLICATION date lags
+its own end by weeks and the newest window is not knowable a priori.
 
-Approach (per I2428 scope):
+Each window ZIP contains, tab-separated with a header row:
 
-1. Download current and prior quarter ZIPs.
-2. Parse INFOTABLE from both → aggregate per CUSIP.
-3. Resolve CUSIP → ticker via the OpenFIGI mapping API (cached in S3).
-4. Compute QoQ share/value deltas + top-N concentration per ticker.
-5. Write parquet to ``data/derived/inst_ownership/{quarter}/{ticker}.parquet``
+  SUBMISSION.tsv  — one row per filing: ACCESSION_NUMBER, FILING_DATE,
+                    SUBMISSIONTYPE (``13F-HR``, ``13F-HR/A``, ...), CIK,
+                    PERIODOFREPORT (the actual 13F "quarter" — NOT the
+                    window's own date range, which mixes report periods).
+  INFOTABLE.tsv   — individual holdings rows keyed by ACCESSION_NUMBER:
+                    CUSIP, VALUE (USD, not thousands, since 2023-01-03 —
+                    see FORM13F_readme.htm in the zip), SSHPRNAMT,
+                    PUTCALL, etc.
+
+A window's holdings therefore span more than one report period (mostly
+the quarter-end 45 days before the window, plus late/amended filings for
+earlier periods) — the report period actually wanted is
+``SUBMISSION.PERIODOFREPORT``, joined to ``INFOTABLE`` via
+``ACCESSION_NUMBER``.
+
+Approach (per I2428 / I10529 scope):
+
+1. Discover and download the newest 2 published window ZIPs.
+2. Parse SUBMISSION + INFOTABLE from both; dedupe to one accession per
+   (CIK, PERIODOFREPORT), an amendment (``.../A``) superseding the
+   original for the same filer+period.
+3. Select the 2 most recent PERIODOFREPORT dates present → current/prior.
+4. Aggregate INFOTABLE per CUSIP for each selected period.
+5. Resolve CUSIP → ticker via the OpenFIGI mapping API (cached in S3).
+6. Compute QoQ share/value deltas + top-N concentration per ticker.
+7. Write parquet to ``data/derived/inst_ownership/{quarter}/{ticker}.parquet``
    (one file per ticker for incremental reads, plus a quarterly aggregate).
 
 S3 layout::
@@ -45,6 +75,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 import zipfile
@@ -69,9 +100,27 @@ DEFAULT_S3_PREFIX = "data/inst_ownership"
 # universe, matching the module docstring's "our ~900-name universe".
 MEMBERSHIP_LATEST_KEY = "universe_membership/latest.json"
 
-SEC_13F_BASE_URL = (
-    "https://www.sec.gov/files/dera/data/form-13f-data-sets"
+SEC_13F_INDEX_URL = (
+    "https://www.sec.gov/data-research/sec-markets-data/form-13f-data-sets"
 )
+SEC_13F_BASE_URL = (
+    "https://www.sec.gov/files/structureddata/data/form-13f-data-sets"
+)
+
+_MONTH_ABBR = {
+    1: "jan", 2: "feb", 3: "mar", 4: "apr", 5: "may", 6: "jun",
+    7: "jul", 8: "aug", 9: "sep", 10: "oct", 11: "nov", 12: "dec",
+}
+_MONTH_NUM = {v: k for k, v in _MONTH_ABBR.items()}
+
+# Regex for the 2024+ three-month filing-window filename, e.g.
+# "01mar2026-31may2026_form13f.zip".
+_WINDOW_FILENAME_RE = re.compile(
+    r"^01([a-z]{3})(\d{4})-(\d{2})([a-z]{3})(\d{4})_form13f\.zip$"
+)
+# Regex for the legacy pre-2024 calendar-quarter filename, e.g.
+# "2023q4_form13f.zip".
+_LEGACY_QUARTER_FILENAME_RE = re.compile(r"^(\d{4})q([1-4])_form13f\.zip$")
 
 # Delay between SEC HTTP requests (rate limiting courtesy).
 _SEC_REQUEST_DELAY = 0.5
@@ -442,37 +491,157 @@ def build_cusip_to_ticker(
 # ═══════════════════════════════════════════════════════════════════
 
 
-def _quarter_str_for_date(d: Date) -> str:
-    """``Date(2024, 3, 15)`` → ``"2024Q1"``."""
+def _quarter_str_for_date(d: Any) -> str:
+    """``Date(2024, 3, 15)`` → ``"2024Q1"``. Accepts a ``date``, a
+    ``datetime``, or a ``pandas.Timestamp`` (all expose ``.year``/``.month``).
+    """
     quarter = (d.month - 1) // 3 + 1
     return f"{d.year}Q{quarter}"
 
 
-def _current_and_prior_quarters() -> list[str]:
-    """Return [current_quarter, prior_quarter] for 13F data.
+def _is_leap_year(year: int) -> bool:
+    return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
 
-    13F data is filed quarterly with ~45-day delay. The current
-    available quarter is typically 1-2 quarters before the calendar
-    date. Returns the two most recent quarters available as [latest, prev].
+
+def _window_filename(year: int, idx: int) -> str:
+    """Deterministically construct the SEC filing-window filename for
+    window ``idx`` (0=Dec-Feb, 1=Mar-May, 2=Jun-Aug, 3=Sep-Nov) ending
+    within calendar ``year`` (the Dec-Feb window's START month is
+    ``year - 1``).
     """
-    today = Date.today()
-    cq = _quarter_str_for_date(today)
-    # Walk back up to 4 quarters to find two that have published data
-    year, q_num = int(cq[:4]), int(cq[5:])
-    available: list[str] = []
-    for _ in range(4):
-        available.append(f"{year}Q{q_num}")
-        q_num -= 1
-        if q_num == 0:
-            year -= 1
-            q_num = 4
-    # Return [latest, prior]; the caller handles missing data
-    return [available[0], available[1]]
+    if idx == 0:
+        start_y, start_m, start_d = year - 1, 12, 1
+        end_d = 29 if _is_leap_year(year) else 28
+        end_y, end_m = year, 2
+    elif idx == 1:
+        start_y, start_m, start_d = year, 3, 1
+        end_y, end_m, end_d = year, 5, 31
+    elif idx == 2:
+        start_y, start_m, start_d = year, 6, 1
+        end_y, end_m, end_d = year, 8, 31
+    elif idx == 3:
+        start_y, start_m, start_d = year, 9, 1
+        end_y, end_m, end_d = year, 11, 30
+    else:
+        raise ValueError(f"window idx must be 0-3, got {idx}")
+    start = f"{start_d:02d}{_MONTH_ABBR[start_m]}{start_y}"
+    end = f"{end_d:02d}{_MONTH_ABBR[end_m]}{end_y}"
+    return f"{start}-{end}_form13f.zip"
 
 
-def _sec_quarter_url(quarter: str) -> str:
-    """Build SEC bulk data URL for a given quarter string."""
-    return f"{SEC_13F_BASE_URL}/{quarter}/{quarter}.zip"
+def _window_index_for_date(d: Date) -> tuple[int, int]:
+    """Return ``(year, idx)`` for the filing window containing date ``d``,
+    using ``_window_filename``'s ``(year, idx)`` convention (``year`` is
+    the window's END year).
+    """
+    m = d.month
+    if m == 12:
+        return (d.year + 1, 0)
+    if m in (1, 2):
+        return (d.year, 0)
+    if m in (3, 4, 5):
+        return (d.year, 1)
+    if m in (6, 7, 8):
+        return (d.year, 2)
+    return (d.year, 3)  # 9, 10, 11
+
+
+def _prior_window(year: int, idx: int) -> tuple[int, int]:
+    """Return the ``(year, idx)`` of the window immediately before the
+    given one."""
+    if idx == 0:
+        return (year - 1, 3)
+    return (year, idx - 1)
+
+
+def _recent_window_filenames(d: Date, count: int) -> list[str]:
+    """Deterministic fallback: the ``count`` most recent window filenames
+    walking backward from (and including) the window containing ``d``,
+    most-recent-first. Used only when the SEC index page can't be fetched
+    or parsed — the index page is the primary source of truth since a
+    window's publication date isn't knowable from the calendar alone.
+    """
+    year, idx = _window_index_for_date(d)
+    names = []
+    for _ in range(count):
+        names.append(_window_filename(year, idx))
+        year, idx = _prior_window(year, idx)
+    return names
+
+
+def _window_end_date(filename: str) -> Date | None:
+    """Return the sort key (end date) for a SEC 13F zip filename — either
+    the 2024+ window naming or the legacy pre-2024 calendar-quarter naming.
+    Returns ``None`` for anything else found on the index page.
+    """
+    m = _WINDOW_FILENAME_RE.match(filename)
+    if m:
+        end_day = int(m.group(3))
+        end_month = _MONTH_NUM.get(m.group(4))
+        end_year = int(m.group(5))
+        if end_month is None:
+            return None
+        try:
+            return Date(end_year, end_month, end_day)
+        except ValueError:
+            return None
+    m2 = _LEGACY_QUARTER_FILENAME_RE.match(filename)
+    if m2:
+        year = int(m2.group(1))
+        q = int(m2.group(2))
+        end_month = q * 3
+        end_day = 31 if end_month in (3, 12) else 30
+        return Date(year, end_month, end_day)
+    return None
+
+
+def discover_window_filenames_from_html(html: str) -> list[str]:
+    """Parse the SEC 13F index page for ``*_form13f.zip`` filenames,
+    returning them most-recent-first (by parsed end date). Filenames the
+    module doesn't recognize (any future naming change) are skipped rather
+    than raising — this only degrades to fewer discovered candidates, and
+    the deterministic fallback still runs if discovery yields nothing.
+    """
+    names = set(re.findall(r"form-13f-data-sets/([A-Za-z0-9_.\-]+\.zip)", html))
+    dated = [(n, _window_end_date(n)) for n in names]
+    dated = [(n, d) for n, d in dated if d is not None]
+    dated.sort(key=lambda pair: pair[1], reverse=True)
+    return [n for n, _ in dated]
+
+
+def _fetch_sec_index_html() -> str | None:
+    """Fetch the SEC 13F data-sets index page HTML, or ``None`` on any
+    failure (network, non-2xx, timeout) — callers fall back to
+    deterministic window-name construction."""
+    try:
+        resp = requests.get(SEC_13F_INDEX_URL, headers=_SEC_HEADERS, timeout=30)
+        resp.raise_for_status()
+        return resp.text
+    except Exception as e:
+        logger.warning(
+            "SEC 13F index page fetch failed (%s): %s: %s",
+            SEC_13F_INDEX_URL, type(e).__name__, e,
+        )
+        return None
+
+
+def _candidate_window_filenames(*, today: Date | None = None, count: int = 8) -> list[str]:
+    """The ``count`` most-recent-first candidate window filenames to try
+    downloading. Discovers from the live SEC index page first; falls back
+    to deterministic construction (walking backward from the window
+    containing ``today``) only if the index page is unreachable or yields
+    no recognizable filenames.
+    """
+    html = _fetch_sec_index_html()
+    if html:
+        discovered = discover_window_filenames_from_html(html)
+        if discovered:
+            return discovered[:count]
+        logger.warning(
+            "SEC 13F index page fetched but no recognizable window "
+            "filenames found — falling back to deterministic construction"
+        )
+    return _recent_window_filenames(today or Date.today(), count)
 
 
 def _user_agent() -> dict[str, str]:
@@ -480,24 +649,24 @@ def _user_agent() -> dict[str, str]:
     return dict(_SEC_HEADERS)
 
 
-def _download_sec_bulk_zip(quarter: str) -> zipfile.ZipFile | None:
-    """Download the SEC quarterly Form 13F bulk ZIP from SEC.gov.
+def _download_sec_bulk_zip(filename: str) -> zipfile.ZipFile | None:
+    """Download one SEC Form 13F filing-window bulk ZIP from SEC.gov by
+    its exact filename (e.g. ``"01mar2026-31may2026_form13f.zip"``).
 
     Streams to a temp file rather than buffering in memory — these ZIPs
     run ~100-400MB and a GitHub-hosted runner shouldn't hold that in RAM.
     Returns a ``ZipFile`` opened on the temp path, or ``None`` if the
-    quarter's data isn't published yet (typically 45+ days after quarter
-    end, HTTP 404) or the request otherwise failed.
+    window isn't published yet (HTTP 404) or the request otherwise failed.
     """
-    url = _sec_quarter_url(quarter)
+    url = f"{SEC_13F_BASE_URL}/{filename}"
     try:
         with requests.get(url, headers=_SEC_HEADERS, timeout=120, stream=True) as resp:
             status = resp.status_code
             if status == 404:
-                logger.info("SEC 13F bulk not yet published for %s (HTTP 404, %s)", quarter, url)
+                logger.info("SEC 13F bulk not published: %s (HTTP 404)", url)
                 return None
             resp.raise_for_status()
-            tmp = tempfile.NamedTemporaryFile(suffix=f"-{quarter}.zip", delete=False)
+            tmp = tempfile.NamedTemporaryFile(suffix=f"-{filename}", delete=False)
             total = 0
             try:
                 for chunk in resp.iter_content(chunk_size=1 << 20):
@@ -507,67 +676,163 @@ def _download_sec_bulk_zip(quarter: str) -> zipfile.ZipFile | None:
             finally:
                 tmp.close()
         logger.info(
-            "downloaded SEC 13F bulk for %s: HTTP %d, %d bytes -> %s",
-            quarter, status, total, tmp.name,
+            "downloaded SEC 13F bulk %s: HTTP %d, %d bytes -> %s",
+            filename, status, total, tmp.name,
         )
         return zipfile.ZipFile(tmp.name)
     except requests.HTTPError as e:
         status = e.response.status_code if e.response is not None else "unknown"
-        logger.warning("SEC 13F bulk not available for %s (HTTP %s): %s", quarter, status, e)
+        logger.warning("SEC 13F bulk not available for %s (HTTP %s): %s", filename, status, e)
         return None
     except Exception as e:
-        logger.warning("SEC 13F bulk download failed for %s: %s: %s", quarter, type(e).__name__, e)
+        logger.warning("SEC 13F bulk download failed for %s: %s: %s", filename, type(e).__name__, e)
         return None
+
+
+def _download_recent_windows(
+    *, count: int = 2, max_candidates: int = 8,
+) -> list[tuple[str, zipfile.ZipFile]]:
+    """Discover and download the ``count`` newest published window ZIPs,
+    skipping unpublished (404) candidates. Respects SEC's rate-limiting
+    courtesy ask (``_SEC_REQUEST_DELAY`` between requests, well under the
+    documented 10 req/s).
+    """
+    candidates = _candidate_window_filenames(count=max_candidates)
+    downloaded: list[tuple[str, zipfile.ZipFile]] = []
+    for i, name in enumerate(candidates):
+        if len(downloaded) >= count:
+            break
+        if i > 0:
+            time.sleep(_SEC_REQUEST_DELAY)
+        zf = _download_sec_bulk_zip(name)
+        if zf is not None:
+            downloaded.append((name, zf))
+    logger.info(
+        "downloaded %d/%d requested SEC 13F window files: %s",
+        len(downloaded), count, [n for n, _ in downloaded],
+    )
+    return downloaded
+
+
+def _parse_submission(zf: zipfile.ZipFile) -> pd.DataFrame:
+    """Parse SUBMISSION.tsv from a SEC 13F window bulk ZIP.
+
+    Tab-separated with a header row. Columns of interest: ACCESSION_NUMBER,
+    FILING_DATE, SUBMISSIONTYPE (e.g. ``13F-HR``, ``13F-HR/A``), CIK,
+    PERIODOFREPORT (the actual 13F report-period date — a window mixes
+    multiple report periods, this is the one downstream code wants).
+
+    Returns a DataFrame with FILING_DATE/PERIODOFREPORT parsed to
+    ``datetime64``, or an empty DataFrame if the file/columns are missing.
+    """
+    try:
+        with zf.open("SUBMISSION.tsv") as f:
+            df = pd.read_csv(f, delimiter="\t", dtype=str, low_memory=False)
+    except KeyError:
+        logger.warning("SUBMISSION.tsv not found in SEC bulk ZIP")
+        return pd.DataFrame()
+
+    if len(df) == 0:
+        return df
+
+    df.columns = [c.strip().upper() for c in df.columns]
+    required = ("ACCESSION_NUMBER", "FILING_DATE", "SUBMISSIONTYPE", "CIK", "PERIODOFREPORT")
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        logger.warning("SUBMISSION.tsv missing required columns: %s", missing)
+        return pd.DataFrame()
+
+    df["FILING_DATE"] = pd.to_datetime(df["FILING_DATE"], format="%d-%b-%Y", errors="coerce")
+    df["PERIODOFREPORT"] = pd.to_datetime(df["PERIODOFREPORT"], format="%d-%b-%Y", errors="coerce")
+    return df[list(required)]
+
+
+def _dedupe_amendments(submissions: pd.DataFrame) -> pd.DataFrame:
+    """Collapse SUBMISSION rows to one winning ACCESSION_NUMBER per
+    (CIK, PERIODOFREPORT): the latest-filed submission wins, with an
+    amendment (``SUBMISSIONTYPE`` ending ``/A``) breaking a same-day tie
+    over the original — an amendment is the authoritative holdings
+    snapshot for that filer+period, per alpha-engine-config-I10529 scope.
+    """
+    df = submissions.dropna(subset=["PERIODOFREPORT", "CIK", "FILING_DATE"]).copy()
+    if len(df) == 0:
+        return df
+    df["_is_amendment"] = df["SUBMISSIONTYPE"].fillna("").str.endswith("/A")
+    df = df.sort_values(["FILING_DATE", "_is_amendment"], ascending=[True, True])
+    winners = df.groupby(["CIK", "PERIODOFREPORT"], as_index=False).tail(1)
+    return winners.drop(columns=["_is_amendment"])
+
+
+def _select_report_periods(winners: pd.DataFrame, count: int = 2) -> list[Any]:
+    """Return the ``count`` most recent distinct PERIODOFREPORT values
+    present in the deduped SUBMISSION winners, most-recent-first."""
+    if len(winners) == 0:
+        return []
+    periods = sorted(winners["PERIODOFREPORT"].dropna().unique(), reverse=True)
+    return list(periods[:count])
 
 
 def _parse_infotable(zf: zipfile.ZipFile) -> pd.DataFrame:
-    """Parse INFOTABLE.txt from a quarterly SEC 13F bulk ZIP.
+    """Parse INFOTABLE.tsv from a SEC 13F window bulk ZIP.
 
-    INFOTABLE is pipe-delimited with header row. Columns of interest:
-    - cusip: str (9-char CUSIP)
-    - put_call: str (empty for equity, "PUT" or "CALL" for options)
-    - shares: float
-    - market_value: float (thousands of USD)
+    Tab-separated with a header row (alpha-engine-config-I10529 — the
+    2024+ format; measured against the 2026-06-01-published
+    ``01mar2026-31may2026_form13f.zip``). Columns of interest:
+    - ACCESSION_NUMBER: str (joins to SUBMISSION.tsv)
+    - CUSIP: str (9-char, alphanumeric)
+    - PUTCALL: str (empty for equity, "PUT"/"CALL" for options)
+    - SSHPRNAMT: float (shares)
+    - VALUE: float — USD (not thousands) since 2023-01-03 per
+      FORM13F_readme.htm; this module only ever downloads 2024+ windows,
+      so no thousands-scaling is applied.
 
-    Returns a DataFrame with cleaned column types.
+    Returns a DataFrame renamed to the lowercase names downstream
+    aggregation code expects: accession_number, cusip, put_call, shares,
+    market_value.
     """
     try:
-        with zf.open("INFOTABLE.txt") as f:
+        with zf.open("INFOTABLE.tsv") as f:
             df = pd.read_csv(
                 f,
-                delimiter="|",
+                delimiter="\t",
                 dtype=str,
                 low_memory=False,
             )
     except KeyError:
-        logger.warning("INFOTABLE.txt not found in SEC bulk ZIP")
+        logger.warning("INFOTABLE.tsv not found in SEC bulk ZIP")
         return pd.DataFrame()
 
     if len(df) == 0:
         return df
 
     # Normalize column names (SEC may vary case)
-    df.columns = [c.strip().lower() for c in df.columns]
+    df.columns = [c.strip().upper() for c in df.columns]
 
     # Required columns
-    for col in ("cusip",):
+    for col in ("ACCESSION_NUMBER", "CUSIP"):
         if col not in df.columns:
             logger.warning("INFOTABLE missing required column: %s", col)
             return pd.DataFrame()
 
     # Parse numeric columns
-    for col in ("shares", "market_value"):
+    for col in ("SSHPRNAMT", "VALUE"):
         if col in df.columns:
             df[col] = pd.to_numeric(df[col].str.replace(",", ""), errors="coerce")
 
     # Filter to equity only (exclude options)
-    if "put_call" in df.columns:
-        df = df[df["put_call"].isna() | (df["put_call"].str.strip() == "")]
+    if "PUTCALL" in df.columns:
+        df = df[df["PUTCALL"].isna() | (df["PUTCALL"].str.strip() == "")]
 
-    # Drop rows with invalid CUSIP
-    df = df[df["cusip"].str.match(r"^\d{9}$", na=False)]
+    # Drop rows with invalid CUSIP (9-char alphanumeric)
+    df = df[df["CUSIP"].str.match(r"^[0-9A-Z]{9}$", na=False)]
 
-    return df
+    return df.rename(columns={
+        "ACCESSION_NUMBER": "accession_number",
+        "CUSIP": "cusip",
+        "PUTCALL": "put_call",
+        "SSHPRNAMT": "shares",
+        "VALUE": "market_value",
+    })
 
 
 def _aggregate_quarter(
@@ -604,7 +869,7 @@ def _aggregate_quarter(
 
     def _fund_stats(group: pd.DataFrame) -> dict:
         shares = group["shares"].fillna(0).astype(float).sum() if "shares" in group.columns else 0.0
-        value = group["market_value"].fillna(0).astype(float).sum() * 1000 if "market_value" in group.columns else 0.0
+        value = group["market_value"].fillna(0).astype(float).sum() if "market_value" in group.columns else 0.0
         n_funds = group["cusip"].nunique()
         return {"n_funds_holding": n_funds, "total_shares_held": shares, "total_value_usd": value}
 
@@ -629,7 +894,7 @@ def _fund_level_data(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = df[["cusip", "shares", "market_value"]].copy()
     out["shares"] = pd.to_numeric(out["shares"], errors="coerce").fillna(0)
-    out["market_value"] = pd.to_numeric(out["market_value"], errors="coerce").fillna(0) * 1000
+    out["market_value"] = pd.to_numeric(out["market_value"], errors="coerce").fillna(0)
     return out
 
 
@@ -924,61 +1189,100 @@ def compute_and_write_inst_ownership(
 ) -> list[InstOwnershipRow] | None:
     """Download, parse, aggregate, and write 13F institutional ownership.
 
-    Full pipeline:
-    1. Download current and prior quarter SEC 13F bulk data.
-    2. Parse INFOTABLE from both — this is where the CUSIPs actually
-       come from (the filings carry CUSIP, not ticker).
-    3. Resolve CUSIP→ticker for the CUSIPs seen in either quarter (cache
-       + OpenFIGI for the delta).
-    4. Compute QoQ deltas per ticker, filtered to the scanned universe.
-    5. Write parquet.
+    Full pipeline (rewritten alpha-engine-config-I10529 — the old
+    calendar-quarter URL scheme 404s for every quarter; SEC now publishes
+    three-month filing windows that mix report periods):
+
+    1. Discover and download the 2 newest published SEC 13F filing-window
+       ZIPs (index-page discovery, deterministic-construction fallback).
+    2. Parse SUBMISSION + INFOTABLE from both; dedupe to one accession per
+       (CIK, PERIODOFREPORT), an amendment superseding the original.
+    3. Select the 2 most recent PERIODOFREPORT dates present as
+       current/prior "quarter" — this is where the CUSIPs actually come
+       from (the filings carry CUSIP, not ticker).
+    4. Resolve CUSIP→ticker for the CUSIPs seen in either period (cache +
+       OpenFIGI for the delta).
+    5. Compute QoQ deltas per ticker, filtered to the scanned universe.
+    6. Write parquet.
 
     Returns the list of rows, or ``None`` if no data could be processed
     (nothing gets written in that case — callers must not treat a
     non-exception return as success without checking for ``None``).
     """
-    # Determine which quarters to process
-    quarters = _current_and_prior_quarters()
-    current_q = quarters[0]
-    prior_q = quarters[1]
+    windows = _download_recent_windows(count=2)
+    if not windows:
+        logger.warning("no SEC 13F window files could be downloaded")
+        return None
+
+    submission_frames: list[pd.DataFrame] = []
+    infotable_frames: list[pd.DataFrame] = []
+    for name, zf in windows:
+        sub = _parse_submission(zf)
+        info = _parse_infotable(zf)
+        logger.info(
+            "parsed SEC 13F window %s: %d submissions, %d infotable rows",
+            name, len(sub), len(info),
+        )
+        if len(sub) > 0:
+            submission_frames.append(sub)
+        if len(info) > 0:
+            infotable_frames.append(info)
+
+    if not submission_frames or not infotable_frames:
+        logger.warning(
+            "no parseable SUBMISSION/INFOTABLE data in the %d downloaded "
+            "window file(s)", len(windows),
+        )
+        return None
+
+    submissions = pd.concat(submission_frames, ignore_index=True)
+    infotable = pd.concat(infotable_frames, ignore_index=True)
+
+    winners = _dedupe_amendments(submissions)
+    periods = _select_report_periods(winners, count=2)
+    if not periods:
+        logger.warning("no report periods resolved from SUBMISSION data")
+        return None
+
+    current_period = periods[0]
+    prior_period = periods[1] if len(periods) > 1 else None
+    current_q = _quarter_str_for_date(current_period)
+    prior_q = _quarter_str_for_date(prior_period) if prior_period is not None else None
 
     logger.info(
-        "inst_ownership: processing %s (current) and %s (prior)",
-        current_q, prior_q,
+        "inst_ownership: selected report periods current=%s (%s), prior=%s (%s) "
+        "from window file(s) %s",
+        current_period.date() if hasattr(current_period, "date") else current_period,
+        current_q,
+        prior_period.date() if hasattr(prior_period, "date") else prior_period,
+        prior_q, [n for n, _ in windows],
     )
 
-    # Download both quarters
-    current_zip = _download_sec_bulk_zip(current_q)
-    if current_zip is None:
-        # Try one quarter back
-        current_q = quarters[1]
-        prior_q = quarters[2] if len(quarters) > 2 else None
-        if prior_q is None:
-            logger.warning("no current or prior quarter data available")
-            return None
-        current_zip = _download_sec_bulk_zip(current_q)
-        if current_zip is None:
-            logger.warning("no SEC 13F data available for any recent quarter")
-            return None
-        prior_zip = _download_sec_bulk_zip(prior_q) if prior_q else None
-    else:
-        prior_zip = _download_sec_bulk_zip(prior_q)
+    current_accessions = set(
+        winners.loc[winners["PERIODOFREPORT"] == current_period, "ACCESSION_NUMBER"]
+    )
+    prior_accessions = (
+        set(winners.loc[winners["PERIODOFREPORT"] == prior_period, "ACCESSION_NUMBER"])
+        if prior_period is not None else set()
+    )
 
-    # Parse INFOTABLE
-    current_df = _parse_infotable(current_zip)
+    current_df = infotable[infotable["accession_number"].isin(current_accessions)]
     if len(current_df) == 0:
-        logger.warning("no INFOTABLE data for %s", current_q)
+        logger.warning("no INFOTABLE rows joined to the current period %s", current_q)
         return None
-    prior_df = _parse_infotable(prior_zip) if prior_zip else pd.DataFrame()
+    prior_df = (
+        infotable[infotable["accession_number"].isin(prior_accessions)]
+        if prior_accessions else pd.DataFrame()
+    )
 
     logger.info(
-        "INFOTABLE parsed: %s: %d rows, %s: %d rows",
+        "INFOTABLE joined to periods: %s: %d rows, %s: %d rows",
         current_q, len(current_df),
-        prior_q, len(prior_df) if prior_zip else 0,
+        prior_q, len(prior_df),
     )
 
     # Resolve CUSIP→ticker for the CUSIPs actually present in the filings
-    # (union of both quarters) — not the universe tickers, which is the
+    # (union of both periods) — not the universe tickers, which is the
     # wrong mapping direction (config#2428 / alpha-engine-config-I10529).
     filing_cusips = set(current_df["cusip"].dropna().astype(str))
     if len(prior_df) > 0:
