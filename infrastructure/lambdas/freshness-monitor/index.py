@@ -1874,6 +1874,15 @@ def _serialize_check_results(
                 "never_written": (never_written_by_id or {}).get(
                     spec.artifact_id
                 ),
+                # alpha-engine-config-I10614 — the console must be able to
+                # render a never-written `absence_expected` row as
+                # DECLARED-ABSENT (its healthy state) rather than as a
+                # fresh-by-short-circuit row that merely happens to have
+                # never been probed. Mirrors `spec.absence_expected`
+                # directly; the never-written probe never runs for this row
+                # (see the I8810 block), so `never_written` above stays
+                # `None` here — this field is the console's positive signal.
+                "absence_expected": spec.absence_expected,
                 # config-I7509: the console must be able to say WHOSE decision
                 # is holding this row quiet past the 14-day clock. A suppressed
                 # row with no named owner is the latch case and reads
@@ -3569,7 +3578,15 @@ def _publish_digest(
     unproduced = sorted(
         aid for aid, flag in (never_written or {}).items() if flag is True
     )
-    if not decisions and not unproduced:
+    # alpha-engine-config-I10614 — a never-written row does NOT page on its
+    # own: every comment on this function and on `_alert_decision` says so,
+    # but `not decisions and not unproduced` published a `severity=warning`
+    # page whose only content was the never-written block (itself labelled
+    # "does not page") whenever the never-written set was non-empty and
+    # decisions were empty. The never-written block stays recorded in
+    # `check_results.json` and is appended to a REAL digest (below, via
+    # `_compose_digest`) only when one exists.
+    if not decisions:
         return 0
 
     severity = "critical" if any(
@@ -4361,9 +4378,21 @@ def _run_probe_pass(
         # directly, not through `_alert_decision`) — so the gap renders instead
         # of reading as a healthy `fresh` row forever. `_NEVER_WRITTEN_PROBE_MAX`
         # still bounds the per-sweep cost.
+        #
+        # alpha-engine-config-I10614 — `spec.absence_expected` rows are
+        # excluded from this probe entirely: their producer writes ONLY on a
+        # condition firing (e.g. a violation), so never-written IS the
+        # healthy state, not a gap to surface. Requiring
+        # `cadence="event_driven"` + `liveness_via` (validated in
+        # `nousergon_lib.artifact_freshness.ArtifactSpec`) still leaves the
+        # anchor proving the producer runs; this just stops the never-written
+        # block (`_compose_digest`'s `unproduced` list, which drove
+        # `_publish_digest` to page on the never-written set alone — the
+        # OTHER I10614 defect, fixed separately) from ever naming this row.
         never_written: bool | None = None
         if (
             (result.state == "missing" or spec.cadence == "event_driven")
+            and not spec.absence_expected
             and len(never_written_by_id) < _NEVER_WRITTEN_PROBE_MAX
         ):
             never_written = _prefix_has_ever_been_written(s3_client, spec, result)
