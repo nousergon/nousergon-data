@@ -872,67 +872,53 @@ def _parse_infotable(zf: zipfile.ZipFile) -> pd.DataFrame:
     })
 
 
-def _aggregate_quarter(
+def _per_fund_holdings(
     df: pd.DataFrame,
     cusip_to_ticker: dict[str, str],
+    accession_to_cik: dict[str, str] | None,
+    keep_tickers: set[str] | None,
 ) -> pd.DataFrame:
-    """Aggregate INFOTABLE holdings to per-ticker rows for one quarter.
+    """One row per (ticker, fund) for one period: ``ticker, fund, shares, market_value``.
 
-    Parameters
-    ----------
-    df : pd.DataFrame
-        Parsed INFOTABLE with columns cusip, shares, market_value.
-    cusip_to_ticker : dict
-        ``{cusip: ticker}`` mapping.
+    ``fund`` is the filer CIK (via ``accession_to_cik``, the winners map from
+    SUBMISSION.tsv) so a fund is the same identity across periods; without the
+    map the accession number stands in (unique per fund within a period once
+    amendments are collapsed, but not comparable across periods).
 
-    Returns
-    -------
-    pd.DataFrame
-        Per-ticker: n_funds, total_shares, total_value.
+    Filters to ``keep_tickers`` FIRST — the universe is ~900 names against
+    ~13k mapped tickers and ~3M rows, so everything downstream is an order of
+    magnitude smaller. All operations are vectorized: the previous shape did
+    ``rows[rows.ticker == t]`` per ticker (O(tickers x rows)) and ran 42 min
+    to the job timeout on 2026-09-13 (run 34780401480).
     """
     if len(df) == 0:
-        return pd.DataFrame()
-
-    # Map CUSIP → ticker
-    df["ticker"] = df["cusip"].map(cusip_to_ticker)
-    df = df[df["ticker"].notna()].copy()
-
-    if len(df) == 0:
-        return pd.DataFrame()
-
-    # Per-fund (cusip, filer) → per-ticker aggregate
-    # Group by ticker for fund-level stats
-    ticker_groups = df.groupby("ticker")
-
-    def _fund_stats(group: pd.DataFrame) -> dict:
-        shares = group["shares"].fillna(0).astype(float).sum() if "shares" in group.columns else 0.0
-        value = group["market_value"].fillna(0).astype(float).sum() if "market_value" in group.columns else 0.0
-        n_funds = group["cusip"].nunique()
-        return {"n_funds_holding": n_funds, "total_shares_held": shares, "total_value_usd": value}
-
-    records = []
-    for ticker, grp in ticker_groups:
-        records.append({**{"ticker": ticker}, **_fund_stats(grp)})
-
-    result = pd.DataFrame(records)
-    result["total_shares_held"] = pd.to_numeric(result["total_shares_held"], errors="coerce")
-    result["total_value_usd"] = pd.to_numeric(result["total_value_usd"], errors="coerce")
-    result["total_shares_held"] = result["total_shares_held"].fillna(0)
-    result["total_value_usd"] = result["total_value_usd"].fillna(0)
-    return result
+        return pd.DataFrame(columns=["ticker", "fund", "shares", "market_value"])
+    out = pd.DataFrame({
+        "ticker": df["cusip"].map(cusip_to_ticker),
+        "fund": (df["accession_number"].map(accession_to_cik)
+                 if accession_to_cik else df["accession_number"]),
+        "shares": pd.to_numeric(df["shares"], errors="coerce").fillna(0.0),
+        "market_value": pd.to_numeric(df["market_value"], errors="coerce").fillna(0.0),
+    })
+    out = out[out["ticker"].notna() & out["fund"].notna()]
+    if keep_tickers is not None:
+        out = out[out["ticker"].isin(keep_tickers)]
+    if len(out) == 0:
+        return pd.DataFrame(columns=["ticker", "fund", "shares", "market_value"])
+    return out.groupby(["ticker", "fund"], as_index=False, sort=False)[["shares", "market_value"]].sum()
 
 
-def _fund_level_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Extract per-ticker, per-fund level data for QoQ delta computation.
-
-    Returns DataFrame with columns: ticker, fund_cik, cusip, shares, market_value.
-    """
-    if len(df) == 0:
-        return pd.DataFrame()
-    out = df[["cusip", "shares", "market_value"]].copy()
-    out["shares"] = pd.to_numeric(out["shares"], errors="coerce").fillna(0)
-    out["market_value"] = pd.to_numeric(out["market_value"], errors="coerce").fillna(0)
-    return out
+def _aggregate_quarter(funds: pd.DataFrame) -> pd.DataFrame:
+    """Per-ticker totals from per-fund holdings: n_funds_holding,
+    total_shares_held, total_value_usd (indexed by ticker)."""
+    if len(funds) == 0:
+        return pd.DataFrame(columns=["n_funds_holding", "total_shares_held", "total_value_usd"])
+    agg = funds.groupby("ticker").agg(
+        n_funds_holding=("fund", "nunique"),
+        total_shares_held=("shares", "sum"),
+        total_value_usd=("market_value", "sum"),
+    )
+    return agg
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -945,157 +931,65 @@ def _compute_qoq_deltas(
     prior: pd.DataFrame,
     cusip_to_ticker: dict[str, str],
     current_quarter: str,
+    *,
+    accession_to_cik: dict[str, str] | None = None,
+    keep_tickers: set[str] | None = None,
 ) -> list[InstOwnershipRow]:
-    """Compute QoQ deltas between two quarters' INFOTABLE data.
+    """Per-ticker institutional-ownership rows with quarter-over-quarter deltas.
 
-    Parameters
-    ----------
-    current : pd.DataFrame
-        Current quarter's raw INFOTABLE.
-    prior : pd.DataFrame
-        Prior quarter's raw INFOTABLE.
-    cusip_to_ticker : dict
-        CUSIP→ticker mapping.
-    current_quarter : str
-        Quarter string (e.g. "2024Q2") for the output rows.
+    Vectorized end to end: per-fund holdings for each period, an outer merge
+    on (ticker, fund) to classify every fund as new / exited / increasing /
+    decreasing / unchanged, then one groupby per ticker.
     """
-    # Aggregate both quarters to per-ticker
-    curr_agg = _aggregate_quarter(current, cusip_to_ticker)
-    prior_agg = _aggregate_quarter(prior, cusip_to_ticker)
-
-    if len(curr_agg) == 0:
+    cf = _per_fund_holdings(current, cusip_to_ticker, accession_to_cik, keep_tickers)
+    if len(cf) == 0:
         return []
+    pf = _per_fund_holdings(prior, cusip_to_ticker, accession_to_cik, keep_tickers)
 
-    # Index by ticker for lookup
-    curr_idx = curr_agg.set_index("ticker") if len(curr_agg) > 0 else pd.DataFrame()
-    prior_idx = prior_agg.set_index("ticker") if len(prior_agg) > 0 else pd.DataFrame()
+    curr_agg = _aggregate_quarter(cf)
+    prior_agg = _aggregate_quarter(pf)
 
-    # Per-fund level for fund-count deltas
-    curr_funds = _fund_level_data(current)
-    prior_funds = _fund_level_data(prior)
+    merged = cf.merge(pf, on=["ticker", "fund"], how="outer", suffixes=("_c", "_p"), indicator=True)
+    both = merged["_merge"] == "both"
+    merged["new"] = merged["_merge"] == "left_only"
+    merged["exited"] = merged["_merge"] == "right_only"
+    merged["increasing"] = both & (merged["shares_c"] > merged["shares_p"])
+    merged["decreasing"] = both & (merged["shares_c"] < merged["shares_p"])
+    fund_counts = merged.groupby("ticker")[["new", "exited", "increasing", "decreasing"]].sum()
 
-    # Map CUSIP→ticker for fund-level
-    if len(curr_funds) > 0:
-        curr_funds["ticker"] = curr_funds["cusip"].map(cusip_to_ticker)
-        curr_funds = curr_funds[curr_funds["ticker"].notna()]
-    if len(prior_funds) > 0:
-        prior_funds["ticker"] = prior_funds["cusip"].map(cusip_to_ticker)
-        prior_funds = prior_funds[prior_funds["ticker"].notna()]
+    # Top-5 concentration: share of the ticker's institutional shares held by
+    # its five largest funds, only where at least five funds hold it.
+    top5 = (cf.sort_values("shares", ascending=False)
+              .groupby("ticker").head(5)
+              .groupby("ticker")["shares"].sum())
+    top5_pct = (top5 / curr_agg["total_shares_held"].replace(0, float("nan")) * 100.0)
+    top5_pct = top5_pct.where(curr_agg["n_funds_holding"] >= 5)
 
     rows: list[InstOwnershipRow] = []
-
-    for ticker in curr_idx.index:
-        c_row = curr_idx.loc[ticker]
-        p_row = prior_idx.loc[ticker] if ticker in prior_idx.index else None
-
-        n_funds = int(c_row.get("n_funds_holding", 0))
-        total_shares = float(c_row.get("total_shares_held", 0))
-        total_value = float(c_row.get("total_value_usd", 0))
-
-        if p_row is not None:
-            prev_shares = float(p_row.get("total_shares_held", 0))
-            prev_value = float(p_row.get("total_value_usd", 0))
-            shares_qoq = total_shares - prev_shares
-            value_qoq = total_value - prev_value
-        else:
-            shares_qoq = None
-            value_qoq = None
-
-        # Fund-level deltas
-        curr_ticker_funds = (
-            curr_funds[curr_funds["ticker"] == ticker] if len(curr_funds) > 0 else pd.DataFrame()
-        )
-        prior_ticker_funds = (
-            prior_funds[prior_funds["ticker"] == ticker] if len(prior_funds) > 0 else pd.DataFrame()
-        )
-
-        # Top 5 concentration
-        if len(curr_ticker_funds) >= 5:
-            top5 = curr_ticker_funds.nlargest(5, "shares")
-            top5_pct = float(top5["shares"].sum() / curr_ticker_funds["shares"].sum() * 100) if curr_ticker_funds["shares"].sum() > 0 else None
-        else:
-            top5_pct = None
-
-        # Delta fund-level tracking
-        curr_ciks = set(curr_ticker_funds.index) if len(curr_ticker_funds) > 0 else set()
-        prior_ciks = set(prior_ticker_funds.index) if len(prior_ticker_funds) > 0 else set()
-
-        # Mapping of CUSIP+Cik as fund identifier for change detection
-        curr_fund_set: set[tuple[str, str]] = set()
-        if len(curr_ticker_funds) > 0 and "cusip" in curr_ticker_funds.columns:
-            for _, r in curr_ticker_funds.iterrows():
-                # Use cusip as fund identifier proxy (each row is one fund's holding of this ticker)
-                cusip_val = str(r.get("cusip", ""))
-                if cusip_val:
-                    # shares as a crude fund identifier
-                    shares_val = str(r.get("shares", 0))
-                    curr_fund_set.add((cusip_val, shares_val))
-
-        prior_fund_set: set[tuple[str, str]] = set()
-        if len(prior_ticker_funds) > 0 and "cusip" in prior_ticker_funds.columns:
-            for _, r in prior_ticker_funds.iterrows():
-                cusip_val = str(r.get("cusip", ""))
-                if cusip_val:
-                    shares_val = str(r.get("shares", 0))
-                    prior_fund_set.add((cusip_val, shares_val))
-
-        # For increase/decrease, compare per-CUSIP share counts between periods
-        # Simpler: compare shares by ticker-fund combination
-        curr_by_cusip: dict[str, float] = {}
-        if len(curr_ticker_funds) > 0 and "shares" in curr_ticker_funds.columns:
-            for _, r in curr_ticker_funds.iterrows():
-                c = str(r.get("cusip", ""))
-                if c:
-                    curr_by_cusip[c] = curr_by_cusip.get(c, 0) + float(r.get("shares", 0))
-
-        prior_by_cusip: dict[str, float] = {}
-        if len(prior_ticker_funds) > 0 and "shares" in prior_ticker_funds.columns:
-            for _, r in prior_ticker_funds.iterrows():
-                c = str(r.get("cusip", ""))
-                if c:
-                    prior_by_cusip[c] = prior_by_cusip.get(c, 0) + float(r.get("shares", 0))
-
-        all_cusips = set(curr_by_cusip) | set(prior_by_cusip)
-
-        n_increasing = 0
-        n_decreasing = 0
-        n_new = 0
-        n_exited = 0
-        for c in all_cusips:
-            curr_s = curr_by_cusip.get(c, 0)
-            prior_s = prior_by_cusip.get(c, 0)
-            if curr_s > 0 and prior_s == 0:
-                n_new += 1
-            elif curr_s == 0 and prior_s > 0:
-                n_exited += 1
-            elif curr_s > prior_s:
-                n_increasing += 1
-            elif curr_s < prior_s:
-                n_decreasing += 1
-
+    for ticker, c in curr_agg.iterrows():
+        counts = fund_counts.loc[ticker] if ticker in fund_counts.index else None
+        has_prior = ticker in prior_agg.index
         rows.append(InstOwnershipRow(
-            ticker=ticker.upper(),
+            ticker=str(ticker),
             quarter=current_quarter,
             schema_version=SCHEMA_VERSION,
-            n_funds_holding=n_funds,
-            total_shares_held=total_shares,
-            total_value_usd=total_value,
-            shares_qoq_change=shares_qoq,
-            value_qoq_change=value_qoq,
-            top5_concentration_pct=top5_pct,
-            n_funds_increasing=n_increasing,
-            n_funds_decreasing=n_decreasing,
-            n_funds_new=n_new,
-            n_funds_exited=n_exited,
-            put_call_ratio=None,  # we excluded options above; future enhancement
+            n_funds_holding=int(c["n_funds_holding"]),
+            total_shares_held=float(c["total_shares_held"]),
+            total_value_usd=float(c["total_value_usd"]),
+            shares_qoq_change=(float(c["total_shares_held"] - prior_agg.loc[ticker, "total_shares_held"])
+                               if has_prior else None),
+            value_qoq_change=(float(c["total_value_usd"] - prior_agg.loc[ticker, "total_value_usd"])
+                              if has_prior else None),
+            n_funds_increasing=int(counts["increasing"]) if counts is not None else 0,
+            n_funds_decreasing=int(counts["decreasing"]) if counts is not None else 0,
+            n_funds_new=int(counts["new"]) if counts is not None else 0,
+            n_funds_exited=int(counts["exited"]) if counts is not None else 0,
+            put_call_ratio=None,  # options rows are excluded by the parser
+            top5_concentration_pct=(float(top5_pct.loc[ticker])
+                                    if ticker in top5_pct.index and pd.notna(top5_pct.loc[ticker])
+                                    else None),
         ))
-
     return rows
-
-
-# ═══════════════════════════════════════════════════════════════════
-# Parquet writer
-# ═══════════════════════════════════════════════════════════════════
 
 
 def rows_to_dataframe(rows: list[InstOwnershipRow]) -> pd.DataFrame:
@@ -1340,7 +1234,13 @@ def compute_and_write_inst_ownership(
         return None
 
     # Compute QoQ deltas
-    rows = _compute_qoq_deltas(current_df, prior_df, cusip_to_ticker, current_q)
+    universe_set = {t.strip().upper() for t in universe_tickers if t.strip()}
+    accession_to_cik = dict(zip(winners["ACCESSION_NUMBER"], winners["CIK"].astype(str)))
+    rows = _compute_qoq_deltas(
+        current_df, prior_df, cusip_to_ticker, current_q,
+        accession_to_cik=accession_to_cik,
+        keep_tickers=universe_set or None,
+    )
     if not rows:
         logger.info("no tickers resolved from CUSIP mapping in %s", current_q)
         return None
