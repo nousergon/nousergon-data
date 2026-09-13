@@ -61,6 +61,13 @@ SCHEMA_VERSION = 1
 DEFAULT_S3_BUCKET = "alpha-engine-research"
 DEFAULT_S3_PREFIX = "data/inst_ownership"
 
+# The Scanner's universe-membership pointer (crucible-research/scoring/
+# universe_membership.py). ``ranks`` carries the FULL scanned universe
+# (~900 names), not the narrower feed cut ``rag/pipelines/_rag_scope.py``
+# resolves for the RAG corpus — this producer covers the whole 13F-eligible
+# universe, matching the module docstring's "our ~900-name universe".
+MEMBERSHIP_LATEST_KEY = "universe_membership/latest.json"
+
 SEC_13F_BASE_URL = (
     "https://www.sec.gov/files/dera/data/form-13f-data-sets"
 )
@@ -136,6 +143,64 @@ class InstOwnershipRow:
     """Number of puts divided by calls for this ticker.
     >1 = bearish options positioning; <1 = bullish. None if no options
     reported or only one side is present."""
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Universe resolution (alpha-engine-config-I10529)
+# ═══════════════════════════════════════════════════════════════════
+
+
+class UniverseUnavailable(RuntimeError):
+    """The scanned universe could not be resolved from the membership pointer.
+
+    Raised rather than falling back to a stale local list — a producer
+    running on the wrong week's universe is a silent scope error, not a
+    degraded run (PRODUCER-repo fail-loud default, AGENTS.md).
+    """
+
+
+def load_universe_from_membership(
+    *,
+    s3_client: Any,
+    bucket: str = DEFAULT_S3_BUCKET,
+    key: str = MEMBERSHIP_LATEST_KEY,
+) -> list[str]:
+    """Resolve the full scanned universe from the Scanner's membership
+    pointer (``s3://{bucket}/{key}``, written by
+    ``crucible-research/scoring/universe_membership.py``).
+
+    Uses the ``ranks`` map (full scanned universe with a rankable
+    attractiveness score, ~900 names) rather than the narrower
+    ``cuts.<feed_cut>.tickers`` set ``rag/pipelines/_rag_scope.py`` reads for
+    the RAG corpus — this producer's docstring targets "our ~900-name
+    universe", the whole 13F-eligible board, not the top-N feed cut.
+
+    Scheduled entry point for alpha-engine-config-I10529 (the producer had no
+    trigger at all before this): avoids requiring a hand-maintained ticker
+    file that goes stale the week the universe changes.
+    """
+    try:
+        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        payload = json.loads(obj["Body"].read())
+    except Exception as e:
+        raise UniverseUnavailable(
+            f"universe membership artifact s3://{bucket}/{key} is missing or "
+            f"unparseable ({type(e).__name__}: {e}). The Scanner writes it "
+            f"every weekly-SF run; refusing to guess the universe."
+        ) from e
+
+    ranks = payload.get("ranks") or {}
+    tickers = sorted({str(t).strip().upper() for t in ranks if str(t).strip()})
+    if not tickers:
+        raise UniverseUnavailable(
+            f"membership artifact s3://{bucket}/{key} carries no non-empty "
+            f"'ranks' map — cannot resolve a universe to process."
+        )
+    logger.info(
+        "[inst_ownership] resolved %d tickers from s3://%s/%s (generated_at=%s)",
+        len(tickers), bucket, key, payload.get("generated_at"),
+    )
+    return tickers
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -805,6 +870,14 @@ def main() -> None:
         help="Path to a text file with one ticker per line",
     )
     parser.add_argument(
+        "--from-membership", action="store_true",
+        help=(
+            "Resolve the universe from the Scanner's "
+            f"s3://<bucket>/{MEMBERSHIP_LATEST_KEY} pointer instead of a "
+            "static file (scheduled-run entry point, alpha-engine-config-I10529)"
+        ),
+    )
+    parser.add_argument(
         "--bucket", type=str, default=DEFAULT_S3_BUCKET,
         help=f"S3 bucket (default: {DEFAULT_S3_BUCKET})",
     )
@@ -814,19 +887,31 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.tickers_file and args.from_membership:
+        print("--tickers-file and --from-membership are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
+
+    s3 = boto3.client("s3")
+
     # Load tickers
     if args.tickers_file:
         with open(args.tickers_file) as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
+    elif args.from_membership:
+        try:
+            tickers = load_universe_from_membership(s3_client=s3, bucket=args.bucket)
+        except UniverseUnavailable as e:
+            print(f"universe resolution failed: {e}", file=sys.stderr)
+            sys.exit(1)
     else:
         print(
-            "Usage: python -m data.derived.inst_ownership --tickers-file <path>",
+            "Usage: python -m data.derived.inst_ownership "
+            "(--tickers-file <path> | --from-membership)",
             file=sys.stderr,
         )
         sys.exit(1)
 
     print(f"Processing {len(tickers)} tickers for 13F institutional ownership...")
-    s3 = boto3.client("s3")
     rows = compute_and_write_inst_ownership(
         tickers, s3_client=s3, bucket=args.bucket,
         force_rebuild_cusip=args.force_rebuild_cusip,
@@ -838,3 +923,11 @@ def main() -> None:
     print(f"Written: {len(rows)} rows for {rows[0].quarter}")
     print(f"Sample: {rows[0].ticker} — {rows[0].n_funds_holding} funds, "
           f"{rows[0].total_shares_held:,.0f} shares")
+
+
+if __name__ == "__main__":
+    # Alpha-engine-config-I10529: `python -m data.derived.inst_ownership` was
+    # a no-op before this — main() existed but nothing ever called it, so the
+    # module's own documented CLI entry point could not have been invoked by
+    # anything, ever. Found while wiring the first real scheduled caller.
+    main()

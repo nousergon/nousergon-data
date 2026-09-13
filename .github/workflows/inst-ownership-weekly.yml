@@ -1,0 +1,150 @@
+name: Institutional ownership (13F) weekly
+
+# alpha-engine-config-I10529. `data/derived/inst_ownership.py` (config#2428,
+# Wave 1 PR B) has existed on `main` since 2026-07-13 and was invoked by
+# NOTHING — no workflow, no EventBridge rule, no Scheduler schedule. Its
+# registry row (`thinktank_inst_ownership`, private-docs/ARTIFACT_REGISTRY.yaml)
+# has therefore never been written once, and the daily freshness sweep has
+# been correctly reporting that gap ever since. This is the schedule
+# (deliverable (a) of that issue).
+#
+# WHY A PLAIN GITHUB ACTIONS CRON, NOT AN EC2 SPOT DISPATCHER: the other
+# scheduled producers in this repo (thinktank-spot-dispatcher,
+# weekly-freshness-spot-dispatcher, data-spot-dispatcher) exist because their
+# workload needs ArcticDB or a long-running box. This producer needs neither:
+# its universe comes from the Scanner's S3 pointer (see below, no ArcticDB
+# read at all — ArcticDB is unreadable outside us-east-1, including from a
+# GitHub-hosted runner, alpha-engine-config-I9771), and its own work is two
+# SEC bulk-ZIP downloads plus ~900 yfinance lookups — the same shape as
+# sync-alert-tier-registry.yml's S3 put/get, not the ArcticDB append that
+# data-spot-dispatcher exists to move off the trading box. A GitHub-hosted
+# runner with a dedicated least-privilege OIDC role is the SOTA-simplest
+# correct answer per repository-tiering-policy.md's public-repo-gets-free-
+# GHA-minutes default; standing up a Lambda + spot box for this workload
+# would be the extra machinery this repo's own AGENTS.md warns against
+# ("Adding a deployed unit means adding its workflow, not extending an
+# existing one") without buying anything a bulk HTTP download needs.
+#
+# UNIVERSE SOURCE: this producer previously required an operator-supplied
+# `--tickers-file`, which would have gone stale the week the universe changed
+# — the same silent-scope-drift class rag-corpus-policy.md's `_rag_scope.py`
+# was written to prevent for the RAG corpus. `--from-membership` (added
+# alongside this workflow) resolves the FULL scanned universe (~900 names,
+# the `ranks` map — not the narrower feed cut `_rag_scope.py` reads) from the
+# Scanner's `universe_membership/latest.json` pointer, the same artifact the
+# weekly SF already writes every Saturday. Fails loud (`UniverseUnavailable`)
+# rather than falling back to a stale list, matching this PRODUCER repo's
+# fail-loud default (AGENTS.md).
+#
+# NOT GOVERNED BY THE 2026-08-07 AWS AUTOMATION PAUSE
+# (`infrastructure/automation_pause.json`): that ruling and its manifest
+# enumerate live AWS EventBridge rules and Scheduler schedules only — this
+# workflow starts no EventBridge rule, Lambda or EC2 instance, exactly like
+# `sync-alert-tier-registry.yml` and `pause-reconcile.yml`, both added after
+# the ruling with their own `schedule:` cron and neither entered in that
+# manifest.
+#
+# CADENCE: Saturday, matching every other weekly fleet process
+# (preference_weekly_all_saturday_sunday_buffer) and the registry row's
+# declared `interval_minutes: 10080`. Offset from the weekly SF's own
+# Saturday-morning trigger and its post-run sweeps.
+#
+# IAM: dedicated least-privilege role `nousergon-data-inst-ownership-sync`
+# (nous-ergon-ops-PR<TBD>, alpha-engine-config-I10529) — s3:GetObject on the
+# membership pointer, s3:GetObject/PutObject on the CUSIP↔ticker crosswalk
+# cache, s3:PutObject on the inst_ownership parquet + latest.json sidecar,
+# and s3:GetObject on the sidecar for the read-back verification step below.
+# Mirrors nousergon-data-registry-sync's shape (one dedicated role per
+# producer, scoped to the exact keys it touches).
+#
+# REGISTRY ROW: landed FIRST as `lifecycle: pending` in nous-ergon-ops per
+# this repo's own AGENTS.md ("Land that row FIRST... It used to be true that
+# adding a scheduled workflow anywhere in the fleet reddened nous-ergon-ops
+# main") — see nous-ergon-ops-PR<TBD>. Flips to `in-service` in a follow-up
+# ops PR once this workflow is on `main`.
+
+on:
+  schedule:
+    # Saturday 12:40 UTC — after the weekly SF's Scanner stage has written
+    # universe_membership/latest.json (the weekly SF triggers Saturday
+    # morning; Scanner is an early stage with a 45min SLA off that trigger)
+    # and clear of sync-alert-tier-registry.yml (13:20) / pause-reconcile.yml
+    # (09:50) / sf-arn-drift-check.yml (09:30)'s daily crons.
+    - cron: '40 12 * * 6'
+  workflow_dispatch:
+
+concurrency:
+  group: inst-ownership-weekly-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  build:
+    name: Build + publish 13F institutional ownership
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/nousergon-data-inst-ownership-sync
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Build + publish institutional ownership (universe resolved from Scanner pointer)
+        run: python -m data.derived.inst_ownership --from-membership
+
+      - name: Verify the write landed (read back latest.json sidecar)
+        run: |
+          python3 - <<'PY'
+          import json
+          import sys
+
+          import boto3
+
+          s3 = boto3.client("s3")
+          bucket = "alpha-engine-research"
+          key = "data/inst_ownership/latest.json"
+          try:
+              obj = s3.get_object(Bucket=bucket, Key=key)
+          except Exception as e:
+              print(f"::error::sidecar s3://{bucket}/{key} unreadable after a run that "
+                    f"reported success: {type(e).__name__}: {e}")
+              sys.exit(1)
+          sidecar = json.loads(obj["Body"].read())
+          written_at = sidecar.get("written_at")
+          row_count = sidecar.get("row_count")
+          print(f"sidecar written_at={written_at} row_count={row_count} "
+                f"artifact_key={sidecar.get('artifact_key')}")
+          if not written_at or not row_count:
+              print(f"::error::sidecar at s3://{bucket}/{key} is missing "
+                    f"written_at/row_count — the run did not actually publish")
+              sys.exit(1)
+          PY
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: inst-ownership-weekly.yml
+
+  notify-main-failure:
+    needs: [build]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
