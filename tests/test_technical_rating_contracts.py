@@ -68,7 +68,7 @@ class TestTechnicalsContract:
         own construction, not merely because it happens to match collect_technicals's
         output shape."""
         art = {
-            "schema_version": 3, "as_of": "2026-06-26", "source": "computed",
+            "schema_version": 4, "as_of": "2026-06-26", "source": "computed",
             "technicals": {
                 "AAPL": {
                     "rsi_14": 55.2, "macd_hist": 0.4, "ma_50": 200.1, "ma_200": None,
@@ -78,6 +78,7 @@ class TestTechnicalsContract:
                     "rating": {
                         "score": 0.6, "label": "Strong Buy", "ma_score": 1.0, "osc_score": 0.2,
                         "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12,
+                        "rating_version": 2,
                     },
                 }
             },
@@ -86,10 +87,10 @@ class TestTechnicalsContract:
 
     def test_wrong_label_fails(self):
         art = {
-            "schema_version": 3, "as_of": "2026-06-26", "source": "computed",
+            "schema_version": 4, "as_of": "2026-06-26", "source": "computed",
             "technicals": {"AAPL": {"rating": {
                 "score": 0.6, "label": "Very Bullish", "ma_score": 1.0, "osc_score": 0.2,
-                "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12,
+                "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12, "rating_version": 2,
             }}},
         }
         assert validate_technicals(art) != []
@@ -133,12 +134,12 @@ class TestTechnicalRatingsContract:
 
     def test_minimal_hand_built_fixture_validates(self):
         art = {
-            "schema_version": 1, "as_of_utc": "2026-06-12T15:00:00Z",
+            "schema_version": 2, "as_of_utc": "2026-06-12T15:00:00Z",
             "quote_as_of_utc": "2026-06-12T15:00:00Z", "source": "computed_intraday",
             "ratings": {
                 "AAPL": {
                     "score": 0.6, "label": "Strong Buy", "ma_score": 1.0, "osc_score": 0.2,
-                    "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12,
+                    "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12, "rating_version": 2,
                     "price": 202.5, "bar_date": "2026-06-12", "basis": "intraday",
                 }
             },
@@ -147,12 +148,12 @@ class TestTechnicalRatingsContract:
 
     def test_missing_basis_field_fails(self):
         art = {
-            "schema_version": 1, "as_of_utc": "2026-06-12T15:00:00Z",
+            "schema_version": 2, "as_of_utc": "2026-06-12T15:00:00Z",
             "quote_as_of_utc": "2026-06-12T15:00:00Z", "source": "computed_intraday",
             "ratings": {
                 "AAPL": {
                     "score": 0.6, "label": "Strong Buy", "ma_score": 1.0, "osc_score": 0.2,
-                    "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12,
+                    "n_buy": 8, "n_neutral": 4, "n_sell": 0, "n_votes": 12, "rating_version": 2,
                     "price": 202.5, "bar_date": "2026-06-12",
                 }
             },

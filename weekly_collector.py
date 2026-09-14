@@ -84,7 +84,7 @@ setup_logging(
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
 )
 
-from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history
+from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history, technical_rating_ledger
 from builders._price_cache_writeboth import (
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
@@ -2960,6 +2960,25 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_technicals_data",
         lambda: metron_market_data.collect_technicals(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.TECHNICALS_PREFIX}latest.json",
+    )
+    # Immutable daily technical-rating ledger (metron-ops#297 part 2) — self-seeding
+    # backfill to 252 trading days, then one immutable date per EOD run. Derived from
+    # the SAME consolidated close_history metron_market_data_history just published (no
+    # new fetch); per-symbol keys (one file per date) → markers + watchdog only.
+    # Writes stay under market_data/technicals/ — the SAME writer identity as
+    # collect_technicals above, no new IAM grant.
+    results["collectors"]["metron_rating_ledger"] = _phase_collect(
+        reg, "metron_rating_ledger",
+        lambda: technical_rating_ledger.collect_rating_ledger(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        supports_auto_skip=False,
+    )
+    # Realized near-term performance of the rating ledger (metron-ops#297 part 2) —
+    # recomputed every EOD run from the ledger + close_history. Runs after the ledger
+    # phase so today's date is already written.
+    results["collectors"]["metron_rating_performance"] = _phase_collect(
+        reg, "metron_rating_performance",
+        lambda: technical_rating_ledger.collect_rating_performance(bucket=bucket, dry_run=dry_run),
+        artifact_key=technical_rating_ledger.RATING_PERFORMANCE_KEY,
     )
     # Period returns + risk stats for Metron tearsheet / Holdings LTM — derived from
     # close_history (no new fetch). Runs after history + technicals.
