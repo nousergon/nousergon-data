@@ -381,6 +381,18 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # policy-observability: modules log their metrics, the console points
     # at the source — Brian ruling 2026-08-03).
     "scripts/weekly_sf_recovery_metric.py": 1,
+    # alpha-engine-config-I10733 / -I10750 — the EDGAR filing-date-indexed
+    # fundamentals collector's own `_S3Store.put_bytes` wrapper (one call
+    # site, reused for every artifact it writes: `sessions/{date}.parquet`,
+    # `facts/{run_date}/{run_id}.parquet`, `runs/{run_date}/{run_id}.json`,
+    # and the `runs/latest.json` freshness sentinel added by I10750). The
+    # sentinel is registered in alpha-engine-config/private-docs/
+    # ARTIFACT_REGISTRY.yaml as `edgar_pit_fundamentals_runs_latest`
+    # (alpha-engine-config-PR — see I10750); `sessions/{date}.parquet` and
+    # the per-run facts/summary keys are variable-cardinality producer
+    # detail the sentinel already stands in for, same treatment as
+    # `price_cache_freshness_sentinel` above.
+    "collectors/edgar_pit_fundamentals.py": 1,
 }
 
 

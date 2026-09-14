@@ -683,6 +683,12 @@ class TestEODSFTopLevelFieldsClosed:
             # _spy_close hard-fail would otherwise be guaranteed).
             "data_spot_retry",
             "data_spot_arctic_retry",
+            # alpha-engine-config-I10750: the edgar-pit-fundamentals-daily leg
+            # added after post-market-arctic-append — same launch/poll/retry
+            # ResultPath shape as the two legs above.
+            "edgar_pit_launch",
+            "edgar_pit_poll",
+            "data_spot_edgar_retry",
             "eod_skip_notify",
             "snapshot_poll",
             "snapshot_result",
