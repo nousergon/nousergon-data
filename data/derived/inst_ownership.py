@@ -942,6 +942,42 @@ def _download_recent_windows(
     return downloaded
 
 
+def _find_zip_member(zf: zipfile.ZipFile, member_name: str) -> str | None:
+    """Return the actual archive name for a top-level SEC 13F member file
+    (e.g. ``"SUBMISSION.tsv"``), tolerating a window ZIP whose entries are
+    nested under a subdirectory instead of sitting at the archive root.
+
+    MEASURED 2026-09-14 (alpha-engine-config-I10763): every 13F window ZIP
+    inspected is flat except ``01jun2025-31aug2025_form13f.zip`` (published
+    2025-09-02), whose 9 members all sit under a
+    ``01JUN2025-31AUG2025_form13f/`` subdirectory — SEC's own packaging is
+    inconsistent and not predictable from the window filename. An exact
+    ``zf.open(member_name)`` lookup KeyErrors on that layout; the prior
+    behaviour (catch and treat the window as carrying no such file) then
+    silently read as "this window has zero submissions/holdings" instead of
+    "this window's SUBMISSION.tsv could not be located" — which is exactly
+    what made the 2025Q2 backfill (the only period whose on-time filings
+    live solely in that one window) report "no on-time submission" instead
+    of the real parse failure.
+
+    Resolved from the archive's actual member list (never assumed from the
+    window's filename or a fixed calendar), per the deliverable: select and
+    read files from what SEC actually published, not an assumed layout.
+    Matches case-insensitively on the basename; prefers a root-level exact
+    match, else the first nested match found (an SEC window ZIP carries one
+    top-level directory at most). Returns ``None`` if nothing matches — the
+    genuinely-missing-file case callers already handle.
+    """
+    names = zf.namelist()
+    if member_name in names:
+        return member_name
+    lowered = member_name.lower()
+    for name in names:
+        if name.rsplit("/", 1)[-1].lower() == lowered:
+            return name
+    return None
+
+
 def _parse_submission(zf: zipfile.ZipFile) -> pd.DataFrame:
     """Parse SUBMISSION.tsv from a SEC 13F window bulk ZIP.
 
@@ -953,12 +989,15 @@ def _parse_submission(zf: zipfile.ZipFile) -> pd.DataFrame:
     Returns a DataFrame with FILING_DATE/PERIODOFREPORT parsed to
     ``datetime64``, or an empty DataFrame if the file/columns are missing.
     """
-    try:
-        with zf.open("SUBMISSION.tsv") as f:
-            df = pd.read_csv(f, delimiter="\t", dtype=str, low_memory=False)
-    except KeyError:
-        logger.warning("SUBMISSION.tsv not found in SEC bulk ZIP")
+    member = _find_zip_member(zf, "SUBMISSION.tsv")
+    if member is None:
+        logger.warning(
+            "SUBMISSION.tsv not found in SEC bulk ZIP (members: %s)",
+            zf.namelist()[:10],
+        )
         return pd.DataFrame()
+    with zf.open(member) as f:
+        df = pd.read_csv(f, delimiter="\t", dtype=str, low_memory=False)
 
     if len(df) == 0:
         return df
@@ -1077,17 +1116,20 @@ def _parse_infotable(zf: zipfile.ZipFile) -> pd.DataFrame:
     aggregation code expects: accession_number, cusip, put_call, shares,
     market_value.
     """
-    try:
-        with zf.open("INFOTABLE.tsv") as f:
-            df = pd.read_csv(
-                f,
-                delimiter="\t",
-                dtype=str,
-                low_memory=False,
-            )
-    except KeyError:
-        logger.warning("INFOTABLE.tsv not found in SEC bulk ZIP")
+    member = _find_zip_member(zf, "INFOTABLE.tsv")
+    if member is None:
+        logger.warning(
+            "INFOTABLE.tsv not found in SEC bulk ZIP (members: %s)",
+            zf.namelist()[:10],
+        )
         return pd.DataFrame()
+    with zf.open(member) as f:
+        df = pd.read_csv(
+            f,
+            delimiter="\t",
+            dtype=str,
+            low_memory=False,
+        )
 
     if len(df) == 0:
         return df
