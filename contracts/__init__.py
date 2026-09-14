@@ -70,3 +70,15 @@ def validate_predictions(data: dict) -> list[str]:
 def validate_executor_params(data: dict) -> list[str]:
     """Validate executor_params.json against contract schema."""
     return _validate(data, "executor_params")
+
+
+def validate_technicals(data: dict) -> list[str]:
+    """Validate market_data/technicals/latest.json against contract schema (metron-ops#293:
+    v3 additive `rating` object)."""
+    return _validate(data, "technicals")
+
+
+def validate_technical_ratings(data: dict) -> list[str]:
+    """Validate market_data/technical_ratings/latest.json against contract schema
+    (metron-ops#293 — new artifact)."""
+    return _validate(data, "technical_ratings")

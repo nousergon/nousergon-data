@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Technical Rating (per-symbol)",
+  "description": "Shared shape of the per-symbol `rating` object (metron-ops#293) — the close-only TradingView-Technical-Ratings-method summary computed by features.feature_engineer.compute_technical_rating. Embedded verbatim in both technicals.schema.json (`technicals.*.rating`) and technical_ratings.schema.json (`ratings.*`, which adds price/bar_date/basis on top of this shape). NOT independently loaded — kept as a standalone file for reference/diffing; each consuming schema inlines its own copy so a single json.load() validates the whole artifact without a resolver.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["score", "label", "ma_score", "osc_score", "n_buy", "n_neutral", "n_sell", "n_votes"],
+  "properties": {
+    "score": {
+      "type": "number",
+      "minimum": -1,
+      "maximum": 1,
+      "description": "Mean of the (up to two) group scores present; a zero-vote group is dropped from the average rather than counted as 0."
+    },
+    "label": {
+      "type": "string",
+      "enum": ["Strong Sell", "Sell", "Neutral", "Buy", "Strong Buy"]
+    },
+    "ma_score": {
+      "type": ["number", "null"],
+      "minimum": -1,
+      "maximum": 1,
+      "description": "Mean of the MA-group votes (SMA+EMA at 10/20/30/50/100/200, up to 12), or null if zero were computable."
+    },
+    "osc_score": {
+      "type": ["number", "null"],
+      "minimum": -1,
+      "maximum": 1,
+      "description": "Mean of the oscillator-group votes (RSI14, MACD(12,26,9), Momentum(10), up to 3), or null if zero were computable."
+    },
+    "n_buy": {"type": "integer", "minimum": 0},
+    "n_neutral": {"type": "integer", "minimum": 0},
+    "n_sell": {"type": "integer", "minimum": 0},
+    "n_votes": {"type": "integer", "minimum": 1, "description": "n_buy + n_neutral + n_sell."}
+  }
+}
