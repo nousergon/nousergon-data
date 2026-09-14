@@ -59,9 +59,21 @@ def test_cfn_lint_is_clean(stack):
 
 def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
     sched = stack.schedules(tpl)
-    assert [s["name"] for s in sched] == ["daily-heal", "eod", "morning", "weekly"]
+    assert [s["name"] for s in sched] == [
+        "data-collection-daily-heal", "data-collection-eod", "data-collection-morning", "data-collection-weekly",
+    ]
     assert {s["group"] for s in sched} == {"nousergon-data-collection"}
     assert len({s["target_ref"] for s in sched}) == 4
+
+
+def test_schedule_names_are_unique_without_their_group(stack, tpl):
+    """CloudFormation's AWS::EarlyValidation::ResourceExistenceCheck compares a
+    schedule's Name WITHOUT its group. The first create (2026-09-14) named one
+    `weekly`, collided with crucible-v2's `crucible-v2/weekly`, and rolled the whole
+    stack back. Every name carries this component's prefix so no other stack's
+    schedule can share it."""
+    for s in stack.schedules(tpl):
+        assert s["name"].startswith("data-collection-"), s["name"]
 
 
 def test_ships_disabled(stack, tpl):
@@ -78,12 +90,14 @@ def test_daily_heal_has_its_own_state_switch(stack, tpl):
     """Its v1 rule is paused by the 2026-08-07 ruling; the cutover must be able
     to enable collection without un-pausing the heal."""
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
-    assert by_name["daily-heal"]["state_parameter"] == "DailyHealState"
-    assert {by_name[n]["state_parameter"] for n in ("eod", "morning", "weekly")} == {"CollectionState"}
+    assert by_name["data-collection-daily-heal"]["state_parameter"] == "DailyHealState"
+    assert {
+        by_name[f"data-collection-{n}"]["state_parameter"] for n in ("eod", "morning", "weekly")
+    } == {"CollectionState"}
 
 
 def test_eod_verifies_the_artifacts_metron_reads(stack, tpl):
-    eod = {s["name"]: s for s in stack.schedules(tpl)}["eod"]["input"]
+    eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
     assert eod["workloads"] == ["post-market-data", "post-market-arctic-append"]
     assert eod["require_trading_day"] is True
     assert set(eod["verify_keys"]) == {
@@ -93,7 +107,7 @@ def test_eod_verifies_the_artifacts_metron_reads(stack, tpl):
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):
-    weekly = {s["name"]: s for s in stack.schedules(tpl)}["weekly"]["input"]
+    weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
     assert weekly["workloads"] == ["morning-enrich", "weekly-phase-one"]
     assert weekly["require_trading_day"] is False
 
@@ -198,12 +212,13 @@ def test_check_live_clean_when_live_matches(stack, tpl):
 def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
     cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
     sched = _scheduler_matching(
-        stack, tpl, eod={"State": "ENABLED", "ScheduleExpression": "cron(45 16 ? * MON-FRI *)"}
+        stack, tpl,
+        **{"data-collection-eod": {"State": "ENABLED", "ScheduleExpression": "cron(45 16 ? * MON-FRI *)"}},
     )
     findings = stack.live_findings(cfn, sched)
     assert any("UPDATE_ROLLBACK_COMPLETE" in x for x in findings)
     assert sum("stack tag" in x for x in findings) == 2
-    assert any("nousergon-data-collection/eod is ENABLED live" in x for x in findings)
+    assert any("nousergon-data-collection/data-collection-eod is ENABLED live" in x for x in findings)
 
 
 def _workflow():

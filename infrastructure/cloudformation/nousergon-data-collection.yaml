@@ -186,7 +186,11 @@ Resources:
   EodSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: eod
+      # Globally unique on purpose: CloudFormation's early existence check
+      # compares a schedule's Name WITHOUT its group, so `weekly` collided with
+      # crucible-v2's `crucible-v2/weekly` and rolled the first create back
+      # (2026-09-14). Every name carries the `data-collection-` prefix.
+      Name: data-collection-eod
       GroupName: !Ref CollectionScheduleGroup
       State: !Ref CollectionState
       ScheduleExpression: 'cron(45 16 ? * MON-FRI *)'
@@ -207,7 +211,7 @@ Resources:
   MorningSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: morning
+      Name: data-collection-morning
       GroupName: !Ref CollectionScheduleGroup
       State: !Ref CollectionState
       ScheduleExpression: 'cron(30 7 ? * MON-FRI *)'
@@ -229,7 +233,7 @@ Resources:
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: weekly
+      Name: data-collection-weekly
       GroupName: !Ref CollectionScheduleGroup
       State: !Ref CollectionState
       ScheduleExpression: 'cron(0 5 ? * SAT *)'
@@ -250,7 +254,7 @@ Resources:
   DailyHealSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
-      Name: daily-heal
+      Name: data-collection-daily-heal
       GroupName: !Ref CollectionScheduleGroup
       State: !Ref DailyHealState
       ScheduleExpression: 'cron(0 5 ? * MON-FRI *)'
