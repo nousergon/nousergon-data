@@ -58,8 +58,16 @@ _CARET_SYMBOLS = {"VIX", "VIX3M", "TNX", "IRX"}
 # from constituents to avoid a collector→collector import at module load.
 _SUB_SECTOR_ETFS = ["SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"]
 
+# alpha-engine-config-I10704: every member of
+# ``features.compute.UNIVERSE_BENCHMARK_PROXIES`` MUST appear here, or the
+# proxy has no price-cache parquet and the universe write has nothing to write
+# from. IWM is the member the pre-I10704 list was missing (the XL* proxies
+# were already collected for their Close-only `macro` rows). The relationship
+# is enforced by tests/test_benchmark_proxies_i10704.py rather than by a
+# runtime import, deliberately: this module is imported by collectors at
+# process start and must not pull in the feature-compute import graph.
 _ALWAYS_DOWNLOAD = [
-    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    "SPY", "IWM", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     *_SUB_SECTOR_ETFS,
 ]

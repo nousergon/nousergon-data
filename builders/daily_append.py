@@ -39,8 +39,10 @@ from features.feature_engineer import (
 from features.factor_momentum import update_factor_momentum_latest
 from features.compute import (
     DEFAULT_BUCKET,
+    UNIVERSE_BENCHMARK_PROXIES,
     _SKIP_TICKERS,
     _UNIVERSE_EXTRA,
+    admits_universe_write,
     _is_sector_etf,
     _load_sector_map,
     _load_sub_sector_etf_map,
@@ -770,8 +772,7 @@ def _scan_universe_and_emit_freshness_receipt(
     if expected_tickers is not None:
         expected_set = {
             t.lstrip("^") for t in expected_tickers
-            if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
-            and not _is_sector_etf(t.lstrip("^"))
+            if admits_universe_write(t)
         }
         syms = [s for s in all_syms if s in expected_set]
         excluded = [s for s in all_syms if s not in expected_set]
@@ -828,6 +829,45 @@ def _scan_universe_and_emit_freshness_receipt(
         age_trading_days = trading_days_stale(last_date.date(), today_iso)
         ages.append((sym, last_date.date().isoformat(), age_trading_days))
 
+    # ── DECLARED-PROXY COVERAGE (alpha-engine-config-I10704) ────────────────
+    #
+    # Everything above this line grades symbols the library ALREADY HOLDS: a
+    # symbol that is simply ABSENT never enters ``syms``, is never scanned,
+    # and the receipt reads ``all_fresh: True`` over the survivors. That is
+    # the absence blindness I10704 paid for — the `universe` library held SPY
+    # and none of the five attribution proxies for months while this scan
+    # reported green every single run, and the first thing that noticed was a
+    # crucible panel compile refusing in-region on 2026-09-14, five days
+    # before the graded Saturday arc.
+    #
+    # A DECLARED proxy (features.compute.UNIVERSE_BENCHMARK_PROXIES) is not
+    # churn-eligible and has no legitimate reason to be missing, so its
+    # absence from the library is graded exactly like staleness: same
+    # violation type, same receipt, same alert class — no new alert class and
+    # no new surface. Deliberately scoped to ABSENCE FROM THE LIBRARY
+    # (``all_syms``), not to scan membership: a proxy the expected_tickers
+    # intersection filters out of ``syms`` is still present and still
+    # loadable by every consumer, and grading scan membership here would
+    # couple this producer invariant to each caller's request list. The
+    # counts below are emitted on EVERY run, zeros included, so "nothing was
+    # checked" can never render the same as "all covered".
+    proxies_absent = sorted(UNIVERSE_BENCHMARK_PROXIES - set(all_syms))
+    if proxies_absent:
+        raise UniverseFreshnessViolation(
+            f"Universe-freshness scan: {len(proxies_absent)} of "
+            f"{len(UNIVERSE_BENCHMARK_PROXIES)} DECLARED benchmark proxies are "
+            f"absent from the `universe` library on bucket {bucket!r}: "
+            f"{proxies_absent}. Every crucible panel compile fetches each "
+            f"declared proxy from this library and refuses on a missing one "
+            f"(alpha-engine-config-I10683/I10704) — load them in-region with "
+            f"`python -m scripts.backfill_benchmark_proxies`.",
+            stale_symbols=[
+                {"symbol": s_, "last_date": None, "age_trading_days": None}
+                for s_ in proxies_absent
+            ],
+        )
+    proxy_ages = {sym: (d, a) for sym, d, a in ages if sym in UNIVERSE_BENCHMARK_PROXIES}
+
     stale = [(s, d, a) for s, d, a in ages if a > max_stale_trading_days]
     stalest = max(ages, key=lambda r: r[2])
 
@@ -851,6 +891,12 @@ def _scan_universe_and_emit_freshness_receipt(
         "n_symbols_checked": len(syms),
         "max_stale_trading_days_threshold": max_stale_trading_days,
         "all_fresh": True,
+        # I10704: emitted every run, zeros included — a reader can tell
+        # "every declared proxy covered" from "nothing was checked".
+        "declared_proxies_total": len(UNIVERSE_BENCHMARK_PROXIES),
+        "declared_proxies_present": len(UNIVERSE_BENCHMARK_PROXIES) - len(proxies_absent),
+        "declared_proxies_scanned": len(proxy_ages),
+        "declared_proxies_missing": proxies_absent,
         "stalest_symbol": stalest[0],
         "stalest_last_date": stalest[1],
         "stalest_age_trading_days": stalest[2],
@@ -1880,8 +1926,7 @@ def _daily_append_impl(
         # blind to SPY entirely).
         closes_stock_keys = {
             t for t in closes
-            if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-            and not _is_sector_etf(t)
+            if admits_universe_write(t)
         }
         # Scope "expected" to the intersection of ArcticDB universe and the
         # caller's request list. A ticker dropped from S&P this week (still
@@ -1898,8 +1943,7 @@ def _daily_append_impl(
         if expected_tickers is not None:
             expected_stocks = {
                 t.lstrip("^") for t in expected_tickers
-                if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)
-                and not _is_sector_etf(t.lstrip("^"))
+                if admits_universe_write(t)
             }
             relevant_arctic = arctic_stock_symbols & expected_stocks
             stragglers = arctic_stock_symbols - expected_stocks
@@ -2085,8 +2129,7 @@ def _daily_append_impl(
     # accounting below keeps treating it as non-stock.
     stock_tickers = [
         t for t in closes
-        if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-        and not _is_sector_etf(t)
+        if admits_universe_write(t)
     ]
 
     n_ok = 0              # fully-featured rows (all FEATURES finite)

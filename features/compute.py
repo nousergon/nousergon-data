@@ -191,25 +191,66 @@ _ARCTICDB_LOOKBACK_DAYS = math.ceil(_FEATURE_WARMUP_ROWS * 365.25 / 252 * 1.20)
 # they are enumerated into _SKIP_TICKERS explicitly.
 _SUB_SECTOR_ETFS = frozenset({"SMH", "IGV", "XBI", "PPH", "XOP", "KRE", "ITA", "GDX"})
 
+# ── The DECLARED benchmark-proxy set ────────────────────────────────────────
+#
+# Macro/index/ETF symbols ALSO promoted to full `universe` members (full OHLCV
+# + engineered features), in addition to their Close-only `macro`-library
+# write. This frozenset is THE declaration — every scoping predicate in
+# builders/backfill.py and builders/daily_append.py reads it (through
+# ``admits_universe_write`` below), and collectors/prices.py's
+# ``_ALWAYS_DOWNLOAD`` is held to it by a lockstep test. There is no second
+# hand-kept list anywhere; adding a proxy here is the only edit needed to make
+# the whole producer maintain it.
+#
+# Why each member:
+#   SPY                 — became a held core position with the 2026-05-13
+#                         portfolio-optimizer cutover, so every held-position
+#                         code path (eod_reconcile #181, morning-planner ATR
+#                         #185) needs SPY's engineered features from
+#                         `universe`.
+#   IWM, XLK, XLV,      — the size/sector ATTRIBUTION proxies declared by
+#   XLF, XLE              `alpha-engine-config/strategy/slots/attribution.yaml`
+#                         and read by `crucible/slots/__init__.py::
+#                         attribution_factor_symbols`. Since crucible-PR271
+#                         (alpha-engine-config-I10683) every panel compile
+#                         fetches EVERY declared proxy from the `universe`
+#                         library and REFUSES on a missing one — a proxy that
+#                         silently drops out is survivorship bias. Measured
+#                         2026-09-14 in-region (alpha-engine-config-I10704):
+#                         the library held SPY alone, so `data.weekly` would
+#                         have failed at its first stage on 2026-09-19.
+#
+# Members deliberately STAY in ``_SKIP_TICKERS`` so prune_delisted_tickers
+# (none of them are in constituents.json → would otherwise all be prune
+# candidates), the daily_append coverage-diff accounting and the
+# constituents-drift check keep treating them as non-stock. The declared set
+# only WIDENS the universe-WRITE candidate set, nothing else. NOT a macro-lib
+# teardown: the same symbols keep their Close-only `macro` rows, and
+# VIX/VIX3M/TNX/IRX/GLD/USO have no tradeable OHLCV we hold, so they stay
+# macro-only.
+UNIVERSE_BENCHMARK_PROXIES = frozenset({
+    "SPY",
+    "IWM", "XLK", "XLV", "XLF", "XLE",
+})
+
+# Legacy name for the SAME object (not a copy) — ~40 call sites and tests
+# spell it this way. Kept as an alias so there is exactly one set in memory
+# and `is`-identity holds; new code should use UNIVERSE_BENCHMARK_PROXIES.
+_UNIVERSE_EXTRA = UNIVERSE_BENCHMARK_PROXIES
+
 # Tickers that are macro/index series, not stocks
 _SKIP_TICKERS = {
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
     *_SUB_SECTOR_ETFS,
+    # Every declared benchmark proxy is skip-protected (see the block above).
+    # IWM is here because the "XL" prefix test cannot reach it; the XL*
+    # proxies are already excluded by ``_is_sector_etf`` but are enumerated
+    # anyway so the `UNIVERSE_BENCHMARK_PROXIES <= _SKIP_TICKERS` invariant
+    # (tests/test_spy_universe_member.py) holds by construction rather than by
+    # coincidence of two independent predicates.
+    *UNIVERSE_BENCHMARK_PROXIES,
 }
-
-# Macro/index symbols ALSO promoted to full `universe` members (full OHLCV +
-# engineered features), in addition to their Close-only `macro`-library write.
-# SPY became a held core position with the 2026-05-13 portfolio-optimizer
-# cutover, so every held-position code path (eod_reconcile #181,
-# morning-planner ATR #185) needs SPY's engineered features (atr_14_pct, ...)
-# from `universe`. Members deliberately STAY in _SKIP_TICKERS so
-# prune_delisted_tickers (SPY ∉ constituents.json → would otherwise be a
-# prune candidate) and the daily_append coverage-diff accounting keep
-# treating them as non-stock — _UNIVERSE_EXTRA only widens the universe-WRITE
-# candidate set, nothing else. NOT a macro-lib teardown: VIX/TNX/IRX have no
-# tradeable OHLCV and are never held, so they stay macro-only.
-_UNIVERSE_EXTRA = frozenset({"SPY"})
 
 # Sector ETFs to skip (not individual stocks)
 _SECTOR_ETF_PREFIXES = {"XL"}
@@ -217,6 +258,38 @@ _SECTOR_ETF_PREFIXES = {"XL"}
 
 def _is_sector_etf(ticker: str) -> bool:
     return len(ticker) == 3 and ticker[:2] in _SECTOR_ETF_PREFIXES
+
+
+def admits_universe_write(ticker: str) -> bool:
+    """THE universe-write scoping predicate — one implementation, one list.
+
+    ``True`` when ``ticker`` is eligible to be written as a symbol in the
+    ArcticDB ``universe`` library: either it is a DECLARED benchmark proxy
+    (``UNIVERSE_BENCHMARK_PROXIES``), or it is an ordinary stock — neither a
+    macro/index series (``_SKIP_TICKERS``) nor a sector ETF
+    (``_is_sector_etf``).
+
+    Eligibility ONLY. Callers still apply their own site conditions (a
+    constituents-membership test, "has price data", a per-run ticker filter).
+
+    Why this is a function and not six copies of a boolean expression:
+    alpha-engine-config-I2703 and I2704 were both the SAME defect — a
+    replicated predicate that DRIFTED at one call site, so SPY silently
+    vanished from the freshness accounting while the write path still wrote
+    it. alpha-engine-config-I10704 is the third instance of the class: the
+    ``_UNIVERSE_EXTRA`` carve-out existed at every site but was ANDed with a
+    bare ``not _is_sector_etf(t)``, so an XL* proxy could never be admitted no
+    matter what the declared list said. Centralising the whole expression is
+    what makes the next proxy a one-line declaration instead of a six-site
+    edit with one site forgotten.
+
+    ``^``-prefixed spellings (``^VIX``) normalise to their bare form, which is
+    what two of the historical call sites did by hand and the others did not.
+    """
+    stem = ticker.lstrip("^")
+    if stem in UNIVERSE_BENCHMARK_PROXIES:
+        return True
+    return stem not in _SKIP_TICKERS and not _is_sector_etf(stem)
 
 
 # ── S3 data loading (self-contained, no predictor imports) ───────────────────

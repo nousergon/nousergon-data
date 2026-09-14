@@ -86,7 +86,14 @@ def _patch_targets(
     macro_keys = ["SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO"]
     sector_etfs = ["XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
                    "XLP", "XLRE", "XLU", "XLV", "XLY"]
-    closes = _stub_closes(universe_symbols + macro_keys + sector_etfs)
+    # I10704: every DECLARED benchmark proxy is collected daily
+    # (collectors/prices.py::_ALWAYS_DOWNLOAD), so it is present in closes —
+    # IWM is the member the literal sector_etfs list does not cover.
+    from features.compute import UNIVERSE_BENCHMARK_PROXIES as _PROXIES_IN_CLOSES
+
+    closes = _stub_closes(
+        universe_symbols + macro_keys + sector_etfs + sorted(_PROXIES_IN_CLOSES)
+    )
 
     hist_dates = pd.date_range("2024-01-01", periods=300, freq="B").tolist()
     if today_in_hist:
@@ -102,7 +109,16 @@ def _patch_targets(
     hist_df.index.name = "date"
 
     universe_lib = MagicMock()
-    universe_lib.list_symbols.return_value = universe_symbols
+    # alpha-engine-config-I10704: the post-write freshness scan refuses a
+    # `universe` library missing a DECLARED benchmark proxy — that absence is
+    # the production state it stayed green over for months. Inject any the
+    # caller did not name so this stub is a valid production shape; `tail`
+    # answers for every symbol uniformly here.
+    from features.compute import UNIVERSE_BENCHMARK_PROXIES as _DECLARED_PROXIES
+
+    universe_lib.list_symbols.return_value = list(universe_symbols) + [
+        p for p in sorted(_DECLARED_PROXIES) if p not in universe_symbols
+    ]
     universe_lib.read_batch.return_value = [
         MagicMock(spec=[], data=hist_df.copy()) for _ in universe_symbols
     ]

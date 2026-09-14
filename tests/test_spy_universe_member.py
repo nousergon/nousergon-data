@@ -27,7 +27,13 @@ import pandas as pd
 import pytest
 
 from builders import prune_delisted_tickers as _prune_mod
-from features.compute import _SKIP_TICKERS, _UNIVERSE_EXTRA, _is_sector_etf
+from features.compute import (
+    UNIVERSE_BENCHMARK_PROXIES,
+    _SKIP_TICKERS,
+    _UNIVERSE_EXTRA,
+    _is_sector_etf,
+    admits_universe_write,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -153,26 +159,26 @@ def test_spy_in_universe_is_never_pruned_even_when_absent_and_stale(monkeypatch)
 
 # ── C. Universe-write predicate contract (audit §A5) ────────────────────────
 #
-# The two universe-write filters are inline in backfill()/daily_append().
-# Replicate them here as the pinned contract AND assert the production
-# source still references _UNIVERSE_EXTRA, so the replicated predicate
-# can't silently drift from production (repo `assert <expr> in src`
-# convention, cf. test_sf_ssm_pipefail_wiring.py).
+# The universe-write filters used to be six inline copies of one boolean
+# expression, replicated here and pinned by source-text needles. As of
+# alpha-engine-config-I10704 there is ONE implementation —
+# ``features.compute.admits_universe_write`` — and every production site calls
+# it. These helpers therefore call the REAL predicate rather than re-spelling
+# it (a replica that has to be kept in lockstep is the defect the three
+# I2703/I2704/I10704 incidents all share); the source-text pins below now
+# assert that each site still DELEGATES, which is the property that matters.
 
 
 def _backfill_admits(t, *, price_data, constituents_set):
     return (
-        (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-        and not _is_sector_etf(t)
+        admits_universe_write(t)
         and price_data[t] is not None
-        and (t in constituents_set or t in _UNIVERSE_EXTRA)
+        and (t in constituents_set or t in UNIVERSE_BENCHMARK_PROXIES)
     )
 
 
 def _daily_append_admits(t):
-    return (
-        t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA
-    ) and not _is_sector_etf(t)
+    return admits_universe_write(t)
 
 
 def test_backfill_universe_filter_admits_spy_despite_absent_constituents():
@@ -190,24 +196,35 @@ def test_daily_append_stock_filter_admits_spy_not_other_macros():
     assert _daily_append_admits("AAPL")
     assert _daily_append_admits("SPY")
     assert not _daily_append_admits("VIX")
-    assert not _daily_append_admits("XLK")  # sector ETF
+    assert not _daily_append_admits("XLI")  # sector ETF, not a declared proxy
+    assert _daily_append_admits("XLK"), "XLK IS a declared attribution proxy (I10704)"
 
 
 @pytest.mark.parametrize(
-    "rel_path,needle",
+    "rel_path,expected_calls",
     [
-        ("builders/backfill.py", "t in _UNIVERSE_EXTRA"),
-        ("builders/daily_append.py", "t in _UNIVERSE_EXTRA"),
+        ("builders/backfill.py", 2),
+        ("builders/daily_append.py", 4),
     ],
 )
-def test_production_filters_reference_universe_extra(rel_path, needle):
-    """Guard against the replicated predicates above drifting from the
-    real inline filters."""
+def test_production_filters_delegate_to_the_one_predicate(rel_path, expected_calls):
+    """Every universe-write scoping site must call ``admits_universe_write``.
+
+    The count is pinned, not just presence: a NEW site that spells the
+    predicate inline instead of calling it is exactly how I2703, I2704 and
+    I10704 each happened, and a bare `in src` needle cannot see that.
+    """
     src = (_REPO_ROOT / rel_path).read_text()
-    assert needle in src, (
-        f"{rel_path} no longer references {needle!r} — the universe-write "
-        f"filter changed; update _backfill_admits/_daily_append_admits and "
-        f"re-verify the SPY-admission + prune-protection contract"
+    assert "admits_universe_write" in src, (
+        f"{rel_path} no longer calls admits_universe_write — a universe-write "
+        f"scoping site has been re-inlined. That is the I2703/I2704/I10704 "
+        f"defect class: a replicated predicate that drifts at one site."
+    )
+    n = src.count("admits_universe_write(")
+    assert n == expected_calls, (
+        f"{rel_path} calls admits_universe_write() {n} time(s), expected "
+        f"{expected_calls}. If a scoping site was added or removed, update "
+        f"this count deliberately — and make sure the new site DELEGATES."
     )
 
 
@@ -233,10 +250,7 @@ def _expected_set_admits(t: str) -> bool:
     `_scan_universe_and_emit_freshness_receipt` and the missing-from-closes
     check in builders/daily_append.py (identical predicate, kept in
     lockstep by the source-text guard below)."""
-    stripped = t.lstrip("^")
-    return (
-        stripped not in _SKIP_TICKERS or stripped in _UNIVERSE_EXTRA
-    ) and not _is_sector_etf(stripped)
+    return admits_universe_write(t)
 
 
 def _closes_stock_keys_admits(t: str) -> bool:
@@ -244,7 +258,7 @@ def _closes_stock_keys_admits(t: str) -> bool:
     check) in builders/daily_append.py — same predicate as
     `_daily_append_admits` above (write-path), kept in lockstep by the
     source-text guard below."""
-    return (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA) and not _is_sector_etf(t)
+    return admits_universe_write(t)
 
 
 def test_expected_set_admits_spy_despite_skip_ticker_membership():
@@ -255,7 +269,8 @@ def test_expected_set_admits_spy_despite_skip_ticker_membership():
     assert _expected_set_admits("SPY")
     assert _expected_set_admits("^SPY")  # caret-stripped callers
     assert not _expected_set_admits("VIX"), "VIX is macro-only, never a universe member"
-    assert not _expected_set_admits("XLK"), "sector ETFs never enter the universe scope"
+    assert not _expected_set_admits("XLI"), "undeclared sector ETFs never enter the universe scope"
+    assert _expected_set_admits("XLK"), "XLK IS a declared attribution proxy (I10704)"
 
 
 def test_closes_stock_keys_admits_spy():
@@ -265,29 +280,34 @@ def test_closes_stock_keys_admits_spy():
     hard-fail instead of a masked real one)."""
     assert _closes_stock_keys_admits("SPY")
     assert not _closes_stock_keys_admits("VIX")
-    assert not _closes_stock_keys_admits("XLK")
+    assert not _closes_stock_keys_admits("XLI")
+    assert _closes_stock_keys_admits("XLK"), "XLK IS a declared attribution proxy (I10704)"
 
 
 @pytest.mark.parametrize(
-    "needle",
+    "anchor",
     [
-        # freshness scan's expected_set
-        'if (t.lstrip("^") not in _SKIP_TICKERS or t.lstrip("^") in _UNIVERSE_EXTRA)',
-        # missing-from-closes's closes_stock_keys
-        "if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)",
+        "expected_set = {",      # freshness scan
+        "closes_stock_keys = {",  # missing-from-closes
+        "expected_stocks = {",    # missing-from-closes expected scope
+        "stock_tickers = [",      # write path
     ],
 )
-def test_daily_append_scoping_sites_reference_universe_extra(needle):
-    """Guard against config-I2703 regressing: both expected_tickers-scoping
-    call sites in daily_append.py (freshness scan + missing-from-closes)
-    must carry the same _UNIVERSE_EXTRA carve-out the write-path predicate
-    already had. Source-text pin, same convention as section C."""
+def test_daily_append_scoping_sites_delegate(anchor):
+    """Guard against config-I2703 regressing: every expected_tickers-scoping
+    call site in daily_append.py must resolve eligibility through the ONE
+    predicate, not a hand-spelled copy. Source-text pin, same convention as
+    section C — the window after the anchor must contain the call."""
     src = (_REPO_ROOT / "builders" / "daily_append.py").read_text()
-    assert needle in src, (
-        f"builders/daily_append.py no longer contains {needle!r} — an "
-        f"expected_tickers-scoping site lost its _UNIVERSE_EXTRA carve-out. "
-        f"This is the exact config-I2703 regression: SPY silently excluded "
-        f"from the freshness/missing-from-closes safety net."
+    # rindex: each anchor also appears in prose in the surrounding docstrings
+    # and comments; the real comprehension is the LAST occurrence.
+    idx = src.rindex(anchor)
+    window = src[idx:idx + 400]
+    assert "admits_universe_write(" in window, (
+        f"the scoping site at {anchor!r} in builders/daily_append.py no longer "
+        f"calls admits_universe_write — it has been re-inlined. This is the "
+        f"exact config-I2703/I10704 regression: a scoping site drifting from "
+        f"the declared benchmark-proxy set."
     )
 
 
@@ -311,11 +331,7 @@ def _regression_preflight_candidate_admits(t: str, *, arctic_syms: set[str]) -> 
     """Mirrors the `candidates` comprehension in backfill.py's
     `_assert_no_arctic_regression` (identical predicate, kept in lockstep by
     the source-text guard below)."""
-    return (
-        t in arctic_syms
-        and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-        and not _is_sector_etf(t)
-    )
+    return t in arctic_syms and admits_universe_write(t)
 
 
 def test_regression_preflight_candidates_admit_spy():
@@ -329,8 +345,11 @@ def test_regression_preflight_candidates_admit_spy():
     assert not _regression_preflight_candidate_admits("VIX", arctic_syms=arctic_syms), (
         "VIX is macro-only, never a universe member"
     )
-    assert not _regression_preflight_candidate_admits("XLK", arctic_syms=arctic_syms), (
-        "sector ETFs never enter the universe scope"
+    assert not _regression_preflight_candidate_admits("XLI", arctic_syms=arctic_syms | {"XLI"}), (
+        "undeclared sector ETFs never enter the universe scope"
+    )
+    assert _regression_preflight_candidate_admits("XLK", arctic_syms=arctic_syms), (
+        "XLK IS a declared attribution proxy (I10704) — eligible once present"
     )
     assert not _regression_preflight_candidate_admits("SPY", arctic_syms={"AAPL"}), (
         "not yet present in ArcticDB universe lib — can't be a regression candidate"
@@ -344,11 +363,12 @@ def test_regression_preflight_site_references_universe_extra():
     (section C/D) already have. Source-text pin, same convention as those
     sections."""
     src = (_REPO_ROOT / "builders" / "backfill.py").read_text()
-    needle = "and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)"
-    assert needle in src, (
-        f"builders/backfill.py no longer contains {needle!r} — the "
-        f"regression-preflight sample-candidate predicate lost its "
-        f"_UNIVERSE_EXTRA carve-out. This is the exact config-I2704 "
-        f"regression: SPY silently excluded from the backfill "
-        f"regression-preflight sample pool."
+    idx = src.index("candidates = sorted(")
+    window = src[idx:idx + 300]
+    assert "admits_universe_write(" in window, (
+        "backfill.py's regression-preflight sample-candidate predicate no "
+        "longer calls admits_universe_write — it has been re-inlined. This is "
+        "the exact config-I2704 regression: SPY (and now every declared "
+        "benchmark proxy) silently excluded from the backfill "
+        "regression-preflight sample pool."
     )

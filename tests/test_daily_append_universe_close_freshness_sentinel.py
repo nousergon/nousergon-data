@@ -31,16 +31,34 @@ from builders.daily_append import (
 )
 
 
+from features.compute import UNIVERSE_BENCHMARK_PROXIES as _DECLARED_PROXIES  # noqa: E402
+
+
 def _today_str(offset_days: int = 0) -> str:
     return (datetime.now(timezone.utc).date() - timedelta(days=offset_days)).isoformat()
 
 
 def _mock_lib_with_dates(symbol_to_date: dict[str, str]) -> MagicMock:
     lib = MagicMock()
-    lib.list_symbols.return_value = list(symbol_to_date.keys())
+    # alpha-engine-config-I10704: the scan now refuses a library that is
+    # missing a DECLARED benchmark proxy, because that is exactly the
+    # production state it stayed green over for months. A stub universe
+    # without them is not a valid production library, so inject any the
+    # caller did not name — they are present and fresh unless a test
+    # deliberately says otherwise.
+    from features.compute import UNIVERSE_BENCHMARK_PROXIES as _PROXIES
+    # An EMPTY map stays empty: the empty-library refusal is its own contract
+    # and must not be masked by injected proxies.
+    lib.list_symbols.return_value = list(symbol_to_date.keys()) + (
+        [p for p in sorted(_PROXIES) if p not in symbol_to_date]
+        if symbol_to_date else []
+    )
 
     def _tail(sym, n=1):
-        df = pd.DataFrame({"Close": [100.0]}, index=[pd.Timestamp(symbol_to_date[sym])])
+        df = pd.DataFrame(
+            {"Close": [100.0]},
+            index=[pd.Timestamp(symbol_to_date.get(sym, _today_str(0)))],
+        )
         result = MagicMock()
         result.data = df
         return result
@@ -135,8 +153,10 @@ class TestScanWiresRunDateThroughToUniverseSentinel:
         )
         body = json.loads(universe_call.kwargs["Body"].decode("utf-8"))
         assert body["run_date"] == today
-        assert body["verified_ticker_count"] == 2
-        assert body["total_symbols_checked"] == 2
+        # +len(_DECLARED_PROXIES): the stub injects the declared benchmark
+        # proxies at today's date (I10704), so they verify exactly too.
+        assert body["verified_ticker_count"] == 2 + len(_DECLARED_PROXIES)
+        assert body["total_symbols_checked"] == 2 + len(_DECLARED_PROXIES)
 
     def test_verified_ticker_count_excludes_recently_but_not_exactly_fresh(self):
         """The core config#3237 distinction: a symbol 1 trading day stale
@@ -159,8 +179,10 @@ class TestScanWiresRunDateThroughToUniverseSentinel:
             if c.kwargs["Key"] == UNIVERSE_CLOSE_FRESHNESS_SENTINEL_KEY
         )
         body = json.loads(universe_call.kwargs["Body"].decode("utf-8"))
-        assert body["verified_ticker_count"] == 1  # only FRESH matches today exactly
-        assert body["total_symbols_checked"] == 2
+        # only FRESH (plus the injected declared proxies, all at today)
+        # matches today exactly — ONE_DAY_STALE deliberately does not.
+        assert body["verified_ticker_count"] == 1 + len(_DECLARED_PROXIES)
+        assert body["total_symbols_checked"] == 2 + len(_DECLARED_PROXIES)
 
     def test_stale_raise_never_reaches_universe_sentinel_write(self):
         """A genuine staleness violation (config#3236-class 100% write

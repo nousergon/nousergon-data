@@ -125,9 +125,11 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("DATA_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot")
 
-# The five data-phase workloads this dispatcher can run, mapped to the EXACT
-# weekly_collector.py invocation the on-trading SF states ran (unchanged args =
-# unchanged M0 data contract: same paths/schemas). Any other value is rejected.
+# The data-phase workloads this dispatcher can run. The five scheduled ones
+# map to the EXACT weekly_collector.py invocation the on-trading SF states ran
+# (unchanged args = unchanged M0 data contract: same paths/schemas); the sixth
+# is the on-demand declared-benchmark-proxy load (alpha-engine-config-I10704).
+# Any other value is rejected.
 _WORKLOADS: dict[str, str] = {
     # weekday pre-open (was step_function_daily.json MorningEnrich)
     "morning-enrich": (
@@ -151,6 +153,16 @@ _WORKLOADS: dict[str, str] = {
     # step_function_daily.json entirely. Runs off the preopen critical path with
     # a much bigger heal timeout budget (see weekly_collector._run_daily_heal).
     "daily-heal": "python weekly_collector.py --daily-heal",
+    # alpha-engine-config-I10704: the one-off, idempotent in-region load of
+    # every DECLARED benchmark proxy (features.compute.
+    # UNIVERSE_BENCHMARK_PROXIES) into the ArcticDB `universe` library. Not
+    # scheduled and not on any pipeline's critical path — this exists so the
+    # load is an `aws lambda invoke` against an EXISTING runner rather than a
+    # hand-typed `ssm send-command`, which is the difference between a step
+    # that is code in the repo and a step that is text someone has to
+    # remember (the alpha-engine-config-I1906 class). Re-running it is a
+    # no-op: every write underneath is union/no-shrink.
+    "benchmark-proxy-backfill": "python -m scripts.backfill_benchmark_proxies",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
