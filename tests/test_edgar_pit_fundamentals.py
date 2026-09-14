@@ -407,6 +407,17 @@ class TestRun:
         recorded = json.loads(store.objects[e.run_summary_key(dt.date(2026, 9, 14), "fixture")])
         assert recorded["coverage_newest_session"]["ratio"] == 1.0
 
+    def test_writes_a_fixed_key_freshness_sentinel_every_run(self, tmp_path) -> None:
+        # alpha-engine-config-I10750: the freshness monitor cannot probe a
+        # variable-run_id key, so every successful run also writes a fixed
+        # `runs/latest.json` pointer — same shape as `run_summary_key`.
+        store = _Store()
+        _run(store, crosscheck_disabled_reason="fixture", work_dir=str(tmp_path))
+        assert e.RUN_LATEST_KEY in store.objects
+        dated = json.loads(store.objects[e.run_summary_key(dt.date(2026, 9, 14), "fixture")])
+        latest = json.loads(store.objects[e.RUN_LATEST_KEY])
+        assert latest == dated
+
     def test_a_second_run_writes_only_what_is_missing(self, tmp_path) -> None:
         store = _Store()
         _run(store, crosscheck_disabled_reason="fixture", work_dir=str(tmp_path))
