@@ -12,8 +12,10 @@ things a schema cannot:
 
 from __future__ import annotations
 
+import importlib.util
 import json
 from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 import yaml
@@ -22,6 +24,33 @@ OVERSEER = Path(__file__).resolve().parents[1] / "infrastructure" / "overseer"
 PLAYBOOKS = OVERSEER / "playbooks.yaml"
 
 TIERS = {"page", "notify-silent", "tracked-only", "dynamic"}
+
+
+@pytest.fixture(scope="module")
+def publish_mod():
+    """Load `publish_alert_tier_registry.py` as a module (no package init)."""
+    spec = importlib.util.spec_from_file_location(
+        "publish_alert_tier_registry", OVERSEER / "publish_alert_tier_registry.py",
+    )
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _NoSuchKey(Exception):
+    pass
+
+
+def _fake_s3(get_object_side_effect=None, get_object_return=None):
+    s3 = MagicMock()
+    s3.exceptions.NoSuchKey = _NoSuchKey
+    if get_object_side_effect is not None:
+        s3.get_object.side_effect = get_object_side_effect
+    else:
+        s3.get_object.return_value = {
+            "Body": MagicMock(read=lambda: json.dumps(get_object_return).encode())
+        }
+    return s3
 
 
 @pytest.fixture(scope="module")
@@ -126,6 +155,49 @@ def test_published_document_matches_the_consumer_contract():
         assert mod.REGISTRY_BUCKET == krepis_tiers.REGISTRY_BUCKET
         assert mod.REGISTRY_OBJECT == krepis_tiers.REGISTRY_OBJECT
         assert mod.SCHEMA_VERSION == krepis_tiers.SUPPORTED_SCHEMA_VERSION
+
+
+def test_heartbeat_republishes_on_a_clean_compare(publish_mod):
+    """alpha-engine-config-I10710: a clean compare must WRITE, not just read.
+
+    The schedule arm's freshness SLA is derived from its own daily cadence,
+    so a healthy, unchanged day must still move `LastModified` — otherwise
+    the SLA pages CRITICAL on the artifact's normal, correct state.
+    """
+    document = publish_mod.build_document()
+    s3 = _fake_s3(get_object_return=document)
+    with patch.object(publish_mod.boto3, "client", return_value=s3):
+        code = publish_mod.heartbeat(bucket="b", obj="k")
+    assert code == 0
+    assert s3.put_object.call_count == 1, (
+        "a clean compare did not re-publish — LastModified would not move"
+    )
+    assert s3.get_object.call_count == 2, (
+        "expected one read for the compare and one read-back inside publish()"
+    )
+
+
+def test_heartbeat_fails_loud_and_does_not_overwrite_real_drift(publish_mod):
+    """A genuine out-of-band mismatch must still fail — and never get papered
+    over by an unconditional republish, or the drift arm's one guarantee
+    (alpha-engine-config-I6751) is gone."""
+    drifted = {"source_digest": "sha256:not-the-repo"}
+    s3 = _fake_s3(get_object_return=drifted)
+    with patch.object(publish_mod.boto3, "client", return_value=s3):
+        code = publish_mod.heartbeat(bucket="b", obj="k")
+    assert code == 1
+    assert s3.put_object.call_count == 0, (
+        "drift must never be silently overwritten by the heartbeat"
+    )
+
+
+def test_heartbeat_fails_loud_on_a_missing_object(publish_mod):
+    s3 = _fake_s3()
+    s3.get_object.side_effect = _NoSuchKey
+    with patch.object(publish_mod.boto3, "client", return_value=s3):
+        code = publish_mod.heartbeat(bucket="b", obj="k")
+    assert code == 1
+    assert s3.put_object.call_count == 0
 
 
 def test_a_tracked_only_row_still_declares_an_intake_or_a_reason(rows):

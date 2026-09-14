@@ -24,12 +24,18 @@ name: Sync alert tier registry to S3
 #             source digest. A put that exits 0 is an event; the read-back is
 #             the effect (principles.md 2.3 — a loop that does not verify its
 #             own action is not closed).
-#   schedule  assert repo == S3 with nothing to publish. This is the arm that
-#             survives what the push arm cannot see: a path filter that stops
-#             matching, a disabled workflow, a hand-edit straight to the
-#             bucket. Without it, "the publish never fired" and "the publish
-#             fired and worked" are the same shape on every surface
-#             (principles.md 2.7).
+#   schedule  assert repo == S3, THEN RE-PUBLISH (alpha-engine-config-I10710).
+#             The compare still survives what the push arm cannot see: a path
+#             filter that stops matching, a disabled workflow, a hand-edit
+#             straight to the bucket — it fails loud on real drift and never
+#             overwrites it silently. But `ARTIFACT_REGISTRY.yaml`'s freshness
+#             SLA for this artifact is derived from THIS arm's daily cadence,
+#             so a clean compare now re-publishes the same content: that is
+#             what moves `LastModified` and makes the SLA a real write-cadence
+#             heartbeat instead of a read-only check nothing ever satisfies on
+#             a healthy (unchanged) day. Without either half, "the publish
+#             never fired" and "the publish fired and worked" are the same
+#             shape on every surface (principles.md 2.7).
 #
 # WHAT FAILURE LOOKS LIKE, AND WHY IT IS SAFE
 #
@@ -100,7 +106,7 @@ jobs:
         if: github.event_name != 'schedule'
         run: python infrastructure/overseer/publish_alert_tier_registry.py
 
-      - name: Assert the published registry still matches the repo (drift arm)
+      - name: Assert repo == S3, then re-publish as a liveness heartbeat (drift arm)
         if: github.event_name == 'schedule'
         run: python infrastructure/overseer/publish_alert_tier_registry.py --assert-in-sync
 
