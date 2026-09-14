@@ -372,7 +372,6 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # retired the S3 mirror) — no new registry row needed.
     "features/metron_supplemental.py": 1,
     "features/writer.py": 1,
-    "lambda/handler.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
     "rag/pipelines/filing_change_detection.py": 2,
