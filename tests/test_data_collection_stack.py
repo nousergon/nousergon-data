@@ -98,12 +98,21 @@ def test_daily_heal_has_its_own_state_switch(stack, tpl):
 
 def test_eod_verifies_the_artifacts_metron_reads(stack, tpl):
     eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
-    assert eod["workloads"] == ["post-market-data", "post-market-arctic-append"]
+    assert eod["workloads"] == ["post-market-data", "post-market-arctic-append", "arctic-probe"]
     assert eod["require_trading_day"] is True
     assert set(eod["verify_keys"]) == {
         "market_data/eod_closes/latest.json",
         "market_data/technicals/rating_performance.json",
     }
+
+
+def test_eod_and_morning_end_with_the_arctic_probe(stack, tpl):
+    """P-05 (alpha-engine-config-I10748): the in-region ArcticDB probe must be
+    the FINAL workload of both schedules so data_gate's ArcticDB-derived
+    clauses see the day's collection before the probe describes it."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    assert by_name["data-collection-eod"]["input"]["workloads"][-1] == "arctic-probe"
+    assert by_name["data-collection-morning"]["input"]["workloads"][-1] == "arctic-probe"
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):
