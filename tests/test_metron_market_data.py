@@ -852,8 +852,8 @@ class TestIntraday:
         # writes (an empty rating pass must not read as "never ran").
         assert result["ratings"] == 0
         puts = _puts(s3)
-        assert set(puts) == {"market_data/intraday/latest.json", "market_data/technical_ratings/latest.json"}
-        ratings_art = puts["market_data/technical_ratings/latest.json"]
+        assert set(puts) == {"market_data/intraday/latest.json", "market_data/intraday/technical_ratings.json"}
+        ratings_art = puts["market_data/intraday/technical_ratings.json"]
         assert ratings_art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
         assert ratings_art["source"] == "computed_intraday"
         assert ratings_art["as_of_utc"] == ratings_art["quote_as_of_utc"] == "2026-06-12T15:00:00Z"
@@ -1128,7 +1128,7 @@ class TestProvisionalBar:
 
 
 class TestIntradayTechnicalRatings:
-    """metron-ops#293: market_data/technical_ratings/latest.json, written alongside
+    """metron-ops#293: market_data/intraday/technical_ratings.json, written alongside
     market_data/intraday/latest.json inside collect_intraday from the SAME fetch."""
 
     _RTH = TestIntraday._RTH
@@ -1149,7 +1149,7 @@ class TestIntradayTechnicalRatings:
             bucket="b", s3_client=s3, intraday_source=self._quotes_source(last), now=self._RTH,
         )
         assert result["status"] == "ok" and result["ratings"] == 1
-        art = _puts(s3)["market_data/technical_ratings/latest.json"]
+        art = _puts(s3)["market_data/intraday/technical_ratings.json"]
         assert art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
         assert art["source"] == "computed_intraday"
         aapl = art["ratings"]["AAPL"]
@@ -1175,7 +1175,7 @@ class TestIntradayTechnicalRatings:
         )
         result = mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=self._RTH)
         assert result["status"] == "ok" and result["ratings"] == 1
-        assert "1299.HK" not in _puts(s3)["market_data/technical_ratings/latest.json"]["ratings"]
+        assert "1299.HK" not in _puts(s3)["market_data/intraday/technical_ratings.json"]["ratings"]
 
     def test_dry_run_computes_but_does_not_write_ratings(self):
         closes = _close_history_closes(260)

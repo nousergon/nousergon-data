@@ -116,7 +116,7 @@ class TestTechnicalRatingsContract:
         mmd.collect_intraday(
             bucket="b", s3_client=s3, intraday_source=self._stub(closes[-1][1] + 5), now=self._RTH,
         )
-        art = _puts(s3)["market_data/technical_ratings/latest.json"]
+        art = _puts(s3)["market_data/intraday/technical_ratings.json"]
         assert art["ratings"]
         assert validate_technical_ratings(art) == []
 
@@ -127,7 +127,7 @@ class TestTechnicalRatingsContract:
         mmd.collect_intraday(
             bucket="b", s3_client=s3, intraday_source=self._stub(100.0), now=self._RTH,
         )
-        art = _puts(s3)["market_data/technical_ratings/latest.json"]
+        art = _puts(s3)["market_data/intraday/technical_ratings.json"]
         assert art["ratings"] == {}
         assert validate_technical_ratings(art) == []
 

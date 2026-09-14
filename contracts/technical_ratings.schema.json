@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Metron Technical Ratings (intraday)",
-  "description": "market_data/technical_ratings/latest.json (metron-ops#293) — per-held-symbol intraday technical rating, written by collectors/metron_market_data.py::collect_intraday (inside _compute_intraday_ratings) from close_history + the SAME intraday quote fetch that produces market_data/intraday/latest.json's `quotes` — no new vendor call. PRODUCER TEST: tests/test_technical_rating_contracts.py. v1, new artifact.",
+  "description": "market_data/intraday/technical_ratings.json (metron-ops#293) — per-held-symbol intraday technical rating, written by collectors/metron_market_data.py::collect_intraday (inside _compute_intraday_ratings) from close_history + the SAME intraday quote fetch that produces market_data/intraday/latest.json's `quotes` — no new vendor call. PRODUCER TEST: tests/test_technical_rating_contracts.py. v1, new artifact.",
   "type": "object",
   "required": ["schema_version", "as_of_utc", "quote_as_of_utc", "source", "ratings"],
   "properties": {

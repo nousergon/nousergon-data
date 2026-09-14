@@ -180,8 +180,10 @@ INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
 # produces `quotes` (no new vendor call): today's `last` is appended/replaces a
 # same-dated bar onto the published close_history and re-rated, so the Holdings rating
 # refreshes every intraday tick rather than waiting for the next EOD run. Single
-# `latest.json` key, mirroring INTRADAY_PREFIX.
-TECHNICAL_RATINGS_PREFIX = "market_data/technical_ratings/"
+# key UNDER INTRADAY_PREFIX: it is written by the same session-gated run, so it shares that
+# prefix's dashboard-role PutObject grant and its ARTIFACT_REGISTRY session-gated exemption.
+# (A separate prefix needed a new grant on a role at its 10,240-byte inline-policy ceiling.)
+TECHNICAL_RATINGS_KEY = f"{INTRADAY_PREFIX}technical_ratings.json"
 TECHNICAL_RATINGS_SCHEMA_VERSION = 1
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
@@ -2232,7 +2234,7 @@ def collect_intraday(
              indices:      {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
              fund_proxies: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
 
-        market_data/technical_ratings/latest.json (metron-ops#293)
+        market_data/intraday/technical_ratings.json (metron-ops#293)
             {schema_version, as_of_utc, quote_as_of_utc, source: "computed_intraday",
              ratings: {yf_symbol: {score, label, ma_score, osc_score, n_buy, n_neutral,
              n_sell, n_votes, price, bar_date, basis: "intraday"}}}
@@ -2374,7 +2376,7 @@ def collect_intraday(
         logger.error("[metron_market_data] intraday write failed: %s", e)
         return {"status": "error", "error": str(e)}
     try:
-        _write_json(s3_client, bucket, f"{TECHNICAL_RATINGS_PREFIX}latest.json", ratings_artifact)
+        _write_json(s3_client, bucket, TECHNICAL_RATINGS_KEY, ratings_artifact)
     except Exception as e:  # fail loud — quotes already wrote; ratings failing must not be silent
         logger.error("[metron_market_data] technical_ratings write failed: %s", e)
         return {"status": "error", "error": str(e), "quotes": len(quotes),

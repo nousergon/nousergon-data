@@ -79,6 +79,6 @@ def validate_technicals(data: dict) -> list[str]:
 
 
 def validate_technical_ratings(data: dict) -> list[str]:
-    """Validate market_data/technical_ratings/latest.json against contract schema
+    """Validate market_data/intraday/technical_ratings.json against contract schema
     (metron-ops#293 — new artifact)."""
     return _validate(data, "technical_ratings")
