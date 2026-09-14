@@ -140,6 +140,77 @@ carry. Adjusted series stay rolling until v2 owns the data plane
 
 ---
 
+## 2c. Point-in-time fundamentals dataset (EDGAR, filing-date indexed — NOT feature-catalog entries)
+
+Producer: `collectors/edgar_pit_fundamentals.py` (alpha-engine-config-I10733). Consumer:
+crucible `crucible/data/point_in_time.py::FilingDatePointInTimeSource`. Contract:
+`contracts/edgar_pit_fundamentals_session.schema.json` (schema_version 1). These columns are not in
+`registry.py::CATALOG` or §3; they are a separate dated artifact, one object per session.
+
+**Key:** `fundamentals_pit/edgar/v1/sessions/{YYYY-MM-DD}.parquet` in the data bucket.
+**Knowledge rule:** the file labelled L uses only SEC EDGAR XBRL `companyfacts` facts with `filed`
+<= L and the ArcticDB `universe` `Close` of session L. It is admissible for session S only when L < S.
+**Restatements:** as of L, a period's value comes from the most recent filing on or before L; every
+version is kept in `fundamentals_pit/edgar/v1/facts/{run_date}/{run_id}.parquet`.
+
+| Column | Units | Compute | Consumers |
+|---|---|---|---|
+| `ticker`, `cik` | identifiers | SEC `company_tickers.json` | crucible |
+| `knowledge_date` | ISO date | the session label L | crucible (refuses a mismatch) |
+| `schema_version` | integer | 1 | crucible (refuses another) |
+| `latest_filed`, `latest_accession` | ISO date, accession | newest filing used for the row; `latest_filed` <= L | crucible (refuses a look-ahead) |
+| `roe` | ratio, clip [-1, 1] | net income TTM / equity; null when equity <= 0 | crucible `roe_ratio` |
+| `debt_to_equity` | ratio / 2, clip [-3, 3] | total debt / equity; null when equity <= 0 or no long-term debt tag | crucible `debt_to_equity_div2_ratio` |
+| `gross_margin` | 0-1 fraction | gross profit TTM (or revenue - cost of revenue) / revenue TTM | crucible `gross_margin_ratio` |
+| `current_ratio` | ratio / 3, clip [0, 3] | current assets / current liabilities | crucible `current_ratio_div3_ratio` |
+| `pe_ratio` | ratio / 30, clip [-3, 3] | market cap / net income TTM | crucible `pe_div30_ratio` |
+| `pb_ratio` | ratio / 5, clip [-3, 3] | market cap / equity | crucible `pb_div5_ratio` |
+| `fcf_yield` | ratio, clip [-0.5, 0.5] | (operating cash flow - capex) TTM / market cap, signed | crucible `fcf_yield_ratio` |
+| `revenue_growth_3y` | CAGR, clip [-0.5, 1.5] | annual revenue, 3 fiscal years | crucible `revenue_growth_3y_ratio` |
+| `eps_growth_3y` | CAGR, clip [-1, 2] | annual diluted EPS on the current split basis, 3 fiscal years | crucible `eps_growth_3y_ratio` |
+| `capex_growth_5y` | CAGR, clip [-1, 2] | annual capex, 5 fiscal years | crucible `capex_growth_5y_ratio` |
+| `payout_ratio` | ratio, clip [0, 2] | dividends paid TTM / net income TTM; 0.0 when cash flow was reported and no dividend tagged | crucible `payout_ratio` |
+| `close_raw` | USD | ArcticDB `universe` `Close` on L (current split basis) | audit |
+| `market_cap_raw` | USD | `close_raw` x `shares_outstanding_raw` | audit |
+| `shares_outstanding_raw` | shares, current split basis | reported shares / product of registry split factors after the report date | audit |
+| `net_income_ttm_raw`, `revenue_ttm_raw`, `gross_profit_ttm_raw`, `fcf_ttm_raw`, `dividends_ttm_raw` | USD | trailing twelve months (see below) | audit |
+| `equity_raw`, `total_debt_raw`, `assets_current_raw`, `liabilities_current_raw` | USD | newest balance sheet | audit |
+
+**TTM:** the fiscal-year value when the newest period is a fiscal year, else the four newest discrete
+quarters, Q2-Q4 derived from year-to-date cumulatives (6M - 3M, 9M - 6M, FY - 9M). Periods older than
+400 days before L are not used. Only 10-K/10-Q (and /A, T) facts are admitted.
+
+**Tag map** (per reporting period, the first concept in the list that reports it wins):
+
+| Quantity | Kind | Unit | Concepts, in priority order |
+|---|---|---|---|
+| revenue | duration | USD | `Revenues`, `RevenueFromContractWithCustomerExcludingAssessedTax`, `SalesRevenueNet`, `RevenueFromContractWithCustomerIncludingAssessedTax`, `SalesRevenueGoodsNet` |
+| cost_of_revenue | duration | USD | `CostOfRevenue`, `CostOfGoodsAndServicesSold`, `CostOfGoodsSold` |
+| gross_profit | duration | USD | `GrossProfit` |
+| net_income | duration | USD | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, `ProfitLoss` |
+| eps_diluted | duration | USD/shares | `EarningsPerShareDiluted`, `EarningsPerShareBasicAndDiluted`, `EarningsPerShareBasic` |
+| equity | instant | USD | `StockholdersEquity`, `StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest` |
+| assets_current | instant | USD | `AssetsCurrent` |
+| liabilities_current | instant | USD | `LiabilitiesCurrent` |
+| debt_combined | instant | USD | `DebtLongtermAndShorttermCombinedAmount`, `DebtAndCapitalLeaseObligations` |
+| long_term_debt_total | instant | USD | `LongTermDebt` |
+| long_term_debt_noncurrent | instant | USD | `LongTermDebtNoncurrent`, `LongTermDebtAndCapitalLeaseObligations` |
+| long_term_debt_current | instant | USD | `LongTermDebtCurrent`, `LongTermDebtAndCapitalLeaseObligationsCurrent` |
+| short_term_borrowings | instant | USD | `ShortTermBorrowings` |
+| commercial_paper | instant | USD | `CommercialPaper` |
+| debt_current | instant | USD | `DebtCurrent` (used only when no current portion, borrowings or paper is tagged) |
+| operating_cash_flow | duration | USD | `NetCashProvidedByUsedInOperatingActivities`, `NetCashProvidedByUsedInOperatingActivitiesContinuingOperations` |
+| capex | duration | USD | `PaymentsToAcquirePropertyPlantAndEquipment`, `PaymentsToAcquireProductiveAssets` |
+| dividends_paid | duration | USD | `PaymentsOfDividendsCommonStock`, `PaymentsOfDividends`, `PaymentsOfOrdinaryDividends` |
+| shares_outstanding | instant | shares | `EntityCommonStockSharesOutstanding` (dei), `CommonStockSharesOutstanding` |
+| diluted_weighted_shares | duration | shares | `WeightedAverageNumberOfDilutedSharesOutstanding` (used only when no share count is tagged) |
+
+Total debt = the combined figure when tagged; else long-term (total, or noncurrent + current portion)
+plus short-term borrowings and commercial paper. With no long-term or combined tag it is null: JPM,
+for one, tags only short-term borrowings.
+
+---
+
 ## 3. Field catalog — units, compute, consumers
 
 Sorted by group, matching `features/registry.py::CATALOG`. Every entry

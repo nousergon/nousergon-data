@@ -81,7 +81,7 @@ import time
 import zipfile
 from dataclasses import asdict, dataclass
 from datetime import date as Date
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Protocol
 
 import pandas as pd
@@ -137,6 +137,29 @@ _SEC_HEADERS = {
 
 # Cache TTL for CUSIP→ticker crosswalk (days).
 _CUSIP_CACHE_TTL_DAYS = 30
+
+# 17 CFR 240.13f-1(a): an institutional investment manager must file a Form
+# 13F within 45 days after the end of each calendar quarter. The crucible
+# consumer (`crucible/data/point_in_time.py`) admits a quarter Q for a
+# session S only when ``(quarter_end + 45 days) < S`` and never inspects
+# FILING_DATE itself — it trusts this producer to have already excluded
+# anything filed later. A submission (original or amendment) filed after
+# this deadline is therefore a point-in-time / look-ahead leak into
+# whatever session first admits the quarter, not merely late data
+# (alpha-engine-config-I10733).
+THIRTEEN_F_FILING_DEADLINE_DAYS = 45
+
+# FORM13F_readme.htm (inside every SEC 13F bulk ZIP) documents a schema
+# change effective this date: INFOTABLE.VALUE is reported in THOUSANDS of
+# USD for submissions filed before 2023-01-03, and in whole USD from that
+# date on. The scale is a property of the FILING, not the window file (a
+# window can carry a late/amended legacy-period submission alongside
+# current ones) — resolved per ACCESSION_NUMBER via SUBMISSION.FILING_DATE,
+# never assumed from which window a row came from.
+SEC_THIRTEEN_F_THOUSANDS_CUTOFF = Date(2023, 1, 3)
+
+# Calendar quarter-end months/days a ``--report-period`` value must land on.
+_QUARTER_END_MONTHS = (3, 6, 9, 12)
 
 # OpenFIGI mapping API (alpha-engine-config-I10529). Keyless: 25 req/min,
 # 10 jobs/request. With ``OPENFIGI_API_KEY`` (X-OPENFIGI-APIKEY header):
@@ -216,6 +239,19 @@ class UniverseUnavailable(RuntimeError):
     Raised rather than falling back to a stale local list — a producer
     running on the wrong week's universe is a silent scope error, not a
     degraded run (PRODUCER-repo fail-loud default, AGENTS.md).
+    """
+
+
+class InstOwnershipPeriodUnavailable(RuntimeError):
+    """A ``--report-period`` backfill could not produce data for the named
+    period — the needed SEC window(s) aren't published, or nothing joined
+    after the filing-date cutoff / universe filter.
+
+    Historical mode (alpha-engine-config-I10733) fails loud and names the
+    period rather than skipping it: a silently-skipped backfill quarter is
+    indistinguishable from a quarter that legitimately has no institutional
+    holders, and crucible's point-in-time consumer has no way to tell the
+    difference between "not backfilled" and "genuinely empty".
     """
 
 
@@ -540,6 +576,28 @@ def _is_leap_year(year: int) -> bool:
     return year % 4 == 0 and (year % 100 != 0 or year % 400 == 0)
 
 
+def _quarter_end_day(month: int) -> int:
+    """The last calendar day of a quarter-end month (3/6/9/12)."""
+    return 31 if month in (3, 12) else 30
+
+
+def _is_quarter_end(d: Date) -> bool:
+    """True iff ``d`` is exactly a calendar quarter-end date (03-31, 06-30,
+    09-30, 12-31) — the only dates ``--report-period`` may name (I10733)."""
+    return d.month in _QUARTER_END_MONTHS and d.day == _quarter_end_day(d.month)
+
+
+def _previous_quarter_end(d: Date) -> Date:
+    """The quarter-end date immediately before ``d`` (``d`` itself must
+    already be a quarter-end — callers validate with ``_is_quarter_end``
+    first)."""
+    idx = _QUARTER_END_MONTHS.index(d.month)
+    if idx == 0:
+        return Date(d.year - 1, 12, 31)
+    prev_month = _QUARTER_END_MONTHS[idx - 1]
+    return Date(d.year, prev_month, _quarter_end_day(prev_month))
+
+
 def _window_filename(year: int, idx: int) -> str:
     """Deterministically construct the SEC filing-window filename for
     window ``idx`` (0=Dec-Feb, 1=Mar-May, 2=Jun-Aug, 3=Sep-Nov) ending
@@ -630,6 +688,139 @@ def _window_end_date(filename: str) -> Date | None:
         end_day = 31 if end_month in (3, 12) else 30
         return Date(year, end_month, end_day)
     return None
+
+
+def _window_date_range(filename: str) -> tuple[Date, Date] | None:
+    """Parse the ``(start, end)`` filing-window date range directly from a
+    SEC 13F bulk zip filename — legacy calendar-quarter or 2024+ windowed
+    naming — for the historical backfill's window-selection-by-date-overlap
+    (I10733). Parses the filename's own tokens rather than reconstructing
+    from ``_window_filename``/``_window_index_for_date``, which only know
+    the regular Dec-Feb/Mar-May/Jun-Aug/Sep-Nov cadence: the real SEC index
+    carries an odd transitional window (``01jan2024-29feb2024_form13f.zip``,
+    2 months, measured live 2026-09-14) that a deterministic reconstruction
+    would never produce. Returns ``None`` for anything unrecognized.
+    """
+    m = _WINDOW_FILENAME_RE.match(filename)
+    if m:
+        start_month = _MONTH_NUM.get(m.group(1))
+        start_year = int(m.group(2))
+        end_day = int(m.group(3))
+        end_month = _MONTH_NUM.get(m.group(4))
+        end_year = int(m.group(5))
+        if start_month is None or end_month is None:
+            return None
+        try:
+            return (Date(start_year, start_month, 1), Date(end_year, end_month, end_day))
+        except ValueError:
+            return None
+    m2 = _LEGACY_QUARTER_FILENAME_RE.match(filename)
+    if m2:
+        year = int(m2.group(1))
+        q = int(m2.group(2))
+        start_month = (q - 1) * 3 + 1
+        end_month = q * 3
+        return (Date(year, start_month, 1), Date(year, end_month, _quarter_end_day(end_month)))
+    return None
+
+
+def _windows_overlapping_range(candidates: list[str], lo: Date, hi: Date) -> list[str]:
+    """Filenames from ``candidates`` whose parsed date range overlaps the
+    inclusive ``[lo, hi]`` filing-date range. Inclusive at both ends
+    deliberately: a filing dated exactly on a window boundary (e.g. the
+    quarter-end date itself) must not fall through the selection net —
+    the true cutoff enforcement is ``_apply_filing_cutoff``, not this
+    coarse window-selection pass.
+    """
+    out = []
+    for name in candidates:
+        rng = _window_date_range(name)
+        if rng is None:
+            continue
+        start, end = rng
+        if start <= hi and end >= lo:
+            out.append(name)
+    return out
+
+
+def _filing_ranges_for_period(current_period: Date, prior_period: Date) -> list[tuple[Date, Date]]:
+    """The two on-time-filing date ranges (prior, prior+45d] and
+    (current, current+45d] whose SEC windows must be downloaded to cover
+    both report periods' filings (I10733)."""
+    deadline = timedelta(days=THIRTEEN_F_FILING_DEADLINE_DAYS)
+    return [
+        (prior_period, prior_period + deadline),
+        (current_period, current_period + deadline),
+    ]
+
+
+def _windows_needed_for_period(
+    current_period: Date, prior_period: Date, *, index_html: str | None = None,
+) -> list[str]:
+    """The sorted set of SEC 13F window filenames that must be downloaded
+    to cover both ``current_period`` and ``prior_period``'s on-time filing
+    ranges. Fetches the live index page (or uses a caller-supplied
+    ``index_html``, e.g. to fetch it once per CLI invocation across many
+    periods) rather than deterministic construction — the index page is
+    the only source that also carries pre-2024 legacy quarters and the
+    2024 transition window.
+
+    Raises ``RuntimeError`` when the index page is unreachable or no
+    published window covers a needed range — historical backfill fails
+    loud rather than silently skipping a period (I10733 / AGENTS.md
+    fail-loud PRODUCER default).
+    """
+    html = index_html if index_html is not None else _fetch_sec_index_html()
+    if not html:
+        raise RuntimeError(
+            "SEC 13F index page unreachable — cannot resolve which window "
+            f"file(s) cover report periods {current_period.isoformat()} / "
+            f"{prior_period.isoformat()}"
+        )
+    all_names = discover_window_filenames_from_html(html)
+    needed: set[str] = set()
+    for lo, hi in _filing_ranges_for_period(current_period, prior_period):
+        matches = _windows_overlapping_range(all_names, lo, hi)
+        if not matches:
+            raise RuntimeError(
+                f"no published SEC 13F window covers on-time filings for "
+                f"{lo.isoformat()} through {hi.isoformat()} "
+                f"({THIRTEEN_F_FILING_DEADLINE_DAYS}-day deadline) — cannot "
+                f"resolve report periods {current_period.isoformat()} / "
+                f"{prior_period.isoformat()}"
+            )
+        needed |= set(matches)
+    return sorted(needed)
+
+
+def _download_windows(
+    filenames: list[str], *, cache: dict[str, zipfile.ZipFile] | None = None,
+) -> list[tuple[str, zipfile.ZipFile]]:
+    """Download each named window, deduped by filename via ``cache`` so the
+    same window (needed by two adjacent report periods in one backfill
+    invocation) is never fetched twice. Raises ``RuntimeError`` naming the
+    filename if a window ``_windows_needed_for_period`` said was required
+    turns out unpublished (HTTP 404) — historical mode never silently
+    drops a needed window (I10733).
+    """
+    if cache is None:
+        cache = {}
+    out: list[tuple[str, zipfile.ZipFile]] = []
+    fresh_downloads = 0
+    for name in filenames:
+        if name not in cache:
+            if fresh_downloads:
+                time.sleep(_SEC_REQUEST_DELAY)
+            zf = _download_sec_bulk_zip(name)
+            if zf is None:
+                raise RuntimeError(
+                    f"SEC 13F window {name} is required to cover a needed "
+                    "on-time filing range but is not published (HTTP 404)"
+                )
+            cache[name] = zf
+            fresh_downloads += 1
+        out.append((name, cache[name]))
+    return out
 
 
 def discover_window_filenames_from_html(html: str) -> list[str]:
@@ -784,6 +975,62 @@ def _parse_submission(zf: zipfile.ZipFile) -> pd.DataFrame:
     return df[list(required)]
 
 
+def _apply_filing_cutoff(submissions: pd.DataFrame) -> pd.DataFrame:
+    """Drop SUBMISSION rows filed more than
+    ``THIRTEEN_F_FILING_DEADLINE_DAYS`` after their own PERIODOFREPORT (17
+    CFR 240.13f-1(a); crucible's point-in-time consumer rule — see the
+    constant's docstring). Applied BEFORE ``_dedupe_amendments`` so a late
+    amendment can never supersede an on-time original with a deadline-
+    violating restatement — the original stands and the late amendment is
+    simply excluded, exactly as a session that already admitted the
+    quarter would never see it.
+    """
+    if len(submissions) == 0:
+        return submissions
+    df = submissions.dropna(subset=["PERIODOFREPORT", "FILING_DATE"]).copy()
+    if len(df) == 0:
+        return df
+    deadline = df["PERIODOFREPORT"] + pd.Timedelta(days=THIRTEEN_F_FILING_DEADLINE_DAYS)
+    admitted = df[df["FILING_DATE"] <= deadline]
+    excluded = len(df) - len(admitted)
+    if excluded:
+        logger.info(
+            "[inst_ownership] filing-date cutoff (17 CFR 240.13f-1(a), "
+            "+%dd): excluded %d/%d submissions filed after their report "
+            "period's deadline",
+            THIRTEEN_F_FILING_DEADLINE_DAYS, excluded, len(df),
+        )
+    return admitted
+
+
+def _apply_value_scaling(infotable: pd.DataFrame, winners: pd.DataFrame) -> pd.DataFrame:
+    """Scale ``market_value`` x1000 for INFOTABLE rows whose owning
+    submission was filed before ``SEC_THIRTEEN_F_THOUSANDS_CUTOFF``
+    (2023-01-03) — see that constant's docstring for the SEC readme
+    citation. Joined via ``accession_number`` -> ``winners.FILING_DATE``
+    since a single window's rows can straddle the boundary (a late or
+    amended legacy-period filing arriving in a post-2023 window); a row
+    whose accession isn't in ``winners`` (already excluded upstream, e.g.
+    by the filing cutoff or amendment dedupe) is left unscaled — it plays
+    no further part in the pipeline.
+    """
+    if len(infotable) == 0 or len(winners) == 0:
+        return infotable
+    filing_dates = winners.set_index("ACCESSION_NUMBER")["FILING_DATE"]
+    accession_filing_date = infotable["accession_number"].map(filing_dates)
+    is_legacy = (accession_filing_date < pd.Timestamp(SEC_THIRTEEN_F_THOUSANDS_CUTOFF)).fillna(False)
+    if not is_legacy.any():
+        return infotable
+    out = infotable.copy()
+    out.loc[is_legacy, "market_value"] = out.loc[is_legacy, "market_value"] * 1000
+    logger.info(
+        "[inst_ownership] VALUE scaling (SEC FORM13F_readme.htm, pre-%s "
+        "reported in thousands): scaled x1000 for %d/%d INFOTABLE rows",
+        SEC_THIRTEEN_F_THOUSANDS_CUTOFF.isoformat(), int(is_legacy.sum()), len(out),
+    )
+    return out
+
+
 def _dedupe_amendments(submissions: pd.DataFrame) -> pd.DataFrame:
     """Collapse SUBMISSION rows to one winning ACCESSION_NUMBER per
     (CIK, PERIODOFREPORT): the latest-filed submission wins, with an
@@ -819,9 +1066,12 @@ def _parse_infotable(zf: zipfile.ZipFile) -> pd.DataFrame:
     - CUSIP: str (9-char, alphanumeric)
     - PUTCALL: str (empty for equity, "PUT"/"CALL" for options)
     - SSHPRNAMT: float (shares)
-    - VALUE: float — USD (not thousands) since 2023-01-03 per
-      FORM13F_readme.htm; this module only ever downloads 2024+ windows,
-      so no thousands-scaling is applied.
+    - VALUE: float — USD since 2023-01-03, THOUSANDS of USD before that
+      per FORM13F_readme.htm. This parser does NOT scale VALUE — the
+      historical backfill (I10733) can download legacy pre-2023 windows,
+      and the scale is a property of the FILING (SUBMISSION.FILING_DATE),
+      not the window file, so scaling is applied by the orchestrator
+      (``_apply_value_scaling``) after joining to SUBMISSION, not here.
 
     Returns a DataFrame renamed to the lowercase names downstream
     aggregation code expects: accession_number, cusip, put_call, shares,
@@ -1011,12 +1261,23 @@ def write_inst_ownership_parquet(
     bucket: str = DEFAULT_S3_BUCKET,
     prefix: str = DEFAULT_S3_PREFIX,
     run_id: str | None = None,
+    update_global_sidecar: bool = True,
 ) -> str:
     """Write a per-(ticker, quarter) institutional-ownership parquet.
 
     Output format: one parquet per quarter at
     ``s3://bucket/prefix/{quarter}/result.parquet``
     with a ``latest.json`` sidecar pointing at the most recent run.
+
+    ``update_global_sidecar`` (default ``True``, the weekly-mode
+    behaviour): when ``False`` the per-quarter ``{prefix}/{quarter}/
+    latest.parquet`` and run artifact are still written, but
+    ``{prefix}/latest.json`` is left untouched. That sidecar is the
+    freshness pointer the weekly-run readback step and downstream
+    freshness monitoring key off; a historical backfill run
+    (``compute_and_write_inst_ownership(report_period=...)``, I10733)
+    writing an old quarter must never move it backward or otherwise
+    disturb what it currently points at.
 
     Returns the artifact S3 key.
     """
@@ -1045,19 +1306,24 @@ def write_inst_ownership_parquet(
         ContentType="application/octet-stream",
     )
 
-    # Update the global latest.json sidecar
-    s3_client.put_object(
-        Bucket=bucket, Key=latest_key,
-        Body=_json.dumps({
-            "run_id": run_id,
-            "artifact_key": artifact_key,
-            "quarter": quarter,
-            "schema_version": SCHEMA_VERSION,
-            "row_count": int(len(df)),
-            "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-        }).encode("utf-8"),
-        ContentType="application/json",
-    )
+    if update_global_sidecar:
+        s3_client.put_object(
+            Bucket=bucket, Key=latest_key,
+            Body=_json.dumps({
+                "run_id": run_id,
+                "artifact_key": artifact_key,
+                "quarter": quarter,
+                "schema_version": SCHEMA_VERSION,
+                "row_count": int(len(df)),
+                "written_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            }).encode("utf-8"),
+            ContentType="application/json",
+        )
+    else:
+        logger.info(
+            "[inst_ownership] historical write for %s — leaving the global "
+            "%s freshness sidecar untouched", quarter, latest_key,
+        )
 
     logger.info(
         "[inst_ownership] wrote %d rows for %s to s3://%s/%s",
@@ -1109,85 +1375,31 @@ def read_inst_ownership_parquet(
 # ═══════════════════════════════════════════════════════════════════
 
 
-def compute_and_write_inst_ownership(
-    universe_tickers: list[str],
+def _rows_for_selected_periods(
     *,
+    winners: pd.DataFrame,
+    infotable: pd.DataFrame,
+    current_period: Any,
+    prior_period: Any | None,
+    universe_tickers: list[str],
     s3_client: Any,
-    bucket: str = DEFAULT_S3_BUCKET,
-    prefix: str = DEFAULT_S3_PREFIX,
-    force_rebuild_cusip: bool = False,
-    openfigi_api_key: str | None = None,
-) -> list[InstOwnershipRow] | None:
-    """Download, parse, aggregate, and write 13F institutional ownership.
+    bucket: str,
+    force_rebuild_cusip: bool,
+    openfigi_api_key: str | None,
+) -> tuple[list[InstOwnershipRow], str] | None:
+    """Shared tail of the pipeline once (current_period, prior_period) are
+    known, for BOTH the weekly "2 most recent" mode and the explicit
+    historical ``--report-period`` mode (I10733): VALUE scaling, join
+    INFOTABLE to each period's winning accessions, resolve CUSIP→ticker,
+    compute QoQ deltas, filter to the scanned universe.
 
-    Full pipeline (rewritten alpha-engine-config-I10529 — the old
-    calendar-quarter URL scheme 404s for every quarter; SEC now publishes
-    three-month filing windows that mix report periods):
-
-    1. Discover and download the 2 newest published SEC 13F filing-window
-       ZIPs (index-page discovery, deterministic-construction fallback).
-    2. Parse SUBMISSION + INFOTABLE from both; dedupe to one accession per
-       (CIK, PERIODOFREPORT), an amendment superseding the original.
-    3. Select the 2 most recent PERIODOFREPORT dates present as
-       current/prior "quarter" — this is where the CUSIPs actually come
-       from (the filings carry CUSIP, not ticker).
-    4. Resolve CUSIP→ticker for the CUSIPs seen in either period (cache +
-       OpenFIGI for the delta).
-    5. Compute QoQ deltas per ticker, filtered to the scanned universe.
-    6. Write parquet.
-
-    Returns the list of rows, or ``None`` if no data could be processed
-    (nothing gets written in that case — callers must not treat a
-    non-exception return as success without checking for ``None``).
+    Returns ``(rows, current_quarter_str)``, or ``None`` if nothing could
+    be produced (empty join, unmapped CUSIPs, or nothing in-universe) —
+    callers decide whether an empty result is a soft skip (weekly) or a
+    loud failure (historical backfill).
     """
-    windows = _download_recent_windows(count=2)
-    if not windows:
-        logger.warning("no SEC 13F window files could be downloaded")
-        return None
-
-    submission_frames: list[pd.DataFrame] = []
-    infotable_frames: list[pd.DataFrame] = []
-    for name, zf in windows:
-        sub = _parse_submission(zf)
-        info = _parse_infotable(zf)
-        logger.info(
-            "parsed SEC 13F window %s: %d submissions, %d infotable rows",
-            name, len(sub), len(info),
-        )
-        if len(sub) > 0:
-            submission_frames.append(sub)
-        if len(info) > 0:
-            infotable_frames.append(info)
-
-    if not submission_frames or not infotable_frames:
-        logger.warning(
-            "no parseable SUBMISSION/INFOTABLE data in the %d downloaded "
-            "window file(s)", len(windows),
-        )
-        return None
-
-    submissions = pd.concat(submission_frames, ignore_index=True)
-    infotable = pd.concat(infotable_frames, ignore_index=True)
-
-    winners = _dedupe_amendments(submissions)
-    periods = _select_report_periods(winners, count=2)
-    if not periods:
-        logger.warning("no report periods resolved from SUBMISSION data")
-        return None
-
-    current_period = periods[0]
-    prior_period = periods[1] if len(periods) > 1 else None
     current_q = _quarter_str_for_date(current_period)
     prior_q = _quarter_str_for_date(prior_period) if prior_period is not None else None
-
-    logger.info(
-        "inst_ownership: selected report periods current=%s (%s), prior=%s (%s) "
-        "from window file(s) %s",
-        current_period.date() if hasattr(current_period, "date") else current_period,
-        current_q,
-        prior_period.date() if hasattr(prior_period, "date") else prior_period,
-        prior_q, [n for n, _ in windows],
-    )
 
     current_accessions = set(
         winners.loc[winners["PERIODOFREPORT"] == current_period, "ACCESSION_NUMBER"]
@@ -1196,6 +1408,8 @@ def compute_and_write_inst_ownership(
         set(winners.loc[winners["PERIODOFREPORT"] == prior_period, "ACCESSION_NUMBER"])
         if prior_period is not None else set()
     )
+
+    infotable = _apply_value_scaling(infotable, winners)
 
     current_df = infotable[infotable["accession_number"].isin(current_accessions)]
     if len(current_df) == 0:
@@ -1247,7 +1461,6 @@ def compute_and_write_inst_ownership(
 
     # Filter to the scanned universe (the mapping can resolve CUSIPs to
     # tickers outside it — OpenFIGI isn't universe-scoped).
-    universe_set = {t.strip().upper() for t in universe_tickers if t.strip()}
     if universe_set:
         before = len(rows)
         rows = [r for r in rows if r.ticker in universe_set]
@@ -1260,11 +1473,228 @@ def compute_and_write_inst_ownership(
         return None
 
     logger.info("inst_ownership: %d tickers resolved for %s", len(rows), current_q)
+    return rows, current_q
 
-    # Write parquet
+
+def _compute_ownership_for_report_period(
+    report_period: Date,
+    universe_tickers: list[str],
+    *,
+    s3_client: Any,
+    bucket: str,
+    prefix: str,
+    force_rebuild_cusip: bool,
+    openfigi_api_key: str | None,
+    update_global_sidecar: bool,
+    window_cache: dict[str, zipfile.ZipFile] | None = None,
+    index_html: str | None = None,
+) -> list[InstOwnershipRow]:
+    """Historical backfill for one explicit report period (I10733) — the
+    ``report_period=`` branch of ``compute_and_write_inst_ownership``.
+
+    Unlike the weekly "2 most recent published PERIODOFREPORT" mode, both
+    periods and the windows that cover them are selected EXPLICITLY from
+    ``report_period`` itself, and every failure mode (bad date, unpublished
+    window, empty join) raises rather than returning ``None`` — a
+    backfill run silently skipping a quarter is indistinguishable from a
+    quarter that legitimately has no institutional holders.
+    """
+    if not _is_quarter_end(report_period):
+        raise ValueError(
+            f"--report-period {report_period.isoformat()} is not a calendar "
+            "quarter-end date (expected one of 03-31, 06-30, 09-30, 12-31)"
+        )
+    prior_period = _previous_quarter_end(report_period)
+
+    filenames = _windows_needed_for_period(report_period, prior_period, index_html=index_html)
+    windows = _download_windows(filenames, cache=window_cache)
+
+    submission_frames: list[pd.DataFrame] = []
+    infotable_frames: list[pd.DataFrame] = []
+    for name, zf in windows:
+        sub = _parse_submission(zf)
+        info = _parse_infotable(zf)
+        logger.info(
+            "parsed SEC 13F window %s: %d submissions, %d infotable rows",
+            name, len(sub), len(info),
+        )
+        if len(sub) > 0:
+            submission_frames.append(sub)
+        if len(info) > 0:
+            infotable_frames.append(info)
+
+    if not submission_frames or not infotable_frames:
+        raise InstOwnershipPeriodUnavailable(
+            f"report period {report_period.isoformat()}: no parseable "
+            f"SUBMISSION/INFOTABLE data in required window(s) {filenames}"
+        )
+
+    submissions = pd.concat(submission_frames, ignore_index=True)
+    infotable = pd.concat(infotable_frames, ignore_index=True)
+
+    submissions = _apply_filing_cutoff(submissions)
+    winners = _dedupe_amendments(submissions)
+
+    current_ts = pd.Timestamp(report_period)
+    prior_ts = pd.Timestamp(prior_period)
+    if current_ts not in set(winners["PERIODOFREPORT"]):
+        raise InstOwnershipPeriodUnavailable(
+            f"report period {report_period.isoformat()}: no on-time (or "
+            f"on-time-amended) submission for this PERIODOFREPORT in "
+            f"downloaded window(s) {filenames} after the "
+            f"{THIRTEEN_F_FILING_DEADLINE_DAYS}-day filing-date cutoff"
+        )
+
+    logger.info(
+        "inst_ownership backfill: report_period=%s prior=%s from window "
+        "file(s) %s", report_period.isoformat(), prior_period.isoformat(), filenames,
+    )
+
+    result = _rows_for_selected_periods(
+        winners=winners, infotable=infotable,
+        current_period=current_ts, prior_period=prior_ts,
+        universe_tickers=universe_tickers, s3_client=s3_client, bucket=bucket,
+        force_rebuild_cusip=force_rebuild_cusip, openfigi_api_key=openfigi_api_key,
+    )
+    if result is None:
+        raise InstOwnershipPeriodUnavailable(
+            f"report period {report_period.isoformat()}: no joinable "
+            "INFOTABLE rows / resolved tickers within the scanned universe"
+        )
+    rows, quarter = result
+
     write_inst_ownership_parquet(
-        rows, quarter=current_q, s3_client=s3_client,
+        rows, quarter=quarter, s3_client=s3_client,
         bucket=bucket, prefix=prefix,
+        update_global_sidecar=update_global_sidecar,
+    )
+    return rows
+
+
+def compute_and_write_inst_ownership(
+    universe_tickers: list[str],
+    *,
+    s3_client: Any,
+    bucket: str = DEFAULT_S3_BUCKET,
+    prefix: str = DEFAULT_S3_PREFIX,
+    force_rebuild_cusip: bool = False,
+    openfigi_api_key: str | None = None,
+    report_period: Date | None = None,
+    update_global_sidecar: bool = True,
+    _window_cache: dict[str, zipfile.ZipFile] | None = None,
+    _index_html: str | None = None,
+) -> list[InstOwnershipRow] | None:
+    """Download, parse, aggregate, and write 13F institutional ownership.
+
+    Two modes:
+
+    - **Weekly** (``report_period=None``, the default): discover and
+      download the 2 newest published SEC 13F filing-window ZIPs, dedupe
+      to one accession per (CIK, PERIODOFREPORT) with an amendment
+      superseding the original, and select the 2 most recent
+      PERIODOFREPORT dates present as current/prior. Returns ``None``
+      (nothing written) on any empty-data outcome — this is the
+      long-standing scheduled-run contract other callers depend on.
+    - **Historical backfill** (``report_period=<a quarter-end date>``,
+      I10733): both periods are named explicitly (``report_period`` and
+      the quarter before it) and only the SEC window(s) whose filing-date
+      coverage actually intersects their 45-day on-time deadlines are
+      downloaded — see ``_compute_ownership_for_report_period``. Fails
+      loud (raises, naming the period) rather than returning ``None`` on
+      any empty-data outcome, and never rewrites the global
+      ``{prefix}/latest.json`` freshness sidecar when
+      ``update_global_sidecar=False`` (the CLI's default for this mode)
+      — that sidecar is the weekly run's own freshness pointer.
+
+    Both modes apply, in order: (1) the ``THIRTEEN_F_FILING_DEADLINE_DAYS``
+    filing-date cutoff BEFORE amendment dedupe, so a late amendment can
+    never supersede an on-time original; (2) VALUE x1000 scaling for
+    submissions filed before ``SEC_THIRTEEN_F_THOUSANDS_CUTOFF``; (3)
+    CUSIP→ticker resolution (cache + OpenFIGI) for the CUSIPs seen in
+    either period; (4) QoQ deltas per ticker, filtered to the scanned
+    universe.
+
+    Returns the list of rows written. For the weekly mode, ``None`` on a
+    soft empty outcome (see above) — callers must not treat a
+    non-exception return as success without checking for ``None``. For
+    the historical mode, always a non-empty list (empty outcomes raise
+    ``InstOwnershipPeriodUnavailable``/``ValueError``/``RuntimeError``
+    instead).
+    """
+    if report_period is not None:
+        return _compute_ownership_for_report_period(
+            report_period, universe_tickers,
+            s3_client=s3_client, bucket=bucket, prefix=prefix,
+            force_rebuild_cusip=force_rebuild_cusip,
+            openfigi_api_key=openfigi_api_key,
+            update_global_sidecar=update_global_sidecar,
+            window_cache=_window_cache, index_html=_index_html,
+        )
+
+    windows = _download_recent_windows(count=2)
+    if not windows:
+        logger.warning("no SEC 13F window files could be downloaded")
+        return None
+
+    submission_frames: list[pd.DataFrame] = []
+    infotable_frames: list[pd.DataFrame] = []
+    for name, zf in windows:
+        sub = _parse_submission(zf)
+        info = _parse_infotable(zf)
+        logger.info(
+            "parsed SEC 13F window %s: %d submissions, %d infotable rows",
+            name, len(sub), len(info),
+        )
+        if len(sub) > 0:
+            submission_frames.append(sub)
+        if len(info) > 0:
+            infotable_frames.append(info)
+
+    if not submission_frames or not infotable_frames:
+        logger.warning(
+            "no parseable SUBMISSION/INFOTABLE data in the %d downloaded "
+            "window file(s)", len(windows),
+        )
+        return None
+
+    submissions = pd.concat(submission_frames, ignore_index=True)
+    infotable = pd.concat(infotable_frames, ignore_index=True)
+
+    submissions = _apply_filing_cutoff(submissions)
+    winners = _dedupe_amendments(submissions)
+    periods = _select_report_periods(winners, count=2)
+    if not periods:
+        logger.warning("no report periods resolved from SUBMISSION data")
+        return None
+
+    current_period = periods[0]
+    prior_period = periods[1] if len(periods) > 1 else None
+    current_q = _quarter_str_for_date(current_period)
+    prior_q = _quarter_str_for_date(prior_period) if prior_period is not None else None
+
+    logger.info(
+        "inst_ownership: selected report periods current=%s (%s), prior=%s (%s) "
+        "from window file(s) %s",
+        current_period.date() if hasattr(current_period, "date") else current_period,
+        current_q,
+        prior_period.date() if hasattr(prior_period, "date") else prior_period,
+        prior_q, [n for n, _ in windows],
+    )
+
+    result = _rows_for_selected_periods(
+        winners=winners, infotable=infotable,
+        current_period=current_period, prior_period=prior_period,
+        universe_tickers=universe_tickers, s3_client=s3_client, bucket=bucket,
+        force_rebuild_cusip=force_rebuild_cusip, openfigi_api_key=openfigi_api_key,
+    )
+    if result is None:
+        return None
+    rows, quarter = result
+
+    write_inst_ownership_parquet(
+        rows, quarter=quarter, s3_client=s3_client,
+        bucket=bucket, prefix=prefix,
+        update_global_sidecar=update_global_sidecar,
     )
 
     return rows
@@ -1343,6 +1773,18 @@ def main() -> None:
             "print the count. No SEC download, no S3 reads/writes."
         ),
     )
+    parser.add_argument(
+        "--report-period", type=str, default=None,
+        help=(
+            "Comma-separated calendar quarter-end date(s) (YYYY-MM-DD, one "
+            "of *-03-31/*-06-30/*-09-30/*-12-31) to backfill historical 13F "
+            "report periods instead of the weekly current/prior-quarter "
+            "window (alpha-engine-config-I10733). Processed in ascending "
+            "order in one invocation; each writes {prefix}/{quarter}/"
+            "latest.parquet only — the global latest.json freshness "
+            "sidecar (the weekly run's pointer) is never touched."
+        ),
+    )
     args = parser.parse_args()
 
     if args.dry_run:
@@ -1351,6 +1793,31 @@ def main() -> None:
     if args.tickers_file and args.from_membership:
         print("--tickers-file and --from-membership are mutually exclusive", file=sys.stderr)
         sys.exit(1)
+
+    report_periods: list[Date] = []
+    if args.report_period:
+        for tok in args.report_period.split(","):
+            tok = tok.strip()
+            if not tok:
+                continue
+            try:
+                d = Date.fromisoformat(tok)
+            except ValueError:
+                print(
+                    f"--report-period value {tok!r} is not a valid YYYY-MM-DD date",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            if not _is_quarter_end(d):
+                print(
+                    f"--report-period value {tok!r} is not a calendar "
+                    "quarter-end date (expected *-03-31, *-06-30, *-09-30, "
+                    "or *-12-31)",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            report_periods.append(d)
+        report_periods.sort()
 
     # Bootstrap S3 access
     try:
@@ -1380,6 +1847,49 @@ def main() -> None:
         sys.exit(1)
 
     openfigi_api_key = os.environ.get(OPENFIGI_API_KEY_ENV_VAR) or None
+
+    if report_periods:
+        # Historical backfill (I10733): one SEC index-page fetch and one
+        # in-process window-zip cache shared across every period in this
+        # invocation — adjacent quarters need overlapping windows (P's
+        # "current" window is P+1's "prior" window).
+        index_html = _fetch_sec_index_html()
+        if not index_html:
+            print(
+                "SEC 13F index page unreachable — cannot resolve historical "
+                "window filenames",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        window_cache: dict[str, zipfile.ZipFile] = {}
+        total_rows = 0
+        for period in report_periods:
+            print(f"Processing report period {period.isoformat()}...")
+            try:
+                rows = compute_and_write_inst_ownership(
+                    tickers, s3_client=s3, bucket=args.bucket,
+                    force_rebuild_cusip=args.force_rebuild_cusip,
+                    openfigi_api_key=openfigi_api_key,
+                    report_period=period, update_global_sidecar=False,
+                    _window_cache=window_cache, _index_html=index_html,
+                )
+            except Exception as e:
+                # Fail-loud producer contract (AGENTS.md): a backfill period
+                # that couldn't be produced is a hard error naming the
+                # period, never a silently skipped period (I10733).
+                print(
+                    f"FAILED report period {period.isoformat()}: "
+                    f"{type(e).__name__}: {e}",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+            print(f"  wrote {len(rows)} rows for {rows[0].quarter}")
+            total_rows += len(rows)
+        print(
+            f"Backfill complete: {len(report_periods)} period(s), "
+            f"{total_rows} total rows"
+        )
+        return
 
     print(f"Processing {len(tickers)} tickers for 13F institutional ownership...")
     rows = compute_and_write_inst_ownership(
