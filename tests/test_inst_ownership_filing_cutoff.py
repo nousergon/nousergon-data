@@ -416,6 +416,61 @@ class TestHistoricalBackfillEndToEnd:
         )
         assert calls.count("01jun2024-31aug2024_form13f.zip") == 1
 
+    def _patch_windows(self, monkeypatch, mar_may):
+        windows = self._windows()
+        windows["01mar2024-31may2024_form13f.zip"] = mar_may
+        monkeypatch.setattr(
+            "data.derived.inst_ownership._download_sec_bulk_zip",
+            lambda name: windows.get(name),
+        )
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    def test_missing_prior_period_raises_never_writes_all_new_funds(self, monkeypatch):
+        # alpha-engine-config-I10763: 2025Q3 was written with every QoQ change
+        # null and n_funds_new == n_funds_holding because 2025-06-30's window
+        # parsed as empty. The prior window here carries no Q1 submission.
+        self._patch_windows(monkeypatch, _make_zip({
+            "SUBMISSION.tsv": (
+                _SUBMISSION_HEADER + "\n"
+                + _submission_row("acc-old", "2024-04-10", "13F-HR", "0000000009", "2023-12-31")
+            ),
+            "INFOTABLE.tsv": (
+                _INFOTABLE_HEADER + "\n"
+                + _infotable_row("acc-old", "22160N109", 100, 10)
+            ),
+        }))
+        s3 = _InMemoryS3()
+        s3.seed_cusip_cache("alpha-engine-research", {"22160N109": "COST"})
+
+        with pytest.raises(InstOwnershipPeriodUnavailable, match="PRIOR period 2024-03-31"):
+            compute_and_write_inst_ownership(
+                ["COST"], s3_client=s3, bucket="alpha-engine-research",
+                report_period=Date(2024, 6, 30), update_global_sidecar=False,
+                _index_html=_WINDOWED_INDEX_HTML,
+            )
+        assert not s3.has("alpha-engine-research", "data/inst_ownership/2024Q2/latest.parquet")
+
+    def test_prior_period_with_no_joinable_rows_raises(self, monkeypatch):
+        # The prior SUBMISSION is present but its INFOTABLE rows are not: the
+        # prior is selected yet joins nothing, which must not read as "all new".
+        self._patch_windows(monkeypatch, _make_zip({
+            "SUBMISSION.tsv": (
+                _SUBMISSION_HEADER + "\n"
+                + _submission_row("acc-q1", "2024-05-10", "13F-HR", "0000000001", "2024-03-31")
+            ),
+            "INFOTABLE.tsv": _INFOTABLE_HEADER + "\n",
+        }))
+        s3 = _InMemoryS3()
+        s3.seed_cusip_cache("alpha-engine-research", {"22160N109": "COST"})
+
+        with pytest.raises(InstOwnershipPeriodUnavailable, match="current or prior period"):
+            compute_and_write_inst_ownership(
+                ["COST"], s3_client=s3, bucket="alpha-engine-research",
+                report_period=Date(2024, 6, 30), update_global_sidecar=False,
+                _index_html=_WINDOWED_INDEX_HTML,
+            )
+        assert not s3.has("alpha-engine-research", "data/inst_ownership/2024Q2/latest.parquet")
+
     def test_non_quarter_end_report_period_refused(self):
         s3 = _InMemoryS3()
         with pytest.raises(ValueError, match="not a calendar quarter-end date"):
