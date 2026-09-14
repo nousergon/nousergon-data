@@ -1461,6 +1461,18 @@ def _rows_for_selected_periods(
         infotable[infotable["accession_number"].isin(prior_accessions)]
         if prior_accessions else pd.DataFrame()
     )
+    # A prior period that was SELECTED but joined no rows is an empty-data
+    # outcome, not "every fund is new". Computing deltas against an empty
+    # prior writes a quarter whose shares/value QoQ change is null on every
+    # row and whose n_funds_new equals n_funds_holding -- a parquet that looks
+    # complete. Measured 2026-09-14 (alpha-engine-config-I10763): 2025Q3 was
+    # written that way while the 2025-06-30 window was unparseable.
+    if prior_period is not None and len(prior_df) == 0:
+        logger.warning(
+            "no INFOTABLE rows joined to the prior period %s -- refusing to "
+            "compute %s QoQ deltas against an empty prior", prior_q, current_q,
+        )
+        return None
 
     logger.info(
         "INFOTABLE joined to periods: %s: %d rows, %s: %d rows",
@@ -1579,6 +1591,14 @@ def _compute_ownership_for_report_period(
 
     current_ts = pd.Timestamp(report_period)
     prior_ts = pd.Timestamp(prior_period)
+    if prior_ts not in set(winners["PERIODOFREPORT"]):
+        raise InstOwnershipPeriodUnavailable(
+            f"report period {report_period.isoformat()}: no on-time (or "
+            f"on-time-amended) submission for the PRIOR period "
+            f"{prior_period.isoformat()} in downloaded window(s) {filenames}; "
+            "QoQ deltas against a missing prior quarter would read every "
+            "fund as new (alpha-engine-config-I10763)"
+        )
     if current_ts not in set(winners["PERIODOFREPORT"]):
         raise InstOwnershipPeriodUnavailable(
             f"report period {report_period.isoformat()}: no on-time (or "
@@ -1601,7 +1621,8 @@ def _compute_ownership_for_report_period(
     if result is None:
         raise InstOwnershipPeriodUnavailable(
             f"report period {report_period.isoformat()}: no joinable "
-            "INFOTABLE rows / resolved tickers within the scanned universe"
+            "INFOTABLE rows for the current or prior period / resolved "
+            "tickers within the scanned universe"
         )
     rows, quarter = result
 
