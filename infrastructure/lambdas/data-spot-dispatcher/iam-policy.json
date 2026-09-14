@@ -53,6 +53,15 @@
       }
     },
     {
+      "Sid": "PassDataCollectionBoxRoleToEc2",
+      "Effect": "Allow",
+      "Action": "iam:PassRole",
+      "Resource": "arn:aws:iam::711398986525:role/nousergon-data-collection-box-role",
+      "Condition": {
+        "StringEquals": { "iam:PassedToService": "ec2.amazonaws.com" }
+      }
+    },
+    {
       "Sid": "SsmRunDataBootstrapDocument",
       "Effect": "Allow",
       "Action": "ssm:SendCommand",
