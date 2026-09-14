@@ -1281,12 +1281,12 @@
     },
     "CheckPostMarketArcticAppendSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotArcticRetryBudget (one relaunch retry before the existing fail-open path).",
+      "Comment": "Success -> the EDGAR pit-fundamentals spot workload retry-counter init (alpha-engine-config-I10750); InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotArcticRetryBudget (one relaunch retry before the existing fail-open path).",
       "Choices": [
         {
           "Variable": "$.postmarket_arctic_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipCaptureSnapshot"
+          "Next": "InitDataSpotEdgarRetryCounter"
         },
         {
           "Variable": "$.postmarket_arctic_poll.Status",
@@ -2525,6 +2525,183 @@
       },
       "OutputPath": "$.merged",
       "Next": "HandleFailure"
+    },
+    "InitDataSpotEdgarRetryCounter": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I10750: schedule edgar-pit-fundamentals-daily (nousergon-data-PR1700/alpha-engine-config-I10733) on the SAME weekday-after-close mechanism as the other EOD data-spot legs, so it inherits the postclose SF's cadence rather than a new standalone EventBridge rule (which would land DISABLED under the 2026-08-07 automation-pause ruling, config-I6617 \u2014 only the weekly SF, the daily preopen/postclose SFs, and the 24/7 box stay live). Retry-budget counter mirrors InitDataSpotRetryCounter / InitDataSpotArcticRetryCounter exactly.",
+      "Result": {
+        "attempts": 0,
+        "force_on_demand": false
+      },
+      "ResultPath": "$.data_spot_edgar_retry",
+      "Next": "LaunchEdgarPitFundamentalsDailySpot"
+    },
+    "LaunchEdgarPitFundamentalsDailySpot": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I10733/-I10750: invoke alpha-engine-data-spot-dispatcher to run edgar-pit-fundamentals-daily (collectors/edgar_pit_fundamentals.py incremental, trailing 15 sessions) in-region on the same ephemeral spot box, after the arctic append leg. Independent of that leg's own data (no shared ResultPath), so a failure here cannot corrupt it.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "Payload": {
+          "execution_id.$": "$$.Execution.Id",
+          "workload": "edgar-pit-fundamentals-daily",
+          "force_on_demand.$": "$.data_spot_edgar_retry.force_on_demand"
+        }
+      },
+      "TimeoutSeconds": 420,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "FAIL-OPEN (mirrors config#1767 #4 for the post-market-data/arctic-append legs): an edgar-pit-fundamentals-daily launch failure must NOT block reconcile + instance-stop.",
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.edgar_pit_launch",
+      "Next": "CheckEdgarPitFundamentalsDailySpotLaunched"
+    },
+    "CheckEdgarPitFundamentalsDailySpotLaunched": {
+      "Type": "Choice",
+      "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "IsPresent-guarded, mirrors CheckPostMarketDataSpotLaunched (config-I2767).",
+          "Next": "PollEdgarPitFundamentalsDailySpot"
+        },
+        {
+          "Not": {
+            "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
+            "IsPresent": true
+          },
+          "Comment": "Malformed dispatcher payload -> the existing data-spot failure notifier, never a silent skip.",
+          "Next": "ExtractDataSpotError"
+        }
+      ],
+      "Default": "CheckSkipCaptureSnapshot"
+    },
+    "PollEdgarPitFundamentalsDailySpot": {
+      "Type": "Task",
+      "Comment": "Poll the edgar-pit-fundamentals-daily spot SSM command. Retry budget mirrors PollPostMarketArcticAppendSpot.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.edgar_pit_launch.Payload.data_spot.command_id",
+        "InstanceId.$": "$.edgar_pit_launch.Payload.data_spot.instance_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 6,
+          "IntervalSeconds": 15,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "ExtractDataSpotError",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.edgar_pit_poll",
+      "Next": "CheckEdgarPitFundamentalsDailySpotStatus"
+    },
+    "CheckEdgarPitFundamentalsDailySpotStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotEdgarRetryBudget.",
+      "Choices": [
+        {
+          "Variable": "$.edgar_pit_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipCaptureSnapshot"
+        },
+        {
+          "Variable": "$.edgar_pit_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "EdgarPitFundamentalsDailySpotWait"
+        },
+        {
+          "Variable": "$.edgar_pit_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "EdgarPitFundamentalsDailySpotWait"
+        },
+        {
+          "Variable": "$.edgar_pit_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "EdgarPitFundamentalsDailySpotWait"
+        }
+      ],
+      "Default": "CheckDataSpotEdgarRetryBudget"
+    },
+    "CheckDataSpotEdgarRetryBudget": {
+      "Type": "Choice",
+      "Comment": "Same one-retry-then-give-up policy as CheckDataSpotArcticRetryBudget. $.data_spot_edgar_retry is always initialized by InitDataSpotEdgarRetryCounter before this state is reachable.",
+      "Choices": [
+        {
+          "Variable": "$.data_spot_edgar_retry.attempts",
+          "NumericLessThan": 1,
+          "Next": "IncrementDataSpotEdgarRetry"
+        }
+      ],
+      "Default": "ExtractDataSpotError"
+    },
+    "IncrementDataSpotEdgarRetry": {
+      "Type": "Pass",
+      "Comment": "force_on_demand flips to true for the retry \u2014 mirrors IncrementDataSpotArcticRetry.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.data_spot_edgar_retry.attempts, 1)",
+        "force_on_demand": true
+      },
+      "ResultPath": "$.data_spot_edgar_retry",
+      "Next": "LaunchEdgarPitFundamentalsDailySpot"
+    },
+    "EdgarPitFundamentalsDailySpotWait": {
+      "Type": "Wait",
+      "Seconds": 20,
+      "Next": "PollEdgarPitFundamentalsDailySpot"
     }
   }
 }
