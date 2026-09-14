@@ -1,0 +1,123 @@
+# Unit descriptor — data collector unit D36 (daily-news).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D36
+component_id: "data-collector-d36-daily-news"
+owning_repo: "nousergon-data"
+title: "daily-news"
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "collectors/daily_news.py:174"
+trigger:
+  kind: "systemd-timer"
+  owner: dashboard box
+  successor: unchanged by v2 phase 4
+  runs_on: "ec2-on-demand"
+  detail: "daily-news.timer, 04:00 America/Los_Angeles"
+writes:
+  - data/news_aggregates_daily/
+  - data/news_articles_daily/
+  - data/news_digest_daily/latest.json
+consumers:
+  - "morning-signal:src/morning_signal/news_context.py"
+  - "crucible-dashboard:views/Daily_News.py"
+  - "crucible-research:thinktank/context.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows:
+  - daily_news
+  - daily_news_articles
+  - news_digest_daily
+run_manifest_prefix: data_collection/runs/D36
+detectors:
+  - kind: "box-timer-health"
+    via: "per-timer exit/streak every 10 min"
+    state: PRESENT
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: PRESENT
+freshness:
+  family: "daily-news"
+  deadline: "06:00 America/Los_Angeles"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: declared news sources
+  floor: 1.0
+  status: proposed
+guards:
+  empty_fresh:
+    state: present
+    note: "--require-digest (scripts/run_daily_news_standalone.sh:125)"
+  cardinality:
+    state: broken_by_design
+    note: >-
+        GDELT/Polygon bail budgets write a PARTIAL digest reported as a normal run. P2
+        reports a partial as `failed` or as a declared partial.
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: risk
+    note: >-
+        RAG ingest is fail-soft inside daily_news.py and the log upload is `|| true`
+        (run_daily_news_standalone.sh:27)
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: PRESENT
+    observability_row: ABSENT
+    run_record: ABSENT
+    detector: PRESENT
+    console_entity: PRESENT
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: "Run record ABSENT: journald plus an `|| true` log upload is not a record. P-06."

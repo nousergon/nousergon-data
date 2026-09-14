@@ -1,0 +1,271 @@
+# Scope declaration for `data.inventory.writers_declared` (plan §4.1).
+#
+# The inventory clause is an AST scan of this repository for S3 PUT and ArcticDB
+# write call sites, asserting a bijection with the unit descriptors: every write
+# site resolves to a descriptor, and every descriptor resolves to a write site.
+# **A new collector with no descriptor turns the board red on its own** — which
+# is the only mechanism in this design that notices a unit nobody registered.
+#
+# A scan needs a scope, and a scope is a place to hide. So the scope lives HERE,
+# in a reviewable file, with one stated reason per entry, rather than as a
+# constant inside the scanner: a filter nobody can see is how the 47th unit stops
+# being counted without the count changing.
+#
+# Two boundaries are drawn deliberately and are the ones to challenge first:
+#
+#  1. **The data-producer plane, not the ops plane.** `infrastructure/lambdas/`
+#     is almost entirely the watch/alert/dispatch plane — it writes ops
+#     artifacts, not published data keys, and it is a different component with
+#     its own registry rows. Walking it would put ~60 rows of someone else's
+#     component on this board. The two producers that DO live there are named
+#     individually below, so narrowing the root does not lose them.
+#  2. **Library modules fold into their parent** (audit §2, verbatim: "Library
+#     modules called only from a parent fold into the parent"). Each one below
+#     names the parent unit whose descriptor accounts for its writes, so its
+#     call sites are ATTRIBUTED rather than excused.
+
+schema_version: writer_inventory.v1
+
+# Directories walked for write call sites. A producer outside this list is
+# invisible to the clause, so adding a producer directory is a deliberate act.
+roots:
+  - collectors
+  - builders
+  - features
+  - data
+  - rag
+  - corporate_actions
+  - store
+  - scripts
+  - lambda
+
+# Python attribute names that constitute a write. Kept narrow on purpose: a
+# broad verb list produces findings nobody can act on, and an inventory that
+# cries wolf is an inventory that gets its scope quietly widened until it is
+# silent.
+write_calls:
+  s3:
+    - put_object
+    - upload_file
+    - upload_fileobj
+    - copy_object
+  arcticdb:
+    - write
+    - append
+    - update
+    - write_batch
+    - write_metadata
+    - stage
+  pandas:
+    # The feature store and the staging closes are written as parquet through
+    # pandas rather than through a put_object call. Omitting these verbs would
+    # make the two most-read published keys in the component invisible to the
+    # one clause that counts producers.
+    - to_parquet
+
+# Producers that live OUTSIDE the walked roots and are named individually.
+extra_paths:
+  - path: infrastructure/lambdas/crypto-balances/index.py
+    parent_units: [D38]
+    reason: The crypto-balances Lambda, the only scheduled data producer in that tree.
+  - path: infrastructure/lambdas/arctic-migration-dispatcher/index.py
+    parent_units: [D42]
+    reason: The ArcticDB migration dispatcher.
+
+# Modules that write ON BEHALF OF a parent unit rather than being units
+# themselves (audit §2). Each names the parent whose descriptor accounts for its
+# writes.
+shared_writers:
+  - path: collectors/arctic_probe.py
+    parent_units: [D18, D32]
+    reason: >-
+      The in-region ArcticDB probe record (plan P-05, alpha-engine-config-I10772):
+      the FINAL workload of the morning (D18) and EOD (D32) collection runs, writing
+      data_collection/probes/arctic/{trading_day}.json so the ladder can read
+      ArcticDB evidence without opening ArcticDB. It observes those runs' libraries
+      rather than producing a published dataset, so its write is attributed to them;
+      its own staleness is a ladder clause, not a unit.
+  - path: store/arctic_store.py
+    parent_units: [D13, D14, D18, D32, D35, D42, D43]
+    reason: >-
+      The single ArcticDB writer. Every unit that appends to a library goes
+      through it, so attributing its call sites to one unit would be wrong and
+      attributing them to none would drop them from the denominator.
+  - path: store/schema_version.py
+    parent_units: [D42]
+    reason: Writes the universe_schema_meta library on behalf of the migration runner.
+  - path: collectors/daily_closes.py
+    parent_units: [D17, D19, D33, D34]
+    reason: >-
+      The staging-closes writer. D17 (polygon T+1) and D19 (yfinance EOD) both
+      call it for the SAME key, which is exactly why plan §2 row 5 requires a
+      source stamp and a divergence metric rather than an implicit overwrite.
+  - path: collectors/daily_closes_fred_repair.py
+    parent_units: [D43]
+    reason: One of the manual repair builders D43 enumerates.
+  - path: collectors/cross_source_observer.py
+    parent_units: [D17, D19]
+    reason: Audit §2 folds it into its parent; it observes the two close vendors.
+  - path: collectors/edgar_pit_fundamentals.py
+    parent_units: [D10, D24]
+    reason: The point-in-time fundamentals fetcher behind both fundamentals units.
+  - path: collectors/news_aggregator.py
+    parent_units: [D36]
+    reason: Audit §2 folds it into daily-news.
+  - path: collectors/topic_news.py
+    parent_units: [D36]
+    reason: Audit §2 folds it into daily-news.
+  - path: collectors/news_sources/gdelt.py
+    parent_units: [D36]
+    reason: A daily-news vendor adapter.
+  - path: collectors/news_sources/polygon.py
+    parent_units: [D36]
+    reason: A daily-news vendor adapter.
+  - path: collectors/news_sources/yahoo_rss.py
+    parent_units: [D36]
+    reason: A daily-news vendor adapter.
+  - path: collectors/nlp/pipeline.py
+    parent_units: [D36]
+    reason: The daily-news NLP stage.
+  - path: collectors/nlp/rule_based_event_extraction.py
+    parent_units: [D36]
+    reason: The daily-news NLP stage.
+  - path: collectors/research_db_upload.py
+    parent_units: [D08, D09]
+    reason: >-
+      Backs up research.db on behalf of the two collectors that populate it.
+      Audit §2 folds it into its parents.
+  - path: data/derived/news_aggregates.py
+    parent_units: [D36]
+    reason: A daily-news derived writer.
+  - path: data/derived/news_articles.py
+    parent_units: [D36]
+    reason: A daily-news derived writer.
+  - path: data/derived/news_digest.py
+    parent_units: [D36]
+    reason: A daily-news derived writer.
+  - path: data/cache.py
+    parent_units: [D03, D04]
+    reason: The price-cache writer behind the two price-cache units.
+  - path: features/writer.py
+    parent_units: [D12, D31]
+    reason: The feature-store writer.
+  - path: features/reader.py
+    parent_units: [D12, D31]
+    reason: Feature-store round-trip helper, folded into the compute units.
+  - path: features/registry.py
+    parent_units: [D12, D31]
+    reason: The CATALOG, which also writes its own derived artifacts.
+  - path: features/postflight.py
+    parent_units: [D12, D31]
+    reason: The zero-variance postflight that marks a compute `degraded`.
+  - path: features/cross_sectional.py
+    parent_units: [D12, D31]
+    reason: A feature family computed and written by the compute units.
+  - path: features/factor_momentum.py
+    parent_units: [D12, D31]
+    reason: A feature family computed and written by the compute units.
+  - path: features/feature_engineer.py
+    parent_units: [D12, D31]
+    reason: The compute entry point's engineering stage.
+  - path: features/gen_schema_md.py
+    parent_units: [D12]
+    reason: Regenerates SCHEMA.md from CATALOG; a build tool for the contract, not a unit.
+  - path: builders/_price_cache_writeboth.py
+    parent_units: [D03]
+    reason: The price-cache dual-write helper.
+  - path: builders/backfill_delisted_history.py
+    parent_units: [D14]
+    reason: Populates the delisted_history library D14 prunes into.
+  - path: builders/migrate_universe_crsp_basis.py
+    parent_units: [D42]
+    reason: A numbered ArcticDB migration.
+  - path: builders/migrate_universe_feature_order.py
+    parent_units: [D42]
+    reason: A numbered ArcticDB migration.
+  - path: builders/migrate_universe_vwap.py
+    parent_units: [D42]
+    reason: A numbered ArcticDB migration.
+  - path: builders/promote_ohlcv_only_schema.py
+    parent_units: [D42]
+    reason: A schema promotion run through the migration path.
+  - path: corporate_actions/__init__.py
+    parent_units: [D43]
+    reason: D43 enumerates corporate_actions/ among the manual repair builders.
+  - path: corporate_actions/registry.py
+    parent_units: [D43]
+    reason: D43 enumerates corporate_actions/ among the manual repair builders.
+  - path: rag/pipelines/emit_manifest.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh, which D16 declares as its trigger.
+  - path: rag/pipelines/emit_progress.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/_watermarks.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/assert_corpus_freshness.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/filing_change_detection.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_sec_filings.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_8k_filings.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_earnings_finnhub.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_news.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_theses.py
+    parent_units: [D16]
+    reason: A step of run_weekly_ingestion.sh.
+  - path: rag/pipelines/ingest_13f.py
+    parent_units: [D39]
+    reason: The 13F ingest behind inst_ownership.
+  - path: rag/pipelines/ingest_form4.py
+    parent_units: [D46]
+    reason: Step 6 of run_weekly_ingestion.sh, which D46 declares as its trigger.
+
+# Paths excluded from the scan entirely, each with the reason it is not a
+# producer of a published data key.
+excluded_paths:
+  - glob: "**/test_*.py"
+    reason: Test scaffolding, not a producer.
+  - glob: "**/*_test.py"
+    reason: Test scaffolding, not a producer.
+  - glob: "**/conftest.py"
+    reason: Test scaffolding, not a producer.
+  - glob: "scripts/check_rehearsal_path.py"
+    reason: Rehearsal tooling for the SF path; writes an ops artifact, not a data key.
+  - glob: "scripts/fault_injection_run.py"
+    reason: Commissioning tooling. It writes fault records, which are the gate's INPUT.
+  - glob: "scripts/lint_extras.py"
+    reason: A lint helper.
+  - glob: "scripts/sf_rerun_common.py"
+    reason: Step Functions rerun tooling — the ops plane, not a data producer.
+  - glob: "scripts/weekday_sf_rerun.py"
+    reason: Step Functions rerun tooling — the ops plane.
+  - glob: "scripts/weekly_sf_rerun.py"
+    reason: Step Functions rerun tooling — the ops plane.
+  - glob: "scripts/weekly_sf_recovery_metric.py"
+    reason: An ops metric about the pipeline, not a published data key.
+  - glob: "scripts/weekly_sf_silence_deadman.py"
+    reason: A deadman for the pipeline — the ops plane.
+
+# Descriptors whose `code_path` names no in-repo Python file, so the REVERSE
+# direction (descriptor -> write site) cannot be checked by an AST scan. Named
+# rather than skipped: the clause detail says which units it could not check in
+# that direction, so partial coverage is reported instead of assumed complete.
+no_python_write_site:
+  - unit: D16
+    reason: Its entry point is rag/pipelines/run_weekly_ingestion.sh, a shell script.
+  - unit: D47
+    reason: >-
+      Component 2. Its producer lives in the `crucible` repository and this scan
+      has no visibility into it; its clauses are graded on the crucible board.
