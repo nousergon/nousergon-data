@@ -168,6 +168,11 @@ def run_summary_key(run_date: dt.date, run_id: str) -> str:
     return f"{DATASET_PREFIX}/runs/{run_date.isoformat()}/{run_id}.json"
 
 
+# alpha-engine-config-I10750: fixed-key freshness sentinel, written alongside
+# every dated run summary — see the comment at its write site in `run()`.
+RUN_LATEST_KEY = f"{DATASET_PREFIX}/runs/latest.json"
+
+
 # ── SEC access ──────────────────────────────────────────────────────────────
 
 SEC_USER_AGENT_ENV = "SEC_EDGAR_USER_AGENT"
@@ -1423,11 +1428,24 @@ def run(
         summary["facts_key"] = facts_key(run_date, run_id)
     summary["finished_at"] = dt.datetime.now(dt.UTC).isoformat()
     if not dry_run:
-        store.put_bytes(
-            run_summary_key(run_date, run_id),
-            json.dumps(summary, indent=2, sort_keys=True, default=str).encode(),
-            "application/json",
-        )
+        summary_bytes = json.dumps(summary, indent=2, sort_keys=True, default=str).encode()
+        store.put_bytes(run_summary_key(run_date, run_id), summary_bytes, "application/json")
+        # alpha-engine-config-I10750: `runs/{run_date}/{run_id}.json` carries a
+        # per-run, non-derivable `run_id` segment — the freshness monitor's
+        # date-templated probe (nousergon_lib.artifact_freshness, `{date}` /
+        # `{trading_day}` / `{cycle_label}` only) cannot resolve it, and the
+        # registry's `*` producer-chosen-segment support (config-I10200)
+        # explicitly forbids the wildcard occupying the LAST path segment
+        # (which `{run_id}.json` would be here). Same shape as
+        # `price_cache_freshness_sentinel` / `_write_feature_store_freshness_
+        # sentinel`: write a FIXED-key pointer every successful run so the
+        # registry watches one exact, unambiguous key instead of a
+        # variable-cardinality prefix. Best-effort: a sentinel-write failure
+        # must never fail a run that already wrote the real artifacts above.
+        try:
+            store.put_bytes(RUN_LATEST_KEY, summary_bytes, "application/json")
+        except Exception:  # noqa: BLE001 — observability nicety, not load-bearing
+            logger.warning("edgar_pit_fundamentals: failed to write %s", RUN_LATEST_KEY, exc_info=True)
     return summary
 
 

@@ -280,12 +280,22 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/crypto_balances.py": 1,
     "collectors/daily_closes.py": 1,
     "collectors/daily_closes_fred_repair.py": 1,
-    # alpha-engine-config-I10733 — EDGAR filing-date point-in-time fundamentals,
-    # one PUT per session written (fundamentals_pit/edgar/v1/runs/{date}/).
-    # The daily cadence only exists once edgar-pit-fundamentals-daily is
-    # scheduled, so its ARTIFACT_REGISTRY freshness row rides that change
-    # (alpha-engine-config-I10750); registering a daily artifact before
-    # anything schedules it would page on absence.
+    # alpha-engine-config-I10733 / -I10750 — EDGAR filing-date point-in-time
+    # fundamentals, one PUT call site (the module's `_S3Store.put_bytes`
+    # wrapper), reused for every key it writes: `sessions/{date}.parquet`,
+    # `facts/{run_date}/{run_id}.parquet`, `runs/{run_date}/{run_id}.json`,
+    # and (I10750) the fixed-key `runs/latest.json` freshness sentinel —
+    # `run_id` is a non-derivable per-run segment the freshness monitor's
+    # `{date}`/`{trading_day}`/`{cycle_label}`-only templating cannot
+    # resolve, and the registry's `*` producer-chosen-segment support
+    # (config-I10200) forbids the wildcard occupying the LAST path segment,
+    # which `{run_id}.json` would be here — same treatment as
+    # `price_cache_freshness_sentinel` above. The daily cadence only exists
+    # once edgar-pit-fundamentals-daily is scheduled, so the
+    # `edgar_pit_fundamentals_runs_latest` ARTIFACT_REGISTRY row (watching
+    # `runs/latest.json`) rides that change (alpha-engine-config-I10750);
+    # registering a daily artifact before anything schedules it would page
+    # on absence.
     "collectors/edgar_pit_fundamentals.py": 1,
     "collectors/fred_history.py": 1,
     "collectors/fundamentals.py": 1,

@@ -166,10 +166,21 @@ class TestEntryEdgesRouteThroughGates:
         assert succ == ["InitDataSpotArcticRetryCounter"]
         assert states["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
 
-    def test_arctic_append_spot_success_enters_snapshot_gate(self, states):
-        # config#1767: the EOD Arctic append also runs on spot; its Success
-        # rejoins the reconcile/snapshot path at CheckSkipCaptureSnapshot.
+    def test_arctic_append_spot_success_enters_edgar_pit_retry_counter(self, states):
+        # alpha-engine-config-I10750: the EOD Arctic append's Success now
+        # enters the edgar-pit-fundamentals-daily retry-counter init, which
+        # then rejoins the reconcile/snapshot path at CheckSkipCaptureSnapshot
+        # once ITS poll succeeds (or fail-opens).
         succ = [c["Next"] for c in states["CheckPostMarketArcticAppendSpotStatus"]["Choices"]
+                if c.get("StringEquals") == "Success"]
+        assert succ == ["InitDataSpotEdgarRetryCounter"]
+        assert states["InitDataSpotEdgarRetryCounter"]["Next"] == "LaunchEdgarPitFundamentalsDailySpot"
+
+    def test_edgar_pit_spot_success_enters_snapshot_gate(self, states):
+        # alpha-engine-config-I10750: edgar-pit-fundamentals-daily's poll
+        # Success rejoins the reconcile/snapshot path at
+        # CheckSkipCaptureSnapshot, mirroring the other two data-spot legs.
+        succ = [c["Next"] for c in states["CheckEdgarPitFundamentalsDailySpotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
         assert succ == ["CheckSkipCaptureSnapshot"]
 
