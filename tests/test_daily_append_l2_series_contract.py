@@ -98,7 +98,16 @@ def _patch_targets(
     hist_df.index.name = "date"
 
     universe_lib = MagicMock()
-    universe_lib.list_symbols.return_value = universe_symbols
+    # alpha-engine-config-I10704: the post-write freshness scan refuses a
+    # `universe` library missing a DECLARED benchmark proxy — that absence is
+    # the production state it stayed green over for months. Inject any the
+    # caller did not name so this stub is a valid production shape; `tail`
+    # answers for every symbol uniformly here.
+    from features.compute import UNIVERSE_BENCHMARK_PROXIES as _DECLARED_PROXIES
+
+    universe_lib.list_symbols.return_value = list(universe_symbols) + [
+        p for p in sorted(_DECLARED_PROXIES) if p not in universe_symbols
+    ]
     universe_lib.read_batch.return_value = [
         MagicMock(spec=[], data=hist_df.copy()) for _ in universe_symbols
     ]

@@ -41,8 +41,10 @@ from features.cross_sectional import materialize_factor_loading_zscores
 from features.compute import (
     DEFAULT_BUCKET,
     SOURCE_CATEGORIES,
+    UNIVERSE_BENCHMARK_PROXIES,
     _SKIP_TICKERS,
     _UNIVERSE_EXTRA,
+    admits_universe_write,
     _apply_daily_delta,
     _build_registry,
     audit_action_jumps,
@@ -921,8 +923,7 @@ def _assert_no_arctic_regression(
     candidates = sorted(
         t for t in planned_universe
         if t in arctic_syms
-        and (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-        and not _is_sector_etf(t)
+        and admits_universe_write(t)
     )
     if len(candidates) > sample_size:
         rng = _rand.Random(run_date)
@@ -1120,12 +1121,11 @@ def backfill(
 
     universe_tickers = [
         t for t in price_data
-        if (t not in _SKIP_TICKERS or t in _UNIVERSE_EXTRA)
-        and not _is_sector_etf(t)
+        if admits_universe_write(t)
         and price_data[t] is not None
-        # _UNIVERSE_EXTRA (SPY) is never in constituents.json — admit it
+        # A declared benchmark proxy is never in constituents.json — admit it
         # explicitly; it is still written Close-only to `macro` separately.
-        and (t in constituents_set or t in _UNIVERSE_EXTRA)
+        and (t in constituents_set or t in UNIVERSE_BENCHMARK_PROXIES)
     ]
     excluded_by_constituents = sorted(
         t for t in price_data
@@ -1164,7 +1164,7 @@ def backfill(
             # a "no data" framing.
             if (
                 ticker_filter in _SKIP_TICKERS
-                and ticker_filter not in _UNIVERSE_EXTRA
+                and ticker_filter not in UNIVERSE_BENCHMARK_PROXIES
             ):
                 log.error(
                     "Ticker %s is in _SKIP_TICKERS and not promoted via "
@@ -1175,7 +1175,14 @@ def backfill(
                     "status": "error",
                     "error": f"ticker_in_skip_list: {ticker_filter}",
                 }
-            if _is_sector_etf(ticker_filter):
+            # alpha-engine-config-I10704: a DECLARED proxy is exempt — four
+            # of the six (XLK/XLV/XLF/XLE) are sector ETFs by the prefix test,
+            # so without this carve-out `--ticker XLE` refuses the very write
+            # the declaration exists to authorise.
+            if (
+                _is_sector_etf(ticker_filter)
+                and ticker_filter not in UNIVERSE_BENCHMARK_PROXIES
+            ):
                 log.error(
                     "Ticker %s is a sector ETF (prefix in _SECTOR_ETF_PREFIXES) "
                     "— not eligible for universe write.",

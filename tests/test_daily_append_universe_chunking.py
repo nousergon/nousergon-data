@@ -27,6 +27,7 @@ These tests pin:
 """
 from __future__ import annotations
 
+import math
 from unittest.mock import MagicMock, patch
 
 import pandas as pd
@@ -38,6 +39,13 @@ from tests.test_daily_append_skip_if_exists import _patch_targets
 # recent_trading_day_str docstring for the incident history
 # (2026-05-04, 2026-06-22, 2026-07-03).
 from tests.conftest import recent_trading_day_str
+from features.compute import UNIVERSE_BENCHMARK_PROXIES as _DECLARED_PROXIES
+
+# Effective universe-write set = the named stock tickers, plus the XLRE leak
+# (len=4, so `_is_sector_etf`'s len==3 prefix test never matched it), plus
+# every DECLARED benchmark proxy (alpha-engine-config-I10704: SPY and the five
+# attribution proxies IWM/XLK/XLV/XLF/XLE, all admitted by the declaration).
+_EXTRA_EFFECTIVE = 1 + len(_DECLARED_PROXIES)
 
 
 @pytest.fixture(autouse=True)
@@ -66,7 +74,7 @@ def test_universe_pass_chunks_read_batch_calls(monkeypatch):
     monkeypatch.setattr(_da, "UNIVERSE_CHUNK_SIZE", 2)
 
     today_str = recent_trading_day_str()
-    # 4 universe + XLRE leak + SPY universe-extra = 6 → 3 chunks at K=2
+    # 4 universe + XLRE leak + the 6 declared proxies → ceil(N/2) chunks at K=2
     universe = ["AAPL", "MSFT", "GOOGL", "AMZN"]
     universe_lib, _, _ = _patch_targets(
         monkeypatch,
@@ -78,8 +86,10 @@ def test_universe_pass_chunks_read_batch_calls(monkeypatch):
     daily_append(date_str=today_str, skip_if_exists=False)
 
     # ceil(6/2) = 3 chunks → 3 read_batch invocations
-    assert universe_lib.read_batch.call_count == 3, (
-        f"Expected 3 chunked read_batch calls (6 effective stock tickers / chunk=2), "
+    expected_chunks = math.ceil((len(universe) + _EXTRA_EFFECTIVE) / 2)
+    assert universe_lib.read_batch.call_count == expected_chunks, (
+        f"Expected {expected_chunks} chunked read_batch calls "
+        f"({len(universe) + _EXTRA_EFFECTIVE} effective stock tickers / chunk=2), "
         f"got {universe_lib.read_batch.call_count}"
     )
 
@@ -87,10 +97,10 @@ def test_universe_pass_chunks_read_batch_calls(monkeypatch):
     call_sizes = [
         len(call.args[0]) for call in universe_lib.read_batch.call_args_list
     ]
-    assert sum(call_sizes) == 6
+    assert sum(call_sizes) == len(universe) + _EXTRA_EFFECTIVE
     assert all(s <= 2 for s in call_sizes)
     # All but the last chunk are at chunk_size
-    assert call_sizes[:-1] == [2, 2]
+    assert call_sizes[:-1] == [2] * (expected_chunks - 1)
 
 
 def test_universe_pass_chunks_write_batches_too(monkeypatch):
@@ -103,7 +113,7 @@ def test_universe_pass_chunks_write_batches_too(monkeypatch):
     monkeypatch.setattr(_da, "UNIVERSE_CHUNK_SIZE", 2)
 
     today_str = recent_trading_day_str()
-    # 3 universe + XLRE leak + SPY universe-extra = 5 effective → 3 chunks at K=2
+    # 3 universe + XLRE leak + the 6 declared proxies → ceil(N/2) chunks at K=2
     universe = ["AAPL", "MSFT", "GOOGL"]
     universe_lib, _, _ = _patch_targets(
         monkeypatch,
@@ -115,8 +125,10 @@ def test_universe_pass_chunks_write_batches_too(monkeypatch):
     daily_append(date_str=today_str, skip_if_exists=False)
 
     # ceil(5/2) = 3 chunks → 3 update_batch invocations
-    assert universe_lib.update_batch.call_count == 3, (
-        f"Expected 3 chunked update_batch calls (5 effective tickers / chunk=2), "
+    expected_chunks = math.ceil((len(universe) + _EXTRA_EFFECTIVE) / 2)
+    assert universe_lib.update_batch.call_count == expected_chunks, (
+        f"Expected {expected_chunks} chunked update_batch calls "
+        f"({len(universe) + _EXTRA_EFFECTIVE} effective tickers / chunk=2), "
         f"got {universe_lib.update_batch.call_count}"
     )
     # Read and write call counts should match (1 read + 1 write per chunk)
@@ -177,7 +189,7 @@ def test_universe_pass_n_ok_accumulates_across_chunks(monkeypatch):
     # All effective stock tickers (universe + XLRE leak + SPY universe-extra)
     # should land in n_ok or n_partial. Without correct accumulation across
     # chunks, only the last chunk's counts survive.
-    expected = len(universe) + 2  # +1 XLRE leak, +1 SPY (_UNIVERSE_EXTRA)
+    expected = len(universe) + _EXTRA_EFFECTIVE
     counted = result["tickers_appended"] + result["tickers_partial"]
     assert counted == expected, (
         f"Counter accumulation across chunks broken: "

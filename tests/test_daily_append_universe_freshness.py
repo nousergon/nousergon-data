@@ -35,10 +35,22 @@ _FRESH_OFFSET_DAYS = 0  # today — always 0 trading days stale
 def _mock_lib_with_dates(symbol_to_date: dict[str, str]) -> MagicMock:
     """Build a mock ArcticDB library that responds to list_symbols + tail."""
     lib = MagicMock()
-    lib.list_symbols.return_value = list(symbol_to_date.keys())
+    # alpha-engine-config-I10704: the scan now refuses a library that is
+    # missing a DECLARED benchmark proxy, because that is exactly the
+    # production state it stayed green over for months. A stub universe
+    # without them is not a valid production library, so inject any the
+    # caller did not name — they are present and fresh unless a test
+    # deliberately says otherwise.
+    from features.compute import UNIVERSE_BENCHMARK_PROXIES as _PROXIES
+    # An EMPTY map stays empty: the empty-library refusal is its own contract
+    # and must not be masked by injected proxies.
+    lib.list_symbols.return_value = list(symbol_to_date.keys()) + (
+        [p for p in sorted(_PROXIES) if p not in symbol_to_date]
+        if symbol_to_date else []
+    )
 
     def _tail(sym, n=1):
-        date_str = symbol_to_date[sym]
+        date_str = symbol_to_date.get(sym, _today_str(0))
         if date_str is None:
             df = pd.DataFrame()
         else:
@@ -49,6 +61,9 @@ def _mock_lib_with_dates(symbol_to_date: dict[str, str]) -> MagicMock:
 
     lib.tail.side_effect = _tail
     return lib
+
+
+from features.compute import UNIVERSE_BENCHMARK_PROXIES as _DECLARED_PROXIES  # noqa: E402
 
 
 def _today_str(offset_days: int = 0) -> str:
@@ -76,7 +91,9 @@ class TestUniverseFreshnessReceipt:
         receipt = _scan_universe_and_emit_freshness_receipt(s3, "test-bucket", lib)
 
         assert receipt["all_fresh"] is True
-        assert receipt["n_symbols_checked"] == 3
+        # +len(_PROXIES): the stub injects the declared benchmark proxies
+        # (I10704) so the library is a valid production shape.
+        assert receipt["n_symbols_checked"] == 3 + len(_DECLARED_PROXIES)
         # stalest field is present and ≤ threshold; the specific symbol +
         # exact age depend on weekday-of-test-run.
         assert receipt["stalest_symbol"] in {"AAPL", "MSFT", "GOOGL"}

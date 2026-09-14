@@ -97,26 +97,32 @@ def test_ticker_filter_returns_in_skip_list_error_for_skip_ticker():
 
 def test_ticker_filter_returns_sector_etf_error_for_sector_etf():
     """A ticker matching the _SECTOR_ETF_PREFIXES (XL*) is rejected with
-    its own dedicated error code."""
+    its own dedicated error code.
+
+    XLI, not XLF: as of alpha-engine-config-I10704 four of the XL* symbols
+    (XLK/XLV/XLF/XLE) are DECLARED benchmark proxies and are therefore
+    deliberately exempt from this refusal — `--ticker XLE` must write. XLI is
+    an undeclared sector ETF, which is what this refusal is actually for.
+    """
     from builders.backfill import backfill
 
-    price_data = {"AAPL": _ohlcv("2026-04-01"), "XLF": _ohlcv("2026-04-01")}
+    price_data = {"AAPL": _ohlcv("2026-04-01"), "XLI": _ohlcv("2026-04-01")}
     patches = _stub_backfill_deps(
         price_data=price_data,
-        constituents_set={"AAPL", "XLF"},
+        constituents_set={"AAPL", "XLI"},
     )
     _enter_all(patches)
     try:
         result = backfill(
             bucket="test-bucket",
-            ticker_filter="XLF",
+            ticker_filter="XLI",
             dry_run=False,
         )
     finally:
         _exit_all(patches)
 
     assert result["status"] == "error"
-    assert result["error"] == "ticker_is_sector_etf: XLF"
+    assert result["error"] == "ticker_is_sector_etf: XLI"
 
 
 def test_ticker_filter_returns_no_data_error_when_parquet_missing():
