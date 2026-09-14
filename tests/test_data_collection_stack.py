@@ -1,0 +1,239 @@
+"""Contract tests for the standalone data-collection stack (alpha-engine-config-I10739).
+
+Nous Ergon's data collection is its own component with its own schedule and
+CloudFormation stack (alpha-engine-config architecture.d/146). These tests hold
+the properties that must survive every later edit: nothing in it depends on a
+Crucible v1 pipeline, every schedule's state is DECLARED in one place and agrees
+with automation_pause.json, it names only workloads the dispatcher runs, and the
+deploy path proves its own effect.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+REPO = Path(__file__).resolve().parent.parent
+HELPER_PATH = REPO / "infrastructure" / "data_collection_stack.py"
+WORKFLOW = REPO / ".github" / "workflows" / "deploy-data-collection-stack.yml"
+WORKFLOWS = REPO / ".github" / "workflows"
+NEW_ROLE = "github-actions-data-collection-stack-deploy"
+V1_PIPELINES = (
+    "ne-postclose-trading-pipeline",
+    "ne-preopen-trading-pipeline",
+    "ne-weekly-freshness-pipeline",
+    "alpha-engine-orchestration",
+)
+
+
+@pytest.fixture(scope="module")
+def stack():
+    spec = importlib.util.spec_from_file_location("data_collection_stack", HELPER_PATH)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+@pytest.fixture(scope="module")
+def tpl(stack):
+    return stack.load_template()
+
+
+def test_lint_is_clean(stack):
+    assert stack.lint() == []
+
+
+@pytest.mark.skipif(shutil.which("cfn-lint") is None, reason="cfn-lint not installed")
+def test_cfn_lint_is_clean(stack):
+    proc = subprocess.run(
+        ["cfn-lint", str(stack.TEMPLATE)], capture_output=True, text=True, check=False
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+
+
+def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
+    sched = stack.schedules(tpl)
+    assert [s["name"] for s in sched] == ["daily-heal", "eod", "morning", "weekly"]
+    assert {s["group"] for s in sched} == {"nousergon-data-collection"}
+    assert len({s["target_ref"] for s in sched}) == 4
+
+
+def test_ships_disabled(stack, tpl):
+    """alpha-engine-config-I10739 deliverable 2: nothing double-writes market_data/*
+    while the v1 SFs still run. The enable PR changes this test's expectation
+    for CollectionState in the same change that flips the Default."""
+    defaults = stack.parameter_defaults(tpl)
+    assert defaults["CollectionState"] == "DISABLED"
+    assert defaults["DailyHealState"] == "DISABLED"
+    assert {s["declared_state"] for s in stack.schedules(tpl)} == {"DISABLED"}
+
+
+def test_daily_heal_has_its_own_state_switch(stack, tpl):
+    """Its v1 rule is paused by the 2026-08-07 ruling; the cutover must be able
+    to enable collection without un-pausing the heal."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    assert by_name["daily-heal"]["state_parameter"] == "DailyHealState"
+    assert {by_name[n]["state_parameter"] for n in ("eod", "morning", "weekly")} == {"CollectionState"}
+
+
+def test_eod_verifies_the_artifacts_metron_reads(stack, tpl):
+    eod = {s["name"]: s for s in stack.schedules(tpl)}["eod"]["input"]
+    assert eod["workloads"] == ["post-market-data", "post-market-arctic-append"]
+    assert eod["require_trading_day"] is True
+    assert set(eod["verify_keys"]) == {
+        "market_data/eod_closes/latest.json",
+        "market_data/technicals/rating_performance.json",
+    }
+
+
+def test_weekly_mirrors_the_v1_order(stack, tpl):
+    weekly = {s["name"]: s for s in stack.schedules(tpl)}["weekly"]["input"]
+    assert weekly["workloads"] == ["morning-enrich", "weekly-phase-one"]
+    assert weekly["require_trading_day"] is False
+
+
+def test_no_dependency_on_a_v1_pipeline(stack):
+    for path in (stack.TEMPLATE, stack.DEFINITION, HELPER_PATH, WORKFLOW):
+        text = path.read_text(encoding="utf-8")
+        for name in V1_PIPELINES:
+            # The template's Description names them as what it replaces; no
+            # resource, ARN, parameter or substitution may reference one.
+            refs = [
+                ln for ln in text.splitlines()
+                if name in ln and ("arn:" in ln or "!Ref" in ln or "Arn" in ln or "stateMachine" in ln)
+            ]
+            assert refs == [], f"{path.name} references {name}: {refs}"
+
+
+def test_pause_manifest_disagreement_is_reported_both_ways(stack, tpl):
+    sched = stack.schedules(tpl)
+    empty = {"pending": {}, "paused": {}, "not_paused": {}}
+    assert len(stack.pause_manifest_problems(sched, empty)) == 4
+    enabled = [dict(s, declared_state="ENABLED") for s in sched]
+    listed_pending = {"pending": {s["qualified_name"]: "x" for s in sched}, "not_paused": {}}
+    problems = stack.pause_manifest_problems(enabled, listed_pending)
+    assert any("not in automation_pause.json not_paused" in p for p in problems)
+    assert any("still listed as pending/paused" in p for p in problems)
+
+
+def test_asl_checker_catches_a_dangling_transition(stack):
+    asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
+    assert stack.asl_problems(asl) == []
+    asl["States"]["Init"]["Next"] = "NoSuchState"
+    inner = asl["States"]["RunWorkloads"]["ItemProcessor"]["States"]
+    inner["RetryOnDemand"]["Next"] = "Nowhere"
+    problems = stack.asl_problems(asl)
+    assert any("NoSuchState" in p for p in problems)
+    assert any("Nowhere" in p for p in problems)
+
+
+def test_the_definition_fails_loud_rather_than_skipping(stack):
+    """Collection has no downstream stage to protect, so unlike the v1 SFs'
+    fail-open data-spot stages every failure path ends in a Fail state and a
+    disabled dispatcher is a failure, never a skip."""
+    asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
+    inner = asl["States"]["RunWorkloads"]["ItemProcessor"]["States"]
+    assert inner["DispatchDisabled"]["Type"] == "Fail"
+    assert inner["CheckRetryBudget"]["Default"] == "WorkloadFailed"
+    assert asl["States"]["NotifyFailure"]["Next"] == "CollectionFailed"
+    assert asl["States"]["CollectionFailed"]["Type"] == "Fail"
+    verify = asl["States"]["VerifyOutputsRefreshed"]["ItemProcessor"]["States"]
+    assert verify["CheckRefreshed"]["Default"] == "OutputNotRefreshed"
+
+
+def test_yaml_aliases_are_refused(stack, tmp_path):
+    bad = tmp_path / "t.yaml"
+    bad.write_text("Resources:\n  A: &x\n    Type: AWS::SNS::Topic\n  B: *x\n", encoding="utf-8")
+    with pytest.raises(ValueError):
+        stack.load_template(bad)
+
+
+def test_definition_key_is_content_addressed(stack, tmp_path):
+    a = tmp_path / "a.json"
+    a.write_text("{}", encoding="utf-8")
+    key1 = stack.definition_key(a)
+    a.write_text('{"x": 1}', encoding="utf-8")
+    key2 = stack.definition_key(a)
+    assert key1 != key2
+    assert key1.startswith(stack.DEFINITION_PREFIX) and key1.endswith(".asl.json")
+
+
+class _Cfn:
+    def __init__(self, status, tags):
+        self._stack = {"StackStatus": status, "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}
+
+    def describe_stacks(self, StackName):  # noqa: N803 — boto3 kwarg
+        return {"Stacks": [self._stack]}
+
+
+class _Scheduler:
+    def __init__(self, overrides=None):
+        self.overrides = overrides or {}
+
+    def get_schedule(self, GroupName, Name):  # noqa: N803 — boto3 kwarg
+        return self.overrides.get(Name, self._declared[Name])
+
+
+def _scheduler_matching(stack, tpl, **overrides):
+    s = _Scheduler(overrides)
+    s._declared = {
+        x["name"]: {"State": x["declared_state"], "ScheduleExpression": x["expression"]}
+        for x in stack.schedules(tpl)
+    }
+    return s
+
+
+def test_check_live_clean_when_live_matches(stack, tpl):
+    f = stack.deploy_fields()
+    cfn = _Cfn("UPDATE_COMPLETE", {k: f[k] for k in ("template-sha256", "definition-sha256")})
+    assert stack.live_findings(cfn, _scheduler_matching(stack, tpl)) == []
+
+
+def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
+    cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
+    sched = _scheduler_matching(
+        stack, tpl, eod={"State": "ENABLED", "ScheduleExpression": "cron(45 16 ? * MON-FRI *)"}
+    )
+    findings = stack.live_findings(cfn, sched)
+    assert any("UPDATE_ROLLBACK_COMPLETE" in x for x in findings)
+    assert sum("stack tag" in x for x in findings) == 2
+    assert any("nousergon-data-collection/eod is ENABLED live" in x for x in findings)
+
+
+def _workflow():
+    return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
+
+
+def test_workflow_path_filters_match():
+    on = _workflow()[True]  # PyYAML reads the bare `on` key as boolean True
+    assert on["push"]["paths"] == on["pull_request"]["paths"]
+    for p in on["push"]["paths"]:
+        assert (REPO / p).exists(), p
+
+
+def test_only_this_workflow_assumes_the_stack_deploy_role():
+    users = sorted(p.name for p in WORKFLOWS.glob("*.yml") if f"role/{NEW_ROLE}" in p.read_text(encoding="utf-8"))
+    assert users == [WORKFLOW.name]
+
+
+def test_apply_runs_only_on_main_and_never_on_a_pull_request():
+    jobs = _workflow()["jobs"]
+    cond = jobs["deploy"]["if"]
+    assert "refs/heads/main" in cond and "pull_request" not in cond
+    assert "schedule" in jobs["check-live"]["if"]
+    assert jobs["lint"].get("permissions", {}).get("id-token") is None
+
+
+def test_deploy_script_verifies_its_own_effect():
+    script = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text(encoding="utf-8")
+    deploy_at = script.index("aws cloudformation deploy")
+    assert "check-live" in script[deploy_at:], "a deploy must be followed by the live comparison"
+    assert "--no-fail-on-empty-changeset" in script
+    for p in ("CollectionState=", "DailyHealState="):
+        assert p in script, f"{p} must be passed explicitly so the template Default is authoritative"

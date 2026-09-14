@@ -1,0 +1,365 @@
+{
+  "Comment": "Nous Ergon data collection (alpha-engine-config-I10739; architecture.d/146). One definition, four state machines in the nousergon-data-collection stack (eod, morning, weekly, daily-heal), each started by its own EventBridge Scheduler schedule with an Input naming the collection, its ordered data-spot-dispatcher workloads, whether it runs only on NYSE trading days, and which published keys must be refreshed by the run. Independent of every Crucible v1 pipeline. FAIL-LOUD by design: unlike the v1 trading SFs' data-spot stages (fail-open so trading continues), data collection has no downstream stage to protect, so a workload failure, a disabled dispatcher or an unrefreshed output FAILS the execution and pages.",
+  "StartAt": "Init",
+  "TimeoutSeconds": 28800,
+  "States": {
+    "Init": {
+      "Type": "Pass",
+      "Comment": "Pin the execution start time as the freshness baseline every verify_keys object must meet or exceed.",
+      "Parameters": {
+        "collection.$": "$.collection",
+        "workloads.$": "$.workloads",
+        "require_trading_day.$": "$.require_trading_day",
+        "verify_keys.$": "$.verify_keys",
+        "started_at.$": "$$.Execution.StartTime"
+      },
+      "Next": "CheckRequireTradingDay"
+    },
+    "CheckRequireTradingDay": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.require_trading_day",
+          "BooleanEquals": true,
+          "Next": "TradingDayCheck"
+        }
+      ],
+      "Default": "RunWorkloads"
+    },
+    "TradingDayCheck": {
+      "Type": "Task",
+      "Comment": "The dispatcher answers from krepis.trading_calendar for today's America/New_York date. It launches nothing for this action.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DispatcherFunctionArn}",
+        "Payload": {
+          "action": "trading-day-check"
+        }
+      },
+      "ResultSelector": {
+        "date.$": "$.Payload.trading_day.date",
+        "is_trading_day.$": "$.Payload.trading_day.is_trading_day"
+      },
+      "ResultPath": "$.trading_day",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "IsTradingDay"
+    },
+    "IsTradingDay": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.trading_day.is_trading_day",
+          "BooleanEquals": true,
+          "Next": "RunWorkloads"
+        }
+      ],
+      "Default": "NotATradingDay"
+    },
+    "NotATradingDay": {
+      "Type": "Succeed",
+      "Comment": "HOLIDAY-SKIPPED terminal state (sf-pipeline-policy 4.1): a distinct, machine-readable success so a scheduled weekday that is an NYSE holiday is never rendered as a missed run."
+    },
+    "RunWorkloads": {
+      "Type": "Map",
+      "Comment": "Workloads run strictly in order (MaxConcurrency 1): each append consumes the parquet its predecessor wrote.",
+      "ItemsPath": "$.workloads",
+      "MaxConcurrency": 1,
+      "ItemSelector": {
+        "workload.$": "$$.Map.Item.Value",
+        "execution_id.$": "$$.Execution.Id",
+        "pipeline_role.$": "$.collection",
+        "force_on_demand": false,
+        "attempts": 0
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "LaunchWorkload",
+        "States": {
+          "LaunchWorkload": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::lambda:invoke",
+            "Parameters": {
+              "FunctionName": "${DispatcherFunctionArn}",
+              "Payload": {
+                "workload.$": "$.workload",
+                "execution_id.$": "$.execution_id",
+                "pipeline_role.$": "$.pipeline_role",
+                "force_on_demand.$": "$.force_on_demand"
+              }
+            },
+            "ResultSelector": {
+              "data_spot.$": "$.Payload.data_spot"
+            },
+            "ResultPath": "$.launch",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Lambda.ServiceException",
+                  "Lambda.AWSLambdaException",
+                  "Lambda.SdkClientException",
+                  "Lambda.TooManyRequestsException"
+                ],
+                "IntervalSeconds": 10,
+                "MaxAttempts": 2,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.workload_error",
+                "Next": "CheckRetryBudget"
+              }
+            ],
+            "Next": "CheckLaunched"
+          },
+          "CheckLaunched": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.launch.data_spot.launched",
+                "BooleanEquals": true,
+                "Next": "WaitForWorkload"
+              }
+            ],
+            "Default": "DispatchDisabled"
+          },
+          "DispatchDisabled": {
+            "Type": "Fail",
+            "Error": "DataCollectionDispatchDisabled",
+            "Cause": "The data-spot dispatcher returned launched=false (DATA_SPOT_DISPATCH_ENABLED=false). A scheduled collection that collects nothing is a failure, never a skip."
+          },
+          "WaitForWorkload": {
+            "Type": "Wait",
+            "Seconds": 60,
+            "Next": "PollWorkload"
+          },
+          "PollWorkload": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+            "Parameters": {
+              "CommandId.$": "$.launch.data_spot.command_id",
+              "InstanceId.$": "$.launch.data_spot.instance_id"
+            },
+            "ResultSelector": {
+              "Status.$": "$.Status",
+              "StatusDetails.$": "$.StatusDetails"
+            },
+            "ResultPath": "$.poll",
+            "Retry": [
+              {
+                "ErrorEquals": [
+                  "Ssm.InvocationDoesNotExistException",
+                  "Ssm.InvocationDoesNotExist"
+                ],
+                "IntervalSeconds": 30,
+                "MaxAttempts": 10,
+                "BackoffRate": 1.5
+              },
+              {
+                "ErrorEquals": ["Ssm.SdkClientException", "Ssm.SsmException"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Catch": [
+              {
+                "ErrorEquals": ["States.ALL"],
+                "ResultPath": "$.workload_error",
+                "Next": "CheckRetryBudget"
+              }
+            ],
+            "Next": "CheckWorkloadStatus"
+          },
+          "CheckWorkloadStatus": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "Variable": "$.poll.Status",
+                "StringEquals": "Success",
+                "Next": "WorkloadSucceeded"
+              },
+              {
+                "Or": [
+                  {"Variable": "$.poll.Status", "StringEquals": "Pending"},
+                  {"Variable": "$.poll.Status", "StringEquals": "InProgress"},
+                  {"Variable": "$.poll.Status", "StringEquals": "Delayed"}
+                ],
+                "Next": "WaitForWorkload"
+              }
+            ],
+            "Default": "CheckRetryBudget"
+          },
+          "CheckRetryBudget": {
+            "Type": "Choice",
+            "Comment": "One retry, ON-DEMAND — the same budget and shape as the v1 EOD SF's post-interruption retry (2026-07-14): a workload that lost a box does not gamble on spot twice.",
+            "Choices": [
+              {
+                "Variable": "$.attempts",
+                "NumericLessThan": 1,
+                "Next": "RetryOnDemand"
+              }
+            ],
+            "Default": "WorkloadFailed"
+          },
+          "RetryOnDemand": {
+            "Type": "Pass",
+            "Parameters": {
+              "workload.$": "$.workload",
+              "execution_id.$": "$.execution_id",
+              "pipeline_role.$": "$.pipeline_role",
+              "force_on_demand": true,
+              "attempts.$": "States.MathAdd($.attempts, 1)"
+            },
+            "Next": "LaunchWorkload"
+          },
+          "WorkloadFailed": {
+            "Type": "Fail",
+            "Error": "DataCollectionWorkloadFailed",
+            "Cause": "A data-spot workload failed on its on-demand retry. The execution history names the workload, the SSM status and the dispatcher error; the box log is under s3://alpha-engine-research/_ssm_logs/data-spot/<workload>/."
+          },
+          "WorkloadSucceeded": {
+            "Type": "Succeed"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CheckVerifyKeys"
+    },
+    "CheckVerifyKeys": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.verify_keys[0]",
+          "IsPresent": true,
+          "Next": "VerifyOutputsRefreshed"
+        }
+      ],
+      "Default": "CollectionSucceeded"
+    },
+    "VerifyOutputsRefreshed": {
+      "Type": "Map",
+      "Comment": "The completion claim is the published artifact, not the workload exit code: every verify key must carry LastModified >= this execution's start. A LastModified the Choice cannot read as a timestamp fails the same way, so a format surprise is loud, never a silent pass.",
+      "ItemsPath": "$.verify_keys",
+      "MaxConcurrency": 4,
+      "ItemSelector": {
+        "key.$": "$$.Map.Item.Value",
+        "started_at.$": "$.started_at"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {
+          "Mode": "INLINE"
+        },
+        "StartAt": "HeadOutput",
+        "States": {
+          "HeadOutput": {
+            "Type": "Task",
+            "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
+            "Parameters": {
+              "Bucket": "${ResearchBucket}",
+              "Key.$": "$.key"
+            },
+            "ResultSelector": {
+              "last_modified.$": "$.LastModified"
+            },
+            "ResultPath": "$.head",
+            "Retry": [
+              {
+                "ErrorEquals": ["S3.SdkClientException", "S3.S3Exception"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 3,
+                "BackoffRate": 2
+              }
+            ],
+            "Next": "CheckRefreshed"
+          },
+          "CheckRefreshed": {
+            "Type": "Choice",
+            "Choices": [
+              {
+                "And": [
+                  {"Variable": "$.head.last_modified", "IsTimestamp": true},
+                  {"Variable": "$.head.last_modified", "TimestampGreaterThanEqualsPath": "$.started_at"}
+                ],
+                "Next": "OutputRefreshed"
+              }
+            ],
+            "Default": "OutputNotRefreshed"
+          },
+          "OutputNotRefreshed": {
+            "Type": "Fail",
+            "Error": "DataCollectionOutputNotRefreshed",
+            "Cause": "A published key's LastModified predates this execution (or is unreadable as a timestamp): the workloads exited 0 but the consumer-facing artifact did not move."
+          },
+          "OutputRefreshed": {
+            "Type": "Succeed"
+          }
+        }
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "NotifyFailure"
+        }
+      ],
+      "Next": "CollectionSucceeded"
+    },
+    "CollectionSucceeded": {
+      "Type": "Succeed"
+    },
+    "NotifyFailure": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "Nous Ergon data collection FAILED",
+        "Message.$": "States.Format('Data collection {} failed. Execution: {}. Error: {}', $.collection, $$.Execution.Id, States.JsonToString($.error))"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "CollectionFailed"
+        }
+      ],
+      "Next": "CollectionFailed"
+    },
+    "CollectionFailed": {
+      "Type": "Fail",
+      "Error": "DataCollectionFailed",
+      "Cause": "See the NotifyFailure input in this execution's history for the failing state and error."
+    }
+  }
+}

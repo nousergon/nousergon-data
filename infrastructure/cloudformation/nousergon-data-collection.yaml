@@ -1,0 +1,283 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >-
+  Nous Ergon data collection (component 1 of 4, alpha-engine-config
+  architecture.d/146; alpha-engine-config-I10739). Owns the schedules and
+  state machines that run market-data collection independently of every
+  Crucible v1 pipeline, so Crucible v2 phase 4 can disable
+  ne-postclose-trading-pipeline, ne-preopen-trading-pipeline and
+  ne-weekly-freshness-pipeline without freezing s3://alpha-engine-research/market_data/*.
+  Deployed on merge by .github/workflows/deploy-data-collection-stack.yml.
+
+# ─────────────────────────────────────────────────────────────────────────────
+# DECLARATION (sf-pipeline-policy §2.6): this file is the one place that says
+# when collection runs and whether it runs at all.
+#
+#   * CollectionState   — the eod, morning and weekly schedules. Ships DISABLED:
+#                         until phase 4's maintenance window the v1 SFs still
+#                         run the same workloads, and both enabled would
+#                         double-write the same keys.
+#   * DailyHealState    — the daily-heal schedule, separately, because its v1
+#                         rule `alpha-engine-daily-heal` is paused by Brian's
+#                         2026-08-07 ruling (infrastructure/automation_pause.json).
+#                         Cutover does not un-pause it; that is its own ruling.
+#
+# ENABLE = a PR that changes a Default below from DISABLED to ENABLED and, in
+# the SAME PR, moves the schedule's name in automation_pause.json from
+# `pending` to `not_paused`. Merging it is the apply. Nothing else flips state:
+# deploy-data-collection-stack.sh passes these Defaults explicitly on every
+# deploy, so a console edit is reverted by the next merge and reported by the
+# weekly check-live run in between.
+#
+# NO IAM IN THIS TEMPLATE. This repo is public and IAM documents are
+# hard-private (repository-tiering-policy; infrastructure-ownership-policy §4).
+# The two roles named below are codified in nous-ergon-ops
+# infrastructure/iam/, and no account literal appears here (AWS::AccountId).
+# ─────────────────────────────────────────────────────────────────────────────
+
+Parameters:
+  CollectionState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: State of the eod, morning and weekly schedules. See the declaration block.
+  DailyHealState:
+    Type: String
+    Default: DISABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: State of the daily-heal schedule (paused by ruling 2026-08-07).
+  DefinitionS3Bucket:
+    Type: String
+    Default: alpha-engine-research
+    Description: Bucket the deploy script stages the ASL definition into.
+  DefinitionS3Key:
+    Type: String
+    Description: >-
+      Content-addressed key of the staged ASL definition
+      (infrastructure/nousergon-data-collection/data-collection-<sha256>.asl.json).
+      A changed definition is a changed key, so CloudFormation updates every
+      state machine; an unchanged one is a true no-op.
+  DispatcherFunctionName:
+    Type: String
+    Default: alpha-engine-data-spot-dispatcher
+    Description: >-
+      The existing data-spot dispatcher. It stays deploy.sh-managed
+      (deploy-data-spot-dispatcher.yml); only its schedules move here.
+  ResearchBucket:
+    Type: String
+    Default: alpha-engine-research
+  AlertsTopicName:
+    Type: String
+    Default: alpha-engine-alerts
+  StateMachineRoleName:
+    Type: String
+    Default: nousergon-data-collection-sfn-role
+  SchedulerRoleName:
+    Type: String
+    Default: alpha-engine-eventbridge-sfn-role
+
+Resources:
+  CollectionLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /aws/vendedlogs/states/ne-data-collection
+      RetentionInDays: 90
+
+  EodStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-eod
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        ResearchBucket: !Ref ResearchBucket
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: component
+          Value: nousergon-data-collection
+
+  MorningStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-morning
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        ResearchBucket: !Ref ResearchBucket
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: component
+          Value: nousergon-data-collection
+
+  WeeklyStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-weekly
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        ResearchBucket: !Ref ResearchBucket
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: component
+          Value: nousergon-data-collection
+
+  DailyHealStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-daily-heal
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        ResearchBucket: !Ref ResearchBucket
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: component
+          Value: nousergon-data-collection
+
+  CollectionScheduleGroup:
+    Type: AWS::Scheduler::ScheduleGroup
+    Properties:
+      Name: nousergon-data-collection
+
+  # Weekday end-of-day collection. Replaces ne-postclose-trading-pipeline's
+  # LaunchPostMarketDataSpot + LaunchPostMarketArcticAppendSpot. 16:45 ET: after
+  # the 16:00 close and outside the v1 postclose window, so the cutover day has
+  # no overlap. Verifies the two artifacts Metron reads most.
+  EodSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: eod
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref CollectionState
+      ScheduleExpression: 'cron(45 16 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref EodStateMachine
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append"], "require_trading_day": true, "verify_keys": ["market_data/eod_closes/latest.json", "market_data/technicals/rating_performance.json"]}'
+
+  # Weekday pre-open ArcticDB enrich + append. Replaces ne-preopen-trading-
+  # pipeline's LaunchMorningEnrichSpot + LaunchMorningArcticAppendSpot. 07:30 ET
+  # leaves the observed ~50 + ~38 min tail finished before the 09:30 open.
+  MorningSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: morning
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref CollectionState
+      ScheduleExpression: 'cron(30 7 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref MorningStateMachine
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append"], "require_trading_day": true, "verify_keys": []}'
+
+  # Saturday weekly collection. Replaces ne-weekly-freshness-pipeline's
+  # MorningEnrich -> DataPhase1 order. 05:00 ET = the v1 SF's 09:00 UTC start
+  # under EDT. No verify_keys: phase 1 auto-skips phases whose cycle output is
+  # already on S3, so an unchanged LastModified is legitimate on a rerun.
+  WeeklySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: weekly
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref CollectionState
+      ScheduleExpression: 'cron(0 5 ? * SAT *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref WeeklyStateMachine
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one"], "require_trading_day": false, "verify_keys": []}'
+
+  # Daily universe-gap heal. Replaces the orchestration stack's
+  # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
+  # machine so the run's outcome is recorded rather than fired and forgotten.
+  DailyHealSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: daily-heal
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref DailyHealState
+      ScheduleExpression: 'cron(0 5 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Ref DailyHealStateMachine
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": false, "verify_keys": []}'
+
+  # Failure alarms are NOT declared here. The fleet's alarms come from files
+  # (nous-ergon-ops infrastructure/cloudwatch/alarms/ne-data-collection-*-failed.json,
+  # applied on merge there), and that repo's daily drift check reports an
+  # alarm owned by a sibling repo's template as `ERROR uncodified`. Their
+  # dimension is the state machine ARN, which is fixed by StateMachineName
+  # above, so the alarm files need nothing from this stack.
+
+Outputs:
+  EodStateMachineArn:
+    Value: !Ref EodStateMachine
+  MorningStateMachineArn:
+    Value: !Ref MorningStateMachine
+  WeeklyStateMachineArn:
+    Value: !Ref WeeklyStateMachine
+  DailyHealStateMachineArn:
+    Value: !Ref DailyHealStateMachine
