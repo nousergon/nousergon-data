@@ -368,6 +368,106 @@ def test_a_reworded_launcher_error_cannot_reclassify_anything():
     assert result.verdict == ps.FAILED
 
 
+def test_an_upstream_pending_row_carries_the_manifests_written_acknowledgement():
+    """Mirrors test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher:
+    the manifest's WRITTEN reason must reach the row, not just the auto-generated
+    per-run "NOT MEASURABLE TODAY" text — alpha-engine-config-I10717. Without
+    this, an operator reading the report (or the notification, which already
+    prints acknowledged_reason generically for every unsweepable row) cannot
+    tell a declared, cyclical gap from a new one without opening
+    preflight_sweep_manifest.json."""
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: [])
+    assert result.verdict == ps.UNSWEEPABLE_VERDICT
+    assert result.acknowledged_reason == DECL["reason"]
+
+
+def test_find_recent_populated_upstream_returns_the_most_recent_hit():
+    """Walks backward day by day and stops at the FIRST (most recent, i.e.
+    smallest offset) populated date — not the oldest one in the window, and
+    not one past it."""
+    def lister(prefix):
+        if prefix == "backtest/2026-08-11/":
+            return [{"Key": "backtest/2026-08-11/results/backtest.parquet", "Size": 100}]
+        if prefix == "backtest/2026-08-08/":
+            return [{"Key": "backtest/2026-08-08/results/backtest.parquet", "Size": 100}]
+        return []
+
+    found = ps.find_recent_populated_upstream(
+        "backtest/{run_date}/", {"run_date": "2026-08-14"}, [".phases/"], lister, 8,
+    )
+    assert found is not None
+    date, detail = found
+    assert date == "2026-08-11"
+    assert detail["age_days"] == 3
+    assert detail["prefix"] == "backtest/2026-08-11/"
+
+
+def test_find_recent_populated_upstream_none_when_outside_the_window():
+    def lister(prefix):
+        # Only populated 9 days back — outside an 8-day window.
+        return (
+            [{"Key": "backtest/2026-08-05/results/backtest.parquet", "Size": 100}]
+            if prefix == "backtest/2026-08-05/" else []
+        )
+
+    found = ps.find_recent_populated_upstream(
+        "backtest/{run_date}/", {"run_date": "2026-08-14"}, [".phases/"], lister, 8,
+    )
+    assert found is None
+
+
+def test_find_recent_populated_upstream_ignores_phase_markers_like_the_same_day_probe():
+    def lister(prefix):
+        return [{"Key": f"{prefix}.phases/preflight.json", "Size": 235}]
+
+    found = ps.find_recent_populated_upstream(
+        "backtest/{run_date}/", {"run_date": "2026-08-14"}, [".phases/"], lister, 8,
+    )
+    assert found is None
+
+
+def test_find_recent_populated_upstream_a_bad_candidate_probe_does_not_abort_the_walk():
+    """A lister raising on ONE candidate day (e.g. a transient S3 hiccup while
+    probing a specific date) must not stop the walk from finding a real hit
+    on a different day — that is a fact about one probe, not about the
+    upstream's whole history."""
+    def lister(prefix):
+        if prefix == "backtest/2026-08-13/":
+            raise RuntimeError("transient")
+        if prefix == "backtest/2026-08-12/":
+            return [{"Key": "backtest/2026-08-12/results/backtest.parquet", "Size": 100}]
+        return []
+
+    found = ps.find_recent_populated_upstream(
+        "backtest/{run_date}/", {"run_date": "2026-08-14"}, [".phases/"], lister, 8,
+    )
+    assert found is not None
+    assert found[0] == "2026-08-12"
+
+
+def test_remeasure_upstream_pending_falls_back_to_classify_when_the_override_stage_is_not_sweepable():
+    """If re-deriving the definition against the override run_date does not
+    even produce a SWEEPABLE stage (e.g. definition drift breaks the override
+    binding), the function must not claim a measurement that never happened —
+    it returns classify_upstream's own unsweepable/upstream_pending verdict."""
+    listing = {"backtest/2026-08-11/": [
+        {"Key": "backtest/2026-08-11/results/backtest.parquet", "Size": 100}
+    ]}
+
+    def lister(prefix):
+        return listing.get(prefix, [])
+
+    bad_definition = {"States": {}}  # derive_stages finds nothing for this name
+    result = ps.remeasure_upstream_pending(
+        _failed(), DECL, {"run_date": "2026-08-14"}, lister,
+        definition=bad_definition, context={"Execution": {"Name": "t", "Id": "t"}},
+        checkout_root="/nonexistent", stage_timeout=30, runner=lambda *a, **k: None,
+    )
+    assert result.verdict == ps.UNSWEEPABLE_VERDICT
+    assert result.unsweepable_kind == ps.UNSWEEPABLE_UPSTREAM_PENDING
+    assert result.measured_against_run_date is None
+
+
 def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction():
     def boom(_prefix):
         raise RuntimeError("AccessDenied")
@@ -623,10 +723,74 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
     return root
 
 
-def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
-    """THE case that made the sweep's first run email '2 failed': the weekly SF
-    has not run today, so the backtest chain's upstream prefix holds only the
-    sweep's own phase markers."""
+def test_the_weekday_case_remeasures_against_the_last_populated_instance(tmp_path):
+    """The SOTA half of alpha-engine-config-I10717: the weekly SF has not run
+    TODAY, but it wrote real content 3 days ago (last Saturday), which is well
+    inside the declared 8-day max_age_days. Both stages accept --run-date and
+    implement a real --preflight-only path, so the sweep re-derives and
+    re-runs them against that populated instance instead of settling for
+    upstream_pending — a stage whose environment is healthy is PASSED for
+    real, not merely acknowledged as unmeasured."""
+    root = _fake_checkout(tmp_path)
+    run_date = _sweep_run_date()
+    historical_date = (dt.date.fromisoformat(run_date) - dt.timedelta(days=3)).isoformat()
+
+    def runner(argv, **_kwargs):
+        script = argv[-1]
+        backtest_chain = (
+            "spot_predictor_backtest.sh" in script
+            or "spot_portfolio_optimizer_backtest.sh" in script
+        )
+        # Mirrors the real script's own S3-nonempty gate: it only proceeds
+        # past the stage preflight when RUN_DATE points at a populated
+        # prefix — which today's date is not, and the historical one is.
+        rc = 0 if not backtest_chain or f"RUN_DATE='{historical_date}'" in script else 1
+        return subprocess.CompletedProcess(
+            args=argv, returncode=rc, stdout="",
+            stderr=("" if rc == 0 else
+                    f"ERROR: s3://alpha-engine-research/backtest/{run_date}/ is empty "
+                    "or unreachable.\n"),
+        )
+
+    aws = FakeAws(listing={
+        f"backtest/{run_date}/": [
+            {"Key": f"backtest/{run_date}/.phases/preflight.json", "Size": 235},
+            {"Key": f"backtest/{run_date}/.phases/runtime_smoke.json", "Size": 239},
+        ],
+        f"backtest/{historical_date}/": [
+            {"Key": f"backtest/{historical_date}/predictor_sweep_df.parquet", "Size": 91234},
+        ],
+    })
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", aws=aws, runner=runner)
+
+    assert report.stages_failed == 0
+    assert report.stages_unsweepable_upstream_pending == 0
+    assert report.stages_unsweepable_coverage_defect == 0
+    remeasured = {
+        r["stage"]: r for r in report.results
+        if r["stage"] in ("PredictorBacktest", "PortfolioOptimizerBacktest")
+    }
+    assert set(remeasured) == {"PredictorBacktest", "PortfolioOptimizerBacktest"}
+    for stage, row in remeasured.items():
+        assert row["verdict"] == ps.PASSED, (stage, row)
+        assert row["measured_against_run_date"] == historical_date, (stage, row)
+        assert "MEASURED AGAINST" in row["reason"]
+        assert historical_date in row["reason"]
+    # Nothing left to keep the run out of `ok` — the pair is MEASURED, not
+    # merely acknowledged as unmeasurable.
+    assert report.outcome == ps.OUTCOME_OK
+    ps.emit(report, aws, "arn:sns")
+    assert f"{ps.REPORT_PREFIX}/last_clean.json" in aws.objects
+
+
+def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_within_max_age(tmp_path):
+    """THE case that made the sweep's first run email '2 failed', now the
+    RARER edge (real staleness, not the ordinary weekday state): the weekly
+    SF has not run today, AND nothing populated the upstream prefix at any
+    point in the declared 8-day max_age_days window either — the remeasure
+    attempt (alpha-engine-config-I10717 (2)) has nothing to re-run against,
+    so the stage stays upstream_pending/degraded, now carrying an explicit
+    staleness note rather than reading as the routine case."""
     root = _fake_checkout(tmp_path)
 
     def runner(argv, **_kwargs):
@@ -652,6 +816,10 @@ def test_the_weekday_case_end_to_end_zero_failures_and_no_page(tmp_path):
     pending = {r["stage"] for r in report.results
                if r.get("unsweepable_kind") == ps.UNSWEEPABLE_UPSTREAM_PENDING}
     assert pending == {"PredictorBacktest", "PortfolioOptimizerBacktest"}
+    for r in report.results:
+        if r["stage"] in pending:
+            assert "STALENESS finding" in r["reason"]
+            assert r.get("measured_against_run_date") is None
     # alpha-engine-config-I7267: +2 (PitParityLookaheadResourceKillCheck,
     # PitParityWalkforwardResourceKillCheck), both acknowledged no-dry-path
     # stages in infrastructure/preflight_sweep_manifest.json.
