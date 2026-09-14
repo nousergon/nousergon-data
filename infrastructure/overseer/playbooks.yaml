@@ -742,6 +742,42 @@ watch_plane_liveness:
 # matches NO row here as a T3 finding (registry drift caught at run time;
 # the cross-repo static chokepoint is tracked separately).
 
+# ── Muted-sibling topic map (alpha-engine-config-I10382) ────────────────────
+# `krepis.alert_tiers` / `krepis.alerts._muted_topic_arn` read this via the
+# same published registry document as `alert_classes` above, rather than
+# guessing `<topic>-muted` by name convention — that convention was itself a
+# recorded fleet bug class (`alpha-engine-config-I10121`: a hand-kept twin of
+# something the code could read went stale and reddened `main` four times).
+#
+# One row per SNS topic that carries an unfiltered email subscription to
+# cipher813@gmail.com (measured 2026-09-09, AWS_PROFILE=ne-admin,
+# us-east-1, 711398986525 — every one of the three has
+# `FilterPolicy: null`). `muted_topic: null` means "no muted sibling exists
+# yet for this topic — a non-page emission keeps its email leg", which is the
+# loud (not silent) fallback `_muted_topic_arn` already applies.
+#
+#   alpha-engine-alerts    -> alpha-engine-alerts-muted (krepis-PR214, zero
+#                              subscribers, the RuntimeRole publishing this
+#                              already holds sns:Publish on it)
+#   crucible-v2-pages      -> crucible-v2-pages-muted (nous-ergon-ops-PR1236,
+#                              applied to the live stack 2026-09-13 18:11:47Z,
+#                              zero subscribers; the crucible-v2 RuntimeRole's
+#                              sns:Publish grant already covers it — nothing
+#                              new needed here)
+#   alpha-engine-alarm-backstop -> none. Published to directly by 51
+#                              CloudWatch alarms (AlarmActions), not through
+#                              this krepis chokepoint — a muted-sibling ARN
+#                              here cannot suppress an alarm's own direct
+#                              email-subscribed delivery (SNS fan-out is not
+#                              interceptable by another subscriber). Retiering
+#                              needs alarm-definition-layer work; investigated
+#                              and recorded on alpha-engine-config-I10382,
+#                              not built in this change.
+muted_topics:
+  alpha-engine-alerts: alpha-engine-alerts-muted
+  crucible-v2-pages: crucible-v2-pages-muted
+  alpha-engine-alarm-backstop: null
+
 alert_classes:
   # ── executor (crucible-executor) ──
   - class: executor_turnover_tripwire

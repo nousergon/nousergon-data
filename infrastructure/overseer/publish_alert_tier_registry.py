@@ -122,12 +122,20 @@ def build_document(playbooks_path: Path = PLAYBOOKS) -> dict:
     # classes (alpha-engine-config-I8995, awaiting a ruling) — but the resolver
     # must not pick between them silently, so the collision is carried in the
     # document and the consumer takes the STRICTEST tier of the colliding rows.
+
+    # alpha-engine-config-I10382 — the declared muted-sibling map. Absent from
+    # a document written before this key existed (schema is additive), so the
+    # consumer must treat a missing key the same as an empty one, never as an
+    # error.
+    muted_topics = dict(doc.get("muted_topics") or {})
+
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source_digest": "sha256:" + hashlib.sha256(raw.encode()).hexdigest(),
         "colliding_sources": dupes,
         "entries": entries,
+        "muted_topics": muted_topics,
     }
 
 
