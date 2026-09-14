@@ -184,7 +184,7 @@ INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
 # prefix's dashboard-role PutObject grant and its ARTIFACT_REGISTRY session-gated exemption.
 # (A separate prefix needed a new grant on a role at its 10,240-byte inline-policy ceiling.)
 TECHNICAL_RATINGS_KEY = f"{INTRADAY_PREFIX}technical_ratings.json"
-TECHNICAL_RATINGS_SCHEMA_VERSION = 1
+TECHNICAL_RATINGS_SCHEMA_VERSION = 2  # v2: additive `rating_version` per rating (metron-ops#297)
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
@@ -200,7 +200,7 @@ EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 5  # v5: + bookValue/revenuePerShare/enterpriseValue (metron-ops#178)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
-TECHNICALS_SCHEMA_VERSION = 3  # v3: additive `rating` object (metron-ops#293, close-only Strong Sell..Strong Buy)
+TECHNICALS_SCHEMA_VERSION = 4  # v4: additive `rating.rating_version` (metron-ops#297); v3 added `rating` (metron-ops#293)
 SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
 SECURITY_PERFORMANCE_PREFIX = "market_data/security_performance/"
 VALUATION_MEDIANS_SCHEMA_VERSION = 1

@@ -759,7 +759,7 @@ class TestTechnicals:
         assert out["rating"]["label"] == "Strong Buy"
         assert set(out["rating"]) == {
             "score", "label", "ma_score", "osc_score",
-            "n_buy", "n_neutral", "n_sell", "n_votes",
+            "n_buy", "n_neutral", "n_sell", "n_votes", "rating_version",
         }
 
     def test_compute_technicals_omits_rating_when_too_short_for_any_vote(self):
@@ -780,7 +780,7 @@ class TestTechnicals:
         result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
         assert result["status"] == "ok" and result["technicals"] == 1
         art = _puts(s3)["market_data/technicals/latest.json"]
-        assert art["schema_version"] == mmd.TECHNICALS_SCHEMA_VERSION == 3
+        assert art["schema_version"] == mmd.TECHNICALS_SCHEMA_VERSION == 4
         assert art["technicals"]["AAPL"]["rating"]["label"] == "Strong Buy"
 
     def test_collect_technicals_omits_symbol_with_no_close_history(self, monkeypatch):
@@ -854,7 +854,7 @@ class TestIntraday:
         puts = _puts(s3)
         assert set(puts) == {"market_data/intraday/latest.json", "market_data/intraday/technical_ratings.json"}
         ratings_art = puts["market_data/intraday/technical_ratings.json"]
-        assert ratings_art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
+        assert ratings_art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 2
         assert ratings_art["source"] == "computed_intraday"
         assert ratings_art["as_of_utc"] == ratings_art["quote_as_of_utc"] == "2026-06-12T15:00:00Z"
         assert ratings_art["ratings"] == {}
@@ -1150,7 +1150,7 @@ class TestIntradayTechnicalRatings:
         )
         assert result["status"] == "ok" and result["ratings"] == 1
         art = _puts(s3)["market_data/intraday/technical_ratings.json"]
-        assert art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
+        assert art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 2
         assert art["source"] == "computed_intraday"
         aapl = art["ratings"]["AAPL"]
         assert aapl["label"] == "Strong Buy"
