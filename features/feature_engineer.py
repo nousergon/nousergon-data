@@ -333,74 +333,145 @@ def _compute_macd(
 # method: Stoch/CCI/ADX/W%R/UO are excluded because this fleet's
 # close_history artifacts carry closes only (no high/low) — see
 # ``compute_technical_rating``'s docstring.
+#
+# metron-ops#297 (Brian ruling 2026-09-14): rule-alignment pass against the
+# published source (https://www.tradingview.com/support/solutions/
+# 43000614331-technical-ratings/, verified 2026-09-14) — Momentum voted on
+# raw price delta instead of the momentum VALUE's own trend, the label
+# boundaries misplaced the two exact-threshold scores, and Hull MA(9) (an MA-
+# group member) was missing entirely. RATING_VERSION bumped so every stamped
+# rating object names which rule set produced it.
+
+RATING_VERSION = 2
 
 _RATING_MA_WINDOWS: tuple[int, ...] = (10, 20, 30, 50, 100, 200)
+_RATING_HMA_PERIOD = 9
 _RATING_RSI_PERIOD = 14
 _RATING_MACD_FAST, _RATING_MACD_SLOW, _RATING_MACD_SIGNAL = 12, 26, 9
 _RATING_MOM_PERIOD = 10
+
+
+def _round_half_up(x: float) -> int:
+    """Round-half-away-from-zero (TradingView's ``math.round``), not Python's
+    banker's rounding — matters for the Hull MA sub-window lengths (9/2 = 4.5
+    must round to 5, not 4)."""
+    import math
+
+    return int(math.floor(x + 0.5)) if x >= 0 else -int(math.floor(-x + 0.5))
+
+
+_RATING_HMA_HALF_LEN = _round_half_up(_RATING_HMA_PERIOD / 2)
+_RATING_HMA_SQRT_LEN = _round_half_up(_RATING_HMA_PERIOD ** 0.5)
+# A full HMA(9) diff series needs `period` obs for the slowest WMA at the most
+# recent point, plus `sqrt_len - 1` earlier points to WMA-smooth over.
+_RATING_HMA_MIN_OBS = _RATING_HMA_PERIOD + _RATING_HMA_SQRT_LEN - 1
 
 # Per-vote minimum observation counts — a vote is skipped, never fabricated,
 # below its own threshold. RSI needs one extra bar past its period to judge
 # rising/falling (needs the current AND the prior RSI reading); MACD needs
 # the slow EMA warmup plus the signal EMA's own smoothing to be minimally
-# meaningful; momentum needs the period-back bar to diff against.
+# meaningful; momentum needs TWO trailing momentum readings (mom[t] vs
+# mom[t-1]), so it needs the period-back bar AND one more.
 _RATING_RSI_MIN_OBS = _RATING_RSI_PERIOD + 2
 _RATING_MACD_MIN_OBS = _RATING_MACD_SLOW + _RATING_MACD_SIGNAL
-_RATING_MOM_MIN_OBS = _RATING_MOM_PERIOD + 1
+_RATING_MOM_MIN_OBS = _RATING_MOM_PERIOD + 2
 
-_RATING_LABELS = (
-    (-0.5, "Strong Sell"),   # score <= -0.5
-    (-0.1, "Sell"),          # -0.5 <  score < -0.1
-    (0.1, "Neutral"),        # -0.1 <= score <=  0.1
-    (0.5, "Buy"),            #  0.1 <  score <  0.5
-)  # score >= 0.5 -> "Strong Buy"
-
-
+# Published boundaries (verified 2026-09-14): Strong Sell s<-0.5; Sell
+# -0.5<=s<-0.1; Neutral -0.1<=s<=0.1; Buy 0.1<s<=0.5; Strong Buy s>0.5. The
+# prior version put the two exact thresholds (-0.5, 0.5) in the "Strong"
+# buckets instead of "Sell"/"Buy" (metron-ops#297).
 def _rating_label(score: float) -> str:
-    if score <= _RATING_LABELS[0][0]:
+    if score < -0.5:
         return "Strong Sell"
-    if score < _RATING_LABELS[1][0]:
+    if score < -0.1:
         return "Sell"
-    if score <= _RATING_LABELS[2][0]:
+    if score <= 0.1:
         return "Neutral"
-    if score < _RATING_LABELS[3][0]:
+    if score <= 0.5:
         return "Buy"
     return "Strong Buy"
 
 
+def _wma_last(s: pd.Series, length: int) -> float | None:
+    """Weighted moving average's LAST value only (weights 1..length, most
+    recent bar weighted highest) — the Hull MA sub-components only ever need
+    the current point, never a rolling series."""
+    if len(s) < length:
+        return None
+    window = s.iloc[-length:].to_numpy(dtype="float64")
+    weights = np.arange(1, length + 1, dtype="float64")
+    return float(np.dot(window, weights) / weights.sum())
+
+
+def _compute_hull_ma(s: pd.Series, period: int = _RATING_HMA_PERIOD) -> float | None:
+    """Hull MA(period)'s last value: ``WMA(2*WMA(n/2) - WMA(n), round(sqrt(n)))``
+    (n = ``period``, half/sqrt lengths rounded half-away-from-zero per the
+    published TradingView pine implementation). Only the trailing
+    ``sqrt_len`` points of the raw ``2*WMA(half) - WMA(n)`` series are needed
+    to WMA-smooth the final value, so this computes exactly those points
+    rather than a full rolling series (cheap — matters at ~240k backfill
+    calls, metron-ops#297)."""
+    half_len = _RATING_HMA_HALF_LEN
+    sqrt_len = _RATING_HMA_SQRT_LEN
+    if len(s) < period + sqrt_len - 1:
+        return None
+    diffs: list[float] = []
+    for k in range(sqrt_len):
+        n = len(s) - k
+        sub = s.iloc[:n]
+        wma_half = _wma_last(sub, half_len)
+        wma_full = _wma_last(sub, period)
+        if wma_half is None or wma_full is None:
+            return None
+        diffs.append(2 * wma_half - wma_full)
+    # diffs[0] is the most recent point; WMA weights the most recent highest,
+    # so reverse to oldest-first before the final weighted dot product.
+    diffs_arr = np.array(diffs[::-1], dtype="float64")
+    weights = np.arange(1, sqrt_len + 1, dtype="float64")
+    return float(np.dot(diffs_arr, weights) / weights.sum())
+
+
 def compute_technical_rating(closes: pd.Series) -> dict | None:
     """Close-only technical rating (TradingView-Technical-Ratings method),
-    ``{score, label, ma_score, osc_score, n_buy, n_neutral, n_sell, n_votes}``
-    or ``None`` when no vote is computable.
+    ``{score, label, ma_score, osc_score, n_buy, n_neutral, n_sell, n_votes,
+    rating_version}`` or ``None`` when no vote is computable.
 
     ``closes`` : ascending price series (any index — only ``.iloc`` order and
     length matter). Positive, non-null values only; the caller filters.
 
-    **MA group** (12 votes): SMA and EMA at 10/20/30/50/100/200 — buy (+1) if
-    the last close is above the average, sell (-1) if below. A window's pair
-    of votes is skipped entirely when ``len(closes)`` is under that window
-    (never an MA computed on partial history).
+    **MA group** (up to 13 votes): SMA and EMA at 10/20/30/50/100/200 — buy
+    (+1) if the last close is above the average, sell (-1) if below. A
+    window's pair of votes is skipped entirely when ``len(closes)`` is under
+    that window (never an MA computed on partial history). Plus Hull MA(9)
+    (metron-ops#297) — buy if the last close is above the HMA, sell if
+    below — skipped below its own ``_RATING_HMA_MIN_OBS``.
 
     **Oscillator group** (up to 3 votes): RSI(14) — buy if RSI < 30 AND
     rising vs the prior bar, sell if RSI > 70 AND falling, else neutral (0);
     MACD(12,26,9) — buy if the MACD line is above its signal line, sell if
-    below, neutral only on an exact tie; Momentum(10) — buy if the close
-    rose vs. 10 bars ago, sell if it fell, neutral on an exact tie. Each vote
-    is independently gated on its own minimum history (see the
+    below, neutral only on an exact tie; Momentum(10) — buy if the momentum
+    VALUE (``close[t] - close[t-10]``) is rising vs. its own prior reading,
+    sell if falling, neutral on an exact tie (metron-ops#297 — the prior
+    version voted on raw price delta, not the momentum value's own trend).
+    Each vote is independently gated on its own minimum history (see the
     ``_RATING_*_MIN_OBS`` constants) and skipped below it.
 
     Each group's score is the mean of its own votes (``None`` if the group
     has zero votes). The overall ``score`` is the mean of the group scores
     that ARE present — a zero-vote group is dropped from the average rather
-    than counted as 0. ``score <= -0.5`` -> "Strong Sell", ``< -0.1`` ->
-    "Sell", ``<= 0.1`` -> "Neutral", ``< 0.5`` -> "Buy", else "Strong Buy".
+    than counted as 0. Published boundaries (verified 2026-09-14):
+    ``score < -0.5`` -> "Strong Sell", ``< -0.1`` -> "Sell", ``<= 0.1`` ->
+    "Neutral", ``<= 0.5`` -> "Buy", else "Strong Buy" — see ``_rating_label``.
 
     **Delta from the full TradingView method**: Stochastic, CCI, ADX,
-    Williams %R and Ultimate Oscillator are excluded. Each needs high/low
-    (Stoch/CCI/ADX/W%R/UO all do), and this producer's ``close_history``
-    artifacts — the only price series available intraday without a new
-    vendor fetch — carry closes only. Returns ``None`` (never a fabricated
-    rating) when neither group has a single computable vote."""
+    Williams %R, Ultimate Oscillator, VWMA(20) and Ichimoku are excluded.
+    VWMA needs volume; the rest need high/low (or, for Stochastic RSI, have
+    an "uptrend/downtrend" precondition the published source leaves
+    unspecified) — this producer's ``close_history`` artifacts, the only
+    price series available intraday without a new vendor fetch, carry
+    closes only. A follow-up issue tracks a high/low/volume-bearing source
+    for the excluded members. Returns ``None`` (never a fabricated rating)
+    when neither group has a single computable vote."""
     s = pd.Series(closes, dtype="float64").dropna()
     s = s[s > 0]
     if s.empty:
@@ -415,6 +486,10 @@ def compute_technical_rating(closes: pd.Series) -> dict | None:
         ma_votes.append(1 if last > sma else (-1 if last < sma else 0))
         ema = float(s.ewm(span=window, adjust=False).mean().iloc[-1])
         ma_votes.append(1 if last > ema else (-1 if last < ema else 0))
+    if len(s) >= _RATING_HMA_MIN_OBS:
+        hma = _compute_hull_ma(s, period=_RATING_HMA_PERIOD)
+        if hma is not None:
+            ma_votes.append(1 if last > hma else (-1 if last < hma else 0))
 
     osc_votes: list[int] = []
     if len(s) >= _RATING_RSI_MIN_OBS:
@@ -435,8 +510,12 @@ def compute_technical_rating(closes: pd.Series) -> dict | None:
         if pd.notna(m) and pd.notna(sig):
             osc_votes.append(1 if m > sig else (-1 if m < sig else 0))
     if len(s) >= _RATING_MOM_MIN_OBS:
-        mom = last - float(s.iloc[-1 - _RATING_MOM_PERIOD])
-        osc_votes.append(1 if mom > 0 else (-1 if mom < 0 else 0))
+        # Momentum(10) VALUE at t and t-1 — the published rule votes on
+        # whether the momentum reading itself is rising, not on raw price
+        # delta (metron-ops#297).
+        mom_t = last - float(s.iloc[-1 - _RATING_MOM_PERIOD])
+        mom_t1 = float(s.iloc[-2]) - float(s.iloc[-2 - _RATING_MOM_PERIOD])
+        osc_votes.append(1 if mom_t > mom_t1 else (-1 if mom_t < mom_t1 else 0))
 
     if not ma_votes and not osc_votes:
         return None
@@ -456,6 +535,7 @@ def compute_technical_rating(closes: pd.Series) -> dict | None:
         "n_neutral": sum(1 for v in all_votes if v == 0),
         "n_sell": sum(1 for v in all_votes if v < 0),
         "n_votes": len(all_votes),
+        "rating_version": RATING_VERSION,
     }
 
 

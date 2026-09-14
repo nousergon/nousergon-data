@@ -4,7 +4,7 @@
   "description": "Shared shape of the per-symbol `rating` object (metron-ops#293) — the close-only TradingView-Technical-Ratings-method summary computed by features.feature_engineer.compute_technical_rating. Embedded verbatim in both technicals.schema.json (`technicals.*.rating`) and technical_ratings.schema.json (`ratings.*`, which adds price/bar_date/basis on top of this shape). NOT independently loaded — kept as a standalone file for reference/diffing; each consuming schema inlines its own copy so a single json.load() validates the whole artifact without a resolver.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["score", "label", "ma_score", "osc_score", "n_buy", "n_neutral", "n_sell", "n_votes"],
+  "required": ["score", "label", "ma_score", "osc_score", "n_buy", "n_neutral", "n_sell", "n_votes", "rating_version"],
   "properties": {
     "score": {
       "type": "number",
@@ -31,6 +31,11 @@
     "n_buy": {"type": "integer", "minimum": 0},
     "n_neutral": {"type": "integer", "minimum": 0},
     "n_sell": {"type": "integer", "minimum": 0},
-    "n_votes": {"type": "integer", "minimum": 1, "description": "n_buy + n_neutral + n_sell."}
+    "n_votes": {"type": "integer", "minimum": 1, "description": "n_buy + n_neutral + n_sell."},
+    "rating_version": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "The RATING_VERSION (features.feature_engineer) that computed this rating -- metron-ops#297. Bumped whenever the vote rules change, so a ledger/scorer consumer can filter to the current rule set."
+    }
   }
 }
