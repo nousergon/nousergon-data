@@ -368,6 +368,19 @@ def test_a_reworded_launcher_error_cannot_reclassify_anything():
     assert result.verdict == ps.FAILED
 
 
+def test_an_upstream_pending_row_carries_the_manifests_written_acknowledgement():
+    """Mirrors test_a_no_dry_path_stage_gets_its_own_verdict_row_with_repo_and_launcher:
+    the manifest's WRITTEN reason must reach the row, not just the auto-generated
+    per-run "NOT MEASURABLE TODAY" text — alpha-engine-config-I10717. Without
+    this, an operator reading the report (or the notification, which already
+    prints acknowledged_reason generically for every unsweepable row) cannot
+    tell a declared, cyclical gap from a new one without opening
+    preflight_sweep_manifest.json."""
+    result = ps.classify_upstream(_failed(), DECL, BINDINGS, lambda _p: [])
+    assert result.verdict == ps.UNSWEEPABLE_VERDICT
+    assert result.acknowledged_reason == DECL["reason"]
+
+
 def test_an_unprobeable_upstream_is_unmeasured_not_a_guess_in_either_direction():
     def boom(_prefix):
         raise RuntimeError("AccessDenied")

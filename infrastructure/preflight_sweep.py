@@ -643,6 +643,16 @@ def classify_upstream(
         "preconditions of this stage are UNKNOWN rather than broken. Declared in "
         "preflight_sweep_manifest.json:upstream_artifact_dependencies."
     )
+    # Same wiring as the dedicated_box and no_dry_path rows below: the
+    # manifest's WRITTEN acknowledgement (which cites the tracked issue and
+    # explains the cadence — e.g. "legitimately unsweepable on the ~6
+    # non-Saturday days of any week") must reach this row and the
+    # notification, not just the auto-generated per-run reason above. Without
+    # it an operator reading this result (or the nightly email) sees only
+    # "NOT MEASURABLE TODAY" and has no way to tell an expected, declared,
+    # cyclical gap from a new one without opening preflight_sweep_manifest.json
+    # — alpha-engine-config-I10717.
+    result.acknowledged_reason = declaration.get("reason")
     return result
 
 
