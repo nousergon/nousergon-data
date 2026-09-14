@@ -402,10 +402,22 @@ def test_every_declared_phase_has_a_registered_gate(phases):
         assert phase.gate in GATES, f"{phase.id} names an unregistered gate {phase.gate!r}"
 
 
-def test_a_rung_pointing_at_the_parent_issue_holds_the_board_clause(board):
+def test_every_rung_names_its_own_tracker_now_that_p26_is_filed(board, phases):
+    """P-26 filed 2026-09-14 as alpha-engine-config-I10792..I10795, one per phase."""
     clause = next(c for c in board if c.name == "data.board.phase_trackers_declared")
-    assert clause.met is False, (
-        "P-26 has not filed the per-phase issues yet; while any rung points at the parent "
-        "KEY issue this clause must be UNMET, or the ladder looks tracked and is not"
-    )
-    assert "P-26" in clause.detail
+    assert clause.met is True, clause.detail
+    assert {p.tracker_issue for p in phases} == {10792, 10793, 10794, 10795}
+    assert not any(p.tracker_is_placeholder for p in phases)
+
+
+def test_a_rung_pointing_at_the_parent_issue_holds_the_board_clause(phases):
+    """A rung that falls back to the parent KEY issue must keep the clause UNMET —
+    a ladder pointed at one issue looks tracked and is not."""
+    import dataclasses
+
+    degraded = [dataclasses.replace(phases[1], tracker_issue=10748, tracker_is_placeholder=True)] + [
+        p for p in phases if p.id != phases[1].id
+    ]
+    clause = clause_module._clause_board_phase_trackers_declared(EmptyStore(), degraded)
+    assert clause.met is False
+    assert "P-26" in clause.detail and phases[1].id in clause.detail
