@@ -326,6 +326,139 @@ def _compute_macd(
     return macd_line, signal_line
 
 
+# ── Technical rating (close-only TradingView-Technical-Ratings method) ────────
+# metron-ops#293 (Brian ruling 2026-09-14, owner build only): a per-symbol
+# Strong Sell..Strong Buy summary rating consumed by nousergon-data's
+# technicals/intraday producers. Close-only DELTA from the full TradingView
+# method: Stoch/CCI/ADX/W%R/UO are excluded because this fleet's
+# close_history artifacts carry closes only (no high/low) — see
+# ``compute_technical_rating``'s docstring.
+
+_RATING_MA_WINDOWS: tuple[int, ...] = (10, 20, 30, 50, 100, 200)
+_RATING_RSI_PERIOD = 14
+_RATING_MACD_FAST, _RATING_MACD_SLOW, _RATING_MACD_SIGNAL = 12, 26, 9
+_RATING_MOM_PERIOD = 10
+
+# Per-vote minimum observation counts — a vote is skipped, never fabricated,
+# below its own threshold. RSI needs one extra bar past its period to judge
+# rising/falling (needs the current AND the prior RSI reading); MACD needs
+# the slow EMA warmup plus the signal EMA's own smoothing to be minimally
+# meaningful; momentum needs the period-back bar to diff against.
+_RATING_RSI_MIN_OBS = _RATING_RSI_PERIOD + 2
+_RATING_MACD_MIN_OBS = _RATING_MACD_SLOW + _RATING_MACD_SIGNAL
+_RATING_MOM_MIN_OBS = _RATING_MOM_PERIOD + 1
+
+_RATING_LABELS = (
+    (-0.5, "Strong Sell"),   # score <= -0.5
+    (-0.1, "Sell"),          # -0.5 <  score < -0.1
+    (0.1, "Neutral"),        # -0.1 <= score <=  0.1
+    (0.5, "Buy"),            #  0.1 <  score <  0.5
+)  # score >= 0.5 -> "Strong Buy"
+
+
+def _rating_label(score: float) -> str:
+    if score <= _RATING_LABELS[0][0]:
+        return "Strong Sell"
+    if score < _RATING_LABELS[1][0]:
+        return "Sell"
+    if score <= _RATING_LABELS[2][0]:
+        return "Neutral"
+    if score < _RATING_LABELS[3][0]:
+        return "Buy"
+    return "Strong Buy"
+
+
+def compute_technical_rating(closes: pd.Series) -> dict | None:
+    """Close-only technical rating (TradingView-Technical-Ratings method),
+    ``{score, label, ma_score, osc_score, n_buy, n_neutral, n_sell, n_votes}``
+    or ``None`` when no vote is computable.
+
+    ``closes`` : ascending price series (any index — only ``.iloc`` order and
+    length matter). Positive, non-null values only; the caller filters.
+
+    **MA group** (12 votes): SMA and EMA at 10/20/30/50/100/200 — buy (+1) if
+    the last close is above the average, sell (-1) if below. A window's pair
+    of votes is skipped entirely when ``len(closes)`` is under that window
+    (never an MA computed on partial history).
+
+    **Oscillator group** (up to 3 votes): RSI(14) — buy if RSI < 30 AND
+    rising vs the prior bar, sell if RSI > 70 AND falling, else neutral (0);
+    MACD(12,26,9) — buy if the MACD line is above its signal line, sell if
+    below, neutral only on an exact tie; Momentum(10) — buy if the close
+    rose vs. 10 bars ago, sell if it fell, neutral on an exact tie. Each vote
+    is independently gated on its own minimum history (see the
+    ``_RATING_*_MIN_OBS`` constants) and skipped below it.
+
+    Each group's score is the mean of its own votes (``None`` if the group
+    has zero votes). The overall ``score`` is the mean of the group scores
+    that ARE present — a zero-vote group is dropped from the average rather
+    than counted as 0. ``score <= -0.5`` -> "Strong Sell", ``< -0.1`` ->
+    "Sell", ``<= 0.1`` -> "Neutral", ``< 0.5`` -> "Buy", else "Strong Buy".
+
+    **Delta from the full TradingView method**: Stochastic, CCI, ADX,
+    Williams %R and Ultimate Oscillator are excluded. Each needs high/low
+    (Stoch/CCI/ADX/W%R/UO all do), and this producer's ``close_history``
+    artifacts — the only price series available intraday without a new
+    vendor fetch — carry closes only. Returns ``None`` (never a fabricated
+    rating) when neither group has a single computable vote."""
+    s = pd.Series(closes, dtype="float64").dropna()
+    s = s[s > 0]
+    if s.empty:
+        return None
+    last = float(s.iloc[-1])
+
+    ma_votes: list[int] = []
+    for window in _RATING_MA_WINDOWS:
+        if len(s) < window:
+            continue
+        sma = float(s.iloc[-window:].mean())
+        ma_votes.append(1 if last > sma else (-1 if last < sma else 0))
+        ema = float(s.ewm(span=window, adjust=False).mean().iloc[-1])
+        ma_votes.append(1 if last > ema else (-1 if last < ema else 0))
+
+    osc_votes: list[int] = []
+    if len(s) >= _RATING_RSI_MIN_OBS:
+        rsi = _compute_rsi(s, period=_RATING_RSI_PERIOD)
+        curr, prev = rsi.iloc[-1], rsi.iloc[-2]
+        if pd.notna(curr) and pd.notna(prev):
+            if curr < 30 and curr > prev:
+                osc_votes.append(1)
+            elif curr > 70 and curr < prev:
+                osc_votes.append(-1)
+            else:
+                osc_votes.append(0)
+    if len(s) >= _RATING_MACD_MIN_OBS:
+        macd_line, signal_line = _compute_macd(
+            s, fast=_RATING_MACD_FAST, slow=_RATING_MACD_SLOW, signal=_RATING_MACD_SIGNAL
+        )
+        m, sig = macd_line.iloc[-1], signal_line.iloc[-1]
+        if pd.notna(m) and pd.notna(sig):
+            osc_votes.append(1 if m > sig else (-1 if m < sig else 0))
+    if len(s) >= _RATING_MOM_MIN_OBS:
+        mom = last - float(s.iloc[-1 - _RATING_MOM_PERIOD])
+        osc_votes.append(1 if mom > 0 else (-1 if mom < 0 else 0))
+
+    if not ma_votes and not osc_votes:
+        return None
+
+    ma_score = (sum(ma_votes) / len(ma_votes)) if ma_votes else None
+    osc_score = (sum(osc_votes) / len(osc_votes)) if osc_votes else None
+    group_scores = [g for g in (ma_score, osc_score) if g is not None]
+    score = sum(group_scores) / len(group_scores)
+
+    all_votes = ma_votes + osc_votes
+    return {
+        "score": round(score, 4),
+        "label": _rating_label(score),
+        "ma_score": round(ma_score, 4) if ma_score is not None else None,
+        "osc_score": round(osc_score, 4) if osc_score is not None else None,
+        "n_buy": sum(1 for v in all_votes if v > 0),
+        "n_neutral": sum(1 for v in all_votes if v == 0),
+        "n_sell": sum(1 for v in all_votes if v < 0),
+        "n_votes": len(all_votes),
+    }
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def compute_features(

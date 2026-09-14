@@ -18,16 +18,20 @@ from collectors import metron_market_data as mmd
 
 def _universe_s3(
     universe: dict | None, heartbeat_ts: str | None = None, watchlist: dict | None = None,
-    eod_closes: dict | None = None,
+    eod_closes: dict | None = None, close_history: dict[str, dict] | None = None,
 ) -> MagicMock:
     """A MagicMock S3 whose get_object dispatches per key: the Metron held-universe JSON
     (raises if None), the Metron watchlist-universe JSON (raises if None — most tests don't
     exercise the watchlist union, matching the artifact simply not existing yet), when
-    ``heartbeat_ts`` is given a fresh UI-heartbeat object (the intraday demand gate), and
-    when ``eod_closes`` is given the settled-close artifact (the scale-coherence
-    cross-check, metron-ops#159 — raises NoSuchKey if None, matching a not-yet-run closes
-    collector); any other key raises NoSuchKey."""
+    ``heartbeat_ts`` is given a fresh UI-heartbeat object (the intraday demand gate), when
+    ``eod_closes`` is given the settled-close artifact (the scale-coherence cross-check,
+    metron-ops#159 — raises NoSuchKey if None, matching a not-yet-run closes collector),
+    ``close_history`` is a ``{yf_symbol: {"closes": [[date, close], …]}}`` map served under
+    ``CLOSE_HISTORY_PREFIX`` (metron-ops#293 intraday/technicals ratings — a symbol absent
+    from the map raises NoSuchKey, matching no close_history published yet); any other key
+    raises NoSuchKey."""
     s3 = MagicMock()
+    close_history = close_history or {}
 
     def _get(Bucket, Key):
         def _body(obj):
@@ -50,6 +54,11 @@ def _universe_s3(
             if eod_closes is None:
                 raise Exception("NoSuchKey")
             return _body(eod_closes)
+        if Key.startswith(mmd.CLOSE_HISTORY_PREFIX):
+            yf_sym = Key[len(mmd.CLOSE_HISTORY_PREFIX):-len(".json")]
+            if yf_sym not in close_history:
+                raise Exception("NoSuchKey")
+            return _body(close_history[yf_sym])
         raise Exception("NoSuchKey")
 
     s3.get_object.side_effect = _get
@@ -726,6 +735,66 @@ class TestSentiment:
         assert out["AAPL"]["n_articles"] == 12
 
 
+def _close_history_closes(n: int, start_date: str = "2025-01-02", start: float = 50.0, step: float = 1.0):
+    """Ascending ``[[date_iso, close], …]`` — business-day-spaced, strictly increasing
+    (matches the "held-universe symbol in a steady uptrend" case for the technical-rating
+    tests). NOT calendar-accurate (every date advances by 1 day) — irrelevant to
+    `compute_technical_rating`, which only uses value order."""
+    base = date.fromisoformat(start_date)
+    return [[str(base + timedelta(days=i)), start + i * step] for i in range(n)]
+
+
+class TestTechnicals:
+    """metron-ops#293: the `rating` object nested per-symbol in
+    market_data/technicals/latest.json (TECHNICALS_SCHEMA_VERSION 2 -> 3, additive)."""
+
+    def _s3(self, close_history: dict[str, dict]):
+        return _universe_s3(_UNIVERSE, close_history=close_history)
+
+    def test_compute_technicals_attaches_rating_when_computable(self):
+        closes = _close_history_closes(260)
+        out = mmd._compute_technicals(closes)
+        assert out is not None
+        assert "rating" in out
+        assert out["rating"]["label"] == "Strong Buy"
+        assert set(out["rating"]) == {
+            "score", "label", "ma_score", "osc_score",
+            "n_buy", "n_neutral", "n_sell", "n_votes",
+        }
+
+    def test_compute_technicals_omits_rating_when_too_short_for_any_vote(self):
+        # _TECH_MIN_OBS (30) already exceeds every rating vote's own minimum
+        # (MA-10 needs 10, momentum needs 11), so a `tech is not None` result
+        # from _compute_technicals always clears the rating floor too -- this
+        # pins that invariant rather than re-deriving the vote minimums here.
+        closes = _close_history_closes(mmd._TECH_MIN_OBS)
+        out = mmd._compute_technicals(closes)
+        assert out is not None and "rating" in out
+
+    def test_collect_technicals_writes_rating_per_symbol(self, monkeypatch):
+        monkeypatch.setattr(
+            mmd, "load_price_derived_universe",
+            lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
+        )
+        s3 = self._s3({"AAPL": {"closes": _close_history_closes(260)}})
+        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        assert result["status"] == "ok" and result["technicals"] == 1
+        art = _puts(s3)["market_data/technicals/latest.json"]
+        assert art["schema_version"] == mmd.TECHNICALS_SCHEMA_VERSION == 3
+        assert art["technicals"]["AAPL"]["rating"]["label"] == "Strong Buy"
+
+    def test_collect_technicals_omits_symbol_with_no_close_history(self, monkeypatch):
+        monkeypatch.setattr(
+            mmd, "load_price_derived_universe",
+            lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
+        )
+        s3 = self._s3({})  # no close_history published for AAPL yet
+        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        assert result["status"] == "ok" and result["technicals"] == 0
+        art = _puts(s3)["market_data/technicals/latest.json"]
+        assert art["technicals"] == {}
+
+
 class TestIntraday:
     _QUOTES = {
         "AAPL": {"last": 202.1, "open": 200.5, "prev_close": 201.5,
@@ -763,12 +832,12 @@ class TestIntraday:
     _RTH = datetime(2026, 6, 12, 15, 0, tzinfo=timezone.utc)
 
     def _s3(self, *, heartbeat_offset_s: int | None = 60, universe: dict | None = _UNIVERSE,
-            eod_closes: dict | None = None):
+            eod_closes: dict | None = None, close_history: dict[str, dict] | None = None):
         """Fake S3 with a heartbeat ``offset_s`` seconds BEFORE the test's RTH now."""
         ts = None
         if heartbeat_offset_s is not None:
             ts = (self._RTH - timedelta(seconds=heartbeat_offset_s)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return _universe_s3(universe, heartbeat_ts=ts, eod_closes=eod_closes)
+        return _universe_s3(universe, heartbeat_ts=ts, eod_closes=eod_closes, close_history=close_history)
 
     def test_writes_quotes_with_currency_when_open_and_app_active(self):
         s3 = self._s3()
@@ -779,8 +848,16 @@ class TestIntraday:
         )
         assert result["status"] == "ok" and result["quotes"] == 2 and result["indices"] == 4
         assert result["fund_proxies"] == len(mmd.FUND_PROXY_ETFS)
+        # No close_history stubbed → zero ratings computable, but the artifact still
+        # writes (an empty rating pass must not read as "never ran").
+        assert result["ratings"] == 0
         puts = _puts(s3)
-        assert set(puts) == {"market_data/intraday/latest.json"}
+        assert set(puts) == {"market_data/intraday/latest.json", "market_data/intraday/technical_ratings.json"}
+        ratings_art = puts["market_data/intraday/technical_ratings.json"]
+        assert ratings_art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
+        assert ratings_art["source"] == "computed_intraday"
+        assert ratings_art["as_of_utc"] == ratings_art["quote_as_of_utc"] == "2026-06-12T15:00:00Z"
+        assert ratings_art["ratings"] == {}
         art = puts["market_data/intraday/latest.json"]
         assert art["schema_version"] == mmd.INTRADAY_SCHEMA_VERSION == 3
         assert art["source"] == "yfinance_delayed"
@@ -1021,6 +1098,94 @@ class TestIntraday:
         )
         assert result["status"] == "ok" and result["quotes"] == 0
         assert s3.put_object.called
+
+
+class TestProvisionalBar:
+    """`_with_provisional_bar` (metron-ops#293): today's intraday quote appended onto
+    the published close_history — replacing a same-dated bar, never duplicating it."""
+
+    def test_appends_a_new_session_date(self):
+        closes = [["2026-06-10", 100.0], ["2026-06-11", 101.0]]
+        out = mmd._with_provisional_bar(closes, "2026-06-12", 102.5)
+        assert out == [["2026-06-10", 100.0], ["2026-06-11", 101.0], ["2026-06-12", 102.5]]
+        assert closes == [["2026-06-10", 100.0], ["2026-06-11", 101.0]]  # input untouched
+
+    def test_replaces_a_same_dated_bar_rather_than_duplicating(self):
+        """The EOD collector races the intraday timer and writes today's settled close
+        first -- the provisional quote must overwrite that bar, not append a duplicate
+        same-dated row (which would corrupt the ascending-unique-date invariant)."""
+        closes = [["2026-06-11", 101.0], ["2026-06-12", 101.8]]  # EOD already wrote 06-12
+        out = mmd._with_provisional_bar(closes, "2026-06-12", 102.5)
+        assert out == [["2026-06-11", 101.0], ["2026-06-12", 102.5]]
+
+    def test_stale_session_date_behind_last_bar_is_dropped(self):
+        closes = [["2026-06-11", 101.0], ["2026-06-12", 101.8]]
+        out = mmd._with_provisional_bar(closes, "2026-06-10", 99.0)
+        assert out == closes  # unchanged -- never inserted out of order
+
+    def test_empty_history_seeds_a_single_bar(self):
+        assert mmd._with_provisional_bar([], "2026-06-12", 102.5) == [["2026-06-12", 102.5]]
+
+
+class TestIntradayTechnicalRatings:
+    """metron-ops#293: market_data/intraday/technical_ratings.json, written alongside
+    market_data/intraday/latest.json inside collect_intraday from the SAME fetch."""
+
+    _RTH = TestIntraday._RTH
+
+    def _quotes_source(self, last: float, session_date: str = "2026-06-12"):
+        quote = {"AAPL": {"last": last, "open": last - 1, "prev_close": last - 0.5,
+                           "session_date": session_date, "prev_session_date": "2026-06-11"}}
+        return TestIntraday._stub(quote, TestIntraday._INDEX_QUOTES, TestIntraday._FUND_PROXY_QUOTES)
+
+    def test_rating_computed_from_close_history_plus_provisional_quote_bar(self):
+        # A steady uptrend through 2026-06-11, then an even-higher intraday `last` for
+        # 2026-06-12 -- reinforces the buy signal (never a new vendor fetch: the whole
+        # series comes from the close_history stub + the quote already fetched above).
+        closes = _close_history_closes(260, start_date="2025-06-13")  # ends 2026-06-11ish, ascending
+        s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": closes}})
+        last = closes[-1][1] + 5.0
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, intraday_source=self._quotes_source(last), now=self._RTH,
+        )
+        assert result["status"] == "ok" and result["ratings"] == 1
+        art = _puts(s3)["market_data/intraday/technical_ratings.json"]
+        assert art["schema_version"] == mmd.TECHNICAL_RATINGS_SCHEMA_VERSION == 1
+        assert art["source"] == "computed_intraday"
+        aapl = art["ratings"]["AAPL"]
+        assert aapl["label"] == "Strong Buy"
+        assert aapl["price"] == last
+        assert aapl["bar_date"] == "2026-06-12"
+        assert aapl["basis"] == "intraday"
+        # 1299.HK is held but the stub source never returns a quote for it (and it has
+        # no close_history stubbed either) -> omitted, never fabricated.
+        assert "1299.HK" not in art["ratings"]
+
+    def test_symbol_without_usable_quote_is_omitted_from_ratings(self):
+        """A held symbol present in close_history but with NO quote this tick (e.g. the
+        fetcher didn't return it) contributes no rating -- ratings is keyed off `quotes`,
+        never off the held universe directly."""
+        closes = _close_history_closes(260)
+        s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": closes}, "1299.HK": {"closes": closes}})
+        # Source returns only AAPL for the held-universe fetch (1299.HK silently absent).
+        source = TestIntraday._stub(
+            {"AAPL": {"last": closes[-1][1] + 1, "open": 1, "prev_close": 1,
+                      "session_date": "2026-06-12", "prev_session_date": "2026-06-11"}},
+            TestIntraday._INDEX_QUOTES, TestIntraday._FUND_PROXY_QUOTES,
+        )
+        result = mmd.collect_intraday(bucket="b", s3_client=s3, intraday_source=source, now=self._RTH)
+        assert result["status"] == "ok" and result["ratings"] == 1
+        assert "1299.HK" not in _puts(s3)["market_data/intraday/technical_ratings.json"]["ratings"]
+
+    def test_dry_run_computes_but_does_not_write_ratings(self):
+        closes = _close_history_closes(260)
+        s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": closes}})
+        result = mmd.collect_intraday(
+            bucket="b", s3_client=s3, dry_run=True,
+            intraday_source=self._quotes_source(closes[-1][1] + 1), now=self._RTH,
+        )
+        assert result["status"] == "ok_dry_run" and result["ratings"] == 1
+        assert not s3.put_object.called
 
 
 class TestEafeUniverse:

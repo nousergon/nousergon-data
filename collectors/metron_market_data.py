@@ -175,6 +175,16 @@ INTRADAY_PREFIX = "market_data/intraday/"
 # diverge intraday — the headline "Nasdaq" most readers see is the Composite. Quotes land
 # under the artifact's `indices` key (same per-symbol shape as held `quotes`).
 INDEX_PROXY_SYMBOLS = ["SPY", "ONEQ", "QQQ", "IWM"]
+# Technical ratings — the intraday sibling of TECHNICALS_PREFIX's per-symbol `rating`
+# object (metron-ops#293). Computed inside collect_intraday from the SAME fetch that
+# produces `quotes` (no new vendor call): today's `last` is appended/replaces a
+# same-dated bar onto the published close_history and re-rated, so the Holdings rating
+# refreshes every intraday tick rather than waiting for the next EOD run. Single
+# key UNDER INTRADAY_PREFIX: it is written by the same session-gated run, so it shares that
+# prefix's dashboard-role PutObject grant and its ARTIFACT_REGISTRY session-gated exemption.
+# (A separate prefix needed a new grant on a role at its 10,240-byte inline-policy ceiling.)
+TECHNICAL_RATINGS_KEY = f"{INTRADAY_PREFIX}technical_ratings.json"
+TECHNICAL_RATINGS_SCHEMA_VERSION = 1
 CLOSES_SCHEMA_VERSION = 1
 FX_SCHEMA_VERSION = 1
 CLOSE_HISTORY_SCHEMA_VERSION = 1
@@ -190,7 +200,7 @@ EARNINGS_SCHEMA_VERSION = 1
 MACRO_SCHEMA_VERSION = 2  # v2: added next_release (per series) + release_events (metron-ops#49)
 FUNDAMENTALS_SCHEMA_VERSION = 5  # v5: + bookValue/revenuePerShare/enterpriseValue (metron-ops#178)
 INTRADAY_SCHEMA_VERSION = 3  # v3: additive `fund_proxies` map (mutual-fund tracking-proxy ETF quotes)
-TECHNICALS_SCHEMA_VERSION = 2  # v2: + pct_from_52wk_high (tearsheet parity with Holdings)
+TECHNICALS_SCHEMA_VERSION = 3  # v3: additive `rating` object (metron-ops#293, close-only Strong Sell..Strong Buy)
 SECURITY_PERFORMANCE_SCHEMA_VERSION = 1
 SECURITY_PERFORMANCE_PREFIX = "market_data/security_performance/"
 VALUATION_MEDIANS_SCHEMA_VERSION = 1
@@ -1457,7 +1467,7 @@ def _compute_technicals(closes: list[list]) -> dict | None:
     gated on having enough history — a 120-day series gets RSI/50d-MA but null 200d-MA."""
     import pandas as pd
 
-    from features.feature_engineer import _compute_macd, _compute_rsi
+    from features.feature_engineer import _compute_macd, _compute_rsi, compute_technical_rating
 
     vals = [c for c in closes if isinstance(c, (list, tuple)) and len(c) == 2 and c[1] is not None]
     if len(vals) < _TECH_MIN_OBS:
@@ -1505,7 +1515,15 @@ def _compute_technicals(closes: list[list]) -> dict | None:
         "mom_60d": _round(last / float(s.iloc[-61]) - 1.0) if len(s) >= 61 else None,
     }
     # All-null → no usable indicator; treat as a coverage gap (no fabricated row).
-    return out if any(v is not None for v in out.values()) else None
+    if not any(v is not None for v in out.values()):
+        return None
+    # metron-ops#293: the close-only Strong Sell..Strong Buy summary rating, computed on
+    # the SAME series (no re-read). Omitted (never a fabricated `None`-filled dict) when
+    # the series can't produce a single vote.
+    rating = compute_technical_rating(s)
+    if rating is not None:
+        out["rating"] = rating
+    return out
 
 
 def collect_technicals(
@@ -1519,7 +1537,12 @@ def collect_technicals(
         market_data/technicals/latest.json
             {schema_version, as_of, technicals: {yf_symbol: {rsi_14, macd_hist, ma_50,
              ma_200, pct_to_ma_50, pct_to_ma_200, high_52w, low_52w, pct_in_52w_range,
-             mom_20d, mom_60d}}}
+             mom_20d, mom_60d, rating: {score, label, ma_score, osc_score, n_buy,
+             n_neutral, n_sell, n_votes}}}}
+
+    ``rating`` (v3, additive, metron-ops#293) is the close-only TradingView-
+    Technical-Ratings summary from ``features.feature_engineer.compute_technical_rating``
+    — omitted per-symbol (never fabricated) when no vote is computable.
 
     Daily cadence (close_history refreshes daily). Universe = SP1500 ∪ Metron held/watchlist.
     Fail-soft per symbol; a symbol with no close_history / too short a series is omitted."""
@@ -2136,6 +2159,66 @@ def _flag_scale_incoherent_quotes(quotes: dict[str, dict], eod_closes: dict[str,
     return n_suspect
 
 
+def _with_provisional_bar(closes: list, session_date: str, last: float) -> list:
+    """Ascending ``[[date_iso, close], …]`` (as published under
+    ``CLOSE_HISTORY_PREFIX``) with today's intraday ``last`` appended as a provisional
+    bar for ``session_date`` — REPLACING an existing bar already dated ``session_date``
+    (the EOD collector racing this run and writing today's settled close first) rather
+    than duplicating it. Never mutates the input. A ``session_date`` behind the
+    published history's last bar is stale/out-of-order input — dropped rather than
+    inserted, since ``compute_technical_rating`` assumes strictly ascending order."""
+    out = [list(c) for c in closes if isinstance(c, (list, tuple)) and len(c) == 2]
+    if not out:
+        return [[session_date, last]]
+    if out[-1][0] == session_date:
+        out[-1] = [session_date, last]
+    elif out[-1][0] < session_date:
+        out.append([session_date, last])
+    # else: session_date is behind the last published bar — drop (stale input).
+    return out
+
+
+def _compute_intraday_ratings(
+    s3_client: Any, bucket: str, quotes: dict[str, dict],
+) -> dict[str, dict]:
+    """Per-held-symbol technical rating from ``close_history`` (already published daily
+    by this module) plus the JUST-FETCHED intraday quote as a provisional same-dated bar
+    (metron-ops#293) — no new vendor fetch. Only symbols with a usable quote (``last`` +
+    ``session_date`` present) are attempted; a symbol with no/too-short close_history
+    yields no rating (omitted, never fabricated) — mirrors ``collect_technicals``'s
+    per-symbol fail-soft."""
+    import pandas as pd
+
+    from features.feature_engineer import compute_technical_rating
+
+    ratings: dict[str, dict] = {}
+    for yf_sym, q in sorted(quotes.items()):
+        last = q.get("last")
+        session_date = q.get("session_date")
+        if last is None or not session_date:
+            continue
+        hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
+        if not hist or not hist.get("closes"):
+            continue
+        try:
+            augmented = _with_provisional_bar(hist["closes"], session_date, float(last))
+            closes = pd.Series(
+                [float(c[1]) for c in augmented if c[1] is not None], dtype="float64"
+            )
+            rating = compute_technical_rating(closes)
+        except Exception as e:  # one bad series must not sink the whole artifact
+            logger.warning("[metron_market_data] intraday rating failed for %s: %s", yf_sym, e)
+            continue
+        if rating is None:
+            continue
+        rating = dict(rating)
+        rating["price"] = float(last)
+        rating["bar_date"] = session_date
+        rating["basis"] = "intraday"
+        ratings[yf_sym] = rating
+    return ratings
+
+
 def collect_intraday(
     *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
     intraday_source: IntradaySource | None = None, force: bool = False,
@@ -2150,6 +2233,20 @@ def collect_intraday(
              quotes:       {yf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
              indices:      {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}},
              fund_proxies: {etf_symbol: {last, open, prev_close, session_date, prev_session_date, currency}}}
+
+        market_data/intraday/technical_ratings.json (metron-ops#293)
+            {schema_version, as_of_utc, quote_as_of_utc, source: "computed_intraday",
+             ratings: {yf_symbol: {score, label, ma_score, osc_score, n_buy, n_neutral,
+             n_sell, n_votes, price, bar_date, basis: "intraday"}}}
+
+    ``ratings`` is derived from the held-universe ``quotes`` this same call just fetched
+    (never a new vendor call): each symbol's published ``close_history`` gets today's
+    ``last`` appended/replacing a same-dated bar, then re-rated via
+    ``features.feature_engineer.compute_technical_rating`` (see
+    ``_compute_intraday_ratings``). Only symbols with a usable quote are emitted; a
+    symbol with no/insufficient close_history is omitted, never fabricated. Written
+    ALONGSIDE ``market_data/intraday/latest.json`` in the same call — both are refreshed
+    on the same cadence and share the same ``as_of_utc``.
 
     ``last`` is ~15-min delayed. Runs every 5 min via a systemd timer on the trading box
     (infrastructure/systemd/metron-intraday.timer), gated on the NYSE session window
@@ -2251,20 +2348,45 @@ def collect_intraday(
                 "quotes": len(quotes), "indices": len(indices),
                 "fund_proxies": len(fund_proxies)}
 
+    # Technical ratings (metron-ops#293) — derived from the `quotes` just fetched above,
+    # no new vendor call. Computed even when `quotes` is empty (yields `{}`) so the
+    # artifact always reflects this run rather than silently reusing a stale one.
+    ratings = _compute_intraday_ratings(s3_client, bucket, quotes)
+    as_of_utc = (now or datetime.now(timezone.utc)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    ratings_artifact = {
+        "schema_version": TECHNICAL_RATINGS_SCHEMA_VERSION,
+        "as_of_utc": as_of_utc,
+        # Same fetch, so the quote timestamp and the rating-run timestamp coincide.
+        "quote_as_of_utc": as_of_utc,
+        "source": "computed_intraday",
+        "ratings": dict(sorted(ratings.items())),
+    }
+
     if dry_run:
-        logger.info("[metron_market_data] DRY-RUN intraday: %d quotes, %d indices, %d fund-proxies (not written)",
-                    len(quotes), len(indices), len(fund_proxies))
+        logger.info(
+            "[metron_market_data] DRY-RUN intraday: %d quotes, %d indices, %d fund-proxies, "
+            "%d ratings (not written)",
+            len(quotes), len(indices), len(fund_proxies), len(ratings),
+        )
         return {"status": "ok_dry_run", "quotes": len(quotes), "indices": len(indices),
-                "fund_proxies": len(fund_proxies)}
+                "fund_proxies": len(fund_proxies), "ratings": len(ratings)}
     try:
         _write_json(s3_client, bucket, f"{INTRADAY_PREFIX}latest.json", artifact)
     except Exception as e:  # fail loud — the timer unit's journal + freshness scan record it
         logger.error("[metron_market_data] intraday write failed: %s", e)
         return {"status": "error", "error": str(e)}
-    logger.info("[metron_market_data] wrote %d intraday quotes + %d indices + %d fund-proxies",
-                len(quotes), len(indices), len(fund_proxies))
+    try:
+        _write_json(s3_client, bucket, TECHNICAL_RATINGS_KEY, ratings_artifact)
+    except Exception as e:  # fail loud — quotes already wrote; ratings failing must not be silent
+        logger.error("[metron_market_data] technical_ratings write failed: %s", e)
+        return {"status": "error", "error": str(e), "quotes": len(quotes),
+                "indices": len(indices), "fund_proxies": len(fund_proxies)}
+    logger.info(
+        "[metron_market_data] wrote %d intraday quotes + %d indices + %d fund-proxies + %d ratings",
+        len(quotes), len(indices), len(fund_proxies), len(ratings),
+    )
     return {"status": "ok", "universe": len(holdings), "quotes": len(quotes),
-            "indices": len(indices), "fund_proxies": len(fund_proxies)}
+            "indices": len(indices), "fund_proxies": len(fund_proxies), "ratings": len(ratings)}
 
 
 def main(argv: list[str] | None = None) -> int:
