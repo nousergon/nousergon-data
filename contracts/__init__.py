@@ -95,3 +95,10 @@ def validate_rating_performance(data: dict) -> list[str]:
     (metron-ops#297 part 2 — new artifact, shared contract with the metron consumer,
     metron-ops#298)."""
     return _validate(data, "rating_performance")
+
+
+def validate_arctic_probe(data: dict) -> list[str]:
+    """Validate data_collection/probes/arctic/{trading_day}.json against contract
+    schema (data-collector plan P-05, alpha-engine-config-I10748 — the ArcticDB
+    in-region probe `collectors/arctic_probe.py` writes)."""
+    return _validate(data, "arctic_probe")

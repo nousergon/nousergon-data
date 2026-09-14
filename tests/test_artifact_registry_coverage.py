@@ -304,6 +304,17 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # registering a daily artifact before anything schedules it would page
     # on absence.
     "collectors/edgar_pit_fundamentals.py": 1,
+    # data-collector plan P-05 / alpha-engine-config-I10748 — the in-region
+    # ArcticDB probe, one PUT site (`write_probe_record`) writing
+    # `data_collection/probes/arctic/{trading_day}.json`. This IS a
+    # freshness-relevant artifact (the data_gate red board's sole ArcticDB
+    # evidence source, plan §4.1) — registering it in
+    # ARTIFACT_REGISTRY.yaml is P-09's reconciliation pass, alongside the
+    # rest of the plan's new probe/ladder rows, once the schedule that
+    # writes it is actually enabled (mirrors the edgar-pit-fundamentals
+    # daily-cadence note above: registering before anything schedules the
+    # write would page on absence).
+    "collectors/arctic_probe.py": 1,
     "collectors/fred_history.py": 1,
     "collectors/fundamentals.py": 1,
     "collectors/historical_constituents.py": 1,  # market_data/historical_constituents.json — PIT S&P 500 membership (#657, G12)
