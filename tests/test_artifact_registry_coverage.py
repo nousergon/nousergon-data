@@ -280,6 +280,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     "collectors/crypto_balances.py": 1,
     "collectors/daily_closes.py": 1,
     "collectors/daily_closes_fred_repair.py": 1,
+    # alpha-engine-config-I10733 — EDGAR filing-date point-in-time fundamentals,
+    # one PUT per session written (fundamentals_pit/edgar/v1/runs/{date}/).
+    # The daily cadence only exists once edgar-pit-fundamentals-daily is
+    # scheduled, so its ARTIFACT_REGISTRY freshness row rides that change
+    # (alpha-engine-config-I10750); registering a daily artifact before
+    # anything schedules it would page on absence.
+    "collectors/edgar_pit_fundamentals.py": 1,
     "collectors/fred_history.py": 1,
     "collectors/fundamentals.py": 1,
     "collectors/historical_constituents.py": 1,  # market_data/historical_constituents.json — PIT S&P 500 membership (#657, G12)
