@@ -203,7 +203,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append"], "require_trading_day": true, "verify_keys": ["market_data/eod_closes/latest.json", "market_data/technicals/rating_performance.json"]}'
+        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_keys": ["market_data/eod_closes/latest.json", "market_data/technicals/rating_performance.json"]}'
 
   # Weekday pre-open ArcticDB enrich + append. Replaces ne-preopen-trading-
   # pipeline's LaunchMorningEnrichSpot + LaunchMorningArcticAppendSpot. 07:30 ET
@@ -224,7 +224,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append"], "require_trading_day": true, "verify_keys": []}'
+        Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_keys": []}'
 
   # Saturday weekly collection. Replaces ne-weekly-freshness-pipeline's
   # MorningEnrich -> DataPhase1 order. 05:00 ET = the v1 SF's 09:00 UTC start
