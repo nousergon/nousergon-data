@@ -191,6 +191,14 @@ _WORKLOADS: dict[str, str] = {
     "edgar-pit-fundamentals-daily": (
         "python -m collectors.edgar_pit_fundamentals incremental --lookback-sessions 15"
     ),
+    # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
+    # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
+    # workload of both the eod and morning schedule inputs
+    # (infrastructure/cloudformation/nousergon-data-collection.yaml) so the
+    # data_gate red board (nousergon-data architecture.d/146 §4.1) has fresh
+    # ArcticDB evidence without ever opening ArcticDB itself, which is
+    # unreachable from the laptop (alpha-engine-config-I9771).
+    "arctic-probe": "python -m collectors.arctic_probe",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
