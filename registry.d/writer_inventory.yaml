@@ -76,6 +76,15 @@ extra_paths:
 # themselves (audit §2). Each names the parent whose descriptor accounts for its
 # writes.
 shared_writers:
+  - path: collectors/arctic_probe.py
+    parent_units: [D18, D32]
+    reason: >-
+      The in-region ArcticDB probe record (plan P-05, alpha-engine-config-I10772):
+      the FINAL workload of the morning (D18) and EOD (D32) collection runs, writing
+      data_collection/probes/arctic/{trading_day}.json so the ladder can read
+      ArcticDB evidence without opening ArcticDB. It observes those runs' libraries
+      rather than producing a published dataset, so its write is attributed to them;
+      its own staleness is a ladder clause, not a unit.
   - path: store/arctic_store.py
     parent_units: [D13, D14, D18, D32, D35, D42, D43]
     reason: >-
