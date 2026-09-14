@@ -1,0 +1,132 @@
+name: Data-collection gate (read-only)
+
+# alpha-engine-config-I10748 deliverable P-04
+# (private-docs/data_collection_plan_260914.md §4.1 "The gate command", §8.3).
+#
+# WHAT THIS IS. Runs `python -m data_gate read --gate data-phase<N> --store
+# s3://alpha-engine-research/data_collection`, which conforms to
+# `schemas/phase_ladder.v1.json` and writes:
+#   - data_collection/gates/ladder.json          — current reading (rewritten
+#     every run; the console reads THIS key — see nous-ergon-ops
+#     data-collection-phase-ladder.yaml / data-collection-board.yaml)
+#   - data_collection/gates/data-phase<N>/{date}/gate.json — dated, never
+#     overwritten (the ladder's history).
+#
+# `data_gate` (the clause generator + reader) and the unit descriptors under
+# `registry.d/units/*.yaml` are sibling deliverables (I10748 P-01/P-02) —
+# this workflow is built alongside them and will fail on
+# `ModuleNotFoundError` until that module lands on `main`. That is expected
+# sequencing, not a defect in this file: this workflow is a consumer of a
+# contract another PR provides (see this PR's body for the merge order).
+#
+# THREE RULES CARRIED VERBATIM FROM THE PLAN (§4.1):
+#   1. A gate READS; it never runs. This workflow launches no collection —
+#      its role (`github-actions-data-gate-read`, nous-ergon-ops) holds no
+#      write capability outside `data_collection/gates/*` and no Step
+#      Functions/Scheduler/Lambda invoke authority at all.
+#   2. A clause is MET, UNMET or UNMEASURABLE, and UNMEASURABLE is never MET.
+#   3. The gate's job succeeds when the measurement succeeds — the process
+#      exits non-zero unless the phase's gate is met. A red run here is the
+#      board telling the truth, not this workflow breaking. See
+#      WORKFLOW_HEALTH_FINDING_STEPS below, which is exactly how this repo's
+#      other read-only drift/health checks (sf-arn-drift-check.yml,
+#      pause-check-alert.yml) declare the same shape.
+#
+# CADENCE. Daily 23:30 UTC — after the EOD spine's 18:15 ET / ~22:15-23:15
+# UTC deadline (plan §2 row 1) so the daily reading reflects a completed
+# cycle — plus Saturday 18:00 UTC for the weekly family's Sat 13:00 ET
+# deadline, on push to the clause/descriptor sources so a topology change is
+# re-read immediately, and on-demand.
+#
+# WHICH GATE. `data-phase0` today (phase 0 is what this repo is building
+# toward, per the plan's phase table). The gate name advances to
+# `data-phase1`/`2`/`3` as later PRs land phase content; this workflow's
+# `--gate` argument is a single source the phase-advance PR updates here,
+# not duplicated per trigger.
+
+on:
+  schedule:
+    - cron: '30 23 * * *'
+    - cron: '0 18 * * 6'
+  push:
+    branches: [main]
+    paths:
+      - 'data_gate/**'
+      - 'registry.d/**'
+      - '.github/workflows/data-gate.yml'
+  workflow_dispatch: {}
+
+concurrency:
+  group: data-gate-read-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+# WORKFLOW HEALTH SEMANTICS (alpha-engine-config-I9169, mirroring
+# sf-arn-drift-check.yml in this same repo). A non-zero exit at the declared
+# step is graded `reporting_findings` — the gate telling the truth about a
+# red board, not a broken control — because plan §4.1 rule 3 makes that exit
+# code the measurement's own verdict. A failure anywhere else (checkout, the
+# OIDC role missing, a dependency install) is graded exactly as before.
+env:
+  WORKFLOW_HEALTH_SEMANTICS: finding-surface
+  WORKFLOW_HEALTH_FINDING_STEPS: |
+    Read the data-collection gate
+  WORKFLOW_HEALTH_FINDING_ISSUE: alpha-engine-config-I10748
+  WORKFLOW_HEALTH_FINDING_REASON: >-
+    `data_gate read` exits non-zero unless every clause tagged for this
+    phase reads MET (plan §4.1 rule 3: "the gate's job succeeds when the
+    measurement succeeds"). At phase 0 every clause starts RED by design
+    (plan §4.1 "Red by default") until phase 0's own exit criteria are
+    satisfied, so this step is expected to fail for an extended period —
+    that is the board being honest, not the control being broken. The
+    ladder object it writes even on failure (data_collection/gates/
+    ladder.json) is what the console renders; a run that never executes at
+    all (OIDC failure, checkout failure) is the real break this declaration
+    does not cover.
+
+jobs:
+  read-gate:
+    name: data-gate-read
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::711398986525:role/github-actions-data-gate-read
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Read the data-collection gate
+        run: >-
+          python -m data_gate read --gate data-phase0
+          --store s3://alpha-engine-research/data_collection
+
+  # ── FAILURE ALERTING, NON-FINDING FAILURES ONLY ─────────────────────────
+  # A scheduled workflow that never ran at all (checkout, OIDC, dependency
+  # install) is a real break and is not covered by the finding-surface
+  # declaration above — same reasoning as fault-injection-weekly.yml in this
+  # repo. A `data_gate read` finding (the board being red) is deliberately
+  # NOT paged from here: it is not one of the three page conditions in plan
+  # §2 row 11, and it is what the console board (nous-ergon-ops
+  # data-collection-phase-ladder.yaml / data-collection-board.yaml) exists
+  # to show once enabled. Page condition 3 (ladder `as_of` stale > 26h) is a
+  # read against the board's own as_of, not against this job's exit code.
+  notify-main-failure:
+    needs: [read-gate]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
