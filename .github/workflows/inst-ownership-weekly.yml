@@ -64,6 +64,16 @@ name: Institutional ownership (13F) weekly
 # Mirrors nousergon-data-registry-sync's shape (one dedicated role per
 # producer, scoped to the exact keys it touches).
 #
+# NEEDS A SECOND ADDITIONAL GRANT NOT YET APPLIED (alpha-engine-config-I10733):
+# s3:GetObject on `data/inst_ownership/*/latest.parquet` for the historical
+# `report_periods` dispatch path's per-quarter head_object read-back below —
+# the existing role only has GetObject on the global latest.json sidecar,
+# which a historical run never writes or reads. HeadObject is authorized by
+# the s3:GetObject action (S3 has no separate IAM action for it). Not
+# applied by this PR — IAM changes are not self-widened here; the dispatch
+# path will fail loud with AccessDenied at the read-back step until this
+# grant lands, which is the correct failure mode (never a silent skip).
+#
 # REGISTRY ROW: landed FIRST as `lifecycle: pending` in nous-ergon-ops per
 # this repo's own AGENTS.md ("Land that row FIRST... It used to be true that
 # adding a scheduled workflow anywhere in the fleet reddened nous-ergon-ops
@@ -79,6 +89,18 @@ on:
     # (09:50) / sf-arn-drift-check.yml (09:30)'s daily crons.
     - cron: '40 12 * * 6'
   workflow_dispatch:
+    inputs:
+      report_periods:
+        description: >-
+          Comma-separated quarter-end date(s) YYYY-MM-DD (e.g.
+          2021-09-30,2021-12-31,...) to backfill historical 13F report
+          periods instead of the weekly current/prior window
+          (alpha-engine-config-I10733). Empty (default): normal weekly run.
+          Non-empty: runs `--report-period "<value>"`, writes each
+          quarter's `latest.parquet` only, and never touches the global
+          `latest.json` freshness sidecar.
+        required: false
+        default: ''
 
 concurrency:
   group: inst-ownership-weekly-main
@@ -92,7 +114,12 @@ jobs:
   build:
     name: Build + publish 13F institutional ownership
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    # 45min covers the normal weekly 2-window run. A historical
+    # `report_periods` backfill downloads/parses one SEC window per quarter
+    # (I10733 CLI shares an in-process window cache, but ~19 quarters still
+    # means many multi-hundred-MB downloads) — raised only on that dispatch
+    # path so the weekly schedule's timeout budget is unchanged.
+    timeout-minutes: ${{ github.event.inputs.report_periods != '' && 350 || 45 }}
 
     steps:
       - name: Checkout data repo
@@ -125,35 +152,79 @@ jobs:
           fi
 
       - name: Build + publish institutional ownership (universe resolved from Scanner pointer)
-        run: python -m data.derived.inst_ownership --from-membership
+        run: |
+          if [ -n "$REPORT_PERIODS" ]; then
+            python -m data.derived.inst_ownership --from-membership --report-period "$REPORT_PERIODS"
+          else
+            python -m data.derived.inst_ownership --from-membership
+          fi
+        env:
+          REPORT_PERIODS: ${{ github.event.inputs.report_periods }}
 
-      - name: Verify the write landed (read back latest.json sidecar)
+      - name: Verify the write landed
         run: |
           python3 - <<'PY'
           import json
+          import os
           import sys
+          from datetime import date
 
           import boto3
 
           s3 = boto3.client("s3")
           bucket = "alpha-engine-research"
-          key = "data/inst_ownership/latest.json"
-          try:
-              obj = s3.get_object(Bucket=bucket, Key=key)
-          except Exception as e:
-              print(f"::error::sidecar s3://{bucket}/{key} unreadable after a run that "
-                    f"reported success: {type(e).__name__}: {e}")
-              sys.exit(1)
-          sidecar = json.loads(obj["Body"].read())
-          written_at = sidecar.get("written_at")
-          row_count = sidecar.get("row_count")
-          print(f"sidecar written_at={written_at} row_count={row_count} "
-                f"artifact_key={sidecar.get('artifact_key')}")
-          if not written_at or not row_count:
-              print(f"::error::sidecar at s3://{bucket}/{key} is missing "
-                    f"written_at/row_count — the run did not actually publish")
-              sys.exit(1)
+          report_periods = os.environ.get("REPORT_PERIODS", "").strip()
+
+          if report_periods:
+              # Historical backfill dispatch (I10733): read back each
+              # written {quarter}/latest.parquet via head_object — the
+              # global latest.json sidecar is the WEEKLY run's freshness
+              # pointer and a backfill run never touches it, so reading it
+              # back here would prove nothing about this run.
+              def quarter_str(d: "date") -> str:
+                  return f"{d.year}Q{(d.month - 1) // 3 + 1}"
+
+              failed = []
+              for tok in report_periods.split(","):
+                  tok = tok.strip()
+                  if not tok:
+                      continue
+                  q = quarter_str(date.fromisoformat(tok))
+                  key = f"data/inst_ownership/{q}/latest.parquet"
+                  try:
+                      head = s3.head_object(Bucket=bucket, Key=key)
+                  except Exception as e:
+                      print(f"::error::s3://{bucket}/{key} unreadable after a "
+                            f"run that reported success: {type(e).__name__}: {e}")
+                      failed.append(q)
+                      continue
+                  print(f"{q}: s3://{bucket}/{key} "
+                        f"ContentLength={head.get('ContentLength')} "
+                        f"LastModified={head.get('LastModified')}")
+              if failed:
+                  print(f"::error::{len(failed)} backfilled quarter(s) missing "
+                        f"their artifact: {failed}")
+                  sys.exit(1)
+          else:
+              key = "data/inst_ownership/latest.json"
+              try:
+                  obj = s3.get_object(Bucket=bucket, Key=key)
+              except Exception as e:
+                  print(f"::error::sidecar s3://{bucket}/{key} unreadable after a run that "
+                        f"reported success: {type(e).__name__}: {e}")
+                  sys.exit(1)
+              sidecar = json.loads(obj["Body"].read())
+              written_at = sidecar.get("written_at")
+              row_count = sidecar.get("row_count")
+              print(f"sidecar written_at={written_at} row_count={row_count} "
+                    f"artifact_key={sidecar.get('artifact_key')}")
+              if not written_at or not row_count:
+                  print(f"::error::sidecar at s3://{bucket}/{key} is missing "
+                        f"written_at/row_count — the run did not actually publish")
+                  sys.exit(1)
           PY
+        env:
+          REPORT_PERIODS: ${{ github.event.inputs.report_periods }}
 
       - name: Append to system-wide deploy changelog
         if: always()

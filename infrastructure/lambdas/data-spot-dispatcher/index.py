@@ -128,7 +128,8 @@ CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot
 # The data-phase workloads this dispatcher can run. The five scheduled ones
 # map to the EXACT weekly_collector.py invocation the on-trading SF states ran
 # (unchanged args = unchanged M0 data contract: same paths/schemas); the sixth
-# is the on-demand declared-benchmark-proxy load (alpha-engine-config-I10704).
+# is the on-demand declared-benchmark-proxy load (alpha-engine-config-I10704);
+# the last two build the EDGAR point-in-time fundamentals (alpha-engine-config-I10733).
 # Any other value is rejected.
 _WORKLOADS: dict[str, str] = {
     # weekday pre-open (was step_function_daily.json MorningEnrich)
@@ -163,6 +164,18 @@ _WORKLOADS: dict[str, str] = {
     # remember (the alpha-engine-config-I1906 class). Re-running it is a
     # no-op: every write underneath is union/no-shrink.
     "benchmark-proxy-backfill": "python -m scripts.backfill_benchmark_proxies",
+    # alpha-engine-config-I10733: the filing-date-indexed EDGAR fundamentals
+    # dataset (`collectors/edgar_pit_fundamentals.py`). In-region because it
+    # reads ArcticDB `Close` for market cap. The backfill is on-demand and
+    # write-if-absent (re-running it writes only missing sessions); the daily
+    # workload materializes the trailing 15 sessions the same way. Neither is
+    # scheduled by this change.
+    "edgar-pit-fundamentals-backfill": (
+        "python -m collectors.edgar_pit_fundamentals backfill --start 2022-01-03"
+    ),
+    "edgar-pit-fundamentals-daily": (
+        "python -m collectors.edgar_pit_fundamentals incremental --lookback-sessions 15"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
