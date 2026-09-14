@@ -68,6 +68,21 @@ for role in nousergon-data-collection-sfn-role alpha-engine-eventbridge-sfn-role
     fi
 done
 
+echo "==> Preflight: stack is not stranded in ROLLBACK_COMPLETE"
+# A FIRST create that fails leaves an empty stack in ROLLBACK_COMPLETE, which
+# CloudFormation refuses to update; every later deploy would fail the same way
+# with a message that names neither the cause nor the fix (2026-09-14). This
+# role holds no cloudformation:DeleteStack on purpose, so name the fix and stop.
+STATUS="$(aws cloudformation describe-stacks --region "$REGION" --stack-name "$STACK_NAME" --query 'Stacks[0].StackStatus' --output text 2>/dev/null || echo ABSENT)"
+if [ "$STATUS" = "ROLLBACK_COMPLETE" ]; then
+    echo "ERROR: stack $STACK_NAME is ROLLBACK_COMPLETE (a failed first create; it holds no resources)." >&2
+    echo "  Read the cause: aws cloudformation describe-stack-events --stack-name $STACK_NAME" >&2
+    echo "  Fix the template, then from an admin identity:" >&2
+    echo "    aws cloudformation delete-stack --stack-name $STACK_NAME && aws cloudformation wait stack-delete-complete --stack-name $STACK_NAME" >&2
+    echo "  and re-run this workflow (workflow_dispatch). Nothing was applied." >&2
+    exit 1
+fi
+
 echo "==> Stage definition s3://$BUCKET/$KEY"
 aws s3 cp "$DEFINITION" "s3://$BUCKET/$KEY" --region "$REGION" --only-show-errors
 
