@@ -32,6 +32,8 @@ import arcticdb as adb
 import pandas as pd
 from nousergon_lib.arcticdb import arctic_uri, open_macro_lib, open_universe_lib
 
+from shadow.root import shadow_arctic_library
+
 log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
@@ -101,6 +103,39 @@ def _get_arctic(bucket: str | None = None) -> adb.Arctic:
     return _arctic_instance
 
 
+def _open_library(
+    name: str, bucket: str | None = None, *, create_if_missing: bool = True
+) -> adb.library.Library:
+    """The ONE place this repository opens an ArcticDB library.
+
+    It exists for the shadow-run redirect (`alpha-engine-config-I10778`, plan
+    `data_collection_plan_260914.md` §6.2 step 4). ArcticDB carries its own C++
+    S3 client, so the boto3-level interceptor that confines a shadow run's S3
+    writes to ``staging/shadow/{trading_day}/`` is **blind** to every ArcticDB
+    append. The redirect for this surface is therefore the library NAME:
+    ``shadow_arctic_library`` turns ``universe`` into
+    ``shadow_20260912_universe`` while a shadow root is active, and is the
+    identity function otherwise — so the production path is byte-for-byte what
+    it was before.
+
+    Routing every open through here is what makes that total rather than
+    careful: ``tests/test_shadow_parity.py::
+    test_arctic_store_routes_every_library_open_through_the_shadow_helper``
+    fails on any ``get_library`` / ``open_*_lib`` call in this module outside
+    this function, so a library opened directly tomorrow cannot quietly write
+    the live universe during a shadow run.
+    """
+    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
+    shadowed = shadow_arctic_library(name)
+    if shadowed != name:
+        return _get_arctic(bucket).get_library(shadowed, create_if_missing=True)
+    if name == "universe":
+        return open_universe_lib(bucket, create_if_missing=create_if_missing)
+    if name == "macro":
+        return open_macro_lib(bucket, create_if_missing=create_if_missing)
+    return _get_arctic(bucket).get_library(name, create_if_missing=create_if_missing)
+
+
 def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
     """Get the universe library (per-ticker OHLCV + features).
 
@@ -109,8 +144,7 @@ def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
     error shape, config#804). This is a PRODUCER site, so ``create_if_missing``
     stays ``True`` to preserve cold-start bootstrap on a fresh bucket.
     """
-    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
-    return open_universe_lib(bucket, create_if_missing=True)
+    return _open_library("universe", bucket)
 
 
 def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
@@ -120,8 +154,7 @@ def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     chokepoint, config#804); ``create_if_missing=True`` preserves the
     producer cold-start bootstrap.
     """
-    bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
-    return open_macro_lib(bucket, create_if_missing=True)
+    return _open_library("macro", bucket)
 
 
 #: Dedicated library holding the ``universe`` data-plane schema-version stamp
@@ -142,8 +175,7 @@ def get_schema_meta_lib(bucket: str | None = None) -> adb.library.Library:
     mockable open-seam producers use, mirroring ``get_universe_lib`` /
     ``get_macro_lib``.
     """
-    arctic = _get_arctic(bucket)
-    return arctic.get_library(SCHEMA_META_LIB, create_if_missing=True)
+    return _open_library(SCHEMA_META_LIB, bucket)
 
 
 def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.library.Library:
@@ -167,8 +199,7 @@ def get_scratch_universe_lib(name: str, bucket: str | None = None) -> adb.librar
             f"must use a distinct name (e.g. 'universe_crsp'). Live names: "
             f"{sorted(_LIVE_LIB_NAMES)}"
         )
-    arctic = _get_arctic(bucket)
-    return arctic.get_library(name, create_if_missing=True)
+    return _open_library(name, bucket)
 
 
 def get_delisted_history_lib(bucket: str | None = None) -> adb.library.Library:
@@ -229,8 +260,7 @@ def get_delisted_history_lib(bucket: str | None = None) -> adb.library.Library:
     ``_get_arctic`` connection singleton + canonical ``arctic_uri`` so the
     S3 endpoint/path_prefix conventions match every other library exactly.
     """
-    arctic = _get_arctic(bucket)
-    return arctic.get_library(DELISTED_HISTORY_LIB, create_if_missing=True)
+    return _open_library(DELISTED_HISTORY_LIB, bucket)
 
 
 def reset_connection():

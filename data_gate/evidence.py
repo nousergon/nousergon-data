@@ -33,8 +33,10 @@ from data_gate.descriptors import REPO_ROOT, Unit
 
 __all__ = [
     "BASE_REQUIREMENTS",
+    "PARITY_KEY_TEMPLATE",
     "GateStore",
     "Reading",
+    "parity_store_key",
     "read_base",
     "read_guard_commissioning",
     "read_ladder_freshness",
@@ -51,11 +53,6 @@ __all__ = [
 #: write, the same "honest phase-0 stub" shape as `_pending` above, so the
 #: gap is an address rather than a shrug (`alpha-engine-config-I10777`).
 STACK_CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
-
-#: Pre-cutover parity per published key (plan §6.2 step 4), produced by P-11
-#: (`alpha-engine-config-I10778`), not built yet.
-def _parity_key(trading_day: dt.date) -> str:
-    return f"staging/shadow/{trading_day.isoformat()}/parity.json"
 
 
 @dataclass(frozen=True)
@@ -502,18 +499,110 @@ def read_roles_bootstrapped(store: GateStore, role_names: tuple[str, ...]) -> Re
     )
 
 
+#: The pre-cutover shadow parity report (plan §6.2 step 4,
+#: `alpha-engine-config-I10778`), relative to the `data_collection` store root
+#: — i.e. `s3://alpha-engine-research/data_collection/parity/{trading_day}.json`.
+#:
+#: DEFINED HERE, on the consumer side, and imported by `shadow.parity` rather
+#: than re-spelled there: the gate declares where it reads, and the producer
+#: writes to that address by construction. Two files agreeing on a key string
+#: is a coincidence that survives exactly until one of them is edited.
+PARITY_KEY_TEMPLATE = "parity/{trading_day}.json"
+
+
+def parity_store_key(trading_day: dt.date) -> str:
+    return PARITY_KEY_TEMPLATE.format(trading_day=trading_day.isoformat())
+
+
 def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     """Pre-cutover parity per published key (plan §6.2 step 4).
 
-    Produced by P-11 (`alpha-engine-config-I10778`), which does not exist
-    yet — a phase-0 stub naming the key it will read, `_pending`'s shape but
-    kept as its own function because the key is trading-day-scoped rather
-    than unit-scoped.
+    Produced by `python -m shadow parity` (`alpha-engine-config-I10778`): one
+    standalone shadow run writes every key under
+    `staging/shadow/{trading_day}/`, each key is diffed against the same
+    trading day's v1 output on row count, symbol set, schema and value
+    tolerance, and the verdicts are published here.
+
+    **Absence is UNMET, not UNMEASURABLE.** `read_objective`'s rule applies:
+    we CAN look, the store answers, and "no shadow run has been compared for
+    this day" is a finding about cutover readiness — which is the whole
+    question this clause exists to answer — rather than a failure of the read.
+
+    The report's own `met` is not taken on trust: this reader re-derives the
+    exception counts from `summary`, so a report claiming `met: true` while
+    carrying unmeasurable rows reads UNMET and says which counts contradict it.
     """
-    key = _parity_key(trading_day)
-    return _pending(
-        key,
-        "pre-cutover parity is produced by P-11 (alpha-engine-config-I10778), not built "
-        "yet.",
-        source="data_gate.evidence (phase-0 stub; blocked on alpha-engine-config-I10778)",
+    key = parity_store_key(trading_day)
+    read = read_store_document(store, key)
+    if read.problem is not None:
+        return Reading(
+            met=False,
+            detail=f"could not read {key}: {read.problem}",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if read.absent:
+        return Reading(
+            met=False,
+            detail=(
+                f"no parity report at {key}. Produce one with `python -m shadow run "
+                "--trading-day <day> --module <entrypoint>` followed by `python -m shadow "
+                "parity --trading-day <day> --store <uri>` (alpha-engine-config-I10778). "
+                "Until then the cutover has no parity evidence, which is the answer, not a "
+                "gap in the read."
+            ),
+            evidence=(key,),
+            source="data_collection store",
+        )
+    document = read.document or {}
+    as_of = str(document.get("generated_at") or "")
+    version = str(document.get("schema_version") or "")
+    if version != "data_parity_report.v1":
+        return Reading(
+            met=False,
+            detail=(
+                f"{key} carries schema_version {version!r}, not 'data_parity_report.v1'. A "
+                "document nobody defined a rendering for is a finding, not a reading."
+            ),
+            evidence=(key,),
+            source="data_collection store",
+            as_of=as_of,
+        )
+    reported_day = str(document.get("trading_day") or "")
+    if reported_day != trading_day.isoformat():
+        return Reading(
+            met=False,
+            detail=(
+                f"{key} reports trading_day {reported_day!r} while this reading is for "
+                f"{trading_day.isoformat()}. A report filed under the wrong day is not "
+                "evidence for either."
+            ),
+            evidence=(key,),
+            source="data_collection store",
+            as_of=as_of,
+        )
+    summary = document.get("summary") or {}
+    total = int(summary.get("total") or 0)
+    matched = int(summary.get("match") or 0)
+    exceptions = {
+        name: int(count)
+        for name, count in summary.items()
+        if name not in {"total", "match"} and int(count or 0)
+    }
+    met = bool(document.get("met")) and total > 0 and matched == total and not exceptions
+    detail = f"{matched}/{total} published keys match"
+    if exceptions:
+        detail += "; " + ", ".join(f"{name}={count}" for name, count in sorted(exceptions.items()))
+    if document.get("met") and not met:
+        detail += (
+            " — the report claims met:true while carrying the exceptions above, so it is "
+            "read UNMET"
+        )
+    return Reading(
+        met=met,
+        detail=detail,
+        evidence=(key,),
+        source="data_collection store",
+        as_of=as_of,
     )
