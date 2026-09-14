@@ -260,6 +260,11 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
     }
 
     compared = 0
+    # Counted and collected separately: the EXAMPLES are capped so the report
+    # stays a readable size, but the COUNT is not. A capped count would report
+    # "50 breaches" over a key where every row drifted, and a parity number that
+    # saturates is a parity number nobody can act on.
+    breach_count = 0
     breaches: list[dict[str, Any]] = []
     if indexed_shadow is None:
         # The shadow side has no identifier column at all; the schema block
@@ -278,11 +283,16 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
         if isinstance(live_row, pd.DataFrame) or isinstance(shadow_row, pd.DataFrame):
             # A duplicated row key. Not comparable cell-by-cell, and a silent
             # `.iloc[0]` would compare arbitrary rows — record it as a breach.
-            breaches.append({"row": str(row_key), "column": None, "reason": "duplicate row key"})
+            breach_count += 1
+            if len(breaches) < 50:
+                breaches.append(
+                    {"row": str(row_key), "column": None, "reason": "duplicate row key"}
+                )
             continue
         for col in shared_columns:
             compared += 1
             if not _numeric_close(live_row[col], shadow_row[col], rel, absolute):
+                breach_count += 1
                 if len(breaches) < 50:
                     breaches.append(
                         {
@@ -294,7 +304,7 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
                     )
     out["values"] = {
         "compared_cells": compared,
-        "breaches": len(breaches),
+        "breaches": breach_count,
         "examples": breaches[:10],
     }
     return out
