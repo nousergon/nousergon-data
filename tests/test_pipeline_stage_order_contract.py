@@ -50,7 +50,12 @@ from pathlib import Path
 
 import pytest
 
-from nousergon_lib.pipeline_status.registry import PIPELINE_STAGE_ORDER
+from nousergon_lib.pipeline_status import registry
+from nousergon_lib.pipeline_status.registry import (
+    PIPELINE_STAGE_ORDER,
+    stale_pending_stages,
+    undefined_spine_stages,
+)
 
 REPO = Path(__file__).resolve().parents[1]
 
@@ -103,7 +108,10 @@ def test_every_pipeline_in_the_spine_has_a_definition_here():
 @pytest.mark.parametrize("pipeline", sorted(PIPELINE_STAGE_ORDER))
 def test_every_spine_stage_exists_in_the_live_definition(pipeline):
     names = _names_for(pipeline)
-    missing = [s for s in PIPELINE_STAGE_ORDER[pipeline] if s not in names]
+    # A stage the library marks PENDING_DEFINITION_STAGES is declared ahead of
+    # this repo's definition and is not reported here (alpha-engine-config-I10762);
+    # the stale-marker test below is what keeps that tolerance honest.
+    missing = list(undefined_spine_stages(pipeline, names))
     assert not missing, (
         f"{pipeline}: nousergon-lib's PIPELINE_STAGE_ORDER names {missing}, "
         f"which {DEFINITIONS[pipeline]} does not contain at any depth. Either "
@@ -112,6 +120,75 @@ def test_every_spine_stage_exists_in_the_live_definition(pipeline):
         f"the benign 'that stage did not run' (the I6857 defect) — or the "
         f"library declares a stage this pipeline never had."
     )
+
+
+@pytest.mark.parametrize("pipeline", sorted(PIPELINE_STAGE_ORDER))
+def test_no_spine_stage_is_still_marked_pending_once_this_repo_defines_it(pipeline):
+    """This repo OWNS the definitions, so it alone is strict about a stale marker.
+
+    ``PENDING_DEFINITION_STAGES`` lets a consumer tolerate a spine stage whose
+    state has not landed here yet — in either merge order — instead of two PRs
+    each waiting on the other's ``main`` (alpha-engine-config-I10762). The PR
+    that ADDS the state is the change that makes the marker stale, so it is the
+    PR that must take a library release without the marker. Consumers reading
+    this repo's ``main`` must NOT fail on this, or the deadlock returns.
+    """
+    stale = stale_pending_stages(pipeline, _names_for(pipeline))
+    assert not stale, (
+        f"{pipeline}: {list(stale)} exist in {DEFINITIONS[pipeline]} but the "
+        f"pinned nousergon-lib still marks them PENDING_DEFINITION_STAGES. Remove "
+        f"the marker in nousergon-lib and bump the pin in this PR — a marker that "
+        f"outlives its definition hides a future rename of that stage."
+    )
+
+
+# ── Both merge orders (alpha-engine-config-I10762) ───────────────────────────
+# Mutation tests: each simulates the mirror PR's view by patching the library
+# registry, and asserts the verdict this repo's guard must return for it.
+
+_EOD = "ne-postclose-trading-pipeline"
+_NEW = "LaunchSomeNewDailySpot"
+
+
+#: A synthetic definition built from the spine as imported, so these tests
+#: grade the merge-order LOGIC and never the live state of the definitions.
+_BASE_DEFINITION = frozenset(PIPELINE_STAGE_ORDER[_EOD]) | {"MarketHoursBlocked"}
+
+
+def _declare(monkeypatch, *, pending: bool) -> None:
+    order = dict(registry.PIPELINE_STAGE_ORDER)
+    order[_EOD] = (*order[_EOD], _NEW)
+    monkeypatch.setattr(registry, "PIPELINE_STAGE_ORDER", order)
+    marks = {k: dict(v) for k, v in registry.PENDING_DEFINITION_STAGES.items()}
+    if pending:
+        marks[_EOD][_NEW] = "alpha-engine-config-I10762 (test fixture)"
+    monkeypatch.setattr(registry, "PENDING_DEFINITION_STAGES", marks)
+
+
+def test_library_first_with_a_pending_marker_is_not_red_here(monkeypatch):
+    _declare(monkeypatch, pending=True)
+    names = set(_BASE_DEFINITION)
+    assert undefined_spine_stages(_EOD, names) == ()
+    assert stale_pending_stages(_EOD, names) == ()
+
+
+def test_library_first_without_a_marker_is_red_here(monkeypatch):
+    _declare(monkeypatch, pending=False)
+    assert undefined_spine_stages(_EOD, set(_BASE_DEFINITION)) == (_NEW,)
+
+
+def test_definition_landing_with_the_marker_still_set_is_red_here(monkeypatch):
+    _declare(monkeypatch, pending=True)
+    names = set(_BASE_DEFINITION) | {_NEW}
+    assert undefined_spine_stages(_EOD, names) == ()
+    assert stale_pending_stages(_EOD, names) == (_NEW,)
+
+
+def test_definition_landing_with_the_marker_cleared_is_green_here(monkeypatch):
+    _declare(monkeypatch, pending=False)
+    names = set(_BASE_DEFINITION) | {_NEW}
+    assert undefined_spine_stages(_EOD, names) == ()
+    assert stale_pending_stages(_EOD, names) == ()
 
 
 @pytest.mark.parametrize("pipeline", sorted(PIPELINE_STAGE_ORDER))
