@@ -139,7 +139,8 @@ def _open_library(
 def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
     """Get the universe library (per-ticker OHLCV + features).
 
-    Delegates to ``nousergon_lib.arcticdb.open_universe_lib`` — the shared
+    Routed through ``_open_library``, which applies the shadow-run redirect and
+    then delegates to ``nousergon_lib.arcticdb.open_universe_lib`` — the shared
     library-open chokepoint (uniform URI + uniform RuntimeError-with-bucket
     error shape, config#804). This is a PRODUCER site, so ``create_if_missing``
     stays ``True`` to preserve cold-start bootstrap on a fresh bucket.
@@ -150,9 +151,10 @@ def get_universe_lib(bucket: str | None = None) -> adb.library.Library:
 def get_macro_lib(bucket: str | None = None) -> adb.library.Library:
     """Get the macro library (market-wide time series).
 
-    Delegates to ``nousergon_lib.arcticdb.open_macro_lib`` (shared open
-    chokepoint, config#804); ``create_if_missing=True`` preserves the
-    producer cold-start bootstrap.
+    Routed through ``_open_library`` (shadow redirect) and thence to
+    ``nousergon_lib.arcticdb.open_macro_lib`` (shared open chokepoint,
+    config#804); ``create_if_missing=True`` preserves the producer cold-start
+    bootstrap.
     """
     return _open_library("macro", bucket)
 
@@ -168,8 +170,8 @@ def get_schema_meta_lib(bucket: str | None = None) -> adb.library.Library:
     """Get the ``universe_schema_meta`` library that carries the universe data
     plane's schema-version stamp (alpha-engine-config-I3241).
 
-    Routed through the same ``_get_arctic`` connection singleton + canonical URI
-    as every other library. ``create_if_missing=True`` so a fresh bucket
+    Routed through ``_open_library`` — the same connection singleton, canonical
+    URI and shadow redirect as every other library. ``create_if_missing=True`` so a fresh bucket
     bootstraps cleanly (an unstamped/absent stamp is read as baseline v0 — see
     ``store.schema_version.assert_schema_version``). This is the single
     mockable open-seam producers use, mirroring ``get_universe_lib`` /
@@ -256,9 +258,10 @@ def get_delisted_history_lib(bucket: str | None = None) -> adb.library.Library:
 
     ``create_if_missing=True``: this is the sole PRODUCER site and must
     bootstrap the library on a fresh bucket (cold start), mirroring
-    ``get_universe_lib`` / ``get_macro_lib``. Routed through the shared
-    ``_get_arctic`` connection singleton + canonical ``arctic_uri`` so the
-    S3 endpoint/path_prefix conventions match every other library exactly.
+    ``get_universe_lib`` / ``get_macro_lib``. Routed through ``_open_library``
+    (shared ``_get_arctic`` singleton, canonical ``arctic_uri``, shadow
+    redirect) so the S3 endpoint/path_prefix conventions match every other
+    library exactly.
     """
     return _open_library(DELISTED_HISTORY_LIB, bucket)
 
