@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_sentiment.schema.json",
+  "title": "Metron news sentiment (market_data/sentiment/latest.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_sentiment (SENTIMENT_SCHEMA_VERSION), projected from data/news_aggregates_daily/. Consumer: Metron api/services/*.py (Holdings Sentiment/Consensus band, attractiveness score, metron-ops#105). Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "source", "sentiment"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "source": {"type": "string", "const": "news_aggregates_daily(LM)"},
+    "sentiment": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "sentiment": {"type": "number", "minimum": -1, "maximum": 1},
+          "sentiment_mean": {"type": "number", "minimum": -1, "maximum": 1},
+          "n_articles": {"type": "integer", "minimum": 0},
+          "event_count": {"type": "integer", "minimum": 0},
+          "event_severity_max": {"type": "number"},
+          "as_of": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}
