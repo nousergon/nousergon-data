@@ -1,0 +1,108 @@
+# Unit descriptor — data collector unit D15L (alpha-engine-data-collector Lambda (ad-hoc phase 2)).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D15L
+component_id: "data-collector-d15l-collector-lambda"
+owning_repo: "nousergon-data"
+title: "alpha-engine-data-collector Lambda (ad-hoc phase 2)"
+component: 1
+lifecycle: deprecated
+owner: brian
+code_path: lambda/handler.py
+trigger:
+  kind: manual
+  owner: aws lambda invoke
+  successor: "retired (plan §8.1, P-12)"
+  runs_on: lambda
+writes:
+  - same keys as D15
+  - health/data_phase2.json
+consumers: []
+consumers_reason: No scheduled caller. UNVERIFIED in the audit; retiring resolves it.
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows: []
+run_manifest_prefix: data_collection/runs/D15L
+detectors: []
+freshness:
+  na_code: "N/A-NOT-RUN"
+  note: "manual invoke only, and the unit is being retired"
+  status: not_applicable
+completeness:
+  denominator: null
+  floor: null
+  status: not_applicable
+  na_code: "N/A-NOT-RUN"
+  note: retiring; see lifecycle
+guards:
+  empty_fresh:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+  cardinality:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+  units:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+  pit:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+  vendor_fallback:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+  success_without_output:
+    state: not_applicable
+    na_code: "N/A-NOT-RUN"
+    note: "retiring (P-12); a guard on a function being deleted is maintenance with no reader"
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: BROKEN
+    consumers: UNVERIFIED
+    schema_contract: ABSENT
+    artifact_registry: ABSENT
+    observability_row: PRESENT
+    run_record: UNVERIFIED
+    detector: UNVERIFIED
+    console_entity: UNVERIFIED
+    survives_phase4: UNVERIFIED
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    Plan §8.1 EXCLUSION: RETIRE. Its identity is BROKEN — `alpha-engine-data-role` has no
+    market_data/* grant and its LIVE trust is lambda.amazonaws.com while the codified
+    trust-policy.json declares GitHub OIDC. P-12 deletes the function and reconciles the
+    drift. The row persists as RETIRED for its declared period rather than vanishing.

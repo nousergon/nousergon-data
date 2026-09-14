@@ -62,6 +62,13 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 # rag/pipelines/ ingest-side scripts are scope-exempt — they write
 # to RAG-corpus S3 not the freshness-monitored production bucket).
 EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
+    # alpha-engine-config-I10769 (data-collector plan P-02) — the `data` gate
+    # ladder store: gates/data-phase<N>/{date}/gate.json, gates/ladder.json and
+    # gates/board/latest.json under s3://alpha-engine-research/data_collection/,
+    # written only by the read-only gate identity. Registered as the
+    # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
+    # the `data_collection/gates/` grandfathered prefix (per-date readings).
+    "data_gate/store.py": 1,
     # alpha-engine-config-I5718 — the §10.2 fault-injection verdict surface,
     # s3://alpha-engine-research/groom/_control/fault-injection/{date}.json.
     # One PUT per programme run (weekly, plus on any change to the dispatch

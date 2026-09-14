@@ -1,0 +1,126 @@
+# Unit descriptor — data collector unit D20 (metron eod_closes + fx).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D20
+component_id: "data-collector-d20-metron-eod-closes-fx"
+owning_repo: "nousergon-data"
+title: metron eod_closes + fx
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "collectors/metron_market_data.py:973"
+trigger:
+  kind: "step-functions"
+  owner: "ne-postclose-trading-pipeline"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
+  schedule: "weekdays 16:45 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - "market_data/eod_closes/{date}.json"
+  - market_data/eod_closes/latest.json
+  - "market_data/fx/{date}.json"
+  - market_data/fx/latest.json
+consumers:
+  - "metron:portfolio_analytics/prices/spine_source.py"
+  - "metron:api/services/fx.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows:
+  - eod_closes
+  - fx
+run_manifest_prefix: data_collection/runs/D20
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: BROKEN
+    note: >-
+        freshness only; no cardinality detector (alpha-engine-config-I5935). Measured
+        2026-09-14: 80 closes against an 88-ticker universe, with a SUCCEEDED postclose.
+freshness:
+  family: "eod-spine"
+  deadline: "18:15 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: metron/holdings_universe.json
+  floor: 1.0
+  status: proposed
+  note: >-
+      floor 1.0 after the symbol-normalization map; the 12 uncovered tickers are 4 suffix
+      mismatches, 7 CUSIPs and one HK listing, and each must be a DECLARED exclusion or a
+      failure (plan §2 row 2)
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: "only a read of HOLDINGS_UNIVERSE_KEY; no floor (alpha-engine-config-I5935). P-13."
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: present_bounded
+    note: >-
+        yfinance gap-fill for stale or uncovered symbols only, count logged
+        (metron_market_data.py:672-676)
+  success_without_output:
+    state: broken
+    note: "`status: ok` with partial coverage (audit §4.2)"
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: PRESENT
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: BROKEN
+    console_entity: PRESENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    The canonical silent-degradation instance for this component: the EOD spine published
+    80 closes for an 88-ticker universe with a green SF.

@@ -1,0 +1,117 @@
+# Unit descriptor — data collector unit D30 (metron sentiment).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D30
+component_id: "data-collector-d30-metron-sentiment"
+owning_repo: "nousergon-data"
+title: metron sentiment
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "collectors/metron_market_data.py:1409"
+trigger:
+  kind: "step-functions"
+  owner: "ne-postclose-trading-pipeline"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
+  schedule: "weekdays 16:45 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - market_data/sentiment/latest.json
+consumers:
+  - "metron:api/services/sentiment.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows: []
+registry_rows_broken:
+  - "metron_sentiment — PARKED while written daily. P-09 unparks it."
+run_manifest_prefix: data_collection/runs/D30
+detectors: []
+freshness:
+  family: "eod-spine"
+  deadline: "18:15 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: metron/holdings_universe.json
+  floor: 0.8
+  status: proposed
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: BROKEN
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: ABSENT
+    console_entity: ABSENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: Same defect as D29.

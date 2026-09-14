@@ -1,0 +1,127 @@
+# Unit descriptor — data collector unit D39 (inst_ownership).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D39
+component_id: "data-collector-d39-inst-ownership"
+owning_repo: "nousergon-data"
+title: inst_ownership
+component: 1
+lifecycle: pending
+owner: brian
+code_path: "data/derived/inst_ownership.py:1305"
+trigger:
+  kind: "github-actions"
+  successor: unchanged by v2 phase 4
+  runs_on: "github-hosted"
+  detail: ".github/workflows/inst-ownership-weekly.yml, cron 40 12 * * 6"
+writes:
+  - "data/inst_ownership/{quarter}/{ticker}.parquet"
+  - data/inst_ownership/latest.json
+consumers:
+  - "crucible-research:thinktank/context.py"
+  - "crucible-research:agents/sector_teams/qual_tools.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows:
+  - thinktank_inst_ownership
+run_manifest_prefix: data_collection/runs/D39
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        artifact freshness only; the WORKFLOW outcome is invisible to the console by
+        ruling (alpha-engine-config-I6843), so the detector must read the run manifest,
+        not the GHA run
+freshness:
+  family: inst_ownership
+  deadline: "Sat 14:40 UTC"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: constituents
+  floor: 0.9
+  status: proposed
+  note: "latest.json measured at 201 B, which no current guard questions"
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: PRESENT
+    observability_row: BROKEN
+    run_record: ABSENT
+    detector: UNVERIFIED
+    console_entity: PRESENT
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    observability.d row still reads `pending` though nousergon-data-PR1689 MERGED. P-08
+    flips it. A lifecycle that lapsed is BROKEN, not absent.
