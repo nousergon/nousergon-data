@@ -163,6 +163,21 @@ _WORKLOADS: dict[str, str] = {
     # remember (the alpha-engine-config-I1906 class). Re-running it is a
     # no-op: every write underneath is union/no-shrink.
     "benchmark-proxy-backfill": "python -m scripts.backfill_benchmark_proxies",
+    # alpha-engine-config-I10739: the weekly phase-1 collection
+    # (`market_data/valuation_medians`, constituents, macro, fundamentals, the
+    # universe prune) as a dispatcher workload, so the standalone
+    # `nousergon-data-collection` stack can run it without the weekly SF's
+    # `DataPhase1` state (`infrastructure/spot_data_phase1.sh`), which Crucible
+    # v2 phase 4 disables. SAME two commands in the SAME order that script's run
+    # block executes (`weekly_collector.py --phase 1`, then
+    # `builders.prune_delisted_tickers --apply`), so the data contract is
+    # unchanged. The subshell makes the pair one pipeline element: the tail runs
+    # `{cmd} 2>&1 | tee` and reads PIPESTATUS[0], which without the parentheses
+    # would report the prune alone and let a failed phase 1 pass.
+    "weekly-phase-one": (
+        "( python weekly_collector.py --phase 1 "
+        "&& python -m builders.prune_delisted_tickers --apply )"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
@@ -179,6 +194,37 @@ def _resolve_workload(event: dict) -> tuple[str, str]:
             f"unknown data-spot workload {w!r} — expected one of {sorted(_WORKLOADS)}"
         )
     return w, _WORKLOADS[w]
+
+
+_MARKET_TZ = "America/New_York"
+
+
+def _trading_day_check(now=None) -> dict:
+    """Answer "is today an NYSE trading day?" for the data-collection SFs.
+
+    alpha-engine-config-I10739. A standalone EventBridge Scheduler cron cannot
+    express the NYSE calendar, and the v1 SFs got it from the predictor
+    Lambda's MarketHoursGate, which phase 4 retires. This dispatcher already
+    ships krepis, whose ``trading_calendar`` is stdlib-only, so the gate lives
+    beside the workloads it gates instead of in a new function.
+
+    The date is today in America/New_York, passed explicitly: ``is_trading_day()``
+    with no argument uses the process's local date, which is UTC in Lambda and
+    is already tomorrow for an evening ET run. Out-of-coverage dates RAISE
+    (krepis' own contract) and the SF's Catch pages — never a guessed answer.
+    """
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    from krepis.trading_calendar import is_trading_day
+
+    today = (now or datetime.now(ZoneInfo(_MARKET_TZ))).date()
+    return {
+        "trading_day": {
+            "date": today.isoformat(),
+            "is_trading_day": bool(is_trading_day(today)),
+        }
+    }
 
 
 def _bootstrap_spec() -> SpotBootstrapSpec:
@@ -459,6 +505,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     up before the error is torn down first so nothing orphans.
     """
     event = event or {}
+    if event.get("action") == "trading-day-check":
+        return _trading_day_check()
     workload, collector_cmd = _resolve_workload(event)
     force_on_demand = bool(event.get("force_on_demand", False))
 

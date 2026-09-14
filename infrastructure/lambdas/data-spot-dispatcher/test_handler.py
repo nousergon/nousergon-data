@@ -231,3 +231,67 @@ def test_the_pat_reaches_only_the_private_repo(monkeypatch):
     authed = [ln for ln in cmd.splitlines() if "x-access-token" in ln]
     assert len(authed) == 1, authed
     assert index.CONFIG_REPO in authed[0]
+
+
+# ── alpha-engine-config-I10739: the standalone data-collection stack ─────────
+
+
+def _install_calendar(monkeypatch, answer):
+    """krepis.trading_calendar is imported lazily by the handler; the krepis
+    stub above has no such submodule, so provide one that records its input."""
+    seen = []
+    mod = types.ModuleType("krepis.trading_calendar")
+
+    def is_trading_day(d):
+        seen.append(d)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    mod.is_trading_day = is_trading_day
+    monkeypatch.setitem(sys.modules, "krepis.trading_calendar", mod)
+    return seen
+
+
+def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(monkeypatch):
+    """Same two commands, same order as spot_data_phase1.sh; the subshell makes
+    PIPESTATUS[0] the pair's exit code, so a failed phase 1 cannot pass."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    workload, cmd = index._resolve_workload({"workload": "weekly-phase-one"})
+    assert workload == "weekly-phase-one"
+    assert cmd.startswith("( ") and cmd.endswith(" )")
+    phase1 = cmd.index("weekly_collector.py --phase 1")
+    prune = cmd.index("builders.prune_delisted_tickers --apply")
+    assert phase1 < prune
+    assert "&&" in cmd[phase1:prune]
+    rendered = index._bootstrap_command("weekly-phase-one", cmd, "tok")
+    assert f"{cmd} 2>&1 | tee -a" in rendered
+    assert "rc=${PIPESTATUS[0]}" in rendered
+
+
+def test_trading_day_check_launches_nothing_and_uses_the_new_york_date(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    def launch_impl(*a, **kw):
+        raise AssertionError("trading-day-check must never launch a box")
+
+    index, ssm, _ec2 = _load(monkeypatch, launch_impl=launch_impl)
+    seen = _install_calendar(monkeypatch, False)
+    # 2026-09-08 00:30 UTC is still Monday 2026-09-07 (Labor Day) in New York.
+    now = datetime(2026, 9, 8, 0, 30, tzinfo=ZoneInfo("UTC")).astimezone(
+        ZoneInfo("America/New_York")
+    )
+    result = index._trading_day_check(now=now)
+    assert result == {"trading_day": {"date": "2026-09-07", "is_trading_day": False}}
+    assert [d.isoformat() for d in seen] == ["2026-09-07"]
+    assert index.handler({"action": "trading-day-check"}, None)["trading_day"]["is_trading_day"] is False
+    assert ssm.sent == []
+
+
+def test_trading_day_check_propagates_calendar_errors(monkeypatch):
+    """An out-of-coverage calendar raises; the SF's Catch pages. Never a guess."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    _install_calendar(monkeypatch, RuntimeError("calendar expired"))
+    with pytest.raises(RuntimeError, match="calendar expired"):
+        index.handler({"action": "trading-day-check"}, None)
