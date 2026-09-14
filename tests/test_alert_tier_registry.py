@@ -157,6 +157,43 @@ def test_published_document_matches_the_consumer_contract():
         assert mod.SCHEMA_VERSION == krepis_tiers.SUPPORTED_SCHEMA_VERSION
 
 
+def test_muted_topics_block_is_published(publish_mod):
+    """alpha-engine-config-I10382 — the declared muted-sibling map.
+
+    krepis reads this key off the SAME published document as `entries`
+    rather than a hand-kept `<topic>-muted` name convention
+    (`alpha-engine-config-I10121` class). Assert the shape the consumer
+    parses: a dict of topic name -> muted sibling name or `None`.
+    """
+    doc = publish_mod.build_document()
+    assert "muted_topics" in doc
+    muted = doc["muted_topics"]
+    assert isinstance(muted, dict)
+    # The three topics measured 2026-09-09 to carry an unfiltered email
+    # subscription must all have a row — `None` is a legitimate value (no
+    # sibling yet), a MISSING key is not (indistinguishable from a registry
+    # that was never taught about the topic at all).
+    for topic in (
+        "alpha-engine-alerts", "crucible-v2-pages", "alpha-engine-alarm-backstop",
+    ):
+        assert topic in muted, f"muted_topics is missing a row for {topic!r}"
+    for topic, sibling in muted.items():
+        assert isinstance(topic, str) and topic
+        assert sibling is None or (isinstance(sibling, str) and sibling)
+        if sibling is not None:
+            assert sibling != topic, f"{topic!r} cannot be its own muted sibling"
+    # Serialisable exactly as published, same as the rest of the document.
+    json.loads(json.dumps(doc))
+
+
+def test_crucible_v2_pages_has_a_declared_muted_sibling(publish_mod):
+    """Closes-when clause of alpha-engine-config-I10382: a tracked-only
+    emission passing `sns_topic_arn` for `crucible-v2-pages` must resolve a
+    zero-subscriber sibling through this registry, not a name guess."""
+    doc = publish_mod.build_document()
+    assert doc["muted_topics"]["crucible-v2-pages"] == "crucible-v2-pages-muted"
+
+
 def test_heartbeat_republishes_on_a_clean_compare(publish_mod):
     """alpha-engine-config-I10710: a clean compare must WRITE, not just read.
 
