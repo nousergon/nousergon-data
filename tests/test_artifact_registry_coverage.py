@@ -285,6 +285,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # installed) per "never register a freshness entry ahead of its producer" — registering
     # now would report a false state=missing. Tracked in metron-ops#111.
     "collectors/crypto_balances.py": 1,
+    # alpha-engine-config-I10783 (data-collector plan P-16) —
+    # write_vendor_divergence_metric's one PUT site:
+    # data_collection/metrics/vendor_divergence/{trading_day}.json, written by
+    # collectors/daily_closes.py::collect() whenever the polygon_only
+    # (morning-enrich) run has both vendors' closes for the day in hand.
+    # Needs an ARTIFACT_REGISTRY.yaml grandfathered_paths entry for the
+    # data_collection/metrics/vendor_divergence/ prefix (per-date readings,
+    # same shape as the data_collection/gates/ prefix above) — companion
+    # config PR, filed by the parent session per I10783.
+    "collectors/cross_source_observer.py": 1,
     "collectors/daily_closes.py": 1,
     "collectors/daily_closes_fred_repair.py": 1,
     # alpha-engine-config-I10733 / -I10750 — EDGAR filing-date point-in-time

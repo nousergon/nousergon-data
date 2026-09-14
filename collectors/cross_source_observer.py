@@ -31,8 +31,12 @@ provenance/observability.
 
 from __future__ import annotations
 
+import json
 import logging
+from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Callable, Optional
+
+import boto3
 
 # ``sources.cross_source_gate`` is imported LAZILY (inside the functions that use
 # it), NOT at module top level. This module lives under ``collectors/`` which is
@@ -203,3 +207,147 @@ def annotate_records(
         "errors": errors,
     }
     return records, summary
+
+
+# ── Vendor-divergence MetricRecord (alpha-engine-config-I10783) ─────────────
+# Both close vendors are measured every trading day regardless of which one
+# wins the coalesced cell (champion-challenger-policy §3: measurement is
+# unconditional — see ``collectors.daily_closes.VENDOR_PRECEDENCE``, which
+# decides ONLY which value is persisted, never whether both are compared).
+# This is the plan's data-collector §2 row 5 deliverable: a daily divergence
+# metric between yfinance and polygon on the SAME settled close.
+
+VENDOR_DIVERGENCE_METRIC_PREFIX = "data_collection/metrics/vendor_divergence/"
+VENDOR_DIVERGENCE_BREACH_BPS = 50.0    # a single symbol's disagreement bound
+VENDOR_DIVERGENCE_BOUND = 0.01         # share of the universe allowed to breach
+
+
+def compute_vendor_divergence(
+    new_closes: dict,
+    prior_rows: dict,
+    run_date: str,
+    *,
+    new_vendor: str = "polygon",
+    prior_vendor: str = "yfinance",
+    breach_bps: float = VENDOR_DIVERGENCE_BREACH_BPS,
+    bound: float = VENDOR_DIVERGENCE_BOUND,
+) -> dict:
+    """Compute the daily yfinance-vs-polygon close divergence MetricRecord.
+
+    ``new_closes``: ``{ticker: close}`` for THIS run's freshly-fetched
+    ``new_vendor`` values (pre- or post-coalesce — the coalesced value is
+    identical to the fresh fetch for any cell this run actually captured,
+    since ``new_vendor`` is the higher-priority tier).
+    ``prior_rows``: ``{ticker: {"Close": ..., "source": ...}}`` — the prior
+    persisted parquet's rows, read before this run's write.
+
+    Compares only the cells where the prior row's source is ``prior_vendor``
+    and a fresh ``new_vendor`` close exists this run — the one moment both
+    vendors' values for the SAME settled date are in hand simultaneously.
+    (``cross_source_gate``'s bounded real-time cross-check covers the
+    general, tiny high-value set; this covers the whole universe using the
+    two closes the pipeline already fetches, at zero extra vendor cost.)
+
+    Never raises: an empty/absent comparison set is reported as
+    ``status: "unmeasurable"`` with a reason, per champion-challenger-policy
+    §7.2 — a MetricRecord asserting nothing happened is the defect this
+    guards against, not an acceptable silence.
+    """
+    breaching: list[dict] = []
+    n_compared = 0
+    for ticker, prior_row in prior_rows.items():
+        if prior_row.get("source") != prior_vendor:
+            continue
+        new_close = new_closes.get(ticker)
+        prior_close = prior_row.get("Close")
+        if new_close is None or prior_close is None:
+            continue
+        try:
+            new_close = float(new_close)
+            prior_close = float(prior_close)
+        except (TypeError, ValueError):
+            continue
+        if new_close != new_close or prior_close != prior_close:  # NaN
+            continue
+        if prior_close == 0:
+            continue
+        n_compared += 1
+        diff_bps = abs(new_close - prior_close) / abs(prior_close) * 10_000.0
+        if diff_bps > breach_bps:
+            breaching.append({
+                "ticker": ticker,
+                f"close_{prior_vendor}": prior_close,
+                f"close_{new_vendor}": new_close,
+                "diff_bps": round(diff_bps, 2),
+            })
+
+    generated_at = datetime.now(timezone.utc).isoformat()
+    if n_compared == 0:
+        return {
+            "schema_version": 1,
+            "metric": "vendor_divergence",
+            "trading_day": run_date,
+            "status": "unmeasurable",
+            "reason": (
+                f"no ({prior_vendor} prior, {new_vendor} fresh) pair found "
+                f"for {run_date}"
+            ),
+            "value": None,
+            "n": 0,
+            "bound": bound,
+            "breach_threshold_bps": breach_bps,
+            "breaching_symbols": [],
+            "champion_vendor": new_vendor,
+            "generated_at": generated_at,
+        }
+
+    share = len(breaching) / n_compared
+    return {
+        "schema_version": 1,
+        "metric": "vendor_divergence",
+        "trading_day": run_date,
+        "status": "breach" if share > bound else "ok",
+        "reason": None,
+        "value": share,
+        "n": n_compared,
+        "bound": bound,
+        "breach_threshold_bps": breach_bps,
+        "breaching_symbols": breaching,
+        "champion_vendor": new_vendor,
+        "generated_at": generated_at,
+    }
+
+
+def write_vendor_divergence_metric(
+    bucket: str,
+    new_closes: dict,
+    prior_rows: dict,
+    run_date: str,
+    *,
+    s3_client=None,
+    **kwargs,
+) -> dict:
+    """Compute + PUT the vendor-divergence MetricRecord for ``run_date``.
+
+    Producer write: unlike :func:`annotate_records`, this does NOT swallow a
+    write failure internally — a failed PUT propagates so the caller's own
+    fail-soft wrapper (mirroring the L1 observer's, in
+    ``collectors.daily_closes.collect``) decides, loudly, whether to let
+    ingestion continue. Never call this in dry-run mode.
+    """
+    record = compute_vendor_divergence(new_closes, prior_rows, run_date, **kwargs)
+    s3 = s3_client or boto3.client("s3")
+    key = f"{VENDOR_DIVERGENCE_METRIC_PREFIX}{run_date}.json"
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=json.dumps(record, sort_keys=True).encode("utf-8"),
+        ContentType="application/json",
+    )
+    logger.info(
+        "vendor_divergence metric written to s3://%s/%s: status=%s value=%s "
+        "n=%d breaching=%d",
+        bucket, key, record["status"], record["value"], record["n"],
+        len(record["breaching_symbols"]),
+    )
+    return record

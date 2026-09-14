@@ -102,3 +102,10 @@ def validate_arctic_probe(data: dict) -> list[str]:
     schema (data-collector plan P-05, alpha-engine-config-I10748 — the ArcticDB
     in-region probe `collectors/arctic_probe.py` writes)."""
     return _validate(data, "arctic_probe")
+
+
+def validate_staging_daily_closes_row(data: dict) -> list[str]:
+    """Validate ONE ROW of staging/daily_closes/{date}.parquet (post
+    `df.reset_index().to_dict('records')`) against contract schema (data-collector
+    plan P-16, alpha-engine-config-I10783 — `source` + `revision` columns)."""
+    return _validate(data, "staging_daily_closes")
