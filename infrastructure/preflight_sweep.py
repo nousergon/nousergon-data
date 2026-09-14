@@ -165,6 +165,11 @@ DEFAULT_CONCURRENCY = int(os.environ.get("PREFLIGHT_SWEEP_CONCURRENCY", "6"))
 # 30 min is generous headroom over the observed worst case without letting a
 # hung stage hold the whole sweep to its own timeout.
 DEFAULT_STAGE_TIMEOUT = int(os.environ.get("PREFLIGHT_SWEEP_STAGE_TIMEOUT", "1800"))
+# Same rationale as unsweepable_streak_threshold_days: one full weekly cycle
+# (the backtest chain writes once, on Saturday) plus one day of slack. Used
+# only when a declaration omits its own `max_age_days` — every entry in the
+# manifest's `upstream_artifact_dependencies` is expected to declare one.
+DEFAULT_UPSTREAM_MAX_AGE_DAYS = 8
 
 
 @dataclass
@@ -187,6 +192,14 @@ class StageResult:
     upstream: dict[str, Any] | None = None
     # For a `no_dry_path` row: the written acknowledgement from the manifest.
     acknowledged_reason: str | None = None
+    # Set only when a same-day `upstream_pending` stage was actually
+    # re-measured against an earlier, populated instance of its declared
+    # upstream (alpha-engine-config-I10717 (2)). The run_date this row's
+    # verdict was ACTUALLY measured against, when it differs from the
+    # sweep's own calendar/probe date. A row with this set is PASSED/FAILED
+    # for real, never `unsweepable` — remeasurement only ever turns a
+    # not-measured stage into a measured one, never the reverse.
+    measured_against_run_date: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -656,6 +669,142 @@ def classify_upstream(
     return result
 
 
+def find_recent_populated_upstream(
+    template: str,
+    base_bindings: dict[str, Any],
+    ignore_subprefixes: list[str],
+    lister,
+    max_age_days: int,
+) -> tuple[str, dict] | None:
+    """Walk backward from ``base_bindings['run_date']``, one day at a time, up
+    to ``max_age_days``, for the most recent date whose rendered upstream
+    prefix holds real content (never a sweep phase-marker or a zero-byte key
+    — the same ``upstream_content`` contract ``classify_upstream`` uses).
+
+    Returns ``(date_iso, detail)`` for the first (most recent, i.e. smallest
+    offset) hit, or ``None`` if nothing in the window has content — which
+    means either the upstream has never run, or its last run is older than
+    the declared cadence, and the caller must not claim a measurement that
+    was never taken.
+
+    A per-candidate probe failure (a bad template substitution, a transient
+    lister error) is treated as "no content at this candidate", not as a
+    reason to abort the whole walk — the SAME-DAY probe already has its own
+    dedicated UNMEASURED path in ``classify_upstream`` for "the probe itself
+    could not run"; this function only widens WHERE a real probe looks, it
+    does not relax what counts as a real probe failure.
+    """
+    start_raw = base_bindings.get("run_date")
+    if not start_raw:
+        return None
+    try:
+        start = dt.date.fromisoformat(str(start_raw)[:10])
+    except ValueError:
+        return None
+    for offset in range(0, max_age_days + 1):
+        candidate = (start - dt.timedelta(days=offset)).isoformat()
+        try:
+            prefix = template.format(**{**base_bindings, "run_date": candidate})
+        except (KeyError, IndexError, ValueError):
+            continue
+        try:
+            present, detail = upstream_content(prefix, ignore_subprefixes, lister)
+        except Exception:  # noqa: BLE001 — one candidate's probe failing is
+            # not the same fact as the probe being unavailable; the walk
+            # keeps going rather than reporting UNMEASURED on the first
+            # unlucky candidate day.
+            continue
+        if present:
+            return candidate, {**detail, "prefix": prefix, "age_days": offset}
+    return None
+
+
+def remeasure_upstream_pending(
+    result: StageResult,
+    declaration: dict[str, Any],
+    bindings: dict[str, Any],
+    lister,
+    *,
+    definition: dict,
+    context: dict[str, Any],
+    checkout_root: str,
+    stage_timeout: int,
+    runner,
+) -> StageResult:
+    """``classify_upstream``, then — if that downgraded the stage to
+    ``upstream_pending`` because TODAY's date is empty — actually MEASURE it
+    against the most recent POPULATED instance of its declared upstream,
+    within the declared ``max_age_days`` cadence window, instead of settling
+    for "not measured".
+
+    This is the SOTA half of alpha-engine-config-I10717: ``degraded`` on the
+    weekday case was a correct grade for an UNMEASURED stage (principle 7 —
+    "no data is never rendered as green"), but "unmeasured" was never
+    structurally required — PredictorBacktest and PortfolioOptimizerBacktest
+    both implement ``--run-date`` override and a real ``--preflight-only``
+    boot+deps+smoke path; the sweep was simply never pointing them at a date
+    that has data. Re-deriving the SAME stage's command against an earlier
+    run_date and re-running it turns a stage that is unsweepable ~6 nights a
+    week into one that is measured for real every night — a real PASS when
+    the environment is healthy, a real FAIL (paging, exactly like any other
+    stage) when it is not.
+
+    ``degraded``/``upstream_pending`` stays reserved for exactly two cases
+    after this: no populated instance exists anywhere in the max-age window
+    (the acknowledgement may have gone stale — see the streak finding), or
+    the override re-derivation itself cannot produce a sweepable stage (a
+    definition-drift case that already has its own coverage-defect path).
+    Never for "today's date happens to be empty", which is the ordinary case
+    this function exists to stop mis-measuring as unmeasured.
+    """
+    classify_upstream(result, declaration, bindings, lister)
+    if result.unsweepable_kind != UNSWEEPABLE_UPSTREAM_PENDING or lister is None:
+        return result
+
+    max_age_days = declaration.get("max_age_days", DEFAULT_UPSTREAM_MAX_AGE_DAYS)
+    found = find_recent_populated_upstream(
+        declaration["prefix"],
+        bindings,
+        list(declaration.get("ignore_subprefixes") or []),
+        lister,
+        max_age_days,
+    )
+    if found is None:
+        result.reason = (
+            f"{result.reason} No populated instance of this declared upstream was "
+            f"found in the last {max_age_days} day(s) either — this is now a "
+            "STALENESS finding, not the ordinary weekday case: either the weekly "
+            "pipeline has stopped writing it, or the declared max_age_days is too "
+            "short for its real cadence."
+        )
+        return result
+
+    candidate_date, detail = found
+    override_bindings = {**bindings, "run_date": candidate_date}
+    override_stages = derive_stages(definition, override_bindings, context, checkout_root)
+    override_stage = next((s for s in override_stages if s.name == result.stage), None)
+    if override_stage is None or override_stage.classification != SWEEPABLE:
+        # The override re-derivation did not even produce a sweepable stage
+        # (definition drift, or the override binding broke something a
+        # different stage needed). Do not claim a measurement that was never
+        # actually taken — the manifest_disagreement path already covers a
+        # derivation that cannot be trusted.
+        return result
+
+    remeasured = run_stage(override_stage, checkout_root, stage_timeout, runner)
+    remeasured.measured_against_run_date = candidate_date
+    remeasured.acknowledged_reason = declaration.get("reason")
+    remeasured.upstream = {**detail, "produced_by": declaration["produced_by"], "present": True}
+    remeasured.reason = (
+        f"MEASURED AGAINST {candidate_date} ({detail['age_days']} day(s) old — the most "
+        f"recent populated instance of the declared upstream within the "
+        f"{max_age_days}-day cadence window), not today's empty "
+        f"{result.upstream['prefix'] if result.upstream else declaration['prefix']!r}. "
+        f"{remeasured.reason or f'preflight exited rc={remeasured.returncode}'}"
+    )
+    return remeasured
+
+
 # ── Persistent-unsweepable streaks ───────────────────────────────────────────
 
 
@@ -848,7 +997,12 @@ def render_notification(report: SweepReport) -> tuple[str, str]:
                 if err:
                     lines.append(f"      last stderr: {err}")
             lines.append("")
-    passed = [r["stage"] for r in report.results if r["verdict"] == PASSED]
+    passed = [
+        r["stage"]
+        + (f" (measured against {r['measured_against_run_date']})" if r.get("measured_against_run_date") else "")
+        for r in report.results
+        if r["verdict"] == PASSED
+    ]
     if passed:
         lines.append("PASSED: " + ", ".join(passed))
     lines.append("")
@@ -1095,13 +1249,32 @@ def sweep(
     # reworded launcher error can never reclassify a real failure; the prefix
     # is still probed on the day, so the declaration alone can never hide one.
     lister = (lambda prefix: aws.list_objects(prefix)) if aws is not None else None
-    for result in results:
+    for i, result in enumerate(results):
         if result.verdict != FAILED:
             continue
         declaration = upstream_decls.get(result.stage)
         if declaration is None:
             continue
-        classify_upstream(result, declaration, bindings, lister)
+        # remeasure_upstream_pending both classifies (today's-date probe,
+        # exactly as before) AND — only when that classification is
+        # upstream_pending — attempts a REAL measurement against the most
+        # recent populated instance of the declared upstream, so a stage
+        # whose same-day precondition is structurally never met on a
+        # preflight day is not left "unmeasured" when it does not have to
+        # be (alpha-engine-config-I10717 (2)). May return a DIFFERENT
+        # StageResult (a real pass/fail from the override run), so the list
+        # entry is replaced rather than mutated in place.
+        results[i] = remeasure_upstream_pending(
+            result,
+            declaration,
+            bindings,
+            lister,
+            definition=definition,
+            context=context,
+            checkout_root=checkout_root,
+            stage_timeout=stage_timeout,
+            runner=runner,
+        )
 
     order = {s.name: i for i, s in enumerate(stages)}
     # ── The invariant: every declared stage carries a verdict ────────────────
