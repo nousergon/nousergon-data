@@ -227,7 +227,7 @@ def test_security_performance_hand_built_fixture_validates():
            "performance": {"AAPL": {
                "period_returns": {"1Y": 0.2}, "ytd_pct": 0.1, "ltm_pct": 0.2,
                "volatility": 0.18, "sharpe": 1.2, "sortino": 1.5, "max_drawdown": -0.1,
-               "beta_vs_spy": 1.1, "vs_spy_window": "1Y", "vs_spy_1y": 0.05,
+               "beta_vs_spy": 1.1, "vs_spy_window": 0.03, "vs_spy_1y": 0.05,
                "n_bars": 260, "history_from": "2025-06-26",
            }}}
     assert validate_metron_security_performance(art) == []
