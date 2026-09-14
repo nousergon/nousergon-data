@@ -1,7 +1,10 @@
 """Tests for `compute_technical_rating` (metron-ops#293, close-only
 TradingView-Technical-Ratings method): the MA/oscillator vote rules, the
 label thresholds, per-vote short-history skipping, and the all-None coverage
-gap. Refs nousergon/metron-ops#293.
+gap. metron-ops#297 adds the rule-alignment coverage (momentum voting on the
+momentum VALUE's own trend, the corrected label boundaries, Hull MA(9), and
+the `rating_version` stamp). Refs nousergon/metron-ops#293,
+nousergon/metron-ops#297.
 """
 from __future__ import annotations
 
@@ -13,7 +16,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from features.feature_engineer import _rating_label, compute_technical_rating
+from features.feature_engineer import _compute_hull_ma, _rating_label, compute_technical_rating
 
 
 def _flat(n: int, price: float = 100.0) -> pd.Series:
@@ -80,11 +83,22 @@ class TestVoteSkippingByHistoryDepth:
         assert out["osc_score"] is None
         assert out["ma_score"] == out["score"]
 
-    def test_eleven_bars_adds_the_momentum_vote_only(self):
+    def test_eleven_bars_adds_hull_ma_vote_only(self):
+        # HMA(9)'s min-obs is 11 (period + sqrt_len - 1 = 9 + 3 - 1); momentum
+        # now needs TWO trailing momentum readings (metron-ops#297), so it
+        # needs 12, not 11 -- osc_score stays None at exactly 11 bars.
         s = _uptrend(11)
         out = compute_technical_rating(s)
         assert out is not None
-        assert out["n_votes"] == 3  # 2 MA(10) votes + momentum(10)
+        assert out["n_votes"] == 3  # 2 MA(10) votes + Hull MA(9)
+        assert out["osc_score"] is None
+        assert out["ma_score"] == out["score"]
+
+    def test_twelve_bars_adds_momentum_vote(self):
+        s = _uptrend(12)
+        out = compute_technical_rating(s)
+        assert out is not None
+        assert out["n_votes"] == 4  # 2 MA(10) + Hull MA(9) + momentum(10)
         assert out["osc_score"] is not None
 
     def test_sixteen_bars_adds_rsi_vote(self):
@@ -93,8 +107,8 @@ class TestVoteSkippingByHistoryDepth:
         # `_wavy_uptrend`'s docstring.
         below = _wavy_uptrend(15)
         at = _wavy_uptrend(16)
-        assert compute_technical_rating(below)["n_votes"] == 3  # MA(10) x2 + momentum
-        assert compute_technical_rating(at)["n_votes"] == 4  # + RSI
+        assert compute_technical_rating(below)["n_votes"] == 4  # MA(10) x2 + HMA(9) + momentum
+        assert compute_technical_rating(at)["n_votes"] == 5  # + RSI
 
     def test_macd_vote_requires_35_bars(self):
         below = _uptrend(34)
@@ -103,10 +117,10 @@ class TestVoteSkippingByHistoryDepth:
         n_at = compute_technical_rating(at)["n_votes"]
         assert n_at == n_below + 1
 
-    def test_full_history_yields_all_twelve_ma_votes_plus_three_oscillator_votes(self):
+    def test_full_history_yields_all_thirteen_ma_votes_plus_three_oscillator_votes(self):
         s = _wavy_uptrend(260)
         out = compute_technical_rating(s)
-        assert out["n_votes"] == 15  # 12 MA + RSI + MACD + momentum
+        assert out["n_votes"] == 16  # 12 SMA/EMA + Hull MA(9) + RSI + MACD + momentum
         assert out["ma_score"] is not None and out["osc_score"] is not None
 
 
@@ -131,7 +145,8 @@ class TestLabelThresholds:
         "score,label",
         [
             (-1.0, "Strong Sell"),
-            (-0.5, "Strong Sell"),
+            (-0.501, "Strong Sell"),
+            (-0.5, "Sell"),  # exact -0.5 -> Sell, NOT Strong Sell (metron-ops#297)
             (-0.499, "Sell"),
             (-0.101, "Sell"),
             (-0.1, "Neutral"),  # NOT "< -0.1" (exact match falls through to Neutral)
@@ -140,7 +155,8 @@ class TestLabelThresholds:
             (0.1, "Neutral"),
             (0.101, "Buy"),
             (0.499, "Buy"),
-            (0.5, "Strong Buy"),
+            (0.5, "Buy"),  # exact 0.5 -> Buy, NOT Strong Buy (metron-ops#297)
+            (0.501, "Strong Buy"),
             (1.0, "Strong Buy"),
         ],
     )
@@ -175,5 +191,89 @@ class TestVoteCounts:
         out = compute_technical_rating(_uptrend(260))
         assert set(out) == {
             "score", "label", "ma_score", "osc_score",
-            "n_buy", "n_neutral", "n_sell", "n_votes",
+            "n_buy", "n_neutral", "n_sell", "n_votes", "rating_version",
         }
+
+    def test_rating_version_stamped(self):
+        from features.feature_engineer import RATING_VERSION
+
+        out = compute_technical_rating(_uptrend(260))
+        assert out["rating_version"] == RATING_VERSION == 2
+
+
+class TestMomentumVotesOnMomentumTrend:
+    """metron-ops#297: the published rule is "the momentum VALUE is rising",
+    not "price is up vs. 10 bars ago". A series with net-positive price
+    change but a DECELERATING momentum value must vote Sell under the new
+    rule -- the old buggy code (``close - close[-11] > 0``) would have voted
+    Buy on this exact fixture."""
+
+    def test_decelerating_gains_vote_sell_despite_net_positive_price(self):
+        # last=109 > close[-11]=101 (net "up" over 10 bars -- the OLD rule's
+        # buy signal), but mom_t=8 < mom_t1=9 (the momentum VALUE itself is
+        # falling) -- the new rule must vote sell (-1).
+        s = pd.Series([100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 109, 109], dtype="float64")
+        out = compute_technical_rating(s)
+        assert out is not None
+        # At 12 bars only momentum has an oscillator vote (RSI needs 16, MACD
+        # needs 35) -- osc_score is exactly that one vote.
+        assert out["osc_score"] == -1.0
+
+    def test_accelerating_gains_vote_buy(self):
+        s = pd.Series([100, 100, 100, 100, 100, 100, 100, 100, 100, 101, 103, 106], dtype="float64")
+        out = compute_technical_rating(s)
+        assert out is not None
+        assert out["osc_score"] == 1.0
+
+    def test_constant_momentum_value_votes_neutral(self):
+        # A perfectly linear (constant-slope) series has a CONSTANT momentum
+        # value (mom_t == mom_t-1 always) -- neutral, not buy, even though
+        # price is unambiguously rising.
+        s = _uptrend(12)
+        out = compute_technical_rating(s)
+        assert out is not None
+        assert out["osc_score"] == 0.0
+
+
+class TestHullMa:
+    def test_matches_independent_reference_implementation(self):
+        vals = [50.0]
+        step = 0.3
+        for i in range(1, 30):
+            step += 0.05 if i % 3 else -0.1
+            vals.append(vals[-1] + step)
+
+        def _ref_wma(arr, length):
+            window = arr[-length:]
+            weights = list(range(1, length + 1))
+            return sum(w * v for w, v in zip(weights, window)) / sum(weights)
+
+        def _ref_hma(arr, period=9):
+            half, sqrt_len = 5, 3  # round-half-up(9/2)=5, round-half-up(sqrt(9))=3
+            diffs = []
+            for k in range(sqrt_len):
+                sub = arr[: len(arr) - k]
+                diffs.append(2 * _ref_wma(sub, half) - _ref_wma(sub, period))
+            diffs = diffs[::-1]
+            weights = list(range(1, sqrt_len + 1))
+            return sum(w * v for w, v in zip(weights, diffs)) / sum(weights)
+
+        expected = _ref_hma(vals, 9)
+        actual = _compute_hull_ma(pd.Series(vals, dtype="float64"), period=9)
+        assert actual == pytest.approx(expected, rel=1e-9)
+
+    def test_below_min_obs_returns_none(self):
+        # min_obs = period + sqrt_len - 1 = 9 + 3 - 1 = 11.
+        assert _compute_hull_ma(pd.Series([100.0] * 10, dtype="float64"), period=9) is None
+
+    def test_at_min_obs_computes(self):
+        assert _compute_hull_ma(_uptrend(11), period=9) is not None
+
+    def test_hma_vote_included_in_ma_group_for_strong_trends(self):
+        # Full-history up/down trends already assert ma_score == +-1.0 --
+        # possible only if the HMA vote (13th MA-group member) agrees with
+        # every SMA/EMA vote. Direct cross-check here for clarity.
+        up = compute_technical_rating(_uptrend(260))
+        down = compute_technical_rating(_downtrend(260))
+        assert up["n_sell"] == 0 and up["ma_score"] == 1.0
+        assert down["n_buy"] == 0 and down["ma_score"] == -1.0

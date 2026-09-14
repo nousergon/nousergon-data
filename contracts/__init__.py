@@ -82,3 +82,16 @@ def validate_technical_ratings(data: dict) -> list[str]:
     """Validate market_data/intraday/technical_ratings.json against contract schema
     (metron-ops#293 — new artifact)."""
     return _validate(data, "technical_ratings")
+
+
+def validate_rating_ledger_entry(data: dict) -> list[str]:
+    """Validate a market_data/technicals/rating_history/{date}.json entry against
+    contract schema (metron-ops#297 part 2 — new artifact)."""
+    return _validate(data, "rating_ledger_entry")
+
+
+def validate_rating_performance(data: dict) -> list[str]:
+    """Validate market_data/technicals/rating_performance.json against contract schema
+    (metron-ops#297 part 2 — new artifact, shared contract with the metron consumer,
+    metron-ops#298)."""
+    return _validate(data, "rating_performance")

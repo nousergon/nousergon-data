@@ -1,11 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Metron Technicals (EOD)",
-  "description": "market_data/technicals/latest.json — per-held-symbol EOD technical indicators, written by collectors/metron_market_data.py::collect_technicals from close_history (no new fetch). PRODUCER TEST: tests/test_technical_rating_contracts.py. v3 (metron-ops#293) is additive: each symbol MAY carry a `rating` object (omitted, never fabricated, when no vote is computable) alongside the pre-existing v1/v2 fields.",
+  "description": "market_data/technicals/latest.json — per-held-symbol EOD technical indicators, written by collectors/metron_market_data.py::collect_technicals from close_history (no new fetch). PRODUCER TEST: tests/test_technical_rating_contracts.py. v3 (metron-ops#293) is additive: each symbol MAY carry a `rating` object (omitted, never fabricated, when no vote is computable) alongside the pre-existing v1/v2 fields. v4 (metron-ops#297) is additive: `rating.rating_version` names the rule-set version that produced the rating.",
   "type": "object",
   "required": ["schema_version", "as_of", "source", "technicals"],
   "properties": {
-    "schema_version": {"type": "integer", "const": 3},
+    "schema_version": {"type": "integer", "const": 4},
     "as_of": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
     "source": {"type": "string", "const": "computed"},
     "technicals": {
@@ -27,10 +27,10 @@
           "mom_20d": {"type": ["number", "null"]},
           "mom_60d": {"type": ["number", "null"]},
           "rating": {
-            "description": "Additive, v3 (metron-ops#293). Present only when compute_technical_rating found at least one computable vote — see technical_rating.schema.json for the shared shape.",
+            "description": "Additive, v3 (metron-ops#293); `rating_version` additive as of v4 (metron-ops#297). Present only when compute_technical_rating found at least one computable vote — see technical_rating.schema.json for the shared shape.",
             "type": "object",
             "additionalProperties": false,
-            "required": ["score", "label", "ma_score", "osc_score", "n_buy", "n_neutral", "n_sell", "n_votes"],
+            "required": ["score", "label", "ma_score", "osc_score", "n_buy", "n_neutral", "n_sell", "n_votes", "rating_version"],
             "properties": {
               "score": {"type": "number", "minimum": -1, "maximum": 1},
               "label": {"type": "string", "enum": ["Strong Sell", "Sell", "Neutral", "Buy", "Strong Buy"]},
@@ -39,7 +39,8 @@
               "n_buy": {"type": "integer", "minimum": 0},
               "n_neutral": {"type": "integer", "minimum": 0},
               "n_sell": {"type": "integer", "minimum": 0},
-              "n_votes": {"type": "integer", "minimum": 1}
+              "n_votes": {"type": "integer", "minimum": 1},
+              "rating_version": {"type": "integer", "minimum": 1}
             }
           }
         }
