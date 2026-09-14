@@ -62,10 +62,13 @@ class LocalStore:
 class S3Store:
     """Keys under ``s3://bucket/prefix``."""
 
-    def __init__(self, bucket: str, prefix: str = "", *, client=None, dry_run: bool = False) -> None:
+    def __init__(
+        self, bucket: str, prefix: str = "", *, client=None, iam_client=None, dry_run: bool = False
+    ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._client = client
+        self._iam_client = iam_client
         self.dry_run = dry_run
 
     @property
@@ -79,6 +82,22 @@ class S3Store:
 
             self._client = boto3.client("s3")
         return self._client
+
+    @property
+    def iam_client(self):
+        """The IAM client `data_gate.evidence.read_roles_bootstrapped` reads
+        the standalone stack's roles through — lazy like `.client` above, and
+        present ONLY on this backend: `LocalStore`/`EmptyStore` (tests, a
+        developer running nothing) carry no such attribute at all, so a
+        roles-bootstrapped read against them is UNMEASURABLE by construction
+        rather than by ever reaching for `boto3` (`alpha-engine-config-
+        I10777`).
+        """
+        if self._iam_client is None:
+            import boto3
+
+            self._iam_client = boto3.client("iam")
+        return self._iam_client
 
     def _s3_key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key

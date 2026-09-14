@@ -82,7 +82,22 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
     orphan_clauses = {
         name
         for name in generated
-        if name.count(".") == 2 and not name.startswith(("data.board.", "data.inventory.", "data.gate.", "data.slo.", "data.cost.", "data.pages.", "data.human_touch."))
+        if name.count(".") == 2
+        and not name.startswith(
+            (
+                "data.board.",
+                "data.inventory.",
+                "data.gate.",
+                "data.slo.",
+                "data.cost.",
+                "data.pages.",
+                "data.human_touch.",
+                # `data-cutover-ready` sub-gate clauses (alpha-engine-config-
+                # I10777) — a precondition of phase 1, not a per-unit audit
+                # cell, so they never map to `base_clause_names`.
+                "data.cutover_ready.",
+            )
+        )
     } - cells
     assert not orphan_clauses, f"base-shaped clauses with no audit cell: {sorted(orphan_clauses)}"
     assert cells <= generated, f"audit cells with no clause: {sorted(cells - generated)}"

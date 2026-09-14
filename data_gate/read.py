@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import re
 import subprocess
 from dataclasses import dataclass
 
@@ -89,12 +90,19 @@ def load_phases(path=None) -> list[DataPhase]:
     return phases
 
 
-#: Every registered gate, and the highest clause phase it grades. A gate that is
-#: not registered has no clause list, so running it would report a pass over
-#: nothing — `evaluate` raises rather than defaulting.
-GATES: dict[str, int] = {
+#: Every registered gate, and the highest clause phase it grades — or `None`
+#: for a gate that is not numbered ceiling-style at all. A numbered gate
+#: (`"data-phaseN"`) selects every clause tagged `data-phaseM` with `M <= N`;
+#: a `None` gate selects only the clauses tagged with ITS OWN name exactly
+#: (`alpha-engine-config-I10777`) — `data-cutover-ready` is a sub-gate of
+#: phase 1 (`registry.d/phases.yaml`'s `sub_gates`), not a ceiling over it,
+#: so it must not silently re-grade phase 1's own clause list under a second
+#: name. A gate that is not registered here has no clause list at all, so
+#: running it would report a pass over nothing — `evaluate` raises rather
+#: than defaulting.
+GATES: dict[str, int | None] = {
     "data-phase0": 0,
-    "data-cutover-ready": 1,
+    "data-cutover-ready": None,
     "data-phase1": 1,
     "data-phase2": 2,
     "data-phase3": 3,
@@ -145,9 +153,14 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
             store, load_units(), load_phases(), trading_day=trading_day
         )
     ceiling = GATES[gate]
-    selected = [
-        c for c in all_clauses if (_phase_number(c.phase) is not None and _phase_number(c.phase) <= ceiling)
-    ]
+    if ceiling is None:
+        selected = [c for c in all_clauses if c.phase == gate]
+    else:
+        selected = [
+            c
+            for c in all_clauses
+            if (_phase_number(c.phase) is not None and _phase_number(c.phase) <= ceiling)
+        ]
     result = GateResult(
         gate=gate,
         trading_day=trading_day,
@@ -156,11 +169,42 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
         store=getattr(store, "uri", None),
         code_sha=_code_sha(),
     )
-    result.coverage = (
-        f"grades the {len(selected)} clause(s) tagged phase <= {ceiling} out of "
-        f"{len(all_clauses)} on the board; the rest are graded by later gates"
-    )
+    if ceiling is None:
+        result.coverage = (
+            f"grades the {len(selected)} clause(s) tagged phase == {gate!r} out of "
+            f"{len(all_clauses)} on the board; the rest are graded by other gates"
+        )
+    else:
+        result.coverage = (
+            f"grades the {len(selected)} clause(s) tagged phase <= {ceiling} out of "
+            f"{len(all_clauses)} on the board; the rest are graded by later gates"
+        )
     return result
+
+
+#: A base or guard clause's audit unit id — `data.D07.schema_contract` or
+#: `data.D20.guard.cardinality` — else the row has no unit.
+_UNIT_ID_RE = re.compile(r"^data\.(D\d+)\.")
+
+
+def _row_unit_id(clause_name: str) -> str:
+    """The audit unit a board row belongs to, or a category label for a
+    non-unit clause — `board`, `gate`, `slo`, `cost`, `pages`, `human_touch`,
+    `inventory`, `cutover_ready` (`alpha-engine-config-I10802`).
+
+    Parsed ONCE here, at generation time, rather than re-derived by the
+    console — `nousergon-console`'s `records_shape.py` has no regex-
+    extraction capability, per that issue's own fix description. Every
+    `data.<x>.<...>` clause name carries the category as its second dotted
+    segment, unit or not, so one regex plus a fallback split covers every
+    clause family this module generates, including ones added after this
+    function was written.
+    """
+    match = _UNIT_ID_RE.match(clause_name)
+    if match:
+        return match.group(1)
+    parts = clause_name.split(".")
+    return parts[1] if len(parts) > 1 else clause_name
 
 
 def _board_document(clauses, *, trading_day: dt.date, generated_utc: str, store_uri: str | None) -> dict:
@@ -176,6 +220,7 @@ def _board_document(clauses, *, trading_day: dt.date, generated_utc: str, store_
         rows.append(
             {
                 "clause": clause.name,
+                "unit_id": _row_unit_id(clause.name),
                 "state": state,
                 "console_state": {
                     "MET": "HEALTHY",

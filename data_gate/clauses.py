@@ -31,7 +31,7 @@ from __future__ import annotations
 
 import datetime as dt
 
-from nousergon_lib.gates import Clause, contain_clause_exceptions, unmeasurable
+from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exceptions, unmeasurable
 
 from data_gate import evidence as ev
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
@@ -40,6 +40,7 @@ from data_gate.inventory import scan
 __all__ = [
     "BOARD_CLAUSES",
     "CLAUSE_PREFIX",
+    "CUTOVER_READY_CLAUSES",
     "base_clause_name",
     "base_clause_names",
     "generate",
@@ -60,6 +61,24 @@ BOARD_CLAUSES: tuple[str, ...] = (
     "data.board.cells_reconciled",
     "data.board.phase_trackers_declared",
     "data.gate.ladder_fresh",
+)
+
+#: The `data-cutover-ready` sub-gate's own clauses (plan §6.2 step 3,
+#: `alpha-engine-config-I10777`) — tagged `phase="data-cutover-ready"` rather
+#: than a numbered phase, so `read.evaluate` selects them by exact phase
+#: match instead of by ceiling (`read.GATES["data-cutover-ready"] is None`).
+CUTOVER_READY_CLAUSES: tuple[str, ...] = (
+    "data.cutover_ready.stack_check_live",
+    "data.cutover_ready.units_covered",
+    "data.cutover_ready.roles_bootstrapped",
+    "data.cutover_ready.parity",
+)
+
+#: The two IAM roles plan §6.2 step 3 names for "roles bootstrapped": the
+#: standalone stack's own execution role, and the identity that deploys it.
+CUTOVER_READY_ROLES: tuple[str, ...] = (
+    "nousergon-data-collection-sfn-role",
+    "github-actions-data-collection-stack-deploy",
 )
 
 
@@ -359,6 +378,153 @@ def _clause_gate_ladder_fresh(store: ev.GateStore, *, trading_day: dt.date) -> C
     )
 
 
+# ---------------------------------------------------------------------------
+# The `data-cutover-ready` sub-gate — plan §6.2 step 3, `alpha-engine-
+# config-I10777`. A precondition inside phase 1, deliberately NOT tagged with
+# a numbered phase: `read.evaluate` selects these four by exact phase match
+# rather than by "<= ceiling", the same distinction `registry.d/phases.yaml`
+# draws between a rung and a sub-gate.
+# ---------------------------------------------------------------------------
+
+
+def _sf_only_units(units: list[Unit]) -> list[Unit]:
+    """Units whose only v1 trigger is a Step Functions pipeline this stack
+    (or its tracked gap, I10753) replaces — plan §6.2 condition (b)'s "37
+    SF-only units", derived from the descriptors rather than hand-listed.
+
+    Plan §6.2 and this issue cite 37; this predicate is what the units_covered
+    clause below counts and reconciles against that number, naming any
+    disagreement as a finding rather than papering over it (plan §4.1
+    "red by default").
+    """
+    out: list[Unit] = []
+    for unit in units:
+        trigger = unit.raw.get("trigger") or {}
+        successor = str(trigger.get("successor") or "")
+        if trigger.get("kind") == "step-functions" and (
+            "nousergon-data-PR1701" in successor or "alpha-engine-config-I10753" in successor
+        ):
+            out.append(unit)
+    return out
+
+
+def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:
+    name = "data.cutover_ready.stack_check_live"
+    requirement = (
+        "the nousergon-data-collection stack's live state (CFN + EventBridge Scheduler) "
+        "matches this checkout, per `infrastructure/data_collection_stack.py check-live` "
+        "— read from a published reading, never from GitHub Actions directly "
+        "(alpha-engine-config-I6843: GitHub Actions outcomes are invisible to the console)"
+    )
+    reading = ev.read_stack_check_live(store)
+    if reading.unmeasurable:
+        return unmeasurable(
+            name, requirement, reading.detail, reading.evidence, phase="data-cutover-ready", source=reading.source
+        )
+    return Clause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        phase="data-cutover-ready",
+        source=reading.source,
+        as_of=reading.as_of,
+    )
+
+
+def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], *, trading_day: dt.date) -> Clause:
+    name = "data.cutover_ready.units_covered"
+    sf_units = _sf_only_units(units)
+    members = [_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in sf_units]
+    statuses = [clause_member_status(m) for m in members]
+    met_n = statuses.count("MET")
+    unmet = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMET")
+    unmeas = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMEASURABLE")
+    requirement = (
+        "every SF-only unit — a step-functions trigger whose successor names PR1701 or "
+        "I10753 — has a standalone workload or a recorded retirement decision, read from "
+        "its own data.<unit>.survives_phase4 base clause"
+    )
+    detail = f"{met_n}/{len(members)} survives_phase4 MET, {len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE"
+    if unmet:
+        detail += f"; unmet: {unmet[:12]}"
+    if unmeas:
+        detail += f"; unmeasurable: {unmeas[:12]}"
+    if len(sf_units) != 37:
+        detail += (
+            f". plan §6.2 and this issue cite 37 SF-only units; the descriptor-derived "
+            f"population is {len(sf_units)} — a disagreement named rather than reconciled "
+            "quietly (plan §4.1 'red by default')"
+        )
+    evidence = tuple(m.name for m in members)
+    if unmeas:
+        return unmeasurable(
+            name,
+            requirement,
+            detail,
+            evidence,
+            phase="data-cutover-ready",
+            source="data_gate.clauses (rollup of survives_phase4)",
+        )
+    return Clause(
+        name,
+        requirement,
+        not unmet,
+        detail,
+        evidence,
+        phase="data-cutover-ready",
+        source="data_gate.clauses (rollup of survives_phase4)",
+    )
+
+
+def _clause_cutover_ready_roles_bootstrapped(store: ev.GateStore) -> Clause:
+    name = "data.cutover_ready.roles_bootstrapped"
+    requirement = (
+        "the standalone stack's execution role and its deploy identity exist — "
+        f"{list(CUTOVER_READY_ROLES)} — read via iam:ListRolePolicies (the gate-read "
+        "identity holds no iam:GetRole grant, alpha-engine-config-I10777)"
+    )
+    reading = ev.read_roles_bootstrapped(store, CUTOVER_READY_ROLES)
+    if reading.unmeasurable:
+        return unmeasurable(
+            name, requirement, reading.detail, reading.evidence, phase="data-cutover-ready", source=reading.source
+        )
+    return Clause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        phase="data-cutover-ready",
+        source=reading.source,
+        as_of=reading.as_of,
+    )
+
+
+def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    name = "data.cutover_ready.parity"
+    requirement = (
+        "pre-cutover parity is published per key at staging/shadow/{trading_day}/parity.json "
+        "(plan §6.2 step 4), produced by P-11 (alpha-engine-config-I10778)"
+    )
+    reading = ev.read_parity(store, trading_day=trading_day)
+    if reading.unmeasurable:
+        return unmeasurable(
+            name, requirement, reading.detail, reading.evidence, phase="data-cutover-ready", source=reading.source
+        )
+    return Clause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        phase="data-cutover-ready",
+        source=reading.source,
+        as_of=reading.as_of,
+    )
+
+
 # Every `_clause_*` above is wrapped so a raising clause becomes ONE
 # UNMEASURABLE row instead of darkening the ladder. Applied by walking this
 # module's globals, so a clause added tomorrow is contained without anyone
@@ -369,9 +535,9 @@ contain_clause_exceptions(globals())
 def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.date) -> list[Clause]:
     """Every clause of the data board, in a stable order.
 
-    Order is (board, base, guard, objective) and within each, descriptor order —
-    stable so a diff between two readings is a diff in STATE rather than in
-    layout.
+    Order is (board, base, guard, cutover-ready, objective) and within each,
+    descriptor order — stable so a diff between two readings is a diff in
+    STATE rather than in layout.
     """
     clauses: list[Clause] = [
         _clause_inventory_writers_declared(store, units),
@@ -387,6 +553,10 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
         for guard in GUARD_CLASSES + OPTIONAL_GUARD_CLASSES:
             if guard in unit.guards:
                 clauses.append(_clause_guard(store, unit, guard, trading_day=trading_day))
+    clauses.append(_clause_cutover_ready_stack_check_live(store))
+    clauses.append(_clause_cutover_ready_units_covered(store, units, trading_day=trading_day))
+    clauses.append(_clause_cutover_ready_roles_bootstrapped(store))
+    clauses.append(_clause_cutover_ready_parity(store, trading_day=trading_day))
     for family in sorted({u.freshness_family for u in units if u.freshness_family}):
         clauses.append(
             _clause_objective(
