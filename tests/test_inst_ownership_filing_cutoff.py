@@ -41,7 +41,10 @@ from data.derived.inst_ownership import (
     _apply_value_scaling,
     _dedupe_amendments,
     _download_windows,
+    _find_zip_member,
     _is_quarter_end,
+    _parse_infotable,
+    _parse_submission,
     _previous_quarter_end,
     _windows_needed_for_period,
     compute_and_write_inst_ownership,
@@ -449,3 +452,131 @@ class TestHistoricalBackfillEndToEnd:
                 report_period=Date(2024, 6, 30), update_global_sidecar=False,
                 _index_html=_WINDOWED_INDEX_HTML,
             )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Nested-subdirectory SEC ZIP layout (alpha-engine-config-I10763)
+# ═══════════════════════════════════════════════════════════════════
+#
+# MEASURED 2026-09-14 directly against SEC.gov: every 13F window ZIP
+# inspected (01mar2025-31may2025, 01sep2025-30nov2025, 01dec2025-28feb2026,
+# 01mar2026-31may2026, ...) has its 9 members at the archive root. Exactly
+# one — 01jun2025-31aug2025_form13f.zip, published 2025-09-02 — packs all
+# 9 members under a top-level ``01JUN2025-31AUG2025_form13f/`` directory
+# instead. That is the ONLY window whose downloaded on-time filings for
+# PERIODOFREPORT 2025-06-30 exist, so the flat ``zf.open("SUBMISSION.tsv")``
+# lookup KeyErroring on it (silently treated as "0 submissions in this
+# window") is exactly why the 2025Q2 backfill reported "no on-time
+# submission for this PERIODOFREPORT" — a parse failure read as a real
+# absence.
+_2025Q2_WINDOWED_INDEX_HTML = """<html><body>
+<a href="/files/structureddata/data/form-13f-data-sets/01mar2025-31may2025_form13f.zip">x</a>
+<a href="/files/structureddata/data/form-13f-data-sets/01jun2025-31aug2025_form13f.zip">x</a>
+</body></html>"""
+
+
+def _nested_zip(top_dir: str, files: dict[str, str]) -> zipfile.ZipFile:
+    """Like ``_make_zip`` but every entry is written under ``top_dir/`` —
+    reproduces the real, measured layout of
+    ``01jun2025-31aug2025_form13f.zip``."""
+    return _make_zip({f"{top_dir}/{name}": content for name, content in files.items()})
+
+
+class TestNestedZipMemberLookup:
+    def test_flat_zip_matches_exact_name(self):
+        zf = _make_zip({"SUBMISSION.tsv": "x"})
+        assert _find_zip_member(zf, "SUBMISSION.tsv") == "SUBMISSION.tsv"
+
+    def test_nested_zip_matches_by_basename(self):
+        zf = _nested_zip("01JUN2025-31AUG2025_form13f", {"SUBMISSION.tsv": "x"})
+        assert _find_zip_member(zf, "SUBMISSION.tsv") == (
+            "01JUN2025-31AUG2025_form13f/SUBMISSION.tsv"
+        )
+
+    def test_missing_member_returns_none(self):
+        zf = _make_zip({"OTHER.tsv": "x"})
+        assert _find_zip_member(zf, "SUBMISSION.tsv") is None
+
+    def test_parse_submission_reads_nested_member(self):
+        zf = _nested_zip("01JUN2025-31AUG2025_form13f", {
+            "SUBMISSION.tsv": (
+                _SUBMISSION_HEADER + "\n"
+                + _submission_row("acc-1", "2025-08-01", "13F-HR", "0000000001", "2025-06-30")
+            ),
+        })
+        df = _parse_submission(zf)
+        assert len(df) == 1
+        assert df.iloc[0]["ACCESSION_NUMBER"] == "acc-1"
+
+    def test_parse_infotable_reads_nested_member(self):
+        zf = _nested_zip("01JUN2025-31AUG2025_form13f", {
+            "INFOTABLE.tsv": (
+                _INFOTABLE_HEADER + "\n"
+                + _infotable_row("acc-1", "22160N109", 400000, 9000)
+            ),
+        })
+        df = _parse_infotable(zf)
+        assert len(df) == 1
+        assert df.iloc[0]["cusip"] == "22160N109"
+
+
+class TestRecordedFixture2025Q2Backfill:
+    """Recorded fixture reproducing alpha-engine-config-I10763's exact
+    failure: report period 2025-06-30, windows
+    ['01jun2025-31aug2025_form13f.zip', '01mar2025-31may2025_form13f.zip'],
+    where the Jun-Aug window (the ONLY one carrying 2025-06-30's on-time
+    filings) is nested. No live network — the two window ZIPs are built
+    in-process with the measured real layout."""
+
+    def _windows(self) -> dict[str, zipfile.ZipFile]:
+        mar_may = _make_zip({
+            "SUBMISSION.tsv": (
+                _SUBMISSION_HEADER + "\n"
+                + _submission_row("acc-q1", "2025-05-10", "13F-HR", "0000000001", "2025-03-31")
+            ),
+            "INFOTABLE.tsv": (
+                _INFOTABLE_HEADER + "\n"
+                + _infotable_row("acc-q1", "22160N109", 291134, 7217)
+            ),
+        })
+        # Nested layout — measured live against the real published ZIP.
+        jun_aug = _nested_zip("01JUN2025-31AUG2025_form13f", {
+            "SUBMISSION.tsv": (
+                _SUBMISSION_HEADER + "\n"
+                + _submission_row("acc-q2", "2025-08-01", "13F-HR", "0000000001", "2025-06-30")
+            ),
+            "INFOTABLE.tsv": (
+                _INFOTABLE_HEADER + "\n"
+                + _infotable_row("acc-q2", "22160N109", 400000, 9000)
+            ),
+        })
+        return {
+            "01mar2025-31may2025_form13f.zip": mar_may,
+            "01jun2025-31aug2025_form13f.zip": jun_aug,
+        }
+
+    def _patch_download(self, monkeypatch):
+        windows = self._windows()
+        monkeypatch.setattr(
+            "data.derived.inst_ownership._download_sec_bulk_zip",
+            lambda name: windows.get(name),
+        )
+        monkeypatch.setattr("time.sleep", lambda _s: None)
+
+    def test_2025q2_backfill_succeeds_with_nested_window(self, monkeypatch):
+        self._patch_download(monkeypatch)
+        s3 = _InMemoryS3()
+        s3.seed_cusip_cache("alpha-engine-research", {"22160N109": "COST"})
+
+        rows = compute_and_write_inst_ownership(
+            ["COST"], s3_client=s3, bucket="alpha-engine-research",
+            report_period=Date(2025, 6, 30), update_global_sidecar=False,
+            _index_html=_2025Q2_WINDOWED_INDEX_HTML,
+        )
+
+        assert rows is not None and len(rows) == 1
+        assert rows[0].ticker == "COST"
+        assert rows[0].quarter == "2025Q2"
+        assert rows[0].shares_qoq_change == 9000 - 7217
+        assert s3.has("alpha-engine-research", "data/inst_ownership/2025Q2/latest.parquet")
+        assert not s3.has("alpha-engine-research", "data/inst_ownership/latest.json")
