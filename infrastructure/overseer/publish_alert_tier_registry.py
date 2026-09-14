@@ -34,6 +34,29 @@ WHY IT VERIFIES ITS OWN WRITE
 is an event; the read-back is the effect. A failed verification is a non-zero
 exit, so a publish that did not land reddens the workflow rather than being
 inferred from an exit code that only proves a request was accepted.
+
+WHY THE SCHEDULE ARM RE-PUBLISHES (alpha-engine-config-I10710)
+----------------------------------------------------------------
+The daily schedule arm used to call `assert_in_sync()` alone: read the object,
+compare digests, publish nothing. `ARTIFACT_REGISTRY.yaml`'s
+`overseer_alert_tier_registry` row derives its freshness SLA
+(`interval_minutes: 1440`, `sla_minutes_after_cron: 480`) from that arm's daily
+execution cadence — but a read-only arm never moves the object's
+`LastModified`, so the SLA measured a write cadence nobody implemented and
+paged CRITICAL every day the table was healthy and unchanged (its normal
+state). SOTA (`principles.md` §2.7): a freshness SLA must describe the
+*observable write cadence of the producer*, not the scheduler's execution
+cadence — "the publish never fired" and "the publish fired and worked" must
+not be the same shape.
+
+The fix keeps the drift GUARANTEE exactly as it was — `heartbeat()` still
+reads the object back and compares `source_digest` against the repo first,
+and still fails loud (non-zero) on a genuine mismatch, without silently
+overwriting whatever an out-of-band actor wrote — and only once repo == S3
+holds does it re-`publish()` the same content, which moves `LastModified`
+forward and turns the daily assert into a real liveness heartbeat. `publish()`
+already does its own put + read-back verification, so the heartbeat's own
+write is checked too.
 """
 
 from __future__ import annotations
@@ -135,11 +158,24 @@ def publish(document: dict, *, bucket: str, obj: str, dry_run: bool) -> int:
     return 0
 
 
-def assert_in_sync(*, bucket: str, obj: str) -> int:
-    """Scheduled arm: assert the published object still matches the repo."""
+def assert_in_sync(*, bucket: str, obj: str) -> tuple[int, dict | None]:
+    """Compare the published object against the repo. Publishes nothing.
+
+    Returns `(exit_code, document)` — `document` is the freshly built repo
+    document on a clean compare (the caller re-publishes it to heartbeat),
+    or `None` on drift / a missing object (the caller must not overwrite
+    either case silently).
+    """
     document = build_document()
     s3 = boto3.client("s3")
-    got = json.loads(s3.get_object(Bucket=bucket, Key=obj)["Body"].read())
+    try:
+        got = json.loads(s3.get_object(Bucket=bucket, Key=obj)["Body"].read())
+    except s3.exceptions.NoSuchKey:
+        logger.error(
+            "alert-tier registry ABSENT at s3://%s/%s — the publish arm has "
+            "never fired, or the object was deleted out of band.", bucket, obj,
+        )
+        return 1, None
     if got.get("source_digest") != document["source_digest"]:
         logger.error(
             "alert-tier registry DRIFT: s3://%s/%s carries source_digest=%s, "
@@ -147,9 +183,24 @@ def assert_in_sync(*, bucket: str, obj: str) -> int:
             "wrote that object.", bucket, obj, got.get("source_digest"),
             document["source_digest"],
         )
-        return 1
+        return 1, None
     logger.info("alert-tier registry in sync (%s)", document["source_digest"])
-    return 0
+    return 0, document
+
+
+def heartbeat(*, bucket: str, obj: str) -> int:
+    """Scheduled arm: assert repo == S3, then re-publish to refresh LastModified.
+
+    alpha-engine-config-I10710 — the registry's freshness SLA is derived from
+    this arm's daily cadence, so it must actually WRITE on a healthy day, or
+    the SLA is unsatisfiable by construction whenever the table is correct
+    and unchanged (its normal state). A real mismatch still fails loud and is
+    never silently overwritten — only a clean compare re-publishes.
+    """
+    code, document = assert_in_sync(bucket=bucket, obj=obj)
+    if code != 0:
+        return code
+    return publish(document, bucket=bucket, obj=obj, dry_run=False)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -159,11 +210,14 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="print the document, write nothing")
     ap.add_argument("--assert-in-sync", action="store_true",
-                    help="verify the published object matches the repo; publish nothing")
+                    help="verify repo == S3, then re-publish to refresh "
+                         "LastModified as a liveness heartbeat "
+                         "(alpha-engine-config-I10710); fails loud on real "
+                         "drift without overwriting it")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     if args.assert_in_sync:
-        return assert_in_sync(bucket=args.bucket, obj=args.obj)
+        return heartbeat(bucket=args.bucket, obj=args.obj)
     return publish(build_document(), bucket=args.bucket, obj=args.obj,
                    dry_run=args.dry_run)
 
