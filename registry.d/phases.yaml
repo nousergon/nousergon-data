@@ -1,0 +1,88 @@
+# The data collector's gate ladder — one rung per phase (plan §6).
+#
+# Rungs are declared here rather than in code so the ladder the console renders
+# and the phases the plan names are one list. `gate: null` is never a pass: the
+# rung renders UNMEASURED, which the console renders UNREPORTED and counts
+# against the transparency gap.
+#
+# `tracker` is each rung's own alpha-engine-config issue and becomes the row's
+# console Decision id — deliberately the same identifier the console's git-host
+# adapter mints for that issue, so the two claims merge into one row instead of
+# rendering the phase twice (`console-policy` §2.5).
+#
+# Where `tracker_is_placeholder: true`, the rung points at the parent KEY issue
+# because its own phase issue is not filed yet (plan item P-26). That is not a
+# quiet default: `data.board.phase_trackers_declared` is UNMET while any rung
+# carries it, so the ladder says out loud that part of itself is not tracked.
+
+schema_version: data_phases.v1
+ladder: data
+
+phases:
+  - id: data-phase0
+    number: 0
+    title: Instrument the board, all red
+    gate: data-phase0
+    tracker_issue: 10748
+    tracker_is_placeholder: false
+    exit: >-
+      The phase-0 gate measures that the board is HONEST, not that it is green:
+      the ladder is live with an as_of under 26 h, 414 base clauses exist one
+      per audit cell, the first reading reproduces the audit with every
+      disagreement citing evidence, the writer inventory reconciles, and
+      withholding the ladder or a manifest renders UNREPORTED/UNMEASURABLE
+      rather than green.
+
+  - id: data-phase1
+    number: 1
+    title: Standalone stack live, contracts published
+    gate: data-phase1
+    tracker_issue: 10748
+    tracker_is_placeholder: true
+    exit: >-
+      survives_phase4 0 red read from live schedule state and a successful
+      standalone-stack manifest per unit; schema_contract, observability_row,
+      artifact_registry, run_record and consumers 0 red for every non-retired
+      unit; 5 consecutive EOD and 5 morning successes plus 2 Saturdays with
+      complete manifests; v1 SF data-stage executions since cutover = 0; a
+      4-week tagged cost baseline measured.
+
+  - id: data-phase2
+    number: 2
+    title: Completeness and correctness guards
+    gate: data-phase2
+    tracker_issue: 10748
+    tracker_is_placeholder: true
+    exit: >-
+      Every applicable guard clause enforcing AND commissioned by an induced
+      fault; EOD spine priced == universe minus declared exclusions on 10
+      consecutive trading days; empty-but-fresh count 0 over 20 cycles; vendor
+      divergence emitted 20 of 20 within bound or each breach named; the
+      executor profile shows no collection writes over 7 days.
+
+  - id: data-phase3
+    number: 3
+    title: Board green, SLOs standing
+    gate: data-phase3
+    tracker_issue: 10748
+    tracker_is_placeholder: true
+    exit: >-
+      All clauses MET, 0 UNMEASURABLE, 0 UNREPORTED, sustained over 20
+      consecutive trading days and 4 Saturdays; freshness SLO attainment >=
+      19/20 per family; cost within the ratified ceiling for one full calendar
+      month; pages <= 2 in that month; human mutating calls 0 outside the
+      reserved list.
+
+# A SUB-gate of phase 1, read before the v2 phase-4 maintenance window (plan
+# §6.2). Registered as a gate so it can be READ, but deliberately NOT a rung:
+# it is a precondition inside phase 1, and giving it a rung would make the
+# ladder claim five phases where the plan declares four.
+sub_gates:
+  - id: data-cutover-ready
+    within: data-phase1
+    reads: >-
+      stack check-live green; all 37 SF-only units have a standalone workload or
+      a recorded retirement decision; roles bootstrapped (iam-drift-check
+      clean); pre-cutover parity per published key. `crucible gate --gate
+      phase4` gains one clause that reads this gate's own artifact, coupling
+      components 1 and 2 through a published artifact rather than through code.

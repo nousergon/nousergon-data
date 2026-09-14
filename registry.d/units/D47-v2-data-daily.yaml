@@ -1,0 +1,131 @@
+# Unit descriptor — data collector unit D47 (crucible v2 data.daily / data.weekly / data.heal).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D47
+component_id: "data-collector-d47-v2-data-daily"
+owning_repo: "nousergon-data"
+title: crucible v2 data.daily / data.weekly / data.heal
+component: 2
+graded_on: "crucible-board"
+lifecycle: "in-service"
+owner: brian
+code_path: "crucible:crucible/track_a.py:702-705, crucible/data/daily.py:172"
+trigger:
+  kind: "eventbridge-scheduler"
+  owner: "crucible-v2-dispatcher"
+  successor: is v2
+  schedule: "cron(30 18 ? * MON-FRI *)"
+  runs_on: "ec2-spot"
+writes:
+  - "crucible-v2 store: data/{trading_day}/panel.parquet"
+  - "crucible-v2 store: data/{trading_day}/coverage.json"
+  - "crucible-v2 store: features/{version}/{trading_day}.parquet"
+consumers:
+  - "crucible:crucible/board.py"
+  - "crucible:crucible/features/depth.py"
+contract:
+  schema: "crucible: coverage floor + UndeclaredUniverseError"
+  producer_test: "crucible:tests/test_data_layer.py"
+  consumer_pins: []
+registry_rows: []
+run_manifest_prefix: data_collection/runs/D47
+detectors:
+  - kind: "crucible-gate"
+    via: crucible board (component 2)
+    state: PRESENT
+freshness:
+  na_code: "N/A-NOT-IMPL"
+  note: "graded on the crucible board, not this one"
+  status: not_applicable
+completeness:
+  denominator: null
+  floor: null
+  status: not_applicable
+  na_code: "N/A-NOT-IMPL"
+  note: graded on the crucible board
+guards:
+  empty_fresh:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+  cardinality:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+  units:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+  pit:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+  vendor_fallback:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+  success_without_output:
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    note: >-
+        component 2 — its guards are crucible's, and grading them here would put two
+        verdicts on one producer
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: UNVERIFIED
+    consumers: PRESENT
+    schema_contract: PRESENT
+    artifact_registry: ABSENT
+    observability_row: PRESENT
+    run_record: PRESENT
+    detector: PRESENT
+    console_entity: PRESENT
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    Plan §8.1 EXCLUSION: COMPONENT 2. It is the first-class CONSUMER of component 1's
+    ArcticDB universe, not a producer of it, and its row, identity and store live on the
+    crucible board. It keeps a descriptor here for exactly one reason: its nine audit
+    cells are nine of the 414, and dropping them would make the board's own completeness
+    claim unverifiable against the audit it was built from. Every clause on this unit
+    reads the CRUCIBLE board as its evidence, never a data-collector artifact, and the
+    data ladder's own deliverable for it is the single input-contract clause: crucible
+    pins contracts/arctic_universe.schema.json (P-07).

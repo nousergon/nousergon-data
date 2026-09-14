@@ -1,0 +1,128 @@
+# Unit descriptor — data collector unit D13 (ArcticDB backfill).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D13
+component_id: "data-collector-d13-arcticdb-backfill"
+owning_repo: "nousergon-data"
+title: ArcticDB backfill
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "builders/backfill.py:1626"
+trigger:
+  kind: "step-functions"
+  owner: "ne-weekly-freshness-pipeline:DataPhase1"
+  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  schedule: "Sat 05:00 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - arcticdb/universe (library)
+  - arcticdb/macro (library)
+consumers:
+  - "crucible:crucible/data/sources.py"
+  - "crucible-predictor:inference/stages/load_prices.py"
+  - "crucible-research:data/fetchers/price_fetcher.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+  target: "contracts/arctic_universe.schema.json, pinned in crucible (P-07)"
+registry_rows: []
+run_manifest_prefix: data_collection/runs/D13
+detectors: []
+freshness:
+  family: weekly
+  deadline: "Sat 13:00 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: "constituents - delisted"
+  floor: 0.99
+  status: proposed
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: present
+    note: UniverseFreshnessViolation (builders/daily_append.py)
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+arcticdb_evidence:
+  via: "data_collection/probes/arctic/{trading_day}.json"
+  reason: >-
+      ArcticDB is unreadable from the laptop and from the gate's own identity
+      (alpha-engine-config-I9771). The gate NEVER opens ArcticDB; the EOD and morning
+      machines write the probe as their final workload, and the probe's own staleness is a
+      clause — so a probe that stops writing makes these clauses UNMEASURABLE rather than
+      stale-green.
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: UNVERIFIED
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: UNVERIFIED
+    console_entity: ABSENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    ArcticDB is unreadable from the laptop (alpha-engine-config-I9771) and the gate never
+    opens it. Every ArcticDB clause reads the in-region probe record instead, and the
+    probe's own staleness is a clause — so a probe that stops writing makes these
+    UNMEASURABLE rather than stale-green.

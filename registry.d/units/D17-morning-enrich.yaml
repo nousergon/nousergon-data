@@ -1,0 +1,122 @@
+# Unit descriptor — data collector unit D17 (morning-enrich (polygon T+1)).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D17
+component_id: "data-collector-d17-morning-enrich"
+owning_repo: "nousergon-data"
+title: "morning-enrich (polygon T+1)"
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "weekly_collector.py:1533 -> collectors/daily_closes.py:649"
+trigger:
+  kind: "step-functions"
+  owner: "ne-preopen-trading-pipeline"
+  successor: "ne-data-collection-morning (nousergon-data-PR1701, DISABLED)"
+  schedule: "weekdays 07:30 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - "staging/daily_closes/{date}.parquet"
+writes_shared_with:
+  - D19
+consumers:
+  - "crucible-executor:executor/upstream_artifact_gate.py"
+  - "crucible-dashboard:loaders/s3_loader.py"
+contract:
+  schema: "sources/contract.py::PriceBar"
+  producer_test: tests/test_price_source_contract.py
+  consumer_pins: []
+registry_rows:
+  - daily_closes_parquet
+run_manifest_prefix: data_collection/runs/D17
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: PRESENT
+  - kind: "sf-execution"
+    via: "ne-preopen-trading-pipeline"
+    state: PRESENT
+freshness:
+  family: morning
+  deadline: "08:30 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: metron/holdings_universe.json
+  floor: 1.0
+  status: proposed
+  note: "after the symbol-normalization map (plan §2 row 2)"
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  units:
+    state: present
+    note: PriceBar
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: present
+    note: "hard-fails on polygon failure; no yfinance fallback"
+  success_without_output:
+    state: risk
+    note: "`skipped` exits 0 after 13:30 PT on the polygon 403 (alpha-engine-config-I7572). P-17."
+  vendor_crosscheck:
+    state: absent
+    note: "D17 and D19 write the SAME key in overwrite and no divergence metric exists. P-16."
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: PRESENT
+    artifact_registry: PRESENT
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: PRESENT
+    console_entity: PRESENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    Page condition 4 (plan amendment 2): the trader needs these appends complete by 08:30
+    ET, and a miss pages rather than sitting on the board.

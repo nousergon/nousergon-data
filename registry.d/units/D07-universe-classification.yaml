@@ -1,0 +1,123 @@
+# Unit descriptor — data collector unit D07 (universe_classification).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D07
+component_id: "data-collector-d07-universe-classification"
+owning_repo: "nousergon-data"
+title: universe_classification
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "collectors/universe_classification.py:95"
+trigger:
+  kind: "step-functions"
+  owner: "ne-weekly-freshness-pipeline:DataPhase1"
+  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  schedule: "Sat 05:00 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - "market_data/universe_classification/{date}.json"
+  - market_data/universe_classification/latest.json
+consumers:
+  - "crucible-research:scoring/universe_board.py"
+  - "crucible-research:scoring/attractiveness_history.py"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows:
+  - universe_classification_latest
+run_manifest_prefix: data_collection/runs/D07
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: PRESENT
+freshness:
+  family: weekly
+  deadline: "Sat 13:00 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: constituents
+  floor: 1.0
+  status: proposed
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: PRESENT
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: PRESENT
+    console_entity: PRESENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    Its consumer fail-softs to null (universe_board.py:1024), so a collapse here is silent
+    downstream — which is why the floor is 1.0 rather than a ratio.

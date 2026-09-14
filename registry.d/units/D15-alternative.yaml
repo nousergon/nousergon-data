@@ -1,0 +1,120 @@
+# Unit descriptor — data collector unit D15 (alternative (phase 2)).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# RED BY DEFAULT. The `audit.cells` block below is the 2026-09-14 baseline
+# reading, transcribed from alpha-engine-config/private-docs/data_collection_audit_260914.md §3. It is NOT evidence: every cell, including
+# the ones scored PRESENT, is a clause that is RED until the gate measures it,
+# and a first reading that DISAGREES with its cell is itself a finding — either
+# the audit was wrong or the system has drifted since.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D15
+component_id: "data-collector-d15-alternative"
+owning_repo: "nousergon-data"
+title: alternative (phase 2)
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "collectors/alternative.py:631"
+trigger:
+  kind: "step-functions"
+  owner: "ne-weekly-freshness-pipeline:DataPhase2"
+  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  schedule: "Sat 05:00 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - "market_data/weekly/{date}/alternative/{ticker}.json"
+  - "market_data/weekly/{date}/alternative/manifest.json"
+  - "market_data/weekly/{date}/alternative/scope.json"
+consumers:
+  - "nousergon-data:features/compute.py (indirect, via features/{date}/alternative.parquet)"
+contract:
+  schema: null
+  producer_test: null
+  consumer_pins: []
+registry_rows:
+  - weekly_alternative_manifest
+  - weekly_alternative_scope
+run_manifest_prefix: data_collection/runs/D15
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: PRESENT
+freshness:
+  family: weekly
+  deadline: "Sat 13:00 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: constituents
+  floor: 0.8
+  status: proposed
+guards:
+  empty_fresh:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  cardinality:
+    state: present_on_input
+    note: >-
+        raises on empty constituents rather than using an implicit list
+        (weekly_collector.py:799, alpha-engine-config-I5814)
+  units:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  pit:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  vendor_fallback:
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
+  success_without_output:
+    state: broken
+    note: >-
+        the scope-baseline write SWALLOWS its exception with a warning
+        (weekly_collector.py:838). P-17.
+audit:
+  source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
+  baseline_date: "2026-09-14"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: ABSENT
+    artifact_registry: PRESENT
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: PRESENT
+    console_entity: PRESENT
+    survives_phase4: BROKEN
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: "alpha-engine-config-I10753: this unit has no standalone-stack workload yet."
