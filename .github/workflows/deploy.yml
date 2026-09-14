@@ -10,6 +10,10 @@ on:
       # separate deploy mechanism — see weekly_collector.py path guard.
       - 'collectors/**'
       - 'dates.py'
+      # alpha-engine-config-I10773 — the phase → audit-unit table the run
+      # manifest is addressed by; shipped in the Lambda image, so a change to
+      # it must redeploy or the image runs an older map than main declares.
+      - 'run_units.py'
       - 'store/**'
       - 'validators/**'
       - 'weekly_collector.py'
