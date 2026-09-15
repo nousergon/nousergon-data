@@ -227,9 +227,19 @@ Resources:
         Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_keys": []}'
 
   # Saturday weekly collection. Replaces ne-weekly-freshness-pipeline's
-  # MorningEnrich -> DataPhase1 order. 05:00 ET = the v1 SF's 09:00 UTC start
-  # under EDT. No verify_keys: phase 1 auto-skips phases whose cycle output is
-  # already on S3, so an unchanged LastModified is legitimate on a rerun.
+  # MorningEnrich -> DataPhase1 -> DataPhase2 -> RAGIngestion chain (v1 data
+  # order; alpha-engine-config-I10753 adds the last two). 05:00 ET = the v1
+  # SF's 09:00 UTC start under EDT. No verify_keys: phase 1 auto-skips phases
+  # whose cycle output is already on S3, so an unchanged LastModified is
+  # legitimate on a rerun.
+  #
+  # alternative-phase-two (D15) measured ~35 min and rag-weekly-ingestion
+  # (D16/D46) measured ~20-23 min across two full v1 executions
+  # (2026-08-04, 2026-08-07 ne-weekly-freshness-pipeline history) — both
+  # comfortably inside the dispatcher's per-workload 7200s ceiling
+  # (DATA_SPOT_MAX_RUNTIME_SECONDS) and, combined with weekly-phase-one's
+  # ~88 min, well inside this state machine's own 28800s TimeoutSeconds.
+  # No split needed (I10753 deliverable 3).
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -246,7 +256,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one"], "require_trading_day": false, "verify_keys": []}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_keys": []}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
