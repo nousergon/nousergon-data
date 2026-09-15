@@ -127,6 +127,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # only freshness catches that. The row rides an alpha-engine-config PR;
     # pinned here first so this repo's guard is honest about the new PUT site
     # either way, per the I5718 and I7167 precedent above.
+    # check-live verdict -> data_collection/deploy/check-live/latest.json, read
+    # by the data gate (alpha-engine-config-I10870). Its ARTIFACT_REGISTRY row
+    # is owned by the registry sibling and is named as outstanding in the PR.
+    "infrastructure/data_collection_stack.py": 1,
     "infrastructure/overseer/publish_alert_tier_registry.py": 1,
     # alpha-engine-config-I8189 — the declared-pause lane set,
     # s3://alpha-engine-research/ops/checks/automation-pause-reconcile/paused_lanes.json.

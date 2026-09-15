@@ -311,6 +311,60 @@ def test_shadow_weekday_renders_the_four_shadow_runs_then_parity_in_order(monkey
     assert "rc=${PIPESTATUS[0]}" in rendered
 
 
+def _every_resolved_workload(index):
+    for workload in sorted(index._WORKLOADS):
+        event = {"workload": workload}
+        if workload in index._WORKLOADS_REQUIRING_TRADING_DAY:
+            event["trading_day"] = "2026-09-14"
+        yield index._resolve_workload(event)
+
+
+def test_every_workload_boot_installs_gitleaks_and_gates_on_dlp_preflight(monkeypatch):
+    """alpha-engine-config-I10866 deliverable 4 (class: I10370). The 2026-09-15
+    shadow-weekday box's flow-doctor diagnosis failed closed with 'gitleaks
+    binary not found on PATH'. Every workload this dispatcher runs makes LLM
+    calls through flow-doctor, so every rendered bootstrap must install the
+    pinned binary and pass the DLP preflight BEFORE the collector starts."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    for workload, cmd in _every_resolved_workload(index):
+        rendered = index._bootstrap_command(workload, cmd, "tok")
+        asset = f"gitleaks_{index.GITLEAKS_VERSION}_linux_x64.tar.gz"
+        assert asset in rendered, workload
+        assert f'echo "{index.GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c -' in rendered, workload
+        preflight = rendered.index("python -m krepis.session_dlp preflight || fail")
+        installed = rendered.index('command -v gitleaks >/dev/null 2>&1 || fail')
+        venv = rendered.index("source .venv/bin/activate")
+        run = rendered.index(f"{cmd} 2>&1 | tee -a")
+        assert venv < installed < preflight < run, workload
+        assert "KREPIS_DLP_DISABLED" not in rendered
+
+
+def test_gitleaks_pin_moves_in_lockstep_with_spot_common():
+    import re
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    common = open(os.path.join(here, "..", "..", "_spot_common.sh"), encoding="utf-8").read()
+    version = re.search(r"^GITLEAKS_VERSION=(\S+)$", common, re.M).group(1)
+    sha = re.search(r"^GITLEAKS_SHA256=(\S+)$", common, re.M).group(1)
+    source = open(os.path.join(here, "index.py"), encoding="utf-8").read()
+    assert f'GITLEAKS_VERSION = "{version}"' in source
+    assert f'GITLEAKS_SHA256 = "{sha}"' in source
+
+
+def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
+    """The four chained legs plus the ArcticDB seed cannot fit the shared
+    7200 s default. SSM executionTimeout and the box's hard-stop timer must
+    both carry the larger cap, and every other workload keeps the default."""
+    index, ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    for workload, cmd in _every_resolved_workload(index):
+        expected = 18000 if workload == "shadow-weekday" else index.MAX_RUNTIME_SECONDS
+        assert index._max_runtime_seconds(workload) == expected
+        assert index._bootstrap_spec(workload).max_runtime_seconds == expected
+        index._send_bootstrap("i-x", workload, cmd, "tok")
+        assert ssm.sent[-1]["Parameters"]["executionTimeout"] == [str(expected)]
+    assert index._max_runtime_seconds(None) == index.MAX_RUNTIME_SECONDS
+
+
 def test_shadow_weekday_requires_trading_day(monkeypatch):
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     with pytest.raises(ValueError, match="requires event\\['trading_day'\\]"):

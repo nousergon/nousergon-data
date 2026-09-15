@@ -133,7 +133,13 @@ def test_the_board_is_red_at_birth(board):
         if c.name.startswith("data.D") and ".guard." not in c.name and not c.name.endswith(".completeness")
     ]
     assert len(base) == 414
-    met = [c for c in base if c.met]
+    # A declared not-applicable (an on-demand unit with no invocation to record,
+    # or no scheduled trigger for phase 4 to remove — alpha-engine-config-I10870/
+    # I10871) is MET off the descriptor plus a real listing, not off a reader
+    # grading evidence; it is held to the `not applicable:` prefix instead.
+    declared_na = [c for c in base if c.met and c.detail.startswith("not applicable")]
+    assert all(c.name.endswith((".run_record", ".survives_phase4")) for c in declared_na), declared_na
+    met = [c for c in base if c.met and c not in declared_na]
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
     # where a schema, a producer test AND a consumer pin all exist.
     # I10823 added readers whose evidence is in THIS tree even against an empty
@@ -559,6 +565,14 @@ _KNOWN_OPS_PLANE_WRITE_SITES = {
         "preflight/sentinel-<uuid>.txt to prove the IAM grant, then relies on "
         "the DELETE to clean it up — not a published data key."
     ),
+    "shadow/arctic_seed.py": (
+        "ensure_seeded() write_batch/write calls land ONLY in "
+        "shadow_{YYYYMMDD}_* ArcticDB libraries (every name is re-checked "
+        "against the shadow prefix and LIVE_ARCTIC_LIBRARIES; live handles are "
+        "read-only wrappers) — the pre-cutover shadow run's private copy of "
+        "live state (alpha-engine-config-I10866), consumed by no pipeline and "
+        "claimed by no unit descriptor, not a published data key."
+    ),
     "validators/stage_output_sweep.py": (
         "_publish_verdict() writes the sweep's OWN verdict document "
         "(alpha-engine-config-I7167) — an ops artifact about other stages' "
@@ -710,19 +724,45 @@ def test_stack_check_live_absent_is_unmet_not_unmeasurable():
     assert evidence.STACK_CHECK_LIVE_KEY in reading.evidence
 
 
-def test_stack_check_live_reads_the_published_status():
-    store = EmptyStore(
-        {evidence.STACK_CHECK_LIVE_KEY: json.dumps({"status": "clean", "findings": []}).encode()}
-    )
-    reading = evidence.read_stack_check_live(store)
-    assert reading.met is True
+_CHECK_LIVE_NOW = dt.datetime(2026, 9, 15, 12, 0, tzinfo=dt.timezone.utc)
 
-    store = EmptyStore(
-        {evidence.STACK_CHECK_LIVE_KEY: json.dumps({"status": "drift", "findings": ["x"]}).encode()}
+
+def _verdict_store(**over):
+    doc = {
+        "schema_version": evidence.STACK_CHECK_LIVE_SCHEMA,
+        "as_of": "2026-09-14T22:31:00Z",
+        "code_sha": "a" * 40,
+        "stack": "nousergon-data-collection",
+        "measured": True,
+        "in_sync": True,
+        "drift": [],
+        "error": None,
+        **over,
+    }
+    return EmptyStore({evidence.STACK_CHECK_LIVE_KEY: json.dumps(doc).encode()})
+
+
+def test_stack_check_live_reads_the_published_verdict():
+    assert evidence.read_stack_check_live(_verdict_store(), now=_CHECK_LIVE_NOW).met is True
+    drift = evidence.read_stack_check_live(_verdict_store(in_sync=False, drift=["x"]), now=_CHECK_LIVE_NOW)
+    assert drift.met is False and drift.unmeasurable is False and "x" in drift.detail
+
+
+def test_stack_check_live_that_could_not_measure_is_unmeasurable():
+    reading = evidence.read_stack_check_live(
+        _verdict_store(measured=False, in_sync=False, error="AccessDenied"), now=_CHECK_LIVE_NOW
     )
-    reading = evidence.read_stack_check_live(store)
-    assert reading.met is False
-    assert reading.unmeasurable is False
+    assert reading.unmeasurable is True and "AccessDenied" in reading.detail
+
+
+def test_a_stale_in_sync_verdict_is_unmet():
+    reading = evidence.read_stack_check_live(_verdict_store(as_of="2026-09-01T00:00:00Z"), now=_CHECK_LIVE_NOW)
+    assert reading.met is False and reading.unmeasurable is False
+
+
+def test_the_pre_i10870_status_shape_is_a_finding_not_a_pass():
+    store = EmptyStore({evidence.STACK_CHECK_LIVE_KEY: json.dumps({"status": "clean"}).encode()})
+    assert evidence.read_stack_check_live(store, now=_CHECK_LIVE_NOW).met is False
 
 
 def test_stack_check_live_denied_is_unmeasurable():

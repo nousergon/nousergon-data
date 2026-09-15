@@ -32,7 +32,7 @@ import arcticdb as adb
 import pandas as pd
 from nousergon_lib.arcticdb import arctic_uri, open_macro_lib, open_universe_lib
 
-from shadow.root import shadow_arctic_library
+from shadow.root import active_root, shadow_arctic_library
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +128,16 @@ def _open_library(
     bucket = bucket or os.environ.get("ARCTIC_BUCKET", DEFAULT_BUCKET)
     shadowed = shadow_arctic_library(name)
     if shadowed != name:
-        return _get_arctic(bucket).get_library(shadowed, create_if_missing=True)
+        # alpha-engine-config-I10866: a shadow library must hold LIVE state
+        # (bounded to before the shadow trading day) before anything reads it,
+        # or the schema assert reads v0 and every history-dependent feature is
+        # computed over one bar. ensure_seeded is idempotent per stamp, and it
+        # raises rather than returning an unseeded library.
+        from shadow.arctic_seed import ensure_seeded
+
+        arctic = _get_arctic(bucket)
+        ensure_seeded(arctic, active_root())
+        return arctic.get_library(shadowed, create_if_missing=True)
     if name == "universe":
         return open_universe_lib(bucket, create_if_missing=create_if_missing)
     if name == "macro":
