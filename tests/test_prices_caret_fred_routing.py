@@ -61,11 +61,11 @@ def test_fred_wins_over_a_short_yfinance_answer_for_vix3m(monkeypatch):
     _patch_yf_download(monkeypatch, _ohlcv(1))
     monkeypatch.setattr(
         _prices, "_fred_ohlcv_for_caret_symbol",
-        lambda ticker, period: _ohlcv(2518),
+        lambda ticker, period, **_kw: _ohlcv(2518),
     )
 
     refreshed, failed = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50,
+        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50, trading_day="2026-09-14",
     )
 
     assert refreshed == 1
@@ -82,11 +82,11 @@ def test_yfinance_wins_when_it_answers_longer(monkeypatch):
     _patch_yf_download(monkeypatch, _ohlcv(2500))
     monkeypatch.setattr(
         _prices, "_fred_ohlcv_for_caret_symbol",
-        lambda ticker, period: _ohlcv(2000),
+        lambda ticker, period, **_kw: _ohlcv(2000),
     )
 
     refreshed, failed = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50,
+        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
     key, body = s3.uploads[0]
@@ -103,11 +103,11 @@ def test_fred_outage_degrades_to_yfinance_not_to_nothing(monkeypatch):
     s3 = _FakeS3()
     _patch_yf_download(monkeypatch, _ohlcv(2484))
     monkeypatch.setattr(
-        _prices, "_fred_ohlcv_for_caret_symbol", lambda ticker, period: None,
+        _prices, "_fred_ohlcv_for_caret_symbol", lambda ticker, period, **_kw: None,
     )
 
     refreshed, failed = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50,
+        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
     assert failed == []
@@ -123,11 +123,11 @@ def test_non_caret_tickers_never_consult_fred(monkeypatch):
     called = []
     monkeypatch.setattr(
         _prices, "_fred_ohlcv_for_caret_symbol",
-        lambda ticker, period: called.append(ticker) or None,
+        lambda ticker, period, **_kw: called.append(ticker) or None,
     )
 
     refreshed, failed = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["AAPL"], "10y", 50,
+        s3, "alpha-engine-research", "predictor/price_cache/", ["AAPL"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
     assert called == [], "a non-caret ticker must never reach the FRED path"
