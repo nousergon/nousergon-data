@@ -23,13 +23,21 @@ component_id: "data-collector-d40-analyst-snapshotter"
 owning_repo: "nousergon-data"
 title: analyst snapshotter
 component: 1
-lifecycle: "proposed-retirement"
+lifecycle: "retired"
 owner: brian
 code_path: "data/snapshotter/analyst_daily.py:161"
+retirement:
+  ruling: "Brian 2026-09-14 R7 (alpha-engine-config-I10753)"
+  reason: "zero-consumer artifact (no reader found for data/analyst_snapshots/*)"
+  archive_prefix: "data/analyst_snapshots/"
+  archive_note: >-
+    Retiring a producer never deletes its archive (standing preference: retain
+    all archives — data is an asset). No S3 lifecycle/delete action taken.
+  no_successor_workload: true
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:RAGIngestion"
-  successor: "none declared (alpha-engine-config-I10753)"
+  successor: "RETIRED (Brian 2026-09-14 R7) — no successor workload; see retirement: above"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
@@ -115,5 +123,10 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    alpha-engine-config-I10753 + R7 retire. Retiring a producer never deletes its archive
-    (standing preference: retain all archives).
+    alpha-engine-config-I10753 + R7 retire, RECORDED (see retirement: block above).
+    run_weekly_ingestion.sh step 8 (analyst pipeline) continues to execute as
+    part of the unchanged script the `rag-weekly-ingestion` workload runs
+    (this unit's own trigger surface is out of scope for I10753/I10779 —
+    trimming step 8 out of the script is a separate follow-up); this row is
+    RETIRED for tracking/monitoring purposes, not asserting the script no
+    longer writes the archive.
