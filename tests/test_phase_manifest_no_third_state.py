@@ -126,7 +126,10 @@ def test_a_collector_disabled_by_declaration_writes_not_applicable_with_a_closed
     assert manifests[0]["status"] == "not_applicable"
     # The reason is drawn from `nousergon_lib`'s CLOSED list, never free text —
     # a free-text reason is how a unit quietly stops being graded.
-    assert manifests[0]["reason"] == run_units.NOT_RUN_NOT_APPLICABLE
+    # `alpha-engine-config-I10831` deliverable 1: a collector switched off in
+    # config.yaml is `disabled_by_declaration`, not the generic
+    # `no_new_data_declared` this used to be the nearest true member for.
+    assert manifests[0]["reason"] == run_units.NOT_RUN_DISABLED_BY_DECLARATION
     assert manifests[0]["reason"] in __import__(
         "nousergon_lib.run_manifest", fromlist=["x"]
     ).NOT_APPLICABLE_REASONS

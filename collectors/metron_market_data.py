@@ -2461,14 +2461,35 @@ def main(argv: list[str] | None = None) -> int:
             captured["result"] = intra
             status = intra.get("status")
             if status == "skipped":
-                # The session/demand gate declared there is nothing to collect
-                # this tick. `no_new_data_declared` is the nearest true member
-                # of run_manifest.NOT_APPLICABLE_REASONS, which is CLOSED at the
-                # pinned lib version; the reason this wants — an explicit
-                # out-of-session-window member — is a lib follow-up.
-                raise run_manifest.NotApplicable(
-                    "no_new_data_declared", str(intra.get("reason") or "gated tick"),
-                )
+                # `collect_intraday` has exactly two skip reasons in source
+                # today (alpha-engine-config-I10831, corrected 2026-09-15 —
+                # matched against nousergon_lib.run_manifest's own per-member
+                # definitions, not guessed):
+                #
+                # * "outside US market window" — the NYSE-session gate. A
+                #   clock fact: the lib's `outside_session_window` docstring
+                #   names this exact shape ("a 5-minute intraday timer gated
+                #   to NYSE market hours ... this tick landed outside it").
+                # * "metron app inactive (no fresh UI heartbeat)" — the
+                #   `--require-heartbeat` demand gate. This unit's systemd
+                #   ExecStart (metron-intraday.service) does NOT pass
+                #   `--require-heartbeat`, so this reason is unreachable in
+                #   production today; it is also not a clock fact, so it does
+                #   not belong under `outside_session_window` either.
+                #
+                # An unrecognized/unreachable reason fails loud rather than
+                # being defaulted to a member whose definition does not match.
+                skip_reason = str(intra.get("reason") or "")
+                if skip_reason != "outside US market window":
+                    raise RuntimeError(
+                        f"D37 intraday collector returned status=skipped with an "
+                        f"unclassified reason {skip_reason!r} — no "
+                        "nousergon_lib.run_manifest.NOT_APPLICABLE_REASONS member has "
+                        "been matched to this cause. Classify it explicitly against "
+                        "the lib's own per-member definitions rather than defaulting "
+                        "(alpha-engine-config-I10831)."
+                    )
+                raise run_manifest.NotApplicable("outside_session_window", skip_reason)
             _record_intraday_run(run_ctx, args.bucket, intra)
             if status not in ("ok", "ok_dry_run"):
                 # A non-ok collector status has FAILED — recorded as such while

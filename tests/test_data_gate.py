@@ -326,6 +326,71 @@ def test_a_filename_that_disagrees_with_the_unit_id_is_refused(tmp_path):
         descriptors.load_units(tmp_path)
 
 
+# ---------------------------------------------------------------------------
+# Retention validation — alpha-engine-config-I10831 deliverable 3
+# ---------------------------------------------------------------------------
+
+
+def test_a_sub_hourly_unit_without_retention_is_refused(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = 5
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    with pytest.raises(DescriptorError, match="must declare `run_manifest_retention`"):
+        descriptors.load_units(tmp_path)
+
+
+def test_a_sub_hourly_unit_with_retention_loads(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = 5
+    base["run_manifest_retention"] = "400 days"
+    base["run_manifest_retention_reason"] = "a full seasonal cycle of session slots"
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    units = descriptors.load_units(tmp_path)
+    assert units[0].cadence_minutes == 5
+    assert units[0].run_manifest_retention_days == 400
+
+
+def test_an_hourly_or_slower_unit_needs_no_retention(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = 60
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    units = descriptors.load_units(tmp_path)
+    assert units[0].run_manifest_retention_days is None
+
+
+def test_a_non_integer_cadence_is_refused(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = "five"
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    with pytest.raises(DescriptorError, match="must be an integer"):
+        descriptors.load_units(tmp_path)
+
+
+def test_a_malformed_retention_shape_is_refused(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = 5
+    base["run_manifest_retention"] = "a long time"
+    base["run_manifest_retention_reason"] = "because"
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    with pytest.raises(DescriptorError, match="is not `<positive integer> days`"):
+        descriptors.load_units(tmp_path)
+
+
+def test_a_retention_with_no_reason_is_refused(tmp_path):
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["trigger"]["cadence_minutes"] = 5
+    base["run_manifest_retention"] = "400 days"
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    with pytest.raises(DescriptorError, match="no run_manifest_retention_reason"):
+        descriptors.load_units(tmp_path)
+
+
+def test_d37_declares_a_validated_retention(units):
+    d37 = next(u for u in units if u.unit_id == "D37")
+    assert d37.cadence_minutes == 5
+    assert d37.run_manifest_retention_days == 400
+
+
 def test_every_declared_na_uses_the_closed_taxonomy(units):
     for unit in units:
         for name, block in unit.guards.items():

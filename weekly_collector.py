@@ -496,9 +496,9 @@ def _phase_not_run(
     * ``applicable=False`` — the unit was correctly asked to do nothing this
       cycle (a collector switched off in ``config.yaml``). Manifest status
       ``not_applicable``, with the closed-list reason
-      :data:`run_units.NOT_RUN_NOT_APPLICABLE`. The returned dict keeps the
-      ``{"status": "ok", "skipped": ...}`` shape the aggregator already treats
-      as a clean run, so the exit code does not move.
+      :data:`run_units.NOT_RUN_DISABLED_BY_DECLARATION`. The returned dict keeps
+      the ``{"status": "ok", "skipped": ...}`` shape the aggregator already
+      treats as a clean run, so the exit code does not move.
     * ``applicable=True`` — the unit SHOULD have run and could not, because an
       upstream input it needs is missing (no tickers, no research.db).
       Manifest status ``failed``, naming the missing input. The returned dict
@@ -530,7 +530,7 @@ def _phase_not_run(
         )
         if applicable:
             raise _PhaseNotRun(name, reason)
-        raise run_manifest.NotApplicable(run_units.NOT_RUN_NOT_APPLICABLE, reason)
+        raise run_manifest.NotApplicable(run_units.NOT_RUN_DISABLED_BY_DECLARATION, reason)
 
     try:
         run_manifest.run_unit(unit.unit_id, _body, **_run_manifest_context(reg, unit))
@@ -726,9 +726,24 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
 
     A mode returning ``status="skipped"`` is a NON-RUN, not a clean run: the
     manifest says ``not_applicable`` with the closed-list reason, never ``ok``
-    (`alpha-engine-config-I10784`). MorningEnrich after 1:30pm PT, and a target
-    date already appended to ArcticDB, are both "the declaration says there is
-    nothing new to collect".
+    (`alpha-engine-config-I10784`).
+
+    ``skip_reason`` is matched explicitly against a known producer, never
+    guess-bucketed (`alpha-engine-config-I10831` deliverable 1, corrected
+    2026-09-15). Today the ONLY producer among the five wrapped modes is
+    :func:`_should_skip_morning_enrich`'s ``stale_overwrite`` reason —
+    MorningEnrich's own freshness guard, skipping because its target date is
+    already appended to ArcticDB. That is
+    :data:`run_units.NOT_RUN_NO_NEW_DATA_DECLARED`: `nousergon_lib.run_manifest`
+    defines the member as "an upstream explicitly declared there is nothing
+    new for THIS run to collect ... a target date already published" — the
+    lib's own example, verbatim. It is neither an operator/config decision
+    (``disabled_by_declaration``) nor a clock fact (``outside_session_window``
+    — no schedule/window was involved, just a freshness comparison against
+    what is already in ArcticDB). A ``skip_reason`` this function does not
+    recognize FAILS LOUD (``_CollectorError``) rather than defaulting to any
+    member — a new skip producer earns its own classification against the
+    lib's definitions, not a guess.
     """
     unit_id = run_units.MODE_UNITS[mode]
     run_date = getattr(args, "date", None) or default_run_date()
@@ -755,13 +770,26 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
             raise _CollectorError(mode, f"{mode} returned status={status!r}: {result}")
         if status == "skipped":
             detail = str((result or {}).get("skip_reason") or f"{mode} reported status=skipped")
+            # Match against the one enumerated producer BEFORE recording the
+            # guard verdict — an unrecognized reason is not a not_applicable
+            # candidate at all (see this function's docstring;
+            # alpha-engine-config-I10831, corrected 2026-09-15).
+            if not detail.startswith("stale_overwrite"):
+                raise _CollectorError(
+                    mode,
+                    f"{mode} returned status=skipped with an unclassified skip_reason "
+                    f"{detail!r} — no nousergon_lib.run_manifest.NOT_APPLICABLE_REASONS "
+                    "member has been matched to this cause. Classify it explicitly "
+                    "against the lib's own per-member definitions rather than "
+                    "defaulting (alpha-engine-config-I10831).",
+                )
             run_ctx.record_guard(
                 expectations.EMPTY_FRESH_GUARD.name,
                 mode=expectations.EMPTY_FRESH_GUARD.mode.value,
                 verdict="not_applicable",
                 detail=f"{unit_id} published nothing on this run ({detail})",
             )
-            raise run_manifest.NotApplicable(run_units.NOT_RUN_NOT_APPLICABLE, detail)
+            raise run_manifest.NotApplicable(run_units.NOT_RUN_NO_NEW_DATA_DECLARED, detail)
         _record_mode_lineage(run_ctx, mode, unit_id, result or {})
         return result
 

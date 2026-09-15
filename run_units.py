@@ -49,7 +49,9 @@ __all__ = [
     "MANIFEST_BUCKET",
     "MODE_ROWS",
     "MODE_UNITS",
-    "NOT_RUN_NOT_APPLICABLE",
+    "NOT_RUN_DISABLED_BY_DECLARATION",
+    "NOT_RUN_NO_NEW_DATA_DECLARED",
+    "NOT_RUN_OUTSIDE_SESSION_WINDOW",
     "PHASE_UNITS",
     "TRIGGER_ENV",
     "EntryRunFailed",
@@ -230,22 +232,42 @@ MODE_ROWS: dict[str, ModeRows] = {
     "chronic_gap_heal": ModeRows("chronic_gap_self_heal", "healed", counts_list=True),
 }
 
-#: The one :data:`NOT_APPLICABLE_REASONS` member this repo maps a
-#: declaration-driven non-run onto.
+#: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase
+#: non-runs map onto (`alpha-engine-config-I10831` deliverable 1, landed as
+#: `nousergon-lib` v0.124.130 / nousergon-lib-PR416). Each name is matched to
+#: the lib's own one-line definition for that member
+#: (`nousergon_lib.run_manifest.NOT_APPLICABLE_REASONS`'s docstring), not
+#: guessed:
 #:
-#: A collector switched off in `config.yaml`, and a MorningEnrich whose target
-#: date is already in ArcticDB, are both "the declaration says there is nothing
-#: new to collect this cycle" — which is what `no_new_data_declared` means. It
-#: is NOT a soft `ok`: the manifest is written, the non-run is COUNTED, and a
+#: * `disabled_by_declaration` — "the unit itself is switched off by a
+#:   standing config declaration ... independent of what any upstream
+#:   published this cycle. The non-run is an operator decision, not a data
+#:   observation." Matches a collector switched off in `config.yaml`.
+#: * `outside_session_window` — "the unit's own schedule fires more often
+#:   than its declared window ... and this tick landed outside it. The
+#:   non-run is a clock fact." Matches a 5-minute intraday timer's off-session
+#:   tick.
+#: * `no_new_data_declared` — "an upstream explicitly declared there is
+#:   nothing new for THIS run to collect (a vendor feed with no fresh rows, a
+#:   target date already published)." Matches MorningEnrich's own freshness
+#:   guard (`_should_skip_morning_enrich`'s `stale_overwrite` reason) —
+#:   neither an operator decision nor a clock fact, but exactly the lib's own
+#:   "target date already published" example.
+#:
+#: None is a soft `ok`: the manifest is written, the non-run is COUNTED, and a
 #: unit answering `not_applicable` every cycle is visible as a unit that has
 #: stopped working.
 #:
-#: `NOT_APPLICABLE_REASONS` is a closed frozenset in `nousergon_lib`, whose pin
-#: is lockstep-guarded across five repos here, so a more precise
-#: `disabled_by_declaration` member is a library change rather than something
-#: this module may invent — a free-text reason is exactly how a unit quietly
-#: stops being graded. Tracked as a follow-up on `alpha-engine-config-I10784`.
-NOT_RUN_NOT_APPLICABLE = "no_new_data_declared"
+#: Corrected 2026-09-15 (`alpha-engine-config-I10831` review): an earlier
+#: revision of this pin mapped the `stale_overwrite` case to
+#: `disabled_by_declaration` and defaulted every OTHER skip reason to
+#: `outside_session_window` — a default bucket for an unenumerated case, not a
+#: match against the lib's own definitions. `weekly_collector.py`'s whole-mode
+#: dispatch now raises loud on any skip_reason it has not explicitly
+#: classified, rather than defaulting.
+NOT_RUN_DISABLED_BY_DECLARATION = "disabled_by_declaration"
+NOT_RUN_OUTSIDE_SESSION_WINDOW = "outside_session_window"
+NOT_RUN_NO_NEW_DATA_DECLARED = "no_new_data_declared"
 
 
 def unit_for(mode: str, phase: str) -> PhaseUnit:
