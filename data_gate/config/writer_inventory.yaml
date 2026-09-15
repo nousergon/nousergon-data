@@ -71,6 +71,34 @@ extra_paths:
   - path: infrastructure/lambdas/arctic-migration-dispatcher/index.py
     parent_units: [D42]
     reason: The ArcticDB migration dispatcher.
+  - path: weekly_collector.py
+    parent_units: [D17, D19, D33, D34]
+    reason: >-
+      alpha-engine-config-I10830: the largest single producer in the repo — ~30
+      S3 put_object/to_parquet call sites (heal-summary, weekly manifest.json +
+      latest_weekly.json pointer, validation.json, health/data_phase{N}.json
+      markers, the alternative-scope ledger, the pending-upgrades ledger, the
+      price-cache parquet writeback) — sits at the TOP LEVEL of the repo, one
+      directory above every walked root, so it was invisible to the forward
+      (write-site -> descriptor) direction of this scan even though D17/D19/
+      D33/D34 already claim it via `code_path` (their REVERSE direction stayed
+      green throughout, via the collectors/daily_closes.py shared-writer entry
+      below, which is exactly how the gap read MET for months). This entry adds
+      the file to the scan population; no descriptor change was needed.
+
+# Third boundary, added by I10830: the walked roots are the DATA-producer
+# directories, but the repo's remaining top-level `*.py` files and `validators/`
+# are the ops/QA plane by the same logic as `infrastructure/lambdas/` above —
+# scripts that probe or grade a run rather than publish a data key. Verified by
+# an AST sweep of every top-level file and `validators/` for the same S3/
+# ArcticDB/parquet verbs this scan uses (I10830): the only two genuine write
+# call sites found there are named in
+# `tests/test_data_gate.py::_KNOWN_OPS_PLANE_WRITE_SITES` (`preflight.py`'s S3
+# PUT/DELETE permission sentinel, and `validators/stage_output_sweep.py`'s own
+# sweep-verdict artifact) — neither publishes a data key a unit descriptor
+# would claim. That test re-derives this from source on every run, so a THIRD
+# ops-plane write site, or a genuine new producer dropped anywhere outside
+# `roots`/`extra_paths`, turns it red rather than staying invisible.
 
 # Modules that write ON BEHALF OF a parent unit rather than being units
 # themselves (audit §2). Each names the parent whose descriptor accounts for its
