@@ -463,7 +463,7 @@ artifacts:
     s3_key_template: "health/daily_data.json"
     cadence: continuous
     interval_minutes: 1440
-    sla_minutes_after_cron: 60
+    sla_minutes_after_cron: 0
     severity: warning
     owner_repo: alpha-engine-data
     created_at: "2025-01-01"
@@ -5644,7 +5644,7 @@ artifacts:
     interval_minutes: 1440
     calendar_aware: true
     run_calendar: trading_days
-    sla_minutes_after_cron: 750
+    sla_minutes_after_cron: 0
     deadline_local: "08:30 America/New_York"
     severity: critical
     remediation: dispatch-diagnose
@@ -5657,7 +5657,7 @@ artifacts:
     interval_minutes: 1440
     calendar_aware: true
     run_calendar: trading_days
-    sla_minutes_after_cron: 750
+    sla_minutes_after_cron: 0
     deadline_local: "08:30 America/New_York"
     severity: critical
     remediation: dispatch-diagnose
@@ -5686,10 +5686,15 @@ def _preopen_specs_and_deadlines(index_mod, fake_s3):
 
 def test_preopen_registry_rows_declare_a_local_deadline(fake_s3):
     """Both rows parse, and the loader carries their declared wall-clock
-    deadline in the parallel map -- `deadline_local` is NOT an ArtifactSpec
-    field (the pinned lib dataclass is frozen and fleet-wide), so a row that
-    silently lost it would otherwise fall back to the 4-day substrate floor
-    with nothing red."""
+    deadline in the parallel map. `deadline_local` IS a native ArtifactSpec
+    field as of the pinned nousergon-lib >=0.124.129 (alpha-engine-config-
+    I10829 phase 2), but `_SPEC_FIELDS` deliberately still excludes it from
+    the constructor kwargs -- this loader keeps threading it through the
+    parallel `deadline_local_by_id` map rather than the substrate field, so a
+    row that silently lost it would otherwise fall back to the 4-day
+    substrate floor with nothing red. Migrating onto the native field is a
+    separate change (policy-shared-code second-adoption trigger already
+    tracked under I10829 phase 2), not implied by the field merely existing."""
     import index
     specs, _rec, _rem, deadlines = _preopen_specs_and_deadlines(index, fake_s3)
     assert {s.artifact_id for s in specs} == {
@@ -5700,8 +5705,10 @@ def test_preopen_registry_rows_declare_a_local_deadline(fake_s3):
     for hhmm, tz in deadlines.values():
         assert (hhmm.hour, hhmm.minute) == (8, 30)
         assert str(tz) == "America/New_York"
-    # And the row still reaches the spec WITHOUT the extension field.
-    assert not any(hasattr(s, "deadline_local") for s in specs)
+    # The native field exists on every spec now (lib default), but this
+    # loader does not populate it from the registry -- it stays None and the
+    # parallel map above is still the one this monitor actually reads.
+    assert all(s.deadline_local is None for s in specs)
 
 
 def test_preopen_deadline_resolves_to_0830_et_at_both_dst_offsets(fake_s3):
@@ -5903,7 +5910,7 @@ def test_preopen_deadline_is_inert_on_a_non_trading_day():
         artifact_id="crucible_trader_preopen_daily_closes", s3_bucket="b",
         s3_key_template="staging/daily_closes/{trading_day}.parquet",
         cadence="continuous", interval_minutes=1440, run_calendar="trading_days",
-        sla_minutes_after_cron=750, severity="critical",
+        sla_minutes_after_cron=0, severity="critical",
         owner_repo="nousergon-data", created_at=date(2026, 9, 14),
     )
     deadline = index.parse_deadline_local("08:30 America/New_York")
@@ -5922,7 +5929,7 @@ def test_preopen_deadline_leaves_probe_failed_alone():
     spec = ArtifactSpec(
         artifact_id="x", s3_bucket="b", s3_key_template="k/{trading_day}",
         cadence="continuous", interval_minutes=1440, run_calendar="trading_days",
-        sla_minutes_after_cron=750, severity="critical",
+        sla_minutes_after_cron=0, severity="critical",
         owner_repo="ae-test", created_at=date(2026, 9, 14),
     )
     deadline = index.parse_deadline_local("08:30 America/New_York")
