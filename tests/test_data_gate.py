@@ -143,10 +143,20 @@ def test_each_gate_grades_only_the_clauses_tagged_at_or_below_its_phase(board):
     for gate, ceiling in GATES.items():
         result = evaluate(EmptyStore(), gate=gate, trading_day=TRADING_DAY, all_clauses=board)
         ceilings[gate] = len(result.clauses)
+        if ceiling is None:
+            # A sub-gate (`data-cutover-ready`): selects its own exactly-
+            # tagged clauses, never a numbered ceiling.
+            for clause in result.clauses:
+                assert clause.phase == gate
+            continue
         for clause in result.clauses:
             assert int(clause.phase.removeprefix("data-phase")) <= ceiling
     assert ceilings["data-phase0"] < ceilings["data-phase1"] < ceilings["data-phase3"]
-    assert ceilings["data-phase3"] == len(board), "phase 3's exit is 'all clauses MET'"
+    # Phase 3's exit is "all clauses MET" over the numbered ladder — except
+    # the `data-cutover-ready` sub-gate's own four clauses, which are
+    # DELIBERATELY not a rung (`registry.d/phases.yaml`) and are graded only
+    # by their own gate.
+    assert ceilings["data-phase3"] == len(board) - len(clause_module.CUTOVER_READY_CLAUSES)
 
 
 def test_every_reading_names_its_store_and_its_commit(board):
@@ -395,6 +405,143 @@ def test_an_objective_with_no_emitter_is_unobserved_not_met():
 def test_a_denied_objective_read_is_unmeasurable_not_a_finding():
     reading = evidence.read_objective(DeniedStore(), "metrics/cost/monthly/latest.json")
     assert reading.unmeasurable is True
+
+
+# ---------------------------------------------------------------------------
+# The `data-cutover-ready` sub-gate (`alpha-engine-config-I10777`, plan §6.2)
+# ---------------------------------------------------------------------------
+
+
+def test_cutover_ready_is_registered_but_carries_no_numbered_ceiling():
+    assert "data-cutover-ready" in GATES
+    assert GATES["data-cutover-ready"] is None
+
+
+def test_cutover_ready_has_exactly_its_four_clauses(board):
+    names = {c.name for c in board if c.phase == "data-cutover-ready"}
+    assert names == set(clause_module.CUTOVER_READY_CLAUSES)
+
+
+def test_cutover_ready_is_unmet_with_nothing_published(board):
+    """Every clause it reads is a phase-1 evidence gap on an empty store, so
+    the sub-gate itself reads UNMET/UNMEASURABLE — never MET on day one."""
+    result = evaluate(EmptyStore(), gate="data-cutover-ready", trading_day=TRADING_DAY, all_clauses=board)
+    assert result.met is False
+    assert len(result.clauses) == 4
+
+
+def test_stack_check_live_absent_is_unmet_not_unmeasurable():
+    """No emitter yet is a finding about the producer side (`read_objective`'s
+    rule), not about our own read."""
+    reading = evidence.read_stack_check_live(EmptyStore())
+    assert reading.met is False
+    assert reading.unmeasurable is False
+    assert evidence.STACK_CHECK_LIVE_KEY in reading.evidence
+
+
+def test_stack_check_live_reads_the_published_status():
+    store = EmptyStore(
+        {evidence.STACK_CHECK_LIVE_KEY: json.dumps({"status": "clean", "findings": []}).encode()}
+    )
+    reading = evidence.read_stack_check_live(store)
+    assert reading.met is True
+
+    store = EmptyStore(
+        {evidence.STACK_CHECK_LIVE_KEY: json.dumps({"status": "drift", "findings": ["x"]}).encode()}
+    )
+    reading = evidence.read_stack_check_live(store)
+    assert reading.met is False
+    assert reading.unmeasurable is False
+
+
+def test_stack_check_live_denied_is_unmeasurable():
+    reading = evidence.read_stack_check_live(DeniedStore())
+    assert reading.unmeasurable is True
+
+
+def test_parity_is_a_phase0_stub_naming_i10778():
+    reading = evidence.read_parity(EmptyStore(), trading_day=TRADING_DAY)
+    assert reading.unmeasurable is True
+    assert reading.met is False
+    assert "I10778" in reading.detail
+    assert reading.evidence == (f"staging/shadow/{TRADING_DAY.isoformat()}/parity.json",)
+
+
+class _FakeIamClient:
+    """A `list_role_policies` double — `NoSuchEntity` for a declared-missing
+    role, success otherwise, and nothing else implemented (a call this
+    module should never make would raise `AttributeError`, loud)."""
+
+    def __init__(self, missing: set[str] = frozenset()) -> None:
+        self.missing = missing
+        self.calls: list[str] = []
+
+    def list_role_policies(self, *, RoleName: str) -> dict:
+        self.calls.append(RoleName)
+        if RoleName in self.missing:
+            from botocore.exceptions import ClientError
+
+            raise ClientError(
+                {"Error": {"Code": "NoSuchEntity", "Message": "no such role"}},
+                "ListRolePolicies",
+            )
+        return {"PolicyNames": []}
+
+
+def test_roles_bootstrapped_is_unmeasurable_with_no_iam_client():
+    """`LocalStore`/`EmptyStore` carry no `iam_client` attribute at all — this
+    reads UNMEASURABLE without ever reaching for `boto3`."""
+    reading = evidence.read_roles_bootstrapped(EmptyStore(), clause_module.CUTOVER_READY_ROLES)
+    assert reading.unmeasurable is True
+
+
+def test_roles_bootstrapped_met_when_every_role_exists():
+    store = EmptyStore()
+    store.iam_client = _FakeIamClient()
+    reading = evidence.read_roles_bootstrapped(store, clause_module.CUTOVER_READY_ROLES)
+    assert reading.met is True
+    assert sorted(store.iam_client.calls) == sorted(clause_module.CUTOVER_READY_ROLES)
+
+
+def test_roles_bootstrapped_unmet_via_list_role_policies_nosuchentity():
+    """The grant gap this issue names: no `iam:GetRole`, so existence is read
+    through `ListRolePolicies`'s `NoSuchEntity` instead."""
+    store = EmptyStore()
+    store.iam_client = _FakeIamClient(missing={clause_module.CUTOVER_READY_ROLES[0]})
+    reading = evidence.read_roles_bootstrapped(store, clause_module.CUTOVER_READY_ROLES)
+    assert reading.met is False
+    assert reading.unmeasurable is False
+    assert clause_module.CUTOVER_READY_ROLES[0] in reading.detail
+
+
+def test_units_covered_reconciles_against_the_37_named_in_the_plan(units):
+    """The descriptor-derived SF-only population, named as a finding if it
+    disagrees with the 37 the plan and this issue cite — never reconciled
+    silently."""
+    sf_units = clause_module._sf_only_units(units)
+    clause = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
+    if len(sf_units) != 37:
+        assert "37" in clause.detail and str(len(sf_units)) in clause.detail
+
+
+def test_units_covered_is_unmeasurable_when_no_survives_phase4_evidence_exists(units):
+    """Every `survives_phase4` base clause is a phase-0 stub on an empty
+    store, so the rollup is UNMEASURABLE — not a false UNMET."""
+    clause = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
+    assert clause.unmeasurable is True
+    assert clause.met is False
+
+
+def test_the_board_document_publishes_unit_id_per_row(tmp_path):
+    """`alpha-engine-config-I10802`: every board row carries `unit_id`, a
+    `D`-number for a base/guard clause or a category label otherwise."""
+    _result, _ladder, board_doc = run(LocalStore(tmp_path), gate="data-phase0", trading_day=TRADING_DAY)
+    by_clause = {row["clause"]: row["unit_id"] for row in board_doc["rows"]}
+    assert by_clause["data.D01.schema_contract"] == "D01"
+    assert by_clause["data.D20.guard.cardinality"] == "D20"
+    assert by_clause["data.board.population_complete"] == "board"
+    assert by_clause["data.gate.ladder_fresh"] == "gate"
+    assert all(row["unit_id"] for row in board_doc["rows"]), "every row names a unit_id"
 
 
 # ---------------------------------------------------------------------------
