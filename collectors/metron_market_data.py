@@ -1115,7 +1115,14 @@ def collect_history(
         logger.error("[metron_market_data] history write failed: %s", e)
         return {"status": "error", "error": str(e)}
     logger.info("[metron_market_data] wrote %d close-history + %d fx-history series", len(closes), len(fx))
-    return {"status": "ok", "close_series": len(closes), "fx_series": len(fx)}
+    # `fx_currencies`: alpha-engine-config-I10855 — the run-manifest recording
+    # site needs the actual currency codes written this run (fx_history/{ccy}.json
+    # has no consolidated companion file the way close_history does), never a
+    # guessed/static list.
+    return {
+        "status": "ok", "close_series": len(closes), "fx_series": len(fx),
+        "fx_currencies": sorted(fx.keys()),
+    }
 
 
 def collect_reference(

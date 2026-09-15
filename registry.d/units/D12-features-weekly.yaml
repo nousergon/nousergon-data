@@ -38,7 +38,15 @@ writes:
   - "features/{date}/interaction.parquet"
   - "features/{date}/macro.parquet"
   - "features/{date}/alternative.parquet"
-  - "features/{date}/factor_loading.parquet"
+  # alpha-engine-config-I10855 (corrected 2026-09-15): "features/{date}/factor_loading.parquet"
+  # removed — no writer ever produces this key. "factor_loading" is a feature
+  # GROUP materialized as ArcticDB columns (features/cross_sectional.py::
+  # materialize_factor_loading_zscores / update_factor_loading_zscores_latest,
+  # wired via builders/daily_append.py), not a standalone S3 parquet snapshot;
+  # `features/writer.py::write_feature_snapshot` only ever writes the 5 groups
+  # above (features/registry.py::GROUPS). The completion check could never
+  # have passed for this unit while this entry stood, regardless of the
+  # recording fix — no run writes this path.
 consumers:
   - "crucible-research:scoring/factor_scoring.py"
   - "crucible-research:data/fetchers/feature_store_reader.py"

@@ -1436,6 +1436,7 @@ def compute_and_write(
                 _zero_variance,
             )
 
+    supplemental_written: dict[str, int] = {}
     if dry_run:
         log.info(
             "[dry-run] Would write feature snapshot: %d tickers, %d features, date=%s",
@@ -1499,7 +1500,7 @@ def compute_and_write(
             supp_features_df, supp_sector_map = compute_metron_supplemental_features(
                 bucket, s3, set(features_df["ticker"]), macro,
             )
-            write_metron_supplemental_snapshot(
+            supplemental_written = write_metron_supplemental_snapshot(
                 date_str, supp_features_df, supp_sector_map, bucket, s3_client=s3,
             )
         except Exception as supp_exc:
@@ -1523,6 +1524,12 @@ def compute_and_write(
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
         "groups_written": summary,
+        # alpha-engine-config-I10855: the swallowed metron-supplemental write's
+        # own group->rows summary (features/writer.py::write_feature_snapshot's
+        # return), empty when the write was skipped (dry_run) or swallowed
+        # (compute/write failure) — the caller's only truthful source of
+        # whether `features/metron_supplemental/` was actually written this run.
+        "metron_supplemental_written": supplemental_written,
         "load_seconds": round(t_load, 1),
         "compute_seconds": round(t_compute, 1),
         "total_seconds": round(t_total, 1),

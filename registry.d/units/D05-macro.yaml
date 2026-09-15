@@ -34,8 +34,16 @@ trigger:
   runs_on: "ec2-spot"
 writes:
   - "market_data/weekly/{date}/macro.json"
-  - macro_history.parquet
-  - "market_data/weekly/{date}/release_calendar.json"
+  # alpha-engine-config-I10855 (corrected 2026-09-15): the prior two entries
+  # here ("macro_history.parquet", "market_data/weekly/{date}/release_calendar.json")
+  # did not match what collectors/macro.py actually writes
+  # (write_macro_history/write_release_calendar write UNDER market_data/, to
+  # fixed non-dated keys, not a weekly/{date}/ partition) — the completion
+  # check could never have passed for this unit regardless of the recording
+  # fix, because no run would ever produce a manifest output matching these
+  # templates. Corrected to the real keys.
+  - "market_data/macro_history.parquet"
+  - "market_data/macro_release_calendar.parquet"
 consumers:
   - "crucible-research:data/fetchers/macro_fetcher.py"
   - "crucible-research:agents/macro_agent.py"
