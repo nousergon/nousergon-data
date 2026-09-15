@@ -140,6 +140,30 @@ GH_PAT_SSM = os.environ.get(
 # Hard ceiling for the on-box SSM command (matches the bootstrap watchdog). Sized
 # above the observed ~50 min enrich + ~38 min append tail with headroom.
 MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"))
+
+# Per-workload runtime caps that must exceed the shared default. shadow-weekday
+# chains FOUR boundary invocations that each ran under their own 7200 s box
+# before this workload existed (~50 min enrich + ~38 min append + EOD data +
+# ~38 min EOD append), plus the one-time ArcticDB seed from live, which is
+# bounded at ~30 min in-region with its own 45 min budget (shadow/root.py
+# "Budget", alpha-engine-config-I10866), plus parity. 5 h covers that sum
+# (~3.9 h) with headroom. It drives BOTH the SSM executionTimeout and the
+# box's hard-stop timer, so neither of them can cut the chain off first.
+_WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
+
+
+def _max_runtime_seconds(workload: "str | None") -> int:
+    return max(MAX_RUNTIME_SECONDS, _WORKLOAD_MAX_RUNTIME_SECONDS.get(workload or "", 0))
+
+
+# gitleaks pin for the DLP boot gate. It moves in LOCKSTEP with
+# infrastructure/_spot_common.sh::install_gitleaks_dlp (same version, same
+# sha256, same release asset); test_handler.py asserts that equality.
+# alpha-engine-config-I10370 / I10866: krepis.session_dlp shells out to this
+# binary on every LLM call (flow-doctor diagnosis) and fails CLOSED without it.
+# A wheel cannot carry it, so the venv install never provides it.
+GITLEAKS_VERSION = "8.30.1"
+GITLEAKS_SHA256 = "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("DATA_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
 CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot")
 
@@ -754,7 +778,7 @@ def _completion_check(event: dict, s3_client=None) -> dict:
     }
 
 
-def _bootstrap_spec() -> SpotBootstrapSpec:
+def _bootstrap_spec(workload: "str | None" = None) -> SpotBootstrapSpec:
     """The part of this box's provisioning krepis renders.
 
     ``nousergon-data`` is public and was already cloned from a plain URL, so
@@ -772,7 +796,7 @@ def _bootstrap_spec() -> SpotBootstrapSpec:
         # renderer additionally ABORTS when it cannot be armed, where the old
         # copy ended in `|| true`. A dispatcher-side failure after
         # send-command can never leave this box orphaned.
-        max_runtime_seconds=MAX_RUNTIME_SECONDS,
+        max_runtime_seconds=_max_runtime_seconds(workload),
         exports={
             "XDG_CACHE_HOME": "/home/ec2-user/.cache",
             "FLOW_DOCTOR_ENABLED": "1",
@@ -862,6 +886,21 @@ pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
 # numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
 pip install -q 'numpy<2' || fail "numpy pin failed"
+# gitleaks + DLP preflight boot gate, for EVERY workload (alpha-engine-config-I10370,
+# I10866). Same pin, same asset, same gate as _spot_common.sh::install_gitleaks_dlp.
+# Without it, flow-doctor's diagnosis fails closed with "gitleaks binary not found
+# on PATH", and the page goes out with no diagnosis. Runs as root, so no sudo.
+if ! command -v gitleaks >/dev/null 2>&1; then
+  curl -fsSL -o /tmp/gitleaks.tar.gz \\
+    "https://github.com/gitleaks/gitleaks/releases/download/v{GITLEAKS_VERSION}/gitleaks_{GITLEAKS_VERSION}_linux_x64.tar.gz" \\
+    || fail "gitleaks download failed"
+  echo "{GITLEAKS_SHA256}  /tmp/gitleaks.tar.gz" | sha256sum -c - || fail "gitleaks sha256 mismatch"
+  tar -xzf /tmp/gitleaks.tar.gz -C /usr/local/bin gitleaks || fail "gitleaks extract failed"
+  chmod +x /usr/local/bin/gitleaks || fail "gitleaks chmod failed"
+  rm -f /tmp/gitleaks.tar.gz
+fi
+command -v gitleaks >/dev/null 2>&1 || fail "gitleaks binary unavailable after install (fail-closed)"
+python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks binary/config not ready)"
 {collector_cmd} 2>&1 | tee -a {log}
 rc=${{PIPESTATUS[0]}}
 trap - EXIT
@@ -869,7 +908,7 @@ aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
 [ "$rc" -eq 0 ] || fail "workload {workload} exited $rc"
 echo "[data-spot] workload {workload} complete"
 """
-    return prelude + "\n" + render_bootstrap(_bootstrap_spec()) + "\n" + tail
+    return prelude + "\n" + render_bootstrap(_bootstrap_spec(workload)) + "\n" + tail
 
 
 def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
@@ -973,7 +1012,7 @@ def _send_bootstrap(instance_id: str, workload: str, collector_cmd: str, run_tok
             "commands": [_bootstrap_command(workload, collector_cmd, run_token)],
             # Execution timeout (NOT the start timeout) — without this SSM kills
             # the command at the 3600s default, guillotining the append tail.
-            "executionTimeout": [str(MAX_RUNTIME_SECONDS)],
+            "executionTimeout": [str(_max_runtime_seconds(workload))],
         },
         TimeoutSeconds=600,  # time to START delivering before giving up
         CloudWatchOutputConfig={

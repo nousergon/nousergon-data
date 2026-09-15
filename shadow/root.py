@@ -35,6 +35,67 @@ no-double-write property plan §6.2 step 4 requires, and
 ``tests/test_shadow_root.py`` is where it is asserted rather than asserted
 here in prose.
 
+**ArcticDB reads: seeded from live, never from nothing** (`alpha-engine-config-I10866`).
+The name redirect applies to reads as well as writes, so without seeding, a
+shadow library is EMPTY. The first real shadow run (2026-09-15, trading day
+2026-09-14) read an empty ``shadow_20260914_universe_schema_meta`` as baseline
+v0 and was refused at the pre-append assert. Deleting that assert would have
+been worse: ``daily_append`` would have computed every rolling and z-score
+column over a single bar, and the parity diff would have been read as
+evidence. S3 does not have this problem, because the interceptor passes reads
+through to live. ArcticDB needs the equivalent: the shadow run must read the
+same live state the live run reads.
+
+*Mechanism chosen: a bounded whole-library seed on first open*
+(``shadow/arctic_seed.py::ensure_seeded``, called from
+``store/arctic_store.py::_open_library``). On the first shadow open for a
+stamp, every ``LIVE_ARCTIC_LIBRARIES`` member is copied through ArcticDB
+``read_batch`` (live, via a read-only wrapper) and ``write_batch`` (shadow).
+The copy keeps only rows strictly before the trading day
+(``date_range=(None, trading_day - 1ns)``), is chunked at 50 symbols, keeps
+the live library's ``LibraryOptions``, and keeps each symbol's metadata. The
+data libraries are verified (symbol set plus per-symbol row count) BEFORE the
+live schema stamp is copied verbatim, and the seed manifest is committed LAST.
+The alternatives, and why they were rejected:
+
+* *Copy-on-first-access per symbol* needs an interposer on every Library
+  method (``read``, ``read_batch``, ``tail``, ``list_symbols``,
+  ``update_batch``, ...). ``daily_append`` reads the whole universe through
+  ``list_symbols`` + ``read_batch`` anyway, so the lazy scheme copies the same
+  bytes behind a much larger surface, and any method it forgets reads empty.
+  That is this defect again, one method at a time.
+* *``read(as_of=...)`` redirect of reads to live* offers no row-level as-of:
+  live writes use ``prune_previous_versions=True``, so earlier versions do not
+  exist. It would also mix live-read and shadow-write handles inside one
+  producer function that holds a single ``Library`` object.
+* *Stamping the shadow meta library at the expected version* fakes exactly
+  what the assert exists to catch. It is never done. The shadow stamp is a
+  byte copy of the live stamp, written only after the data it describes has
+  been copied and verified. If live is unstamped, shadow stays unstamped, and
+  both read as baseline through the same code path.
+
+Idempotent per stamp: a committed ``shadow_{stamp}_seed_manifest`` makes every
+later open (the other legs of ``shadow-weekday``) two metadata reads. No
+manifest means no completed seed, so every existing ``shadow_{stamp}_*``
+library is deleted and the copy starts from nothing. That includes the empty
+libraries the 2026-09-15 run created.
+
+*Budget.* The universe holds about 900 symbols × about 2,500 daily rows.
+Measured in-region, sequentially: a full-series read costs about 0.3-0.5 s per
+symbol (``builders/daily_append.py`` step 4a comment), and a full-series write
+costs about 1.5 s per symbol (``daily_append`` docstring, 904 × 1.5 s ≈ 22 min).
+Even sequentially, a whole-universe copy is therefore bounded near 30 minutes.
+``read_batch``/``write_batch`` parallelise the S3 I/O, so the real number is
+lower. ``macro`` (tens of symbols) and ``delisted_history`` add minutes. The
+seed carries its own 45-minute budget (``DATA_COLLECTION_SHADOW_SEED_BUDGET_SECONDS``)
+and raises on overrun, instead of being cut off silently by the box's timer.
+The ``shadow-weekday`` dispatcher workload gets an 18,000 s (5 h) runtime cap,
+so the SSM ``executionTimeout`` and the box's hard-stop timer both cover it.
+The shared 7,200 s default could not cover the four chained legs
+(``morning-enrich`` about 50 min + ``morning-arctic-append`` about 38 min +
+``post-market-data`` + ``daily-arctic-append`` about 38 min) even before the
+seed was added.
+
 **Fail loud.** Nothing in this module degrades. An S3 operation nobody
 classified, a key that will not rewrite, an ArcticDB library name that
 collides with a live one — each raises ``ShadowGuardViolation`` and kills the
