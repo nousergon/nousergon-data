@@ -369,6 +369,13 @@ def main():
     # writes nothing, including the manifest.
     import run_units
 
+    # In-region only (alpha-engine-config-I9771): refuse before touching the
+    # published parquets at all, not just before the write. (This tool writes
+    # `alpha-engine-research` parquets, not ArcticDB directly, but D43's
+    # descriptor scopes it as a manual repair of D13's parent series and the
+    # same runs_on constraint applies fleet-wide to every D43 entry point.)
+    run_units.require_in_region("daily_closes_fred_repair")
+
     holder: dict = {}
 
     def _body(ctx):
