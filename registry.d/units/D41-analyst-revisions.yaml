@@ -23,13 +23,21 @@ component_id: "data-collector-d41-analyst-revisions"
 owning_repo: "nousergon-data"
 title: analyst_revisions
 component: 1
-lifecycle: "proposed-retirement"
+lifecycle: "retired"
 owner: brian
 code_path: "data/derived/analyst_revisions.py:374"
+retirement:
+  ruling: "Brian 2026-09-14 R7 (alpha-engine-config-I10753)"
+  reason: "zero-consumer artifact (no reader found for data/analyst_revisions/*)"
+  archive_prefix: "data/analyst_revisions/"
+  archive_note: >-
+    Retiring a producer never deletes its archive (standing preference: retain
+    all archives — data is an asset). No S3 lifecycle/delete action taken.
+  no_successor_workload: true
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:RAGIngestion"
-  successor: "none declared (alpha-engine-config-I10753)"
+  successor: "RETIRED (Brian 2026-09-14 R7) — no successor workload; see retirement: above"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
@@ -114,4 +122,8 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
-notes: "alpha-engine-config-I10753 + R7 retire."
+notes: >-
+    alpha-engine-config-I10753 + R7 retire, RECORDED (see retirement: block above).
+    Same residual note as D40: step 8 continues inside the unchanged
+    run_weekly_ingestion.sh script; this row is RETIRED for
+    tracking/monitoring purposes, not asserting the write stopped.

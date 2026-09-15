@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/constituents.schema.json",
+  "title": "S&P 500/400 constituents (market_data/weekly/{date}/constituents.json, v1)",
+  "description": "Producer: collectors/constituents.py::collect. SSGA SPDR (SPY/MDY) membership + Wikipedia GICS sector/sub-industry. No embedded schema_version today (config#6946 era); this file is v1 of the external contract, versioned by filename/git history per architecture.d/146 rule 3 rather than a payload field -- a future payload schema_version is an additive, backward-compatible change. Consumer: crucible/data/universe.py (v2 declared universe), crucible-executor. Plan §3 boundary table row 4.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "date", "tickers", "sector_map", "sector_etf_map", "sub_industry_map",
+    "sub_sector_etf_map", "sp500_count", "sp400_count", "total_count", "fetched_at"
+  ],
+  "properties": {
+    "date": {"type": "string", "format": "date"},
+    "tickers": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "sp500_tickers": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "sp400_tickers": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "sector_map": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "sector_etf_map": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "sub_industry_map": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "sub_sector_etf_map": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "sp500_count": {"type": "integer", "minimum": 0},
+    "sp400_count": {"type": "integer", "minimum": 0},
+    "total_count": {"type": "integer", "minimum": 0},
+    "fetched_at": {"type": "string"}
+  }
+}

@@ -40,9 +40,10 @@ writes:
 consumers:
   - "crucible:crucible/data/sources.py (via the parent libraries)"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
   target: "none — it writes D13's libraries, under D13's contract"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D43

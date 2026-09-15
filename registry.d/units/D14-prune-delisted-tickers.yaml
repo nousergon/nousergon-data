@@ -38,9 +38,10 @@ writes:
 consumers: []
 consumers_reason: "No external reader of `delisted_history` was found. R7 keep."
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D14
 detectors: []

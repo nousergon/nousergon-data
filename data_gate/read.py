@@ -38,7 +38,7 @@ from data_gate.descriptors import REPO_ROOT, load_units
 
 __all__ = ["BOARD_KEY", "DataPhase", "GATES", "evaluate", "load_phases", "run"]
 
-PHASES_PATH = REPO_ROOT / "registry.d" / "phases.yaml"
+PHASES_PATH = REPO_ROOT / "data_gate" / "config" / "phases.yaml"
 
 #: The per-clause board document the console's `data-collection-board` fragment
 #: reads. `latest.json` only: the console renders current state and never owns

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_earnings.schema.json",
+  "title": "Metron earnings dates (market_data/earnings/latest.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_reference (EARNINGS_SCHEMA_VERSION). Consumer: Metron api/services/*.py (Calendar page). Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "earnings"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "earnings": {"type": "object", "additionalProperties": {"type": "string", "format": "date"}}
+  }
+}

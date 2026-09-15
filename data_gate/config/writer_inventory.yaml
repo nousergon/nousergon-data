@@ -265,6 +265,10 @@ excluded_paths:
 no_python_write_site:
   - unit: D16
     reason: Its entry point is rag/pipelines/run_weekly_ingestion.sh, a shell script.
+  - unit: D15L
+    reason: >-
+      Retired (alpha-engine-config-I10779, P-12); lambda/handler.py deleted this PR.
+      No write site to check — the unit no longer runs.
   - unit: D47
     reason: >-
       Component 2. Its producer lives in the `crucible` repository and this scan

@@ -39,9 +39,10 @@ consumers:
   - "crucible-research:scoring/universe_board.py"
   - "crucible-research:scoring/attractiveness_history.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/universe_classification.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/universe.py"
 registry_rows:
   - universe_classification_latest
 run_manifest_prefix: data_collection/runs/D07

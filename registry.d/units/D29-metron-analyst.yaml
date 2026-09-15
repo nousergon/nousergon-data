@@ -37,9 +37,10 @@ writes:
 consumers:
   - "metron:api/services/analyst.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/metron_analyst.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_analyst.schema.json"
 registry_rows: []
 registry_rows_broken:
   - >-

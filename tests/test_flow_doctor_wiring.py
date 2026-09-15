@@ -341,16 +341,8 @@ class TestEntrypointModuleTopWiring:
         assert idx != -1, f"missing required text: {needle!r}"
         return idx
 
-    def test_lambda_handler_calls_setup_logging_at_module_top(self):
-        text = (REPO_ROOT / "lambda" / "handler.py").read_text()
-        # setup_logging call appears before the def of handler()
-        setup_idx = self._index_of("setup_logging(", text)
-        handler_def_idx = self._index_of("def handler(", text)
-        assert setup_idx < handler_def_idx, (
-            "setup_logging must be called at module-top, before def handler()"
-        )
-        # exclude_patterns is plumbed (even if empty list)
-        assert "exclude_patterns=" in text[setup_idx:handler_def_idx]
+    # test_lambda_handler_calls_setup_logging_at_module_top removed:
+    # lambda/handler.py was deleted (alpha-engine-config-I10779, D15L retired).
 
     def test_weekly_collector_calls_setup_logging_at_module_top(self):
         text = (REPO_ROOT / "weekly_collector.py").read_text()

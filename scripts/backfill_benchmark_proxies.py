@@ -63,10 +63,16 @@ import json
 import logging
 import sys
 
+import run_units
+from dates import default_run_date
 from features.compute import UNIVERSE_BENCHMARK_PROXIES
+from nousergon_lib import run_manifest
 from store.arctic_store import DEFAULT_BUCKET, get_universe_lib
 
 log = logging.getLogger(__name__)
+
+#: This script IS audit unit D35 (`registry.d/units/D35-benchmark-proxy-backfill.yaml`).
+UNIT_ID = "D35"
 
 
 def _resolve_symbols(raw: str | None) -> list[str]:
@@ -172,9 +178,47 @@ def main(argv: list[str] | None = None) -> int:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     )
 
+    # alpha-engine-config-I10790 (P-24): a hand-run repair leaves the same
+    # record a scheduled unit does. The wrapper writes
+    # `data_collection/runs/D35/{trading_day}/{run_id}.json` on both paths, so
+    # an on-demand load is counted rather than invisible — including the
+    # laptop-triggered dispatch of the in-region workload.
+    #
+    # `--dry-run` passes `sink=None`: the body runs exactly as it would, and
+    # nothing is written, which is what the flag already promises.
+    sink = None if args.dry_run else run_units.manifest_sink(args.bucket)
+    try:
+        return run_manifest.run_unit(
+            UNIT_ID,
+            lambda ctx: _execute(args, ctx),
+            sink=sink,
+            trigger=run_units.resolve_trigger("on_demand"),
+            trading_day=default_run_date(),
+            log_location=run_units.resolve_log_location(),
+        ).value
+    except _ProxyLoadFailed as failed:
+        print("FAILED: " + " | ".join(failed.failures), file=sys.stderr)
+        return 1
+
+
+class _ProxyLoadFailed(RuntimeError):
+    """At least one declared proxy could not be loaded.
+
+    Raised so the run manifest reads `status: failed` with the named cause —
+    a partial success IS a failure here, because a proxy that silently drops
+    out is survivorship bias, which is what the panel compile refuses on.
+    """
+
+    def __init__(self, failures: list[str]):
+        self.failures = failures
+        super().__init__("; ".join(failures)[:2000])
+
+
+def _execute(args: argparse.Namespace, ctx: run_manifest.UnitRun) -> int:
     symbols = _resolve_symbols(args.symbols)
     log.info("Declared benchmark proxies to load: %s (bucket=%s, dry_run=%s)",
              symbols, args.bucket, args.dry_run)
+    ctx.rows_in = len(symbols)
 
     results: list[dict] = []
     failures: list[str] = []
@@ -203,9 +247,17 @@ def main(argv: list[str] | None = None) -> int:
 
     print(json.dumps(summary, indent=2, default=str))
 
+    loaded = [r for r in results if r.get("status") != "error"]
+    ctx.record_output(
+        "arcticdb/universe (benchmark proxy series)",
+        rows_out=len(loaded),
+        schema_version="arcticdb/universe",
+    )
     if failures:
-        print("FAILED: " + " | ".join(failures), file=sys.stderr)
-        return 1
+        ctx.reject("declared_proxy_not_loaded", len(failures))
+
+    if failures:
+        raise _ProxyLoadFailed(failures)
     return 0
 
 

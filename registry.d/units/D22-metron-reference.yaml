@@ -40,9 +40,13 @@ consumers:
   - "metron:portfolio_analytics/calendar/spine_source.py"
   - "crucible-evaluator:grading/attribution.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema:
+    - contracts/metron_sectors.schema.json
+    - contracts/metron_earnings.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_sectors.schema.json"
+    - "metron:tests/contracts/metron_earnings.schema.json"
 registry_rows:
   - metron_earnings
 run_manifest_prefix: data_collection/runs/D22

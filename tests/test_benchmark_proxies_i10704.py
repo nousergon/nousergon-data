@@ -249,24 +249,63 @@ def test_freshness_scan_goes_red_when_a_declared_proxy_is_absent(dropped):
     assert "DECLARED benchmark proxies" in str(exc.value)
 
 
-def test_present_proxy_outside_the_scan_scope_is_not_graded_absent():
-    """Pins the DELIBERATE scope of the check: absence from the LIBRARY.
+def test_present_proxy_outside_the_request_list_is_still_scanned():
+    """A proxy the caller's ``expected_tickers`` omits is still SCANNED.
 
-    A proxy the caller's ``expected_tickers`` intersection filters out of
-    ``syms`` is still present and still loadable by every consumer, so it is
-    not a coverage failure. Grading scan membership instead would couple this
-    producer invariant to each caller's request list — and would make the
-    check fire on states the panel compile is perfectly happy with.
+    Measured 2026-09-14: the receipt read present=6, scanned=5 and
+    all_fresh=True while IWM, omitted from the request list, had no close
+    for the session. Scanning only requested proxies is the blind spot.
     """
     held = sorted(UNIVERSE_BENCHMARK_PROXIES) + ["AAPL"]
     receipt = _run_scan(
         held, _today_iso(),
-        expected_tickers=["AAPL", "SPY", "IWM", "XLK", "XLV", "XLF"],  # omits XLE
+        expected_tickers=["AAPL", "SPY", "XLK", "XLV", "XLF", "XLE"],  # omits IWM
     )
     assert receipt["declared_proxies_missing"] == []
-    assert receipt["declared_proxies_present"] == len(UNIVERSE_BENCHMARK_PROXIES)
-    # XLE was present but out of scan scope, so it is not among the scanned.
-    assert receipt["declared_proxies_scanned"] == len(UNIVERSE_BENCHMARK_PROXIES) - 1
+    assert receipt["declared_proxies_scanned"] == len(UNIVERSE_BENCHMARK_PROXIES)
+
+
+def _stub_universe_lib_dates(last_dates: dict[str, str]):
+    lib = MagicMock()
+    lib.list_symbols.return_value = list(last_dates)
+
+    def _tail(sym, n=1):
+        res = MagicMock()
+        res.data = pd.DataFrame(
+            {"Close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp(last_dates[sym])]),
+        )
+        return res
+
+    lib.tail.side_effect = _tail
+    return lib
+
+
+def test_freshness_scan_goes_red_when_a_declared_proxy_lags_the_universe():
+    """THE 2026-09-14 production state: IWM held through 09-11, stocks through
+    09-14, IWM outside the request list, staleness threshold tolerant."""
+    from builders import daily_append as da
+
+    dates = {s: "2026-09-14" for s in sorted(UNIVERSE_BENCHMARK_PROXIES) + ["AAPL", "MSFT"]}
+    dates["IWM"] = "2026-09-11"
+    with pytest.raises(da.UniverseFreshnessViolation) as exc:
+        da._scan_universe_and_emit_freshness_receipt(
+            MagicMock(), "alpha-engine-research", _stub_universe_lib_dates(dates),
+            max_stale_trading_days=99,
+            expected_tickers=["AAPL", "MSFT", "SPY", "XLK", "XLV", "XLF", "XLE"],
+        )
+    assert "IWM(last=2026-09-11)" in str(exc.value)
+    assert "lag the universe head 2026-09-14" in str(exc.value)
+
+
+def test_declared_proxies_are_requested_daily():
+    """Every declared proxy must be in the daily closes request list, or its
+    session close never reaches staging/daily_closes (IWM, 2026-09-14)."""
+    from weekly_collector import _MACRO_DAILY_TICKERS
+
+    missing = sorted(UNIVERSE_BENCHMARK_PROXIES - set(_MACRO_DAILY_TICKERS))
+    assert not missing, (
+        f"declared proxies absent from weekly_collector._MACRO_DAILY_TICKERS: {missing}"
+    )
 
 
 def test_freshness_scan_passes_and_reports_coverage_when_all_proxies_present():
