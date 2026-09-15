@@ -32,6 +32,16 @@ trigger:
   successor: unchanged by v2 phase 4
   runs_on: "ec2-on-demand"
   detail: "daily-news.timer, 04:00 America/Los_Angeles"
+  # alpha-engine-config-I10871/I10870: machine-readable cadence for
+  # data_gate/cadence.py::unit_cadence — the AWS cron/named-day/weekdays
+  # shapes it parses only cover scheduled-once-a-week/weekday forms, not a
+  # daily systemd timer, so this is declared as `continuous` the same way
+  # news_digest_daily's own ARTIFACT_REGISTRY row already models the SAME
+  # timer (cadence: continuous, interval_minutes: 1440). Verified against
+  # infrastructure/systemd/daily-news.timer on origin/main:
+  # `OnCalendar=*-*-* 04:00:00 America/Los_Angeles`, `Persistent=true` — every
+  # calendar day, not weekday-gated.
+  cadence_minutes: 1440
 writes:
   # alpha-engine-config-I10870: corrected from the bare prefixes
   # "data/news_aggregates_daily/" / "data/news_articles_daily/" to the

@@ -34,12 +34,16 @@ trigger:
   runs_on: "ec2-spot"
 writes:
   - "reference/price_cache/{ticker}.parquet"
-consumers:
-  # alpha-engine-config-I10870: resolved by a code read on origin/main
-  # (git grep "reference/price_cache" across the fleet, 2026-09-15) — the
-  # audit's UNVERIFIED was a search gap, not an absent reader.
-  - "crucible-predictor:regime/features.py"
-  - "crucible-backtester:analysis/exit_timing.py"
+consumers: []
+consumers_reason: >-
+    alpha-engine-config-I10870: resolved by a code read on origin/main (git grep
+    "reference/price_cache" across the fleet, 2026-09-15) — the audit's UNVERIFIED was a
+    search gap, not truly no reader. But both readers found (crucible-predictor:
+    regime/features.py, crucible-backtester:analysis/exit_timing.py) are v1 repos
+    retired in v2 phase 4; plan §3 counts only SURVIVING consumers (Metron, crucible
+    v2, crucible-executor, dashboard/morning-signal/thinktank where §3 names them),
+    and a grep of those found none. This is a retirement candidate for Brian, not a
+    consumers_ruling KEEP — left UNMET with the question named.
 contract:
   schema: null
   producer_test: null
