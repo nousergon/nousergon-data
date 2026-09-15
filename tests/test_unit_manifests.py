@@ -20,8 +20,10 @@ guarantee the record is exactly how a dying producer starts reporting success.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -500,3 +502,152 @@ def test_d38_unmeasurable_code_sha_runs_the_collector_unrecorded(
 
     assert ran == [True], "the collector must still run when no manifest can be written"
     assert out["statusCode"] == 200
+
+
+# ───────────────────────── D16 — rag-weekly-ingestion ────────────────────────
+#
+# `alpha-engine-config-I10862`: D16's pipeline is a bash script
+# (`run_weekly_ingestion.sh`) run as a subprocess by
+# `rag.pipelines.run_weekly_ingestion_recorded`, which never reimplements it
+# and never parses its logs — it reads back the real S3 objects the script's
+# own steps wrote. These tests fake both boundaries: the subprocess exit code
+# and the S3 objects a real run would have left behind.
+
+
+class _FakeS3:
+    """A minimal ``list_objects_v2``/``get_object`` double keyed by object.
+
+    ``objects`` maps a full S3 key to ``(body_bytes, last_modified)``. No
+    pagination — every fixture here is well under 1000 keys.
+    """
+
+    def __init__(self, objects: dict[str, tuple[bytes, datetime]]) -> None:
+        self.objects = objects
+
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):  # noqa: N803
+        return {
+            "Contents": [
+                {"Key": key, "LastModified": last_modified}
+                for key, (_, last_modified) in self.objects.items()
+                if key.startswith(Prefix)
+            ],
+            "IsTruncated": False,
+        }
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        body, _ = self.objects[Key]
+        return {"Body": io.BytesIO(body)}
+
+
+@pytest.fixture
+def d16(monkeypatch):
+    from rag.pipelines import run_weekly_ingestion_recorded as module
+
+    since = datetime(2026, 9, 19, 6, 0, tzinfo=timezone.utc)
+    monkeypatch.setattr(module, "_utcnow", lambda: since)
+    monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--date", "2026-09-19"])
+    return module, since
+
+
+def _d16_fixture_objects(after):
+    """Every declared D16 output, timestamped just after ``after`` (the run's
+    own "since" boundary) so `_iter_new_keys` picks all of them up."""
+    ts = after + timedelta(seconds=5)
+    manifest_body = json.dumps({"totals": {"documents": 1234, "chunks": 9000, "tickers": 640}}).encode()
+    filing_body = json.dumps({"n_analyzed": 42, "n_lazy": 3}).encode()
+    return {
+        "rag/manifest/2026-09-19.json": (manifest_body, ts),
+        "rag/manifest/latest.json": (manifest_body, ts),
+        "rag/watermarks/v1/sec_edgar.json": (
+            json.dumps({"AAPL::10-K": "2026-09-19T00:00:00Z", "MSFT::10-K": "2026-09-19T00:00:00Z"}).encode(),
+            ts,
+        ),
+        "rag/filing_changes/2026-09-19.json": (filing_body, ts),
+        "rag/filing_changes/latest.json": (filing_body, ts),
+        "rag/corpus_freshness/latest.json": (json.dumps({"status": "fresh"}).encode(), ts),
+        "health/rag_ingestion_progress/2026-09-19.json": (json.dumps({"step": 10, "of": 10}).encode(), ts),
+    }
+
+
+def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
+    module, since = d16
+    fake_s3 = _FakeS3(_d16_fixture_objects(since))
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
+
+    assert module.main() == 0
+
+    manifest = sink.only
+    assert sink.only_key.startswith("data_collection/runs/D16/2026-09-19/")
+    assert manifest["unit_id"] == "D16"
+    assert manifest["status"] == "ok"
+    assert manifest["trigger"] == "scheduled"
+    assert manifest["trading_day"] == "2026-09-19"
+    keyed = {o["key"]: o["rows_out"] for o in manifest["outputs"]}
+    assert keyed == {
+        "rag/manifest/2026-09-19.json": 1234,
+        "rag/manifest/latest.json": 1234,
+        "rag/watermarks/v1/sec_edgar.json": 2,
+        "rag/filing_changes/2026-09-19.json": 42,
+        "rag/filing_changes/latest.json": 42,
+        "rag/corpus_freshness/latest.json": 1,
+        "health/rag_ingestion_progress/2026-09-19.json": 1,
+    }
+    verdicts = {g["verdict"] for g in manifest["guards"]}
+    assert "ok" in verdicts
+
+
+def test_d16_script_failure_writes_a_failed_manifest_and_keeps_the_exit_code(sink, d16, monkeypatch):
+    module, since = d16
+    fake_s3 = _FakeS3({})  # nothing published — the script died before step 10
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 1)  # noqa: ARG005
+    monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
+
+    assert module.main() == 1
+
+    manifest = sink.only
+    assert manifest["status"] == "failed"
+    assert "exited 1" in manifest["reason"]
+    assert manifest["outputs"] == []
+    verdicts = {g["verdict"] for g in manifest["guards"]}
+    assert "empty_fresh" in verdicts
+
+
+def test_d16_exit_zero_with_no_published_output_is_a_failed_manifest(sink, d16, monkeypatch):
+    """The withholding shape for a script that exits 0 but silently wrote
+    nothing — indistinguishable from a real failure to every downstream
+    reader unless it is graded the same way."""
+    module, since = d16
+    fake_s3 = _FakeS3({})
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
+
+    assert module.main() == 1
+
+    manifest = sink.only
+    assert manifest["status"] == "failed"
+    assert "published no output" in manifest["reason"]
+    assert manifest["outputs"] == []
+
+
+def test_d16_dry_run_writes_no_manifest(d16, monkeypatch):
+    module, since = d16
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--date", "2026-09-19", "--dry-run"])
+    monkeypatch.setenv("NE_DATA_CODE_SHA", FAKE_SHA)
+
+    # sink=None on a dry run (write=False) — run_manifest.run_unit logs one
+    # line in its place and calls no sink at all, so no S3 client is needed.
+    assert module.main() == 0
+
+
+def test_d16_dispatcher_workload_calls_the_recorded_entrypoint():
+    """The dispatcher no longer runs the bare bash script directly."""
+    dispatcher = _load_script(
+        REPO_ROOT / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py",
+        "_test_data_spot_dispatcher_index",
+    )
+
+    command = dispatcher._WORKLOADS["rag-weekly-ingestion"]
+    assert "rag.pipelines.run_weekly_ingestion_recorded" in command
+    assert "bash rag/pipelines/run_weekly_ingestion.sh" not in command

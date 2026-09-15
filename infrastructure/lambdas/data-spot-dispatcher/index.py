@@ -230,12 +230,18 @@ _WORKLOADS: dict[str, str] = {
     "alternative-phase-two": "python weekly_collector.py --phase 2",
     # SAME script the v1 SF's RAGIngestion state ran
     # (`infrastructure/spot_rag_ingestion.sh` -> `bash
-    # rag/pipelines/run_weekly_ingestion.sh`, unchanged). Covers D16 (its own
-    # writes) AND D46 (Form 4 insider transactions, step 6 of the script) —
-    # D46 does NOT get its own dispatcher key: it is a substep of this same
-    # script, not a standalone entry point, so a second key would re-run the
-    # identical EDGAR fetch a second time per week. D40/D41 (steps 7/8) still
-    # execute as part of this unchanged script (this dispatcher does not own
+    # rag/pipelines/run_weekly_ingestion.sh`), now wrapped by
+    # `rag/pipelines/run_weekly_ingestion_recorded.py`
+    # (alpha-engine-config-I10862): a thin `run_units.recorded_entry("D16", ...)`
+    # entrypoint that runs the SAME unchanged bash script as a subprocess and
+    # writes `data_collection/runs/D16/{trading_day}/{run_id}.json` around it
+    # — the ingestion steps themselves, their order, their env/venv resolution
+    # are untouched. Covers D16 (its own writes) AND D46 (Form 4 insider
+    # transactions, step 6 of the script) — D46 does NOT get its own
+    # dispatcher key: it is a substep of this same script, not a standalone
+    # entry point, so a second key would re-run the identical EDGAR fetch a
+    # second time per week. D40/D41 (steps 7/8) still execute as part of this
+    # unchanged script (this dispatcher does not own
     # rag/pipelines/run_weekly_ingestion.sh — that is `nousergon-data`'s RAG
     # pipeline code, a sibling surface); their retirement is at the
     # descriptor/registry layer (not tracked, not asserted), matching the
@@ -254,7 +260,7 @@ _WORKLOADS: dict[str, str] = {
         "--query Parameter.Value --output text --region us-east-1 2>/dev/null || echo ''); "
         "if [ -z \"$val\" ]; then echo \"ERROR: could not fetch /alpha-engine/$name from SSM\" >&2; exit 1; fi; "
         "export $name=\"$val\"; unset val; done; "
-        "bash rag/pipelines/run_weekly_ingestion.sh )"
+        "python -m rag.pipelines.run_weekly_ingestion_recorded )"
     ),
     # alpha-engine-config-I10778, plan P-11: the pre-cutover shadow run. Chains
     # the FOUR weekday-boundary invocations that a live v1 producer still owns
