@@ -33,8 +33,18 @@ trigger:
   runs_on: "ec2-on-demand"
   detail: "daily-news.timer, 04:00 America/Los_Angeles"
 writes:
-  - data/news_aggregates_daily/
-  - data/news_articles_daily/
+  # alpha-engine-config-I10870: corrected from the bare prefixes
+  # "data/news_aggregates_daily/" / "data/news_articles_daily/" to the
+  # literal keys nousergon_lib.eval_artifacts.eval_latest_key() actually
+  # writes (data/derived/news_aggregates.py::aggregate_and_write,
+  # data/derived/news_articles.py::articles_build_and_write) — these are the
+  # PRIMARY artifacts the ARTIFACT_REGISTRY daily_news / daily_news_articles
+  # rows already cover; the bare-prefix spelling never matched either row's
+  # s3_key_template. The per-run dated parquet under each prefix
+  # (eval_artifact_key, variable {run_id}) is not separately registered —
+  # same eval-artifact pattern as every other producer using this module.
+  - data/news_aggregates_daily/latest.json
+  - data/news_articles_daily/latest.json
   - data/news_digest_daily/latest.json
 consumers:
   - "morning-signal:src/morning_signal/news_context.py"

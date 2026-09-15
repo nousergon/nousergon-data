@@ -40,7 +40,20 @@ writes:
   - "staging/daily_closes/*"
   - arcticdb/universe (library)
 consumers: []
-consumers_reason: No reader of the heal record. R5 decides whether it is enabled or retired.
+consumers_reason: No reader of the heal record.
+consumers_ruling:
+  # alpha-engine-config-I10870: R5 ruled (a) — enable ne-data-collection-
+  # daily-heal at data phase 2, after the completeness guards exist, so the
+  # heal's effect is verified (detect -> act -> verify closed loop, principle
+  # 3). data_gate/clauses.py accepts this block to render the consumers
+  # clause MET-by-ruling: the "reader" of a heal record is its own
+  # verification step, not a downstream consumer of the JSON.
+  ruling: "Brian 2026-09-14 R5(a) (alpha-engine-config-I10748, plan §7)"
+  reason: >-
+    daily-heal is enabled at data phase 2 (after the completeness guards
+    exist); its reader is the phase-2 heal verification step, which closes
+    the detect -> act -> verify loop rather than leaving the heal record
+    unread.
 contract:
   schema: null
   producer_test: null

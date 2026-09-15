@@ -34,10 +34,12 @@ trigger:
   runs_on: "ec2-spot"
 writes:
   - "reference/price_cache/{ticker}.parquet"
-consumers: []
-consumers_reason: >-
-    UNVERIFIED in the audit: no reader was found for the literal key. Phase 0 resolves it
-    by a code read; until then the clause reads UNMET with the question named, never MET.
+consumers:
+  # alpha-engine-config-I10870: resolved by a code read on origin/main
+  # (git grep "reference/price_cache" across the fleet, 2026-09-15) — the
+  # audit's UNVERIFIED was a search gap, not an absent reader.
+  - "crucible-predictor:regime/features.py"
+  - "crucible-backtester:analysis/exit_timing.py"
 contract:
   schema: null
   producer_test: null

@@ -146,6 +146,44 @@ def _retired(unit: Unit, name: str, requirement: str, phase: str) -> RetiredClau
     )
 
 
+def _consumers_ruling_override(
+    unit: Unit, name: str, requirement: str, reading: ev.Reading, *, phase: str
+) -> Clause | None:
+    """Plan §3's rule: a key with no surviving consumer gets a retirement
+    decision, OR a declared ``consumers: []`` with a reason, which renders as
+    a finding. `alpha-engine-config-I10870` adds the third case the rule
+    already implied but the descriptor schema had no field for: a key Brian
+    has RULED kept with no reader wired (R5/R7, plan §7) is not an open
+    finding, it is a closed decision — recorded here the same way an
+    executed retirement is recorded (`_retired` above), never by inventing a
+    consumer.
+
+    ``consumers_ruling:`` is an optional descriptor block (``ruling:``,
+    ``reason:``) distinct from ``consumers_reason`` (which only explains an
+    UNMET, never clears it). Only reached when `read_consumers` already read
+    UNMET AND the descriptor declares `consumers: []` — the call site also
+    checks that, so a unit with a real reader problem (non-empty `consumers`
+    that don't resolve) still fails regardless of a ruling block; a ruling
+    documents "no reader wired", never "the declared reader is broken".
+    """
+    ruling = unit.raw.get("consumers_ruling")
+    if not ruling or not isinstance(ruling, dict):
+        return None
+    ruling_text = str(ruling.get("ruling") or "").strip()
+    reason_text = " ".join(str(ruling.get("reason") or "").split())
+    if not ruling_text or not reason_text:
+        return None
+    return Clause(
+        name,
+        requirement,
+        True,
+        f"KEPT with no reader wired, by ruling: {ruling_text} — {reason_text} ({reading.detail})",
+        reading.evidence,
+        phase=phase,
+        source="registry.d/units (consumers_ruling)",
+    )
+
+
 def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Clause:
     name = base_clause_name(unit.unit_id, column)
     phase = f"data-phase{unit.clause_phase[column]}"
@@ -154,6 +192,11 @@ def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: d
     if unit.retired:
         return _retired(unit, name, requirement, phase)
     reading = ev.read_base(store, unit, column, trading_day=trading_day)
+
+    if column == "consumers" and not reading.met and not reading.unmeasurable and not unit.raw.get("consumers"):
+        override = _consumers_ruling_override(unit, name, requirement, reading, phase=phase)
+        if override is not None:
+            return override
 
     if reading.unmeasurable:
         return unmeasurable(
