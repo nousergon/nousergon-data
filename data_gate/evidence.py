@@ -16,9 +16,11 @@ not exist has exactly two honest options, and "assume it is fine" is neither:
 
 A phase-0 stub therefore returns UNMEASURABLE naming its future key. It never
 returns MET, and there is a test that says so (`test_no_clause_is_met_without_a
-_read`). The two readers that ARE implemented here read real committed
-artifacts — the declared schema files in this repository, and the ladder's own
-age — and they are allowed to read MET because they actually measured something.
+_read`). The readers that ARE implemented here read real artifacts — the
+declared schema files in this repository, the ladder's own age, the standalone
+stack's roles, and (since `alpha-engine-config-I10810`) the run manifests
+themselves — and they are allowed to read MET because they actually measured
+something.
 """
 
 from __future__ import annotations
@@ -28,14 +30,18 @@ import pathlib
 from dataclasses import dataclass, field
 
 from nousergon_lib.gates import LADDER_KEY, GateStore, read_store_document
+from nousergon_lib.run_manifest import SCHEMA_VERSION as _MANIFEST_SCHEMA
 
 from data_gate.descriptors import REPO_ROOT, Unit
 
 __all__ = [
     "BASE_REQUIREMENTS",
+    "EMPTY_FRESH_VERDICT",
+    "MANIFEST_STATUSES",
     "PARITY_KEY_TEMPLATE",
     "GateStore",
     "Reading",
+    "empty_fresh_runs",
     "parity_store_key",
     "read_base",
     "read_guard_commissioning",
@@ -43,6 +49,7 @@ __all__ = [
     "read_objective",
     "read_parity",
     "read_roles_bootstrapped",
+    "read_run_record",
     "read_stack_check_live",
 ]
 
@@ -130,7 +137,9 @@ _BASE_EVIDENCE_KEY: dict[str, str] = {
     "schema_contract": "nousergon-data: contracts/<key>.schema.json + producer test (phase 1)",
     "artifact_registry": "alpha-engine-config: private-docs/ARTIFACT_REGISTRY.yaml (phase 1)",
     "observability_row": "nous-ergon-ops: governance/observability.d/<component>.yaml (phase 1)",
-    "run_record": "{prefix}/{trading_day}/*.json (phase 1)",
+    # Read for real since `alpha-engine-config-I10810` — kept here because the
+    # UNMET/UNMEASURABLE details still name the key they looked at.
+    "run_record": "{prefix}/{trading_day}/*.json",
     "detector": "data_collection/commissioning/<detector>/latest.json (phase 3)",
     "console_entity": "console:/component/<component_id> (phase 3)",
     "survives_phase4": "{prefix}/{trading_day}/*.json under the standalone stack (phase 1)",
@@ -207,10 +216,290 @@ def _read_schema_contract(unit: Unit) -> Reading:
     )
 
 
+#: The store is opened at `s3://alpha-engine-research/data_collection`, but a
+#: descriptor's `run_manifest_prefix` is the FULL key prefix
+#: (`data_collection/runs/D19`). Stripping the store's own prefix is what makes
+#: the two addressable from one declaration — and it is done here, once, rather
+#: than by rewriting 46 descriptors into a form only this reader can use.
+_STORE_PREFIX = "data_collection/"
+
+
+def _store_relative(prefix: str) -> str:
+    return prefix[len(_STORE_PREFIX):] if prefix.startswith(_STORE_PREFIX) else prefix
+
+
+#: `data_run_manifest.v1`'s closed status set. A manifest carrying anything else
+#: is the third ok-but-degraded state the run-record requirement forbids, and it
+#: is a finding rather than something to map onto the nearest neighbour.
+MANIFEST_STATUSES = frozenset({"ok", "failed", "not_applicable"})
+
+#: The guard verdict that IS an empty-but-fresh write. Objective 6 is counted
+#: from this, never from `rows_out == 0`.
+EMPTY_FRESH_VERDICT = "empty_fresh"
+
+
+def empty_fresh_runs(manifests: list[dict]) -> list[str]:
+    """The run ids that published a fresh, EMPTY artifact — plan §2 objective 6.
+
+    **Counted from `guards[].verdict`, never from `rows_out == 0`.** The two are
+    not the same question and the naive form gets the answer backwards on the
+    most common case: a phase that correctly had nothing to do this cycle
+    records `rows_out: 0` with a `not_applicable` guard verdict, and an
+    auto-skipped phase records the same. Counting zeros would file every one of
+    those as an empty-but-fresh write — the objective would breach on units that
+    are working exactly as designed, and the real empty writes would be
+    indistinguishable inside the noise.
+
+    The guard is the thing that actually looked at the artifact
+    (`validators/expectations.py::check_empty_fresh` — it HEADs the object,
+    separates "zero bytes" from "zero rows" from "could not count", and returns
+    `unmeasurable` rather than a pass when it could not look). Reading its
+    verdict is reading a measurement; counting zeros is re-deriving one badly
+    from a field that was never the evidence.
+    """
+    return [
+        str(m.get("run_id") or "?")
+        for m in manifests
+        if any(str(g.get("verdict")) == EMPTY_FRESH_VERDICT for g in (m.get("guards") or []))
+    ]
+
+
+def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Reading | None:
+    """The ArcticDB probe backing a unit that declares `arcticdb_evidence`.
+
+    `alpha-engine-config-I10772` (P-05). The gate NEVER opens ArcticDB — the
+    bucket carries an explicit Deny that blocks even `ne-admin` from outside the
+    region (`alpha-engine-config-I9771`), so a reader that tried would be
+    UNMEASURABLE on every run for a reason that has nothing to do with the unit.
+    Instead the EOD and morning machines write
+    `data_collection/probes/arctic/{trading_day}.json` as their FINAL workload,
+    and this reads that.
+
+    Returns ``None`` for a unit that declares no `arcticdb_evidence` (the reader
+    simply does not apply), and a **red** Reading otherwise whenever the probe
+    is absent, unreadable, or withholding the library this unit writes. Never
+    MET on a withheld probe: a probe that stopped writing must make these
+    clauses UNMEASURABLE rather than leave them stale-green, which is the whole
+    reason the probe exists rather than a timestamp.
+    """
+    declared = unit.raw.get("arcticdb_evidence") or {}
+    via = declared.get("via")
+    if not via:
+        return None
+    key = _store_relative(str(via).format(trading_day=trading_day.isoformat()))
+    read = read_store_document(store, key)
+    if read.problem is not None:
+        return Reading(
+            met=False,
+            detail=(
+                f"{unit.unit_id} writes ArcticDB and its run evidence is the probe at {key}, "
+                f"which could not be read: {read.problem}"
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if read.absent:
+        return Reading(
+            met=False,
+            detail=(
+                f"{unit.unit_id} writes ArcticDB and its run evidence is the probe at {key}, "
+                "which is ABSENT for this trading day. The gate never opens ArcticDB "
+                "(alpha-engine-config-I9771); a probe that did not write leaves this "
+                "UNMEASURABLE rather than stale-green."
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    document = read.document or {}
+    libraries = document.get("libraries") or {}
+    if not isinstance(libraries, dict) or not libraries:
+        return Reading(
+            met=False,
+            detail=f"the probe at {key} declares no `libraries` block, so it is evidence of nothing",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    withheld = sorted(
+        name
+        for name, row in libraries.items()
+        if not isinstance(row, dict) or not row.get("read_ok") or row.get("row_count") is None
+    )
+    if withheld:
+        return Reading(
+            met=False,
+            detail=(
+                f"the probe at {key} withheld a reading for library/libraries {withheld} "
+                "(read_ok false, or no row_count). A withheld probe is UNMEASURABLE, never MET."
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    summary = ", ".join(
+        f"{name}: {row.get('row_count')} rows @ {row.get('last_index_date')}"
+        for name, row in sorted(libraries.items())
+    )
+    return Reading(
+        met=True,
+        detail=f"ArcticDB evidence from the in-region probe {key} — {summary}",
+        evidence=(key,),
+        source="data_collection store",
+        as_of=str(document.get("as_of") or trading_day.isoformat()),
+    )
+
+
+def read_run_record(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Reading:
+    """Every execution of this unit on this trading day, as it recorded itself.
+
+    `alpha-engine-config-I10810` deliverable 3 — the reader that replaces the
+    phase-0 UNMEASURABLE stub. It lists
+    ``data_collection/runs/{unit_id}/{trading_day}/*.json`` and grades what it
+    finds against the requirement: a record on BOTH paths, and **no third
+    ok-but-degraded state**.
+
+    The distinctions this reader keeps, each of which the obvious shortcut
+    loses:
+
+    * **Listing failure is UNMEASURABLE, absence is UNMET.** We could not look
+      versus we looked and there was nothing — opposite findings with opposite
+      owners.
+    * **A `failed` manifest still satisfies this clause.** The requirement is
+      that the execution left a record, not that it succeeded; grading a failure
+      record as UNMET would reward a unit for writing nothing on its bad days,
+      which is precisely the behaviour the objective exists to end.
+    * **A status outside the closed set is UNMET**, named. That IS the third
+      ok-but-degraded state.
+    * **Empty-but-fresh is counted from the guard verdict**, never from
+      `rows_out == 0` — see :func:`empty_fresh_runs`.
+    * **An ArcticDB unit's evidence is the probe**, and a withheld probe is
+      UNMEASURABLE rather than MET — see :func:`_read_arctic_probe`.
+    """
+    prefix = f"{_store_relative(unit.run_manifest_prefix)}/{trading_day.isoformat()}/"
+    try:
+        keys = sorted(k for k in store.list_keys(prefix) if k.endswith(".json"))
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        # A deliberate catch, not a swallow: the failure mode is "this one
+        # prefix could not be listed", the gate reading carrying every other
+        # clause survives, and the recording surface is this UNMEASURABLE row.
+        return Reading(
+            met=False,
+            detail=f"could not list {prefix}: {type(exc).__name__}: {exc}",
+            evidence=(f"{prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+
+    if not keys:
+        return Reading(
+            met=False,
+            detail=(
+                f"no run manifest under {prefix}. {unit.unit_id} either did not execute on "
+                "this trading day or executed without recording itself — and those are "
+                "indistinguishable from here, which is exactly the state the run-record "
+                "objective exists to end (plan §2 row 7)."
+            ),
+            evidence=(f"{prefix}*.json",),
+            source="data_collection store",
+        )
+
+    manifests: list[dict] = []
+    problems: list[str] = []
+    for key in keys:
+        read = read_store_document(store, key)
+        if read.problem is not None:
+            problems.append(f"{key}: {read.problem}")
+        elif read.absent:
+            problems.append(f"{key}: vanished between listing and read")
+        else:
+            manifests.append(read.document or {})
+
+    if problems:
+        return Reading(
+            met=False,
+            detail=f"{len(problems)} of {len(keys)} manifest(s) under {prefix} unreadable: {problems[:4]}",
+            evidence=tuple(keys[:8]),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+
+    wrong_schema = sorted(
+        {str(m.get("schema_version")) for m in manifests if m.get("schema_version") != _MANIFEST_SCHEMA}
+    )
+    if wrong_schema:
+        return Reading(
+            met=False,
+            detail=(
+                f"{prefix} holds record(s) whose schema_version is {wrong_schema}, not "
+                f"{_MANIFEST_SCHEMA!r}. A reader that accepted them would be grading a "
+                "contract nobody declared."
+            ),
+            evidence=tuple(keys[:8]),
+            source="data_collection store",
+        )
+
+    statuses = [str(m.get("status")) for m in manifests]
+    third_state = sorted({s for s in statuses if s not in MANIFEST_STATUSES})
+    if third_state:
+        return Reading(
+            met=False,
+            detail=(
+                f"{prefix} holds run(s) with status {third_state}, outside the closed set "
+                f"{sorted(MANIFEST_STATUSES)}. This is the third ok-but-degraded state the "
+                "requirement forbids: a run that produced a partial or defective artifact "
+                "is `failed`, and a cycle it correctly sat out is `not_applicable` with a "
+                "closed-list reason."
+            ),
+            evidence=tuple(keys[:8]),
+            source="data_collection store",
+        )
+
+    empty_fresh = empty_fresh_runs(manifests)
+    counts = {s: statuses.count(s) for s in sorted(set(statuses))}
+    summary = (
+        f"{len(manifests)} run(s) recorded under {prefix}: {counts}; "
+        f"rows_out total {sum(int(m.get('rows_out') or 0) for m in manifests)}; "
+        f"empty-but-fresh runs (guards[].verdict == 'empty_fresh') {len(empty_fresh)}"
+    )
+
+    probe = _read_arctic_probe(store, unit, trading_day)
+    if probe is not None:
+        if not probe.met:
+            # The manifests exist; the ArcticDB half of the evidence does not.
+            # Red, and carrying BOTH halves so the row is a work item with an
+            # address rather than a bare unmeasurable.
+            return Reading(
+                met=False,
+                detail=f"{summary}. {probe.detail}",
+                evidence=tuple(keys[:8]) + probe.evidence,
+                unmeasurable=probe.unmeasurable,
+                source=probe.source,
+            )
+        return Reading(
+            met=True,
+            detail=f"{summary}. {probe.detail}",
+            evidence=tuple(keys[:8]) + probe.evidence,
+            source="data_collection store",
+            as_of=probe.as_of,
+        )
+
+    return Reading(
+        met=True,
+        detail=summary,
+        evidence=tuple(keys[:8]),
+        source="data_collection store",
+        as_of=str(manifests[-1].get("finished") or ""),
+    )
+
+
 def read_base(store: GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Reading:
     """The evidence behind one base clause."""
     if column == "schema_contract":
         return _read_schema_contract(unit)
+    if column == "run_record":
+        return read_run_record(store, unit, trading_day=trading_day)
     key = _BASE_EVIDENCE_KEY[column].format(prefix=unit.run_manifest_prefix, trading_day=trading_day)
     return _pending(
         key,

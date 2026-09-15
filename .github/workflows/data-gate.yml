@@ -2,15 +2,41 @@ name: Data-collection gate (read-only)
 
 # alpha-engine-config-I10748 deliverable P-04
 # (private-docs/data_collection_plan_260914.md §4.1 "The gate command", §8.3).
+# Second read added under alpha-engine-config-I10832/I10808, PR1716's own
+# follow-up: PR1716 (nousergon-data#1716) shipped the `data-cutover-ready`
+# sub-gate in `data_gate/read.py::GATES` but this workflow only ever invoked
+# `data-phase0` — the sub-gate had a clause list and a registered name and no
+# scheduled reader.
 #
-# WHAT THIS IS. Runs `python -m data_gate read --gate data-phase<N> --store
-# s3://alpha-engine-research/data_collection`, which conforms to
+# WHAT THIS IS. Runs `python -m data_gate read --gate <name> --store
+# s3://alpha-engine-research/data_collection` TWICE per job — once for
+# `data-phase0`, once for `data-cutover-ready` — each of which conforms to
 # `schemas/phase_ladder.v1.json` and writes:
 #   - data_collection/gates/ladder.json          — current reading (rewritten
 #     every run; the console reads THIS key — see nous-ergon-ops
 #     data-collection-phase-ladder.yaml / data-collection-board.yaml)
-#   - data_collection/gates/data-phase<N>/{date}/gate.json — dated, never
-#     overwritten (the ladder's history).
+#   - data_collection/gates/board/latest.json     — current per-clause board
+#     (rewritten every run; see BOTH READS, ONE BOARD below)
+#   - data_collection/gates/<gate>/{date}/gate.json — dated, never
+#     overwritten (that gate's own history).
+#
+# BOTH READS, ONE BOARD. `data_gate.read.run()` evaluates every registered
+# gate (`GATES`, currently data-phase0/data-cutover-ready/data-phase1/2/3) on
+# every invocation regardless of the `--gate` argument, and builds the ladder
+# and the board (`gates/board/latest.json`) from that same all-clauses list —
+# the `--gate` argument only selects which single `GateResult` is returned
+# for THIS invocation's exit code and its own dated history key. So the two
+# reads below write byte-for-byte equivalent `ladder.json` / `board/
+# latest.json` documents (module `data_gate/read.py::run` — verified by
+# reading it, not assumed): same clauses, same states, same evidence: only
+# `generated_utc` can differ by the few seconds between the two `python -m
+# data_gate` invocations. The second write does not clobber the first's
+# board with a NARROWER one — there is no narrower board to clobber, because
+# neither read ever wrote a cutover-ready-only or phase0-only board. Running
+# both is still correct and not redundant ceremony: each read is the only
+# way to get THAT gate's own exit code (phase0 met does not imply
+# cutover-ready met, or the reverse) and THAT gate's own dated history file
+# under `gates/<gate>/{date}/gate.json`.
 #
 # `data_gate` (the clause generator + reader) and the unit descriptors under
 # `registry.d/units/*.yaml` are sibling deliverables (I10748 P-01/P-02) —
@@ -19,18 +45,32 @@ name: Data-collection gate (read-only)
 # sequencing, not a defect in this file: this workflow is a consumer of a
 # contract another PR provides (see this PR's body for the merge order).
 #
-# THREE RULES CARRIED VERBATIM FROM THE PLAN (§4.1):
+# THREE RULES CARRIED VERBATIM FROM THE PLAN (§4.1), for EACH read:
 #   1. A gate READS; it never runs. This workflow launches no collection —
 #      its role (`github-actions-data-gate-read`, nous-ergon-ops) holds no
 #      write capability outside `data_collection/gates/*` and no Step
 #      Functions/Scheduler/Lambda invoke authority at all.
 #   2. A clause is MET, UNMET or UNMEASURABLE, and UNMEASURABLE is never MET.
 #   3. The gate's job succeeds when the measurement succeeds — the process
-#      exits non-zero unless the phase's gate is met. A red run here is the
-#      board telling the truth, not this workflow breaking. See
+#      exits non-zero unless that gate is met. A red run here is the board
+#      telling the truth, not this workflow breaking. See
 #      WORKFLOW_HEALTH_FINDING_STEPS below, which is exactly how this repo's
 #      other read-only drift/health checks (sf-arn-drift-check.yml,
 #      pause-check-alert.yml) declare the same shape.
+#
+#      CORRECTED alpha-engine-config-I10832 (was silently dead code since
+#      PR1710): "Fail the job on a non-MET reading" gated on
+#      `steps.gate_read.outcome == 'success'`. Per GitHub's own contract,
+#      `outcome` is the step's result BEFORE `continue-on-error` is applied
+#      — it can only read `success` when the underlying `python -m data_gate`
+#      call itself exited 0, at which point `exit_code` is already `'0'` and
+#      the paired `exit_code != '0'` half of the AND can never be true. Rule
+#      3 was never actually enforced: the job reported green on every UNMET
+#      or UNMEASURABLE reading since this workflow started running (its one
+#      live run, 34925958385, happened to read MET and never exercised the
+#      branch). Fixed below to `outcome == 'failure'`, which is what
+#      `continue-on-error: true` on the read step actually produces on a
+#      non-zero exit.
 #
 # CADENCE. Daily 23:30 UTC — after the EOD spine's 18:15 ET / ~22:15-23:15
 # UTC deadline (plan §2 row 1) so the daily reading reflects a completed
@@ -38,11 +78,13 @@ name: Data-collection gate (read-only)
 # deadline, on push to the clause/descriptor sources so a topology change is
 # re-read immediately, and on-demand.
 #
-# WHICH GATE. `data-phase0` today (phase 0 is what this repo is building
-# toward, per the plan's phase table). The gate name advances to
-# `data-phase1`/`2`/`3` as later PRs land phase content; this workflow's
-# `--gate` argument is a single source the phase-advance PR updates here,
-# not duplicated per trigger.
+# WHICH GATES. `data-phase0` (phase 0 is what this repo is building toward,
+# per the plan's phase table) and `data-cutover-ready` (PR1716's sub-gate of
+# phase 1, `registry.d/phases.yaml`'s `sub_gates` — graded independently of
+# the phase0/1/2/3 ceiling ladder). The phase0 gate name advances to
+# `data-phase1`/`2`/`3` as later PRs land phase content; this workflow's two
+# `--gate` arguments are the single source those PRs update here, not
+# duplicated per trigger.
 
 on:
   schedule:
@@ -65,25 +107,30 @@ permissions:
   contents: read
 
 # WORKFLOW HEALTH SEMANTICS (alpha-engine-config-I9169, mirroring
-# sf-arn-drift-check.yml in this same repo). A non-zero exit at the declared
-# step is graded `reporting_findings` — the gate telling the truth about a
-# red board, not a broken control — because plan §4.1 rule 3 makes that exit
-# code the measurement's own verdict. A failure anywhere else (checkout, the
-# OIDC role missing, a dependency install) is graded exactly as before.
+# sf-arn-drift-check.yml in this same repo). A non-zero exit at either
+# declared step is graded `reporting_findings` — the gate telling the truth
+# about a red board, not a broken control — because plan §4.1 rule 3 makes
+# that exit code the measurement's own verdict. A failure anywhere else
+# (checkout, the OIDC role missing, a dependency install) is graded exactly
+# as before.
 env:
   WORKFLOW_HEALTH_SEMANTICS: finding-surface
   WORKFLOW_HEALTH_FINDING_STEPS: |
-    Read the data-collection gate
+    Read the data-phase0 gate
+    Read the data-cutover-ready gate
+    Fail the job on a non-MET reading
   WORKFLOW_HEALTH_FINDING_ISSUE: alpha-engine-config-I10748
   WORKFLOW_HEALTH_FINDING_REASON: >-
-    `data_gate read` exits non-zero unless every clause tagged for this
-    phase reads MET (plan §4.1 rule 3: "the gate's job succeeds when the
+    `data_gate read` exits non-zero unless every clause tagged for that gate
+    reads MET (plan §4.1 rule 3: "the gate's job succeeds when the
     measurement succeeds"). At phase 0 every clause starts RED by design
     (plan §4.1 "Red by default") until phase 0's own exit criteria are
-    satisfied, so this step is expected to fail for an extended period —
-    that is the board being honest, not the control being broken. The
-    ladder object it writes even on failure (data_collection/gates/
-    ladder.json) is what the console renders; a run that never executes at
+    satisfied, and `data-cutover-ready` is expected to read UNMET on its
+    first live runs too, so these steps are expected to fail for an
+    extended period — that is the board being honest, not the control being
+    broken. The ladder/board objects written even on failure
+    (data_collection/gates/ladder.json, data_collection/gates/board/
+    latest.json) are what the console renders; a run that never executes at
     all (OIDC failure, checkout failure) is the real break this declaration
     does not cover.
 
@@ -94,6 +141,7 @@ jobs:
     timeout-minutes: 15
     outputs:
       gate_exit_code: ${{ steps.gate_read.outputs.exit_code }}
+      cutover_gate_exit_code: ${{ steps.gate_read_cutover.outputs.exit_code }}
     steps:
       - name: Checkout data repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -128,7 +176,7 @@ jobs:
       # dependency) also exits 1 and would misread as an unmet finding
       # rather than a break — the install step above is the guard against
       # that, and it pages unconditionally on its own failure.
-      - name: Read the data-collection gate
+      - name: Read the data-phase0 gate
         id: gate_read
         continue-on-error: true
         run: |
@@ -139,44 +187,83 @@ jobs:
           echo "exit_code=$code" >> "$GITHUB_OUTPUT"
           exit "$code"
 
-      # Restores rule 3 (the job fails unless the gate is MET) now that the
-      # step above no longer fails the job on its own via
-      # `continue-on-error`. Runs whenever the read step actually executed
-      # (success or captured non-zero) — never when an earlier step
-      # (checkout, OIDC, install) prevented it from running at all, which
-      # already fails the job through its own `if:`-less step.
-      - name: Fail the job on a non-MET reading
-        if: steps.gate_read.outcome == 'success' && steps.gate_read.outputs.exit_code != '0'
+      # Second invocation, same contract, `data-cutover-ready`'s own exit
+      # code. This does NOT depend on the step above succeeding — with
+      # `continue-on-error: true` on that step its `conclusion` is
+      # `success`, so this step runs unconditionally like any normal next
+      # step, and needs no `if:` to avoid being skipped. See "BOTH READS,
+      # ONE BOARD" at the top of this file for why running it a second time
+      # writes an equivalent, not a conflicting, `ladder.json`/`board/
+      # latest.json`.
+      - name: Read the data-cutover-ready gate
+        id: gate_read_cutover
+        continue-on-error: true
         run: |
-          echo "::error::data_gate exited ${{ steps.gate_read.outputs.exit_code }} — see WORKFLOW_HEALTH_SEMANTICS above for what that means and whether it pages."
-          exit 1
+          set +e
+          python -m data_gate read --gate data-cutover-ready \
+            --store s3://alpha-engine-research/data_collection
+          code=$?
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      # Restores rule 3 (the job fails unless EACH gate is MET) now that
+      # neither read step above fails the job on its own via
+      # `continue-on-error`. Fires whenever either read step's own exit
+      # code was non-zero (`outcome == 'failure'`, the pre-continue-on-error
+      # result — see the CORRECTED note at the top of this file for why this
+      # is `'failure'`, not `'success'`) — never when an earlier step
+      # (checkout, OIDC, install) prevented a read from running at all,
+      # which already fails the job through its own `if:`-less step.
+      - name: Fail the job on a non-MET reading
+        if: steps.gate_read.outcome == 'failure' || steps.gate_read_cutover.outcome == 'failure'
+        run: |
+          set -e
+          status=0
+          if [ "${{ steps.gate_read.outcome }}" = "failure" ]; then
+            echo "::error::data-phase0 read exited ${{ steps.gate_read.outputs.exit_code }} — see WORKFLOW_HEALTH_SEMANTICS above for what that means and whether it pages."
+            status=1
+          fi
+          if [ "${{ steps.gate_read_cutover.outcome }}" = "failure" ]; then
+            echo "::error::data-cutover-ready read exited ${{ steps.gate_read_cutover.outputs.exit_code }} — see WORKFLOW_HEALTH_SEMANTICS above for what that means and whether it pages."
+            status=1
+          fi
+          exit "$status"
 
   # ── FAILURE ALERTING, NON-FINDING FAILURES ONLY ─────────────────────────
   # A scheduled workflow that never ran at all (checkout, OIDC, dependency
   # install) is a real break and is not covered by the finding-surface
   # declaration above — same reasoning as fault-injection-weekly.yml in this
-  # repo. A `data_gate read` finding (the board being red, exit code 1) is
-  # deliberately NOT paged from here: it is not one of the three page
-  # conditions in plan §2 row 11, and it is what the console board
-  # (nous-ergon-ops data-collection-phase-ladder.yaml /
+  # repo. A `data_gate read` finding from EITHER gate (the board being red,
+  # exit code 1) is deliberately NOT paged from here: it is not one of the
+  # three page conditions in plan §2 row 11, and it is what the console
+  # board (nous-ergon-ops data-collection-phase-ladder.yaml /
   # data-collection-board.yaml) exists to show once enabled. Page condition
   # 3 (ladder `as_of` stale > 26h) is a read against the board's own as_of,
-  # not against this job's exit code.
+  # not against this job's exit codes.
   #
-  # The `read-gate.outputs.gate_exit_code != '1'` guard is what makes that
-  # real: `needs: [read-gate]` + `failure()` alone cannot tell a suppressed
-  # finding (job failed on purpose, exit code 1) from checkout/OIDC/install
-  # never reaching the read step at all (job failed, output empty) or a
-  # genuine measurement failure (job failed, exit code 2) — both of which
-  # must still page. alpha-engine-config-I10748 (this workflow's own
-  # deliverable) is what surfaced the gap: run 34904545029's phase-0 read
-  # found 4/5 clauses unmet by design and this job still dispatched a
-  # `ci-main-failure` event to Fleet CI Watch (config#2855) for an expected
-  # finding.
+  # The guard below is what makes that real, extended to both reads
+  # (alpha-engine-config-I10832): `needs: [read-gate]` + `failure()` alone
+  # cannot tell a suppressed finding (either or both reads exited 1 on
+  # purpose) from checkout/OIDC/install never reaching either read step at
+  # all (job failed, both outputs empty) or a genuine measurement failure on
+  # either gate (job failed, that gate's exit code is 2) — all of which must
+  # still page. It pages unless BOTH outputs are in {0, 1} — i.e. it does
+  # NOT page when the only failures are expected UNMET findings, and DOES
+  # page when either output is empty (never ran) or anything other than 0/1
+  # (a real measurement failure). alpha-engine-config-I10748 (this
+  # workflow's own deliverable) is what surfaced the original single-gate
+  # gap: run 34904545029's phase-0 read found 4/5 clauses unmet by design
+  # and this job still dispatched a `ci-main-failure` event to Fleet CI
+  # Watch (config#2855) for an expected finding.
   notify-main-failure:
     needs: [read-gate]
     if: >-
       ${{ failure() && github.ref == 'refs/heads/main' &&
-          needs.read-gate.outputs.gate_exit_code != '1' }}
+          (
+            (needs.read-gate.outputs.gate_exit_code != '0' &&
+             needs.read-gate.outputs.gate_exit_code != '1') ||
+            (needs.read-gate.outputs.cutover_gate_exit_code != '0' &&
+             needs.read-gate.outputs.cutover_gate_exit_code != '1')
+          ) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
