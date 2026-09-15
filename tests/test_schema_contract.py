@@ -47,7 +47,14 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from features import gen_schema_md
 from features.feature_engineer import FEATURES, compute_features
-from features.registry import CATALOG, PRIVATE_PACK_COMPUTE
+from features.registry import (
+    ALLOWED_UNITS_SUFFIXES,
+    CATALOG,
+    GRANDFATHERED_BARE_FIELDS,
+    PRIVATE_PACK_COMPUTE,
+    FeatureUnitsSuffixError,
+    validate_units_suffix,
+)
 
 
 _FEATURES_DIR = Path(__file__).resolve().parents[1] / "features"
@@ -240,47 +247,13 @@ def test_private_pack_row_renders_sentinel_not_formula():
 # ── Naming-convention sniff tests ────────────────────────────────────────────
 
 
-_ALLOWED_SUFFIXES = ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
-
-# Bare-named fields are grandfathered (see SCHEMA.md §1). New bare-named
-# fields are NOT permitted — the test below enforces it. Adding a new
-# bare-named field requires updating this set AND justifying it in the PR
-# body.
-_GRANDFATHERED_BARE_FIELDS: frozenset[str] = frozenset({
-    # Technical
-    "rsi_14", "macd_cross", "macd_above_zero", "macd_line_last",
-    "price_vs_ma50", "price_vs_ma200", "momentum_20d", "avg_volume_20d",
-    "dist_from_52w_high", "momentum_5d", "rel_volume_ratio",
-    "return_vs_spy_5d", "dist_from_52w_low", "vol_ratio_10_60",
-    "bollinger_pct", "sector_vs_spy_5d", "sector_vs_spy_10d",
-    "sector_vs_spy_20d",
-    # config#934 — sub-sector benchmark-relative momentum. Bare-named for the
-    # same reason as the sector_vs_spy_* family above: a decimal excess return
-    # over a fixed horizon (the _5d/_10d/_20d suffix names the WINDOW, not
-    # units). Follows the identical convention as its sector-level sibling.
-    "sub_sector_vs_benchmark_5d", "sub_sector_vs_benchmark_10d",
-    "sub_sector_vs_benchmark_20d",
-    "price_accel", "ema_cross_8_21", "atr_14_pct",
-    "realized_vol_20d", "realized_vol_63d", "volume_trend",
-    "obv_slope_10d", "rsi_slope_5d", "volume_price_div",
-    "return_60d", "return_120d", "overnight_return_5d",
-    "intraday_return_5d", "dist_from_5d_high", "dist_from_20d_high",
-    "beta_60d", "idio_vol_60d", "vol_of_vol_30d", "max_drawdown_60d",
-    # Macro
-    "vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d",
-    "oil_mom_5d", "vix_term_slope", "xsect_dispersion",
-    # Interaction
-    "mom5d_x_vix", "rsi_x_vix", "sector_x_trend", "atr_x_vix",
-    "vol_trend_x_vix",
-    # Alternative
-    "earnings_surprise_pct", "days_since_earnings", "eps_revision_4w",
-    "revision_streak", "put_call_ratio", "iv_rank", "iv_vs_rv",
-    # Fundamental
-    "pe_ratio", "pb_ratio", "debt_to_equity", "revenue_growth_yoy",
-    "fcf_yield", "gross_margin", "roe", "current_ratio",
-    "revenue_growth_3y", "eps_growth_3y", "payout_ratio",
-    "dividend_yield", "capex_growth_5y",
-})
+# SOLE canonical copy of the suffix vocabulary and the grandfathered-bare-
+# field set is `features/registry.py` (alpha-engine-config#10781) — this
+# test imports it rather than keeping its own literal, so the write-time
+# assertion (`features/writer.py`) and this PR-time test can never disagree
+# about which names are legal.
+_ALLOWED_SUFFIXES = ALLOWED_UNITS_SUFFIXES
+_GRANDFATHERED_BARE_FIELDS = GRANDFATHERED_BARE_FIELDS
 
 
 def test_new_fields_must_carry_units_suffix():
@@ -320,6 +293,67 @@ def test_grandfathered_set_matches_documented_bare_names():
         "Either restore the column or remove it from the grandfathered "
         f"set: {sorted(stale)}"
     )
+
+
+# ── Write-time enforcement (alpha-engine-config#10781) ──────────────────────
+#
+# The two tests above are the PR-time (CI) half of the contract. The tests
+# below prove the SAME contract is enforced at WRITE TIME —
+# `features/writer.py::write_feature_snapshot` calls
+# `features.registry.validate_units_suffix` on every column before any S3
+# `put_object`, closing the gap the avg_volume_20d incident exploited: a
+# mis-suffixed column that CI never saw (e.g. a runtime-only DataFrame
+# column, or a CI run skipped/bypassed) still cannot reach S3.
+
+
+def test_validate_units_suffix_accepts_a_suffixed_name():
+    validate_units_suffix("avg_volume_20d_raw")
+
+
+def test_validate_units_suffix_accepts_a_grandfathered_bare_name():
+    validate_units_suffix("rsi_14")
+
+
+def test_validate_units_suffix_rejects_a_deliberately_mis_suffixed_name():
+    """The write-time assertion itself: a column with neither a recognized
+    suffix nor a grandfathered bare name is rejected."""
+    with pytest.raises(FeatureUnitsSuffixError, match="units suffix"):
+        validate_units_suffix("totally_bogus_units_field")
+
+
+def test_write_feature_snapshot_rejects_a_mis_suffixed_column_before_any_s3_write():
+    """End-to-end: `write_feature_snapshot` refuses a mis-suffixed column at
+    write time, and never calls `put_object` while doing so — proving the
+    rejection happens BEFORE the write, not merely alongside it.
+
+    Simulates a registry entry that regressed past the suffix contract (the
+    exact avg_volume_20d shape) by monkeypatching `features.writer.GROUPS`,
+    since every real `CATALOG` entry today is already contract-compliant.
+    """
+    import features.writer as writer_module
+
+    bad_name = "mis_suffixed_test_column"  # no suffix, not grandfathered
+    original_groups = writer_module.GROUPS
+    writer_module.GROUPS = {"technical": [bad_name]}
+    try:
+        df = pd.DataFrame({"ticker": ["AAPL", "MSFT"], bad_name: [1.0, 2.0]})
+
+        calls: list[str] = []
+
+        class _FailingS3Client:
+            def put_object(self, **kwargs):
+                calls.append(kwargs.get("Key", ""))
+                raise AssertionError(
+                    "put_object must never be called for a rejected snapshot"
+                )
+
+        with pytest.raises(FeatureUnitsSuffixError, match="units suffix"):
+            writer_module.write_feature_snapshot(
+                "2026-09-14", df, bucket="test-bucket", s3_client=_FailingS3Client()
+            )
+        assert calls == [], "S3 was written to despite the mis-suffixed column"
+    finally:
+        writer_module.GROUPS = original_groups
 
 
 # ── Units sniff test ─────────────────────────────────────────────────────────

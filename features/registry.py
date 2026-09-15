@@ -232,6 +232,100 @@ def get_feature(name: str) -> FeatureEntry:
     return _CATALOG_BY_NAME[name]
 
 
+# ── Units-suffix contract (alpha-engine-config#10781) ───────────────────────
+#
+# Root cause (fleet CLAUDE.md standing rule): `avg_volume_20d` was emitted as
+# a normalized ratio and consumed as raw shares — 901/903 tickers silently
+# failed the scanner liquidity gate for months, because nothing checked that
+# a column's NAME disclosed its UNITS. `ALLOWED_UNITS_SUFFIXES` and
+# `GRANDFATHERED_BARE_FIELDS` below are the SOLE canonical copy of that
+# contract — `tests/test_schema_contract.py` imports both rather than
+# duplicating them (previously the grandfathered set was defined twice: once
+# here implicitly via CATALOG membership, once as a hand-maintained literal
+# in the test file). `validate_units_suffix` is called at PR time (via the
+# test) AND at write time (`features/writer.py::write_feature_snapshot`) —
+# the same check, enforced at both layers, from one source.
+
+#: Recognized units suffixes. A column name ending in one of these is
+#: self-disclosing; anything else must be grandfathered below or renamed.
+ALLOWED_UNITS_SUFFIXES: tuple[str, ...] = ("_raw", "_ratio", "_pct", "_zscore", "_log_return")
+
+#: Bare-named fields grandfathered as of 2026-05-25 (the avg_volume_20d
+#: audit). New bare-named fields are NOT permitted — `validate_units_suffix`
+#: (and `tests/test_schema_contract.py::test_new_fields_must_carry_units_suffix`)
+#: enforce it. Adding a new bare-named field requires updating this set AND
+#: justifying it in the PR body.
+GRANDFATHERED_BARE_FIELDS: frozenset[str] = frozenset({
+    # Technical
+    "rsi_14", "macd_cross", "macd_above_zero", "macd_line_last",
+    "price_vs_ma50", "price_vs_ma200", "momentum_20d", "avg_volume_20d",
+    "dist_from_52w_high", "momentum_5d", "rel_volume_ratio",
+    "return_vs_spy_5d", "dist_from_52w_low", "vol_ratio_10_60",
+    "bollinger_pct", "sector_vs_spy_5d", "sector_vs_spy_10d",
+    "sector_vs_spy_20d",
+    # config#934 — sub-sector benchmark-relative momentum. Bare-named for the
+    # same reason as the sector_vs_spy_* family above: a decimal excess return
+    # over a fixed horizon (the _5d/_10d/_20d suffix names the WINDOW, not
+    # units). Follows the identical convention as its sector-level sibling.
+    "sub_sector_vs_benchmark_5d", "sub_sector_vs_benchmark_10d",
+    "sub_sector_vs_benchmark_20d",
+    "price_accel", "ema_cross_8_21", "atr_14_pct",
+    "realized_vol_20d", "realized_vol_63d", "volume_trend",
+    "obv_slope_10d", "rsi_slope_5d", "volume_price_div",
+    "return_60d", "return_120d", "overnight_return_5d",
+    "intraday_return_5d", "dist_from_5d_high", "dist_from_20d_high",
+    "beta_60d", "idio_vol_60d", "vol_of_vol_30d", "max_drawdown_60d",
+    # Macro
+    "vix_level", "yield_10y", "yield_curve_slope", "gold_mom_5d",
+    "oil_mom_5d", "vix_term_slope", "xsect_dispersion",
+    # Interaction
+    "mom5d_x_vix", "rsi_x_vix", "sector_x_trend", "atr_x_vix",
+    "vol_trend_x_vix",
+    # Alternative
+    "earnings_surprise_pct", "days_since_earnings", "eps_revision_4w",
+    "revision_streak", "put_call_ratio", "iv_rank", "iv_vs_rv",
+    # Fundamental
+    "pe_ratio", "pb_ratio", "debt_to_equity", "revenue_growth_yoy",
+    "fcf_yield", "gross_margin", "roe", "current_ratio",
+    "revenue_growth_3y", "eps_growth_3y", "payout_ratio",
+    "dividend_yield", "capex_growth_5y",
+})
+
+
+class FeatureUnitsSuffixError(ValueError):
+    """Raised when a feature column name violates the units-suffix contract.
+
+    Never swallowed — a producer repo has no graceful-degrade carve-out
+    (AGENTS.md). Raised at write time by `features/writer.py` before any S3
+    `put_object`, so a mis-suffixed column fails the whole snapshot rather
+    than partially writing.
+    """
+
+
+def validate_units_suffix(name: str) -> None:
+    """Raise `FeatureUnitsSuffixError` unless `name` carries a units suffix
+    or is in `GRANDFATHERED_BARE_FIELDS`.
+
+    This is the write-time half of the units-suffix contract
+    (alpha-engine-config#10781) — the PR-time half is
+    `tests/test_schema_contract.py::test_new_fields_must_carry_units_suffix`,
+    which imports the same two module-level constants above rather than
+    keeping its own copy.
+    """
+    if name in GRANDFATHERED_BARE_FIELDS:
+        return
+    if any(name.endswith(suffix) for suffix in ALLOWED_UNITS_SUFFIXES):
+        return
+    raise FeatureUnitsSuffixError(
+        f"Feature column {name!r} lacks a units suffix "
+        f"({ALLOWED_UNITS_SUFFIXES}) and is not in registry.GRANDFATHERED_BARE_FIELDS. "
+        "Rename the column with a units suffix (preferred) or add it to "
+        "GRANDFATHERED_BARE_FIELDS with a written PR-body rationale. This is "
+        "the avg_volume_20d defect class — a column's units must be legible "
+        "from its name, never inferred by the consumer (alpha-engine-config#10781)."
+    )
+
+
 def get_group_features(group: str) -> list[str]:
     """Return feature names for a group."""
     return GROUPS.get(group, [])
