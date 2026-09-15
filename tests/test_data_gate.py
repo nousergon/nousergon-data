@@ -311,7 +311,7 @@ def test_the_writer_inventory_reconciles_today(units):
     assert reading.undeclared == [], (
         "write-site file(s) with no descriptor and no declared parent: "
         f"{reading.undeclared}. Add the unit descriptor, or attribute the module to its "
-        "parent in registry.d/writer_inventory.yaml with a reason."
+        "parent in data_gate/config/writer_inventory.yaml with a reason."
     )
     assert reading.units_without_write_site == []
     assert not reading.parse_failures
