@@ -876,8 +876,111 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         return captured["result"]
 
 
+def _daily_heal_daily_closes_keys(result: dict) -> list[str]:
+    """The ``staging/daily_closes/{day}.parquet`` keys D33's universe-gap heal
+    actually staged this run — one per entry in
+    ``collectors.universe_gap_heal.healed_days``, never a copy of the
+    descriptor's ``staging/daily_closes/*`` wildcard (alpha-engine-config-I10861).
+    Each entry is normally ``{"date": ..., "kind": ..., ...}``
+    (``_self_heal_missing_universe_days``); a bare date string is tolerated too
+    so a caller passing the plain list this function's own row count is
+    measured from does not need to fabricate the dict shape."""
+    healed = (
+        (result.get("collectors") or {}).get("universe_gap_heal") or {}
+    ).get("healed_days") or []
+    dates = [h.get("date") if isinstance(h, dict) else h for h in healed]
+    return [f"staging/daily_closes/{d}.parquet" for d in dates if d]
+
+
+def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
+    """The ``reference/price_cache/{ticker}.parquet`` keys D34's chronic-gap
+    self-heal actually wrote this run (``_self_heal_chronic_polygon_gaps`` via
+    ``_price_cache_write_prefixes`` — never ``staging/daily_closes``, which
+    this mode never touches; alpha-engine-config-I10861)."""
+    healed = (
+        (result.get("collectors") or {}).get("chronic_gap_self_heal") or {}
+    ).get("healed") or []
+    return [f"reference/price_cache/{h['ticker']}.parquet" for h in healed if h.get("ticker")]
+
+
+#: mode -> extra ``(key_or_keys_fn, present_fn, rows_fn)`` entries recording
+#: every S3 key that mode's own result shows it ACTUALLY wrote this run — the
+#: whole-mode twin of ``_phase_collect``'s ``extra_outputs``
+#: (alpha-engine-config-I10861). Each callable is evaluated against the
+#: mode's own ``result`` dict at record time, never against the descriptor:
+#: recording a key the mode did not write this run would be the same defect
+#: this deliverable exists to close, just moved one level up. Deliberately
+#: keyed independent of the ArcticDB row measurement below — D17's weekday
+#: ``--skip-arctic-append`` run publishes ``staging/daily_closes`` with NO
+#: arctic write in the same run, and gating this recording behind the arctic
+#: count (as the prior single-key implementation did) left it permanently
+#: unrecorded on every weekday run.
+_MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "morning_enrich": (
+        (
+            lambda r: [f"staging/daily_closes/{r.get('date')}.parquet"],
+            lambda r: ((r.get("collectors") or {}).get("daily_closes") or {}).get("status")
+            == "ok",
+            lambda r: ((r.get("collectors") or {}).get("daily_closes") or {}).get(
+                "tickers_captured"
+            )
+            or 0,
+        ),
+    ),
+    "daily_heal": (
+        (
+            lambda r: [f"data/heal/daily/{r.get('date')}.json"],
+            lambda r: bool(r.get("date")),
+            lambda r: r.get("days_healed") or 0,
+        ),
+        (
+            _daily_heal_daily_closes_keys,
+            lambda r: bool(_daily_heal_daily_closes_keys(r)),
+            lambda r: len(
+                ((r.get("collectors") or {}).get("universe_gap_heal") or {}).get(
+                    "healed_days"
+                )
+                or []
+            ),
+        ),
+    ),
+    "chronic_gap_heal": (
+        (
+            _chronic_gap_heal_price_cache_keys,
+            lambda r: bool(_chronic_gap_heal_price_cache_keys(r)),
+            lambda r: sum(
+                int(h.get("rows_added") or 0)
+                for h in (
+                    (r.get("collectors") or {}).get("chronic_gap_self_heal") or {}
+                ).get("healed")
+                or []
+            ),
+        ),
+    ),
+}
+
+
 def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None:
-    """Fold a whole-mode unit's published count onto its run manifest."""
+    """Fold a whole-mode unit's published outputs onto its run manifest.
+
+    ``alpha-engine-config-I10861``: every S3 key the mode's own result shows
+    it actually wrote this run is recorded under THAT key (``_MODE_EXTRA_
+    OUTPUTS`` — never copied from the descriptor). The ArcticDB library write,
+    when this run made one, is recorded under the library's own reference
+    spelling (``arcticdb/universe``, matching every ``MODE_UNITS`` descriptor's
+    ``writes:`` entry) instead of a synthesized ``arcticdb://{unit_id}`` that
+    no S3 key template a descriptor could declare would ever match — the
+    literal-key defect that left D33/D34's completion check red by
+    construction on every run. PR1739 fixed the same class one call site over,
+    for ``_record_phase_lineage``.
+    """
+    for key_or_keys, present_fn, rows_fn in _MODE_EXTRA_OUTPUTS.get(mode, ()):
+        if present_fn(result):
+            keys = key_or_keys(result) if callable(key_or_keys) else (key_or_keys,)
+            rows_out = int(rows_fn(result) or 0)
+            for k in keys:
+                run_ctx.record_output(k, rows_out=rows_out)
+
     spec = run_units.MODE_ROWS.get(mode)
     published = (result.get("collectors") or {}).get(spec.collector, {}) if spec else {}
     rows: int | None = None
@@ -911,7 +1014,7 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     # empty-but-fresh objective needs; the ArcticDB probe
     # (data_collection/probes/arctic/{trading_day}.json) is the independent
     # read-back of the same write.
-    run_ctx.record_output(f"arcticdb://{unit_id}", rows_out=rows)
+    run_ctx.record_output("arcticdb/universe", rows_out=rows)
     _record_rejections(run_ctx, published, spec.rejected_keys)
     run_ctx.record_guard(
         expectations.EMPTY_FRESH_GUARD.name,

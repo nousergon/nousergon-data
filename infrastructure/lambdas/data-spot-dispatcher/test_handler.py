@@ -809,3 +809,69 @@ def test_multi_key_unit_skipping_one_key_fails_naming_it(monkeypatch, unit_id):
         assert completion["failure_mode"] == "output_missing"
         assert all(f["mode"] == "output_missing" for f in completion["findings"])
         assert all(f["unit"] == unit_id for f in completion["findings"])
+
+
+# ── alpha-engine-config-I10861: whole-mode units record REAL S3 keys, never a
+# synthesized `arcticdb://{unit_id}` that no descriptor template could ever
+# match. D17/D33/D34 (below) each publish at least one graded S3 key
+# template; D18/D32 declare ONLY the (unverifiable) ArcticDB library write and
+# are already covered by test_a_prose_writes_entry_is_counted_not_silently_
+# dropped (D18) — the same shape applies to D32 and is not duplicated here.
+#
+# D33/D34 also declare `arcticdb/universe (library)`, which lands in
+# `unverifiable` rather than `keys_checked` (same as D18/D32) — so these use
+# their own pass/withhold pair instead of the `_MULTI_KEY_UNIT_OUTPUTS` table
+# above, whose `test_multi_key_unit_full_run_passes` asserts `unverifiable ==
+# []` for every entry (true for D01/D05/.../D26, none of which declare an
+# ArcticDB write; false for D33/D34).
+_WHOLE_MODE_UNIT_OUTPUTS: dict[str, list[dict]] = {
+    # D17 morning-enrich: the polygon overwrite this run staged.
+    "D17": [
+        {"key": "staging/daily_closes/2026-09-14.parquet", "rows_out": 903},
+    ],
+    # D33 daily-heal: the heal-summary artifact (always written) plus one
+    # `staging/daily_closes/*`-matching key for a day the universe-gap heal
+    # actually staged this run.
+    "D33": [
+        {"key": "data/heal/daily/2026-09-14.json", "rows_out": 2},
+        {"key": "staging/daily_closes/2026-09-11.parquet", "rows_out": 2},
+    ],
+    # D34 chronic-gap-heal: `reference/price_cache/*` — corrected from the
+    # descriptor's stale `staging/daily_closes/*` (this mode never writes
+    # that key; see registry.d/units/D34-chronic-gap-heal.yaml).
+    "D34": [
+        {"key": "reference/price_cache/PSTG.parquet", "rows_out": 12},
+    ],
+}
+
+
+@pytest.mark.parametrize("unit_id", sorted(_WHOLE_MODE_UNIT_OUTPUTS))
+def test_whole_mode_unit_full_run_passes(monkeypatch, unit_id):
+    index = _index(monkeypatch)
+    outputs = _WHOLE_MODE_UNIT_OUTPUTS[unit_id]
+    doc = _manifest(unit_id=unit_id, outputs=outputs)
+    prefix = f"data_collection/runs/{unit_id}"
+    result, _ = _check(index, {f"{prefix}/2026-09-14/01K5AA.json": doc}, units=(unit_id,))
+    completion = result["completion"]
+    assert completion["ok"] is True, completion["findings"]
+    assert completion["failure_mode"] == ""
+
+
+@pytest.mark.parametrize("unit_id", sorted(_WHOLE_MODE_UNIT_OUTPUTS))
+def test_whole_mode_unit_skipping_one_key_fails_naming_it(monkeypatch, unit_id):
+    outputs = _WHOLE_MODE_UNIT_OUTPUTS[unit_id]
+    prefix = f"data_collection/runs/{unit_id}"
+    for i in range(len(outputs)):
+        index = _index(monkeypatch)
+        withheld = outputs[:i] + outputs[i + 1:]
+        doc = _manifest(unit_id=unit_id, outputs=withheld)
+        result, _ = _check(index, {f"{prefix}/2026-09-14/01K5AA.json": doc}, units=(unit_id,))
+        completion = result["completion"]
+        assert completion["ok"] is False, (
+            f"{unit_id}: withholding {outputs[i]['key']!r} did not fail the check "
+            f"(remaining keys satisfy every declared template — the withheld key "
+            f"was never actually required)"
+        )
+        assert completion["failure_mode"] == "output_missing"
+        assert all(f["mode"] == "output_missing" for f in completion["findings"])
+        assert all(f["unit"] == unit_id for f in completion["findings"])
