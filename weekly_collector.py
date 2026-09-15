@@ -379,6 +379,33 @@ def _rows_out(result: dict, rows_key: str | None) -> int | None:
     return int(value)
 
 
+#: The real feature-store groups `features/writer.py::write_feature_snapshot` can
+#: write (`features.registry.GROUPS` — "factor_loading" is NOT one: it is an
+#: ArcticDB-materialized column set (features/cross_sectional.py), never a
+#: standalone `features/{date}/factor_loading.parquet` key; D12's descriptor
+#: entry naming it was corrected alongside this list, alpha-engine-config-I10855).
+_FEATURE_GROUPS: tuple[str, ...] = ("technical", "fundamental", "interaction", "macro", "alternative")
+
+
+def _feature_group_extra_outputs(run_date: str) -> tuple[tuple[str, object, object], ...]:
+    """One ``(key, present_fn, rows_fn)`` per feature-store group, read from
+    ``compute_and_write``'s own ``groups_written`` (threaded straight from
+    ``write_feature_snapshot``'s return — features/writer.py). A group absent
+    from ``groups_written`` had no columns available this run (writer.py:60) and
+    is correctly NOT recorded — never a copy of the descriptor's 5-entry list
+    regardless of what actually landed on S3 (alpha-engine-config-I10855)."""
+    def _present(group: str):
+        return lambda r: group in (r.get("groups_written") or {})
+
+    def _rows(group: str):
+        return lambda r: (r.get("groups_written") or {}).get(group) or 0
+
+    return tuple(
+        (f"features/{run_date}/{group}.parquet", _present(group), _rows(group))
+        for group in _FEATURE_GROUPS
+    )
+
+
 def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> dict:
     """The per-run manifest arguments shared by every wrapped call site here."""
     return {
@@ -395,6 +422,7 @@ def _phase_collect(
     run_fn,
     *,
     artifact_key: str | None = None,
+    extra_outputs: tuple[tuple[str, object, object], ...] = (),
     supports_auto_skip: bool = True,
     verify_artifact_exists: bool = False,
     bucket: str | None = None,
@@ -414,6 +442,17 @@ def _phase_collect(
 
     ``supports_auto_skip=False`` (multi-file / shared-DB / ArcticDB producers with no
     single stable S3 key) → markers + watchdog only, the phase always runs.
+
+    ``extra_outputs`` (alpha-engine-config-I10855): a unit whose descriptor declares
+    MORE than one published key records every one of them, never just ``artifact_key``.
+    Each entry is ``(key, present_fn, rows_fn)`` — both callables take the collector's
+    own ``result`` dict and are evaluated at record time (never before: the write may be
+    conditional). ``present_fn(result)`` is truthy only when THIS run actually wrote
+    ``key`` — recording a key the collector did not write would be the same defect this
+    deliverable exists to close, just moved one level up. ``rows_fn(result)`` returns the
+    ``rows_out`` this run measured for that key; never a placeholder 0 standing in for an
+    uncounted write. Recorded under the SAME gating as ``artifact_key`` (skipped on
+    auto-skip / dry-run) so a cache-hit or dry run never claims a fresh write.
 
     ``verify_artifact_exists=True`` (config-I2702 deliverable #2, "verify-by-artifact
     workloads"): after a collector reports ``status="ok"``, HEAD-check that
@@ -452,7 +491,10 @@ def _phase_collect(
             verify_artifact_exists=verify_artifact_exists,
             bucket=bucket,
         )
-        _record_phase_lineage(run_ctx, unit, name, result, artifact_key, bucket or reg.bucket, reg)
+        _record_phase_lineage(
+            run_ctx, unit, name, result, artifact_key, bucket or reg.bucket, reg,
+            extra_outputs=extra_outputs,
+        )
         return result
 
     try:
@@ -550,6 +592,8 @@ def _record_phase_lineage(
     artifact_key: str | None,
     bucket: str | None,
     reg: "PhaseRegistry",
+    *,
+    extra_outputs: tuple[tuple[str, object, object], ...] = (),
 ) -> None:
     """Fold one phase's outcome onto its run manifest, and grade its publish.
 
@@ -564,6 +608,22 @@ def _record_phase_lineage(
 
     if artifact_key and not auto_skipped and not dry:
         run_ctx.record_output(artifact_key, rows_out=rows if rows is not None else 0)
+    # alpha-engine-config-I10855: a unit that publishes MORE than one declared key
+    # records every one it actually wrote THIS run — never copied from the
+    # descriptor (`present_fn`), and never a 0 standing in for an uncounted write
+    # (`rows_fn`). Same auto-skip/dry-run gating as the primary artifact_key: a
+    # cache-hit or dry run wrote nothing new, so it claims nothing new.
+    if not auto_skipped and not dry:
+        for extra_key, present_fn, rows_fn in extra_outputs:
+            if present_fn(result):
+                # `extra_key` is either a literal key, or a ``result -> list[str]``
+                # callable for a unit whose per-run key set is only known from
+                # what it actually wrote (e.g. one key per currency/symbol) —
+                # never a fixed count guessed ahead of the run.
+                keys = extra_key(result) if callable(extra_key) else (extra_key,)
+                rows_out = int(rows_fn(result) or 0)
+                for k in keys:
+                    run_ctx.record_output(k, rows_out=rows_out)
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
 
@@ -941,6 +1001,17 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
             ),
             artifact_key=f"{market_prefix}weekly/{run_date}/constituents.json",
+            # alpha-engine-config-I10855: `latest_weekly.json` is D01's second
+            # declared key, but it is written once, by `_finalize`/`_write_manifest`
+            # at the very end of the whole weekly run — not by `constituents.collect`
+            # itself. `_finalize` only writes it when `only is None` (a full run) and
+            # not dry_run; that write is then deterministic once THIS phase completes
+            # successfully. There is no later hook back into D01's manifest to record
+            # it after the fact, so it is declared here — present only under the same
+            # `only is None` condition `_finalize` itself gates on.
+            extra_outputs=(
+                (f"{market_prefix}latest_weekly.json", lambda r: True, lambda r: r.get("count") or 0),
+            ) if only is None else (),
         )
         results["collectors"]["constituents"] = const_result
         # Use the tickers returned by collect() directly (empty on auto-skip →
@@ -1070,6 +1141,25 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 bucket=bucket, s3_prefix=market_prefix, run_date=run_date, dry_run=dry_run,
             ),
             artifact_key=f"{market_prefix}weekly/{run_date}/macro.json",
+            # alpha-engine-config-I10855: `macro.collect` writes two SECONDARY,
+            # fail-soft artifacts alongside macro.json (`write_macro_history` /
+            # `write_release_calendar` — collectors/macro.py), each guarded so a
+            # secondary failure never masks the primary write. Their own status
+            # dicts (`macro_history`/`release_calendar` in the result) are the
+            # only truthful source of "did this run actually write it" — a
+            # `skipped_empty`/`error` status means no PUT happened this run.
+            extra_outputs=(
+                (
+                    f"{market_prefix}macro_history.parquet",
+                    lambda r: (r.get("macro_history") or {}).get("status") == "ok",
+                    lambda r: (r.get("macro_history") or {}).get("rows") or 0,
+                ),
+                (
+                    f"{market_prefix}macro_release_calendar.parquet",
+                    lambda r: (r.get("release_calendar") or {}).get("status") == "ok",
+                    lambda r: (r.get("release_calendar") or {}).get("rows") or 0,
+                ),
+            ),
         )
 
     # ── 4b. Short interest ───────────────────────────────────────────────────
@@ -1148,6 +1238,17 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     dry_run=dry_run,
                 ),
                 artifact_key=f"{market_prefix}universe_classification/{run_date}.json",
+                # alpha-engine-config-I10855: `latest.json` is co-written with the
+                # dated key in the SAME `s3.put_object` pair, unconditionally on
+                # `status == "ok"` (collectors/universe_classification.py) — same
+                # row count as the dated artifact.
+                extra_outputs=(
+                    (
+                        f"{market_prefix}universe_classification/latest.json",
+                        lambda r: r.get("status") == "ok",
+                        lambda r: r.get("ok_count") or 0,
+                    ),
+                ),
             )
     elif only in (None, "universe_classification") and not uc_enabled:
         logger.info("universe_classification collector disabled via config — skipping")
@@ -1194,6 +1295,23 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     run_date=run_date,
                 ),
                 supports_auto_skip=False,
+                # alpha-engine-config-I10855: D08 had NO recording at all (no
+                # `artifact_key`) — `research.db` (the live pointer) and
+                # `backups/research_{date}.db` are both written, ONLY when the run
+                # actually inserted rows (`db_upload` names the two keys the
+                # producer itself just uploaded; see collectors/universe_returns.py).
+                extra_outputs=(
+                    (
+                        "research.db",
+                        lambda r: bool((r.get("db_upload") or {}).get("pointer_key")),
+                        lambda r: r.get("rows_inserted") or 0,
+                    ),
+                    (
+                        f"backups/research_{run_date}.db",
+                        lambda r: bool((r.get("db_upload") or {}).get("backup_key")),
+                        lambda r: r.get("rows_inserted") or 0,
+                    ),
+                ),
             )
 
     # ── 5b. Signal returns (score_performance + predictor_outcomes) ────────────
@@ -1268,6 +1386,10 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             reg, "features",
             lambda: compute_and_write(date_str=run_date, bucket=bucket, dry_run=dry_run),
             artifact_key=f"features/{run_date}/schema_version.json",
+            # alpha-engine-config-I10855: D12 declares 5 real parquet keys under
+            # `features/{date}/` (D12 does not declare the metron_supplemental
+            # prefix — that is D31's daily call below).
+            extra_outputs=_feature_group_extra_outputs(run_date),
         )
 
     # ── 8. ArcticDB universe rebuild ─────────────────────────────────────────
@@ -1381,6 +1503,17 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     results["collectors"]["alternative"] = _phase_collect(
         reg, "alternative", _collect_alternative,
         artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json",
+        # alpha-engine-config-I10855: `scope.json` is written unconditionally,
+        # inside THIS phase body, strictly before the first vendor call (see the
+        # comment block above) — a write failure there raises and never reaches
+        # this point, so by the time _record_phase_lineage runs it always
+        # exists. `{ticker}.json` (D15's third declared, wildcard, key) needs no
+        # separate entry: both this key and manifest.json are single path
+        # segments under .../alternative/, so either one already satisfies that
+        # template's regex.
+        extra_outputs=(
+            (scope_key, lambda r: True, lambda r: len(universe_tickers)),
+        ),
     )
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
@@ -3541,6 +3674,26 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_market_data",
         lambda: metron_market_data.collect(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.CLOSES_PREFIX}{run_date}.json",
+        # alpha-engine-config-I10855: D20 writes 4 keys unconditionally on
+        # status="ok" — dated + latest closes, dated + latest fx
+        # (collectors/metron_market_data.py::collect).
+        extra_outputs=(
+            (
+                f"{metron_market_data.CLOSES_PREFIX}latest.json",
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("closes") or 0,
+            ),
+            (
+                f"{metron_market_data.FX_PREFIX}{run_date}.json",
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("fx") or 0,
+            ),
+            (
+                f"{metron_market_data.FX_PREFIX}latest.json",
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("fx") or 0,
+            ),
+        ),
     )
     # Per-symbol close-history + per-currency FX-history for Metron's NAV reconstruction +
     # as-of-date realized/dividend FX. Per-symbol keys (no single stable artifact) →
@@ -3549,6 +3702,28 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_market_data_history",
         lambda: metron_market_data.collect_history(bucket=bucket, dry_run=dry_run),
         supports_auto_skip=False,
+        # alpha-engine-config-I10855: D21 had NO recording at all. The
+        # consolidated artifact satisfies BOTH `close_history/{sym}.json`
+        # (wildcard) and its own literal `close_history/consolidated.json`
+        # entry — a single-path-segment file under close_history/ matches the
+        # `{sym}.json` pattern too. `fx_history/{ccy}.json` has no consolidated
+        # companion, so every currency actually written is recorded by name
+        # (`fx_currencies` — collectors/metron_market_data.py::collect_history).
+        extra_outputs=(
+            (
+                metron_market_data.CONSOLIDATED_CLOSE_HISTORY_KEY,
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("close_series") or 0,
+            ),
+            (
+                lambda r: [
+                    f"{metron_market_data.FX_HISTORY_PREFIX}{ccy}.json"
+                    for ccy in (r.get("fx_currencies") or [])
+                ],
+                lambda r: r.get("status") == "ok" and bool(r.get("fx_currencies")),
+                lambda r: 1,
+            ),
+        ),
     )
     # GICS sectors + SPY weights + earnings dates — Metron's last external fetches, now
     # on the spine so Metron reads ALL market/reference data from `data`.
@@ -3556,6 +3731,16 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_reference_data",
         lambda: metron_market_data.collect_reference(bucket=bucket, run_date=run_date, dry_run=dry_run),
         artifact_key=f"{metron_market_data.SECTORS_PREFIX}latest.json",
+        # alpha-engine-config-I10855: D22's second key (earnings/latest.json) is
+        # co-written unconditionally with sectors/latest.json on status="ok"
+        # (collectors/metron_market_data.py::collect_reference).
+        extra_outputs=(
+            (
+                f"{metron_market_data.EARNINGS_PREFIX}latest.json",
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("earnings") or 0,
+            ),
+        ),
     )
     # Macro indicators (FRED observation series) for Metron's Macro page — Metron's last
     # direct external fetch, now on the spine.
@@ -3591,6 +3776,19 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         reg, "metron_rating_ledger",
         lambda: technical_rating_ledger.collect_rating_ledger(bucket=bucket, run_date=run_date, dry_run=dry_run),
         supports_auto_skip=False,
+        # alpha-engine-config-I10855: D26 had NO recording at all. The manifest
+        # key (a single path segment under rating_history/) matches BOTH its
+        # own literal declared entry AND the `rating_history/*` wildcard entry
+        # — recorded only when the collector actually rewrote it this run
+        # (`backfill_written or live_written`; a rerun with nothing new to
+        # backfill/live-write, same day, legitimately does not rewrite it).
+        extra_outputs=(
+            (
+                technical_rating_ledger.RATING_LEDGER_MANIFEST_KEY,
+                lambda r: bool(r.get("backfill_written") or r.get("live_written")),
+                lambda r: r.get("total_dates") or 0,
+            ),
+        ),
     )
     # Realized near-term performance of the rating ledger (metron-ops#297 part 2) —
     # recomputed every EOD run from the ledger + close_history. Runs after the ledger
@@ -3669,6 +3867,25 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
             zero_variance_fatal=False,
         ),
         artifact_key=f"features/{run_date}/schema_version.json",
+        # alpha-engine-config-I10855: D31 declares the same 5 parquet keys as
+        # D12 PLUS `features/metron_supplemental/` (a prefix — any key under it
+        # satisfies the pattern). The supplemental write is its own best-effort
+        # step inside compute_and_write (swallowed on failure); recorded via its
+        # `sectors.json` sidecar, the one key `write_metron_supplemental_snapshot`
+        # writes unconditionally on every non-empty write
+        # (features/metron_supplemental.py) — present only when that function
+        # got PAST its early "nothing to write" return, i.e. it wrote at least
+        # one group parquet or a non-empty sectors map (`{"sectors": 0}` alone
+        # is that early-return sentinel, never a real write).
+        extra_outputs=_feature_group_extra_outputs(run_date) + (
+            (
+                f"features/metron_supplemental/{run_date}/sectors.json",
+                lambda r: bool(
+                    {k: v for k, v in (r.get("metron_supplemental_written") or {}).items() if k != "sectors"}
+                ) or ((r.get("metron_supplemental_written") or {}).get("sectors") or 0) > 0,
+                lambda r: (r.get("metron_supplemental_written") or {}).get("sectors") or 0,
+            ),
+        ),
     )
 
     # ── ArcticDB daily append ────────────────────────────────────────────────
