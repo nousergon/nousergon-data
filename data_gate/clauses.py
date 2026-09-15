@@ -47,8 +47,11 @@ __all__ = [
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
     "RetiredClause",
+    "UnconnectedClause",
     "base_clause_name",
     "is_retired",
+    "is_unconnected",
+    "is_ungraded",
     "base_clause_names",
     "completeness_clause_name",
     "generate",
@@ -146,41 +149,70 @@ def _retired(unit: Unit, name: str, requirement: str, phase: str) -> RetiredClau
     )
 
 
-def _consumers_ruling_override(
-    unit: Unit, name: str, requirement: str, reading: ev.Reading, *, phase: str
-) -> Clause | None:
-    """Plan §3's rule: a key with no surviving consumer gets a retirement
-    decision, OR a declared ``consumers: []`` with a reason, which renders as
-    a finding. `alpha-engine-config-I10870` adds the third case the rule
-    already implied but the descriptor schema had no field for: a key Brian
-    has RULED kept with no reader wired (R5/R7, plan §7) is not an open
-    finding, it is a closed decision — recorded here the same way an
-    executed retirement is recorded (`_retired` above), never by inventing a
-    consumer.
+@dataclass(frozen=True)
+class UnconnectedClause(Clause):
+    """A unit's ``consumers`` clause when the unit is KEPT with no surviving
+    consumer by a recorded decision (`alpha-engine-config-I10873`).
 
-    ``consumers_ruling:`` is an optional descriptor block (``ruling:``,
-    ``reason:``) distinct from ``consumers_reason`` (which only explains an
-    UNMET, never clears it). Only reached when `read_consumers` already read
-    UNMET AND the descriptor declares `consumers: []` — the call site also
-    checks that, so a unit with a real reader problem (non-empty `consumers`
-    that don't resolve) still fails regardless of a ruling block; a ruling
-    documents "no reader wired", never "the declared reader is broken".
+    Brian, 2026-09-15: *"the console should say they exist but there are no
+    consumers ... I will definitely want to know what is connected and what
+    isn't."* So it is neither green nor red:
+
+    * never MET (``met=False``) — "kept, nothing reads it" is not health;
+    * never UNMET — it is a closed decision, not an open finding, so
+      `read.evaluate` excludes it from every gate exactly as it excludes
+      `RetiredClause`, and the phase-1 exit does not go red on it;
+    * rendered on the board as ``UNCONNECTED`` (console ``DISABLED``: declared,
+      with reason, owner and re-exam — `observability-policy` §8.3).
+
+    Only the ``consumers`` column changes; every other column of the unit is
+    still graded. A unit that is unconnected WITHOUT a decision stays an
+    ordinary UNMET clause (plan §3 finding).
     """
-    ruling = unit.raw.get("consumers_ruling")
-    if not ruling or not isinstance(ruling, dict):
-        return None
-    ruling_text = str(ruling.get("ruling") or "").strip()
-    reason_text = " ".join(str(ruling.get("reason") or "").split())
-    if not ruling_text or not reason_text:
-        return None
+
+    decision: str = ""
+
+
+def is_unconnected(clause: Clause) -> bool:
+    return isinstance(clause, UnconnectedClause)
+
+
+def is_ungraded(clause: Clause) -> bool:
+    """Published on the board, graded by no gate: RETIRED or UNCONNECTED."""
+    return is_retired(clause) or is_unconnected(clause)
+
+
+def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase: str) -> Clause:
+    """The ``consumers`` clause of a unit with no SURVIVING consumer.
+
+    A consumer list that names only v1 repos (retiring in v2 phase 4) is
+    treated exactly like an empty one — `data_gate/config/consumer_repos.yaml`.
+    """
+    evidence = (unit.path.relative_to(unit.path.parents[2]).as_posix(),)
+    decision = unit.consumers_decision
+    if decision:
+        return UnconnectedClause(
+            name,
+            requirement,
+            False,
+            f"UNCONNECTED: {unit.unit_id} is collected and graded on every other column, but no "
+            f"surviving consumer reads it — {unit.connection_reason}. Graded by no gate.",
+            evidence,
+            phase=phase,
+            source="registry.d/units (consumers_decision)",
+            as_of=decision["ruled_on"],
+            decision=f"{decision['decision']} by {decision['ruled_by']} {decision['ruled_on']} ({decision['ruling']})",
+        )
     return Clause(
         name,
         requirement,
-        True,
-        f"KEPT with no reader wired, by ruling: {ruling_text} — {reason_text} ({reading.detail})",
-        reading.evidence,
+        False,
+        f"unconnected with no recorded decision: {unit.connection_reason}. A key with no surviving "
+        "consumer needs a keep (`consumers_decision`) or retire (`lifecycle: retired`) ruling "
+        "(plan §3).",
+        evidence,
         phase=phase,
-        source="registry.d/units (consumers_ruling)",
+        source="registry.d/units",
     )
 
 
@@ -191,12 +223,9 @@ def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: d
     requirement = ev.BASE_REQUIREMENTS[column].format(unit=unit.unit_id, title=unit.title)
     if unit.retired:
         return _retired(unit, name, requirement, phase)
+    if column == "consumers" and unit.connection == "unconnected":
+        return _clause_consumers_unconnected(unit, name, requirement, phase)
     reading = ev.read_base(store, unit, column, trading_day=trading_day)
-
-    if column == "consumers" and not reading.met and not reading.unmeasurable and not unit.raw.get("consumers"):
-        override = _consumers_ruling_override(unit, name, requirement, reading, phase=phase)
-        if override is not None:
-            return override
 
     if reading.unmeasurable:
         return unmeasurable(

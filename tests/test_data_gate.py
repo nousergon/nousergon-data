@@ -22,7 +22,7 @@ from data_gate import clauses as clause_module
 from data_gate import descriptors, evidence
 from data_gate.descriptors import REPO_ROOT, DescriptorError, load_units
 from data_gate.inventory import load_inventory_scope, scan
-from data_gate.read import GATES, BOARD_KEY, evaluate, load_phases, run
+from data_gate.read import GATES, BOARD_KEY, _board_document, evaluate, load_phases, run
 from data_gate.store import DryRunWriteRefusedError, LocalStore, open_store, parse_store_uri
 
 from tests.data_gate_support import TRADING_DAY, DeniedStore, EmptyStore
@@ -188,7 +188,7 @@ def test_each_gate_grades_only_the_clauses_tagged_at_or_below_its_phase(board):
     # DELIBERATELY not a rung (`registry.d/phases.yaml`) and are graded only
     # by their own gate.
     # RETIRED clauses (I10823 deliverable 6) are rendered but graded by no gate.
-    retired = sum(1 for c in board if clause_module.is_retired(c))
+    retired = sum(1 for c in board if clause_module.is_ungraded(c))  # RETIRED + UNCONNECTED (I10873)
     assert ceilings["data-phase3"] == len(board) - len(clause_module.CUTOVER_READY_CLAUSES) - retired
 
 
@@ -330,51 +330,159 @@ def test_empty_consumers_without_a_reason_is_refused(tmp_path):
         descriptors.load_units(tmp_path)
 
 
-def test_a_consumers_ruling_missing_reason_is_refused(tmp_path):
-    """alpha-engine-config-I10870: a malformed consumers_ruling would silently
-    never fire `_consumers_ruling_override` (no override, clause stays UNMET)
-    rather than fail loud — so it is refused at load time instead."""
+# ---------------------------------------------------------------------------
+# Connected / unconnected (alpha-engine-config-I10873, Brian ruling 2026-09-15).
+# ---------------------------------------------------------------------------
+
+_DECISION = {
+    "decision": "kept-unconnected",
+    "ruled_by": "Brian",
+    "ruled_on": "2026-09-15",
+    "ruling": "Brian 2026-09-15 (alpha-engine-config-I10873)",
+    "reason": "kept, reincorporation possible",
+    "reexam": "a v2 component proposes reading this key",
+}
+
+
+def _d01(tmp_path, **overrides):
     base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
-    base["consumers_ruling"] = {"ruling": "Brian 2026-09-14 R7(a)"}  # no reason
+    base.update(overrides)
+    for key, value in list(base.items()):
+        if value is _DROP:
+            base.pop(key)
     (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
-    with pytest.raises(DescriptorError, match="consumers_ruling is present but missing"):
+    return tmp_path
+
+
+_DROP = object()
+
+
+def _gated(clause, gate="data-phase1"):
+    result = evaluate(EmptyStore(), gate=gate, trading_day=TRADING_DAY, all_clauses=[clause])
+    return {c.name for c in result.clauses}
+
+
+def test_the_retired_consumers_ruling_block_is_refused(tmp_path):
+    """The I10870 block rendered a kept, unread unit MET. A stale copy must fail
+    loud, never silently keep meaning green."""
+    _d01(tmp_path, consumers=[], consumers_reason="none", consumers_ruling={"ruling": "x", "reason": "y"})
+    with pytest.raises(DescriptorError, match="replaced by `consumers_decision`"):
         descriptors.load_units(tmp_path)
 
 
-def test_a_consumers_ruling_renders_the_clause_met(tmp_path):
-    """A unit with `consumers: []` + a `consumers_ruling` block (R5/R7, plan
-    §7) reads MET on the consumers base clause, citing the ruling — never by
-    inventing a consumer. Mirrors D02/D14/D33's real descriptors."""
-    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
-    base["consumers"] = []
-    base["consumers_reason"] = "no reader wired"
-    base["consumers_ruling"] = {
-        "ruling": "Brian 2026-09-14 R7(a) (alpha-engine-config-I10748)",
-        "reason": "PIT substrate a backtest needs even with no reader wired today",
-    }
-    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+@pytest.mark.parametrize("field", ["decision", "ruled_by", "ruled_on", "ruling", "reason", "reexam"])
+def test_a_consumers_decision_missing_any_field_is_refused(tmp_path, field):
+    decision = {k: v for k, v in _DECISION.items() if k != field}
+    _d01(tmp_path, consumers=[], consumers_reason="none", consumers_decision=decision)
+    with pytest.raises(DescriptorError, match="consumers_decision is missing"):
+        descriptors.load_units(tmp_path)
+
+
+def test_a_consumers_decision_on_a_connected_unit_is_refused(tmp_path):
+    """Reincorporation flips the unit to connected; the decision block must go
+    in the same change, or the descriptor says two contradictory things."""
+    _d01(tmp_path, consumers=["metron:api/services/prices.py"], consumers_decision=dict(_DECISION))
+    with pytest.raises(DescriptorError, match="surviving consumer"):
+        descriptors.load_units(tmp_path)
+
+
+def test_an_unclassified_consumer_repo_is_refused(tmp_path):
+    _d01(tmp_path, consumers=["some-new-repo:reader.py"])
+    with pytest.raises(DescriptorError, match="in neither list"):
+        descriptors.load_units(tmp_path)
+
+
+def test_an_unconnected_kept_unit_is_neither_met_nor_red(tmp_path):
+    """The ruling: exists, no consumer — never MET-green, never a phase-1 failure."""
+    _d01(tmp_path, consumers=[], consumers_reason="no reader", consumers_decision=dict(_DECISION))
     [unit] = descriptors.load_units(tmp_path)
+    assert unit.connection == "unconnected"
 
     clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
-    assert clause.met is True
-    assert "KEPT with no reader wired, by ruling" in clause.detail
-    assert "R7(a)" in clause.detail
-    assert clause.source == "registry.d/units (consumers_ruling)"
+    assert clause_module.is_unconnected(clause)
+    assert clause.met is False and clause.unmeasurable is False
+    assert clause.detail.startswith("UNCONNECTED:")
+    assert "kept-unconnected by Brian on 2026-09-15" in clause.detail
+    for gate in GATES:
+        assert clause.name not in _gated(clause, gate), gate
+
+    document = _board_document([clause], trading_day=TRADING_DAY, generated_utc="t", store_uri=None, units=[unit])
+    [row] = document["rows"]
+    assert row["state"] == "UNCONNECTED"
+    assert row["console_state"] == "DISABLED"
+    assert row["console_state"] not in {"HEALTHY", "DEGRADED", "FAILED"}
+    assert row["connection"] == "unconnected" and row["consumers"] == []
+    assert row["connection_decision"] == "kept-unconnected by Brian 2026-09-15"
+    assert document["clauses_total"] == 0 and document["clauses_unconnected"] == 1
 
 
-def test_a_consumers_ruling_does_not_paper_over_a_real_reader_problem(tmp_path):
-    """A unit whose DECLARED consumers don't resolve still fails even with a
-    consumers_ruling block present — the override only fires for the
-    `consumers: []` + reason shape, never to mask an unresolved reader."""
-    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
-    base["consumers"] = ["nousergon-data:this/path/does/not/exist.py"]
-    base["consumers_ruling"] = {"ruling": "Brian 2026-09-14 R7(a)", "reason": "irrelevant"}
-    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+def test_a_unit_listing_only_v1_consumers_reads_unconnected(tmp_path):
+    _d01(
+        tmp_path,
+        consumers=["crucible-research:agents/macro_agent.py", "crucible-predictor:x.py"],
+        consumers_decision=dict(_DECISION),
+    )
     [unit] = descriptors.load_units(tmp_path)
-
+    assert unit.connection == "unconnected"
+    assert unit.surviving_consumers == []
+    assert unit.retiring_consumers == ["crucible-research:agents/macro_agent.py", "crucible-predictor:x.py"]
     clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
-    assert clause.met is False
-    assert "KEPT with no reader wired" not in clause.detail
+    assert clause_module.is_unconnected(clause)
+    assert "retiring in crucible v2 phase 4" in clause.detail
+
+
+def test_an_unconnected_unit_without_a_decision_stays_a_graded_finding(tmp_path):
+    _d01(tmp_path, consumers=["crucible-research:agents/macro_agent.py"])
+    [unit] = descriptors.load_units(tmp_path)
+    clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
+    assert not clause_module.is_unconnected(clause)
+    assert clause.met is False and not clause.unmeasurable
+    assert "NO recorded keep/retire decision" in clause.detail
+    assert clause.name in _gated(clause, "data-phase1")
+
+
+def test_a_connected_unit_is_unaffected(tmp_path):
+    """A surviving consumer keeps the real reader path: the clause is graded,
+    never UNCONNECTED, and the row names the consumer."""
+    _d01(tmp_path, consumers=["nousergon-data:data_gate/read.py", "crucible-research:x.py"])
+    [unit] = descriptors.load_units(tmp_path)
+    assert unit.connection == "connected"
+    assert unit.surviving_consumers == ["nousergon-data:data_gate/read.py"]
+    clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
+    assert not clause_module.is_unconnected(clause)
+    assert clause.name in _gated(clause, "data-phase1")
+    document = _board_document([clause], trading_day=TRADING_DAY, generated_utc="t", store_uri=None, units=[unit])
+    [row] = document["rows"]
+    assert row["connection"] == "connected"
+    assert row["consumers"] == ["nousergon-data:data_gate/read.py"]
+    assert row["state"] in {"MET", "UNMET", "UNMEASURABLE"}
+
+
+def test_the_ruled_units_are_unconnected_on_the_real_board(units, board):
+    ruled = {"D02", "D03", "D04", "D05", "D06", "D07", "D08", "D14", "D33", "D46"}
+    by_id = {u.unit_id: u for u in units}
+    for unit_id in ruled:
+        assert by_id[unit_id].connection == "unconnected", unit_id
+        [clause] = [c for c in board if c.name == f"data.{unit_id}.consumers"]
+        assert clause_module.is_unconnected(clause), unit_id
+    assert not any(c.met for c in board if clause_module.is_unconnected(c))
+
+
+def test_connection_counts_are_correct_and_cover_every_unit(units, board):
+    document = _board_document(board, trading_day=TRADING_DAY, generated_utc="t", store_uri=None, units=units)
+    counts = document["connection_counts"]
+    expected = {state: sum(1 for u in units if u.connection == state) for state in descriptors.CONNECTION_STATES}
+    for state, n in expected.items():
+        assert counts[state] == n, state
+    assert counts["units_total"] == len(units) == sum(expected.values())
+    assert counts["unconnected_decided"] + counts["unconnected_undecided"] == counts["unconnected"]
+    assert counts["unconnected_decided"] == sum(
+        1 for u in units if u.connection == "unconnected" and u.consumers_decision
+    )
+    unit_rows = [r for r in document["rows"] if r["unit_id"] in {u.unit_id for u in units}]
+    assert unit_rows and all(r["connection"] in descriptors.CONNECTION_STATES for r in unit_rows)
+    assert all("connection" not in r for r in document["rows"] if r["unit_id"] not in {u.unit_id for u in units})
+    assert document["clauses_unconnected"] == sum(1 for c in board if clause_module.is_unconnected(c))
 
 
 def test_a_filename_that_disagrees_with_the_unit_id_is_refused(tmp_path):

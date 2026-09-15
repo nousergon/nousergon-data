@@ -34,7 +34,7 @@ from nousergon_lib.gates import (
 )
 
 from data_gate import clauses as clause_module
-from data_gate.descriptors import REPO_ROOT, load_units
+from data_gate.descriptors import CONNECTION_STATES, REPO_ROOT, load_units
 
 __all__ = ["BOARD_KEY", "DataPhase", "GATES", "evaluate", "load_phases", "run"]
 
@@ -157,8 +157,12 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
     # they count in no MET/UNMET/UNMEASURABLE denominator and no phase's red
     # count (alpha-engine-config-I10823 deliverable 6). The board still renders
     # them, with the reason.
+    # UNCONNECTED clauses (a unit kept with no surviving consumer by a recorded
+    # decision, alpha-engine-config-I10873) are excluded the same way: never
+    # MET-green, never red toward any phase exit.
     retired = [c for c in all_clauses if clause_module.is_retired(c)]
-    gradable = [c for c in all_clauses if not clause_module.is_retired(c)]
+    unconnected = [c for c in all_clauses if clause_module.is_unconnected(c)]
+    gradable = [c for c in all_clauses if not clause_module.is_ungraded(c)]
     if ceiling is None:
         selected = [c for c in gradable if c.phase == gate]
     else:
@@ -187,6 +191,11 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
         )
     if retired:
         result.coverage += f"; {len(retired)} RETIRED clause(s) on the board are graded by no gate"
+    if unconnected:
+        result.coverage += (
+            f"; {len(unconnected)} UNCONNECTED consumers clause(s) (kept, no surviving consumer, "
+            "by recorded decision) are graded by no gate"
+        )
     return result
 
 
@@ -197,6 +206,12 @@ CONSOLE_STATE: dict[str, str] = {
     "UNMET": "DEGRADED",
     "UNMEASURABLE": "UNREPORTED",
     "RETIRED": "RETIRED",
+    # A unit kept with no surviving consumer by a recorded decision
+    # (alpha-engine-config-I10873). §8.3 DISABLED — "deliberately off, with a
+    # declared reason, owner and re-exam trigger" — is the closed-vocabulary
+    # member for a declared, non-failing, non-healthy disposition; the board's
+    # own `state` keeps the precise name.
+    "UNCONNECTED": "DISABLED",
 }
 
 
@@ -225,47 +240,93 @@ def _row_unit_id(clause_name: str) -> str:
     return parts[1] if len(parts) > 1 else clause_name
 
 
-def _board_document(clauses, *, trading_day: dt.date, generated_utc: str, store_uri: str | None) -> dict:
+def _connection_summary(units) -> tuple[dict[str, dict], dict]:
+    """Per-unit connection facts and their counts (`alpha-engine-config-I10873`).
+
+    Every unit is exactly one of `CONNECTION_STATES`; the counts state their
+    denominator (`console-policy` §5.3) and are published even at zero.
+    """
+    per_unit: dict[str, dict] = {}
+    for unit in units:
+        decision = unit.consumers_decision
+        per_unit[unit.unit_id] = {
+            "connection": unit.connection,
+            "consumers": unit.surviving_consumers,
+            "retiring_consumers": unit.retiring_consumers,
+            "connection_reason": unit.connection_reason,
+            "connection_decision": (
+                f"{decision['decision']} by {decision['ruled_by']} {decision['ruled_on']}" if decision else None
+            ),
+        }
+    counts = {state: 0 for state in CONNECTION_STATES}
+    for facts in per_unit.values():
+        counts[facts["connection"]] += 1
+    counts["units_total"] = len(per_unit)
+    counts["unconnected_decided"] = sum(
+        1 for f in per_unit.values() if f["connection"] == "unconnected" and f["connection_decision"]
+    )
+    counts["unconnected_undecided"] = counts["unconnected"] - counts["unconnected_decided"]
+    return per_unit, counts
+
+
+def _board_document(
+    clauses, *, trading_day: dt.date, generated_utc: str, store_uri: str | None, units=None
+) -> dict:
     """One row per clause, for the console's board fragment.
 
     Each row carries `console-policy` §5.1's four fields — state, source, as-of
     and evidence — and the header carries the transparency-gap count, which is
     the number this whole board exists to drive to zero.
+
+    Every row of an audit unit (``unit_id`` ``Dxx``) also carries that unit's
+    connection facts — ``connection``, ``consumers``, ``retiring_consumers``,
+    ``connection_reason``, ``connection_decision`` — so the console can filter
+    the board to what is connected and what is not (`alpha-engine-config-I10873`).
+    Non-unit rows carry none of them: connection is not a fact about them.
     """
+    per_unit, connection_counts = _connection_summary(units if units is not None else load_units())
     rows = []
     for clause in clauses:
         if clause_module.is_retired(clause):
             state = "RETIRED"
+        elif clause_module.is_unconnected(clause):
+            state = "UNCONNECTED"
         else:
             state = "UNMEASURABLE" if clause.unmeasurable else ("MET" if clause.met else "UNMET")
-        rows.append(
-            {
-                "clause": clause.name,
-                "unit_id": _row_unit_id(clause.name),
-                "state": state,
-                # `observability-policy` §8.3's closed vocabulary. RETIRED is a
-                # declared state (neither green nor red), and `nousergon-console`
-                # `console/model/kinds.py` carries it.
-                "console_state": CONSOLE_STATE[state],
-                "phase": clause.phase,
-                "requirement": clause.requirement,
-                "detail": clause.detail,
-                "evidence": sorted(clause.evidence),
-                "source": clause.source,
-                "as_of": clause.as_of,
-            }
-        )
+        unit_id = _row_unit_id(clause.name)
+        row = {
+            "clause": clause.name,
+            "unit_id": unit_id,
+            "state": state,
+            # `observability-policy` §8.3's closed vocabulary. RETIRED and
+            # DISABLED are declared states (neither green nor red), and
+            # `nousergon-console` `console/model/kinds.py` carries both.
+            "console_state": CONSOLE_STATE[state],
+            "phase": clause.phase,
+            "requirement": clause.requirement,
+            "detail": clause.detail,
+            "evidence": sorted(clause.evidence),
+            "source": clause.source,
+            "as_of": clause.as_of,
+        }
+        if unit_id in per_unit:
+            row.update(per_unit[unit_id])
+        rows.append(row)
     unmeasurable = sum(1 for r in rows if r["state"] == "UNMEASURABLE")
     retired = sum(1 for r in rows if r["state"] == "RETIRED")
+    unconnected = sum(1 for r in rows if r["state"] == "UNCONNECTED")
     return {
         "schema_version": "data_board.v1",
         "board": "data-collection",
         "trading_day": trading_day.isoformat(),
         "generated_utc": generated_utc,
         "store": store_uri,
-        # The graded denominator: RETIRED rows are published but excluded.
-        "clauses_total": len(rows) - retired,
+        # The graded denominator: RETIRED and UNCONNECTED rows are published
+        # but excluded.
+        "clauses_total": len(rows) - retired - unconnected,
         "clauses_retired": retired,
+        "clauses_unconnected": unconnected,
+        "connection_counts": connection_counts,
         "clauses_met": sum(1 for r in rows if r["state"] == "MET"),
         "clauses_unmet": sum(1 for r in rows if r["state"] == "UNMET"),
         # The transparency gap (observability-policy §8.4). Published even at
@@ -315,6 +376,7 @@ def run(
         trading_day=trading_day,
         generated_utc=ladder.generated_utc,
         store_uri=getattr(store, "uri", None),
+        units=units,
     )
 
     if not dry_run:
@@ -334,7 +396,14 @@ def render(result: GateResult, board: dict, *, dry_run: bool) -> str:
     lines.append(
         f"board: {board['clauses_met']} met / {board['clauses_unmet']} unmet / "
         f"{board['transparency_gap']} unmeasurable of {board['clauses_total']} graded clauses "
-        f"({board['clauses_retired']} RETIRED, graded by no gate)"
+        f"({board['clauses_retired']} RETIRED, {board['clauses_unconnected']} UNCONNECTED, "
+        "graded by no gate)"
+    )
+    counts = board["connection_counts"]
+    lines.append(
+        f"units: {counts['connected']} connected / {counts['unconnected']} unconnected "
+        f"({counts['unconnected_undecided']} with no recorded decision) / {counts['retired']} retired "
+        f"of {counts['units_total']}"
     )
     lines.append(f"transparency gap (UNREPORTED): {board['transparency_gap']} — objective is 0")
     if dry_run:
