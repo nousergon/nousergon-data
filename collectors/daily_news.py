@@ -49,10 +49,13 @@ from datetime import date as Date
 from datetime import datetime, timezone
 from typing import Any
 
+import run_units
 from collectors.nlp.loughran_mcdonald import (
     LmDictUnavailable,
     ensure_lm_master_dict,
 )
+from dates import default_run_date
+from validators import expectations
 
 logger = logging.getLogger(__name__)
 
@@ -508,6 +511,54 @@ def read_daily_news(*, bucket: str = DEFAULT_BUCKET, s3_client: Any = None):
     )
 
 
+def _record_run(ctx, bucket: str, result: dict) -> None:
+    """Record what this D36 run read and published, with measured row counts.
+
+    Every published key the collector NAMES in its own result dict is recorded
+    with the count the collector itself measured — never a 0 standing in for
+    "we did not count" (`data_collection_plan_260914.md` §2 row 6). The three
+    artifacts are independent: the aggregate is primary and the article
+    companion / digest are fail-soft secondaries, so a run can legitimately
+    publish one, two or three of them. A run that published NONE is graded by
+    the empty-fresh guard below rather than passing silently.
+    """
+    ctx.record_input(f"s3://{bucket}/{HOLDINGS_UNIVERSE_KEY}")
+    ctx.rows_in = int(result.get("articles", 0))
+
+    published: list[str] = []
+    for key, rows_key in (
+        (result.get("key"), "rows"),
+        (result.get("articles_key"), "articles_rows"),
+        (result.get("digest_key"), "digest_total"),
+    ):
+        if not key:
+            continue
+        ctx.record_output(key, rows_out=int(result.get(rows_key) or 0))
+        published.append(key)
+
+    if published:
+        ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="ok",
+            detail=f"D36 published {len(published)} key(s): {', '.join(published)}",
+            key=published[0],
+            value=float(ctx.rows_out),
+        )
+    else:
+        ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="empty_fresh",
+            detail=(
+                f"D36 returned status={result.get('status')!r} "
+                f"(reason={result.get('reason')!r}) and published NO key — a run that "
+                "claimed a terminal state with no artifact behind it."
+            ),
+            value=0.0,
+        )
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
@@ -543,12 +594,39 @@ def main() -> int:
         ),
     )
     args = parser.parse_args()
-    result = collect(
-        args.bucket,
-        run_date=args.date,
-        hours=args.hours,
-        dry_run=args.dry_run,
-        require_digest=args.require_digest,
+
+    # One `data_run_manifest.v1` per execution of this entry point
+    # (`data_collection_plan_260914.md` §2 row 7; alpha-engine-config-I10810).
+    # The systemd timer (daily-news.timer, 04:00 PT) is the scheduled path; an
+    # operator running this by hand exports $NE_DATA_TRIGGER to say so.
+    def _body(run_ctx) -> dict:
+        result = collect(
+            args.bucket,
+            run_date=args.date,
+            hours=args.hours,
+            dry_run=args.dry_run,
+            require_digest=args.require_digest,
+        )
+        _record_run(run_ctx, args.bucket, result)
+        # A collector returning a non-ok status has FAILED — the manifest says
+        # so rather than recording a successful run over a failure the body
+        # reported (`observability-policy` §3.1). `recorded_entry` catches this
+        # sentinel outside `run_unit`, so `main`'s exit-code contract below is
+        # exactly what it was before the manifest existed.
+        status = result.get("status")
+        if status not in ("ok", "ok_dry_run", "skipped"):
+            raise run_units.EntryRunFailed(
+                f"daily_news returned status={status!r}: {result}", value=result
+            )
+        return result
+
+    result = run_units.recorded_entry(
+        "D36",
+        _body,
+        trigger="scheduled",
+        trading_day=args.date or default_run_date(),
+        bucket=args.bucket,
+        write=not args.dry_run,
     )
     logger.info("[daily_news] complete: %s", result)
     return 0 if result.get("status", "").startswith("ok") or result["status"] == "skipped" else 1

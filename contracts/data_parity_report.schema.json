@@ -1,0 +1,159 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Pre-cutover shadow parity report",
+  "description": "data_collection/parity/{trading_day}.json (data-collector plan §6.2 step 4, alpha-engine-config-I10778). Written by `python -m shadow parity`, which diffs one standalone shadow run's output under staging/shadow/{trading_day}/ against the same trading day's v1 output, per key: row count, symbol set, schema, value tolerance. Read by nousergon-data/data_gate/evidence.py::read_parity as the `data.cutover_ready.parity` clause's evidence (alpha-engine-config-I10777). PRODUCER TEST: tests/test_shadow_parity.py. v1.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "trading_day",
+    "generated_at",
+    "bucket",
+    "shadow_prefix",
+    "code_sha",
+    "tolerance",
+    "met",
+    "summary",
+    "excluded_units",
+    "keys"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"type": "string", "const": "data_parity_report.v1"},
+    "trading_day": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "The trading day BOTH sides were produced for. The whole point of the override is that this is the same day on both sides; the weaker fallback in plan §6.2 step 4 compares against the previous day."
+    },
+    "generated_at": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$",
+      "description": "UTC timestamp the comparison ran. The gate clause's as_of, and what makes a stale report visibly stale rather than silently reused."
+    },
+    "bucket": {"type": "string"},
+    "shadow_prefix": {
+      "type": "string",
+      "pattern": "^staging/shadow/\\d{4}-\\d{2}-\\d{2}/$",
+      "description": "The output root the shadow run was confined to. shadow/root.py::ShadowRoot.prefix is the single source of this string."
+    },
+    "code_sha": {
+      "type": "string",
+      "description": "The commit the comparison ran from, or the literal \"unknown\" when the checkout is not a git working tree."
+    },
+    "tolerance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["relative", "absolute"],
+      "properties": {
+        "relative": {"type": "number", "minimum": 0},
+        "absolute": {"type": "number", "minimum": 0}
+      }
+    },
+    "met": {
+      "type": "boolean",
+      "description": "TRUE only when every row's verdict is `match`. An unmeasurable, missing or in-region-only row is not parity evidence (plan §4.1 rule 2: UNMEASURABLE is never met), so it makes this false."
+    },
+    "summary": {
+      "type": "object",
+      "description": "Counts by verdict, plus `total`. Every verdict in the row enum appears as a key.",
+      "additionalProperties": {"type": "integer", "minimum": 0},
+      "required": ["total"]
+    },
+    "excluded_units": {
+      "type": "array",
+      "description": "Units deliberately not compared, each with its reason. Present so the report's denominator is auditable: a unit missing from `keys` is either here or a finding.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["unit_id", "reason"],
+        "properties": {
+          "unit_id": {"type": "string"},
+          "reason": {"type": "string", "minLength": 1}
+        }
+      }
+    },
+    "keys": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/keyResult"}
+    }
+  },
+  "$defs": {
+    "keyResult": {
+      "type": "object",
+      "required": ["key", "unit_ids", "verdict", "comparator"],
+      "properties": {
+        "key": {
+          "type": "string",
+          "description": "The LIVE key (or, for an unaddressable declaration, the descriptor's own text). The shadow side is this key under `shadow_prefix`, carried in `shadow_key`."
+        },
+        "shadow_key": {"type": "string"},
+        "shadow_library": {
+          "type": "string",
+          "description": "For an ArcticDB row: the shadow library the run wrote, which an in-region comparator diffs against the live library named in `key`."
+        },
+        "unit_ids": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "pattern": "^D[0-9]+L?$"},
+          "description": "Every unit declaring this write. Two units on one key (D17/D19 on staging/daily_closes) is one comparison attributed to both."
+        },
+        "verdict": {
+          "type": "string",
+          "enum": [
+            "match",
+            "mismatch",
+            "live_missing",
+            "shadow_missing",
+            "both_missing",
+            "unmeasurable",
+            "in_region_only"
+          ],
+          "description": "`in_region_only` is its own verdict rather than a flavour of `unmeasurable` because it names a DIFFERENT next action: run the comparator in-region, not fix a read."
+        },
+        "comparator": {
+          "type": "string",
+          "enum": ["parquet", "json", "opaque", "arcticdb", "none"]
+        },
+        "unmeasurable_reason": {"type": "string"},
+        "detail": {"type": "string"},
+        "row_count": {"$ref": "#/$defs/sidePair"},
+        "symbol_set": {
+          "type": "object",
+          "properties": {
+            "basis": {"type": "string"},
+            "live": {"type": "integer", "minimum": 0},
+            "shadow": {"type": "integer", "minimum": 0},
+            "only_live": {"type": "array", "items": {"type": "string"}},
+            "only_shadow": {"type": "array", "items": {"type": "string"}}
+          }
+        },
+        "schema": {
+          "type": "object",
+          "properties": {
+            "match": {"type": "boolean"},
+            "only_live": {"type": "array", "items": {"type": "string"}},
+            "only_shadow": {"type": "array", "items": {"type": "string"}},
+            "dtype_changes": {"type": "object"}
+          }
+        },
+        "values": {
+          "type": "object",
+          "properties": {
+            "compared_cells": {"type": "integer", "minimum": 0},
+            "breaches": {"type": "integer", "minimum": 0},
+            "examples": {"type": "array"}
+          }
+        },
+        "sha256": {"$ref": "#/$defs/sidePair"}
+      }
+    },
+    "sidePair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["live", "shadow"],
+      "properties": {
+        "live": {"type": ["integer", "string"]},
+        "shadow": {"type": ["integer", "string"]}
+      }
+    }
+  }
+}

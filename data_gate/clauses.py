@@ -505,7 +505,8 @@ def _clause_cutover_ready_roles_bootstrapped(store: ev.GateStore) -> Clause:
 def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
     name = "data.cutover_ready.parity"
     requirement = (
-        "pre-cutover parity is published per key at staging/shadow/{trading_day}/parity.json "
+        "pre-cutover parity is published per key at "
+        "data_collection/parity/{trading_day}.json "
         "(plan §6.2 step 4), produced by P-11 (alpha-engine-config-I10778)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)

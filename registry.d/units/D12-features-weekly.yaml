@@ -63,6 +63,17 @@ completeness:
   denominator: "constituents - declared exclusions"
   floor: 0.95
   status: proposed
+  # alpha-engine-config-I10787 (P-20): the per-key ABSOLUTE floor the run-manifest
+  # completion check grades `outputs[].rows_out` against. Distinct from `floor`
+  # above, which is a RATIO against a denominator the check cannot resolve.
+  # N/A-NOT-IMPL because this unit's collector reports no row count on its success
+  # path at all — the same measured fact `run_units.PhaseUnit.rows_key = None`
+  # already records, which makes its manifest `rows_out` a constant 0 rather than
+  # a measurement. Grading a constant against a floor tests the constant. The key
+  # is still graded on PRESENCE. Lifting this to a real floor is P-13
+  # (alpha-engine-config-I5935), which is also what gives the collector a count.
+  rows_out_floor: null
+  rows_out_floor_na_code: "N/A-NOT-IMPL"
 guards:
   empty_fresh:
     state: present

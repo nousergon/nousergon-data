@@ -41,6 +41,8 @@ Centralized data collection — price universe, macro, alternative data, feature
 | RAG ingestion pipelines | [`rag/pipelines/`](rag/pipelines/) |
 | Per-step completion emails | [`emailer.py`](emailer.py) |
 | Step Function preflight | [`sf_preflight.py`](sf_preflight.py) |
+| Shadow-run output-root override (pre-cutover) | [`shadow/root.py`](shadow/root.py), [`shadow/interceptor.py`](shadow/interceptor.py) |
+| Shadow-vs-v1 per-key parity diff | [`shadow/parity.py`](shadow/parity.py) — `python -m shadow parity` |
 
 ## Inputs / outputs
 
