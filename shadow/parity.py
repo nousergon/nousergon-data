@@ -40,10 +40,12 @@ then those rows are honestly unmeasurable rather than quietly green.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import hashlib
 import io
 import json
 import math
+import pathlib
 import re
 import string
 from dataclasses import dataclass, field
@@ -58,11 +60,13 @@ __all__ = [
     "DEFAULT_RELATIVE_TOLERANCE",
     "PARITY_KEY_TEMPLATE",
     "PARITY_SCHEMA_VERSION",
+    "ContractSchema",
     "KeyResult",
     "ParityReport",
     "compare_bytes",
     "expand_writes",
     "parity_key",
+    "resolve_contract",
     "run_parity",
 ]
 
@@ -102,9 +106,92 @@ EXCLUDED_UNITS: dict[str, str] = {
 
 _FORMATTER = string.Formatter()
 
+_REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+_CONTRACTS_DIR = _REPO_ROOT / "contracts"
+
+#: A `{date}`-style placeholder inside a contract's own `x-key-pattern`. Never
+#: crosses a `/` — every key template in this repo names one path segment.
+_KEY_PATTERN_PLACEHOLDER_RE = re.compile(r"\{[A-Za-z0-9_]+\}")
+
 
 def parity_key(trading_day: dt.date) -> str:
     return PARITY_KEY_TEMPLATE.format(trading_day=trading_day.isoformat())
+
+
+# ---------------------------------------------------------------------------
+# Contract resolution (alpha-engine-config-I10894): which fields of a key are
+# DATA versus PROVENANCE, declared in the contract, never hand-listed here.
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class ContractSchema:
+    """One `contracts/*.schema.json` that declares the key it documents."""
+
+    path: pathlib.Path
+    provenance_fields: frozenset[str]
+    pattern: "re.Pattern[str]"
+
+
+def _key_pattern_regex(template: str) -> "re.Pattern[str]":
+    parts: list[str] = []
+    pos = 0
+    for match in _KEY_PATTERN_PLACEHOLDER_RE.finditer(template):
+        parts.append(re.escape(template[pos : match.start()]))
+        parts.append(r"[^/]+")
+        pos = match.end()
+    parts.append(re.escape(template[pos:]))
+    return re.compile("^" + "".join(parts) + "$")
+
+
+def _provenance_fields(schema: dict[str, Any]) -> frozenset[str]:
+    properties = schema.get("properties")
+    if not isinstance(properties, dict):
+        return frozenset()
+    return frozenset(
+        name
+        for name, prop in properties.items()
+        if isinstance(prop, dict) and prop.get("x-provenance") is True
+    )
+
+
+@functools.lru_cache(maxsize=1)
+def _load_contract_schemas() -> tuple[ContractSchema, ...]:
+    """Every contract that declares an `x-key-pattern` for the key it documents.
+
+    **Declared, not discovered** — the same rule `expand_writes` states for
+    write targets. The key-to-schema mapping lives in the contract file
+    itself (`x-key-pattern`), so this module never hand-lists a key or a
+    schema filename (I10894 deliverable 2). A contract with no
+    `x-key-pattern` is simply not resolvable from a key — it is not an error,
+    since most contracts here are consumer-pinned by code path, not by S3 key.
+    """
+    schemas: list[ContractSchema] = []
+    if not _CONTRACTS_DIR.is_dir():
+        return tuple(schemas)
+    for path in sorted(_CONTRACTS_DIR.glob("*.schema.json")):
+        try:
+            schema = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        template = schema.get("x-key-pattern")
+        if not template:
+            continue
+        schemas.append(ContractSchema(path, _provenance_fields(schema), _key_pattern_regex(template)))
+    return tuple(schemas)
+
+
+def resolve_contract(live_key: str) -> ContractSchema | None:
+    """The contract documenting `live_key`, or ``None``.
+
+    ``None`` is the honest default for a key with no declared contract: every
+    field of it compares as data — "a key with no contract resolves every
+    field as data. That is the red default" (I10894 deliverable 2).
+    """
+    for contract in _load_contract_schemas():
+        if contract.pattern.fullmatch(live_key):
+            return contract
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +311,9 @@ def _numeric_close(a: Any, b: Any, rel: float, absolute: float) -> bool:
     return math.isclose(af, bf, rel_tol=rel, abs_tol=absolute)
 
 
-def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]:
+def _compare_frames(
+    live, shadow, rel: float, absolute: float, provenance_columns: frozenset[str] = frozenset()
+) -> dict[str, Any]:
     import pandas as pd  # local: pandas import is ~1s and the CLI may never need it
 
     out: dict[str, Any] = {}
@@ -276,6 +365,8 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
     # saturates is a parity number nobody can act on.
     breach_count = 0
     breaches: list[dict[str, Any]] = []
+    provenance_diff_count = 0
+    provenance_diffs: list[dict[str, Any]] = []
     if indexed_shadow is None:
         # The shadow side has no identifier column at all; the schema block
         # above already carries that as a mismatch, and comparing positionally
@@ -285,8 +376,14 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
             "breaches": 1,
             "examples": [{"reason": f"the shadow side has no {column!r} column to align on"}],
         }
+        out["provenance_diffs"] = {"count": 0, "examples": []}
         return out
     shared_columns = [c for c in indexed_live.columns if c in indexed_shadow.columns]
+    # Provenance columns (I10894) are declared by the contract, never
+    # hand-listed here — a column absent from `provenance_columns` is DATA,
+    # the red default for a key with no contract or an undeclared field.
+    data_columns = [c for c in shared_columns if c not in provenance_columns]
+    prov_columns = [c for c in shared_columns if c in provenance_columns]
     for row_key in sorted(live_keys & shadow_keys, key=str):
         live_row = indexed_live.loc[row_key]
         shadow_row = indexed_shadow.loc[row_key]
@@ -299,7 +396,7 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
                     {"row": str(row_key), "column": None, "reason": "duplicate row key"}
                 )
             continue
-        for col in shared_columns:
+        for col in data_columns:
             compared += 1
             if not _numeric_close(live_row[col], shadow_row[col], rel, absolute):
                 breach_count += 1
@@ -312,11 +409,24 @@ def _compare_frames(live, shadow, rel: float, absolute: float) -> dict[str, Any]
                             "shadow": _jsonable(shadow_row[col]),
                         }
                     )
+        for col in prov_columns:
+            if not _numeric_close(live_row[col], shadow_row[col], rel, absolute):
+                provenance_diff_count += 1
+                if len(provenance_diffs) < 50:
+                    provenance_diffs.append(
+                        {
+                            "row": str(row_key),
+                            "column": str(col),
+                            "live": _jsonable(live_row[col]),
+                            "shadow": _jsonable(shadow_row[col]),
+                        }
+                    )
     out["values"] = {
         "compared_cells": compared,
         "breaches": breach_count,
         "examples": breaches[:10],
     }
+    out["provenance_diffs"] = {"count": provenance_diff_count, "examples": provenance_diffs[:10]}
     return out
 
 
@@ -377,10 +487,46 @@ def _json_breaches(live: Any, shadow: Any, rel: float, absolute: float, path: st
     return [] if live == shadow else [f"{path}: {live!r} live vs {shadow!r} shadow"]
 
 
+#: A top-level field name out of one `_json_breaches` path string, e.g.
+#: ``"$.fetched_at: ..."`` -> ``"fetched_at"``. Provenance fields declared in
+#: a contract are top-level today (`fetched_at`, `revision`); a diff any
+#: deeper than that is never matched here and stays a data breach.
+_TOP_LEVEL_FIELD_RE = re.compile(r"^\$\.([A-Za-z0-9_]+)\b")
+
+
+def _split_json_diffs(
+    diffs: list[str], provenance_fields: frozenset[str]
+) -> tuple[list[str], list[str]]:
+    """Route each `_json_breaches` diff into (data breaches, provenance diffs)."""
+    breaches: list[str] = []
+    provenance: list[str] = []
+    for diff in diffs:
+        match = _TOP_LEVEL_FIELD_RE.match(diff)
+        if match and match.group(1) in provenance_fields:
+            provenance.append(diff)
+        else:
+            breaches.append(diff)
+    return breaches, provenance
+
+
 def compare_bytes(
-    key: str, live: bytes, shadow: bytes, *, rel: float, absolute: float
+    key: str,
+    live: bytes,
+    shadow: bytes,
+    *,
+    rel: float,
+    absolute: float,
+    contract: "ContractSchema | None" = None,
 ) -> dict[str, Any]:
-    """Compare one key's two payloads. Returns the row body; never raises for data."""
+    """Compare one key's two payloads. Returns the row body; never raises for data.
+
+    ``contract``, when resolved (:func:`resolve_contract`), separates
+    provenance fields from data fields (I10894): a provenance diff is
+    reported under ``provenance_diffs`` and never counts toward
+    ``values.breaches`` or the row's verdict. ``None`` is the red default —
+    every field compares as data.
+    """
+    provenance_fields = contract.provenance_fields if contract is not None else frozenset()
     if key.endswith(".parquet"):
         import pandas as pd
 
@@ -393,7 +539,7 @@ def compare_bytes(
                 "verdict": "unmeasurable",
                 "unmeasurable_reason": f"parquet would not parse: {type(exc).__name__}: {exc}",
             }
-        body = _compare_frames(live_frame, shadow_frame, rel, absolute)
+        body = _compare_frames(live_frame, shadow_frame, rel, absolute, provenance_fields)
         matched = (
             body["row_count"]["live"] == body["row_count"]["shadow"]
             and body["schema"]["match"]
@@ -413,11 +559,13 @@ def compare_bytes(
                 "verdict": "unmeasurable",
                 "unmeasurable_reason": f"json would not parse: {type(exc).__name__}: {exc}",
             }
-        breaches = _json_breaches(live_doc, shadow_doc, rel, absolute)
+        all_diffs = _json_breaches(live_doc, shadow_doc, rel, absolute)
+        breaches, provenance_diffs = _split_json_diffs(all_diffs, provenance_fields)
         return {
             "comparator": "json",
             "verdict": "match" if not breaches else "mismatch",
             "values": {"breaches": len(breaches), "examples": breaches[:10]},
+            "provenance_diffs": {"count": len(provenance_diffs), "examples": provenance_diffs[:10]},
             "row_count": {
                 "live": len(live_doc) if isinstance(live_doc, (list, dict)) else 1,
                 "shadow": len(shadow_doc) if isinstance(shadow_doc, (list, dict)) else 1,
@@ -584,9 +732,63 @@ def _compare_one_key(
             live_key, unit_ids, "shadow_missing", "none",
             {"detail": "v1 wrote it; the shadow run did not", "shadow_key": shadow_key},
         )
-    body = compare_bytes(live_key, live, shadow, rel=rel, absolute=absolute)
+    body = compare_bytes(
+        live_key, live, shadow, rel=rel, absolute=absolute, contract=resolve_contract(live_key)
+    )
     body["shadow_key"] = shadow_key
     return KeyResult(live_key, unit_ids, body.pop("verdict"), body.pop("comparator"), body)
+
+
+# ---------------------------------------------------------------------------
+# Run-manifest reading (alpha-engine-config-I10890): the run's SCOPE and, for
+# a prefix family, its CANDIDATE keys, both read from manifests rather than
+# from listing a live prefix or trusting every descriptor whether or not this
+# run touched it.
+# ---------------------------------------------------------------------------
+
+
+def _read_manifest(reader: "S3Reader", key: str) -> dict[str, Any] | None:
+    raw = reader.get(key)
+    if raw is None:
+        return None
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # A manifest this tool cannot parse is not evidence either way; it is
+        # never treated as "this unit ran" or "this unit did not run".
+        return None
+
+
+def _latest_manifests_by_unit(reader: "S3Reader", prefix: str, limit: int = 5000) -> dict[str, dict[str, Any]]:
+    """Every `data_run_manifest.v1` JSON under `prefix`, keyed by `unit_id`,
+    keeping only the LATEST attempt (max `finished`) per unit.
+
+    The shadow prefix accumulates across attempts — four attempts on 09-15
+    left four D17 manifests under the same trading day (I10890 gotcha) — so
+    taking every manifest found would double-count a unit's outputs across
+    retries. `finished` compares as an ISO-8601 UTC string, which sorts
+    lexicographically in time order.
+    """
+    latest: dict[str, dict[str, Any]] = {}
+    for key in sorted(k for k in reader.list(prefix, limit) if k.endswith(".json")):
+        manifest = _read_manifest(reader, key)
+        if manifest is None:
+            continue
+        unit_id = str(manifest.get("unit_id") or "")
+        if not unit_id:
+            continue
+        current = latest.get(unit_id)
+        if current is None or str(manifest.get("finished") or "") >= str(current.get("finished") or ""):
+            latest[unit_id] = manifest
+    return latest
+
+
+def _manifest_output_keys(manifest: dict[str, Any], prefix_value: str) -> set[str]:
+    return {
+        str(out.get("key") or "")
+        for out in manifest.get("outputs") or []
+        if str(out.get("key") or "").startswith(prefix_value)
+    }
 
 
 def run_parity(
@@ -605,11 +807,33 @@ def run_parity(
     root = ShadowRoot(trading_day)
     reader = reader or S3Reader(bucket)
     units = units if units is not None else load_units()
+    unit_by_id = {unit.unit_id: unit for unit in units}
     targets = expand_writes(units, trading_day)
 
+    # alpha-engine-config-I10890: the authoritative scope of THIS run is the
+    # set of units that left a run manifest under the shadow prefix — never
+    # "every in-service unit", which grades Saturday-only units against a
+    # weekday run and always reds. An EMPTY manifest listing is read as "no
+    # manifest evidence available" (e.g. a unit list handed in directly,
+    # without ever running `shadow run`), not as "nothing ran" — it falls
+    # back to grading every declared write, the old, more-conservative
+    # behaviour, rather than silently excluding everything.
+    shadow_manifest_prefix = root.key("data_collection/runs/")
+    shadow_manifests = _latest_manifests_by_unit(reader, shadow_manifest_prefix)
+    executed_units = set(shadow_manifests)
+    scoped = bool(executed_units)
+
     rows: list[KeyResult] = []
+    out_of_scope_units: set[str] = set()
     for target in targets:
         unit_ids = target.unit_id.split(",")
+        if scoped and not (set(unit_ids) & executed_units):
+            # Every unit declaring this write sat outside the run; it is
+            # named once, per unit, in `excluded` below — never silently
+            # dropped, and never a `shadow_missing` row a correct shadow run
+            # could not have produced.
+            out_of_scope_units.update(unit_ids)
+            continue
         if target.kind == "arcticdb":
             rows.append(
                 KeyResult(
@@ -638,6 +862,68 @@ def run_parity(
             )
             continue
         if target.kind == "prefix":
+            if scoped:
+                # I10890 deliverable 2: the candidate set is the union of
+                # what the RUN MANIFESTS say was written for this trading
+                # day — never a live listing, which cannot tell a write made
+                # today from a stale object left by a dropped holding, and
+                # cannot bound itself to one day's worth of a high-cardinality
+                # prefix (`news_aggregates_daily/…`, `close_history/{sym}`).
+                v1_keys: set[str] = set()
+                any_v1_manifest = False
+                for unit_id in unit_ids:
+                    unit = unit_by_id.get(unit_id)
+                    if unit is None:
+                        continue
+                    v1_manifests = _latest_manifests_by_unit(
+                        reader, f"{unit.run_manifest_prefix}/{trading_day.isoformat()}/"
+                    )
+                    if v1_manifests:
+                        any_v1_manifest = True
+                    for manifest in v1_manifests.values():
+                        v1_keys |= _manifest_output_keys(manifest, target.value)
+                if not any_v1_manifest:
+                    rows.append(
+                        KeyResult(
+                            target.declared, unit_ids, "unmeasurable", "none",
+                            {
+                                "unmeasurable_reason": (
+                                    "no v1 manifest for trading day — v1 wrote no "
+                                    f"data_collection/runs/{{unit}}/{trading_day.isoformat()}/ "
+                                    "record for any owning unit, so there is nothing to enumerate "
+                                    "this family against for this day (I10890 deliverable 2)"
+                                )
+                            },
+                        )
+                    )
+                    continue
+                shadow_keys = set()
+                for unit_id in unit_ids:
+                    manifest = shadow_manifests.get(unit_id)
+                    if manifest is not None:
+                        shadow_keys |= _manifest_output_keys(manifest, target.value)
+                members = v1_keys | shadow_keys
+                if not members:
+                    rows.append(
+                        KeyResult(
+                            target.declared, unit_ids, "both_missing", "none",
+                            {
+                                "detail": (
+                                    f"neither manifest declares an output under {target.value!r} "
+                                    "for this trading day"
+                                )
+                            },
+                        )
+                    )
+                    continue
+                for member in sorted(members):
+                    rows.append(
+                        _compare_one_key(reader, root, member, unit_ids, rel_tolerance, absolute_tolerance)
+                    )
+                continue
+            # No manifest evidence at all (see `scoped` above) — fall back to
+            # the pre-I10890 direct listing, capped and honestly unmeasurable
+            # past the cap.
             try:
                 live_keys = set(reader.list(target.value, max_keys_per_prefix))
                 shadow_keys = {
@@ -680,12 +966,34 @@ def run_parity(
             _compare_one_key(reader, root, target.value, unit_ids, rel_tolerance, absolute_tolerance)
         )
 
-    excluded = [{"unit_id": unit_id, "reason": reason} for unit_id, reason in sorted(EXCLUDED_UNITS.items())]
+    excluded = [
+        {"unit_id": unit_id, "reason": reason, "class": "hand_excluded"}
+        for unit_id, reason in sorted(EXCLUDED_UNITS.items())
+    ]
     for unit in units:
         lifecycle = str(unit.raw.get("lifecycle"))
-        if unit.unit_id not in EXCLUDED_UNITS and lifecycle not in LIVE_LIFECYCLES:
+        if unit.unit_id in EXCLUDED_UNITS:
+            continue
+        if lifecycle not in LIVE_LIFECYCLES:
             excluded.append(
-                {"unit_id": unit.unit_id, "reason": f"lifecycle {lifecycle!r} — no live v1 producer"}
+                {
+                    "unit_id": unit.unit_id,
+                    "reason": f"lifecycle {lifecycle!r} — no live v1 producer",
+                    "class": "lifecycle",
+                }
+            )
+        elif unit.unit_id in out_of_scope_units:
+            excluded.append(
+                {
+                    "unit_id": unit.unit_id,
+                    "reason": (
+                        f"out_of_run_scope: no run manifest for this unit under the shadow run's "
+                        f"prefix {shadow_manifest_prefix!r} — it was not executed by this run "
+                        f"(executed units: {sorted(executed_units) or ['none']}); a weekday shadow "
+                        "run never covers a Saturday-only unit, and this is not a parity failure"
+                    ),
+                    "class": "out_of_run_scope",
+                }
             )
 
     stamp = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0).isoformat()

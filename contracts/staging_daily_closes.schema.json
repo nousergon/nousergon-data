@@ -2,6 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Staging Daily Closes (per-row record)",
   "description": "staging/daily_closes/{date}.parquet — one row per ticker, written by collectors/daily_closes.py::collect(). The parquet is intermediate state (7-day S3 lifecycle expiry), consumed by builders/daily_append.py (ArcticDB ingest) and crucible-executor/executor/upstream_artifact_gate.py (freshness only, no column pin). This schema validates ONE ROW after `df.reset_index().to_dict('records')` — the persisted artifact is the parquet, not a JSON document; the row shape is the contract. v1 adds `source` (already persisted) and `revision` (alpha-engine-config-I10783, additive) so the write records which vendor produced each cell and how many times it has been overwritten, instead of a silent overwrite between vendors. Mirrors sources/contract.py::PriceBar.RECORD_KEYS and sources/SCHEMA.md §2, which remain the authoritative field catalog (this schema is a data-collector-plan-P-16 restatement of that catalog for consumer pinning). PRODUCER TEST: tests/test_staging_daily_closes_contract.py.",
+  "x-key-pattern": "staging/daily_closes/{date}.parquet",
   "type": "object",
   "required": [
     "ticker", "date", "Open", "High", "Low", "Close",
@@ -33,7 +34,8 @@
     "revision": {
       "type": "integer",
       "minimum": 1,
-      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783)."
+      "x-provenance": true,
+      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783). x-provenance (alpha-engine-config-I10894): a run-identity counter, not a data value — shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs` instead, because it is DEFINED to differ between the live and shadow read-modify-write chains (I10891)."
     }
   }
 }
