@@ -65,6 +65,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -82,6 +83,12 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT / "infrastructure" / "lambdas"))
 sys.path.insert(0, str(REPO_ROOT))
 
+# Imported AFTER the sys.path inserts above — these are repo-root modules and
+# this script is executed by path, not as a package.
+import run_units  # noqa: E402
+from dates import default_run_date  # noqa: E402
+from validators import expectations  # noqa: E402
+
 logging.basicConfig(
     level=os.environ.get("LOG_LEVEL", "INFO"),
     format="[arctic-migration-run] %(asctime)s %(levelname)s %(message)s",
@@ -90,6 +97,12 @@ log = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+#: A real, non-placeholder git sha — the same shape `run_manifest` accepts. The
+#: D42 manifest's `code_sha` is `--merged-sha` when it matches this, because the
+#: box's checkout IS that sha and a value carried in the dispatch is not
+#: dependent on git being callable from this working directory.
+_REAL_SHA = re.compile(r"^(?!0{40}$)[0-9a-f]{40}$")
 ACCOUNT_ID = os.environ.get("ARCTIC_MIGRATION_ACCOUNT_ID", "711398986525")
 
 # The three fleet trading Step Functions a migration full-rewrite must never
@@ -202,8 +215,13 @@ def completion_marker_key(head_migration_number: int) -> str:
 
 def write_completion_marker(
     *, bucket: str, region: str, head_migration_number: int, payload: dict
-) -> None:
-    """Best-effort S3 write of the run's terminal state.
+) -> bool:
+    """Best-effort S3 write of the run's terminal state. ``True`` if it landed.
+
+    The return value exists so the D42 run manifest records the marker as a
+    PUBLISHED output only when the PUT actually succeeded — a manifest that
+    lists an object the run failed to write is worse than one that lists none
+    (alpha-engine-config-I10810).
 
     Deliberate swallow (no-silent-fails rule, documented per the global
     policy): (a) failure mode swallowed = the completion-marker PUT failing;
@@ -222,11 +240,13 @@ def write_completion_marker(
             Bucket=bucket, Key=key, Body=body, ContentType="application/json"
         )
         log.info("completion marker written: s3://%s/%s", bucket, key)
+        return True
     except Exception as exc:  # noqa: BLE001 — documented non-fatal swallow, see docstring
         log.warning(
             "completion-marker write FAILED (non-fatal): s3://%s/%s: %s: %s",
             bucket, key, type(exc).__name__, exc,
         )
+        return False
 
 
 def notify(
@@ -311,9 +331,49 @@ def _git_head_sha() -> str:
         return ""
 
 
-def run(args: argparse.Namespace) -> int:
+def run(args: argparse.Namespace, run_ctx: Any = None) -> int:
+    """Apply the pending ArcticDB migration chain; return this process's exit code.
+
+    ``run_ctx`` is the D42 run manifest's context when this was entered through
+    :func:`main` (the normal path). Every terminal branch below records what it
+    read, what it published and why it ended there, so the manifest distinguishes
+    the four outcomes a bare exit code cannot: applied, nothing-pending,
+    refused-mutex-active, and failed. It is optional so the function stays
+    callable from a test or a REPL without a manifest.
+    """
     from migrations import pending_migrations
     from store.arctic_store import get_schema_meta_lib, get_universe_lib
+
+    def _record(**kwargs) -> None:
+        if run_ctx is not None:
+            run_ctx.record_guard(**kwargs)
+
+    def _record_marker(written: bool, migrations_applied: int) -> None:
+        """Record the completion marker as an output ONLY if its PUT landed.
+
+        ``rows_out`` is the number of migrations this run applied — a measured
+        count, and the only row-like quantity D42 has. The ArcticDB libraries it
+        rewrites report none, which is recorded as an `unmeasurable` guard
+        rather than as a zero (`data_collection_plan_260914.md` §4.5).
+        """
+        if run_ctx is None:
+            return
+        if written:
+            run_ctx.record_output(
+                completion_marker_key(args.head_migration_number),
+                rows_out=migrations_applied,
+            )
+        else:
+            run_ctx.record_guard(
+                guard="arctic_migration_completion_marker",
+                mode="observe",
+                verdict="unmeasurable",
+                detail=(
+                    "the completion-marker PUT failed (non-fatal, see the WARNING above); "
+                    "this manifest is the run's surviving record of the outcome."
+                ),
+                key=completion_marker_key(args.head_migration_number),
+            )
 
     head_sha = _git_head_sha()
     if head_sha and args.merged_sha and head_sha != args.merged_sha:
@@ -334,7 +394,7 @@ def run(args: argparse.Namespace) -> int:
         running = running_pipeline_executions(region=args.region)
     except MutexProbeError as exc:
         log.error("mutex probe FAILED — refusing to proceed: %s", exc)
-        write_completion_marker(
+        marker_written = write_completion_marker(
             bucket=args.bucket, region=args.region,
             head_migration_number=args.head_migration_number,
             payload={
@@ -358,6 +418,17 @@ def run(args: argparse.Namespace) -> int:
             head_migration_number=args.head_migration_number,
             merged_sha=args.merged_sha, error=f"mutex probe failed: {exc}",
         )
+        _record(
+            guard="arctic_migration_mutex",
+            mode="enforce",
+            verdict="unmeasurable",
+            detail=(
+                "the states:ListExecutions mutex probe over the three guarded pipelines "
+                f"FAILED ({exc}); this run refused to proceed rather than guess the mutex "
+                "was clear. No migration applied, stamp UNBUMPED."
+            ),
+        )
+        _record_marker(marker_written, 0)
         return 1
 
     if running:
@@ -365,7 +436,7 @@ def run(args: argparse.Namespace) -> int:
             "mutex ACTIVE — %s has a RUNNING execution; refusing this migration "
             "run cleanly (manual re-trigger needed once it clears)", running,
         )
-        write_completion_marker(
+        marker_written = write_completion_marker(
             bucket=args.bucket, region=args.region,
             head_migration_number=args.head_migration_number,
             payload={
@@ -385,6 +456,17 @@ def run(args: argparse.Namespace) -> int:
             dedup_key=f"arctic-migration-mutex-active-{args.head_migration_number}",
             context=context,
         )
+        _record(
+            guard="arctic_migration_mutex",
+            mode="enforce",
+            verdict="not_applicable",
+            detail=(
+                f"mutex ACTIVE — {running} had a RUNNING execution, so this run refused "
+                "cleanly. Exit 0 and NO migration applied: the manifest is what "
+                "distinguishes this from a run that applied the chain."
+            ),
+        )
+        _record_marker(marker_written, 0)
         return 0
 
     if args.dry_run:
@@ -405,7 +487,7 @@ def run(args: argparse.Namespace) -> int:
 
     if not pending:
         log.info("current=%d — nothing pending, nothing to do", current)
-        write_completion_marker(
+        marker_written = write_completion_marker(
             bucket=args.bucket, region=args.region,
             head_migration_number=args.head_migration_number,
             payload={
@@ -427,11 +509,25 @@ def run(args: argparse.Namespace) -> int:
         #   2. the lane's own console row — the dispatcher's `publish_lane ok`
         #      runs on this exit path (config-I7029).
         # An absent run is therefore still visible as an absent/ageing console
-        # row; silence here does not read as health.
+        # row; silence here does not read as health. Since
+        # alpha-engine-config-I10810 there is a THIRD surface: this run's own
+        # `data_run_manifest.v1`, which records the no-op as an executed run.
         #
         # Every other outcome below still notifies: a migration that APPLIED is
         # a state change, and a refusal or failure is a decision an operator
         # has to act on.
+        _record(
+            guard="arctic_migration_chain",
+            mode="observe",
+            verdict="not_applicable",
+            detail=(
+                f"schema version is already {current} and nothing is pending — the unit "
+                "ran and correctly applied no migration. Recorded, not notified "
+                "(alpha-engine-config-I7123)."
+            ),
+            value=float(current),
+        )
+        _record_marker(marker_written, 0)
         return 0
 
     # ── 3. Apply, strictly in order, abort loud on first failure ───────
@@ -439,7 +535,7 @@ def run(args: argparse.Namespace) -> int:
         applied = apply_pending(pending, universe_lib, meta_lib)
     except MigrationRunError as exc:
         log.error("MIGRATION FAILED: %s", exc)
-        write_completion_marker(
+        marker_written = write_completion_marker(
             bucket=args.bucket, region=args.region,
             head_migration_number=args.head_migration_number,
             payload={
@@ -463,10 +559,22 @@ def run(args: argparse.Namespace) -> int:
             head_migration_number=args.head_migration_number,
             merged_sha=args.merged_sha, error=str(exc),
         )
+        _record(
+            guard="arctic_migration_chain",
+            mode="enforce",
+            verdict="below_floor",
+            detail=(
+                f"migration {exc.migration_number:04d} FAILED ({exc.cause}); the chain "
+                "aborted there and the schema-version stamp is UNBUMPED for it and "
+                "everything after it. Producer appends will keep refusing cleanly."
+            ),
+            value=float(exc.migration_number),
+        )
+        _record_marker(marker_written, 0)
         return 1
 
     log.info("SUCCESS — applied migrations %s", applied)
-    write_completion_marker(
+    marker_written = write_completion_marker(
         bucket=args.bucket, region=args.region,
         head_migration_number=args.head_migration_number,
         payload={
@@ -483,6 +591,27 @@ def run(args: argparse.Namespace) -> int:
         dedup_key=f"arctic-migration-success-{args.head_migration_number}",
         context=context,
     )
+    _record(
+        guard="arctic_migration_chain",
+        mode="enforce",
+        verdict="ok",
+        detail=f"applied migrations {applied}; schema-version stamp advanced from {current}",
+        value=float(len(applied)),
+        baseline=float(current),
+    )
+    _record(
+        guard=expectations.EMPTY_FRESH_GUARD.name,
+        mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+        verdict="unmeasurable",
+        detail=(
+            "D42 publishes by rewriting the `universe`, `macro` and "
+            "`universe_schema_meta` ArcticDB libraries, which report no row count to "
+            "this call site, so the empty-but-fresh guard cannot read one. "
+            "UNMEASURABLE, not a pass — phase-2 work is the migration body reporting "
+            "the rows it rewrote (data_collection_plan_260914.md §4.5)."
+        ),
+    )
+    _record_marker(marker_written, len(applied))
     return 0
 
 
@@ -504,7 +633,40 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
-    return run(args)
+
+    # One `data_run_manifest.v1` per execution of the D42 unit
+    # (`data_collection_plan_260914.md` §2 row 7; alpha-engine-config-I10810).
+    # The run is triggered by .github/workflows/run-arctic-migrations.yml (push
+    # to migrations/** or workflow_dispatch) -> the dispatcher Lambda -> this
+    # script on an in-region spot box, so `gha` is the honest trigger even
+    # though the process itself is on EC2; $NE_DATA_TRIGGER overrides it for a
+    # hand-run repair.
+    #
+    # `code_sha` is the merge sha this box was cloned at rather than a measured
+    # `git rev-parse` — the box's checkout IS that sha, and naming it makes the
+    # record independent of whether git is callable from this working directory.
+    def _body(run_ctx) -> int:
+        rc = run(args, run_ctx)
+        if rc != 0:
+            # The manifest records `failed` with this reason; `recorded_entry`
+            # catches the sentinel outside `run_unit` and hands the exit code
+            # straight back, so the process's contract is unchanged.
+            raise run_units.EntryRunFailed(
+                f"run_arctic_migrations exited {rc} for head "
+                f"{args.head_migration_number:04d} (merged_sha={args.merged_sha})",
+                value=rc,
+            )
+        return rc
+
+    return run_units.recorded_entry(
+        "D42",
+        _body,
+        trigger="gha",
+        trading_day=default_run_date(),
+        bucket=args.bucket,
+        write=not args.dry_run,
+        code_sha=args.merged_sha if _REAL_SHA.match(args.merged_sha or "") else None,
+    )
 
 
 if __name__ == "__main__":

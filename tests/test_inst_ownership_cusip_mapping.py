@@ -282,10 +282,33 @@ class TestBuildCusipToTickerCacheMerge:
         assert result == {}
 
 
+class _NullSink:
+    """A ManifestSink that keeps the write off the network. Shared by the
+    main()-invoking tests below and by tests/test_inst_ownership_reader.py."""
+
+    bucket = "test-bucket"
+
+    def write(self, key: str, payload: bytes):  # noqa: ARG002
+        return None
+
+
 class TestMainExitCodeContract:
     """Fail-loud producer contract: main() must exit non-zero when nothing
     was produced, never sys.exit(0) — a producer that writes nothing and
     reports success was the root defect this issue tracks."""
+
+    @pytest.fixture(autouse=True)
+    def _no_real_manifest_writes(self, monkeypatch):
+        """`main()` now writes one D39 run manifest per execution
+        (alpha-engine-config-I10810). Swap the SINK so these tests exercise the
+        real path without a live S3 PUT; the manifest's own content is graded in
+        tests/test_unit_manifests.py."""
+        import run_units
+
+        monkeypatch.setenv("NE_DATA_CODE_SHA", "a" * 40)
+        monkeypatch.setattr(
+            run_units, "manifest_sink", lambda bucket, s3_client=None: _NullSink(),
+        )
 
     def test_exits_1_when_compute_returns_none(self, monkeypatch, tmp_path):
         from data.derived.inst_ownership import main

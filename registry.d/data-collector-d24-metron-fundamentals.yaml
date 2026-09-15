@@ -1,0 +1,55 @@
+# Observability registry row — GENERATED, do not hand-edit.
+#
+# Produced by `scripts/gen_observability_rows.py` from
+# `registry.d/units/D24-*.yaml` (alpha-engine-config-I10775, plan §4.1
+# item P-08). Re-run the generator after editing the unit descriptor; a diff
+# here with no matching unit-descriptor change is itself a finding.
+#
+# Gathered by `nous-ergon-ops`'s `gather_repo_descriptors.py` (console-policy
+# §2.6 one-file onboarding) — no console or ops-side code change is needed for
+# this row to publish.
+component_id: data-collector-d24-metron-fundamentals
+owning_repo: nousergon-data
+substrate: step-functions
+origin: ne-postclose-trading-pipeline
+owner: brian
+lifecycle: in-service
+authority_tier: t1
+authority_tier_reason: 'A deterministic collector with no judgment: D24''s own code path (collectors/metron_market_data.py:1274)
+  writes only the key templates its unit descriptor names in writes[]. No branching on model output; no
+  LLM call in this unit.'
+signals:
+  execution:
+    status: emitted
+    reason: The owning substrate (Step Functions / GitHub Actions) retains per-execution start/terminal-status/history
+      natively.
+  cost:
+    status: unknown
+    reason: No run-level cost record exists yet; component=data-collection cost tagging is phase-3 work
+      (plan P-21). Makes no LLM call.
+  resource:
+    status: unknown
+    reason: Spot-vs-on-demand and box headroom are not independently published per unit; read at the pipeline/dispatcher
+      level only.
+  data:
+    status: emitted
+    reason: unit descriptor's own audit.cells.run_record reads PRESENT (baseline_date 2026-09-14); re-measured,
+      not re-asserted, at the next data-gate read.
+  outcome:
+    status: emitted
+    reason: unit descriptor's own audit.cells.detector reads PRESENT (baseline_date 2026-09-14); re-measured,
+      not re-asserted, at the next data-gate read.
+log_location: s3:alpha-engine-research/_ssm_logs/data-spot/d24/
+log_location_reason: The unit's spot workload logs to the SSM capture path, per the owning pipeline 'ne-postclose-trading-pipeline'
+  (plan §4.4). Not yet independently re-resolved per unit.
+alert_channel: sns:alpha-engine-alerts, via the owning pipeline's NotifyFailure state
+alert_channel_reason: Declared from the owning pipeline's ASL definition (plan §4.6).
+severity_source: binary — the owning pipeline's/workflow's own terminal status
+severity_source_reason: 'Declared from the trigger: no envelope, no severity string at this layer.'
+console_surface: unknown
+console_surface_reason: No pane renders this unit individually yet. plan §4.1's data-collection-board
+  (P-03) is the console surface once built; this row is what it will render.
+retention: 90 days (the owning pipeline's log group RetentionInDays); published S3 artifacts are retained
+  indefinitely per the standing archive-retention preference.
+retention_reason: Declared from the unit descriptor's trigger; not independently probed against live bucket/log-group
+  lifecycle rules for D24 specifically.
