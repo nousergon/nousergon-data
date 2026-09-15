@@ -30,6 +30,7 @@ own MET/UNMET/UNMEASURABLE), source, as_of and evidence.
 from __future__ import annotations
 
 import datetime as dt
+from dataclasses import dataclass
 
 from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exceptions, unmeasurable
 
@@ -41,7 +42,9 @@ __all__ = [
     "BOARD_CLAUSES",
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
+    "RetiredClause",
     "base_clause_name",
+    "is_retired",
     "base_clause_names",
     "generate",
     "guard_clause_name",
@@ -100,11 +103,47 @@ def base_clause_names(units: list[Unit]) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RetiredClause(Clause):
+    """A clause of a unit whose descriptor declares ``lifecycle: retired``.
+
+    `alpha-engine-config-I10823` deliverable 6; `observability-policy` §8.3's
+    ``RETIRED``: removed on purpose, the row persists so the absence is STATED.
+    Never MET (``met=False``) and never unmeasurable — it is not graded at all.
+    `read.evaluate` excludes it from every gate, so it counts in no MET / UNMET
+    / UNMEASURABLE denominator and in no phase's red count, and the board
+    renders it ``RETIRED`` with the retirement's ruling and reason in `detail`.
+    `descriptors.py` refuses a retired descriptor without that reason.
+    """
+
+    retirement: str = ""
+
+
+def is_retired(clause: Clause) -> bool:
+    return isinstance(clause, RetiredClause)
+
+
+def _retired(unit: Unit, name: str, requirement: str, phase: str) -> RetiredClause:
+    return RetiredClause(
+        name,
+        requirement,
+        False,
+        f"RETIRED: {unit.retirement_summary}. {unit.unit_id} is declared `lifecycle: retired`, so "
+        "this clause is not graded and counts toward no gate.",
+        (unit.path.relative_to(unit.path.parents[2]).as_posix(),),
+        phase=phase,
+        source="registry.d/units (lifecycle: retired)",
+        retirement=unit.retirement_summary,
+    )
+
+
 def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Clause:
     name = base_clause_name(unit.unit_id, column)
     phase = f"data-phase{unit.clause_phase[column]}"
     cell = unit.cells[column]
     requirement = ev.BASE_REQUIREMENTS[column].format(unit=unit.unit_id, title=unit.title)
+    if unit.retired:
+        return _retired(unit, name, requirement, phase)
     reading = ev.read_base(store, unit, column, trading_day=trading_day)
 
     if reading.unmeasurable:
@@ -158,6 +197,8 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         "guard has been COMMISSIONED by an induced fault (observability-policy §9.1: a guard "
         "that has never fired is not in service)"
     )
+    if unit.retired:
+        return _retired(unit, name, requirement, "data-phase2")
     if state == "not_applicable":
         # An N/A with a code from the closed taxonomy is a real answer, and it
         # is MET — but only because `descriptors.py` refuses an N/A without one.
@@ -435,8 +476,11 @@ def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:
 
 def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], *, trading_day: dt.date) -> Clause:
     name = "data.cutover_ready.units_covered"
-    sf_units = _sf_only_units(units)
-    members = [_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in sf_units]
+    # A retired unit's survives_phase4 is satisfied by its recorded retirement
+    # decision, which is exactly what the requirement accepts — it is not a
+    # member to grade (alpha-engine-config-I10823).
+    sf_units = [u for u in _sf_only_units(units) if not u.retired]
+    members =[_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in sf_units]
     statuses = [clause_member_status(m) for m in members]
     met_n = statuses.count("MET")
     unmet = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMET")

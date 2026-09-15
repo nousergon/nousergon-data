@@ -153,12 +153,18 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
             store, load_units(), load_phases(), trading_day=trading_day
         )
     ceiling = GATES[gate]
+    # RETIRED clauses grade nothing: excluded from every gate's clause list, so
+    # they count in no MET/UNMET/UNMEASURABLE denominator and no phase's red
+    # count (alpha-engine-config-I10823 deliverable 6). The board still renders
+    # them, with the reason.
+    retired = [c for c in all_clauses if clause_module.is_retired(c)]
+    gradable = [c for c in all_clauses if not clause_module.is_retired(c)]
     if ceiling is None:
-        selected = [c for c in all_clauses if c.phase == gate]
+        selected = [c for c in gradable if c.phase == gate]
     else:
         selected = [
             c
-            for c in all_clauses
+            for c in gradable
             if (_phase_number(c.phase) is not None and _phase_number(c.phase) <= ceiling)
         ]
     result = GateResult(
@@ -179,7 +185,19 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
             f"grades the {len(selected)} clause(s) tagged phase <= {ceiling} out of "
             f"{len(all_clauses)} on the board; the rest are graded by later gates"
         )
+    if retired:
+        result.coverage += f"; {len(retired)} RETIRED clause(s) on the board are graded by no gate"
     return result
+
+
+#: Board state -> console state (`observability-policy` §8.3). Total over the
+#: board's four states; a state without a row here is a KeyError, not a default.
+CONSOLE_STATE: dict[str, str] = {
+    "MET": "HEALTHY",
+    "UNMET": "DEGRADED",
+    "UNMEASURABLE": "UNREPORTED",
+    "RETIRED": "RETIRED",
+}
 
 
 #: A base or guard clause's audit unit id — `data.D07.schema_contract` or
@@ -216,17 +234,19 @@ def _board_document(clauses, *, trading_day: dt.date, generated_utc: str, store_
     """
     rows = []
     for clause in clauses:
-        state = "UNMEASURABLE" if clause.unmeasurable else ("MET" if clause.met else "UNMET")
+        if clause_module.is_retired(clause):
+            state = "RETIRED"
+        else:
+            state = "UNMEASURABLE" if clause.unmeasurable else ("MET" if clause.met else "UNMET")
         rows.append(
             {
                 "clause": clause.name,
                 "unit_id": _row_unit_id(clause.name),
                 "state": state,
-                "console_state": {
-                    "MET": "HEALTHY",
-                    "UNMET": "DEGRADED",
-                    "UNMEASURABLE": "UNREPORTED",
-                }[state],
+                # `observability-policy` §8.3's closed vocabulary. RETIRED is a
+                # declared state (neither green nor red), and `nousergon-console`
+                # `console/model/kinds.py` carries it.
+                "console_state": CONSOLE_STATE[state],
                 "phase": clause.phase,
                 "requirement": clause.requirement,
                 "detail": clause.detail,
@@ -236,13 +256,16 @@ def _board_document(clauses, *, trading_day: dt.date, generated_utc: str, store_
             }
         )
     unmeasurable = sum(1 for r in rows if r["state"] == "UNMEASURABLE")
+    retired = sum(1 for r in rows if r["state"] == "RETIRED")
     return {
         "schema_version": "data_board.v1",
         "board": "data-collection",
         "trading_day": trading_day.isoformat(),
         "generated_utc": generated_utc,
         "store": store_uri,
-        "clauses_total": len(rows),
+        # The graded denominator: RETIRED rows are published but excluded.
+        "clauses_total": len(rows) - retired,
+        "clauses_retired": retired,
         "clauses_met": sum(1 for r in rows if r["state"] == "MET"),
         "clauses_unmet": sum(1 for r in rows if r["state"] == "UNMET"),
         # The transparency gap (observability-policy §8.4). Published even at
@@ -310,7 +333,8 @@ def render(result: GateResult, board: dict, *, dry_run: bool) -> str:
     lines = [result.render(), ""]
     lines.append(
         f"board: {board['clauses_met']} met / {board['clauses_unmet']} unmet / "
-        f"{board['transparency_gap']} unmeasurable of {board['clauses_total']} clauses"
+        f"{board['transparency_gap']} unmeasurable of {board['clauses_total']} graded clauses "
+        f"({board['clauses_retired']} RETIRED, graded by no gate)"
     )
     lines.append(f"transparency gap (UNREPORTED): {board['transparency_gap']} — objective is 0")
     if dry_run:
