@@ -120,7 +120,12 @@ def test_the_board_is_red_at_birth(board):
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
     # where a schema, a producer test AND a consumer pin all exist.
     assert all(c.name.endswith(".schema_contract") for c in met), sorted(c.name for c in met)
-    assert len(met) < 20, "far more base clauses read MET than have real readers"
+    # I10774 (P-07) landed schema + producer test + consumer pin for every plan §3
+    # boundary-table key that lacked one (Metron market-data spine, constituents,
+    # universe_classification, the ArcticDB `universe` library row contract),
+    # raising the MET count from <20 to 21. Bound kept generous, not exact, so the
+    # next unit's contract landing doesn't require a synchronized edit here too.
+    assert len(met) < 30, "far more base clauses read MET than have real readers"
 
 
 # ---------------------------------------------------------------------------

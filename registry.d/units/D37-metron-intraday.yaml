@@ -39,10 +39,15 @@ consumers:
   - "metron:api/services/market_snapshot.py"
   - "metron:api/services/technical_rating.py"
 contract:
-  schema: contracts/technical_ratings.schema.json
-  producer_test: tests/test_technical_rating_contracts.py
+  schema:
+    - contracts/technical_ratings.schema.json
+    - contracts/metron_intraday_latest.schema.json
+  producer_test:
+    - tests/test_technical_rating_contracts.py
+    - tests/test_p07_contracts.py
   consumer_pins:
     - "metron:tests/contracts/technical_ratings.schema.json"
+    - "metron:tests/contracts/metron_intraday_latest.schema.json"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D37
 detectors:

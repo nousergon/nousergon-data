@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_close_history.schema.json",
+  "title": "Metron per-symbol close history (market_data/close_history/{yf_symbol}.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_history (CLOSE_HISTORY_SCHEMA_VERSION). Consumer: Metron portfolio_analytics/prices/spine_source.py (NAV reconstruction), api/services/data_spine.py. Plan §3 boundary table row 1. The consolidated CONSOLIDATED_CLOSE_HISTORY_KEY artifact shares this per-symbol row shape under `series`/`currency` maps.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "yf_symbol", "currency", "adjustment_basis", "closes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "yf_symbol": {"type": "string", "minLength": 1},
+    "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+    "adjustment_basis": {"type": "string"},
+    "closes": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {"type": "string", "format": "date"},
+          {"type": "number"}
+        ]
+      }
+    }
+  }
+}

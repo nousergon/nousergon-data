@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_fx.schema.json",
+  "title": "Metron FX rates (market_data/fx/{run_date,latest}.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_metron_data (FX_SCHEMA_VERSION). Consumer: Metron portfolio_analytics currency conversion. Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "base", "rates"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "base": {"type": "string", "const": "USD"},
+    "rates": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "exclusiveMinimum": 0}
+    }
+  }
+}

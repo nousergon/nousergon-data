@@ -40,9 +40,10 @@ consumers:
   - "crucible-predictor:inference/stages/load_prices.py"
   - "crucible-research:data/fetchers/price_fetcher.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
   target: "contracts/arctic_universe.schema.json, pinned in crucible (P-07)"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D13

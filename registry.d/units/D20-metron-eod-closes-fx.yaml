@@ -41,9 +41,13 @@ consumers:
   - "metron:portfolio_analytics/prices/spine_source.py"
   - "metron:api/services/fx.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema:
+    - contracts/metron_closes.schema.json
+    - contracts/metron_fx.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_closes.schema.json"
+    - "metron:tests/contracts/metron_fx.schema.json"
 registry_rows:
   - eod_closes
   - fx

@@ -38,9 +38,10 @@ consumers:
   - "crucible:crucible/data/sources.py"
   - "crucible-predictor:inference/stages/load_prices.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
   target: "contracts/arctic_universe.schema.json, pinned in crucible (P-07)"
 registry_rows:
   - "feature_store_freshness_sentinel (indirect, depends_on)"
