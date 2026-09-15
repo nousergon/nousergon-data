@@ -259,6 +259,14 @@ shared_writers:
   - path: rag/pipelines/ingest_form4.py
     parent_units: [D46]
     reason: Step 6 of run_weekly_ingestion.sh, which D46 declares as its trigger.
+  - path: rag/pipelines/run_weekly_ingestion_recorded.py
+    parent_units: [D16]
+    reason: >-
+      alpha-engine-config-I10862: the `run_units.recorded_entry("D16", ...)` wrapper
+      that runs run_weekly_ingestion.sh as a subprocess and records its
+      data_run_manifest.v1 — this IS D16's dispatcher-invoked entry point
+      (infrastructure/lambdas/data-spot-dispatcher/index.py::_WORKLOADS
+      "rag-weekly-ingestion"), not a substep of the script it wraps.
 
 # Paths excluded from the scan entirely, each with the reason it is not a
 # producer of a published data key.
