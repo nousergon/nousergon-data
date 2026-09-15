@@ -459,12 +459,12 @@ def test_stack_check_live_denied_is_unmeasurable():
     assert reading.unmeasurable is True
 
 
-def test_parity_is_a_phase0_stub_naming_i10778():
+def test_parity_absent_is_unmet_naming_i10778():
     reading = evidence.read_parity(EmptyStore(), trading_day=TRADING_DAY)
-    assert reading.unmeasurable is True
+    assert reading.unmeasurable is False
     assert reading.met is False
     assert "I10778" in reading.detail
-    assert reading.evidence == (f"staging/shadow/{TRADING_DAY.isoformat()}/parity.json",)
+    assert reading.evidence == (evidence.parity_store_key(TRADING_DAY),)
 
 
 class _FakeIamClient:
