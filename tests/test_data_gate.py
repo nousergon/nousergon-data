@@ -517,6 +517,12 @@ _KNOWN_OPS_PLANE_WRITE_SITES = {
         "(alpha-engine-config-I7167) — an ops artifact about other stages' "
         "output, not a data key any unit descriptor would claim."
     ),
+    "validators/expectations.py": (
+        "publish_completeness_metric() PUTs a unit's completeness MetricRecord "
+        "at data_collection/metrics/eod_completeness/{trading_day}.json "
+        "(alpha-engine-config-I10780) — gate evidence ABOUT a unit's output, "
+        "read by the data.<unit>.completeness clause, not a published data key."
+    ),
 }
 
 
