@@ -34,7 +34,10 @@ import boto3
 import pandas as pd
 import requests
 
-from builders._price_cache_writeboth import price_cache_write_prefixes
+from builders._price_cache_writeboth import (
+    assert_valid_price_cache_ticker,
+    price_cache_write_prefixes,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -272,6 +275,7 @@ def backfill_to_s3(
                     # Wave 3 PR1: write-both to legacy ``predictor/price_cache/``
                     # + new ``reference/price_cache/`` (see
                     # builders/_price_cache_writeboth.py for soak contract)
+                    assert_valid_price_cache_ticker(ticker)
                     for prefix in price_cache_write_prefixes(s3_prefix):
                         s3.upload_file(
                             str(parquet_path),

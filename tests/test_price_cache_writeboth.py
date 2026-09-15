@@ -26,6 +26,7 @@ from builders._price_cache_writeboth import (
     PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
     PRICE_CACHE_LEGACY_PREFIX,
     PRICE_CACHE_NEW_PREFIX,
+    assert_valid_price_cache_ticker,
     list_price_cache_keys,
     price_cache_read_prefixes,
     price_cache_write_prefixes,
@@ -230,6 +231,51 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_fred_backfill_refuses_caret_ticker_write(monkeypatch):
+    """alpha-engine-config-I9288 chokepoint: even a FRED_HISTORY_MAP entry
+    keyed with a caret must refuse to write, not just fail the earlier
+    ``unknown ticker`` check (which only screens membership, not shape)."""
+    from collectors import fred_history
+
+    idx = pd.date_range("2020-01-01", periods=20, freq="B")
+    fake_ohlcv = pd.DataFrame(
+        {
+            "Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0,
+            "Adj_Close": 1.0, "Volume": 0, "VWAP": None, "source": "fred",
+        },
+        index=idx,
+    )
+    monkeypatch.setattr(
+        fred_history, "fetch_fred_history", lambda *_args, **_kw: fake_ohlcv,
+    )
+    monkeypatch.setattr(fred_history, "fred_history_to_ohlcv", lambda df: df)
+    # Simulate a caret-keyed FRED_HISTORY_MAP entry reaching the writer —
+    # the scenario the chokepoint guards even though today's map is bare.
+    monkeypatch.setattr(
+        fred_history, "FRED_HISTORY_MAP", {"^VIX3M": "VXVCLS"},
+    )
+
+    recorded: list[tuple[str, str]] = []
+
+    class _RecordingS3:
+        def upload_file(self, _local, bucket, key):
+            recorded.append((bucket, key))
+
+    monkeypatch.setattr(fred_history.boto3, "client", lambda _svc: _RecordingS3())
+
+    out = fred_history.backfill_to_s3(
+        bucket="test-bucket",
+        s3_prefix=PRICE_CACHE_LEGACY_PREFIX,
+        tickers=["^VIX3M"],
+        period_years=5,
+        dry_run=False,
+    )
+
+    assert out["status"] == "partial"
+    assert out["per_ticker"]["^VIX3M"]["status"] == "error"
+    assert recorded == [], "chokepoint must refuse the write, not just log"
+
+
 def test_fred_backfill_uploads_to_both_prefixes(monkeypatch):
     """``backfill_to_s3`` uploads each FRED-sourced ticker parquet via
     ``s3.upload_file``. Wave 3 wraps that in a write-both loop."""
@@ -366,6 +412,66 @@ def test_weekly_chronic_gap_self_heal_writes_reference_only(monkeypatch):
     assert not any(
         c["Key"].startswith(PRICE_CACHE_LEGACY_PREFIX) for c in put_calls
     )
+
+
+def test_weekly_chronic_gap_self_heal_refuses_caret_ticker_write(monkeypatch):
+    """alpha-engine-config-I9288 chokepoint: ``_self_heal_chronic_polygon_gaps``
+    must refuse to PUT a caret-keyed ticker rather than writing a stray
+    price-cache key. Recorded as a per-ticker error, not a crash."""
+    import weekly_collector as wc
+
+    target_date = "2026-05-12"
+    target_ts = pd.Timestamp(target_date).normalize()
+
+    import yfinance as yf
+
+    idx = pd.bdate_range(target_ts - pd.Timedelta(days=10), target_ts)
+    new_rows_df = pd.DataFrame(
+        {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 100},
+        index=idx,
+    )
+    monkeypatch.setattr(yf, "download", lambda *_a, **_kw: new_rows_df.copy())
+
+    class _StaleTail:
+        data = pd.DataFrame(index=[pd.Timestamp("2026-04-01")])
+
+    class _FakeUniverseLib:
+        def tail(self, _ticker, n=1):
+            return _StaleTail()
+
+    monkeypatch.setattr(
+        "store.arctic_store.get_universe_lib", lambda _bucket: _FakeUniverseLib(),
+    )
+
+    put_calls: list[dict] = []
+
+    class _FakeS3Exceptions:
+        class NoSuchKey(Exception):
+            pass
+
+    class _FakeS3:
+        exceptions = _FakeS3Exceptions
+
+        def get_object(self, **_kw):
+            raise _FakeS3Exceptions.NoSuchKey("no prior parquet")
+
+        def put_object(self, **kw):
+            put_calls.append(kw)
+
+    monkeypatch.setattr(wc.boto3, "client", lambda _svc: _FakeS3())
+    monkeypatch.setattr("builders.backfill.backfill", lambda **_kw: {"status": "ok"})
+
+    summary = wc._self_heal_chronic_polygon_gaps(
+        bucket="test-bucket",
+        target_date=target_date,
+        chronic_tickers=["^VIX3M"],
+        dry_run=False,
+    )
+
+    assert put_calls == [], "chokepoint must refuse the write, not just log"
+    assert len(summary["errors"]) == 1
+    assert summary["errors"][0]["ticker"] == "^VIX3M"
+    assert "^" in summary["errors"][0]["reason"]
 
 
 # ---------------------------------------------------------------------------
