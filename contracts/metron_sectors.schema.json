@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_sectors.schema.json",
+  "title": "Metron sectors/countries (market_data/sectors/latest.json, schema_version 2)",
+  "description": "Producer: collectors/metron_market_data.py::collect_reference (SECTORS_SCHEMA_VERSION). v2 additive `countries` map (metron-ops). Consumer: Metron api/services/*.py, portfolio_analytics/sectors/spine_source.py. Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "sectors", "countries", "spy_sector_weights"],
+  "properties": {
+    "schema_version": {"const": 2},
+    "as_of": {"type": "string", "format": "date"},
+    "sectors": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "countries": {"type": "object", "additionalProperties": {"type": "string", "minLength": 1}},
+    "spy_sector_weights": {"type": "object", "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1}}
+  }
+}

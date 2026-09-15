@@ -214,14 +214,43 @@ def main() -> None:
     def _norm(x: float) -> "int | float":
         return int(x) if float(x).is_integer() else x
 
-    result = splice_rebase(
-        args.ticker, args.splice_date, args.true_ex_date,
-        _norm(args.split_from), _norm(args.split_to),
-        bucket=args.bucket, dry_run=not args.apply,
-    )
-    print(json.dumps(result, indent=2, default=str))
-    if result.get("status") in ("dry_run_canary_not_cleared", "no_such_symbol"):
+    # alpha-engine-config-I10790 (P-24): this is audit unit D43 — a manual
+    # repair of D13's ArcticDB libraries. It runs through the same run-manifest
+    # wrapper a scheduled unit does, so a hand-run repair leaves a record
+    # (`data_collection_plan_260914.md` §4.4). Without `--apply` nothing is
+    # written, including the manifest.
+    import run_units
+
+    def _body(ctx):
+        result = splice_rebase(
+            args.ticker, args.splice_date, args.true_ex_date,
+            _norm(args.split_from), _norm(args.split_to),
+            bucket=args.bucket, dry_run=not args.apply,
+        )
+        print(json.dumps(result, indent=2, default=str))
+        ctx.record_output(
+            f"arcticdb/universe:{args.ticker}",
+            rows_out=int(result.get("rows_rewritten") or result.get("rows") or 0),
+            schema_version="arcticdb/universe",
+        )
+        if result.get("status") in ("dry_run_canary_not_cleared", "no_such_symbol"):
+            raise _SpliceRebaseFailed(f"{args.ticker}: {result.get('status')}")
+        return result
+
+    try:
+        run_units.manual_run("D43", _body, write=args.apply, bucket=args.bucket)
+    except _SpliceRebaseFailed as exc:
+        print(f"FAILED: {exc}", file=sys.stderr)
         sys.exit(1)
+
+
+class _SpliceRebaseFailed(RuntimeError):
+    """The rebase did not reach its contracted end state.
+
+    Raised rather than `sys.exit(1)` inside the wrapper so the run manifest
+    records `status: failed` with the named cause before the process exits —
+    a repair that died is a fact about D13's libraries, not a silent rc.
+    """
 
 
 if __name__ == "__main__":

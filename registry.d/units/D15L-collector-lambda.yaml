@@ -23,13 +23,29 @@ component_id: "data-collector-d15l-collector-lambda"
 owning_repo: "nousergon-data"
 title: "alpha-engine-data-collector Lambda (ad-hoc phase 2)"
 component: 1
-lifecycle: deprecated
+lifecycle: retired
 owner: brian
-code_path: lambda/handler.py
+retirement:
+  ruling: "plan §8.1 EXCLUSION: RETIRE (alpha-engine-config-I10779, P-12)"
+  reason: >-
+    superseded (alpha-engine-config-I5759): production DataPhase2 moved off
+    lambda:invoke onto the EC2-spot dispatcher in 2026; this function's only
+    live caller had been infrastructure/deploy.sh's own post-deploy smoke
+    test. Code (lambda/, infrastructure/deploy.sh, infrastructure/
+    canary_status.py, Dockerfile, .github/workflows/deploy.yml) deleted in
+    this PR. The AWS Lambda function itself is deleted by a separate,
+    operator-run command (mutating AWS action, never automated on merge) —
+    see closes-when.
+  closes_when: >-
+    `aws lambda list-functions --query "Functions[?FunctionName=='alpha-engine-data-collector']"`
+    returns empty. Operator command:
+    `AWS_PROFILE=ne-admin aws lambda delete-function --function-name alpha-engine-data-collector --region us-east-1`
+  archive_note: "No S3 archive to retain — the function wrote the same market_data/* keys D15 does; D15's own archive is untouched."
+code_path: "lambda/handler.py (DELETED this PR; retained in git history)"
 trigger:
   kind: manual
   owner: aws lambda invoke
-  successor: "retired (plan §8.1, P-12)"
+  successor: "retired (plan §8.1, P-12) — code deleted; function deletion is operator-gated, see retirement.closes_when"
   runs_on: lambda
 writes:
   - same keys as D15
@@ -102,7 +118,23 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    Plan §8.1 EXCLUSION: RETIRE. Its identity is BROKEN — `alpha-engine-data-role` has no
-    market_data/* grant and its LIVE trust is lambda.amazonaws.com while the codified
-    trust-policy.json declares GitHub OIDC. P-12 deletes the function and reconciles the
-    drift. The row persists as RETIRED for its declared period rather than vanishing.
+    Plan §8.1 EXCLUSION: RETIRE. RE-MEASURED 2026-09-14 (alpha-engine-config-I10779): the
+    audit's trust-drift claim (audit §3 row D15L, E-ID2: "live trust `lambda.amazonaws.com`
+    != codified GitHub OIDC (`trust-policy.json:4-18`)") does NOT reproduce. Live
+    (`AWS_PROFILE=ne-admin aws iam get-role --role-name alpha-engine-data-role
+    --query Role.AssumeRolePolicyDocument`) and codified
+    (nous-ergon-ops `infrastructure/iam/alpha-engine-data-role/trust-policy.json`, unchanged
+    since its only commit b253070d) BOTH declare `{"Principal": {"Service":
+    "lambda.amazonaws.com"}}` — a 12-line, single-statement document with no OIDC content at
+    all; the file has never had a `trust-policy.json:4-18` GitHub-OIDC form to diff against
+    (git log confirms one commit, ever). No trust-policy PR is needed — there is no drift to
+    reconcile. The S3 grant half of E-ID2 ("no market_data/* grant") is also narrower than
+    stated: `alpha-engine-data-role-policy.json`'s S3Access statement covers the whole
+    `alpha-engine-research`/`alpha-engine-research/*` bucket (over-broad, not absent) —
+    consistent with audit finding 7's separate "every data spot writer holds whole-bucket
+    Delete" complaint (note: this role's statement grants Get/Put/List only, not Delete).
+    RECOMMENDATION: re-verify the audit's other E-ID2-tagged rows before treating this class
+    of claim as settled elsewhere in the register.
+    Function deletion (operator-gated) resolves the only real gap this row had (an
+    over-broad, unused execution role attached to a superseded Lambda). The row persists as
+    RETIRED for its declared period rather than vanishing.

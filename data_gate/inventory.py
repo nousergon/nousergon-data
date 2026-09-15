@@ -29,12 +29,12 @@ from data_gate.descriptors import REPO_ROOT, Unit
 
 __all__ = ["InventoryReading", "WriterInventory", "load_inventory_scope", "scan"]
 
-SCOPE_PATH = REPO_ROOT / "registry.d" / "writer_inventory.yaml"
+SCOPE_PATH = REPO_ROOT / "data_gate" / "config" / "writer_inventory.yaml"
 
 
 @dataclass(frozen=True)
 class WriterInventory:
-    """The declared scope of the scan, read from `registry.d/writer_inventory.yaml`."""
+    """The declared scope of the scan, read from `data_gate/config/writer_inventory.yaml`."""
 
     roots: tuple[str, ...]
     write_calls: frozenset[str]

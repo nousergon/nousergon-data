@@ -98,6 +98,18 @@ def main() -> None:
             f"(config#1572)."
         )
 
+    # alpha-engine-config-I10790 (P-24): audit unit D43 — a manual repair of
+    # D13's ArcticDB libraries under the same run-manifest wrapper a scheduled
+    # unit uses, so a hand-run purge leaves a record (plan §4.4). Without
+    # `--apply` nothing is written, including the manifest.
+    import run_units
+
+    run_units.manual_run(
+        "D43", lambda ctx: _purge(args, ctx), write=args.apply, bucket=args.bucket
+    )
+
+
+def _purge(args: argparse.Namespace, ctx) -> None:
     import boto3
 
     from store.arctic_store import get_macro_lib, get_universe_lib
@@ -137,12 +149,20 @@ def main() -> None:
         log.info("purge_phantom_day: no parquet at s3://%s/%s", args.bucket, key)
 
     all_errors = [e for res in results.values() for e in res["errors"]]
+    total_affected = sum(len(res["affected"]) for res in results.values())
+    for name, res in results.items():
+        ctx.record_output(
+            f"arcticdb/{name}",
+            rows_out=len(res["affected"]),
+            schema_version=f"arcticdb/{name}",
+        )
+        if res["errors"]:
+            ctx.reject("purge_symbol_failed", len(res["errors"]))
     if all_errors:
         raise SystemExit(
             f"purge_phantom_day: {len(all_errors)} symbol(s) failed — re-run "
             f"to converge (idempotent); first: {all_errors[0]}"
         )
-    total_affected = sum(len(res["affected"]) for res in results.values())
     print(
         f"purge_phantom_day {mode} complete: {total_affected} symbol row(s) "
         f"{'purged' if args.apply else 'would be purged'} for {args.date}; "

@@ -38,9 +38,10 @@ writes:
 consumers:
   - "crucible-executor:executor/upstream_artifact_gate.py (via D17's key)"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
   target: "none — it writes D17's and D13's contracts, not one of its own"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D34

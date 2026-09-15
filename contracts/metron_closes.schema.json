@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_closes.schema.json",
+  "title": "Metron EOD closes (market_data/eod_closes/{run_date,latest}.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_metron_data (CLOSES_SCHEMA_VERSION). Consumer: Metron api/services/*.py, portfolio_analytics/prices/spine_source.py. Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "source", "closes"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "source": {"type": "string"},
+    "closes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["close", "currency", "bar_date"],
+        "properties": {
+          "close": {"type": "number", "exclusiveMinimum": 0},
+          "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+          "bar_date": {"type": "string", "format": "date"}
+        }
+      }
+    }
+  }
+}

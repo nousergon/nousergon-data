@@ -37,9 +37,10 @@ writes:
 consumers:
   - "metron:portfolio_analytics/macro/spine_source.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/metron_macro.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_macro.schema.json"
 registry_rows:
   - metron_macro
 run_manifest_prefix: data_collection/runs/D23

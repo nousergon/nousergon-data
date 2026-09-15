@@ -53,9 +53,6 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _REQUIREMENTS_PIN_RE = re.compile(
     r"nousergon-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
-_DOCKERFILE_PIN_RE = re.compile(
-    r'"nousergon-lib\[[^\]]*\]\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"'
-)
 _LAMBDA_PIN_RE = re.compile(
     r"nousergon-lib(?:\[[^\]]*\])?\s*@\s*git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
 )
@@ -160,19 +157,22 @@ def _read_pin(filename: str, regex: re.Pattern[str]) -> str:
 
 
 def test_requirements_and_dockerfile_pins_match():
+    """Dockerfile dropped from this lockstep (alpha-engine-config-I10779): it
+    was the root ``Dockerfile``, which built ONLY the now-deleted D15L
+    (``alpha-engine-data-collector``) Lambda image — no other component built
+    from it. The remaining three surfaces (requirements.txt,
+    requirements-daily-news.txt, deploy-infrastructure.yml) still carry
+    independent copies of the pin and still need it asserted."""
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
-    docker_pin = _read_pin("Dockerfile", _DOCKERFILE_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
     deploy_infra_pin = _read_pin(
         ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
     )
-    assert req_pin == docker_pin == daily_news_pin == deploy_infra_pin, (
+    assert req_pin == daily_news_pin == deploy_infra_pin, (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
-        f"Dockerfile={docker_pin!r}, requirements-daily-news.txt={daily_news_pin!r}, "
+        f"requirements-daily-news.txt={daily_news_pin!r}, "
         f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}. "
-        f"All four must move in lockstep — the Dockerfile strips lib from "
-        f"requirements.txt before pip install, so requirements-only bumps "
-        f"don't propagate to the Lambda image, the slim daily-news file "
+        f"All three must move in lockstep — the slim daily-news file "
         f"carries an independent copy of the pin, and the deploy-infrastructure "
         f"workflow's drift-check step installs its own copy directly."
     )

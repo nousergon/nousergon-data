@@ -41,9 +41,13 @@ consumers:
   - "metron:api/services/prices.py"
   - "crucible-evaluator:grading/attribution.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema:
+    - contracts/metron_close_history.schema.json
+    - contracts/metron_fx_history.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_close_history.schema.json"
+    - "metron:tests/contracts/metron_fx_history.schema.json"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D21
 detectors: []

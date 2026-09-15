@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Staging Daily Closes (per-row record)",
+  "description": "staging/daily_closes/{date}.parquet — one row per ticker, written by collectors/daily_closes.py::collect(). The parquet is intermediate state (7-day S3 lifecycle expiry), consumed by builders/daily_append.py (ArcticDB ingest) and crucible-executor/executor/upstream_artifact_gate.py (freshness only, no column pin). This schema validates ONE ROW after `df.reset_index().to_dict('records')` — the persisted artifact is the parquet, not a JSON document; the row shape is the contract. v1 adds `source` (already persisted) and `revision` (alpha-engine-config-I10783, additive) so the write records which vendor produced each cell and how many times it has been overwritten, instead of a silent overwrite between vendors. Mirrors sources/contract.py::PriceBar.RECORD_KEYS and sources/SCHEMA.md §2, which remain the authoritative field catalog (this schema is a data-collector-plan-P-16 restatement of that catalog for consumer pinning). PRODUCER TEST: tests/test_staging_daily_closes_contract.py.",
+  "type": "object",
+  "required": [
+    "ticker", "date", "Open", "High", "Low", "Close",
+    "Adj_Close", "Volume", "VWAP", "source", "revision"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "ticker": {
+      "type": "string",
+      "description": "Canonical store-key (dash form for US class shares, e.g. BRK-B; caret-stripped for index tickers, e.g. VIX not ^VIX)."
+    },
+    "date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "Trading day of the bar (YYYY-MM-DD)."
+    },
+    "Open": {"type": ["number", "null"], "description": "Price, native currency (currently USD-only persisted)."},
+    "High": {"type": ["number", "null"], "description": "Price, native currency."},
+    "Low": {"type": ["number", "null"], "description": "Price, native currency."},
+    "Close": {"type": ["number", "null"], "description": "Price, native currency. Null Close is treated as missing by the source-priority coalesce."},
+    "Adj_Close": {"type": ["number", "null"], "description": "Split/dividend-adjusted close where the source provides one (yfinance); equals Close where it does not (polygon, FRED)."},
+    "Volume": {"type": ["integer", "null"], "minimum": 0, "description": "Raw shares. 0 when the source carries no volume (FRED single-value closes)."},
+    "VWAP": {"type": ["number", "null"], "description": "True volume-weighted price. Null when the source can't provide it — never a (H+L+C)/3 proxy."},
+    "source": {
+      "type": "string",
+      "enum": ["polygon", "fred", "yfinance"],
+      "description": "Provenance — the vendor that WON this cell under collectors.daily_closes.VENDOR_PRECEDENCE (the declared, reversible champion pointer; polygon is champion per the 2026-09-09 ruling). Not necessarily the only vendor that supplied a value this trading day — see data_collection/metrics/vendor_divergence/{date}.json for the cross-vendor comparison."
+    },
+    "revision": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783)."
+    }
+  }
+}

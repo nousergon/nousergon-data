@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_fundamentals.schema.json",
+  "title": "Metron fundamentals (market_data/fundamentals/latest.json, schema_version 5)",
+  "description": "Producer: collectors/metron_market_data.py::collect_fundamentals (FUNDAMENTALS_SCHEMA_VERSION). yfinance Ticker.info pass-through over FUNDAMENTALS_INFO_KEYS -- consumer owns display/unit semantics; a symbol's row carries only the keys yfinance returned non-null (sparse by design, never fabricated). Consumer: Metron api/services/*.py (tearsheet). Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "source", "fundamentals"],
+  "properties": {
+    "schema_version": {"const": 5},
+    "as_of": {"type": "string", "format": "date"},
+    "source": {"type": "string", "const": "yfinance"},
+    "fundamentals": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": {"type": ["number", "string", "boolean"]},
+        "properties": {
+          "trailingPE": {"type": "number"}, "forwardPE": {"type": "number"},
+          "trailingPegRatio": {"type": "number"}, "enterpriseToEbitda": {"type": "number"},
+          "priceToBook": {"type": "number"}, "priceToSalesTrailing12Months": {"type": "number"},
+          "earningsGrowth": {"type": "number"}, "revenueGrowth": {"type": "number"},
+          "debtToEquity": {"type": "number"}, "currentRatio": {"type": "number"}, "quickRatio": {"type": "number"},
+          "returnOnEquity": {"type": "number"}, "returnOnAssets": {"type": "number"},
+          "grossMargins": {"type": "number"}, "operatingMargins": {"type": "number"},
+          "totalDebt": {"type": "number"}, "totalCash": {"type": "number"},
+          "ebitda": {"type": "number"}, "freeCashflow": {"type": "number"},
+          "beta": {"type": "number"}, "dividendYield": {"type": "number"}, "marketCap": {"type": "number"},
+          "sector": {"type": "string"}, "industry": {"type": "string"},
+          "trailingEps": {"type": "number"}, "forwardEps": {"type": "number"},
+          "bookValue": {"type": "number"}, "revenuePerShare": {"type": "number"}, "enterpriseValue": {"type": "number"}
+        }
+      }
+    }
+  }
+}

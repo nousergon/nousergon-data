@@ -37,9 +37,10 @@ writes:
 consumers:
   - "metron:api/services/security_performance.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/metron_security_performance.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_security_performance.schema.json"
 registry_rows:
   - metron_security_performance
 run_manifest_prefix: data_collection/runs/D28

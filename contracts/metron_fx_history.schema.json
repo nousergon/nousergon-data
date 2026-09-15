@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_fx_history.schema.json",
+  "title": "Metron per-currency FX history (market_data/fx_history/{CCY}.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_history (FX_HISTORY_SCHEMA_VERSION). Consumer: Metron portfolio_analytics as-of-date realized/dividend FX. Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "currency", "base", "rates"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+    "base": {"type": "string", "const": "USD"},
+    "rates": {
+      "type": "array",
+      "items": {
+        "type": "array",
+        "minItems": 2,
+        "maxItems": 2,
+        "prefixItems": [
+          {"type": "string", "format": "date"},
+          {"type": "number", "exclusiveMinimum": 0}
+        ]
+      }
+    }
+  }
+}

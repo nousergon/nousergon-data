@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_valuation_medians.schema.json",
+  "title": "Metron valuation medians (market_data/valuation_medians/latest.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_valuation_medians (VALUATION_MEDIANS_SCHEMA_VERSION). A derived aggregate -- medians + member counts only, never per-ticker rows. Consumer: Metron api/services/*.py (Holdings by sector/country valuation bands). Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "source", "by_sector", "by_country"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "source": {"type": "string", "const": "yfinance"},
+    "by_sector": {"type": "object", "additionalProperties": {"$ref": "#/$defs/medianBucket"}},
+    "by_country": {"type": "object", "additionalProperties": {"$ref": "#/$defs/medianBucket"}}
+  },
+  "$defs": {
+    "medianBucket": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["n"],
+      "properties": {
+        "n": {"type": "integer", "minimum": 1},
+        "trailing_pe": {"type": "number"},
+        "forward_pe": {"type": "number"},
+        "price_to_book": {"type": "number"},
+        "price_to_sales": {"type": "number"},
+        "ev_ebitda": {"type": "number"},
+        "dividend_yield": {"type": "number"}
+      }
+    }
+  }
+}

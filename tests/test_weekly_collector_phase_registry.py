@@ -60,8 +60,8 @@ class _FakeS3:
         raise ClientError({"Error": {"Code": "404", "Message": "no"}}, "HeadObject")
 
 
-def _reg(fake: _FakeS3, *, force=False, force_phases=None, skip_phases=None) -> PhaseRegistry:
-    return PhaseRegistry(
+def _reg(fake: _FakeS3, *, force=False, force_phases=None, skip_phases=None, mode="phase1") -> PhaseRegistry:
+    reg = PhaseRegistry(
         date="2026-06-13",
         bucket="alpha-engine-research",
         marker_prefix="data",
@@ -70,6 +70,12 @@ def _reg(fake: _FakeS3, *, force=False, force_phases=None, skip_phases=None) -> 
         force_phases=force_phases or [],
         skip_phases=skip_phases or [],
     )
+    # alpha-engine-config-I10773: `_build_registry` stamps the run mode on every
+    # production registry, and `_phase_collect` resolves the phase's audit unit
+    # from it. Set here so these tests exercise the same path production does —
+    # the phases below are weekly phase-1 collectors.
+    reg.data_mode = mode
+    return reg
 
 
 # ── _phase_collect contract ──────────────────────────────────────────────────
@@ -237,7 +243,7 @@ def test_verify_artifact_exists_passes_when_artifact_present(monkeypatch):
     monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
 
     out = weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        _reg(fake, mode="daily"), "daily_closes", lambda: {"status": "ok"},
         artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
     )
     assert out["status"] == "ok"
@@ -251,7 +257,7 @@ def test_verify_artifact_exists_downgrades_ok_to_error_when_artifact_absent(monk
     monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
 
     out = weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        _reg(fake, mode="daily"), "daily_closes", lambda: {"status": "ok"},
         artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
     )
     assert out["status"] == "error"
@@ -265,12 +271,12 @@ def test_verify_artifact_exists_error_marker_reruns_next_attempt(monkeypatch):
     monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
 
     weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: {"status": "ok"},
+        _reg(fake, mode="daily"), "daily_closes", lambda: {"status": "ok"},
         artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
     )
     calls = []
     weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: calls.append(1) or {"status": "ok"},
+        _reg(fake, mode="daily"), "daily_closes", lambda: calls.append(1) or {"status": "ok"},
         artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
     )
     assert calls == [1], "a verify-by-artifact failure must not auto-skip the retry"
@@ -284,7 +290,7 @@ def test_verify_artifact_exists_skips_check_on_dry_run_status(monkeypatch):
     monkeypatch.setattr(weekly_collector.boto3, "client", lambda *a, **k: fake)
 
     out = weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: {"status": "ok_dry_run"},
+        _reg(fake, mode="daily"), "daily_closes", lambda: {"status": "ok_dry_run"},
         artifact_key=art, verify_artifact_exists=True, bucket="alpha-engine-research",
     )
     assert out["status"] == "ok_dry_run"
@@ -302,7 +308,7 @@ def test_verify_artifact_exists_false_leaves_existing_behavior_unchanged(monkeyp
     monkeypatch.setattr(weekly_collector.boto3, "client", _boom_client)
 
     out = weekly_collector._phase_collect(
-        _reg(fake), "daily_closes", lambda: {"status": "ok"}, artifact_key=art,
+        _reg(fake, mode="daily"), "daily_closes", lambda: {"status": "ok"}, artifact_key=art,
     )
     assert out["status"] == "ok"
 
