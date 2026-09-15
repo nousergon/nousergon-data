@@ -59,10 +59,20 @@ units stated.
 | `source` | str | Provenance — the producing adapter's `name` (`polygon` / `fred` / `yfinance` / …). |
 | `currency` | str (ISO-4217) | Native currency of the listing. Defaults `USD`. **Carried in-memory only in Phase 1a** — see §4. |
 | `vwap` | float \| None (price) | True volume-weighted price. `None` when the source can't provide it — never a `(H+L+C)/3` proxy (2026-04-17 VWAP-centralization decision). Only Polygon supplies real VWAP today. |
+| `revision` | int (count) | Per-cell write counter, default `1`. Incremented only by `collectors.daily_closes._coalesce_by_source_priority` when an existing cell is actually overwritten by an equal-or-higher-priority source — a queryable audit trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783). Never set by an adapter directly. |
 
 `to_record()` / `from_record()` bridge `PriceBar` ↔ the legacy persisted dict
 (`RECORD_KEYS` in `sources/contract.py`): keys
-`ticker, date, Open, High, Low, Close, Adj_Close, Volume, VWAP, source`.
+`ticker, date, Open, High, Low, Close, Adj_Close, Volume, VWAP, source, revision`.
+
+**Vendor precedence.** `source` names which vendor's row won the cell; it is
+decided by `collectors.daily_closes.VENDOR_PRECEDENCE` (`polygon`/`fred` = 3,
+`yfinance` = 1), a single declared, reversible mapping — never an implicit
+write-order dependency. `VENDOR_CHAMPION = "polygon"` per the 2026-09-09 "stay
+on free polygon" ruling (`champion-challenger-policy.md`). Both vendors are
+measured every trading day regardless of which one is persisted: see
+`collectors/cross_source_observer.py::write_vendor_divergence_metric`, which
+emits `data_collection/metrics/vendor_divergence/{trading_day}.json`.
 
 ---
 

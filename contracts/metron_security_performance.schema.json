@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_security_performance.schema.json",
+  "title": "Metron security performance (market_data/security_performance/latest.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_security_performance (SECURITY_PERFORMANCE_SCHEMA_VERSION), derived from close_history -- no new fetch. Consumer: Metron api/services/*.py (tearsheet, Holdings LTM, markets strip). Plan \u00a73 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "as_of",
+    "source",
+    "performance"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "as_of": {
+      "type": "string",
+      "format": "date"
+    },
+    "source": {
+      "type": "string",
+      "const": "computed"
+    },
+    "performance": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "period_returns",
+          "ytd_pct",
+          "ltm_pct",
+          "n_bars",
+          "history_from"
+        ],
+        "properties": {
+          "period_returns": {
+            "type": "object",
+            "additionalProperties": {
+              "type": [
+                "number",
+                "null"
+              ]
+            }
+          },
+          "ytd_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "ltm_pct": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "volatility": {
+            "type": "number"
+          },
+          "sharpe": {
+            "type": "number"
+          },
+          "sortino": {
+            "type": "number"
+          },
+          "max_drawdown": {
+            "type": "number"
+          },
+          "beta_vs_spy": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "vs_spy_window": {
+            "type": [
+              "number",
+              "null"
+            ]
+          },
+          "vs_spy_1y": {
+            "type": "number"
+          },
+          "n_bars": {
+            "type": "integer",
+            "minimum": 2
+          },
+          "history_from": {
+            "type": "string",
+            "format": "date"
+          }
+        }
+      }
+    }
+  }
+}

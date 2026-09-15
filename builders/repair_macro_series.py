@@ -296,21 +296,37 @@ def main(argv: list[str] | None = None) -> int:
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    results = []
-    for symbol in [s.strip() for s in args.symbols.split(",") if s.strip()]:
-        res = repair_symbol(
-            symbol,
-            bucket=args.bucket,
-            s3_prefix=args.s3_prefix,
-            period=args.period,
-            source=args.source,
-            dry_run=args.dry_run,
-        )
-        log.info("repair %s: %s", symbol, json.dumps(res, default=str))
-        results.append(res)
+    # alpha-engine-config-I10790 (P-24): audit unit D43 — a manual repair of
+    # D13's parent libraries, under the same run-manifest wrapper a scheduled
+    # unit uses, so a hand-run repair leaves a record (plan §4.4).
+    import run_units
 
-    print(json.dumps({"results": results}, default=str, indent=2))
-    return 0
+    def _body(ctx):
+        results = []
+        for symbol in [s.strip() for s in args.symbols.split(",") if s.strip()]:
+            res = repair_symbol(
+                symbol,
+                bucket=args.bucket,
+                s3_prefix=args.s3_prefix,
+                period=args.period,
+                source=args.source,
+                dry_run=args.dry_run,
+            )
+            log.info("repair %s: %s", symbol, json.dumps(res, default=str))
+            results.append(res)
+            ctx.record_output(
+                f"{args.s3_prefix}{symbol}.parquet",
+                rows_out=int(res.get("rows_after") or res.get("rows") or 0),
+                schema_version="price_cache/parquet",
+            )
+
+        ctx.rows_in = len(results)
+        print(json.dumps({"results": results}, default=str, indent=2))
+        return 0
+
+    return run_units.manual_run(
+        "D43", _body, write=not args.dry_run, bucket=args.bucket
+    ).value
 
 
 if __name__ == "__main__":

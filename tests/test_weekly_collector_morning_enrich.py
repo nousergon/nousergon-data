@@ -21,6 +21,26 @@ import pytest
 import weekly_collector
 from polygon_client import PolygonForbiddenError
 
+
+class _RecordingSink:
+    """In-memory stand-in for the run-manifest S3 sink.
+
+    alpha-engine-config-I10773: the four routing tests below drive `run_weekly`
+    against a placeholder bucket, and every whole-mode unit now writes one
+    `data_run_manifest.v1` record. The sink is stubbed so the routing assertion
+    stays about routing — and the records are kept, so a mode that stops writing
+    one is visible here rather than only in production.
+    """
+
+    def __init__(self):
+        self.writes: list[tuple[str, dict]] = []
+
+    def write(self, key: str, payload: bytes):
+        import json as _json
+
+        self.writes.append((key, _json.loads(payload.decode("utf-8"))))
+        return None
+
 _PT = ZoneInfo("America/Los_Angeles")
 
 
@@ -704,7 +724,8 @@ def test_chronic_gap_heal_routes_via_run_weekly():
     )
     with patch("weekly_collector._run_chronic_gap_heal",
                return_value={"status": "ok", "mode": "chronic_gap_heal"}) as heal:
-        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+        with patch("run_units.manifest_sink", return_value=_RecordingSink()):
+            out = weekly_collector.run_weekly({"bucket": "b"}, args)
     heal.assert_called_once()
     assert out["mode"] == "chronic_gap_heal"
 
@@ -780,7 +801,8 @@ def test_arctic_append_routes_via_run_weekly():
     )
     with patch("weekly_collector._run_morning_arctic_append",
                return_value={"status": "ok", "mode": "morning_arctic_append"}) as ap:
-        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+        with patch("run_units.manifest_sink", return_value=_RecordingSink()):
+            out = weekly_collector.run_weekly({"bucket": "b"}, args)
     ap.assert_called_once()
     assert out["mode"] == "morning_arctic_append"
 
@@ -980,7 +1002,8 @@ def test_daily_arctic_append_routes_via_run_weekly():
     )
     with patch("weekly_collector._run_daily_arctic_append",
                return_value={"status": "ok", "mode": "daily_arctic_append"}) as ap:
-        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+        with patch("run_units.manifest_sink", return_value=_RecordingSink()):
+            out = weekly_collector.run_weekly({"bucket": "b"}, args)
     ap.assert_called_once()
     assert out["mode"] == "daily_arctic_append"
 
@@ -1180,7 +1203,8 @@ def test_daily_heal_routes_via_run_weekly():
     )
     with patch("weekly_collector._run_daily_heal",
                return_value={"status": "ok", "mode": "daily_heal"}) as heal:
-        out = weekly_collector.run_weekly({"bucket": "b"}, args)
+        with patch("run_units.manifest_sink", return_value=_RecordingSink()):
+            out = weekly_collector.run_weekly({"bucket": "b"}, args)
     heal.assert_called_once()
     assert out["mode"] == "daily_heal"
 

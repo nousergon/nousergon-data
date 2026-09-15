@@ -91,6 +91,11 @@ from builders._price_cache_writeboth import (
     write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
 )
 from dates import default_run_date  # config#1014: trading-day-axis default
+# alpha-engine-config-I10773 (P-06) / I10785 (P-18): one run manifest per unit
+# execution, and the common empty-but-fresh guard before every publish claim.
+import run_units
+from nousergon_lib import run_manifest
+from validators import expectations
 
 logger = logging.getLogger(__name__)
 
@@ -218,7 +223,7 @@ def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "Phase
     if args.dry_run:
         return None
     _csv = lambda s: [p.strip() for p in (s or "").split(",") if p.strip()]
-    return PhaseRegistry(
+    reg = PhaseRegistry(
         date=date,
         bucket=config["bucket"],
         marker_prefix="data",
@@ -227,6 +232,32 @@ def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "Phase
         force_phases=_csv(getattr(args, "force_phases", "")),
         hard_caps=config.get("full_run_hard_caps_seconds") or {},
     )
+    # alpha-engine-config-I10773: which run mode this is, resolved from the SAME
+    # args `run_weekly` dispatches on, and carried on the registry every phase
+    # already receives. Phase names are not unique across modes (`prices` and
+    # `features` each appear in two), so the mode is half the key that resolves
+    # a phase to its audit unit — see `run_units.PHASE_UNITS`. Derived once
+    # here rather than threaded through 29 call sites, and derived from the
+    # dispatch inputs rather than declared a second time, so it cannot disagree
+    # with the mode that actually ran.
+    reg.data_mode = _resolve_run_mode(args)
+    return reg
+
+
+def _resolve_run_mode(args: argparse.Namespace) -> str:
+    """The run mode, by the same ladder ``run_weekly`` dispatches on."""
+    for flag in (
+        "morning_enrich",
+        "morning_arctic_append",
+        "daily_arctic_append",
+        "chronic_gap_heal",
+        "daily_heal",
+    ):
+        if getattr(args, flag, False):
+            return flag
+    if getattr(args, "daily", False):
+        return "daily"
+    return f"phase{getattr(args, 'phase', None) or 1}"
 
 
 def _s3_object_exists(bucket: str, key: str) -> bool:
@@ -244,6 +275,33 @@ def _s3_object_exists(bucket: str, key: str) -> bool:
         if code in ("404", "NoSuchKey"):
             return False
         raise
+
+
+def _rows_out(result: dict, rows_key: str | None) -> int | None:
+    """The row count this collector reported, or ``None`` when it reports none.
+
+    ``None`` is never coerced to 0: "the collector did not count" and "the
+    collector counted zero" are different facts with opposite consequences, and
+    the empty-but-fresh objective (plan §2 row 6) is computed from this number.
+    A missing key read as zero would mark every such unit an empty write; read
+    as fine, it would mark none of them. The guard records UNMEASURABLE instead.
+    """
+    if not rows_key:
+        return None
+    value = result.get(rows_key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return int(value)
+
+
+def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> dict:
+    """The per-run manifest arguments shared by every wrapped call site here."""
+    return {
+        "sink": run_units.manifest_sink(reg.bucket, reg.s3_client),
+        "trigger": run_units.resolve_trigger("scheduled"),
+        "trading_day": reg.date,
+        "log_location": run_units.resolve_log_location(),
+    }
 
 
 def _phase_collect(
@@ -290,49 +348,156 @@ def _phase_collect(
         except Exception as e:  # best-effort: record + continue (mirrors prior try/except)
             logger.error("%s failed: %s", name, e)
             return {"status": "error", "error": str(e)}
+
+    # alpha-engine-config-I10773 (P-06) + I10785 (P-18): every execution of
+    # every unit writes one `data_run_manifest.v1` record, and every published
+    # key passes the empty-but-fresh guard. Both hang off THIS function because
+    # it is the one path every scheduled collector already passes through —
+    # wiring them per call site is how a unit ends up unobserved on the one day
+    # someone adds a collector in a hurry.
+    unit = run_units.unit_for(reg.data_mode, name)
+
+    def _body(run_ctx) -> dict:
+        result = _phase_body(
+            reg,
+            name,
+            run_fn,
+            artifact_key=artifact_key,
+            supports_auto_skip=supports_auto_skip,
+            verify_artifact_exists=verify_artifact_exists,
+            bucket=bucket,
+        )
+        _record_phase_lineage(run_ctx, unit, name, result, artifact_key, bucket or reg.bucket, reg)
+        return result
+
     try:
-        with reg.phase(name, supports_auto_skip=supports_auto_skip) as ctx:
-            if ctx.skipped:
-                logger.info(
-                    "%s: auto-skip (%s) — output already on S3 this date", name, ctx.skip_reason
-                )
-                return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
-            result = run_fn() or {}
-            if result.get("status") == "error":
-                raise _CollectorError(name, result.get("error"))
-            # `degraded` is verified exactly like `ok` (alpha-engine-config-I7572):
-            # its whole meaning is "the artifact WAS produced, and something in it
-            # is known-defective". Verifying only `ok` would let the one status
-            # that continues the pipeline skip the verify-by-artifact contract —
-            # i.e. the new non-fatal path would be the only unverified one.
-            if verify_artifact_exists and artifact_key and result.get("status") in ("ok", "degraded"):
-                if bucket is None:
-                    raise _CollectorError(
-                        name, "verify_artifact_exists=True but bucket was not supplied to _phase_collect"
-                    )
-                if not _s3_object_exists(bucket, artifact_key):
-                    raise _CollectorError(
-                        name,
-                        f"collector reported status={result.get('status')} but its contracted artifact "
-                        f"s3://{bucket}/{artifact_key} does not exist (verify-by-artifact, "
-                        f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
-                        f"never just 'the process did not crash')",
-                    )
-            # `degraded` is deliberately NOT recorded as a completed artifact.
-            # record_artifact is what arms same-date auto-skip, and a rerun that
-            # skips a degraded phase returns `{"status": "ok", "auto_skipped":
-            # True}` — the degradation would vanish on the second run, which is a
-            # false green on exactly the day someone is rerunning to look at it.
-            # The cost is that a same-date rerun recomputes the snapshot; that is
-            # the right trade against losing the verdict.
-            if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
-                ctx.record_artifact(artifact_key)
-            return result
+        run_result = run_manifest.run_unit(
+            unit.unit_id, _body, **_run_manifest_context(reg, unit)
+        )
+        return run_result.value
     except _CollectorError as ce:
         return {"status": "error", "error": ce.detail}
     except Exception as e:
         logger.error("%s phase failed: %s", name, e)
         return {"status": "error", "error": str(e)}
+
+
+def _record_phase_lineage(
+    run_ctx,
+    unit: run_units.PhaseUnit,
+    name: str,
+    result: dict,
+    artifact_key: str | None,
+    bucket: str | None,
+    reg: "PhaseRegistry",
+) -> None:
+    """Fold one phase's outcome onto its run manifest, and grade its publish.
+
+    Called on the SUCCESS path only: a phase that raised never reaches here, and
+    its manifest is written by the wrapper with `status: failed` and no output
+    — which is the completion claim the failure path must not make
+    (`observability-policy` §3.1).
+    """
+    rows = _rows_out(result, unit.rows_key)
+    auto_skipped = bool(result.get("auto_skipped"))
+    dry = result.get("status") == "ok_dry_run"
+
+    if artifact_key and not auto_skipped and not dry:
+        run_ctx.record_output(artifact_key, rows_out=rows if rows is not None else 0)
+
+    if auto_skipped or dry:
+        reading = expectations.GuardReading(
+            "not_applicable",
+            f"{unit.unit_id} published nothing on this run "
+            f"({'same-date auto-skip' if auto_skipped else 'dry run'}); there is no new "
+            "write for the guard to grade",
+            key=artifact_key,
+        )
+    else:
+        reading = expectations.check_empty_fresh(
+            unit_id=unit.unit_id,
+            artifact_key=artifact_key,
+            bucket=bucket,
+            s3_client=reg.s3_client,
+            rows_out=rows,
+        )
+    expectations.report(reading, unit_id=unit.unit_id)
+    run_ctx.record_guard(
+        expectations.EMPTY_FRESH_GUARD.name,
+        mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+        verdict=reading.verdict,
+        detail=reading.detail,
+        key=reading.key,
+        value=reading.value,
+        baseline=reading.baseline,
+    )
+    run_ctx.record_metric(
+        expectations.verdict_metric(
+            unit.unit_id, reading, source_path=f"weekly_collector.py::_phase_collect[{name}]"
+        )
+    )
+    # OBSERVE mode (`sf-pipeline-policy` §7a): the verdict is logged at ERROR and
+    # rides on the manifest and the board, and the exit code does not move. The
+    # promotion criterion lives in `validators/expectations.py`.
+    if expectations.EMPTY_FRESH_GUARD.enforcing and not reading.clean:
+        raise _CollectorError(name, f"empty_fresh guard: {reading.detail}")
+
+
+def _phase_body(
+    reg: "PhaseRegistry",
+    name: str,
+    run_fn,
+    *,
+    artifact_key: str | None,
+    supports_auto_skip: bool,
+    verify_artifact_exists: bool,
+    bucket: str | None,
+) -> dict:
+    """The phase-registry half of :func:`_phase_collect`.
+
+    Split out so it RAISES rather than returning an error dict: the run-manifest
+    wrapper needs the exception to write `status: failed`, and
+    :func:`_phase_collect` restores the module's best-effort-continue posture
+    outside it. Returning an error dict from inside the wrapper would file every
+    collector failure as a successful run.
+    """
+    with reg.phase(name, supports_auto_skip=supports_auto_skip) as ctx:
+        if ctx.skipped:
+            logger.info(
+                "%s: auto-skip (%s) — output already on S3 this date", name, ctx.skip_reason
+            )
+            return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
+        result = run_fn() or {}
+        if result.get("status") == "error":
+            raise _CollectorError(name, result.get("error"))
+        # `degraded` is verified exactly like `ok` (alpha-engine-config-I7572):
+        # its whole meaning is "the artifact WAS produced, and something in it
+        # is known-defective". Verifying only `ok` would let the one status
+        # that continues the pipeline skip the verify-by-artifact contract —
+        # i.e. the new non-fatal path would be the only unverified one.
+        if verify_artifact_exists and artifact_key and result.get("status") in ("ok", "degraded"):
+            if bucket is None:
+                raise _CollectorError(
+                    name, "verify_artifact_exists=True but bucket was not supplied to _phase_collect"
+                )
+            if not _s3_object_exists(bucket, artifact_key):
+                raise _CollectorError(
+                    name,
+                    f"collector reported status={result.get('status')} but its contracted artifact "
+                    f"s3://{bucket}/{artifact_key} does not exist (verify-by-artifact, "
+                    f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
+                    f"never just 'the process did not crash')",
+                )
+        # `degraded` is deliberately NOT recorded as a completed artifact.
+        # record_artifact is what arms same-date auto-skip, and a rerun that
+        # skips a degraded phase returns `{"status": "ok", "auto_skipped":
+        # True}` — the degradation would vanish on the second run, which is a
+        # false green on exactly the day someone is rerunning to look at it.
+        # The cost is that a same-date rerun recomputes the snapshot; that is
+        # the right trade against losing the verdict.
+        if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
+            ctx.record_artifact(artifact_key)
+        return result
 
 
 def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
@@ -347,22 +512,89 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
     return reg.phase(name, supports_auto_skip=False, **log_ctx)
 
 
+def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) -> dict:
+    """Run a whole-mode unit under the run-manifest wrapper.
+
+    Five of this module's run modes ARE one audit unit end to end — morning
+    enrich (D17), morning and post-market ArcticDB append (D18/D32), daily heal
+    (D33), chronic-gap heal (D34). They do not go through ``_phase_collect``,
+    so they are wrapped here, at the single dispatch, rather than inside each
+    body: one place, and a mode added without a manifest fails loudly on the
+    ``MODE_UNITS`` lookup instead of running unobserved.
+
+    The manifest's ``rows_out`` is 0 for these today because their bodies
+    publish through ArcticDB and per-symbol keys and report no row count; the
+    guard therefore records ``unmeasurable`` rather than a pass, which is a red
+    work item with an address (plan §4.5, phase 2).
+    """
+    unit_id = run_units.MODE_UNITS[mode]
+    run_date = getattr(args, "date", None) or default_run_date()
+    if getattr(args, "dry_run", False):
+        return fn(config, args)
+
+    captured: dict = {}
+
+    def _body(run_ctx) -> dict:
+        result = fn(config, args)
+        captured["result"] = result
+        # A mode function returning a non-ok status has FAILED — the manifest
+        # says so rather than recording a successful run whose body reported a
+        # failure it swallowed (`observability-policy` §3.1). The raise is
+        # caught below and the caller's own return value is unchanged: the
+        # manifest's honesty must not become a new exit-code path on a
+        # scheduled pipeline.
+        status = (result or {}).get("status")
+        if status not in (None, "ok", "skipped", "ok_dry_run"):
+            raise _CollectorError(mode, f"{mode} returned status={status!r}: {result}")
+        run_ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="unmeasurable",
+            detail=(
+                f"{unit_id} publishes through ArcticDB/per-symbol keys and reports no row "
+                "count, so the empty-but-fresh guard cannot read it from this call site. "
+                "UNMEASURABLE, not a pass — phase-2 work is the body recording its own "
+                "outputs (data_collection_plan_260914.md §4.5)."
+            ),
+        )
+        return result
+
+    try:
+        return run_manifest.run_unit(
+            unit_id,
+            _body,
+            sink=run_units.manifest_sink(config["bucket"]),
+            trigger=run_units.resolve_trigger("scheduled"),
+            trading_day=run_date,
+            log_location=run_units.resolve_log_location(),
+        ).value
+    except _CollectorError:
+        # The manifest is already written with `status: failed`; the caller
+        # keeps the result dict it would have received before this wrapper
+        # existed, and main()'s exit-code contract is untouched.
+        return captured["result"]
+
+
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
     """Run collectors based on mode selection."""
     if getattr(args, "morning_enrich", False):
-        return _run_morning_enrich(config, args)
+        return _run_whole_mode_unit("morning_enrich", _run_morning_enrich, config, args)
 
     if getattr(args, "morning_arctic_append", False):
-        return _run_morning_arctic_append(config, args)
+        return _run_whole_mode_unit(
+            "morning_arctic_append", _run_morning_arctic_append, config, args
+        )
 
     if getattr(args, "daily_arctic_append", False):
-        return _run_daily_arctic_append(config, args)
+        return _run_whole_mode_unit(
+            "daily_arctic_append", _run_daily_arctic_append, config, args
+        )
 
     if getattr(args, "chronic_gap_heal", False):
-        return _run_chronic_gap_heal(config, args)
+        return _run_whole_mode_unit("chronic_gap_heal", _run_chronic_gap_heal, config, args)
 
     if getattr(args, "daily_heal", False):
-        return _run_daily_heal(config, args)
+        return _run_whole_mode_unit("daily_heal", _run_daily_heal, config, args)
 
     if args.daily:
         return _run_daily(config, args)
@@ -1741,6 +1973,39 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                 skip_if_canonical=skip_if_canonical,
             )
         results["collectors"]["daily_closes"] = dc_result
+        # ── Vendor cross-check: no silent non-measurement ────────────────────
+        # alpha-engine-config-I10783 / nousergon-data-PR1712. The divergence
+        # MetricRecord is written INSIDE `daily_closes.collect` on the
+        # `polygon_only` path — the one moment this run's fresh polygon closes
+        # and the prior parquet's yfinance closes for the SAME settled date are
+        # both in hand. That call is gated on a non-empty prior-rows set, and a
+        # morning with no comparison set would otherwise write nothing at all,
+        # which makes "we did not measure" and "we measured and it was fine"
+        # the same silence (`champion-challenger-policy` §7.2: measurement is
+        # unconditional). So when the collector wrote no record, D17 writes the
+        # UNMEASURABLE one — `compute_vendor_divergence` reports exactly that
+        # for an empty comparison set, and never raises.
+        if not dry_run and not (dc_result or {}).get("vendor_divergence"):
+            try:
+                from collectors.cross_source_observer import write_vendor_divergence_metric
+
+                write_vendor_divergence_metric(bucket, {}, {}, target_date)
+            except Exception as exc:  # noqa: BLE001
+                # Swallow rationale (repo fail-loud rule): (a) the failure mode
+                # swallowed is a failed PUT of the divergence METRIC, never a
+                # data write; (b) the primary deliverable — polygon's
+                # authoritative OHLCV+VWAP overwriting the yfinance row the
+                # predictor reads minutes later — is already complete and
+                # unaffected; (c) the recording surface is this ERROR line, which
+                # reaches flow-doctor and the morning run's log capture, and the
+                # metric's own key stays absent, which its freshness clause reads
+                # as a miss. Raising here would trade a missing metric for a
+                # failed morning enrich.
+                logger.error(
+                    "vendor_divergence UNMEASURABLE record failed to write for %s: %s — "
+                    "divergence is unrecorded for this run",
+                    target_date, exc,
+                )
     except Exception as e:
         logger.exception("Morning polygon enrichment failed for %s", target_date)
         results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
@@ -2754,7 +3019,15 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
 # daily_closes.collect. Shared by the EOD --daily collector and the split-out
 # --daily-arctic-append state so both pass daily_append the SAME expected_tickers.
 _MACRO_DAILY_TICKERS = [
-    "SPY", "GLD", "USO",
+    # alpha-engine-config-I10704 follow-up: every member of
+    # ``features.compute.UNIVERSE_BENCHMARK_PROXIES`` must be requested here,
+    # or the day's close never reaches staging/daily_closes and daily_append
+    # has no bar to write. IWM was declared (nousergon-data-PR1694) and loaded
+    # once in-region, but was absent from this list, so 2026-09-14's
+    # staging/daily_closes held no IWM row and crucible `data.daily` refused
+    # the session. Enforced by
+    # tests/test_benchmark_proxies_i10704.py::test_declared_proxies_are_requested_daily.
+    "SPY", "IWM", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
     # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),

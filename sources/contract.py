@@ -31,9 +31,17 @@ from typing import Optional, Protocol, runtime_checkable
 # THIS dict precisely, so an adapter-driven ``collect()`` (Phase 1b) is
 # byte-identical to today. ``currency`` is intentionally NOT a persisted key yet
 # (see SCHEMA.md §4).
+#
+# ``revision`` (alpha-engine-config-I10783, minor additive schema bump): a
+# monotonic per-cell write counter. A freshly-fetched bar always starts at 1;
+# ``collectors.daily_closes._coalesce_by_source_priority`` is the only place
+# that increments it, when a cell is actually overwritten by an equal-or-
+# higher-priority source — so the persisted parquet carries an explicit,
+# queryable trail of how many times each (ticker, date) cell has been written,
+# instead of a silent overwrite between vendors. See SCHEMA.md §2.
 RECORD_KEYS: tuple[str, ...] = (
     "ticker", "date", "Open", "High", "Low", "Close",
-    "Adj_Close", "Volume", "VWAP", "source",
+    "Adj_Close", "Volume", "VWAP", "source", "revision",
 )
 
 
@@ -59,6 +67,7 @@ class PriceBar:
     source: str                    # provenance — the producing adapter's name
     currency: str = "USD"          # ISO-4217 native currency of the listing
     vwap: Optional[float] = None   # true volume-weighted price; None when the source can't provide it
+    revision: int = 1              # per-cell write counter; see RECORD_KEYS note (I10783)
 
     def to_record(self) -> dict:
         """Reproduce the EXACT legacy pipeline record dict.
@@ -77,6 +86,7 @@ class PriceBar:
             "Volume": self.volume,
             "VWAP": self.vwap,
             "source": self.source,
+            "revision": self.revision,
         }
 
     @classmethod
@@ -94,6 +104,7 @@ class PriceBar:
             vwap=r["VWAP"],
             source=r["source"],
             currency=currency,
+            revision=r.get("revision", 1),
         )
 
 

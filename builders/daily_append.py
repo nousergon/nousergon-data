@@ -793,6 +793,14 @@ def _scan_universe_and_emit_freshness_receipt(
     else:
         syms = all_syms
 
+    # Every declared proxy the library holds is SCANNED, whatever the caller's
+    # expected_tickers says. Scoping proxies by the request list is how IWM
+    # went unscanned while stale: 2026-09-14's receipt read
+    # declared_proxies_present=6, declared_proxies_scanned=5, all_fresh=True,
+    # and crucible `data.daily` refused the session an hour later for IWM's
+    # missing close (alpha-engine-config-I10704 follow-up).
+    syms = list(dict.fromkeys([*syms, *sorted(UNIVERSE_BENCHMARK_PROXIES & set(all_syms))]))
+
     from nousergon_lib.dates import trading_days_stale
     today = datetime.now(timezone.utc).date()
     today_iso = today.isoformat()
@@ -868,6 +876,33 @@ def _scan_universe_and_emit_freshness_receipt(
         )
     proxy_ages = {sym: (d, a) for sym, d, a in ages if sym in UNIVERSE_BENCHMARK_PROXIES}
 
+    # A declared proxy LAGGING the universe head is graded like an absent one.
+    # The staleness threshold below tolerates a few trading days for ordinary
+    # symbols, but every crucible panel compile reads each declared proxy's
+    # close for the SAME settle session as the stocks and refuses on a missing
+    # one, so a proxy one session behind the universe is already a refusal.
+    universe_head = max(
+        (d for s_, d, _ in ages if s_ not in UNIVERSE_BENCHMARK_PROXIES), default=None,
+    )
+    proxies_lagging = sorted(
+        (sym, d) for sym, (d, _) in proxy_ages.items()
+        if universe_head is not None and d < universe_head
+    )
+    if proxies_lagging:
+        raise UniverseFreshnessViolation(
+            f"Universe-freshness scan: {len(proxies_lagging)} DECLARED benchmark "
+            f"proxy(ies) lag the universe head {universe_head} on bucket {bucket!r}: "
+            + ", ".join(f"{sym}(last={d})" for sym, d in proxies_lagging)
+            + ". Every crucible panel compile reads each declared proxy's close for "
+            "the settle session and refuses on a missing one. Check that the proxy "
+            "is requested in weekly_collector._MACRO_DAILY_TICKERS, then load it "
+            "in-region with `python -m scripts.backfill_benchmark_proxies`.",
+            stale_symbols=[
+                {"symbol": sym, "last_date": d, "age_trading_days": proxy_ages[sym][1]}
+                for sym, d in proxies_lagging
+            ],
+        )
+
     stale = [(s, d, a) for s, d, a in ages if a > max_stale_trading_days]
     stalest = max(ages, key=lambda r: r[2])
 
@@ -897,6 +932,7 @@ def _scan_universe_and_emit_freshness_receipt(
         "declared_proxies_present": len(UNIVERSE_BENCHMARK_PROXIES) - len(proxies_absent),
         "declared_proxies_scanned": len(proxy_ages),
         "declared_proxies_missing": proxies_absent,
+        "declared_proxies_lagging": [],
         "stalest_symbol": stalest[0],
         "stalest_last_date": stalest[1],
         "stalest_age_trading_days": stalest[2],

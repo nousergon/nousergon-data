@@ -217,6 +217,45 @@ _WORKLOADS: dict[str, str] = {
     # ArcticDB evidence without ever opening ArcticDB itself, which is
     # unreachable from the laptop (alpha-engine-config-I9771).
     "arctic-probe": "python -m collectors.arctic_probe",
+    # alpha-engine-config-I10753: the five weekly units with no standalone
+    # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
+    # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no
+    # workload; see their descriptors' `retirement:` block. D15, D16 and D46
+    # get real successors here.
+    #
+    # SAME command the v1 SF's DataPhase2 state ran
+    # (`infrastructure/spot_data_weekly.sh --phase2-only` ->
+    # `weekly_collector.py --phase 2`, alpha-engine-config-I5759's move off
+    # lambda:invoke): unchanged args = unchanged M0 data contract.
+    "alternative-phase-two": "python weekly_collector.py --phase 2",
+    # SAME script the v1 SF's RAGIngestion state ran
+    # (`infrastructure/spot_rag_ingestion.sh` -> `bash
+    # rag/pipelines/run_weekly_ingestion.sh`, unchanged). Covers D16 (its own
+    # writes) AND D46 (Form 4 insider transactions, step 6 of the script) —
+    # D46 does NOT get its own dispatcher key: it is a substep of this same
+    # script, not a standalone entry point, so a second key would re-run the
+    # identical EDGAR fetch a second time per week. D40/D41 (steps 7/8) still
+    # execute as part of this unchanged script (this dispatcher does not own
+    # rag/pipelines/run_weekly_ingestion.sh — that is `nousergon-data`'s RAG
+    # pipeline code, a sibling surface); their retirement is at the
+    # descriptor/registry layer (not tracked, not asserted), matching the
+    # standing "retiring a producer never deletes its archive" preference.
+    #
+    # The RAG-specific secrets (VOYAGE_API_KEY, FINNHUB_API_KEY,
+    # EDGAR_IDENTITY, RAG_DATABASE_URL) are NOT part of this dispatcher's
+    # generic bootstrap — the phase-1/phase-2 boxes never needed them
+    # (I10753 gotcha). Fetched here with the EXACT SSM read-loop
+    # `infrastructure/spot_rag_ingestion.sh` already uses, verbatim, so this
+    # workload's on-box environment mirrors what run_weekly_ingestion.sh has
+    # always run under rather than a parallel invention.
+    "rag-weekly-ingestion": (
+        "( for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do "
+        "val=$(aws ssm get-parameter --name /alpha-engine/$name --with-decryption "
+        "--query Parameter.Value --output text --region us-east-1 2>/dev/null || echo ''); "
+        "if [ -z \"$val\" ]; then echo \"ERROR: could not fetch /alpha-engine/$name from SSM\" >&2; exit 1; fi; "
+        "export $name=\"$val\"; unset val; done; "
+        "bash rag/pipelines/run_weekly_ingestion.sh )"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a

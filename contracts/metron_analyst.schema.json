@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_analyst.schema.json",
+  "title": "Metron analyst consensus (market_data/analyst/latest.json, schema_version 1)",
+  "description": "Producer: collectors/metron_market_data.py::collect_analyst (ANALYST_SCHEMA_VERSION). Consumer: Metron api/services/*.py (Holdings Sentiment/Consensus band, attractiveness score, metron-ops#105). Plan §3 boundary table row 1.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of", "source", "analyst"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "as_of": {"type": "string", "format": "date"},
+    "source": {"type": "string", "const": "yfinance+finnhub"},
+    "analyst": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": true,
+        "properties": {
+          "consensus_rating": {"type": "string"},
+          "rating_score": {"type": "number"},
+          "mean_target": {"type": "number"},
+          "median_target": {"type": "number"},
+          "num_analysts": {"type": "integer", "minimum": 0}
+        }
+      }
+    }
+  }
+}

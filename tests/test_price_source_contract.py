@@ -70,6 +70,7 @@ def test_to_record_keys_are_the_legacy_contract():
     )
     assert tuple(bar.to_record().keys()) == RECORD_KEYS
     assert "currency" not in bar.to_record()
+    assert bar.to_record()["revision"] == 1
 
 
 def test_record_roundtrip_lossless():
@@ -77,16 +78,24 @@ def test_record_roundtrip_lossless():
     samples = [
         {"ticker": "AAPL", "date": "2026-06-12", "Open": 1.0, "High": 2.0,
          "Low": 0.5, "Close": 1.5, "Adj_Close": 1.5, "Volume": 1000,
-         "VWAP": 1.4, "source": "polygon"},
+         "VWAP": 1.4, "source": "polygon", "revision": 1},
         {"ticker": "VIX", "date": "2026-06-12", "Open": 17.0, "High": 17.0,
          "Low": 17.0, "Close": 17.0, "Adj_Close": 17.0, "Volume": 0,
-         "VWAP": None, "source": "fred"},
+         "VWAP": None, "source": "fred", "revision": 2},
         {"ticker": "MSFT", "date": "2026-06-12", "Open": 10.0, "High": 11.0,
          "Low": 9.0, "Close": 10.5, "Adj_Close": 10.4, "Volume": 50,
-         "VWAP": None, "source": "yfinance"},
+         "VWAP": None, "source": "yfinance", "revision": 1},
     ]
     for r in samples:
         assert PriceBar.from_record(r).to_record() == r
+
+
+def test_from_record_defaults_revision_for_legacy_rows():
+    """A pre-I10783 persisted row with no ``revision`` column reads as 1."""
+    legacy = {"ticker": "AAPL", "date": "2026-06-12", "Open": 1.0, "High": 2.0,
+              "Low": 0.5, "Close": 1.5, "Adj_Close": 1.5, "Volume": 1000,
+              "VWAP": 1.4, "source": "polygon"}
+    assert PriceBar.from_record(legacy).revision == 1
 
 
 # ── 2. Port conformance ──────────────────────────────────────────────────────
@@ -144,7 +153,7 @@ def test_polygon_adapter_golden(monkeypatch):
     assert by_ticker["AAPL"].to_record() == {
         "ticker": "AAPL", "date": "2026-06-12", "Open": 1.0, "High": 2.0,
         "Low": 0.5, "Close": 1.5, "Adj_Close": 1.5, "Volume": 1000,
-        "VWAP": 1.4, "source": "polygon",
+        "VWAP": 1.4, "source": "polygon", "revision": 1,
     }
 
 

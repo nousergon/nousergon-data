@@ -216,7 +216,7 @@ def _clause_inventory_writers_declared(store: ev.GateStore, units: list[Unit]) -
     puts it in the phase-0 EXIT rather than leaving it for later.
     """
     reading = scan(units)
-    evidence = ("registry.d/writer_inventory.yaml", "registry.d/units/")
+    evidence = ("data_gate/config/writer_inventory.yaml", "registry.d/units/")
     requirement = (
         "every S3 PUT and ArcticDB write call site in the declared producer roots resolves "
         "to a unit descriptor, and every descriptor resolves to a write site"
@@ -322,9 +322,9 @@ def _clause_board_phase_trackers_declared(store: ev.GateStore, phases) -> Clause
             if undeclared
             else "every rung names its own tracker"
         ),
-        ("registry.d/phases.yaml",),
+        ("data_gate/config/phases.yaml",),
         phase="data-phase0",
-        source="registry.d/phases.yaml",
+        source="data_gate/config/phases.yaml",
     )
 
 

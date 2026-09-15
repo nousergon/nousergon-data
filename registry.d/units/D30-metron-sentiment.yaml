@@ -37,9 +37,10 @@ writes:
 consumers:
   - "metron:api/services/sentiment.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/metron_sentiment.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "metron:tests/contracts/metron_sentiment.schema.json"
 registry_rows: []
 registry_rows_broken:
   - "metron_sentiment — PARKED while written daily. P-09 unparks it."

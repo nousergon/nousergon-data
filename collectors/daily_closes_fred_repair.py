@@ -363,16 +363,39 @@ def main():
     )
     args = parser.parse_args()
 
-    result = repair(
-        bucket=args.bucket,
-        start=args.start,
-        end=args.end,
-        s3_prefix=args.prefix,
-        tickers=args.tickers,
-        dry_run=args.dry_run,
-    )
-    print(json.dumps(result, indent=2, default=str))
-    sys.exit(0 if result.get("status") == "ok" else 2)
+    # alpha-engine-config-I10790 (P-24): audit unit D43 — a manual repair of
+    # D19's published parquets, under the same run-manifest wrapper a scheduled
+    # unit uses, so a hand-run repair leaves a record (plan §4.4). `--dry-run`
+    # writes nothing, including the manifest.
+    import run_units
+
+    holder: dict = {}
+
+    def _body(ctx):
+        result = repair(
+            bucket=args.bucket,
+            start=args.start,
+            end=args.end,
+            s3_prefix=args.prefix,
+            tickers=args.tickers,
+            dry_run=args.dry_run,
+        )
+        holder["result"] = result
+        print(json.dumps(result, indent=2, default=str))
+        ctx.record_output(
+            f"{args.prefix}[{args.start}..{args.end}]",
+            rows_out=int(result.get("rows_repaired") or result.get("dates_repaired") or 0),
+            schema_version="daily_closes/parquet",
+        )
+        if result.get("status") != "ok":
+            raise RuntimeError(f"fred repair returned status={result.get('status')!r}")
+        return result
+
+    try:
+        run_units.manual_run("D43", _body, write=not args.dry_run, bucket=args.bucket)
+    except RuntimeError:
+        sys.exit(2)
+    sys.exit(0)
 
 
 if __name__ == "__main__":
