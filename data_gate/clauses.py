@@ -550,8 +550,11 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
     name = "data.cutover_ready.parity"
     requirement = (
         "pre-cutover parity is published per key at "
-        "data_collection/parity/{trading_day}.json "
-        "(plan §6.2 step 4), produced by P-11 (alpha-engine-config-I10778)"
+        "data_collection/parity/{report_trading_day}.json (plan §6.2 step 4), produced by "
+        f"P-11 (alpha-engine-config-I10778), and the most recent report is within "
+        f"{ev.PARITY_FRESHNESS_TRADING_DAYS} trading days of this gate's own trading day "
+        "(alpha-engine-config-I10857) — a shadow run is a one-off for a completed day, "
+        "never keyed to the gate's own running day"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:

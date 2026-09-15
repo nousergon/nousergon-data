@@ -31,6 +31,10 @@ from dataclasses import dataclass, field
 
 from nousergon_lib.gates import LADDER_KEY, GateStore, read_store_document
 from nousergon_lib.run_manifest import SCHEMA_VERSION as _MANIFEST_SCHEMA
+from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeAccessIssue]
+    previous_trading_day,
+    subtract_trading_days,
+)
 
 from data_gate.descriptors import REPO_ROOT, Unit
 
@@ -38,6 +42,8 @@ __all__ = [
     "BASE_REQUIREMENTS",
     "EMPTY_FRESH_VERDICT",
     "MANIFEST_STATUSES",
+    "PARITY_FRESHNESS_TRADING_DAYS",
+    "PARITY_KEY_PREFIX",
     "PARITY_KEY_TEMPLATE",
     "GateStore",
     "Reading",
@@ -810,30 +816,135 @@ def read_roles_bootstrapped(store: GateStore, role_names: tuple[str, ...]) -> Re
 #: is a coincidence that survives exactly until one of them is edited.
 PARITY_KEY_TEMPLATE = "parity/{trading_day}.json"
 
+#: The prefix every parity report is listed under, so the reader can find the
+#: most recent one instead of only the gate's own trading day.
+PARITY_KEY_PREFIX = "parity/"
+
+#: How many TRADING days old (never calendar days — a Monday gate reading a
+#: Friday shadow run is 1 trading day stale, not 3) a parity report may be and
+#: still count as fresh. 5 trading days is one calendar week of slack for a
+#: shadow run that is a one-off pre-cutover operation (`alpha-engine-config-
+#: I10778`), not a daily producer — declared here, beside the reader that
+#: enforces it, per `alpha-engine-config-I10857` deliverable 1.
+PARITY_FRESHNESS_TRADING_DAYS = 5
+
 
 def parity_store_key(trading_day: dt.date) -> str:
     return PARITY_KEY_TEMPLATE.format(trading_day=trading_day.isoformat())
 
 
+def _parity_report_day(key: str) -> dt.date | None:
+    """The trading day a `parity/<day>.json` key names, or `None` if the key
+    under the prefix does not match that shape (never crash the listing over
+    an unrelated object someone left beside the reports)."""
+    if not key.startswith(PARITY_KEY_PREFIX) or not key.endswith(".json"):
+        return None
+    stem = key[len(PARITY_KEY_PREFIX) : -len(".json")]
+    try:
+        return dt.date.fromisoformat(stem)
+    except ValueError:
+        return None
+
+
+def _trading_days_between(earlier: dt.date, later: dt.date) -> int:
+    """How many trading-calendar steps separate two trading days, walking the
+    calendar rather than subtracting dates — a Friday-to-Monday gap is 1, not
+    3. Capped so a malformed report dated far in the past cannot spin this
+    into a long loop; a report that old is stale by any window and the exact
+    count stops mattering past the cap."""
+    age = 0
+    cursor = later
+    while cursor > earlier and age <= 10_000:
+        cursor = previous_trading_day(cursor)
+        age += 1
+    return age
+
+
 def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
-    """Pre-cutover parity per published key (plan §6.2 step 4).
+    """Pre-cutover parity: the most recent report within the freshness window.
 
     Produced by `python -m shadow parity` (`alpha-engine-config-I10778`): one
     standalone shadow run writes every key under
     `staging/shadow/{trading_day}/`, each key is diffed against the same
     trading day's v1 output on row count, symbol set, schema and value
-    tolerance, and the verdicts are published here.
+    tolerance, and the verdicts are published to `parity/{trading_day}.json`.
+
+    **The clause's OWN trading day is not the report's.** A shadow run is a
+    one-off pre-cutover operation for a completed day, so it is filed under
+    that day's key — never the gate's own, running day. Reading only
+    `parity/{gate trading_day}.json` (the pre-`I10857` shape) makes the clause
+    structurally unmeetable: on any given day the gate looks for a report that
+    cannot exist until the day is over. This reader instead lists every
+    published report, keeps the ones dated on or before the gate's trading
+    day (a report from the future is never selected, however it got there),
+    and grades the most recent of those.
+
+    **Freshness is trading days, via the calendar, never calendar days.**
+    `PARITY_FRESHNESS_TRADING_DAYS` bounds how far back the selected report
+    may be; older reads UNMET naming its age, so a stale shadow run cannot
+    quietly stand in for cutover readiness forever.
 
     **Absence is UNMET, not UNMEASURABLE.** `read_objective`'s rule applies:
-    we CAN look, the store answers, and "no shadow run has been compared for
-    this day" is a finding about cutover readiness — which is the whole
-    question this clause exists to answer — rather than a failure of the read.
+    we CAN look, the store answers, and "no shadow run has been compared
+    within the window" is a finding about cutover readiness — which is the
+    whole question this clause exists to answer — rather than a failure of
+    the read. A failed *listing* (denied, throttled) is UNMEASURABLE, kept
+    distinct the same way `read_run_record` keeps it distinct.
 
     The report's own `met` is not taken on trust: this reader re-derives the
     exception counts from `summary`, so a report claiming `met: true` while
     carrying unmeasurable rows reads UNMET and says which counts contradict it.
     """
-    key = parity_store_key(trading_day)
+    try:
+        keys = list(store.list_keys(PARITY_KEY_PREFIX))
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        # A deliberate catch (fail-loud rule, `AGENTS.md`): the failure mode is
+        # "the parity prefix could not be listed"; the reading carrying every
+        # other clause survives; the recording surface is this UNMEASURABLE row.
+        return Reading(
+            met=False,
+            detail=f"could not list {PARITY_KEY_PREFIX}: {type(exc).__name__}: {exc}",
+            evidence=(f"{PARITY_KEY_PREFIX}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+
+    candidates = sorted(
+        (day, key)
+        for key in keys
+        if (day := _parity_report_day(key)) is not None and day <= trading_day
+    )
+    if not candidates:
+        return Reading(
+            met=False,
+            detail=(
+                f"no parity report at or before {trading_day.isoformat()} under "
+                f"{PARITY_KEY_PREFIX}. Produce one with `python -m shadow run "
+                "--trading-day <day> --module <entrypoint>` followed by `python -m shadow "
+                "parity --trading-day <day> --store <uri>` (alpha-engine-config-I10778). "
+                "Until then the cutover has no parity evidence, which is the answer, not a "
+                "gap in the read."
+            ),
+            evidence=(f"{PARITY_KEY_PREFIX}*.json",),
+            source="data_collection store",
+        )
+
+    report_day, key = candidates[-1]
+    floor = subtract_trading_days(trading_day, PARITY_FRESHNESS_TRADING_DAYS)
+    if report_day < floor:
+        age_trading_days = _trading_days_between(report_day, trading_day)
+        return Reading(
+            met=False,
+            detail=(
+                f"most recent parity report is {key} (trading_day {report_day.isoformat()}), "
+                f"{age_trading_days} trading day(s) before the gate's {trading_day.isoformat()} "
+                f"— older than the {PARITY_FRESHNESS_TRADING_DAYS}-trading-day freshness window "
+                "(evidence.PARITY_FRESHNESS_TRADING_DAYS). Stale."
+            ),
+            evidence=(key,),
+            source="data_collection store",
+        )
+
     read = read_store_document(store, key)
     if read.problem is not None:
         return Reading(
@@ -844,16 +955,14 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             source="data_collection store",
         )
     if read.absent:
+        # Vanished between listing and read — an access-timing gap, not an
+        # answer about cutover readiness (same distinction `read_run_record`
+        # draws for a manifest that disappears mid-read).
         return Reading(
             met=False,
-            detail=(
-                f"no parity report at {key}. Produce one with `python -m shadow run "
-                "--trading-day <day> --module <entrypoint>` followed by `python -m shadow "
-                "parity --trading-day <day> --store <uri>` (alpha-engine-config-I10778). "
-                "Until then the cutover has no parity evidence, which is the answer, not a "
-                "gap in the read."
-            ),
+            detail=f"{key} was listed but could not be read back (vanished between listing and read).",
             evidence=(key,),
+            unmeasurable=True,
             source="data_collection store",
         )
     document = read.document or {}
@@ -871,12 +980,12 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             as_of=as_of,
         )
     reported_day = str(document.get("trading_day") or "")
-    if reported_day != trading_day.isoformat():
+    if reported_day != report_day.isoformat():
         return Reading(
             met=False,
             detail=(
-                f"{key} reports trading_day {reported_day!r} while this reading is for "
-                f"{trading_day.isoformat()}. A report filed under the wrong day is not "
+                f"{key} reports trading_day {reported_day!r} while its own key names "
+                f"{report_day.isoformat()}. A report filed under the wrong day is not "
                 "evidence for either."
             ),
             evidence=(key,),
@@ -892,7 +1001,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
         if name not in {"total", "match"} and int(count or 0)
     }
     met = bool(document.get("met")) and total > 0 and matched == total and not exceptions
-    detail = f"{matched}/{total} published keys match"
+    detail = f"{matched}/{total} published keys match (report {key}, trading_day {report_day.isoformat()})"
     if exceptions:
         detail += "; " + ", ".join(f"{name}={count}" for name, count in sorted(exceptions.items()))
     if document.get("met") and not met:
