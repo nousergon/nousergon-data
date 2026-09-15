@@ -112,6 +112,41 @@ def price_cache_read_prefixes(primary: str = PRICE_CACHE_LEGACY_PREFIX) -> list[
     return [primary]
 
 
+def assert_valid_price_cache_ticker(ticker: str) -> None:
+    """Chokepoint guard: raise if ``ticker`` would write a corrupt price-cache
+    key (alpha-engine-config-I9288).
+
+    Every WRITE path that puts a per-ticker parquet under this prefix
+    (``collectors/prices.py`` yfinance refresh, ``collectors/fred_history.py``
+    FRED backfill, ``weekly_collector.py`` chronic-gap self-heal) MUST call
+    this immediately before formatting ``f"{prefix}{ticker}.parquet"`` /
+    uploading. Price-cache tickers are bare names — caret-prefixing
+    (``^VIX``, ``^VIX3M``, ``^TNX``, ``^IRX``) is an internal yfinance-request
+    detail owned by ``collectors/prices.py::_CARET_SYMBOLS`` at the fetch
+    boundary only, never the on-disk/S3 key. A ``^`` reaching a writer means
+    the bare-name contract was already violated upstream (measured root
+    cause: a caret-embedded literal in ``weekly_collector.py``'s
+    ``_MACRO_DAILY_TICKERS`` reaching ``prices.collect``'s ticker population)
+    and writing it produces a stray key (``^VIX3M.parquet``) that
+    ``_find_stale_fast`` re-discovers every subsequent run.
+
+    Deliberately RAISES rather than skip-and-warn: this is the write-time
+    invariant of last resort, not the population-level defense (that one —
+    ``collectors/prices.py::_find_stale_fast`` — skips a stray with a
+    WARNING so a legacy key already in S3 can't halt a producer run). A
+    writer that still reaches this guard with a caret ticker has a bug
+    upstream of the population filter, and a producer repo fails loud on
+    its own writers rather than silently emitting a corrupt key.
+    """
+    if "^" in ticker:
+        raise ValueError(
+            f"price-cache write refused: ticker {ticker!r} contains '^' — "
+            "price-cache keys are bare ticker names; caret-prefixing is "
+            "internal to the yfinance-request boundary only "
+            "(collectors/prices.py::_CARET_SYMBOLS). See alpha-engine-config-I9288."
+        )
+
+
 def list_price_cache_keys(
     s3: Any, bucket: str, primary: str = PRICE_CACHE_LEGACY_PREFIX,
 ) -> list[str]:
@@ -202,4 +237,5 @@ __all__ = [
     "price_cache_read_prefixes",
     "list_price_cache_keys",
     "write_price_cache_freshness_sentinel",
+    "assert_valid_price_cache_ticker",
 ]

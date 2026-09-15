@@ -39,6 +39,7 @@ import pandas as pd
 import yfinance as yf
 
 from builders._price_cache_writeboth import (
+    assert_valid_price_cache_ticker,
     price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
@@ -156,6 +157,44 @@ def collect(
     return result
 
 
+def _reject_caret_tickers(tickers: list[str], context: str) -> list[str]:
+    """Drop any ``^``-prefixed entry from ``tickers``, one WARNING per stray
+    (alpha-engine-config-I9288).
+
+    Price-cache tickers are bare names everywhere in this module except the
+    yfinance-request boundary inside ``_refresh_stale``, which prepends
+    ``^`` itself for members of ``_CARET_SYMBOLS``. A caret-prefixed literal
+    reaching a population built here is always a stray — either a caller
+    upstream already embedded the caret (measured root cause:
+    ``weekly_collector.py``'s ``_MACRO_DAILY_TICKERS``, which
+    ``daily_closes.collect`` wants caret-prefixed but which is not this
+    collector's contract), or a residual key from a prior run of the bug
+    this closes (``^VIX``, ``^TNX``, ``^VIX3M`` observed live in
+    ``reference/price_cache/``).
+
+    Dropping (not raising) here is deliberate: a stray key already sitting
+    in S3, or a caller passing one, must not halt a producer run — but it
+    must not be silent either, so every drop is a named WARNING a human or
+    Flow Doctor can act on. Contrast with
+    ``builders._price_cache_writeboth.assert_valid_price_cache_ticker``,
+    which RAISES — that is the write-time chokepoint of last resort, this
+    is the population-level filter that keeps the collector running.
+    """
+    clean: list[str] = []
+    for t in tickers:
+        if t.startswith("^"):
+            logger.warning(
+                "%s: dropping stray caret-prefixed ticker %r from the price-cache "
+                "population — price-cache tickers are bare names; caret-prefixing "
+                "is internal to the yfinance-request boundary only "
+                "(_CARET_SYMBOLS). See alpha-engine-config-I9288.",
+                context, t,
+            )
+            continue
+        clean.append(t)
+    return clean
+
+
 def _find_stale_fast(
     s3,
     bucket: str,
@@ -173,10 +212,18 @@ def _find_stale_fast(
     ``staleness_threshold_days`` value means "N trading sessions behind"
     whether this runs weekly or daily. Any ticker with no parquet, or a
     parquet more than ``staleness_threshold_days`` sessions stale, is stale.
+
+    A ``^``-prefixed basename must never become a ticker here (alpha-engine-
+    config-I9288): neither a stray S3 key discovered by listing nor a
+    caret-embedded literal in ``all_tickers`` enters the staleness map or
+    the refresh population — both are dropped with a WARNING via
+    :func:`_reject_caret_tickers`.
     """
     from nousergon_lib.dates import is_fresh_in_trading_days
 
     reference = reference_date if reference_date is not None else datetime.now(timezone.utc).date()
+
+    all_tickers = _reject_caret_tickers(all_tickers, "_find_stale_fast: requested tickers")
 
     # Build map of ticker -> last modified from S3 listing
     existing: dict[str, datetime] = {}
@@ -187,6 +234,14 @@ def _find_stale_fast(
             if not key.endswith(".parquet"):
                 continue
             ticker = key.split("/")[-1].replace(".parquet", "")
+            if ticker.startswith("^"):
+                logger.warning(
+                    "_find_stale_fast: stray caret-prefixed price-cache key %s "
+                    "excluded from the staleness map — bare names are the "
+                    "contract for this listing. See alpha-engine-config-I9288.",
+                    key,
+                )
+                continue
             existing[ticker] = obj["LastModified"]
 
     logger.info("S3 cache: %d parquets found", len(existing))
@@ -435,6 +490,7 @@ def _refresh_stale(
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
                     # see builders/_price_cache_writeboth.py for soak contract)
+                    assert_valid_price_cache_ticker(ticker)
                     parquet_path = local_dir / f"{ticker}.parquet"
                     new_df.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
                     for prefix in price_cache_write_prefixes(s3_prefix):

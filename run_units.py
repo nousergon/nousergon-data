@@ -56,9 +56,11 @@ __all__ = [
     "TRIGGER_ENV",
     "EntryRunFailed",
     "ModeRows",
+    "NotInRegionError",
     "PhaseUnit",
     "manifest_sink",
     "manual_run",
+    "require_in_region",
     "resolve_log_location",
     "recorded_entry",
     "resolve_trigger",
@@ -341,10 +343,11 @@ def manual_run(
 
     These tools run **in-region only** (fleet `CLAUDE.md`; the ArcticDB bucket
     carries an explicit Deny that blocks even `ne-admin` from the laptop,
-    `alpha-engine-config-I9771`). This wrapper does not enforce that — the
-    component role under `alpha-engine-config-I10756` does — but the manifest's
-    `compute` row records where the run actually happened, so a laptop
-    invocation is visible after the fact rather than merely forbidden.
+    `alpha-engine-config-I9771`). This wrapper does not itself enforce that —
+    D43's own entry points call :func:`require_in_region` before reaching here
+    (`alpha-engine-config-I10790`) — but the manifest's `compute` row still
+    records where the run actually happened, so a run that somehow reaches
+    this wrapper off-box is visible after the fact too, not merely forbidden.
     """
     from dates import default_run_date  # local: keeps `dates` off the import path of CLIs that do not need it
 
@@ -356,6 +359,43 @@ def manual_run(
         trading_day=trading_day or default_run_date(),
         log_location=resolve_log_location(),
     )
+
+
+class NotInRegionError(RuntimeError):
+    """A D43 manual-repair tool was invoked off the in-region box.
+
+    D43 (`registry.d/units/D43-manual-repair-builders.yaml`) writes ArcticDB's
+    ``universe`` / ``macro`` libraries directly, and ArcticDB is unreadable
+    from the laptop: the ``alpha-engine-data`` bucket carries an explicit Deny
+    that blocks even ``ne-admin`` on ``ListObjectsV2`` / ``GetBucketPolicy``
+    (measured 2026-09-01, `alpha-engine-config-I9771`). A laptop invocation
+    would otherwise fail deep inside the repair with an opaque boto3
+    AccessDenied, after having already done some of its work — this refuses
+    up front instead.
+    """
+
+
+def require_in_region(tool: str) -> None:
+    """Refuse to run ``tool`` unless the box declared ``NE_DATA_INSTANCE_TYPE``.
+
+    `alpha-engine-config-I9771` / `-I10790`: D43's four manual repair CLIs run
+    in-region only. ``NE_DATA_INSTANCE_TYPE`` is the same box-declared signal
+    :func:`nousergon_lib.run_manifest._resolve_compute` already reads for the
+    manifest's ``compute`` row (also read by :func:`resolve_log_location`
+    above) — its absence means "not on a declared in-region box," which is
+    reused here rather than adding a second identity check.
+
+    Call this BEFORE any ArcticDB read/write or :func:`manual_run` dispatch,
+    so an off-box invocation refuses before touching production data — not
+    merely after it, via the manifest's ``compute`` row.
+    """
+    if not os.environ.get("NE_DATA_INSTANCE_TYPE"):
+        raise NotInRegionError(
+            f"{tool}: refusing to run off the in-region box — "
+            "NE_DATA_INSTANCE_TYPE is not set. ArcticDB is unreadable from the "
+            "laptop or CI (alpha-engine-config-I9771); run this on the "
+            "data-spot/EOD box, in-region."
+        )
 
 
 def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
