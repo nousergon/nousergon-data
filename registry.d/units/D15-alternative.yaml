@@ -48,7 +48,16 @@ contract:
   consumer_pins: []
 registry_rows:
   - weekly_alternative_manifest
-  - weekly_alternative_scope
+  # alpha-engine-config-I10870: the real artifact_id is
+  # weekly_alternative_scope_marker (config-I5951/nousergon-data#1199), not
+  # weekly_alternative_scope — corrected; the key itself was already covered
+  # via the by_template match, only this id reference was stale. The
+  # per-ticker payload (market_data/weekly/{date}/alternative/{ticker}.json)
+  # has no artifact_id of its own — it is covered by the
+  # market_data/weekly/{date}/alternative/ grandfathered prefix (variable
+  # per-ticker cardinality, no {ticker}-shaped placeholder the freshness
+  # monitor can resolve).
+  - weekly_alternative_scope_marker
 run_manifest_prefix: data_collection/runs/D15
 detectors:
   - kind: "freshness-monitor"

@@ -23,19 +23,32 @@ component_id: "data-collector-d09-signal-returns"
 owning_repo: "nousergon-data"
 title: signal_returns
 component: 1
-lifecycle: "proposed-retirement"
+lifecycle: "retired"
 owner: brian
 code_path: "collectors/signal_returns.py:79"
+retirement:
+  ruling: "Brian 2026-09-14 R7 (alpha-engine-config-I10748, plan §7 (b))"
+  reason: >-
+    zero-surviving-consumer artifact — its declared reader
+    (crucible-research:evals) resolves to a v1 research.db table reader with
+    no v2 or Metron consumer, and its own INPUTS (predictor/predictions,
+    signals/) are v1 artifacts retired in v2 phase 4; v2 attribution
+    supersedes it (plan §8.1 exclusion, R7(b)).
+  archive_prefix: "research.db::score_performance"
+  archive_note: >-
+    Retiring a producer never deletes its archive (standing preference: retain
+    all archives — data is an asset). No table-drop action taken.
+  no_successor_workload: true
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:DataPhase1"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  successor: "RETIRED (Brian 2026-09-14 R7) — no successor workload; see retirement: above"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - "research.db::score_performance"
-consumers:
-  - "crucible-research:evals (research.db readers)"
+consumers: []
+consumers_reason: "No surviving reader. R7(b) RETIRE (alpha-engine-config-I10870, mirrors D40/D41)."
 contract:
   schema: null
   producer_test: null
@@ -115,6 +128,7 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    Plan §8.1 EXCLUSION under R7(b): its inputs are v1 artifacts retired in v2 phase 4 and
-    v2 attribution supersedes it. The row stays on the board so the retirement is visible
-    rather than silent.
+    alpha-engine-config-I10870 + R7(b) retire, RECORDED (see retirement: block above).
+    Plan §8.1 EXCLUSION: its inputs are v1 artifacts retired in v2 phase 4 and v2
+    attribution supersedes it. The row stays on the board so the retirement is visible
+    rather than silent (mirrors D15L/D40/D41's already-executed R7 retirements).

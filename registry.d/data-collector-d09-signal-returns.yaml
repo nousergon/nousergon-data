@@ -13,11 +13,14 @@ owning_repo: nousergon-data
 substrate: step-functions
 origin: ne-weekly-freshness-pipeline:DataPhase1
 owner: brian
-lifecycle: deprecated
+lifecycle: retired
 lifecycle_owner: brian
 lifecycle_reexam: '2026-09-28'
 lifecycle_reason: 'Generated from registry.d/units/D09-*.yaml (P-08): the unit descriptor declares lifecycle:
-  ''proposed-retirement'' — R7 (plan §7) retirement recommendation, not yet executed'
+  ''retired'' — Brian 2026-09-14 R7 (alpha-engine-config-I10748, plan §7 (b)). zero-surviving-consumer
+  artifact — its declared reader (crucible-research:evals) resolves to a v1 research.db table reader with
+  no v2 or Metron consumer, and its own INPUTS (predictor/predictions, signals/) are v1 artifacts retired
+  in v2 phase 4; v2 attribution supersedes it (plan §8.1 exclusion, R7(b)).'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D09''s own code path (collectors/signal_returns.py:79)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no

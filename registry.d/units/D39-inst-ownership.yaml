@@ -31,6 +31,13 @@ trigger:
   successor: unchanged by v2 phase 4
   runs_on: "github-hosted"
   detail: ".github/workflows/inst-ownership-weekly.yml, cron 40 12 * * 6"
+  # alpha-engine-config-I10871/I10870: machine-readable cadence for
+  # data_gate/cadence.py::unit_cadence, which parses the EventBridge
+  # `cron(m h ? * DOW *)` shape, not GHA's POSIX `schedule: - cron: '40 12 *
+  # * 6'`. Verified against .github/workflows/inst-ownership-weekly.yml on
+  # origin/main: `- cron: '40 12 * * 6'` — 12:40 UTC every Saturday (POSIX
+  # day-of-week 6 = Saturday).
+  schedule: "cron(40 12 ? * SAT *)"
 writes:
   - "data/inst_ownership/{quarter}/{ticker}.parquet"
   - data/inst_ownership/latest.json
