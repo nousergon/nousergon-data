@@ -103,6 +103,11 @@ LIFECYCLE_BY_UNIT_LIFECYCLE: dict[str, str] = {
     "disabled": "disabled",
     "deprecated": "deprecated",
     "proposed-retirement": "deprecated",
+    # An executed R7 retirement (alpha-engine-config-I10779 retired D15L on
+    # 2026-09-15): the row stays, tombstoned, so the console keeps a `retired`
+    # entity with a declared reason rather than an ABSENT finding — the two
+    # outcomes observability-policy §8.3 allows for a removal.
+    "retired": "retired",
 }
 
 LIFECYCLE_NEEDS_REASON = {"pending", "disabled", "deprecated", "retired"}
@@ -234,6 +239,18 @@ def build_row(unit) -> dict[str, Any]:
             row["lifecycle_reason"] = (
                 f"Generated from registry.d/units/{unit.unit_id}-*.yaml (P-08): the unit "
                 "descriptor itself declares lifecycle: pending."
+            )
+        elif lifecycle == "retired":
+            retirement = data.get("retirement") or {}
+            if not retirement.get("ruling") or not retirement.get("reason"):
+                raise ValueError(
+                    f"{unit.unit_id}: lifecycle 'retired' needs a retirement block with "
+                    "`ruling` and `reason` — a retirement without a stated reason is not a fact"
+                )
+            row["lifecycle_reason"] = (
+                f"Generated from registry.d/units/{unit.unit_id}-*.yaml (P-08): the unit "
+                f"descriptor declares lifecycle: 'retired' — {retirement['ruling']}. "
+                f"{' '.join(str(retirement['reason']).split())}"
             )
         else:
             row["lifecycle_reason"] = (
