@@ -194,7 +194,7 @@ def _coalesce_by_source_priority(
         close = row.get("Close")
         if close is None or pd.isna(close):
             return 0
-        return _SOURCE_PRIORITY.get(row.get("source"), _UNKNOWN_SOURCE_PRIORITY)
+        return VENDOR_PRECEDENCE.get(row.get("source"), _UNKNOWN_SOURCE_PRIORITY)
 
     new_by_ticker = {r["ticker"]: r for r in new_records}
     existing_by_ticker = {r["ticker"]: r for r in existing_rows}
@@ -212,12 +212,18 @@ def _coalesce_by_source_priority(
             continue
 
         if old_row is None:
+            new_row.setdefault("revision", 1)
             merged[ticker] = new_row
             stats["new_only"] += 1
         elif new_p < 0:  # ticker absent from this run → retain prior
             merged[ticker] = old_row
             stats["retained"] += 1
         elif new_p >= old_p:  # equal-or-higher source wins (tie → restatement)
+            # I10783: this cell is genuinely being (re)written — bump its
+            # revision counter off the prior row's, rather than trusting
+            # whatever the fresh fetch happened to carry. A legacy prior row
+            # with no ``revision`` column reads as 1.
+            new_row["revision"] = old_row.get("revision", 1) + 1
             merged[ticker] = new_row
             stats["overwritten"] += 1
         else:  # fresh value is strictly lower-quality — keep the better existing
@@ -244,16 +250,33 @@ _POLYGON_MIN_COVERAGE = 0.95    # below this, polygon_only mode hard-fails
 _DISCREPANCY_WARN_PCT = 0.01    # |polygon_close - yfinance_close| / yfinance_close
 _DISCREPANCY_ERROR_PCT = 0.05
 
-# Source-of-record priority for the coalescing merge (institutional waterfall).
-# A cell is replaced only by an equal-or-higher-priority source; a lower-priority
-# or *missing* value never clobbers a higher-quality existing value. This is the
-# structural form of Brian's 2026-05-10 decision ("a cell is only updated if the
-# data exists in [the authoritative source], else the prior datapoint is
-# retained") — generalized so data can never regress to a less-informative value.
-# polygon (adjusted close + true VWAP) and fred (sole source for its index
-# series) are co-primary over DISJOINT ticker domains (equities vs ^indices), so
-# they never compete for the same cell; yfinance is the backstop tier.
-_SOURCE_PRIORITY = {"polygon": 3, "fred": 3, "yfinance": 1}
+# ── Vendor precedence — the declared, reversible champion pointer ───────────
+# (alpha-engine-config-I10783, data-collector plan §2 row 5.) A single mapping
+# of vendor -> priority tier, read by every consumer instead of an implicit
+# write-order dependency ("whichever run happened to write last wins"). This
+# IS the institutional source-of-record waterfall: a cell is replaced only by
+# an equal-or-higher-priority source; a lower-priority or *missing* value
+# never clobbers a higher-quality existing value (the structural form of
+# Brian's 2026-05-10 decision — "a cell is only updated if the data exists in
+# [the authoritative source], else the prior datapoint is retained" —
+# generalized so data can never regress to a less-informative value). polygon
+# (adjusted close + true VWAP) and fred (sole source for its index series)
+# are co-primary over DISJOINT ticker domains (equities vs ^indices), so they
+# never compete for the same cell; yfinance is the backstop tier.
+#
+# ``VENDOR_CHAMPION`` names the champion vendor per champion-challenger-policy
+# (nous-ergon-ops/policies/champion-challenger-policy.md): polygon, per the
+# 2026-09-09 "stay on free polygon" ruling. Both vendors are measured every
+# trading day regardless of this pointer — see
+# ``collectors.cross_source_observer.write_vendor_divergence_metric``. Flip
+# this ONE mapping to change precedence fleet-wide; nothing else may
+# re-derive an ordering from write timing or code order. Flipping it and
+# observing ``_coalesce_by_source_priority`` follow it is asserted by
+# ``tests/test_vendor_precedence.py``.
+VENDOR_CHAMPION = "polygon"
+VENDOR_PRECEDENCE = {"polygon": 3, "fred": 3, "yfinance": 1}
+# Back-compat alias — the name used throughout this module before I10783.
+_SOURCE_PRIORITY = VENDOR_PRECEDENCE
 # Prior parquet rows written before the `source` column existed: treat as
 # backstop-tier so a fresh polygon/fred value wins but a missing fresh value
 # still retains them (never blanked).
@@ -1121,6 +1144,17 @@ def collect(
                 records, missing, run_date,
             )
 
+    # I10783: every freshly-fetched record gets an explicit revision counter
+    # before it reaches the coalesce/write path, regardless of which
+    # low-level fetch built the dict (some — ``_fetch_polygon_closes``,
+    # ``_fred_record`` — predate the PriceBar contract and don't set it).
+    # ``_coalesce_by_source_priority`` bumps it off the prior row's when a
+    # cell is actually overwritten; this default only covers the "no prior
+    # row" / "coalesce never ran" cases so the persisted column is always
+    # present, never partially-NaN.
+    for _r in records:
+        _r.setdefault("revision", 1)
+
     # ── Source-priority coalesce (yfinance_only / auto) — config#720 ─────────
     # Merge preserved canonical rows from the existing parquet into the
     # records list via the SAME ``_coalesce_by_source_priority`` primitive
@@ -1263,6 +1297,36 @@ def collect(
             defer_unexplained=_defer_unexplained_errors,
         )
 
+    # ── Vendor-divergence MetricRecord (alpha-engine-config-I10783) ──────────
+    # polygon_only (D17, morning-enrich) is the run that has both this run's
+    # fresh polygon closes AND the prior parquet's yfinance closes (D19,
+    # written the same trading day) in hand simultaneously — the one moment
+    # both vendors' values for the SAME settled date can be compared. Never
+    # raises into ingestion (mirrors the L1 observer wrapper above); the
+    # write itself does not swallow a PUT failure, so a write error is loud
+    # in this log rather than silent.
+    vendor_divergence_record: dict = {}
+    if source == "polygon_only" and existing_rows_for_merge and polygon_count > 0 and not dry_run:
+        try:
+            from collectors.cross_source_observer import write_vendor_divergence_metric
+
+            prior_by_ticker = {
+                r["ticker"]: r for r in existing_rows_for_merge if r.get("ticker")
+            }
+            new_closes_by_ticker = {
+                str(t): closes_df.loc[t, "Close"] for t in closes_df.index
+            }
+            vendor_divergence_record = write_vendor_divergence_metric(
+                bucket, new_closes_by_ticker, prior_by_ticker, run_date,
+            )
+        except Exception as exc:  # metric must never break ingestion
+            logger.error(
+                "vendor_divergence metric FAILED to write for %s (source=%s): %s "
+                "— divergence is unmeasured for this run",
+                run_date, source, exc,
+            )
+            vendor_divergence_record = {"error": str(exc)}
+
     # ONE informational email per run for confirmed corporate-action
     # restatements — but only when THIS collect() owns the email (standalone
     # single-date call). When driven by _collect_window, the email is deferred
@@ -1282,6 +1346,7 @@ def collect(
             "corporate_actions": explained_actions,
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
+            "vendor_divergence": vendor_divergence_record,
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1309,6 +1374,7 @@ def collect(
             "corporate_actions": explained_actions,
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
+            "vendor_divergence": vendor_divergence_record,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
