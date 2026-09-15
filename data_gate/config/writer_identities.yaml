@@ -22,3 +22,7 @@ bucket: alpha-engine-research
 undeclared_probe_key: data_gate_identity_probe/undeclared-prefix/probe.json
 by_runs_on:
   ec2-spot: nousergon-data-collection-box-role
+  # D43's manual repair builders: in-region only, "under the component role"
+  # (its descriptor; alpha-engine-config-I10756 / I9771) — the same box
+  # identity, never the laptop (nousergon-data-PR1746 enforces the region).
+  "in-region only (alpha-engine-config-I9771)": nousergon-data-collection-box-role

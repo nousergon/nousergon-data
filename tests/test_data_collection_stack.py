@@ -329,6 +329,73 @@ def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
     assert any("nousergon-data-collection/data-collection-eod is ENABLED live" in x for x in findings)
 
 
+def test_check_live_key_is_the_one_the_gate_reads(stack):
+    """The producer is a standalone script and imports nothing from data_gate,
+    so the two spellings are pinned here (alpha-engine-config-I10870)."""
+    from data_gate import evidence
+
+    assert stack.CHECK_LIVE_KEY == "data_collection/" + evidence.STACK_CHECK_LIVE_KEY
+    assert stack.CHECK_LIVE_SCHEMA == evidence.STACK_CHECK_LIVE_SCHEMA
+
+
+class _S3:
+    def __init__(self, fail=False):
+        self.fail, self.puts = fail, []
+
+    def put_object(self, **kw):
+        if self.fail:
+            raise PermissionError("AccessDenied")
+        self.puts.append(kw)
+
+
+def _fake_boto3(monkeypatch, *, cfn=None, sched=None, s3):
+    import sys
+    import types
+
+    def client(name):
+        if name == "s3":
+            return s3
+        if name == "cloudformation":
+            if cfn is None:
+                raise PermissionError("AccessDenied on DescribeStacks")
+            return cfn
+        return sched
+
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=client))
+    monkeypatch.setenv("GITHUB_SHA", "b" * 40)
+
+
+def test_check_live_publishes_drift_and_still_exits_non_zero(stack, tpl, monkeypatch):
+    s3 = _S3()
+    cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
+    _fake_boto3(monkeypatch, cfn=cfn, sched=_scheduler_matching(stack, tpl), s3=s3)
+    assert stack.main(["check-live"]) == 1
+    (put,) = s3.puts
+    doc = json.loads(put["Body"])
+    assert (put["Bucket"], put["Key"]) == (stack.CHECK_LIVE_BUCKET, stack.CHECK_LIVE_KEY)
+    assert doc["in_sync"] is False and doc["measured"] is True and doc["drift"]
+    assert doc["code_sha"] == "b" * 40 and doc["stack"] == stack.STACK_NAME
+
+
+def test_check_live_publishes_when_it_cannot_measure(stack, monkeypatch):
+    s3 = _S3()
+    _fake_boto3(monkeypatch, cfn=None, s3=s3)
+    assert stack.main(["check-live"]) == 2
+    doc = json.loads(s3.puts[0]["Body"])
+    assert doc["measured"] is False and doc["in_sync"] is False and "AccessDenied" in doc["error"]
+
+
+def test_check_live_in_sync_publishes_and_a_failed_publish_is_loud(stack, tpl, monkeypatch):
+    f = stack.deploy_fields()
+    cfn = _Cfn("UPDATE_COMPLETE", {k: f[k] for k in ("template-sha256", "definition-sha256")})
+    s3 = _S3()
+    _fake_boto3(monkeypatch, cfn=cfn, sched=_scheduler_matching(stack, tpl), s3=s3)
+    assert stack.main(["check-live"]) == 0
+    assert json.loads(s3.puts[0]["Body"])["in_sync"] is True
+    _fake_boto3(monkeypatch, cfn=cfn, sched=_scheduler_matching(stack, tpl), s3=_S3(fail=True))
+    assert stack.main(["check-live"]) == 3
+
+
 def _workflow():
     return yaml.safe_load(WORKFLOW.read_text(encoding="utf-8"))
 

@@ -67,12 +67,22 @@ class S3Store:
     """Keys under ``s3://bucket/prefix``."""
 
     def __init__(
-        self, bucket: str, prefix: str = "", *, client=None, iam_client=None, dry_run: bool = False
+        self,
+        bucket: str,
+        prefix: str = "",
+        *,
+        client=None,
+        iam_client=None,
+        scheduler_client=None,
+        sfn_client=None,
+        dry_run: bool = False,
     ) -> None:
         self.bucket = bucket
         self.prefix = prefix.strip("/")
         self._client = client
         self._iam_client = iam_client
+        self._scheduler_client = scheduler_client
+        self._sfn_client = sfn_client
         self.dry_run = dry_run
         # External evidence sources (alpha-engine-config-I10823); attached by
         # `open_store`.
@@ -106,6 +116,26 @@ class S3Store:
 
             self._iam_client = boto3.client("iam")
         return self._iam_client
+
+    @property
+    def scheduler_client(self):
+        """EventBridge Scheduler, for `data_gate.standalone`'s live schedule
+        state. Like `iam_client`, present ONLY on this backend, so a local or
+        test read of live state is UNMEASURABLE by construction."""
+        if self._scheduler_client is None:
+            import boto3
+
+            self._scheduler_client = boto3.client("scheduler")
+        return self._scheduler_client
+
+    @property
+    def sfn_client(self):
+        """Step Functions, for the standalone machines' executions."""
+        if self._sfn_client is None:
+            import boto3
+
+            self._sfn_client = boto3.client("stepfunctions")
+        return self._sfn_client
 
     def _s3_key(self, key: str) -> str:
         return f"{self.prefix}/{key}" if self.prefix else key
