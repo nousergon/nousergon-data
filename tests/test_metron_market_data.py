@@ -100,6 +100,12 @@ def test_builds_and_writes_closes_and_fx_artifacts():
     assert set(puts) == {
         "market_data/eod_closes/2026-06-11.json", "market_data/eod_closes/latest.json",
         "market_data/fx/2026-06-11.json", "market_data/fx/latest.json",
+        # alpha-engine-config-I10827: the cardinality guard publishes D20's
+        # completeness reading on EVERY execution, at the fixed per-trading-day
+        # address the `data.D20.completeness` ladder clause reads. Kept in this
+        # EXACT set assertion rather than filtered out of it — an unexpected PUT
+        # from this collector is a finding, and that is what this line is for.
+        "data_collection/metrics/eod_completeness/2026-06-11.json",
     }
     closes_art = puts["market_data/eod_closes/latest.json"]
     assert closes_art["schema_version"] == mmd.CLOSES_SCHEMA_VERSION

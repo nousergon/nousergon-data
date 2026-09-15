@@ -629,7 +629,13 @@ def test_every_prose_key_uses_the_underscore_marker(manifest):
                 "prefix it with '_' as the pending block does"
             )
         else:
-            assert key.startswith(("alpha-", "DO-NOT-DELETE-")), (
+            # Same reasoning for a default-bus rule or default-group schedule:
+            # graded against the AWS naming constraint, not a prefix list.
+            # `crucible-v2-spot-interruption-redispatch` (2026-09-15) is a real
+            # v2 EventBridge rule the old "alpha-" prefix test refused, so a
+            # correct classification could not land. Prose still fails here —
+            # it carries spaces.
+            assert aws_name_re.match(key) and len(key) <= 64, (
                 f"not_paused key {key!r} does not look like a live trigger name; if "
                 "it is a grouping label, prefix it with '_' as the pending block does"
             )

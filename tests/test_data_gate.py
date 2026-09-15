@@ -127,7 +127,11 @@ def test_no_clause_is_met_without_a_read(board):
 
 def test_the_board_is_red_at_birth(board):
     """214 cells were scored PRESENT; none of them is green on day one."""
-    base = [c for c in board if c.name.startswith("data.D") and ".guard." not in c.name]
+    base = [
+        c
+        for c in board
+        if c.name.startswith("data.D") and ".guard." not in c.name and not c.name.endswith(".completeness")
+    ]
     assert len(base) == 414
     met = [c for c in base if c.met]
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
@@ -513,6 +517,12 @@ _KNOWN_OPS_PLANE_WRITE_SITES = {
         "(alpha-engine-config-I7167) — an ops artifact about other stages' "
         "output, not a data key any unit descriptor would claim."
     ),
+    "validators/expectations.py": (
+        "publish_completeness_metric() PUTs a unit's completeness MetricRecord "
+        "at data_collection/metrics/eod_completeness/{trading_day}.json "
+        "(alpha-engine-config-I10780) — gate evidence ABOUT a unit's output, "
+        "read by the data.<unit>.completeness clause, not a published data key."
+    ),
 }
 
 
@@ -854,3 +864,99 @@ def test_a_rung_pointing_at_the_parent_issue_holds_the_board_clause(phases):
     clause = clause_module._clause_board_phase_trackers_declared(EmptyStore(), degraded)
     assert clause.met is False
     assert "P-26" in clause.detail and phases[1].id in clause.detail
+
+
+# ---------------------------------------------------------------------------
+# Completeness clause — `alpha-engine-config-I10780` (plan item P-13).
+# ---------------------------------------------------------------------------
+
+
+def test_only_d20_gets_a_completeness_clause(board):
+    """`data_collection/metrics/eod_completeness/{trading_day}.json` is a single
+    non-unit-scoped key naming the EOD spine specifically — the clause is
+    generated for D20 only, not for every unit that merely declares a
+    `completeness` block (most are `status: proposed`, no reader behind them)."""
+    names = [c.name for c in board if c.name.endswith(".completeness") and c.name.startswith("data.D")]
+    assert names == ["data.D20.completeness"]
+
+
+def test_the_completeness_clause_is_tagged_phase_1_observe(board):
+    clause = next(c for c in board if c.name == "data.D20.completeness")
+    assert clause.phase == "data-phase1"
+
+
+def test_no_completeness_metric_published_is_unmet_not_a_vacuous_pass():
+    """Absent means we looked and there is nothing there — UNMET (we looked
+    successfully), not UNMEASURABLE (we could not look at all)."""
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    reading = evidence.read_completeness_metric(EmptyStore(), unit, trading_day=TRADING_DAY)
+    assert reading.met is False
+    assert reading.unmeasurable is False
+    assert "eod_completeness" in reading.detail
+
+
+def test_a_green_completeness_metric_reads_met():
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore(
+        {
+            "metrics/eod_completeness/2026-09-14.json": json.dumps(
+                {
+                    "status": "GREEN",
+                    "value": 1.0,
+                    "target": 1.0,
+                    "status_reason": "D20: 80/80 covered — zero undeclared misses",
+                    "last_updated_utc": "2026-09-14T21:15:00Z",
+                }
+            ).encode()
+        }
+    )
+    reading = evidence.read_completeness_metric(store, unit, trading_day=TRADING_DAY)
+    assert reading.met is True
+    assert reading.unmeasurable is False
+    assert reading.as_of == "2026-09-14T21:15:00Z"
+
+
+def test_a_red_completeness_metric_reads_unmet_but_measured():
+    """RED is a real reading — the guard looked and found a gap — never
+    UNMEASURABLE, which would let a genuine miss hide behind 'we didn't look'."""
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore(
+        {
+            "metrics/eod_completeness/2026-09-14.json": json.dumps(
+                {
+                    "status": "RED",
+                    "value": 0.9,
+                    "target": 1.0,
+                    "status_reason": "D20: undeclared miss",
+                    "last_updated_utc": "2026-09-14T21:15:00Z",
+                }
+            ).encode()
+        }
+    )
+    reading = evidence.read_completeness_metric(store, unit, trading_day=TRADING_DAY)
+    assert reading.met is False
+    assert reading.unmeasurable is False
+
+
+def test_an_na_status_completeness_metric_is_unmeasurable():
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore(
+        {
+            "metrics/eod_completeness/2026-09-14.json": json.dumps(
+                {
+                    "status": "N/A-MISSING-INPUT",
+                    "status_reason": "denominator artifact unreadable",
+                    "last_updated_utc": "2026-09-14T21:15:00Z",
+                }
+            ).encode()
+        }
+    )
+    reading = evidence.read_completeness_metric(store, unit, trading_day=TRADING_DAY)
+    assert reading.met is False
+    assert reading.unmeasurable is True
+
+
+def test_a_denied_completeness_read_is_unmeasurable():
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    reading = evidence.read_completeness_metric(DeniedStore(), unit, trading_day=TRADING_DAY)
+    assert reading.unmeasurable is True

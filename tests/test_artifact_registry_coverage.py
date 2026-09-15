@@ -69,6 +69,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
     # the `data_collection/gates/` grandfathered prefix (per-date readings).
     "data_gate/store.py": 1,
+    # alpha-engine-config-I10780 (data-collector plan P-13) — the EOD-spine
+    # cardinality guard's single daily reading,
+    # s3://alpha-engine-research/data_collection/metrics/eod_completeness/{trading_day}.json
+    # (`validators/expectations.py::publish_completeness_metric`), read by
+    # `data_gate/clauses.py`'s `data.D20.completeness` clause. Needs an
+    # ARTIFACT_REGISTRY.yaml row (or grandfathered_paths entry) in
+    # alpha-engine-config — tracked as a follow-up rather than opened from
+    # here, so this repo's guard is honest about the new PUT site either way.
+    "validators/expectations.py": 1,
     # alpha-engine-config-I5718 — the §10.2 fault-injection verdict surface,
     # s3://alpha-engine-research/groom/_control/fault-injection/{date}.json.
     # One PUT per programme run (weekly, plus on any change to the dispatch

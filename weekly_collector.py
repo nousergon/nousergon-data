@@ -204,9 +204,15 @@ class _CollectorError(RuntimeError):
     phase writes an ``error`` marker (→ a recovery RE-RUNS it) instead of a lying
     ``ok`` marker. Caught at the call site to preserve best-effort-continue."""
 
-    def __init__(self, name: str, detail) -> None:
+    def __init__(self, name: str, detail, result: dict | None = None) -> None:
         super().__init__(f"{name}: {detail}")
         self.detail = detail
+        #: The collector's own result dict, when it produced one before failing.
+        #: Carried so the FAILURE manifest can still record the guard readings
+        #: and metrics the collector graded itself on — `observability-policy`
+        #: §3.1: the failure path writes the same telemetry as the success path,
+        #: except the completion claim (`alpha-engine-config-I10827`).
+        self.result = result or {}
 
 
 class _DegradedRun(RuntimeError):
@@ -482,15 +488,23 @@ def _phase_collect(
     unit = run_units.unit_for(reg.data_mode, name)
 
     def _body(run_ctx) -> dict:
-        result = _phase_body(
-            reg,
-            name,
-            run_fn,
-            artifact_key=artifact_key,
-            supports_auto_skip=supports_auto_skip,
-            verify_artifact_exists=verify_artifact_exists,
-            bucket=bucket,
-        )
+        try:
+            result = _phase_body(
+                reg,
+                name,
+                run_fn,
+                artifact_key=artifact_key,
+                supports_auto_skip=supports_auto_skip,
+                verify_artifact_exists=verify_artifact_exists,
+                bucket=bucket,
+            )
+        except _CollectorError as ce:
+            # The manifest is about to be written with `status: failed`. Fold on
+            # whatever the collector graded itself before it failed, so the
+            # failure record carries its verdicts rather than only its cause
+            # (`alpha-engine-config-I10827`).
+            _record_collector_guards(run_ctx, ce.result)
+            raise
         _record_phase_lineage(
             run_ctx, unit, name, result, artifact_key, bucket or reg.bucket, reg,
             extra_outputs=extra_outputs,
@@ -626,6 +640,7 @@ def _record_phase_lineage(
                     run_ctx.record_output(k, rows_out=rows_out)
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
+    _record_collector_guards(run_ctx, result)
 
     if auto_skipped or dry:
         reading = expectations.GuardReading(
@@ -672,6 +687,38 @@ def _record_phase_lineage(
     # claim.
     if result.get("status") == "degraded":
         raise _DegradedRun(name, result)
+
+
+def _record_collector_guards(run_ctx, result: dict) -> None:
+    """Fold guard readings a COLLECTOR graded itself onto its run manifest.
+
+    `alpha-engine-config-I10827`. Most guards on this board are evaluated here,
+    from outside the collector, because most of them only need the published
+    key and a row count. The cardinality guard is different: grading
+    ``covered / (denominator - declared exclusions)`` needs the SYMBOLS, and by
+    the time a result dict reaches this function the symbols are gone — only
+    their count survived. So the collector grades itself and returns the
+    reading, and this folds it on.
+
+    Generic on purpose rather than special-cased to D20: a collector that
+    returns ``guards``/``metrics`` gets them recorded, which is what makes the
+    next such guard a change in ONE collector rather than a change here too.
+    A malformed entry RAISES through ``record_guard``'s own validation — the
+    manifest's guard vocabulary is closed, and a reading nobody can render is a
+    finding, not something to drop on the floor.
+    """
+    for entry in result.get("guards") or ():
+        run_ctx.record_guard(
+            entry["guard"],
+            mode=entry["mode"],
+            verdict=entry["verdict"],
+            detail=entry["detail"],
+            key=entry.get("key"),
+            value=entry.get("value"),
+            baseline=entry.get("baseline"),
+        )
+    for metric in result.get("metrics") or ():
+        run_ctx.record_metric(metric)
 
 
 def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]) -> None:
@@ -724,7 +771,7 @@ def _phase_body(
             return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
         result = run_fn() or {}
         if result.get("status") == "error":
-            raise _CollectorError(name, result.get("error"))
+            raise _CollectorError(name, result.get("error"), result)
         # `degraded` is verified exactly like `ok` (alpha-engine-config-I7572):
         # its whole meaning is "the artifact WAS produced, and something in it
         # is known-defective". Verifying only `ok` would let the one status

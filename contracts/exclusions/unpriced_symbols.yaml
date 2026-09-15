@@ -1,0 +1,107 @@
+# Declared exclusions from the EOD spine's cardinality denominator.
+#
+# `data_collection_plan_260914.md` §2 row 2 and §4.5 (plan item P-13);
+# `alpha-engine-config-I10780`. Read by `validators/expectations.py::load_exclusions`
+# and applied by `check_cardinality` BEFORE the coverage floor is evaluated:
+#
+#     covered / (denominator - declared_exclusions) >= floor
+#
+# The rule this file exists to enforce: an undeclared missing symbol is a
+# FAILURE, never a silent exclusion. Every symbol in `metron/holdings_universe.json`
+# that the EOD spine (`market_data/eod_closes/{date}.json`, unit D20) cannot price
+# must have a row here, or the cardinality guard counts it against the floor.
+#
+# Measured 2026-09-14 (alpha-engine-config-I10780): 88 universe tickers, 80
+# published closes, 8 unexplained by string match alone. Of those 8, 4
+# resolve once the suffix normalization map (`suffix_normalization.yaml`) is
+# applied (D05, NOVN, RMS, SU are published under their exchange-suffixed
+# yf_symbol). The remaining 8 listed below are genuinely unpriceable by the
+# current vendor chain (polygon/yfinance) and are declared here — after
+# normalization + these 8 exclusions, 80/80 = 1.0 coverage, explaining the
+# gap entirely. Zero undeclared misses as of this measurement.
+#
+# Schema:
+#   symbol: the RAW denominator symbol as it appears in
+#     metron/holdings_universe.json's `tickers` list (pre-normalization).
+#   class: one of `fixed_income_cusip` | `unsupported_exchange`.
+#   reason: why this symbol cannot be priced by the current vendor chain.
+#   owner: who re-examines this exclusion.
+#   re_exam: ISO date — the exclusion is reviewed no later than this date
+#     (does the symbol still hold, is it still unpriced, has a vendor path
+#     opened up).
+schema_version: 1
+
+exclusions:
+  # ── Fixed-income CUSIPs (7) ──────────────────────────────────────────────
+  # Metron holds these as bond/note positions (broker-snapshot-priced in
+  # Metron itself, config#1029's "non-listed instruments" note). Neither
+  # polygon nor yfinance carries CUSIP-keyed fixed-income quotes — there is
+  # no equity-style close for a 9-character CUSIP identifier.
+  - symbol: "149159VZ5"
+    class: fixed_income_cusip
+    reason: >-
+      CUSIP-identified fixed-income position; no equity vendor (polygon,
+      yfinance) prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "40219MBJ2"
+    class: fixed_income_cusip
+    reason: >-
+      CUSIP-identified fixed-income position; no equity vendor (polygon,
+      yfinance) prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "46659C4L1"
+    class: fixed_income_cusip
+    reason: >-
+      CUSIP-identified fixed-income position; no equity vendor (polygon,
+      yfinance) prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "63983RFZ7"
+    class: fixed_income_cusip
+    reason: >-
+      CUSIP-identified fixed-income position; no equity vendor (polygon,
+      yfinance) prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "912810UJ5"
+    class: fixed_income_cusip
+    reason: >-
+      912-prefix US Treasury CUSIP; no equity vendor (polygon, yfinance)
+      prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "912828YK0"
+    class: fixed_income_cusip
+    reason: >-
+      912-prefix US Treasury CUSIP; no equity vendor (polygon, yfinance)
+      prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  - symbol: "912834PB8"
+    class: fixed_income_cusip
+    reason: >-
+      912-prefix US Treasury CUSIP; no equity vendor (polygon, yfinance)
+      prices CUSIP-keyed instruments.
+    owner: brian
+    re_exam: "2026-12-14"
+
+  # ── Unsupported exchange (1) ─────────────────────────────────────────────
+  - symbol: "1299"
+    class: unsupported_exchange
+    reason: >-
+      HKEX listing (Hong Kong). Unlike the SI/SW/PA foreign listings covered
+      by the suffix normalization map, this symbol has no known
+      polygon/yfinance-servable suffixed form (`1299.HK` unverified against
+      the current vendor chain) — declared unpriced rather than guessed at.
+      Re-examine whether a `.HK` yfinance form exists before promoting the
+      guard to enforce (plan §4.5).
+    owner: brian
+    re_exam: "2026-12-14"
