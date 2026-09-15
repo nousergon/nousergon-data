@@ -500,7 +500,19 @@ def read_base(store: GateStore, unit: Unit, column: str, *, trading_day: dt.date
         return _read_schema_contract(unit)
     if column == "run_record":
         return read_run_record(store, unit, trading_day=trading_day)
-    key = _BASE_EVIDENCE_KEY[column].format(prefix=unit.run_manifest_prefix, trading_day=trading_day)
+    if column in {"observability_row", "artifact_registry", "consumers", "identity"}:
+        # `alpha-engine-config-I10823`. Imported here, not at module top:
+        # `unit_readers` imports `Reading` from this module.
+        from data_gate import unit_readers
+
+        if column == "observability_row":
+            return unit_readers.read_observability_row(unit)
+        if column == "artifact_registry":
+            return unit_readers.read_artifact_registry(store, unit)
+        if column == "consumers":
+            return unit_readers.read_consumers(store, unit)
+        return unit_readers.read_identity(store, unit)
+    key =_BASE_EVIDENCE_KEY[column].format(prefix=unit.run_manifest_prefix, trading_day=trading_day)
     return _pending(
         key,
         f"The audit's 2026-09-14 reading of this cell is the baseline the board reconciles "

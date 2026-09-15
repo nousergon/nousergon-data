@@ -29,6 +29,10 @@ class LocalStore:
     def __init__(self, root: pathlib.Path | str, *, dry_run: bool = False) -> None:
         self.root = pathlib.Path(root)
         self.dry_run = dry_run
+        # External evidence sources (alpha-engine-config-I10823); attached by
+        # `open_store` only when configured.
+        self.artifact_registry_source = None
+        self.github_contents = None
 
     @property
     def uri(self) -> str:
@@ -70,6 +74,10 @@ class S3Store:
         self._client = client
         self._iam_client = iam_client
         self.dry_run = dry_run
+        # External evidence sources (alpha-engine-config-I10823); attached by
+        # `open_store`.
+        self.artifact_registry_source = None
+        self.github_contents = None
 
     @property
     def uri(self) -> str:
@@ -146,12 +154,42 @@ def parse_store_uri(uri: str) -> tuple[str, str]:
     return "file", uri
 
 
-def open_store(uri: str, *, dry_run: bool = False):
-    """The store named by ``uri``."""
+def open_store(
+    uri: str,
+    *,
+    dry_run: bool = False,
+    artifact_registry: str | None = None,
+    github_token: str | None = None,
+):
+    """The store named by ``uri``, carrying the external evidence sources.
+
+    `alpha-engine-config-I10823`: ``artifact_registry_source`` and
+    ``github_contents`` ride on the store the same way ``iam_client`` does, so
+    the clause generator's signature does not change and a store built WITHOUT
+    them (every test fixture) reads those columns UNMEASURABLE by construction.
+    A live S3 store defaults the registry to the published copy the freshness
+    monitor enforces; GitHub is attached only when a token is supplied.
+    """
+    from data_gate.sources import PUBLISHED_REGISTRY_URI, ArtifactRegistrySource, GitHubContents
+
     scheme, location = parse_store_uri(uri)
     if scheme == "s3":
         bucket, _, prefix = location.partition("/")
         if not bucket:
             raise ValueError(f"store uri {uri!r} names no bucket")
-        return S3Store(bucket, prefix, dry_run=dry_run)
-    return LocalStore(location, dry_run=dry_run)
+        store = S3Store(bucket, prefix, dry_run=dry_run)
+        registry_uri = artifact_registry or PUBLISHED_REGISTRY_URI
+        store.artifact_registry_source = ArtifactRegistrySource.for_uri(registry_uri, lambda: store.client)
+    else:
+        store = LocalStore(location, dry_run=dry_run)
+        if artifact_registry:
+
+            def _s3_client():
+                import boto3
+
+                return boto3.client("s3")
+
+            store.artifact_registry_source = ArtifactRegistrySource.for_uri(artifact_registry, _s3_client)
+    if github_token:
+        store.github_contents = GitHubContents(github_token)
+    return store

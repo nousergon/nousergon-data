@@ -132,6 +132,16 @@ class Unit:
         return str(self.raw["lifecycle"])
 
     @property
+    def retired(self) -> bool:
+        """Declared retired — every clause renders RETIRED and grades nothing."""
+        return self.lifecycle == "retired"
+
+    @property
+    def retirement_summary(self) -> str:
+        block = self.raw.get("retirement") or {}
+        return f"{str(block.get('ruling')).strip()} — {' '.join(str(block.get('reason')).split())}"
+
+    @property
     def component(self) -> int:
         return int(self.raw.get("component", 1))
 
@@ -249,6 +259,26 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
     completeness = document["completeness"] or {}
     if completeness.get("status") == "not_applicable":
         _check_na("completeness", completeness, unit_id)
+
+    if document["lifecycle"] == "retired":
+        # `alpha-engine-config-I10823` deliverable 6. A retired unit's clauses
+        # stop grading and render RETIRED with this block's reason — so a
+        # retirement with no ruling or no reason would silently remove a unit
+        # from every denominator on nobody's say-so. A retirement without a
+        # reason is not a fact.
+        retirement = document.get("retirement")
+        missing_fields = [
+            name
+            for name in ("ruling", "reason")
+            if not isinstance(retirement, dict) or not str(retirement.get(name) or "").strip()
+        ]
+        if missing_fields:
+            raise DescriptorError(
+                f"{path.name}: lifecycle is 'retired' but the `retirement:` block is missing or has "
+                f"no {missing_fields}. Retiring a unit removes it from every gate's denominator; "
+                "that needs the ruling that retired it and the reason, or it is a unit that "
+                "disappeared (observability-policy §8.3: RETIRED is declared, never inferred)."
+            )
 
     if not document["consumers"] and not str(document.get("consumers_reason") or "").strip():
         raise DescriptorError(

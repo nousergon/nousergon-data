@@ -16,9 +16,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import os
 import sys
 
 from data_gate import read as read_module
+from data_gate.sources import GITHUB_TOKEN_ENV
 from data_gate.store import open_store
 
 EXIT_MET = 0
@@ -42,6 +44,15 @@ def _parser() -> argparse.ArgumentParser:
         help="ISO date the reading is filed under; defaults to today UTC",
     )
     reader.add_argument(
+        "--artifact-registry",
+        default=None,
+        help=(
+            "ARTIFACT_REGISTRY.yaml to grade the artifact_registry column against: a local path or "
+            "s3:// URI. Defaults to the published copy for an s3:// store; a local store without "
+            "it reads that column UNMEASURABLE."
+        ),
+    )
+    reader.add_argument(
         "--dry-run",
         action="store_true",
         help="evaluate and render, write nothing at all",
@@ -56,7 +67,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.trading_day
         else dt.datetime.now(dt.timezone.utc).date()
     )
-    store = open_store(args.store, dry_run=args.dry_run)
+    store = open_store(
+        args.store,
+        dry_run=args.dry_run,
+        artifact_registry=args.artifact_registry,
+        github_token=os.environ.get(GITHUB_TOKEN_ENV) or None,
+    )
     try:
         result, _ladder, board = read_module.run(
             store, gate=args.gate, trading_day=trading_day, dry_run=args.dry_run
