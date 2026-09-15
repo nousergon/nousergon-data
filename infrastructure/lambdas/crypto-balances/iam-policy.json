@@ -33,6 +33,12 @@
       "Effect": "Allow",
       "Action": ["s3:PutObject"],
       "Resource": "arn:aws:s3:::alpha-engine-research/crypto/holdings.json"
+    },
+    {
+      "Sid": "WriteRunManifests",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject"],
+      "Resource": "arn:aws:s3:::alpha-engine-research/data_collection/runs/*"
     }
   ]
 }
