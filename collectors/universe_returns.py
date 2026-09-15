@@ -307,8 +307,15 @@ def collect(
     #
     # No try/except: a failed producer write must fail the run. The previous
     # WARNING-and-continue is why nothing went red.
+    #
+    # `db_upload` names the two keys ACTUALLY written this run (empty when
+    # total_inserted == 0 — a run that inserted nothing legitimately uploads
+    # nothing) — alpha-engine-config-I10855 deliverable 2: the run manifest
+    # must record what a run wrote, never copy the two keys from the
+    # descriptor unconditionally.
+    db_upload: dict = {}
     if not dry_run and total_inserted > 0:
-        upload_research_db(s3, db_path, bucket, run_date or default_run_date())
+        db_upload = upload_research_db(s3, db_path, bucket, run_date or default_run_date())
 
     # Any real error (exception or "no rows computed" after pre-filter) is a
     # hard failure under the no-silent-fails rule. The old `partial` path was
@@ -327,6 +334,7 @@ def collect(
         "dates_processed": len(dates_to_process),
         "rows_inserted": total_inserted,
         "errors": errors[:20],
+        "db_upload": db_upload,
     }
 
 

@@ -714,3 +714,98 @@ def test_the_execution_start_time_parses_as_the_freshness_bound(monkeypatch):
     index = _index(monkeypatch)
     now = _dt.datetime(2026, 9, 14, 20, 45, tzinfo=_dt.timezone.utc)
     assert index._parse_ts(_STARTED, where="x") == now
+
+
+# ── alpha-engine-config-I10855: multi-key units record EVERY published key ────
+#
+# Withholding shape, against the REAL completion-check logic (never a stub):
+# for every unit whose descriptor declares more than one published-key
+# template, a manifest carrying every key a full run actually writes PASSES,
+# and a manifest missing any ONE of them FAILS, naming the missing key. D20
+# (above) and D31 (`test_a_unit_whose_collector_reports_no_count_is_graded_on_
+# presence`) already cover two such units; this table covers the rest fixed by
+# nousergon-data-PR<TBD> (weekly_collector.py `_phase_collect`/
+# `_record_phase_lineage` `extra_outputs`).
+#
+# Some declared templates are WILDCARDS ("{ticker}.json", "*", trailing "/")
+# that a single-path-segment companion file (manifest.json, consolidated.json,
+# a manifest key) already satisfies — D15/D21/D26's ``outputs`` below are
+# deliberately fewer than their unit's key-shaped template count for exactly
+# that reason (see weekly_collector.py's `extra_outputs` comments for each).
+_MULTI_KEY_UNIT_OUTPUTS: dict[str, list[dict]] = {
+    "D01": [
+        {"key": "market_data/weekly/2026-09-14/constituents.json", "rows_out": 903},
+        {"key": "market_data/latest_weekly.json", "rows_out": 903},
+    ],
+    "D05": [
+        {"key": "market_data/weekly/2026-09-14/macro.json", "rows_out": 40},
+        {"key": "market_data/macro_history.parquet", "rows_out": 520},
+        {"key": "market_data/macro_release_calendar.parquet", "rows_out": 12},
+    ],
+    "D07": [
+        {"key": "market_data/universe_classification/2026-09-14.json", "rows_out": 900},
+        {"key": "market_data/universe_classification/latest.json", "rows_out": 900},
+    ],
+    "D08": [
+        {"key": "research.db", "rows_out": 1200},
+        {"key": "backups/research_2026-09-14.db", "rows_out": 1200},
+    ],
+    "D12": [
+        {"key": "features/2026-09-14/technical.parquet", "rows_out": 903},
+        {"key": "features/2026-09-14/fundamental.parquet", "rows_out": 903},
+        {"key": "features/2026-09-14/interaction.parquet", "rows_out": 903},
+        {"key": "features/2026-09-14/macro.parquet", "rows_out": 1},
+        {"key": "features/2026-09-14/alternative.parquet", "rows_out": 903},
+    ],
+    "D15": [
+        {"key": "market_data/weekly/2026-09-14/alternative/manifest.json", "rows_out": 903},
+        {"key": "market_data/weekly/2026-09-14/alternative/scope.json", "rows_out": 903},
+    ],
+    "D21": [
+        {"key": "market_data/close_history/consolidated.json", "rows_out": 903},
+        {"key": "market_data/fx_history/USD.json", "rows_out": 1},
+    ],
+    "D22": [
+        {"key": "market_data/sectors/latest.json", "rows_out": 903},
+        {"key": "market_data/earnings/latest.json", "rows_out": 200},
+    ],
+    "D26": [
+        {"key": "market_data/technicals/rating_history/_manifest.json", "rows_out": 252},
+    ],
+}
+
+
+@pytest.mark.parametrize("unit_id", sorted(_MULTI_KEY_UNIT_OUTPUTS))
+def test_multi_key_unit_full_run_passes(monkeypatch, unit_id):
+    index = _index(monkeypatch)
+    outputs = _MULTI_KEY_UNIT_OUTPUTS[unit_id]
+    doc = _manifest(unit_id=unit_id, outputs=outputs)
+    prefix = f"data_collection/runs/{unit_id}"
+    result, _ = _check(index, {f"{prefix}/2026-09-14/01K5AA.json": doc}, units=(unit_id,))
+    completion = result["completion"]
+    assert completion["ok"] is True, completion["findings"]
+    assert completion["failure_mode"] == ""
+    assert completion["units"][0]["unverifiable"] == []
+
+
+@pytest.mark.parametrize("unit_id", sorted(_MULTI_KEY_UNIT_OUTPUTS))
+def test_multi_key_unit_skipping_one_key_fails_naming_it(monkeypatch, unit_id):
+    """Withholding shape: drop exactly one recorded key from an otherwise-full
+    run and the check must fail — never silently pass on the remaining keys —
+    and every finding must name a key this run genuinely did not publish."""
+    outputs = _MULTI_KEY_UNIT_OUTPUTS[unit_id]
+    prefix = f"data_collection/runs/{unit_id}"
+    for i in range(len(outputs)):
+        index = _index(monkeypatch)
+        withheld = outputs[:i] + outputs[i + 1:]
+        doc = _manifest(unit_id=unit_id, outputs=withheld)
+        result, _ = _check(index, {f"{prefix}/2026-09-14/01K5AA.json": doc}, units=(unit_id,))
+        completion = result["completion"]
+        assert completion["ok"] is False, (
+            f"{unit_id}: withholding {outputs[i]['key']!r} did not fail the check "
+            f"(remaining keys satisfy every declared template — the withheld key "
+            f"was never actually required)"
+        )
+        assert completion["failure_mode"] == "output_missing"
+        assert all(f["mode"] == "output_missing" for f in completion["findings"])
+        assert all(f["unit"] == unit_id for f in completion["findings"])

@@ -11,6 +11,7 @@ Everything here runs against an in-memory or tmp-dir store. No AWS.
 from __future__ import annotations
 
 import ast
+import datetime as dt
 import json
 import textwrap
 
@@ -677,7 +678,74 @@ def test_parity_absent_is_unmet_naming_i10778():
     assert reading.unmeasurable is False
     assert reading.met is False
     assert "I10778" in reading.detail
-    assert reading.evidence == (evidence.parity_store_key(TRADING_DAY),)
+    assert reading.evidence == (f"{evidence.PARITY_KEY_PREFIX}*.json",)
+
+
+def _parity_report(trading_day, *, met=True, matched=3, total=3, exceptions=None):
+    summary = {"total": total, "match": matched, **(exceptions or {})}
+    return json.dumps(
+        {
+            "schema_version": "data_parity_report.v1",
+            "trading_day": trading_day.isoformat(),
+            "generated_at": f"{trading_day.isoformat()}T21:00:00Z",
+            "met": met,
+            "summary": summary,
+        }
+    ).encode()
+
+
+def test_parity_fresh_prior_day_report_is_graded_not_absent():
+    """The bug this issue fixes: a shadow run for the day BEFORE the gate's own
+    trading day must be found and graded, never treated as absent just because
+    it is not filed under the gate's own trading_day key."""
+    from nousergon_lib.trading_calendar import previous_trading_day
+
+    report_day = previous_trading_day(TRADING_DAY)
+    key = evidence.parity_store_key(report_day)
+    store = EmptyStore({key: _parity_report(report_day)})
+    reading = evidence.read_parity(store, trading_day=TRADING_DAY)
+    assert reading.unmeasurable is False
+    assert reading.met is True
+    assert key in reading.evidence
+    assert report_day.isoformat() in reading.detail
+
+
+def test_parity_stale_report_reads_unmet_naming_age():
+    from nousergon_lib.trading_calendar import subtract_trading_days
+
+    stale_day = subtract_trading_days(TRADING_DAY, evidence.PARITY_FRESHNESS_TRADING_DAYS + 1)
+    key = evidence.parity_store_key(stale_day)
+    store = EmptyStore({key: _parity_report(stale_day)})
+    reading = evidence.read_parity(store, trading_day=TRADING_DAY)
+    assert reading.unmeasurable is False
+    assert reading.met is False
+    assert "Stale" in reading.detail
+    assert str(evidence.PARITY_FRESHNESS_TRADING_DAYS + 1) in reading.detail
+    assert key in reading.evidence
+
+
+def test_parity_never_selects_a_report_dated_after_the_gate_day():
+    """A report filed for a day after the gate's own trading day is never
+    picked, even when it is the only report in the store."""
+    from nousergon_lib.trading_calendar import previous_trading_day
+
+    future_day = TRADING_DAY + dt.timedelta(days=1)
+    past_day = previous_trading_day(TRADING_DAY)
+    store = EmptyStore(
+        {
+            evidence.parity_store_key(future_day): _parity_report(future_day),
+            evidence.parity_store_key(past_day): _parity_report(past_day),
+        }
+    )
+    reading = evidence.read_parity(store, trading_day=TRADING_DAY)
+    assert reading.met is True
+    assert evidence.parity_store_key(past_day) in reading.evidence
+    assert evidence.parity_store_key(future_day) not in reading.evidence
+
+
+def test_parity_denied_listing_is_unmeasurable():
+    reading = evidence.read_parity(DeniedStore(), trading_day=TRADING_DAY)
+    assert reading.unmeasurable is True
 
 
 class _FakeIamClient:
