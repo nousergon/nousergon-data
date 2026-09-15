@@ -512,6 +512,14 @@ _KNOWN_OPS_PLANE_WRITE_SITES = {
         "preflight/sentinel-<uuid>.txt to prove the IAM grant, then relies on "
         "the DELETE to clean it up — not a published data key."
     ),
+    "shadow/arctic_seed.py": (
+        "ensure_seeded() write_batch/write calls land ONLY in "
+        "shadow_{YYYYMMDD}_* ArcticDB libraries (every name is re-checked "
+        "against the shadow prefix and LIVE_ARCTIC_LIBRARIES; live handles are "
+        "read-only wrappers) — the pre-cutover shadow run's private copy of "
+        "live state (alpha-engine-config-I10866), consumed by no pipeline and "
+        "claimed by no unit descriptor, not a published data key."
+    ),
     "validators/stage_output_sweep.py": (
         "_publish_verdict() writes the sweep's OWN verdict document "
         "(alpha-engine-config-I7167) — an ops artifact about other stages' "
