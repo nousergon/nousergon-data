@@ -13,11 +13,12 @@ owning_repo: nousergon-data
 substrate: step-functions
 origin: ne-weekly-freshness-pipeline:RAGIngestion
 owner: brian
-lifecycle: deprecated
+lifecycle: retired
 lifecycle_owner: brian
 lifecycle_reexam: '2026-09-28'
 lifecycle_reason: 'Generated from registry.d/units/D41-*.yaml (P-08): the unit descriptor declares lifecycle:
-  ''proposed-retirement'' — R7 (plan §7) retirement recommendation, not yet executed'
+  ''retired'' — Brian 2026-09-14 R7 (alpha-engine-config-I10753). zero-consumer artifact (no reader found
+  for data/analyst_revisions/*)'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D41''s own code path (data/derived/analyst_revisions.py:374)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no
