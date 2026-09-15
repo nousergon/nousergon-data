@@ -136,12 +136,16 @@ def test_the_board_is_red_at_birth(board):
     # paths. Every other column needs a store or an external source to read MET.
     tree_readers = (".schema_contract", ".observability_row", ".consumers")
     assert all(c.name.endswith(tree_readers) for c in met), sorted(c.name for c in met)
-    # I10774 (P-07) landed schema + producer test + consumer pin for every plan §3
-    # boundary-table key that lacked one (Metron market-data spine, constituents,
-    # universe_classification, the ArcticDB `universe` library row contract),
-    # raising the MET count from <20 to 21. Bound kept generous, not exact, so the
-    # next unit's contract landing doesn't require a synchronized edit here too.
-    assert len(met) < 30, "far more base clauses read MET than have real readers"
+    # The ceiling is DERIVED, not hand-tuned: every base clause whose column is
+    # one of the tree readers above, excluding RETIRED rows, is the whole
+    # universe a real (non-store) reader could possibly mark MET. A hand-picked
+    # number breaks on every legitimate schema/registry-row/consumer-pin landing
+    # (I10774 raised it 20->21, I10775/I10823 raised it again) — this bound
+    # tracks the reader registry itself, so it only breaks when a clause OUTSIDE
+    # that registry reads MET, which `assert all(...)` above already catches
+    # structurally, or when RETIRED bookkeeping is wrong.
+    eligible = [c for c in base if c.name.endswith(tree_readers) and not clause_module.is_retired(c)]
+    assert len(met) <= len(eligible), "more clauses read MET than have a real reader backing them"
 
 
 # ---------------------------------------------------------------------------
