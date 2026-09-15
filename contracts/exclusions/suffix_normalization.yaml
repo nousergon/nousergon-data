@@ -1,0 +1,52 @@
+# Suffix normalization map — applied to the EOD spine's denominator BEFORE
+# the cardinality check (`data_collection_plan_260914.md` §2 row 2, plan item
+# P-13; `alpha-engine-config-I10780`).
+#
+# `metron/holdings_universe.json` carries TWO representations of the same
+# foreign-listed instrument that have drifted apart:
+#   - `tickers`: a flat list of bare symbols (denominator for the cardinality
+#     guard) — foreign listings appear WITHOUT their exchange suffix (`D05`).
+#   - `holdings[].yf_symbol`: the symbol Metron actually fetches with —
+#     foreign listings carry the exchange suffix yfinance/polygon require
+#     (`D05.SI`), and that suffixed form is what lands in the published
+#     `market_data/eod_closes/{date}.json` `closes` map.
+#
+# Without this map a bare `D05` in the denominator never string-matches the
+# suffixed `D05.SI` key that DID get priced, and the guard counts a real
+# match as a miss. `check_cardinality` (`validators/expectations.py`) maps
+# each denominator symbol through this table before looking it up in the
+# covered set — a declared map, not a runtime heuristic, so an unmatched
+# symbol after normalization is a real gap (declared exclusion or a genuine
+# undeclared miss), never something silently resolved by guessing at a
+# suffix pattern.
+#
+# Measured 2026-09-14 against the live artifacts: these 4 are exactly the
+# suffix mismatches accounting for 4 of the 12 raw non-matches between
+# `tickers` (88) and `closes` (80, of which 4 keys carry a suffix no bare
+# `tickers` entry has). Add a row here — never a code-level heuristic —
+# the day a new foreign listing enters the held/watchlist universe.
+#
+# Schema:
+#   denominator_symbol: the bare symbol as it appears in
+#     `metron/holdings_universe.json`'s `tickers` list.
+#   priced_symbol: the yf_symbol it is actually published under in
+#     `market_data/eod_closes/{date}.json`'s `closes` map.
+#   exchange: human-readable exchange name, for the audit trail only.
+schema_version: 1
+
+normalize:
+  - denominator_symbol: "D05"
+    priced_symbol: "D05.SI"
+    exchange: "Singapore Exchange (SGX)"
+
+  - denominator_symbol: "NOVN"
+    priced_symbol: "NOVN.SW"
+    exchange: "SIX Swiss Exchange"
+
+  - denominator_symbol: "RMS"
+    priced_symbol: "RMS.PA"
+    exchange: "Euronext Paris"
+
+  - denominator_symbol: "SU"
+    priced_symbol: "SU.PA"
+    exchange: "Euronext Paris"

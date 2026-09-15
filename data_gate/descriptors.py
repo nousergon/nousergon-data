@@ -185,6 +185,15 @@ class Unit:
         return freshness.get("family")
 
     @property
+    def completeness(self) -> dict[str, Any] | None:
+        """The unit's declared cardinality block: ``denominator``, ``floor``,
+        ``status``, ``note`` (`data_collection_plan_260914.md` §2 row 2). ``None``
+        when the raw block is empty/absent — most units publish no single
+        countable denominator and declare no completeness block at all."""
+        value = self.raw.get("completeness")
+        return dict(value) if isinstance(value, dict) and value else None
+
+    @property
     def run_manifest_prefix(self) -> str:
         return str(self.raw["run_manifest_prefix"])
 
