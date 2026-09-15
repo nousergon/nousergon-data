@@ -19,7 +19,7 @@ RUN microdnf install -y git && microdnf clean all
 # requirements file so the [flow_doctor]-only install above isn't
 # overridden by the [arcticdb,flow_doctor,rag] extras pinned for EC2.
 COPY requirements.txt ${LAMBDA_TASK_ROOT}/
-RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.127" && \
+RUN pip install --no-cache-dir "nousergon-lib[flow-doctor] @ git+https://github.com/nousergon/nousergon-lib@v0.124.128" && \
     grep -vE "^#|^$|^pytest|^python-dotenv|^boto3|^botocore|^s3transfer|^nousergon-lib" requirements.txt > /tmp/req-lambda.txt && \
     pip install --no-cache-dir -r /tmp/req-lambda.txt && \
     rm -rf /root/.cache/pip /tmp/req-lambda.txt
@@ -36,6 +36,11 @@ COPY weekly_collector.py ${LAMBDA_TASK_ROOT}/
 # ``validators/`` COPY below (2026-05-18) and ``polygon_client.py``. Any new
 # repo-root module imported by Lambda code MUST be COPYied here.
 COPY dates.py ${LAMBDA_TASK_ROOT}/
+# alpha-engine-config-I10773: weekly_collector imports run_units at module
+# scope to resolve each collector phase to its audit unit before writing the
+# run manifest. Without this COPY the Lambda fails at LOAD time, not at the
+# first manifest write, which is the failure mode the comment above names.
+COPY run_units.py ${LAMBDA_TASK_ROOT}/
 COPY store/ ${LAMBDA_TASK_ROOT}/store/
 # validators/ — top-level imports in collectors/alternative.py +
 # collectors/fundamentals.py (added 2026-05-16 via PR #254 per-collector
