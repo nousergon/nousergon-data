@@ -1,0 +1,24 @@
+# Which workload identity each data-collection unit writes under — read by
+# `data_gate/unit_readers.py::read_identity` (alpha-engine-config-I10823).
+#
+# The `identity` base column grades the TARGET identity: plan §6 moves every
+# unit onto the standalone `nousergon-data-collection` stack, whose EC2 workload
+# runs as `nousergon-data-collection-box-role` (alpha-engine-config-I10756,
+# nous-ergon-ops infrastructure/iam/nousergon-data-collection-box-role/). A
+# unit whose `trigger.runs_on` has no row here renders UNMET naming this file:
+# an undeclared writer identity cannot be shown to be scoped.
+#
+# Keyed by `trigger.runs_on`, not by unit, because the box role is ONE identity
+# shared by every unit on the box — it is graded per unit against that unit's
+# declared prefixes, and against an undeclared probe key that no unit writes.
+#
+# Role names are not secrets (data-gate.yml and data_gate/clauses.py already
+# name fleet roles and this account); policy content stays in nous-ergon-ops.
+schema_version: data_writer_identities.v1
+account_id: "711398986525"
+bucket: alpha-engine-research
+# A key no unit declares and no grant should cover. PutObject or DeleteObject
+# being ALLOWED here is a whole-bucket wildcard.
+undeclared_probe_key: data_gate_identity_probe/undeclared-prefix/probe.json
+by_runs_on:
+  ec2-spot: nousergon-data-collection-box-role

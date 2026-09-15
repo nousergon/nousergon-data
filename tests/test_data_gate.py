@@ -131,13 +131,21 @@ def test_the_board_is_red_at_birth(board):
     met = [c for c in base if c.met]
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
     # where a schema, a producer test AND a consumer pin all exist.
-    assert all(c.name.endswith(".schema_contract") for c in met), sorted(c.name for c in met)
-    # I10774 (P-07) landed schema + producer test + consumer pin for every plan §3
-    # boundary-table key that lacked one (Metron market-data spine, constituents,
-    # universe_classification, the ArcticDB `universe` library row contract),
-    # raising the MET count from <20 to 21. Bound kept generous, not exact, so the
-    # next unit's contract landing doesn't require a synchronized edit here too.
-    assert len(met) < 30, "far more base clauses read MET than have real readers"
+    # I10823 added readers whose evidence is in THIS tree even against an empty
+    # store: generated observability rows, and this repository's own consumer
+    # paths. Every other column needs a store or an external source to read MET.
+    tree_readers = (".schema_contract", ".observability_row", ".consumers")
+    assert all(c.name.endswith(tree_readers) for c in met), sorted(c.name for c in met)
+    # The ceiling is DERIVED, not hand-tuned: every base clause whose column is
+    # one of the tree readers above, excluding RETIRED rows, is the whole
+    # universe a real (non-store) reader could possibly mark MET. A hand-picked
+    # number breaks on every legitimate schema/registry-row/consumer-pin landing
+    # (I10774 raised it 20->21, I10775/I10823 raised it again) — this bound
+    # tracks the reader registry itself, so it only breaks when a clause OUTSIDE
+    # that registry reads MET, which `assert all(...)` above already catches
+    # structurally, or when RETIRED bookkeeping is wrong.
+    eligible = [c for c in base if c.name.endswith(tree_readers) and not clause_module.is_retired(c)]
+    assert len(met) <= len(eligible), "more clauses read MET than have a real reader backing them"
 
 
 # ---------------------------------------------------------------------------
@@ -168,7 +176,9 @@ def test_each_gate_grades_only_the_clauses_tagged_at_or_below_its_phase(board):
     # the `data-cutover-ready` sub-gate's own four clauses, which are
     # DELIBERATELY not a rung (`registry.d/phases.yaml`) and are graded only
     # by their own gate.
-    assert ceilings["data-phase3"] == len(board) - len(clause_module.CUTOVER_READY_CLAUSES)
+    # RETIRED clauses (I10823 deliverable 6) are rendered but graded by no gate.
+    retired = sum(1 for c in board if clause_module.is_retired(c))
+    assert ceilings["data-phase3"] == len(board) - len(clause_module.CUTOVER_READY_CLAUSES) - retired
 
 
 def test_every_reading_names_its_store_and_its_commit(board):
