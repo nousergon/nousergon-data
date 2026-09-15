@@ -8,6 +8,7 @@ No AWS: live Scheduler / Step Functions state is a fake attached to a LocalStore
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -118,7 +119,11 @@ def test_a_daily_unit_is_not_due_before_its_run_and_grace(tmp_path, units):
 
 
 def test_an_undeclared_cadence_is_named_not_guessed(tmp_path, units):
-    unit = units["D36"]
+    # A real descriptor with its cadence declaration removed, so the test keeps
+    # its meaning after every real unit declares one (alpha-engine-config-I10877).
+    base = units["D36"]
+    trigger = {k: v for k, v in base.raw["trigger"].items() if k not in ("schedule", "cadence_minutes")}
+    unit = dataclasses.replace(base, raw={**base.raw, "trigger": trigger})
     assert cadence.unit_cadence(unit.raw).kind == "undeclared"
     reading = evidence.read_run_record(LocalStore(tmp_path), unit, trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is False and "I10871" in reading.detail
