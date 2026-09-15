@@ -44,7 +44,13 @@ consumers_reason: >-
 contract:
   schema: contracts/rating_ledger_entry.schema.json
   producer_test: tests/test_technical_rating_ledger.py
-  consumer_pins: []
+  consumer_pins:
+    - "nousergon-data:collectors/technical_rating_ledger.py:460 (D27, in-producer derivation)"
+  # P-07 (alpha-engine-config#10870): the sole declared consumer is D27, the
+  # realized-performance scorer in this SAME repo/module — there is no cross-repo
+  # boundary to pin a copy across. tests/test_technical_rating_ledger.py already
+  # exercises that reader (its own docstring: "the realized-performance scorer"),
+  # so the producer test doubles as the consumer-contract test here.
 registry_rows: []
 # alpha-engine-config-I10870: `technical_rating_history` was never a real
 # ARTIFACT_REGISTRY artifact_id — both writes[] entries are already covered

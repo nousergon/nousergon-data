@@ -196,3 +196,17 @@ def validate_arctic_universe_row(data: dict) -> list[str]:
     """Validate one ArcticDB `universe` library symbol-frame row against the pinned
     column/dtype/index contract (crucible's consumer copy: contracts/arctic_universe.schema.json)."""
     return _validate(data, "arctic_universe")
+
+
+def validate_crypto_holdings(data: dict) -> list[str]:
+    """Validate crypto/holdings.json (collectors/crypto_balances.py::collect, D38).
+    Consumer: Metron api/services/crypto.py (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "crypto_holdings")
+
+
+def validate_inst_ownership_row(data: dict) -> list[str]:
+    """Validate one row of data/inst_ownership/{quarter}/latest.parquet
+    (data/derived/inst_ownership.py::InstOwnershipRow, D39). Consumer: crucible v2
+    crucible/data/point_in_time.py::SnapshotPointInTimeSource._load_institutional
+    (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "inst_ownership")

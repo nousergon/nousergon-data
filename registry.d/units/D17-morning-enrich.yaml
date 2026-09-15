@@ -40,9 +40,23 @@ consumers:
   - "crucible-executor:executor/upstream_artifact_gate.py"
   - "crucible-dashboard:loaders/s3_loader.py"
 contract:
-  schema: "sources/contract.py::PriceBar"
-  producer_test: tests/test_price_source_contract.py
-  consumer_pins: []
+  schema: "contracts/staging_daily_closes.schema.json"
+  producer_test: tests/test_staging_daily_closes_contract.py
+  consumer_pins:
+    - "crucible-executor:contracts/staging_daily_closes.schema.json"
+  # P-07 (alpha-engine-config#10870): the schema/producer_test above pin the
+  # exact staging/daily_closes/{date}.parquet artifact this unit writes
+  # (writes_shared_with: D19, same S3 key template). The generic
+  # `sources/contract.py::PriceBar` reference was correct but imprecise —
+  # this is the specific versioned contract. The consumer pin is
+  # crucible-executor's `contracts/staging_daily_closes.schema.json`,
+  # already reconciled against this producer schema by
+  # crucible-executor `tests/test_contract_producer_parity.py`
+  # (alpha-engine-config-I10796) and consumed for freshness by
+  # `executor/upstream_artifact_gate.py`, pinned by
+  # `tests/test_contract_staging_daily_closes.py`. crucible-dashboard's
+  # `loaders/s3_loader.py` reads the same key but has no schema-level
+  # dependency (freshness/listing only) — no pin added there.
 registry_rows:
   - daily_closes_parquet
 run_manifest_prefix: data_collection/runs/D17

@@ -45,9 +45,20 @@ consumers:
   - "crucible-research:thinktank/context.py"
   - "crucible-research:agents/sector_teams/qual_tools.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: "contracts/inst_ownership.schema.json"
+  producer_test: tests/test_inst_ownership_contract.py
+  consumer_pins:
+    - "crucible:tests/contracts/inst_ownership.schema.json"
+  # P-07 (alpha-engine-config#10870): the `consumers` field above (crucible-research
+  # only, v1, retiring) is STALE — crucible v2's
+  # crucible/data/point_in_time.py::SnapshotPointInTimeSource._load_institutional
+  # reads `{prefix}/{quarter}/latest.parquet` (write_inst_ownership_parquet's
+  # per-quarter sidecar) via `crucible.keys.inst_ownership_key`, verified live on
+  # crucible origin/main 2026-09-15. That write key is also missing from this
+  # descriptor's `writes` list above (`data/inst_ownership/{quarter}/{ticker}.parquet`
+  # + `latest.json` only). Both are `consumers`/`writes` corrections — out of scope
+  # here (owned by a sibling agent this session, per P-07 dispatch scope) — flagged
+  # for that follow-up. This contract pins the row shape crucible already depends on.
 registry_rows:
   - thinktank_inst_ownership
 run_manifest_prefix: data_collection/runs/D39
