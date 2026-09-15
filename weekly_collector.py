@@ -87,6 +87,7 @@ setup_logging(
 
 from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history, technical_rating_ledger
 from builders._price_cache_writeboth import (
+    assert_valid_price_cache_ticker as _assert_valid_price_cache_ticker,
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
     write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
@@ -2350,6 +2351,7 @@ def _self_heal_chronic_polygon_gaps(
             ].sort_index()
 
             if not dry_run:
+                _assert_valid_price_cache_ticker(ticker)
                 buf = _io.BytesIO()
                 combined_pcache.to_parquet(buf, engine="pyarrow", compression="snappy")
                 body = buf.getvalue()

@@ -45,35 +45,35 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 2754
+    line: 2756
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer. (Line shifted from 2604 by
-      alpha-engine-config-I10861's `_record_mode_lineage` `_MODE_EXTRA_OUTPUTS`
-      additions; site unchanged.)
+      data, feeds no downstream consumer. (Line shifted from 2754 by
+      alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
+      call additions (2 lines); site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4123
+    line: 4125
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer. (Line shifted from 3973 by
-      alpha-engine-config-I10861's `_record_mode_lineage` `_MODE_EXTRA_OUTPUTS`
-      additions; site unchanged.)
+      data, feeds no downstream consumer. (Line shifted from 4123 by
+      alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
+      call additions (2 lines); site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4284
+    line: 4286
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer. (Line shifted from 4134 by
-      alpha-engine-config-I10861's `_record_mode_lineage` `_MODE_EXTRA_OUTPUTS`
-      additions; site unchanged.)
+      data, feeds no downstream consumer. (Line shifted from 4284 by
+      alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
+      call additions (2 lines); site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
