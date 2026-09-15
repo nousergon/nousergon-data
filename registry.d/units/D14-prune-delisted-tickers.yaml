@@ -37,15 +37,18 @@ writes:
   - "builders/prune_audit/{trading_day}-*.json"
 consumers: []
 consumers_reason: "No external reader of `delisted_history` was found."
-consumers_ruling:
-  # alpha-engine-config-I10870: R7 ruled KEEP for D14 (option (a)) —
-  # data_gate/clauses.py accepts this block to render the consumers clause
-  # MET-by-ruling rather than leaving a deliberately-kept producer UNMET.
-  ruling: "Brian 2026-09-14 R7(a) (alpha-engine-config-I10748, plan §7)"
+consumers_decision:
+  # alpha-engine-config-I10873: renders the consumers clause UNCONNECTED (not MET, not red,
+  # graded by no gate). Delete this block in the same change that adds a surviving consumer.
+  decision: kept-unconnected
+  ruled_by: Brian
+  ruled_on: "2026-09-14"
+  ruling: >-
+    Brian 2026-09-14 R7(a) (alpha-engine-config-I10748, plan §7); restated 2026-09-15 alpha-engine-config-I10873
   reason: >-
-    survivorship-bias/point-in-time delisted-history substrate a backtest
-    needs even with no reader wired today; kept because it already runs
-    inside phase 1.
+    kept, reincorporation possible — survivorship-bias/point-in-time delisted-history substrate a backtest needs even with no reader wired today.
+  reexam: >-
+    a crucible v2 backtest reads delisted_history (reincorporate: add the consumer, delete this block)
 contract:
   schema: contracts/arctic_universe.schema.json
   producer_test: tests/test_p07_contracts.py

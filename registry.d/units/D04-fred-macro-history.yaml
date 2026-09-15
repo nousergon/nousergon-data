@@ -42,8 +42,20 @@ consumers_reason: >-
     regime/features.py, crucible-backtester:analysis/exit_timing.py) are v1 repos
     retired in v2 phase 4; plan §3 counts only SURVIVING consumers (Metron, crucible
     v2, crucible-executor, dashboard/morning-signal/thinktank where §3 names them),
-    and a grep of those found none. This is a retirement candidate for Brian, not a
-    consumers_ruling KEEP — left UNMET with the question named.
+    and a grep of those found none. Brian ruled KEEP on 2026-09-15 (alpha-engine-config-I10873):
+    see consumers_decision.
+consumers_decision:
+  # alpha-engine-config-I10873: renders the consumers clause UNCONNECTED (not MET, not red,
+  # graded by no gate). Delete this block in the same change that adds a surviving consumer.
+  decision: kept-unconnected
+  ruled_by: Brian
+  ruled_on: "2026-09-15"
+  ruling: >-
+    Brian 2026-09-15 (alpha-engine-config-I10873): "for the decision cant we keep all for now but the console should say they exist but there are no consumers"
+  reason: >-
+    kept, reincorporation possible — collected and graded on every other column; its only readers are v1 repos retiring in crucible v2 phase 4, and the console shows it as unconnected so what is and is not wired stays visible.
+  reexam: >-
+    a v2 component proposes reading this key (reincorporate: add the consumer, delete this block), or crucible v2 phase 4 decommission review
 contract:
   schema: null
   producer_test: null

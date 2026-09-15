@@ -119,8 +119,9 @@ BASE_REQUIREMENTS: dict[str, str] = {
         "(alpha-engine-config-I10756)"
     ),
     "consumers": (
-        "every consumer {unit} declares resolves to a live reader, or the unit declares "
-        "`consumers: []` with a reason, which renders as a finding"
+        "every consumer {unit} declares resolves to a live reader and at least one lives in a "
+        "repo that survives v2 phase 4; a unit with none is UNCONNECTED — a finding until a "
+        "recorded keep (`consumers_decision`) or retire decision, then graded by no gate"
     ),
     "schema_contract": (
         "{unit} publishes a versioned schema with a producer test that validates a real "

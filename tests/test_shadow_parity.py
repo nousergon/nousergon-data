@@ -91,7 +91,11 @@ def test_no_s3_write_operation_can_escape_the_shadow_root(shadow_active):
             continue
         params = {"Bucket": "alpha-engine-research", "Key": "market_data/technicals/latest.json"}
         try:
-            result = interceptor.rewrite_params(operation, params, service="s3", root=ROOT)
+            # A fresh ledger per operation: this grades each operation's
+            # classification alone, not read-your-writes across the loop (I10891).
+            result = interceptor.rewrite_params(
+                operation, params, service="s3", root=ROOT, ledger=interceptor.RunLedger()
+            )
         except ShadowGuardViolation:
             continue  # refused: the safe outcome
         if operation in interceptor.READ_OPERATIONS:
