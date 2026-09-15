@@ -26,6 +26,7 @@ from collectors import constituents as constituents_mod
 from collectors import metron_market_data as mmd
 from collectors import universe_classification as uc
 from contracts import (
+    validate_arctic_universe_row,
     validate_constituents,
     validate_metron_analyst,
     validate_metron_close_history,
@@ -389,3 +390,49 @@ def test_universe_classification_missing_field_fails():
            "ticker_count": 1, "ok_count": 1,
            "data": {"AAPL": {"sector": "Technology", "country": "United States"}}}
     assert validate_universe_classification(art) != []
+
+
+# ── ArcticDB universe library row (alpha-engine-config-I10828) ──────────────
+# atr_14_pct and VWAP: crucible-executor's price_cache.load_atr_14_pct hard-fails
+# when atr_14_pct is absent from the frame; VWAP is the raw-price column
+# builders/daily_append.py writes alongside OHLCV. Hand-built fixture only --
+# no producer-write test here because daily_append's per-ticker Arctic write
+# path needs a live/mocked ArcticDB library, out of scope for this contract
+# fixture (mirrors the existing schema-only note at the top of this file).
+
+def test_arctic_universe_row_with_atr_and_vwap_validates():
+    art = {
+        "symbol": "AAPL", "index_date": "2026-06-26",
+        "Open": 200.0, "High": 202.0, "Low": 199.0, "Close": 201.0, "Volume": 5_000_000,
+        "VWAP": 200.5, "atr_14_pct": 0.0182,
+    }
+    assert validate_arctic_universe_row(art) == []
+
+
+def test_arctic_universe_row_with_null_atr_and_vwap_validates():
+    # VWAP null on yfinance/FRED-sourced rows; atr_14_pct null during the
+    # <14-row ATR warmup window. Both additive/nullable, never required.
+    art = {
+        "symbol": "AAPL", "index_date": "2026-06-26",
+        "Open": 200.0, "High": 202.0, "Low": 199.0, "Close": 201.0, "Volume": 5_000_000,
+        "VWAP": None, "atr_14_pct": None,
+    }
+    assert validate_arctic_universe_row(art) == []
+
+
+def test_arctic_universe_row_without_atr_and_vwap_still_validates():
+    # Rows written before this contract update carry neither column.
+    art = {
+        "symbol": "AAPL", "index_date": "2026-06-26",
+        "Open": 200.0, "High": 202.0, "Low": 199.0, "Close": 201.0, "Volume": 5_000_000,
+    }
+    assert validate_arctic_universe_row(art) == []
+
+
+def test_arctic_universe_row_negative_vwap_fails():
+    art = {
+        "symbol": "AAPL", "index_date": "2026-06-26",
+        "Open": 200.0, "High": 202.0, "Low": 199.0, "Close": 201.0, "Volume": 5_000_000,
+        "VWAP": -1.0,
+    }
+    assert validate_arctic_universe_row(art) != []
