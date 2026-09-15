@@ -40,9 +40,16 @@ consumers:
   - "crucible-executor:executor/upstream_artifact_gate.py"
   - "crucible-dashboard:loaders/s3_loader.py"
 contract:
-  schema: "sources/contract.py::PriceBar"
-  producer_test: tests/test_price_source_contract.py
-  consumer_pins: []
+  schema: "contracts/staging_daily_closes.schema.json"
+  producer_test: tests/test_staging_daily_closes_contract.py
+  consumer_pins:
+    - "crucible-executor:contracts/staging_daily_closes.schema.json"
+  # P-07 (alpha-engine-config#10870): same artifact as D17 (writes_shared_with:
+  # D17, same S3 key template) — see D17's descriptor for the full note. The
+  # consumer pin is crucible-executor's `contracts/staging_daily_closes.schema.json`
+  # (alpha-engine-config-I10796), reconciled by
+  # `tests/test_contract_producer_parity.py` and pinned by
+  # `tests/test_contract_staging_daily_closes.py`.
 registry_rows:
   - daily_closes_parquet
 run_manifest_prefix: data_collection/runs/D19
