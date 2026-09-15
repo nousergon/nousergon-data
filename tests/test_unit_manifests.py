@@ -203,7 +203,12 @@ def test_d37_writes_one_manifest_per_tick_with_both_declared_keys(sink, metron, 
 
 
 def test_d37_off_session_tick_is_recorded_as_not_applicable(sink, metron, monkeypatch):
-    """The timer fires ~288x/day; the non-runs leave a record, not silence."""
+    """The timer fires ~288x/day; the non-runs leave a record, not silence.
+
+    `alpha-engine-config-I10831` deliverable 1: this site now tags the
+    precise `outside_session_window` member rather than the generic
+    `no_new_data_declared` — the withholding shape below fails against the
+    old tag."""
     monkeypatch.setattr(metron, "collect_intraday", lambda **kw: {  # noqa: ARG005
         "status": "skipped", "reason": "outside US market window",
     })
@@ -212,8 +217,28 @@ def test_d37_off_session_tick_is_recorded_as_not_applicable(sink, metron, monkey
 
     manifest = sink.only
     assert manifest["status"] == "not_applicable"
+    assert manifest["reason"] == "outside_session_window"
     assert manifest["reason"] in run_units.run_manifest.NOT_APPLICABLE_REASONS
     assert manifest["outputs"] == []
+
+
+def test_d37_an_unclassified_skip_reason_fails_loud(sink, metron, monkeypatch):
+    """No default bucket: `collect_intraday`'s only two source-level skip
+    reasons are "outside US market window" and "metron app inactive (no
+    fresh UI heartbeat)" — the latter unreachable in production because
+    metron-intraday.service's ExecStart never passes `--require-heartbeat`.
+    Anything else is unclassified and fails loud rather than being tagged
+    `outside_session_window` by default (`alpha-engine-config-I10831`,
+    corrected 2026-09-15)."""
+    monkeypatch.setattr(metron, "collect_intraday", lambda **kw: {  # noqa: ARG005
+        "status": "skipped", "reason": "metron app inactive (no fresh UI heartbeat)",
+    })
+
+    with pytest.raises(RuntimeError, match="unclassified reason"):
+        metron.main(["--only-intraday", "--date", "2026-09-14"])
+
+    manifest = sink.only
+    assert manifest["status"] == "failed"
 
 
 def test_d37_empty_fetch_refusal_is_a_failed_manifest(sink, metron, monkeypatch):

@@ -210,23 +210,55 @@ def test_every_whole_mode_unit_has_a_declared_row_source():
 # ── A non-run is `not_applicable`, never `ok` ────────────────────────────────
 
 
-def test_a_skipped_mode_writes_not_applicable_and_returns_its_own_result(monkeypatch):
-    """`alpha-engine-config-I10784`: MorningEnrich after 1:30pm PT returns
-    `status="skipped"` and used to record a manifest saying `ok` — a non-run
-    filed as a successful run."""
+def test_a_stale_overwrite_skip_writes_no_new_data_declared(monkeypatch):
+    """`alpha-engine-config-I10784`: MorningEnrich returning `status="skipped"`
+    used to record a manifest saying `ok` — a non-run filed as a successful
+    run.
+
+    `alpha-engine-config-I10831` deliverable 1, corrected 2026-09-15:
+    `_should_skip_morning_enrich`'s `stale_overwrite` reason — the target
+    date is already appended to ArcticDB — matches
+    `nousergon_lib.run_manifest`'s own `no_new_data_declared` definition
+    verbatim ("an upstream explicitly declared there is nothing new for THIS
+    run to collect ... a target date already published"), not
+    `disabled_by_declaration` (no operator/config switch was involved) and
+    not `outside_session_window` (this is a data fact, not a clock fact)."""
     out, m = _run(
         monkeypatch,
         "morning_enrich",
-        {"status": "skipped", "skip_reason": "polygon free tier will not serve today", "collectors": {}},
+        {
+            "status": "skipped",
+            "skip_reason": (
+                "stale_overwrite (polygon target=2026-09-14, ArcticDB SPY last=2026-09-15) — "
+                "polygon's T+1 settled day is older than the yfinance EOD row already in "
+                "ArcticDB"
+            ),
+            "collectors": {},
+        },
     )
     assert m["status"] == "not_applicable"
-    assert m["reason"] == run_units.NOT_RUN_NOT_APPLICABLE
+    assert m["reason"] == run_units.NOT_RUN_NO_NEW_DATA_DECLARED
     assert [g["verdict"] for g in m["guards"]] == ["not_applicable"]
     # The caller's contract is the mode's own dict — `run_unit` returns
     # `value=None` on the not-applicable path, and returning that would turn an
     # honest non-run into an AttributeError upstream.
     assert out["status"] == "skipped"
-    assert out["skip_reason"] == "polygon free tier will not serve today"
+
+
+def test_an_unclassified_skip_reason_fails_loud(monkeypatch):
+    """No default bucket: a skip_reason this dispatch has not explicitly
+    matched to a `NOT_APPLICABLE_REASONS` member is a FAILED manifest, not a
+    guess (`alpha-engine-config-I10831`, corrected 2026-09-15 — the prior
+    revision defaulted every non-`stale_overwrite` skip to
+    `outside_session_window`, which was a bucket, not a match)."""
+    out, m = _run(
+        monkeypatch,
+        "morning_enrich",
+        {"status": "skipped", "skip_reason": "polygon free tier will not serve today", "collectors": {}},
+    )
+    assert m["status"] == "failed"
+    assert "polygon free tier will not serve today" in m["reason"]
+    assert out["status"] == "skipped"
 
 
 def test_a_failing_mode_still_writes_failed_and_returns_its_result(monkeypatch):
