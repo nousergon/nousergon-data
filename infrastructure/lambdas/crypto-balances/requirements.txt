@@ -4,3 +4,18 @@
 # package (no platform-wheel selection). boto3 is NOT listed — the python3.12 runtime provides
 # it, and bundling it would bloat the zip by ~17 MB for nothing.
 embit>=0.7.0
+
+# nousergon_lib.run_manifest — the `data_run_manifest.v1` writer behind
+# run_unit_entry.recorded_entry, so every invocation of this producer leaves one
+# run record (alpha-engine-config-I10810, data_collection_plan_260914.md §2 row 7).
+# Same pin as every other Lambda in this repo; the lockstep guard tests hold it.
+#
+# MEASURED COST (2026-09-14, `uv pip install --target`): embit alone is 1.9 MB
+# unzipped. embit + nousergon-lib is 42 MB unzipped / 21.8 MB zipped, of which
+# 26 MB is boto3/botocore/s3transfer — which the python3.12 runtime already
+# provides and which deploy.sh therefore DELETES from the package (see its
+# packaging step). After that prune: 16 MB unzipped / 5.5 MB zipped, against a
+# 250 MB unzipped / 50 MB direct-upload ceiling. `nousergon_lib/__init__.py` is
+# three lines and pulls nothing heavy at import, so cold start pays for the
+# module it uses, not for the library.
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.128

@@ -47,6 +47,9 @@ import time
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
+import run_units
+from dates import default_run_date
+from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
 
 logger = logging.getLogger(__name__)
@@ -2389,6 +2392,35 @@ def collect_intraday(
             "indices": len(indices), "fund_proxies": len(fund_proxies), "ratings": len(ratings)}
 
 
+def _record_intraday_run(ctx, bucket: str, result: dict) -> None:
+    """Record what this D37 run read and published, with measured counts.
+
+    The two keys the descriptor declares are recorded separately: the quotes
+    artifact's ``rows_out`` is the number of quote records actually in it (held
+    quotes + index proxies + fund proxies — the same counts the collector
+    already returns), and the ratings artifact's is the number of rated
+    symbols. Both are the collector's OWN measurements, never a 0 standing in
+    for an unreported count (`data_collection_plan_260914.md` §2 row 6).
+    """
+    ctx.record_input(f"s3://{bucket}/{HOLDINGS_UNIVERSE_KEY}")
+    ctx.record_input(f"s3://{bucket}/{CLOSES_PREFIX}latest.json")
+
+    quotes = int(result.get("quotes") or 0)
+    indices = int(result.get("indices") or 0)
+    fund_proxies = int(result.get("fund_proxies") or 0)
+    ctx.rows_in = quotes + indices + fund_proxies
+    ctx.record_output(
+        f"{INTRADAY_PREFIX}latest.json",
+        rows_out=quotes + indices + fund_proxies,
+        schema_version=str(INTRADAY_SCHEMA_VERSION),
+    )
+    ctx.record_output(
+        TECHNICAL_RATINGS_KEY,
+        rows_out=int(result.get("ratings") or 0),
+        schema_version=str(TECHNICAL_RATINGS_SCHEMA_VERSION),
+    )
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m collectors.metron_market_data", description=__doc__)
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
@@ -2412,8 +2444,50 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     if args.only_intraday:
-        intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
-                                 require_heartbeat=args.require_heartbeat)
+        # ONE `data_run_manifest.v1` per 5-minute tick of metron-intraday.timer
+        # (`data_collection_plan_260914.md` §2 row 7; alpha-engine-config-I10810).
+        # The timer fires every 5 minutes around the clock and the collector
+        # gates each tick on the NYSE session, so MOST ticks are off-session
+        # no-ops. Those are recorded as `not_applicable`, not skipped silently:
+        # a unit whose non-runs leave no record is indistinguishable from a unit
+        # that stopped running, which is the defect the run record exists to
+        # end. It is also why D37's descriptor declares a retention for its
+        # manifest prefix — ~288 records per day, not ~1.
+        captured: dict = {}
+
+        def _intraday_body(run_ctx) -> dict:
+            intra = collect_intraday(bucket=args.bucket, dry_run=args.dry_run, force=args.force,
+                                     require_heartbeat=args.require_heartbeat)
+            captured["result"] = intra
+            status = intra.get("status")
+            if status == "skipped":
+                # The session/demand gate declared there is nothing to collect
+                # this tick. `no_new_data_declared` is the nearest true member
+                # of run_manifest.NOT_APPLICABLE_REASONS, which is CLOSED at the
+                # pinned lib version; the reason this wants — an explicit
+                # out-of-session-window member — is a lib follow-up.
+                raise run_manifest.NotApplicable(
+                    "no_new_data_declared", str(intra.get("reason") or "gated tick"),
+                )
+            _record_intraday_run(run_ctx, args.bucket, intra)
+            if status not in ("ok", "ok_dry_run"):
+                # A non-ok collector status has FAILED — recorded as such while
+                # the caller's exit-code contract stays exactly what it was
+                # (`observability-policy` §3.1).
+                raise run_units.EntryRunFailed(
+                    f"collect_intraday returned status={status!r}: {intra}", value=intra,
+                )
+            return intra
+
+        run_units.recorded_entry(
+            "D37",
+            _intraday_body,
+            trigger="scheduled",
+            trading_day=args.date or default_run_date(),
+            bucket=args.bucket,
+            write=not args.dry_run,
+        )
+        intra = captured["result"]
         logger.info("[metron_market_data] intraday done: %s", intra)
         return 0 if intra.get("status") in ("ok", "ok_dry_run", "skipped") else 1
     result = collect(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)

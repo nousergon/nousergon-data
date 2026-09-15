@@ -1,16 +1,16 @@
 {
-  "Comment": "Nous Ergon data collection (alpha-engine-config-I10739; architecture.d/146). One definition, four state machines in the nousergon-data-collection stack (eod, morning, weekly, daily-heal), each started by its own EventBridge Scheduler schedule with an Input naming the collection, its ordered data-spot-dispatcher workloads, whether it runs only on NYSE trading days, and which published keys must be refreshed by the run. Independent of every Crucible v1 pipeline. FAIL-LOUD by design: unlike the v1 trading SFs' data-spot stages (fail-open so trading continues), data collection has no downstream stage to protect, so a workload failure, a disabled dispatcher or an unrefreshed output FAILS the execution and pages.",
+  "Comment": "Nous Ergon data collection (alpha-engine-config-I10739; architecture.d/146). One definition, four state machines in the nousergon-data-collection stack (eod, morning, weekly, daily-heal), each started by its own EventBridge Scheduler schedule with an Input naming the collection, its ordered data-spot-dispatcher workloads, whether it runs only on NYSE trading days, and which audit UNITS (`verify_units`) must each leave a passing `data_run_manifest.v1` for the run. Independent of every Crucible v1 pipeline. FAIL-LOUD by design: unlike the v1 trading SFs' data-spot stages (fail-open so trading continues), data collection has no downstream stage to protect, so a workload failure, a disabled dispatcher, a missing run manifest, a non-ok run, an undeclared-but-promised output or a row count under its floor each FAIL the execution and page.",
   "StartAt": "Init",
   "TimeoutSeconds": 28800,
   "States": {
     "Init": {
       "Type": "Pass",
-      "Comment": "Pin the execution start time as the freshness baseline every verify_keys object must meet or exceed.",
+      "Comment": "Pin the execution start time as the freshness baseline: every verified unit's newest run manifest must have FINISHED at or after it, or the unit left no record of THIS run.",
       "Parameters": {
         "collection.$": "$.collection",
         "workloads.$": "$.workloads",
         "require_trading_day.$": "$.require_trading_day",
-        "verify_keys.$": "$.verify_keys",
+        "verify_units.$": "$.verify_units",
         "started_at.$": "$$.Execution.StartTime"
       },
       "Next": "CheckRequireTradingDay"
@@ -253,79 +253,53 @@
           "Next": "NotifyFailure"
         }
       ],
-      "Next": "CheckVerifyKeys"
+      "Next": "CheckVerifyUnits"
     },
-    "CheckVerifyKeys": {
+    "CheckVerifyUnits": {
       "Type": "Choice",
       "Choices": [
         {
-          "Variable": "$.verify_keys[0]",
+          "Variable": "$.verify_units[0]",
           "IsPresent": true,
-          "Next": "VerifyOutputsRefreshed"
+          "Next": "VerifyRunManifests"
         }
       ],
       "Default": "CollectionSucceeded"
     },
-    "VerifyOutputsRefreshed": {
-      "Type": "Map",
-      "Comment": "The completion claim is the published artifact, not the workload exit code: every verify key must carry LastModified >= this execution's start. A LastModified the Choice cannot read as a timestamp fails the same way, so a format surprise is loud, never a silent pass.",
-      "ItemsPath": "$.verify_keys",
-      "MaxConcurrency": 4,
-      "ItemSelector": {
-        "key.$": "$$.Map.Item.Value",
-        "started_at.$": "$.started_at"
-      },
-      "ItemProcessor": {
-        "ProcessorConfig": {
-          "Mode": "INLINE"
-        },
-        "StartAt": "HeadOutput",
-        "States": {
-          "HeadOutput": {
-            "Type": "Task",
-            "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
-            "Parameters": {
-              "Bucket": "${ResearchBucket}",
-              "Key.$": "$.key"
-            },
-            "ResultSelector": {
-              "last_modified.$": "$.LastModified"
-            },
-            "ResultPath": "$.head",
-            "Retry": [
-              {
-                "ErrorEquals": ["S3.SdkClientException", "S3.S3Exception"],
-                "IntervalSeconds": 5,
-                "MaxAttempts": 3,
-                "BackoffRate": 2
-              }
-            ],
-            "Next": "CheckRefreshed"
-          },
-          "CheckRefreshed": {
-            "Type": "Choice",
-            "Choices": [
-              {
-                "And": [
-                  {"Variable": "$.head.last_modified", "IsTimestamp": true},
-                  {"Variable": "$.head.last_modified", "TimestampGreaterThanEqualsPath": "$.started_at"}
-                ],
-                "Next": "OutputRefreshed"
-              }
-            ],
-            "Default": "OutputNotRefreshed"
-          },
-          "OutputNotRefreshed": {
-            "Type": "Fail",
-            "Error": "DataCollectionOutputNotRefreshed",
-            "Cause": "A published key's LastModified predates this execution (or is unreadable as a timestamp): the workloads exited 0 but the consumer-facing artifact did not move."
-          },
-          "OutputRefreshed": {
-            "Type": "Succeed"
-          }
+    "VerifyRunManifests": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I10787 (plan P-20). The completion claim is the RUN MANIFEST of every unit this machine runs, not a HEAD on two keys: the manifest must exist for this execution, carry status=ok, and list EVERY key the unit's descriptor says it publishes at or above that key's declared rows_out floor. Per-key floor compliance means searching an array of objects by field value, which ASL cannot express (a Map over outputs[] can only assert 'some output exists' — the claim being replaced), so the check is an action on the dispatcher Lambda that already reads this repo's descriptors, exactly as TradingDayCheck is. It launches nothing. FAIL LOUD: a dispatcher error goes to NotifyFailure through the Catch below, and a measured finding goes to one of four distinct named Fail states — there is no edge from here to CollectionSucceeded that is not an affirmative measured pass.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "${DispatcherFunctionArn}",
+        "Payload": {
+          "action": "completion-check",
+          "collection.$": "$.collection",
+          "units.$": "$.verify_units",
+          "started_at.$": "$.started_at"
         }
       },
-      "ResultPath": null,
+      "ResultSelector": {
+        "ok.$": "$.Payload.completion.ok",
+        "failure_mode.$": "$.Payload.completion.failure_mode",
+        "summary.$": "$.Payload.completion.summary",
+        "findings.$": "$.Payload.completion.findings",
+        "units.$": "$.Payload.completion.units"
+      },
+      "ResultPath": "$.completion",
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2
+        }
+      ],
       "Catch": [
         {
           "ErrorEquals": ["States.ALL"],
@@ -333,7 +307,89 @@
           "Next": "NotifyFailure"
         }
       ],
-      "Next": "CollectionSucceeded"
+      "Next": "CheckCompletion"
+    },
+    "CheckCompletion": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.completion.ok",
+          "BooleanEquals": true,
+          "Next": "CollectionSucceeded"
+        }
+      ],
+      "Default": "NotifyCompletionFindings"
+    },
+    "NotifyCompletionFindings": {
+      "Type": "Task",
+      "Comment": "Page BEFORE the Fail state so the operator gets the finding list, not just the error name. A publish failure routes on to the same switch: a paging outage must never convert a completion finding into a green run.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "${AlertsTopicArn}",
+        "Subject": "Nous Ergon data collection COMPLETION CHECK FAILED",
+        "Message.$": "States.Format('Data collection {} failed its run-manifest completion check. Execution: {}. Mode: {}. {}', $.collection, $$.Execution.Id, $.completion.failure_mode, $.completion.summary)"
+      },
+      "ResultPath": null,
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": null,
+          "Next": "CompletionFailureMode"
+        }
+      ],
+      "Next": "CompletionFailureMode"
+    },
+    "CompletionFailureMode": {
+      "Type": "Choice",
+      "Comment": "Four named failure modes, in the precedence the Lambda applies: a missing manifest explains a missing output, never the reverse. A mode this switch does not know is a Fail of its own — a new mode must never fall through to a pass.",
+      "Choices": [
+        {
+          "Variable": "$.completion.failure_mode",
+          "StringEquals": "manifest_missing",
+          "Next": "ManifestMissing"
+        },
+        {
+          "Variable": "$.completion.failure_mode",
+          "StringEquals": "run_not_ok",
+          "Next": "RunNotOk"
+        },
+        {
+          "Variable": "$.completion.failure_mode",
+          "StringEquals": "output_missing",
+          "Next": "OutputMissing"
+        },
+        {
+          "Variable": "$.completion.failure_mode",
+          "StringEquals": "rows_below_floor",
+          "Next": "RowsBelowFloor"
+        }
+      ],
+      "Default": "CompletionModeUnknown"
+    },
+    "ManifestMissing": {
+      "Type": "Fail",
+      "Error": "DataCollectionManifestMissing",
+      "CausePath": "$.completion.summary"
+    },
+    "RunNotOk": {
+      "Type": "Fail",
+      "Error": "DataCollectionRunNotOk",
+      "CausePath": "$.completion.summary"
+    },
+    "OutputMissing": {
+      "Type": "Fail",
+      "Error": "DataCollectionOutputMissing",
+      "CausePath": "$.completion.summary"
+    },
+    "RowsBelowFloor": {
+      "Type": "Fail",
+      "Error": "DataCollectionRowsBelowFloor",
+      "CausePath": "$.completion.summary"
+    },
+    "CompletionModeUnknown": {
+      "Type": "Fail",
+      "Error": "DataCollectionCompletionModeUnknown",
+      "CausePath": "$.completion.summary"
     },
     "CollectionSucceeded": {
       "Type": "Succeed"

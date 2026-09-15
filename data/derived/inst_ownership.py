@@ -87,6 +87,9 @@ from typing import Any, Protocol
 import pandas as pd
 import requests
 
+import run_units
+from dates import default_run_date
+
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
@@ -1795,6 +1798,29 @@ def _run_dry_run() -> int:
     return 0 if mapping else 1
 
 
+def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> None:
+    """Record one quarter's published keys with the row count that landed.
+
+    ``write_inst_ownership_parquet`` writes a run-scoped artifact under a run id
+    this caller never sees, plus the two STABLE keys consumers actually read.
+    Those two are what the manifest names, so a reader can go straight from the
+    record to the object — and ``rows_out`` is ``len(rows)``, the count the
+    producer itself measured, never a 0 standing in for an unreported one.
+    """
+    quarter = rows[0].quarter
+    ctx.record_output(
+        f"{prefix}/{quarter}/latest.parquet",
+        rows_out=len(rows),
+        schema_version=str(SCHEMA_VERSION),
+    )
+    if global_sidecar:
+        ctx.record_output(
+            f"{prefix}/latest.json",
+            rows_out=len(rows),
+            schema_version=str(SCHEMA_VERSION),
+        )
+
+
 def main() -> None:
     """CLI entry point: ``python -m data.derived.inst_ownership ...``."""
     import argparse
@@ -1851,7 +1877,29 @@ def main() -> None:
     args = parser.parse_args()
 
     if args.dry_run:
+        # Read-only OpenFIGI sanity check: no SEC download, no S3 read or write.
+        # Not a unit execution, so it writes no run manifest.
         sys.exit(_run_dry_run())
+
+    # One `data_run_manifest.v1` per execution of this entry point
+    # (`data_collection_plan_260914.md` §2 row 7; alpha-engine-config-I10810).
+    # The scheduled path is .github/workflows/inst-ownership-weekly.yml, hence
+    # the `gha` trigger; $NE_DATA_TRIGGER overrides it when a launcher declares
+    # something else. `_run_cli` calls `sys.exit` on every failure path exactly
+    # as it did before — SystemExit is recorded as a `failed` manifest and then
+    # re-raised, so the workflow's exit-code contract is unchanged.
+    run_units.recorded_entry(
+        "D39",
+        lambda run_ctx: _run_cli(args, run_ctx),
+        trigger="gha",
+        trading_day=default_run_date(),
+        bucket=args.bucket,
+    )
+
+
+def _run_cli(args, run_ctx) -> None:
+    """The CLI's actual work, recording its lineage on ``run_ctx``."""
+    import sys
 
     if args.tickers_file and args.from_membership:
         print("--tickers-file and --from-membership are mutually exclusive", file=sys.stderr)
@@ -1896,6 +1944,7 @@ def main() -> None:
         with open(args.tickers_file) as f:
             tickers = [line.strip().upper() for line in f if line.strip()]
     elif args.from_membership:
+        run_ctx.record_input(f"s3://{args.bucket}/{MEMBERSHIP_LATEST_KEY}")
         try:
             tickers = load_universe_from_membership(s3_client=s3, bucket=args.bucket)
         except UniverseUnavailable as e:
@@ -1910,6 +1959,7 @@ def main() -> None:
         sys.exit(1)
 
     openfigi_api_key = os.environ.get(OPENFIGI_API_KEY_ENV_VAR) or None
+    run_ctx.declare_denominator("scanner universe_membership", len(tickers))
 
     if report_periods:
         # Historical backfill (I10733): one SEC index-page fetch and one
@@ -1947,6 +1997,9 @@ def main() -> None:
                 )
                 sys.exit(1)
             print(f"  wrote {len(rows)} rows for {rows[0].quarter}")
+            _record_written_quarter(
+                run_ctx, args.bucket, DEFAULT_S3_PREFIX, rows, global_sidecar=False,
+            )
             total_rows += len(rows)
         print(
             f"Backfill complete: {len(report_periods)} period(s), "
@@ -1967,6 +2020,9 @@ def main() -> None:
         print("No data processed (see logs for details).", file=sys.stderr)
         sys.exit(1)
 
+    _record_written_quarter(
+        run_ctx, args.bucket, DEFAULT_S3_PREFIX, rows, global_sidecar=True,
+    )
     print(f"Written: {len(rows)} rows for {rows[0].quarter}")
     print(f"Sample: {rows[0].ticker} — {rows[0].n_funds_holding} funds, "
           f"{rows[0].total_shares_held:,.0f} shares")

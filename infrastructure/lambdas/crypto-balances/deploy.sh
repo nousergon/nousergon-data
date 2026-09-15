@@ -74,7 +74,13 @@ python3 -c "import ast; ast.parse(open('${SCRIPT_DIR}/index.py').read()); print(
 # Delegates to the one _shared/run_handler_tests.sh so this gate can never
 # re-drift into the naive no-install `python3 -m pytest` form (config#2295).
 source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
-run_handler_tests "${SCRIPT_DIR}" boto3
+# index.py now imports run_units -> nousergon_lib.run_manifest
+# (the D38 run record, alpha-engine-config-I10810), and the tests do a real
+# `import index`, so the pin has to be installed rather than stubbed. The repo
+# root joins the path for the three vendored root modules.
+NOUSERGON_LIB_REQ="$(requirement_pin "${SCRIPT_DIR}/requirements.txt" nousergon-lib)"
+HANDLER_TEST_PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/collectors" \
+  run_handler_tests "${SCRIPT_DIR}" boto3 "${NOUSERGON_LIB_REQ}"
 
 # ----- 1. Package: deps (embit) + vendor the handler + collector + zip -------
 # embit is pure-Python-capable + ships a prebuilt linux_x86_64 libsecp256k1, so `pip install
@@ -87,8 +93,35 @@ trap "rm -rf '$PKG'" EXIT
 echo "Installing deps into ${PKG} (pip install -t)..."
 python3 -m pip install --quiet --target "${PKG}" --upgrade -r "${SCRIPT_DIR}/requirements.txt"
 
+# nousergon-lib drags boto3/botocore/s3transfer in as declared dependencies. The
+# python3.12 runtime ALREADY provides all three, so shipping them costs 26 MB
+# unzipped / 16 MB zipped for nothing — the same reasoning requirements.txt has
+# always applied to boto3. Measured 2026-09-14: 42 MB -> 16 MB unzipped,
+# 21.8 MB -> 5.5 MB zipped. Nothing in the package imports a botocore internal.
+rm -rf "${PKG}"/boto3 "${PKG}"/botocore "${PKG}"/s3transfer \
+       "${PKG}"/boto3-*.dist-info "${PKG}"/botocore-*.dist-info "${PKG}"/s3transfer-*.dist-info
+
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${REPO_ROOT}/collectors/crypto_balances.py" "${PKG}/crypto_balances.py"
+# The run-manifest chokepoint (alpha-engine-config-I10810) and the two repo-root
+# modules it needs. Vendored flat, same as the collector: one implementation of
+# the record idiom across the timers, the workflows and this handler.
+cp "${REPO_ROOT}/run_units.py" "${PKG}/run_units.py"
+cp "${REPO_ROOT}/dates.py" "${PKG}/dates.py"
+
+# The sha of the tree this package was built from. A Lambda has no git checkout,
+# so `run_manifest.resolve_code_sha()` cannot measure one — and a sha carried in
+# the ARTIFACT is the stronger answer anyway: it names the code actually
+# deployed. Without it the handler still collects, logs an ERROR, and writes NO
+# manifest (index.py::_deployed_code_sha) — visible as a missing D38 run record.
+BUILD_SHA="$(git -C "${REPO_ROOT}" rev-parse HEAD)"
+if ! printf '%s' "${BUILD_SHA}" | grep -Eq '^[0-9a-f]{40}$'; then
+  echo "ERROR: git rev-parse HEAD in ${REPO_ROOT} did not return a 40-char sha (got '${BUILD_SHA}'). A manifest cannot record a value nobody measured." >&2
+  exit 1
+fi
+printf '%s' "${BUILD_SHA}" > "${PKG}/code_sha.txt"
+echo "Packaged code_sha: ${BUILD_SHA}"
+
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"
