@@ -49,12 +49,16 @@ contract:
     - "metron:tests/contracts/metron_earnings.schema.json"
 registry_rows:
   - metron_earnings
+  - metron_sectors
 run_manifest_prefix: data_collection/runs/D22
 detectors:
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
     state: UNVERIFIED
-    note: earnings only; the sectors key has no row
+    note: >-
+        both keys now declared in registry_rows (I10809); the artifact_registry clause
+        itself is phase 1 (not yet generated) so this reads UNVERIFIED, not PRESENT,
+        until the gate measures it
 freshness:
   family: "eod-spine"
   deadline: "18:15 America/New_York"
@@ -124,4 +128,7 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
-notes: "Two keys, one registry row. The sectors key is the unmonitored half. P-09."
+notes: >-
+    Two keys, one already-existing registry row (metron_sectors, live since 2026-06-11) that
+    this descriptor had not declared — the D22 "AR U" audit cell was the undeclared link, not
+    a missing registry row (alpha-engine-config-I10809, P-09).

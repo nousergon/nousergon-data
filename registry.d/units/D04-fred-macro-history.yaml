@@ -33,7 +33,7 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
-  - "predictor/price_cache/<macro series>"
+  - "reference/price_cache/{ticker}.parquet"
 consumers: []
 consumers_reason: >-
     UNVERIFIED in the audit: no reader was found for the literal key. Phase 0 resolves it
@@ -119,3 +119,10 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
+notes: >-
+    alpha-engine-config-I10820: `writes` was a prose placeholder
+    (`predictor/price_cache/<macro series>`), unmeasurable by the shadow parity tool.
+    `collectors/fred_history.py::backfill_to_s3` (code read, `builders/_price_cache_writeboth.py`
+    Wave 3 PR4 cutover, DONE) writes ONLY `reference/price_cache/{ticker}.parquet` — the
+    legacy `predictor/price_cache/` prefix is retired and no longer written. `{ticker}` ranges
+    over `FRED_HISTORY_MAP`'s macro series keys (e.g. TWO, HYOAS).

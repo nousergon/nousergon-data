@@ -33,7 +33,8 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
-  - "research.db::universe_returns (S3 key NOT LOCATED — phase 0 deliverable)"
+  - "research.db"
+  - "backups/research_{date}.db"
 consumers:
   - "crucible-research:evals/last_week_scorecard.py"
   - "crucible-research:evals/judge_outcome_ic.py"
@@ -53,7 +54,9 @@ completeness:
   denominator: null
   floor: null
   status: unresolved
-  note: "blocked on the phase-0 key resolution below"
+  note: >-
+      the write-target key is now located (I10820); a row-count denominator for the
+      universe_returns table is a separate, still-open question
 guards:
   empty_fresh:
     state: absent
@@ -115,7 +118,11 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    Audit §8 unmeasurable: the exact published key was not located. Phase 0 closes it by a
-    code read (plan §8.2). Until the key is named, every clause that would read it is
-    UNMET with the question stated — not UNMEASURABLE, because nothing was denied: we have
-    not yet looked.
+    alpha-engine-config-I10820: code read of `collectors/research_db_upload.py::
+    upload_research_db` (the sole writer, per `tests/test_research_db_dated_backup.py`'s
+    guard against a bypass) — `universe_returns` is a TABLE inside the single-file
+    `research.db` SQLite database, not an independently-addressable S3 object, so the
+    resolvable write target is the pointer key (`research.db`, registered as
+    `research_db_backup`) and the dated series (`backups/research_{date}.db`, registered
+    as `research_db_dated_backup`) that carry it. `collectors/universe_returns.py::collect`
+    inserts rows then calls `upload_research_db` to publish both.
