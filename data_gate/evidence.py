@@ -36,6 +36,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
     subtract_trading_days,
 )
 
+from data_gate.cadence import Cadence, gate_moment, latest_due_fire, unit_cadence
 from data_gate.descriptors import REPO_ROOT, Unit
 
 __all__ = [
@@ -58,15 +59,23 @@ __all__ = [
     "read_roles_bootstrapped",
     "read_run_record",
     "read_stack_check_live",
+    "manifests_since",
+    "STACK_CHECK_LIVE_SCHEMA",
+    "STACK_CHECK_LIVE_MAX_AGE",
 ]
 
-#: Where `infrastructure/data_collection_stack.py check-live`'s reading WILL
-#: be published, once the deploy workflow (`.github/workflows/
-#: deploy-data-collection-stack.yml`, sibling-owned) gains a write step. That
-#: workflow is not touched here — this reader points at the key it will
-#: write, the same "honest phase-0 stub" shape as `_pending` above, so the
-#: gap is an address rather than a shrug (`alpha-engine-config-I10777`).
-STACK_CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
+#: Where `infrastructure/data_collection_stack.py check-live` publishes its
+#: verdict, RELATIVE TO THE STORE ROOT (`s3://alpha-engine-research/
+#: data_collection`). It used to be spelled with the `data_collection/` prefix,
+#: which a store already rooted there resolves to
+#: `data_collection/data_collection/deploy/...` — a key nothing would ever
+#: write. The producer imports nothing from here (it is a standalone script),
+#: so `tests/test_data_collection_stack.py` pins the two spellings together.
+STACK_CHECK_LIVE_KEY = "deploy/check-live/latest.json"
+STACK_CHECK_LIVE_SCHEMA = "data_collection_check_live.v1"
+#: check-live runs after every deploy and weekly (Sunday 22:30 UTC). A verdict
+#: older than one cycle plus a day means the emitter stopped.
+STACK_CHECK_LIVE_MAX_AGE = dt.timedelta(days=8)
 
 #: The `MetricRecord` (`krepis.metrics`) status vocabulary that represents a
 #: real reading (the guard looked and has an answer, good or bad) versus the
@@ -164,18 +173,26 @@ def _declared_schema_files(unit: Unit) -> list[str]:
     contract = unit.raw.get("contract") or {}
     out: list[str] = []
     for field_name in ("schema", "producer_test"):
-        value = contract.get(field_name)
-        if not value:
-            continue
-        token = str(value).split(" ")[0].split("::")[0]
-        if ":" in token and not token.endswith(".json"):
-            # A cross-repo reference such as `metron:tests/...`. This gate has no
-            # visibility into another repository's tree, so it is not evidence
-            # here; the consumer-pin clause is where that is graded, in phase 1.
-            continue
-        if token.endswith((".json", ".py")):
-            out.append(token)
+        # A multi-artifact unit (D20-D22, D37) declares a LIST. Stringifying
+        # the list matched no suffix and returned zero files, so a fully built
+        # contract read UNMET — every value is one declaration, scalar or not.
+        for value in _as_list(contract.get(field_name)):
+            token = str(value).split(" ")[0].split("::")[0]
+            if ":" in token and not token.endswith(".json"):
+                # A cross-repo reference such as `metron:tests/...`. This gate has no
+                # visibility into another repository's tree, so it is not evidence
+                # here; the consumer-pin clause is where that is graded, in phase 1.
+                continue
+            if token.endswith((".json", ".py")):
+                out.append(token)
     return out
+
+
+def _as_list(value: object) -> list:
+    """A descriptor field that may be declared as one value or several."""
+    if value is None or value == "":
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
 def _read_schema_contract(unit: Unit) -> Reading:
@@ -365,7 +382,140 @@ def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Re
     )
 
 
-def read_run_record(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Reading:
+def _cadence_note(cadence: Cadence) -> str:
+    if cadence.kind != "undeclared":
+        return ""
+    return (
+        f" Graded against the gate's own trading day because the descriptor {cadence.source} "
+        "(alpha-engine-config-I10871): a unit that runs less than daily reads red on the days "
+        "it is not due until it declares when it runs."
+    )
+
+
+def _parse_utc(stamp: object) -> dt.datetime | None:
+    try:
+        parsed = dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=dt.timezone.utc)
+
+
+def _day_folder(key: str) -> dt.date | None:
+    parts = key.split("/")
+    try:
+        return dt.date.fromisoformat(parts[-2])
+    except (ValueError, IndexError):
+        return None
+
+
+@dataclass
+class Cycle:
+    """The manifests one reader grades, and how they were selected."""
+
+    where: str
+    expected: str
+    keys: list[str] = field(default_factory=list)
+    manifests: list[dict] = field(default_factory=list)
+    problems: list[str] = field(default_factory=list)
+
+
+def _read_keys(store: GateStore, keys: list[str]) -> tuple[list[tuple[str, dict]], list[str]]:
+    docs: list[tuple[str, dict]] = []
+    problems: list[str] = []
+    for key in keys:
+        read = read_store_document(store, key)
+        if read.problem is not None:
+            problems.append(f"{key}: {read.problem}")
+        elif read.absent:
+            problems.append(f"{key}: vanished between listing and read")
+        else:
+            docs.append((key, read.document or {}))
+    return docs, problems
+
+
+#: How many calendar days BEFORE a fire a run's manifest folder may be named.
+#: A manifest is filed under the trading day it collected, not the day it ran:
+#: the 07:30 morning run records T-1, and the Saturday weekly records Friday
+#: (or Thursday across a Good Friday). Four days covers the longest such gap.
+_FOLDER_LAG_DAYS = 4
+
+
+def manifests_since(
+    store: GateStore, unit: Unit, *, since: dt.datetime, as_of: dt.datetime
+) -> tuple[list[tuple[str, dict]], list[str], str]:
+    """Every manifest of ``unit`` whose run STARTED in ``[since, as_of]``.
+
+    Lists only the day folders that can hold such a run (see
+    `_FOLDER_LAG_DAYS`), never the unit's whole history. Raises on a listing
+    failure — the caller classifies that as UNMEASURABLE. A manifest whose
+    ``started`` does not parse is kept when its folder is on or after the fire
+    date, so an unparseable stamp can never hide a record.
+    """
+    base = f"{_store_relative(unit.run_manifest_prefix)}/"
+    first = since.date() - dt.timedelta(days=_FOLDER_LAG_DAYS)
+    last = as_of.date()
+    keys: list[str] = []
+    day = first
+    while day <= last:
+        keys.extend(k for k in store.list_keys(f"{base}{day.isoformat()}/") if k.endswith(".json"))
+        day += dt.timedelta(days=1)
+    docs, problems = _read_keys(store, sorted(keys))
+    selected: list[tuple[str, dict]] = []
+    for key, doc in docs:
+        started = _parse_utc(doc.get("started"))
+        folder = _day_folder(key)
+        if started is not None:
+            if since <= started <= as_of:
+                selected.append((key, doc))
+        elif folder is not None and folder >= since.date():
+            selected.append((key, doc))
+    return selected, problems, f"{base}{{{first.isoformat()}..{last.isoformat()}}}/"
+
+
+def _cycle(
+    store: GateStore, unit: Unit, cadence: Cadence, *, trading_day: dt.date, now: dt.datetime | None
+) -> Cycle:
+    """The manifests `read_run_record` grades, selected by the unit's cadence."""
+    base = f"{_store_relative(unit.run_manifest_prefix)}/"
+    if cadence.kind == "scheduled":
+        as_of = gate_moment(trading_day, now)
+        fire = latest_due_fire(cadence, as_of=as_of)
+        docs, problems, where = manifests_since(store, unit, since=fire, as_of=as_of)
+        return Cycle(
+            where=where,
+            expected=f"for the run due at {fire.strftime('%Y-%m-%dT%H:%MZ')} ({cadence.source})",
+            keys=[k for k, _ in docs],
+            manifests=[d for _, d in docs],
+            problems=problems,
+        )
+    if cadence.kind == "on_demand":
+        # The most recent invocation, whenever it was. On-demand units are low
+        # volume, so listing the unit's whole prefix is bounded.
+        days = sorted(
+            {d for k in store.list_keys(base) if k.endswith(".json") and (d := _day_folder(k)) and d <= trading_day}
+        )
+        if not days:
+            return Cycle(where=base, expected="for any invocation")
+        latest = f"{base}{days[-1].isoformat()}/"
+        keys = sorted(k for k in store.list_keys(latest) if k.endswith(".json"))
+    else:
+        latest = f"{base}{trading_day.isoformat()}/"
+        keys = sorted(k for k in store.list_keys(latest) if k.endswith(".json"))
+    docs, problems = _read_keys(store, keys)
+    return Cycle(
+        where=latest,
+        expected=(
+            "for the most recent invocation" if cadence.kind == "on_demand" else "for this trading day"
+        ),
+        keys=keys,
+        manifests=[d for _, d in docs],
+        problems=problems,
+    )
+
+
+def read_run_record(
+    store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None
+) -> Reading:
     """Every execution of this unit on this trading day, as it recorded itself.
 
     `alpha-engine-config-I10810` deliverable 3 — the reader that replaces the
@@ -391,44 +541,67 @@ def read_run_record(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Re
     * **An ArcticDB unit's evidence is the probe**, and a withheld probe is
       UNMEASURABLE rather than MET — see :func:`_read_arctic_probe`.
     """
-    prefix = f"{_store_relative(unit.run_manifest_prefix)}/{trading_day.isoformat()}/"
+    cadence = unit_cadence(unit.raw)
+    unit_prefix = f"{_store_relative(unit.run_manifest_prefix)}/"
     try:
-        keys = sorted(k for k in store.list_keys(prefix) if k.endswith(".json"))
+        cycle = _cycle(store, unit, cadence, trading_day=trading_day, now=now)
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
-        # A deliberate catch, not a swallow: the failure mode is "this one
-        # prefix could not be listed", the gate reading carrying every other
-        # clause survives, and the recording surface is this UNMEASURABLE row.
+        # A deliberate catch, not a swallow: the failure mode is "this unit's
+        # manifest prefix could not be listed", the gate reading carrying every
+        # other clause survives, and the recording surface is this UNMEASURABLE row.
         return Reading(
             met=False,
-            detail=f"could not list {prefix}: {type(exc).__name__}: {exc}",
-            evidence=(f"{prefix}*.json",),
+            detail=f"could not list {unit_prefix}: {type(exc).__name__}: {exc}",
+            evidence=(f"{unit_prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    prefix = cycle.where
+
+    if cycle.problems:
+        # Checked BEFORE absence: an unreadable manifest can carry no `started`
+        # to select it by, and "nothing there" must never stand in for "could
+        # not read what is there".
+        return Reading(
+            met=False,
+            detail=f"{len(cycle.problems)} manifest(s) under {prefix} unreadable: {cycle.problems[:4]}",
+            evidence=tuple(cycle.keys[:8]) or (f"{prefix}*.json",),
             unmeasurable=True,
             source="data_collection store",
         )
 
-    if not keys:
+    if not cycle.keys:
+        if cadence.kind == "on_demand":
+            # Plan §2 row 7 asks that every EXECUTION leave a record. A unit
+            # that runs only when invoked and has never been invoked has no
+            # execution to record: a declared not-applicable (the guard-clause
+            # N/A shape), citing the listing that proved it.
+            return Reading(
+                met=True,
+                detail=(
+                    f"not applicable: {unit.unit_id} runs on demand ({cadence.source}) and no "
+                    f"invocation has been recorded under {unit_prefix} — nothing executed, so "
+                    "nothing was left unrecorded"
+                ),
+                evidence=(f"{unit_prefix}*.json",),
+                source="data_collection store",
+            )
         return Reading(
             met=False,
             detail=(
-                f"no run manifest under {prefix}. {unit.unit_id} either did not execute on "
-                "this trading day or executed without recording itself — and those are "
+                f"no run manifest {cycle.expected}, under {prefix}. {unit.unit_id} either did "
+                "not execute or executed without recording itself — and those are "
                 "indistinguishable from here, which is exactly the state the run-record "
                 "objective exists to end (plan §2 row 7)."
+                + _cadence_note(cadence)
             ),
             evidence=(f"{prefix}*.json",),
             source="data_collection store",
         )
 
-    manifests: list[dict] = []
-    problems: list[str] = []
-    for key in keys:
-        read = read_store_document(store, key)
-        if read.problem is not None:
-            problems.append(f"{key}: {read.problem}")
-        elif read.absent:
-            problems.append(f"{key}: vanished between listing and read")
-        else:
-            manifests.append(read.document or {})
+    keys = cycle.keys
+    manifests = cycle.manifests
+    problems = cycle.problems
 
     if problems:
         return Reading(
@@ -478,7 +651,14 @@ def read_run_record(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Re
         f"empty-but-fresh runs (guards[].verdict == 'empty_fresh') {len(empty_fresh)}"
     )
 
-    probe = _read_arctic_probe(store, unit, trading_day)
+    # The probe is filed under the trading day the run COLLECTED, which for a
+    # weekly or morning unit is not the gate's own day.
+    recorded = sorted(str(m.get("trading_day") or "") for m in manifests if m.get("trading_day"))
+    try:
+        probe_day = dt.date.fromisoformat(recorded[-1]) if recorded else trading_day
+    except ValueError:
+        probe_day = trading_day
+    probe = _read_arctic_probe(store, unit, probe_day)
     if probe is not None:
         if not probe.met:
             # The manifests exist; the ArcticDB half of the evidence does not.
@@ -514,6 +694,12 @@ def read_base(store: GateStore, unit: Unit, column: str, *, trading_day: dt.date
         return _read_schema_contract(unit)
     if column == "run_record":
         return read_run_record(store, unit, trading_day=trading_day)
+    if column == "survives_phase4":
+        # `alpha-engine-config-I10870`. Imported here: `standalone` imports
+        # `Reading` from this module.
+        from data_gate import standalone
+
+        return standalone.read_survives_phase4(store, unit, trading_day=trading_day)
     if column in {"observability_row", "artifact_registry", "consumers", "identity"}:
         # `alpha-engine-config-I10823`. Imported here, not at module top:
         # `unit_readers` imports `Reading` from this module.
@@ -762,21 +948,22 @@ def read_ladder_freshness(
     )
 
 
-def read_stack_check_live(store: GateStore) -> Reading:
+def read_stack_check_live(store: GateStore, *, now: dt.datetime | None = None) -> Reading:
     """The `nousergon-data-collection` stack's live-vs-checkout comparison.
 
-    `infrastructure/data_collection_stack.py check-live` runs from
-    `deploy-data-collection-stack.yml` (sibling-owned, not touched here) but
-    does not yet publish its result to the store — this reader points at the
-    key it WILL read, `STACK_CHECK_LIVE_KEY`, the same honest-stub shape as
-    `_pending` above but expressed as a real read: a deploy workflow that
-    starts writing this key needs no change here to be picked up.
+    `infrastructure/data_collection_stack.py check-live` publishes
+    ``{schema_version, as_of, code_sha, stack, measured, in_sync, drift, error}``
+    to `STACK_CHECK_LIVE_KEY` on every run — after every deploy and weekly —
+    including the runs that fail (`alpha-engine-config-I10870`).
 
-    Absence here is UNMET, not UNMEASURABLE: `read_objective`'s rule applies
-    — we CAN look (the store answers), there is simply no emitter yet, and
-    "no emitter" is a finding about the producer side, not about our read
-    (`alpha-engine-config-I10777`).
+    * Absent: UNMET — the store answers, there is no emitter (a producer
+      finding, `read_objective`'s rule).
+    * ``measured: false``: UNMEASURABLE — check-live could not look at the stack.
+    * Older than `STACK_CHECK_LIVE_MAX_AGE`: UNMET — the emitter stopped, and a
+      stale ``in_sync: true`` is not a current one.
+    * Otherwise MET exactly when ``in_sync`` is true.
     """
+    now = now or dt.datetime.now(dt.timezone.utc)
     read = read_store_document(store, STACK_CHECK_LIVE_KEY)
     if read.problem is not None:
         return Reading(
@@ -799,24 +986,47 @@ def read_stack_check_live(store: GateStore) -> Reading:
             source="data_collection store",
         )
     document = read.document or {}
-    status = str(document.get("status") or "")
-    if status not in {"clean", "drift"}:
+    as_of = str(document.get("as_of") or "")
+    common = {"evidence": (STACK_CHECK_LIVE_KEY,), "source": "data_collection store", "as_of": as_of}
+    version = document.get("schema_version")
+    in_sync = document.get("in_sync")
+    if version != STACK_CHECK_LIVE_SCHEMA or not isinstance(in_sync, bool):
         return Reading(
             met=False,
             detail=(
-                f"{STACK_CHECK_LIVE_KEY} carries status {status!r}, outside the closed set "
-                "{clean, drift}. A status nobody defined a rendering for is a finding."
+                f"{STACK_CHECK_LIVE_KEY} carries schema_version {version!r} / in_sync {in_sync!r}; "
+                f"expected {STACK_CHECK_LIVE_SCHEMA!r} with a boolean in_sync. A document nobody "
+                "defined a rendering for is a finding."
             ),
-            evidence=(STACK_CHECK_LIVE_KEY,),
-            source="data_collection store",
-            as_of=str(document.get("as_of") or ""),
+            **common,
         )
+    if document.get("measured") is False:
+        return Reading(
+            met=False,
+            detail=f"check-live could not measure the stack at {as_of}: {document.get('error')}",
+            unmeasurable=True,
+            **common,
+        )
+    stamp = _parse_utc(as_of) if as_of else None
+    if stamp is None or now - stamp > STACK_CHECK_LIVE_MAX_AGE:
+        return Reading(
+            met=False,
+            detail=(
+                f"{STACK_CHECK_LIVE_KEY} as_of {as_of!r} is older than "
+                f"{STACK_CHECK_LIVE_MAX_AGE.days} days (or unparseable): check-live has stopped "
+                "publishing, and a stale verdict is not a current one"
+            ),
+            **common,
+        )
+    drift = document.get("drift") or []
     return Reading(
-        met=status == "clean",
-        detail=f"{STACK_CHECK_LIVE_KEY}: status={status}, findings={document.get('findings')}",
-        evidence=(STACK_CHECK_LIVE_KEY,),
-        source="data_collection store",
-        as_of=str(document.get("as_of") or ""),
+        met=in_sync,
+        detail=(
+            f"{STACK_CHECK_LIVE_KEY}: stack {document.get('stack')} in_sync={in_sync} at {as_of} "
+            f"(code_sha {str(document.get('code_sha') or '?')[:12]})"
+            + (f"; drift: {drift[:6]}" if drift else "")
+        ),
+        **common,
     )
 
 

@@ -13,7 +13,11 @@ Subcommands::
     lint                 static checks, no credentials (exit 1 on any finding)
     get <field>          one deploy argument, printed bare, for the deploy script
     check-live           compare the live stack and schedules to this checkout
-                         (boto3; exit 1 on drift, 2 when it cannot measure)
+                         (boto3; exit 1 on drift, 2 when it cannot measure) and
+                         publish the verdict to s3://alpha-engine-research/
+                         data_collection/deploy/check-live/latest.json on EVERY
+                         run, failures included (exit 3 if only the publish
+                         fails). --no-publish for a local read.
 
 ``check-live`` exists because "No changes to deploy" is indistinguishable from
 success, and a merged-but-unapplied stack is a known fleet failure: the deploy
@@ -311,6 +315,59 @@ def live_findings(cfn, scheduler) -> list[str]:  # noqa: ANN001 — boto3 client
     return findings
 
 
+#: Where every check-live run publishes its verdict, for the data gate's
+#: `data.cutover_ready.stack_check_live` clause (alpha-engine-config-I10870).
+#: The gate reads it relative to its store root `data_collection/`
+#: (`data_gate.evidence.STACK_CHECK_LIVE_KEY`); a test pins the two together.
+#: The writer, github-actions-data-collection-stack-deploy, holds s3:PutObject
+#: on exactly this key (nous-ergon-ops infrastructure/iam/).
+CHECK_LIVE_BUCKET = "alpha-engine-research"
+CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
+CHECK_LIVE_SCHEMA = "data_collection_check_live.v1"
+
+
+def _code_sha() -> str:
+    import os
+    import subprocess
+
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        return subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "rev-parse", "HEAD"], capture_output=True, text=True, check=True
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return "unknown (git rev-parse failed)"
+
+
+def check_live_verdict(findings: list[str], *, error: str | None, now=None) -> dict:  # noqa: ANN001
+    """The published verdict. A run that could not measure is ``measured: false``
+    and ``in_sync: false`` — never silent, never in sync."""
+    import datetime as dt
+
+    moment = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+    return {
+        "schema_version": CHECK_LIVE_SCHEMA,
+        "as_of": moment.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "code_sha": _code_sha(),
+        "stack": STACK_NAME,
+        "measured": error is None,
+        "in_sync": error is None and not findings,
+        "drift": list(findings),
+        "error": error,
+    }
+
+
+def publish_verdict(s3, verdict: dict) -> None:  # noqa: ANN001 — boto3 client
+    s3.put_object(
+        Bucket=CHECK_LIVE_BUCKET,
+        Key=CHECK_LIVE_KEY,
+        Body=json.dumps(verdict, indent=2).encode("utf-8"),
+        ContentType="application/json",
+    )
+
+
 def main(argv: list[str]) -> int:
     if not argv:
         print(__doc__)
@@ -332,17 +389,33 @@ def main(argv: list[str]) -> int:
     if cmd == "check-live":
         import boto3
 
+        publish = "--no-publish" not in argv[1:]
+        findings: list[str] = []
+        error: str | None = None
         try:
             findings = live_findings(
                 boto3.client("cloudformation"), boto3.client("scheduler")
             )
-        except Exception as exc:  # noqa: BLE001 — reported as UNMEASURED, exit 2
-            print(f"::error::check-live could not measure: {type(exc).__name__}: {exc}")
-            return 2
+        except Exception as exc:  # noqa: BLE001 — published as measured:false, exit 2
+            error = f"{type(exc).__name__}: {exc}"
+            print(f"::error::check-live could not measure: {error}")
         for f in findings:
             print(f"::error::{f}")
         print(f"data-collection check-live: {len(findings)} finding(s)")
-        return 1 if findings else 0
+        rc = 2 if error else (1 if findings else 0)
+        if not publish:
+            return rc
+        verdict = check_live_verdict(findings, error=error)
+        try:
+            publish_verdict(boto3.client("s3"), verdict)
+        except Exception as exc:  # noqa: BLE001 — fail loud: an unpublished verdict is exit 3
+            print(
+                f"::error::check-live could not publish its verdict to "
+                f"s3://{CHECK_LIVE_BUCKET}/{CHECK_LIVE_KEY}: {type(exc).__name__}: {exc}"
+            )
+            return rc or 3
+        print(f"data-collection check-live: verdict published to s3://{CHECK_LIVE_BUCKET}/{CHECK_LIVE_KEY}")
+        return rc
     print(__doc__)
     return 2
 
