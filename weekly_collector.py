@@ -3019,7 +3019,15 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
 # daily_closes.collect. Shared by the EOD --daily collector and the split-out
 # --daily-arctic-append state so both pass daily_append the SAME expected_tickers.
 _MACRO_DAILY_TICKERS = [
-    "SPY", "GLD", "USO",
+    # alpha-engine-config-I10704 follow-up: every member of
+    # ``features.compute.UNIVERSE_BENCHMARK_PROXIES`` must be requested here,
+    # or the day's close never reaches staging/daily_closes and daily_append
+    # has no bar to write. IWM was declared (nousergon-data-PR1694) and loaded
+    # once in-region, but was absent from this list, so 2026-09-14's
+    # staging/daily_closes held no IWM row and crucible `data.daily` refused
+    # the session. Enforced by
+    # tests/test_benchmark_proxies_i10704.py::test_declared_proxies_are_requested_daily.
+    "SPY", "IWM", "GLD", "USO",
     "XLB", "XLC", "XLE", "XLF", "XLI", "XLK",
     "XLP", "XLRE", "XLU", "XLV", "XLY",
     # config#934 — sub-sector benchmark ETFs (SMH/IGV/XBI/PPH/XOP/KRE/ITA/GDX),
