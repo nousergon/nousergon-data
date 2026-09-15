@@ -250,6 +250,78 @@ def test_arcticdb_writes_are_classified_in_region_only_not_skipped():
     assert {t.value for t in arctic} >= {"universe", "macro"}
 
 
+# ---------------------------------------------------------------------------
+# D04/D08/D14: prose write targets corrected to resolvable keys (I10820)
+# ---------------------------------------------------------------------------
+#
+# nousergon-data-PR1727 replaced these three descriptors' `writes` prose with
+# concrete key/prefix/library patterns. The tests below prove the parity tool
+# itself resolves them — not just that the YAML looks like a key — since a
+# corrected descriptor the resolver still can't parse would grade
+# `unmeasurable` exactly as before, silently.
+
+
+def test_d04_fred_macro_history_resolves_to_a_listable_prefix():
+    """D04's `{ticker}` is one of many FRED series keys — not derivable ahead
+    of time — so the corrected descriptor is a listable prefix, not a single
+    key. It must not fall back to `undiffable`."""
+    targets = parity.expand_writes(_one_unit("D04"), TRADING_DAY)
+    assert len(targets) == 1
+    target = targets[0]
+    assert target.kind == "prefix"
+    assert target.value == "reference/price_cache/"
+    assert target.reason == ""
+
+
+def test_d08_universe_returns_resolves_to_the_research_db_carrier_keys():
+    """D08's `universe_returns` is a TABLE inside `research.db`, not an S3
+    object — the resolvable target is the two files that carry it: the live
+    pointer key and the per-day dated backup, both now concrete keys."""
+    targets = {t.value: t for t in parity.expand_writes(_one_unit("D08"), TRADING_DAY)}
+    assert set(targets) == {"research.db", f"backups/research_{TRADING_DAY.isoformat()}.db"}
+    for target in targets.values():
+        assert target.kind == "key"
+        assert target.reason == ""
+
+
+def test_d14_prune_delisted_tickers_resolves_both_write_targets():
+    """D14 declares two outputs: an ArcticDB library/symbol reference
+    (`delisted_history::{ticker}`) and a listable audit-record prefix
+    (`builders/prune_audit/{trading_day}-*.json`). Neither may resolve as
+    `undiffable` after PR1727's correction."""
+    targets = parity.expand_writes(_one_unit("D14"), TRADING_DAY)
+    assert {t.kind for t in targets} == {"arcticdb", "prefix"}
+    arctic = next(t for t in targets if t.kind == "arcticdb")
+    assert arctic.value == "delisted_history"
+    prefix = next(t for t in targets if t.kind == "prefix")
+    assert prefix.value == f"builders/prune_audit/{TRADING_DAY.isoformat()}-"
+
+
+def test_delisted_history_library_symbol_reference_is_arcticdb_not_prose():
+    """Class-level fix: `classify_write` recognised only the `arcticdb/<lib>`
+    prefix spelling. D14's `<library>::{symbol}` spelling — a genuine
+    ArcticDB library/symbol reference per `store/arctic_store.py::
+    DELISTED_HISTORY_LIB` — fell through to the generic `::` prose branch and
+    graded `unmeasurable` even after the descriptor was corrected. It must
+    now classify as `arcticdb`, gated on the same `LIVE_ARCTIC_LIBRARIES`
+    registry `shadow.root` uses to redirect shadow writes."""
+    target = parity.classify_write("D14", "delisted_history::{ticker}", TRADING_DAY)
+    assert target.kind == "arcticdb"
+    assert target.value == "delisted_history"
+    assert target.reason == ""
+
+
+def test_a_prose_target_still_grades_unmeasurable():
+    """Withholding case: a descriptor that still declares a write in prose —
+    D09's `research.db::score_performance`, a SQLite table pointer, not an
+    ArcticDB library — must NOT be swept up by the D14 library/symbol fix.
+    `research.db` is not in `LIVE_ARCTIC_LIBRARIES`, so this stays
+    `undiffable`, distinguishing a real fix from a resolver that got looser."""
+    target = parity.classify_write("D09", "research.db::score_performance", TRADING_DAY)
+    assert target.kind == "undiffable"
+    assert "prose" in target.reason
+
+
 def _frame(symbols, close):
     import pandas as pd
 

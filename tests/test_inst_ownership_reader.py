@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from io import BytesIO
 
+import pytest
+
 from data.derived.inst_ownership import (
     InstOwnershipRow,
     read_inst_ownership_parquet,
@@ -111,6 +113,25 @@ class TestMainCLIGuard:
     ``--tickers-file`` argument, (3) success path with valid file and
     mocked compute.
     """
+
+    @pytest.fixture(autouse=True)
+    def _no_real_manifest_writes(self, monkeypatch):
+        """`main()` now writes one D39 run manifest per execution
+        (alpha-engine-config-I10810). Swap the SINK so these tests exercise the
+        real path without a live S3 PUT — and so the boto3-absent test measures
+        the CLI's import guard rather than the sink's own lazy boto3 import."""
+        import run_units
+
+        class _NullSink:
+            bucket = "test-bucket"
+
+            def write(self, key: str, payload: bytes):  # noqa: ARG002
+                return None
+
+        monkeypatch.setenv("NE_DATA_CODE_SHA", "a" * 40)
+        monkeypatch.setattr(
+            run_units, "manifest_sink", lambda bucket, s3_client=None: _NullSink(),
+        )
 
     def test_missing_boto3_exits_with_code_1(self, monkeypatch):
         """Simulate absent boto3 — verifies SystemExit(1) from the import guard."""

@@ -82,12 +82,23 @@ def test_a_stale_ladder_pages_rather_than_rendering_its_last_state(tmp_path):
     assert "page condition 3" in fresh.detail
 
 
-def test_withholding_a_manifest_renders_unmeasurable_never_green(board):
-    """A clause whose evidence has no reader yet is UNMEASURABLE, with its key."""
+def test_withholding_a_manifest_renders_red_never_green(board):
+    """A unit with no run manifest for the day is UNMET, with its key named.
+
+    UNMET rather than UNMEASURABLE since `alpha-engine-config-I10810` built the
+    reader: the store ANSWERED and the prefix was empty, which is a finding about
+    the producer, not about our read. The two are kept apart on purpose — "we
+    could not look" and "we looked and there was nothing" have opposite owners.
+    Either way it is red, which is the property this test defends.
+    """
     run_record = next(c for c in board if c.name == "data.D01.run_record")
-    assert run_record.unmeasurable is True
     assert run_record.met is False
-    assert "data_collection/runs/D01" in " ".join(run_record.evidence)
+    assert run_record.unmeasurable is False
+    # Store-relative, like every other reader here: the store is opened at
+    # `s3://alpha-engine-research/data_collection`, so the key it looked at is
+    # `runs/<unit>/<day>/*.json` under that.
+    assert "runs/D01" in " ".join(run_record.evidence)
+    assert "no run manifest" in run_record.detail
 
 
 def test_a_denied_store_never_produces_a_met_gate(units, phases):

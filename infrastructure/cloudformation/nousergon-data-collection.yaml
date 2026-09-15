@@ -62,9 +62,6 @@ Parameters:
     Description: >-
       The existing data-spot dispatcher. It stays deploy.sh-managed
       (deploy-data-spot-dispatcher.yml); only its schedules move here.
-  ResearchBucket:
-    Type: String
-    Default: alpha-engine-research
   AlertsTopicName:
     Type: String
     Default: alpha-engine-alerts
@@ -93,7 +90,6 @@ Resources:
         Key: !Ref DefinitionS3Key
       DefinitionSubstitutions:
         DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
-        ResearchBucket: !Ref ResearchBucket
         AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
       LoggingConfiguration:
         Level: ERROR
@@ -116,7 +112,6 @@ Resources:
         Key: !Ref DefinitionS3Key
       DefinitionSubstitutions:
         DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
-        ResearchBucket: !Ref ResearchBucket
         AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
       LoggingConfiguration:
         Level: ERROR
@@ -139,7 +134,6 @@ Resources:
         Key: !Ref DefinitionS3Key
       DefinitionSubstitutions:
         DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
-        ResearchBucket: !Ref ResearchBucket
         AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
       LoggingConfiguration:
         Level: ERROR
@@ -162,7 +156,6 @@ Resources:
         Key: !Ref DefinitionS3Key
       DefinitionSubstitutions:
         DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
-        ResearchBucket: !Ref ResearchBucket
         AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
       LoggingConfiguration:
         Level: ERROR
@@ -182,7 +175,12 @@ Resources:
   # Weekday end-of-day collection. Replaces ne-postclose-trading-pipeline's
   # LaunchPostMarketDataSpot + LaunchPostMarketArcticAppendSpot. 16:45 ET: after
   # the 16:00 close and outside the v1 postclose window, so the cutover day has
-  # no overlap. Verifies the two artifacts Metron reads most.
+  # no overlap. `verify_units` is every manifest-emitting unit its two collector
+  # workloads run (run_units.PHASE_UNITS ("daily", *) minus the arctic append the
+  # --skip-arctic-append flag defers, plus MODE_UNITS["daily_arctic_append"]): the
+  # completion claim covers every key each of them publishes, not the two Metron
+  # reads most (alpha-engine-config-I10787). `arctic-probe` is absent because it
+  # writes no run manifest — a gap named in the P-20 report, not a silent skip.
   EodSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -203,11 +201,14 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_keys": ["market_data/eod_closes/latest.json", "market_data/technicals/rating_performance.json"]}'
+        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_units": ["D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31", "D32"]}'
 
   # Weekday pre-open ArcticDB enrich + append. Replaces ne-preopen-trading-
   # pipeline's LaunchMorningEnrichSpot + LaunchMorningArcticAppendSpot. 07:30 ET
   # leaves the observed ~50 + ~38 min tail finished before the 09:30 open.
+  # Its former "no key verification" posture was never justified — the pre-open
+  # enrich is what the predictor reads next, and an SSM exit code alone was the
+  # whole completion claim. It now verifies D17/D18's run manifests.
   MorningSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -224,14 +225,12 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_keys": []}'
+        Input: '{"collection": "morning", "workloads": ["morning-enrich", "morning-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_units": ["D17", "D18"]}'
 
   # Saturday weekly collection. Replaces ne-weekly-freshness-pipeline's
   # MorningEnrich -> DataPhase1 -> DataPhase2 -> RAGIngestion chain (v1 data
   # order; alpha-engine-config-I10753 adds the last two). 05:00 ET = the v1
-  # SF's 09:00 UTC start under EDT. No verify_keys: phase 1 auto-skips phases
-  # whose cycle output is already on S3, so an unchanged LastModified is
-  # legitimate on a rerun.
+  # SF's 09:00 UTC start under EDT.
   #
   # alternative-phase-two (D15) measured ~35 min and rag-weekly-ingestion
   # (D16/D46) measured ~20-23 min across two full v1 executions
@@ -240,6 +239,15 @@ Resources:
   # (DATA_SPOT_MAX_RUNTIME_SECONDS) and, combined with weekly-phase-one's
   # ~88 min, well inside this state machine's own 28800s TimeoutSeconds.
   # No split needed (I10753 deliverable 3).
+  #
+  # Phase 1 auto-skips phases whose cycle output is already on S3, so an
+  # unchanged LastModified was never a usable claim — which is why this used
+  # to run unverified (verify_keys: []). The manifest check handles it
+  # precisely instead: an auto-skipped unit DECLARES itself by writing an
+  # `empty_fresh` guard with verdict `not_applicable`, which exempts its key
+  # coverage and nothing else — its manifest must still exist for this run
+  # and still report status ok. verify_units now covers every phase-1 unit
+  # plus D15 (alternative-phase-two) and D16 (rag-weekly-ingestion).
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -256,7 +264,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_keys": []}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D09", "D10", "D11", "D12", "D13", "D15", "D16", "D17"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
@@ -277,7 +285,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": false, "verify_keys": []}'
+        Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": false, "verify_units": ["D33"]}'
 
   # Failure alarms are NOT declared here. The fleet's alarms come from files
   # (nous-ergon-ops infrastructure/cloudwatch/alarms/ne-data-collection-*-failed.json,
