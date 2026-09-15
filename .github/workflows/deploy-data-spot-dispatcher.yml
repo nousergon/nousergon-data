@@ -24,6 +24,13 @@ on:
     paths:
       - 'infrastructure/lambdas/data-spot-dispatcher/**'
       - '.github/workflows/deploy-data-spot-dispatcher.yml'
+      # alpha-engine-config-I10787: these two are PACKAGED into the function zip
+      # (deploy.sh), so a descriptor edit changes what the completion check
+      # grades. Without them on this filter the merge button would leave the
+      # deployed Lambda grading the previous descriptor set, silently.
+      - 'registry.d/units/**'
+      - 'data_gate/descriptors.py'
+      - 'data_gate/__init__.py'
   workflow_dispatch:
 
 concurrency:

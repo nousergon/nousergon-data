@@ -1,0 +1,155 @@
+"""`python -m shadow run …` and `python -m shadow parity …`.
+
+Two commands, one for each half of plan §6.2 step 4.
+
+``run`` is the output-root override. It activates the shadow root BEFORE the
+target module is imported — which is the whole reason it exists as a wrapper
+rather than a flag inside each collector. A flag would have to be threaded
+through every entrypoint, and any entrypoint that forgot it would write live
+keys; activating first means the redirect is in place before a single
+collector line runs::
+
+    python -m shadow run --trading-day 2026-09-12 --module weekly_collector -- --mode eod
+
+``parity`` is the diff, and its exit codes are the same contract
+``data_gate.__main__`` declares, for the same reason: "the keys do not match"
+and "we could not compare them" are different facts.
+
+* **0** — the comparison ran AND every key matched.
+* **1** — the comparison ran and parity is NOT met. The report is still
+  published; this is the code that stops CI or a person reading "not there
+  yet" as "done".
+* **2** — the comparison itself failed. Nothing is published.
+"""
+
+from __future__ import annotations
+
+import argparse
+import datetime as dt
+import json
+import os
+import runpy
+import subprocess
+import sys
+
+from data_gate.store import open_store
+from shadow import parity as parity_module
+from shadow.root import ShadowRoot, activate, deactivate
+
+EXIT_MET = 0
+EXIT_NOT_MET = 1
+EXIT_UNMEASURED = 2
+
+DEFAULT_BUCKET = "alpha-engine-research"
+
+
+def _code_sha() -> str:
+    sha = os.environ.get("GITHUB_SHA")
+    if sha:
+        return sha
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:  # noqa: BLE001 - provenance is best-effort; "unknown" is recorded as such
+        # Swallowed deliberately: (a) the failure mode is "this checkout is not a
+        # git working tree"; (b) the report is still produced and still correct —
+        # only its provenance field degrades; (c) it is recorded on the surface
+        # that matters, as `code_sha: "unknown"` inside the published report.
+        return "unknown"
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="shadow", description=__doc__)
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    runner = sub.add_parser("run", help="run a collector entrypoint under the shadow output root")
+    runner.add_argument("--trading-day", required=True, help="ISO date; the shadow root's date")
+    runner.add_argument("--module", required=True, help="module to run as __main__, e.g. weekly_collector")
+    runner.add_argument("argv", nargs=argparse.REMAINDER, help="arguments passed to the module")
+
+    diff = sub.add_parser("parity", help="diff the shadow output against the same day's v1 output")
+    diff.add_argument("--trading-day", required=True)
+    diff.add_argument("--bucket", default=DEFAULT_BUCKET)
+    diff.add_argument(
+        "--store",
+        required=True,
+        help="where the report is published: s3://alpha-engine-research/data_collection, or a directory",
+    )
+    diff.add_argument("--relative-tolerance", type=float, default=parity_module.DEFAULT_RELATIVE_TOLERANCE)
+    diff.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
+    diff.add_argument("--max-keys-per-prefix", type=int, default=50)
+    diff.add_argument("--dry-run", action="store_true", help="compare and render, publish nothing")
+    return parser
+
+
+def _run(args) -> int:
+    root = ShadowRoot(dt.date.fromisoformat(args.trading_day))
+    activate(root)
+    argv = [a for a in args.argv if a != "--"]
+    sys.argv = [args.module, *argv]
+    print(
+        f"shadow: output root active — every S3 write lands under {root.prefix!r} and every "
+        f"ArcticDB library under {root.arctic_prefix!r}; running {args.module}",
+        file=sys.stderr,
+    )
+    try:
+        runpy.run_module(args.module, run_name="__main__", alter_sys=True)
+    except SystemExit as exc:
+        return int(exc.code or 0)
+    finally:
+        deactivate()
+    return 0
+
+
+def _parity(args) -> int:
+    trading_day = dt.date.fromisoformat(args.trading_day)
+    store = open_store(args.store, dry_run=args.dry_run)
+    try:
+        report = parity_module.run_parity(
+            trading_day=trading_day,
+            bucket=args.bucket,
+            code_sha=_code_sha(),
+            rel_tolerance=args.relative_tolerance,
+            absolute_tolerance=args.absolute_tolerance,
+            max_keys_per_prefix=args.max_keys_per_prefix,
+        )
+    except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
+        print(f"shadow parity: the comparison failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_UNMEASURED
+    document = report.as_dict()
+    payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
+    key = parity_module.parity_key(trading_day)
+    if not args.dry_run:
+        store.put_bytes(key, payload)
+    print(_render(report, key, dry_run=args.dry_run))
+    return EXIT_MET if report.met else EXIT_NOT_MET
+
+
+def _render(report, key: str, *, dry_run: bool) -> str:
+    summary = report.summary
+    lines = [
+        f"parity {report.trading_day} — {'MET' if report.met else 'NOT MET'}",
+        f"  shadow root : {report.shadow_prefix}",
+        f"  published   : {'(dry run, nothing written)' if dry_run else key}",
+        "  " + ", ".join(f"{name}={count}" for name, count in sorted(summary.items()) if count),
+    ]
+    for row in report.rows:
+        if row.verdict != "match":
+            detail = row.body.get("unmeasurable_reason") or row.body.get("detail") or ""
+            lines.append(f"  [{row.verdict}] {row.key} ({','.join(row.unit_ids)}) {detail}"[:200])
+    return "\n".join(lines)
+
+
+def main(argv: "list[str] | None" = None) -> int:
+    args = _parser().parse_args(argv)
+    if args.command == "run":
+        return _run(args)
+    return _parity(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

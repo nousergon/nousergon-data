@@ -101,7 +101,11 @@ source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 # `krepis`: test_handler.py:34 imports krepis.spot_bootstrap for REAL (it is
 # not stubbed). Measured — deploy-data-spot-dispatcher failed on main
 # 2026-08-29T00:11 with ModuleNotFoundError: No module named 'krepis'.
-run_handler_tests "${SCRIPT_DIR}" krepis
+# `PyYAML`: the completion-check action loads the committed unit descriptors
+# through data_gate/descriptors.py, which imports yaml (alpha-engine-config-
+# I10787). Lazy-imported in index.py, so the hermetic guard does not demand a
+# stub — but the tests exercise the real loader, so the gate installs it.
+run_handler_tests "${SCRIPT_DIR}" krepis PyYAML
 
 # ----- 0. Scratch dir + validate handler syntax ------------------------------
 
@@ -127,6 +131,21 @@ echo "Installing deps into ${PKG} (Lambda-safe pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+
+# alpha-engine-config-I10787: the completion-check action grades every verified
+# unit against its COMMITTED descriptor, so the descriptors and the repo's one
+# descriptor loader ride in the zip at their repo-relative paths — descriptors.py
+# computes UNITS_DIR from its own location, so `data_gate/` + `registry.d/units/`
+# at the zip root resolve to /var/task/registry.d/units at runtime. Packaging the
+# loader rather than re-parsing the YAML here keeps ONE implementation of "what a
+# unit declares" (shared-code-policy §2); a second parser is how the Lambda and
+# the board start disagreeing about a unit's published keys.
+REPO_ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
+mkdir -p "${PKG}/data_gate" "${PKG}/registry.d/units"
+cp "${REPO_ROOT_DIR}/data_gate/__init__.py" "${REPO_ROOT_DIR}/data_gate/descriptors.py" "${PKG}/data_gate/"
+cp "${REPO_ROOT_DIR}"/registry.d/units/*.yaml "${PKG}/registry.d/units/"
+echo "Packaged $(ls "${PKG}/registry.d/units" | wc -l | tr -d ' ') unit descriptors + the data_gate loader"
+
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
 echo "Packaged ${ZIP} ($(wc -c < "${ZIP}") bytes)"

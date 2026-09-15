@@ -43,7 +43,8 @@ STACK_NAME = "nousergon-data-collection"
 DEFINITION_PREFIX = "infrastructure/nousergon-data-collection/"
 STATE_PARAMETERS = ("CollectionState", "DailyHealState")
 MARKET_TZ = "America/New_York"
-INPUT_FIELDS = {"collection", "workloads", "require_trading_day", "verify_keys"}
+INPUT_FIELDS = {"collection", "workloads", "require_trading_day", "verify_units"}
+UNITS_DIR = REPO_ROOT / "registry.d" / "units"
 COMPLETE = {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
 _ACCOUNT_LITERAL = re.compile(r"(?<!\d)\d{12}(?!\d)")
 _PLACEHOLDER = re.compile(r"\$\{(\w+)\}")
@@ -156,6 +157,17 @@ def dispatcher_workloads(path: Path = DISPATCHER) -> set[str]:
     raise ValueError(f"{path}: no _WORKLOADS literal found")
 
 
+def declared_units(directory: Path = UNITS_DIR) -> set[str]:
+    """Every unit id with a descriptor, from the filenames alone.
+
+    Filename-derived rather than YAML-parsed on purpose: `data_gate` already
+    grades the filename against the in-file `unit_id`, so this lint needs no
+    second opinion — it only needs to refuse a `verify_units` entry that names a
+    unit nobody declared, which would grade nothing and read as a pass.
+    """
+    return {p.name.split("-", 1)[0] for p in directory.glob("*.yaml")}
+
+
 def _state_maps(states: dict, where: str = "States"):
     yield where, states
     for name, st in states.items():
@@ -234,6 +246,7 @@ def lint() -> list[str]:
         if placeholders - subs:
             problems.append(f"{logical}: unsubstituted placeholders {sorted(placeholders - subs)}")
     workloads = dispatcher_workloads()
+    units = declared_units()
     for s in schedules(tpl):
         where = s["qualified_name"]
         if s["state_parameter"] not in STATE_PARAMETERS:
@@ -249,6 +262,19 @@ def lint() -> list[str]:
         unknown = [w for w in s["input"].get("workloads", []) if w not in workloads]
         if unknown or not s["input"].get("workloads"):
             problems.append(f"{where}: workloads {unknown or '[]'} not in the dispatcher's _WORKLOADS")
+        verify_units = s["input"].get("verify_units", [])
+        undeclared = [u for u in verify_units if u not in units]
+        if undeclared:
+            problems.append(
+                f"{where}: verify_units {undeclared} have no descriptor under registry.d/units/; "
+                "the completion check would grade nothing for them and read as a pass"
+            )
+        if not verify_units:
+            problems.append(
+                f"{where}: verify_units is empty. Every schedule's completion claim is its "
+                "units' run manifests (alpha-engine-config-I10787); an empty list is a "
+                "machine whose only completion claim is an SSM exit code"
+            )
     problems += pause_manifest_problems(
         schedules(tpl), json.loads(PAUSE_MANIFEST.read_text(encoding="utf-8"))
     )

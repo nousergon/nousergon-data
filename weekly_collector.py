@@ -31,6 +31,7 @@ import os
 import signal
 import time
 from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -208,6 +209,90 @@ class _CollectorError(RuntimeError):
         self.detail = detail
 
 
+class _DegradedRun(RuntimeError):
+    """A phase that produced its artifact with a KNOWN defect in it.
+
+    `alpha-engine-config-I10784` (P-17). ``degraded`` is a real third outcome
+    for the PROCESS — the EOD Step Function reads this process's exit code to
+    decide whether to run the ArcticDB append, and a features-only column
+    defect must not withhold the day's SPY close (2026-08-17). It is NOT a
+    third outcome for the RUN MANIFEST: `data_run_manifest.v1`'s status is
+    ``ok`` | ``failed`` | ``not_applicable`` and nothing else, and its own
+    contract says a run that produced a partial or defective artifact is
+    ``failed``.
+
+    So the two claims are separated here rather than conflated. This exception
+    is raised from inside the manifest wrapper AFTER the phase's lineage is
+    recorded, which makes the manifest say ``failed`` and carry the defect as
+    its reason; :func:`_phase_collect` catches it outside the wrapper and
+    returns the collector's ORIGINAL ``degraded`` result, so the aggregator,
+    the alert text and the exit code are byte-for-byte what they were.
+    """
+
+    def __init__(self, name: str, result: dict) -> None:
+        detail = result.get("error") or result.get("detail") or result.get("reason") or "no detail reported"
+        super().__init__(f"{name} produced a DEGRADED artifact: {detail}")
+        self.name = name
+        self.result = result
+
+
+class _PhaseNotRun(RuntimeError):
+    """A phase that did not run at all, for a reason that is NOT a failure.
+
+    `alpha-engine-config-I10784`. Raised from inside the manifest wrapper by
+    :func:`_phase_not_run` so the non-run leaves a record; see that function
+    for why the status split is what it is.
+    """
+
+    def __init__(self, name: str, reason: str) -> None:
+        super().__init__(f"{name} did not run: {reason}")
+        self.name = name
+        self.reason = reason
+
+
+#: The manifest context of the whole-mode unit currently executing, if any.
+#:
+#: `alpha-engine-config-I10784`: the two heal modes (D33/D34) contain DECLARED
+#: best-effort steps whose failure is deliberately non-fatal — a hung heal must
+#: not fail the pipeline, and the loud gate is Saturday's postflight. Those
+#: swallows stay (each carries its own inline rationale at its site), but a
+#: swallow that leaves no trace is indistinguishable from a step that stopped
+#: running. This lets :func:`_record_swallowed_step` fold each one onto the
+#: mode's own manifest as a ``failed`` guard reading, so the exit code does not
+#: move and the step is COUNTED. A ContextVar rather than a parameter because
+#: the swallow sites are ~8 frames below the wrapper and threading a context
+#: through them is how the next one added gets forgotten.
+_CURRENT_RUN_CTX: ContextVar = ContextVar("_CURRENT_RUN_CTX", default=None)
+
+
+def _record_swallowed_step(step: str, detail: str, *, unit_id: str | None = None) -> None:
+    """Record a DECLARED best-effort step's failure on the current run manifest.
+
+    No-op outside a whole-mode unit (a dry run, or a direct call in a test):
+    there is no manifest to fold onto, and the caller's own log line is the
+    record. Never raises — this is the transparency surface for a swallow, and
+    it must not itself become a new way for the swallow to become fatal.
+    """
+    ctx = _CURRENT_RUN_CTX.get()
+    if ctx is None:
+        return
+    # `unmeasurable` rather than a new verdict: `data_run_manifest.v1`'s
+    # GuardVerdict enum is closed to (ok, empty_fresh, below_floor,
+    # unmeasurable, not_applicable), and a step that aborted contributed a
+    # quantity nobody measured. Red and counted, which is the property that
+    # matters — never a pass.
+    ctx.record_guard(
+        "best_effort_step",
+        mode="observe",
+        verdict="unmeasurable",
+        detail=(
+            f"{step} failed and was swallowed by a DECLARED best-effort posture "
+            f"(the loud gate for this class is the postflight, not this step): {detail}"
+        )[:2000],
+        key=unit_id,
+    )
+
+
 def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "PhaseRegistry | None":
     """Construct a per-date :class:`PhaseRegistry` for marker-based skip/resume +
     watchdog (L4528 — data is the 2nd consumer of the lib phase framework, after
@@ -375,11 +460,86 @@ def _phase_collect(
             unit.unit_id, _body, **_run_manifest_context(reg, unit)
         )
         return run_result.value
+    except _DegradedRun as dr:
+        # The manifest is already durable with `status: failed` and the defect
+        # as its reason. The PROCESS posture is unchanged: the collector's own
+        # `degraded` result is returned, the aggregator still renders the run
+        # `degraded`, and main() still exits 0 so the EOD SF runs the ArcticDB
+        # append. See `_DegradedRun` for why the two claims are separated.
+        return dr.result
     except _CollectorError as ce:
         return {"status": "error", "error": ce.detail}
     except Exception as e:
         logger.error("%s phase failed: %s", name, e)
         return {"status": "error", "error": str(e)}
+
+
+def _phase_not_run(
+    reg: "PhaseRegistry | None",
+    name: str,
+    *,
+    reason: str,
+    applicable: bool,
+) -> dict:
+    """Record a phase that did NOT run, and return the caller's status dict.
+
+    `alpha-engine-config-I10784` (P-17). Before this existed, every one of these
+    call sites assigned a status dict straight into ``results["collectors"]``,
+    which meant the unit's non-run was invisible: no manifest, nothing under
+    ``data_collection/runs/<unit>/<day>/``, and therefore indistinguishable on
+    every downstream surface from a unit that has silently stopped being
+    scheduled at all. A non-run that leaves no record is the exact defect the
+    run-record objective exists to end.
+
+    The two cases are genuinely different and are recorded differently:
+
+    * ``applicable=False`` — the unit was correctly asked to do nothing this
+      cycle (a collector switched off in ``config.yaml``). Manifest status
+      ``not_applicable``, with the closed-list reason
+      :data:`run_units.NOT_RUN_NOT_APPLICABLE`. The returned dict keeps the
+      ``{"status": "ok", "skipped": ...}`` shape the aggregator already treats
+      as a clean run, so the exit code does not move.
+    * ``applicable=True`` — the unit SHOULD have run and could not, because an
+      upstream input it needs is missing (no tickers, no research.db).
+      Manifest status ``failed``, naming the missing input. The returned dict
+      keeps ``{"status": "skipped", ...}``, which the aggregator already routes
+      to ``results["status"] = "failed"`` and main() to ``SystemExit(1)`` — so
+      this is a new RECORD of an existing non-zero exit, not a new exit path.
+
+    ``reg is None`` (dry run) writes nothing, exactly as ``_phase_collect``
+    does: a dry run must not leave a manifest claiming a unit ran.
+    """
+    if not applicable:
+        payload = {"status": "ok", "skipped": reason}
+    else:
+        payload = {"status": "skipped", "reason": reason}
+    if reg is None:
+        return payload
+
+    unit = run_units.unit_for(reg.data_mode, name)
+
+    def _body(run_ctx) -> dict:
+        run_ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="not_applicable",
+            detail=(
+                f"{unit.unit_id} published nothing on this run ({reason}); there is no new "
+                "write for the guard to grade"
+            ),
+        )
+        if applicable:
+            raise _PhaseNotRun(name, reason)
+        raise run_manifest.NotApplicable(run_units.NOT_RUN_NOT_APPLICABLE, reason)
+
+    try:
+        run_manifest.run_unit(unit.unit_id, _body, **_run_manifest_context(reg, unit))
+    except _PhaseNotRun:
+        # The manifest is durable with `status: failed` naming the missing
+        # input. The caller's dict is returned unchanged so the aggregator and
+        # the exit code behave exactly as they did before the record existed.
+        pass
+    return payload
 
 
 def _record_phase_lineage(
@@ -404,6 +564,8 @@ def _record_phase_lineage(
 
     if artifact_key and not auto_skipped and not dry:
         run_ctx.record_output(artifact_key, rows_out=rows if rows is not None else 0)
+    if not auto_skipped and not dry:
+        _record_rejections(run_ctx, result, unit.rejected_keys)
 
     if auto_skipped or dry:
         reading = expectations.GuardReading(
@@ -441,6 +603,39 @@ def _record_phase_lineage(
     # promotion criterion lives in `validators/expectations.py`.
     if expectations.EMPTY_FRESH_GUARD.enforcing and not reading.clean:
         raise _CollectorError(name, f"empty_fresh guard: {reading.detail}")
+
+    # `alpha-engine-config-I10784` (P-17): the manifest has no third
+    # ok-but-degraded state. Raised LAST, after every fact above is on the
+    # record, so the failure manifest carries the output, the guard reading and
+    # the metric that explain it — `observability-policy` §3.1: the failure path
+    # writes the same telemetry as the success path, except the completion
+    # claim.
+    if result.get("status") == "degraded":
+        raise _DegradedRun(name, result)
+
+
+def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]) -> None:
+    """Fold a collector's own not-published counts onto its manifest, by reason.
+
+    `alpha-engine-config-I10810` deliverable 2. A count that is absent, is not a
+    number, or is zero contributes nothing — ``UnitRun.reject`` refuses a
+    non-positive count on purpose, and a rejection class with no members is not
+    a rejection.
+
+    A key the collector RENAMES would drop out silently here — the known
+    weakness of every declared-key table, and the reason the alternative
+    (searching the result for something that looks like a count) is worse: it
+    invents numbers. The backstop is
+    ``tests/test_whole_mode_row_counts.py::test_every_declared_row_and_rejection
+    _key_exists_in_its_writer``, which pins each declared key against the source
+    of the writer that reports it.
+    """
+    for key, reason in pairs:
+        value = result.get(key)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            continue
+        if int(value) > 0:
+            run_ctx.reject(reason, int(value))
 
 
 def _phase_body(
@@ -522,10 +717,18 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
     body: one place, and a mode added without a manifest fails loudly on the
     ``MODE_UNITS`` lookup instead of running unobserved.
 
-    The manifest's ``rows_out`` is 0 for these today because their bodies
-    publish through ArcticDB and per-symbol keys and report no row count; the
-    guard therefore records ``unmeasurable`` rather than a pass, which is a red
-    work item with an address (plan §4.5, phase 2).
+    ``rows_out`` comes from :data:`run_units.MODE_ROWS`, which names the step
+    inside each mode's own result that published and the key it reports its
+    count under (`alpha-engine-config-I10810` deliverable 2). A mode with no
+    entry there, or whose named step did not report a number, records an
+    ``unmeasurable`` guard verdict rather than 0 — red, counted, and with an
+    address (plan §4.5).
+
+    A mode returning ``status="skipped"`` is a NON-RUN, not a clean run: the
+    manifest says ``not_applicable`` with the closed-list reason, never ``ok``
+    (`alpha-engine-config-I10784`). MorningEnrich after 1:30pm PT, and a target
+    date already appended to ArcticDB, are both "the declaration says there is
+    nothing new to collect".
     """
     unit_id = run_units.MODE_UNITS[mode]
     run_date = getattr(args, "date", None) or default_run_date()
@@ -535,7 +738,11 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
     captured: dict = {}
 
     def _body(run_ctx) -> dict:
-        result = fn(config, args)
+        token = _CURRENT_RUN_CTX.set(run_ctx)
+        try:
+            result = fn(config, args)
+        finally:
+            _CURRENT_RUN_CTX.reset(token)
         captured["result"] = result
         # A mode function returning a non-ok status has FAILED — the manifest
         # says so rather than recording a successful run whose body reported a
@@ -546,33 +753,92 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         status = (result or {}).get("status")
         if status not in (None, "ok", "skipped", "ok_dry_run"):
             raise _CollectorError(mode, f"{mode} returned status={status!r}: {result}")
-        run_ctx.record_guard(
-            expectations.EMPTY_FRESH_GUARD.name,
-            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
-            verdict="unmeasurable",
-            detail=(
-                f"{unit_id} publishes through ArcticDB/per-symbol keys and reports no row "
-                "count, so the empty-but-fresh guard cannot read it from this call site. "
-                "UNMEASURABLE, not a pass — phase-2 work is the body recording its own "
-                "outputs (data_collection_plan_260914.md §4.5)."
-            ),
-        )
+        if status == "skipped":
+            detail = str((result or {}).get("skip_reason") or f"{mode} reported status=skipped")
+            run_ctx.record_guard(
+                expectations.EMPTY_FRESH_GUARD.name,
+                mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+                verdict="not_applicable",
+                detail=f"{unit_id} published nothing on this run ({detail})",
+            )
+            raise run_manifest.NotApplicable(run_units.NOT_RUN_NOT_APPLICABLE, detail)
+        _record_mode_lineage(run_ctx, mode, unit_id, result or {})
         return result
 
     try:
-        return run_manifest.run_unit(
+        run_result = run_manifest.run_unit(
             unit_id,
             _body,
             sink=run_units.manifest_sink(config["bucket"]),
             trigger=run_units.resolve_trigger("scheduled"),
             trading_day=run_date,
             log_location=run_units.resolve_log_location(),
-        ).value
+        )
+        # `run_unit` does not re-raise NotApplicable — it records the non-run
+        # and returns with `value=None`. The caller's contract is the mode's own
+        # result dict, so the captured one is returned rather than the wrapper's
+        # None, which would turn an honest non-run into an AttributeError.
+        if run_result.status == "not_applicable":
+            return captured["result"]
+        return run_result.value
     except _CollectorError:
         # The manifest is already written with `status: failed`; the caller
         # keeps the result dict it would have received before this wrapper
         # existed, and main()'s exit-code contract is untouched.
         return captured["result"]
+
+
+def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None:
+    """Fold a whole-mode unit's published count onto its run manifest."""
+    spec = run_units.MODE_ROWS.get(mode)
+    published = (result.get("collectors") or {}).get(spec.collector, {}) if spec else {}
+    rows: int | None = None
+    if spec:
+        raw = published.get(spec.rows_key)
+        if spec.counts_list and isinstance(raw, list):
+            rows = len(raw)
+        elif not spec.counts_list and not isinstance(raw, bool) and isinstance(raw, (int, float)):
+            rows = int(raw)
+
+    if rows is None:
+        where = (
+            f"{spec.collector}.{spec.rows_key}" if spec else "no declared row source"
+        )
+        run_ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="unmeasurable",
+            detail=(
+                f"{unit_id} reported no row count this run ({where}), so the empty-but-fresh "
+                "guard cannot read it from this call site. UNMEASURABLE, not a pass — the "
+                "work item is the step recording its own outputs "
+                "(data_collection_plan_260914.md §4.5)."
+            ),
+        )
+        return
+
+    # These units publish through ArcticDB libraries and per-symbol keys rather
+    # than one S3 object, so the manifest's output is addressed by the unit's
+    # declared prefix. The count is REAL and measured, which is what the
+    # empty-but-fresh objective needs; the ArcticDB probe
+    # (data_collection/probes/arctic/{trading_day}.json) is the independent
+    # read-back of the same write.
+    run_ctx.record_output(f"arcticdb://{unit_id}", rows_out=rows)
+    _record_rejections(run_ctx, published, spec.rejected_keys)
+    run_ctx.record_guard(
+        expectations.EMPTY_FRESH_GUARD.name,
+        mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+        verdict="ok" if rows > 0 else "empty_fresh",
+        detail=(
+            f"{unit_id} published {rows} row(s) via {spec.collector}.{spec.rows_key}"
+            if rows > 0
+            else (
+                f"{unit_id} completed and published ZERO rows via "
+                f"{spec.collector}.{spec.rows_key} — a fresh, empty write"
+            )
+        ),
+        value=float(rows),
+    )
 
 
 def run_weekly(config: dict, args: argparse.Namespace) -> dict:
@@ -681,9 +947,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 "No tickers available — skipping historical constituents (PIT map "
                 "needs today's roster to replay changes from)"
             )
-            results["collectors"]["historical_constituents"] = {
-                "status": "skipped", "reason": "no tickers",
-            }
+            results["collectors"]["historical_constituents"] = _phase_not_run(
+                reg, "historical_constituents", reason="no tickers", applicable=True
+            )
         else:
             results["collectors"]["historical_constituents"] = _phase_collect(
                 reg, "historical_constituents",
@@ -701,7 +967,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         if not tickers:
             logger.warning("No tickers available — skipping price cache refresh")
-            results["collectors"]["prices"] = {"status": "skipped", "reason": "no tickers"}
+            results["collectors"]["prices"] = _phase_not_run(
+                reg, "prices", reason="no tickers", applicable=True
+            )
         else:
             # supports_auto_skip=False: prices writes per-ticker parquet (no single
             # stable S3 key to validate), so markers + watchdog only — the phase
@@ -795,9 +1063,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         if not tickers:
             logger.warning("No tickers available — skipping short interest")
-            results["collectors"]["short_interest"] = {
-                "status": "skipped", "reason": "no tickers",
-            }
+            results["collectors"]["short_interest"] = _phase_not_run(
+                reg, "short_interest", reason="no tickers", applicable=True
+            )
         else:
             results["collectors"]["short_interest"] = _phase_collect(
                 reg, "short_interest",
@@ -813,7 +1081,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             )
     elif only in (None, "short_interest") and not si_enabled:
         logger.info("short_interest collector disabled via config — skipping")
-        results["collectors"]["short_interest"] = {"status": "ok", "skipped": "disabled_in_config"}
+        results["collectors"]["short_interest"] = _phase_not_run(
+            reg, "short_interest", reason="disabled_in_config", applicable=False
+        )
 
     # ── 4c. Universe classification ──────────────────────────────────────────
     # Per-ticker yfinance Ticker.info scrape for sector/country-of-domicile/
@@ -835,9 +1105,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         if not tickers:
             logger.warning("No tickers available — skipping universe classification")
-            results["collectors"]["universe_classification"] = {
-                "status": "skipped", "reason": "no tickers",
-            }
+            results["collectors"]["universe_classification"] = _phase_not_run(
+                reg, "universe_classification", reason="no tickers", applicable=True
+            )
         else:
             results["collectors"]["universe_classification"] = _phase_collect(
                 reg, "universe_classification",
@@ -853,7 +1123,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             )
     elif only in (None, "universe_classification") and not uc_enabled:
         logger.info("universe_classification collector disabled via config — skipping")
-        results["collectors"]["universe_classification"] = {"status": "ok", "skipped": "disabled_in_config"}
+        results["collectors"]["universe_classification"] = _phase_not_run(
+            reg, "universe_classification", reason="disabled_in_config", applicable=False
+        )
 
     # ── 5. Universe returns ──────────────────────────────────────────────────
     if only in (None, "universe_returns"):
@@ -919,7 +1191,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 supports_auto_skip=False,
             )
         else:
-            results["collectors"]["signal_returns"] = {"status": "skipped", "reason": "no research.db"}
+            results["collectors"]["signal_returns"] = _phase_not_run(
+                reg, "signal_returns", reason="no research.db", applicable=True
+            )
 
     # ── 6. Fundamentals ───────────────────────────────────────────────────────
     if only in (None, "fundamentals"):
@@ -928,7 +1202,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
         logger.info("=" * 60)
         if not tickers:
             logger.warning("No tickers available — skipping fundamentals")
-            results["collectors"]["fundamentals"] = {"status": "skipped", "reason": "no tickers"}
+            results["collectors"]["fundamentals"] = _phase_not_run(
+                reg, "fundamentals", reason="no tickers", applicable=True
+            )
         else:
             results["collectors"]["fundamentals"] = _phase_collect(
                 reg, "fundamentals",
@@ -1050,38 +1326,74 @@ def _run_phase2(config: dict, args: argparse.Namespace) -> dict:
     # scope.json at resolution time — before the first API call — means even a
     # partial run leaves a truthful baseline.  Read preference is scope.json
     # first, manifest second (see collectors/alternative.py).
+    # The write is NOT swallowed (alpha-engine-config-I10784, P-17; was a bare
+    # `except Exception: logger.warning(... "non-fatal")` here). The paragraph
+    # above is the reason it cannot be non-fatal: the whole point of writing
+    # scope.json at resolution time is that a partial run still leaves a
+    # truthful baseline for the guard. A run that fails to write it and then
+    # collects anyway produces exactly the state that paragraph exists to
+    # prevent — the guard falls back to a PRE-CHANGE prior manifest, and the
+    # only run that can advance the baseline is one the guard permits, which is
+    # none. The failure now surfaces as a `_CollectorError`, which the phase
+    # registry records as an `error` marker (so a recovery re-runs it) and
+    # which reaches the run manifest as `status: failed`.
     scope_key = f"{market_prefix}weekly/{run_date}/alternative/scope.json"
-    try:
-        s3 = boto3.client("s3")
-        s3.put_object(
-            Bucket=bucket,
-            Key=scope_key,
-            Body=json.dumps({
-                "tickers_requested": len(universe_tickers),
-                "resolved_from": "constituents.json",
-                "run_date": run_date,
-                "resolved_at": datetime.now(timezone.utc).isoformat(),
-            }),
-            ContentType="application/json",
-        )
-        logger.info("Wrote scope baseline: s3://%s/%s (%d tickers)",
-                     bucket, scope_key, len(universe_tickers))
-    except Exception:
-        logger.warning("Failed to write scope baseline %s — non-fatal; "
-                        "scope guard will fall back to prior manifest", scope_key)
 
-    results["collectors"]["alternative"] = _phase_collect(
-        reg, "alternative",
-        lambda: alternative.collect(
+    def _collect_alternative() -> dict:
+        # Inside the phase body, so the failure below lands on D15's own run
+        # manifest as `status: failed` rather than crashing outside every
+        # record this unit writes. Still strictly before the first vendor call,
+        # which is the property the paragraph above depends on.
+        _write_alternative_scope_baseline(bucket, scope_key, run_date, universe_tickers)
+        return alternative.collect(
             bucket=bucket, s3_prefix=market_prefix, run_date=run_date,
             tickers=universe_tickers, dry_run=dry_run,
-        ),
+        )
+
+    results["collectors"]["alternative"] = _phase_collect(
+        reg, "alternative", _collect_alternative,
         artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json",
     )
 
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     _finalize(results, bucket, market_prefix, run_date, dry_run, None)
     return results
+
+
+def _write_alternative_scope_baseline(
+    bucket: str, scope_key: str, run_date: str, universe_tickers: list[str]
+) -> None:
+    """Publish D15's resolved scope, or RAISE.
+
+    `alpha-engine-config-I10784` (P-17) — this write used to be wrapped in a
+    bare ``except Exception: logger.warning(..., "non-fatal; scope guard will
+    fall back to prior manifest")``, the swallow named in the plan's §1 layer
+    verdict. It is not non-fatal. The caller's own comment says why: the guard
+    (`collectors/alternative.py::_assert_scope_stable`) needs a truthful
+    baseline for the NEXT run, and writing it at resolution time is what makes
+    a partial run still leave one. A run that fails this write and collects
+    anyway leaves the guard reading a PRE-CHANGE prior manifest — after which
+    the only run that can advance the baseline is one the guard permits, and
+    the guard permits none. The "fallback" the warning promised is the
+    deadlock, not a recovery from it.
+
+    The fleet default is RAISE (`AGENTS.md`, fail loud and fast); the deviation
+    this swallow represented is closed here rather than re-justified.
+    """
+    boto3.client("s3").put_object(
+        Bucket=bucket,
+        Key=scope_key,
+        Body=json.dumps({
+            "tickers_requested": len(universe_tickers),
+            "resolved_from": "constituents.json",
+            "run_date": run_date,
+            "resolved_at": datetime.now(timezone.utc).isoformat(),
+        }),
+        ContentType="application/json",
+    )
+    logger.info(
+        "Wrote scope baseline: s3://%s/%s (%d tickers)", bucket, scope_key, len(universe_tickers)
+    )
 
 
 def _previous_trading_day(reference: datetime | None = None) -> str:
@@ -2594,6 +2906,7 @@ def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
             "%s — skipping (best-effort). %s",
             standalone_timeout_s, target_date, e,
         )
+        _record_swallowed_step("universe_gap_heal", f"hard timeout after {standalone_timeout_s}s: {e}")
         results["collectors"]["universe_gap_heal"] = {"status": "skipped", "error": str(e)}
     except Exception as e:
         logger.exception("standalone universe-gap self-heal failed for %s (non-blocking)", target_date)
@@ -2913,6 +3226,7 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
             results["collectors"]["chronic_gap_drift_detection"] = drift_result
         except Exception as e:
             logger.warning("Chronic-gap drift detection failed (non-blocking): %s", e)
+            _record_swallowed_step("chronic_gap_drift_detection", str(e))
             results["collectors"]["chronic_gap_drift_detection"] = {
                 "status": "skipped",
                 "error": str(e),
@@ -2936,6 +3250,7 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
             chronic_tickers = cdrift_result["still_constituents"]
         except Exception as e:
             logger.warning("Chronic-gap constituents drift check failed (non-blocking): %s", e)
+            _record_swallowed_step("chronic_gap_constituents_drift", str(e))
             results["collectors"]["chronic_gap_constituents_drift"] = {
                 "status": "skipped",
                 "error": str(e),
@@ -2980,6 +3295,10 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
                 "Chronic-gap self-heal hit the %ds hard timeout for %s — "
                 "skipping (best-effort); postflight remains the freshness gate. %s",
                 _CHRONIC_HEAL_HARD_TIMEOUT_S, target_date, e,
+            )
+            _record_swallowed_step(
+                "chronic_gap_self_heal",
+                f"hard timeout after {_CHRONIC_HEAL_HARD_TIMEOUT_S}s: {e}",
             )
             results["collectors"]["chronic_gap_self_heal"] = {
                 "status": "skipped",
