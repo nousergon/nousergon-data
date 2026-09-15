@@ -33,8 +33,8 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
-  - arcticdb/delisted_history (library)
-  - prune audit record
+  - "delisted_history::{ticker}"
+  - "builders/prune_audit/{trading_day}-*.json"
 consumers: []
 consumers_reason: "No external reader of `delisted_history` was found. R7 keep."
 contract:
@@ -127,3 +127,15 @@ clause_phase:
 notes: >-
     Run record is UNVERIFIED: stdout into /var/log/data-weekly.log only. P-06 puts it
     through the run-manifest wrapper.
+
+    alpha-engine-config-I10820: `writes` was two prose entries, unmeasurable by the shadow
+    parity tool. Code read of `builders/prune_delisted_tickers.py`: `_retain_delisted`
+    (line ~224) writes each pruned ticker's full frame to the `delisted_history` ArcticDB
+    library (`store/arctic_store.py::DELISTED_HISTORY_LIB`) under the ticker's own symbol
+    key — `delisted_history::{ticker}`. `_write_audit` (line 548) writes one JSON per run
+    to `AUDIT_PREFIX = "builders/prune_audit/"` (line 82) with key
+    `{AUDIT_PREFIX}{today}-{HHMMSSZ}-{apply|dryrun}.json` — the `HHMMSSZ` run-time segment
+    is not derivable ahead of time (same class as the edgar-pit-fundamentals `{run_id}.json`
+    precedent, `tests/test_artifact_registry_coverage.py`), so the descriptor states it as
+    the listable prefix pattern `builders/prune_audit/{trading_day}-*.json` rather than a
+    single derivable key.
