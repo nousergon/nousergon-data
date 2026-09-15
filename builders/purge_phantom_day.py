@@ -104,6 +104,10 @@ def main() -> None:
     # `--apply` nothing is written, including the manifest.
     import run_units
 
+    # In-region only (alpha-engine-config-I9771): refuse before touching
+    # ArcticDB or the staging parquet at all, not just before the write.
+    run_units.require_in_region("purge_phantom_day")
+
     run_units.manual_run(
         "D43", lambda ctx: _purge(args, ctx), write=args.apply, bucket=args.bucket
     )

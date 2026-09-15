@@ -221,6 +221,10 @@ def main() -> None:
     # written, including the manifest.
     import run_units
 
+    # In-region only (alpha-engine-config-I9771): refuse before touching
+    # ArcticDB or the registry at all, not just before the write.
+    run_units.require_in_region("splice_rebase")
+
     def _body(ctx):
         result = splice_rebase(
             args.ticker, args.splice_date, args.true_ex_date,
