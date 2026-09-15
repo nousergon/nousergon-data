@@ -114,16 +114,93 @@ def test_a_heal_unit_counts_the_length_of_what_it_healed(monkeypatch):
         "daily_heal",
         {
             "status": "ok",
+            "date": "2026-09-13",
+            "days_healed": 2,
             "collectors": {
                 "universe_gap_heal": {
                     "status": "ok",
-                    "healed_days": ["2026-09-11", "2026-09-12"],
+                    "healed_days": [
+                        {"date": "2026-09-11", "kind": "missing", "tickers": 903},
+                        {"date": "2026-09-12", "kind": "fallback_quality", "tickers": 903},
+                    ],
                 }
             },
         },
     )
     assert m["unit_id"] == "D33"
-    assert m["rows_out"] == 2
+    # alpha-engine-config-I10861: the manifest's aggregate rows_out is now the
+    # SUM over every real key this run wrote (never the single synthesized
+    # arcticdb://{unit_id} key alone) — the heal-summary artifact, one
+    # staging/daily_closes/{day}.parquet per healed day, and the ArcticDB
+    # library write.
+    keys = {o["key"]: o["rows_out"] for o in m["outputs"]}
+    assert keys == {
+        "data/heal/daily/2026-09-13.json": 2,
+        "staging/daily_closes/2026-09-11.parquet": 2,
+        "staging/daily_closes/2026-09-12.parquet": 2,
+        "arcticdb/universe": 2,
+    }
+    assert [g["verdict"] for g in m["guards"]] == ["ok"]
+
+
+def test_morning_enrich_records_its_daily_closes_write_even_without_an_arctic_append(
+    monkeypatch,
+):
+    """`alpha-engine-config-I10861`: D17's weekday run passes
+    ``--skip-arctic-append`` — the arctic append happens in D18's own SF
+    state, not inline here. Gating the S3 output recording behind the
+    (absent) arctic row measurement, as the pre-fix single-key
+    ``_record_mode_lineage`` did, left D17's weekday runs with NO recorded
+    output at all."""
+    out, m = _run(
+        monkeypatch,
+        "morning_enrich",
+        {
+            "status": "ok",
+            "date": "2026-09-14",
+            "collectors": {
+                "daily_closes": {"status": "ok", "tickers_captured": 903},
+            },
+        },
+    )
+    assert m["unit_id"] == "D17"
+    keys = {o["key"]: o["rows_out"] for o in m["outputs"]}
+    assert keys == {"staging/daily_closes/2026-09-14.parquet": 903}
+    # The arctic row measurement is genuinely absent this run — unmeasurable,
+    # never silently 0 — and the S3 write above is recorded regardless.
+    assert [g["verdict"] for g in m["guards"]] == ["unmeasurable"]
+
+
+def test_chronic_gap_heal_records_one_price_cache_key_per_healed_ticker(monkeypatch):
+    """`alpha-engine-config-I10861`: D34 writes
+    ``reference/price_cache/{ticker}.parquet`` per healed ticker — never the
+    descriptor's stale ``staging/daily_closes/*`` claim, which this mode does
+    not touch (see registry.d/units/D34-chronic-gap-heal.yaml)."""
+    out, m = _run(
+        monkeypatch,
+        "chronic_gap_heal",
+        {
+            "status": "ok",
+            "collectors": {
+                "chronic_gap_self_heal": {
+                    "status": "ok",
+                    "healed": [
+                        {"ticker": "PSTG", "rows_added": 5},
+                        {"ticker": "BF-B", "rows_added": 3},
+                    ],
+                    "skipped_already_fresh": [],
+                    "errors": [],
+                },
+            },
+        },
+    )
+    assert m["unit_id"] == "D34"
+    keys = {o["key"]: o["rows_out"] for o in m["outputs"]}
+    assert keys == {
+        "reference/price_cache/PSTG.parquet": 8,
+        "reference/price_cache/BF-B.parquet": 8,
+        "arcticdb/universe": 2,
+    }
     assert [g["verdict"] for g in m["guards"]] == ["ok"]
 
 

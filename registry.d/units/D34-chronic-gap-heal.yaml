@@ -25,15 +25,23 @@ title: "chronic-gap-heal"
 component: 1
 lifecycle: "in-service"
 owner: brian
-code_path: "weekly_collector.py:2580"
+code_path: "weekly_collector.py:3319"
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:MorningEnrich"
   successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
+# alpha-engine-config-I10861: corrected from "staging/daily_closes/*", which
+# this mode never writes — `_run_chronic_gap_heal` ->
+# `_self_heal_chronic_polygon_gaps` writes `reference/price_cache/{ticker}.parquet`
+# (via `builders._price_cache_writeboth.price_cache_write_prefixes`) for each
+# healed ticker, never `staging/daily_closes` (that key is D17/D19/D33's).
+# `code_path` was also stale (weekly_collector.py:2580 no longer points at
+# `_run_chronic_gap_heal` after PR1739 shifted the file) — both measured
+# against the live function 2026-09-15.
 writes:
-  - "staging/daily_closes/*"
+  - "reference/price_cache/*"
   - arcticdb/universe (library)
 consumers:
   - "crucible-executor:executor/upstream_artifact_gate.py (via D17's key)"

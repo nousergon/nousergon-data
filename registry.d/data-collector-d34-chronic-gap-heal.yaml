@@ -15,7 +15,7 @@ origin: ne-weekly-freshness-pipeline:MorningEnrich
 owner: brian
 lifecycle: in-service
 authority_tier: t1
-authority_tier_reason: 'A deterministic collector with no judgment: D34''s own code path (weekly_collector.py:2580)
+authority_tier_reason: 'A deterministic collector with no judgment: D34''s own code path (weekly_collector.py:3319)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no
   LLM call in this unit.'
 signals:
