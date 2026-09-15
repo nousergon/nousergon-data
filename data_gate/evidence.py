@@ -50,6 +50,7 @@ __all__ = [
     "empty_fresh_runs",
     "parity_store_key",
     "read_base",
+    "read_completeness_metric",
     "read_guard_commissioning",
     "read_ladder_freshness",
     "read_objective",
@@ -67,6 +68,13 @@ __all__ = [
 #: gap is an address rather than a shrug (`alpha-engine-config-I10777`).
 STACK_CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
 
+#: The `MetricRecord` (`krepis.metrics`) status vocabulary that represents a
+#: real reading (the guard looked and has an answer, good or bad) versus the
+#: N/A-* states that mean the guard could not evaluate this cycle at all.
+_METRIC_REAL_STATUSES: frozenset[str] = frozenset({"GREEN", "WATCH", "RED"})
+_METRIC_NA_STATUSES: frozenset[str] = frozenset(
+    {"N/A-NOT-IMPL", "N/A-NOT-RUN", "N/A-LOW-N", "N/A-MISSING-INPUT"}
+)
 
 @dataclass(frozen=True)
 class Reading:
@@ -576,6 +584,79 @@ def read_guard_commissioning(
         evidence=(key,),
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
+    )
+
+
+def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Reading:
+    """One unit's cardinality/completeness `MetricRecord` for a single trading day.
+
+    `validators/expectations.py::publish_completeness_metric` writes this key
+    (`data_collection_plan_260914.md` §2 row 2, plan item P-13;
+    `alpha-engine-config-I10780`, extending `alpha-engine-config-I5935`). Ships
+    in phase 1 OBSERVE (`sf-pipeline-policy` §7a): this clause reads the real
+    MEASURED coverage regardless of the guard's own staging — observe mode
+    governs only whether a bad reading halts the collector run, never whether
+    the board renders it. Distinct from `data.slo.completeness.<family>`
+    (phase 3, a rolling 20-cycle SLO over ALL units in a freshness family):
+    this clause is the single-day, single-unit reading that PROVES the guard
+    ran and published something today.
+    """
+    key = f"metrics/eod_completeness/{trading_day.isoformat()}.json"
+    read = read_store_document(store, key)
+    if read.problem is not None:
+        return Reading(
+            met=False,
+            detail=f"could not read {key}: {read.problem}",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if read.absent:
+        return Reading(
+            met=False,
+            detail=(
+                f"no completeness metric at {key}. The cardinality guard "
+                "(validators/expectations.py::check_cardinality /"
+                "publish_completeness_metric) has not published a reading for this "
+                "trading day — nothing emits it yet, which is the P-13 gap this clause "
+                "exists to surface."
+            ),
+            evidence=(key,),
+            source="data_collection store",
+        )
+    document = read.document or {}
+    status = str(document.get("status") or "")
+    as_of = str(document.get("last_updated_utc") or "")
+    if status in _METRIC_NA_STATUSES:
+        return Reading(
+            met=False,
+            detail=f"{key}: status={status} ({document.get('status_reason')})",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=as_of,
+        )
+    if status not in _METRIC_REAL_STATUSES:
+        return Reading(
+            met=False,
+            detail=(
+                f"{key} carries status {status!r}, outside the closed MetricRecord status "
+                f"vocabulary {sorted(_METRIC_REAL_STATUSES | _METRIC_NA_STATUSES)}"
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=as_of,
+        )
+    return Reading(
+        met=status == "GREEN",
+        detail=(
+            f"{key}: status={status}, value={document.get('value')}, "
+            f"floor={document.get('target')} — {document.get('status_reason')}"
+        ),
+        evidence=(key,),
+        source="data_collection store",
+        as_of=as_of,
     )
 
 

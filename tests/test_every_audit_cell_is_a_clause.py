@@ -98,6 +98,7 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 "data.cutover_ready.",
             )
         )
+        and not name.endswith(".completeness")
     } - cells
     assert not orphan_clauses, f"base-shaped clauses with no audit cell: {sorted(orphan_clauses)}"
     assert cells <= generated, f"audit cells with no clause: {sorted(cells - generated)}"

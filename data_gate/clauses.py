@@ -11,6 +11,10 @@ committed descriptors — nothing here is hand-listed:
   ``data.<unit>.guard.{empty_fresh,cardinality,units,pit,vendor_fallback,
   success_without_output}``, plus ``vendor_crosscheck`` on the two units that
   write one key.
+* **completeness**, one per unit that declares a ``completeness`` block with a
+  denominator: ``data.<unit>.completeness`` — the phase-1 OBSERVE-mode reading
+  of the day's single `MetricRecord` (plan §2 row 2, P-13), distinct from both
+  the guard-commissioning clause above and the rolling SLO below.
 * **objective**: ``data.slo.freshness.<family>``,
   ``data.slo.completeness.<family>``, ``data.cost.monthly``,
   ``data.pages.monthly``, ``data.human_touch.monthly``.
@@ -46,6 +50,7 @@ __all__ = [
     "base_clause_name",
     "is_retired",
     "base_clause_names",
+    "completeness_clause_name",
     "generate",
     "guard_clause_name",
 ]
@@ -91,6 +96,10 @@ def base_clause_name(unit_id: str, column: str) -> str:
 
 def guard_clause_name(unit_id: str, guard: str) -> str:
     return f"{CLAUSE_PREFIX}.{unit_id}.guard.{guard}"
+
+
+def completeness_clause_name(unit_id: str) -> str:
+    return f"{CLAUSE_PREFIX}.{unit_id}.completeness"
 
 
 def base_clause_names(units: list[Unit]) -> list[str]:
@@ -230,6 +239,55 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         f"declared state {state!r} ({note}); {reading.detail}",
         reading.evidence,
         phase="data-phase2",
+        source=reading.source,
+        as_of=reading.as_of,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Completeness clause — one per unit that declares a `completeness` block
+# with a denominator (`data_collection_plan_260914.md` §2 row 2, plan item
+# P-13; `alpha-engine-config-I10780`). D20 (the EOD spine) is the only unit
+# declaring one today.
+#
+# Distinct from the per-guard `data.<unit>.guard.cardinality` clause above
+# (which reads a `faults/` induced-fault COMMISSIONING record, phase 2, per
+# `observability-policy` §9.1) and from `data.slo.completeness.<family>`
+# below (a phase-3 rolling 20-cycle SLO over a whole freshness family). This
+# clause reads the single-day `MetricRecord` the guard publishes and is the
+# phase-1 proof that the guard actually RAN and measured something today,
+# alongside the observe-mode stack (plan §2 row 2 amendment 3).
+# ---------------------------------------------------------------------------
+
+
+def _clause_completeness(store: ev.GateStore, unit: Unit, *, trading_day: dt.date) -> Clause:
+    name = completeness_clause_name(unit.unit_id)
+    block = unit.completeness or {}
+    denominator = block.get("denominator") or "?"
+    floor = block.get("floor")
+    requirement = (
+        f"{unit.unit_id} covers >= {floor} of its declared universe ({denominator}) minus "
+        "DECLARED exclusions (contracts/exclusions/unpriced_symbols.yaml), after suffix "
+        "normalization (contracts/exclusions/suffix_normalization.yaml) — phase 1 OBSERVE "
+        "(data_collection_plan_260914.md §2 row 2, plan item P-13)"
+    )
+    reading = ev.read_completeness_metric(store, unit, trading_day=trading_day)
+    if reading.unmeasurable:
+        return unmeasurable(
+            name,
+            requirement,
+            reading.detail,
+            reading.evidence,
+            phase="data-phase1",
+            source=reading.source,
+        )
+    return Clause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        phase="data-phase1",
         source=reading.source,
         as_of=reading.as_of,
     )
@@ -605,6 +663,18 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_cutover_ready_units_covered(store, units, trading_day=trading_day))
     clauses.append(_clause_cutover_ready_roles_bootstrapped(store))
     clauses.append(_clause_cutover_ready_parity(store, trading_day=trading_day))
+    # `data_collection/metrics/eod_completeness/{trading_day}.json` is a single
+    # non-unit-scoped key (`validators/expectations.py::publish_completeness_metric`;
+    # plan §2 row 2, P-13) — it names the EOD spine specifically, not a generic
+    # per-unit path. Many units declare a `completeness` block (most `status:
+    # proposed`, no reader behind them yet), so this clause is generated for the
+    # ONE unit the key actually describes rather than looped over every
+    # descriptor that happens to carry the field. Generalizing past D20 needs a
+    # per-unit metric key first — declared here, not inferred from the
+    # descriptor, so a second unit never silently collides on this key.
+    for unit in units:
+        if unit.unit_id == "D20" and (unit.completeness or {}).get("denominator"):
+            clauses.append(_clause_completeness(store, unit, trading_day=trading_day))
     for family in sorted({u.freshness_family for u in units if u.freshness_family}):
         clauses.append(
             _clause_objective(
