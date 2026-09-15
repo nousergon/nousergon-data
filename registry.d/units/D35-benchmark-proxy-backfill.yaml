@@ -37,9 +37,10 @@ consumers:
   - "nousergon-data:features/compute.py::UNIVERSE_BENCHMARK_PROXIES"
 consumers_reason: UNVERIFIED in the audit. Phase 0 resolves the consumer and the exact key.
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: contracts/arctic_universe.schema.json
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:crucible/data/sources.py::ArcticPriceSource"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D35
 detectors: []

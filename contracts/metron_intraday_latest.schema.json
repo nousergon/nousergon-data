@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/metron_intraday_latest.schema.json",
+  "title": "Metron intraday quotes (market_data/intraday/latest.json, schema_version 3)",
+  "description": "Producer: collectors/metron_market_data.py::collect_intraday (INTRADAY_SCHEMA_VERSION). v3 additive `fund_proxies` map. Written alongside market_data/intraday/technical_ratings.json (contracts/technical_ratings.schema.json) in the same call, sharing `as_of_utc`. A quote carries `suspect: true` (never dropped) on a >40% move or scale-incoherent-vs-settled-close flag. Consumer: Metron api/services/*.py (15-min Today view, Overview markets strip). Plan §3 boundary table row 2.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "as_of_utc", "source", "quotes", "indices", "fund_proxies"],
+  "properties": {
+    "schema_version": {"const": 3},
+    "as_of_utc": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"},
+    "source": {"type": "string", "const": "yfinance_delayed"},
+    "quotes": {"type": "object", "additionalProperties": {"$ref": "#/$defs/quote"}},
+    "indices": {"type": "object", "additionalProperties": {"$ref": "#/$defs/quote"}},
+    "fund_proxies": {"type": "object", "additionalProperties": {"$ref": "#/$defs/quote"}}
+  },
+  "$defs": {
+    "quote": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["last", "open", "prev_close", "session_date", "prev_session_date", "currency"],
+      "properties": {
+        "last": {"type": "number"},
+        "open": {"type": "number"},
+        "prev_close": {"type": "number"},
+        "session_date": {"type": "string", "format": "date"},
+        "prev_session_date": {"type": "string", "format": "date"},
+        "currency": {"type": "string", "minLength": 3, "maxLength": 3},
+        "suspect": {"type": "boolean"}
+      }
+    }
+  }
+}
