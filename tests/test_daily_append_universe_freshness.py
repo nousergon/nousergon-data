@@ -202,7 +202,9 @@ class TestExpectedTickersScoping:
         )
 
         assert receipt["all_fresh"] is True
-        assert receipt["n_symbols_checked"] == 2  # stragglers excluded from count
+        # stragglers excluded; every declared benchmark proxy the library holds is
+        # scanned regardless of expected_tickers (IWM, 2026-09-14): 2 stocks + 6 proxies
+        assert receipt["n_symbols_checked"] == 8
         s3.put_object.assert_called_once()
 
     def test_stale_symbol_in_expected_still_raises(self):
@@ -322,7 +324,8 @@ class TestBenchmarkTickerNeverExcludedFromScan:
         )
 
         assert receipt["all_fresh"] is True
-        assert receipt["n_symbols_checked"] == 3, (
+        # 3 requested (incl. SPY) + the 5 other declared proxies, always scanned (IWM, 2026-09-14)
+        assert receipt["n_symbols_checked"] == 8, (
             "SPY must be included in the checked set, not treated as an "
             "excluded churn-out straggler"
         )
