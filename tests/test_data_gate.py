@@ -459,7 +459,7 @@ def test_a_connected_unit_is_unaffected(tmp_path):
 
 
 def test_the_ruled_units_are_unconnected_on_the_real_board(units, board):
-    ruled = {"D02", "D03", "D04", "D05", "D06", "D08", "D14", "D33", "D46"}
+    ruled = {"D02", "D03", "D04", "D05", "D06", "D07", "D08", "D14", "D33", "D46"}
     by_id = {u.unit_id: u for u in units}
     for unit_id in ruled:
         assert by_id[unit_id].connection == "unconnected", unit_id
