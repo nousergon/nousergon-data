@@ -51,6 +51,7 @@ import run_units
 from dates import default_run_date
 from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
+from validators import expectations
 
 logger = logging.getLogger(__name__)
 
@@ -1032,7 +1033,18 @@ def collect(
         _write_json(s3_client, bucket, f"{FX_PREFIX}latest.json", fx_artifact)
     except Exception as e:  # fail loud to the phase registry — never a silent producer
         logger.error("[metron_market_data] artifact write failed: %s", e)
-        return {"status": "error", "error": str(e)}
+        return {
+            "status": "error", "error": str(e),
+            # The failure path emits the same telemetry as the success path,
+            # except the completion claim (`observability-policy` §3.1): the
+            # trading day still gets a completeness document, graded
+            # UNMEASURABLE, so the board reads red rather than absent.
+            **_grade_cardinality(
+                s3_client, bucket, run_date,
+                denominator=yf_symbols, covered=(), closes_key=closes_key,
+                write_failure=f"{type(e).__name__}: {e}",
+            ),
+        }
 
     logger.info("[metron_market_data] wrote %d closes + %d fx → s3://%s/%s{,latest}",
                 len(closes), len(rates), bucket, CLOSES_PREFIX)
@@ -1040,6 +1052,112 @@ def collect(
         "status": "ok", "universe": len(holdings),
         "closes": len(closes), "fx": len(rates),
         "closes_key": closes_key, "fx_key": fx_key,
+        **_grade_cardinality(
+            s3_client, bucket, run_date,
+            denominator=yf_symbols, covered=closes.keys(), closes_key=closes_key,
+        ),
+    }
+
+
+#: D20's declared completeness floor, from
+#: ``registry.d/units/D20-metron-eod-closes-fx.yaml``'s ``completeness.floor``.
+#: Mirrored as a constant rather than loaded from the descriptor at runtime so
+#: the EOD collector does not take a dependency on the gate's YAML loader on the
+#: box; ``tests/test_d20_cardinality_wiring.py`` asserts the two are equal, so
+#: the mirror cannot drift silently.
+D20_COMPLETENESS_FLOOR = 1.0
+
+
+def _grade_cardinality(
+    s3_client: Any,
+    bucket: str,
+    run_date: str,
+    *,
+    denominator,
+    covered,
+    closes_key: str | None,
+    write_failure: str | None = None,
+) -> dict:
+    """Grade D20's published coverage and publish the completeness metric.
+
+    `alpha-engine-config-I10827`, wiring the guard built by
+    `alpha-engine-config-I10780` (P-13) into the call site it was built for.
+
+    Two artifacts come out of one reading, on purpose:
+
+    * the verdict rides on THIS run's manifest (returned here under ``guards``,
+      folded on by ``weekly_collector._record_phase_lineage``), which is where a
+      diagnosis of one execution starts; and
+    * ``data_collection/metrics/eod_completeness/{trading_day}.json``, a fixed
+      address per trading day, which is what the ladder's
+      ``data.D20.completeness`` clause reads — the gate cannot discover a run id
+      first.
+
+    **Written on EVERY scheduled execution, including the one whose write
+    failed.** A guard that records only when the happy path is reached is
+    indistinguishable from a guard that stopped running (`principles.md` §2.7),
+    and a trading day with no metric document must render red rather than
+    absent. A failed write is graded `unmeasurable`: the run published nothing,
+    so there is no coverage to measure — which is not the same claim as
+    coverage of zero.
+
+    OBSERVE mode (`sf-pipeline-policy` §7a): the verdict is logged at ERROR and
+    rides on the manifest and the board; no exit code moves. The promotion
+    criterion lives on ``expectations.CARDINALITY_GUARD``.
+    """
+    if write_failure is not None:
+        reading = expectations.CardinalityReading(
+            "unmeasurable",
+            f"D20 published nothing this run — the artifact write failed ({write_failure}), so "
+            "there is no coverage to grade. UNMEASURABLE, not zero coverage.",
+            key=closes_key,
+            baseline=D20_COMPLETENESS_FLOOR,
+        )
+    else:
+        reading = expectations.check_cardinality(
+            unit_id="D20",
+            denominator_symbols=denominator,
+            covered_symbols=covered,
+            floor=D20_COMPLETENESS_FLOOR,
+        )
+    expectations.report(reading, unit_id="D20", staging=expectations.CARDINALITY_GUARD)
+
+    metric = expectations.cardinality_metric(
+        "D20", reading, source_path="collectors/metron_market_data.py::collect",
+    )
+    try:
+        expectations.publish_completeness_metric(s3_client, bucket, run_date, metric)
+    except Exception as exc:  # noqa: BLE001 -- see the two-line rationale below
+        # DELIBERATE swallow. (a) Failure mode: the completeness METRIC's own
+        # PUT failing. (b) The primary deliverable survives — the closes and FX
+        # artifacts are already durable above, and the verdict still reaches
+        # this run's manifest through the returned `guards` entry. (c) Recording
+        # surface: this ERROR line, plus the absent
+        # data_collection/metrics/eod_completeness/{day}.json, which the
+        # `data.D20.completeness` clause reads as UNMET with the key named.
+        # Raising here would turn a metric-write blip into a failed EOD run,
+        # which inverts the rule that a measurement never gates the thing it
+        # measures.
+        logger.error(
+            "[metron_market_data] completeness metric PUT failed for %s (%s: %s) — the closes "
+            "are written and the verdict is on this run's manifest; data.D20.completeness will "
+            "read UNMET for this trading day",
+            run_date, type(exc).__name__, exc,
+        )
+
+    return {
+        "guards": [
+            {
+                "guard": expectations.CARDINALITY_GUARD.name,
+                "mode": expectations.CARDINALITY_GUARD.mode.value,
+                "verdict": reading.verdict,
+                "detail": reading.detail[:2000],
+                "key": reading.key,
+                "value": reading.value,
+                "baseline": reading.baseline,
+            }
+        ],
+        "metrics": [metric],
     }
 
 
