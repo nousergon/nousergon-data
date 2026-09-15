@@ -50,6 +50,30 @@ contract:
     - "metron:tests/contracts/metron_intraday_latest.schema.json"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D37
+# D37 is the ONE unit whose run records need a retention decision stated in the
+# descriptor. metron-intraday.timer fires every 5 minutes around the clock, so
+# this prefix takes ~288 objects per day (~78 in-session `ok`/`failed` runs plus
+# ~210 off-session `not_applicable` ones) against ~1/day for every other unit —
+# ~105k objects and ~100 MB a year. Declared here rather than left to the
+# bucket's default so the cost of the run-record objective is a decision on the
+# record, not a surprise on a bill (alpha-engine-config-I10810).
+#
+# SCHEMA GAP, stated rather than worked around: `data_gate/descriptors.py`
+# neither requires nor validates these two keys — it checks a REQUIRED list and
+# ignores extras, so nothing enforces the shape and nothing enforces that a
+# high-cardinality prefix declares one at all. The key NAMES mirror the only
+# existing precedent in this tree, `registry.d/ae-preflight-sweep.yaml`'s
+# `retention` / `retention_reason` pair. Neither this declaration nor that one
+# is wired to an S3 lifecycle rule; applying it is ops-plane work in
+# `nous-ergon-ops`, and until it lands this states the intent and nothing
+# deletes anything.
+run_manifest_retention: 400 days
+run_manifest_retention_reason: >-
+    Longer than a year so a full seasonal cycle of session slots is available to
+    the completeness clause ("age <= 10 minutes in >= 99% of session slots"),
+    which cannot be computed over a window shorter than the period it grades.
+    Not indefinite: a five-minute unit's run records are a trend, and the
+    artifacts themselves are the durable output.
 detectors:
   - kind: "box-timer-health"
     via: "timer-level exit/streak"

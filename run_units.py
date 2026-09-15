@@ -33,9 +33,13 @@ with an address, not a pass.
 
 from __future__ import annotations
 
+import datetime as dt
+import logging
 import os
 import socket
+from collections.abc import Callable
 from dataclasses import dataclass
+from typing import Any
 
 from nousergon_lib import run_manifest
 from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
@@ -43,13 +47,18 @@ from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
 __all__ = [
     "LOG_LOCATION_ENV",
     "MANIFEST_BUCKET",
+    "MODE_ROWS",
     "MODE_UNITS",
+    "NOT_RUN_NOT_APPLICABLE",
     "PHASE_UNITS",
     "TRIGGER_ENV",
+    "EntryRunFailed",
+    "ModeRows",
     "PhaseUnit",
     "manifest_sink",
     "manual_run",
     "resolve_log_location",
+    "recorded_entry",
     "resolve_trigger",
     "unit_for",
 ]
@@ -69,6 +78,8 @@ _DEFAULT_LOG_GROUP = "cloudwatch:/alpha-engine/data-spot"
 #: so `data_collection/runs/` needs no new grant on the writer identity.
 MANIFEST_BUCKET = "alpha-engine-research"
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass(frozen=True)
 class PhaseUnit:
@@ -87,6 +98,27 @@ class PhaseUnit:
     unit_id: str
     rows_key: str | None
     mode: str
+    #: ``(result key, rejection reason)`` pairs — the counts this collector
+    #: already reports for records it did NOT publish. `alpha-engine-config-
+    #: I10810` deliverable 2: a manifest that carries ``rows_out`` without
+    #: ``rows_rejected`` says a run published N rows and is silent about the
+    #: M it dropped, which is the same shape of blindness ``rows_out: 0``
+    #: without a guard verdict has. Declared per unit for the same reason
+    #: ``rows_key`` is: the collectors do not agree on a key, and guessing one
+    #: either invents rejections or hides them.
+    rejected_keys: tuple[tuple[str, str], ...] = ()
+
+
+#: Every class of ticker ``builders.daily_append.daily_append`` counted and did
+#: NOT append, by the key it reports it under. Shared by the D32 phase entry and
+#: by the whole-mode append units, which call the same function.
+_APPEND_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
+    ("tickers_errored", "append_error"),
+    ("tickers_skipped", "already_present"),
+    ("tickers_missing_from_closes", "missing_from_daily_closes"),
+    ("tickers_quality_blocked", "quality_gate_blocked"),
+    ("tickers_l2_quarantined", "l2_gate_quarantined"),
+)
 
 
 #: (mode, phase name) -> the unit it is. Modes match ``run_weekly``'s dispatch:
@@ -106,10 +138,20 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("phase1", "signal_returns"): PhaseUnit("D09", "rows_written", "phase1"),
     ("phase1", "fundamentals"): PhaseUnit("D10", "n_ok", "phase1"),
     ("phase1", "metron_valuation_medians"): PhaseUnit("D11", "covered", "phase1"),
-    # features/compute.py and builders/backfill.py report no row count on their
-    # success path; the guard reads UNMEASURABLE for these rather than 0.
+    # features/compute.py reports no row count on its success path; the guard
+    # reads UNMEASURABLE for D12/D31 rather than 0. Closing that needs
+    # `compute_and_write` to return the snapshot's row count —
+    # `alpha-engine-config-I10810` deliverable 2, deferred because `features/`
+    # is owned by a concurrent change set.
     ("phase1", "features"): PhaseUnit("D12", None, "phase1"),
-    ("phase1", "arcticdb"): PhaseUnit("D13", None, "phase1"),
+    # builders/backfill.py DOES report one (`tickers_written` = n_ok), with the
+    # two counts of what it did not write alongside it.
+    ("phase1", "arcticdb"): PhaseUnit(
+        "D13",
+        "tickers_written",
+        "phase1",
+        rejected_keys=(("tickers_errored", "backfill_error"), ("tickers_skipped", "backfill_skipped")),
+    ),
     # ── weekly, phase 2 ────────────────────────────────────────────────────
     ("phase2", "alternative"): PhaseUnit("D15", "tickers_processed", "phase2"),
     # ── weekday EOD ───────────────────────────────────────────────────────
@@ -127,7 +169,14 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("daily", "metron_analyst_data"): PhaseUnit("D29", "analyst", "daily"),
     ("daily", "metron_sentiment_data"): PhaseUnit("D30", "sentiment", "daily"),
     ("daily", "features"): PhaseUnit("D31", None, "daily"),
-    ("daily", "arcticdb"): PhaseUnit("D32", None, "daily"),
+    # builders/daily_append.py reports `tickers_appended` (n_ok) and names every
+    # class of ticker it did NOT append.
+    ("daily", "arcticdb"): PhaseUnit(
+        "D32",
+        "tickers_appended",
+        "daily",
+        rejected_keys=_APPEND_REJECTED_KEYS,
+    ),
 }
 
 #: The run modes that ARE one unit end to end, wrapped whole at the dispatch in
@@ -139,6 +188,64 @@ MODE_UNITS: dict[str, str] = {
     "chronic_gap_heal": "D34",
     "daily_arctic_append": "D32",
 }
+
+
+@dataclass(frozen=True)
+class ModeRows:
+    """Where a whole-mode unit's published row count lives in its own result.
+
+    `alpha-engine-config-I10810` deliverable 2. The five whole-mode units do not
+    go through ``_phase_collect``, so they have no ``PhaseUnit.rows_key``; what
+    they DO have is a nested ``results["collectors"][<step>]`` dict written by
+    the step that published. Naming the step and the key here — rather than
+    searching the result for something that looks like a count — is the same
+    discipline ``rows_key`` enforces one level down: a renamed key is a loud
+    ``unmeasurable``, never a silent zero.
+
+    Args:
+        collector: The key under ``results["collectors"]`` that published.
+        rows_key: The key in THAT dict carrying the published count.
+        counts_list: ``rows_key`` names a list whose LENGTH is the count (the
+            two heal units report healed items, not a number).
+        rejected_keys: ``(key, reason)`` pairs in that same dict.
+    """
+
+    collector: str
+    rows_key: str
+    counts_list: bool = False
+    rejected_keys: tuple[tuple[str, str], ...] = ()
+
+
+#: mode -> where that mode's row count lives. A mode in :data:`MODE_UNITS` with
+#: no entry here records an ``unmeasurable`` guard verdict rather than 0 — red,
+#: counted, and with an address.
+MODE_ROWS: dict[str, ModeRows] = {
+    # MorningEnrich and both ArcticDB appends publish through
+    # `builders.daily_append.daily_append`, surfaced as the `arcticdb` step.
+    "morning_enrich": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
+    "morning_arctic_append": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
+    "daily_arctic_append": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
+    # The two heal units publish DAYS and TICKERS respectively, as lists.
+    "daily_heal": ModeRows("universe_gap_heal", "healed_days", counts_list=True),
+    "chronic_gap_heal": ModeRows("chronic_gap_self_heal", "healed", counts_list=True),
+}
+
+#: The one :data:`NOT_APPLICABLE_REASONS` member this repo maps a
+#: declaration-driven non-run onto.
+#:
+#: A collector switched off in `config.yaml`, and a MorningEnrich whose target
+#: date is already in ArcticDB, are both "the declaration says there is nothing
+#: new to collect this cycle" — which is what `no_new_data_declared` means. It
+#: is NOT a soft `ok`: the manifest is written, the non-run is COUNTED, and a
+#: unit answering `not_applicable` every cycle is visible as a unit that has
+#: stopped working.
+#:
+#: `NOT_APPLICABLE_REASONS` is a closed frozenset in `nousergon_lib`, whose pin
+#: is lockstep-guarded across five repos here, so a more precise
+#: `disabled_by_declaration` member is a library change rather than something
+#: this module may invent — a free-text reason is exactly how a unit quietly
+#: stops being graded. Tracked as a follow-up on `alpha-engine-config-I10784`.
+NOT_RUN_NOT_APPLICABLE = "no_new_data_declared"
 
 
 def unit_for(mode: str, phase: str) -> PhaseUnit:
@@ -236,3 +343,147 @@ def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
     so ``data_collection/runs/`` needs no new grant.
     """
     return S3ManifestSink(bucket=bucket, prefix=DEFAULT_MANIFEST_PREFIX, s3_client=s3_client)
+
+
+# ---------------------------------------------------------------------------
+# Standalone entry points — a unit whose execution IS its own process.
+# ---------------------------------------------------------------------------
+#
+# `run_units` above answers *which collector phase inside `weekly_collector.py`
+# is which audit unit*. This section answers the other half: a unit whose entry
+# point is its OWN process — a systemd timer (D36, D37), a Lambda handler
+# (D38), a GitHub Actions job (D39, D42) — has no `_phase_collect` to hang a
+# manifest off, and each of those five call sites would otherwise grow its own
+# copy of the same twenty lines. One copy, here, alongside `manual_run`, which
+# is the same concern for hand-run repairs.
+#
+# **The two rules that shape the API.**
+#
+# 1. *The record layer must not become a new way for a producer to die.*
+#    `run_manifest.run_unit` resolves the running tree's commit sha BEFORE the
+#    body runs and REFUSES an invocation that cannot name one. That refusal is
+#    right for the manifest and wrong for the collector: a box whose `git` went
+#    missing would stop collecting data, not merely stop recording it. So the
+#    sha is resolved in `recorded_entry` first, and a failure to measure it
+#    degrades to running the body unrecorded with a loud ERROR — never to
+#    skipping the unit's work. The degradation is visible: no manifest lands
+#    under `data_collection/runs/<unit>/`, which the run-record clause reads as
+#    a missing run. Red, never green.
+#
+# 2. *A body whose work failed still returns what its caller expected.* The
+#    established idiom is `weekly_collector.py::_run_whole_mode_unit`: the body
+#    raises a sentinel so the manifest says `failed`, and the sentinel is caught
+#    OUTSIDE `run_unit` so the caller's return value and the process's
+#    exit-code contract are unchanged. `EntryRunFailed` is that sentinel,
+#    lifted so every entry point raises the same one.
+#
+# A write error from the sink itself is deliberately NOT caught (see
+# `run_manifest.run_unit`'s own note): a manifest that failed to write is a run
+# that did not happen as far as every downstream reader is concerned.
+
+class EntryRunFailed(Exception):
+    """Raised INSIDE a unit body whose work reported failure.
+
+    The manifest is written with ``status: failed`` and the reason this
+    carries; :func:`recorded_entry` then returns ``value`` to the caller, so the
+    entry point's own exit-code contract is exactly what it was before the
+    manifest existed. Mirrors ``weekly_collector.py::_CollectorError``.
+    """
+
+    def __init__(self, reason: str, value: Any = None) -> None:
+        super().__init__(reason)
+        self.value = value
+
+
+def _unrecorded_ctx(unit_id: str, trading_day: str, trigger: str) -> run_manifest.UnitRun:
+    """A context the body can record on when NO manifest can be written.
+
+    Everything recorded on it is discarded. It exists so the body is one code
+    path whether or not the record layer is available — a second, manifest-less
+    body is how the two drift until the recorded one is the untested one.
+    """
+    started = dt.datetime.now(dt.timezone.utc)
+    return run_manifest.UnitRun(
+        run_id=run_manifest.new_run_id(started),
+        unit_id=unit_id,
+        trading_day=trading_day,
+        calendar_date=started.date().isoformat(),
+        trigger=trigger,
+        started=started,
+        code_sha="",
+        log_location=resolve_log_location(),
+    )
+
+
+def recorded_entry(
+    unit_id: str,
+    body: Callable[[run_manifest.UnitRun], Any],
+    *,
+    trigger: str,
+    trading_day: str,
+    bucket: str = MANIFEST_BUCKET,
+    write: bool = True,
+    code_sha: str | None = None,
+    s3_client: Any = None,
+) -> Any:
+    """Run ``body`` as unit ``unit_id`` and write one manifest for it.
+
+    Args:
+        unit_id: The descriptor under ``registry.d/units/`` this process IS.
+        body: ``fn(ctx)`` — records its own inputs, outputs and guards on
+            ``ctx`` and raises :class:`EntryRunFailed` if its work failed.
+        trigger: The unit's normal trigger, per its descriptor
+            (``scheduled`` for a timer, ``gha`` for a workflow). Overridden by
+            ``$NE_DATA_TRIGGER`` when the launcher declared one.
+        trading_day: The trading-day axis this run is keyed on.
+        bucket: Where the manifest lands. The collectors' writer identity
+            already holds ``alpha-engine-research/*``.
+        write: ``False`` for a dry run — the body runs exactly as it would and
+            no manifest is written (``run_unit`` logs one line in its place).
+        code_sha: The sha of the tree that is running, when the caller knows it
+            better than this process can measure (a Lambda has no git checkout;
+            a migration run is FOR a named merge sha). ``None`` measures it.
+        s3_client: Injectable for tests.
+
+    Returns whatever ``body`` returned, or — when ``body`` raised
+    :class:`EntryRunFailed` — the value that sentinel carried. Every other
+    exception propagates AFTER its manifest is durable.
+    """
+    if code_sha is None:
+        try:
+            code_sha = run_manifest.resolve_code_sha()
+        except run_manifest.CodeShaError as exc:
+            # DELIBERATE degrade, per rule 1 in rule 1 of the section header above.
+            # (a) Failure mode swallowed: this process cannot measure the commit
+            #     sha of the tree it is running, so no well-formed manifest can
+            #     be written for this execution.
+            # (b) Recording surface: this ERROR line, AND the absence of an
+            #     object under data_collection/runs/<unit_id>/<trading_day>/,
+            #     which the run-record clause grades as a missing run — red, and
+            #     counted. The unit's DATA work still runs: the record layer
+            #     never decides whether a producer produces.
+            logger.error(
+                "unit %s: cannot measure code_sha (%s) — running UNRECORDED. No manifest "
+                "will be written for this execution and the run-record clause will read "
+                "it as a missing run. Export $%s on a host with no git checkout.",
+                unit_id, exc, run_manifest.CODE_SHA_ENV,
+            )
+            try:
+                return body(_unrecorded_ctx(unit_id, trading_day, resolve_trigger(trigger)))
+            except EntryRunFailed as failed:
+                return failed.value
+
+    try:
+        return run_manifest.run_unit(
+            unit_id,
+            body,
+            sink=manifest_sink(bucket, s3_client) if write else None,
+            trigger=resolve_trigger(trigger),
+            trading_day=trading_day,
+            log_location=resolve_log_location(),
+            code_sha=code_sha,
+        ).value
+    except EntryRunFailed as failed:
+        # The manifest is already written with `status: failed`. The caller
+        # keeps the value it would have received before this wrapper existed.
+        return failed.value

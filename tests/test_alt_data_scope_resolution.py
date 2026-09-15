@@ -263,6 +263,12 @@ def test_phase2_resolves_from_constituents_not_signals(monkeypatch):
     monkeypatch.setattr(wc.alternative, "collect", _fake_collect)
     monkeypatch.setattr(wc, "_build_registry", lambda *a, **k: None)
     monkeypatch.setattr(wc, "_finalize", lambda *a, **k: None)
+    # The scope-baseline write is a REAL S3 PUT and is no longer swallowed
+    # (alpha-engine-config-I10784): before that change this test passed only
+    # because the laptop's AccessDenied was caught and warned. Stubbing it keeps
+    # this test about scope RESOLUTION; the write's own failure behaviour is
+    # asserted in tests/test_phase_manifest_no_third_state.py.
+    monkeypatch.setattr(wc, "_write_alternative_scope_baseline", lambda *a, **k: None)
 
     class _Args:
         date = "2026-07-31"

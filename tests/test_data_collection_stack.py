@@ -96,14 +96,54 @@ def test_daily_heal_has_its_own_state_switch(stack, tpl):
     } == {"CollectionState"}
 
 
-def test_eod_verifies_the_artifacts_metron_reads(stack, tpl):
+def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
+    """alpha-engine-config-I10787 (P-20): the completion claim is the run manifest
+    of every unit the machine runs, not a HEAD on the two keys Metron reads most.
+    The set below is `run_units.PHASE_UNITS` for the "daily" mode (minus the arctic
+    append `--skip-arctic-append` defers) plus MODE_UNITS["daily_arctic_append"]."""
     eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
     assert eod["workloads"] == ["post-market-data", "post-market-arctic-append", "arctic-probe"]
     assert eod["require_trading_day"] is True
-    assert set(eod["verify_keys"]) == {
-        "market_data/eod_closes/latest.json",
-        "market_data/technicals/rating_performance.json",
+    assert "verify_keys" not in eod
+    assert set(eod["verify_units"]) == {
+        "D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25",
+        "D26", "D27", "D28", "D29", "D30", "D31", "D32",
     }
+
+
+def test_every_schedule_verifies_units_and_none_verifies_keys(stack, tpl):
+    """No machine keeps the "no key verification" posture: an SSM exit code was
+    never a completion claim, and the morning enrich is what the predictor reads
+    next. Every schedule names at least one unit, and every named unit has a
+    descriptor — a unit nobody declared would grade nothing and read as a pass."""
+    declared = stack.declared_units()
+    for s in stack.schedules(tpl):
+        units = s["input"]["verify_units"]
+        assert units, f"{s['name']} verifies no units"
+        assert not set(units) - declared, f"{s['name']}: undeclared {sorted(set(units) - declared)}"
+        assert "verify_keys" not in s["input"]
+
+
+def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
+    """The lint is the guard, so it is graded rather than assumed."""
+    import json as _json
+
+    real_loader = stack.load_template
+
+    def _mutate(inputs):
+        base = real_loader()
+        for res in base["Resources"].values():
+            if res["Type"] != "AWS::Scheduler::Schedule":
+                continue
+            payload = _json.loads(res["Properties"]["Target"]["Input"])
+            payload["verify_units"] = inputs
+            res["Properties"]["Target"]["Input"] = _json.dumps(payload)
+        return base
+
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(["D99"]))
+    assert any("verify_units ['D99']" in p for p in stack.lint())
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate([]))
+    assert any("verify_units is empty" in p for p in stack.lint())
 
 
 def test_eod_and_morning_end_with_the_arctic_probe(stack, tpl):
@@ -172,8 +212,61 @@ def test_the_definition_fails_loud_rather_than_skipping(stack):
     assert inner["CheckRetryBudget"]["Default"] == "WorkloadFailed"
     assert asl["States"]["NotifyFailure"]["Next"] == "CollectionFailed"
     assert asl["States"]["CollectionFailed"]["Type"] == "Fail"
-    verify = asl["States"]["VerifyOutputsRefreshed"]["ItemProcessor"]["States"]
-    assert verify["CheckRefreshed"]["Default"] == "OutputNotRefreshed"
+    # The completion check has no edge to CollectionSucceeded that is not an
+    # affirmative measured pass: ok==true is the ONLY choice, a dispatcher error
+    # is caught to NotifyFailure, and every failure mode — including one this
+    # switch does not know — ends in a Fail state.
+    assert asl["States"]["CheckCompletion"]["Default"] == "NotifyCompletionFindings"
+    assert [c["Next"] for c in asl["States"]["CheckCompletion"]["Choices"]] == ["CollectionSucceeded"]
+    assert asl["States"]["VerifyRunManifests"]["Catch"][0]["Next"] == "NotifyFailure"
+    switch = asl["States"]["CompletionFailureMode"]
+    assert switch["Default"] == "CompletionModeUnknown"
+    for state in ("ManifestMissing", "RunNotOk", "OutputMissing", "RowsBelowFloor",
+                  "CompletionModeUnknown"):
+        assert asl["States"][state]["Type"] == "Fail"
+        # A named error per mode, and a Cause carrying the unit and key.
+        assert asl["States"][state]["CausePath"] == "$.completion.summary"
+    assert [asl["States"][s]["Error"] for s in
+            ("ManifestMissing", "RunNotOk", "OutputMissing", "RowsBelowFloor")] == [
+        "DataCollectionManifestMissing", "DataCollectionRunNotOk",
+        "DataCollectionOutputMissing", "DataCollectionRowsBelowFloor",
+    ]
+    # A paging outage must never convert a finding into a green run.
+    assert asl["States"]["NotifyCompletionFindings"]["Catch"][0]["Next"] == "CompletionFailureMode"
+
+
+def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack):
+    """The ASL's Choice arms and the dispatcher's precedence tuple are one list.
+    Drift here is a mode that fails the execution as "unknown" rather than named."""
+    import ast
+
+    asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
+    arms = [c["StringEquals"] for c in asl["States"]["CompletionFailureMode"]["Choices"]]
+    tree = ast.parse(stack.DISPATCHER.read_text(encoding="utf-8"))
+    modes = None
+    for node in ast.walk(tree):
+        target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
+        if isinstance(target, ast.Name) and target.id == "COMPLETION_FAILURE_MODES":
+            modes = [e.value for e in node.value.elts]
+    assert modes is not None, "COMPLETION_FAILURE_MODES not found in the dispatcher"
+    assert arms == modes
+
+
+def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack):
+    """A descriptor edit must reach the deployed function on the merge button
+    alone: deploy.sh packages the loader and the descriptors, and the deploy
+    workflow's path filter fires on them. Without the filter the Lambda would go
+    on grading the previous descriptor set with nothing red."""
+    deploy = (REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "deploy.sh").read_text(
+        encoding="utf-8"
+    )
+    assert "data_gate/descriptors.py" in deploy
+    assert "registry.d/units" in deploy
+    paths = yaml.safe_load(
+        (WORKFLOWS / "deploy-data-spot-dispatcher.yml").read_text(encoding="utf-8")
+    )[True]["push"]["paths"]
+    assert "registry.d/units/**" in paths
+    assert "data_gate/descriptors.py" in paths
 
 
 def test_yaml_aliases_are_refused(stack, tmp_path):
