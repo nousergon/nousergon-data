@@ -269,6 +269,81 @@ def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(m
     assert "rc=${PIPESTATUS[0]}" in rendered
 
 
+# ── alpha-engine-config-I10778, plan P-11: the pre-cutover shadow run ────────
+
+
+def test_shadow_weekday_is_in_the_allowlist(monkeypatch):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert "shadow-weekday" in index._WORKLOADS
+    assert "shadow-weekday" in index._WORKLOADS_REQUIRING_TRADING_DAY
+
+
+def test_shadow_weekday_renders_the_four_shadow_runs_then_parity_in_order(monkeypatch):
+    """Same subshell + && pipeline-element shape as weekly-phase-one: one exit
+    code for all five legs, and each of the four boundary invocations gets the
+    SAME weekly_collector.py flags the scheduled workloads above it use, plus
+    `--date` pinning it to the requested historical trading day."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    workload, cmd = index._resolve_workload(
+        {"workload": "shadow-weekday", "trading_day": "2026-09-14"}
+    )
+    assert workload == "shadow-weekday"
+    assert cmd.startswith("( ") and cmd.endswith(" )")
+    assert "{trading_day}" not in cmd  # substituted, never left as a template
+
+    legs = [
+        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date 2026-09-14",
+        "--morning-arctic-append --date 2026-09-14",
+        "--daily --skip-arctic-append --date 2026-09-14",
+        "--daily-arctic-append --date 2026-09-14",
+        "python -m shadow parity --trading-day 2026-09-14 "
+        "--store s3://alpha-engine-research/data_collection",
+    ]
+    positions = [cmd.index(leg) for leg in legs]
+    assert positions == sorted(positions), "legs must run in the declared order"
+    # Every shadow-run leg AND the parity comparison target the requested
+    # trading day, not "today" (4 `shadow run` legs + 1 `shadow parity`).
+    assert cmd.count("--trading-day 2026-09-14") == 5
+    assert cmd.count("&&") == 4  # five legs, four joins — any leg's failure halts the chain
+
+    rendered = index._bootstrap_command("shadow-weekday", cmd, "tok")
+    assert f"{cmd} 2>&1 | tee -a" in rendered
+    assert "rc=${PIPESTATUS[0]}" in rendered
+
+
+def test_shadow_weekday_requires_trading_day(monkeypatch):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    with pytest.raises(ValueError, match="requires event\\['trading_day'\\]"):
+        index._resolve_workload({"workload": "shadow-weekday"})
+
+
+@pytest.mark.parametrize(
+    "bad_day",
+    [
+        "",
+        "not-a-date",
+        "2026/09/14",
+        "26-09-14",
+        "2026-13-40",  # regex-shaped, not a real calendar date
+        "2026-09-14; rm -rf /",  # injection attempt
+        "2026-09-14T00:00:00",  # trailing content the regex must not tolerate
+    ],
+)
+def test_shadow_weekday_rejects_malformed_trading_day(monkeypatch, bad_day):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    with pytest.raises(ValueError):
+        index._resolve_workload({"workload": "shadow-weekday", "trading_day": bad_day})
+
+
+def test_shadow_weekday_other_workloads_ignore_trading_day(monkeypatch):
+    """A non-templated workload never requires (or substitutes) trading_day —
+    only the workloads that opt in via _WORKLOADS_REQUIRING_TRADING_DAY do."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    workload, cmd = index._resolve_workload({"workload": "morning-enrich"})
+    assert workload == "morning-enrich"
+    assert cmd == index._WORKLOADS["morning-enrich"]
+
+
 def test_trading_day_check_launches_nothing_and_uses_the_new_york_date(monkeypatch):
     from datetime import datetime
     from zoneinfo import ZoneInfo
