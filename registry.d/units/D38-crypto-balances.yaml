@@ -38,9 +38,16 @@ writes:
 consumers:
   - "metron:api/services/crypto.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: "contracts/crypto_holdings.schema.json"
+  producer_test: tests/test_crypto_holdings_contract.py
+  consumer_pins:
+    - "metron:tests/contracts/crypto_holdings.schema.json"
+  # P-07 (alpha-engine-config#10870): D38 is PAUSED (alpha-engine-config-I10748),
+  # but Metron api/services/crypto.py::for_portfolio still reads crypto/holdings.json
+  # (data_spine.CRYPTO_HOLDINGS_KEY) unconditionally — a surviving consumer per
+  # plan §3 regardless of run cadence. Pinned copy + reader-exercising test in
+  # metron tests/test_p07_contracts.py (alpha-engine-config-PR-pending, mirrors
+  # the existing metron_* schema family there).
 registry_rows:
   - crypto_holdings (SUPPRESSED)
 run_manifest_prefix: data_collection/runs/D38

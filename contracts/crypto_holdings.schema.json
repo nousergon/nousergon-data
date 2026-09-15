@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/crypto_holdings.schema.json",
+  "title": "Crypto wallet holdings (crypto/holdings.json, schema_version 1)",
+  "description": "Producer: collectors/crypto_balances.py::collect (HOLDINGS_SCHEMA_VERSION). Consumer: Metron api/services/crypto.py::_read_holdings_s3/for_portfolio (data-collector plan P-07, alpha-engine-config-I10870, D38). Metron makes no chain calls itself — this artifact is the sole coupling. D38 is PAUSED (alpha-engine-config-I10748, 2026-08-07); the contract is built regardless of run cadence, per plan §3 (a surviving consumer, Metron, already reads this key).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["schema_version", "as_of_utc", "source", "balances"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "as_of_utc": {
+      "type": "string",
+      "description": "UTC timestamp the artifact was written, %Y-%m-%dT%H:%M:%SZ. Metron's _is_stale() parses this with datetime.fromisoformat after a 'Z' -> '+00:00' substitution."
+    },
+    "source": { "type": "string" },
+    "balances": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["chain", "address", "symbol", "balance"],
+        "properties": {
+          "chain": { "type": "string", "description": "upper-cased chain code, e.g. BTC, ETH" },
+          "address": { "type": "string" },
+          "symbol": { "type": "string" },
+          "balance": { "type": "number", "description": "native units" },
+          "price_usd": {
+            "type": "number",
+            "description": "absent when price_fn failed this cycle (best-effort; balances still publish without it)"
+          },
+          "value_usd": {
+            "type": "number",
+            "description": "balance * price_usd; present iff price_usd is present"
+          }
+        }
+      }
+    }
+  }
+}
