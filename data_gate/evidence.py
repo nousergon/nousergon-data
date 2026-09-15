@@ -39,7 +39,23 @@ __all__ = [
     "read_guard_commissioning",
     "read_ladder_freshness",
     "read_objective",
+    "read_parity",
+    "read_roles_bootstrapped",
+    "read_stack_check_live",
 ]
+
+#: Where `infrastructure/data_collection_stack.py check-live`'s reading WILL
+#: be published, once the deploy workflow (`.github/workflows/
+#: deploy-data-collection-stack.yml`, sibling-owned) gains a write step. That
+#: workflow is not touched here — this reader points at the key it will
+#: write, the same "honest phase-0 stub" shape as `_pending` above, so the
+#: gap is an address rather than a shrug (`alpha-engine-config-I10777`).
+STACK_CHECK_LIVE_KEY = "data_collection/deploy/check-live/latest.json"
+
+#: Pre-cutover parity per published key (plan §6.2 step 4), produced by P-11
+#: (`alpha-engine-config-I10778`), not built yet.
+def _parity_key(trading_day: dt.date) -> str:
+    return f"staging/shadow/{trading_day.isoformat()}/parity.json"
 
 
 @dataclass(frozen=True)
@@ -358,4 +374,146 @@ def read_ladder_freshness(
         evidence=(key,),
         source="data_collection store",
         as_of=stamp,
+    )
+
+
+def read_stack_check_live(store: GateStore) -> Reading:
+    """The `nousergon-data-collection` stack's live-vs-checkout comparison.
+
+    `infrastructure/data_collection_stack.py check-live` runs from
+    `deploy-data-collection-stack.yml` (sibling-owned, not touched here) but
+    does not yet publish its result to the store — this reader points at the
+    key it WILL read, `STACK_CHECK_LIVE_KEY`, the same honest-stub shape as
+    `_pending` above but expressed as a real read: a deploy workflow that
+    starts writing this key needs no change here to be picked up.
+
+    Absence here is UNMET, not UNMEASURABLE: `read_objective`'s rule applies
+    — we CAN look (the store answers), there is simply no emitter yet, and
+    "no emitter" is a finding about the producer side, not about our read
+    (`alpha-engine-config-I10777`).
+    """
+    read = read_store_document(store, STACK_CHECK_LIVE_KEY)
+    if read.problem is not None:
+        return Reading(
+            met=False,
+            detail=f"could not read {STACK_CHECK_LIVE_KEY}: {read.problem}",
+            evidence=(STACK_CHECK_LIVE_KEY,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if read.absent:
+        return Reading(
+            met=False,
+            detail=(
+                f"no check-live reading at {STACK_CHECK_LIVE_KEY}. "
+                "`infrastructure/data_collection_stack.py check-live` runs on a schedule "
+                "and after every deploy but does not yet publish its result here — until "
+                "it does, this clause reads the gap rather than the stack"
+            ),
+            evidence=(STACK_CHECK_LIVE_KEY,),
+            source="data_collection store",
+        )
+    document = read.document or {}
+    status = str(document.get("status") or "")
+    if status not in {"clean", "drift"}:
+        return Reading(
+            met=False,
+            detail=(
+                f"{STACK_CHECK_LIVE_KEY} carries status {status!r}, outside the closed set "
+                "{clean, drift}. A status nobody defined a rendering for is a finding."
+            ),
+            evidence=(STACK_CHECK_LIVE_KEY,),
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
+    return Reading(
+        met=status == "clean",
+        detail=f"{STACK_CHECK_LIVE_KEY}: status={status}, findings={document.get('findings')}",
+        evidence=(STACK_CHECK_LIVE_KEY,),
+        source="data_collection store",
+        as_of=str(document.get("as_of") or ""),
+    )
+
+
+def read_roles_bootstrapped(store: GateStore, role_names: tuple[str, ...]) -> Reading:
+    """Whether the standalone stack's roles exist, via `iam:ListRolePolicies`.
+
+    `alpha-engine-config-I10777`: the gate-read identity
+    (`github-actions-data-gate-read`) holds `iam:GetRolePolicy`/
+    `GetPolicyVersion`/`ListRolePolicies` but NOT `iam:GetRole`.
+    `ListRolePolicies` answers the same existence question — it raises
+    `NoSuchEntity` for a role that was never created — without the missing
+    grant, so this reads (c) of the cutover-ready gate without needing a new
+    IAM grant.
+
+    `store` supplies the client: only a live `S3Store` carries an
+    `iam_client` (mirroring its own lazy `.client` for S3); `LocalStore` and
+    `EmptyStore` do not, so a local/test read is UNMEASURABLE by construction
+    rather than reaching for `boto3` — the same "never MET without a read"
+    rule this module exists to enforce, applied to IAM instead of S3.
+    """
+    evidence = tuple(f"iam:{name}" for name in role_names)
+    client = getattr(store, "iam_client", None)
+    if client is None:
+        return Reading(
+            met=False,
+            detail=(
+                "this store backend supplies no IAM client (only a live S3Store does); "
+                f"roles: {list(role_names)}"
+            ),
+            evidence=evidence,
+            unmeasurable=True,
+            source="iam:ListRolePolicies",
+        )
+    missing: list[str] = []
+    problems: list[str] = []
+    for name in role_names:
+        try:
+            client.list_role_policies(RoleName=name)
+        except Exception as exc:  # noqa: BLE001 - classified by AWS error code below
+            code = ""
+            response = getattr(exc, "response", None)
+            if isinstance(response, dict):
+                code = str((response.get("Error") or {}).get("Code") or "")
+            if code == "NoSuchEntity":
+                missing.append(name)
+            else:
+                problems.append(f"{name}: {type(exc).__name__}: {exc}")
+    if problems:
+        return Reading(
+            met=False,
+            detail=f"could not verify role(s): {'; '.join(problems)}",
+            evidence=evidence,
+            unmeasurable=True,
+            source="iam:ListRolePolicies",
+        )
+    if missing:
+        return Reading(
+            met=False,
+            detail=f"role(s) not bootstrapped — ListRolePolicies raised NoSuchEntity: {missing}",
+            evidence=evidence,
+            source="iam:ListRolePolicies",
+        )
+    return Reading(
+        met=True,
+        detail=f"ListRolePolicies succeeded for every declared role: {list(role_names)}",
+        evidence=evidence,
+        source="iam:ListRolePolicies",
+    )
+
+
+def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
+    """Pre-cutover parity per published key (plan §6.2 step 4).
+
+    Produced by P-11 (`alpha-engine-config-I10778`), which does not exist
+    yet — a phase-0 stub naming the key it will read, `_pending`'s shape but
+    kept as its own function because the key is trading-day-scoped rather
+    than unit-scoped.
+    """
+    key = _parity_key(trading_day)
+    return _pending(
+        key,
+        "pre-cutover parity is produced by P-11 (alpha-engine-config-I10778), not built "
+        "yet.",
+        source="data_gate.evidence (phase-0 stub; blocked on alpha-engine-config-I10778)",
     )

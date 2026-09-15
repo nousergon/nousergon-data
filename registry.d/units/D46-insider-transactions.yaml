@@ -29,7 +29,13 @@ code_path: "rag/pipelines/ingest_form4.py:559"
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:RAGIngestion"
-  successor: "none declared (alpha-engine-config-I10753)"
+  successor: >-
+    nousergon-data-collection/data-collection-weekly, dispatcher workload
+    `rag-weekly-ingestion` (alpha-engine-config-I10753) — SAME shared key as
+    D16, step 6 (`rag.pipelines.ingest_form4`) of the unchanged
+    run_weekly_ingestion.sh. No separate dispatcher key: it is a substep of
+    that one script, not a standalone entry point, and a second key would
+    double-fetch the same EDGAR Form 4 filings each week.
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
@@ -117,5 +123,7 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    alpha-engine-config-I10753. Its consumer's survival past phase 4 is confirmed at the
-    data-cutover-ready gate, not assumed here.
+    alpha-engine-config-I10753: covered by the `rag-weekly-ingestion` workload
+    (shared with D16, see `trigger.successor`) — no standalone dispatcher key.
+    Its consumer's survival past phase 4 is confirmed at the data-cutover-ready
+    gate, not assumed here.

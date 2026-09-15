@@ -26,10 +26,13 @@ chokepoints, no lib change):
      The Lambda returns immediately with the command_id — the Step Function polls
      ssm:GetCommandInvocation to a terminal status, exactly like the groom SF.
 
-The box does its Arctic write / S3 read+write via its OWN instance profile
-(alpha-engine-executor-profile -> alpha-engine-executor-role), the SAME profile
-`spot_data_weekly.sh` uses for the Saturday data spot — so the ArcticDB/S3
-credentials already exist on the box; this Lambda passes NONE of them.
+The box does its Arctic write / S3 read+write via its OWN instance profile —
+today still `alpha-engine-executor-profile` -> `alpha-engine-executor-role`,
+the SAME profile `spot_data_weekly.sh` uses for the Saturday data spot, so the
+ArcticDB/S3 credentials already exist on the box and this Lambda passes NONE
+of them. `DATA_SPOT_IAM_PROFILE` is env-overridable to the narrower
+`nousergon-data-collection-box-profile` (alpha-engine-config-I10756) once that
+role is live — see the constant's definition below for the cutover sequencing.
 
 FAILURE ISOLATION (config#1767 deliverable #4, LOAD-BEARING): this Lambda is only
 the launcher. The fail-OPEN decision lives in the Step Function: a data-spot
@@ -98,10 +101,25 @@ KEY_NAME = os.environ.get("DATA_SPOT_KEY_NAME", "alpha-engine-key")
 # NO IB port exposure (config#1767 deliverable #3): reuse the standard fleet SG,
 # which does not open the IB Gateway port. The data spot only needs egress + SSM.
 SECURITY_GROUP = os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
-# The box's Arctic-write + S3 read/write come from this profile — the SAME one
-# spot_data_weekly.sh grants the Saturday data spot (executor role already has
-# ArcticDB s3 read/write for enrich paths). Mirrors the Saturday spot role rather
-# than minting a new one.
+# The box's Arctic-write + S3 read/write come from this profile — historically
+# the SAME one spot_data_weekly.sh grants the Saturday data spot (executor
+# role, component 3/crucible-trading). alpha-engine-config-I10756
+# (architecture.d/146, one workload identity per component) splits data
+# collection (component 1) onto its own `nousergon-data-collection-box-role`
+# / `nousergon-data-collection-box-profile` (nous-ergon-ops
+# `infrastructure/iam/nousergon-data-collection-box-role/`) so a grant widened
+# for collection can no longer widen the trader, and a CloudTrail S3 write is
+# attributable to one component. This Lambda's own iam-policy.json already
+# holds the PassRole grant for the new role (`PassDataCollectionBoxRoleToEc2`)
+# so DATA_SPOT_IAM_PROFILE can be overridden to
+# "nousergon-data-collection-box-profile" today (e.g. per-workload via the SF
+# input, or a per-environment Lambda env var) — the DEFAULT stays the
+# executor profile until nous-ergon-ops bootstraps the new role live
+# (create-role/create-instance-profile are operator-gated,
+# role-provisioning-notes.md). Flip the default in a follow-up once
+# `iam-drift-check.yml` shows the new role off its `NEVER BOOTSTRAPPED` list;
+# flipping it earlier fails every collection launch with an IAM error the
+# launch path cannot recover from.
 IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "alpha-engine-executor-profile")
 # Large ephemeral disk so daily_closes fetch + ArcticDB append never hit the
 # /tmp-100% failure mode that motivated this move (config#1767 gotcha).
@@ -199,6 +217,45 @@ _WORKLOADS: dict[str, str] = {
     # ArcticDB evidence without ever opening ArcticDB itself, which is
     # unreachable from the laptop (alpha-engine-config-I9771).
     "arctic-probe": "python -m collectors.arctic_probe",
+    # alpha-engine-config-I10753: the five weekly units with no standalone
+    # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
+    # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no
+    # workload; see their descriptors' `retirement:` block. D15, D16 and D46
+    # get real successors here.
+    #
+    # SAME command the v1 SF's DataPhase2 state ran
+    # (`infrastructure/spot_data_weekly.sh --phase2-only` ->
+    # `weekly_collector.py --phase 2`, alpha-engine-config-I5759's move off
+    # lambda:invoke): unchanged args = unchanged M0 data contract.
+    "alternative-phase-two": "python weekly_collector.py --phase 2",
+    # SAME script the v1 SF's RAGIngestion state ran
+    # (`infrastructure/spot_rag_ingestion.sh` -> `bash
+    # rag/pipelines/run_weekly_ingestion.sh`, unchanged). Covers D16 (its own
+    # writes) AND D46 (Form 4 insider transactions, step 6 of the script) —
+    # D46 does NOT get its own dispatcher key: it is a substep of this same
+    # script, not a standalone entry point, so a second key would re-run the
+    # identical EDGAR fetch a second time per week. D40/D41 (steps 7/8) still
+    # execute as part of this unchanged script (this dispatcher does not own
+    # rag/pipelines/run_weekly_ingestion.sh — that is `nousergon-data`'s RAG
+    # pipeline code, a sibling surface); their retirement is at the
+    # descriptor/registry layer (not tracked, not asserted), matching the
+    # standing "retiring a producer never deletes its archive" preference.
+    #
+    # The RAG-specific secrets (VOYAGE_API_KEY, FINNHUB_API_KEY,
+    # EDGAR_IDENTITY, RAG_DATABASE_URL) are NOT part of this dispatcher's
+    # generic bootstrap — the phase-1/phase-2 boxes never needed them
+    # (I10753 gotcha). Fetched here with the EXACT SSM read-loop
+    # `infrastructure/spot_rag_ingestion.sh` already uses, verbatim, so this
+    # workload's on-box environment mirrors what run_weekly_ingestion.sh has
+    # always run under rather than a parallel invention.
+    "rag-weekly-ingestion": (
+        "( for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do "
+        "val=$(aws ssm get-parameter --name /alpha-engine/$name --with-decryption "
+        "--query Parameter.Value --output text --region us-east-1 2>/dev/null || echo ''); "
+        "if [ -z \"$val\" ]; then echo \"ERROR: could not fetch /alpha-engine/$name from SSM\" >&2; exit 1; fi; "
+        "export $name=\"$val\"; unset val; done; "
+        "bash rag/pipelines/run_weekly_ingestion.sh )"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
