@@ -51,7 +51,7 @@ from typing import Any, Iterable
 
 from data_gate import evidence
 from data_gate.descriptors import Unit, load_units
-from shadow.root import ShadowRoot
+from shadow.root import LIVE_ARCTIC_LIBRARIES, ShadowRoot
 
 __all__ = [
     "DEFAULT_ABSOLUTE_TOLERANCE",
@@ -135,6 +135,16 @@ def classify_write(unit_id: str, declared: str, trading_day: dt.date) -> WriteTa
     arctic = re.match(r"^arcticdb/([A-Za-z0-9_]+)\b", text)
     if arctic:
         return WriteTarget(unit_id, declared, "arcticdb", value=arctic.group(1))
+    # A second ArcticDB spelling: `<library>::{symbol}` (D14's
+    # `delisted_history::{ticker}`) — a library/symbol reference, not the
+    # `arcticdb/<library>` prefix form above. Gated on `LIVE_ARCTIC_LIBRARIES`
+    # (the same registry `shadow.root` uses to redirect writes) so this can
+    # never mistake a genuine prose pointer — `research.db::score_performance`
+    # (D09), a SQLite table inside a single-file DB, not an ArcticDB library —
+    # for a diffable one; `research.db` is not in that set.
+    lib_symbol = re.match(r"^([A-Za-z0-9_]+)::\{[A-Za-z0-9_]+\}$", text)
+    if lib_symbol and lib_symbol.group(1) in LIVE_ARCTIC_LIBRARIES:
+        return WriteTarget(unit_id, declared, "arcticdb", value=lib_symbol.group(1))
     if "::" in text or "(" in text or " " in text:
         return WriteTarget(
             unit_id,

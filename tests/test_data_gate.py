@@ -10,6 +10,7 @@ Everything here runs against an in-memory or tmp-dir store. No AWS.
 
 from __future__ import annotations
 
+import ast
 import json
 import textwrap
 
@@ -18,8 +19,8 @@ import yaml
 
 from data_gate import clauses as clause_module
 from data_gate import descriptors, evidence
-from data_gate.descriptors import DescriptorError, load_units
-from data_gate.inventory import scan
+from data_gate.descriptors import REPO_ROOT, DescriptorError, load_units
+from data_gate.inventory import load_inventory_scope, scan
 from data_gate.read import GATES, BOARD_KEY, evaluate, load_phases, run
 from data_gate.store import DryRunWriteRefusedError, LocalStore, open_store, parse_store_uri
 
@@ -363,6 +364,132 @@ def test_a_file_that_will_not_parse_is_not_no_write_sites(units, tmp_path, monke
     reading = scan(units)
     assert "collectors/broken.py" in reading.parse_failures
     assert reading.ok is False
+
+
+# ---------------------------------------------------------------------------
+# The scan POPULATION itself — I10830: `roots` is a hand-maintained list, and
+# a producer dropped outside every root is invisible to the clause above
+# rather than failing it (weekly_collector.py sat at the repo's top level,
+# one directory above every walked root, while D17/D19/D33/D34's REVERSE
+# check stayed green via the collectors/daily_closes.py shared-writer entry —
+# so its own ~30 write sites were never scanned and `writers_declared` read
+# MET over an incomplete population for months). This test re-derives the
+# producer population from source on every run, independent of
+# writer_inventory.yaml's declared `roots`, so a NEW producer placed outside
+# both `roots` and `extra_paths` turns this test red instead of staying
+# silently unscanned.
+# ---------------------------------------------------------------------------
+
+# Verb subset deliberately narrower than writer_inventory.yaml's `write_calls`:
+# `put_object`/`upload_file`/`upload_fileobj`/`copy_object`/`write_batch`/
+# `write_metadata`/`stage`/`to_parquet` are essentially unambiguous S3/ArcticDB/
+# parquet writes wherever they appear. `write`/`append`/`update` are NOT — they
+# collide with `list.append`/`dict.update`/plain file `.write()` constantly
+# outside the already-curated roots, and applying them repo-wide would drown
+# a real finding in false positives from files that have never been a producer
+# (emailer.py, sf_preflight.py, the data_gate tool itself, …). Narrowing here
+# trades false negatives on ambiguous verbs for a signal an autonomous sweep
+# can act on; the four narrow verbs are exactly the ones that found
+# weekly_collector.py in the first place (I10830 root-cause investigation).
+_UNAMBIGUOUS_WRITE_VERBS = frozenset(
+    {
+        "put_object",
+        "upload_file",
+        "upload_fileobj",
+        "copy_object",
+        "write_batch",
+        "write_metadata",
+        "stage",
+        "to_parquet",
+    }
+)
+
+# Directories that are never a producer's home. `infrastructure/` is the
+# watch/alert/dispatch/ops plane (writer_inventory.yaml boundary 1, verbatim:
+# "almost entirely the watch/alert/dispatch plane — it writes ops artifacts,
+# not published data keys, and it is a different component with its own
+# registry rows"); its two genuine data producers are named individually in
+# `extra_paths` and stay covered because that membership is checked
+# separately below, independent of this prefix skip.
+_NON_PRODUCER_DIR_PREFIXES = (
+    "tests/",
+    "migrations/",
+    "data_gate/",  # the gate tool itself, not a thing it grades
+    "infrastructure/",  # ops plane; its two producers are named in extra_paths
+    ".venv/",
+    ".git/",
+    ".worktrees/",
+    "__pycache__/",
+)
+
+# Individual files, anywhere in the tree, whose only write call sites publish
+# an OPS artifact (a permission sentinel, a sweep's own verdict) rather than a
+# data key a unit descriptor would claim — verified by reading each one
+# (I10830). A third entry here needs the same read before being added.
+_KNOWN_OPS_PLANE_WRITE_SITES = {
+    "preflight.py": (
+        "_check_s3_writeable_sentinel() PUTs a throwaway "
+        "preflight/sentinel-<uuid>.txt to prove the IAM grant, then relies on "
+        "the DELETE to clean it up — not a published data key."
+    ),
+    "validators/stage_output_sweep.py": (
+        "_publish_verdict() writes the sweep's OWN verdict document "
+        "(alpha-engine-config-I7167) — an ops artifact about other stages' "
+        "output, not a data key any unit descriptor would claim."
+    ),
+}
+
+
+def _source_derived_write_sites(repo_root):
+    """AST-scan the WHOLE repo tree for unambiguous S3/ArcticDB/parquet write
+    call sites — never reading writer_inventory.yaml's `roots`, so this cannot
+    agree with the scope by construction."""
+    found: dict[str, list[str]] = {}
+    for path in sorted(repo_root.rglob("*.py")):
+        rel = path.relative_to(repo_root).as_posix()
+        if rel.startswith(_NON_PRODUCER_DIR_PREFIXES):
+            continue
+        name = path.name
+        if name == "conftest.py" or name.startswith("test_") or name.endswith("_test.py"):
+            continue
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+        except SyntaxError:
+            # A file that won't parse is covered by the inventory scan's own
+            # parse_failures clause (test_a_file_that_will_not_parse_is_not_no_write_sites)
+            # once it is inside the scan population; not this test's concern.
+            continue
+        sites = [
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _UNAMBIGUOUS_WRITE_VERBS
+        ]
+        if sites:
+            found[rel] = sites
+    return found
+
+
+def test_every_genuine_write_site_sits_inside_the_scanned_population():
+    scope = load_inventory_scope()
+    outside = {}
+    for rel, verbs in _source_derived_write_sites(REPO_ROOT).items():
+        top_level_dir = rel.split("/", 1)[0]
+        if top_level_dir in scope.roots or rel in scope.extra_paths:
+            continue
+        if rel in _KNOWN_OPS_PLANE_WRITE_SITES:
+            continue
+        outside[rel] = verbs
+    assert not outside, (
+        "producer module(s) with unambiguous S3/ArcticDB/parquet write call "
+        f"sites sit outside writer_inventory.yaml's scan population: {outside}. "
+        "Add each to `roots` (a whole producer directory) or `extra_paths` (a "
+        "single file) in data_gate/config/writer_inventory.yaml with a reason, "
+        "or — only if it genuinely writes an ops artifact rather than a "
+        "published data key — add it to _KNOWN_OPS_PLANE_WRITE_SITES above "
+        "with the reason, after reading the call site."
+    )
 
 
 # ---------------------------------------------------------------------------

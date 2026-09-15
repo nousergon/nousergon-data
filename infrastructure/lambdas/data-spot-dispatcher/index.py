@@ -256,22 +256,111 @@ _WORKLOADS: dict[str, str] = {
         "export $name=\"$val\"; unset val; done; "
         "bash rag/pipelines/run_weekly_ingestion.sh )"
     ),
+    # alpha-engine-config-I10778, plan P-11: the pre-cutover shadow run. Chains
+    # the FOUR weekday-boundary invocations that a live v1 producer still owns
+    # today — morning-enrich (was step_function_daily.json MorningEnrich),
+    # morning-arctic-append (MorningArcticAppend), post-market-data (was
+    # step_function_eod.json PostMarketData, expressed here as `--daily
+    # --skip-arctic-append`) and post-market-arctic-append (`--daily-arctic-
+    # append`, PostMarketArcticAppend) — each run under `python -m shadow run`
+    # (PR1720), which activates the shadow output root BEFORE weekly_collector
+    # is imported so every S3 write lands under `staging/shadow/{trading_day}/`
+    # and every ArcticDB library carries the `shadow_{YYYYMMDD}_` prefix
+    # (`shadow/root.py::INVARIANT`) — then `python -m shadow parity` publishes
+    # the diff against that same day's live v1 output to
+    # `s3://alpha-engine-research/data_collection`. SAME weekly_collector.py
+    # entrypoints and flags as the four scheduled workloads above (unchanged
+    # args = unchanged M0 data contract); the only difference is `--date
+    # {trading_day}` on every leg, pinning all four runs (and the parity
+    # comparison) to the SAME historical trading day rather than "today", and
+    # the shadow-run wrapper redirecting every write.
+    #
+    # The subshell + `&&` chain (same pipeline-element pattern as
+    # weekly-phase-one above) makes the five legs ONE unit: PIPESTATUS[0] is
+    # the whole chain's exit code, so a failure in any leg — including
+    # `shadow parity` returning 1 for "ran but NOT MET" — fails the run rather
+    # than silently continuing to the next leg or reporting success. Each
+    # `shadow run` leg still runs weekly_collector.py's own manifest-writing
+    # code path unchanged (data_run_manifest.v1 via run_units), so this
+    # workload writes its own run manifests exactly the way every sibling
+    # weekly_collector-backed workload does — the shadow interceptor redirects
+    # WHERE they land, never WHETHER they are written.
+    #
+    # `{trading_day}` is a TEMPLATE placeholder, not embedded user input: it is
+    # substituted by `_resolve_workload` below from `event["trading_day"]`
+    # after validating it is a real ISO calendar date, the same
+    # allowlist-before-substitution posture `_WORKLOAD_RE` already applies to
+    # the workload key itself. On-demand only (data collector plan P-11 §6.2
+    # step 4) — deliberately not wired into any EventBridge/Scheduler cadence
+    # or CFN schedule input, so it needs no `governance/observability.d/` /
+    # `authority.d/` row: that requirement (`nousergon-data` AGENTS.md
+    # "Infrastructure is one workflow per deployed unit") binds a *scheduled*
+    # workflow, and this is a manual validation command inside the ALREADY
+    # registered data-spot-dispatcher Lambda, invoked at most a handful of
+    # times during the pre-cutover validation window. It is also not a
+    # `registry.d/units/` entry: those units feed the `verify_units` /
+    # completion-check contract for LIVE producers, and every byte this
+    # workload writes is, by construction, under the shadow prefix and never a
+    # live key — there is no live completeness claim for this workload to make.
+    "shadow-weekday": (
+        "( python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date {trading_day} "
+        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--morning-arctic-append --date {trading_day} "
+        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--daily --skip-arctic-append --date {trading_day} "
+        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--daily-arctic-append --date {trading_day} "
+        "&& python -m shadow parity --trading-day {trading_day} "
+        "--store s3://alpha-engine-research/data_collection )"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
 # strict allowlist regex too (rules out shell-metacharacter injection outright).
 _WORKLOAD_RE = re.compile(r"^[a-z][a-z-]{0,63}$")
 
+# Workloads whose command is a TEMPLATE requiring a "trading_day" substitution
+# from the event rather than a fixed string. Never grows into a general
+# templating mechanism: adding a workload here means adding its own validated
+# placeholder(s) below, never accepting free-text into the rendered command.
+_WORKLOADS_REQUIRING_TRADING_DAY: frozenset[str] = frozenset({"shadow-weekday"})
+_TRADING_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
 
 def _resolve_workload(event: dict) -> tuple[str, str]:
     """Pull the workload key from the SF input; unknown/malformed RAISES (a
-    mis-wired SF state must fail loud, not silently run the wrong collector)."""
+    mis-wired SF state must fail loud, not silently run the wrong collector).
+
+    A workload in ``_WORKLOADS_REQUIRING_TRADING_DAY`` additionally requires
+    ``event["trading_day"]`` to be a real ISO calendar date — validated the
+    same way every other input this Lambda embeds into a shell command is
+    validated (allowlist first, never free text), and RAISES rather than
+    guessing or defaulting to "today" on anything malformed.
+    """
     w = str(event.get("workload") or "").strip()
     if not _WORKLOAD_RE.match(w) or w not in _WORKLOADS:
         raise ValueError(
             f"unknown data-spot workload {w!r} — expected one of {sorted(_WORKLOADS)}"
         )
-    return w, _WORKLOADS[w]
+    template = _WORKLOADS[w]
+    if w in _WORKLOADS_REQUIRING_TRADING_DAY:
+        import datetime as _dt
+
+        trading_day = str(event.get("trading_day") or "").strip()
+        if not _TRADING_DAY_RE.match(trading_day):
+            raise ValueError(
+                f"workload {w!r} requires event['trading_day'] as an ISO date "
+                f"(YYYY-MM-DD); got {trading_day!r}"
+            )
+        try:
+            _dt.date.fromisoformat(trading_day)
+        except ValueError as exc:
+            raise ValueError(
+                f"workload {w!r} trading_day={trading_day!r} is not a valid calendar date"
+            ) from exc
+        return w, template.format(trading_day=trading_day)
+    return w, template
 
 
 _MARKET_TZ = "America/New_York"
@@ -913,9 +1002,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     "collection": ...}`` (alpha-engine-config-I10787).
 
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
-    "post-market-data" | "post-market-arctic-append" | "daily-heal",
-    "force_on_demand": bool, "execution_id": str, "run_date": str,
-    "pipeline_role": str}. `force_on_demand` (default False) is set by the
+    "post-market-data" | "post-market-arctic-append" | "daily-heal" | ... |
+    "shadow-weekday", "force_on_demand": bool, "execution_id": str,
+    "run_date": str, "pipeline_role": str}. The "shadow-weekday" workload
+    additionally requires "trading_day" (ISO YYYY-MM-DD) — see
+    `_WORKLOADS_REQUIRING_TRADING_DAY`. `force_on_demand` (default False) is set by the
     EOD SF's post-interruption retry (2026-07-14 incident) and the weekday
     SF's identical retry (config#2542) so the one retry attempt never gambles
     on spot a second time; the "daily-heal" workload (alpha-engine-config-
