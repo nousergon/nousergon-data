@@ -79,13 +79,15 @@ import inspect
 import json
 import logging
 import os
+import re
 import time
 import urllib.parse
 import urllib.request
 from collections import defaultdict
 from dataclasses import replace as dc_replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time as dt_time, timedelta, timezone
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import boto3
 import yaml
@@ -102,7 +104,11 @@ from nousergon_lib.artifact_freshness import (
     listable_prefix,
     resolve_current_cycle,
 )
-from nousergon_lib.trading_calendar import last_closed_trading_day, previous_trading_day
+from nousergon_lib.trading_calendar import (
+    is_trading_day,
+    last_closed_trading_day,
+    previous_trading_day,
+)
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
@@ -343,6 +349,241 @@ _SPEC_FIELDS = frozenset(
 )
 
 
+# ── Wall-clock local deadlines (alpha-engine-config-I10805) ─────────────────
+#
+# `sla_minutes_after_cron` is a FIXED-UTC-MINUTES offset from a cadence anchor.
+# For every cadence that is a real deadline in somebody's local business day
+# that is wrong twice a year, and for `cadence: continuous` with a
+# daily-or-longer `interval_minutes` it is not consulted at ALL: the substrate's
+# `_freshness_floor` returns a TRADING-DAY floor for that shape
+# (`subtract_trading_days(last_closed_trading_day(now), ceil(interval/1440))`),
+# so a row declaring `sla_minutes_after_cron: 750` grades against "written since
+# the start of the previous trading day", never against 12:30 UTC.
+#
+# MEASURED 2026-09-14 against the pinned substrate (nousergon_lib 0.124.x) with
+# the two live `crucible_trader_preopen_*` rows' exact fields:
+#
+#     resolve_current_cycle(now=2026-09-15T13:00Z) -> tick 2026-09-15T00:00Z
+#     _freshness_floor(...)                        -> 2026-09-11T00:00Z
+#
+# — a ~4-day-wide window, not an 08:30 ET deadline. So the pre-open page
+# condition 4 (`data_collection_plan_260914.md` §2 row 11 amendment 2 /
+# alpha-engine-config-I10796) did not exist at all, DST aside: the two rows
+# would only have paged once the morning appends were multiple TRADING DAYS
+# late, by which time several sessions had already traded on stale data.
+#
+# `deadline_local: "HH:MM <IANA zone>"` is the fix, and it is deliberately
+# NOT a variant of the SLA-minutes arithmetic: the deadline is resolved by
+# `datetime.combine(local_day, HH:MM, tzinfo=ZoneInfo(zone)).astimezone(utc)`
+# on the row's OWN local calendar day, so the UTC instant it lands on moves
+# with the zone's offset (12:30 UTC under EDT, 13:30 UTC under EST) with no
+# per-season maintenance and no second constant to keep in step.
+#
+# WHY IT LIVES HERE AND NOT IN `nousergon_lib.artifact_freshness`: `ArtifactSpec`
+# is a frozen lib dataclass pinned fleet-wide at one version by lockstep guard
+# tests, so a new field there is a lib release plus a pin bump across every
+# pinned requirements file in this repo — a lockstep change in its own right.
+# The monitor already carries five registry fields the substrate does not model
+# (`recovery`, `critical_while_champion_arm`, `escalate_to_issue`,
+# `remediation`, `producer_trigger`) as parallel maps keyed by `artifact_id`,
+# and the loader strips unknown keys before constructing the spec, so this is
+# the established, forward-safe shape. Lifting it into the substrate once a
+# SECOND consumer needs it is `policy-shared-code`'s second-adoption trigger;
+# the follow-up is filed rather than pre-built.
+#
+# The re-grade is applied to EVERY row that declares the field, in
+# `_run_probe_pass`, immediately after the probe and before driver attribution,
+# the episode signature and `_alert_decision` — so the page line, the episode
+# identity and `check_results.json` all carry the deadline verdict rather than
+# the floor verdict it replaces.
+
+_DEADLINE_LOCAL_HELP = (
+    "expected '<HH:MM> <IANA zone>', e.g. '08:30 America/New_York'"
+)
+_HHMM_RE = re.compile(r"([01]\d|2[0-3]):[0-5]\d")
+
+
+def parse_deadline_local(value: Any) -> tuple[dt_time, ZoneInfo] | None:
+    """Parse a ``deadline_local`` registry value into ``(time, tzinfo)``.
+
+    Returns ``None`` for absent or malformed values. Malformed DEGRADES to
+    "this row has no local deadline" (today's behaviour) rather than raising:
+    the loader must not be the thing that takes the whole registry — and
+    therefore every page in the fleet — down over one row's typo. The
+    chokepoint that catches the typo is the PR-time validator in
+    ``alpha-engine-config/scripts/validate_artifact_registry.py``, which
+    rejects exactly the same shapes this returns ``None`` for.
+
+    Note this field can only ADD a page relative to the substrate's floor on
+    the row's own local day; see :func:`apply_local_deadline` for the one
+    place it removes one and why that removal is the field's meaning.
+    """
+    if not isinstance(value, str) or not value.strip():
+        return None
+    parts = value.strip().split()
+    if len(parts) != 2:
+        logger.warning(
+            "registry row carries a malformed deadline_local %r — %s; row keeps "
+            "its substrate freshness floor", value, _DEADLINE_LOCAL_HELP,
+        )
+        return None
+    hhmm, zone = parts
+    # Strict zero-padded HH:MM. `time.fromisoformat` alone also accepts the
+    # compact `0830`, a seconds field and a trailing UTC offset — all three
+    # would read as a valid deadline while meaning something the registry
+    # grammar does not, and an offset in particular would silently re-fix the
+    # deadline to one UTC instant, which is the whole defect this field exists
+    # to remove.
+    if not _HHMM_RE.fullmatch(hhmm):
+        logger.warning(
+            "registry row carries a malformed deadline_local time %r — %s; row "
+            "keeps its substrate freshness floor", value, _DEADLINE_LOCAL_HELP,
+        )
+        return None
+    try:
+        parsed = dt_time.fromisoformat(hhmm)
+    except ValueError:
+        logger.warning(
+            "registry row carries a malformed deadline_local time %r — %s; row "
+            "keeps its substrate freshness floor", value, _DEADLINE_LOCAL_HELP,
+        )
+        return None
+    if parsed.tzinfo is not None or parsed.second or parsed.microsecond:
+        logger.warning(
+            "registry row carries a deadline_local time %r with a tz offset or "
+            "sub-minute precision — %s; row keeps its substrate freshness floor",
+            value, _DEADLINE_LOCAL_HELP,
+        )
+        return None
+    try:
+        tz = ZoneInfo(zone)
+    except (ZoneInfoNotFoundError, ValueError):
+        logger.warning(
+            "registry row carries an unknown deadline_local zone %r — %s; row "
+            "keeps its substrate freshness floor", value, _DEADLINE_LOCAL_HELP,
+        )
+        return None
+    return parsed, tz
+
+
+def resolve_local_deadline_utc(
+    deadline: tuple[dt_time, ZoneInfo], on_local_date: date,
+) -> datetime:
+    """The UTC instant ``deadline`` falls on for ``on_local_date``.
+
+    DST-correct BY CONSTRUCTION, not by table: the wall-clock time is attached
+    to the local calendar day with ``tzinfo=`` and the zone resolves its own
+    UTC offset for that date, so 08:30 America/New_York is 12:30 UTC while EDT
+    is in force and 13:30 UTC from the 2026-11-01 changeover onward, with no
+    constant anywhere in this repo that has to be edited on either side of it.
+    """
+    hhmm, tz = deadline
+    return datetime.combine(on_local_date, hhmm, tzinfo=tz).astimezone(timezone.utc)
+
+
+def apply_local_deadline(
+    spec: ArtifactSpec,
+    result: CheckResult,
+    deadline: tuple[dt_time, ZoneInfo] | None,
+    now: datetime,
+) -> CheckResult:
+    """Re-grade ``result`` against ``spec``'s wall-clock local deadline.
+
+    Semantics, on the row's own LOCAL calendar day:
+
+    * Not a trading day in that zone ⇒ untouched. The row's declared
+      ``run_calendar`` already owns the weekend/holiday gate and the substrate
+      short-circuits it to ``fresh``; re-deriving that here would be a second
+      calendar to keep in step with the first.
+    * ``probe_failed`` ⇒ untouched. The monitor being broken is not a producer
+      verdict and must keep its own no-grace page path.
+    * BEFORE the deadline ⇒ a ``missing``/``stale`` verdict is downgraded to
+      ``fresh``. This is the ONE place the field removes a page, and it is the
+      field's whole meaning: a deadline says absence before it is EXPECTED. It
+      is bounded to the current local day (never across days) and it removes a
+      page, never a fact — ``reason`` records the pending deadline and the row
+      still reaches ``check_results.json`` with it.
+    * AT OR AFTER the deadline ⇒ the artifact must carry a ``last_modified``
+      inside ``[local midnight, deadline]``. Anything else — absent, or written
+      after the deadline, or carried over from a previous day — is a confirmed
+      miss (``missing`` when nothing was found, ``stale`` when a too-old or
+      too-late instance was), with ``sla_violated_by_minutes`` counted from the
+      deadline so :func:`_alert_decision`'s SLA-grace gate opens immediately.
+
+    Severity is untouched: the row's declared ``severity`` (``critical`` for
+    both pre-open rows) is what routes the resulting decision to the page
+    transport. This function never raises one.
+    """
+    if deadline is None:
+        return result
+    now_utc = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    _hhmm, tz = deadline
+    local_day = now_utc.astimezone(tz).date()
+    if not is_trading_day(local_day):
+        return result
+    if result.state == "probe_failed":
+        return result
+
+    due_utc = resolve_local_deadline_utc(deadline, local_day)
+    label = f"{_hhmm.isoformat(timespec='minutes')} {tz.key} ({due_utc:%H:%MZ}) on {local_day}"
+
+    if now_utc < due_utc:
+        if result.state in ("missing", "stale"):
+            logger.info(
+                "deadline_local: %s %s→fresh — deadline %s has not passed",
+                spec.artifact_id, result.state, label,
+            )
+            return dc_replace(
+                result,
+                state="fresh",
+                sla_violated_by_minutes=0,
+                reason=(
+                    f"absence is expected before the declared deadline {label}; "
+                    f"substrate verdict was {result.state}: {result.reason}"
+                ),
+            )
+        return result
+
+    day_start_utc = datetime.combine(
+        local_day, dt_time(0, 0), tzinfo=tz,
+    ).astimezone(timezone.utc)
+    late_by = max(1, int((now_utc - due_utc).total_seconds() // 60))
+    last_modified = result.last_modified
+    if last_modified is not None and last_modified.tzinfo is None:
+        last_modified = last_modified.replace(tzinfo=timezone.utc)
+
+    if last_modified is None:
+        return dc_replace(
+            result,
+            state="missing",
+            sla_violated_by_minutes=late_by,
+            reason=(
+                f"not written by the declared deadline {label} — {late_by} min "
+                f"late. Substrate verdict was {result.state}: {result.reason}"
+            ),
+        )
+    if not (day_start_utc <= last_modified <= due_utc):
+        return dc_replace(
+            result,
+            state="stale",
+            sla_violated_by_minutes=late_by,
+            reason=(
+                f"newest instance last_modified={last_modified.isoformat()} is "
+                f"outside [{day_start_utc.isoformat()}, {due_utc.isoformat()}] — "
+                f"the declared deadline {label} was missed by {late_by} min"
+            ),
+        )
+    return dc_replace(
+        result,
+        state="fresh",
+        sla_violated_by_minutes=0,
+        reason=(
+            f"written {last_modified.isoformat()}, inside the declared deadline "
+            f"{label}"
+        ),
+    )
+
+
 # ── Registry loader ─────────────────────────────────────────────────────────
 
 
@@ -376,14 +617,16 @@ def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
 ) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
            dict[str, bool], dict[str, str], dict[str, str],
-           dict[str, Any]]:
+           dict[str, Any], dict[str, tuple[dt_time, ZoneInfo]]]:
     """Like :func:`load_registry`, but also returns the per-artifact
     ``recovery:`` spec map (config#1240), the
     ``critical_while_champion_arm`` map (config-I3086), the
     ``escalate_to_issue`` map (config#2055 Gap 2), the
     ``remediation:`` declared-response-lane map (config-I3282), the
     ``producer_trigger`` map (config-I6570) — all keyed by ``artifact_id`` —
-    and the ``declared_off`` input (config-I8719): the well-formed
+    the ``deadline_local`` wall-clock-deadline map
+    (alpha-engine-config-I10805, parsed by :func:`parse_deadline_local`), and
+    the ``declared_off`` input (config-I8719): the well-formed
     ``declared_off:`` blocks plus the publisher's ``declared_off_resolution``
     block, which :func:`resolve_declared_off` turns into a suppression map
     once ``now`` is known.
@@ -411,6 +654,7 @@ def load_registry_with_recovery(
     escalate_to_issue_by_id: dict[str, bool] = {}
     remediation_by_id: dict[str, str] = {}
     producer_trigger_by_id: dict[str, str] = {}
+    deadline_local_by_id: dict[str, tuple[dt_time, ZoneInfo]] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -429,6 +673,12 @@ def load_registry_with_recovery(
         remediation = merged.get("remediation")
         if isinstance(remediation, str) and remediation:
             remediation_by_id[spec.artifact_id] = remediation
+        # alpha-engine-config-I10805 — the row's wall-clock local deadline.
+        # Malformed values are dropped by the parser (which logs) so one typo
+        # cannot take the whole registry, and therefore every page, down.
+        deadline_local = parse_deadline_local(merged.get("deadline_local"))
+        if deadline_local is not None:
+            deadline_local_by_id[spec.artifact_id] = deadline_local
         # config-I6570 — only a well-formed trigger is carried. A malformed
         # value is dropped here rather than raising: the field's whole job is
         # to REMOVE a page, so a typo must degrade to today's behaviour, not
@@ -468,7 +718,7 @@ def load_registry_with_recovery(
     }
     return (specs, recovery_by_id, critical_arms_by_id,
             escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id,
-            declared_off_input)
+            declared_off_input, deadline_local_by_id)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -4144,7 +4394,8 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     )
 
     (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input,
+     deadline_local_by_id) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
@@ -4184,6 +4435,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         remediation_by_id=remediation_by_id,
         suppression_by_id=suppression_by_id,
         declared_off_by_id=declared_off_by_id,
+        deadline_local_by_id=deadline_local_by_id,
         # config-I9206 — one cache per INVOCATION, created here and discarded
         # with the pass. The intraday rule probes two rows, so it gains little;
         # it is threaded so there is exactly one way check_freshness is called.
@@ -4223,6 +4475,7 @@ def _run_probe_pass(
     prev_issue_filed: dict[str, str] | None = None,
     prev_episode_state: dict[str, dict[str, str]] | None = None,
     list_cache: dict | None = None,
+    deadline_local_by_id: dict[str, tuple[dt_time, ZoneInfo]] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -4290,8 +4543,17 @@ def _run_probe_pass(
     # Per-pass cache of lazily-created SF/Lambda clients (shared across the
     # walk so a pass dispatching several recoveries reuses one client each).
     aws_clients: dict[str, Any] = {}
+    deadline_local_by_id = deadline_local_by_id or {}
     for spec in specs:
         result, exc = _check_one(s3_client, spec, now, list_cache=list_cache)
+        # alpha-engine-config-I10805 — a row declaring a wall-clock local
+        # deadline is graded against THAT, not against the substrate's
+        # cadence floor, and the re-grade happens here so every downstream
+        # consumer (driver attribution, episode identity, `_alert_decision`,
+        # `check_results.json`, the digest) sees one verdict rather than two.
+        result = apply_local_deadline(
+            spec, result, deadline_local_by_id.get(spec.artifact_id), now,
+        )
         if exc is not None:
             per_spec_exceptions += 1
             logger.warning(
@@ -4575,7 +4837,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
     (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input,
+     deadline_local_by_id) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     # config-I9206 — wall-clock phase marks. The 2026-09-01 timeout was
@@ -4666,6 +4929,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         declared_off_by_id=declared_off_by_id,
         prev_issue_filed=prev_issue_filed,
         prev_episode_state=prev_episode_state,
+        deadline_local_by_id=deadline_local_by_id,
         # config-I9206 — ONE cache for this invocation, owned by the handler
         # and discarded with it.
         list_cache=list_cache,

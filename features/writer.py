@@ -15,7 +15,7 @@ from typing import Optional
 
 import pandas as pd
 
-from features.registry import GROUPS
+from features.registry import GROUPS, validate_units_suffix
 
 logger = logging.getLogger(__name__)
 
@@ -49,15 +49,33 @@ def write_feature_snapshot(
         import boto3
         s3_client = boto3.client("s3")
 
+    # Resolve which registered columns are actually present, per group,
+    # BEFORE any S3 write.
+    group_available: dict[str, list[str]] = {}
+    for group, feature_names in GROUPS.items():
+        available = [f for f in feature_names if f in features_df.columns]
+        if available:
+            group_available[group] = available
+        else:
+            logger.debug("Skipping group %s — no columns present in DataFrame", group)
+
+    # Write-time units-suffix contract (alpha-engine-config#10781): every
+    # column about to be written must carry a units suffix (`_raw`,
+    # `_ratio`, `_pct`, `_zscore`, `_log_return`) or be grandfathered
+    # (`features.registry.GRANDFATHERED_BARE_FIELDS`) — enforced HERE, not
+    # only later in CI (`tests/test_schema_contract.py`), closing the
+    # avg_volume_20d root cause: it was emitted as a normalized ratio and
+    # consumed as raw shares, 901/903 tickers silently failing the scanner
+    # liquidity gate for months. Validated across ALL groups before any
+    # `put_object`, so a mis-suffixed column fails the whole snapshot rather
+    # than writing some groups and rejecting the rest partway through.
+    for available in group_available.values():
+        for name in available:
+            validate_units_suffix(name)
+
     written = {}
 
-    for group, feature_names in GROUPS.items():
-        # Find which features from this group exist in the DataFrame
-        available = [f for f in feature_names if f in features_df.columns]
-        if not available:
-            logger.debug("Skipping group %s — no columns present in DataFrame", group)
-            continue
-
+    for group, available in group_available.items():
         # Build the group DataFrame
         if group == "macro":
             # Macro features are identical across tickers — write one row per date
