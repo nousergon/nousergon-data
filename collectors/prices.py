@@ -43,6 +43,13 @@ from builders._price_cache_writeboth import (
     price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
+from dates import (
+    FutureBarError,
+    assert_no_bar_after,
+    clip_to_trading_day,
+    default_run_date,
+    history_window,
+)
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
 logger = logging.getLogger(__name__)
@@ -130,8 +137,13 @@ def collect(
         }
 
     # ── Refresh stale tickers via yfinance ───────────────────────────────────
+    # alpha-engine-config-I10893: the refresh window is anchored on the run's
+    # trading day, never on wall-clock time — a ``--date D`` run executed on
+    # D+1 must not fetch (or publish) the partial D+1 session.
+    trading_day = str(reference_date) if reference_date is not None else default_run_date()
     refreshed, failed_tickers = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
+        trading_day=trading_day,
     )
 
     # ── Validate refreshed tickers ─────────────────────────────────────────
@@ -328,12 +340,16 @@ def _longest_of(candidates: list[tuple[str, pd.DataFrame]]) -> tuple[str, pd.Dat
     return max(named, key=lambda kv: len(kv[1]))
 
 
-def _fred_ohlcv_for_caret_symbol(ticker: str, period: str) -> "pd.DataFrame | None":
+def _fred_ohlcv_for_caret_symbol(
+    ticker: str, period: str, *, trading_day: "str | date | None" = None,
+) -> "pd.DataFrame | None":
     """Fetch ``ticker``'s FRED-sourced history, reshaped to the yfinance OHLCV
     column set. Returns ``None`` (never raises) on any failure — the caller
     falls back to whatever yfinance answered, since FRED being unavailable
     must degrade to yfinance rather than to nothing (alpha-engine-config-I9286
-    deliverable 2).
+    deliverable 2). ``trading_day`` bounds the FRED observation window's end
+    (alpha-engine-config-I10893); ``None`` keeps the lookup-only callers that
+    never publish (tests of the unmapped-symbol path) working.
     """
     from collectors.fred_history import FRED_HISTORY_MAP, fetch_fred_history, fred_history_to_ohlcv
 
@@ -342,7 +358,7 @@ def _fred_ohlcv_for_caret_symbol(ticker: str, period: str) -> "pd.DataFrame | No
         return None
     years = int(period.rstrip("y")) if period.endswith("y") and period[:-1].isdigit() else 10
     try:
-        fred_df = fetch_fred_history(series_id, period_years=years)
+        fred_df = fetch_fred_history(series_id, period_years=years, end_date=trading_day)
         out = fred_history_to_ohlcv(fred_df)
     except Exception as exc:
         logger.warning(
@@ -370,8 +386,17 @@ def _refresh_stale(
     stale: list[str],
     fetch_period: str,
     batch_size: int,
+    *,
+    trading_day: "str | date",
 ) -> tuple[int, list[str]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
+
+    ``trading_day`` (required, alpha-engine-config-I10893) bounds every fetch
+    to ``[trading_day − fetch_period, trading_day]`` via explicit
+    ``start``/``end`` — never ``period=``, which ends at vendor "now" and so
+    published a partial D+1 session on a ``--date D`` rerun. Each frame is
+    checked by :func:`dates.assert_no_bar_after` immediately before upload;
+    a :class:`dates.FutureBarError` propagates (not a per-ticker failure).
 
     Runs under ``yf_quiet`` (nousergon_lib.yfinance_quiet): yfinance's
     per-symbol "possibly delisted" ERROR spray is demoted so one transient/
@@ -382,7 +407,11 @@ def _refresh_stale(
     """
     import time
 
-    logger.info("Refreshing %d stale tickers (period=%s) ...", len(stale), fetch_period)
+    window_start, window_end_excl = history_window(trading_day, fetch_period)
+    logger.info(
+        "Refreshing %d stale tickers (window=%s: start=%s, end=%s exclusive) ...",
+        len(stale), fetch_period, window_start.isoformat(), window_end_excl.isoformat(),
+    )
 
     refreshed = 0
     failed_tickers: list[str] = []
@@ -401,7 +430,8 @@ def _refresh_stale(
                 tickers_arg = yf_symbols[0] if len(yf_symbols) == 1 else yf_symbols
                 raw = yf.download(
                     tickers=tickers_arg,
-                    period=fetch_period,
+                    start=window_start.isoformat(),
+                    end=window_end_excl.isoformat(),
                     interval="1d",
                     auto_adjust=True,
                     progress=False,
@@ -431,7 +461,10 @@ def _refresh_stale(
                     if idx.tz is not None:
                         idx = idx.tz_convert("UTC").tz_localize(None)
                     new_df.index = idx
-                    new_df = new_df.sort_index()
+                    new_df = clip_to_trading_day(
+                        new_df.sort_index(), trading_day,
+                        label=f"price_cache_refresh[{ticker}]",
+                    )
 
                     # ── FRED longest-of selection for caret index tickers ───
                     # (alpha-engine-config-I9286). yfinance answers ``^VIX3M``
@@ -445,7 +478,9 @@ def _refresh_stale(
                     # degrading to yfinance — so take whichever answers longer,
                     # every run, and log which source won.
                     if ticker in _CARET_SYMBOLS:
-                        fred_df = _fred_ohlcv_for_caret_symbol(ticker, fetch_period)
+                        fred_df = _fred_ohlcv_for_caret_symbol(
+                            ticker, fetch_period, trading_day=trading_day,
+                        )
                         if fred_df is not None:
                             source, new_df = _longest_of(
                                 [("yfinance", new_df), ("fred", fred_df)]
@@ -491,12 +526,18 @@ def _refresh_stale(
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
                     # see builders/_price_cache_writeboth.py for soak contract)
                     assert_valid_price_cache_ticker(ticker)
+                    assert_no_bar_after(
+                        new_df.index, trading_day,
+                        artifact=f"{s3_prefix}{ticker}.parquet",
+                    )
                     parquet_path = local_dir / f"{ticker}.parquet"
                     new_df.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
                     for prefix in price_cache_write_prefixes(s3_prefix):
                         s3.upload_file(str(parquet_path), bucket, f"{prefix}{ticker}.parquet")
                     refreshed += 1
 
+                except FutureBarError:
+                    raise  # run-level contract violation, never a per-ticker miss
                 except Exception as e:
                     logger.warning("Refresh failed for %s: %s", ticker, e)
                     failed_tickers.append(ticker)

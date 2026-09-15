@@ -106,6 +106,7 @@ def test_prices_refresh_stale_refuses_caret_ticker_write(monkeypatch, tmp_path):
         stale=["^VIX3M"],
         fetch_period="10y",
         batch_size=10,
+        trading_day="2026-09-14",
     )
 
     assert refreshed == 0
@@ -212,7 +213,7 @@ def test_collect_does_not_mark_partial_from_stray_caret_key(monkeypatch):
 
     refresh_calls: list[list[str]] = []
 
-    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size):
+    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, **_kw):
         refresh_calls.append(list(stale))
         # Simulate every requested ticker refreshing cleanly — the point of
         # this test is that ^VIX3M never reaches this call at all.
