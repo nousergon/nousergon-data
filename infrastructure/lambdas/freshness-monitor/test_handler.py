@@ -1824,7 +1824,7 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
+    specs, recovery, critical_arms, _esc, _rem, _pt, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
@@ -1879,7 +1879,7 @@ def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
 def test_load_registry_parses_critical_while_champion_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    _specs, _recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
+    _specs, _recovery, critical_arms, _esc, _rem, _pt, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
 
@@ -1887,7 +1887,7 @@ def test_load_registry_parses_critical_while_champion_arm(fake_s3):
 def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _dl = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
@@ -1903,7 +1903,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
 def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _dl = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
@@ -1918,7 +1918,7 @@ def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
     fail toward paging, never toward silence."""
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _dl = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -2137,7 +2137,7 @@ artifacts:
     created_at: 2025-01-01
 """
     import index
-    _specs, _recovery, _arms, escalate, _rem, _pt, _do = index.load_registry_with_recovery(
+    _specs, _recovery, _arms, escalate, _rem, _pt, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert escalate == {"config_scoring_weights": True}
 
@@ -2481,7 +2481,7 @@ def test_load_registry_parses_remediation_map(monkeypatch, fake_s3):
     undeclared rows are simply absent."""
     import index
     fake_s3._registry_body = _DRAIN_REGISTRY
-    _s, _r, _a, _e, remediation, _pt, _do = index.load_registry_with_recovery(
+    _s, _r, _a, _e, remediation, _pt, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert remediation == {
@@ -2679,7 +2679,7 @@ def test_loader_parses_producer_trigger_and_drops_malformed(fake_s3):
     today's alerting behaviour instead of taking the registry down."""
     import index
     fake_s3._registry_body = _PRODUCER_REGISTRY
-    specs, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
+    specs, _r, _a, _e, _rem, producer, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert {s.artifact_id for s in specs} == {
@@ -3959,7 +3959,7 @@ def test_partially_malformed_trigger_list_is_dropped_whole(fake_s3, caplog):
         b"      - scheduler:good\n"
         b"      - not-a-trigger\n"
     )
-    _s, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
+    _s, _r, _a, _e, _rem, producer, _do, _dl = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert producer == {}
@@ -5593,3 +5593,373 @@ def test_wildcard_probe_does_not_count_a_sibling_diagnostic(monkeypatch):
         "IsTruncated": False,
     }])
     assert index._prefix_has_ever_been_written(stub, spec, result) is False
+
+
+# ── Pre-open page condition 4 + the DST-correct deadline ────────────────────
+#
+# alpha-engine-config-I10805, closing the two gaps I10796 (P-27) left behind.
+# `data_collection_plan_260914.md` §2 row 11 amendment 2 gave crucible-trader
+# a FOURTH page condition — "the morning appends the trader reads are not
+# complete by 08:30 ET" — and `ARTIFACT_REGISTRY.yaml` expressed it as
+# `cadence: continuous` + `interval_minutes: 1440` + `sla_minutes_after_cron:
+# 750` (00:00 UTC + 12h30m = 12:30 UTC = 08:30 ET *under EDT*).
+#
+# MEASURED against the pinned substrate before writing this: that expression
+# does not produce an 08:30 ET deadline in ANY season. For `continuous` with
+# `run_calendar: trading_days` and `interval_minutes >= 1440`,
+# `nousergon_lib.artifact_freshness._freshness_floor` returns a TRADING-DAY
+# floor and never consults `sla_minutes_after_cron` at all --
+#
+#     now      = 2026-09-15T13:00Z  (a Tuesday, after the 08:30 ET deadline)
+#     tick     = 2026-09-15T00:00Z
+#     floor    = 2026-09-11T00:00Z
+#
+# -- a ~4-day window. So page condition 4 was commissioned on paper and
+# emitted nothing: the rows would first page once the morning appends were
+# several TRADING DAYS late, by which time the sessions they were meant to
+# protect had already traded. This is observability-policy §9 commissioning
+# for that page condition, and `deadline_local` is the mechanism that makes it
+# real (see `apply_local_deadline` for the semantics and why it lives in the
+# monitor rather than in the pinned lib dataclass).
+#
+# EVERY clock here is passed explicitly. Nothing in this block reads a wall
+# clock, and no fixture is graded against one: a date-anchored fixture graded
+# against `datetime.now` expired at UTC midnight once and ejected a docs-only
+# PR from the merge queue.
+
+# Pinned copy of the two live `ARTIFACT_REGISTRY.yaml` rows (as of
+# alpha-engine-config-PR10803) plus the `deadline_local` field this change
+# adds to them. Kept here rather than read from alpha-engine-config: this repo
+# never imports that one, and the registry the Lambda parses is an S3 object,
+# so the fixture is the same bytes the loader sees in production.
+_PREOPEN_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 0
+artifacts:
+  - artifact_id: crucible_trader_preopen_daily_closes
+    s3_key_template: "staging/daily_closes/{trading_day}.parquet"
+    cadence: continuous
+    interval_minutes: 1440
+    calendar_aware: true
+    run_calendar: trading_days
+    sla_minutes_after_cron: 750
+    deadline_local: "08:30 America/New_York"
+    severity: critical
+    remediation: dispatch-diagnose
+    owner_repo: nousergon-data
+    created_at: 2026-09-14
+
+  - artifact_id: crucible_trader_preopen_universe_append
+    s3_key_template: "feature_store/_freshness.json"
+    cadence: continuous
+    interval_minutes: 1440
+    calendar_aware: true
+    run_calendar: trading_days
+    sla_minutes_after_cron: 750
+    deadline_local: "08:30 America/New_York"
+    severity: critical
+    remediation: dispatch-diagnose
+    owner_repo: nousergon-data
+    created_at: 2026-09-14
+"""
+
+# A Tuesday, EDT (UTC-4): the 08:30 America/New_York deadline is 12:30 UTC.
+_PREOPEN_EDT_DAY = date(2026, 9, 15)
+# A Tuesday AFTER the 2026-11-01 changeover, EST (UTC-5): the same declared
+# 08:30 America/New_York deadline is 13:30 UTC.
+_PREOPEN_EST_DAY = date(2026, 11, 3)
+
+_PREOPEN_KEYS = (
+    "staging/daily_closes/2026-09-15.parquet",
+    "feature_store/_freshness.json",
+)
+
+
+def _preopen_specs_and_deadlines(index_mod, fake_s3):
+    fake_s3._registry_body = _PREOPEN_REGISTRY
+    (specs, recovery, _arms, _esc, remediation, _pt, _do,
+     deadlines) = index_mod.load_registry_with_recovery(fake_s3, "b", "k")
+    return specs, recovery, remediation, deadlines
+
+
+def test_preopen_registry_rows_declare_a_local_deadline(fake_s3):
+    """Both rows parse, and the loader carries their declared wall-clock
+    deadline in the parallel map -- `deadline_local` is NOT an ArtifactSpec
+    field (the pinned lib dataclass is frozen and fleet-wide), so a row that
+    silently lost it would otherwise fall back to the 4-day substrate floor
+    with nothing red."""
+    import index
+    specs, _rec, _rem, deadlines = _preopen_specs_and_deadlines(index, fake_s3)
+    assert {s.artifact_id for s in specs} == {
+        "crucible_trader_preopen_daily_closes",
+        "crucible_trader_preopen_universe_append",
+    }
+    assert set(deadlines) == {s.artifact_id for s in specs}
+    for hhmm, tz in deadlines.values():
+        assert (hhmm.hour, hhmm.minute) == (8, 30)
+        assert str(tz) == "America/New_York"
+    # And the row still reaches the spec WITHOUT the extension field.
+    assert not any(hasattr(s, "deadline_local") for s in specs)
+
+
+def test_preopen_deadline_resolves_to_0830_et_at_both_dst_offsets(fake_s3):
+    """The DST half of I10805. The SAME declared `08:30 America/New_York`
+    must land on 12:30 UTC under EDT and 13:30 UTC under EST -- the fixed
+    `sla_minutes_after_cron: 750` it replaces is 12:30 UTC in both seasons,
+    i.e. 07:30 ET from 2026-11-01 onward, an hour before the deadline the
+    plan declares. Resolution is by zone lookup on the local calendar day, so
+    no constant in this repo changes on either side of the changeover."""
+    import index
+    _specs, _rec, _rem, deadlines = _preopen_specs_and_deadlines(index, fake_s3)
+    deadline = deadlines["crucible_trader_preopen_daily_closes"]
+
+    edt = index.resolve_local_deadline_utc(deadline, _PREOPEN_EDT_DAY)
+    est = index.resolve_local_deadline_utc(deadline, _PREOPEN_EST_DAY)
+
+    assert edt == datetime(2026, 9, 15, 12, 30, tzinfo=timezone.utc)
+    assert est == datetime(2026, 11, 3, 13, 30, tzinfo=timezone.utc)
+    # The offset moved by exactly one hour, and the LOCAL wall time did not.
+    assert est.hour - edt.hour == 1
+    for resolved, day in ((edt, _PREOPEN_EDT_DAY), (est, _PREOPEN_EST_DAY)):
+        local = resolved.astimezone(deadline[1])
+        assert (local.date(), local.hour, local.minute) == (day, 8, 30)
+
+
+def _run_preopen_pass(index_mod, fake_s3, monkeypatch, now, written_at):
+    """Drive the REAL probe pass over the two pinned rows with the morning
+    keys written at ``written_at`` (or absent when ``None``), and return
+    ``(alerted, paged_artifact_ids, publish_mock, pairs)``."""
+    specs, recovery, remediation, deadlines = _preopen_specs_and_deadlines(
+        index_mod, fake_s3,
+    )
+    fake_s3._head_returns = (
+        {k: {"LastModified": written_at} for k in _PREOPEN_KEYS}
+        if written_at is not None else {}
+    )
+    publish_mock = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index_mod, "publish", publish_mock)
+    monkeypatch.setattr(index_mod, "_maybe_dispatch_drain", lambda *a, **k: False)
+
+    pairs, alerted, _d, _e, _counts, _tel = index_mod._run_probe_pass(
+        fake_s3, specs, recovery, now,
+        remediation_by_id=remediation,
+        deadline_local_by_id=deadlines,
+    )
+    paged = {
+        spec.artifact_id for spec, result in pairs
+        if index_mod._maybe_alert(spec, result, now)
+    }
+    return alerted, paged, publish_mock, pairs
+
+
+def test_preopen_morning_append_late_for_0830_et_pages_critical(
+    fake_s3, monkeypatch,
+):
+    """Page condition 4, end to end through the real pass: on a trading day,
+    at 13:00 UTC (09:00 ET -- past the 08:30 ET deadline, before the 09:30 ET
+    open), a morning append written at 12:55 UTC (08:55 ET) is LATE. Both
+    rows must grade as a confirmed miss at `severity: critical` and reach the
+    page transport.
+
+    Under the substrate floor alone this same input reads `fresh`: the
+    12:55 UTC write is well inside the 2026-09-11T00:00Z trading-day floor.
+    That is the gap this test exists to keep closed, and the control at the
+    bottom measures it rather than asserting it."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    now = datetime(2026, 9, 15, 13, 0, tzinfo=timezone.utc)
+    late = datetime(2026, 9, 15, 12, 55, tzinfo=timezone.utc)
+    alerted, paged, publish_mock, pairs = _run_preopen_pass(
+        index, fake_s3, monkeypatch, now, late,
+    )
+
+    assert paged == {
+        "crucible_trader_preopen_daily_closes",
+        "crucible_trader_preopen_universe_append",
+    }
+    assert alerted == 2
+    # Routed to the page transport, not merely recorded on the console.
+    publish_mock.assert_called_once()
+    assert publish_mock.call_args.kwargs["severity"] == "critical"
+    for spec, result in pairs:
+        assert result.state == "stale"
+        assert result.sla_violated_by_minutes == 30
+        assert "08:30 America/New_York" in result.reason
+        decision = index._alert_decision(spec, result, now)
+        assert decision["severity"] == "critical"
+
+    # The control: the SAME clock and the SAME rows WITHOUT the deadline
+    # declared read fresh and page nobody. This is the measured before/after,
+    # not an assertion that the monitor alerts in general.
+    specs, recovery, remediation, _dl = _preopen_specs_and_deadlines(index, fake_s3)
+    fake_s3._head_returns = {k: {"LastModified": late} for k in _PREOPEN_KEYS}
+    monkeypatch.setattr(index, "_maybe_dispatch_drain", lambda *a, **k: False)
+    _pairs, alerted_without, _d, _e, _c, _t = index._run_probe_pass(
+        fake_s3, specs, recovery, now, remediation_by_id=remediation,
+    )
+    assert alerted_without == 0
+
+
+def test_preopen_morning_append_on_time_for_0830_et_does_not_page(
+    fake_s3, monkeypatch,
+):
+    """The other half. Same clock, same rows, append written at 12:10 UTC
+    (08:10 ET) -- inside the deadline. No page, and the row records WHY it is
+    fresh rather than inheriting the substrate's much wider verdict."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    now = datetime(2026, 9, 15, 13, 0, tzinfo=timezone.utc)
+    on_time = datetime(2026, 9, 15, 12, 10, tzinfo=timezone.utc)
+    alerted, paged, publish_mock, pairs = _run_preopen_pass(
+        index, fake_s3, monkeypatch, now, on_time,
+    )
+
+    assert paged == set()
+    assert alerted == 0
+    publish_mock.assert_not_called()
+    for _spec, result in pairs:
+        assert result.state == "fresh"
+        assert result.sla_violated_by_minutes == 0
+        assert "inside the declared deadline" in result.reason
+
+
+def test_preopen_deadline_pages_an_hour_later_in_est(fake_s3, monkeypatch):
+    """The DST half, through the same real pass. On 2026-11-03 (EST) a write
+    at 13:00 UTC is 08:00 ET -- ON TIME. The fixed `sla_minutes_after_cron:
+    750` deadline it replaces (12:30 UTC, i.e. 07:30 ET that season) would
+    have paged on it. Forty minutes later, at 13:40 UTC (08:40 ET), the same
+    row IS late and pages."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    now = datetime(2026, 11, 3, 14, 0, tzinfo=timezone.utc)   # 09:00 ET
+    fake_s3._registry_body = _PREOPEN_REGISTRY
+    keys = (
+        "staging/daily_closes/2026-11-03.parquet",
+        "feature_store/_freshness.json",
+    )
+
+    for written_utc, expect_paged in (
+        (datetime(2026, 11, 3, 13, 0, tzinfo=timezone.utc), False),   # 08:00 ET
+        (datetime(2026, 11, 3, 13, 40, tzinfo=timezone.utc), True),   # 08:40 ET
+    ):
+        specs, recovery, remediation, deadlines = _preopen_specs_and_deadlines(
+            index, fake_s3,
+        )
+        fake_s3._head_returns = {k: {"LastModified": written_utc} for k in keys}
+        monkeypatch.setattr(index, "_maybe_dispatch_drain", lambda *a, **k: False)
+        monkeypatch.setattr(
+            index, "publish", mock.Mock(return_value=mock.Mock(dedup_skipped=False)),
+        )
+        _pairs, alerted, _d, _e, _c, _t = index._run_probe_pass(
+            fake_s3, specs, recovery, now,
+            remediation_by_id=remediation,
+            deadline_local_by_id=deadlines,
+        )
+        assert bool(alerted) is expect_paged, written_utc
+
+
+def test_preopen_deadline_does_not_page_before_it_falls(fake_s3, monkeypatch):
+    """A deadline says absence before it is EXPECTED. At 11:00 UTC (07:00 ET)
+    the morning appends are not due yet, so an absent key must NOT page --
+    otherwise the field converts a once-a-day deadline into an all-night
+    page. The suppression is bounded to the current local day and the row
+    still records the substrate's verdict in `reason`."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+
+    now = datetime(2026, 9, 15, 11, 0, tzinfo=timezone.utc)
+    alerted, paged, publish_mock, pairs = _run_preopen_pass(
+        index, fake_s3, monkeypatch, now, None,
+    )
+    assert (alerted, paged) == (0, set())
+    publish_mock.assert_not_called()
+    for _spec, result in pairs:
+        assert result.state == "fresh"
+        assert "absence is expected before the declared deadline" in result.reason
+
+
+def test_preopen_deadline_is_inert_on_a_non_trading_day():
+    """2026-09-13 is a Sunday. `run_calendar: trading_days` already owns the
+    weekend gate; re-deriving it here would be a second calendar to keep in
+    step with the first, so `apply_local_deadline` returns the substrate's
+    verdict untouched."""
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="crucible_trader_preopen_daily_closes", s3_bucket="b",
+        s3_key_template="staging/daily_closes/{trading_day}.parquet",
+        cadence="continuous", interval_minutes=1440, run_calendar="trading_days",
+        sla_minutes_after_cron=750, severity="critical",
+        owner_repo="nousergon-data", created_at=date(2026, 9, 14),
+    )
+    deadline = index.parse_deadline_local("08:30 America/New_York")
+    sunday_after = datetime(2026, 9, 13, 20, 0, tzinfo=timezone.utc)
+    missing = CheckResult(state="missing", reason="no instance")
+    assert index.apply_local_deadline(spec, missing, deadline, sunday_after) is missing
+
+
+def test_preopen_deadline_leaves_probe_failed_alone():
+    """The monitor being broken is not a producer verdict: `probe_failed`
+    keeps its own no-grace page path rather than being re-graded (or, before
+    the deadline falls, suppressed) by this field."""
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="x", s3_bucket="b", s3_key_template="k/{trading_day}",
+        cadence="continuous", interval_minutes=1440, run_calendar="trading_days",
+        sla_minutes_after_cron=750, severity="critical",
+        owner_repo="ae-test", created_at=date(2026, 9, 14),
+    )
+    deadline = index.parse_deadline_local("08:30 America/New_York")
+    broken = CheckResult(state="probe_failed", reason="AccessDenied")
+    for now in (
+        datetime(2026, 9, 15, 11, 0, tzinfo=timezone.utc),   # before deadline
+        datetime(2026, 9, 15, 13, 0, tzinfo=timezone.utc),   # after deadline
+    ):
+        assert index.apply_local_deadline(spec, broken, deadline, now) is broken
+
+
+def test_parse_deadline_local_grammar_and_malformed_degrade():
+    """A malformed value degrades to "no local deadline" (today's behaviour)
+    rather than raising: the loader must not be the thing that takes the whole
+    registry -- and therefore EVERY page in the fleet -- down over one row's
+    typo. The PR-time validator in alpha-engine-config is the chokepoint that
+    rejects it."""
+    import index
+    parsed = index.parse_deadline_local("08:30 America/New_York")
+    assert parsed is not None
+    assert (parsed[0].hour, parsed[0].minute) == (8, 30)
+    assert str(parsed[1]) == "America/New_York"
+    assert str(index.parse_deadline_local(" 16:00 Europe/London ")[1]) == (
+        "Europe/London"
+    )
+    for bad in (
+        None, "", "   ", "08:30", "America/New_York", "0830 America/New_York",
+        "08:30 Not/AZone", "25:00 America/New_York", "08:30:15 America/New_York",
+        "08:30+01:00 America/New_York", "08:30 America/New_York extra", 830,
+        ["08:30 America/New_York"],
+    ):
+        assert index.parse_deadline_local(bad) is None, bad
+
+
+def test_deadline_local_is_stripped_before_the_spec_is_constructed():
+    """Forward-compat guard. `_SPEC_FIELDS` must NOT list `deadline_local`:
+    the pinned `ArtifactSpec` has no such field, so leaking it into the
+    constructor is a TypeError that takes the whole registry load down."""
+    import index
+    assert "deadline_local" not in index._SPEC_FIELDS
