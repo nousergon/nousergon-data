@@ -210,3 +210,41 @@ def validate_inst_ownership_row(data: dict) -> list[str]:
     crucible/data/point_in_time.py::SnapshotPointInTimeSource._load_institutional
     (alpha-engine-config-I10870, P-07)."""
     return _validate(data, "inst_ownership")
+
+
+def validate_alternative_ticker(data: dict) -> list[str]:
+    """Validate market_data/weekly/{date}/alternative/{ticker}.json
+    (collectors/alternative.py::_process_one_ticker, D15). SELF-CONSUMED: the sole
+    reader is this repo's features/compute.py::_load_cached_alternative /
+    _alt_entry_from_payload (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "alternative_ticker")
+
+
+def validate_news_digest_daily(data: dict) -> list[str]:
+    """Validate data/news_digest_daily/{run_id,latest}.json
+    (data/derived/news_digest.py::build_digest/write_digest, D36). Consumer
+    (HARD requirement): morning-signal src/morning_signal/news_context.py::
+    load_news_context (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "news_digest_daily")
+
+
+def validate_news_article_row(data: dict) -> list[str]:
+    """Validate one row of data/news_articles_daily/{run_id}_articles.parquet
+    (data/derived/news_articles.py::NewsArticleRecord, D36). Consumer:
+    crucible-dashboard views/Daily_News.py (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "news_article_row")
+
+
+def validate_news_aggregate_row(data: dict) -> list[str]:
+    """Validate one row of data/news_aggregates_daily/{run_id}.parquet
+    (data/derived/news_aggregates.py::NewsTickerDailyAggregate, D36). Producer
+    side only — live consumer is crucible-research (v1, alpha-engine-config-I10870,
+    P-07)."""
+    return _validate(data, "news_aggregate_row")
+
+
+def validate_feature_registry(data: dict) -> list[str]:
+    """Validate features/registry.json (features/registry.py::generate_registry_json,
+    D12). Consumer: crucible-dashboard views/13_Feature_Store.py::_load_registry
+    (alpha-engine-config-I10870, P-07)."""
+    return _validate(data, "feature_registry")

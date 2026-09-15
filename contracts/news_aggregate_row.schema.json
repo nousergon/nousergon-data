@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/news_aggregate_row.schema.json",
+  "title": "One row of data/news_aggregates_daily/{run_id}.parquet (schema_version 1, D36)",
+  "description": "Producer: data/derived/news_aggregates.py::NewsTickerDailyAggregate / aggregate_and_write (collectors/daily_news.py::collect), one row per (ticker, aggregate_date). Live consumer: crucible-research thinktank/context.py via data/substrate/reader.py (v1, retiring under phase 4 — out of scope for a consumer pin in this PR; producer side built regardless per plan §3, a surviving consumer). Not read by morning-signal or crucible-dashboard, which both consume the digest / article-row artifacts instead (data-collector plan P-07, alpha-engine-config-I10870, D36).",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["ticker", "aggregate_date", "schema_version", "n_articles", "lm_sentiment_trusted_mean"],
+  "properties": {
+    "ticker": { "type": "string" },
+    "aggregate_date": { "type": "string" },
+    "schema_version": { "const": 1 },
+    "n_articles": { "type": ["integer", "number"] },
+    "n_articles_trusted_weighted": { "type": "number" },
+    "n_articles_by_source_json": { "type": "string" },
+    "lm_sentiment_mean": { "type": "number" },
+    "lm_sentiment_max": { "type": "number" },
+    "lm_sentiment_min": { "type": "number" },
+    "lm_sentiment_trusted_mean": { "type": "number" },
+    "lm_positive_words_total": { "type": ["integer", "number"] },
+    "lm_negative_words_total": { "type": ["integer", "number"] },
+    "lm_uncertainty_words_total": { "type": ["integer", "number"] },
+    "lm_total_tokens": { "type": ["integer", "number"] },
+    "event_count": { "type": ["integer", "number"] },
+    "event_severity_max": { "type": "number" },
+    "event_severity_mean": { "type": "number" },
+    "event_categories": { "type": "string" },
+    "top_event_descriptions": { "type": "string" },
+    "entity_mentions_count": { "type": ["integer", "number"] }
+  }
+}
