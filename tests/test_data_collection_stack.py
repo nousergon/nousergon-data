@@ -116,8 +116,14 @@ def test_eod_and_morning_end_with_the_arctic_probe(stack, tpl):
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):
+    """alpha-engine-config-I10753: DataPhase2 (D15) and RAGIngestion (D16/D46)
+    join morning-enrich/weekly-phase-one in v1 data order. D40/D41 are
+    retired (R7) and get no workload; D46 is a substep of rag-weekly-ingestion,
+    not its own key."""
     weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
-    assert weekly["workloads"] == ["morning-enrich", "weekly-phase-one"]
+    assert weekly["workloads"] == [
+        "morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion",
+    ]
     assert weekly["require_trading_day"] is False
 
 

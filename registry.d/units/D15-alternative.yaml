@@ -29,7 +29,11 @@ code_path: "collectors/alternative.py:631"
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:DataPhase2"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  successor: >-
+    nousergon-data-collection/data-collection-weekly, dispatcher workload
+    `alternative-phase-two` (alpha-engine-config-I10753). DISABLED until the
+    phase-4 cutover PR (CollectionState ENABLED); SAME command
+    (`weekly_collector.py --phase 2`) the v1 DataPhase2 state ran.
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
@@ -117,4 +121,8 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
-notes: "alpha-engine-config-I10753: this unit has no standalone-stack workload yet."
+notes: >-
+    alpha-engine-config-I10753: standalone workload `alternative-phase-two` added
+    (nousergon-data-PR pending merge). Measured span across two full v1
+    executions (2026-08-04, 2026-08-07 ne-weekly-freshness-pipeline history):
+    ~35 min, well inside the dispatcher's 7200s per-workload ceiling.
