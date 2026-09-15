@@ -72,6 +72,8 @@ _load_dotenv()
 # captured by flow-doctor's ERROR handler.
 from nousergon_lib.logging import setup_logging, guard_entrypoint, get_flow_doctor
 from nousergon_lib.phase_registry import PhaseRegistry
+from shadow.root import active_root as _active_shadow_root  # I10891: run state under a shadow root
+from shadow.run_state import RunStatePhaseRegistry
 # Canonical experiment-package config resolver (alpha-engine-config#1157): the
 # lift of the five inline _find_config / load_config / config_loader copies into
 # the shared-lib chokepoint. load_config below delegates to it.
@@ -315,7 +317,7 @@ def _build_registry(config: dict, args: argparse.Namespace, date: str) -> "Phase
     if args.dry_run:
         return None
     _csv = lambda s: [p.strip() for p in (s or "").split(",") if p.strip()]
-    reg = PhaseRegistry(
+    reg = RunStatePhaseRegistry(
         date=date,
         bucket=config["bucket"],
         marker_prefix="data",
@@ -769,6 +771,10 @@ def _phase_body(
             logger.info(
                 "%s: auto-skip (%s) — output already on S3 this date", name, ctx.skip_reason
             )
+            if _active_shadow_root() is not None:  # I10891: a shadow skip is never `ok`
+                raise _CollectorError(name, f"auto-skipped under shadow ({ctx.skip_reason}); "
+                                      "published nothing on this run — clear the shadow prefix "
+                                      "or --force-phases, a skipped shadow unit is not evidence")
             return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
         result = run_fn() or {}
         if result.get("status") == "error":
