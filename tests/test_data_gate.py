@@ -330,6 +330,53 @@ def test_empty_consumers_without_a_reason_is_refused(tmp_path):
         descriptors.load_units(tmp_path)
 
 
+def test_a_consumers_ruling_missing_reason_is_refused(tmp_path):
+    """alpha-engine-config-I10870: a malformed consumers_ruling would silently
+    never fire `_consumers_ruling_override` (no override, clause stays UNMET)
+    rather than fail loud — so it is refused at load time instead."""
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["consumers_ruling"] = {"ruling": "Brian 2026-09-14 R7(a)"}  # no reason
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    with pytest.raises(DescriptorError, match="consumers_ruling is present but missing"):
+        descriptors.load_units(tmp_path)
+
+
+def test_a_consumers_ruling_renders_the_clause_met(tmp_path):
+    """A unit with `consumers: []` + a `consumers_ruling` block (R5/R7, plan
+    §7) reads MET on the consumers base clause, citing the ruling — never by
+    inventing a consumer. Mirrors D02/D14/D33's real descriptors."""
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["consumers"] = []
+    base["consumers_reason"] = "no reader wired"
+    base["consumers_ruling"] = {
+        "ruling": "Brian 2026-09-14 R7(a) (alpha-engine-config-I10748)",
+        "reason": "PIT substrate a backtest needs even with no reader wired today",
+    }
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    [unit] = descriptors.load_units(tmp_path)
+
+    clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
+    assert clause.met is True
+    assert "KEPT with no reader wired, by ruling" in clause.detail
+    assert "R7(a)" in clause.detail
+    assert clause.source == "registry.d/units (consumers_ruling)"
+
+
+def test_a_consumers_ruling_does_not_paper_over_a_real_reader_problem(tmp_path):
+    """A unit whose DECLARED consumers don't resolve still fails even with a
+    consumers_ruling block present — the override only fires for the
+    `consumers: []` + reason shape, never to mask an unresolved reader."""
+    base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
+    base["consumers"] = ["nousergon-data:this/path/does/not/exist.py"]
+    base["consumers_ruling"] = {"ruling": "Brian 2026-09-14 R7(a)", "reason": "irrelevant"}
+    (tmp_path / "D01-constituents.yaml").write_text(yaml.safe_dump(base))
+    [unit] = descriptors.load_units(tmp_path)
+
+    clause = clause_module._clause_base(EmptyStore(), unit, "consumers", trading_day=TRADING_DAY)
+    assert clause.met is False
+    assert "KEPT with no reader wired" not in clause.detail
+
+
 def test_a_filename_that_disagrees_with_the_unit_id_is_refused(tmp_path):
     base = yaml.safe_load((descriptors.UNITS_DIR / "D01-constituents.yaml").read_text())
     (tmp_path / "D99-constituents.yaml").write_text(yaml.safe_dump(base))

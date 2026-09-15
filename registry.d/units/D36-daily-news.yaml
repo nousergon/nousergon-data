@@ -32,9 +32,29 @@ trigger:
   successor: unchanged by v2 phase 4
   runs_on: "ec2-on-demand"
   detail: "daily-news.timer, 04:00 America/Los_Angeles"
+  # alpha-engine-config-I10871/I10870: machine-readable cadence for
+  # data_gate/cadence.py::unit_cadence — the AWS cron/named-day/weekdays
+  # shapes it parses only cover scheduled-once-a-week/weekday forms, not a
+  # daily systemd timer, so this is declared as `continuous` the same way
+  # news_digest_daily's own ARTIFACT_REGISTRY row already models the SAME
+  # timer (cadence: continuous, interval_minutes: 1440). Verified against
+  # infrastructure/systemd/daily-news.timer on origin/main:
+  # `OnCalendar=*-*-* 04:00:00 America/Los_Angeles`, `Persistent=true` — every
+  # calendar day, not weekday-gated.
+  cadence_minutes: 1440
 writes:
-  - data/news_aggregates_daily/
-  - data/news_articles_daily/
+  # alpha-engine-config-I10870: corrected from the bare prefixes
+  # "data/news_aggregates_daily/" / "data/news_articles_daily/" to the
+  # literal keys nousergon_lib.eval_artifacts.eval_latest_key() actually
+  # writes (data/derived/news_aggregates.py::aggregate_and_write,
+  # data/derived/news_articles.py::articles_build_and_write) — these are the
+  # PRIMARY artifacts the ARTIFACT_REGISTRY daily_news / daily_news_articles
+  # rows already cover; the bare-prefix spelling never matched either row's
+  # s3_key_template. The per-run dated parquet under each prefix
+  # (eval_artifact_key, variable {run_id}) is not separately registered —
+  # same eval-artifact pattern as every other producer using this module.
+  - data/news_aggregates_daily/latest.json
+  - data/news_articles_daily/latest.json
   - data/news_digest_daily/latest.json
 consumers:
   - "morning-signal:src/morning_signal/news_context.py"

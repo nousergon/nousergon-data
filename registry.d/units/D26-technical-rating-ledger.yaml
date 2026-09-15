@@ -51,8 +51,12 @@ contract:
   # boundary to pin a copy across. tests/test_technical_rating_ledger.py already
   # exercises that reader (its own docstring: "the realized-performance scorer"),
   # so the producer test doubles as the consumer-contract test here.
-registry_rows:
-  - "technical_rating_history (path_prefix, alpha-engine-config-PR10738)"
+registry_rows: []
+# alpha-engine-config-I10870: `technical_rating_history` was never a real
+# ARTIFACT_REGISTRY artifact_id — both writes[] entries are already covered
+# by the market_data/technicals/rating_history/ grandfathered path_prefix
+# (ARTIFACT_REGISTRY.yaml), which is what the removed entry's own
+# "(path_prefix, ...)" parenthetical was pointing at without ever resolving.
 run_manifest_prefix: data_collection/runs/D26
 detectors:
   - kind: "freshness-monitor"

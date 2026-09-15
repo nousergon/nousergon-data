@@ -301,6 +301,10 @@ def main(argv: list[str] | None = None) -> int:
     # unit uses, so a hand-run repair leaves a record (plan §4.4).
     import run_units
 
+    # In-region only (alpha-engine-config-I9771): refuse before touching
+    # ArcticDB or the price-cache parquets at all, not just before the write.
+    run_units.require_in_region("repair_macro_series")
+
     def _body(ctx):
         results = []
         for symbol in [s.strip() for s in args.symbols.split(",") if s.strip()]:

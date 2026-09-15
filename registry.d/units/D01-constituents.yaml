@@ -46,7 +46,12 @@ contract:
     - "crucible:crucible/data/universe.py"
 registry_rows:
   - constituents_dated
-  - latest_weekly
+  # alpha-engine-config-I10870: the row for market_data/latest_weekly.json is
+  # named weekly_collector_latest_pointer, not latest_weekly — the id below
+  # was never a real artifact_id (config#1239's own row comment names the
+  # producer and the correct id). Corrected; the key itself was already
+  # covered via the by_template match, only this id reference was stale.
+  - weekly_collector_latest_pointer
 run_manifest_prefix: data_collection/runs/D01
 detectors:
   - kind: "freshness-monitor"

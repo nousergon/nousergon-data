@@ -64,7 +64,11 @@ from typing import Any
 import yaml
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from data_gate.descriptors import UNITS_DIR, load_units  # noqa: E402
+from data_gate.descriptors import (  # noqa: E402
+    EXTERNALLY_OWNED_OBSERVABILITY_ROWS,
+    UNITS_DIR,
+    load_units,
+)
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 OUT_DIR = REPO_ROOT / "registry.d"
@@ -74,9 +78,12 @@ OUT_DIR = REPO_ROOT / "registry.d"
 #: elsewhere silently drops out of the coverage check's denominator, so the
 #: test (`tests/test_observability_row_coverage.py`) asserts every entry here
 #: names a row that actually exists in `nous-ergon-ops`.
-EXTERNALLY_OWNED_ROWS: dict[str, str] = {
-    "D39": "nousergon-data-inst-ownership-weekly",
-}
+#: alpha-engine-config-I10870: moved to `data_gate/descriptors.py` as
+#: `EXTERNALLY_OWNED_OBSERVABILITY_ROWS`, the single source of truth this
+#: module and `data_gate/unit_readers.py::read_observability_row` both read —
+#: aliased here so callers importing `gen.EXTERNALLY_OWNED_ROWS` (this
+#: module's own tests included) keep working.
+EXTERNALLY_OWNED_ROWS: dict[str, str] = EXTERNALLY_OWNED_OBSERVABILITY_ROWS
 
 #: `observability_registry.py::SUBSTRATES` is a closed set. Every
 #: `trigger.kind` value used across the 46 unit descriptors must resolve here,

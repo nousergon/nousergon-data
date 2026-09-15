@@ -24,7 +24,7 @@ from typing import Any
 
 import yaml
 
-from data_gate.descriptors import REPO_ROOT, Unit
+from data_gate.descriptors import EXTERNALLY_OWNED_OBSERVABILITY_ROWS, REPO_ROOT, Unit
 from data_gate.evidence import GateStore, Reading
 from data_gate.sources import GATE_ROLE, GITHUB_TOKEN_ENV, SourceUnavailable
 
@@ -75,13 +75,24 @@ def _normalized(template: str) -> str:
 
 
 def _literal_prefix(template: str) -> str:
-    """Everything before the first placeholder or wildcard."""
-    cut = len(template)
-    for marker in ("{", "*"):
-        index = template.find(marker)
-        if index != -1:
-            cut = min(cut, index)
-    return template[:cut]
+    """Everything up to the first bare wildcard, with every ``{placeholder}``
+    normalized to a literal ``{}`` token first (alpha-engine-config-I10870).
+
+    Cutting at the first ``{`` (the old behaviour) meant a template with a
+    named placeholder BEFORE its final per-entity segment — e.g.
+    ``market_data/weekly/{date}/alternative/{ticker}.json`` — could never be
+    covered by a grandfathered path_prefix that spells the placeholder out
+    (``market_data/weekly/{date}/alternative/``, the same convention the
+    registry already uses for ``backtest/{trading_day}/.phases/``): the old
+    literal prefix stopped at ``market_data/weekly/``, shorter than any
+    prefix naming the placeholder, so ``startswith`` could never hold.
+    Normalizing both sides first (placeholder NAME is irrelevant to a prefix
+    match) fixes that without loosening anything — a template with no
+    placeholder before its wildcard normalizes to itself, unchanged.
+    """
+    normalized = _normalized(template)
+    index = normalized.find("*")
+    return normalized if index == -1 else normalized[:index]
 
 
 def _concrete(template: str) -> str:
@@ -129,7 +140,30 @@ def read_observability_row(unit: Unit, *, rows_dir: pathlib.Path | None = None) 
     (`scripts/gen_observability_rows.py`, nousergon-data-PR1713) that
     nous-ergon-ops' `gather_repo_descriptors.py` publishes to the console; the
     gate job checks out `main`, so this reads exactly what is published.
+
+    `EXTERNALLY_OWNED_OBSERVABILITY_ROWS` (alpha-engine-config-I10870) is the
+    one declared exception: a unit whose row is hand-authored in
+    `nous-ergon-ops` rather than generated here. This repo cannot read that
+    private repo to verify the row's content, so this is MET-by-declaration,
+    not a full read — the same honesty tier `read_artifact_registry`'s
+    grandfathered-prefix branch already uses for a key this reader cannot
+    itself confirm is fresh. Before this constant existed, the generator's
+    own docstring said D39's ops-side row was deliberate and this reader
+    still graded D39 UNMET for carrying no row of its own — two halves of the
+    same module disagreeing about the same unit.
     """
+    external = EXTERNALLY_OWNED_OBSERVABILITY_ROWS.get(unit.unit_id)
+    if external:
+        return Reading(
+            met=True,
+            detail=(
+                f"externally owned: nous-ergon-ops/governance/observability.d/{external}.yaml "
+                "(declared in EXTERNALLY_OWNED_OBSERVABILITY_ROWS — this repo cannot read that "
+                "private repo to verify content, only that the carve-out is declared)"
+            ),
+            evidence=(f"nous-ergon-ops:governance/observability.d/{external}.yaml", _descriptor_ref(unit)),
+            source="data_gate.descriptors.EXTERNALLY_OWNED_OBSERVABILITY_ROWS",
+        )
     directory = rows_dir or OBSERVABILITY_ROWS_DIR
     expected = f"registry.d/{unit.component_id}.yaml"
     index, failures = _observability_index(str(directory))
@@ -250,7 +284,11 @@ def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
         if str(row.get("s3_bucket") or "alpha-engine-research") != "alpha-engine-research":
             continue
         by_template.setdefault(_normalized(str(row.get("s3_key_template") or "")), []).append(row)
-    prefixes = [str(g.get("path_prefix") or "") for g in registry.grandfathered if g.get("path_prefix")]
+    prefixes = [
+        _normalized(str(g.get("path_prefix") or ""))
+        for g in registry.grandfathered
+        if g.get("path_prefix")
+    ]
 
     registered: list[str] = []
     grandfathered: list[str] = []
