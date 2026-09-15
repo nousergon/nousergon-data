@@ -139,6 +139,13 @@ jobs:
     name: data-gate-read
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # alpha-engine-config-I10823: the `consumers` column resolves each declared
+    # reader path on its repository's default branch through the GitHub
+    # contents API, with this run's own short-lived token (`contents: read`
+    # reads any public repository; no PAT). A dedicated variable name so a
+    # hermetic test run never picks one up by accident.
+    env:
+      DATA_GATE_GITHUB_TOKEN: ${{ github.token }}
     outputs:
       gate_exit_code: ${{ steps.gate_read.outputs.exit_code }}
       cutover_gate_exit_code: ${{ steps.gate_read_cutover.outputs.exit_code }}

@@ -15,6 +15,7 @@ renders complete over a unit nobody declared.
 from __future__ import annotations
 
 import pathlib
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -81,6 +82,18 @@ NA_TAXONOMY: frozenset[str] = frozenset(
     }
 )
 
+#: The shape `run_manifest_retention` must take: a positive integer count of
+#: days (`alpha-engine-config-I10831` deliverable 3; precedent: D37's
+#: `run_manifest_retention: 400 days`). A free-text value is exactly the kind
+#: of undeclared knob the field exists to end.
+_RETENTION_PATTERN = re.compile(r"^\d+\s+days$")
+
+#: A unit firing more than once an hour takes one manifest per tick, not one
+#: per day — its `run_manifest_prefix` is high-cardinality and its S3 cost is
+#: a decision, not a default. `trigger.cadence_minutes` mirrors the field name
+#: `nous-ergon-ops` registry rows already use for the same fact.
+_SUB_HOURLY_MINUTES = 60
+
 _REQUIRED_TOP_LEVEL = (
     "unit_id",
     "component_id",
@@ -132,6 +145,16 @@ class Unit:
         return str(self.raw["lifecycle"])
 
     @property
+    def retired(self) -> bool:
+        """Declared retired — every clause renders RETIRED and grades nothing."""
+        return self.lifecycle == "retired"
+
+    @property
+    def retirement_summary(self) -> str:
+        block = self.raw.get("retirement") or {}
+        return f"{str(block.get('ruling')).strip()} — {' '.join(str(block.get('reason')).split())}"
+
+    @property
     def component(self) -> int:
         return int(self.raw.get("component", 1))
 
@@ -165,6 +188,19 @@ class Unit:
     def run_manifest_prefix(self) -> str:
         return str(self.raw["run_manifest_prefix"])
 
+    @property
+    def cadence_minutes(self) -> int | None:
+        trigger = self.raw.get("trigger") or {}
+        value = trigger.get("cadence_minutes")
+        return None if value is None else int(value)
+
+    @property
+    def run_manifest_retention_days(self) -> int | None:
+        retention = self.raw.get("run_manifest_retention")
+        if retention is None:
+            return None
+        return int(str(retention).strip().split()[0])
+
 
 def _check_na(where: str, block: dict[str, Any], unit_id: str) -> None:
     """A not-applicable declaration carries a code from the closed taxonomy."""
@@ -182,6 +218,60 @@ def _check_na(where: str, block: dict[str, Any], unit_id: str) -> None:
             f"observability-policy §3.5's closed taxonomy {sorted(NA_TAXONOMY)}. A code "
             "outside the set is a new engineering state nobody has defined a rendering "
             "for."
+        )
+
+
+def _check_retention(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> None:
+    """A sub-hourly unit declares a validated `run_manifest_retention`.
+
+    `alpha-engine-config-I10831` deliverable 3. D37 (metron-intraday, 5-minute
+    cadence) is the precedent this generalizes: ~288 manifests/day against
+    ~1/day for every other unit is a bucket-cost decision that belongs on the
+    record, not left to the bucket's default. A cadence at or above 60 minutes
+    is exempt — the field is optional there, but if declared anyway its shape
+    is still checked, so a stray declaration can never silently mean nothing.
+    """
+    trigger = document.get("trigger") or {}
+    raw_cadence = trigger.get("cadence_minutes")
+    cadence_minutes: int | None = None
+    if raw_cadence is not None:
+        try:
+            cadence_minutes = int(raw_cadence)
+        except (TypeError, ValueError):
+            raise DescriptorError(
+                f"{path.name}: trigger.cadence_minutes must be an integer number of "
+                f"minutes, got {raw_cadence!r}."
+            )
+        if cadence_minutes <= 0:
+            raise DescriptorError(
+                f"{path.name}: trigger.cadence_minutes must be positive, got {cadence_minutes}."
+            )
+
+    retention = document.get("run_manifest_retention")
+    reason = document.get("run_manifest_retention_reason")
+    sub_hourly = cadence_minutes is not None and cadence_minutes < _SUB_HOURLY_MINUTES
+
+    if retention is None:
+        if sub_hourly:
+            raise DescriptorError(
+                f"{unit_id}: trigger.cadence_minutes={cadence_minutes} is sub-hourly — its "
+                "run_manifest_prefix takes one manifest per tick, not one per day — so it "
+                "must declare `run_manifest_retention` (`<int> days`) and "
+                "`run_manifest_retention_reason`. A missing declaration leaves the bucket's "
+                "default to decide a cost nobody chose (precedent: D37)."
+            )
+        return
+
+    if not _RETENTION_PATTERN.match(str(retention).strip()):
+        raise DescriptorError(
+            f"{unit_id}: run_manifest_retention {retention!r} is not `<positive integer> "
+            "days` — the only shape this field is declared to accept."
+        )
+    if not str(reason or "").strip():
+        raise DescriptorError(
+            f"{unit_id}: run_manifest_retention is declared with no "
+            "run_manifest_retention_reason. A retention number with no rationale is a knob "
+            "nobody can safely change later."
         )
 
 
@@ -250,6 +340,26 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
     if completeness.get("status") == "not_applicable":
         _check_na("completeness", completeness, unit_id)
 
+    if document["lifecycle"] == "retired":
+        # `alpha-engine-config-I10823` deliverable 6. A retired unit's clauses
+        # stop grading and render RETIRED with this block's reason — so a
+        # retirement with no ruling or no reason would silently remove a unit
+        # from every denominator on nobody's say-so. A retirement without a
+        # reason is not a fact.
+        retirement = document.get("retirement")
+        missing_fields = [
+            name
+            for name in ("ruling", "reason")
+            if not isinstance(retirement, dict) or not str(retirement.get(name) or "").strip()
+        ]
+        if missing_fields:
+            raise DescriptorError(
+                f"{path.name}: lifecycle is 'retired' but the `retirement:` block is missing or has "
+                f"no {missing_fields}. Retiring a unit removes it from every gate's denominator; "
+                "that needs the ruling that retired it and the reason, or it is a unit that "
+                "disappeared (observability-policy §8.3: RETIRED is declared, never inferred)."
+            )
+
     if not document["consumers"] and not str(document.get("consumers_reason") or "").strip():
         raise DescriptorError(
             f"{path.name}: declares no consumers and gives no reason. Plan §3's rule: a key "
@@ -257,6 +367,8 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
             "`consumers: []` WITH a reason, which renders as a finding. An empty list with "
             "no reason renders as nothing at all."
         )
+
+    _check_retention(unit_id, document, path)
 
 
 def load_units(directory: pathlib.Path | None = None) -> list[Unit]:

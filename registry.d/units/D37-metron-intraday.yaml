@@ -32,6 +32,7 @@ trigger:
   successor: unchanged by v2 phase 4
   runs_on: "ec2-on-demand"
   detail: "metron-intraday.timer, *:00/5:00, NYSE-session gated"
+  cadence_minutes: 5
 writes:
   - market_data/intraday/latest.json
   - market_data/intraday/technical_ratings.json
@@ -58,15 +59,15 @@ run_manifest_prefix: data_collection/runs/D37
 # bucket's default so the cost of the run-record objective is a decision on the
 # record, not a surprise on a bill (alpha-engine-config-I10810).
 #
-# SCHEMA GAP, stated rather than worked around: `data_gate/descriptors.py`
-# neither requires nor validates these two keys — it checks a REQUIRED list and
-# ignores extras, so nothing enforces the shape and nothing enforces that a
-# high-cardinality prefix declares one at all. The key NAMES mirror the only
-# existing precedent in this tree, `registry.d/ae-preflight-sweep.yaml`'s
-# `retention` / `retention_reason` pair. Neither this declaration nor that one
-# is wired to an S3 lifecycle rule; applying it is ops-plane work in
-# `nous-ergon-ops`, and until it lands this states the intent and nothing
-# deletes anything.
+# `data_gate/descriptors.py` now validates both keys (alpha-engine-config-
+# I10831 deliverable 3): `trigger.cadence_minutes` below marks this unit
+# sub-hourly, which requires `run_manifest_retention` in `<int> days` shape
+# plus a non-empty `run_manifest_retention_reason`, refusing to load
+# otherwise. The key NAMES mirror the only other precedent in this tree,
+# `registry.d/ae-preflight-sweep.yaml`'s `retention` / `retention_reason`
+# pair. Neither declaration is wired to an S3 lifecycle rule; applying one is
+# ops-plane work in `nous-ergon-ops`, and until it lands this states the
+# intent and nothing deletes anything.
 run_manifest_retention: 400 days
 run_manifest_retention_reason: >-
     Longer than a year so a full seasonal cycle of session slots is available to

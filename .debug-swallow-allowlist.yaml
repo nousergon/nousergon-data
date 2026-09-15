@@ -45,29 +45,32 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 2443
+    line: 2471
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer.
+      data, feeds no downstream consumer. (Line shifted from 2443 by
+      alpha-engine-config-I10831's re-tagging comments; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 3728
+    line: 3756
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer.
+      data, feeds no downstream consumer. (Line shifted from 3728 by
+      alpha-engine-config-I10831's re-tagging comments; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 3889
+    line: 3917
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
-      data, feeds no downstream consumer.
+      data, feeds no downstream consumer. (Line shifted from 3889 by
+      alpha-engine-config-I10831's re-tagging comments; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
