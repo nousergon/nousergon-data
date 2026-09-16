@@ -64,10 +64,15 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["unit_id", "reason"],
+        "required": ["unit_id", "reason", "class"],
         "properties": {
           "unit_id": {"type": "string"},
-          "reason": {"type": "string", "minLength": 1}
+          "reason": {"type": "string", "minLength": 1},
+          "class": {
+            "type": "string",
+            "enum": ["hand_excluded", "lifecycle", "out_of_run_scope"],
+            "description": "hand_excluded: EXCLUDED_UNITS (a declared, reviewable exception). lifecycle: no live v1 producer for this unit's declared lifecycle. out_of_run_scope: the unit produced no run manifest under this shadow run — it was not part of the workload the run executed (alpha-engine-config-I10890)."
+          }
         }
       }
     },
@@ -140,6 +145,14 @@
           "properties": {
             "compared_cells": {"type": "integer", "minimum": 0},
             "breaches": {"type": "integer", "minimum": 0},
+            "examples": {"type": "array"}
+          }
+        },
+        "provenance_diffs": {
+          "type": "object",
+          "description": "Differences confined to fields the resolved contract marks `x-provenance` (alpha-engine-config-I10894) — e.g. `revision`, `fetched_at`. Reported as information; NEVER counted in `values.breaches` and never met-breaking.",
+          "properties": {
+            "count": {"type": "integer", "minimum": 0},
             "examples": {"type": "array"}
           }
         },

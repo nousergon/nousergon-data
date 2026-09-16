@@ -527,3 +527,280 @@ def test_the_gate_reads_the_key_this_tool_publishes():
 
     assert evidence.parity_store_key(TRADING_DAY) == parity.parity_key(TRADING_DAY)
     assert parity.parity_key(TRADING_DAY) == "parity/2026-09-12.json"
+
+
+# ---------------------------------------------------------------------------
+# I10890: parity scoped to the units the shadow run actually executed
+# ---------------------------------------------------------------------------
+
+
+def _manifest_bytes(unit_id: str, finished: str, output_keys: Iterable[str]) -> bytes:
+    return json.dumps(
+        {
+            "schema_version": "data_run_manifest.v1",
+            "unit_id": unit_id,
+            "finished": finished,
+            "outputs": [{"key": k, "rows_out": 1} for k in output_keys],
+        }
+    ).encode("utf-8")
+
+
+def _shadow_manifest_key(unit_id: str, trading_day: dt.date = TRADING_DAY, run_id: str = "run1") -> str:
+    return ROOT.key(f"data_collection/runs/{unit_id}/{trading_day.isoformat()}/{run_id}.json")
+
+
+def _v1_manifest_key(unit_id: str, trading_day: dt.date = TRADING_DAY, run_id: str = "run1") -> str:
+    return f"data_collection/runs/{unit_id}/{trading_day.isoformat()}/{run_id}.json"
+
+
+def test_a_unit_absent_from_the_run_manifests_lands_in_out_of_run_scope_not_shadow_missing():
+    """A weekday shadow run that only ran D17 must not grade D18 at all — not
+    as `in_region_only`, not as anything a real shadow run could not fix."""
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    live_key = "staging/daily_closes/2026-09-12.parquet"
+    reader = _FakeReader(
+        {
+            live_key: payload,
+            ROOT.key(live_key): payload,
+            _shadow_manifest_key("D17"): _manifest_bytes("D17", "2026-09-12T20:00:00Z", [live_key]),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY,
+        bucket="alpha-engine-research",
+        reader=reader,
+        units=_one_unit("D17") + _one_unit("D18"),
+    )
+    assert [row.key for row in report.rows] == [live_key]
+    assert report.summary["in_region_only"] == 0
+    excluded = {e["unit_id"]: e for e in report.excluded}
+    assert excluded["D18"]["class"] == "out_of_run_scope"
+    assert "D18" not in {uid for row in report.rows for uid in row.unit_ids}
+
+
+def test_a_unit_present_in_the_manifests_is_still_graded():
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    live_key = "staging/daily_closes/2026-09-12.parquet"
+    reader = _FakeReader(
+        {
+            live_key: payload,
+            ROOT.key(live_key): payload,
+            _shadow_manifest_key("D17"): _manifest_bytes("D17", "2026-09-12T20:00:00Z", [live_key]),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D17")
+    )
+    assert report.summary["match"] == 1
+    assert not any(e["unit_id"] == "D17" for e in report.excluded)
+
+
+def test_a_prefix_family_compares_only_the_trading_days_manifest_keys():
+    """D04 (a `prefix` target) must never be diffed by listing the live
+    prefix — only the keys the run manifests declare for THIS trading day."""
+    member = "reference/price_cache/AAPL.parquet"
+    stray = "reference/price_cache/ZZZZ_stale_from_another_day.parquet"
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _FakeReader(
+        {
+            member: payload,
+            ROOT.key(member): payload,
+            stray: b"stale bytes nobody's manifest declares",
+            _shadow_manifest_key("D04"): _manifest_bytes("D04", "2026-09-12T20:00:00Z", [member]),
+            _v1_manifest_key("D04"): _manifest_bytes("D04", "2026-09-12T19:00:00Z", [member]),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D04")
+    )
+    assert [row.key for row in report.rows] == [member]
+    assert report.summary["match"] == 1
+    assert not any("max-keys-per-prefix" in (row.body.get("unmeasurable_reason") or "") for row in report.rows)
+
+
+def test_a_51_object_historical_prefix_does_not_produce_unmeasurable():
+    member = "reference/price_cache/AAPL.parquet"
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    objects = {member: payload, ROOT.key(member): payload}
+    for i in range(51):
+        objects[f"reference/price_cache/historical_{i:03d}.parquet"] = b"not for this trading day"
+    objects[_shadow_manifest_key("D04")] = _manifest_bytes("D04", "2026-09-12T20:00:00Z", [member])
+    objects[_v1_manifest_key("D04")] = _manifest_bytes("D04", "2026-09-12T19:00:00Z", [member])
+    report = parity.run_parity(
+        trading_day=TRADING_DAY,
+        bucket="alpha-engine-research",
+        reader=_FakeReader(objects),
+        units=_one_unit("D04"),
+        max_keys_per_prefix=50,
+    )
+    assert report.summary["unmeasurable"] == 0
+    assert [row.key for row in report.rows] == [member]
+
+
+def test_a_prefix_family_with_no_v1_manifest_for_the_trading_day_is_unmeasurable():
+    member = "reference/price_cache/AAPL.parquet"
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _FakeReader(
+        {
+            member: payload,
+            ROOT.key(member): payload,
+            _shadow_manifest_key("D04"): _manifest_bytes("D04", "2026-09-12T20:00:00Z", [member]),
+            # no v1 manifest under data_collection/runs/D04/2026-09-12/ at all
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D04")
+    )
+    assert report.summary["unmeasurable"] == 1
+    assert "no v1 manifest for trading day" in report.rows[0].body["unmeasurable_reason"]
+
+
+def test_no_manifest_evidence_anywhere_falls_back_to_the_old_full_listing():
+    """An empty manifest listing (a unit list handed in without ever running
+    `shadow run`) must not silently exclude everything — it grades as
+    before I10890, the more conservative of the two behaviours."""
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    live_key = "staging/daily_closes/2026-09-12.parquet"
+    reader = _FakeReader({live_key: payload, ROOT.key(live_key): payload})
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D17")
+    )
+    assert report.summary["match"] == 1
+    assert not any(e["class"] == "out_of_run_scope" for e in report.excluded)
+
+
+def test_the_shadow_prefix_accumulating_across_attempts_keeps_only_the_latest_manifest():
+    """I10890 gotcha: four shadow attempts left four D17 manifests on one day.
+    The stale attempt's own declared output must not appear as a candidate."""
+    current = "staging/daily_closes/2026-09-12.parquet"
+    stale = "staging/daily_closes/2026-09-12-attempt1-only.parquet"
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _FakeReader(
+        {
+            current: payload,
+            ROOT.key(current): payload,
+            _shadow_manifest_key("D17", run_id="attempt1"): _manifest_bytes(
+                "D17", "2026-09-12T14:50:00Z", [stale]
+            ),
+            _shadow_manifest_key("D17", run_id="attempt4"): _manifest_bytes(
+                "D17", "2026-09-12T19:17:00Z", [current]
+            ),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D17")
+    )
+    assert [row.key for row in report.rows] == [current]
+
+
+# ---------------------------------------------------------------------------
+# I10894: provenance fields (revision, fetched_at) are declared, not counted
+# as data breaches
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_contract_reads_the_declared_key_pattern_and_provenance_fields():
+    contract = parity.resolve_contract("staging/daily_closes/2026-09-12.parquet")
+    assert contract is not None
+    assert contract.provenance_fields == frozenset({"revision"})
+
+    contract = parity.resolve_contract("market_data/weekly/2026-09-12/constituents.json")
+    assert contract is not None
+    assert contract.provenance_fields == frozenset({"fetched_at"})
+
+    assert parity.resolve_contract("no/such/key.json") is None
+
+
+def test_a_parquet_pair_differing_only_in_revision_is_match_under_provenance_diffs():
+    import pandas as pd
+
+    live = pd.DataFrame({"ticker": ["AAPL"], "Close": [100.0], "revision": [2]})
+    shadow = pd.DataFrame({"ticker": ["AAPL"], "Close": [100.0], "revision": [3]})
+    key = "staging/daily_closes/2026-09-12.parquet"
+    contract = parity.resolve_contract(key)
+    body = parity.compare_bytes(
+        key, _parquet(live), _parquet(shadow), rel=1e-6, absolute=1e-9, contract=contract
+    )
+    assert body["verdict"] == "match"
+    assert body["values"]["breaches"] == 0
+    assert body["provenance_diffs"]["count"] == 1
+    assert body["provenance_diffs"]["examples"][0]["column"] == "revision"
+
+
+def test_a_parquet_pair_differing_in_close_still_mismatches_with_a_contract_present():
+    import pandas as pd
+
+    live = pd.DataFrame({"ticker": ["AAPL"], "Close": [100.0], "revision": [2]})
+    shadow = pd.DataFrame({"ticker": ["AAPL"], "Close": [101.0], "revision": [2]})
+    key = "staging/daily_closes/2026-09-12.parquet"
+    contract = parity.resolve_contract(key)
+    body = parity.compare_bytes(
+        key, _parquet(live), _parquet(shadow), rel=1e-6, absolute=1e-9, contract=contract
+    )
+    assert body["verdict"] == "mismatch"
+    assert body["values"]["breaches"] == 1
+    assert body["values"]["examples"][0]["column"] == "Close"
+    assert body["provenance_diffs"]["count"] == 0
+
+
+def test_a_schemaless_key_still_red_defaults_every_field_as_data():
+    """No contract resolved -> `revision` is not exempted from anything."""
+    import pandas as pd
+
+    live = pd.DataFrame({"ticker": ["AAPL"], "revision": [2]})
+    shadow = pd.DataFrame({"ticker": ["AAPL"], "revision": [3]})
+    body = parity.compare_bytes(
+        "no/contract/for/this.parquet", _parquet(live), _parquet(shadow), rel=1e-6, absolute=1e-9
+    )
+    assert body["verdict"] == "mismatch"
+    assert body["values"]["breaches"] == 1
+    assert body["provenance_diffs"]["count"] == 0
+
+
+def test_a_json_pair_differing_only_in_fetched_at_is_match_under_provenance_diffs():
+    live = json.dumps({"date": "2026-09-12", "fetched_at": "12:18:49Z", "sp500_count": 503}).encode()
+    shadow = json.dumps({"date": "2026-09-12", "fetched_at": "19:17:03Z", "sp500_count": 503}).encode()
+    key = "market_data/weekly/2026-09-12/constituents.json"
+    contract = parity.resolve_contract(key)
+    body = parity.compare_bytes(key, live, shadow, rel=1e-6, absolute=1e-9, contract=contract)
+    assert body["verdict"] == "match"
+    assert body["values"]["breaches"] == 0
+    assert body["provenance_diffs"]["count"] == 1
+    assert "fetched_at" in body["provenance_diffs"]["examples"][0]
+
+
+def test_a_json_pair_differing_in_a_data_field_still_mismatches_with_a_contract_present():
+    live = json.dumps({"date": "2026-09-12", "fetched_at": "12:18:49Z", "sp500_count": 503}).encode()
+    shadow = json.dumps({"date": "2026-09-12", "fetched_at": "12:18:49Z", "sp500_count": 502}).encode()
+    key = "market_data/weekly/2026-09-12/constituents.json"
+    contract = parity.resolve_contract(key)
+    body = parity.compare_bytes(key, live, shadow, rel=1e-6, absolute=1e-9, contract=contract)
+    assert body["verdict"] == "mismatch"
+    assert body["values"]["breaches"] == 1
+    assert body["provenance_diffs"]["count"] == 0
+
+
+def test_the_report_schema_accepts_excluded_class_and_provenance_diffs():
+    """The producer contract test for the two schema additions."""
+    import jsonschema
+
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    live_key = "staging/daily_closes/2026-09-12.parquet"
+    reader = _FakeReader(
+        {
+            live_key: payload,
+            ROOT.key(live_key): payload,
+            _shadow_manifest_key("D17"): _manifest_bytes("D17", "2026-09-12T20:00:00Z", [live_key]),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY,
+        bucket="alpha-engine-research",
+        reader=reader,
+        units=_one_unit("D17") + _one_unit("D18"),
+    )
+    schema = json.loads(
+        (REPO_ROOT / "contracts" / "data_parity_report.schema.json").read_text(encoding="utf-8")
+    )
+    jsonschema.validate(report.as_dict(), schema)
+    assert any(e["class"] == "out_of_run_scope" for e in report.excluded)
