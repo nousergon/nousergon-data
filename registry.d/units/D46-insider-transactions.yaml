@@ -69,7 +69,17 @@ contract:
   producer_test: null
   consumer_pins: []
 registry_rows: []
-run_manifest_prefix: data_collection/runs/D46
+# alpha-engine-config-I10753: points at D16's manifest, not a `D46`-shaped
+# prefix of its own. D46 has no standalone dispatcher entry point (see
+# trigger.successor) — `rag.pipelines.run_weekly_ingestion_recorded` (D16's
+# wrapper) records D46's declared `writes:` keys into the SAME
+# `data_run_manifest.v1` it already writes for D16
+# (`OUTPUT_PREFIXES` includes `data/insider_transactions/`). The dispatcher's
+# completion check reads `run_manifest_prefix` per-unit
+# (`index.py::_check_unit`), so naming "D46" in a schedule's `verify_units`
+# grades these same keys against D46's own `writes:`/floor without a second
+# manifest or a second script run.
+run_manifest_prefix: data_collection/runs/D16
 detectors: []
 freshness:
   family: weekly
@@ -146,5 +156,15 @@ clause_phase:
 notes: >-
     alpha-engine-config-I10753: covered by the `rag-weekly-ingestion` workload
     (shared with D16, see `trigger.successor`) — no standalone dispatcher key.
-    Its consumer's survival past phase 4 is confirmed at the data-cutover-ready
-    gate, not assumed here.
+    D46 is now named in the `weekly` schedule's `verify_units`
+    (`infrastructure/cloudformation/nousergon-data-collection.yaml`) and its
+    `run_manifest_prefix` points at D16's manifest (see the field's own
+    comment above) — without this, `data_gate.standalone.read_survives_phase4`
+    read D46 as having no covering schedule at all (neither a workload nor a
+    recorded retirement), which is a real UNMET, not the same
+    schedule-still-DISABLED UNMET D15/D16 read pre-cutover. Verified live via
+    `python -m data_gate read --gate data-cutover-ready --dry-run` on
+    2026-09-16: D15/D16 now UNMET only on "schedule DISABLED" (expected,
+    cutover-gated); D46 was UNMET on "no schedule ... lists it in
+    verify_units" before this fix. Its consumer's survival past phase 4 is
+    confirmed at the data-cutover-ready gate, not assumed here.
