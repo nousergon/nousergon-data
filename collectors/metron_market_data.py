@@ -212,6 +212,10 @@ ANALYST_SCHEMA_VERSION = 1  # consensus rating + price targets + #analysts (free
 SENTIMENT_SCHEMA_VERSION = 1  # LM news sentiment + event rollup (held-universe latest slice)
 BASE_CURRENCY = "USD"
 DEFAULT_HISTORY_PERIOD = "10y"  # mirrors the predictor price_cache 10y convention
+# Calendar lookback for a "latest bar on or before D" fetch (closes / fx): covers a
+# holiday-stretched week so D's (or the prior session's) bar is always inside the
+# window. Replaces ``period="5d"``, which ended at vendor "now" (alpha-engine-config-I10893).
+LATEST_BAR_LOOKBACK = "10d"
 BENCHMARK = "SPY"  # the attribution benchmark whose GICS sector weights we publish
 
 # yfinance ``funds_data.sector_weightings`` snake_case keys → canonical GICS label
@@ -383,9 +387,19 @@ def _log_yf_coverage(
 
 
 @_yf_quiet
-def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
-    """Latest daily close per yf_symbol via yfinance → ``{yf_symbol: (close, bar_date)}``.
-    Foreign listings (``.HK``/``.PA``/…) resolve natively. Unpriceable symbols omitted."""
+def _yfinance_closes(
+    yf_symbols: list[str], *, trading_day: "str | date | None" = None,
+) -> dict[str, tuple[float, str]]:
+    """Latest daily close on or before ``trading_day`` per yf_symbol via yfinance →
+    ``{yf_symbol: (close, bar_date)}``. Foreign listings (``.HK``/``.PA``/…) resolve
+    natively. Unpriceable symbols omitted. The fetch is bounded by
+    ``[trading_day − 10d, trading_day]`` (alpha-engine-config-I10893) so a rerun for D
+    executed on D+1 never reports D+1's partial session as D's close; ``None`` resolves
+    to the last closed session (``dates.default_run_date``), never wall-clock now."""
+    from dates import clip_to_trading_day, default_run_date, history_window
+
+    trading_day = str(trading_day) if trading_day is not None else default_run_date()
+    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -401,7 +415,7 @@ def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
         try:
             raw = yf.download(
                 tickers=batch[0] if len(batch) == 1 else batch,
-                period="5d", interval="1d", auto_adjust=False,
+                start=start.isoformat(), end=end_excl.isoformat(), interval="1d", auto_adjust=False,
                 progress=False, group_by="ticker", threads=True,
             )
             is_multi = isinstance(raw.columns, pd.MultiIndex)
@@ -409,7 +423,7 @@ def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
                 try:
                     df = (raw[sym] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = df.dropna(subset=["Close"])
+                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"closes[{sym}]")
                     if df.empty:
                         continue
                     last = df.iloc[-1]
@@ -425,11 +439,19 @@ def _yfinance_closes(yf_symbols: list[str]) -> dict[str, tuple[float, str]]:
 
 
 @_yf_quiet
-def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, float]:
-    """Latest FX rate per currency via yfinance ``{CCY}{BASE}=X`` → ``{CCY: rate}``
-    (``base`` per 1 unit of ``CCY``). Unresolvable pairs omitted — no fabrication."""
+def _yfinance_fx(
+    currencies: list[str], base: str = BASE_CURRENCY, *, trading_day: "str | date | None" = None,
+) -> dict[str, float]:
+    """Latest FX rate on or before ``trading_day`` per currency via yfinance
+    ``{CCY}{BASE}=X`` → ``{CCY: rate}`` (``base`` per 1 unit of ``CCY``). Unresolvable
+    pairs omitted — no fabrication. Bounded like :func:`_yfinance_closes`
+    (alpha-engine-config-I10893)."""
     if not currencies:
         return {}
+    from dates import clip_to_trading_day, default_run_date, history_window
+
+    trading_day = str(trading_day) if trading_day is not None else default_run_date()
+    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -444,14 +466,14 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
     try:
         raw = yf.download(
             tickers=list(pairs) if len(pairs) > 1 else next(iter(pairs)),
-            period="5d", interval="1d", auto_adjust=False,
+            start=start.isoformat(), end=end_excl.isoformat(), interval="1d", auto_adjust=False,
             progress=False, group_by="ticker", threads=True,
         )
         is_multi = isinstance(raw.columns, pd.MultiIndex)
         for pair, ccy in pairs.items():
             try:
                 df = (raw[pair] if is_multi else raw).copy()
-                df = df.dropna(subset=["Close"])
+                df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"fx[{pair}]")
                 if df.empty:
                     continue
                 out[ccy] = round(float(df.iloc[-1]["Close"]), 6)
@@ -466,11 +488,15 @@ def _yfinance_fx(currencies: list[str], base: str = BASE_CURRENCY) -> dict[str, 
 
 @_yf_quiet
 def _yf_history(
-    symbols: list[str], period: str, *, is_fx: bool = False, base: str = BASE_CURRENCY,
-    auto_adjust: bool = False,
+    symbols: list[str], period: str, *, trading_day: "str | date", is_fx: bool = False,
+    base: str = BASE_CURRENCY, auto_adjust: bool = False,
 ) -> dict[str, list[tuple[str, float]]]:
-    """Daily close series per symbol via yfinance over ``period`` →
-    ``{key: [(bar_date, close), …]}`` ascending. ``is_fx`` maps a currency to the
+    """Daily close series per symbol via yfinance over ``[trading_day − period,
+    trading_day]`` → ``{key: [(bar_date, close), …]}`` ascending. The window is
+    explicit ``start``/``end`` derived from ``trading_day`` (required,
+    alpha-engine-config-I10893) — never ``period=``, which ends at vendor "now" and
+    published a pre-close D+1 bar into ``fx_history`` on a ``--date D`` rerun, with a
+    start that drifted with wall-clock time. ``is_fx`` maps a currency to the
     ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted.
     ``auto_adjust`` selects the basis (config#1865): ``False`` (default) is split-adjusted-
     only; ``True`` is dividend-adjusted, matching the price_cache basis (see
@@ -483,9 +509,12 @@ def _yf_history(
         logger.warning("[metron_market_data] yfinance/pandas unavailable for history")
         return {}
 
+    from dates import clip_to_trading_day, history_window
+
     targets = {f"{c}{base}=X": c for c in symbols if c and c != base} if is_fx else {s: s for s in symbols if s}
     if not targets:
         return {}
+    start, end_excl = history_window(trading_day, period)
     out: dict[str, list[tuple[str, float]]] = {}
     keys = list(targets)
     batches = [keys[i:i + _YFINANCE_BATCH_SIZE] for i in range(0, len(keys), _YFINANCE_BATCH_SIZE)]
@@ -493,14 +522,15 @@ def _yf_history(
         if i > 0:
             time.sleep(_YFINANCE_BATCH_DELAY)
         try:
-            raw = yf.download(tickers=batch[0] if len(batch) == 1 else batch, period=period,
+            raw = yf.download(tickers=batch[0] if len(batch) == 1 else batch,
+                              start=start.isoformat(), end=end_excl.isoformat(),
                               interval="1d", auto_adjust=auto_adjust, progress=False, group_by="ticker", threads=True)
             is_multi = isinstance(raw.columns, pd.MultiIndex)
             for key in batch:
                 try:
                     df = (raw[key] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = df.dropna(subset=["Close"])
+                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"history[{key}]")
                     if df.empty:
                         continue
                     out[targets[key]] = [(d.date().isoformat(), round(float(c), 6)) for d, c in df["Close"].items()]
@@ -513,24 +543,26 @@ def _yf_history(
     return out
 
 
-def _yfinance_close_history(yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
+def _yfinance_close_history(
+    yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD, *, trading_day: "str | date",
+) -> dict[str, list[tuple[str, float]]]:
     """Legacy split-only-adjusted (``auto_adjust=False``) yfinance fetch. No longer
     ``collect_history``'s default source (config#1865: superseded by
     ``_price_cache_close_history``, which reads the dividend-adjusted price_cache and
     gap-fills via ``_yfinance_close_history_dividend_adjusted``) — kept for direct callers/
     tests that want the pre-#1865 split-only basis explicitly."""
-    return _yf_history(yf_symbols, period, is_fx=False)
+    return _yf_history(yf_symbols, period, trading_day=trading_day, is_fx=False)
 
 
 def _yfinance_close_history_dividend_adjusted(
-    yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD,
+    yf_symbols: list[str], period: str = DEFAULT_HISTORY_PERIOD, *, trading_day: "str | date",
 ) -> dict[str, list[tuple[str, float]]]:
     """Dividend-adjusted (``auto_adjust=True``) yfinance fetch — same basis as
     ``reference/price_cache/`` (see ``collectors/prices.py``). Used by
     ``_price_cache_close_history`` to gap-fill symbols price_cache doesn't cover, so a
     published close_history series is never a split-only/dividend-adjusted chimera
     (config#1865)."""
-    return _yf_history(yf_symbols, period, is_fx=False, auto_adjust=True)
+    return _yf_history(yf_symbols, period, trading_day=trading_day, is_fx=False, auto_adjust=True)
 
 
 def _period_to_timedelta(period: str) -> Any:
@@ -608,13 +640,19 @@ def _price_cache_close_series(
 
     import pandas as pd
 
-    cutoff = pd.Timestamp.now(tz="UTC").tz_localize(None) - _period_to_timedelta(period)
-    trimmed = df.loc[df.index >= cutoff, "Close"].dropna()
+    # alpha-engine-config-I10893: the lookback window is anchored on the run's
+    # trading day, not wall-clock now, and bars dated after it are out of the
+    # window — a price_cache parquet refreshed on D+1 must not leak D+1 into a
+    # close_history series published for D.
+    ref_day = reference_day or last_closed_trading_day()
+    ref_ts = pd.Timestamp(ref_day)
+    cutoff = ref_ts - _period_to_timedelta(period)
+    idx = pd.to_datetime(df.index)
+    trimmed = df.loc[(idx >= cutoff) & (idx.normalize() <= ref_ts), "Close"].dropna()
     if trimmed.empty:
         return None
 
     latest_date = trimmed.index.max().date()
-    ref_day = reference_day or last_closed_trading_day()
     if not is_fresh_in_trading_days(latest_date, ref_day, max_stale=PRICE_CACHE_MAX_STALE_TRADING_DAYS):
         logger.info(
             "[metron_market_data] price_cache stale for %s: latest cached bar %s is %d "
@@ -673,7 +711,9 @@ def _price_cache_close_history(
                 from_cache[sym] = series
             else:
                 gaps.append(sym)
-        gap_filled = _yfinance_close_history_dividend_adjusted(gaps, period) if gaps else {}
+        gap_filled = (
+            _yfinance_close_history_dividend_adjusted(gaps, period, trading_day=ref_day) if gaps else {}
+        )
         logger.info(
             "[metron_market_data] close_history: %d/%d symbols from price_cache, "
             "%d yfinance gap-fill (dividend-adjusted basis, config#1865; includes "
@@ -685,8 +725,10 @@ def _price_cache_close_history(
     return _source
 
 
-def _yfinance_fx_history(currencies: list[str], period: str = DEFAULT_HISTORY_PERIOD) -> dict[str, list[tuple[str, float]]]:
-    return _yf_history(currencies, period, is_fx=True)
+def _yfinance_fx_history(
+    currencies: list[str], period: str = DEFAULT_HISTORY_PERIOD, *, trading_day: "str | date",
+) -> dict[str, list[tuple[str, float]]]:
+    return _yf_history(currencies, period, trading_day=trading_day, is_fx=True)
 
 
 @_yf_quiet
@@ -1001,10 +1043,18 @@ def collect(
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in holdings}
     yf_symbols = sorted(ccy_by_yf)
 
-    fetch_closes = close_source or _yfinance_closes
-    fetch_fx = fx_source or _yfinance_fx
+    fetch_closes = close_source or (lambda syms: _yfinance_closes(syms, trading_day=run_date))
+    fetch_fx = fx_source or (lambda ccys: _yfinance_fx(ccys, trading_day=run_date))
     priced = fetch_closes(yf_symbols)
     rates = fetch_fx(currencies)
+    # alpha-engine-config-I10893 write-site guard: a closes artifact keyed on
+    # run_date must not carry a later session's bar. Raises, never trims.
+    from dates import assert_no_bar_after
+
+    assert_no_bar_after(
+        [bar_date for _close, bar_date in priced.values()], run_date,
+        artifact=f"{CLOSES_PREFIX}{run_date}.json",
+    )
 
     closes = {
         yf: {"close": close, "currency": ccy_by_yf.get(yf, "USD"), "bar_date": bar_date}
@@ -1162,7 +1212,8 @@ def _grade_cardinality(
 
 
 def collect_history(
-    *, bucket: str = DEFAULT_BUCKET, dry_run: bool = False, s3_client: Any = None,
+    *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
+    s3_client: Any = None,
     period: str = DEFAULT_HISTORY_PERIOD,
     close_history_source: CloseHistorySource | None = None,
     fx_history_source: FxHistorySource | None = None,
@@ -1188,7 +1239,21 @@ def collect_history(
     ``_price_cache_close_history``'s docstring for the full basis-change and
     staleness-fallback rationale (Operator decision 2026-07-08 + Brian ruling 2026-07-15).
 
+    Point-in-time bound (alpha-engine-config-I10893): every series is bounded to
+    ``[run_date − period, run_date]`` — the price_cache read, the yfinance gap-fill and
+    the FX fetch all derive their window from ``run_date`` (default: last closed
+    session via ``dates.default_run_date``), and every series is checked by
+    ``dates.assert_no_bar_after`` before anything is written. A bar after run_date
+    RAISES; it is never trimmed at the write site.
+
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
+    from datetime import date as _date
+
+    from dates import assert_no_bar_after, default_run_date
+
+    if run_date is None:
+        run_date = default_run_date()
+    trading_day = _date.fromisoformat(str(run_date)[:10])
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
@@ -1204,8 +1269,20 @@ def collect_history(
     hist_symbols = sorted(
         set(ccy_by_yf) | set(RISK_FACTOR_ETFS) | set(INDEX_PROXY_SYMBOLS) | set(FUND_PROXY_ETFS)
     )
-    closes = (close_history_source or _price_cache_close_history(s3_client, bucket, period))(hist_symbols)
-    fx = (fx_history_source or _yfinance_fx_history)(currencies)
+    closes = (
+        close_history_source
+        or _price_cache_close_history(s3_client, bucket, period, reference_day=trading_day)
+    )(hist_symbols)
+    fx = (
+        fx_history_source
+        or (lambda ccys: _yfinance_fx_history(ccys, period, trading_day=trading_day))
+    )(currencies)
+    for yf_sym, series in closes.items():
+        assert_no_bar_after([d for d, _c in series], trading_day,
+                            artifact=f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
+    for ccy, series in fx.items():
+        assert_no_bar_after([d for d, _r in series], trading_day,
+                            artifact=f"{FX_HISTORY_PREFIX}{ccy}.json")
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
         return {"status": "ok_dry_run", "close_series": len(closes), "fx_series": len(fx)}
@@ -2640,7 +2717,7 @@ def main(argv: list[str] | None = None) -> int:
     logger.info("[metron_market_data] latest done: %s", result)
     ok = result.get("status") in ("ok", "ok_dry_run", "skipped")
     if args.history:
-        hist = collect_history(bucket=args.bucket, dry_run=args.dry_run)
+        hist = collect_history(bucket=args.bucket, run_date=args.date, dry_run=args.dry_run)
         logger.info("[metron_market_data] history done: %s", hist)
         ok = ok and hist.get("status") in ("ok", "ok_dry_run", "skipped")
     if args.reference:

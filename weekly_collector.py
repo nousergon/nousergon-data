@@ -94,7 +94,7 @@ from builders._price_cache_writeboth import (
     price_cache_write_prefixes as _price_cache_write_prefixes,
     write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
 )
-from dates import default_run_date  # config#1014: trading-day-axis default
+from dates import assert_no_bar_after as _assert_no_bar_after, default_run_date  # config#1014 trading-day axis; I10893 write guard
 # alpha-engine-config-I10773 (P-06) / I10785 (P-18): one run manifest per unit
 # execution, and the common empty-but-fresh guard before every publish claim.
 import run_units
@@ -1276,7 +1276,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             lambda: fred_history.backfill_to_s3(
                 bucket=bucket,
                 s3_prefix=price_cfg.get("s3_prefix", "predictor/price_cache/"),
-                tickers=["TWO", "HYOAS", "BAA10Y"],
+                tickers=["TWO", "HYOAS", "BAA10Y"], trading_day=run_date,
                 dry_run=dry_run,
             ),
             supports_auto_skip=False,
@@ -2358,6 +2358,7 @@ def _self_heal_chronic_polygon_gaps(
 
             if not dry_run:
                 _assert_valid_price_cache_ticker(ticker)
+                _assert_no_bar_after(combined_pcache.index, target_date, artifact=f"price_cache/{ticker}.parquet")  # I10893
                 buf = _io.BytesIO()
                 combined_pcache.to_parquet(buf, engine="pyarrow", compression="snappy")
                 body = buf.getvalue()
@@ -3858,7 +3859,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     # markers + watchdog only, no auto-skip.
     results["collectors"]["metron_market_data_history"] = _phase_collect(
         reg, "metron_market_data_history",
-        lambda: metron_market_data.collect_history(bucket=bucket, dry_run=dry_run),
+        lambda: metron_market_data.collect_history(bucket=bucket, run_date=run_date, dry_run=dry_run),
         supports_auto_skip=False,
         # alpha-engine-config-I10855: D21 had NO recording at all. The
         # consolidated artifact satisfies BOTH `close_history/{sym}.json`
