@@ -56,6 +56,29 @@ def test_every_descriptor_cadence_is_classified_without_raising(units):
     assert kinds["D01"] == "scheduled" and kinds["D19"] == "scheduled"
     assert kinds["D35"] == "on_demand" and kinds["D43"] == "on_demand"
     assert kinds["D37"] == "continuous"
+    # D42: GHA-hosted, push/workflow_dispatch-only — `trigger.on_demand: true`
+    # (alpha-engine-config-I10877) declares cadence independent of `kind`,
+    # which stays `github-actions` for substrate/log-location derivation.
+    assert kinds["D42"] == "on_demand"
+
+
+def test_no_other_descriptor_has_d42s_gap(units):
+    """Every push/dispatch-only, non-`manual`/`on-demand-dispatch`-kind unit
+    must declare `trigger.on_demand: true` or a `trigger.schedule` /
+    `trigger.cadence_minutes` — never read `undeclared` by omission
+    (alpha-engine-config-I10877 deliverable 2). D42 is the only current
+    instance; this guards against a silent regression as new units land."""
+    for uid, unit in units.items():
+        if unit.retired:
+            continue
+        trigger = unit.raw.get("trigger") or {}
+        kind = trigger.get("kind")
+        has_declared_cadence = bool(
+            trigger.get("on_demand") or trigger.get("schedule") or trigger.get("cadence_minutes")
+        )
+        if kind in ("manual", "on-demand-dispatch") or has_declared_cadence:
+            continue
+        assert False, f"{uid}: kind={kind!r} declares no cadence shape — would read undeclared"
 
 
 def test_every_stack_schedule_expression_parses():
@@ -102,6 +125,34 @@ def test_an_on_demand_unit_with_an_old_manifest_reads_its_latest_invocation(tmp_
 def test_an_on_demand_unit_never_invoked_is_not_applicable(tmp_path, units):
     reading = evidence.read_run_record(LocalStore(tmp_path), units["D35"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True and reading.detail.startswith("not applicable")
+
+
+def test_d42_with_no_migration_run_is_not_applicable_not_graded_against_the_gate_day(tmp_path, units):
+    """The defect this issue fixes: D42's run_record used to read UNMET on
+    every gate day no migration ran, because `kind: github-actions` with no
+    schedule read `undeclared` (graded against the gate's own day)."""
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D42"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is True and reading.detail.startswith("not applicable")
+    assert reading.unmeasurable is False
+
+
+def test_d42_grades_its_most_recent_migration_manifest(tmp_path, units):
+    _write(tmp_path, "D42", "2026-08-03", "RUN1")
+    # D42 writes ArcticDB, so like D35 its evidence is also the probe for the
+    # day the run migrated — the manifest's trading_day, not the gate's.
+    probe = tmp_path / "probes" / "arctic" / "2026-08-03.json"
+    probe.parent.mkdir(parents=True)
+    probe.write_text(json.dumps({"libraries": {"universe": {"read_ok": True, "row_count": 1}}}))
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D42"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is True and "2026-08-03" in reading.evidence[0]
+
+
+def test_d42s_observability_row_derivation_is_unchanged_by_the_cadence_flag():
+    """`trigger.on_demand` must never leak into substrate/log-location/alert-
+    channel derivation — that stays keyed on `trigger.kind` alone."""
+    from scripts import gen_observability_rows as gor
+
+    assert gor.SUBSTRATE_BY_TRIGGER_KIND["github-actions"] != gor.SUBSTRATE_BY_TRIGGER_KIND["on-demand-dispatch"]
 
 
 def test_a_daily_unit_missing_today_is_unmet(tmp_path, units):
