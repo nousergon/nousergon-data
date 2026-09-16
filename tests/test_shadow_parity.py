@@ -315,6 +315,44 @@ def test_delisted_history_library_symbol_reference_is_arcticdb_not_prose():
     assert target.reason == ""
 
 
+
+# ---------------------------------------------------------------------------
+# D03/D46: writer-template reachability fix (alpha-engine-config-I10895)
+# ---------------------------------------------------------------------------
+#
+# D03 declared the retired `predictor/price_cache/*.parquet` tree (nothing
+# writes there since the Wave 3 PR4 cutover) and D46 declared a
+# `{date}.parquet` shape no writer ever produced. Both are corrected here to
+# the key their writer code actually publishes; these tests prove
+# `expand_writes` resolves the corrected templates rather than falling back
+# to `undiffable` — a corrected descriptor the resolver still can't parse
+# would silently grade the same as before.
+
+
+def test_d03_prices_resolves_to_the_reference_price_cache_prefix():
+    """D03's `{ticker}` is one of ~900 tickers, not derivable ahead of time —
+    a listable prefix, same as D04/D34, which already declare this key and
+    now dedup with it in one comparison instead of three unmeasurable rows."""
+    targets = parity.expand_writes(_one_unit("D03"), TRADING_DAY)
+    assert len(targets) == 1
+    target = targets[0]
+    assert target.kind == "prefix"
+    assert target.value == "reference/price_cache/"
+    assert target.reason == ""
+
+
+def test_d46_insider_transactions_resolves_both_write_targets():
+    """D46 declares two outputs: the run-stamped artifact (`{run_stamp}` is
+    not derivable ahead of time — a listable prefix) and the concrete
+    `latest.json` sidecar key. Neither may resolve as `undiffable`."""
+    targets = {t.kind: t for t in parity.expand_writes(_one_unit("D46"), TRADING_DAY)}
+    assert set(targets) == {"prefix", "key"}
+    assert targets["prefix"].value == "data/insider_transactions/"
+    assert targets["prefix"].reason == ""
+    assert targets["key"].value == "data/insider_transactions/latest.json"
+    assert targets["key"].reason == ""
+
+
 def test_a_prose_target_still_grades_unmeasurable():
     """Withholding case: a descriptor that still declares a write in prose —
     D09's `research.db::score_performance`, a SQLite table pointer, not an

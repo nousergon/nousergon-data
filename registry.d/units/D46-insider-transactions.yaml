@@ -39,7 +39,16 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
-  - "data/insider_transactions/{date}.parquet"
+  # alpha-engine-config-I10895: corrected from the never-produced
+  # "data/insider_transactions/{date}.parquet". `rag/pipelines/ingest_form4.py`'s
+  # `write_form4_parquet` (DEFAULT_S3_PREFIX = "data/insider_transactions") uses
+  # `nousergon_lib.eval_artifacts` — one dated artifact per run (YYMMDDHHMM +
+  # "_result.parquet", per `new_eval_run_id`/`eval_artifact_key`) plus the
+  # operator-UX `latest.json` sidecar (`eval_latest_key`) on every invocation. Both are
+  # declared so parity pairs the unit by run manifest (alpha-engine-config-I10890) instead
+  # of the retired date-partitioned scheme.
+  - "data/insider_transactions/{run_stamp}_result.parquet"
+  - "data/insider_transactions/latest.json"
 consumers:
   - "crucible-research:data/substrate/reader.py"
   - "crucible-research:thinktank/analyst.py"
