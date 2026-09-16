@@ -43,9 +43,16 @@ writes:
 consumers:
   - "nousergon-data:features/compute.py (indirect, via features/{date}/alternative.parquet)"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema: "contracts/alternative_ticker.schema.json"
+  producer_test: tests/test_alternative_ticker_contract.py
+  consumer_pins:
+    - "nousergon-data:features/compute.py:939 (_alt_entry_from_payload, in-producer derivation)"
+  # P-07 (alpha-engine-config#10870): the only declared consumer is
+  # features/compute.py::_load_cached_alternative -> _alt_entry_from_payload in THIS
+  # repo (D26 pattern, PR1747) — no cross-repo boundary to pin a copy across.
+  # tests/test_alternative_ticker_contract.py exercises that reader directly
+  # against a schema-conformant fixture, so the producer test doubles as the
+  # consumer-contract test here.
 registry_rows:
   - weekly_alternative_manifest
   # alpha-engine-config-I10870: the real artifact_id is

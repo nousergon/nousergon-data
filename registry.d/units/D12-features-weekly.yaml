@@ -52,9 +52,27 @@ consumers:
   - "crucible-research:data/fetchers/feature_store_reader.py"
   - "crucible-dashboard:views/13_Feature_Store.py"
 contract:
-  schema: "features/registry.py::CATALOG <-> SCHEMA.md §3"
-  producer_test: tests/test_schema_contract.py
-  consumer_pins: []
+  schema:
+    - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+    - "contracts/feature_registry.schema.json"
+  # LIST value (two schemas): the pre-existing per-COLUMN parquet contract
+  # (unchanged) plus a new versioned JSON Schema for the SEPARATE
+  # features/registry.json artifact — see below. data_gate/evidence.py only reads a
+  # scalar today (the D37 defect, PR1747/a63bbb0b); a sibling in the data_gate track
+  # is extending it to lists.
+  producer_test:
+    - tests/test_schema_contract.py
+    - tests/test_feature_registry_contract.py
+  consumer_pins:
+    - "crucible-dashboard:tests/contracts/feature_registry.schema.json"
+  # P-07 (alpha-engine-config#10870): schema/producer_test for the per-column parquet
+  # contract already existed pre-PR. The coupling artifact
+  # crucible-dashboard views/13_Feature_Store.py actually reads via S3 GET is
+  # `features/registry.json` (features/registry.py::generate_registry_json/
+  # upload_registry, a serialization of CATALOG) — it had no versioned JSON Schema
+  # of its own before this PR. contracts/feature_registry.schema.json +
+  # tests/test_feature_registry_contract.py (validates the REAL live CATALOG
+  # serialization) formalize it, and the dashboard pins a copy in the same PR.
 registry_rows:
   - feature_store_freshness_sentinel
 run_manifest_prefix: data_collection/runs/D12
