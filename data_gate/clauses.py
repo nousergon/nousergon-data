@@ -558,25 +558,41 @@ def _clause_gate_ladder_fresh(store: ev.GateStore, *, trading_day: dt.date) -> C
 # ---------------------------------------------------------------------------
 
 
-def _sf_only_units(units: list[Unit]) -> list[Unit]:
-    """Units whose only v1 trigger is a Step Functions pipeline this stack
-    (or its tracked gap, I10753) replaces — plan §6.2 condition (b)'s "37
-    SF-only units", derived from the descriptors rather than hand-listed.
+# The plan's §6.2 condition (b) figure. Kept as a named constant so the
+# reconciliation below reads as arithmetic rather than a magic literal.
+PLAN_SF_ONLY_UNITS = 37
 
-    Plan §6.2 and this issue cite 37; this predicate is what the units_covered
-    clause below counts and reconciles against that number, naming any
-    disagreement as a finding rather than papering over it (plan §4.1
-    "red by default").
+
+def _replaced_by_standalone_stack(unit: Unit) -> bool:
+    """Does this unit's v1 trigger disappear when phase 4 turns the SFs off?
+
+    The test is the DECLARED SUCCESSOR, not the trigger's kind. It used to be
+    `kind == "step-functions"` as well, and that silently dropped **D33**:
+    its kind is `eventbridge-rule`, its successor is
+    `ne-data-collection-daily-heal (nousergon-data-PR1701, DISABLED)`, so the
+    standalone stack replaces it exactly like the others — and
+    `data.cutover_ready.units_covered` would have read a clean 33/33 MET with
+    D33's `survives_phase4` never graded at all. A gate that can read MET over
+    an ungraded member is worse than a gate that reads UNMET, so the predicate
+    keys on the successor, which is the property the requirement is about.
+    Any future unit whose v1 trigger is an EventBridge rule, a scheduler entry
+    or anything else the stack takes over is covered by the same rule without
+    a second edit here (alpha-engine-config-I10908).
     """
-    out: list[Unit] = []
-    for unit in units:
-        trigger = unit.raw.get("trigger") or {}
-        successor = str(trigger.get("successor") or "")
-        if trigger.get("kind") == "step-functions" and (
-            "nousergon-data-PR1701" in successor or "alpha-engine-config-I10753" in successor
-        ):
-            out.append(unit)
-    return out
+    trigger = unit.raw.get("trigger") or {}
+    successor = str(trigger.get("successor") or "")
+    return "nousergon-data-PR1701" in successor or "alpha-engine-config-I10753" in successor
+
+
+def _sf_only_units(units: list[Unit]) -> list[Unit]:
+    """Units the standalone stack (or its tracked gap, I10753) replaces —
+    plan §6.2 condition (b)'s "37 SF-only units", derived from the descriptors
+    rather than hand-listed.
+
+    Includes retired members; `_clause_cutover_ready_units_covered` drops them
+    for grading and uses the difference to reconcile against the plan's 37.
+    """
+    return [unit for unit in units if _replaced_by_standalone_stack(unit)]
 
 
 def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:
@@ -609,27 +625,39 @@ def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], 
     # A retired unit's survives_phase4 is satisfied by its recorded retirement
     # decision, which is exactly what the requirement accepts — it is not a
     # member to grade (alpha-engine-config-I10823).
-    sf_units = [u for u in _sf_only_units(units) if not u.retired]
+    declared = _sf_only_units(units)
+    retired_members = sorted(u.unit_id for u in declared if u.retired)
+    sf_units = [u for u in declared if not u.retired]
     members =[_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in sf_units]
     statuses = [clause_member_status(m) for m in members]
     met_n = statuses.count("MET")
     unmet = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMET")
     unmeas = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMEASURABLE")
     requirement = (
-        "every SF-only unit — a step-functions trigger whose successor names PR1701 or "
-        "I10753 — has a standalone workload or a recorded retirement decision, read from "
-        "its own data.<unit>.survives_phase4 base clause"
+        "every unit the standalone stack replaces — any trigger whose declared successor "
+        "names PR1701 or I10753, whatever its kind — has a standalone workload or a "
+        "recorded retirement decision, read from its own data.<unit>.survives_phase4 "
+        "base clause"
     )
     detail = f"{met_n}/{len(members)} survives_phase4 MET, {len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE"
     if unmet:
         detail += f"; unmet: {unmet[:12]}"
     if unmeas:
         detail += f"; unmeasurable: {unmeas[:12]}"
-    if len(sf_units) != 37:
+    # Reconcile against the plan's figure by arithmetic, not by asserting a
+    # disagreement. The graded population is the declared population minus the
+    # units whose retirement decision is already recorded (I10823), and naming
+    # the retirements is what makes the two numbers comparable at all.
+    detail += (
+        f". plan §6.2 cites {PLAN_SF_ONLY_UNITS} SF-only units; descriptors declare "
+        f"{len(declared)}, of which {len(retired_members)} carry a recorded retirement "
+        f"({retired_members or 'none'}), leaving {len(sf_units)} graded here"
+    )
+    if len(declared) != PLAN_SF_ONLY_UNITS:
         detail += (
-            f". plan §6.2 and this issue cite 37 SF-only units; the descriptor-derived "
-            f"population is {len(sf_units)} — a disagreement named rather than reconciled "
-            "quietly (plan §4.1 'red by default')"
+            f" — and {len(declared)} != {PLAN_SF_ONLY_UNITS}, a residual disagreement "
+            "between the plan and the descriptors, named rather than reconciled quietly "
+            "(plan §4.1 'red by default')"
         )
     evidence = tuple(m.name for m in members)
     if unmeas:
