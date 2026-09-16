@@ -24,8 +24,10 @@ from __future__ import annotations
 import logging
 import tempfile
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+from dates import FutureBarError, as_trading_day, assert_no_bar_after, default_run_date
 
 from nousergon_lib.secrets import get_secret
 from typing import Optional
@@ -89,6 +91,7 @@ def fetch_fred_history(
     series_id: str,
     period_years: int = 10,
     api_key: str | None = None,
+    end_date: "date | datetime | str | None" = None,
 ) -> pd.DataFrame:
     """Fetch a multi-year date-range time series from FRED.
 
@@ -98,6 +101,9 @@ def fetch_fred_history(
         period_years: trailing window in years. Default 10 to match the
             yfinance refresh ``period="10y"``.
         api_key: optional override; defaults to ``FRED_API_KEY`` env var.
+        end_date: last observation date to request (inclusive) — the run's
+            trading day on every publishing path (alpha-engine-config-I10893).
+            ``None`` means today (UTC) and is only for ad-hoc/operator reads.
 
     Returns:
         DataFrame indexed by date (DatetimeIndex, ascending) with a
@@ -113,7 +119,10 @@ def fetch_fred_history(
             "Set the env var or pass api_key explicitly."
         )
 
-    end_date = datetime.now(timezone.utc).date()
+    end_date = (
+        as_trading_day(end_date) if end_date is not None
+        else datetime.now(timezone.utc).date()
+    )
     start_date = end_date - timedelta(days=int(period_years * 365.25) + 7)
 
     params = {
@@ -225,8 +234,14 @@ def backfill_to_s3(
     tickers: list[str] | None = None,
     period_years: int = 10,
     dry_run: bool = False,
+    trading_day: "date | str | None" = None,
 ) -> dict:
     """Backfill TWO + HYOAS (or any subset of ``FRED_HISTORY_MAP``) to S3.
+
+    ``trading_day`` bounds the fetch end and is enforced at the write site by
+    :func:`dates.assert_no_bar_after` (alpha-engine-config-I10893). ``None``
+    resolves to :func:`dates.default_run_date` (last closed session), never
+    to wall-clock today.
 
     One-shot operator step. Run after Stage 2.5 ships and before Stage 2c-full
     consumes the new parquets. Idempotent — full rewrite each call (matches
@@ -252,6 +267,7 @@ def backfill_to_s3(
             f"Known: {sorted(FRED_HISTORY_MAP.keys())}"
         )
 
+    trading_day = str(trading_day) if trading_day is not None else default_run_date()
     s3 = boto3.client("s3") if not dry_run else None
     results: dict[str, dict] = {}
 
@@ -261,8 +277,13 @@ def backfill_to_s3(
         for ticker in tickers:
             series_id = FRED_HISTORY_MAP[ticker]
             try:
-                fred_df = fetch_fred_history(series_id, period_years=period_years)
+                fred_df = fetch_fred_history(
+                    series_id, period_years=period_years, end_date=trading_day,
+                )
                 ohlcv = fred_history_to_ohlcv(fred_df)
+                assert_no_bar_after(
+                    ohlcv.index, trading_day, artifact=f"{s3_prefix}{ticker}.parquet",
+                )
                 parquet_path = local_dir / f"{ticker}.parquet"
                 ohlcv.to_parquet(parquet_path, engine="pyarrow", compression="snappy")
                 results[ticker] = {
@@ -287,6 +308,8 @@ def backfill_to_s3(
                             bucket, prefix, ticker, len(ohlcv),
                             results[ticker]["first_date"], results[ticker]["last_date"],
                         )
+            except FutureBarError:
+                raise  # run-level contract violation, never a per-ticker miss
             except Exception as e:
                 logger.error("Backfill failed for %s (%s): %s", ticker, series_id, e)
                 results[ticker] = {"status": "error", "error": str(e)}
@@ -336,6 +359,10 @@ def main():
         "--dry-run", action="store_true",
         help="Fetch but skip S3 upload.",
     )
+    parser.add_argument(
+        "--date", default=None,
+        help="Trading day the series is bounded to (inclusive). Default: last closed session.",
+    )
     args = parser.parse_args()
 
     result = backfill_to_s3(
@@ -344,6 +371,7 @@ def main():
         tickers=args.tickers,
         period_years=args.period_years,
         dry_run=args.dry_run,
+        trading_day=args.date,
     )
     print(json.dumps(result, indent=2, default=str))
     sys.exit(0 if result["status"] == "ok" else 2)
