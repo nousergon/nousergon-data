@@ -130,8 +130,6 @@ class TestStatesPresent:
             "EvalRollingMean",
             "CheckSkipRationaleClustering",
             "RationaleClustering",
-            "CheckSkipReplayConcordance",
-            "ReplayConcordance",
             "CheckSkipCounterfactual",
             "Counterfactual",
         ):
@@ -857,8 +855,8 @@ class TestEvalRollingMean:
         function is pinned at Lambda's 900s service maximum and the state
         carries a guard band ABOVE it, so the FUNCTION's ceiling is the backstop
         that fires and emits a REPORT line, instead of the state killing the
-        graceful return at the wall. `ReplayConcordance` and `EvalJudgeProcess`
-        carry the identical 960 for the identical reason
+        graceful return at the wall. `EvalJudgeProcess` carries the
+        identical 960 for the identical reason
         (alpha-engine-config-I7181); `tests/test_sf_lambda_timeout_ordering.py`
         is where that rule is stated and enforced fleet-wide.
         """
@@ -904,13 +902,15 @@ class TestEvalRollingMean:
 
 
 class TestSkipRationaleClustering:
-    def test_skip_flag_bypasses_to_concordance_gate(self, states):
-        """Skipping clustering must NOT also skip concordance — they
+    def test_skip_flag_bypasses_to_counterfactual_gate(self, states):
+        """Skipping clustering must NOT also skip counterfactual — they
         are independent agent-justification signals (clustering = cross-
-        week templating; concordance = same-input cross-model agreement).
-        The skip path lands on CheckSkipReplayConcordance rather than
-        SaturdayHealthCheck so the concordance Lambda still fires
-        unless its own skip flag is set."""
+        week templating; counterfactual = 3-deep decision-tree match).
+        The skip path lands on CheckSkipCounterfactual rather than
+        SaturdayHealthCheck so the counterfactual Lambda still fires
+        unless its own skip flag is set. It landed on
+        CheckSkipReplayConcordance until alpha-engine-config-I10539
+        (Brian ruling 2026-09-16, option b) retired that stage."""
         skip = states["CheckSkipRationaleClustering"]
         choice = skip["Choices"][0]
         and_clauses = choice["And"]
@@ -919,7 +919,7 @@ class TestSkipRationaleClustering:
             and c.get("BooleanEquals") is True
             for c in and_clauses
         )
-        assert choice["Next"] == "CheckSkipReplayConcordance"
+        assert choice["Next"] == "CheckSkipCounterfactual"
         # Critically NOT routed directly to SaturdayHealthCheck — that
         # would bundle-skip both observability paths.
         assert choice["Next"] != "SaturdayHealthCheck"
@@ -946,20 +946,21 @@ class TestRationaleClustering:
         # own configured timeout (config#1650).
         assert states["RationaleClustering"]["TimeoutSeconds"] == 900
 
-    def test_success_continues_to_concordance_gate(self, states):
-        # Clustering converges to CheckSkipReplayConcordance (the gate
-        # in front of the cheap-model concordance Lambda) rather than
-        # directly to SaturdayHealthCheck.
-        assert states["RationaleClustering"]["Next"] == "CheckSkipReplayConcordance"
+    def test_success_continues_to_counterfactual_gate(self, states):
+        # Clustering converges to CheckSkipCounterfactual (the gate in
+        # front of the counterfactual Lambda) rather than directly to
+        # SaturdayHealthCheck. It converged on CheckSkipReplayConcordance
+        # until alpha-engine-config-I10539 retired that stage.
+        assert states["RationaleClustering"]["Next"] == "CheckSkipCounterfactual"
 
-    def test_catch_routes_to_concordance_gate_not_failure(self, states):
+    def test_catch_routes_to_counterfactual_gate_not_failure(self, states):
         # alpha-engine-config#6722: routes through MarkRationaleClusteringDegraded
-        # before converging on CheckSkipReplayConcordance exactly as before.
+        # before converging on CheckSkipCounterfactual exactly as before.
         catch = states["RationaleClustering"]["Catch"][0]
         assert catch["ErrorEquals"] == ["States.ALL"]
         assert catch["Next"] == "MarkRationaleClusteringDegraded"
         assert catch["Next"] != "HandleFailure"
-        assert states["MarkRationaleClusteringDegraded"]["Next"] == "CheckSkipReplayConcordance"
+        assert states["MarkRationaleClusteringDegraded"]["Next"] == "CheckSkipCounterfactual"
 
     def test_retries_on_transient_lambda_errors(self, states):
         retry = states["RationaleClustering"]["Retry"][0]
@@ -968,80 +969,45 @@ class TestRationaleClustering:
         assert retry["MaxAttempts"] == 1
 
 
-# ── Replay concordance skip-gate + state ─────────────────────────────────
+# ── Replay concordance: RETIRED (alpha-engine-config-I10539) ─────────────
 
 
-class TestSkipReplayConcordance:
-    def test_skip_flag_bypasses_to_counterfactual_gate(self, states):
-        """Skipping concordance must NOT also skip counterfactual —
-        they are independent agent-justification signals (concordance
-        = same-input cross-model agreement; counterfactual = 3-deep
-        decision-tree match). The skip path lands on
-        CheckSkipCounterfactual rather than SaturdayHealthCheck so the
-        counterfactual Lambda still fires unless its own skip flag is
-        set."""
-        skip = states["CheckSkipReplayConcordance"]
-        choice = skip["Choices"][0]
-        and_clauses = choice["And"]
-        assert any(
-            c.get("Variable") == "$.skip_replay_concordance"
-            and c.get("BooleanEquals") is True
-            for c in and_clauses
-        )
-        assert choice["Next"] == "CheckSkipCounterfactual"
-        assert choice["Next"] != "SaturdayHealthCheck"
+class TestReplayConcordanceRetired:
+    """alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b).
 
-    def test_default_runs_concordance(self, states):
-        assert states["CheckSkipReplayConcordance"]["Default"] == "ReplayConcordance"
+    The stage replayed a corpus that no longer exists: its default
+    ``agent_filter`` named the six-team research agents retired under
+    ``-I1580`` on 2026-07-20, and the 56-day window slid past the last
+    matching DecisionArtifact (2026-07-11) between the 2026-08-29 run
+    (``n_artifacts_candidate: 46``) and the 2026-09-05 run (``0``). The
+    zero-call run then failed the 2026-09-12 canonical weekly SF at
+    ``AggregateCosts`` with ``CostCoverageError``.
 
+    These assertions are the class-level guard, not an instance fix: a
+    measurement stage exists only while its population exists, so the
+    three states and the skip flag must stay gone together. Re-adding one
+    of them without the others is the partial-retirement defect.
+    """
 
-class TestReplayConcordance:
-    def test_invokes_live_alias(self, states):
-        params = states["ReplayConcordance"]["Parameters"]
-        assert params["FunctionName"] == "alpha-engine-replay-concordance:live"
+    def test_states_are_gone(self, states):
+        for name in (
+            "CheckSkipReplayConcordance",
+            "ReplayConcordance",
+            "MarkReplayConcordanceDegraded",
+        ):
+            assert name not in states, f"retired SF state is back: {name}"
 
-    def test_payload_carries_required_fields(self, states):
-        payload = states["ReplayConcordance"]["Parameters"]["Payload"]
-        assert payload["end_time_iso.$"] == "$$.Execution.StartTime"
-        # alpha-engine-config-I7898 (2026-08-20): ReplayConcordance migrated
-        # off the OpenRouter provider slug onto the krepis registry entry id
-        # (deepseek-v4-flash), paired with crucible-backtester-PR716.
-        assert payload["target_models"] == ["deepseek-v4-flash"]
-        assert payload["window_days"] == 56
-        assert payload["max_artifacts"] == 150
+    def test_nothing_still_points_at_the_retired_states(self, states):
+        import json
 
-    def test_timeout_is_a_guard_band_above_the_lambda_cap(self, states):
-        """960, deliberately ABOVE the Lambda's own 900s (config-I7181).
-
-        Same second branch of the ordering rule as EvalJudgeProcess above
-        -- see that docstring. Concordance was the worse instance: killed
-        at the wall in 22 of 38 real runs, the MODAL outcome. Made
-        self-deadlining by crucible-backtester#633, measured live
-        2026-08-11 returning at 622s with "stopping early on budget:
-        141 of 150 artifacts not replayed" instead of dying at 900.
-        """
-        assert states["ReplayConcordance"]["TimeoutSeconds"] == 960
-
-    def test_success_continues_to_counterfactual_gate(self, states):
-        # Concordance converges to CheckSkipCounterfactual rather than
-        # directly to SaturdayHealthCheck — counterfactual is the next
-        # leg of the agent-justification triple.
-        assert states["ReplayConcordance"]["Next"] == "CheckSkipCounterfactual"
-
-    def test_catch_routes_to_counterfactual_gate_not_failure(self, states):
-        # alpha-engine-config#6722: routes through MarkReplayConcordanceDegraded
-        # before converging on CheckSkipCounterfactual exactly as before.
-        catch = states["ReplayConcordance"]["Catch"][0]
-        assert catch["ErrorEquals"] == ["States.ALL"]
-        assert catch["Next"] == "MarkReplayConcordanceDegraded"
-        assert catch["Next"] != "HandleFailure"
-        assert states["MarkReplayConcordanceDegraded"]["Next"] == "CheckSkipCounterfactual"
-
-    def test_retries_on_transient_lambda_errors(self, states):
-        retry = states["ReplayConcordance"]["Retry"][0]
-        assert "Lambda.ServiceException" in retry["ErrorEquals"]
-        assert "Lambda.TooManyRequestsException" in retry["ErrorEquals"]
-        assert retry["MaxAttempts"] == 1
+        blob = json.dumps(states)
+        for name in (
+            "CheckSkipReplayConcordance",
+            "ReplayConcordance",
+            "MarkReplayConcordanceDegraded",
+        ):
+            for key in ('"Next": "%s"' % name, '"Default": "%s"' % name):
+                assert key not in blob, f"dangling edge to retired state: {key}"
 
 
 # ── Counterfactual rule fit skip-gate + state ────────────────────────────
@@ -1053,12 +1019,13 @@ class TestSkipCounterfactual:
         skip-gate (ROADMAP L1146 — SF-wired daily cost aggregator
         added 2026-05-25), not directly on BranchAComplete. The cost
         aggregator reads cost JSONLs written by upstream LLM states
-        (Research / eval-judge / rationale-clustering / replay-
-        concordance / counterfactual); a counterfactual skip does NOT
-        invalidate those upstream rows, so the aggregator MUST still
-        run. The four observability skip flags (skip_counterfactual /
-        skip_rationale_clustering / skip_replay_concordance /
-        skip_aggregate_costs) are independent. Pre-L1146 this assertion
+        (Research / eval-judge / rationale-clustering /
+        counterfactual); a counterfactual skip does NOT invalidate those
+        upstream rows, so the aggregator MUST still run. The three
+        remaining observability skip flags (skip_counterfactual /
+        skip_rationale_clustering / skip_aggregate_costs) are
+        independent; skip_replay_concordance went with the stage retired
+        under alpha-engine-config-I10539. Pre-L1146 this assertion
         pinned ``BranchAComplete``; the L1146 wire-up rerouted through
         ``CheckSkipAggregateCosts``, and alpha-engine-config-I7194 moved
         that gate to the TOP LEVEL — so the branch terminal is once again
