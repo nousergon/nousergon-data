@@ -215,6 +215,7 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
         stale=["AAPL"],
         fetch_period="10y",
         batch_size=10,
+        trading_day="2026-09-14",
     )
 
     assert refreshed == 1

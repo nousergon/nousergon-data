@@ -37,7 +37,18 @@ writes:
 consumers:
   - "crucible-predictor:inference/stages/load_universe.py"
   - "crucible-backtester:pipeline_common.py"
-  - "crucible-dashboard:health_checker.py"
+consumers_decision:
+  # alpha-engine-config-I10873: renders the consumers clause UNCONNECTED (not MET, not red,
+  # graded by no gate). Delete this block in the same change that adds a surviving consumer.
+  decision: kept-unconnected
+  ruled_by: Brian
+  ruled_on: "2026-09-15"
+  ruling: >-
+    Brian 2026-09-15 (alpha-engine-config-I10873): "for the decision cant we keep all for now but the console should say they exist but there are no consumers"
+  reason: >-
+    kept, reincorporation possible — collected and graded on every other column; its only readers are v1 repos retiring in crucible v2 phase 4, and the console shows it as unconnected so what is and is not wired stays visible.
+  reexam: >-
+    a v2 component proposes reading this key (reincorporate: add the consumer, delete this block), or crucible v2 phase 4 decommission review
 contract:
   schema: "sources/contract.py::PriceBar"
   producer_test: tests/test_price_source_contract.py

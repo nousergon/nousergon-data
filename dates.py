@@ -75,3 +75,132 @@ def default_run_date(now: datetime | None = None) -> str:
             exc_info=True,
         )
         return fallback
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I10893 — history fetches are bounded by the trading day.
+#
+# A ``--date D`` run executed on D+1 (retry, late rerun, backfill, shadow run)
+# used to fetch vendor history with ``period="10y"`` and no ``start``/``end``,
+# so the series ended at vendor "now" — including a PARTIAL, pre-close D+1
+# session — and that bar was published as a settled close
+# (``reference/price_cache/*.parquet``, ``market_data/fx_history/*.json``,
+# measured 2026-09-15). The window start drifted with wall-clock time too.
+#
+# Point-in-time rule: every history fetch serving a run for D asks for
+# ``[D − window, D]`` (``end`` exclusive at D + 1 calendar day), and every
+# writer publishing such a series calls :func:`assert_no_bar_after` first,
+# which RAISES — never trims — on a bar dated after D.
+# ---------------------------------------------------------------------------
+
+
+class FutureBarError(ValueError):
+    """A series about to be published carries a bar dated after its run's
+    trading day (alpha-engine-config-I10893). Subclasses ``ValueError`` and is
+    deliberately re-raised through per-ticker ``except Exception`` blocks by
+    every writer: it is a contract violation of the run, not a one-ticker
+    vendor hiccup."""
+
+
+def as_trading_day(trading_day: "date | datetime | str") -> "date":
+    """Normalize an ISO string / ``date`` / ``datetime`` to a ``date``."""
+    from datetime import date as _date
+
+    if isinstance(trading_day, datetime):
+        return trading_day.date()
+    if isinstance(trading_day, _date):
+        return trading_day
+    return _date.fromisoformat(str(trading_day)[:10])
+
+
+def history_window(
+    trading_day: "date | datetime | str", period: str = "10y",
+) -> "tuple[date, date]":
+    """``(start, end_exclusive)`` for a history fetch serving trading day D.
+
+    ``start`` is D minus ``period`` on the calendar (``"10y"`` → same month/day
+    ten years earlier; ``"6mo"`` → months; ``"35d"`` → days), so the first bar
+    is a pure function of D and never of wall-clock time. ``end_exclusive`` is
+    D + 1 calendar day — the vendor convention (yfinance ``end``) is exclusive,
+    and a calendar day (not the next session) is the tightest bound that still
+    includes D: nothing dated after D is requestable.
+
+    Raises ``ValueError`` on a period shape it cannot parse — a mistyped window
+    must not silently become a different window on a producer.
+    """
+    import pandas as pd
+
+    d = pd.Timestamp(as_trading_day(trading_day))
+    p = str(period).strip()
+    try:
+        if p.endswith("mo"):
+            start = d - pd.DateOffset(months=int(p[:-2]))
+        elif p.endswith("y"):
+            start = d - pd.DateOffset(years=int(p[:-1]))
+        elif p.endswith("d"):
+            start = d - pd.Timedelta(days=int(p[:-1]))
+        else:
+            raise ValueError(p)
+    except ValueError as exc:
+        raise ValueError(
+            f"history_window: unparseable period {period!r} "
+            "(expected '<n>y', '<n>mo' or '<n>d')"
+        ) from exc
+    return start.date(), (d + pd.Timedelta(days=1)).date()
+
+
+def clip_to_trading_day(frame, trading_day: "date | datetime | str", *, label: str):
+    """Drop rows dated after D from a FETCHED frame at the fetch boundary.
+
+    The fetch already asks for ``end = D + 1`` (exclusive); a vendor that
+    answers beyond the requested end is out of contract, so rows past D are
+    removed here and the count is logged at WARNING (the recording surface).
+    This is the request bound, applied to the response — it is NOT the write
+    guard: writers still call :func:`assert_no_bar_after`, which raises.
+    """
+    import pandas as pd
+
+    if frame is None or len(frame) == 0:
+        return frame
+    cutoff = pd.Timestamp(as_trading_day(trading_day))
+    idx = pd.to_datetime(frame.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    keep = idx.normalize() <= cutoff
+    dropped = int((~keep).sum())
+    if dropped:
+        log.warning(
+            "%s: vendor returned %d row(s) dated after trading_day %s despite "
+            "end-bound — dropped at the fetch boundary (alpha-engine-config-I10893)",
+            label, dropped, cutoff.date().isoformat(),
+        )
+    return frame[keep]
+
+
+def assert_no_bar_after(
+    bar_dates, trading_day: "date | datetime | str", *, artifact: str,
+) -> None:
+    """Write-site guard: raise :class:`FutureBarError` when any bar in
+    ``bar_dates`` (a DatetimeIndex, or an iterable of ISO strings / dates /
+    timestamps) is dated after ``trading_day``. Raises, never trims — a
+    publisher that reaches this with a future bar bypassed the fetch bound."""
+    import pandas as pd
+
+    d = as_trading_day(trading_day)
+    values = list(bar_dates) if not isinstance(bar_dates, pd.Index) else bar_dates
+    if len(values) == 0:
+        return
+    idx = pd.to_datetime(pd.Index(values))
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    last = idx.max()
+    if pd.isna(last) or last.date() <= d:
+        return
+    n_after = int((idx.normalize() > pd.Timestamp(d)).sum())
+    raise FutureBarError(
+        f"{artifact}: refusing to publish a series whose last bar "
+        f"{last.date().isoformat()} is after the run's trading_day "
+        f"{d.isoformat()} ({n_after} bar(s) after D). A run for D must never "
+        "publish a later (possibly pre-close) session — see "
+        "alpha-engine-config-I10893."
+    )

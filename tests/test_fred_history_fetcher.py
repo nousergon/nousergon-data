@@ -270,7 +270,7 @@ class TestBackfillToS3:
             index=pd.date_range("2018-01-02", periods=10, freq="B"),
         )
 
-        def maybe_fail(series_id, period_years=10, api_key=None):
+        def maybe_fail(series_id, period_years=10, api_key=None, end_date=None):
             if series_id == "DGS2":
                 raise RuntimeError("synthetic failure for TWO")
             return df_ok

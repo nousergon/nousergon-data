@@ -1,0 +1,29 @@
+# Which consumer repositories COUNT as a connection for a unit's `consumers`
+# column (data_collection_plan_260914.md §3: only SURVIVING consumers count).
+#
+# alpha-engine-config-I10873, Brian ruling 2026-09-15: "I will definitely want
+# to know what is connected and what isn't." A unit is CONNECTED when at least
+# one declared consumer lives in a `surviving` repo, and UNCONNECTED when its
+# consumer list is empty or names only `retiring` repos (the v1 readers that
+# are decommissioned in crucible v2 phase 4).
+#
+# CLOSED: `data_gate/descriptors.py` refuses a descriptor naming a consumer repo
+# that is in neither list, because an unclassified repo would silently decide a
+# unit's connection by default. Add the repo here, in the list it belongs to.
+surviving:
+  - crucible            # crucible v2
+  - crucible-executor
+  - crucible-dashboard
+  - metron
+  - morning-signal
+  - thinktank
+  - nousergon-data      # self-consumed (a producer that reads its own key)
+retiring:
+  - crucible-research   # v1, retires in crucible v2 phase 4
+  - crucible-predictor  # v1, retires in crucible v2 phase 4
+  - crucible-backtester # v1, retires in crucible v2 phase 4
+  # ASSUMPTION (alpha-engine-config-I10873, 2026-09-15): crucible-evaluator is
+  # not on the plan §3 surviving list, so it does not count as a connection. It
+  # is only ever declared beside a metron reader today (D21, D22), so no unit's
+  # connection turns on this classification. Move it if v2 adopts it.
+  - crucible-evaluator

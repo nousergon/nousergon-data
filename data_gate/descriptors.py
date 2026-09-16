@@ -129,6 +129,44 @@ _REQUIRED_TOP_LEVEL = (
 )
 
 
+CONSUMER_REPOS_PATH = REPO_ROOT / "data_gate" / "config" / "consumer_repos.yaml"
+
+#: A unit's connection to a surviving consumer (`alpha-engine-config-I10873`).
+#: Closed: the board publishes exactly these values on every unit row.
+CONNECTION_STATES: tuple[str, ...] = ("connected", "unconnected", "retired")
+
+#: The one `consumers_decision.decision` value the gate accepts today: Brian's
+#: 2026-09-15 ruling — keep collecting, render "exists, no consumer", allow
+#: reincorporation. A retirement is `lifecycle: retired`, not a decision here.
+CONSUMERS_DECISIONS: frozenset[str] = frozenset({"kept-unconnected"})
+_CONSUMERS_DECISION_FIELDS = ("decision", "ruled_by", "ruled_on", "ruling", "reason", "reexam")
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def consumer_repo(entry: str) -> str:
+    """The repository part of a ``repo:path`` consumer entry."""
+    return str(entry).strip().split(":", 1)[0]
+
+
+_CONSUMER_REPO_CLASSES: dict[str, frozenset[str]] | None = None
+
+
+def consumer_repo_classes() -> dict[str, frozenset[str]]:
+    """``{"surviving": …, "retiring": …}`` from `consumer_repos.yaml`, cached."""
+    global _CONSUMER_REPO_CLASSES
+    if _CONSUMER_REPO_CLASSES is None:
+        document = yaml.safe_load(CONSUMER_REPOS_PATH.read_text(encoding="utf-8"))
+        surviving = frozenset(document["surviving"])
+        retiring = frozenset(document["retiring"])
+        if not surviving or surviving & retiring:
+            raise DescriptorError(
+                f"{CONSUMER_REPOS_PATH.name}: `surviving` must be non-empty and disjoint from "
+                f"`retiring` (overlap: {sorted(surviving & retiring)})"
+            )
+        _CONSUMER_REPO_CLASSES = {"surviving": surviving, "retiring": retiring}
+    return _CONSUMER_REPO_CLASSES
+
+
 class DescriptorError(ValueError):
     """A descriptor that cannot be graded. Always fatal, never skipped.
 
@@ -167,6 +205,64 @@ class Unit:
     def retirement_summary(self) -> str:
         block = self.raw.get("retirement") or {}
         return f"{str(block.get('ruling')).strip()} — {' '.join(str(block.get('reason')).split())}"
+
+    @property
+    def declared_consumers(self) -> list[str]:
+        return [str(c).strip() for c in self.raw.get("consumers") or []]
+
+    @property
+    def surviving_consumers(self) -> list[str]:
+        """Declared consumers in a repo that survives v2 phase 4 — the only
+        ones that count as a connection (plan §3)."""
+        surviving = consumer_repo_classes()["surviving"]
+        return [c for c in self.declared_consumers if consumer_repo(c) in surviving]
+
+    @property
+    def retiring_consumers(self) -> list[str]:
+        retiring = consumer_repo_classes()["retiring"]
+        return [c for c in self.declared_consumers if consumer_repo(c) in retiring]
+
+    @property
+    def connection(self) -> str:
+        """``connected`` / ``unconnected`` / ``retired`` — one of
+        :data:`CONNECTION_STATES`, derived from the descriptor alone.
+
+        `alpha-engine-config-I10873` (Brian ruling 2026-09-15). A consumer list
+        that names only v1 repos is UNCONNECTED, exactly like an empty one.
+        """
+        if self.retired:
+            return "retired"
+        return "connected" if self.surviving_consumers else "unconnected"
+
+    @property
+    def consumers_decision(self) -> dict[str, str] | None:
+        block = self.raw.get("consumers_decision")
+        return {k: " ".join(str(v).split()) for k, v in block.items()} if isinstance(block, dict) else None
+
+    @property
+    def connection_reason(self) -> str:
+        """Why the unit is (un)connected, as one line a reader can act on."""
+        if self.connection == "retired":
+            return f"retired: {self.retirement_summary}"
+        if self.connection == "connected":
+            return f"read by {len(self.surviving_consumers)} surviving consumer(s): {self.surviving_consumers}"
+        parts = []
+        if self.retiring_consumers:
+            parts.append(f"declared readers are all v1 repos retiring in crucible v2 phase 4: {self.retiring_consumers}")
+        else:
+            parts.append("no consumer declared")
+        decision = self.consumers_decision
+        if decision:
+            parts.append(
+                f"{decision['decision']} by {decision['ruled_by']} on {decision['ruled_on']} "
+                f"({decision['ruling']}): {decision['reason']}; re-exam: {decision['reexam']}"
+            )
+        else:
+            reason = " ".join(str(self.raw.get("consumers_reason") or "").split())
+            if reason:
+                parts.append(f"reason: {reason}")
+            parts.append("NO recorded keep/retire decision (plan §3 finding)")
+        return "; ".join(parts)
 
     @property
     def component(self) -> int:
@@ -391,25 +487,53 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
             "no reason renders as nothing at all."
         )
 
-    consumers_ruling = document.get("consumers_ruling")
-    if consumers_ruling is not None:
-        # alpha-engine-config-I10870: the third case plan §3's rule already
-        # implied (a KEPT-with-no-reader decision, not an open finding) —
-        # data_gate/clauses.py::_consumers_ruling_override consumes this
-        # block, so a malformed one would silently never fire (no override,
-        # clause stays UNMET) rather than fail loud here at load time.
-        missing_ruling_fields = [
+    if "consumers_ruling" in document:
+        # alpha-engine-config-I10873: the I10870 block rendered a kept,
+        # unread unit MET — green over "nothing reads this". Renamed so a
+        # stale copy fails loud instead of silently meaning nothing.
+        raise DescriptorError(
+            f"{path.name}: `consumers_ruling` was replaced by `consumers_decision` "
+            f"(fields {list(_CONSUMERS_DECISION_FIELDS)}); a kept unit with no consumer renders "
+            "UNCONNECTED, never MET (Brian ruling 2026-09-15, alpha-engine-config-I10873)."
+        )
+
+    classes = consumer_repo_classes()
+    unclassified = sorted(
+        {consumer_repo(c) for c in document["consumers"] or []} - classes["surviving"] - classes["retiring"]
+    )
+    if unclassified:
+        raise DescriptorError(
+            f"{path.name}: consumer repo(s) {unclassified} are in neither list of "
+            f"{CONSUMER_REPOS_PATH.relative_to(REPO_ROOT)}. An unclassified repo would decide "
+            "whether this unit is connected by default; classify it there."
+        )
+
+    decision = document.get("consumers_decision")
+    if decision is not None:
+        missing_decision_fields = [
             name
-            for name in ("ruling", "reason")
-            if not isinstance(consumers_ruling, dict) or not str(consumers_ruling.get(name) or "").strip()
+            for name in _CONSUMERS_DECISION_FIELDS
+            if not isinstance(decision, dict) or not str(decision.get(name) or "").strip()
         ]
-        if missing_ruling_fields:
+        if missing_decision_fields:
             raise DescriptorError(
-                f"{path.name}: consumers_ruling is present but missing {missing_ruling_fields}. "
-                "A ruling with no `ruling:` citation or no `reason:` is not a recorded decision — "
-                "it would silently never override the consumers clause (see "
-                "_consumers_ruling_override), which is worse than declaring consumers_ruling at "
-                "all."
+                f"{path.name}: consumers_decision is missing {missing_decision_fields}. An "
+                "UNCONNECTED clause is declared, never inferred (observability-policy §8.3 "
+                "DISABLED: reason, owner and re-exam trigger), so every field is required."
+            )
+        if decision["decision"] not in CONSUMERS_DECISIONS:
+            raise DescriptorError(
+                f"{path.name}: consumers_decision.decision {decision['decision']!r} is not one of "
+                f"{sorted(CONSUMERS_DECISIONS)}. Retiring a unit is `lifecycle: retired`."
+            )
+        if not _ISO_DATE.match(str(decision["ruled_on"]).strip()):
+            raise DescriptorError(f"{path.name}: consumers_decision.ruled_on must be YYYY-MM-DD")
+        surviving = [c for c in document["consumers"] or [] if consumer_repo(c) in classes["surviving"]]
+        if surviving:
+            raise DescriptorError(
+                f"{path.name}: declares consumers_decision (kept with no consumer) but also a "
+                f"surviving consumer {surviving}. A reincorporated unit is CONNECTED — delete the "
+                "decision block in the same change that adds the consumer."
             )
 
     _check_retention(unit_id, document, path)

@@ -383,7 +383,9 @@ def test_the_board_renders_retired_as_its_own_console_state(board):
     assert retired_rows and all(r["console_state"] == "RETIRED" for r in retired_rows)
     assert document["clauses_retired"] == len(retired_rows)
     assert document["clauses_total"] == document["clauses_met"] + document["clauses_unmet"] + document["transparency_gap"]
-    assert len(document["rows"]) == document["clauses_total"] + document["clauses_retired"]
+    assert len(document["rows"]) == (
+        document["clauses_total"] + document["clauses_retired"] + document["clauses_unconnected"]
+    )
     assert CONSOLE_STATE["RETIRED"] not in {"HEALTHY", "DEGRADED", "UNREPORTED"}
 
 
