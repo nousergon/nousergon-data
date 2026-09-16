@@ -10,6 +10,9 @@
 # FLOW_DOCTOR_* env vars.
 # ─────────────────────────────────────────────────────────────────────────────
 
+# alpha-engine-config-I10880: weekly_collector.py overrides this to
+# "data-collector-shadow" for a shadow run (its own rate-limiter budget) —
+# see flow-doctor.yaml for the live comment.
 flow_name: data-collector
 repo: nousergon/nousergon-data
 owner: "@brianmcmahon"

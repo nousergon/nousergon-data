@@ -81,10 +81,30 @@ from nousergon_lib.config import resolve_experiment_config
 from nousergon_lib.yfinance_quiet import quiet_yfinance
 _FLOW_DOCTOR_EXCLUDE_PATTERNS: list[str] = []
 _FLOW_DOCTOR_YAML = str(Path(__file__).parent / "flow-doctor.yaml")
+# alpha-engine-config-I10880: a shadow run (`python -m shadow run` sets
+# DATA_COLLECTION_SHADOW_TRADING_DAY on the child process before this module
+# is imported — shadow/root.py's ENV_TRADING_DAY) reports under a distinct
+# flow name so it draws its own rate-limiter budget instead of the
+# production "data-collector" flow's. flow_doctor's RateLimiter keys
+# max_diagnosed_per_day / max_issues_per_day / max_alerts_per_day on
+# flow_name (flow_doctor/core/rate_limiter.py::RateLimiter.check ->
+# store.count_actions_today(action, self.flow_name)), so this override alone
+# is sufficient to give the shadow workload a separate budget — no change to
+# flow-doctor.yaml's rate_limits block, and no import of the shadow module
+# (a bare env-var read keeps this file off the excluded shadow/* surface).
+# Measured 2026-09-15: a shadow-weekday run filed nousergon-data-I1743/I1752
+# under flow=data-collector and burned the production 3/day diagnosis
+# budget hours before a live collection run needed it.
+_FLOW_NAME = (
+    "data-collector-shadow"
+    if os.environ.get("DATA_COLLECTION_SHADOW_TRADING_DAY")
+    else "data-collector"
+)
 setup_logging(
     "data-collector",
     flow_doctor_yaml=_FLOW_DOCTOR_YAML,
     exclude_patterns=_FLOW_DOCTOR_EXCLUDE_PATTERNS,
+    flow_name=_FLOW_NAME,
 )
 
 from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history, technical_rating_ledger

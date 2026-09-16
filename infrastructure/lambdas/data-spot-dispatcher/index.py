@@ -901,6 +901,17 @@ if ! command -v gitleaks >/dev/null 2>&1; then
 fi
 command -v gitleaks >/dev/null 2>&1 || fail "gitleaks binary unavailable after install (fail-closed)"
 python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks binary/config not ready)"
+# Diagnosis-transport preflight, for EVERY workload (alpha-engine-config-I10880).
+# flow-doctor's `diagnosis.provider: router` wire imports `openai`
+# (flow_doctor/diagnosis/provider.py's RouterProvider) at CALL time, not
+# import time, so a missing package was never caught until the first real
+# diagnosis — measured on this exact box class 2026-09-15 (i-0521ac62ccfa5196a,
+# shadow-weekday, SSM command 426ffbd1): "ModuleNotFoundError: No module
+# named 'openai'", diagnosis filed WITHOUT a diagnosis. requirements.txt now
+# declares it (krepis[openai] pin, installed by the `pip install -r
+# requirements.txt` above); this gate catches future drift the same way the
+# DLP gate above does: fail closed at boot, not at the first LLM call.
+python -c "import openai" || fail "openai package (flow-doctor diagnosis router wire) not installed"
 {collector_cmd} 2>&1 | tee -a {log}
 rc=${{PIPESTATUS[0]}}
 trap - EXIT
