@@ -33,7 +33,12 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
-  - "predictor/price_cache/*.parquet"
+  # alpha-engine-config-I10895: corrected from the retired "predictor/price_cache/*.parquet"
+  # tree. `builders/_price_cache_writeboth.py::PRICE_CACHE_NEW_PREFIX` (Wave 3 PR4 cutover,
+  # DONE) is the sole write; `collectors/prices.py:441` uploads
+  # `f"{prefix}{ticker}.parquet"` through `price_cache_write_prefixes()`. Same key D04/D34
+  # already declare, so parity dedups it into one comparison instead of three unmeasurable rows.
+  - "reference/price_cache/{ticker}.parquet"
 consumers:
   - "crucible-predictor:inference/stages/load_universe.py"
   - "crucible-backtester:pipeline_common.py"
