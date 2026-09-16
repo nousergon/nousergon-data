@@ -61,9 +61,21 @@ consumers:
   - "crucible-dashboard:views/Daily_News.py"
   - "crucible-research:thinktank/context.py"
 contract:
-  schema: null
-  producer_test: null
-  consumer_pins: []
+  schema:
+    - "contracts/news_digest_daily.schema.json"
+    - "contracts/news_article_row.schema.json"
+    - "contracts/news_aggregate_row.schema.json"
+  # LIST value (three distinct published keys, three schemas) — data_gate/evidence.py
+  # only reads a scalar today (the D37 defect noted in PR1747/a63bbb0b); the sibling
+  # fixing _declared_schema_files in the data_gate track should extend it to lists.
+  producer_test: tests/test_news_daily_contract.py
+  consumer_pins:
+    - "morning-signal:tests/contracts/news_digest_daily.schema.json (HARD requirement, load_news_context raises when absent/stale/empty)"
+    - "crucible-dashboard:tests/contracts/news_article_row.schema.json"
+  # P-07 (alpha-engine-config#10870): news_aggregate_row has no consumer pin here —
+  # its live consumer (crucible-research thinktank/context.py) is v1, retiring under
+  # phase 4, and out of scope for this PR; the producer schema is still built per
+  # plan §3 (a surviving consumer exists regardless of tier).
 registry_rows:
   - daily_news
   - daily_news_articles
