@@ -3,6 +3,7 @@
   "$id": "nousergon-data/contracts/constituents.schema.json",
   "title": "S&P 500/400 constituents (market_data/weekly/{date}/constituents.json, v1)",
   "description": "Producer: collectors/constituents.py::collect. SSGA SPDR (SPY/MDY) membership + Wikipedia GICS sector/sub-industry. No embedded schema_version today (config#6946 era); this file is v1 of the external contract, versioned by filename/git history per architecture.d/146 rule 3 rather than a payload field -- a future payload schema_version is an additive, backward-compatible change. Consumer: crucible/data/universe.py (v2 declared universe), crucible-executor. Plan §3 boundary table row 4.",
+  "x-key-pattern": "market_data/weekly/{date}/constituents.json",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -21,6 +22,10 @@
     "sp500_count": {"type": "integer", "minimum": 0},
     "sp400_count": {"type": "integer", "minimum": 0},
     "total_count": {"type": "integer", "minimum": 0},
-    "fetched_at": {"type": "string"}
+    "fetched_at": {
+      "type": "string",
+      "x-provenance": true,
+      "description": "Wall-clock stamp of the fetch, not a data value (alpha-engine-config-I10894): shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs`, because a shadow run and its live counterpart never fetch at the same instant."
+    }
   }
 }
