@@ -127,3 +127,24 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
+notes: >-
+    alpha-engine-config-I11002 (measured 2026-09-17, under I10753): `trigger.successor`
+    above is ASPIRATIONAL, not a measured fact — NO standalone workload runs this unit
+    today. `_WORKLOADS["morning-enrich"]` is `python weekly_collector.py --morning-enrich
+    --skip-chronic-heal --skip-arctic-append`, which explicitly skips the chronic heal on
+    both the morning and the weekly schedule; `_WORKLOADS["daily-heal"]`
+    (`--daily-heal`) maps to D33 (`run_units.py:197`), a different unit and a different
+    mode. So this is one of the two live `data.cutover_ready.units_covered` UNMETs, and
+    when phase 4 disables `ne-weekly-freshness-pipeline:MorningEnrich` the heal stops with
+    no successor. The fix is a new dispatcher workload key over the standalone entrypoint
+    that already exists (`weekly_collector.py:1197`, `args.chronic_gap_heal` ->
+    `_run_whole_mode_unit("chronic_gap_heal", ...)`, with its manifest key extractor at
+    `weekly_collector.py:1042`) — a change to
+    `infrastructure/lambdas/data-spot-dispatcher/index.py`, which I10753's change set does
+    not own. Registered meanwhile in
+    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE`. The
+    `nousergon-data-PR1701` token is LEFT IN `trigger.successor` deliberately:
+    `data_gate/clauses.py::_replaced_by_standalone_stack` keys membership of the graded set
+    on it, so correcting the prose by deleting the token would silently drop a genuinely
+    uncovered unit out of the gate's denominator — the exact blindness
+    alpha-engine-config-I10908 was filed for.

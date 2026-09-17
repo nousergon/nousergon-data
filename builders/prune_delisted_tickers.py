@@ -71,11 +71,13 @@ import boto3
 import pandas as pd
 
 import corporate_actions as ca
+import run_units
 from builders._constituents_loader import load_constituents_for_run_date
 from dates import default_run_date
 from features.compute import DEFAULT_BUCKET, _SKIP_TICKERS, _is_sector_etf
 from polygon_client import polygon_client
 from store.arctic_store import get_delisted_history_lib, get_universe_lib
+from validators import expectations
 
 log = logging.getLogger(__name__)
 
@@ -556,13 +558,19 @@ def prune_delisted_tickers(
 
     # Always write the audit, even on dry-run + zero-prune — gives Sat
     # SF reviewers a per-week artifact they can grep across runs.
-    _write_audit(s3, bucket, summary)
+    # `audit_key` is the key it landed at, or None when the PUT failed —
+    # recorded on the summary because D14's run manifest declares the key this
+    # run actually published and may not re-derive it (the `{ts}` segment is
+    # wall-clock; alpha-engine-config-I11001).
+    summary["audit_key"] = _write_audit(s3, bucket, summary)
 
     return summary
 
 
-def _write_audit(s3, bucket: str, summary: dict) -> None:
+def _write_audit(s3, bucket: str, summary: dict) -> str | None:
     """Write a per-run audit JSON to S3 for forensic review.
+
+    Returns the key written, or ``None`` when the PUT failed.
 
     Keyed by ``summary["trading_day"]`` — NEVER ``summary["today"]``
     (alpha-engine-config-I10820): the shadow-parity comparator renders this
@@ -581,12 +589,14 @@ def _write_audit(s3, bucket: str, summary: dict) -> None:
             ContentType="application/json",
         )
         log.info("Audit written: s3://%s/%s", bucket, key)
+        return key
     except Exception as exc:
         log.warning(
             "Failed to write audit to s3://%s/%s: %s. "
             "Pruning result still authoritative — audit is observability.",
             bucket, key, exc,
         )
+        return None
 
 
 def main() -> int:
@@ -622,15 +632,85 @@ def main() -> int:
     if args.tickers:
         tickers_override = [t.strip().upper() for t in args.tickers.split(",") if t.strip()]
 
-    summary = prune_delisted_tickers(
-        bucket=args.bucket,
-        absent_days=args.absent_days,
-        apply=args.apply,
-        tickers_override=tickers_override,
+    # alpha-engine-config-I11001. D14's descriptor has always declared
+    # `run_manifest_prefix: data_collection/runs/D14`, and nothing wrote it:
+    # this entrypoint ran as the second half of the `weekly-phase-one`
+    # dispatcher workload and left no run record, so the standalone weekly
+    # schedule could not name D14 in `verify_units` without failing every run
+    # on a manifest that never existed — and a failed prune was
+    # indistinguishable from one that never ran. Same thin-wrapper shape
+    # `rag/pipelines/run_weekly_ingestion_recorded.py` uses for D16
+    # (alpha-engine-config-I10862): the prune itself is untouched, and exactly
+    # one `run_units.recorded_entry` call is added around it.
+    #
+    # `trading_day` is resolved ONCE here and passed into BOTH the prune and
+    # the manifest. The audit key embeds `summary["trading_day"]`, and the
+    # completion check renders `builders/prune_audit/{trading_day}-*.json`
+    # against the MANIFEST's `trading_day` (`index.py::_key_pattern`) — two
+    # independent `default_run_date()` calls could straddle a session boundary
+    # and produce a manifest that can never match the key its own run wrote.
+    trading_day = default_run_date()
+
+    def _entry(ctx) -> dict:
+        summary = prune_delisted_tickers(
+            bucket=args.bucket,
+            absent_days=args.absent_days,
+            apply=args.apply,
+            tickers_override=tickers_override,
+            trading_day=trading_day,
+        )
+        # `delisted_history::{ticker}` is an ArcticDB symbol, not an S3 key;
+        # the completion check declares it unverifiable and skips it. Recorded
+        # anyway, with the count of frames retained, because the manifest is
+        # also the forensic record and "ungraded" is not "unrecorded".
+        for ticker in summary.get("retained") or []:
+            ctx.record_output(f"delisted_history::{ticker}", rows_out=1)
+
+        audit_key = summary.get("audit_key")
+        if audit_key:
+            ctx.record_output(audit_key, rows_out=int(summary.get("pruned_count") or 0))
+            ctx.record_guard(
+                expectations.EMPTY_FRESH_GUARD.name,
+                mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+                verdict="ok",
+                detail=(
+                    f"D14 published {audit_key} "
+                    f"(pruned={summary.get('pruned_count')}, retained={summary.get('retained_count')})"
+                ),
+                value=float(summary.get("pruned_count") or 0),
+            )
+            return summary
+
+        # The audit PUT is the ONLY S3 key this unit publishes, so losing it
+        # means the run produced no gradable output — fail loud rather than
+        # returning a manifest that says `ok` over nothing. The prune's own
+        # ArcticDB work has already happened and is reported in the summary
+        # the sentinel carries; this fails the RECORD, not the deletion.
+        ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict="empty_fresh",
+            detail=(
+                "the prune completed but its audit PUT to "
+                f"{AUDIT_PREFIX}{trading_day}-*.json failed, so this run published no "
+                "gradable key"
+            ),
+        )
+        raise run_units.EntryRunFailed(
+            f"D14 audit write to s3://{args.bucket}/{AUDIT_PREFIX} failed — "
+            "the prune ran but left no publishable record",
+            value=summary,
+        )
+
+    summary = run_units.recorded_entry(
+        "D14",
+        _entry,
+        trigger="scheduled",
+        trading_day=trading_day,
     )
 
     print(json.dumps(summary, indent=2, default=str))
-    return 0
+    return 0 if (summary or {}).get("audit_key") else 1
 
 
 if __name__ == "__main__":
