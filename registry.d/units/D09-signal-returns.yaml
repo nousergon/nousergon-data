@@ -132,3 +132,17 @@ notes: >-
     Plan §8.1 EXCLUSION: its inputs are v1 artifacts retired in v2 phase 4 and v2
     attribution supersedes it. The row stays on the board so the retirement is visible
     rather than silent (mirrors D15L/D40/D41's already-executed R7 retirements).
+
+    alpha-engine-config-I10753 (2026-09-17): D09 was ALSO still named in the
+    `data-collection-weekly` schedule's `verify_units`
+    (`infrastructure/cloudformation/nousergon-data-collection.yaml`) — nousergon-data-PR1701
+    wrote that input before the R7 ruling landed, so the standalone stack was asserting a
+    completeness claim for a producer this block declares retired with
+    `no_successor_workload: true`. It read green only because
+    `weekly_collector.py --phase 1` still runs the `signal_returns` phase
+    (`run_units.PHASE_UNITS[("phase1", "signal_returns")]`), and would have gone RED the
+    day that stops — a false red over a deliberate retirement, the
+    alpha-engine-config-I7715 class. Removed, and
+    `tests/test_data_collection_stack.py::test_every_standalone_successor_unit_is_covered_or_retired`
+    now refuses any unit with a `retirement:` block appearing in a schedule's
+    `verify_units`, so it cannot come back by hand.

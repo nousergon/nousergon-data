@@ -140,6 +140,20 @@ notes: >-
     Run record is UNVERIFIED: stdout into /var/log/data-weekly.log only. P-06 puts it
     through the run-manifest wrapper.
 
+    alpha-engine-config-I11001 (measured 2026-09-17, under I10753): this unit is one of
+    the two `data.cutover_ready.units_covered` UNMETs. The WORKLOAD is not the gap —
+    `_WORKLOADS["weekly-phase-one"]` is `( python weekly_collector.py --phase 1 && python
+    -m builders.prune_delisted_tickers --apply )`, so the standalone weekly schedule does
+    run it. The gap is that nothing writes the `run_manifest_prefix` declared below:
+    `builders/prune_delisted_tickers.py` imports no `run_units` entrypoint at all (grep for
+    `run_units|recorded_entry|manifest_sink`: zero hits). Until it does, naming D14 in the
+    weekly schedule's `verify_units` would fail EVERY run on a manifest that is never
+    written, so it is deliberately absent there and registered instead in
+    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE`. The
+    `nousergon-data-PR1701` token stays in `trigger.successor` above on purpose:
+    `data_gate/clauses.py::_replaced_by_standalone_stack` keys membership of the graded set
+    on it, and dropping it would turn a true UNMET into an invisible non-member.
+
     alpha-engine-config-I10820: `writes` was two prose entries, unmeasurable by the shadow
     parity tool. Code read of `builders/prune_delisted_tickers.py`: `_retain_delisted`
     (line ~224) writes each pruned ticker's full frame to the `delisted_history` ArcticDB

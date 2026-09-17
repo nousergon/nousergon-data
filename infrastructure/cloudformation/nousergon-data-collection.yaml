@@ -251,6 +251,19 @@ Resources:
   # (insider_transactions — no dispatcher key of its own, graded against the
   # SAME manifest D16 writes; its descriptor's run_manifest_prefix points at
   # D16's prefix, alpha-engine-config-I10753).
+  #
+  # D09 (signal_returns) is NOT listed, and that absence is the recorded
+  # decision rather than an omission: its descriptor carries a `retirement:`
+  # block (Brian 2026-09-14 R7, alpha-engine-config-I10748 plan §7 (b)) with
+  # `no_successor_workload: true`, exactly like D40/D41. It was listed here
+  # because PR1701 wrote this input BEFORE that ruling landed, so the stack
+  # was asserting a completeness claim for a unit declared retired — green
+  # today only because `weekly_collector.py --phase 1` still happens to run
+  # the phase, and a guaranteed FALSE RED the day it stops.
+  # `tests/test_data_collection_stack.py::
+  # test_every_standalone_successor_unit_is_covered_or_retired` now pins both
+  # directions, so a retired unit cannot reappear here and a live one cannot
+  # quietly drop out (alpha-engine-config-I10753).
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -267,7 +280,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D09", "D10", "D11", "D12", "D13", "D15", "D16", "D17", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D15", "D16", "D17", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
