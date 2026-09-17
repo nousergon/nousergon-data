@@ -108,13 +108,18 @@ setup_logging(
 )
 
 from collectors import constituents, historical_constituents, prices, macro, universe_returns, signal_returns, alternative, daily_closes, fundamentals, short_interest, metron_market_data, universe_classification, fred_history, technical_rating_ledger
+from collectors import CaretTickerError  # I10904 write-site guard
 from builders._price_cache_writeboth import (
     assert_valid_price_cache_ticker as _assert_valid_price_cache_ticker,
     price_cache_read_prefixes as _price_cache_read_prefixes,
     price_cache_write_prefixes as _price_cache_write_prefixes,
     write_price_cache_freshness_sentinel as _write_price_cache_freshness_sentinel,
 )
-from dates import assert_no_bar_after as _assert_no_bar_after, default_run_date  # config#1014 trading-day axis; I10893 write guard
+from dates import (  # config#1014 trading-day axis; I10893 write guard
+    FutureBarError as _FutureBarError,
+    assert_no_bar_after as _assert_no_bar_after,
+    default_run_date,
+)
 # alpha-engine-config-I10773 (P-06) / I10785 (P-18): one run manifest per unit
 # execution, and the common empty-but-fresh guard before every publish claim.
 import run_units
@@ -2271,7 +2276,17 @@ def _self_heal_chronic_polygon_gaps(
 
     Idempotent: tickers already at target_date are skipped, so re-running
     after a partial completion costs only the freshness reads. Best-effort
-    per-ticker — one ticker's yfinance failure does not block the others.
+    per-ticker — one ticker's ordinary yfinance/network failure does not
+    block the others. NOT best-effort for a run-level contract violation:
+    a caret-prefixed ticker reaching the write-time guard
+    (``CaretTickerError``) or a post-close/future bar
+    (``dates.FutureBarError``) propagates out of this loop rather than
+    being folded into ``summary["errors"]`` — both are population/clock
+    bugs upstream of any one ticker's fetch, and the caller
+    (``_run_chronic_gap_self_heal_step`` / weekly_collector's
+    `chronic_gap_self_heal` state) already has a broad handler that
+    records the step as ``status: error`` without failing the pipeline
+    (alpha-engine-config-I10904).
 
     Returns a summary dict with per-ticker outcomes; the caller should
     log it (not raise) so a yfinance hiccup on a chronic gap doesn't
@@ -2377,7 +2392,16 @@ def _self_heal_chronic_polygon_gaps(
             ].sort_index()
 
             if not dry_run:
-                _assert_valid_price_cache_ticker(ticker)
+                try:
+                    _assert_valid_price_cache_ticker(ticker)
+                except ValueError as _caret_exc:
+                    # I10904: this site's only handler (`except Exception as
+                    # exc` below) was folding a caret-ticker contract
+                    # violation into an ordinary per-ticker self-heal
+                    # failure. Re-raise as the dedicated type so the
+                    # `except CaretTickerError: raise` clause below catches
+                    # only this failure, not an unrelated ValueError.
+                    raise CaretTickerError(str(_caret_exc)) from _caret_exc
                 _assert_no_bar_after(combined_pcache.index, target_date, artifact=f"price_cache/{ticker}.parquet")  # I10893
                 buf = _io.BytesIO()
                 combined_pcache.to_parquet(buf, engine="pyarrow", compression="snappy")
@@ -2407,6 +2431,10 @@ def _self_heal_chronic_polygon_gaps(
                 new_rows.index[-1].date(),
                 len(new_rows),
             )
+        except _FutureBarError:
+            raise  # run-level contract violation, never a per-ticker miss (I10893)
+        except CaretTickerError:
+            raise  # run-level contract violation, never a per-ticker miss (I10904)
         except Exception as exc:
             logger.exception("chronic-gap self-heal failed for %s", ticker)
             summary["errors"].append({"ticker": ticker, "reason": str(exc)})

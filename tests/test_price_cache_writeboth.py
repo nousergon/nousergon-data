@@ -22,6 +22,7 @@ from unittest.mock import MagicMock
 import pandas as pd
 import pytest
 
+from collectors import CaretTickerError
 from builders._price_cache_writeboth import (
     PRICE_CACHE_FRESHNESS_SENTINEL_KEY,
     PRICE_CACHE_LEGACY_PREFIX,
@@ -235,7 +236,13 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
 def test_fred_backfill_refuses_caret_ticker_write(monkeypatch):
     """alpha-engine-config-I9288 chokepoint: even a FRED_HISTORY_MAP entry
     keyed with a caret must refuse to write, not just fail the earlier
-    ``unknown ticker`` check (which only screens membership, not shape)."""
+    ``unknown ticker`` check (which only screens membership, not shape).
+
+    alpha-engine-config-I10904: the guard's ``ValueError`` used to be caught
+    by this call site's own broad ``except Exception`` and folded into an
+    ordinary per-ticker ``status: error`` — indistinguishable from a
+    transient yfinance/FRED miss. It now propagates as ``CaretTickerError``
+    out of ``backfill_to_s3`` rather than being recorded per-ticker."""
     from collectors import fred_history
 
     idx = pd.date_range("2020-01-01", periods=20, freq="B")
@@ -264,16 +271,15 @@ def test_fred_backfill_refuses_caret_ticker_write(monkeypatch):
 
     monkeypatch.setattr(fred_history.boto3, "client", lambda _svc: _RecordingS3())
 
-    out = fred_history.backfill_to_s3(
-        bucket="test-bucket",
-        s3_prefix=PRICE_CACHE_LEGACY_PREFIX,
-        tickers=["^VIX3M"],
-        period_years=5,
-        dry_run=False,
-    )
+    with pytest.raises(CaretTickerError, match=r"\^VIX3M"):
+        fred_history.backfill_to_s3(
+            bucket="test-bucket",
+            s3_prefix=PRICE_CACHE_LEGACY_PREFIX,
+            tickers=["^VIX3M"],
+            period_years=5,
+            dry_run=False,
+        )
 
-    assert out["status"] == "partial"
-    assert out["per_ticker"]["^VIX3M"]["status"] == "error"
     assert recorded == [], "chokepoint must refuse the write, not just log"
 
 
@@ -418,7 +424,14 @@ def test_weekly_chronic_gap_self_heal_writes_reference_only(monkeypatch):
 def test_weekly_chronic_gap_self_heal_refuses_caret_ticker_write(monkeypatch):
     """alpha-engine-config-I9288 chokepoint: ``_self_heal_chronic_polygon_gaps``
     must refuse to PUT a caret-keyed ticker rather than writing a stray
-    price-cache key. Recorded as a per-ticker error, not a crash."""
+    price-cache key.
+
+    alpha-engine-config-I10904: this site's only handler used to be a broad
+    ``except Exception`` that folded the guard's ``ValueError`` into an
+    ordinary per-ticker self-heal failure (``summary["errors"]``) —
+    indistinguishable from a transient yfinance miss. It now propagates as
+    ``CaretTickerError`` out of the loop entirely, a run-level contract
+    violation rather than a per-ticker one."""
     import weekly_collector as wc
 
     target_date = "2026-05-12"
@@ -462,17 +475,15 @@ def test_weekly_chronic_gap_self_heal_refuses_caret_ticker_write(monkeypatch):
     monkeypatch.setattr(wc.boto3, "client", lambda _svc: _FakeS3())
     monkeypatch.setattr("builders.backfill.backfill", lambda **_kw: {"status": "ok"})
 
-    summary = wc._self_heal_chronic_polygon_gaps(
-        bucket="test-bucket",
-        target_date=target_date,
-        chronic_tickers=["^VIX3M"],
-        dry_run=False,
-    )
+    with pytest.raises(CaretTickerError, match=r"\^VIX3M"):
+        wc._self_heal_chronic_polygon_gaps(
+            bucket="test-bucket",
+            target_date=target_date,
+            chronic_tickers=["^VIX3M"],
+            dry_run=False,
+        )
 
     assert put_calls == [], "chokepoint must refuse the write, not just log"
-    assert len(summary["errors"]) == 1
-    assert summary["errors"][0]["ticker"] == "^VIX3M"
-    assert "^" in summary["errors"][0]["reason"]
 
 
 # ---------------------------------------------------------------------------

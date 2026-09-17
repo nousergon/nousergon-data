@@ -27,6 +27,7 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+from collectors import CaretTickerError
 from dates import FutureBarError, as_trading_day, assert_no_bar_after, default_run_date
 
 from nousergon_lib.secrets import get_secret
@@ -296,7 +297,14 @@ def backfill_to_s3(
                     # Wave 3 PR1: write-both to legacy ``predictor/price_cache/``
                     # + new ``reference/price_cache/`` (see
                     # builders/_price_cache_writeboth.py for soak contract)
-                    assert_valid_price_cache_ticker(ticker)
+                    try:
+                        assert_valid_price_cache_ticker(ticker)
+                    except ValueError as _caret_exc:
+                        # I10904: re-raise as the dedicated type so the
+                        # `except CaretTickerError: raise` clause below
+                        # catches only this failure, not an unrelated
+                        # ValueError elsewhere in this block.
+                        raise CaretTickerError(str(_caret_exc)) from _caret_exc
                     for prefix in price_cache_write_prefixes(s3_prefix):
                         s3.upload_file(
                             str(parquet_path),
@@ -310,6 +318,8 @@ def backfill_to_s3(
                         )
             except FutureBarError:
                 raise  # run-level contract violation, never a per-ticker miss
+            except CaretTickerError:
+                raise  # run-level contract violation, never a per-ticker miss (I10904)
             except Exception as e:
                 logger.error("Backfill failed for %s (%s): %s", ticker, series_id, e)
                 results[ticker] = {"status": "error", "error": str(e)}

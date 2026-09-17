@@ -43,6 +43,7 @@ from builders._price_cache_writeboth import (
     price_cache_read_prefixes,
     price_cache_write_prefixes,
 )
+from collectors import CaretTickerError
 from dates import (
     FutureBarError,
     assert_no_bar_after,
@@ -525,7 +526,17 @@ def _refresh_stale(
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
                     # see builders/_price_cache_writeboth.py for soak contract)
-                    assert_valid_price_cache_ticker(ticker)
+                    try:
+                        assert_valid_price_cache_ticker(ticker)
+                    except ValueError as _caret_exc:
+                        # I10904: the guard's own ValueError was being caught
+                        # by the broad `except Exception` below and folded
+                        # into an ordinary per-ticker miss. Re-raise as the
+                        # dedicated type so the `except CaretTickerError:
+                        # raise` clause ahead of that handler catches only
+                        # this failure — an unrelated ValueError elsewhere in
+                        # this block still degrades to a per-ticker failure.
+                        raise CaretTickerError(str(_caret_exc)) from _caret_exc
                     assert_no_bar_after(
                         new_df.index, trading_day,
                         artifact=f"{s3_prefix}{ticker}.parquet",
@@ -538,6 +549,8 @@ def _refresh_stale(
 
                 except FutureBarError:
                     raise  # run-level contract violation, never a per-ticker miss
+                except CaretTickerError:
+                    raise  # run-level contract violation, never a per-ticker miss (I10904)
                 except Exception as e:
                     logger.warning("Refresh failed for %s: %s", ticker, e)
                     failed_tickers.append(ticker)
