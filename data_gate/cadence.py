@@ -14,9 +14,16 @@ Three shapes, each derived from a declared field, never a hand list:
   ``"Sat 05:00 America/New_York"``, ``"weekdays 16:45 America/New_York"``).
   The evidence is the most recent fire at or before the gate's moment, less a
   completion grace.
-* **on_demand** — ``trigger.kind`` is ``manual`` or ``on-demand-dispatch``. The
-  evidence is the most recent invocation, whenever it was; no invocation at all
-  is a declared not-applicable, not a failure.
+* **on_demand** — ``trigger.kind`` is ``manual`` or ``on-demand-dispatch``, OR
+  ``trigger.on_demand`` is ``true``. The evidence is the most recent
+  invocation, whenever it was; no invocation at all is a declared
+  not-applicable, not a failure. The explicit flag exists because ``kind`` is
+  also how ``scripts/gen_observability_rows.py`` derives SUBSTRATE, log
+  location and alert channel (``SUBSTRATE_BY_TRIGGER_KIND``) — a GHA-hosted
+  unit whose trigger is push/``workflow_dispatch``-only (D42) is genuinely
+  on-demand for CADENCE purposes but must keep ``kind: github-actions`` for
+  substrate purposes, so cadence declares it independently rather than
+  overloading ``kind`` with a second meaning.
 * **continuous** — ``trigger.cadence_minutes`` or a ``rate(...)`` schedule: runs
   at least daily, so the gate's own trading day is the right day.
 
@@ -117,6 +124,8 @@ def unit_cadence(raw: dict) -> Cadence:
     """The cadence a unit descriptor declares — see the module docstring."""
     trigger = raw.get("trigger") or {}
     kind = str(trigger.get("kind") or "")
+    if trigger.get("on_demand") is True:
+        return Cadence(kind="on_demand", source=f"trigger.on_demand=true (kind={kind or '?'})")
     if kind in _ON_DEMAND_KINDS:
         return Cadence(kind="on_demand", source=f"trigger.kind={kind}")
     if trigger.get("cadence_minutes"):

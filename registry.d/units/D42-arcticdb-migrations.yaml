@@ -30,36 +30,27 @@ code_path: >-
     infrastructure/lambdas/arctic-migration-dispatcher/index.py:603
 trigger:
   kind: "github-actions"
+  on_demand: true
   successor: unchanged by v2 phase 4
   runs_on: "github-hosted"
   detail: >-
       .github/workflows/run-arctic-migrations.yml, on push to migrations/** and
       workflow_dispatch
-  # alpha-engine-config-I10871/I10870: verified against
+  # alpha-engine-config-I10871/I10870/I10877: verified against
   # .github/workflows/run-arctic-migrations.yml on origin/main — `on: {push:
   # {paths: [migrations/**]}, workflow_dispatch: {}}`, no `schedule:` block at
   # all. This is genuinely on-demand (event-driven by a migrations/** push, or
-  # a manual dispatch), never scheduled. NOT declared as
-  # `kind: on-demand-dispatch` here: that value's existing meaning in this
-  # file (SUBSTRATE_BY_TRIGGER_KIND -> "ec2-spot", scripts/
-  # gen_observability_rows.py::_log_location -> the SSM spot-log path,
-  # _alert_channel likewise) describes the OTHER on-demand shape — an EC2
-  # spot dispatcher unit (D35's own trigger) — and would MISDESCRIBE this
-  # unit's actual, correctly-derived GitHub-Actions log location and alert
-  # channel (notify-main-failure) just to satisfy a cadence classification.
-  # data_gate/cadence.py::unit_cadence's closed vocabulary
-  # ({"manual","on-demand-dispatch"} for on_demand; else scheduled/
-  # continuous/undeclared) has no shape for "GHA workflow, push +
-  # workflow_dispatch, no cron" that doesn't collide with that meaning — a
-  # genuine gap in that module's vocabulary, not a fact this descriptor can
-  # paper over by mislabeling its trigger.kind. Left `undeclared`
-  # deliberately: cadence.py's own docstring states this reads UNMEASURABLE/
-  # graded against the gate's day, "so a missing declaration can never make a
-  # row greener than it would be with one" — the honest, strictest default,
-  # not a gap this fix silently hides. Follow-up: cadence.py needs a fourth
-  # shape (or a `trigger.on_demand: true` flag independent of `kind`) for
-  # this exact case; out of scope here since cadence.py is owned by a sibling
-  # PR (nousergon-data-PR1749).
+  # a manual dispatch), never scheduled. `kind` stays `github-actions` — that
+  # value drives SUBSTRATE_BY_TRIGGER_KIND (scripts/gen_observability_rows.py)
+  # to the correct GitHub-Actions log location and alert channel
+  # (notify-main-failure); reusing `kind: on-demand-dispatch` here would
+  # misdescribe this unit's substrate to satisfy a cadence classification (that
+  # value means "EC2 spot dispatcher", D35's shape). `trigger.on_demand: true`
+  # is the fix (I10877): a cadence declaration independent of `kind`, read by
+  # `data_gate/cadence.py::unit_cadence` before it looks at `kind` at all — so
+  # this unit is graded as `on_demand` (most-recent-invocation, or a declared
+  # not-applicable if none) instead of `undeclared`/graded against the gate's
+  # own day.
 writes:
   - arcticdb/universe (library)
   - arcticdb/macro (library)
