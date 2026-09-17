@@ -1087,17 +1087,34 @@ def test_units_covered_membership_keys_on_the_successor_not_the_trigger_kind(uni
     graded = {u.unit_id for u in clause_module._sf_only_units(units) if not u.retired}
     for unit_id in sorted(dropped_by_kind & graded):
         assert any(unit_id in name for name in clause.evidence), (
-            f"{unit_id} is replaced by the standalone stack but its survives_phase4 "
-            "clause is not in the rollup's evidence"
+            f"{unit_id} is replaced by the standalone stack but its descriptor is not in "
+            "the rollup's evidence"
         )
 
 
-def test_units_covered_is_unmeasurable_when_no_survives_phase4_evidence_exists(units):
+def test_phase1_units_produced_is_unmeasurable_when_no_survives_phase4_evidence_exists(units):
     """Every `survives_phase4` base clause is a phase-0 stub on an empty
-    store, so the rollup is UNMEASURABLE — not a false UNMET."""
-    clause = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
+    store, so the PHASE-1 rollup over them is UNMEASURABLE — not a false UNMET.
+
+    It moved off `data.cutover_ready.units_covered` with the live reading
+    itself (`alpha-engine-config-I10989`): that sub-gate is read before the
+    cutover and may not depend on production evidence that only the cutover can
+    produce.
+    """
+    clause = clause_module._clause_phase1_units_produced(EmptyStore(), units, trading_day=TRADING_DAY)
     assert clause.unmeasurable is True
     assert clause.met is False
+
+
+def test_units_covered_answers_statically_with_no_store_reads(units):
+    """`alpha-engine-config-I10989`: the sub-gate's leg is answered from the
+    committed stack definition and the committed descriptors, so an empty store
+    and a DENIED store give the same verdict — it reads neither."""
+    empty = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
+    denied = clause_module._clause_cutover_ready_units_covered(DeniedStore(), units, trading_day=TRADING_DAY)
+    assert empty.unmeasurable is False
+    assert (empty.met, empty.detail, empty.evidence) == (denied.met, denied.detail, denied.evidence)
+    assert "verify_units" in empty.requirement
 
 
 def test_the_board_document_publishes_unit_id_per_row(tmp_path):
