@@ -1158,7 +1158,6 @@ def _build_proposed_input(skip_flags: dict[str, bool] | None = None) -> dict:
         "skip_eval_judge": False,
         "skip_eval_rolling_mean": False,
         "skip_rationale_clustering": False,
-        "skip_replay_concordance": False,
         "skip_counterfactual": False,
         "skip_aggregate_costs": False,
         "skip_predictor_training": False,

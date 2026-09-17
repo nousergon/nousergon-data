@@ -221,7 +221,14 @@ CODIFIED_FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     "alpha-engine-weekly-coverage-sweep": 300,
     "alpha-engine-predictor-regime-retrospective-eval": 600,
     "alpha-engine-predictor-regime-substrate": 300,
-    "alpha-engine-replay-concordance": 900,
+    # alpha-engine-replay-concordance was RETIRED from this pipeline by
+    # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): its
+    # replay corpus — the six-team research agents — was retired under
+    # -I1580 on 2026-07-20, and the resulting zero-call run failed the
+    # 2026-09-12 canonical weekly SF at AggregateCosts. Its row is removed
+    # rather than left behind, for the same reason the eval-judge poll rows
+    # below were: an entry naming a function no SF invokes is an unchecked
+    # claim.
     "alpha-engine-replay-counterfactual": 600,
     "alpha-engine-research-aggregate-costs": 300,
     # alpha-engine-research-eval-judge-poll and -process were RETIRED by

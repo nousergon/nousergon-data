@@ -884,6 +884,13 @@ alert_classes:
     # DECLARED: input-quality degradation — suboptimal results, not a halt.
     tier: notify-silent
   - class: backtester_replay_concordance_empty_corpus
+    # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): the
+    # ReplayConcordance STAGE is retired from ne-weekly-freshness-pipeline,
+    # but this class row is DELIBERATELY KEPT — its raiser is
+    # crucible-backtester replay/batch.py, which remains in the repo and is
+    # still invocable standalone (and by the canary). A class row removed
+    # while its raiser lives is an undeclared alert class, which is the
+    # defect the alert-class guard exists to catch.
     # alpha-engine-config-I7183: ReplayConcordance's agent_filter matched
     # zero decision_artifacts in the trailing window (measured 2026-09-12:
     # the default six-team filter's last match was 2026-07-11). The stage

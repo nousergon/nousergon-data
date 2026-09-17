@@ -179,16 +179,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "RationaleClustering": frozenset(
         {"dry_run_llm.$", "end_time_iso.$", "run_date.$"}
     ),
-    "ReplayConcordance": frozenset(
-        {
-            "dry_run_llm.$",
-            "end_time_iso.$",
-            "max_artifacts",
-            "target_models",
-            "window_days",
-            "run_date.$",
-        }
-    ),
+    # ReplayConcordance LEFT this table under alpha-engine-config-I10539
+    # (Brian ruling 2026-09-16, option b) with the state itself — an entry
+    # naming a state this walk cannot reach exempts nothing while reading
+    # as coverage.
     "Counterfactual": frozenset(
         {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days", "run_date.$"}
     ),
