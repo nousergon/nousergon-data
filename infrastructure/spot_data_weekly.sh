@@ -827,8 +827,10 @@ DEPS
 # a scanner that cannot be verified aborts the boot loudly (fail-closed
 # stays; this makes the binary present so it no longer fires on every boot).
 # This file does not source _spot_common.sh (see the header), so the same
-# block lives here directly rather than via install_gitleaks_dlp().
-echo "==> Installing gitleaks + running DLP preflight gate..."
+# block lives here directly rather than via install_gitleaks_dlp() — now
+# including that function's diagnosis-transport preflight (I10880), kept in
+# lockstep with it for the same reason the gitleaks pin is.
+echo "==> Installing gitleaks + running DLP + diagnosis-transport preflight gates..."
 run_ssm "gitleaks-dlp" 300 <<'GITLEAKS_DLP'
 set -euo pipefail
 GITLEAKS_VERSION=8.30.1
@@ -850,8 +852,22 @@ if ! "$PYTHON_BIN" -m krepis.session_dlp preflight; then
   exit 1
 fi
 echo "DLP preflight OK."
+# alpha-engine-config-I10880: flow-doctor's `diagnosis.provider: router` wire
+# imports `openai` at call time (flow_doctor/diagnosis/provider.py's
+# RouterProvider), not at import time, so a missing package was never caught
+# until the first real diagnosis — on the production data-collector flow
+# (this script also bootstraps the `shadow-weekday` box, dispatched by
+# infrastructure/lambdas/data-spot-dispatcher). requirements.txt now
+# declares it (krepis[openai] pin); this boot gate catches future drift the
+# same way the DLP gate above does: fail closed at boot, not at the first
+# LLM call.
+if ! "$PYTHON_BIN" -c "import openai" 2>/dev/null; then
+  echo "FATAL: openai package (flow-doctor diagnosis router wire) not installed — every flow-doctor diagnosis on this box would fail closed at the first real failure instead of at boot" >&2
+  exit 1
+fi
+echo "Diagnosis-transport preflight OK."
 GITLEAKS_DLP
-echo "  Gitleaks installed, DLP preflight OK."
+echo "  Gitleaks installed, DLP + diagnosis-transport preflight OK."
 
 # ── Launch-only: hand the bootstrapped spot to the weekday SF ────────────────
 # config#1807: the weekday pre-open data phase (MorningEnrich +

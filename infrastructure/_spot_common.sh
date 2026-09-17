@@ -432,7 +432,12 @@ install_gitleaks_dlp() {
   # fail-closed no longer fires on every boot). KREPIS_DLP_DISABLED=1 is
   # explicitly not read anywhere here — see the non-inferable gotcha in
   # alpha-engine-config-I10370: it would silence the fleet's only DLP control.
-  echo "==> Installing gitleaks + running DLP preflight gate..."
+  #
+  # Also gates the diagnosis wire's client library (alpha-engine-config-
+  # I10880) — `import openai` — for the same reason: a dependency an LLM
+  # call needs but that only fails at the first real call is a fail-closed
+  # posture that fires in production instead of at boot.
+  echo "==> Installing gitleaks + running DLP + diagnosis-transport preflight gates..."
   local _script
   read -r -d '' _script <<'GITLEAKS_DLP_SCRIPT' || true
 set -euo pipefail
@@ -455,6 +460,19 @@ if ! "$PYTHON_BIN" -m krepis.session_dlp preflight; then
   exit 1
 fi
 echo "DLP preflight OK."
+# alpha-engine-config-I10880: flow-doctor's `diagnosis.provider: router` wire
+# imports `openai` (flow_doctor/diagnosis/provider.py's
+# _call_openai_compat_chat, used by RouterProvider) at call time, not at
+# import time — so a missing package was never caught until the FIRST real
+# diagnosis attempt, on the production data-collector flow, in production.
+# requirements.txt now declares it (krepis[openai] pin), but a boot gate
+# next to the DLP preflight above catches a future drift the same way: fail
+# closed at boot, not silently at the first LLM call.
+if ! "$PYTHON_BIN" -c "import openai" 2>/dev/null; then
+  echo "FATAL: openai package (flow-doctor diagnosis router wire) not installed — every flow-doctor diagnosis on this box would fail closed at the first real failure instead of at boot" >&2
+  exit 1
+fi
+echo "Diagnosis-transport preflight OK."
 GITLEAKS_DLP_SCRIPT
   run_ssm "gitleaks-dlp" "$_script" 300
   echo "  Gitleaks installed, DLP preflight OK."

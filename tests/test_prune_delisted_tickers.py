@@ -463,6 +463,7 @@ def test_audit_written_on_dry_run(monkeypatch):
     _mod.prune_delisted_tickers(
         absent_days=14, apply=False,
         today=pd.Timestamp("2026-04-28"),
+        trading_day="2026-04-28",
     )
 
     s3.put_object.assert_called_once()
@@ -472,6 +473,53 @@ def test_audit_written_on_dry_run(monkeypatch):
     body = json.loads(call.kwargs["Body"])
     assert body["pruned_count"] == 1
     assert body["pruned"][0]["ticker"] == "HOLX"
+
+
+def test_audit_keyed_by_trading_day_not_today(monkeypatch):
+    """alpha-engine-config-I10820: the audit key must be stamped with
+    ``trading_day``, not the SF's own wall-clock ``today`` — a delayed or
+    off-schedule run (e.g. a Saturday SF auditing Friday's trading day) must
+    still produce a key the shadow-parity comparator's ``{trading_day}``
+    template can find."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=False,
+        today=pd.Timestamp("2026-04-25"),
+        trading_day="2026-04-24",
+    )
+
+    call = s3.put_object.call_args
+    assert call.kwargs["Key"].startswith("builders/prune_audit/2026-04-24-")
+    body = json.loads(call.kwargs["Body"])
+    assert body["trading_day"] == "2026-04-24"
+    assert body["today"] == "2026-04-25"
+
+
+def test_audit_trading_day_defaults_via_the_fleet_canonical_chokepoint(monkeypatch):
+    """No explicit ``trading_day`` — falls back to ``dates.default_run_date()``,
+    the same chokepoint ``collectors/universe_returns.py`` uses for its own
+    dated write, never to ``today`` (alpha-engine-config-I10820)."""
+    s3 = _stub_s3(constituents_tickers=["AAPL"])
+    lib = _stub_universe_lib(
+        symbols=["AAPL", "HOLX"],
+        last_dates={"AAPL": "2026-04-25", "HOLX": "2026-04-06"},
+    )
+    _patch_targets(monkeypatch, s3_mock=s3, universe_lib_mock=lib)
+    monkeypatch.setattr(_mod, "default_run_date", lambda: "2026-04-27")
+
+    _mod.prune_delisted_tickers(
+        absent_days=14, apply=False,
+        today=pd.Timestamp("2026-04-28"),
+    )
+
+    call = s3.put_object.call_args
+    assert call.kwargs["Key"].startswith("builders/prune_audit/2026-04-27-")
 
 
 def test_audit_written_on_apply(monkeypatch):
@@ -485,6 +533,7 @@ def test_audit_written_on_apply(monkeypatch):
     _mod.prune_delisted_tickers(
         absent_days=14, apply=True,
         today=pd.Timestamp("2026-04-28"),
+        trading_day="2026-04-28",
     )
 
     s3.put_object.assert_called_once()

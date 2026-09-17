@@ -118,7 +118,10 @@ _EXPECTED_SKIPS = {
     "skip_data_phase2",
     "skip_eval_judge",
     "skip_rationale_clustering",
-    "skip_replay_concordance",
+    # skip_replay_concordance retired: alpha-engine-config-I10539 (Brian
+    # ruling 2026-09-16, option b) removed the ReplayConcordance state and
+    # its CheckSkipReplayConcordance gate — there is no longer a Lambda
+    # invocation to skip.
     "skip_counterfactual",
     # Added 2026-05-25 (ROADMAP L1146 — SF-wire aggregate_costs.py CLI).
     # Observability skip; independent of the three above per the
@@ -289,7 +292,7 @@ _SPOT_STATES = {
 # defaults floor as an unread control var; removing it is a separate
 # change because ApplyShellRunDefaults and the offcycle presets also set
 # it, and a half-removed control var is worse than an unread one.
-# (research #202 added dry_run_llm) + replay-concordance + counterfactual
+# (research #202 added dry_run_llm) + counterfactual
 # (backtester #225 added dry_run_llm) — all reusing the canonical
 # $.research_dry shell-run-dry signal (already true under shell_run / false
 # on the real run). DriftDetection is NOT here — it is a SPOT state (see
@@ -318,13 +321,16 @@ _DRY_LAMBDA_STATES = {
     # right guard for its new shape: a dry_run_llm entry here would assert a
     # Payload key the state does not have.
     "RationaleClustering": ("dry_run_llm.$", "$.research_dry"),
-    "ReplayConcordance": ("dry_run_llm.$", "$.research_dry"),
+    # alpha-engine-config-I10539: ReplayConcordance is retired — a
+    # dry_run_llm entry here would assert a Payload on a state that no
+    # longer exists.
     "Counterfactual": ("dry_run_llm.$", "$.research_dry"),
 }
 
 # Skip-exception rewire (this PR): ZERO skip-exceptions remain. The
 # keystone's 5 documented hard-skips (skip_drift_detection / skip_eval_judge
-# / skip_rationale_clustering / skip_replay_concordance / skip_counterfactual)
+# / skip_rationale_clustering / skip_counterfactual; skip_replay_concordance
+# retired with its stage under alpha-engine-config-I10539)
 # were ALL flipped skip→dry — DriftDetection via the spot
 # commands.$/States.Format(--preflight-only) mechanism (data #261), the 6
 # eval Lambdas via dry_run_llm.$=$.research_dry (research #202 +
@@ -889,7 +895,6 @@ class TestApplyShellRunDefaults:
             # spot, so there is no drift state to run dry OR skip.)
             "skip_eval_judge",
             "skip_rationale_clustering",
-            "skip_replay_concordance",
             "skip_counterfactual",
         ):
             assert forbidden not in blob, (
@@ -1172,8 +1177,8 @@ class TestConsolidatedNotify:
         real Saturday run / true on the preflight. The handlers then run a no-write
         (ReportCard) / no-Opus-no-write probe (Director) on the preflight, still
         exercising container boot / imports / IAM / S3-read. Mirrors the other
-        advisory Lambdas (eval-judge / rationale-clustering / replay-concordance /
-        counterfactual) which all run dry via $.research_dry rather than skipping.
+        advisory Lambdas (eval-judge / rationale-clustering / counterfactual)
+        which all run dry via $.research_dry rather than skipping.
         """
         for state_name in ("ReportCard", "Director"):
             payload = states[state_name]["Parameters"]["Payload"]

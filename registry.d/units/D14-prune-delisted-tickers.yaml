@@ -151,3 +151,15 @@ notes: >-
     precedent, `tests/test_artifact_registry_coverage.py`), so the descriptor states it as
     the listable prefix pattern `builders/prune_audit/{trading_day}-*.json` rather than a
     single derivable key.
+
+    Second defect found under this same issue: `_write_audit` stamped the key with `today`
+    (the SF's own wall-clock execution date), not the trading day being audited — the v1
+    morning run for trading day 09-14 wrote `builders/prune_audit/2026-09-15-...json` (the
+    day IT ran, not the day it was pruning for). A weekday shadow run for trading_day
+    2026-09-14 compared against `builders/prune_audit/2026-09-14-*.json` and found the
+    PREVIOUS trading day's file instead, reading `shadow_missing`. Fixed in
+    `prune_delisted_tickers()`: a new `trading_day` parameter (default
+    `dates.default_run_date()`, the same fleet-canonical chokepoint `collectors/
+    universe_returns.py` already uses for its own dated write) now stamps the audit key;
+    `today` still governs the staleness threshold and is unchanged. The template above was
+    already correct — the writer was the defect, not the descriptor.

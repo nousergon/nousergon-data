@@ -315,6 +315,32 @@ def test_delisted_history_library_symbol_reference_is_arcticdb_not_prose():
     assert target.reason == ""
 
 
+def test_d14_prune_audit_key_matches_once_the_writer_stamps_trading_day():
+    """alpha-engine-config-I10820 second defect: `_write_audit` used to stamp
+    the audit key with the SF's own wall-clock `today`, never the trading day
+    being audited, so this family's manifest-scoped keys (rendered with
+    `{trading_day}` per `test_d14_prune_delisted_tickers_resolves_both_write_
+    targets` above) could never match a real object. Fixed at the writer
+    (`builders/prune_delisted_tickers.py::prune_delisted_tickers`'s new
+    `trading_day` parameter). This proves the FULL comparison — descriptor
+    template + a manifest whose output key now uses that same stamp — reaches
+    `match`, not `shadow_missing`."""
+    member = f"builders/prune_audit/{TRADING_DAY.isoformat()}-191704Z-apply.json"
+    payload = json.dumps({"trading_day": TRADING_DAY.isoformat()}).encode("utf-8")
+    reader = _FakeReader(
+        {
+            _shadow_manifest_key("D14"): _manifest_bytes("D14", "2026-09-12T20:00:00Z", [member]),
+            _v1_manifest_key("D14"): _manifest_bytes("D14", "2026-09-12T12:18:50Z", [member]),
+            member: payload,
+            ROOT.key(member): payload,
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D14")
+    )
+    matched = {row.key: row.verdict for row in report.rows if row.comparator != "arcticdb"}
+    assert matched == {member: "match"}
+
 
 # ---------------------------------------------------------------------------
 # D03/D46: writer-template reachability fix (alpha-engine-config-I10895)

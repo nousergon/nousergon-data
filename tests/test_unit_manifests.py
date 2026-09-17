@@ -551,7 +551,11 @@ def d16(monkeypatch):
 
 def _d16_fixture_objects(after):
     """Every declared D16 output, timestamped just after ``after`` (the run's
-    own "since" boundary) so `_iter_new_keys` picks all of them up."""
+    own "since" boundary) so `_iter_new_keys` picks all of them up. Also
+    includes D46's declared write key (alpha-engine-config-I10753: D46 has no
+    dispatcher entry point of its own and is graded against this same
+    manifest — see D46's `run_manifest_prefix` and this module's
+    `OUTPUT_PREFIXES`)."""
     ts = after + timedelta(seconds=5)
     manifest_body = json.dumps({"totals": {"documents": 1234, "chunks": 9000, "tickers": 640}}).encode()
     filing_body = json.dumps({"n_analyzed": 42, "n_lazy": 3}).encode()
@@ -566,6 +570,8 @@ def _d16_fixture_objects(after):
         "rag/filing_changes/latest.json": (filing_body, ts),
         "rag/corpus_freshness/latest.json": (json.dumps({"status": "fresh"}).encode(), ts),
         "health/rag_ingestion_progress/2026-09-19.json": (json.dumps({"step": 10, "of": 10}).encode(), ts),
+        "data/insider_transactions/2609190500_result.parquet": (b"PAR1-fake-parquet-bytes", ts),
+        "data/insider_transactions/latest.json": (json.dumps({"rows": 17}).encode(), ts),
     }
 
 
@@ -592,6 +598,8 @@ def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
         "rag/filing_changes/latest.json": 42,
         "rag/corpus_freshness/latest.json": 1,
         "health/rag_ingestion_progress/2026-09-19.json": 1,
+        "data/insider_transactions/2609190500_result.parquet": 1,
+        "data/insider_transactions/latest.json": 1,
     }
     verdicts = {g["verdict"] for g in manifest["guards"]}
     assert "ok" in verdicts

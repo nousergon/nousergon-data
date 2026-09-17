@@ -388,17 +388,14 @@ STAGES: tuple[Stage, ...] = (
             "MarkEvalJudgeDegraded", "MarkEvalRollingMeanDegraded",
         }),
     ),
+    # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): the
+    # replay_concordance stage was retired from the weekly SF, so
+    # rationale_clustering's successor gate is now CheckSkipCounterfactual.
     Stage(
         "rationale_clustering", "skip_rationale_clustering",
         "CheckSkipRationaleClustering", "RationaleClustering",
-        frozenset({"CheckSkipReplayConcordance"}),
-        degraded_witness=frozenset({"MarkRationaleClusteringDegraded"}),
-    ),
-    Stage(
-        "replay_concordance", "skip_replay_concordance",
-        "CheckSkipReplayConcordance", "ReplayConcordance",
         frozenset({"CheckSkipCounterfactual"}),
-        degraded_witness=frozenset({"MarkReplayConcordanceDegraded"}),
+        degraded_witness=frozenset({"MarkRationaleClusteringDegraded"}),
     ),
     Stage(
         "counterfactual", "skip_counterfactual",
@@ -730,7 +727,7 @@ BRANCH_A_STAGES = frozenset({
     "scanner", "regime_substrate", "signals_envelope", "challenger_shadow",
     "rag_ingestion", "regime_retrospective_eval",
     "data_phase2", "eval_judge", "rationale_clustering",
-    "replay_concordance", "counterfactual",
+    "counterfactual",
     # alpha-engine-config-I7194: aggregate_costs left this set when the
     # aggregator moved out of ResearchPredictorParallel branch 0 to the
     # top-level tail — it is modeled with the other tail stages below.
