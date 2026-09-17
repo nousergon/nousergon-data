@@ -2860,6 +2860,23 @@ def _daily_append_impl(
         "date": date_str,
         "tickers_appended": n_ok,
         "tickers_partial": n_partial,
+        # alpha-engine-config-I10810 (measured 2026-09-16, D18/D32): the run
+        # manifest's `rows_out` read `tickers_appended` (n_ok, "fully-featured,
+        # zero-NaN" rows only) as "how many rows this run published" — but a
+        # row with >=1 NaN feature (n_partial, logged per-ticker as
+        # `partial-features`) is STILL a real ArcticDB write, just with
+        # degraded feature coverage. On a live run this meant `n_ok=0
+        # n_partial=909 n_err=1` (2026-09-16 D32, 2026-09-15 D18) reported
+        # `rows_out=0` + one `append_error` rejection while ArcticDB actually
+        # received a full-universe write, verified directly against the
+        # `universe` library. `tickers_published` is the total ArcticDB
+        # actually received this run (n_ok + n_partial) — the number the
+        # empty-but-fresh objective needs. `tickers_appended` /
+        # `tickers_partial` keep their existing, narrower meanings
+        # (fully-featured vs degraded-coverage) for the coverage-quality
+        # observability that already consumes them; this is an ADDITIVE key,
+        # not a rename, so no existing reader's semantics change.
+        "tickers_published": n_ok + n_partial,
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
         "tickers_parquet_warmup": n_parquet_warmup,
