@@ -239,9 +239,34 @@ def test_the_ladder_and_the_gate_reading_cannot_disagree(tmp_path):
 
 
 def test_the_cli_exit_codes_separate_not_met_from_unmeasured(tmp_path, monkeypatch):
-    from data_gate.__main__ import EXIT_NOT_MET, EXIT_UNMEASURED, main
+    """alpha-engine-config-I10906: default exit is 0 on any successful measurement —
+    the verdict is not a process failure, it already has a durable surface (ladder/
+    board/history). Only `--fail-on-unmet` recovers the old "1 means UNMET" code,
+    for a human `workflow_dispatch`/PR-time invocation that wants it."""
+    from data_gate.__main__ import EXIT_MET, EXIT_NOT_MET, EXIT_UNMEASURED, main
 
-    code = main(["read", "--gate", "data-phase0", "--store", str(tmp_path), "--trading-day", "2026-09-14"])
+    # Two DISTINCT fresh stores: reading a gate publishes gates/ladder.json, and
+    # `data.gate.ladder_fresh` grades a store that already has one — reusing the
+    # same store between these two calls would flip the second reading's verdict
+    # from UNMET to MET on that clause alone, independent of --fail-on-unmet.
+    store_a = tmp_path / "a"
+    store_b = tmp_path / "b"
+
+    code = main(["read", "--gate", "data-phase0", "--store", str(store_a), "--trading-day", "2026-09-14"])
+    assert code == EXIT_MET
+
+    code = main(
+        [
+            "read",
+            "--gate",
+            "data-phase0",
+            "--store",
+            str(store_b),
+            "--trading-day",
+            "2026-09-14",
+            "--fail-on-unmet",
+        ]
+    )
     assert code == EXIT_NOT_MET
 
     def _explode(*_args, **_kwargs):
@@ -250,6 +275,14 @@ def test_the_cli_exit_codes_separate_not_met_from_unmeasured(tmp_path, monkeypat
     monkeypatch.setattr("data_gate.read.run", _explode)
     assert (
         main(["read", "--gate", "data-phase0", "--store", str(tmp_path), "--dry-run"])
+        == EXIT_UNMEASURED
+    )
+    # A measurement failure exits 2 regardless of --fail-on-unmet — that flag only
+    # governs the UNMET code path, never the "we could not ask" code path.
+    assert (
+        main(
+            ["read", "--gate", "data-phase0", "--store", str(tmp_path), "--dry-run", "--fail-on-unmet"]
+        )
         == EXIT_UNMEASURED
     )
 
