@@ -274,6 +274,16 @@ Resources:
   # test_every_standalone_successor_unit_is_covered_or_retired` now pins both
   # directions, so a retired unit cannot reappear here and a live one cannot
   # quietly drop out (alpha-engine-config-I10753).
+  #
+  # D34 (chronic-gap-heal) joins them (alpha-engine-config-I11002). It had NO
+  # successor at all until this change: `morning-enrich` above passes
+  # `--skip-chronic-heal` on this schedule, and `daily-heal` (a different
+  # schedule, weekday cadence) maps to D33, a different unit. The new
+  # `chronic-gap-heal` workload runs it here rather than on `daily-heal`'s
+  # weekday cadence, matching both D34's descriptor `trigger.schedule` (Sat
+  # 05:00 America/New_York) and its v1 successor name
+  # (`ne-data-collection-weekly`) — chronic-gap-heal was never a daily
+  # operation, unlike D33's own heal.
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -290,7 +300,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion", "chronic-gap-heal"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D34", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state

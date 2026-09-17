@@ -1071,9 +1071,29 @@ def test_units_covered_membership_keys_on_the_successor_not_the_trigger_kind(uni
         if "nousergon-data-PR1701" in str((u.raw.get("trigger") or {}).get("successor") or "")
         or "alpha-engine-config-I10753" in str((u.raw.get("trigger") or {}).get("successor") or "")
     }
-    assert members == declares_successor, (
-        "membership must be exactly the units declaring a PR1701/I10753 successor"
+    assert declares_successor <= members, (
+        "every unit declaring a PR1701/I10753 successor must be a member — the successor "
+        "leg is what carries D33, whose kind is not step-functions"
     )
+
+    # NOT an equality any more (alpha-engine-config-I11014). Membership is the
+    # UNION of the successor leg and `kind == "step-functions"`, because
+    # recording a retirement REWRITES the successor: D09, D40 and D41 are
+    # step-functions units whose retirement is recorded, and under an equality
+    # they fell out of the population before the retirement count ran. That
+    # printed "0 carry a recorded retirement" as a structural constant and
+    # invented a residual disagreement with plan §6.2's 37.
+    #
+    # Measured 2026-09-17: successor-token 34, step-functions 36, union 37 —
+    # the plan's figure exactly — of which 3 retired leaves the 34 graded.
+    # The assertion above still forbids the original defect (dropping D33 by
+    # keying on kind alone); it just no longer forbids the union.
+    extra = members - declares_successor
+    assert all(
+        str((u.raw.get("trigger") or {}).get("kind") or "") == "step-functions"
+        for u in units
+        if u.unit_id in extra
+    ), "the only members beyond the successor leg may be step-functions units"
 
     dropped_by_kind = {u for u in declares_successor if kinds.get(u) != "step-functions"}
     assert dropped_by_kind, (

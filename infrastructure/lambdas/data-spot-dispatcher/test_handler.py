@@ -269,6 +269,25 @@ def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(m
     assert "rc=${PIPESTATUS[0]}" in rendered
 
 
+# ── alpha-engine-config-I11002: D34 (chronic-gap-heal) had no successor ──────
+
+
+def test_chronic_gap_heal_is_in_the_allowlist_and_needs_no_trading_day(monkeypatch):
+    """D34's heal operates on the current chronic-gap state, not a historical
+    trading day — same 'today' semantics weekly-phase-one and
+    rag-weekly-ingestion already use, so it is deliberately absent from
+    `_WORKLOADS_REQUIRING_TRADING_DAY`."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert "chronic-gap-heal" in index._WORKLOADS
+    assert "chronic-gap-heal" not in index._WORKLOADS_REQUIRING_TRADING_DAY
+    workload, cmd = index._resolve_workload({"workload": "chronic-gap-heal"})
+    assert workload == "chronic-gap-heal"
+    assert cmd == "python weekly_collector.py --chronic-gap-heal"
+    rendered = index._bootstrap_command("chronic-gap-heal", cmd, "tok")
+    assert f"{cmd} 2>&1 | tee -a" in rendered
+    assert "rc=${PIPESTATUS[0]}" in rendered
+
+
 # ── alpha-engine-config-I10778, plan P-11: the pre-cutover shadow run ────────
 
 
