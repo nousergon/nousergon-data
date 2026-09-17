@@ -117,20 +117,89 @@ def test_the_board_does_not_count_an_undeclared_empty_run_for_any_unit(tmp_path,
         assert "published NOTHING" in reading.detail
 
 
-def test_a_malformed_declaration_is_refused_at_descriptor_load(units):
-    """Not-declared is the safe reading for the run and the wrong one for the author."""
+@pytest.mark.parametrize(
+    "block",
+    [
+        {"reason": "because we said so", "note": "x"},  # reason outside the closed list
+        {"reason": "not_a_trading_day", "note": "  "},  # no evidence for the declaration
+        True,  # a bare truthy value, naming neither
+    ],
+)
+def test_a_malformed_declaration_is_refused_rather_than_read_as_not_declared(units, block):
+    """Not-declared is the safe reading for the run and the wrong one for the author.
+
+    Refused by `run_units.empty_declaration` — the one parser — and therefore by
+    `test_every_declaration_is_well_formed_and_carries_its_evidence` above, which
+    runs it over every committed descriptor. That is the gate: no descriptor
+    reaches `main` carrying a block that would silently do nothing.
+
+    Deliberately NOT enforced inside `data_gate/descriptors.py::_validate`. That
+    module is a PACKAGED LAMBDA ARTIFACT — `infrastructure/lambdas/data-spot-
+    dispatcher/deploy.sh` copies `data_gate/__init__.py`, `data_gate/descriptors.py`
+    and `registry.d/units/*.yaml` into the zip and nothing else, and its
+    completion check calls `load_units()` at runtime. An earlier revision of this
+    change imported `run_units` from `_validate`; `run_units` imports
+    `nousergon_lib.run_manifest`, neither of which is in that zip, so every
+    completion check would have raised. `test_the_packaged_descriptor_loader_
+    imports_nothing_the_lambda_zip_lacks` below is the detector for the class.
+    """
     document = dict(units[0].raw)
-    document[run_units.EMPTY_IS_VALID_FIELD] = {"reason": "because we said so", "note": "x"}
-    with pytest.raises(descriptors.DescriptorError):
-        descriptors._validate(units[0].unit_id, document, units[0].path)
+    document[run_units.EMPTY_IS_VALID_FIELD] = block
+    with pytest.raises(run_units.EmptyDeclarationError):
+        run_units.empty_declaration(document)
 
-    document[run_units.EMPTY_IS_VALID_FIELD] = {"reason": "not_a_trading_day", "note": "  "}
-    with pytest.raises(descriptors.DescriptorError):
-        descriptors._validate(units[0].unit_id, document, units[0].path)
 
-    document[run_units.EMPTY_IS_VALID_FIELD] = True
-    with pytest.raises(descriptors.DescriptorError):
-        descriptors._validate(units[0].unit_id, document, units[0].path)
+def test_the_packaged_descriptor_loader_imports_nothing_the_lambda_zip_lacks():
+    """`data_gate/descriptors.py` may import only stdlib plus `yaml`.
+
+    `infrastructure/lambdas/data-spot-dispatcher/deploy.sh` packages this module
+    and the descriptors alone — `PyYAML` is the one third-party dependency it
+    installs for them, and nothing else in this repository rides along. An import
+    added here (at module scope OR inside a function, which is how it slips past
+    review) breaks the dispatcher's completion check in production, not merely in
+    its hermetic test. Graded from the source rather than from an import attempt:
+    the repo venv has every one of these installed, so importing it successfully
+    here proves nothing about the zip.
+    """
+    import ast
+
+    allowed = {"yaml"}
+    source = (descriptors.REPO_ROOT / "data_gate" / "descriptors.py").read_text()
+    offenders: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            names = [a.name.split(".")[0] for a in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            if node.level:  # a relative import stays inside data_gate
+                continue
+            names = [(node.module or "").split(".")[0]]
+        else:
+            continue
+        offenders += [n for n in names if n not in allowed and n not in _STDLIB]
+    assert not offenders, (
+        "data_gate/descriptors.py imports "
+        f"{sorted(set(offenders))}, which the data-spot-dispatcher Lambda zip does not "
+        "carry (deploy.sh packages this module + registry.d/units + PyYAML, nothing "
+        "else). Its completion check calls load_units() at runtime and would raise."
+    )
+
+
+#: The stdlib names `data_gate/descriptors.py` may reach for. Enumerated rather
+#: than derived from `sys.stdlib_module_names`, which would also bless a name
+#: that is stdlib on the laptop and absent from the Lambda runtime image.
+_STDLIB = {
+    "__future__",
+    "collections",
+    "dataclasses",
+    "datetime",
+    "functools",
+    "itertools",
+    "json",
+    "os",
+    "pathlib",
+    "re",
+    "typing",
+}
 
 
 # ---------------------------------------------------------------------------

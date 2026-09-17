@@ -395,8 +395,6 @@ def _check_retention(unit_id: str, document: dict[str, Any], path: pathlib.Path)
 
 
 def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> None:
-    import run_units  # local: `run_units` reads descriptors through this module
-
     missing = [key for key in _REQUIRED_TOP_LEVEL if key not in document]
     if missing:
         raise DescriptorError(f"{path.name}: missing required field(s) {missing}")
@@ -453,18 +451,6 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
                 f"{path.name}: guards.{name} has no note. A guard state with no evidence "
                 "behind it is a claim, and the board renders claims as findings."
             )
-
-    # `alpha-engine-config-I11011`. Optional, and absent on almost every unit:
-    # it declares that this unit completing with NO published output is a
-    # legitimate outcome, which switches off the RAISE the producer would
-    # otherwise make. Validated at load, loudly, because a malformed
-    # declaration reads as "not declared" — the safe direction for the run and
-    # the wrong one for whoever wrote it, who would never learn it does nothing.
-    if run_units.EMPTY_IS_VALID_FIELD in document:
-        try:
-            run_units.empty_declaration(document)
-        except ValueError as exc:
-            raise DescriptorError(f"{path.name}: {exc}") from None
 
     freshness = document["freshness"] or {}
     if freshness.get("status") == "not_applicable":
