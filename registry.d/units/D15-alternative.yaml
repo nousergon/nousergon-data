@@ -139,6 +139,8 @@ clause_phase:
   survives_phase4: 1
 notes: >-
     alpha-engine-config-I10753: standalone workload `alternative-phase-two` added
-    (nousergon-data-PR pending merge). Measured span across two full v1
+    (nousergon-data-PR1714, MERGED 2026-09-15 — corrected 2026-09-17 from
+    "pending merge", which had outlived the merge and read as outstanding
+    work). Measured span across two full v1
     executions (2026-08-04, 2026-08-07 ne-weekly-freshness-pipeline history):
     ~35 min, well inside the dispatcher's 7200s per-workload ceiling.
