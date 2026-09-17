@@ -167,6 +167,104 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
     assert weekly["require_trading_day"] is False
 
 
+# alpha-engine-config-I10753. Units whose descriptor declares a standalone-stack
+# successor but which NO schedule verifies today, each with the tracked issue
+# that closes it. This register is asserted for EQUALITY below, not membership:
+# a new uncovered unit fails, and covering one of these without deleting its row
+# fails too. It is deliberately not a `skip` or a soft warning — the whole point
+# of `data.cutover_ready.units_covered` is that an ungraded member never reads
+# as covered, and the same must hold for the register that records the
+# exceptions to it.
+_UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
+    # No workload runs it at all: the `morning-enrich` workload passes
+    # `--skip-chronic-heal`, and `daily-heal` (`--daily-heal`) is D33, a
+    # different mode. `weekly_collector.py` has a standalone
+    # `--chronic-gap-heal` entrypoint (`args.chronic_gap_heal`), so the fix is a
+    # dispatcher workload key, which lives in a file this change does not own.
+    "D34": "alpha-engine-config-I11002",
+}
+
+
+def _unit_descriptors() -> dict[str, dict]:
+    out = {}
+    for path in sorted((REPO / "registry.d" / "units").glob("*.yaml")):
+        doc = yaml.safe_load(path.read_text(encoding="utf-8"))
+        out[doc["unit_id"]] = doc
+    return out
+
+
+def test_every_standalone_successor_unit_is_covered_or_retired(stack, tpl):
+    """alpha-engine-config-I10753 closes-when, as an executable predicate.
+
+    The issue's deliverable is per-unit prose ("a workload, or a recorded
+    retirement"), which is exactly the shape that reads satisfied while a unit
+    quietly falls out of a JSON string in a CloudFormation input. So assert the
+    property over EVERY descriptor rather than over the five the issue names —
+    a fix that survives the class, not the instance:
+
+    * a unit whose descriptor carries a `retirement:` block must NOT be
+      verified by any schedule (D09/D40/D41 — the stack may not assert a
+      completeness claim for a producer declared retired, which is green only
+      while the retired code still happens to run and is a false red the day
+      it stops), and
+    * every other unit whose v1 trigger the standalone stack takes over must
+      be named in at least one schedule's `verify_units`.
+    """
+    units = _unit_descriptors()
+    verified_by: dict[str, list[str]] = {}
+    for sched in stack.schedules(tpl):
+        for unit_id in sched["input"].get("verify_units") or []:
+            verified_by.setdefault(unit_id, []).append(sched["name"])
+
+    unknown = sorted(set(verified_by) - set(units))
+    assert unknown == [], f"verify_units names units with no descriptor: {unknown}"
+
+    retired = {u for u, d in units.items() if d.get("retirement")}
+    wrongly_verified = sorted(retired & set(verified_by))
+    assert wrongly_verified == [], (
+        "these units carry a recorded retirement yet are still verified by a "
+        f"schedule: {wrongly_verified}"
+    )
+    for unit_id in sorted(retired):
+        assert units[unit_id]["retirement"].get("ruling"), f"{unit_id} retirement names no ruling"
+        # `no_successor_workload` is the field that turns "this unit is retired"
+        # into "and that is why no schedule runs it", so it is required exactly
+        # of the units the standalone stack would otherwise have had to take
+        # over — the ones whose v1 trigger is a Step Functions state. D15L is
+        # retired with its code deleted and a `manual` trigger; there was never
+        # a schedule to succeed, and demanding the field there would be
+        # bookkeeping rather than a claim.
+        if ((units[unit_id].get("trigger") or {}).get("kind")) == "step-functions":
+            assert units[unit_id]["retirement"].get("no_successor_workload") is True, (
+                f"{unit_id} has a retirement: block without no_successor_workload: true"
+            )
+
+    # "the standalone stack takes this unit's v1 trigger over" is the SAME
+    # property data_gate's units_covered predicate keys on (the declared
+    # successor, not trigger.kind — alpha-engine-config-I10908), restated here
+    # so the two cannot drift into disagreeing about who is in scope.
+    owed = {
+        unit_id
+        for unit_id, doc in units.items()
+        if unit_id not in retired
+        and any(
+            token in str((doc.get("trigger") or {}).get("successor") or "")
+            for token in ("nousergon-data-PR1701", "alpha-engine-config-I10753")
+        )
+    }
+    uncovered = sorted(owed - set(verified_by))
+    assert uncovered == sorted(_UNCOVERED_WITH_A_TRACKED_ISSUE), (
+        "the set of standalone-successor units no schedule verifies changed: "
+        f"{uncovered} (register: {sorted(_UNCOVERED_WITH_A_TRACKED_ISSUE)})"
+    )
+
+    # Not asserted: that a unit is verified by exactly ONE schedule. D03
+    # (prices) is refreshed by both the EOD collection and weekly phase 1, and
+    # D17 (morning-enrich) runs on the morning schedule and again as the weekly
+    # chain's first workload — each run writes its own manifest for its own
+    # trading day, so a second grader is a second real claim, not a duplicate.
+
+
 def test_no_dependency_on_a_v1_pipeline(stack):
     for path in (stack.TEMPLATE, stack.DEFINITION, HELPER_PATH, WORKFLOW):
         text = path.read_text(encoding="utf-8")
