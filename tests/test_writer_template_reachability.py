@@ -33,7 +33,9 @@ from data_gate.writer_template_check import run_all
 #:    edited live by a sibling PR (fix/d39-crucible-consumer-I10873); not
 #:    touched here.
 #: Both are reported, not fixed, per this issue's deliverable 3.
-_KNOWN_FLAGGED = frozenset({"D01", "D39"})
+#: D01 was removed 2026-09-16 (alpha-engine-config-I10898): its six
+#: undeclared dual-path map keys are now in its descriptor's `writes:`.
+_KNOWN_FLAGGED = frozenset({"D39"})
 
 
 def test_d03_prices_writes_template_is_reachable():
