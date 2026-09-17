@@ -1,0 +1,224 @@
+name: Data-collection daily report
+
+# The data collector's daily accountability delivery — `alpha-engine-config-I10952`.
+#
+# Brian, 2026-09-17: "a data collector daily update in telegram similar to what
+# we are doing with crucible v2." This is that message. `data-gate.yml` READS
+# the ladder and publishes it; this job reads what that reader published and
+# delivers it. It evaluates no clause and writes no gate artifact.
+#
+# ── Why a SEPARATE workflow, and a separate MESSAGE ───────────────────────
+#
+# Rejected: adding data-collection rows to crucible's `report.morning`. That
+# would widen the morning-report identity from `crucible/board/*` to this
+# bucket, put two systems' ladders inside one headline budget, and make
+# crucible's content policy govern this text. The decisive reason is narrower
+# than any of those: TWO SYSTEMS NEED TWO ABSENCE DETECTORS. One combined
+# message that still arrives while its data-collection half renders empty is
+# exactly the unobserved-but-green state principle 7 forbids. Its own job, its
+# own manifest prefix (`data_collection/runs/report.daily/`), its own
+# observability row (`nous-ergon-ops/governance/observability.d/
+# nousergon-data-data-report.yaml`, `cadence_minutes: 1440`) whose silence pages.
+#
+# Rejected for the same reason as crucible's: a second job inside
+# `data-gate.yml`. A workflow carries ONE schedule set, and this job's cadence
+# is not the gate's — the gate publishes at 23:30 UTC and this reads that
+# reading ~11h later. Sharing a file means both jobs fire at both times unless
+# each is gated on `github.event.schedule`, a string comparison against a cron
+# literal that fails open the moment either cron is edited, and reads green
+# while doing so.
+#
+# ── The cron is an INPUT to delivery time, not a statement of it ──────────
+#
+# `30 10 * * *`, which is `data_gate.report.DELIVERY_CRON_UTC`, and
+# `tests/test_data_report.py` parses this file and asserts the two are equal
+# so the literal and the code cannot silently disagree.
+#
+# THE ARITHMETIC. Every scheduled workflow on this account fires 3-5h after its
+# declared cron: MEASURED and chronic, not a bad day (`alpha-engine-config-
+# I9966`, which moved crucible's `report.morning` from `0 13` to `0 10` for
+# this reason). Intended delivery 06:30 PT = 13:30 UTC under PDT; subtract the
+# 3h LOWER bound of the measured lag — the lower bound, so the delivery window
+# OPENS at the intended time and closes 2h later rather than opening 2h early —
+# and the declared instant is 10:30 UTC.
+#
+# WHY 30 MINUTES AFTER crucible's `0 10` rather than the same instant: two
+# accountability messages landing together are read as one message, and this
+# report's absence would then hide inside the crucible one having arrived.
+# Staggering them keeps this report's silence visible to the READER, not only
+# to the registry.
+#
+# ── UTC, and what it drifts to in November ────────────────────────────────
+#
+# GitHub Actions crons are UTC and have no timezone. `30 10 * * *` is 03:30 PDT
+# today and becomes 02:30 PST on 2026-11-01. DECLARED rather than discovered:
+# the message prints the local time it was actually delivered at
+# (`data_gate.report.DELIVERY_TZ`) and `tests/test_data_report.py` asserts both
+# resolutions, so November is a committed fact a reader can look up.
+#
+# The rejected alternative was two crons with a job-level
+# `if: github.event.schedule == '...'` picking the right one per season — a
+# partial parser over a cron literal deciding whether the day's report goes out
+# at all. One cron that lands an hour early for four months is a smaller defect
+# than a guard that can silently deliver twice or not at all.
+#
+# ── The reporter may not write what it reports ────────────────────────────
+#
+# `github-actions-data-report` (nous-ergon-ops), NOT `github-actions-data-gate-
+# read`. It reads `data_collection/gates/*` and writes exactly
+# `data_collection/runs/report.daily/*`. A reporting surface that could write
+# the gate artifacts would be able to author the reading it reports.
+#
+# Its `s3:ListBucket` on those two prefixes is not a convenience: S3 returns
+# 403 for a MISSING key when the caller also lacks `ListBucket`, which is how
+# an absence silently becomes a denial. `data_gate.report` renders absent and
+# denied as different facts, and the grant is what lets it tell them apart.
+#
+# That role is created by an OPERATOR-GATED apply of the ops stack, not by
+# merging the ops PR (`pull-request-policy` §4.2 form 3 — the merge emits the
+# exact command AND a detector stays red until it runs). Until it happens this
+# workflow fails daily on the identity read-back below, naming the exact
+# command. That is the detector working, not a defect in this file.
+#
+# ── No hardcoded account id or bucket, unlike data-gate.yml ───────────────
+#
+# This repository is PUBLIC and its run logs are public. `data-gate.yml`
+# hardcodes `arn:aws:iam::<account>:role/...` and the bucket name in the tree;
+# crucible solved exactly that with repository VARIABLES plus an `::add-mask::`
+# step (`alpha-engine-config-I10156`), because GitHub masks SECRETS and does
+# NOT mask repository variables. That form is adopted here rather than
+# inherited. The `data-gate.yml` correction is filed separately as
+# `alpha-engine-config-I10973` and is named in this PR's body — bundling it
+# would put an unrelated identifier change inside a feature diff.
+#
+# ── Delivery needs no AWS credential ──────────────────────────────────────
+#
+# Telegram only, `severity=info`, notifying (never silent — `alpha-engine-
+# config-I9916`: crucible's first delivery went out silent, the manifest read
+# `ok`, and Brian never saw it), SNS off, no dedup key (a report that stops
+# arriving when nothing changed is indistinguishable from one that stopped
+# arriving). `ALPHA_ENGINE_SECRETS_SOURCE=env` forces `krepis.secrets` to
+# resolve the bot token and chat id from the environment rather than reaching
+# SSM, which this role is deliberately not granted.
+#
+# ── Why notify-main-failure is here ───────────────────────────────────────
+#
+# `tests/test_scheduled_workflow_reachability.py` requires it on EVERY
+# scheduled workflow in this repo, by job name, with `needs:` naming every
+# other job and an `if` gated to `refs/heads/main`. Separately, the data
+# collector has no `alerts.sweep` equivalent at all, so this job's failures
+# would otherwise reach nobody until the observability row's absence deadline.
+
+on:
+  schedule:
+    # 03:30 PDT / 02:30 PST — `data_gate.report.DELIVERY_CRON_UTC`. See the
+    # arithmetic and DST sections above.
+    - cron: '30 10 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+# Serialised, and a superseded run is NOT cancelled. A cancelled run here is a
+# day with no report and no failed manifest — an ABSENCE page for a scheduling
+# artefact.
+concurrency:
+  group: data-report
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  # Repository VARIABLES, not literals: this repo is public (see the section
+  # above). The mask step below is what keeps the account id out of the
+  # printed ARN, because GitHub does not mask variables.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  REPORT_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-data-report
+  STORE_URI: ${{ vars.DATA_STORE_URI }}
+  # Where the `ne-groomer` GitHub App's credentials live in SSM. It names WHERE
+  # the credentials are, never what they are — the same reason the store URI is
+  # a variable. An Actions token cannot reach the private alpha-engine-config
+  # repository at all, which is why the rolling issue needs an App token.
+  DATA_TRACKER_APP_SSM_PREFIX: ${{ vars.DATA_TRACKER_APP_SSM_PREFIX }}
+  # The fleet console's base URL. Unset means the full update says no console
+  # is configured, in words, rather than linking nothing silently.
+  DATA_CONSOLE_URL: ${{ vars.DATA_CONSOLE_URL }}
+
+jobs:
+  report:
+    name: deliver the data collector's daily update
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      # Every configuration input this job cannot run without, checked in one
+      # place with the exact command that fixes each. A job that dies inside
+      # `krepis.secrets` on an empty token reports a Python traceback where an
+      # operator step belongs.
+      - name: Repository variables and secrets are set
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; missing=1; fi
+          if [ -z "$STORE_URI" ]; then echo "::error::repository variable DATA_STORE_URI is not set - set it with: gh variable set DATA_STORE_URI --repo nousergon/nousergon-data --body '<s3-uri-of-the-data-collection-store>'"; missing=1; fi
+          if [ -z "$TELEGRAM_BOT_TOKEN" ]; then echo "::error::repository secret TELEGRAM_BOT_TOKEN is not set - set it with: gh secret set TELEGRAM_BOT_TOKEN --repo nousergon/nousergon-data. Without it no message can be delivered and this report is silent."; missing=1; fi
+          if [ -z "$TELEGRAM_CHAT_ID" ]; then echo "::error::repository secret TELEGRAM_CHAT_ID is not set - set it with: gh secret set TELEGRAM_CHAT_ID --repo nousergon/nousergon-data"; missing=1; fi
+          if [ -z "$DATA_TRACKER_APP_SSM_PREFIX" ]; then echo "::error::repository variable DATA_TRACKER_APP_SSM_PREFIX is not set - set it with: gh variable set DATA_TRACKER_APP_SSM_PREFIX --repo nousergon/nousergon-data --body '<ne-groomer app ssm prefix>'. The full update is posted to nousergon/alpha-engine-config, which an Actions token cannot reach."; missing=1; fi
+          exit "$missing"
+
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # This repo is public and its run logs are public; GitHub masks SECRETS,
+      # not repository VARIABLES. The identity assertion below prints an
+      # assumed-role ARN that embeds the account id — mask it before the
+      # credential step runs. The assertion still works with masking on: it
+      # compares only the role-name segment, which the mask does not touch.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.REPORT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      # The identity actually obtained, read back from AWS rather than restated
+      # from `env`. What is falsifiable is the identity, not the literal.
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${REPORT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The daily report must run as an identity that cannot write the gate artifacts it reports. If the role does not exist yet, the nous-ergon-ops stack owning github-actions-data-gate-read has not been applied since the ops PR adding github-actions-data-report merged. That apply is OPERATOR-GATED as a security boundary, not automated: run AWS_PROFILE=ne-admin aws cloudformation deploy --stack-name data-collection --template-file infrastructure/cloudformation/data-collection.yaml --capabilities CAPABILITY_NAMED_IAM --region us-east-1 from a nous-ergon-ops checkout on main, then re-run this workflow. This job staying red until that happens is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Read the published reading and deliver it
+        env:
+          # Forces `krepis.secrets` to resolve from the environment instead of
+          # reaching SSM, which this role is deliberately not granted.
+          ALPHA_ENGINE_SECRETS_SOURCE: env
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        # No `--fail-on-unmet` equivalent exists on this subcommand: `report`
+        # exits 0 when the update was delivered and 2 when it could not be, and
+        # the ladder's verdict never enters the exit code
+        # (`alpha-engine-config-I10906`).
+        run: python -m data_gate report --store "$STORE_URI"
+
+  # Required of every scheduled workflow in this repo by
+  # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
+  # naming every other job and an `if` gated to the default branch.
+  notify-main-failure:
+    needs: [report]
+    if: failure() && github.ref == 'refs/heads/main'
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

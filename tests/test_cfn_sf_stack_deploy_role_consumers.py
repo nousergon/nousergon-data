@@ -56,10 +56,53 @@ INTENDED_CONSUMER = "deploy-infrastructure.yml"
 #: (the `nousergon-data#1179` failure: a green deploy that created no schedule).
 DEFERRED_CONSUMER = "deploy-scheduled-groom-dispatcher.yml"
 
+#: The account segment of an assumable ARN. Either the literal id, or a
+#: repository VARIABLE holding it — `alpha-engine-config-I10156`: this repo is
+#: public and its run logs are public, so a workflow added after that scrub
+#: templates the account id rather than typing it. The consumer count below has
+#: to survive that form, or the first public-safe workflow silently drops out of
+#: every count in this module — which is exactly what `data-report.yml` did
+#: before this pattern was widened.
+_ACCOUNT = r"(?:\d+|\$\{\{\s*vars\.[A-Za-z0-9_]+\s*\}\})"
+_ARN = rf"arn:aws:iam::{_ACCOUNT}:role/[A-Za-z0-9+=,.@_-]+"
+
 _ROLE_TO_ASSUME = re.compile(
-    r"^\s*role-to-assume:\s*(?P<arn>arn:aws:iam::\d+:role/[A-Za-z0-9+=,.@_-]+)\s*$",
+    rf"^\s*role-to-assume:\s*(?P<arn>{_ARN})\s*$",
     re.MULTILINE,
 )
+
+#: `role-to-assume: ${{ env.SOME_ARN }}` — the ARN is assembled once in the
+#: workflow-level environment block and referenced from the step. An
+#: INDIRECTION, not a second shape: it is resolved against that block below so
+#: the role it names is still counted. A `role-to-assume` line matching neither
+#: pattern is what `test_every_role_to_assume_names_this_account` catches.
+_ROLE_TO_ASSUME_INDIRECT = re.compile(
+    r"^\s*role-to-assume:\s*\$\{\{\s*env\.(?P<var>[A-Za-z0-9_]+)\s*\}\}\s*$",
+    re.MULTILINE,
+)
+
+_ARN_ASSIGNMENT = re.compile(rf"^\s*(?P<name>[A-Za-z0-9_]+):\s*(?P<arn>{_ARN})\s*$", re.MULTILINE)
+
+
+def _arn_assignments(text: str) -> dict[str, str]:
+    """Every ``NAME: arn:aws:iam::...:role/...`` assignment in the file.
+
+    Read with a regex rather than a YAML parse on purpose: the value carries
+    ``${{ }}`` expressions, and this module's whole contract is over the TEXT a
+    reviewer reads.
+    """
+    return {m.group("name"): m.group("arn") for m in _ARN_ASSIGNMENT.finditer(text)}
+
+
+def _arns(text: str) -> list[str]:
+    """Every ARN a ``role-to-assume:`` line resolves to, direct or indirect."""
+    arns = [m.group("arn") for m in _ROLE_TO_ASSUME.finditer(text)]
+    assignments = _arn_assignments(text)
+    for match in _ROLE_TO_ASSUME_INDIRECT.finditer(text):
+        resolved = assignments.get(match.group("var"))
+        if resolved is not None:
+            arns.append(resolved)
+    return arns
 
 
 def _workflows() -> list[Path]:
@@ -73,10 +116,7 @@ def _workflows() -> list[Path]:
 def _assumed_roles(path: Path) -> list[str]:
     """Role NAMES named in `role-to-assume:` lines. Executable references only —
     a role named in a comment is documentation, not a consumer."""
-    return [
-        m.group("arn").rsplit("/", 1)[1]
-        for m in _ROLE_TO_ASSUME.finditer(path.read_text())
-    ]
+    return [arn.rsplit("/", 1)[1] for arn in _arns(path.read_text())]
 
 
 def test_exactly_one_workflow_assumes_the_new_role():
@@ -116,11 +156,18 @@ def test_every_role_to_assume_names_this_account(workflow: str):
     for the wrong reason."""
     text = (WORKFLOW_DIR / workflow).read_text()
     declared = text.count("role-to-assume:")
-    matched = len(_ROLE_TO_ASSUME.findall(text))
+    matched = len(_arns(text))
     assert declared == matched, (
         f"{workflow}: {declared} role-to-assume line(s), {matched} parsed. "
         f"An unparsed line makes this module's consumer count meaningless."
     )
     for role_arn_name in _assumed_roles(WORKFLOW_DIR / workflow):
         assert role_arn_name, workflow
-    assert f"arn:aws:iam::{ACCOUNT}:role/" in text or declared == 0
+    # The account is this one, named either literally or through a repository
+    # variable holding it. Both are accepted; a THIRD account is not.
+    for arn in _arns(text):
+        account = arn.split("::", 1)[1].split(":role/", 1)[0]
+        assert account == ACCOUNT or account.startswith("${{"), (
+            f"{workflow}: role-to-assume names account {account!r}, which is neither "
+            f"{ACCOUNT} nor a repository variable holding it."
+        )
