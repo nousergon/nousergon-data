@@ -159,10 +159,13 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
     """alpha-engine-config-I10753: DataPhase2 (D15) and RAGIngestion (D16/D46)
     join morning-enrich/weekly-phase-one in v1 data order. D40/D41 are
     retired (R7) and get no workload; D46 is a substep of rag-weekly-ingestion,
-    not its own key."""
+    not its own key. chronic-gap-heal (D34) joins them at the tail
+    (alpha-engine-config-I11002) — it has no data-order dependency on the
+    other four legs, so it is appended rather than interleaved."""
     weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
     assert weekly["workloads"] == [
         "morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion",
+        "chronic-gap-heal",
     ]
     assert weekly["require_trading_day"] is False
 
@@ -176,12 +179,10 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
 # as covered, and the same must hold for the register that records the
 # exceptions to it.
 _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
-    # No workload runs it at all: the `morning-enrich` workload passes
-    # `--skip-chronic-heal`, and `daily-heal` (`--daily-heal`) is D33, a
-    # different mode. `weekly_collector.py` has a standalone
-    # `--chronic-gap-heal` entrypoint (`args.chronic_gap_heal`), so the fix is a
-    # dispatcher workload key, which lives in a file this change does not own.
-    "D34": "alpha-engine-config-I11002",
+    # D34 (chronic-gap-heal) fixed by alpha-engine-config-I11002: the
+    # `chronic-gap-heal` dispatcher workload now runs it on `WeeklySchedule`,
+    # named in that schedule's `verify_units` below. This register is
+    # asserted for EQUALITY — leaving the row after the fix fails on purpose.
 }
 
 
