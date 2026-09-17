@@ -173,11 +173,17 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("daily", "metron_analyst_data"): PhaseUnit("D29", "analyst", "daily"),
     ("daily", "metron_sentiment_data"): PhaseUnit("D30", "sentiment", "daily"),
     ("daily", "features"): PhaseUnit("D31", None, "daily"),
-    # builders/daily_append.py reports `tickers_appended` (n_ok) and names every
-    # class of ticker it did NOT append.
+    # builders/daily_append.py reports `tickers_published` (n_ok + n_partial —
+    # every row actually written to ArcticDB this run, whether fully-featured
+    # or carrying >=1 NaN feature) and names every class of ticker it did NOT
+    # append. `tickers_appended` (n_ok alone) UNDERCOUNTS real writes — a row
+    # with one NaN feature is still published, and on the 2026-09-16 D32 run
+    # 909 of 910 published rows were exactly that shape, which read as
+    # `rows_out: 0` before this fix (alpha-engine-config-I10810, measured
+    # against the live `universe` library, not just the manifest).
     ("daily", "arcticdb"): PhaseUnit(
         "D32",
-        "tickers_appended",
+        "tickers_published",
         "daily",
         rejected_keys=_APPEND_REJECTED_KEYS,
     ),
@@ -226,9 +232,11 @@ class ModeRows:
 MODE_ROWS: dict[str, ModeRows] = {
     # MorningEnrich and both ArcticDB appends publish through
     # `builders.daily_append.daily_append`, surfaced as the `arcticdb` step.
-    "morning_enrich": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
-    "morning_arctic_append": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
-    "daily_arctic_append": ModeRows("arcticdb", "tickers_appended", rejected_keys=_APPEND_REJECTED_KEYS),
+    # `tickers_published` (n_ok + n_partial), not `tickers_appended` (n_ok
+    # alone) — see the ("daily", "arcticdb") PhaseUnit above for why.
+    "morning_enrich": ModeRows("arcticdb", "tickers_published", rejected_keys=_APPEND_REJECTED_KEYS),
+    "morning_arctic_append": ModeRows("arcticdb", "tickers_published", rejected_keys=_APPEND_REJECTED_KEYS),
+    "daily_arctic_append": ModeRows("arcticdb", "tickers_published", rejected_keys=_APPEND_REJECTED_KEYS),
     # The two heal units publish DAYS and TICKERS respectively, as lists.
     "daily_heal": ModeRows("universe_gap_heal", "healed_days", counts_list=True),
     "chronic_gap_heal": ModeRows("chronic_gap_self_heal", "healed", counts_list=True),
