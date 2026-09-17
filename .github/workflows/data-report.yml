@@ -193,6 +193,36 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --quiet -r requirements.txt
 
+      # The preflight above checks every CONFIGURATION input and caught none of
+      # this: the job's first run reached the tracker with the whole report
+      # rendered and died on a missing optional dependency
+      # (`PyJWT not installed`, run 35247437540). An installed-capability check
+      # belongs beside the configuration check — both are preconditions, and a
+      # precondition discovered after the S3 reads is one discovered too late.
+      # Importing is the assertion: `github_app` resolves PyJWT's crypto
+      # backend at import, so a present-but-backendless install fails here too.
+      - name: The optional capabilities this job needs are installed
+        run: |
+          python - <<'PY'
+          import sys
+
+          missing = []
+          for module, extra in (
+              ("nousergon_lib.github_app", "github-app"),
+              ("nousergon_lib.gates.report", "gates"),
+              ("nousergon_lib.gates.tracker", "github-app"),
+          ):
+              try:
+                  __import__(module)
+              except Exception as exc:  # noqa: BLE001 - the reason is the payload
+                  missing.append(f"{module} ({exc}) -- needs nousergon-lib[{extra}]")
+          if missing:
+              for line in missing:
+                  print(f"::error::this job cannot run: {line}")
+              sys.exit(1)
+          print("capabilities present: github_app, gates.report, gates.tracker")
+          PY
+
       # The identity actually obtained, read back from AWS rather than restated
       # from `env`. What is falsifiable is the identity, not the literal.
       - name: Confirm the identity this job actually assumed
