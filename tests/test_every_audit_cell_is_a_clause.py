@@ -96,6 +96,10 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 # I10777) — a precondition of phase 1, not a per-unit audit
                 # cell, so they never map to `base_clause_names`.
                 "data.cutover_ready.",
+                # The phase-1 exit's production rollup (alpha-engine-config-
+                # I10989) — a rollup over `survives_phase4`, not a per-unit
+                # audit cell of its own.
+                "data.phase1.",
             )
         )
         and not name.endswith(".completeness")

@@ -45,7 +45,12 @@ from data_gate.cadence import COMPLETION_GRACE, gate_moment, latest_due_fire, pa
 from data_gate.descriptors import REPO_ROOT, Unit
 from data_gate.evidence import Reading, manifests_since, read_run_record
 
-__all__ = ["EXECUTION_START_WINDOW", "covering_schedules", "read_survives_phase4"]
+__all__ = [
+    "EXECUTION_START_WINDOW",
+    "covering_schedules",
+    "read_standalone_workload_declared",
+    "read_survives_phase4",
+]
 
 _STACK_HELPER = REPO_ROOT / "infrastructure" / "data_collection_stack.py"
 
@@ -55,6 +60,11 @@ _STACK_HELPER = REPO_ROOT / "infrastructure" / "data_collection_stack.py"
 EXECUTION_START_WINDOW = dt.timedelta(minutes=15)
 
 _SOURCE_LIVE = "scheduler:GetSchedule + states:ListExecutions + data_collection store"
+
+#: `read_standalone_workload_declared` reads the committed stack definition and
+#: the committed descriptor, and NOTHING else. Named so a reader can tell the
+#: two questions apart on the source line alone.
+_SOURCE_DECLARED = "infrastructure/data_collection_stack.py (verify_units) + registry.d/units"
 
 
 @lru_cache(maxsize=1)
@@ -290,4 +300,52 @@ def read_survives_phase4(
         evidence=evidence,
         source=_SOURCE_LIVE,
         as_of=max(str(r.as_of or "") for r in readings),
+    )
+
+
+def read_standalone_workload_declared(unit: Unit) -> Reading:
+    """Is a standalone workload DECLARED for this unit — plan §6.2 item 3.
+
+    A static question, answerable with every schedule off, and deliberately so:
+    `data-cutover-ready` is read BEFORE the maintenance window that enables the
+    schedules, so a leg of it that needs an ENABLED schedule is satisfiable only
+    by the action it guards (`alpha-engine-config-I10989`). The dynamic question
+    — has the unit PRODUCED under its own enabled schedule — is
+    `read_survives_phase4`, and it belongs at the phase-1 exit, "read after the
+    cutover's first 5 trading days" (plan §6.2 item 7).
+
+    MET when some schedule in the `nousergon-data-collection` stack names the
+    unit in its ``verify_units`` — the same list the machine's own completion
+    check grades, so "declared" means the workload will actually verify it, not
+    that a descriptor mentions a successor. Schedule STATE is not read here, and
+    no AWS client is touched at all.
+
+    Retirement is not handled here: a retired unit is satisfied by its recorded
+    retirement decision and is dropped before this is called.
+    """
+    descriptor = unit.path.relative_to(REPO_ROOT).as_posix()
+    schedules = covering_schedules(unit.unit_id)
+    if schedules:
+        names = [s["qualified_name"] for s in schedules]
+        return Reading(
+            met=True,
+            detail=(
+                f"{unit.unit_id} is named in the verify_units of {names} in the "
+                "nousergon-data-collection stack definition (schedule state not read: this leg "
+                "is answered before the cutover enables them)"
+            ),
+            evidence=(descriptor, "infrastructure/data_collection_stack.py") + tuple(f"verify_units:{n}" for n in names),
+            source=_SOURCE_DECLARED,
+        )
+    trigger = unit.raw.get("trigger") or {}
+    return Reading(
+        met=False,
+        detail=(
+            f"no schedule in the nousergon-data-collection stack names {unit.unit_id} in its "
+            f"verify_units, although its descriptor declares the successor "
+            f"{trigger.get('successor')!r}. It needs a standalone workload or a recorded "
+            "retirement decision (plan §6.2 item 3)"
+        ),
+        evidence=(descriptor, "infrastructure/cloudformation/nousergon-data-collection.yaml"),
+        source=_SOURCE_DECLARED,
     )
