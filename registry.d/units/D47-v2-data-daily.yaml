@@ -41,9 +41,25 @@ consumers:
   - "crucible:crucible/board.py"
   - "crucible:crucible/features/depth.py"
 contract:
-  schema: "crucible: coverage floor + UndeclaredUniverseError"
-  producer_test: "crucible:tests/test_data_layer.py"
-  consumer_pins: []
+  schema: "contracts/arctic_universe.schema.json"
+  producer_test: tests/test_p07_contracts.py
+  consumer_pins:
+    - "crucible:tests/test_arctic_universe_contract.py"
+  # P-07 (alpha-engine-config-I10873): the plan §8.1 exclusion's single input-contract
+  # clause. Previous value was PROSE ("crucible: coverage floor +
+  # UndeclaredUniverseError") — data_gate/evidence.py::_declared_schema_files skips
+  # any cross-repo token, so a prose description was read as "no schema and no
+  # producer test declared" even though the real contract already existed on both
+  # sides. Corrected to real, already-existing paths: this repo's
+  # contracts/arctic_universe.schema.json (the column/dtype/index contract for the
+  # ArcticDB `universe` library D47 reads via `ArcticPriceSource.load_panel`) +
+  # tests/test_p07_contracts.py (hand-built-fixture producer test, existing) +
+  # crucible's ALREADY-MERGED consumer pin `tests/test_arctic_universe_contract.py`
+  # (verified live on crucible origin/main, 2026-09-16: exercises the pinned schema
+  # copy at `tests/contracts/arctic_universe.schema.json` through the real
+  # `ArcticPriceSource.load_panel` rename/refuse contract). This is a mechanical
+  # fix to how the existing contract is DECLARED, not a change to what is graded —
+  # D47 stays excluded from every other clause per the `notes` block below.
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D47
 detectors:

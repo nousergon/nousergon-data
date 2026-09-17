@@ -10,6 +10,20 @@ machine's ``verify_units`` completion check on every execution that names it
 (PR1725), and made a failed or partial ingestion indistinguishable from a unit
 that never ran.
 
+**Also covers D46 (`alpha-engine-config-I10753`).** D46 (insider_transactions,
+Form 4) is step 6 of this SAME script and gets no dispatcher key of its own —
+a second entry point would re-run the identical EDGAR fetch a second time per
+week (see `index.py::_WORKLOADS["rag-weekly-ingestion"]`'s comment). Rather
+than leave D46 with no run record at all, its descriptor's
+``run_manifest_prefix`` points at THIS manifest (`data_collection/runs/D16`,
+not its own `D16`-shaped prefix under `D46`), and this module's
+``OUTPUT_PREFIXES`` includes D46's declared write prefix
+(`data/insider_transactions/`) so D46's keys land in the one manifest this
+process already writes. The dispatcher's completion check reads
+`run_manifest_prefix` from each unit's own descriptor (`index.py::_check_unit`),
+so naming "D46" in a schedule's `verify_units` grades those same keys against
+D46's own `writes:` floor — no second manifest, no second script run.
+
 This module is a THIN wrapper (`data_collection_plan_260914.md` §4.4;
 ``nousergon-data`` AGENTS.md's "wrap, don't reimplement" precedent): it runs
 the existing bash script completely unchanged — same nine ingestion steps,
@@ -70,15 +84,18 @@ BUCKET = "alpha-engine-research"
 #: — the three `rag/manifest*`/`rag/filing_changes*` literals collapse to
 #: their shared parent prefix; `rag/watermarks/` and `rag/corpus_freshness/`
 #: are already prefixes; `health/rag_ingestion_progress/{date}.json` gets its
-#: own). Declared here, not derived from the descriptor at runtime, for the
-#: same reason `run_units.PHASE_UNITS` is a literal table: a renamed prefix on
-#: either side is a loud test failure, never a silent miss.
+#: own), PLUS D46's declared write prefix (`data/insider_transactions/`,
+#: alpha-engine-config-I10753 — step 6 of this same script, no separate
+#: manifest). Declared here, not derived from either descriptor at runtime,
+#: for the same reason `run_units.PHASE_UNITS` is a literal table: a renamed
+#: prefix on either side is a loud test failure, never a silent miss.
 OUTPUT_PREFIXES: tuple[str, ...] = (
     "rag/manifest/",
     "rag/watermarks/v1/",
     "rag/filing_changes/",
     "rag/corpus_freshness/",
     "health/rag_ingestion_progress/",
+    "data/insider_transactions/",
 )
 
 

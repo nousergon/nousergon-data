@@ -248,3 +248,17 @@ def validate_feature_registry(data: dict) -> list[str]:
     D12). Consumer: crucible-dashboard views/13_Feature_Store.py::_load_registry
     (alpha-engine-config-I10870, P-07)."""
     return _validate(data, "feature_registry")
+
+
+def validate_fundamentals_snapshot(data: dict) -> list[str]:
+    """Validate archive/fundamentals/{date}.json (collectors/fundamentals.py::collect,
+    D10). Consumer: crucible-dashboard health_checker.py (`archive/fundamentals/`
+    freshness check) (alpha-engine-config-I10873, P-07)."""
+    return _validate(data, "fundamentals_snapshot")
+
+
+def validate_rag_manifest(data: dict) -> list[str]:
+    """Validate rag/manifest/{date,latest}.json (rag/pipelines/emit_manifest.py::
+    build_manifest, D16). Consumer: crucible-dashboard loaders/s3_loader.py::
+    load_rag_manifest (alpha-engine-config-I10873, P-07)."""
+    return _validate(data, "rag_manifest")

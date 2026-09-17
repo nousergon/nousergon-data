@@ -569,12 +569,9 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.RationaleClustering": (
             "Same fold as Scanner (routes through "
             "MarkRationaleClusteringDegraded) before continuing to "
-            "CheckSkipReplayConcordance unchanged."
-        ),
-        "ResearchPredictorParallel.ReplayConcordance": (
-            "Same fold as Scanner (routes through "
-            "MarkReplayConcordanceDegraded) before continuing to "
-            "CheckSkipCounterfactual unchanged."
+            "CheckSkipCounterfactual — its continuation until "
+            "alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b) "
+            "was CheckSkipReplayConcordance, retired with that stage."
         ),
         "ResearchPredictorParallel.Counterfactual": (
             "Same fold as Scanner (routes through MarkCounterfactualDegraded) "

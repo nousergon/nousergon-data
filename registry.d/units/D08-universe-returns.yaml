@@ -138,3 +138,18 @@ notes: >-
     `research_db_backup`) and the dated series (`backups/research_{date}.db`, registered
     as `research_db_dated_backup`) that carry it. `collectors/universe_returns.py::collect`
     inserts rows then calls `upload_research_db` to publish both.
+
+    Follow-up measurement under this same issue, per its "establish which — writer stopped
+    or template wrong" instruction: **the template is correct and the writer is NOT
+    stopped.** S3 (`ne-admin`, 2026-09-16): `backups/research_2026-09-11.db`, uploaded
+    2026-09-12T10:24:31Z alongside `research.db` itself — ISO-dashed, matching
+    `BACKUP_KEY_TEMPLATE = "backups/research_{date}.db"` exactly. The earlier "newest
+    object 2026-07-10" reading predates two since-merged fixes: PR1663 (2026-09-08,
+    alpha-engine-config-I10202) restored the dated-backup writer, and the run 4 days later
+    (Sat 2026-09-12) produced this fresh ISO-dashed object — confirming the resumed
+    writer's live key format already matches the descriptor. The 2026-09-14 parity
+    report's `both_missing` reading (code_sha 65d40b9) also predates the I10890
+    run-manifest-scoping fix (PR1756, merged after) that now excludes a Saturday-only unit
+    like D08 from a weekday shadow run instead of grading it against one; both prior
+    findings are superseded by later merges, not live defects. No further change to this
+    descriptor's `writes` is needed.

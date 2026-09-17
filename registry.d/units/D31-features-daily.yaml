@@ -39,12 +39,38 @@ consumers:
   - "crucible-research:scoring/factor_scoring.py"
   - "crucible-dashboard:views/13_Feature_Store.py"
 consumers_reason: >-
-    The `metron_supplemental` reader was NOT found. Phase 0 resolves it; if none exists it
-    becomes an R7-style retirement proposal.
+    The `metron_supplemental` reader was NOT found by a live `git grep -rn
+    metron_supplemental` across `metron` origin/main, 2026-09-16
+    (alpha-engine-config-I10873) — zero matches. `features/metron_supplemental.py`
+    writes `features/metron_supplemental/{date}/` with no known consumer anywhere
+    in the roster. This is a genuine R7-style retirement candidate for the
+    `metron_supplemental` sub-artifact specifically (NOT for D31's main
+    `features/{date}/*.parquet` write, which crucible-dashboard and
+    crucible-research both read). Reserved: routed to the Decision Queue via
+    alpha-engine-config-I10932 (filed this session) rather than retired unilaterally.
 contract:
-  schema: "features/registry.py::CATALOG"
-  producer_test: tests/test_schema_contract.py
-  consumer_pins: []
+  schema:
+    - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+    - "contracts/feature_registry.schema.json"
+  # LIST value, mirrors D12 (PR1750): the pre-existing per-column parquet contract
+  # plus the SEPARATE features/registry.json artifact. D31 (daily) and D12 (weekly)
+  # run through the SAME shared code path (features/compute.py -> upload_registry,
+  # compute.py:1456) — one producer, one registry.json, one contract, whichever
+  # trigger last ran.
+  producer_test:
+    - tests/test_schema_contract.py
+    - tests/test_feature_registry_contract.py
+  consumer_pins:
+    - "crucible-dashboard:tests/contracts/feature_registry.schema.json"
+  # P-07 (alpha-engine-config-I10873): reuses the ALREADY-MERGED crucible-dashboard
+  # pin from D12 (crucible-dashboard-PR862, merged 2026-09-15T17:04:36Z) — verified
+  # live on crucible-dashboard origin/main this session. It is the same artifact
+  # (features/registry.json) produced by the same code path regardless of whether
+  # the weekly (D12) or daily (D31) trigger last ran, so the existing pin covers
+  # both units honestly; no new companion PR needed for this part of the contract.
+  # The per-column parquet contract (CATALOG <-> SCHEMA.md §3) has no separate pin
+  # of its own — same as D12, the registry.json pin is what makes `consumer_pins`
+  # non-empty.
 registry_rows:
   - feature_store_freshness_sentinel
 run_manifest_prefix: data_collection/runs/D31
