@@ -247,7 +247,10 @@ Resources:
   # `empty_fresh` guard with verdict `not_applicable`, which exempts its key
   # coverage and nothing else — its manifest must still exist for this run
   # and still report status ok. verify_units now covers every phase-1 unit
-  # plus D15 (alternative-phase-two) and D16 (rag-weekly-ingestion).
+  # plus D15 (alternative-phase-two), D16 (rag-weekly-ingestion) and D46
+  # (insider_transactions — no dispatcher key of its own, graded against the
+  # SAME manifest D16 writes; its descriptor's run_manifest_prefix points at
+  # D16's prefix, alpha-engine-config-I10753).
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -264,7 +267,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D09", "D10", "D11", "D12", "D13", "D15", "D16", "D17"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D09", "D10", "D11", "D12", "D13", "D15", "D16", "D17", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
