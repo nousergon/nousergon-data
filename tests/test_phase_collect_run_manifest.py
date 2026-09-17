@@ -93,8 +93,24 @@ def test_a_normal_phase_writes_one_ok_manifest_with_its_output():
     assert m["trading_day"] == "2026-09-14"
     assert m["status"] == "ok"
     assert m["reason"] == ""
+    # `bytes` / `version_id` / `version_capture` arrived with nousergon-lib
+    # v0.124.131 (lib PR418, alpha-engine-config-I10892): every output record
+    # now carries the provenance a later reader needs to fetch THAT object
+    # rather than whatever is at the key now. `head_object` is the capture
+    # mode when the sink measured it itself, which is this case — FakeS3
+    # reports 4096 bytes for KEY. Asserting the WHOLE record on purpose: a
+    # subset assertion would not have caught the field set changing under us,
+    # and this mismatch is what the pin bump to v0.124.133 surfaced.
     assert m["outputs"] == [
-        {"key": KEY, "etag": None, "schema_version": None, "rows_out": 896, "bytes": None}
+        {
+            "key": KEY,
+            "etag": None,
+            "schema_version": None,
+            "rows_out": 896,
+            "bytes": 4096,
+            "version_id": None,
+            "version_capture": "head_object",
+        }
     ]
     assert m["rows_out"] == 896
     assert [g["verdict"] for g in m["guards"]] == ["ok"]
