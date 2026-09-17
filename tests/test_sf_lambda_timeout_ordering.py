@@ -123,19 +123,14 @@ _SERVICE_MAX_GUARD_BAND: dict[tuple[str, str], int] = {
     # against a budget funding 2). 930 gives the function 30s to time out and
     # emit its REPORT line before the state would abort it.
     ("step_function.json", "Director"): 930,
-    # alpha-engine-replay-concordance and alpha-engine-research-eval-judge-process
-    # are both at the 900s maximum AND are now self-deadlining: their loops ask
-    # before each item whether one more fits, then stop and return a PARTIAL with
-    # the residue recorded (crucible-backtester#633 for concordance, measured live
-    # 2026-08-11 returning at 622s with "141 of 150 artifacts not replayed";
-    # crucible-research-PR613 for the judge). A self-deadlining function's clock
-    # starts at INVOKE; the SF clock starts at SCHEDULE, earlier by dispatch plus
-    # cold start. An equal ceiling therefore guarantees the SF fires first and
-    # pre-empts the graceful partial return -- the state would be killed at the
-    # wall precisely because the function learned not to be. 60s over the measured
-    # 2.0-3.0s Init Duration, rounded an order of magnitude so a cold-start
-    # regression cannot recreate the race. alpha-engine-config-I7181.
-    ("step_function.json", "ReplayConcordance"): 960,
+    # ReplayConcordance LEFT this table under alpha-engine-config-I10539
+    # (Brian ruling 2026-09-16, option b), which retired the stage from
+    # ne-weekly-freshness-pipeline. It is removed rather than left behind for
+    # the same reason EvalJudgeProcess is, stated below: a guard-band entry
+    # naming a state this walk cannot reach exempts nothing while reading as
+    # coverage. The rule it carried (a self-deadlining function needs an SF
+    # ceiling ABOVE its own, alpha-engine-config-I7181) is unchanged and is
+    # still stated on EvalRollingMean.
     # EvalJudgeProcess LEFT this table on 2026-08-29 (alpha-engine-config-I9329)
     # and did not move to _KNOWN_UNBOUND: it is no longer a lambda:invoke at
     # all. As an ssm:sendCommand it is governed by the INVERSE rule — its

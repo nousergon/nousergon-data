@@ -131,7 +131,9 @@ class TestDerivePlan:
             "skip_data_phase2",
             "skip_eval_judge",
             "skip_rationale_clustering",
-            "skip_replay_concordance",
+            # skip_replay_concordance retired: alpha-engine-config-I10539
+            # (Brian ruling 2026-09-16, option b) removed the
+            # ReplayConcordance stage from the weekly SF.
             "skip_counterfactual",
             # skip_aggregate_costs is NOT here (alpha-engine-config-I7194):
             # the aggregator left Branch A for the top-level tail, where it

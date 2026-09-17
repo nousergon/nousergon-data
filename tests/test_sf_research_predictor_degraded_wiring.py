@@ -124,8 +124,11 @@ _BRANCH_A_MARK_STATES = {
     "MarkRegimeRetrospectiveEvalDegraded": "CheckSkipDataPhase2",
     "MarkEvalJudgeDegraded": "EvalRollingMean",
     "MarkEvalRollingMeanDegraded": "CheckSkipRationaleClustering",
-    "MarkRationaleClusteringDegraded": "CheckSkipReplayConcordance",
-    "MarkReplayConcordanceDegraded": "CheckSkipCounterfactual",
+    # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): the
+    # ReplayConcordance stage is retired, so MarkRationaleClusteringDegraded
+    # folds straight onto CheckSkipCounterfactual and
+    # MarkReplayConcordanceDegraded no longer exists.
+    "MarkRationaleClusteringDegraded": "CheckSkipCounterfactual",
     # alpha-engine-config-I7194: Counterfactual is Branch A's last work state
     # now that the aggregator runs at the top level, so this fold lands on the
     # branch terminal directly. MarkAggregateCostsDegraded left this table with
@@ -163,7 +166,7 @@ def test_branch_a_mark_state_shape(branch_a, name, next_target):
         "EvalJudgeProcess",
         "EvalRollingMean",
         "RationaleClustering",
-        "ReplayConcordance",
+        # alpha-engine-config-I10539: ReplayConcordance is retired.
         "Counterfactual",
     ],
 )

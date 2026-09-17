@@ -85,7 +85,7 @@ skip_regime_substrate, skip_research, skip_rag_ingestion,
 skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
 skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest,
 skip_portfolio_optimizer_backtest, skip_backtester, skip_backtester_stage_only,
-skip_parity, skip_replay_concordance, skip_counterfactual, skip_aggregate_costs
+skip_parity, skip_counterfactual, skip_aggregate_costs
 ```
 
 **`skip_backtester_stage_only` (config#2362 Option A, operator-ruled

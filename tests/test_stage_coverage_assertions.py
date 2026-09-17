@@ -757,10 +757,10 @@ def test_stage_coverage_producers_thread_the_execution_arn():
         )
 
 
-# ── alpha-engine-config-I10194 §1 step (1): the five partition-split writers ─
+# ── alpha-engine-config-I10194 §1 step (1): the partition-split writers ──
 #
-# `Counterfactual`, `RationaleClustering`, `ReplayConcordance`,
-# `EvalRollingMean` and `EvalJudgeSubmitFirstSaturday` are `crucible-research`
+# `Counterfactual`, `RationaleClustering`, `EvalRollingMean` and
+# `EvalJudgeSubmitFirstSaturday` are `crucible-research`
 # Lambda handlers. Each derives its OWN `run_date` for the
 # `krepis.stage_coverage.assert_stage_coverage` call from
 # `event["end_time_iso"]` — the RAW calendar `$$.Execution.StartTime` — because
@@ -770,7 +770,7 @@ def test_stage_coverage_producers_thread_the_execution_arn():
 # the split is invisible: the verdict still lands under a plausible-looking
 # prefix (the `alpha-engine-config-I8155` class, at the Lambda half).
 #
-# This half of the fix is INERT ON ITS OWN and that is expected: the five
+# This half of the fix is INERT ON ITS OWN and that is expected: the
 # handlers must also be changed to PREFER `event.get("run_date")` over the
 # derived value (`alpha-engine-config-I10194` §1 step (2), `crucible-research`,
 # a separate PR). Until that lands the handlers ignore the extra Payload key,
@@ -782,7 +782,8 @@ def test_stage_coverage_producers_thread_the_execution_arn():
 _PARTITION_SPLIT_RESEARCH_STATES = (
     "Counterfactual",
     "RationaleClustering",
-    "ReplayConcordance",
+    # `ReplayConcordance` left this tuple with its stage under
+    # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b).
     "EvalRollingMean",
     "EvalJudgeSubmitFirstSaturday",
 )

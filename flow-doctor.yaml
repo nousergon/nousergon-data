@@ -1,3 +1,8 @@
+# alpha-engine-config-I10880: overridden to "data-collector-shadow" (its own
+# rate-limiter budget) for a shadow run — weekly_collector.py's
+# setup_logging(..., flow_name=...) call, keyed off
+# DATA_COLLECTION_SHADOW_TRADING_DAY (shadow/root.py::ENV_TRADING_DAY). The
+# value below stands for every non-shadow entrypoint.
 flow_name: data-collector
 repo: nousergon/nousergon-data
 owner: "@brianmcmahon"

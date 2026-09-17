@@ -10,7 +10,7 @@ schema_version: 1
 # RECORD-LOUD), never allowlisted — see alpha-engine-config-I10226.
 entries:
   - path: collectors/alternative.py
-    line: 1572
+    line: 1580
     reason: >-
       (a) failure mode swallowed: s3.get_object against
       archive/revisions/{date}.json fails/404s for every checked date.
@@ -19,7 +19,9 @@ entries:
       anywhere in this codebase, so the loop 404s by construction; it is
       documented dead code kept only as a non-regressing safety net, and
       result["revision_4w"] is already None on entry and stays None, so
-      nothing is silently degraded from a populated value.
+      nothing is silently degraded from a populated value. (Shifted +8 by
+      alpha-engine-config-I10899's `from dates import ...` bounded-fetch
+      import addition; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: emailer.py
@@ -45,35 +47,35 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 2763
+    line: 2783
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
       data, feeds no downstream consumer. (Line shifted from 2754 by
       alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
-      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.)
+      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.) (Shifted +20 by alpha-engine-config-I10880's shadow-flow-name setup_logging override.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4132
+    line: 4152
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
       data, feeds no downstream consumer. (Line shifted from 4123 by
       alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
-      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.)
+      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.) (Shifted +20 by alpha-engine-config-I10880's shadow-flow-name setup_logging override.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4293
+    line: 4313
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
       suffix for the logger.info summary line immediately below; writes no
       data, feeds no downstream consumer. (Line shifted from 4284 by
       alpha-engine-config-I9288's `assert_valid_price_cache_ticker` import +
-      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.)
+      call additions (2 lines); site unchanged.) (Shifted +6 by alpha-engine-config-I10891's shadow run-state import + skip guard.) (Shifted +1 by alpha-engine-config-I10893's chronic-gap-heal future-bar guard.) (Shifted +20 by alpha-engine-config-I10880's shadow-flow-name setup_logging override.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226

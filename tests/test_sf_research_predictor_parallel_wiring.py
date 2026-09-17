@@ -17,7 +17,9 @@ This restructures the sequential
 into an SF Parallel:
   Branch A (as of the 2026-05-16 origin) = CheckSkipResearch -> Research ->
              DataPhase2 -> eval-judge chain -> EvalRollingMean ->
-             RationaleClustering -> ReplayConcordance -> Counterfactual
+             RationaleClustering -> Counterfactual
+             (ReplayConcordance sat between those two until
+             alpha-engine-config-I10539 retired it, 2026-09-16)
   Branch B = CheckSkipPredictorTraining -> PredictorTraining quartet
   join    -> AggregateBranchOutcomes -> CheckBranchOutcomes ->
              CheckSkipBacktester (config#902: the standalone DriftDetection
@@ -115,7 +117,8 @@ _BRANCH_A_STATES = {
     "MergeEvalJudgeProcessPollCount", "EvalJudgeProcessLivenessGate",
     "ExtractEvalJudgeProcessError", "EvalRollingMean",
     "CheckSkipRationaleClustering", "RationaleClustering",
-    "CheckSkipReplayConcordance", "ReplayConcordance",
+    # alpha-engine-config-I10539: CheckSkipReplayConcordance +
+    # ReplayConcordance + MarkReplayConcordanceDegraded are retired.
     "CheckSkipCounterfactual", "Counterfactual", "ExtractSignalsEnvelopeError",
     "PublishResearchFailureImmediate",
     "BranchAComplete", "BranchAFailed",
@@ -1008,7 +1011,7 @@ class TestPerBranchErrorIsolation:
             "EvalJudgeProcess",
             "EvalRollingMean",
             "RationaleClustering",
-            "ReplayConcordance",
+            # alpha-engine-config-I10539: ReplayConcordance is retired.
             "Counterfactual",
         ):
             for c in branch_a[n].get("Catch", []):

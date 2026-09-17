@@ -254,15 +254,21 @@ class TestDeclaredStagesCanActuallyBeSeen:
 
 
 class TestKnownProducersStayDeclared:
-    """Pins the four producers measured on 2026-08-13, so a future edit
+    """Pins the producers measured on 2026-08-13, so a future edit
     that drops one has to say so in a diff rather than in a silence."""
 
-    def test_replay_concordance_is_required(self, coverage):
-        """I7176 item A2: ReplayConcordance is wall-killed in 58% of runs
-        and its budget cannot be sized until its spend is visible."""
-        assert coverage["required_producers"]["ReplayConcordance"] == [
-            "replay-concordance"
-        ]
+    def test_replay_concordance_is_not_declared(self, coverage):
+        """alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b):
+        the ReplayConcordance STAGE is retired, so requiring its cost record
+        is a demand for spend that can no longer happen — that is exactly the
+        ``CostCoverageError`` that ended the 2026-09-12 canonical run. It must
+        also not reappear as conditional or allowed: nothing in the definition
+        invokes the concordance Lambda, so an out-of-band standalone
+        invocation landing in this run_date's prefix SHOULD read as
+        present-but-undeclared and refuse loudly."""
+        assert "ReplayConcordance" not in coverage["required_producers"]
+        assert "ReplayConcordance" not in coverage["conditional_producers"]
+        assert "replay-concordance" not in coverage["allowed_producers"]
 
     def test_challenger_shadow_is_required(self, coverage):
         assert coverage["required_producers"]["ChallengerShadow"] == [
