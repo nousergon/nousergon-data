@@ -109,3 +109,26 @@ entries:
       literal's ABSENCE, not a use of it.
     expires: "2027-02-27"
     tracking: alpha-engine-config-I9295
+  - path: requirements.txt
+    pattern: "openai:dist"
+    reason: >-
+      `krepis[openai]` is the ROUTER'S OWN EXTRA, not a provider call site.
+      krepis IS the router (Brian's 2026-08-29 ruling, alpha-engine-config-I9294
+      / -I9295); the extra installs the `openai` SDK for krepis's own use so it
+      can speak the OpenAI WIRE FORMAT to the router endpoint. No call site in
+      this repo addresses OpenAI, and the router package's own extras cannot by
+      construction be a bypass of the router.
+      It is load-bearing rather than incidental: `crucible` pins the same extra
+      under alpha-engine-config-I10473, where omitting it meant no v2 box could
+      make a call in the openai wire format at all (`ModuleNotFoundError: No
+      module named 'openai'`, measured 2026-09-10 on i-0fcd1c9649a27aa62).
+      INTERIM. Nothing in this repo changed: the guard workflow was bumped
+      nousergon-lib@c115e758 -> @855687d6 by Dependabot #1782 on 2026-09-17 and
+      the stricter guard began matching a pin that has been at
+      requirements.txt:208 for months, holding `main` red from b804b940 onward.
+      The real fix is in the guard — a dist spec for the router package itself,
+      with any extras, must not match — tracked at alpha-engine-config-I11017.
+      DELETE THIS ENTRY when that lands; its `closes-when` is this repo green
+      with no entry for krepis[openai].
+    expires: "2026-10-17"
+    tracking: alpha-engine-config-I11017
