@@ -318,9 +318,94 @@ def test_a_denied_simulation_is_unmeasurable_naming_the_grant(units):
 def test_an_undeclared_writer_identity_is_unmet_naming_the_config(units):
     store = EmptyStore()
     store.iam_client = _Simulator(("",))
-    reading = unit_readers.read_identity(store, _unit(units, "D39"))  # runs_on: github-hosted
+    unit = _unit(units, "D19", trigger={"kind": "systemd-timer", "runs_on": "a-compute-class-nobody-declared"})
+    reading = unit_readers.read_identity(store, unit)
     assert not reading.met and not reading.unmeasurable
     assert "writer_identities.yaml" in reading.detail
+
+
+def test_a_per_unit_identity_overrides_the_runs_on_class(units, tmp_path):
+    """`by_unit` wins: two units of one `runs_on` class are two identities."""
+    path = tmp_path / "writer_identities.yaml"
+    config = yaml.safe_load(unit_readers.WRITER_IDENTITIES_PATH.read_text(encoding="utf-8"))
+    config["by_unit"] = {"D19": "a-per-unit-role"}
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    store = EmptyStore()
+    store.iam_client = _Simulator(("staging/",))
+    reading = unit_readers.read_identity(store, _unit(units, "D19"), identities_path=path)
+    assert all(c["PolicySourceArn"].endswith("role/a-per-unit-role") for c in store.iam_client.calls)
+    assert reading.met, reading.detail
+
+
+def test_every_simulation_asks_about_exactly_one_resource_arn(units):
+    """alpha-engine-config-I10929: batching makes a verdict unattributable."""
+    store = EmptyStore()
+    store.iam_client = _Simulator(("staging/",))
+    unit_readers.read_identity(store, _unit(units, "D19"))
+    assert store.iam_client.calls
+    assert all(len(c["ResourceArns"]) == 1 for c in store.iam_client.calls), store.iam_client.calls
+
+
+class _CollapsingSimulator:
+    """AWS's real batching behaviour: ONE result naming the policy TEMPLATE.
+
+    Measured 2026-09-17 against live IAM — three ARNs in one call return a
+    single `EvaluationResult` whose `EvalResourceName` is
+    ``arn:aws:s3:::${BucketName}/${KeyName}``, with no per-ARN verdict.
+    """
+
+    TEMPLATE = "arn:aws:s3:::${BucketName}/${KeyName}"
+
+    def __init__(self, decision: str = "allowed") -> None:
+        self.decision = decision
+        self.calls: list[dict] = []
+
+    def simulate_principal_policy(self, **kwargs):
+        self.calls.append(kwargs)
+        return {
+            "EvaluationResults": [{"EvalResourceName": self.TEMPLATE, "EvalDecision": self.decision}],
+            "IsTruncated": False,
+        }
+
+
+def test_a_batched_call_raises_rather_than_returning_a_verdict():
+    """The guard is EXERCISED: re-batching for speed fails loud, not silently."""
+    client = _CollapsingSimulator()
+    with pytest.raises(unit_readers.UnattributableSimulation) as excinfo:
+        unit_readers._simulate(
+            client,
+            "arn:aws:iam::711398986525:role/nousergon-data-collection-box-role",
+            "s3:PutObject",
+            ["arn:aws:s3:::alpha-engine-research/data/a.json", "arn:aws:s3:::alpha-engine-research/data/b.json"],
+        )
+    assert "${BucketName}" in str(excinfo.value)
+
+
+@pytest.mark.parametrize("decision", ["allowed", "implicitDeny"])
+def test_an_unattributable_response_is_unmeasurable_never_a_denial(units, decision):
+    """The collapse is symmetric — neither direction may be read as a verdict."""
+    store = EmptyStore()
+    store.iam_client = _CollapsingSimulator(decision)
+    reading = unit_readers.read_identity(store, _unit(units, "D19"))
+    assert reading.unmeasurable and not reading.met
+    assert "may NOT PutObject" not in reading.detail
+    assert "${BucketName}" in reading.detail and "unattributable" in reading.detail
+
+
+def test_a_simulation_that_answers_about_nothing_is_not_a_denial(units):
+    """An empty EvaluationResults is "we did not get an answer", not "denied"."""
+
+    class _Silent:
+        calls: list = []
+
+        def simulate_principal_policy(self, **kwargs):
+            return {"EvaluationResults": [], "IsTruncated": False}
+
+    store = EmptyStore()
+    store.iam_client = _Silent()
+    reading = unit_readers.read_identity(store, _unit(units, "D19"))
+    assert reading.unmeasurable and not reading.met
+    assert "0 EvaluationResult" in reading.detail
 
 
 # ---------------------------------------------------------------------------
