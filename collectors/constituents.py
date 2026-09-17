@@ -338,10 +338,20 @@ def collect(
     # and to populate the daily_closes request list for the same run. Existing
     # _run_phase1 caller (line 156) just stores the dict — the extra key is
     # additive, no breakage.
+    # alpha-engine-config-I10898: the three dual-path maps above are six of
+    # D01's eight published keys, and the run manifest has to record every one
+    # of them (I10855) or the dispatcher's completion check fails the unit for
+    # a key it declares and does not report. Their sizes are returned here so
+    # the caller's `extra_outputs` can record a real `rows_out` rather than a
+    # zero that the empty-but-fresh guard would then read as a fresh empty
+    # write.
     return {
         "status": "ok",
         "count": len(tickers),
         "tickers": tickers,
+        "sector_map_count": len(sector_etf_map),
+        "sub_industry_map_count": len(sub_industry_map),
+        "sub_sector_etf_map_count": len(sub_sector_etf_map),
     }
 
 

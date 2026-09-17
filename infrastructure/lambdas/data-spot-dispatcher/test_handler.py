@@ -799,9 +799,18 @@ def test_the_execution_start_time_parses_as_the_freshness_bound(monkeypatch):
 # deliberately fewer than their unit's key-shaped template count for exactly
 # that reason (see weekly_collector.py's `extra_outputs` comments for each).
 _MULTI_KEY_UNIT_OUTPUTS: dict[str, list[dict]] = {
+    # alpha-engine-config-I10898: D01 publishes EIGHT keys, not two — three
+    # dual-path maps alongside the constituents pair. The completion check
+    # grades every declared key, so a full run's manifest records all eight.
     "D01": [
         {"key": "market_data/weekly/2026-09-14/constituents.json", "rows_out": 903},
         {"key": "market_data/latest_weekly.json", "rows_out": 903},
+        {"key": "data/sector_map.json", "rows_out": 11},
+        {"key": "reference/price_cache/sector_map.json", "rows_out": 11},
+        {"key": "data/sub_industry_map.json", "rows_out": 903},
+        {"key": "reference/price_cache/sub_industry_map.json", "rows_out": 903},
+        {"key": "data/sub_sector_etf_map.json", "rows_out": 11},
+        {"key": "reference/price_cache/sub_sector_etf_map.json", "rows_out": 11},
     ],
     "D05": [
         {"key": "market_data/weekly/2026-09-14/macro.json", "rows_out": 40},

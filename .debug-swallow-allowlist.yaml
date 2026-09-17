@@ -47,7 +47,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 2879
+    line: 2892
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
@@ -58,7 +58,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4248
+    line: 4261
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
@@ -69,7 +69,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
-    line: 4409
+    line: 4422
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — cosmetic duration
