@@ -219,6 +219,63 @@ def test_every_manifest_conforms_to_the_contract():
     assert contracts.conformance_errors("data_run_manifest", _manifests(s3)[0]) == []
 
 
+def test_an_extra_output_is_graded_by_the_empty_fresh_guard_too():
+    """`alpha-engine-config-I10785`: every published key, not just `artifact_key`.
+
+    D08 (`universe_returns`) writes `research.db` and a dated backup through
+    `extra_outputs` — before this, neither key was ever HEAD-checked by this
+    guard, only recorded as an output.
+    """
+    s3 = FakeS3({"research.db": 2048, "backups/research_2026-09-14.db": 2048})
+    reg = FakeRegistry(s3)
+    reg.data_mode = "phase1"
+    result = weekly_collector._phase_collect(
+        reg,
+        "universe_returns",
+        lambda: {"status": "ok", "rows_inserted": 40, "db_upload": {"pointer_key": "research.db", "backup_key": "backups/research_2026-09-14.db"}},
+        supports_auto_skip=False,
+        extra_outputs=(
+            ("research.db", lambda r: bool((r.get("db_upload") or {}).get("pointer_key")), lambda r: r.get("rows_inserted") or 0),
+            (f"backups/research_2026-09-14.db", lambda r: bool((r.get("db_upload") or {}).get("backup_key")), lambda r: r.get("rows_inserted") or 0),
+        ),
+    )
+    assert result["status"] == "ok"
+    m = _manifests(s3)[0]
+    assert m["unit_id"] == "D08"
+    # Both extra keys, plus the (absent) primary — three guard readings, one
+    # each, all clean since both extra keys published real bytes.
+    guarded_keys = {g["key"] for g in m["guards"] if g["key"]}
+    assert guarded_keys == {"research.db", "backups/research_2026-09-14.db"}
+    assert all(g["verdict"] == "ok" for g in m["guards"] if g["key"] in guarded_keys)
+    # Still exactly ONE board metric per run — the worst of the graded keys.
+    assert len(m["metrics"]) == 1
+    assert m["metrics"][0]["name"] == "data.D08.guard.empty_fresh"
+    assert m["metrics"][0]["status"] == "GREEN"
+
+
+def test_a_broken_extra_output_is_the_one_the_board_metric_reports():
+    """The worst key wins the single per-run board row, not the first one."""
+    s3 = FakeS3({"research.db": 2048})  # backup key never landed on S3
+    reg = FakeRegistry(s3)
+    reg.data_mode = "phase1"
+    result = weekly_collector._phase_collect(
+        reg,
+        "universe_returns",
+        lambda: {"status": "ok", "rows_inserted": 40, "db_upload": {"pointer_key": "research.db", "backup_key": "backups/research_2026-09-14.db"}},
+        supports_auto_skip=False,
+        extra_outputs=(
+            ("research.db", lambda r: bool((r.get("db_upload") or {}).get("pointer_key")), lambda r: r.get("rows_inserted") or 0),
+            (f"backups/research_2026-09-14.db", lambda r: bool((r.get("db_upload") or {}).get("backup_key")), lambda r: r.get("rows_inserted") or 0),
+        ),
+    )
+    assert result["status"] == "ok", "observe mode must not move the exit code"
+    m = _manifests(s3)[0]
+    by_key = {g["key"]: g["verdict"] for g in m["guards"] if g["key"]}
+    assert by_key["research.db"] == "ok"
+    assert by_key["backups/research_2026-09-14.db"] == "empty_fresh"
+    assert m["metrics"][0]["status"] == "RED", "the broken key must win the single board row"
+
+
 def test_the_run_mode_is_resolved_from_the_same_args_run_weekly_dispatches_on():
     import argparse
 
