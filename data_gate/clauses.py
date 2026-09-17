@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exceptions, unmeasurable
 
 from data_gate import evidence as ev
+from data_gate import standalone
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
 from data_gate.inventory import scan
 
@@ -46,6 +47,7 @@ __all__ = [
     "BOARD_CLAUSES",
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
+    "PHASE1_UNITS_PRODUCED_CLAUSE",
     "RetiredClause",
     "UnconnectedClause",
     "base_clause_name",
@@ -87,6 +89,11 @@ CUTOVER_READY_CLAUSES: tuple[str, ...] = (
 
 #: The two IAM roles plan §6.2 step 3 names for "roles bootstrapped": the
 #: standalone stack's own execution role, and the identity that deploys it.
+#: The phase-1 exit's own rollup clause (plan §6.2 item 7) — the production
+#: evidence that `data-cutover-ready` must NOT carry, because it cannot be
+#: answered until the cutover has run (`alpha-engine-config-I10989`).
+PHASE1_UNITS_PRODUCED_CLAUSE = "data.phase1.units_produced"
+
 CUTOVER_READY_ROLES: tuple[str, ...] = (
     "nousergon-data-collection-sfn-role",
     "github-actions-data-collection-stack-deploy",
@@ -620,38 +627,26 @@ def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:
     )
 
 
-def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], *, trading_day: dt.date) -> Clause:
-    name = "data.cutover_ready.units_covered"
-    # A retired unit's survives_phase4 is satisfied by its recorded retirement
-    # decision, which is exactly what the requirement accepts — it is not a
-    # member to grade (alpha-engine-config-I10823).
+def _cutover_population(units: list[Unit]) -> tuple[list[Unit], list[str], list[Unit]]:
+    """(declared, recorded retirements, units left to grade) for §6.2 item 3."""
     declared = _sf_only_units(units)
     retired_members = sorted(u.unit_id for u in declared if u.retired)
-    sf_units = [u for u in declared if not u.retired]
-    members =[_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in sf_units]
-    statuses = [clause_member_status(m) for m in members]
-    met_n = statuses.count("MET")
-    unmet = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMET")
-    unmeas = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMEASURABLE")
-    requirement = (
-        "every unit the standalone stack replaces — any trigger whose declared successor "
-        "names PR1701 or I10753, whatever its kind — has a standalone workload or a "
-        "recorded retirement decision, read from its own data.<unit>.survives_phase4 "
-        "base clause"
-    )
-    detail = f"{met_n}/{len(members)} survives_phase4 MET, {len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE"
-    if unmet:
-        detail += f"; unmet: {unmet[:12]}"
-    if unmeas:
-        detail += f"; unmeasurable: {unmeas[:12]}"
-    # Reconcile against the plan's figure by arithmetic, not by asserting a
-    # disagreement. The graded population is the declared population minus the
-    # units whose retirement decision is already recorded (I10823), and naming
-    # the retirements is what makes the two numbers comparable at all.
-    detail += (
+    graded = [u for u in declared if not u.retired]
+    return declared, retired_members, graded
+
+
+def _plan_reconciliation(declared: list[Unit], retired_members: list[str], graded: list[Unit]) -> str:
+    """The plan-vs-descriptors arithmetic, printed by both rollups.
+
+    Reconcile by arithmetic, never by asserting a disagreement away: the graded
+    population is the declared population minus the units whose retirement
+    decision is already recorded (I10823), and naming the retirements is what
+    makes the two numbers comparable at all.
+    """
+    detail = (
         f". plan §6.2 cites {PLAN_SF_ONLY_UNITS} SF-only units; descriptors declare "
         f"{len(declared)}, of which {len(retired_members)} carry a recorded retirement "
-        f"({retired_members or 'none'}), leaving {len(sf_units)} graded here"
+        f"({retired_members or 'none'}), leaving {len(graded)} graded here"
     )
     if len(declared) != PLAN_SF_ONLY_UNITS:
         detail += (
@@ -659,6 +654,86 @@ def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], 
             "between the plan and the descriptors, named rather than reconciled quietly "
             "(plan §4.1 'red by default')"
         )
+    return detail
+
+
+def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], *, trading_day: dt.date) -> Clause:
+    """Plan §6.2 item 3, and ONLY that: a standalone workload is DECLARED for
+    every SF-only unit, or its retirement is recorded.
+
+    A static question, answered from the committed stack definition and the
+    committed descriptors with no live state of any kind — `alpha-engine-
+    config-I10989`. It used to roll up `survives_phase4`, which requires an
+    ENABLED schedule and a manifest produced inside its execution; all four
+    schedules are deliberately DISABLED until the cutover, and the cutover is
+    gated on this very sub-gate, so that leg was satisfiable only by the action
+    it guards. The production evidence is not lost: it is graded, unchanged, by
+    `data.phase1.units_produced` at the phase-1 exit, where §6.2 item 7 puts it.
+
+    A retired unit's requirement is satisfied by its recorded retirement
+    decision, which is exactly what the requirement accepts — it is not a
+    member to grade (alpha-engine-config-I10823).
+    """
+    name = "data.cutover_ready.units_covered"
+    declared, retired_members, graded = _cutover_population(units)
+    readings = {unit.unit_id: standalone.read_standalone_workload_declared(unit) for unit in graded}
+    missing = sorted(uid for uid, r in readings.items() if not r.met)
+    met_n = len(readings) - len(missing)
+    requirement = (
+        "every unit the standalone stack replaces — any trigger whose declared successor "
+        "names PR1701 or I10753, whatever its kind — has a standalone workload DECLARED in "
+        "the nousergon-data-collection stack's verify_units, or a recorded retirement "
+        "decision. Live schedule state is not an input: this sub-gate is read BEFORE the "
+        "window that enables the schedules (plan §6.2 item 3, alpha-engine-config-I10989)"
+    )
+    detail = f"{met_n}/{len(readings)} SF-only units have a declared standalone workload"
+    if missing:
+        detail += (
+            f"; no verify_units entry for {missing} — "
+            + "; ".join(readings[uid].detail for uid in missing[:4])
+        )
+    detail += _plan_reconciliation(declared, retired_members, graded)
+    evidence = tuple(dict.fromkeys(e for r in readings.values() for e in r.evidence))
+    return Clause(
+        name,
+        requirement,
+        not missing,
+        detail,
+        evidence,
+        phase="data-cutover-ready",
+        source="data_gate.clauses (rollup of declared standalone workloads)",
+    )
+
+
+def _clause_phase1_units_produced(store: ev.GateStore, units: list[Unit], *, trading_day: dt.date) -> Clause:
+    """Plan §6.2 item 7 — the PRODUCTION evidence, at the phase-1 exit.
+
+    Exactly the reading `data.cutover_ready.units_covered` used to carry: every
+    SF-only unit's `survives_phase4`, which needs an ENABLED schedule, a
+    SUCCEEDED execution for the latest due fire, and an ok scheduled-trigger
+    manifest inside it. It reads UNMET until the cutover has run, which is
+    correct and is not circular, because nothing is gated on it: phase 1 exits
+    AFTER the cutover, "read after the cutover's first 5 trading days".
+    """
+    name = "data.phase1.units_produced"
+    declared, retired_members, graded = _cutover_population(units)
+    members = [_clause_base(store, unit, "survives_phase4", trading_day=trading_day) for unit in graded]
+    statuses = [clause_member_status(m) for m in members]
+    met_n = statuses.count("MET")
+    unmet = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMET")
+    unmeas = sorted(m.name for m, s in zip(members, statuses, strict=True) if s == "UNMEASURABLE")
+    requirement = (
+        "after the cutover, every unit the standalone stack replaces has PRODUCED under its "
+        "own enabled schedule — read from its data.<unit>.survives_phase4 base clause: the "
+        "schedule ENABLED in live state, a SUCCEEDED execution for the latest due fire, and "
+        "an ok scheduled-trigger manifest inside it (plan §6.2 item 7)"
+    )
+    detail = f"{met_n}/{len(members)} survives_phase4 MET, {len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE"
+    if unmet:
+        detail += f"; unmet: {unmet[:12]}"
+    if unmeas:
+        detail += f"; unmeasurable: {unmeas[:12]}"
+    detail += _plan_reconciliation(declared, retired_members, graded)
     evidence = tuple(m.name for m in members)
     if unmeas:
         return unmeasurable(
@@ -666,7 +741,7 @@ def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], 
             requirement,
             detail,
             evidence,
-            phase="data-cutover-ready",
+            phase="data-phase1",
             source="data_gate.clauses (rollup of survives_phase4)",
         )
     return Clause(
@@ -675,7 +750,7 @@ def _clause_cutover_ready_units_covered(store: ev.GateStore, units: list[Unit], 
         not unmet,
         detail,
         evidence,
-        phase="data-cutover-ready",
+        phase="data-phase1",
         source="data_gate.clauses (rollup of survives_phase4)",
     )
 
@@ -763,6 +838,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_cutover_ready_units_covered(store, units, trading_day=trading_day))
     clauses.append(_clause_cutover_ready_roles_bootstrapped(store))
     clauses.append(_clause_cutover_ready_parity(store, trading_day=trading_day))
+    clauses.append(_clause_phase1_units_produced(store, units, trading_day=trading_day))
     # `data_collection/metrics/eod_completeness/{trading_day}.json` is a single
     # non-unit-scoped key (`validators/expectations.py::publish_completeness_metric`;
     # plan §2 row 2, P-13) — it names the EOD spine specifically, not a generic
