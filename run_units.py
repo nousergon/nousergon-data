@@ -42,15 +42,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
-# `import a.b as b`, NOT `from a import b`. `nousergon_lib` resolves as a
-# NAMESPACE package in the per-lambda dependency environments the
-# glob-derived Lambda handler tests build, and `from nousergon_lib import
-# run_manifest` fails there with `cannot import name 'run_manifest' from
-# 'nousergon_lib' (unknown location)` — a submodule is not an attribute of a
-# namespace package until something imports it. The direct submodule form
-# below works in both environments, which is why the pre-existing line beside
-# it never had this problem. Measured on GHA run 35280338083.
-import nousergon_lib.run_manifest as run_manifest
+from nousergon_lib import run_manifest
 from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
 
 __all__ = [
