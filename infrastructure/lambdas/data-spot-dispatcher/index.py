@@ -149,6 +149,17 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 # "Budget", alpha-engine-config-I10866), plus parity. 5 h covers that sum
 # (~3.9 h) with headroom. It drives BOTH the SSM executionTimeout and the
 # box's hard-stop timer, so neither of them can cut the chain off first.
+# The two standalone comparators (alpha-engine-config-I10920) are deliberately
+# ABSENT: both are read-and-compare passes over one trading day, and the 7200 s
+# shared default already covers the parity leg measured inside the 2026-09-15
+# shadow-weekday chain. MEASURED on the first dispatch of each, 2026-09-17,
+# trading day 2026-09-14 (alpha-engine-config-I10920): `shadow-parity`
+# published its 23-row report ~4.5 min after launch, `arctic-parity` ran
+# 18:24:02Z -> 18:26:02Z (120 s of comparator), both including box boot and
+# the venv build. Neither is within an order of magnitude of 7200 s.
+# A cap is added here only against a MEASURED overrun, per
+# that issue's deliverable 3 ("measure the first run rather than guessing"); an
+# entry invented ahead of evidence is a number nothing checks.
 _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
 
 
@@ -171,7 +182,15 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
 # remaining bound is retention: a parity run more than 30 days after its trading
 # day reads `live_superseded`, by name. Adding a workload here means adding a
 # refusal in `_resolve_workload` and its test; an empty entry is the ruling.
-_WORKLOAD_PARITY_WINDOW: dict[str, "tuple[str, str] | None"] = {"shadow-weekday": None}
+# The two standalone comparators (alpha-engine-config-I10920) inherit the same
+# ruling for the same reason: each grades a key against the object v1's run
+# manifest recorded for the trading day, so a clock window would refuse runs
+# that are correct and admit runs that are not.
+_WORKLOAD_PARITY_WINDOW: dict[str, "tuple[str, str] | None"] = {
+    "shadow-weekday": None,
+    "shadow-parity": None,
+    "arctic-parity": None,
+}
 
 
 def _max_runtime_seconds(workload: "str | None") -> int:
@@ -366,6 +385,55 @@ _WORKLOADS: dict[str, str] = {
         "&& python -m shadow parity --trading-day {trading_day} "
         "--store s3://alpha-engine-research/data_collection )"
     ),
+    # alpha-engine-config-I10920: the two parity COMPARATORS, each launchable on
+    # its own rather than only as the tail of the five-hour `shadow-weekday`
+    # chain above.
+    #
+    # Why they are separate keys and not `&&`-chained into one: `shadow parity`
+    # exits 1 for "the comparison ran and parity is NOT MET" and 2 for "the
+    # comparison itself failed" (`shadow/__main__.py`), which is the same
+    # two-code contract `data_gate.__main__` declares. A chained `&&` would make
+    # the (expected, informative) NOT-MET exit skip the ArcticDB leg entirely,
+    # so the report would keep its four `in_region_only` rows precisely on the
+    # runs where the rest of it has something to say.
+    #
+    # `shadow-parity` re-publishes `data_collection/parity/{trading_day}.json`
+    # from the shadow prefix an EARLIER `shadow-weekday` run already wrote. It
+    # exists because the comparator's own fixes ship far more often than the
+    # 5-hour producer chain can be re-run: I10890 (`out_of_run_scope`), I10892
+    # (`live_superseded`) and I10894 (`provenance_diffs`) all landed after the
+    # only published report was generated, and without this key the sole way to
+    # read a post-fix verdict was to re-run four collector legs that write
+    # nothing new. Reads and compares only; the single object it writes is the
+    # report itself.
+    #
+    # `arctic-parity` then fills that report's four `in_region_only` rows
+    # (`arcticdb/universe`, `macro`, `delisted_history`, `universe_schema_meta`)
+    # in place, via `shadow/arctic_parity.py::rewrite_report`, which only ever
+    # NARROWS the `in_region_only` set. It must run in-region and can run
+    # nowhere else: it opens `store.arctic_store._open_library` directly, and
+    # ArcticDB is unreachable from the laptop (alpha-engine-config-I9771). It
+    # reads the report it is about to rewrite, so it is ordered AFTER
+    # `shadow-parity`, never before — run alone against a stale report it would
+    # write four fresh ArcticDB verdicts onto 464 stale S3 rows and publish the
+    # mixture under one `generated_at`.
+    #
+    # Neither is scheduled, by the same reasoning `shadow-weekday` records: a
+    # manual validation command inside the already-registered dispatcher Lambda
+    # is not a scheduled workflow and needs no `governance/observability.d/`
+    # row. Neither writes a live key — every byte is under
+    # `data_collection/parity/` or `data_collection/runs/arctic-parity/`.
+    # Coverage of these keys against `shadow/` is asserted by
+    # `shadow/dispatch.py` plus its test, so the next comparator cannot land
+    # unreachable the way `arctic_parity` did (alpha-engine-config-I10920).
+    "shadow-parity": (
+        "python -m shadow parity --trading-day {trading_day} "
+        "--store s3://alpha-engine-research/data_collection"
+    ),
+    "arctic-parity": (
+        "python -m shadow arctic-parity --trading-day {trading_day} "
+        "--store s3://alpha-engine-research/data_collection"
+    ),
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a
@@ -376,7 +444,9 @@ _WORKLOAD_RE = re.compile(r"^[a-z][a-z-]{0,63}$")
 # from the event rather than a fixed string. Never grows into a general
 # templating mechanism: adding a workload here means adding its own validated
 # placeholder(s) below, never accepting free-text into the rendered command.
-_WORKLOADS_REQUIRING_TRADING_DAY: frozenset[str] = frozenset({"shadow-weekday"})
+_WORKLOADS_REQUIRING_TRADING_DAY: frozenset[str] = frozenset(
+    {"shadow-weekday", "shadow-parity", "arctic-parity"}
+)
 _TRADING_DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
