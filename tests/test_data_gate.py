@@ -1001,13 +1001,62 @@ def test_roles_bootstrapped_unmet_via_list_role_policies_nosuchentity():
 
 
 def test_units_covered_reconciles_against_the_37_named_in_the_plan(units):
-    """The descriptor-derived SF-only population, named as a finding if it
-    disagrees with the 37 the plan and this issue cite — never reconciled
-    silently."""
-    sf_units = clause_module._sf_only_units(units)
+    """The reconciliation is arithmetic and is ALWAYS printed: the plan's
+    figure, the declared population, the recorded retirements by name, and
+    what is left to grade. The old version of this test only asserted
+    anything when the two numbers disagreed, so it passed vacuously the
+    moment they agreed (alpha-engine-config-I10908)."""
+    declared = clause_module._sf_only_units(units)
+    retired = sorted(u.unit_id for u in declared if u.retired)
+    graded = [u for u in declared if not u.retired]
     clause = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
-    if len(sf_units) != 37:
-        assert "37" in clause.detail and str(len(sf_units)) in clause.detail
+
+    assert str(clause_module.PLAN_SF_ONLY_UNITS) in clause.detail
+    assert f"descriptors declare {len(declared)}" in clause.detail
+    assert f"leaving {len(graded)} graded here" in clause.detail
+    for unit_id in retired:
+        assert unit_id in clause.detail
+
+
+def test_units_covered_membership_keys_on_the_successor_not_the_trigger_kind(units):
+    """`alpha-engine-config-I10908`. D33's trigger kind is `eventbridge-rule`
+    and its successor is `ne-data-collection-daily-heal (nousergon-data-PR1701,
+    DISABLED)` — the standalone stack replaces it exactly like the
+    step-functions units. Keying membership on `kind == "step-functions"`
+    dropped it silently, so `units_covered` could read a clean MET with D33's
+    `survives_phase4` never graded at all. A gate that reads MET over an
+    ungraded member is worse than one that reads UNMET."""
+    members = {u.unit_id for u in clause_module._sf_only_units(units)}
+    kinds = {
+        u.unit_id: str((u.raw.get("trigger") or {}).get("kind") or "")
+        for u in units
+    }
+
+    declares_successor = {
+        u.unit_id
+        for u in units
+        if "nousergon-data-PR1701" in str((u.raw.get("trigger") or {}).get("successor") or "")
+        or "alpha-engine-config-I10753" in str((u.raw.get("trigger") or {}).get("successor") or "")
+    }
+    assert members == declares_successor, (
+        "membership must be exactly the units declaring a PR1701/I10753 successor"
+    )
+
+    dropped_by_kind = {u for u in declares_successor if kinds.get(u) != "step-functions"}
+    assert dropped_by_kind, (
+        "this regression test is only meaningful while at least one replaced unit "
+        "has a non-step-functions trigger; if that is no longer true, keep the "
+        "assertion above and delete this one deliberately"
+    )
+    assert dropped_by_kind <= members
+
+    clause = clause_module._clause_cutover_ready_units_covered(EmptyStore(), units, trading_day=TRADING_DAY)
+    graded = {u.unit_id for u in clause_module._sf_only_units(units) if not u.retired}
+    for unit_id in sorted(dropped_by_kind & graded):
+        assert any(unit_id in name for name in clause.evidence), (
+            f"{unit_id} is replaced by the standalone stack but its survives_phase4 "
+            "clause is not in the rollup's evidence"
+        )
 
 
 def test_units_covered_is_unmeasurable_when_no_survives_phase4_evidence_exists(units):

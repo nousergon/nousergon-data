@@ -780,6 +780,217 @@ def test_a_json_pair_differing_in_a_data_field_still_mismatches_with_a_contract_
     assert body["provenance_diffs"]["count"] == 0
 
 
+# ---------------------------------------------------------------------------
+# I10892: grade the live object v1's manifest recorded for the trading day
+# ---------------------------------------------------------------------------
+
+
+class _VersionedReader(_FakeReader):
+    """A versioned bucket: `objects` is the CURRENT object per key, `versions`
+    every retained (key, version_id) -> (etag, bytes)."""
+
+    def __init__(self, objects, etags, versions=None):
+        super().__init__(objects)
+        self.etags = etags
+        self.versions = versions or {}
+        self.version_gets: list[tuple[str, str]] = []
+
+    def get_with_meta(self, key, version_id=None):
+        if version_id is not None:
+            self.version_gets.append((key, version_id))
+            hit = self.versions.get((key, version_id))
+            return None if hit is None else {"body": hit[1], "etag": hit[0], "version_id": version_id}
+        if key not in self.objects:
+            return None
+        return {"body": self.objects[key], "etag": self.etags.get(key), "version_id": "current"}
+
+
+_CLOSE_KEY = "staging/daily_closes/2026-09-12.parquet"
+
+
+def _v1_manifest_with_version(etag, version_id, key=_CLOSE_KEY, capture="head_object"):
+    record = {"key": key, "rows_out": 1, "etag": etag, "version_id": version_id}
+    if capture is not None:
+        record["version_capture"] = capture
+    return json.dumps(
+        {"schema_version": "data_run_manifest.v1", "unit_id": "D17", "finished": "2026-09-12T20:10:00Z", "outputs": [record]}
+    ).encode("utf-8")
+
+
+def _run_d17(reader):
+    return parity.run_parity(
+        trading_day=TRADING_DAY, bucket="alpha-engine-research", reader=reader, units=_one_unit("D17")
+    )
+
+
+def test_current_etag_matching_the_manifest_grades_the_current_object():
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _VersionedReader(
+        {_CLOSE_KEY: payload, ROOT.key(_CLOSE_KEY): payload, _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", "v-day")},
+        {_CLOSE_KEY: "e-day"},
+    )
+    report = _run_d17(reader)
+    row = report.rows[0]
+    assert row.verdict == "match"
+    assert row.body["live_version"]["basis"] == "current_matches_manifest"
+    assert reader.version_gets == []
+
+
+def test_a_superseded_live_key_with_a_recorded_version_id_is_graded_against_that_version():
+    """The 09-15 shape: v1's D+1 run rewrote the key; the day's version is retained."""
+    day_payload = _parquet(_frame(["AAPL"], [146.80]))
+    next_day_payload = _parquet(_frame(["AAPL"], [150.18]))
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: next_day_payload,
+            ROOT.key(_CLOSE_KEY): day_payload,
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", "v-day"),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+        versions={(_CLOSE_KEY, "v-day"): ("e-day", day_payload)},
+    )
+    row = _run_d17(reader).rows[0]
+    assert row.verdict == "match"
+    assert row.body["live_version"] == {
+        "basis": "manifest_version_id",
+        "manifest_etag": "e-day",
+        "manifest_version_id": "v-day",
+        "current_etag": "e-next-day",
+    }
+    assert reader.version_gets == [(_CLOSE_KEY, "v-day")]
+
+
+def test_a_recorded_version_still_catches_a_real_difference():
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [150.18])),
+            ROOT.key(_CLOSE_KEY): _parquet(_frame(["AAPL"], [146.78])),
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", "v-day"),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+        versions={(_CLOSE_KEY, "v-day"): ("e-day", _parquet(_frame(["AAPL"], [146.80])))},
+    )
+    row = _run_d17(reader).rows[0]
+    assert row.verdict == "mismatch"
+    assert row.body["live_version"]["basis"] == "manifest_version_id"
+
+
+def test_etag_differs_and_no_version_id_recorded_is_live_superseded_never_mismatch():
+    payload = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [2.0])),
+            ROOT.key(_CLOSE_KEY): payload,
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", None),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+    )
+    report = _run_d17(reader)
+    row = report.rows[0]
+    assert row.verdict == "live_superseded"
+    assert row.body["live_version"]["basis"] == "superseded_no_version_id"
+    assert report.summary["live_superseded"] == 1
+    assert report.summary["mismatch"] == 0
+    assert report.met is False
+
+
+def test_a_recorded_version_past_retention_is_live_superseded():
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [2.0])),
+            ROOT.key(_CLOSE_KEY): _parquet(_frame(["AAPL"], [1.0])),
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", "v-expired"),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+    )
+    row = _run_d17(reader).rows[0]
+    assert row.verdict == "live_superseded"
+    assert row.body["live_version"]["basis"] == "recorded_version_not_retained"
+
+
+def test_a_manifest_with_no_output_record_for_the_key_keeps_todays_behaviour():
+    """No record -> the current object is graded, exactly as before I10892."""
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [2.0])),
+            ROOT.key(_CLOSE_KEY): _parquet(_frame(["AAPL"], [1.0])),
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-other", "v-other", key="some/other/key.json"),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+    )
+    row = _run_d17(reader).rows[0]
+    assert row.verdict == "mismatch"
+    assert row.body["live_version"] == {"basis": "unrecorded"}
+
+
+@pytest.mark.parametrize(
+    "etag, version_id, capture",
+    [
+        (None, None, None),  # a pre-I10892 manifest: etag null, no version fields
+        ("e", "v", "unavailable"),  # a lookup that failed is not a measurement
+        (None, None, "object_absent"),
+    ],
+)
+def test_an_unmeasured_record_keeps_todays_behaviour(etag, version_id, capture):
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [2.0])),
+            ROOT.key(_CLOSE_KEY): _parquet(_frame(["AAPL"], [1.0])),
+            _v1_manifest_key("D17"): _v1_manifest_with_version(etag, version_id, capture=capture),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+    )
+    row = _run_d17(reader).rows[0]
+    assert row.verdict == "mismatch"
+    assert row.body["live_version"]["basis"] == "unrecorded"
+    assert reader.version_gets == []
+
+
+def test_a_live_superseded_report_conforms_to_the_schema():
+    import jsonschema
+
+    reader = _VersionedReader(
+        {
+            _CLOSE_KEY: _parquet(_frame(["AAPL"], [2.0])),
+            ROOT.key(_CLOSE_KEY): _parquet(_frame(["AAPL"], [1.0])),
+            _v1_manifest_key("D17"): _v1_manifest_with_version("e-day", None),
+        },
+        {_CLOSE_KEY: "e-next-day"},
+    )
+    report = _run_d17(reader)
+    schema = json.loads((REPO_ROOT / "contracts" / "data_parity_report.schema.json").read_text(encoding="utf-8"))
+    jsonschema.validate(report.as_dict(), schema)
+    assert set(report.summary) - {"total"} <= set(
+        schema["$defs"]["keyResult"]["properties"]["verdict"]["enum"]
+    )
+
+
+def test_s3_reader_get_with_meta_fetches_a_version_and_treats_no_such_version_as_absent():
+    class _Err(Exception):
+        def __init__(self, code):
+            self.response = {"Error": {"Code": code}}
+
+    class _Client:
+        def __init__(self):
+            self.calls = []
+
+        def get_object(self, **kw):
+            self.calls.append(kw)
+            if kw.get("VersionId") == "gone":
+                raise _Err("NoSuchVersion")
+            if kw.get("VersionId") == "denied":
+                raise _Err("AccessDenied")
+            return {"Body": io.BytesIO(b"x"), "ETag": '"abc"', "VersionId": kw.get("VersionId", "null")}
+
+    client = _Client()
+    reader = parity.S3Reader("alpha-engine-research", client=client)
+    assert reader.get_with_meta("k", version_id="v1") == {"body": b"x", "etag": "abc", "version_id": "v1"}
+    assert reader.get_with_meta("k") == {"body": b"x", "etag": "abc", "version_id": None}
+    assert reader.get_with_meta("k", version_id="gone") is None
+    with pytest.raises(_Err):
+        reader.get_with_meta("k", version_id="denied")
+
+
 def test_the_report_schema_accepts_excluded_class_and_provenance_diffs():
     """The producer contract test for the two schema additions."""
     import jsonschema
