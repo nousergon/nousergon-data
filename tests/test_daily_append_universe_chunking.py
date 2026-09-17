@@ -197,3 +197,8 @@ def test_universe_pass_n_ok_accumulates_across_chunks(monkeypatch):
         f"n_partial={result['tickers_partial']} = {counted}, "
         f"expected {expected}"
     )
+    # alpha-engine-config-I10810: `tickers_published` (what run_units.py's
+    # rows_key reads for D17/D18/D32) must be exactly this same total — a
+    # NaN-feature ("partial") row is still a real ArcticDB write, so it must
+    # count as published even though it isn't "fully featured".
+    assert result["tickers_published"] == expected

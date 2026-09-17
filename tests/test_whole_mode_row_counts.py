@@ -78,6 +78,11 @@ class _Sink:
 
 
 def test_an_arctic_append_records_its_measured_ticker_count(monkeypatch):
+    """`tickers_published` (n_ok + n_partial) is the row count, not
+    `tickers_appended` (n_ok alone) — a row with >=1 NaN feature is still a
+    real ArcticDB write. Fixture shape mirrors the 2026-09-16 D32 live
+    incident: almost every row landed in `tickers_partial`, not
+    `tickers_appended` (alpha-engine-config-I10810)."""
     out, m = _run(
         monkeypatch,
         "daily_arctic_append",
@@ -86,7 +91,9 @@ def test_an_arctic_append_records_its_measured_ticker_count(monkeypatch):
             "collectors": {
                 "arcticdb": {
                     "status": "ok",
-                    "tickers_appended": 891,
+                    "tickers_appended": 2,
+                    "tickers_partial": 889,
+                    "tickers_published": 891,
                     "tickers_errored": 2,
                     "tickers_quality_blocked": 5,
                 }
@@ -210,7 +217,7 @@ def test_a_real_zero_is_empty_fresh_not_a_pass(monkeypatch):
     _, m = _run(
         monkeypatch,
         "morning_arctic_append",
-        {"status": "ok", "collectors": {"arcticdb": {"status": "ok", "tickers_appended": 0}}},
+        {"status": "ok", "collectors": {"arcticdb": {"status": "ok", "tickers_published": 0}}},
     )
     assert m["rows_out"] == 0
     assert [g["verdict"] for g in m["guards"]] == ["empty_fresh"]
@@ -227,7 +234,7 @@ def test_a_mode_whose_declared_step_reported_no_count_is_unmeasurable(monkeypatc
     )
     assert m["outputs"] == []
     assert [g["verdict"] for g in m["guards"]] == ["unmeasurable"]
-    assert "arcticdb.tickers_appended" in m["guards"][0]["detail"]
+    assert "arcticdb.tickers_published" in m["guards"][0]["detail"]
 
 
 def test_every_declared_row_and_rejection_key_exists_in_its_writer():
@@ -262,7 +269,7 @@ def test_every_declared_row_and_rejection_key_exists_in_its_writer():
     # (`tickers_captured`, `sectors`, …) live in `collectors/` and are covered by
     # their own phases' guard verdicts.
     checked = {
-        "tickers_written", "tickers_appended", "tickers_errored", "tickers_skipped",
+        "tickers_written", "tickers_appended", "tickers_published", "tickers_errored", "tickers_skipped",
         "tickers_missing_from_closes", "tickers_quality_blocked", "tickers_l2_quarantined",
         "healed_days", "healed",
     }
@@ -346,3 +353,16 @@ def test_a_failing_mode_still_writes_failed_and_returns_its_result(monkeypatch):
     )
     assert m["status"] == "failed"
     assert out["status"] == "failed"
+
+
+def test_arctic_append_units_read_tickers_published_not_tickers_appended():
+    """Pin against regressing alpha-engine-config-I10810 (measured 2026-09-16):
+    `tickers_appended` alone (n_ok, "fully-featured" rows) undercounted real
+    ArcticDB writes on a live D18/D32 run where 909 of 910 published rows
+    carried >=1 NaN feature (`tickers_partial`) and so were invisible to both
+    `rows_out` and `rows_rejected`. Every arctic-append rows_key MUST be
+    `tickers_published` (n_ok + n_partial), which `builders.daily_append`
+    reports as the total actually written this run."""
+    assert run_units.PHASE_UNITS[("daily", "arcticdb")].rows_key == "tickers_published"
+    for mode in ("morning_enrich", "morning_arctic_append", "daily_arctic_append"):
+        assert run_units.MODE_ROWS[mode].rows_key == "tickers_published", mode
