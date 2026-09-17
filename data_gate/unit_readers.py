@@ -30,6 +30,7 @@ from data_gate.sources import GATE_ROLE, GITHUB_TOKEN_ENV, SourceUnavailable
 
 __all__ = [
     "OBSERVABILITY_ROWS_DIR",
+    "UnattributableSimulation",
     "WRITER_IDENTITIES_PATH",
     "read_artifact_registry",
     "read_consumers",
@@ -451,22 +452,93 @@ def _load_identities(path: pathlib.Path) -> dict[str, Any]:
     document = yaml.safe_load(path.read_text(encoding="utf-8"))
     if not isinstance(document, dict) or not isinstance(document.get("by_runs_on"), dict):
         raise ValueError(f"{path} carries no `by_runs_on` mapping")
+    by_unit = document.get("by_unit")
+    if by_unit is not None and not isinstance(by_unit, dict):
+        raise ValueError(f"{path} carries a `by_unit` that is not a mapping")
     return document
 
 
-def _simulate(client, role_arn: str, action: str, resources: list[str]) -> dict[str, str]:
-    decisions: dict[str, str] = {}
+def _declared_role(config: dict[str, Any], unit: Unit, runs_on: str) -> str | None:
+    """The unit's declared writer role: its own row first, then its `runs_on` class.
+
+    `by_runs_on` cannot be the only axis — two units sharing a `runs_on` do not
+    share an identity (`github-hosted` D39 federates into
+    `nousergon-data-inst-ownership-sync`, `github-hosted` D42 dispatches a spot
+    box running as `alpha-engine-executor-role`). `by_unit` is the per-unit
+    override and wins where both exist.
+    """
+    by_unit = config.get("by_unit") or {}
+    row = by_unit.get(unit.unit_id)
+    if row:
+        return str(row)
+    return (config["by_runs_on"] or {}).get(runs_on)
+
+
+class UnattributableSimulation(RuntimeError):
+    """A ``SimulatePrincipalPolicy`` response that cannot be tied to the ARN asked about.
+
+    `alpha-engine-config-I10929`: batching N resource ARNs into one call returns
+    ONE ``EvaluationResult`` whose ``EvalResourceName`` is the POLICY TEMPLATE
+    (``arn:aws:s3:::${BucketName}/${KeyName}``), not any of the ARNs asked
+    about. The per-ARN verdicts are not in the response at all, so no parsing
+    recovers them. Read naively that collapse is symmetric: every requested ARN
+    looks denied (19 false UNMET rows on the 2026-09-17 board), AND a genuinely
+    denied key inside a batch is masked by a permissive sibling. Raising here is
+    what keeps the column measuring the grants rather than the call shape — and
+    what stops the defect returning if the call is ever re-batched for speed.
+    """
+
+
+#: ``${BucketName}``-style policy variables. Their presence in an
+#: ``EvalResourceName`` is the signal that AWS answered about a policy pattern
+#: rather than about the resource we named.
+_POLICY_VARIABLE_RE = re.compile(r"\$\{[^}]*\}")
+
+
+def _simulate_one(client, role_arn: str, action: str, resource: str) -> str:
+    """The decision for exactly ONE (action, resource) pair, asserted attributable.
+
+    One resource ARN per call — the only call shape whose verdict is
+    attributable. On the way out the response must carry exactly one result and
+    its ``EvalResourceName`` must be the ARN we asked about; anything else
+    raises `UnattributableSimulation` rather than being read as a denial.
+    """
+    names: list[str] = []
+    decisions: list[str] = []
     marker = None
     while True:
-        kwargs: dict[str, Any] = {"PolicySourceArn": role_arn, "ActionNames": [action], "ResourceArns": resources}
+        kwargs: dict[str, Any] = {"PolicySourceArn": role_arn, "ActionNames": [action], "ResourceArns": [resource]}
         if marker:
             kwargs["Marker"] = marker
         response = client.simulate_principal_policy(**kwargs)
         for result in response.get("EvaluationResults") or []:
-            decisions[str(result.get("EvalResourceName"))] = str(result.get("EvalDecision"))
+            names.append(str(result.get("EvalResourceName")))
+            decisions.append(str(result.get("EvalDecision")))
         if not response.get("IsTruncated"):
-            return decisions
+            break
         marker = response.get("Marker")
+    if len(decisions) != 1:
+        raise UnattributableSimulation(
+            f"simulating {action} on {resource} returned {len(decisions)} EvaluationResult(s) "
+            f"({names}); exactly one is required for the verdict to be attributable"
+        )
+    if names[0] != resource:
+        hint = (
+            " — that is a policy-variable TEMPLATE, not a resource: the call was answered about a "
+            "policy pattern, and the per-ARN verdicts are not in the response"
+            if _POLICY_VARIABLE_RE.search(names[0])
+            else ""
+        )
+        raise UnattributableSimulation(
+            f"simulating {action} on {resource} returned a verdict about {names[0]!r}{hint}. "
+            "An unattributable response is never read as a denial (alpha-engine-config-I10929)"
+        )
+    return decisions[0]
+
+
+def _simulate(client, role_arn: str, action: str, resources: list[str]) -> dict[str, str]:
+    """``{resource_arn: decision}``, one call per resource so every verdict is attributable."""
+    return {resource: _simulate_one(client, role_arn, action, resource) for resource in dict.fromkeys(resources)}
 
 
 def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path | None = None) -> Reading:
@@ -490,14 +562,15 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
     config = _load_identities(path)
     runs_on = str((unit.raw.get("trigger") or {}).get("runs_on") or "")
     config_ref = path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else str(path)
-    role = (config["by_runs_on"] or {}).get(runs_on)
+    role = _declared_role(config, unit, runs_on)
     ref = _descriptor_ref(unit)
     if not role:
         return Reading(
             met=False,
             detail=(
-                f"no workload identity is declared for runs_on={runs_on!r} in {config_ref} "
-                f"(declared: {sorted(config['by_runs_on'])}). A unit whose writer identity is not "
+                f"no workload identity is declared for {unit.unit_id} (runs_on={runs_on!r}) in "
+                f"{config_ref} (by_unit: {sorted(config.get('by_unit') or {})}; by_runs_on: "
+                f"{sorted(config['by_runs_on'])}). A unit whose writer identity is not "
                 "declared cannot be shown to be scoped."
             ),
             evidence=(config_ref, ref),
@@ -531,6 +604,19 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
         writes = _simulate(client, role_arn, "s3:PutObject", declared_arns)
         probe_put = _simulate(client, role_arn, "s3:PutObject", [probe]).get(probe)
         probe_delete = _simulate(client, role_arn, "s3:DeleteObject", [probe]).get(probe)
+    except UnattributableSimulation as exc:
+        # Never a denial: a response we cannot tie to the ARN we asked about is
+        # a response we did not get. Deliberate swallow — (a) the failure mode
+        # is "this role's verdict is unattributable", (b) every other clause and
+        # every other unit still grades, (c) the recording surface is this row's
+        # UNMEASURABLE detail, which names the response verbatim.
+        return Reading(
+            met=False,
+            detail=f"unattributable IAM simulation for {role}: {exc}",
+            evidence=evidence,
+            unmeasurable=True,
+            source="iam:SimulatePrincipalPolicy",
+        )
     except Exception as exc:  # noqa: BLE001 - classified by AWS error code below
         # Deliberate: the failure mode is "this role could not be simulated";
         # every other clause survives; the recording surface is this row.
