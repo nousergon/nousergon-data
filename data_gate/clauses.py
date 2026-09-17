@@ -39,6 +39,7 @@ from dataclasses import dataclass
 from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exceptions, unmeasurable
 
 from data_gate import evidence as ev
+from data_gate import exit_criteria as xc
 from data_gate import standalone
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
 from data_gate.inventory import scan
@@ -47,6 +48,7 @@ __all__ = [
     "BOARD_CLAUSES",
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
+    "EXIT_CRITERION_CLAUSES",
     "PHASE1_UNITS_PRODUCED_CLAUSE",
     "RetiredClause",
     "UnconnectedClause",
@@ -93,6 +95,25 @@ CUTOVER_READY_CLAUSES: tuple[str, ...] = (
 #: evidence that `data-cutover-ready` must NOT carry, because it cannot be
 #: answered until the cutover has run (`alpha-engine-config-I10989`).
 PHASE1_UNITS_PRODUCED_CLAUSE = "data.phase1.units_produced"
+
+#: The phase EXIT criteria that had no clause at all until `alpha-engine-config-
+#: I10954`: the operational counters `data_gate/config/phases.yaml` names in its
+#: `exit:` lists. Every one reads UNMET or UNMEASURABLE today, which is the
+#: correct reading and is the proof the gate can see them: before they existed,
+#: `data_gate read --gate data-phase1` would have reported MET with not one of
+#: them measured.
+EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
+    "data.phase1.consecutive_eod_cycles",
+    "data.phase1.consecutive_morning_cycles",
+    "data.phase1.consecutive_weekly_cycles",
+    "data.phase1.v1_data_stage_quiet",
+    "data.phase1.cost_baseline_measured",
+    "data.phase2.eod_universe_covered",
+    "data.phase2.empty_fresh_free",
+    "data.phase2.vendor_divergence_emitted",
+    "data.phase2.executor_collection_writes_zero",
+    "data.phase3.sustained_window",
+)
 
 CUTOVER_READY_ROLES: tuple[str, ...] = (
     "nousergon-data-collection-sfn-role",
@@ -806,6 +827,191 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
     )
 
 
+# ---------------------------------------------------------------------------
+# Phase EXIT criteria — the operational counters (`alpha-engine-config-I10954`).
+#
+# Until these existed, every `exit:` line of `data_gate/config/phases.yaml` was
+# PROSE. `read.evaluate` is a pure rollup of the clause list, so once the cell
+# and guard columns went green the gate would have reported MET without "5
+# consecutive EOD successes", "10 consecutive trading days", "0 empty-but-fresh
+# over 20 cycles" or "sustained over 20 trading days and 4 Saturdays" having
+# been measured at all — a predicate keyed on the MECHANISM (the columns) rather
+# than on the PROPERTY the plan's exit names (`alpha-engine-config-I10906` /
+# -I10908 / -I10928).
+#
+# Each reads artifacts that already exist: the run manifests under
+# `data_collection/runs/<unit>/<trading_day>/`, the committed stack schedules,
+# the published metric documents, and the gate's own dated readings. Every one
+# of them reads UNMET or UNMEASURABLE today. That is the correct reading, and it
+# is the proof the gate can see them at all.
+# ---------------------------------------------------------------------------
+
+
+def _exit_clause(name: str, requirement: str, reading: ev.Reading, *, phase: str) -> Clause:
+    """One exit-criterion clause out of its reading, MET / UNMET / UNMEASURABLE."""
+    if reading.unmeasurable:
+        return unmeasurable(
+            name, requirement, reading.detail, reading.evidence, phase=phase, source=reading.source
+        )
+    return Clause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        phase=phase,
+        source=reading.source,
+        as_of=reading.as_of,
+    )
+
+
+def _clause_phase1_consecutive_eod_cycles(cycles: xc.CycleSet) -> Clause:
+    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_EOD]
+    return _exit_clause(
+        "data.phase1.consecutive_eod_cycles",
+        (
+            f"{required} CONSECUTIVE complete EOD cycles ending at the latest due fire — every "
+            "unit the schedule verifies recorded an ok scheduled-trigger manifest inside the "
+            "cycle (plan §6 phase-1 exit)"
+        ),
+        xc.read_consecutive_cycles(cycles, required=required),
+        phase="data-phase1",
+    )
+
+
+def _clause_phase1_consecutive_morning_cycles(cycles: xc.CycleSet) -> Clause:
+    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_MORNING]
+    return _exit_clause(
+        "data.phase1.consecutive_morning_cycles",
+        (
+            f"{required} CONSECUTIVE complete morning cycles ending at the latest due fire "
+            "(plan §6 phase-1 exit)"
+        ),
+        xc.read_consecutive_cycles(cycles, required=required),
+        phase="data-phase1",
+    )
+
+
+def _clause_phase1_consecutive_weekly_cycles(cycles: xc.CycleSet) -> Clause:
+    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_WEEKLY]
+    return _exit_clause(
+        "data.phase1.consecutive_weekly_cycles",
+        (
+            f"{required} CONSECUTIVE Saturdays of the weekly schedule with complete manifests "
+            "(plan §6 phase-1 exit)"
+        ),
+        xc.read_consecutive_cycles(cycles, required=required),
+        phase="data-phase1",
+    )
+
+
+def _clause_phase1_v1_data_stage_quiet(store: ev.GateStore) -> Clause:
+    return _exit_clause(
+        "data.phase1.v1_data_stage_quiet",
+        (
+            "v1 Step Functions data-stage executions since the cutover = 0 — the collector is "
+            "not running twice (plan §6 phase-1 exit)"
+        ),
+        xc.read_v1_data_stage_quiet(store),
+        phase="data-phase1",
+    )
+
+
+def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
+    return _exit_clause(
+        "data.phase1.cost_baseline_measured",
+        (
+            f"a {xc.PHASE1_COST_BASELINE_WEEKS}-week tagged cost baseline has been MEASURED "
+            "(plan §6 phase-1 exit) — a different question from data.cost.monthly, which grades "
+            "the same document against the ratified ceiling at phase 3"
+        ),
+        xc.read_cost_baseline_measured(store, weeks=xc.PHASE1_COST_BASELINE_WEEKS),
+        phase="data-phase1",
+    )
+
+
+def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    return _exit_clause(
+        "data.phase2.eod_universe_covered",
+        (
+            f"the EOD spine priced the declared universe minus DECLARED exclusions on "
+            f"{xc.PHASE2_EOD_COVERAGE_DAYS} CONSECUTIVE trading days (plan §6 phase-2 exit); a "
+            "day with no completeness MetricRecord breaks the streak, because a missing "
+            "measurement is not a passing one"
+        ),
+        xc.read_eod_universe_covered(
+            store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS
+        ),
+        phase="data-phase2",
+    )
+
+
+def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
+    return _exit_clause(
+        "data.phase2.empty_fresh_free",
+        (
+            f"zero empty-but-fresh writes over {xc.PHASE2_EMPTY_FRESH_CYCLES} EOD cycles, "
+            "counted from the guards' own `empty_fresh` verdict and never from rows_out == 0 "
+            "(plan §2 objective 6, phase-2 exit)"
+        ),
+        xc.read_empty_fresh_free(cycles, required_cycles=xc.PHASE2_EMPTY_FRESH_CYCLES),
+        phase="data-phase2",
+    )
+
+
+def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> Clause:
+    return _exit_clause(
+        "data.phase2.vendor_divergence_emitted",
+        (
+            f"a vendor cross-check verdict was EMITTED on {xc.PHASE2_VENDOR_CYCLES} of "
+            f"{xc.PHASE2_VENDOR_CYCLES} cycles, within bound or with each breach named (plan §6 "
+            "phase-2 exit). A silent cycle is the failure: no verdict is indistinguishable from "
+            "agreement while being a total absence of measurement"
+        ),
+        xc.read_vendor_divergence_emitted(cycle_sets, required_cycles=xc.PHASE2_VENDOR_CYCLES),
+        phase="data-phase2",
+    )
+
+
+def _clause_phase2_executor_collection_writes_zero(store: ev.GateStore) -> Clause:
+    return _exit_clause(
+        "data.phase2.executor_collection_writes_zero",
+        (
+            "the executor profile shows no collection writes over 7 days (plan §6 phase-2 exit) "
+            "— the producer/consumer separation the collector split exists to establish"
+        ),
+        xc.read_executor_collection_writes_zero(store),
+        phase="data-phase2",
+    )
+
+
+def _clause_phase3_sustained_window(
+    store: ev.GateStore, weekly: xc.CycleSet, *, trading_day: dt.date
+) -> Clause:
+    name = "data.phase3.sustained_window"
+    return _exit_clause(
+        name,
+        (
+            f"every clause MET with 0 UNMEASURABLE and 0 UNREPORTED, SUSTAINED over "
+            f"{xc.PHASE3_TRADING_DAYS} consecutive trading days and {xc.PHASE3_SATURDAYS} "
+            "Saturdays (plan §6 phase-3 exit), read from the gate's own dated readings — which "
+            "are never overwritten, and are therefore the only record a sustain claim can "
+            "honestly be built on. This clause is excluded from the readings it grades, so the "
+            "window is not its own precondition"
+        ),
+        xc.read_sustained_window(
+            store,
+            gate="data-phase3",
+            self_clause=name,
+            trading_day=trading_day,
+            trading_days=xc.PHASE3_TRADING_DAYS,
+            weekly=weekly,
+            saturdays=xc.PHASE3_SATURDAYS,
+        ),
+        phase="data-phase3",
+    )
+
+
 # Every `_clause_*` above is wrapped so a raising clause becomes ONE
 # UNMEASURABLE row instead of darkening the ladder. Applied by walking this
 # module's globals, so a clause added tomorrow is contained without anyone
@@ -899,4 +1105,31 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
             "metrics/human_touch/monthly/latest.json",
         )
     )
+    # The phase EXIT criteria (`alpha-engine-config-I10954`). The cycle sets are
+    # collected ONCE per schedule and shared by every clause that counts over
+    # them: four clauses re-deriving the same twenty-cycle window would list the
+    # same manifest prefixes four times for the same answer.
+    cycle_sets = {
+        schedule: xc.collect_cycles(
+            store,
+            units,
+            schedule_name=schedule,
+            count=count,
+            trading_day=trading_day,
+        )
+        for schedule, count in xc.CYCLE_COUNTS.items()
+    }
+    eod = cycle_sets[xc.SCHEDULE_EOD]
+    morning = cycle_sets[xc.SCHEDULE_MORNING]
+    weekly = cycle_sets[xc.SCHEDULE_WEEKLY]
+    clauses.append(_clause_phase1_consecutive_eod_cycles(eod))
+    clauses.append(_clause_phase1_consecutive_morning_cycles(morning))
+    clauses.append(_clause_phase1_consecutive_weekly_cycles(weekly))
+    clauses.append(_clause_phase1_v1_data_stage_quiet(store))
+    clauses.append(_clause_phase1_cost_baseline_measured(store))
+    clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
+    clauses.append(_clause_phase2_empty_fresh_free(eod))
+    clauses.append(_clause_phase2_vendor_divergence_emitted([eod, morning, weekly]))
+    clauses.append(_clause_phase2_executor_collection_writes_zero(store))
+    clauses.append(_clause_phase3_sustained_window(store, weekly, trading_day=trading_day))
     return clauses

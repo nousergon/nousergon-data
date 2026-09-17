@@ -98,8 +98,12 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 "data.cutover_ready.",
                 # The phase-1 exit's production rollup (alpha-engine-config-
                 # I10989) — a rollup over `survives_phase4`, not a per-unit
-                # audit cell of its own.
+                # audit cell of its own — and the phase EXIT criterion counters
+                # (alpha-engine-config-I10954), which grade a phase's own exit
+                # rather than any one unit's cell.
                 "data.phase1.",
+                "data.phase2.",
+                "data.phase3.",
             )
         )
         and not name.endswith(".completeness")
