@@ -588,7 +588,22 @@ def _replaced_by_standalone_stack(unit: Unit) -> bool:
     """
     trigger = unit.raw.get("trigger") or {}
     successor = str(trigger.get("successor") or "")
-    return "nousergon-data-PR1701" in successor or "alpha-engine-config-I10753" in successor
+    if "nousergon-data-PR1701" in successor or "alpha-engine-config-I10753" in successor:
+        return True
+    # ...AND the v1 trigger kind, because RECORDING A RETIREMENT REWRITES THE
+    # SUCCESSOR. D09, D40 and D41 are step-functions units whose retirement is
+    # recorded (D40/D41 under Brian's R7 ruling, 2026-09-14); their successor
+    # no longer names the standalone stack, so a successor-only predicate drops
+    # them out of the population BEFORE the retirement count runs. That made
+    # `_plan_reconciliation` print "0 carry a recorded retirement" as a
+    # structural constant and then report a residual disagreement against the
+    # plan that does not exist (alpha-engine-config-I11014).
+    #
+    # Measured 2026-09-17 over all 46 descriptors: successor-token 34,
+    # step-functions 36, UNION **37** — exactly plan §6.2's figure — of which 3
+    # are retired, leaving 34 graded, exactly what the board reads. The plan
+    # was right; the population was undercounting.
+    return str(trigger.get("kind") or "") == "step-functions"
 
 
 def _sf_only_units(units: list[Unit]) -> list[Unit]:
@@ -648,7 +663,14 @@ def _plan_reconciliation(declared: list[Unit], retired_members: list[str], grade
         f"{len(declared)}, of which {len(retired_members)} carry a recorded retirement "
         f"({retired_members or 'none'}), leaving {len(graded)} graded here"
     )
-    if len(declared) != PLAN_SF_ONLY_UNITS:
+    if len(declared) == PLAN_SF_ONLY_UNITS:
+        # Reconciled. Printed as the equation rather than dropped, so a reader
+        # can check the arithmetic instead of trusting that it was checked.
+        detail += (
+            f" ({len(declared)} declared - {len(retired_members)} retired = {len(graded)} graded, "
+            f"reconciled against plan §6.2)"
+        )
+    else:
         detail += (
             f" — and {len(declared)} != {PLAN_SF_ONLY_UNITS}, a residual disagreement "
             "between the plan and the descriptors, named rather than reconciled quietly "

@@ -130,3 +130,68 @@ def test_phase1_units_produced_is_tagged_phase1_not_cutover_ready(boards):
     )
     assert clause.phase == "data-phase1"
     assert clause_module.PHASE1_UNITS_PRODUCED_CLAUSE not in clause_module.CUTOVER_READY_CLAUSES
+
+
+# ── the population must survive a retirement (alpha-engine-config-I11014) ────
+
+
+class TestARetirementDoesNotLeaveThePopulation:
+    """Recording a retirement REWRITES `trigger.successor`.
+
+    The population predicate used to key on that field alone, so a retired unit
+    fell out of the set before the retirement count ran. Two numbers were
+    artifacts of the same exclusion: the clause printed "0 carry a recorded
+    retirement" as a structural constant, and then reported a residual
+    disagreement against plan §6.2's 37 that did not exist.
+
+    Measured 2026-09-17 over all 46 descriptors: successor-token 34,
+    step-functions 36, union 37 — the plan's figure — of which 3 are retired,
+    leaving the 34 the board grades. The plan was right the whole time.
+    """
+
+    def test_a_retired_step_functions_unit_is_still_declared(self):
+        from data_gate import clauses
+        from data_gate.descriptors import load_units
+
+        declared, retired, graded = clauses._cutover_population(load_units())
+        declared_ids = {u.unit_id for u in declared}
+
+        # The three whose successor a retirement rewrote. Named rather than
+        # counted: a count would pass again if a different unit went missing.
+        for unit_id in ("D09", "D40", "D41"):
+            assert unit_id in declared_ids, (
+                f"{unit_id} is a step-functions unit with a recorded retirement and it "
+                "dropped out of the declared population — the predicate is keying on a "
+                "field the retirement rewrote (alpha-engine-config-I11014)"
+            )
+            assert unit_id in retired
+            assert unit_id not in {u.unit_id for u in graded}
+
+    def test_d33_is_still_declared_though_its_kind_is_not_step_functions(self):
+        """The successor leg must keep carrying D33 (alpha-engine-config-I10908).
+
+        Its kind is `eventbridge-rule`; only its successor names the standalone
+        stack. Adding the kind leg must not become a replacement for the
+        successor leg.
+        """
+        from data_gate import clauses
+        from data_gate.descriptors import load_units
+
+        declared, _, graded = clauses._cutover_population(load_units())
+        assert "D33" in {u.unit_id for u in declared}
+        assert "D33" in {u.unit_id for u in graded}
+
+    def test_the_reconciliation_resolves_and_says_so(self):
+        from data_gate import clauses
+        from data_gate.descriptors import load_units
+
+        declared, retired, graded = clauses._cutover_population(load_units())
+        detail = clauses._plan_reconciliation(declared, retired, graded)
+
+        assert len(declared) == clauses.PLAN_SF_ONLY_UNITS
+        assert len(declared) - len(retired) == len(graded)
+        assert "residual disagreement" not in detail
+        assert "reconciled against plan" in detail
+        # The retirement count must be able to be non-zero, which is the whole
+        # defect: it was structurally 0 before.
+        assert len(retired) > 0
