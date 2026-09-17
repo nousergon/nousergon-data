@@ -38,9 +38,25 @@ consumers:
   - "crucible-research:agents/sector_teams/quant_tools.py"
   - "crucible-dashboard:health_checker.py"
 contract:
-  schema: null
-  producer_test: null
+  schema: "contracts/fundamentals_snapshot.schema.json"
+  producer_test: tests/test_fundamentals_snapshot_contract.py
   consumer_pins: []
+  # P-07 (alpha-engine-config-I10873): D10 is CONNECTED (crucible-dashboard
+  # health_checker.py's `fundamentals` freshness check genuinely reads
+  # `archive/fundamentals/` — verified 2026-09-16, NOT the stale
+  # price_cache_slim reference the issue's remainder table named for D03/D10;
+  # that claim does not hold for D10). Producer side built this PR: a
+  # versioned schema for the flat ticker-keyed snapshot + a producer test
+  # against the REAL `collect()` write body (both the real-data and NEUTRAL
+  # sentinel shapes) and a hand-built fixture. `consumer_pins` stays EMPTY —
+  # crucible-dashboard has no pinned copy of this schema yet
+  # (`tests/contracts/` on its origin/main carries only feature_registry.schema.json
+  # and news_article_row.schema.json as of 2026-09-16). Needs a companion
+  # crucible-dashboard PR: `tests/contracts/fundamentals_snapshot.schema.json`
+  # (copy of this file) + a contract test asserting health_checker.py's
+  # `fundamentals` check's fixture data validates against it. Until that
+  # lands this clause stays UNMET by design — a declared pin with nothing
+  # behind it would be a false green.
 registry_rows:
   - fundamentals_snapshot
 run_manifest_prefix: data_collection/runs/D10
