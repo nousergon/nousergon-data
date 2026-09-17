@@ -244,7 +244,7 @@ MODE_ROWS: dict[str, ModeRows] = {
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase
 #: non-runs map onto (`alpha-engine-config-I10831` deliverable 1, landed as
-#: `nousergon-lib` v0.124.130 / nousergon-lib-PR416). Each name is matched to
+#: `nousergon-lib` v0.124.133 / nousergon-lib-PR416). Each name is matched to
 #: the lib's own one-line definition for that member
 #: (`nousergon_lib.run_manifest.NOT_APPLICABLE_REASONS`'s docstring), not
 #: guessed:
