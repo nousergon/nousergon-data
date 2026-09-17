@@ -36,7 +36,7 @@ from nousergon_lib.gates import (
 from data_gate import clauses as clause_module
 from data_gate.descriptors import CONNECTION_STATES, REPO_ROOT, load_units
 
-__all__ = ["BOARD_KEY", "DataPhase", "GATES", "evaluate", "load_phases", "run"]
+__all__ = ["BOARD_KEY", "DataPhase", "ExitCriterion", "GATES", "evaluate", "load_phases", "run"]
 
 PHASES_PATH = REPO_ROOT / "data_gate" / "config" / "phases.yaml"
 
@@ -44,6 +44,65 @@ PHASES_PATH = REPO_ROOT / "data_gate" / "config" / "phases.yaml"
 #: reads. `latest.json` only: the console renders current state and never owns
 #: history (`console-policy` §1); the dated gate readings are the history.
 BOARD_KEY = "gates/board/latest.json"
+
+
+@dataclass(frozen=True)
+class ExitCriterion:
+    """One line of a rung's exit, and the clause(s) that MEASURE it.
+
+    `alpha-engine-config-I10954`. Exactly one of ``clause`` and
+    ``exit_measured_by`` is set — the first for the clause that exists FOR this
+    criterion, the second for the clause(s) that already covered it. Both are
+    resolved against the generated clause set by
+    `tests/test_phase_exit_criteria_are_graded.py`, so a criterion that names
+    nothing, or names a clause the phase's own gate does not grade, is a test
+    failure rather than a line of prose the gate reads MET around.
+    """
+
+    phase_id: str
+    text: str
+    #: `fnmatch` patterns, so one criterion can name a clause FAMILY
+    #: (``data.D*.run_record``) without restating 46 names that the descriptors
+    #: already generate.
+    patterns: tuple[str, ...]
+    #: Which key declared them — ``clause`` or ``exit_measured_by``.
+    declared_by: str
+
+
+def _exit_criteria(row: dict) -> tuple[ExitCriterion, ...]:
+    """A rung's `exit:` list, refusing every shape that could read as graded.
+
+    Raises rather than skipping: a criterion this loader silently dropped is
+    exactly the defect I10954 was filed for, one level further in.
+    """
+    phase_id = str(row["id"])
+    declared = row.get("exit")
+    if not isinstance(declared, list) or not declared:
+        raise ValueError(
+            f"{phase_id} declares `exit:` as {type(declared).__name__}, not a non-empty list. "
+            "A rung's exit is a list of criteria, each naming the clause that measures it "
+            "(alpha-engine-config-I10954) — prose is what let a gate read MET with the "
+            "operational counters unmeasured."
+        )
+    criteria: list[ExitCriterion] = []
+    for entry in declared:
+        if not isinstance(entry, dict) or not str(entry.get("criterion") or "").strip():
+            raise ValueError(f"{phase_id}: an exit entry carries no `criterion:` text: {entry!r}")
+        text = " ".join(str(entry["criterion"]).split())
+        named = [key for key in ("clause", "exit_measured_by") if entry.get(key)]
+        if len(named) != 1:
+            raise ValueError(
+                f"{phase_id}: exit criterion {text!r} declares {named or 'neither'} — exactly one "
+                "of `clause:` (the clause that exists for this criterion) and "
+                "`exit_measured_by:` (the clause that already covers it) is required."
+            )
+        key = named[0]
+        value = entry[key]
+        patterns = tuple(str(v) for v in (value if isinstance(value, list) else [value]))
+        criteria.append(
+            ExitCriterion(phase_id=phase_id, text=text, patterns=patterns, declared_by=key)
+        )
+    return tuple(criteria)
 
 
 @dataclass(frozen=True)
@@ -56,7 +115,8 @@ class DataPhase:
     gate: str | None
     tracker_issue: int
     tracker_is_placeholder: bool
-    exit_criteria: str
+    exit_criteria: tuple[ExitCriterion, ...]
+    notes: str = ""
 
     def as_ladder_phase(self) -> Phase:
         return Phase.on_alpha_engine_config(
@@ -78,7 +138,8 @@ def load_phases(path=None) -> list[DataPhase]:
             gate=row.get("gate"),
             tracker_issue=int(row["tracker_issue"]),
             tracker_is_placeholder=bool(row.get("tracker_is_placeholder", False)),
-            exit_criteria=str(row.get("exit") or ""),
+            exit_criteria=_exit_criteria(row),
+            notes=" ".join(str(row.get("notes") or "").split()),
         )
         for row in document["phases"]
     ]
