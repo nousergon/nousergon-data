@@ -48,6 +48,7 @@ from data_gate.evidence import Reading, manifests_since, read_run_record
 __all__ = [
     "EXECUTION_START_WINDOW",
     "covering_schedules",
+    "stack_schedules",
     "read_standalone_workload_declared",
     "read_survives_phase4",
 ]
@@ -75,6 +76,17 @@ def _stack_schedules() -> tuple[dict, ...]:
     module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     spec.loader.exec_module(module)  # type: ignore[union-attr]
     return tuple(module.schedules(module.load_template()))
+
+
+def stack_schedules() -> tuple[dict, ...]:
+    """Every schedule the COMMITTED stack declares.
+
+    The public reading of the parsed template, so a caller that needs a
+    schedule by name (`data_gate.exit_criteria`, which counts a schedule's
+    cycles) reads the same parse the deploy tool does instead of re-parsing
+    the template or hand-listing the names.
+    """
+    return _stack_schedules()
 
 
 def covering_schedules(unit_id: str) -> list[dict]:
