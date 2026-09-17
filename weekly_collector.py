@@ -1261,6 +1261,19 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             # `only is None` condition `_finalize` itself gates on.
             extra_outputs=(
                 (f"{market_prefix}latest_weekly.json", lambda r: True, lambda r: r.get("count") or 0),
+                # alpha-engine-config-I10898: the three dual-path maps
+                # `constituents.collect` writes. Declared in D01's descriptor as
+                # published keys, so the manifest has to record them or the
+                # dispatcher's completion check fails D01 on a key it declares
+                # and never reports. Written unconditionally by a real run, so
+                # the same `present_fn` as latest_weekly.json; rows come from
+                # the counts collect() now returns, never a bare 0.
+                ("data/sector_map.json", lambda r: True, lambda r: r.get("sector_map_count") or 0),
+                ("reference/price_cache/sector_map.json", lambda r: True, lambda r: r.get("sector_map_count") or 0),
+                ("data/sub_industry_map.json", lambda r: True, lambda r: r.get("sub_industry_map_count") or 0),
+                ("reference/price_cache/sub_industry_map.json", lambda r: True, lambda r: r.get("sub_industry_map_count") or 0),
+                ("data/sub_sector_etf_map.json", lambda r: True, lambda r: r.get("sub_sector_etf_map_count") or 0),
+                ("reference/price_cache/sub_sector_etf_map.json", lambda r: True, lambda r: r.get("sub_sector_etf_map_count") or 0),
             ) if only is None else (),
         )
         results["collectors"]["constituents"] = const_result

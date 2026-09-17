@@ -35,6 +35,21 @@ trigger:
 writes:
   - "market_data/weekly/{date}/constituents.json"
   - market_data/latest_weekly.json
+  # alpha-engine-config-I10898. `collectors/constituents.py` makes FOUR
+  # `s3.put_object` call sites, not two: three of them write the same body to
+  # a `data/` and a `reference/price_cache/` path (the dual-path convention
+  # config#934 established). All six were undeclared, which is the same class
+  # of gap I10895 closed for D03/D46 — `data_gate/writer_template_check.py`
+  # flagged D01 on its first fleet-wide run. Declared as written keys, not as
+  # consumers: `sub_industry_map.json` is additive with no reader yet, by its
+  # own code comment, and declaring a consumer it does not have would be the
+  # opposite defect.
+  - data/sector_map.json
+  - reference/price_cache/sector_map.json
+  - data/sub_industry_map.json
+  - reference/price_cache/sub_industry_map.json
+  - data/sub_sector_etf_map.json
+  - reference/price_cache/sub_sector_etf_map.json
 consumers:
   - "crucible:crucible/data/universe.py"
   - "crucible:crucible/data/point_in_time.py"
