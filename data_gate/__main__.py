@@ -2,14 +2,22 @@
 
 Exit codes are the contract, not a detail:
 
-* **0** — the measurement succeeded AND the gate is met.
-* **1** — the measurement succeeded and the gate is NOT met. The ladder is still
-  written. This is the code that stops CI or a person reading "not there yet" as
-  "done".
+* **0** — the measurement succeeded. This is the default whatever the verdict —
+  MET or UNMET — because the verdict is not a process failure: it already has a
+  durable surface (the ladder, the board, the dated gate history) and a page
+  path (`data.ladder_fresh`). A scheduled reader that fails the job on every
+  UNMET reading during a red-by-design phase makes a genuine reader break
+  (auth, import, a bad write) indistinguishable from the expected finding —
+  see `alpha-engine-config-I10906`.
+* **1** — the measurement succeeded and the gate is NOT met, but ONLY when
+  `--fail-on-unmet` is passed. That flag is for a human invocation —
+  `workflow_dispatch` or a PR-time check — that wants the process to stop CI
+  or a review on "not there yet". A cron-triggered reading must never pass it.
 * **2** — the measurement itself failed (the clause list would not build, the
   descriptors would not validate). Distinct from 1 on purpose: "the gate says
   no" and "we could not ask" are different facts, and a single non-zero code
-  would let a broken grader look exactly like a failing system.
+  would let a broken grader look exactly like a failing system. Never gated
+  behind `--fail-on-unmet` — a reader failure always exits non-zero.
 """
 
 from __future__ import annotations
@@ -57,6 +65,19 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="evaluate and render, write nothing at all",
     )
+    reader.add_argument(
+        "--fail-on-unmet",
+        action="store_true",
+        help=(
+            "exit 1 when the gate is measured but not MET. Opt-in, for a human "
+            "workflow_dispatch or PR-time invocation that wants the exit code to "
+            "carry the verdict. A scheduled/cron invocation must NOT pass this — "
+            "the verdict already has a durable surface (ladder/board/history); "
+            "coupling the job's own success to it makes a real reader break "
+            "indistinguishable from the expected red-by-design finding "
+            "(alpha-engine-config-I10906)."
+        ),
+    )
     return parser
 
 
@@ -85,7 +106,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"data_gate: the measurement failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_UNMEASURED
     print(read_module.render(result, board, dry_run=args.dry_run))
-    return EXIT_MET if result.met else EXIT_NOT_MET
+    if result.met:
+        return EXIT_MET
+    return EXIT_NOT_MET if args.fail_on_unmet else EXIT_MET
 
 
 if __name__ == "__main__":
