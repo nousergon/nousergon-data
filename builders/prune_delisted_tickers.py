@@ -72,6 +72,7 @@ import pandas as pd
 
 import corporate_actions as ca
 from builders._constituents_loader import load_constituents_for_run_date
+from dates import default_run_date
 from features.compute import DEFAULT_BUCKET, _SKIP_TICKERS, _is_sector_etf
 from polygon_client import polygon_client
 from store.arctic_store import get_delisted_history_lib, get_universe_lib
@@ -241,6 +242,7 @@ def prune_delisted_tickers(
     constituents_override: "set[str] | list[str] | None" = None,
     run_date: str | None = None,
     today: pd.Timestamp | None = None,
+    trading_day: str | None = None,
 ) -> dict:
     """Prune ArcticDB universe symbols that are confirmed delistings.
 
@@ -282,6 +284,18 @@ def prune_delisted_tickers(
     today
         Override the staleness reference date for testing. Defaults to
         UTC midnight today.
+    trading_day
+        ``YYYY-MM-DD`` STAMPED ON THE AUDIT KEY (``builders/prune_audit/
+        {trading_day}-...``). Defaults to ``dates.default_run_date()`` — the
+        same fleet-canonical trading-day chokepoint ``collectors/
+        universe_returns.py`` uses for its own dated write — never to
+        ``today``. ``today`` is wall-clock (when the SF happened to execute);
+        a weekly Saturday run's ``today`` and the trading day it is auditing
+        are different dates, and stamping the audit with ``today`` produced a
+        key the shadow-parity comparator's ``{trading_day}``-templated
+        descriptor could never match (alpha-engine-config-I10820): the parity
+        run for trading day D looked for ``builders/prune_audit/D-*.json``
+        while the writer had stamped the SF's own run date instead.
 
     Returns
     -------
@@ -294,6 +308,7 @@ def prune_delisted_tickers(
     # apply-path deletion loop below.
     delisted_lib = None
     today = today or pd.Timestamp(datetime.now(timezone.utc).date())
+    trading_day = trading_day or default_run_date()
     threshold_date = today - timedelta(days=absent_days)
 
     arctic_symbols = set(universe_lib.list_symbols())
@@ -509,6 +524,7 @@ def prune_delisted_tickers(
         "status": "ok",
         "applied": apply,
         "today": today.strftime("%Y-%m-%d"),
+        "trading_day": trading_day,
         "absent_days_threshold": absent_days,
         "constituents_date": weekly_date,
         "arctic_universe_size_before": len(arctic_symbols),
@@ -546,10 +562,17 @@ def prune_delisted_tickers(
 
 
 def _write_audit(s3, bucket: str, summary: dict) -> None:
-    """Write a per-run audit JSON to S3 for forensic review."""
+    """Write a per-run audit JSON to S3 for forensic review.
+
+    Keyed by ``summary["trading_day"]`` — NEVER ``summary["today"]``
+    (alpha-engine-config-I10820): the shadow-parity comparator renders this
+    unit's declared write as ``builders/prune_audit/{trading_day}-*.json``,
+    and a key stamped with the run's own wall-clock date can never match that
+    template on a delayed or off-schedule run.
+    """
     ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H%M%SZ")
     suffix = "apply" if summary["applied"] else "dryrun"
-    key = f"{AUDIT_PREFIX}{summary['today']}-{ts}-{suffix}.json"
+    key = f"{AUDIT_PREFIX}{summary['trading_day']}-{ts}-{suffix}.json"
     try:
         s3.put_object(
             Bucket=bucket,

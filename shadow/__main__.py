@@ -1,6 +1,11 @@
-"""`python -m shadow run …` and `python -m shadow parity …`.
+"""`python -m shadow run …`, `python -m shadow parity …` and
+`python -m shadow arctic-parity …`.
 
-Two commands, one for each half of plan §6.2 step 4.
+Three commands. `run` and `parity` are the two halves of plan §6.2 step 4;
+`arctic-parity` (`alpha-engine-config-I10819`) is the in-region follow-up that
+fills the `in_region_only` rows `parity` cannot measure from the laptop.
+**Run it on the data-spot box, never the laptop** — it opens ArcticDB
+directly, which is unreachable from here (`alpha-engine-config-I9771`).
 
 ``run`` is the output-root override. It activates the shadow root BEFORE the
 target module is imported — which is the whole reason it exists as a wrapper
@@ -83,6 +88,20 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
     diff.add_argument("--max-keys-per-prefix", type=int, default=50)
     diff.add_argument("--dry-run", action="store_true", help="compare and render, publish nothing")
+
+    arctic = sub.add_parser(
+        "arctic-parity",
+        help="in-region only: fill the ArcticDB in_region_only rows of an already-published parity report",
+    )
+    arctic.add_argument("--trading-day", required=True)
+    arctic.add_argument("--bucket", default=DEFAULT_BUCKET)
+    arctic.add_argument(
+        "--store",
+        required=True,
+        help="where the report was published: s3://alpha-engine-research/data_collection, or a directory",
+    )
+    arctic.add_argument("--relative-tolerance", type=float, default=parity_module.DEFAULT_RELATIVE_TOLERANCE)
+    arctic.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
     return parser
 
 
@@ -144,10 +163,32 @@ def _render(report, key: str, *, dry_run: bool) -> str:
     return "\n".join(lines)
 
 
+def _arctic_parity(args) -> int:
+    from shadow import arctic_parity
+
+    trading_day = dt.date.fromisoformat(args.trading_day)
+    store = open_store(args.store, dry_run=False)
+    try:
+        updated = arctic_parity.run_arctic_parity(
+            trading_day=trading_day,
+            bucket=args.bucket,
+            store=store,
+            rel_tolerance=args.relative_tolerance,
+            absolute_tolerance=args.absolute_tolerance,
+        )
+    except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
+        print(f"shadow arctic-parity: the comparison failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_UNMEASURED
+    print(json.dumps(updated["summary"], indent=2, sort_keys=True))
+    return EXIT_MET if updated["met"] else EXIT_NOT_MET
+
+
 def main(argv: "list[str] | None" = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "run":
         return _run(args)
+    if args.command == "arctic-parity":
+        return _arctic_parity(args)
     return _parity(args)
 
 
