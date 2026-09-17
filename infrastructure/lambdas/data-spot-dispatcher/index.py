@@ -237,6 +237,23 @@ _WORKLOADS: dict[str, str] = {
     # step_function_daily.json entirely. Runs off the preopen critical path with
     # a much bigger heal timeout budget (see weekly_collector._run_daily_heal).
     "daily-heal": "python weekly_collector.py --daily-heal",
+    # alpha-engine-config-I11002: D34 (chronic-gap-heal) had no successor at
+    # all — `morning-enrich` above passes `--skip-chronic-heal` on BOTH the
+    # morning and the weekly schedule, and `daily-heal` maps to D33
+    # (`run_units.py:197`), a different unit and a different mode. The
+    # standalone entrypoint already existed unreachable
+    # (`weekly_collector.py:1197`, `args.chronic_gap_heal` ->
+    # `_run_whole_mode_unit("chronic_gap_heal", ...)`, manifest key extractor at
+    # `weekly_collector.py:1042`) — this is the missing dispatcher key over it.
+    # Wired into `WeeklySchedule` (Sat 05:00 America/New_York), matching both
+    # D34's descriptor `trigger.schedule` and its v1 cadence
+    # (`ne-data-collection-weekly`, the successor its `trigger.successor`
+    # already names), not `daily-heal`'s weekday cadence — chronic-gap-heal was
+    # never a daily operation and D33's own weekday heal is a different unit
+    # with a different scope. No `trading_day` template: the heal always
+    # operates on the CURRENT chronic-gap state, the same "today" semantics
+    # `weekly-phase-one` and `rag-weekly-ingestion` already use.
+    "chronic-gap-heal": "python weekly_collector.py --chronic-gap-heal",
     # alpha-engine-config-I10704: the one-off, idempotent in-region load of
     # every DECLARED benchmark proxy (features.compute.
     # UNIVERSE_BENCHMARK_PROXIES) into the ArcticDB `universe` library. Not

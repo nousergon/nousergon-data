@@ -29,7 +29,15 @@ code_path: "weekly_collector.py:3319"
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:MorningEnrich"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  # alpha-engine-config-I11002: corrected from the aspirational
+  # "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)" — that PR's
+  # `weekly` schedule ran `morning-enrich` with `--skip-chronic-heal`, so no
+  # standalone workload actually covered this unit until now. The
+  # `chronic-gap-heal` dispatcher key (nousergon-data-PR1701 remains the
+  # anchor `data_gate/clauses.py::_replaced_by_standalone_stack` keys
+  # membership on) is wired into the SAME `ne-data-collection-weekly` stack's
+  # `WeeklySchedule`, alongside `morning-enrich`.
+  successor: "ne-data-collection-weekly chronic-gap-heal workload (nousergon-data-PR1701, DISABLED)"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 # alpha-engine-config-I10861: corrected from "staging/daily_closes/*", which
@@ -148,3 +156,15 @@ notes: >-
     on it, so correcting the prose by deleting the token would silently drop a genuinely
     uncovered unit out of the gate's denominator — the exact blindness
     alpha-engine-config-I10908 was filed for.
+
+    FIXED (alpha-engine-config-I11002, same session): added `_WORKLOADS["chronic-gap-heal"]`
+    (`python weekly_collector.py --chronic-gap-heal`) to the dispatcher, wired it into
+    `WeeklySchedule`'s `workloads` alongside `morning-enrich`, and added `D34` to that
+    schedule's `verify_units` in
+    `infrastructure/cloudformation/nousergon-data-collection.yaml`. Chose the weekly
+    schedule over `daily-heal` (weekday cadence, D33's unit) to match both this
+    descriptor's own `trigger.schedule` and the v1 cadence the `trigger.successor` above
+    already named. De-registered from
+    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE` in the same
+    change. `trigger.successor` corrected to name the actual workload, keeping the
+    `nousergon-data-PR1701` anchor token.
