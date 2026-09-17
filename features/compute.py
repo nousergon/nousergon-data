@@ -1499,6 +1499,7 @@ def compute_and_write(
         try:
             supp_features_df, supp_sector_map = compute_metron_supplemental_features(
                 bucket, s3, set(features_df["ticker"]), macro,
+                trading_day=date_str,
             )
             supplemental_written = write_metron_supplemental_snapshot(
                 date_str, supp_features_df, supp_sector_map, bucket, s3_client=s3,

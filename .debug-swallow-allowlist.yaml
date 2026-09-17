@@ -10,7 +10,7 @@ schema_version: 1
 # RECORD-LOUD), never allowlisted — see alpha-engine-config-I10226.
 entries:
   - path: collectors/alternative.py
-    line: 1572
+    line: 1580
     reason: >-
       (a) failure mode swallowed: s3.get_object against
       archive/revisions/{date}.json fails/404s for every checked date.
@@ -19,7 +19,9 @@ entries:
       anywhere in this codebase, so the loop 404s by construction; it is
       documented dead code kept only as a non-regressing safety net, and
       result["revision_4w"] is already None on entry and stays None, so
-      nothing is silently degraded from a populated value.
+      nothing is silently degraded from a populated value. (Shifted +8 by
+      alpha-engine-config-I10899's `from dates import ...` bounded-fetch
+      import addition; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: emailer.py

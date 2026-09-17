@@ -61,6 +61,7 @@ from typing import Optional
 
 import boto3
 
+from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, history_window
 from nousergon_lib.secrets import get_secret
 import requests
 
@@ -622,6 +623,13 @@ def _process_one_ticker(
             "ticker": ticker,
             "error": f"per-ticker hard timeout ({_PER_TICKER_TIMEOUT_S}s)",
         }
+    except FutureBarError:
+        # I10899: a future bar is a run_date/clock contract violation, not a
+        # per-ticker vendor hiccup — history_window(run_date, ...) is a pure
+        # function of run_date, so every ticker under this run shares the
+        # same fault. Propagate rather than recording one more per-ticker
+        # "error" among ~900.
+        raise
     except Exception as e:
         scrubbed = _scrub_url_creds(e)
         logger.warning("Alternative data failed for %s: %s", ticker, scrubbed)
@@ -1644,7 +1652,16 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
         info = t.info if hasattr(t, "info") else {}
         price = info.get("regularMarketPrice") or info.get("previousClose", 0)
         if not price:
-            hist = t.history(period="1d")
+            # I10899: bounded to [run_date - 5d, run_date] via explicit
+            # start/end (never period=) so a run for D executed on D+1
+            # cannot fall back to a partial D+1 price.
+            _start, _end_excl = history_window(run_date, "5d")
+            hist = t.history(start=_start.isoformat(), end=_end_excl.isoformat())
+            hist = clip_to_trading_day(hist, run_date, label=f"options_price_fallback[{ticker}]")
+            assert_no_bar_after(
+                hist.index, run_date,
+                artifact=f"alternative/options_flow/{ticker}#price_fallback",
+            )
             price = float(hist["Close"].iloc[-1]) if not hist.empty else 0
 
         if price > 0 and "strike" in calls.columns and "impliedVolatility" in calls.columns:
@@ -1662,7 +1679,16 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
 
                 # IV rank approximation via realized vol
                 try:
-                    hist = t.history(period="1y")
+                    # I10899: bounded to [run_date - 1y, run_date] via explicit
+                    # start/end (never period=) — see the price-fallback note
+                    # above.
+                    _start, _end_excl = history_window(run_date, "1y")
+                    hist = t.history(start=_start.isoformat(), end=_end_excl.isoformat())
+                    hist = clip_to_trading_day(hist, run_date, label=f"options_iv_rank[{ticker}]")
+                    assert_no_bar_after(
+                        hist.index, run_date,
+                        artifact=f"alternative/options_flow/{ticker}#iv_rank",
+                    )
                     if not hist.empty and len(hist) >= 30:
                         returns = hist["Close"].pct_change().dropna()
                         rolling_vol = returns.rolling(20).std() * np.sqrt(252)
@@ -1671,6 +1697,8 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
                             result["iv_rank"] = round(
                                 float((rolling_vol < atm_iv).sum() / len(rolling_vol) * 100), 1
                             )
+                except FutureBarError:
+                    raise  # run-level contract violation, never a per-ticker miss (I10899)
                 except Exception as e:
                     # RECORD-LOUD (alpha-engine-config-I10226): a swallow here
                     # returns `result` with `iv_rank` silently missing — this
@@ -1688,6 +1716,8 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
 
     except ImportError:
         logger.debug("yfinance/numpy not available for options data")
+    except FutureBarError:
+        raise  # run-level contract violation, never a per-ticker miss (I10899)
     except Exception as e:
         logger.warning("Options fetch failed for %s: %s", ticker, _scrub_url_creds(e))
 
