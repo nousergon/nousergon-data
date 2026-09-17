@@ -371,7 +371,11 @@ def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch)
     overlaps v1's D+1 postclose is NOT refused. The declaration exists, is
     None, and resolving the workload stays silent and succeeds."""
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
-    assert index._WORKLOAD_PARITY_WINDOW == {"shadow-weekday": None}
+    assert index._WORKLOAD_PARITY_WINDOW == {
+        "shadow-weekday": None,
+        "shadow-parity": None,
+        "arctic-parity": None,
+    }
     assert set(index._WORKLOAD_PARITY_WINDOW) <= set(index._WORKLOADS)
     workload, _cmd = index._resolve_workload({"workload": "shadow-weekday", "trading_day": "2026-09-14"})
     assert workload == "shadow-weekday"
@@ -950,3 +954,150 @@ def test_whole_mode_unit_skipping_one_key_fails_naming_it(monkeypatch, unit_id):
         assert completion["failure_mode"] == "output_missing"
         assert all(f["mode"] == "output_missing" for f in completion["findings"])
         assert all(f["unit"] == unit_id for f in completion["findings"])
+
+
+# ── alpha-engine-config-I10920: the standalone parity comparators ────────────
+
+
+def _shadow_dispatch_declaration():
+    """Load `shadow/dispatch.py` BY PATH, outside the `shadow` package.
+
+    Importing `shadow` here would pull in `shadow.root` -> boto3 and
+    `shadow.parity` -> arcticdb/pandas into a Lambda test process whose boto3
+    is a stub. The declaration is deliberately import-free so it can be read
+    like this; see its module docstring.
+    """
+    import importlib.util
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    path = os.path.join(here, "..", "..", "..", "shadow", "dispatch.py")
+    spec = importlib.util.spec_from_file_location("_shadow_dispatch_decl", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _shadow_module_stems():
+    here = os.path.dirname(os.path.abspath(__file__))
+    shadow_dir = os.path.join(here, "..", "..", "..", "shadow")
+    return sorted(
+        name[: -len(".py")]
+        for name in os.listdir(shadow_dir)
+        if name.endswith(".py")
+    )
+
+
+def test_every_shadow_module_declares_whether_it_is_dispatchable():
+    """THE CLASS FIX (alpha-engine-config-I10920).
+
+    `shadow/arctic_parity.py` merged with no `_WORKLOADS` entry and therefore
+    could not run at all — ArcticDB is unreachable from the laptop
+    (I9771) and only this dispatcher puts code in-region. Nothing was red.
+    A module under `shadow/` must now answer the question one way or the
+    other: it carries a workload, or it states why it needs none.
+    """
+    decl = _shadow_dispatch_declaration()
+    declared = set(decl.DISPATCHABLE_MODULES) | set(decl.NOT_DISPATCHABLE_MODULES)
+    overlap = set(decl.DISPATCHABLE_MODULES) & set(decl.NOT_DISPATCHABLE_MODULES)
+    assert not overlap, f"declared both dispatchable and not: {sorted(overlap)}"
+
+    on_disk = set(_shadow_module_stems())
+    assert not (on_disk - declared), (
+        "undeclared shadow module(s) — add a workload in the dispatcher and an "
+        "entry in shadow/dispatch.py::DISPATCHABLE_MODULES, or say in "
+        "NOT_DISPATCHABLE_MODULES why it needs none: "
+        f"{sorted(on_disk - declared)}"
+    )
+    assert not (declared - on_disk), (
+        f"shadow/dispatch.py declares module(s) that do not exist: {sorted(declared - on_disk)}"
+    )
+    # A reason, never a blank — an empty string is how this map would quietly
+    # become a skip-list.
+    for name, reason in decl.NOT_DISPATCHABLE_MODULES.items():
+        assert reason.strip(), name
+
+
+def test_every_dispatchable_shadow_module_resolves_to_a_real_workload(monkeypatch):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    decl = _shadow_dispatch_declaration()
+    for module, (workload, subcommand) in decl.DISPATCHABLE_MODULES.items():
+        assert workload in index._WORKLOADS, f"{module}: no _WORKLOADS[{workload!r}]"
+        assert workload in index._WORKLOADS_REQUIRING_TRADING_DAY, (
+            f"{module}: {workload!r} must refuse a dispatch with no trading day"
+        )
+        _resolved, cmd = index._resolve_workload(
+            {"workload": workload, "trading_day": "2026-09-14"}
+        )
+        assert subcommand in cmd, (
+            f"{module}: {workload!r} does not invoke `python -m {subcommand}`"
+        )
+
+
+@pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
+def test_standalone_comparator_is_in_the_allowlist(monkeypatch, workload):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert workload in index._WORKLOADS
+    assert workload in index._WORKLOADS_REQUIRING_TRADING_DAY
+
+
+@pytest.mark.parametrize(
+    "workload,expected",
+    [
+        (
+            "shadow-parity",
+            "python -m shadow parity --trading-day 2026-09-14 "
+            "--store s3://alpha-engine-research/data_collection",
+        ),
+        (
+            "arctic-parity",
+            "python -m shadow arctic-parity --trading-day 2026-09-14 "
+            "--store s3://alpha-engine-research/data_collection",
+        ),
+    ],
+)
+def test_standalone_comparator_renders_the_requested_trading_day(monkeypatch, workload, expected):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    resolved, cmd = index._resolve_workload(
+        {"workload": workload, "trading_day": "2026-09-14"}
+    )
+    assert resolved == workload
+    assert cmd == expected
+    assert "{trading_day}" not in cmd
+    rendered = index._bootstrap_command(workload, cmd, "tok")
+    assert f"{cmd} 2>&1 | tee -a" in rendered
+    assert "rc=${PIPESTATUS[0]}" in rendered
+
+
+@pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
+def test_standalone_comparator_requires_trading_day(monkeypatch, workload):
+    """`Closes-when` of alpha-engine-config-I10920: removing a comparator from
+    `_WORKLOADS_REQUIRING_TRADING_DAY` fails here. Defaulting to "today" would
+    silently compare the wrong day's shadow prefix."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    with pytest.raises(ValueError, match="requires event\\['trading_day'\\]"):
+        index._resolve_workload({"workload": workload})
+
+
+@pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
+@pytest.mark.parametrize(
+    "bad_day",
+    ["", "not-a-date", "2026/09/14", "2026-13-40", "2026-09-14; rm -rf /", "2026-09-14T00:00:00"],
+)
+def test_standalone_comparator_rejects_malformed_trading_day(monkeypatch, workload, bad_day):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    with pytest.raises(ValueError):
+        index._resolve_workload({"workload": workload, "trading_day": bad_day})
+
+
+@pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
+def test_standalone_comparator_writes_no_live_key(monkeypatch, workload):
+    """Neither comparator may address a live `market_data/*` prefix: every byte
+    either lands under `data_collection/` (the report and its run manifest) or
+    is a read. The store argument is the ONLY write target in the command."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    _resolved, cmd = index._resolve_workload(
+        {"workload": workload, "trading_day": "2026-09-14"}
+    )
+    assert "market_data" not in cmd
+    assert cmd.count("s3://") == 1
+    assert "--store s3://alpha-engine-research/data_collection" in cmd
