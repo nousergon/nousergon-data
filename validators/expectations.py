@@ -173,6 +173,7 @@ def check_empty_fresh(
     s3_client: Any,
     rows_out: int | None,
     floor: int | None = None,
+    rows_key: str | None = None,
     staging: GuardStaging = EMPTY_FRESH_GUARD,
 ) -> GuardReading:
     """Grade one unit's published key: present, non-empty, above its floor.
@@ -193,11 +194,19 @@ def check_empty_fresh(
         floor: Minimum acceptable ``rows_out``, from the unit's descriptor.
             ``None`` means the unit declares no floor and only the non-empty
             half of the guard applies.
+        rows_key: The result-dict field ``rows_out`` was read from (e.g.
+            ``run_units.PhaseUnit.rows_key``), named in the verdict for exactly
+            one reason: a floor check that silently trusts a mis-counted
+            ``rows_out`` fires false positives, and the fastest way to catch
+            that is a verdict that says which number it read, not just what
+            the number was. ``None`` when the caller has no such field to name
+            (a literal count was passed directly).
 
     Returns a :class:`GuardReading`. **It never raises on a verdict** — the
     consequence, if any, is the caller's, which is what keeps observe mode a
     one-line difference from enforcing mode.
     """
+    source = f"result[{rows_key!r}]" if rows_key else "the caller's own count"
     if not artifact_key or not bucket:
         return GuardReading(
             "not_applicable",
@@ -238,9 +247,9 @@ def check_empty_fresh(
         return GuardReading(
             "unmeasurable",
             f"{unit_id} publishes s3://{bucket}/{artifact_key} ({size} bytes) but reports "
-            "no row count, so the empty-and-floor half of this guard cannot be evaluated. "
-            "UNMEASURABLE, not a pass: the fix is the collector reporting its count "
-            "(run_units.PHASE_UNITS rows_key)",
+            f"no row count (read from {source}), so the empty-and-floor half of this guard "
+            "cannot be evaluated. UNMEASURABLE, not a pass: the fix is the collector "
+            "reporting its count (run_units.PHASE_UNITS rows_key)",
             key=artifact_key,
             baseline=None if floor is None else float(floor),
         )
@@ -248,7 +257,7 @@ def check_empty_fresh(
     if rows_out == 0:
         return GuardReading(
             "empty_fresh",
-            f"{unit_id} published s3://{bucket}/{artifact_key} with 0 rows",
+            f"{unit_id} published s3://{bucket}/{artifact_key} with 0 rows (read from {source})",
             key=artifact_key,
             value=0.0,
             baseline=None if floor is None else float(floor),
@@ -257,8 +266,8 @@ def check_empty_fresh(
     if floor is not None and rows_out < floor:
         return GuardReading(
             "below_floor",
-            f"{unit_id} published {rows_out} rows to s3://{bucket}/{artifact_key}, below its "
-            f"declared floor of {floor}",
+            f"{unit_id} published {rows_out} rows (read from {source}) to "
+            f"s3://{bucket}/{artifact_key}, below its declared floor of {floor}",
             key=artifact_key,
             value=float(rows_out),
             baseline=float(floor),
@@ -266,7 +275,7 @@ def check_empty_fresh(
 
     return GuardReading(
         "ok",
-        f"{unit_id} published {rows_out} rows ({size} bytes) to {artifact_key}",
+        f"{unit_id} published {rows_out} rows (read from {source}, {size} bytes) to {artifact_key}",
         key=artifact_key,
         value=float(rows_out),
         baseline=None if floor is None else float(floor),

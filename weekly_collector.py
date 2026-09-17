@@ -413,6 +413,37 @@ def _rows_out(result: dict, rows_key: str | None) -> int | None:
     return int(value)
 
 
+#: Severity a `GuardReading.verdict` carries onto the board's single per-run
+#: metric (`_worst_reading`, below). Matches `expectations.verdict_metric`'s
+#: status mapping: RED outranks the missing-input state, which outranks clean.
+_EMPTY_FRESH_SEVERITY: dict[str, int] = {
+    "ok": 0,
+    "not_applicable": 0,
+    "unmeasurable": 1,
+    "below_floor": 2,
+    "empty_fresh": 2,
+}
+
+
+def _worst_reading(readings: list["expectations.GuardReading"]) -> "expectations.GuardReading":
+    """The one verdict a unit's single board metric renders, from every key
+    graded this run (`alpha-engine-config-I10785`).
+
+    Never the first key checked, and never an average — the worst, so a
+    broken second or third published key cannot hide behind a clean first
+    one. Within the clean tier, `ok` is preferred over `not_applicable`: a
+    unit that actually measured something reports what it measured rather
+    than a shrug from an earlier, less-informative key.
+    """
+    def _rank(reading: "expectations.GuardReading") -> tuple[int, int]:
+        return (
+            _EMPTY_FRESH_SEVERITY.get(reading.verdict, 2),
+            1 if reading.verdict == "ok" else 0,
+        )
+
+    return max(readings, key=_rank)
+
+
 #: The real feature-store groups `features/writer.py::write_feature_snapshot` can
 #: write (`features.registry.GROUPS` — "factor_loading" is NOT one: it is an
 #: ArcticDB-materialized column set (features/cross_sectional.py), never a
@@ -648,6 +679,12 @@ def _record_phase_lineage(
     auto_skipped = bool(result.get("auto_skipped"))
     dry = result.get("status") == "ok_dry_run"
 
+    # `extra_written` collects every extra key this run actually wrote, paired
+    # with the row count just recorded for it — the exact number the
+    # empty-but-fresh guard below grades each one against
+    # (`alpha-engine-config-I10785`: "every published PUT", not only the
+    # primary `artifact_key`).
+    extra_written: list[tuple[str, int]] = []
     if artifact_key and not auto_skipped and not dry:
         run_ctx.record_output(artifact_key, rows_out=rows if rows is not None else 0)
     # alpha-engine-config-I10855: a unit that publishes MORE than one declared key
@@ -666,46 +703,77 @@ def _record_phase_lineage(
                 rows_out = int(rows_fn(result) or 0)
                 for k in keys:
                     run_ctx.record_output(k, rows_out=rows_out)
+                    extra_written.append((k, rows_out))
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
     _record_collector_guards(run_ctx, result)
 
     if auto_skipped or dry:
-        reading = expectations.GuardReading(
-            "not_applicable",
-            f"{unit.unit_id} published nothing on this run "
-            f"({'same-date auto-skip' if auto_skipped else 'dry run'}); there is no new "
-            "write for the guard to grade",
-            key=artifact_key,
-        )
+        readings = [
+            expectations.GuardReading(
+                "not_applicable",
+                f"{unit.unit_id} published nothing on this run "
+                f"({'same-date auto-skip' if auto_skipped else 'dry run'}); there is no new "
+                "write for the guard to grade",
+                key=artifact_key,
+            )
+        ]
     else:
-        reading = expectations.check_empty_fresh(
-            unit_id=unit.unit_id,
-            artifact_key=artifact_key,
-            bucket=bucket,
-            s3_client=reg.s3_client,
-            rows_out=rows,
+        readings = [
+            expectations.check_empty_fresh(
+                unit_id=unit.unit_id,
+                artifact_key=artifact_key,
+                bucket=bucket,
+                s3_client=reg.s3_client,
+                rows_out=rows,
+                rows_key=unit.rows_key,
+            )
+        ]
+        # `alpha-engine-config-I10785` (P-18): "every published key passes a
+        # non-empty + floor check before the PUT" — a unit recording extra
+        # outputs (`I10855`) publishes real keys this guard would otherwise
+        # never look at. Each is graded on its OWN row count (the same number
+        # `run_ctx.record_output` above was just given), never the primary
+        # key's count standing in for a key it did not measure.
+        for extra_key_name, extra_rows in extra_written:
+            readings.append(
+                expectations.check_empty_fresh(
+                    unit_id=unit.unit_id,
+                    artifact_key=extra_key_name,
+                    bucket=bucket,
+                    s3_client=reg.s3_client,
+                    rows_out=extra_rows,
+                )
+            )
+
+    for reading in readings:
+        expectations.report(reading, unit_id=unit.unit_id)
+        run_ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict=reading.verdict,
+            detail=reading.detail,
+            key=reading.key,
+            value=reading.value,
+            baseline=reading.baseline,
         )
-    expectations.report(reading, unit_id=unit.unit_id)
-    run_ctx.record_guard(
-        expectations.EMPTY_FRESH_GUARD.name,
-        mode=expectations.EMPTY_FRESH_GUARD.mode.value,
-        verdict=reading.verdict,
-        detail=reading.detail,
-        key=reading.key,
-        value=reading.value,
-        baseline=reading.baseline,
-    )
+
+    # The board's `data.<unit>.guard.empty_fresh` clause reads ONE MetricRecord
+    # per run (`data_gate/clauses.py`, sibling-owned) — every graded key rides
+    # its own `guards[]` entry above for diagnosis, but the single board row is
+    # the WORST of them, never just the first, so a unit with N published keys
+    # cannot read clean on the strength of only its first key being checked.
+    worst = _worst_reading(readings)
     run_ctx.record_metric(
         expectations.verdict_metric(
-            unit.unit_id, reading, source_path=f"weekly_collector.py::_phase_collect[{name}]"
+            unit.unit_id, worst, source_path=f"weekly_collector.py::_phase_collect[{name}]"
         )
     )
     # OBSERVE mode (`sf-pipeline-policy` §7a): the verdict is logged at ERROR and
     # rides on the manifest and the board, and the exit code does not move. The
     # promotion criterion lives in `validators/expectations.py`.
-    if expectations.EMPTY_FRESH_GUARD.enforcing and not reading.clean:
-        raise _CollectorError(name, f"empty_fresh guard: {reading.detail}")
+    if expectations.EMPTY_FRESH_GUARD.enforcing and not worst.clean:
+        raise _CollectorError(name, f"empty_fresh guard: {worst.detail}")
 
     # `alpha-engine-config-I10784` (P-17): the manifest has no third
     # ok-but-degraded state. Raised LAST, after every fact above is on the

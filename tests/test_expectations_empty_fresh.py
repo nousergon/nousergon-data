@@ -80,6 +80,22 @@ def test_an_unreported_row_count_is_unmeasurable_never_a_pass_and_never_zero():
     assert "not a pass" in reading.detail
 
 
+def test_the_verdict_names_which_field_the_row_count_was_read_from():
+    """A floor check silently trusting a mis-counted `rows_out` fires falsely
+    (`alpha-engine-config-I10785`) — the verdict must say which number it
+    read, so a false fire is diagnosable from the manifest alone."""
+    reading = _check(rows_out=None, rows_key="rows_inserted")
+    assert "result['rows_inserted']" in reading.detail
+
+    reading = _check(rows_out=40, rows_key="rows_inserted")
+    assert "result['rows_inserted']" in reading.detail
+
+    # No `rows_key` supplied (a literal count passed directly) names that too,
+    # rather than silently omitting the provenance.
+    reading = _check(rows_out=None)
+    assert "the caller's own count" in reading.detail
+
+
 def test_a_denied_head_is_unmeasurable_not_a_pass():
     denied = ClientError({"Error": {"Code": "AccessDenied"}}, "HeadObject")
     reading = _check(s3_client=FakeS3(raises=denied))
