@@ -659,3 +659,108 @@ def test_d16_dispatcher_workload_calls_the_recorded_entrypoint():
     command = dispatcher._WORKLOADS["rag-weekly-ingestion"]
     assert "rag.pipelines.run_weekly_ingestion_recorded" in command
     assert "bash rag/pipelines/run_weekly_ingestion.sh" not in command
+
+
+# ─────────────────── D14 — prune_delisted_tickers (I11001) ───────────────────
+#
+# Unlike D36/D37/D38/D39/D42 this unit is not its own process: it is the second
+# half of the `weekly-phase-one` dispatcher workload
+# (`( python weekly_collector.py --phase 1 && python -m
+# builders.prune_delisted_tickers --apply )`). It still has to satisfy the same
+# property — its descriptor declares `run_manifest_prefix:
+# data_collection/runs/D14`, and until alpha-engine-config-I11001 nothing wrote
+# it, so the weekly schedule could not name D14 in `verify_units` without
+# failing every run on a manifest that never existed.
+
+
+def _prune_summary(**over) -> dict:
+    summary = {
+        "applied": True,
+        "trading_day": "2026-09-18",
+        "pruned_count": 3,
+        "retained_count": 2,
+        "retained": ["AAA", "BBB"],
+        "audit_key": "builders/prune_audit/2026-09-18-2026-09-19T010203Z-apply.json",
+    }
+    summary.update(over)
+    return summary
+
+
+@pytest.fixture
+def prune(monkeypatch):
+    from builders import prune_delisted_tickers as module
+
+    monkeypatch.setattr(sys, "argv", ["prune_delisted_tickers", "--apply"])
+    monkeypatch.setattr(module, "default_run_date", lambda: "2026-09-18")
+    return module
+
+
+def test_d14_writes_one_manifest_keyed_on_the_day_the_audit_key_embeds(sink, prune, monkeypatch):
+    seen: dict = {}
+
+    def _fake(**kwargs):
+        seen.update(kwargs)
+        return _prune_summary()
+
+    monkeypatch.setattr(prune, "prune_delisted_tickers", _fake)
+
+    assert prune.main() == 0
+
+    # The prune and the manifest must agree about the day, or the completion
+    # check renders `builders/prune_audit/{trading_day}-*.json` against a date
+    # the key it is looking for does not carry.
+    assert seen["trading_day"] == "2026-09-18"
+    manifest = sink.only
+    assert sink.only_key.startswith("data_collection/runs/D14/2026-09-18/")
+    assert manifest["unit_id"] == "D14"
+    assert manifest["status"] == "ok"
+    assert manifest["trading_day"] == "2026-09-18"
+    keys = {o["key"]: o["rows_out"] for o in manifest["outputs"]}
+    assert keys["builders/prune_audit/2026-09-18-2026-09-19T010203Z-apply.json"] == 3
+    assert keys["delisted_history::AAA"] == 1
+    assert keys["delisted_history::BBB"] == 1
+
+
+def test_d14_zero_prune_week_is_still_a_clean_ok(sink, prune, monkeypatch):
+    """A week with nothing to prune is the NORMAL case, not an empty run: the
+    audit object is written unconditionally and is the key being graded."""
+    monkeypatch.setattr(
+        prune, "prune_delisted_tickers",
+        lambda **kw: _prune_summary(pruned_count=0, retained_count=0, retained=[]),  # noqa: ARG005
+    )
+
+    assert prune.main() == 0
+
+    manifest = sink.only
+    assert manifest["status"] == "ok"
+    assert [o["key"] for o in manifest["outputs"]] == [
+        "builders/prune_audit/2026-09-18-2026-09-19T010203Z-apply.json"
+    ]
+    assert {g["verdict"] for g in manifest["guards"]} == {"ok"}
+
+
+def test_d14_a_failed_audit_put_is_a_failed_manifest_not_a_silent_ok(sink, prune, monkeypatch):
+    """The audit object is the only S3 key this unit publishes. Losing it means
+    the run produced nothing gradable, which must not record as `ok`."""
+    monkeypatch.setattr(
+        prune, "prune_delisted_tickers", lambda **kw: _prune_summary(audit_key=None),  # noqa: ARG005
+    )
+
+    assert prune.main() == 1
+
+    manifest = sink.only
+    assert manifest["status"] == "failed"
+    assert "empty_fresh" in {g["verdict"] for g in manifest["guards"]}
+    assert [o["key"] for o in manifest["outputs"]] == ["delisted_history::AAA", "delisted_history::BBB"]
+
+
+def test_d14_exception_propagates_after_the_record_is_durable(sink, prune, monkeypatch):
+    def _boom(**kw):  # noqa: ARG001
+        raise RuntimeError("arctic exploded")
+
+    monkeypatch.setattr(prune, "prune_delisted_tickers", _boom)
+
+    with pytest.raises(RuntimeError, match="arctic exploded"):
+        prune.main()
+
+    assert sink.only["status"] == "failed"

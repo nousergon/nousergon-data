@@ -137,22 +137,34 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    Run record is UNVERIFIED: stdout into /var/log/data-weekly.log only. P-06 puts it
-    through the run-manifest wrapper.
+    Run record WAS unverified — stdout into /var/log/data-weekly.log only. P-06's
+    run-manifest wrapper landed 2026-09-17 (see alpha-engine-config-I11001 below); the
+    `audit.cells.run_record: UNVERIFIED` cell above is the 2026-09-14 transcribed
+    baseline and is deliberately left as read, per this file's header — a cell is
+    re-scored by the gate measuring it, never by editing the baseline.
 
-    alpha-engine-config-I11001 (measured 2026-09-17, under I10753): this unit is one of
-    the two `data.cutover_ready.units_covered` UNMETs. The WORKLOAD is not the gap —
+    alpha-engine-config-I11001, FIXED 2026-09-17 (under I10753): this was one of the two
+    `data.cutover_ready.units_covered` UNMETs, and the WORKLOAD was never the gap —
     `_WORKLOADS["weekly-phase-one"]` is `( python weekly_collector.py --phase 1 && python
-    -m builders.prune_delisted_tickers --apply )`, so the standalone weekly schedule does
-    run it. The gap is that nothing writes the `run_manifest_prefix` declared below:
-    `builders/prune_delisted_tickers.py` imports no `run_units` entrypoint at all (grep for
-    `run_units|recorded_entry|manifest_sink`: zero hits). Until it does, naming D14 in the
-    weekly schedule's `verify_units` would fail EVERY run on a manifest that is never
-    written, so it is deliberately absent there and registered instead in
-    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE`. The
-    `nousergon-data-PR1701` token stays in `trigger.successor` above on purpose:
-    `data_gate/clauses.py::_replaced_by_standalone_stack` keys membership of the graded set
-    on it, and dropping it would turn a true UNMET into an invisible non-member.
+    -m builders.prune_delisted_tickers --apply )`, so the standalone weekly schedule
+    always ran it. The gap was that nothing wrote the `run_manifest_prefix` declared
+    below: `builders/prune_delisted_tickers.py` imported no `run_units` entrypoint at all,
+    so naming D14 in `verify_units` would have failed every run on a manifest that never
+    existed, and a failed prune was indistinguishable from one that never ran. Its
+    `--apply` entrypoint now goes through `run_units.recorded_entry("D14", ...)` (the same
+    thin-wrapper shape `rag/pipelines/run_weekly_ingestion_recorded.py` uses for D16) and
+    D14 is named in the weekly schedule's `verify_units`. The one non-obvious constraint:
+    `main()` resolves `default_run_date()` ONCE and passes it to both the prune and the
+    manifest, because `_write_audit` stamps the key with `summary["trading_day"]` while
+    the completion check renders `builders/prune_audit/{trading_day}-*.json` against the
+    MANIFEST's own `trading_day` (`index.py::_key_pattern`) — two independent resolutions
+    could straddle a session boundary and produce a manifest that can never match the key
+    its own run wrote. `completeness.status: not_applicable` below means no `rows_out`
+    floor applies, so a zero-prune week records a clean `ok` rather than a false red;
+    a failed audit PUT, by contrast, is a `failed` manifest, since that object is the only
+    S3 key this unit publishes. Graded by
+    `tests/test_unit_manifests.py::test_d14_*` (four cases: ok, zero-prune,
+    failed-PUT, exception-propagates).
 
     alpha-engine-config-I10820: `writes` was two prose entries, unmeasurable by the shadow
     parity tool. Code read of `builders/prune_delisted_tickers.py`: `_retain_delisted`

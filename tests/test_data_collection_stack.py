@@ -176,14 +176,6 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
 # as covered, and the same must hold for the register that records the
 # exceptions to it.
 _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
-    # `weekly-phase-one` DOES run it (`python -m builders.prune_delisted_tickers
-    # --apply`, the second half of the subshell), so the gap is not the workload
-    # — it is that `builders/prune_delisted_tickers.py` imports no `run_units`
-    # entrypoint and writes no manifest under the
-    # `data_collection/runs/D14` prefix its own descriptor declares. Naming it
-    # in verify_units before that exists would fail every weekly run on a
-    # manifest that is never written.
-    "D14": "alpha-engine-config-I11001",
     # No workload runs it at all: the `morning-enrich` workload passes
     # `--skip-chronic-heal`, and `daily-heal` (`--daily-heal`) is D33, a
     # different mode. `weekly_collector.py` has a standalone

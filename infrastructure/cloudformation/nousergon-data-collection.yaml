@@ -252,6 +252,16 @@ Resources:
   # SAME manifest D16 writes; its descriptor's run_manifest_prefix points at
   # D16's prefix, alpha-engine-config-I10753).
   #
+  # D14 (prune_delisted_tickers) joins them (alpha-engine-config-I11001). The
+  # `weekly-phase-one` workload has always RUN it — it is the second half of
+  # that workload's subshell — but `builders/prune_delisted_tickers.py` wrote
+  # no run manifest, so naming it here would have failed every execution on a
+  # manifest that never existed. Its `--apply` entrypoint now goes through
+  # `run_units.recorded_entry("D14", ...)` (the D16 wrapper shape), resolving
+  # the trading day ONCE and passing it to both the prune and the manifest so
+  # the audit key `builders/prune_audit/{trading_day}-*.json` and the manifest
+  # the completion check renders it against cannot disagree about the date.
+  #
   # D09 (signal_returns) is NOT listed, and that absence is the recorded
   # decision rather than an omission: its descriptor carries a `retirement:`
   # block (Brian 2026-09-14 R7, alpha-engine-config-I10748 plan §7 (b)) with
@@ -280,7 +290,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D15", "D16", "D17", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
