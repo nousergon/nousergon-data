@@ -152,7 +152,12 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 # The two standalone comparators (alpha-engine-config-I10920) are deliberately
 # ABSENT: both are read-and-compare passes over one trading day, and the 7200 s
 # shared default already covers the parity leg measured inside the 2026-09-15
-# shadow-weekday chain. A cap is added here only against a MEASURED overrun, per
+# shadow-weekday chain. MEASURED on the first dispatch of each, 2026-09-17,
+# trading day 2026-09-14 (alpha-engine-config-I10920): `shadow-parity`
+# published its 23-row report ~4.5 min after launch, `arctic-parity` ran
+# 18:24:02Z -> 18:26:02Z (120 s of comparator), both including box boot and
+# the venv build. Neither is within an order of magnitude of 7200 s.
+# A cap is added here only against a MEASURED overrun, per
 # that issue's deliverable 3 ("measure the first run rather than guessing"); an
 # entry invented ahead of evidence is a number nothing checks.
 _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
