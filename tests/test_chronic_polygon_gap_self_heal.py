@@ -299,6 +299,52 @@ def test_self_heal_per_ticker_failure_is_isolated():
     )
 
 
+def test_self_heal_raises_future_bar_error_rather_than_recording_a_per_ticker_error():
+    """alpha-engine-config-I10904 ("the sharper half"): this loop's only
+    handler used to be a bare ``except Exception as exc``, so a post-close
+    bar reaching the write-time guard (``_assert_no_bar_after`` /
+    ``dates.FutureBarError``, I10893) was folded into an ordinary per-ticker
+    ``summary["errors"]`` entry rather than failing the run — the one
+    behaviour I10893 exists to guarantee at every OTHER price-cache write
+    site. Reproduced here via an existing S3 parquet that already carries a
+    bar dated after ``target_date`` (e.g. a prior corrupt write): the
+    self-heal loop must now propagate ``FutureBarError`` instead."""
+    from dates import FutureBarError
+    from weekly_collector import _self_heal_chronic_polygon_gaps
+
+    universe_lib = _stub_universe_lib({"PSTG": "2026-05-05"})
+    # Existing parquet already carries a bar AFTER target_date — a corrupt
+    # prior write, or a clock-skewed backfill. combined_pcache inherits it
+    # via the existing-rows union even though the fresh yfinance fetch is
+    # itself correctly clipped to `target_date`.
+    existing_pcache = pd.DataFrame(
+        {"Open": 70.0, "High": 71.0, "Low": 69.0, "Close": 70.0, "Volume": 1_000},
+        index=pd.bdate_range(start="2026-05-01", end="2026-05-11"),  # 2026-05-11 > target
+    )
+    s3 = _stub_s3_with_pcache({"PSTG": existing_pcache})
+
+    fresh_yf = pd.DataFrame(
+        {"Open": [73.0], "High": [75.0], "Low": [73.0], "Close": [74.5], "Volume": [1_500]},
+        index=pd.DatetimeIndex(["2026-05-06"]),
+    )
+
+    backfill_mock = MagicMock()
+
+    with patch("weekly_collector.boto3.client", return_value=s3), \
+         patch("store.arctic_store.get_universe_lib", return_value=universe_lib), \
+         patch("yfinance.download", return_value=fresh_yf), \
+         patch("builders.backfill.backfill", backfill_mock):
+        with pytest.raises(FutureBarError, match="2026-05-11"):
+            _self_heal_chronic_polygon_gaps(
+                bucket="test-bucket",
+                target_date="2026-05-08",
+                chronic_tickers=["PSTG"],
+            )
+
+    # Never reaches the write — no backfill invoked for the offending ticker.
+    backfill_mock.assert_not_called()
+
+
 def test_self_heal_empty_chronic_tickers_is_noop():
     """No chronic-gap config → empty list → no work done. Preserves the
     pre-PR behavior when the config section is absent."""

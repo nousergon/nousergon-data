@@ -40,7 +40,7 @@ import pandas as pd
 import pytest
 
 from builders._price_cache_writeboth import assert_valid_price_cache_ticker
-from collectors import prices
+from collectors import CaretTickerError, prices
 
 
 def _make_s3(contents: list[dict]) -> MagicMock:
@@ -72,10 +72,15 @@ def test_chokepoint_accepts_bare_tickers(ticker):
 def test_prices_refresh_stale_refuses_caret_ticker_write(monkeypatch, tmp_path):
     """Even if a caret-embedded ticker reaches ``_refresh_stale`` (bypassing
     the population filter — the exact bug this issue closes), the write-time
-    chokepoint raises instead of uploading a stray key. ``_refresh_stale``'s
-    existing per-ticker isolation catches it and records the ticker as
-    failed, rather than crashing the whole batch or writing the corrupt
-    key."""
+    chokepoint raises instead of uploading a stray key.
+
+    alpha-engine-config-I10904: this call site's per-ticker isolation
+    (``except FutureBarError: raise`` / ``except Exception``) used to catch
+    the guard's bare ``ValueError`` in the broad handler and record the
+    ticker as an ordinary per-ticker ``failed`` — indistinguishable from a
+    transient yfinance miss. It now propagates as ``CaretTickerError`` out
+    of ``_refresh_stale`` (a population-contract violation, not a per-ticker
+    one), before any upload."""
     idx = pd.bdate_range("2016-08-19", periods=2600)
     fake_df = pd.DataFrame(
         {"Open": 1.0, "High": 1.0, "Low": 1.0, "Close": 1.0, "Volume": 1.0},
@@ -99,18 +104,17 @@ def test_prices_refresh_stale_refuses_caret_ticker_write(monkeypatch, tmp_path):
             self.uploads.append(key)
 
     s3 = _RecordingS3()
-    refreshed, failed = prices._refresh_stale(
-        s3=s3,
-        bucket="test-bucket",
-        s3_prefix="predictor/price_cache/",
-        stale=["^VIX3M"],
-        fetch_period="10y",
-        batch_size=10,
-        trading_day="2026-09-14",
-    )
+    with pytest.raises(CaretTickerError, match=r"\^VIX3M"):
+        prices._refresh_stale(
+            s3=s3,
+            bucket="test-bucket",
+            s3_prefix="predictor/price_cache/",
+            stale=["^VIX3M"],
+            fetch_period="10y",
+            batch_size=10,
+            trading_day="2026-09-14",
+        )
 
-    assert refreshed == 0
-    assert failed == ["^VIX3M"]
     assert s3.uploads == [], "chokepoint must refuse the write, not just log"
 
 
