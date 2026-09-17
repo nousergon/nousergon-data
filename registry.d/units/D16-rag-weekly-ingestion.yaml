@@ -47,9 +47,24 @@ consumers:
   - "crucible-dashboard:loaders/s3_loader.py"
   - "crucible-research:agents/sector_teams/rag_retrieval_tools.py"
 contract:
-  schema: null
-  producer_test: null
+  schema: "contracts/rag_manifest.schema.json"
+  producer_test: tests/test_rag_manifest_contract.py
   consumer_pins: []
+  # P-07 (alpha-engine-config-I10873): disambiguates R7's split of this unit's
+  # writes — `rag/watermarks/*` and `rag/corpus_freshness/latest.json` are
+  # dropped (zero external readers, see `notes` below); the SURVIVING
+  # published key with a real consumer is `rag/manifest/{date,latest}.json`
+  # (rag/pipelines/emit_manifest.py::build_manifest), read by
+  # crucible-dashboard loaders/s3_loader.py::load_rag_manifest — verified
+  # 2026-09-16 (the module's own docstring: "the presentation layer ...
+  # never queries pgvector directly"). Producer side built this PR: a
+  # versioned schema for the manifest shape + a producer test against the
+  # REAL `build_manifest()` output (pgvector `execute_query` mocked
+  # deterministic, no live DB) plus a hand-built fixture. `consumer_pins`
+  # stays EMPTY — crucible-dashboard has no pinned copy yet. Needs a
+  # companion crucible-dashboard PR: `tests/contracts/rag_manifest.schema.json`
+  # (copy of this file) + a contract test pinning `load_rag_manifest`'s
+  # expected shape. Until that lands this clause stays UNMET by design.
 registry_rows:
   - rag_corpus_freshness
 run_manifest_prefix: data_collection/runs/D16
