@@ -418,11 +418,37 @@ def test_the_report_subcommand_has_no_fail_on_unmet_flag():
 # ── the whole job, end to end ────────────────────────────────────────────────
 
 
+class _RecordingTracker:
+    """A stand-in for `nousergon_lib.gates.tracker.Tracker`.
+
+    The real one refuses to act without a credential, which is correct — but it
+    means any end-to-end test that does not substitute it is measuring the
+    credential check rather than the job. Two tests below did exactly that, and
+    one of them would have reached the real `deliver()` had the tracker not
+    raised first (alpha-engine-config-I10952, caught against v0.124.133).
+    """
+
+    def __init__(self):
+        self.comments = []
+
+    def find_or_create_issue(self, *, title, body):
+        return 7
+
+    def post_comment(self, issue, body):
+        self.comments.append((issue, body))
+        return "https://github.com/nousergon/alpha-engine-config/issues/7#issuecomment-1"
+
+    def update_issue_body(self, issue, body):
+        return None
+
+
 def test_a_run_files_every_declared_key_and_names_its_trigger_as_a_key(monkeypatch):
     """The closes-when predicate asks whether `trigger.schedule` EXISTS as a
     key. A trigger recorded only as a field inside `run.json` cannot be
     asserted by a key listing, so it is written both ways."""
     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setattr(report_module, "_tracker", _RecordingTracker)
+    monkeypatch.setattr(report_module, "deliver", lambda *a, **k: None)
     store = _live_shaped_store()
 
     manifest = report_module.run_report(
@@ -444,8 +470,11 @@ def test_a_failed_delivery_still_files_a_manifest_that_says_so(monkeypatch):
     """A job that dies without filing one is indistinguishable from a job that
     never ran, and the absence detector would then page for the wrong reason."""
     monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setattr(report_module, "_tracker", _RecordingTracker)
     monkeypatch.setattr(
-        report_module, "deliver", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no"))
+        report_module,
+        "deliver",
+        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("the transport refused it")),
     )
     store = _live_shaped_store()
 
@@ -459,7 +488,7 @@ def test_a_failed_delivery_still_files_a_manifest_that_says_so(monkeypatch):
 
     filed = json.loads(store.written["runs/report.daily/2026-09-18/2026-09-21/run.json"])
     assert filed["status"] == "failed"
-    assert "no" in filed["reason"]
+    assert "the transport refused it" in filed["reason"]
 
 
 def test_the_tracker_comment_is_posted_before_the_headline_is_rendered(monkeypatch):
