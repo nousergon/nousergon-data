@@ -36,6 +36,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
     subtract_trading_days,
 )
 
+import run_units
 from data_gate.cadence import Cadence, gate_moment, latest_due_fire, unit_cadence
 from data_gate.descriptors import REPO_ROOT, Unit
 
@@ -49,6 +50,7 @@ __all__ = [
     "GateStore",
     "Reading",
     "empty_fresh_runs",
+    "empty_success_runs",
     "parity_store_key",
     "read_base",
     "read_completeness_metric",
@@ -296,6 +298,26 @@ def empty_fresh_runs(manifests: list[dict]) -> list[str]:
     ]
 
 
+def empty_success_runs(manifests: list[dict]) -> list[str]:
+    """The run ids that claimed `ok` while recording no output at all.
+
+    `alpha-engine-config-I11011`. Derived from the RECORD — status, `outputs`
+    and `rows_out` — through the one predicate the producer enforces against its
+    own run context before writing (:func:`run_units.is_empty_success`). One
+    predicate, both sides, deliberately: a reader that instead trusted a marker
+    the producer sets would go blind the moment the producer stopped setting
+    it, which is the exact failure this issue is about. Grading the property
+    keeps the reader honest about producers that predate the rule — the ten
+    manifests of the 2026-09-15 shadow run are named by this today, without
+    being rewritten.
+
+    Distinct from :func:`empty_fresh_runs`, which counts a unit that published
+    a fresh but EMPTY artifact. This counts a unit that published no artifact
+    at all and called it a success.
+    """
+    return [str(m.get("run_id") or "?") for m in manifests if run_units.is_empty_success(m)]
+
+
 def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Reading | None:
     """The ArcticDB probe backing a unit that declares `arcticdb_evidence`.
 
@@ -539,6 +561,15 @@ def read_run_record(
       ok-but-degraded state.
     * **Empty-but-fresh is counted from the guard verdict**, never from
       `rows_out == 0` — see :func:`empty_fresh_runs`.
+    * **A run that claimed `ok` while publishing NOTHING is not a recorded
+      run** (`alpha-engine-config-I11011`). `rows_out: 0` with an empty
+      `outputs` array is a unit that completed having written nothing and filed
+      it as a success — indistinguishable, on every surface that reads this
+      record, from a unit that published its deliverable. It is UNMET unless
+      the descriptor DECLARES zero output legitimate for that unit; it is never
+      the default reading of an empty result. Distinct from a `failed` or
+      `not_applicable` record, both of which still satisfy the clause: they
+      already say what happened.
     * **An ArcticDB unit's evidence is the probe**, and a withheld probe is
       UNMEASURABLE rather than MET — see :func:`_read_arctic_probe`.
     """
@@ -644,12 +675,46 @@ def read_run_record(
             source="data_collection store",
         )
 
+    # `alpha-engine-config-I11011`. Checked BEFORE the run is counted: a
+    # manifest reading `ok` with `rows_out: 0` and an empty `outputs` array is
+    # a run that produced nothing, recorded as a success, and counting it here
+    # is what let ten units read as recorded runs on the 2026-09-15 shadow run
+    # while the parity comparator was the only thing that noticed they had
+    # written no keys. The unit may DECLARE that publishing nothing is
+    # legitimate for it (`empty_is_valid` in its descriptor, naming which
+    # not-applicable reason the empty run is); that declaration is what makes
+    # this readable, and it is never the default reading of an empty result.
+    empty_success = empty_success_runs(manifests)
+    declaration = run_units.empty_declaration(unit.raw)
+    if empty_success and declaration is None:
+        return Reading(
+            met=False,
+            detail=(
+                f"{len(empty_success)} of {len(manifests)} run(s) under {prefix} recorded "
+                f"`status: ok` with rows_out 0 and an empty `outputs` array — {empty_success[:8]}. "
+                f"{unit.unit_id} completed having published NOTHING and filed it as a success, "
+                "which is indistinguishable from a real success on every surface that reads "
+                "this record. Not counted as a recorded run: a unit for which zero output is "
+                "legitimate declares that in its descriptor "
+                f"(`{run_units.EMPTY_IS_VALID_FIELD}`, naming the not-applicable reason the "
+                "empty run is), and the fleet default is to RAISE."
+            ),
+            evidence=tuple(keys[:8]),
+            source="data_collection store",
+        )
+
     empty_fresh = empty_fresh_runs(manifests)
     counts = {s: statuses.count(s) for s in sorted(set(statuses))}
     summary = (
         f"{len(manifests)} run(s) recorded under {prefix}: {counts}; "
         f"rows_out total {sum(int(m.get('rows_out') or 0) for m in manifests)}; "
         f"empty-but-fresh runs (guards[].verdict == 'empty_fresh') {len(empty_fresh)}"
+        + (
+            f"; {len(empty_success)} run(s) published nothing, DECLARED legitimate "
+            f"({run_units.EMPTY_IS_VALID_FIELD}.reason={declaration.reason}): {declaration.note}"
+            if empty_success and declaration is not None
+            else ""
+        )
     )
 
     # The probe is filed under the trading day the run COLLECTED, which for a

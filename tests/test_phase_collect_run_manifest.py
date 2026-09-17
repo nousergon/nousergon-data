@@ -195,15 +195,30 @@ def test_a_unit_reporting_no_row_count_reads_unmeasurable_never_green():
 
 
 def test_an_auto_skip_publishes_nothing_and_says_so_rather_than_reading_as_empty():
+    """`alpha-engine-config-I11011`: `not_applicable`, never `ok`.
+
+    A same-date auto-skip published nothing — `rows_out: 0`, `outputs: []` —
+    and used to record `status: ok`, which every downstream surface counted as
+    a run that produced its deliverable. It is the lib's own closed-list
+    `no_new_data_declared` ("a target date already published"), and it is
+    COUNTED: a unit answering not-applicable every cycle is a unit that has
+    stopped working, and the board can see that only because the non-run left a
+    record saying what it was.
+
+    The collector's own result dict is unchanged, so no exit code moves.
+    """
     s3 = FakeS3({KEY: 4096})
     reg = FakeRegistry(s3, skipped=True)
     result = weekly_collector._phase_collect(
         reg, "daily_closes", lambda: pytest.fail("must not recompute"), artifact_key=KEY
     )
     assert result["auto_skipped"] is True
+    assert result["status"] == "ok"
     m = _manifests(s3)[0]
-    assert m["status"] == "ok"
+    assert m["status"] == "not_applicable"
+    assert m["reason"].startswith("no_new_data_declared")
     assert m["outputs"] == []
+    assert m["rows_out"] == 0
     assert m["guards"][0]["verdict"] == "not_applicable"
 
 
