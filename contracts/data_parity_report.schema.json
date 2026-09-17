@@ -110,9 +110,20 @@
             "shadow_missing",
             "both_missing",
             "unmeasurable",
-            "in_region_only"
+            "in_region_only",
+            "live_superseded"
           ],
-          "description": "`in_region_only` is its own verdict rather than a flavour of `unmeasurable` because it names a DIFFERENT next action: run the comparator in-region, not fix a read."
+          "description": "`in_region_only` is its own verdict rather than a flavour of `unmeasurable` because it names a DIFFERENT next action: run the comparator in-region, not fix a read. `live_superseded` (alpha-engine-config-I10892): v1's run manifest for this trading day records an ETag the live key no longer carries, and no retained VersionId to fetch the recorded object by — the live object belongs to a later run, so it is not evidence either way. Never met."
+        },
+        "live_version": {
+          "type": "object",
+          "description": "Which live object was graded, against v1's run manifest for the trading day (alpha-engine-config-I10892). `basis`: `current_matches_manifest` (the current object IS the recorded one), `manifest_version_id` (the recorded VersionId was fetched), `superseded_no_version_id`, `recorded_version_not_retained`, or `unrecorded` (no manifest record carrying an etag — graded against the current object, as before).",
+          "properties": {
+            "basis": {"type": "string"},
+            "manifest_etag": {"type": ["string", "null"]},
+            "manifest_version_id": {"type": ["string", "null"]},
+            "current_etag": {"type": ["string", "null"]}
+          }
         },
         "comparator": {
           "type": "string",

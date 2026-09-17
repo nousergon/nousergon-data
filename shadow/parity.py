@@ -633,6 +633,7 @@ class ParityReport:
             "both_missing": 0,
             "unmeasurable": 0,
             "in_region_only": 0,
+            "live_superseded": 0,
         }
         for row in self.rows:
             counts[row.verdict] = counts.get(row.verdict, 0) + 1
@@ -687,6 +688,34 @@ class S3Reader:
                 return None
             raise
 
+    def get_with_meta(self, key: str, version_id: str | None = None) -> dict[str, Any] | None:
+        """One object's bytes with the ETag and VersionId it was served as.
+
+        ``version_id`` fetches that exact version (alpha-engine-config-I10892).
+        A missing key OR a version no longer retained (the bucket's 30-day
+        noncurrent expiry) is ``None``; any other failure re-raises.
+        """
+        kwargs: dict[str, Any] = {"Bucket": self.bucket, "Key": key}
+        if version_id:
+            kwargs["VersionId"] = version_id
+        try:
+            resp = self.client.get_object(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - a missing key/version is an answer; anything else re-raises
+            code = ""
+            response = getattr(exc, "response", None)
+            if isinstance(response, dict):
+                code = str((response.get("Error") or {}).get("Code") or "")
+            if code in {"NoSuchKey", "NoSuchVersion", "404", "NotFound"}:
+                return None
+            raise
+        etag = resp.get("ETag")
+        version = resp.get("VersionId")
+        return {
+            "body": resp["Body"].read(),
+            "etag": etag.strip('"') if isinstance(etag, str) else None,
+            "version_id": version if isinstance(version, str) and version != "null" else None,
+        }
+
     def list(self, prefix: str, limit: int) -> list[str]:
         keys: list[str] = []
         token = None
@@ -702,12 +731,89 @@ class S3Reader:
         return keys[:limit]
 
 
+#: `version_capture` values under which a manifest output's etag/version_id is
+#: a measurement (nousergon_lib.run_manifest.VERSION_CAPTURES). A record with
+#: no `version_capture` at all predates I10892; its etag, when non-null, was
+#: passed by the write site and is trusted the same way.
+_MEASURED_VERSION_CAPTURES = frozenset({"caller", "head_object"})
+
+
+def recorded_live_version(manifests: Iterable[dict[str, Any]], live_key: str) -> dict[str, Any] | None:
+    """The output record for ``live_key`` in v1's manifests for the trading day,
+    when it carries a measured ETag or VersionId; otherwise ``None``.
+
+    Among several manifests recording the key, the latest ``finished`` wins —
+    the object a same-day retry left behind is the one that stands for the day.
+    """
+    best: tuple[str, dict[str, Any]] | None = None
+    for manifest in manifests:
+        for out in manifest.get("outputs") or []:
+            if str(out.get("key") or "") != live_key:
+                continue
+            capture = out.get("version_capture")
+            if capture is not None and capture not in _MEASURED_VERSION_CAPTURES:
+                continue
+            if not out.get("etag") and not out.get("version_id"):
+                continue
+            finished = str(manifest.get("finished") or "")
+            if best is None or finished >= best[0]:
+                best = (finished, out)
+    return None if best is None else best[1]
+
+
+def _read_live_as_recorded(
+    reader: S3Reader, live_key: str, expected: dict[str, Any] | None
+) -> tuple[bytes | None, dict[str, Any]]:
+    """The live bytes to grade, and how they were chosen (``live_version``).
+
+    Returns ``(None, {...basis: superseded_*/recorded_version_not_retained})``
+    when the object v1 recorded for the day can no longer be read — the caller
+    turns that into ``live_superseded``, never ``mismatch`` and never ``match``.
+    """
+    if expected is None:
+        return reader.get(live_key), {"basis": "unrecorded"}
+    manifest_etag = str(expected["etag"]).strip('"') if expected.get("etag") else None
+    manifest_version = expected.get("version_id") or None
+    current = reader.get_with_meta(live_key)
+    info: dict[str, Any] = {
+        "manifest_etag": manifest_etag,
+        "manifest_version_id": manifest_version,
+        "current_etag": current["etag"] if current else None,
+    }
+    if current is not None and (
+        (manifest_etag is not None and current["etag"] == manifest_etag)
+        or (manifest_etag is None and manifest_version is not None and current["version_id"] == manifest_version)
+    ):
+        return current["body"], {"basis": "current_matches_manifest", **info}
+    if manifest_version is None:
+        if current is None:
+            # Nothing to supersede with: the key is gone and no version names
+            # the recorded object. That is the ordinary live_missing row.
+            return None, {"basis": "live_missing", **info}
+        return None, {"basis": "superseded_no_version_id", **info}
+    recorded = reader.get_with_meta(live_key, version_id=manifest_version)
+    if recorded is None:
+        return None, {"basis": "recorded_version_not_retained", **info}
+    return recorded["body"], {"basis": "manifest_version_id", **info}
+
+
 def _compare_one_key(
-    reader: S3Reader, root: ShadowRoot, live_key: str, unit_ids: list[str], rel, absolute
+    reader: S3Reader,
+    root: ShadowRoot,
+    live_key: str,
+    unit_ids: list[str],
+    rel,
+    absolute,
+    expected: dict[str, Any] | None = None,
 ) -> KeyResult:
+    """Grade one key. ``expected`` is v1's manifest output record for this
+    trading day (:func:`recorded_live_version`); with it, the live side is the
+    object v1 published FOR THAT DAY, not whatever a later run left at the key
+    (alpha-engine-config-I10892). Without it, the current live object, as before.
+    """
     shadow_key = root.key(live_key)
     try:
-        live = reader.get(live_key)
+        live, live_version = _read_live_as_recorded(reader, live_key, expected)
         shadow = reader.get(shadow_key)
     except Exception as exc:  # noqa: BLE001 - a denied/failed read is UNMEASURABLE, and named
         return KeyResult(
@@ -716,6 +822,21 @@ def _compare_one_key(
             "unmeasurable",
             "none",
             {"unmeasurable_reason": f"{type(exc).__name__}: {exc}", "shadow_key": shadow_key},
+        )
+    if live is None and live_version["basis"] in {"superseded_no_version_id", "recorded_version_not_retained"}:
+        why = (
+            "the live key's current ETag differs from the one v1's manifest recorded for this "
+            "trading day, and the manifest carries no VersionId to fetch the recorded object by"
+            if live_version["basis"] == "superseded_no_version_id"
+            else "the recorded VersionId is no longer retained (noncurrent-version expiry)"
+        )
+        return KeyResult(
+            live_key, unit_ids, "live_superseded", "none",
+            {
+                "detail": f"{why}; the current object belongs to a later run and is not parity evidence",
+                "shadow_key": shadow_key,
+                "live_version": live_version,
+            },
         )
     if live is None and shadow is None:
         return KeyResult(
@@ -736,6 +857,7 @@ def _compare_one_key(
         live_key, live, shadow, rel=rel, absolute=absolute, contract=resolve_contract(live_key)
     )
     body["shadow_key"] = shadow_key
+    body["live_version"] = live_version
     return KeyResult(live_key, unit_ids, body.pop("verdict"), body.pop("comparator"), body)
 
 
@@ -809,6 +931,27 @@ def run_parity(
     units = units if units is not None else load_units()
     unit_by_id = {unit.unit_id: unit for unit in units}
     targets = expand_writes(units, trading_day)
+
+    # alpha-engine-config-I10892: the live object each key is graded against is
+    # the one v1's run manifest RECORDED for this trading day. Read once per
+    # unit; a unit with no manifest (or a record with no measured version) keeps
+    # the pre-I10892 behaviour of grading the current live object.
+    v1_manifest_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def _expected(live_key: str, owners: list[str]) -> dict[str, Any] | None:
+        manifests: list[dict[str, Any]] = []
+        for unit_id in owners:
+            unit = unit_by_id.get(unit_id)
+            if unit is None:
+                continue
+            if unit_id not in v1_manifest_cache:
+                v1_manifest_cache[unit_id] = list(
+                    _latest_manifests_by_unit(
+                        reader, f"{unit.run_manifest_prefix}/{trading_day.isoformat()}/"
+                    ).values()
+                )
+            manifests.extend(v1_manifest_cache[unit_id])
+        return recorded_live_version(manifests, live_key)
 
     # alpha-engine-config-I10890: the authoritative scope of THIS run is the
     # set of units that left a run manifest under the shadow prefix — never
@@ -918,7 +1061,10 @@ def run_parity(
                     continue
                 for member in sorted(members):
                     rows.append(
-                        _compare_one_key(reader, root, member, unit_ids, rel_tolerance, absolute_tolerance)
+                        _compare_one_key(
+                            reader, root, member, unit_ids, rel_tolerance, absolute_tolerance,
+                            expected=_expected(member, unit_ids),
+                        )
                     )
                 continue
             # No manifest evidence at all (see `scoped` above) — fall back to
@@ -947,7 +1093,12 @@ def run_parity(
                 )
                 continue
             for member in sorted(live_keys | shadow_keys)[:max_keys_per_prefix]:
-                rows.append(_compare_one_key(reader, root, member, unit_ids, rel_tolerance, absolute_tolerance))
+                rows.append(
+                    _compare_one_key(
+                        reader, root, member, unit_ids, rel_tolerance, absolute_tolerance,
+                        expected=_expected(member, unit_ids),
+                    )
+                )
             if max(len(live_keys), len(shadow_keys)) >= max_keys_per_prefix:
                 rows.append(
                     KeyResult(
@@ -963,7 +1114,10 @@ def run_parity(
                 )
             continue
         rows.append(
-            _compare_one_key(reader, root, target.value, unit_ids, rel_tolerance, absolute_tolerance)
+            _compare_one_key(
+                reader, root, target.value, unit_ids, rel_tolerance, absolute_tolerance,
+                expected=_expected(target.value, unit_ids),
+            )
         )
 
     excluded = [

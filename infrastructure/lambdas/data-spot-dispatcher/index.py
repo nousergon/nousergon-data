@@ -152,6 +152,28 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
 
 
+# Parity time windows, per workload (alpha-engine-config-I10892 deliverable 3).
+# DECLARED, and deliberately EMPTY for shadow-weekday: no dispatch is refused for
+# overlapping v1's D+1 postclose (~20:00Z). The 09-15 run's 103 false mismatches
+# came from grading day D's shadow against live keys v1 had already rewritten
+# for D+1. That race is closed at the comparison, not the clock:
+#   * `alpha-engine-research` is versioned with 30-day noncurrent retention
+#     (nous-ergon-ops-PR1308), and every v1 run manifest now records each
+#     output's etag + VersionId (nousergon-lib run_manifest.record_output);
+#   * `shadow parity` grades each key against the object v1's manifest recorded
+#     for the trading day — the current object when its ETag still matches, the
+#     recorded VersionId when not, and the named verdict `live_superseded`
+#     (never met, never mismatch) when neither can be read.
+# A clock window would add a refusal that cannot improve a correct report and
+# would still be wrong for a run finishing after 20:00Z by a minute; snapshotting
+# VersionIds at dispatch would duplicate what the manifests already record, and
+# be less exact (dispatch precedes the D-close run for an early dispatch). The
+# remaining bound is retention: a parity run more than 30 days after its trading
+# day reads `live_superseded`, by name. Adding a workload here means adding a
+# refusal in `_resolve_workload` and its test; an empty entry is the ruling.
+_WORKLOAD_PARITY_WINDOW: dict[str, "tuple[str, str] | None"] = {"shadow-weekday": None}
+
+
 def _max_runtime_seconds(workload: "str | None") -> int:
     return max(MAX_RUNTIME_SECONDS, _WORKLOAD_MAX_RUNTIME_SECONDS.get(workload or "", 0))
 

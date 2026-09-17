@@ -365,6 +365,18 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
     assert index._max_runtime_seconds(None) == index.MAX_RUNTIME_SECONDS
 
 
+def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch):
+    """alpha-engine-config-I10892 deliverable 3. Parity grades against the
+    VersionId v1's manifest recorded for the trading day, so a dispatch that
+    overlaps v1's D+1 postclose is NOT refused. The declaration exists, is
+    None, and resolving the workload stays silent and succeeds."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index._WORKLOAD_PARITY_WINDOW == {"shadow-weekday": None}
+    assert set(index._WORKLOAD_PARITY_WINDOW) <= set(index._WORKLOADS)
+    workload, _cmd = index._resolve_workload({"workload": "shadow-weekday", "trading_day": "2026-09-14"})
+    assert workload == "shadow-weekday"
+
+
 def test_shadow_weekday_requires_trading_day(monkeypatch):
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     with pytest.raises(ValueError, match="requires event\\['trading_day'\\]"):
