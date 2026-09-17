@@ -123,7 +123,7 @@ def collect(
         run_date = default_run_date()
 
     macro = _fetch_fred()
-    market = _fetch_market_prices()
+    market = _fetch_market_prices(run_date)
     macro.update(market)
 
     # Compute breadth. If the caller did not pass in price_data, load the
@@ -560,24 +560,50 @@ def write_release_calendar(bucket: str, s3_prefix: str = "market_data/", dry_run
     return {"status": "ok", "rows": len(df)}
 
 
-def _fetch_market_prices() -> dict:
-    """Fetch commodity and index prices via yfinance."""
+def _fetch_market_prices(trading_day: str | None = None) -> dict:
+    """Fetch commodity and index prices via yfinance, bounded to ``trading_day``.
+
+    alpha-engine-config-I10899: this used to fetch ``period="35d"``, which ends at
+    vendor "now" rather than at the run's trading day — a ``macro.collect(run_date=D)``
+    executed on D+1 could publish a pre-close D+1 bar into ``sp500_close`` etc. Now
+    requests the explicit ``[D − 35d, D]`` window (mirroring ``collectors/prices.py``,
+    alpha-engine-config-I10893) and refuses (via :func:`dates.assert_no_bar_after`) to
+    derive fields from a frame that still carries a bar after D.
+    """
+    from dates import (
+        FutureBarError,
+        assert_no_bar_after,
+        clip_to_trading_day,
+        default_run_date,
+        history_window,
+    )
+
+    if trading_day is None:
+        trading_day = default_run_date()
+
     commodity_tickers = ["CL=F", "GC=F", "HG=F"]
     index_tickers = ["SPY", "QQQ", "IWM"]
     all_tickers = commodity_tickers + index_tickers
 
     result: dict = {}
     try:
+        window_start, window_end_excl = history_window(trading_day, "35d")
         with quiet_yfinance():
             df = yf.download(
                 all_tickers,
-                period="35d",
+                start=window_start.isoformat(),
+                end=window_end_excl.isoformat(),
                 interval="1d",
                 auto_adjust=True,
                 progress=False,
                 group_by="ticker",
                 threads=True,
             )
+        df = clip_to_trading_day(df, trading_day, label="macro_market_prices")
+        assert_no_bar_after(
+            df.index, trading_day,
+            artifact=f"market_data/weekly/{trading_day}/macro.json#market_prices",
+        )
 
         def _last_close(ticker: str) -> Optional[float]:
             try:
@@ -613,6 +639,8 @@ def _fetch_market_prices() -> dict:
         result["qqq_30d_return"] = _return_30d("QQQ")
         result["iwm_30d_return"] = _return_30d("IWM")
 
+    except FutureBarError:
+        raise  # run-level contract violation, never a per-field miss (I10899)
     except Exception as e:
         logger.warning("yfinance macro download failed: %s", e)
         for k in ["oil_wti", "gold", "copper", "sp500_close",

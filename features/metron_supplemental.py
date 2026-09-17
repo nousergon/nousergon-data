@@ -36,6 +36,7 @@ import pandas as pd
 from collectors.constituents import GICS_TO_ETF
 from collectors.fundamentals import _fetch_single_ticker
 from collectors.metron_market_data import load_metron_universe
+from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, history_window
 from features.feature_engineer import FEATURES, MIN_ROWS_FOR_FEATURES, compute_features
 from features.writer import write_feature_snapshot
 from nousergon_lib.yfinance_quiet import yf_quiet
@@ -77,15 +78,30 @@ def uncovered_metron_tickers(bucket: str, s3_client, existing_tickers: set[str])
 
 
 @yf_quiet
-def _fetch_ticker_ohlcv(ticker: str, period: str = "2y") -> pd.DataFrame | None:
-    """Full OHLCV for one arbitrary ticker. Held/watchlist tickers outside the
-    ArcticDB ``universe`` lib have no cached price history, so this fetches on
-    demand — unlike the main pipeline, which reads a pre-populated cache.
-    Returns None on fetch failure or insufficient history (never fabricates)."""
+def _fetch_ticker_ohlcv(
+    ticker: str, trading_day: str, period: str = "2y",
+) -> pd.DataFrame | None:
+    """Full OHLCV for one arbitrary ticker, bounded to ``trading_day`` (I10899).
+
+    Held/watchlist tickers outside the ArcticDB ``universe`` lib have no cached
+    price history, so this fetches on demand — unlike the main pipeline, which
+    reads a pre-populated cache. Bounded to ``[trading_day − period, trading_day]``
+    via explicit ``start``/``end`` (never ``period=``, which ends at vendor "now"
+    and could publish a partial post-close bar into these display-only
+    factor-scoring features on a rerun). Returns None on fetch failure or
+    insufficient history (never fabricates)."""
     import yfinance as yf
 
+    window_start, window_end_excl = history_window(trading_day, period)
     try:
-        df = yf.download(ticker, period=period, interval="1d", auto_adjust=True, progress=False)
+        df = yf.download(
+            ticker,
+            start=window_start.isoformat(),
+            end=window_end_excl.isoformat(),
+            interval="1d",
+            auto_adjust=True,
+            progress=False,
+        )
     except Exception as exc:  # noqa: BLE001 - one bad ticker must not abort the batch
         logger.warning("[metron_supplemental] OHLCV fetch failed for %s: %s", ticker, exc)
         return None
@@ -93,6 +109,11 @@ def _fetch_ticker_ohlcv(ticker: str, period: str = "2y") -> pd.DataFrame | None:
         return None
     if isinstance(df.columns, pd.MultiIndex):  # yf.download can nest columns even for one ticker
         df.columns = df.columns.get_level_values(0)
+    df = clip_to_trading_day(df, trading_day, label=f"metron_supplemental_ohlcv[{ticker}]")
+    assert_no_bar_after(
+        df.index, trading_day,
+        artifact=f"{SUPPLEMENTAL_PREFIX}{trading_day}/technical.parquet#{ticker}",
+    )
     if len(df) < MIN_ROWS_FOR_FEATURES:
         logger.info(
             "[metron_supplemental] %s has %d rows (<%d minimum) — skipped",
@@ -123,6 +144,7 @@ def compute_metron_supplemental_features(
     s3_client,
     existing_tickers: set[str],
     macro: dict[str, pd.Series],
+    trading_day: str | None = None,
     ohlcv_fetcher=_fetch_ticker_ohlcv,
     fundamentals_fetcher=_fetch_single_ticker,
 ) -> tuple[pd.DataFrame, dict[str, str]]:
@@ -143,6 +165,11 @@ def compute_metron_supplemental_features(
     if not uncovered:
         return pd.DataFrame(), {}
 
+    if trading_day is None:
+        from dates import default_run_date  # config#1014: trading-day axis
+
+        trading_day = default_run_date()
+
     spy_series = macro.get("SPY")
     vix_series = macro.get("VIX")
     tnx_series = macro.get("TNX")
@@ -156,7 +183,7 @@ def compute_metron_supplemental_features(
     sector_map: dict[str, str] = {}
 
     for ticker in uncovered:
-        df = ohlcv_fetcher(ticker)
+        df = ohlcv_fetcher(ticker, trading_day=trading_day)
         if df is None:
             continue
 
