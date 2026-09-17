@@ -26,3 +26,26 @@ by_runs_on:
   # (its descriptor; alpha-engine-config-I10756 / I9771) — the same box
   # identity, never the laptop (nousergon-data-PR1746 enforces the region).
   "in-region only (alpha-engine-config-I9771)": nousergon-data-collection-box-role
+# Per-unit overrides, read BEFORE `by_runs_on` (alpha-engine-config-I10929).
+# `runs_on` is a compute CLASS, not an identity: two `github-hosted` units
+# federate into different roles, and two `lambda` units are two functions with
+# two execution roles. A unit whose identity is not the class default declares
+# it here, and every row below was read off the live deployment on 2026-09-17,
+# not inferred from the unit's name.
+by_unit:
+  # Dashboard-box systemd timers (trigger.owner: "dashboard box"); the box runs
+  # under alpha-engine-dashboard-profile -> alpha-engine-dashboard-role.
+  D36: alpha-engine-dashboard-role
+  D37: alpha-engine-dashboard-role
+  # Lambda `alpha-engine-crypto-balances`; its execution role, read from the
+  # deployed function configuration.
+  D38: alpha-engine-crypto-balances-role
+  # GitHub-hosted, but the writer is the OIDC role the workflow assumes
+  # (.github/workflows/inst-ownership-weekly.yml `role-to-assume`), not the
+  # runner.
+  D39: nousergon-data-inst-ownership-sync
+  # GitHub-hosted dispatch only: run-arctic-migrations.yml invokes
+  # alpha-engine-arctic-migration-dispatcher, which launches the in-region spot
+  # box under ARCTIC_MIGRATION_IAM_PROFILE (unset on the deployed Lambda ->
+  # the alpha-engine-executor-profile default). The box is what writes ArcticDB.
+  D42: alpha-engine-executor-role
