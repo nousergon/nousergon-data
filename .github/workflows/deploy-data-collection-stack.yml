@@ -87,10 +87,14 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --quiet 'cfn-lint==1.56.0' 'pyyaml>=6' 'boto3>=1.34'
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-data-collection-stack-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-data-collection-stack-deploy
           aws-region: us-east-1
       - name: Deploy and verify
         env:
@@ -115,10 +119,14 @@ jobs:
           python-version: '3.12'
       - name: Install dependencies
         run: python -m pip install --quiet 'pyyaml>=6' 'boto3>=1.34'
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-data-collection-stack-deploy
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-data-collection-stack-deploy
           aws-region: us-east-1
       - name: Check live
         run: python3 infrastructure/data_collection_stack.py check-live

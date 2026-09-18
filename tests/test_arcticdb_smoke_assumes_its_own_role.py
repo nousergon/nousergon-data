@@ -32,8 +32,15 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "live-arcticdb-smoke.yml"
 
+# The account segment is either the literal id or the repository VARIABLE
+# holding it — this repo is public and its run logs are public
+# (alpha-engine-config-I10973), so the literal form was replaced with
+# `${{ vars.AWS_ACCOUNT_ID }}`. Both spellings name the same role.
 SMOKE_ROLE_ARN = (
     "arn:aws:iam::711398986525:role/github-actions-arcticdb-smoke-read"
+)
+SMOKE_ROLE_ARN_VAR = (
+    "arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-arcticdb-smoke-read"
 )
 DEPLOY_ROLE = "github-actions-lambda-deploy"
 
@@ -45,10 +52,10 @@ def test_the_workflow_exists() -> None:
 
 def test_the_smoke_assumes_the_dedicated_read_role() -> None:
     wf = WORKFLOW.read_text(encoding="utf-8")
-    assert f"role-to-assume: {SMOKE_ROLE_ARN}" in wf, (
-        f"live-arcticdb-smoke.yml must assume {SMOKE_ROLE_ARN} — the role whose "
-        f"whole grant is a read of s3://alpha-engine-research/arcticdb/*. "
-        f"alpha-engine-config-I10110."
+    assert f"role-to-assume: {SMOKE_ROLE_ARN}" in wf or f"role-to-assume: {SMOKE_ROLE_ARN_VAR}" in wf, (
+        f"live-arcticdb-smoke.yml must assume github-actions-arcticdb-smoke-read "
+        f"(literal or {SMOKE_ROLE_ARN_VAR!r}) — the role whose whole grant is a "
+        f"read of s3://alpha-engine-research/arcticdb/*. alpha-engine-config-I10110."
     )
 
 

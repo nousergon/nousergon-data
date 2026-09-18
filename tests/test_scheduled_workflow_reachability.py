@@ -66,6 +66,11 @@ NON_CHECK_STEPS = {
     # is an infrastructure break, not a drift finding (alpha-engine-config-
     # I10164 part 2).
     "Install boto3 for the floor-calibration check",
+    # Log hygiene, not a check: masks the account id before the credentials
+    # step so this public repo's run log never prints it (alpha-engine-
+    # config-I10973). Its own failure already fails the job outright (no
+    # continue-on-error) rather than being read as a finding.
+    "Mask the account id in this public log",
 }
 
 
