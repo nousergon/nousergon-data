@@ -154,8 +154,44 @@ def test_main_writes_the_metric_document(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
     rc = m.main(["--days", "3"])
     assert rc == 0
-    assert len(s3.puts) == 1
+    # Two PUTs: the metric document, then the run record (alpha-engine-config-I11058).
+    assert len(s3.puts) == 2
     body = json.loads(s3.puts[0]["Body"])
     assert body["collection_writes"] == 0
     assert body["days_covered"] == 0  # no archive objects in this fake
     assert s3.puts[0]["Key"] == m.DEFAULT_KEY
+
+    run_record = json.loads(s3.puts[1]["Body"])
+    assert s3.puts[1]["Key"].startswith("data_collection/runs/executor_profile/")
+    assert run_record["producer"] == "executor_profile"
+    assert run_record["status"] == "ok"
+    assert run_record["error"] is None
+
+
+def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):
+    class _BrokenS3(_PutCapturingS3):
+        def get_paginator(self, name):
+            raise RuntimeError("boom: archive unreachable")
+
+    s3 = _BrokenS3({})
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None):
+            assert name == "s3"
+            return s3
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+
+    try:
+        m.main(["--days", "3"])
+    except RuntimeError as exc:
+        assert "boom" in str(exc)
+    else:
+        raise AssertionError("expected the underlying RuntimeError to propagate")
+
+    assert len(s3.puts) == 1  # only the error run record — never the metric document
+    run_record = json.loads(s3.puts[0]["Body"])
+    assert s3.puts[0]["Key"].startswith("data_collection/runs/executor_profile/")
+    assert run_record["status"] == "error"
+    assert "boom" in run_record["error"]
