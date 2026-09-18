@@ -615,8 +615,11 @@ def main() -> int:
         # exactly what it was before the manifest existed.
         status = result.get("status")
         if status not in ("ok", "ok_dry_run", "skipped"):
+            # alpha-engine-config-I10941: bounded + elided rather than a raw
+            # f-string of `result` — the same shape that truncated the actual
+            # cause out of the 2026-09-16 morning_enrich shadow failure.
             raise run_units.EntryRunFailed(
-                f"daily_news returned status={status!r}: {result}", value=result
+                run_units.describe_mode_failure("daily_news", result), value=result
             )
         return result
 
