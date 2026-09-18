@@ -1665,11 +1665,17 @@ def _daily_append_impl(
     closes = _load_daily_closes(s3, bucket, date_str)
 
     # ── 2. Load supporting data ──────────────────────────────────────────────
+    # `alpha-engine-config-I10923`: both loaders RAISE
+    # (`features.compute.ReferenceMapUnavailable`) rather than degrading to
+    # an empty map — an absent/unreadable D01 reference map used to silently
+    # fall every ticker's sector feature to its neutral default here, with
+    # no recording surface. Was: "Best-effort: an empty map (file not yet
+    # written by the weekly collector) degrades sub_sector_vs_benchmark_* to
+    # neutral 0.0."
     sector_map = _load_sector_map(s3, bucket)
     # sub_sector_etf_map (config#934): ticker → sub-sector benchmark ETF
     # (SMH/IGV/…), defaulting to the sector ETF for sub-industries with no
-    # liquid proxy. Best-effort: an empty map (file not yet written by the
-    # weekly collector) degrades sub_sector_vs_benchmark_* to neutral 0.0.
+    # liquid proxy.
     sub_sector_etf_map = _load_sub_sector_etf_map(s3, bucket)
     # The distinct NON-sector sub-sector ETF symbols this run must keep fresh
     # in ArcticDB (the XL* sector ETFs are already handled by the sector-ETF
