@@ -493,6 +493,32 @@ def _feature_group_extra_outputs(run_date: str) -> tuple[tuple[str, object, obje
     )
 
 
+def _prices_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, object], ...]:
+    """The per-ticker price-cache parquet keys ``collectors/prices.py::collect``
+    actually uploaded THIS run, each with its own row count
+    (alpha-engine-config-I11026 — D03's manifest recorded ``rows_out: 0``,
+    ``outputs: []`` on every run, including a measured 3m38s run that wrote
+    real data, because the phase declares no single stable ``artifact_key``
+    — per-symbol writes have no fixed key a descriptor could name ahead of
+    the run). Read from ``result["written"]`` via
+    :func:`collectors.prices.written_keys` — what the run actually published
+    — never from the requested ticker population or the descriptor's
+    (nonexistent) declared list: a ticker that was never stale, or that
+    failed the refresh, never appears. ``extra_key`` is the callable form
+    because the key SET is per-run; ``rows_fn`` returns the
+    ``{key: rows}`` mapping so each key is graded on ITS OWN count, not the
+    batch's aggregate ``refreshed``."""
+    def _keys(r: dict) -> list[str]:
+        return list(prices.written_keys(r, s3_prefix))
+
+    def _rows(r: dict) -> dict[str, int]:
+        return prices.written_keys(r, s3_prefix)
+
+    return (
+        (_keys, lambda r: bool(r.get("written")), _rows),
+    )
+
+
 def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> dict:
     """The per-run manifest arguments shared by every wrapped call site here."""
     return {
@@ -743,8 +769,20 @@ def _record_phase_lineage(
                 # what it actually wrote (e.g. one key per currency/symbol) —
                 # never a fixed count guessed ahead of the run.
                 keys = extra_key(result) if callable(extra_key) else (extra_key,)
-                rows_out = int(rows_fn(result) or 0)
+                # `rows_fn(result)` is either a single count (applied to every
+                # key this call site declares — the I10855 shape, unchanged)
+                # or a ``{key: rows}`` mapping for a unit whose keys carry
+                # DIFFERENT counts each (e.g. one price-cache parquet per
+                # ticker) — alpha-engine-config-I11026. A key absent from the
+                # mapping records 0 rather than raising: `extra_key` is the
+                # single source of what was published, so a mapping that
+                # under-reports a key `extra_key` names is a producer bug to
+                # surface via the empty-fresh guard below, not to hide here.
+                rows_val = rows_fn(result)
+                per_key_rows = rows_val if isinstance(rows_val, dict) else None
+                default_rows = 0 if per_key_rows is not None else int(rows_val or 0)
                 for k in keys:
+                    rows_out = int(per_key_rows.get(k, 0) or 0) if per_key_rows is not None else default_rows
                     run_ctx.record_output(k, rows_out=rows_out)
                     extra_written.append((k, rows_out))
     if not auto_skipped and not dry:
@@ -1446,6 +1484,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     reference_date=run_date,
                 ),
                 supports_auto_skip=False,
+                # alpha-engine-config-I11026: every per-ticker parquet this run
+                # actually wrote, with its own row count.
+                extra_outputs=_prices_extra_outputs(
+                    price_cfg.get("s3_prefix", "predictor/price_cache/")
+                ),
             )
             # config#2350 — reference/price_cache/ is variable cardinality
             # (grandfathered in ARTIFACT_REGISTRY.yaml) so this unconditional
@@ -4040,6 +4083,11 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
                 reference_date=run_date,
             ),
             supports_auto_skip=False,
+            # alpha-engine-config-I11026: every per-ticker parquet this run
+            # actually wrote, with its own row count.
+            extra_outputs=_prices_extra_outputs(
+                price_cfg.get("s3_prefix", "predictor/price_cache/")
+            ),
         )
         # Same unconditional sentinel the Saturday run writes (config#2350) —
         # now also written on a successful weekday refresh so the freshness
