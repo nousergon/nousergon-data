@@ -1,0 +1,163 @@
+name: Data-collection phase-exit metrics
+
+# Schedules the two phase-exit metric producers nothing schedules today
+# (alpha-engine-config-I11058; producers landed CLI-only in
+# nousergon-data-PR1797 / alpha-engine-config-I11035, -I11036).
+#
+# `data_gate.producers.v1_data_stage` and `.executor_profile` are
+# `python -m` entry points with argparse mains. Until this workflow, nothing
+# in the fleet ever invoked them: the S3 keys `data.phase1.v1_data_stage_quiet`
+# and `data.phase2.executor_collection_writes_zero` read were never written,
+# and both clauses report UNMEASURABLE forever (`alpha-engine-config-I11035`,
+# `-I11036`).
+#
+# ── Cadence: mirrors the collector's own daily cadence ─────────────────────
+#
+# `data-gate.yml` (this repo) evaluates the whole ladder at `30 23 * * *`
+# (daily) and additionally `0 18 * * 6` (Saturday). These two producers run
+# at `0 22 * * *` — 90 minutes before the daily ladder read, same cadence
+# (daily, every day including Saturday) as the rest of the collector's
+# metric documents, so the clauses' freshness has defined meaning: a reading
+# more than a day old is late, not merely absent.
+#
+# A SEPARATE workflow from `data-gate.yml` and `data-report.yml` for the
+# same reason `data-report.yml`'s own header gives: a workflow carries ONE
+# schedule set, and a scheduled workflow needs its own absence detector
+# (`notify-main-failure`) rather than a shared one another job's failure
+# could mask.
+#
+# ── The absence of data must never render green ─────────────────────────
+#
+# Each producer's `main()` (data_gate/producers/_run_record.py) writes a
+# run record to `data_collection/runs/<producer>/{date}.json` on BOTH the
+# success and the failure path — so a day this schedule silently never
+# fired (no record at all) is distinguishable from a day it fired and had
+# nothing to report (a record with status=ok and a zero count). The GHA
+# job also goes red on the failure path (no swallow: `main()` re-raises
+# after recording), which is what `notify-main-failure` below pages on.
+#
+# ── IAM: a NEW role, not yet applied ────────────────────────────────────
+#
+# `github-actions-data-collection-phase-exit-metrics` needs:
+#   states:ListExecutions, states:GetExecutionHistory on
+#     arn:aws:states:us-east-1:<account>:stateMachine:ne-weekly-freshness-pipeline
+#   s3:ListBucket, s3:GetObject on nousergon-fleet-cloudtrail-archive
+#     (prefix AWSLogs/<account>/CloudTrail/*)
+#   s3:PutObject on alpha-engine-research
+#     data_collection/metrics/{v1_data_stage,executor_profile}/* and
+#     data_collection/runs/{v1_data_stage,executor_profile}/*
+# Codified in `nous-ergon-ops` (out of this repo's tier — IAM is private),
+# tracked as `alpha-engine-config-I11061` (filed alongside this PR). Until
+# that stack is applied this job fails loud on the identity read-back below
+# naming the exact operator command — the same operator-gated-apply shape
+# `data-report.yml` already uses for `github-actions-data-report`
+# (`pull-request-policy.md` §4.2 form 3: the merge emits the exact command
+# AND a detector stays red until it runs).
+
+on:
+  schedule:
+    - cron: '0 22 * * *'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: phase-exit-metrics
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  PHASE_EXIT_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-data-collection-phase-exit-metrics
+
+jobs:
+  v1_data_stage:
+    name: v1_data_stage phase-exit metric
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The role does not exist yet until the nous-ergon-ops stack granting it (alpha-engine-config-I11061) has been applied. That apply is OPERATOR-GATED as a security boundary, not automated — see the issue for the exact command. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Run v1_data_stage producer
+        run: python -m data_gate.producers.v1_data_stage
+
+  executor_profile:
+    name: executor_profile phase-exit metric
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The role does not exist yet until the nous-ergon-ops stack granting it (alpha-engine-config-I11061) has been applied. That apply is OPERATOR-GATED as a security boundary, not automated — see the issue for the exact command. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      - name: Run executor_profile producer
+        run: python -m data_gate.producers.executor_profile
+
+  # Required of every scheduled workflow in this repo by
+  # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
+  # naming every other job and an `if` gated to the default branch.
+  notify-main-failure:
+    needs: [v1_data_stage, executor_profile]
+    if: failure() && github.ref == 'refs/heads/main'
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
