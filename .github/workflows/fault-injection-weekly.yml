@@ -67,13 +67,17 @@ jobs:
       # The derivation tests above DO run on every PR without credentials, so
       # the two dangerous swaps (production Lambda, production SNS topic) stay
       # guarded on the path that actually changes them.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials
         id: creds
         if: github.event_name != 'pull_request'
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-fault-injection
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-fault-injection
           aws-region: us-east-1
 
       # §2.4 no-silent-caps: on the scheduled run, unavailable credentials mean

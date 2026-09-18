@@ -46,6 +46,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials (OIDC)
         # Fork PRs without the configured OIDC trust will fail this step
         # silently (continue-on-error) so downstream skip-on-no-creds
@@ -53,7 +57,7 @@ jobs:
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-arcticdb-smoke-read
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-arcticdb-smoke-read
           aws-region: us-east-1
 
       - name: Set up Python 3.12
