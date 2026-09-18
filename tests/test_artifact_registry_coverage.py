@@ -69,26 +69,31 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
     # the `data_collection/gates/` grandfathered prefix (per-date readings).
     "data_gate/store.py": 1,
-    # alpha-engine-config-I11035 / -I11036 — the two phase-exit metric
-    # producers, one PUT each:
+    # alpha-engine-config-I11035 / -I11036, SCHEDULED as of -I11058 — the two
+    # phase-exit metric producers, one metric-document PUT each:
     #   metrics/v1_data_stage/executions_since_cutover.json
     #   metrics/executor_profile/collection_writes/latest.json
     # both under s3://alpha-engine-research/data_collection/, read by
     # `data.phase1.v1_data_stage_quiet` and
-    # `data.phase2.executor_collection_writes_zero`.
-    #
-    # NO ARTIFACT_REGISTRY.yaml row yet, and that is deliberate rather than an
-    # omission: both are CLI-only today (`python -m data_gate.producers.*`) and
-    # NOTHING SCHEDULES THEM. A freshness row declares a cadence and an SLA; a
-    # row naming a cadence no producer runs at would page on day one for an
-    # artifact that was never due. The registry entry belongs with the
-    # schedule, and both are tracked together — see the follow-up issue on
-    # alpha-engine-config. Pinned here first so this repo's guard is honest
-    # about the new PUT sites either way, the same posture
-    # `validators/expectations.py` and `scripts/fault_injection_run.py` above
-    # already take.
+    # `data.phase2.executor_collection_writes_zero`. Each now has a
+    # REGISTERED ARTIFACT_REGISTRY.yaml row — `data_collection_v1_data_stage_
+    # quiet_metric` and `data_collection_executor_collection_writes_metric` —
+    # landed together with `.github/workflows/phase-exit-metrics.yml`, which
+    # runs both daily at 22:00 UTC (90 min before data-gate.yml's 23:30 UTC
+    # ladder read; same daily cadence as the rest of the collector's metric
+    # documents). This comment used to say "no row yet, deliberately" — that
+    # is no longer true; a cadence now runs both producers.
     "data_gate/producers/v1_data_stage.py": 1,
     "data_gate/producers/executor_profile.py": 1,
+    # alpha-engine-config-I11058 — the run-record writer both producers'
+    # `main()` calls on both the success AND the error path (execution
+    # signal class 1, observability-policy.md §3.1), one PUT call site
+    # shared by both. Writes into the already-grandfathered
+    # `data_collection/runs/` prefix (see ARTIFACT_REGISTRY.yaml
+    # `grandfathered_paths`) under its own per-producer sub-path — not a
+    # `data_run_manifest.v1` record (that shape is `collectors/`'s, owned by
+    # alpha-engine-config-I10941/I10942/I10939), so no new registry row.
+    "data_gate/producers/_run_record.py": 1,
     # alpha-engine-config-I10780 (data-collector plan P-13) — the EOD-spine
     # cardinality guard's single daily reading,
     # s3://alpha-engine-research/data_collection/metrics/eod_completeness/{trading_day}.json
