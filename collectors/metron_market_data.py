@@ -2697,8 +2697,12 @@ def main(argv: list[str] | None = None) -> int:
                 # A non-ok collector status has FAILED — recorded as such while
                 # the caller's exit-code contract stays exactly what it was
                 # (`observability-policy` §3.1).
+                # alpha-engine-config-I10941: bounded + elided rather than a
+                # raw f-string of `intra` — the same shape that truncated the
+                # actual cause out of the 2026-09-16 morning_enrich shadow
+                # failure's manifest.
                 raise run_units.EntryRunFailed(
-                    f"collect_intraday returned status={status!r}: {intra}", value=intra,
+                    run_units.describe_mode_failure("collect_intraday", intra), value=intra,
                 )
             return intra
 

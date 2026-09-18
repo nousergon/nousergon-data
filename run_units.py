@@ -692,6 +692,84 @@ def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
 # `run_manifest.run_unit`'s own note): a manifest that failed to write is a run
 # that did not happen as far as every downstream reader is concerned.
 
+#: `nousergon_lib.run_manifest.run_unit` bounds the final `reason` field to
+#: 2000 chars (`f"{type(exc).__name__}: {exc}"[:2000]`) with no marker when it
+#: cuts. `describe_mode_failure` below stays well under that so its own,
+#: EXPLICIT bound is what fires first (alpha-engine-config-I10941).
+REASON_MAX_LEN = 1800
+
+
+def elide_bulk(value: Any, max_items: int = 20, _depth: int = 0) -> Any:
+    """Recursively replace an over-long list/tuple with a count placeholder.
+
+    `alpha-engine-config-I10941`. A collector result dict is free-form and one
+    of its fields can legitimately be a per-ticker array — `tickers`,
+    `symbols`, `articles` — with no upper bound the schema enforces. Nothing
+    that renders a result dict into a bounded string (a manifest `reason`, a
+    log line) may `repr()` it raw, or that array is what eats the budget
+    before the actual cause is reached. Depth-limited defensively against a
+    pathological/cyclic-looking structure; this is a diagnostic renderer, not
+    a general serializer, so it never raises.
+    """
+    if _depth > 6:
+        return "<max depth reached>"
+    if isinstance(value, dict):
+        return {k: elide_bulk(v, max_items, _depth + 1) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        if len(value) > max_items:
+            kind = "tuple" if isinstance(value, tuple) else "list"
+            return f"<{kind}: {len(value)} items elided>"
+        return [elide_bulk(v, max_items, _depth + 1) for v in value]
+    return value
+
+
+def describe_mode_failure(mode: str, result: dict, *, max_len: int = REASON_MAX_LEN) -> str:
+    """Build a bounded, diagnosable failure reason for a mode/aggregate result
+    that reported a non-``ok`` status.
+
+    `alpha-engine-config-I10941`. The 2026-09-16 shadow failure's manifest
+    `reason` was `_CollectorError: morning_enrich: morning_enrich returned
+    status='failed': {...}` with the WHOLE result dict f-strung in —
+    `constituents_preflight`'s 903-ticker `tickers` array ate the entire
+    field, and the sub-collector that actually failed never appeared. This
+    replaces that raw f-string at every call site of the same shape
+    (`weekly_collector.py::_run_whole_mode_unit`,
+    `collectors/daily_news.py`, `collectors/metron_market_data.py`).
+
+    The failing sub-collector — the first entry under ``result["collectors"]``
+    whose own ``status`` is not ok/skipped/not_applicable — is named FIRST, so
+    it lands in the field's first 200 characters before anything
+    variable-length. When no such sub-collector is present (a flat result,
+    e.g. `daily_news`), the mode's own status stands in for it. The full
+    result then follows through :func:`elide_bulk`, never raw, and the whole
+    string is hard-capped at ``max_len`` with an explicit ``reason_truncated``
+    marker appended when even the elided rendering does not fit — so a future
+    truncation is visible as truncation, not a sentence that happens to stop.
+    """
+    result = result or {}
+    status = result.get("status")
+    collectors = result.get("collectors") if isinstance(result.get("collectors"), dict) else {}
+    failing = [
+        (name, sub)
+        for name, sub in collectors.items()
+        if isinstance(sub, dict)
+        and sub.get("status") not in ("ok", "ok_dry_run", "skipped", "not_applicable", None)
+    ]
+    if failing:
+        fname, fsub = failing[0]
+        header = (
+            f"{mode}: failing_collector={fname!r} "
+            f"status={fsub.get('status')!r} error={fsub.get('error') or fsub.get('detail')!r}"
+        )
+    else:
+        header = f"{mode} returned status={status!r} (no sub-collector reported non-ok)"
+    reason = f"{header} | full_result(elided)={elide_bulk(result)!r}"
+    if len(reason) <= max_len:
+        return reason
+    cut = reason[: max_len - 60]
+    return f"{cut} …[reason_truncated: true, full length {len(reason)} chars]"
+
+
 class EntryRunFailed(Exception):
     """Raised INSIDE a unit body whose work reported failure.
 
