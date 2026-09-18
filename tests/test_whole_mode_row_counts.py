@@ -233,7 +233,14 @@ def test_a_mode_whose_declared_step_reported_no_count_is_unmeasurable(monkeypatc
         {"status": "ok", "collectors": {"arcticdb": {"status": "ok"}}},
     )
     assert m["outputs"] == []
-    assert [g["verdict"] for g in m["guards"]] == ["unmeasurable"]
+    # `alpha-engine-config-I11011`: and because it recorded NO output at all,
+    # the run is `failed`, not `ok`. A unit that cannot say what it published
+    # is not distinguishable, on this record, from one that published nothing —
+    # and the fleet default for both is RAISE. The raise is caught outside the
+    # wrapper, so the mode's own return value and the exit code are unchanged.
+    assert m["status"] == "failed"
+    assert m["reason"].startswith("EmptyProduction")
+    assert [g["verdict"] for g in m["guards"]] == ["unmeasurable", "empty_fresh"]
     assert "arcticdb.tickers_published" in m["guards"][0]["detail"]
 
 

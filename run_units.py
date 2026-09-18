@@ -34,10 +34,11 @@ with an address, not a pass.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import logging
 import os
 import socket
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -54,12 +55,20 @@ __all__ = [
     "NOT_RUN_OUTSIDE_SESSION_WINDOW",
     "PHASE_UNITS",
     "TRIGGER_ENV",
+    "EMPTY_PRODUCTION_GUARD",
+    "EMPTY_IS_VALID_FIELD",
+    "EmptyDeclaration",
+    "EmptyProduction",
     "EntryRunFailed",
     "ModeRows",
     "NotInRegionError",
     "PhaseUnit",
+    "empty_declaration",
+    "empty_declaration_for",
+    "is_empty_success",
     "manifest_sink",
     "manual_run",
+    "record_empty_production",
     "require_in_region",
     "resolve_log_location",
     "recorded_entry",
@@ -280,6 +289,209 @@ NOT_RUN_OUTSIDE_SESSION_WINDOW = "outside_session_window"
 NOT_RUN_NO_NEW_DATA_DECLARED = "no_new_data_declared"
 
 
+# ---------------------------------------------------------------------------
+# A run that published NOTHING — the terminal state, and who may have it.
+# ---------------------------------------------------------------------------
+#
+# `alpha-engine-config-I11011`. The 2026-09-15 shadow run recorded ten units
+# (D20, D22-D30) whose manifests read `status: ok`, `rows_out: 0`,
+# `outputs: []` — a zero-second run that produced nothing, filed as a success.
+# Every surface that consumes the manifest counted it: the board's `run_record`
+# column, the completeness clauses. The parity comparator was the only thing
+# that noticed, and only because it went looking for outputs that were not
+# there.
+#
+# **The rule.** `rows_out: 0` with an empty `outputs` array is not `ok`. A
+# producer unit that completes having written nothing reaches one of two
+# terminal states, never the third:
+#
+# * `not_applicable`, with a closed-list reason — when the unit DECLARES, in
+#   its descriptor, that publishing nothing is a legitimate outcome for it (a
+#   heal pass with nothing to heal; a weekend-scoped unit on a weekday). The
+#   declaration names which `NOT_APPLICABLE_REASONS` member the empty run IS,
+#   so the non-run is counted rather than waved through.
+# * `failed` — for every unit that has NOT declared it. The fleet default is
+#   RAISE (`~/Development/CLAUDE.md`, "fail loud and fast"), and this is the
+#   recording-surface half of that rule: the raise happens INSIDE the manifest
+#   wrapper, so the record says `failed`, and it is caught OUTSIDE by the
+#   caller's existing sentinel handling, so no exit code moves. The manifest
+#   becomes honest without the pipeline's posture changing.
+#
+# Empty-is-valid is never the DEFAULT reading of an empty result, which is the
+# whole defect: today "the unit worked and had nothing to say" and "the unit
+# silently did nothing" render identically, and so a fix to the second is
+# unverifiable — success and silence look the same
+# (`engagement-protocol-policy` §5: detection blindness outranks the defects it
+# hides).
+
+#: The descriptor block a unit uses to declare that publishing nothing is a
+#: legitimate outcome for it. Absent — the default — means it is not.
+EMPTY_IS_VALID_FIELD = "empty_is_valid"
+
+#: The guard recorded on EVERY run that completed having published nothing,
+#: declared or not. Named for the audit §4.1 class it answers
+#: (`guards.success_without_output` in the descriptors): a unit reporting
+#: success without producing output. Recorded on the declared path too — a
+#: guard that records only when it fires is indistinguishable from a guard that
+#: stopped running (`principles.md` §2.7).
+EMPTY_PRODUCTION_GUARD = "data_success_without_output"
+
+
+class EmptyProduction(Exception):
+    """A producer unit completed having recorded no output at all.
+
+    Raised INSIDE the unit body, so the manifest is written with
+    ``status: failed`` and this as its reason; caught OUTSIDE the wrapper by the
+    same sentinel idiom ``_DegradedRun`` / :class:`EntryRunFailed` already use,
+    so the caller's return value and the process's exit-code contract are
+    unchanged. The record becomes honest; the pipeline's posture does not move.
+    """
+
+
+@dataclass(frozen=True)
+class EmptyDeclaration:
+    """A unit's declaration that publishing nothing is legitimate FOR IT.
+
+    Args:
+        reason: Which :data:`nousergon_lib.run_manifest.NOT_APPLICABLE_REASONS`
+            member an empty run of this unit IS. A member, not free text, for
+            the same reason the lib closes that list: a free-text reason is how
+            a unit quietly stops being graded.
+        note: Why zero output is legitimate here, in words. Required — a
+            declaration with no evidence behind it is a claim, and this one
+            switches off a RAISE.
+    """
+
+    reason: str
+    note: str
+
+
+class EmptyDeclarationError(ValueError):
+    """A descriptor's ``empty_is_valid`` block is malformed.
+
+    Loud rather than ignored: a declaration that fails to parse would otherwise
+    read as "not declared", which is the safe direction for THIS run and the
+    wrong direction for the operator, who wrote a declaration and would never
+    learn it does nothing.
+    """
+
+
+def empty_declaration(unit_raw: Mapping[str, Any]) -> EmptyDeclaration | None:
+    """The unit's empty-is-valid declaration, or ``None`` when it has none.
+
+    ``None`` is the default and the strict reading: a unit that has not
+    declared zero output legitimate RAISES on one.
+    """
+    block = unit_raw.get(EMPTY_IS_VALID_FIELD)
+    if block is None or block is False:
+        return None
+    if not isinstance(block, Mapping):
+        raise EmptyDeclarationError(
+            f"{EMPTY_IS_VALID_FIELD} must be a mapping with `reason` and `note`, got "
+            f"{type(block).__name__}. A bare truthy value would switch off a RAISE without "
+            "saying which not-applicable reason the empty run is, or why it is legitimate."
+        )
+    reason = str(block.get("reason") or "")
+    if reason not in run_manifest.NOT_APPLICABLE_REASONS:
+        raise EmptyDeclarationError(
+            f"{EMPTY_IS_VALID_FIELD}.reason {reason!r} is not one of "
+            f"{sorted(run_manifest.NOT_APPLICABLE_REASONS)}. The manifest of a declared-empty "
+            "run carries this member verbatim, so a reason outside the closed list would "
+            "write a record the schema refuses and nothing downstream counts."
+        )
+    note = " ".join(str(block.get("note") or "").split())
+    if not note:
+        raise EmptyDeclarationError(
+            f"{EMPTY_IS_VALID_FIELD}.note is empty. The note is the evidence for a declaration "
+            "that switches off the fleet's default RAISE; without it the board renders a claim."
+        )
+    return EmptyDeclaration(reason=reason, note=note)
+
+
+def empty_declaration_for(unit_id: str) -> EmptyDeclaration | None:
+    """:func:`empty_declaration` for the committed descriptor of ``unit_id``.
+
+    The producer call sites know their unit id, not their descriptor. Read from
+    ``registry.d/units/`` — the ONLY source of units (plan §4.1) — rather than a
+    second list here, which is the drift this module's own header argues
+    against. Cached: the descriptors are committed files that do not change
+    inside a run.
+    """
+    return _empty_declarations().get(unit_id)
+
+
+@functools.lru_cache(maxsize=1)
+def _empty_declarations() -> dict[str, EmptyDeclaration]:
+    from data_gate.descriptors import load_units  # local: keeps `yaml` off the CLI import path
+
+    out: dict[str, EmptyDeclaration] = {}
+    for unit in load_units():
+        declared = empty_declaration(unit.raw)
+        if declared is not None:
+            out[unit.unit_id] = declared
+    return out
+
+
+def is_empty_success(manifest: Mapping[str, Any]) -> bool:
+    """Did this manifest claim success while recording no output at all?
+
+    THE predicate, read by the producer (against the run context, before the
+    record is written) and by the board's ``run_record`` reader (against the
+    record, after). One predicate, both sides, so a producer that stops
+    enforcing it cannot also stop it being detected — the reader grades the
+    PROPERTY, never the producer's own classification of it.
+    """
+    if str(manifest.get("status")) != "ok":
+        return False
+    return not (manifest.get("outputs") or []) and not int(manifest.get("rows_out") or 0)
+
+
+def record_empty_production(run_ctx, unit_id: str, *, detail: str) -> None:
+    """Record the terminal state of a run that published nothing. NEVER returns.
+
+    Raises :class:`nousergon_lib.run_manifest.NotApplicable` when the unit
+    declares empty-is-valid, and :class:`EmptyProduction` when it does not.
+    Both write a manifest; neither writes ``ok``.
+    """
+    declared = empty_declaration_for(unit_id)
+    detail = " ".join(str(detail).split())
+    if declared is None:
+        run_ctx.record_guard(
+            EMPTY_PRODUCTION_GUARD,
+            # `enforce`: the verdict had a consequence on this run — it is what
+            # made the manifest `failed` rather than `ok`. The PROCESS posture
+            # is unchanged (the raise is caught outside the wrapper), but the
+            # record is not observe-only, and `mode` records consequence on the
+            # record, not on the exit code.
+            mode="enforce",
+            # `empty_fresh` is the `data_run_manifest.v1` GuardVerdict for
+            # "published an absent or empty artifact" — its own definition, and
+            # the closest true member. The enum is closed in `nousergon-lib`.
+            verdict="empty_fresh",
+            detail=(
+                f"{unit_id} completed having published NOTHING — no recorded output and "
+                f"rows_out 0 — and its descriptor declares no `{EMPTY_IS_VALID_FIELD}`. "
+                f"Recorded `failed`, never `ok`: a run that produced nothing and a run that "
+                f"produced its deliverable must not render identically. {detail}"
+            )[:2000],
+        )
+        raise EmptyProduction(
+            f"{unit_id} published nothing on this run and does not declare "
+            f"{EMPTY_IS_VALID_FIELD}: {detail}"
+        )
+    run_ctx.record_guard(
+        EMPTY_PRODUCTION_GUARD,
+        mode="observe",
+        verdict="not_applicable",
+        detail=(
+            f"{unit_id} published nothing on this run, which its descriptor DECLARES "
+            f"legitimate ({EMPTY_IS_VALID_FIELD}.reason={declared.reason}): {declared.note}. "
+            f"{detail}"
+        )[:2000],
+    )
+    raise run_manifest.NotApplicable(declared.reason, f"{unit_id}: {detail}")
+
+
 def unit_for(mode: str, phase: str) -> PhaseUnit:
     """The unit a ``_phase_collect`` phase is, or RAISE.
 
@@ -359,9 +571,23 @@ def manual_run(
     """
     from dates import default_run_date  # local: keeps `dates` off the import path of CLIs that do not need it
 
+    def _body(ctx):
+        value = fn(ctx)
+        if write and not ctx.outputs and not int(ctx.rows_out or 0):
+            # `alpha-engine-config-I11011`. A repair run that wrote nothing is
+            # the one this matters most for: it is invoked BECAUSE something is
+            # broken, and "ran, repaired nothing, reported ok" is the shape that
+            # closes an incident without fixing it. Deliberately NOT caught here
+            # — an operator running a repair by hand is the one caller who
+            # should see the raise.
+            record_empty_production(
+                ctx, unit_id, detail=f"manual/on-demand run of {unit_id} recorded no output"
+            )
+        return value
+
     return run_manifest.run_unit(
         unit_id,
-        fn,
+        _body,
         sink=manifest_sink(bucket) if write else None,
         trigger=resolve_trigger(trigger),
         trading_day=trading_day or default_run_date(),
@@ -543,16 +769,43 @@ def recorded_entry(
             except EntryRunFailed as failed:
                 return failed.value
 
+    captured: dict[str, Any] = {}
+
+    def _checked(ctx) -> Any:
+        captured["value"] = value = body(ctx)
+        if write and not ctx.outputs and not int(ctx.rows_out or 0):
+            # `alpha-engine-config-I11011`: `rows_out: 0` with an empty
+            # `outputs` array is not `ok`. Raised from INSIDE the wrapper so the
+            # manifest records the honest terminal state, and caught below so
+            # the entry point's own exit-code contract is exactly what it was —
+            # the same separation `EntryRunFailed` above makes, for the same
+            # reason.
+            record_empty_production(
+                ctx, unit_id, detail=f"{unit_id} completed without recording any output"
+            )
+        return value
+
     try:
-        return run_manifest.run_unit(
+        run_result = run_manifest.run_unit(
             unit_id,
-            body,
+            _checked,
             sink=manifest_sink(bucket, s3_client) if write else None,
             trigger=resolve_trigger(trigger),
             trading_day=trading_day,
             log_location=resolve_log_location(),
             code_sha=code_sha,
-        ).value
+        )
+        # `run_unit` does not re-raise `NotApplicable` — it records the declared
+        # non-production and returns `value=None`. The caller's contract is the
+        # body's own return value, so the captured one is returned rather than
+        # the wrapper's None.
+        if run_result.status == "not_applicable":
+            return captured.get("value")
+        return run_result.value
+    except EmptyProduction:
+        # The manifest is already durable with `status: failed` and the empty
+        # production as its reason.
+        return captured.get("value")
     except EntryRunFailed as failed:
         # The manifest is already written with `status: failed`. The caller
         # keeps the value it would have received before this wrapper existed.

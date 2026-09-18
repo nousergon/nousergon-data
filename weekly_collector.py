@@ -270,6 +270,28 @@ class _DegradedRun(RuntimeError):
         self.result = result
 
 
+class _PhaseNotApplicable(run_manifest.NotApplicable):
+    """A phase that RAN and correctly published nothing new this cycle.
+
+    `alpha-engine-config-I11011`. A same-date auto-skip used to return
+    ``{"status": "ok", "auto_skipped": True}`` and record a manifest reading
+    ``status: ok`` with ``rows_out: 0`` and ``outputs: []`` — a run that
+    published nothing, indistinguishable on every downstream surface from one
+    that published its deliverable. It is a ``not_applicable`` with the lib's
+    own closed-list reason for "a target date already published", and it is
+    COUNTED.
+
+    Carries the collector's result dict so :func:`_phase_collect` returns
+    exactly what it returned before the record existed — the manifest becomes
+    honest, the exit code does not move.
+    """
+
+    def __init__(self, name: str, result: dict, reason: str, detail: str) -> None:
+        super().__init__(reason, detail)
+        self.name = name
+        self.result = result
+
+
 class _PhaseNotRun(RuntimeError):
     """A phase that did not run at all, for a reason that is NOT a failure.
 
@@ -545,6 +567,7 @@ def _phase_collect(
     # wiring them per call site is how a unit ends up unobserved on the one day
     # someone adds a collector in a hurry.
     unit = run_units.unit_for(reg.data_mode, name)
+    captured: dict = {}
 
     def _body(run_ctx) -> dict:
         try:
@@ -564,6 +587,7 @@ def _phase_collect(
             # (`alpha-engine-config-I10827`).
             _record_collector_guards(run_ctx, ce.result)
             raise
+        captured["result"] = result
         _record_phase_lineage(
             run_ctx, unit, name, result, artifact_key, bucket or reg.bucket, reg,
             extra_outputs=extra_outputs,
@@ -574,7 +598,26 @@ def _phase_collect(
         run_result = run_manifest.run_unit(
             unit.unit_id, _body, **_run_manifest_context(reg, unit)
         )
+        # `run_unit` does not re-raise `NotApplicable` — it records the declared
+        # non-production and returns `value=None`. The caller's contract is the
+        # collector's own result dict, so the captured one is returned rather
+        # than the wrapper's None (the same restoration `_run_whole_mode_unit`
+        # makes, for the same reason).
+        if run_result.status == "not_applicable":
+            return captured["result"]
         return run_result.value
+    except run_units.EmptyProduction:
+        # `alpha-engine-config-I11011`. The manifest is already durable with
+        # `status: failed` and the empty production as its reason. The PROCESS
+        # posture is unchanged: the collector's own result dict is returned, so
+        # a cache-hit or a genuinely empty phase moves no exit code — only the
+        # record it leaves behind.
+        return captured["result"]
+    except _PhaseNotApplicable:
+        # Unreachable in practice: `run_unit` catches `NotApplicable` itself.
+        # Kept so a future change to that contract cannot turn a declared
+        # non-production into an unhandled traceback.
+        return captured["result"]
     except _DegradedRun as dr:
         # The manifest is already durable with `status: failed` and the defect
         # as its reason. The PROCESS posture is unchanged: the collector's own
@@ -783,6 +826,44 @@ def _record_phase_lineage(
     # claim.
     if result.get("status") == "degraded":
         raise _DegradedRun(name, result)
+
+    # `alpha-engine-config-I11011`: a phase that completed having published
+    # NOTHING does not record `ok`. Two shapes reach here, and both are raised
+    # from inside the manifest wrapper and caught outside it, so the record
+    # moves and the exit code does not:
+    #
+    # * a same-date auto-skip, whose output was already published earlier today
+    #   — `not_applicable` with the closed-list reason the lib defines as "a
+    #   target date already published", never `ok`. It is COUNTED, which is the
+    #   property that matters: a unit answering not-applicable every cycle is a
+    #   unit that has stopped working, and the board can see that only because
+    #   the non-run left a record that says what it was.
+    # * a run that was not skipped and still recorded no output at all — the
+    #   ten units of the 2026-09-15 shadow run. `failed` unless the descriptor
+    #   declares empty-is-valid.
+    #
+    # A DRY run is exempt: it wrote nothing because it was asked to write
+    # nothing, and `reg is None` already keeps a dry run from writing a manifest
+    # at all on the paths that have one.
+    if dry:
+        return
+    if auto_skipped:
+        raise _PhaseNotApplicable(
+            name,
+            result,
+            run_units.NOT_RUN_NO_NEW_DATA_DECLARED,
+            f"{unit.unit_id} auto-skipped: its output for this date was already published "
+            f"({result.get('skip_reason')})",
+        )
+    if not run_ctx.outputs and not int(run_ctx.rows_out or 0):
+        run_units.record_empty_production(
+            run_ctx,
+            unit.unit_id,
+            detail=(
+                f"phase {name!r} reported status={result.get('status')!r} and recorded no "
+                f"published output"
+            ),
+        )
 
 
 def _record_collector_guards(run_ctx, result: dict) -> None:
@@ -998,6 +1079,17 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
             )
             raise run_manifest.NotApplicable(run_units.NOT_RUN_NO_NEW_DATA_DECLARED, detail)
         _record_mode_lineage(run_ctx, mode, unit_id, result or {})
+        # `alpha-engine-config-I11011`: same rule as `_phase_collect`, at the
+        # other dispatch. A whole-mode unit that finished having recorded no
+        # output at all — including one whose declared row source reported no
+        # number, so nothing could be recorded — does not file `ok`. Raised
+        # inside the wrapper, caught below, exit code unchanged.
+        if not run_ctx.outputs and not int(run_ctx.rows_out or 0):
+            run_units.record_empty_production(
+                run_ctx,
+                unit_id,
+                detail=f"mode {mode!r} completed and recorded no published output",
+            )
         return result
 
     try:
@@ -1016,6 +1108,11 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         if run_result.status == "not_applicable":
             return captured["result"]
         return run_result.value
+    except run_units.EmptyProduction:
+        # `alpha-engine-config-I11011`. The manifest is durable with
+        # `status: failed` and the empty production as its reason; the caller
+        # keeps the result dict it would have received before this existed.
+        return captured["result"]
     except _CollectorError:
         # The manifest is already written with `status: failed`; the caller
         # keeps the result dict it would have received before this wrapper
