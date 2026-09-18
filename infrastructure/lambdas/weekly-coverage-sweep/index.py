@@ -51,6 +51,19 @@ last two are the ones that must not be collapsed into either of the first:
   returns it as its own outcome so the SF can page for it, because a sweep
   that never ran cannot page for itself.
 
+**What it also answers now — ``alpha-engine-config-I9693``.** The cycle verdict
+says whether the WEEK's work happened. It cannot say whether THIS execution did
+any of it, and the two diverge on exactly the run that matters: measured live
+2026-09-18, ``watch-rerun-2026-09-11-1`` entered ZERO of the sixteen declared
+spine stages, reported ``SUCCEEDED``, and is indistinguishable from a four-hour
+full run in ``list-executions``. Five consecutive Saturdays were "recovered"
+that way. So this handler also returns ``observer_did_work`` — a fact it had
+already computed to build the cycle — and the state machine's
+``CheckExecutionDidWork`` Choice routes an explicit ``false`` to the
+``VacuousRun`` Fail terminal. ``None`` means unestablished and is never
+expressible as ``false``: an unknown is not rendered green, and it is not
+manufactured into a red either.
+
 It never raises: this state sits DOWNSTREAM of the pipeline's real success
 terminal, and an observe-only tail that fails a completed run is a worse defect
 than the one it was added to detect (``sf-pipeline-policy.md`` §2.1 blast
@@ -155,6 +168,81 @@ def _declared_skip_stage_spine(
             pipeline, run_date, type(exc).__name__, exc,
         )
         return None, ()
+
+
+#: What ``observer_did_work`` means when it is absent from this handler's
+#: return value: the observer's contribution could not be established. It is
+#: NOT ``false``. The SF's ``CheckExecutionDidWork`` Choice fires only on an
+#: explicit ``false``, so an unknown never manufactures a ``VacuousRun``
+#: terminal out of a sweep that could not read the cycle
+#: (``principles.md`` §2.7 cuts both ways — an unmeasured run is not green,
+#: and it is not red either; the ``unavailable`` outcome above is the surface
+#: that reports it).
+OBSERVER_WORK_UNKNOWN = None
+
+
+def _observer_contribution(sweep, observer_execution_arn: str) -> dict:
+    """Did THIS execution enter any declared spine stage? — ``alpha-engine-config-I9693``.
+
+    The cycle verdict answers *did the WEEK's work happen*. It cannot answer
+    *did THIS execution do any of it*, and the two diverge on exactly the run
+    that matters: measured live 2026-09-18, ``watch-rerun-2026-09-11-1``
+    entered **zero** of the sixteen declared spine stages (26 ``skip_*`` flags
+    true), reported ``SUCCEEDED``, and is indistinguishable from a full run in
+    ``list-executions``. Five consecutive Saturdays were "recovered" this way.
+
+    ``sweep.cycle`` already carries the per-execution breakdown — the observer
+    row is flagged ``is_observer`` and its ``stages_entered`` is the declared
+    spine stages it entered, computed by
+    ``nousergon_lib.pipeline_status`` against ``PIPELINE_STAGE_ORDER``. So this
+    derives nothing new and calls nothing new: it SURFACES a fact the sweep
+    already established, where the state machine's Choice can read it.
+
+    Returns a dict always carrying ``did_work`` — ``True``/``False`` when the
+    observer row was found, ``None`` when it was not. ``None`` is a refusal,
+    never a default: see :data:`OBSERVER_WORK_UNKNOWN`.
+    """
+    cycle = getattr(sweep, "cycle", None)
+    if cycle is None:
+        return {
+            "did_work": OBSERVER_WORK_UNKNOWN,
+            "reason": "the cycle could not be read, so this execution's own "
+                      "contribution to it is unestablished",
+        }
+    rows = list(getattr(cycle, "executions", ()) or ())
+    row = next((r for r in rows if getattr(r, "is_observer", False)), None)
+    if row is None and observer_execution_arn:
+        row = next(
+            (r for r in rows
+             if getattr(r, "execution_arn", "") == observer_execution_arn),
+            None,
+        )
+    if row is None:
+        return {
+            "did_work": OBSERVER_WORK_UNKNOWN,
+            "reason": "this execution is not among the cycle's contributing "
+                      f"executions ({len(rows)} read) — its own contribution "
+                      "is unestablished",
+            "execution_arn": observer_execution_arn,
+        }
+    entered = tuple(getattr(row, "stages_entered", ()) or ())
+    spine = tuple(getattr(cycle, "stage_spine", ()) or ())
+    return {
+        "did_work": bool(entered),
+        "execution_arn": getattr(row, "execution_arn", "") or observer_execution_arn,
+        "pipeline_role": getattr(row, "pipeline_role", None),
+        "stages_entered": list(entered),
+        "stages_entered_count": len(entered),
+        "spine_size": len(spine),
+        "reason": (
+            f"this execution entered {len(entered)} of {len(spine)} declared "
+            "spine stages"
+            if entered else
+            "this execution entered NONE of the "
+            f"{len(spine)} declared spine stages — it dispatched no work, so "
+            "its terminal must not read as a run that did"
+        ),
+    }
 
 
 def _outcome_for(sweep) -> str:
@@ -264,12 +352,15 @@ def handler(event, _context):
         # healthy" defect (principles.md §2.7) the whole sweep exists to
         # detect. What ``dry_run`` withholds is the WRITES and the page, never
         # the verdict.
+        observer = _observer_contribution(sweep, observer_execution_arn)
         return {
             "outcome": _outcome_for(sweep),
             "dry_run": True,
             "run_date": run_date,
             "partitions_read": list(sweep.partitions_read),
             "explanation": explanation,
+            "observer": observer,
+            "observer_did_work": observer["did_work"],
         }
 
     published = False
@@ -310,12 +401,16 @@ def handler(event, _context):
         logger.exception("coverage sweep ran but could not publish for %s", run_date)
         write_error = f"{type(exc).__name__}: {exc}"
 
+    observer = _observer_contribution(sweep, observer_execution_arn)
+
     if write_error is not None:
         return {
             "outcome": OUTCOME_UNAVAILABLE,
             "reason": f"the sweep ran but could not publish its result: {write_error}",
             "run_date": run_date,
             "explanation": explanation,
+            "observer": observer,
+            "observer_did_work": observer["did_work"],
         }
 
     if sweep.should_alert:
@@ -333,9 +428,22 @@ def handler(event, _context):
             # The outcome below still says findings, and the SF records it.
             logger.exception("coverage sweep finding could not be paged")
 
+    if observer["did_work"] is False:
+        # Fail loud on the way out: the terminal the SF is about to take is a
+        # Fail, and the log line that explains why belongs next to it.
+        logger.error(
+            "VACUOUS RUN: %s %s — %s (alpha-engine-config-I9693). The SF's "
+            "CheckExecutionDidWork Choice routes this execution to the "
+            "VacuousRun Fail terminal so list-executions cannot show it as a "
+            "run that did work.",
+            PIPELINE, run_date, observer["reason"],
+        )
+
     return {
         "outcome": _outcome_for(sweep),
         "run_date": run_date,
+        "observer": observer,
+        "observer_did_work": observer["did_work"],
         "coverage_established": sweep.coverage_established,
         "deferral_reason": sweep.deferral_reason,
         "partitions_read": list(sweep.partitions_read),
