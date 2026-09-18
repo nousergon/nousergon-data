@@ -142,11 +142,47 @@ def test_main_writes_the_metric_document(monkeypatch, capsys):
 
     rc = m.main(["--cutover-utc", cutover])
     assert rc == 0
-    assert len(s3.puts) == 1
+    # Two PUTs: the metric document, then the run record (alpha-engine-config-I11058).
+    assert len(s3.puts) == 2
     body = json.loads(s3.puts[0]["Body"])
     assert body["executions_since_cutover"] == 1
     assert s3.puts[0]["Bucket"] == m.DEFAULT_BUCKET
     assert s3.puts[0]["Key"] == m.DEFAULT_KEY
+
+    run_record = json.loads(s3.puts[1]["Body"])
+    assert s3.puts[1]["Key"].startswith("data_collection/runs/v1_data_stage/")
+    assert run_record["producer"] == "v1_data_stage"
+    assert run_record["status"] == "ok"
+    assert run_record["error"] is None
+    assert run_record["detail"]["executions_since_cutover"] == 1
+
+
+def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):
+    class _BrokenSFN:
+        def get_paginator(self, name):
+            raise RuntimeError("boom: sfn unreachable")
+
+    s3 = _FakeS3()
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None):
+            return {"stepfunctions": _BrokenSFN(), "s3": s3}[name]
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+
+    try:
+        m.main(["--cutover-utc", "2026-09-01T00:00:00Z"])
+    except RuntimeError as exc:
+        assert "boom" in str(exc)
+    else:
+        raise AssertionError("expected the underlying RuntimeError to propagate")
+
+    assert len(s3.puts) == 1  # only the error run record — never the metric document
+    run_record = json.loads(s3.puts[0]["Body"])
+    assert s3.puts[0]["Key"].startswith("data_collection/runs/v1_data_stage/")
+    assert run_record["status"] == "error"
+    assert "boom" in run_record["error"]
 
 
 def test_main_no_write_skips_the_put(monkeypatch):
