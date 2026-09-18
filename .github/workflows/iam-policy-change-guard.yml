@@ -90,12 +90,16 @@ jobs:
       # to unavailable rather than failing the guard outright: the two original
       # branches still work, so a credentials blip must not block a PR that
       # satisfies them.
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials (read-only IAM drift-check role)
         id: aws
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c  # v6.2.3
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-iam-drift-check
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-iam-drift-check
           aws-region: us-east-1
 
       - name: Check iam-policy.json changes have deploy.sh or gate:operator
