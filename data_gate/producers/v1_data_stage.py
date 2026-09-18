@@ -191,15 +191,31 @@ def main(argv: list[str] | None = None) -> int:
 
     import boto3  # noqa: PLC0415 - deferred so import stays light for tests
 
+    from data_gate.producers._run_record import write_run_record  # noqa: PLC0415
+
     sfn = boto3.client("stepfunctions", region_name=args.region)
     s3 = boto3.client("s3", region_name=args.region)
 
-    cutover = _parse_cutover(args.cutover_utc)
-    count = count_executions_since_cutover(
-        sfn, state_machine_arn=args.state_machine_arn, cutover=cutover, scan_cap=args.scan_cap
-    )
-    metric = build_metric(cutover_utc=args.cutover_utc, count=count)
-    print(json.dumps(metric, indent=2, sort_keys=True))
+    started_at = dt.datetime.now(dt.timezone.utc)
+    try:
+        cutover = _parse_cutover(args.cutover_utc)
+        count = count_executions_since_cutover(
+            sfn, state_machine_arn=args.state_machine_arn, cutover=cutover, scan_cap=args.scan_cap
+        )
+        metric = build_metric(cutover_utc=args.cutover_utc, count=count)
+        print(json.dumps(metric, indent=2, sort_keys=True))
+    except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
+        if not args.no_write:
+            write_run_record(
+                s3,
+                bucket=args.bucket,
+                producer="v1_data_stage",
+                status="error",
+                started_at=started_at,
+                finished_at=dt.datetime.now(dt.timezone.utc),
+                error=str(exc),
+            )
+        raise
 
     if not args.no_write:
         s3.put_object(
@@ -209,6 +225,20 @@ def main(argv: list[str] | None = None) -> int:
             ContentType="application/json",
         )
         print(f"WROTE s3://{args.bucket}/{args.key}")
+
+        write_run_record(
+            s3,
+            bucket=args.bucket,
+            producer="v1_data_stage",
+            status="ok",
+            started_at=started_at,
+            finished_at=dt.datetime.now(dt.timezone.utc),
+            detail={
+                "metric_key": args.key,
+                "executions_since_cutover": count.executions_since_cutover,
+                "executions_scanned": count.executions_scanned,
+            },
+        )
 
     return 0
 
