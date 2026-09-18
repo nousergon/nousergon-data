@@ -29,6 +29,8 @@ Centralized data collection — price universe, macro, alternative data, feature
 | Short interest (FINRA, bi-monthly) | [`collectors/short_interest.py`](collectors/short_interest.py) |
 | Fundamentals | [`collectors/fundamentals.py`](collectors/fundamentals.py) |
 | Signal-returns collector | [`collectors/signal_returns.py`](collectors/signal_returns.py) |
+| Phase-1 exit metric: v1 SF data-stage executions since cutover | [`data_gate/producers/v1_data_stage.py`](data_gate/producers/v1_data_stage.py) |
+| Phase-2 exit metric: executor writes into collection prefixes | [`data_gate/producers/executor_profile.py`](data_gate/producers/executor_profile.py) |
 | Engineered feature store | [`features/feature_engineer.py`](features/feature_engineer.py) |
 | Feature registry | [`features/registry.py`](features/registry.py) |
 | Feature reader / writer | [`features/reader.py`](features/reader.py), [`features/writer.py`](features/writer.py) |
@@ -61,6 +63,8 @@ Centralized data collection — price universe, macro, alternative data, feature
 | Weekly market data bundle | `s3://alpha-engine-research/market_data/weekly/{date}/` |
 | Phase 1 completion marker | `s3://alpha-engine-research/health/data_phase1.json` |
 | Universe returns table | `s3://alpha-engine-research/research.db` (`universe_returns`) |
+| Phase 1 exit: v1 SF data-stage executions since cutover | `s3://alpha-engine-research/data_collection/metrics/v1_data_stage/executions_since_cutover.json` |
+| Phase 2 exit: executor writes into collection prefixes | `s3://alpha-engine-research/data_collection/metrics/executor_profile/collection_writes/latest.json` |
 | RAG corpus | Neon pgvector — `rag.documents`, `rag.chunks` (HNSW) |
 
 ## Run modes

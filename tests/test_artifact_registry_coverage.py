@@ -69,6 +69,26 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
     # the `data_collection/gates/` grandfathered prefix (per-date readings).
     "data_gate/store.py": 1,
+    # alpha-engine-config-I11035 / -I11036 — the two phase-exit metric
+    # producers, one PUT each:
+    #   metrics/v1_data_stage/executions_since_cutover.json
+    #   metrics/executor_profile/collection_writes/latest.json
+    # both under s3://alpha-engine-research/data_collection/, read by
+    # `data.phase1.v1_data_stage_quiet` and
+    # `data.phase2.executor_collection_writes_zero`.
+    #
+    # NO ARTIFACT_REGISTRY.yaml row yet, and that is deliberate rather than an
+    # omission: both are CLI-only today (`python -m data_gate.producers.*`) and
+    # NOTHING SCHEDULES THEM. A freshness row declares a cadence and an SLA; a
+    # row naming a cadence no producer runs at would page on day one for an
+    # artifact that was never due. The registry entry belongs with the
+    # schedule, and both are tracked together — see the follow-up issue on
+    # alpha-engine-config. Pinned here first so this repo's guard is honest
+    # about the new PUT sites either way, the same posture
+    # `validators/expectations.py` and `scripts/fault_injection_run.py` above
+    # already take.
+    "data_gate/producers/v1_data_stage.py": 1,
+    "data_gate/producers/executor_profile.py": 1,
     # alpha-engine-config-I10780 (data-collector plan P-13) — the EOD-spine
     # cardinality guard's single daily reading,
     # s3://alpha-engine-research/data_collection/metrics/eod_completeness/{trading_day}.json
