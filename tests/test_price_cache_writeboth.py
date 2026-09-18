@@ -209,7 +209,7 @@ def test_prices_refresh_uploads_to_both_prefixes(monkeypatch, tmp_path):
             recorded.append((bucket, key))
 
     s3 = _RecordingS3()
-    refreshed, failed = prices._refresh_stale(
+    refreshed, failed, written = prices._refresh_stale(
         s3=s3,
         bucket="test-bucket",
         s3_prefix=PRICE_CACHE_LEGACY_PREFIX,
