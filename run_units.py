@@ -151,12 +151,20 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("phase1", "signal_returns"): PhaseUnit("D09", "rows_written", "phase1"),
     ("phase1", "fundamentals"): PhaseUnit("D10", "n_ok", "phase1"),
     ("phase1", "metron_valuation_medians"): PhaseUnit("D11", "covered", "phase1"),
-    # features/compute.py reports no row count on its success path; the guard
-    # reads UNMEASURABLE for D12/D31 rather than 0. Closing that needs
-    # `compute_and_write` to return the snapshot's row count —
-    # `alpha-engine-config-I10810` deliverable 2, deferred because `features/`
-    # is owned by a concurrent change set.
-    ("phase1", "features"): PhaseUnit("D12", None, "phase1"),
+    # features/compute.py::compute_and_write already returns `tickers_computed`
+    # (n_ok — the row count of the snapshot actually written; see the `result`
+    # dict at the end of that function) on every non-error path. `alpha-engine-
+    # config-I10810` deliverable 2 / I10785: this closes the D12/D31
+    # UNMEASURABLE `data_empty_fresh` verdict — rejected tickers are reported
+    # separately under `tickers_skipped` (empty featured_df) and
+    # `tickers_errored` (compute raised), so they are declared here too rather
+    # than left silent the way `rows_out: 0` alone would be.
+    ("phase1", "features"): PhaseUnit(
+        "D12",
+        "tickers_computed",
+        "phase1",
+        rejected_keys=(("tickers_skipped", "empty_features"), ("tickers_errored", "compute_error")),
+    ),
     # builders/backfill.py DOES report one (`tickers_written` = n_ok), with the
     # two counts of what it did not write alongside it.
     ("phase1", "arcticdb"): PhaseUnit(
@@ -181,7 +189,14 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("daily", "metron_security_performance_data"): PhaseUnit("D28", "performance", "daily"),
     ("daily", "metron_analyst_data"): PhaseUnit("D29", "analyst", "daily"),
     ("daily", "metron_sentiment_data"): PhaseUnit("D30", "sentiment", "daily"),
-    ("daily", "features"): PhaseUnit("D31", None, "daily"),
+    # Same producer as D12 above (features/compute.py::compute_and_write) —
+    # `tickers_computed` closes the D31 UNMEASURABLE verdict the same way.
+    ("daily", "features"): PhaseUnit(
+        "D31",
+        "tickers_computed",
+        "daily",
+        rejected_keys=(("tickers_skipped", "empty_features"), ("tickers_errored", "compute_error")),
+    ),
     # builders/daily_append.py reports `tickers_published` (n_ok + n_partial —
     # every row actually written to ArcticDB this run, whether fully-featured
     # or carrying >=1 NaN feature) and names every class of ticker it did NOT
