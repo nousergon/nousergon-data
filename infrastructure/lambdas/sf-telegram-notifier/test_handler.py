@@ -753,3 +753,59 @@ class TestEodArtifactVerification:
         text = _telegram_mod.send_message.call_args.args[0]
         assert "Artifacts:" not in text
         assert "ARTIFACT(S) MISSING" not in text
+
+
+class TestVacuousRunMapping:
+    """alpha-engine-config-I9693: the weekly SF's deliberate
+    ``Error: "VacuousRun"`` Fail terminal.
+
+    An execution that entered none of the declared spine stages now FAILS
+    rather than reporting SUCCEEDED. Rendering that honest terminal as a
+    generic crash would trade one misreading for another — the operator needs
+    to know the run did NO WORK, not that it broke. Same doctrine as
+    ``DegradedRun`` one level up, keyed off the same ``Error`` field the
+    definition stamps.
+    """
+
+    def test_vacuous_renders_its_own_label_and_emoji(self, reset_send_message):
+        reset_send_message.describe_execution.return_value = {
+            "input": '{"run_date": "2026-09-11", "pipeline_role": "watch-rerun"}',
+            "error": "VacuousRun",
+            "cause": "Weekly freshness pipeline VACUOUS RUN - this execution "
+                     "entered none of the declared spine stages",
+        }
+        result = index.handler(_event("FAILED"), None)
+        text = _telegram_mod.send_message.call_args.args[0]
+
+        assert "— NO WORK DONE" in text
+        assert "— FAILED*" not in text
+        assert "— DEGRADED" not in text
+        assert index._VACUOUS_EMOJI in text
+        # The RAW AWS status is unchanged in the return contract — only the
+        # rendered text distinguishes it.
+        assert result["status"] == "FAILED"
+
+    def test_a_genuine_crash_is_still_a_crash(self, reset_send_message):
+        reset_send_message.describe_execution.return_value = {
+            "input": '{"run_date": "2026-09-11"}',
+            "error": "PipelineFailure",
+            "cause": "Pipeline step failed",
+        }
+        index.handler(_event("FAILED"), None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "NO WORK DONE" not in text
+
+    def test_the_three_renderings_are_mutually_distinguishable(self):
+        """A shared emoji would put the whole point back where it started."""
+        assert len({
+            index._VACUOUS_EMOJI,
+            index._DEGRADED_EMOJI,
+            index._STATUS_EMOJI["FAILED"],
+            index._STATUS_EMOJI["SUCCEEDED"],
+        }) == 4
+
+    def test_the_error_literal_is_matched_exactly(self):
+        assert index._is_vacuous_run({"error": "VacuousRun"}) is True
+        assert index._is_vacuous_run({"error": "DegradedRun"}) is False
+        assert index._is_vacuous_run({"error": ""}) is False
+        assert index._is_vacuous_run(None) is False

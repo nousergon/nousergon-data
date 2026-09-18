@@ -144,14 +144,32 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
 
 
 def assert_observe_only_tail(states: dict, entry: str) -> None:
-    """Every path out of `entry` reaches a Succeed, and none reaches a Fail.
+    """Every path out of `entry` reaches a Succeed, and none reaches a Fail —
+    with ONE declared exception, named below.
 
     An observe-only tail sits downstream of a pipeline's real success terminal.
     It may page, it may write, it may find nothing — but it may not turn a
     completed run into a failed one (sf-pipeline-policy §2.1 blast radius). A
     reachability walk rather than a hand-listed set of terminals, so a state
     added to the tail later is covered by this assertion existing.
+
+    **The exception: ``VacuousRun`` (alpha-engine-config-I9693).** The invariant
+    above is about a run that ALREADY COMPLETED. ``VacuousRun`` fails only a run
+    that did not: an execution that entered none of the pipeline's declared
+    spine stages. Measured live 2026-09-18, ``watch-rerun-2026-09-11-1`` entered
+    ZERO of the sixteen, reported ``SUCCEEDED``, and was indistinguishable from
+    a four-hour full run in ``list-executions``; five consecutive Saturdays were
+    "recovered" that way. It sits in the tail and nowhere else because
+    ``alpha-engine-config-I8186`` forbids the obvious alternative — making
+    ``WriteCompletionMarker`` unreachable from recovery reruns — so the honest
+    terminal has to come AFTER the marker is written and after the sweep has
+    augmented it. The carve-out is kept narrow on purpose: exactly one Fail
+    state, reached from exactly one Choice, on a branch that requires an
+    explicit boolean ``false``. Any OTHER Fail in this tail is still the defect
+    the invariant was written for.
     """
+    declared_fail = "VacuousRun"
+    declared_fail_gate = "CheckExecutionDidWork"
     seen: set[str] = set()
     stack = [entry]
     terminals: set[str] = set()
@@ -161,10 +179,24 @@ def assert_observe_only_tail(states: dict, entry: str) -> None:
             continue
         seen.add(name)
         st = states[name]
+        if name == declared_fail:
+            # The one declared exception. Pinned rather than waved through: its
+            # gate must still be the vacuity Choice, and that Choice must still
+            # fire only on an explicit boolean false.
+            gate = states[declared_fail_gate]
+            assert gate["Type"] == "Choice"
+            rules = [r for r in gate["Choices"] if r["Next"] == declared_fail]
+            assert len(rules) == 1
+            conjuncts = rules[0]["And"]
+            assert any(c.get("BooleanEquals") is False for c in conjuncts)
+            assert any(c.get("IsPresent") is True for c in conjuncts)
+            continue
         assert st["Type"] != "Fail", (
             f"{name} is reachable from the observe-only tail at {entry} and is a "
             "Fail state — a tail downstream of the success terminal must never "
-            "fail a run that already completed"
+            "fail a run that already completed. The ONE declared exception is "
+            f"{declared_fail!r} (alpha-engine-config-I9693); see this helper's "
+            "docstring for why it is narrow and why it belongs here"
         )
         nexts = []
         if "Next" in st:
