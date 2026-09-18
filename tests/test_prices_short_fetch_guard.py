@@ -67,7 +67,7 @@ def test_short_fetch_does_not_overwrite_a_full_price_cache(monkeypatch):
     s3 = _FakeS3({"reference/price_cache/VIX3M.parquet": _parquet_bytes(full)})
     _patch_download(monkeypatch, _ohlcv(1))
 
-    refreshed, failed = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50, trading_day="2026-09-14",
     )
 
@@ -80,7 +80,7 @@ def test_full_fetch_still_uploads(monkeypatch):
     s3 = _FakeS3({"reference/price_cache/VIX.parquet": _parquet_bytes(_ohlcv(2500))})
     _patch_download(monkeypatch, _ohlcv(2515))
 
-    refreshed, failed = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["VIX"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
@@ -93,7 +93,7 @@ def test_short_fetch_for_a_brand_new_ticker_is_allowed(monkeypatch):
     s3 = _FakeS3({})
     _patch_download(monkeypatch, _ohlcv(26))
 
-    refreshed, failed = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["NEWCO"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1

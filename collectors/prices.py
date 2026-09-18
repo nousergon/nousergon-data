@@ -142,7 +142,7 @@ def collect(
     # trading day, never on wall-clock time — a ``--date D`` run executed on
     # D+1 must not fetch (or publish) the partial D+1 session.
     trading_day = str(reference_date) if reference_date is not None else default_run_date()
-    refreshed, failed_tickers = _refresh_stale(
+    refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
         trading_day=trading_day,
     )
@@ -164,10 +164,31 @@ def collect(
         "failed": len(failed_tickers),
         "failed_tickers": failed_tickers[:20],
         "total": len(all_tickers),
+        # alpha-engine-config-I11026: the per-ticker keys + row counts this
+        # run actually uploaded — never a copy of `stale` (attempted, not
+        # written), never the batch's aggregate `refreshed` count standing in
+        # for every key's row count. `written_keys()` below turns this into
+        # the manifest's `extra_outputs` callable form.
+        "written": dict(written),
     }
     if validation:
         result["validation"] = validation
     return result
+
+
+def written_keys(result: dict, s3_prefix: str = "predictor/price_cache/") -> dict[str, int]:
+    """``{s3_key: row_count}`` for every ticker parquet ``collect()`` actually
+    uploaded this run, addressed under the SAME write prefix(es) the upload
+    itself used (``price_cache_write_prefixes`` — post-cutover, exactly one:
+    ``reference/price_cache/``). Reads only ``result["written"]`` (the record
+    of what was written), never the requested ticker population, so a ticker
+    that failed or was never stale never appears here
+    (alpha-engine-config-I11026)."""
+    out: dict[str, int] = {}
+    for ticker, rows in (result.get("written") or {}).items():
+        for prefix in price_cache_write_prefixes(s3_prefix):
+            out[f"{prefix}{ticker}.parquet"] = int(rows or 0)
+    return out
 
 
 def _reject_caret_tickers(tickers: list[str], context: str) -> list[str]:
@@ -389,7 +410,7 @@ def _refresh_stale(
     batch_size: int,
     *,
     trading_day: "str | date",
-) -> tuple[int, list[str]]:
+) -> tuple[int, list[str], list[tuple[str, int]]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
 
     ``trading_day`` (required, alpha-engine-config-I10893) bounds every fetch
@@ -405,6 +426,15 @@ def _refresh_stale(
     variant (the 2026-06-19 PCAR recurrence of the config#1029 PCKM storm).
     The replacement recording surface is the aggregated ``log_yf_coverage``
     record emitted before returning.
+
+    Returns ``(refreshed, failed_tickers, written)`` — ``written`` is the
+    ``[(ticker, row_count)]`` list for every ticker actually uploaded this
+    run, appended ONLY after ``s3.upload_file`` succeeds (never a copy of
+    ``stale``, never a count of attempts). ``alpha-engine-config-I11026``:
+    the per-symbol key set D03 publishes is knowable only from what this run
+    wrote, so the caller (``collect()``) hands this straight to the run
+    manifest via the ``extra_outputs`` callable form rather than the
+    descriptor's declared (and here nonexistent) fixed key list.
     """
     import time
 
@@ -416,6 +446,7 @@ def _refresh_stale(
 
     refreshed = 0
     failed_tickers: list[str] = []
+    written: list[tuple[str, int]] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -546,6 +577,7 @@ def _refresh_stale(
                     for prefix in price_cache_write_prefixes(s3_prefix):
                         s3.upload_file(str(parquet_path), bucket, f"{prefix}{ticker}.parquet")
                     refreshed += 1
+                    written.append((ticker, len(new_df)))
 
                 except FutureBarError:
                     raise  # run-level contract violation, never a per-ticker miss
@@ -578,4 +610,4 @@ def _refresh_stale(
              "misses retry next refresh; persistent misses are delisting/rename "
              "candidates for universe pruning",
     )
-    return refreshed, failed_tickers
+    return refreshed, failed_tickers, written
