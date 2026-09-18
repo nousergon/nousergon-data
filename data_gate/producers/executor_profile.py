@@ -272,23 +272,39 @@ def main(argv: list[str] | None = None) -> int:
 
     import boto3  # noqa: PLC0415 - deferred so import stays light for tests
 
+    from data_gate.producers._run_record import write_run_record  # noqa: PLC0415
+
     s3 = boto3.client("s3", region_name=args.region)
     archive_bucket, archive_prefix = _resolve_archive(args.archive)
 
-    end = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)  # yesterday: today's archive is incomplete
-    start = end - dt.timedelta(days=args.days - 1)
+    started_at = dt.datetime.now(dt.timezone.utc)
+    try:
+        end = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)  # yesterday: today's archive is incomplete
+        start = end - dt.timedelta(days=args.days - 1)
 
-    count = count_collection_writes(
-        s3,
-        archive_bucket=archive_bucket,
-        archive_prefix=archive_prefix,
-        region=args.region,
-        object_bucket=args.object_bucket,
-        start=start,
-        end=end,
-    )
-    metric = build_metric(count=count)
-    print(json.dumps(metric, indent=2, sort_keys=True))
+        count = count_collection_writes(
+            s3,
+            archive_bucket=archive_bucket,
+            archive_prefix=archive_prefix,
+            region=args.region,
+            object_bucket=args.object_bucket,
+            start=start,
+            end=end,
+        )
+        metric = build_metric(count=count)
+        print(json.dumps(metric, indent=2, sort_keys=True))
+    except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
+        if not args.no_write:
+            write_run_record(
+                s3,
+                bucket=args.bucket,
+                producer="executor_profile",
+                status="error",
+                started_at=started_at,
+                finished_at=dt.datetime.now(dt.timezone.utc),
+                error=str(exc),
+            )
+        raise
 
     if not args.no_write:
         s3.put_object(
@@ -298,6 +314,21 @@ def main(argv: list[str] | None = None) -> int:
             ContentType="application/json",
         )
         print(f"WROTE s3://{args.bucket}/{args.key}")
+
+        write_run_record(
+            s3,
+            bucket=args.bucket,
+            producer="executor_profile",
+            status="ok",
+            started_at=started_at,
+            finished_at=dt.datetime.now(dt.timezone.utc),
+            detail={
+                "metric_key": args.key,
+                "collection_writes": count.collection_writes,
+                "days_covered": count.days_covered,
+                "days_requested": count.days_requested,
+            },
+        )
 
     return 0
 
