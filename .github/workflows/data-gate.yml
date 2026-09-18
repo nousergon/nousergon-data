@@ -142,6 +142,15 @@ permissions:
   id-token: write
   contents: read
 
+env:
+  # Repository VARIABLES, not literals: this repo is public and its run logs
+  # are public (alpha-engine-config-I10973). GitHub masks SECRETS, not
+  # repository variables — the `::add-mask::` step below is what keeps the
+  # account id out of the printed ARN.
+  AWS_ACCOUNT_ID: ${{ vars.AWS_ACCOUNT_ID }}
+  GATE_ROLE_ARN: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-data-gate-read
+  STORE_URI: ${{ vars.DATA_STORE_URI }}
+
 jobs:
   read-gate:
     name: data-gate-read
@@ -159,13 +168,29 @@ jobs:
       # string `true` appends the flag below.
       FAIL_ON_UNMET_FLAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.fail_on_unmet == true) && '--fail-on-unmet' || '' }}
     steps:
+      # Every configuration input this job cannot run without, checked in one
+      # place with the exact command that fixes each. Without it an unset
+      # AWS_ACCOUNT_ID produces `arn:aws:iam:::role/...` and an opaque
+      # `AssumeRoleWithWebIdentity` failure (alpha-engine-config-I10973).
+      - name: Repository variables are set
+        run: |
+          missing=0
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; missing=1; fi
+          if [ -z "$STORE_URI" ]; then echo "::error::repository variable DATA_STORE_URI is not set - set it with: gh variable set DATA_STORE_URI --repo nousergon/nousergon-data --body '<s3-uri-of-the-data-collection-store>'"; missing=1; fi
+          exit "$missing"
+
       - name: Checkout data repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      # This repository is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
 
       - name: Configure AWS credentials via OIDC
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-data-gate-read
+          role-to-assume: ${{ env.GATE_ROLE_ARN }}
           aws-region: us-east-1
 
       - name: Set up Python 3.12
@@ -187,7 +212,7 @@ jobs:
         id: gate_read
         run: |
           python -m data_gate read --gate data-phase0 \
-            --store s3://alpha-engine-research/data_collection \
+            --store "$STORE_URI" \
             $FAIL_ON_UNMET_FLAG
 
       # Second invocation, same contract, `data-cutover-ready`'s own exit
@@ -198,7 +223,7 @@ jobs:
         id: gate_read_cutover
         run: |
           python -m data_gate read --gate data-cutover-ready \
-            --store s3://alpha-engine-research/data_collection \
+            --store "$STORE_URI" \
             $FAIL_ON_UNMET_FLAG
 
   # ── FAILURE ALERTING ─────────────────────────────────────────────────────

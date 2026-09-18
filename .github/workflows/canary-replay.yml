@@ -133,12 +133,16 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
       - name: Configure AWS credentials
         id: aws_creds
         continue-on-error: true
         uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6.2.3
         with:
-          role-to-assume: arn:aws:iam::711398986525:role/github-actions-canary-replay-dispatch
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-canary-replay-dispatch
           aws-region: us-east-1
 
       - name: Skip (no OIDC trust — fork PR)
@@ -203,13 +207,21 @@ jobs:
 
       - name: Poll for completion marker
         if: steps.aws_creds.outcome == 'success'
+        env:
+          # Repository VARIABLE, not a literal — this repo is public and its
+          # run logs are public (alpha-engine-config-I10973). The bucket is
+          # the store URI's host segment; no second variable is needed for
+          # the same fact `DATA_STORE_URI` already carries.
+          STORE_URI: ${{ vars.DATA_STORE_URI }}
         run: |
           MARKER_KEY="${{ steps.dispatch.outputs.marker_key }}"
           DISPATCHED_AT="${{ steps.dispatch.outputs.dispatched_at }}"
+          BUCKET="${STORE_URI#s3://}"
+          BUCKET="${BUCKET%%/*}"
           DEADLINE=$((SECONDS + 1200))
           while [ "$SECONDS" -lt "$DEADLINE" ]; do
-            if aws s3api head-object --bucket alpha-engine-research --key "$MARKER_KEY" --region us-east-1 >/dev/null 2>&1; then
-              aws s3 cp "s3://alpha-engine-research/${MARKER_KEY}" marker.json --region us-east-1 --quiet
+            if aws s3api head-object --bucket "$BUCKET" --key "$MARKER_KEY" --region us-east-1 >/dev/null 2>&1; then
+              aws s3 cp "s3://${BUCKET}/${MARKER_KEY}" marker.json --region us-east-1 --quiet
               # config-I2753 defense-in-depth: marker_key is deterministic
               # per (repo, PR, sha) — the dispatcher now deletes any
               # pre-existing marker before launching (primary fix), but this
