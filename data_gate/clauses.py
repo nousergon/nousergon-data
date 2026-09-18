@@ -927,6 +927,20 @@ def _clause_phase1_consecutive_weekly_cycles(cycles: xc.CycleSet) -> Clause:
     )
 
 
+def _clause_board_collector_code_identity(cycles: xc.CycleSet) -> Clause:
+    """Visibility only (`alpha-engine-config-I10931`) — never gates anything."""
+    reading = xc.read_code_identity_delta(cycles)
+    return _exit_clause(
+        "data.board.collector_code_identity",
+        (
+            "the weekly schedule's code identity (code_sha), compared between the two most "
+            "recent populated cycles — reported, never blocking; a change is not a defect"
+        ),
+        reading,
+        phase="data-phase0",
+    )
+
+
 def _clause_phase1_v1_data_stage_quiet(store: ev.GateStore) -> Clause:
     return _exit_clause(
         "data.phase1.v1_data_stage_quiet",
@@ -1147,6 +1161,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase1_consecutive_eod_cycles(eod))
     clauses.append(_clause_phase1_consecutive_morning_cycles(morning))
     clauses.append(_clause_phase1_consecutive_weekly_cycles(weekly))
+    clauses.append(_clause_board_collector_code_identity(weekly))
     clauses.append(_clause_phase1_v1_data_stage_quiet(store))
     clauses.append(_clause_phase1_cost_baseline_measured(store))
     clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
