@@ -1093,7 +1093,13 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         # scheduled pipeline.
         status = (result or {}).get("status")
         if status not in (None, "ok", "skipped", "ok_dry_run"):
-            raise _CollectorError(mode, f"{mode} returned status={status!r}: {result}")
+            # alpha-engine-config-I10941: bounded + elided, never a raw
+            # f-string of `result` — that inlined `constituents_preflight`'s
+            # 903-ticker array and truncated the actual cause out of the
+            # 2026-09-16 shadow run's manifest. `result` is also passed
+            # through so the failure manifest still folds on whatever guards
+            # the mode graded itself (`_record_collector_guards` below).
+            raise _CollectorError(mode, run_units.describe_mode_failure(mode, result), result)
         if status == "skipped":
             detail = str((result or {}).get("skip_reason") or f"{mode} reported status=skipped")
             # Match against the one enumerated producer BEFORE recording the
