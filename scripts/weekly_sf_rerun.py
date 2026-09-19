@@ -1283,6 +1283,7 @@ def derive_plan(
     start_time: datetime | None = None,
     prior_histories: list | None = None,
     source_label: str = "source execution",
+    force_rerun: frozenset[str] = frozenset(),
 ) -> RerunPlan:
     """Derive the recovery plan from the source execution, optionally folding
     in the EARLIER executions of the same ``run_date`` (``prior_histories`` as
@@ -1357,6 +1358,46 @@ def derive_plan(
         return not st.emit_skip and not st.detect_failure
 
     must_rerun = [f for f in (*plan.failed, *plan.degraded) if not _is_meta(f)]
+
+    # --rerun-stage (alpha-engine-config-I11106): force a stage the deriver
+    # witnessed as COMPLETED to run again. The deriver's job is to reuse work
+    # that is still valid; it cannot know that a stage's *output* is no longer
+    # trustworthy for a reason outside the execution history — a dependency
+    # redeployed since, a producer contract fixed, a fix whose only proof is
+    # that the stage runs again. Measured case: the 2026-09-19 recovery had to
+    # re-enter Director so `director-plan` would emit the cost record that
+    # AggregateCosts is graded on (alpha-engine-config-I11100). Without this
+    # flag the alternative is hand-editing the derived JSON, which bypasses
+    # every coherence guard below — the deriver exists so recovery is ONE
+    # mechanical command (sf-pipeline-policy §2.5), and an operator editing
+    # its output by hand is that guarantee already broken.
+    #
+    # A forced stage joins must_rerun deliberately: the reachability guard
+    # below then PROVES the emitted skip set can actually enter it, instead of
+    # trusting that dropping a flag was sufficient. Forcing a stage whose skip
+    # flag is not the only thing gating it fails loudly there rather than
+    # producing a rerun that silently does not run it.
+    for _stage in sorted(force_rerun):
+        if _stage not in STAGES_BY_NAME:
+            raise SystemExit(
+                f"FATAL: --rerun-stage {_stage!r} is not a declared stage. "
+                f"Known: {', '.join(sorted(STAGES_BY_NAME))}"
+            )
+        _flag = STAGES_BY_NAME[_stage].flag
+        _had_flag = plan.skip_flags.pop(_flag, None) is not None
+        _was_completed = _stage in plan.completed
+        if _was_completed:
+            plan.completed.remove(_stage)
+        if _stage not in must_rerun and not _is_meta(_stage):
+            must_rerun.append(_stage)
+        plan.notes.append(
+            f"{_stage}: FORCED to re-run by --rerun-stage"
+            + (f" (dropped {_flag})" if _had_flag else f" ({_flag} was not set)")
+            + (" — was witnessed completed" if _was_completed else "")
+            + ". The operator asserted this stage's prior output is not "
+            "trustworthy for this recovery; the reachability guard below "
+            "proves the emitted input can enter it."
+        )
 
     if "skip_backtester" in plan.skip_flags and any(
         f in must_rerun for f in BACKTESTER_OVERSHADOWED
@@ -1950,6 +1991,21 @@ def main(argv: list | None = None) -> int:
             "vacuous_rerun_accepted_reason (alpha-engine-config-I11075)."
         ),
     )
+    ap.add_argument(
+        "--rerun-stage",
+        action="append",
+        default=[],
+        metavar="STAGE",
+        help="force a stage to re-run even though the deriver witnessed it "
+             "completed (repeatable). Use when a stage's prior output is "
+             "untrustworthy for a reason outside the execution history — a "
+             "redeployed dependency, a producer-contract fix whose only proof "
+             "is a fresh run. The reachability guard still applies, so a stage "
+             "that cannot be entered by the emitted input fails loudly — "
+             "measured: research_self_test, scanner_leaderboard and "
+             "backtester_stage_only are gated by more than their own skip "
+             "flag and cannot be forced this way.",
+    )
     ap.add_argument("--region", default="us-east-1")
     args = ap.parse_args(argv)
 
@@ -1990,6 +2046,7 @@ def main(argv: list | None = None) -> int:
         start_time=source.get("startDate"),
         prior_histories=prior,
         source_label=source_arn.rsplit(":", 1)[-1],
+        force_rerun=frozenset(args.rerun_stage),
     )
     plan.warnings.extend(chain_warnings)
     name = next_rerun_name(sf, args.state_machine_arn, plan.run_date)
