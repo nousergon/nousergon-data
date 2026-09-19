@@ -29,17 +29,49 @@ def summary_state_name(setter: str) -> str:
     return f"{setter}Summary" if setter.startswith("Set") else f"Set{setter}Summary"
 
 
-def assert_degraded_continuation(states: dict, setter: str, expected_next: str) -> str:
-    """`setter` -> its summary Pass -> `expected_next`, unchanged.
+def assert_degraded_continuation(
+    states: dict, setter: str, expected_next: str, via: str | None = None,
+) -> str:
+    """`setter` -> [`via`] -> its summary Pass -> `expected_next`, unchanged.
 
     Returns the summary state name so a caller can make further assertions
     about it.
+
+    ``via`` names a single OBSERVATION state interposed between the family
+    setter and its summary (alpha-engine-config-I11073's
+    ``SetResearchPredictorDegradedRoutes``). It exists because a Pass has
+    exactly one ``ResultPath`` and a family that must record both a boolean and
+    the identity of what set it therefore needs two. It is opt-in per caller
+    and asserted to be a Pass that changes nothing but the state input, so the
+    chain stays pinned end to end rather than merely being allowed to drift:
+    the default is still the strict two-state form every other family uses.
     """
     summary = summary_state_name(setter)
-    assert states[setter]["Next"] == summary, (
-        f"{setter} must route through {summary} (alpha-engine-config-I6891) — "
+    first_hop = via or summary
+    assert states[setter]["Next"] == first_hop, (
+        f"{setter} must route through {first_hop} (alpha-engine-config-I6891) — "
         f"found {states[setter].get('Next')!r}"
     )
+    if via is not None:
+        hop = states[via]
+        assert hop["Type"] == "Pass", (
+            f"{via} is interposed on a fail-open continuation, so it must be a "
+            "Pass: anything that can fail turns an observation into a second "
+            "failure mode on the path that is already degraded"
+        )
+        assert hop.get("ResultPath", "").startswith("$."), (
+            f"{via} must write to a named field on the state input"
+        )
+        assert hop["ResultPath"] != "$.degraded_summary", (
+            f"{via} must not write $.degraded_summary — that is last-write-wins "
+            "across families (alpha-engine-config-I10540) and is exactly what "
+            "an interposed observation state exists to avoid"
+        )
+        assert hop["Next"] == summary, (
+            f"{via} must hand back to {summary} — an interposed observation "
+            f"may not change the fail-open continuation; found "
+            f"{hop.get('Next')!r}"
+        )
     body = states[summary]
     assert body["Type"] == "Pass"
     assert body["ResultPath"] == "$.degraded_summary", (

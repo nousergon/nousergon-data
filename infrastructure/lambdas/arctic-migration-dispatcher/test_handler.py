@@ -218,7 +218,7 @@ def test_valid_event_launches_spot_and_sends_async_ssm(monkeypatch):
     assert out["head_migration_number"] == 1
     assert out["merged_sha"] == "a" * 40
     assert calls["spot"] is True
-    assert calls["profile"] == "alpha-engine-executor-profile"
+    assert calls["profile"] == "nousergon-data-collection-box-profile"
     assert calls["tag_name"] == "alpha-engine-arctic-migration-spot"
     assert idx._test_ec2.terminated == []
 

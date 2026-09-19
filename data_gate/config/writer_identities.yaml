@@ -46,6 +46,16 @@ by_unit:
   D39: nousergon-data-inst-ownership-sync
   # GitHub-hosted dispatch only: run-arctic-migrations.yml invokes
   # alpha-engine-arctic-migration-dispatcher, which launches the in-region spot
-  # box under ARCTIC_MIGRATION_IAM_PROFILE (unset on the deployed Lambda ->
-  # the alpha-engine-executor-profile default). The box is what writes ArcticDB.
-  D42: alpha-engine-executor-role
+  # box under ARCTIC_MIGRATION_IAM_PROFILE. The box is what writes ArcticDB.
+  #
+  # alpha-engine-config-I11019: the dispatcher's default now names
+  # nousergon-data-collection-box-profile -> nousergon-data-collection-box-role
+  # (nousergon-data-PR<THIS>). Declaration follows deployment, not code: this
+  # row still names the role the box actually ran under LAST, and stays
+  # alpha-engine-executor-role until (1) the operator applies the dispatcher's
+  # updated iam-policy.json (`deploy.sh --apply-iam`, IAM is never CI-applied
+  # here) AND (2) a subsequent migrations/** push launches a box and that box
+  # is observed writing ArcticDB under the new role. Flip this row in that
+  # follow-up PR, not here — changing the row without changing what the
+  # dispatcher launches (or vice versa) makes the column lie (I11019 itself).
+  D42: alpha-engine-executor-role  # PENDING flip to nousergon-data-collection-box-role, see above
