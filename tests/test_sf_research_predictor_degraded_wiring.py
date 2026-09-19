@@ -343,7 +343,14 @@ def test_aggregate_branch_outcomes_hoists_both_degraded_fields(states):
 
 
 def test_check_branch_outcomes_default_is_the_degraded_fold(states):
-    assert states["CheckBranchOutcomes"]["Default"] == "CheckResearchPredictorDegraded"
+    """alpha-engine-config-I11106: CheckBranchOutcomes' Default now hops through
+    SetModelZooUnservable (a straight copy-through Pass, not a Choice) before
+    reaching the degraded fold, so CheckBranchOutcomes keeps AggregateBranchOutcomes
+    as its immediate, floor-provable predecessor for tests/test_sf_choice_guards.py's
+    config#2275 guard. The degraded-fold destination is unchanged one hop later."""
+    assert states["CheckBranchOutcomes"]["Default"] == "SetModelZooUnservable"
+    assert states["SetModelZooUnservable"]["Type"] == "Pass"
+    assert states["SetModelZooUnservable"]["Next"] == "CheckResearchPredictorDegraded"
 
 
 def test_check_research_predictor_degraded_ors_both_branches(states):
