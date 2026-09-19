@@ -226,6 +226,38 @@ jobs:
             --store "$STORE_URI" \
             $FAIL_ON_UNMET_FLAG
 
+      # Three more invocations, same contract, same "BOTH READS, ONE BOARD"
+      # argument above — `data-phase1`/`2`/`3` are already registered in
+      # `data_gate/read.py::GATES` (ceilings 1/2/3) and already graded on the
+      # console's board, but until now only `data-phase0` and
+      # `data-cutover-ready` were ever passed as `--gate`, and only the
+      # `--gate` argument gets a DATED artifact written
+      # (`gates/<gate>/{date}/gate.json`). `data.phase3.sustained_window`
+      # reads that dated key for `data-phase3` and had never seen one —
+      # `alpha-engine-config-I10795`. Each of these writes only its OWN never-
+      # before-written dated key; none can clobber a better reading (see this
+      # PR's body).
+      - name: Read the data-phase1 gate
+        id: gate_read_phase1
+        run: |
+          python -m data_gate read --gate data-phase1 \
+            --store "$STORE_URI" \
+            $FAIL_ON_UNMET_FLAG
+
+      - name: Read the data-phase2 gate
+        id: gate_read_phase2
+        run: |
+          python -m data_gate read --gate data-phase2 \
+            --store "$STORE_URI" \
+            $FAIL_ON_UNMET_FLAG
+
+      - name: Read the data-phase3 gate
+        id: gate_read_phase3
+        run: |
+          python -m data_gate read --gate data-phase3 \
+            --store "$STORE_URI" \
+            $FAIL_ON_UNMET_FLAG
+
   # ── FAILURE ALERTING ─────────────────────────────────────────────────────
   # Simplified under I10906: with the verdict no longer coupled to the job's
   # exit code, `failure()` on this job now means exactly one thing — the
