@@ -164,6 +164,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.WaitResolveZoo": "ssm:getCommandInvocation single poll — bounded by ResolveZooSpecs' own executionTimeout",
         "ResearchPredictorParallel.ModelZooTrainMap.WaitTrainSpec": "ssm:getCommandInvocation single poll — bounded by TrainSpecDispatch's own executionTimeout",
         "ResearchPredictorParallel.WaitForModelZoo": "ssm:getCommandInvocation single poll — bounded by ModelZooSelect's own executionTimeout",
+        "ResearchPredictorParallel.ReadModelZooArenaCycle": "s3:getObject of one ~13 KB verdict artifact — TimeoutSeconds 60 IS declared; listed so the pairing is visible beside the other model-zoo states (alpha-engine-config-I11101)",
         "WaitForBacktester": "ssm:getCommandInvocation single poll — bounded by Backtester's own executionTimeout",
         "WaitForPredictorBacktest": "ssm:getCommandInvocation single poll — bounded by PredictorBacktest's own executionTimeout",
         "WaitForPortfolioOptimizerBacktest": "ssm:getCommandInvocation single poll — bounded by PortfolioOptimizerBacktest's own executionTimeout",
@@ -607,6 +608,15 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "one; see TrainSpecDispatch/WaitTrainSpec below for the "
             "per-iteration case — also routes to PublishModelZooFailure"
             "Immediate -> MarkModelZooDegraded)."
+        ),
+        "ResearchPredictorParallel.ReadModelZooArenaCycle": (
+            "Same fail-open group as every other model-zoo state: the Catch "
+            "routes ExtractModelZooVerdictUnreadable -> "
+            "PublishModelZooFailureImmediate -> MarkModelZooDegraded, which "
+            "sets Branch B's $.research_degraded_local and folds into "
+            "$.research_predictor_degraded at the join. The flag is written "
+            "two hops downstream, which is what this walk cannot see "
+            "(alpha-engine-config-I11101 deliverable 4)."
         ),
         "ResearchPredictorParallel.ModelZooSelect": (
             "Same shared convergence as ResolveZooSpecs (routes to "

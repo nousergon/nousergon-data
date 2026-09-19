@@ -3899,7 +3899,7 @@
             },
             "CheckModelZooStatus": {
               "Type": "Choice",
-              "Comment": "Any non-success routes to PublishModelZooFailureImmediate (SNS alert) then BranchBComplete - selection is best-effort and its failure is logged on the box (predictor-model-zoo-select.log); the champion is already live. The alert is required because PREDICTOR_DEFER_TRAINING_EMAIL=1 deferred the base retrain email to the zoo digest, so a silent zoo failure would otherwise mean zero email for the run. [I5687: poll budget cap=108 via $.model_zoo_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default] | alpha-engine-config-I11106: a Success poll is split further \u2014 the MODEL_ZOO_SELECT_OUTCOME v1 contract (crucible-predictor's spot-model-zoo-select workload) prints exactly one stdout line and exits 0 on BOTH a genuine decided outcome and a correctly-refused (unservable) one, so 'the command ran to completion' and 'something was promoted' are different facts and Status alone cannot distinguish them. The unservable branch is checked FIRST (Choice order is first-match) so it never falls through to the unconditional Success->BranchBComplete edge below. KNOWN-FRAGILE PATTERN, ACCEPTED: string-matching on StandardOutputContent is the same idiom as ParityReplayResourceKill/PitParityCompareResourceKill (alpha-engine-config-I11101 records a false match there escalating a recoverable failure into a hard weekly failure) \u2014 cheap and consistent with the existing fleet convention here, but NOT the durable source of truth. That is arena/model/{date}.json::decision.status, written by ModelZooSelect before this poll ever runs; moving this Choice onto a structured read of that artifact is alpha-engine-config-I11101 deliverable 4. The match is anchored on the full literal marker (never a bare '*unservable*') to minimise false-positive surface until that migration lands.",
+              "Comment": "Any non-success routes to PublishModelZooFailureImmediate (SNS alert) then BranchBComplete - selection is best-effort and its failure is logged on the box (predictor-model-zoo-select.log); the champion is already live. The alert is required because PREDICTOR_DEFER_TRAINING_EMAIL=1 deferred the base retrain email to the zoo digest, so a silent zoo failure would otherwise mean zero email for the run. [I5687: poll budget cap=108 via $.model_zoo_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default] | alpha-engine-config-I11101 deliverable 4, superseding the I11106 interim: a Success poll means \"the command ran to completion\", which is a DIFFERENT fact from \"something was promoted\" — the MODEL_ZOO_SELECT_OUTCOME v1 workload exits 0 on both a decided outcome and a correctly-refused (unservable) one. The interim shipped 2026-09-19 read that second fact with StringMatches on $.model_zoo_poll.StandardOutputContent, and it FAILED ON ITS FIRST REAL RUN (watch-rerun-2026-09-18-1, MEASURED): SSM caps StandardOutputContent at ~24,000 characters and appends the literal \"--output truncated--\"; the model-zoo-select log was 28,759 bytes and MODEL_ZOO_SELECT_OUTCOME is its LAST line, so the marker sat 4.7 KB past the SF's horizon, the arm never matched, and the run stamped model_zoo_unservable=false into both completion markers while the arena's own verdict read UNSERVABLE. A VERDICT IS NEVER SCRAPED FROM A TRUNCATABLE LOG STREAM — the same defect class as the ParityReplayResourceKill/PitParityCompareResourceKill stdout matches on alpha-engine-config-I11101. The Success arm now reads arena/model/{run_date}.json::decision.status, written by ModelZooSelect before this poll ever runs: the producer's own durable record (sf-pipeline-policy.md §2.3a/§2.4).",
               "Choices": [
                 {
                   "And": [
@@ -3927,26 +3927,9 @@
                   "Next": "ModelZooWait"
                 },
                 {
-                  "And": [
-                    {
-                      "Variable": "$.model_zoo_poll.Status",
-                      "StringEquals": "Success"
-                    },
-                    {
-                      "Variable": "$.model_zoo_poll.StandardOutputContent",
-                      "IsPresent": true
-                    },
-                    {
-                      "Variable": "$.model_zoo_poll.StandardOutputContent",
-                      "StringMatches": "*MODEL_ZOO_SELECT_OUTCOME: unservable*"
-                    }
-                  ],
-                  "Next": "ModelZooUnservableDeclared"
-                },
-                {
                   "Variable": "$.model_zoo_poll.Status",
                   "StringEquals": "Success",
-                  "Next": "BranchBComplete"
+                  "Next": "ReadModelZooArenaCycle"
                 }
               ],
               "Default": "ModelZooSelectLivenessGate"
@@ -3994,9 +3977,86 @@
               "ResultPath": "$.research_degraded_local",
               "Next": "BranchBComplete"
             },
+            "ReadModelZooArenaCycle": {
+              "Type": "Task",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: the DURABLE source of the M slot's verdict. ModelZooSelect writes arena/model/{date}.json (and latest.json) before it exits 0 — its decision block carries status=\"unservable\" together with the per-arm ineligible reasons — so the fact this branch needs is already recorded by its producer, and reading it here replaces the StringMatches-on-stdout interim CheckModelZooStatus documents. | THE DATED KEY, NEVER latest.json: latest.json is whatever ran most recently, which on a recovery arc need not be this cycle; $.run_date is the trading day every arena prefix keys off (alpha-engine-config-I8809, PARTITION FAMILY = trading_day). | PARSED IN ResultSelector ON PURPOSE: States.StringToJson inside a Pass's Parameters raises States.Runtime, which a Pass cannot Catch, so a malformed artifact would kill the whole Parallel and with it the run; in a Task's ResultSelector the identical failure is an ordinary Task error the Catch below absorbs. | STATE SIZE: the cycle artifact measured 13,196 bytes on 2026-09-18 against a branch effective input of ~108 KB (the figure alpha-engine-config-I8194 measured when ParityParallel hit States.DataLimitExceeded), so the peak here is ~121 KB of the 256 KB ceiling. It is transient: BranchBComplete carries no ResultPath, so its Parameters envelope is the branch's entire output and none of this crosses the join.",
+              "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+              "Parameters": {
+                "Bucket": "alpha-engine-research",
+                "Key.$": "States.Format('arena/model/{}.json', $.run_date)"
+              },
+              "ResultSelector": {
+                "cycle.$": "States.StringToJson($.Body)"
+              },
+              "ResultPath": "$.model_zoo_arena",
+              "TimeoutSeconds": 60,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "S3.SdkClientException",
+                    "S3.S3Exception",
+                    "States.Timeout"
+                  ],
+                  "IntervalSeconds": 5,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "sf-pipeline-policy.md §2.3a: the ABSENCE of a verdict is UNKNOWN and must never read as a pass. A missing, unreadable or malformed arena cycle after a ModelZooSelect that exited 0 is a producer-contract breach, so it converges on the existing model-zoo fail-open group (PublishModelZooFailureImmediate -> MarkModelZooDegraded) and the run degrades HONESTLY rather than silently stamping model_zoo_unservable=false — which is exactly the false \"false\" the stdout-scraping interim produced.",
+                  "ResultPath": "$.model_zoo_arena_error",
+                  "Next": "ExtractModelZooVerdictUnreadable"
+                }
+              ],
+              "Next": "CheckModelZooVerdict"
+            },
+            "ExtractModelZooVerdictAbsent": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: the arena cycle object for $.run_date was read and parsed, but carries no decision.status. SEPARATE from ExtractModelZooVerdictUnreadable because $.model_zoo_arena_error exists only on that state's Catch path and this one has no error to carry — tests/test_sf_field_reachability.py proves a state may only reference fields EVERY reaching path produces, and folding the two causes into one Pass violated exactly that. Same destination, same honesty: sf-pipeline-policy.md §2.3a makes an unestablished verdict UNKNOWN, which degrades, never the passing value.",
+              "Parameters": {
+                "phase": "CheckModelZooVerdict",
+                "source": "arena cycle parsed but decision.status is absent",
+                "poll.$": "$.model_zoo_poll"
+              },
+              "ResultPath": "$.model_zoo_error",
+              "Next": "PublishModelZooFailureImmediate"
+            },
+            "ExtractModelZooVerdictUnreadable": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: normalises BOTH ways the M slot's verdict can go missing — the arena cycle object unreadable/unparseable (ReadModelZooArenaCycle's Catch) and the object present but carrying no decision.status (CheckModelZooVerdict's IsPresent arm) — into the $.model_zoo_error shape PublishModelZooFailureImmediate formats. Exists for the same reason ExtractModelZooSelectError does: jumping straight to that notifier without producing $.model_zoo_error died with States.Runtime live on 2026-07-10 (config#2160). | sf-pipeline-policy.md §2.3a: this is the UNKNOWN path, not the unservable one. A ModelZooSelect that exited 0 whose verdict cannot then be established is a producer-contract breach, so the run degrades honestly rather than stamping model_zoo_unservable=false — which is precisely the false \"false\" the stdout-scraping interim wrote into both completion markers on watch-rerun-2026-09-18-1.",
+              "Parameters": {
+                "phase": "ReadModelZooArenaCycle",
+                "source": "arena/model/{run_date}.json carries no readable decision.status",
+                "arena_error.$": "$.model_zoo_arena_error",
+                "poll.$": "$.model_zoo_poll"
+              },
+              "ResultPath": "$.model_zoo_error",
+              "Next": "PublishModelZooFailureImmediate"
+            },
+            "CheckModelZooVerdict": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: consumes arena/model/{date}.json::decision.status. The IsPresent:false arm is FIRST and explicit (Choice order is first-match) because a cycle artifact that parsed but carries no decision.status is the same UNKNOWN as one that would not parse, and sf-pipeline-policy.md §2.3a forbids resolving an absent verdict to the passing value. Only an explicit \"unservable\" reaches ModelZooUnservableDeclared; every other DECIDED status (a real promotion, or a decided no-move) is the ordinary clean completion the Default carries to BranchBComplete, exactly as the pre-I11106 unconditional Success edge did.",
+              "Choices": [
+                {
+                  "Variable": "$.model_zoo_arena.cycle.decision.status",
+                  "IsPresent": false,
+                  "Next": "ExtractModelZooVerdictAbsent"
+                },
+                {
+                  "Variable": "$.model_zoo_arena.cycle.decision.status",
+                  "StringEquals": "unservable",
+                  "Next": "ModelZooUnservableDeclared"
+                }
+              ],
+              "Default": "BranchBComplete"
+            },
             "ModelZooUnservableDeclared": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config-I11106: reached ONLY when CheckModelZooStatus sees a Success poll whose StandardOutputContent carries the MODEL_ZOO_SELECT_OUTCOME v1 contract's declared-unservable marker (crucible-predictor's spot-model-zoo-select workload, --select-only). Sets the BRANCH-LOCAL $.model_zoo_unservable=true, folded out of the Parallel branch scope by BranchBComplete below (mirrors $.research_degraded_local -> branch_b_degraded) since a Parallel branch cannot write an outer-scope JSONPath directly. Deliberately NOT routed through MarkModelZooDegraded / PublishModelZooFailureImmediate and does NOT touch $.research_degraded_local: sf-pipeline-policy.md §2.3a treats a correctness VERDICT (here: the arena's own conclusion that nothing on the leaderboard clears the promotion bar this cycle) as distinct from a stage failure, and folding it into research_predictor_degraded/degraded_summary would render a CORRECT refusal as though the stage had broken — exactly the ambiguity alpha-engine-config-I11106 exists to remove. NOTHING about what may be promoted changes here: ModelZooSelect already wrote its arena-cycle artifact and (correctly) promoted nothing before exiting 0; this state only makes that refusal legible instead of indistinguishable from a crash.",
+              "Comment": "alpha-engine-config-I11106, rewired by -I11101 deliverable 4: reached ONLY when CheckModelZooVerdict reads decision.status == \"unservable\" out of the arena cycle artifact ModelZooSelect wrote for $.run_date. It was previously reached by StringMatches on the SSM poll's StandardOutputContent, which SSM truncates at ~24,000 characters — measured on watch-rerun-2026-09-18-1, where the MODEL_ZOO_SELECT_OUTCOME marker fell 4.7 KB outside that window and this state was never entered on a genuinely unservable cycle. Sets the BRANCH-LOCAL $.model_zoo_unservable=true, folded out of the Parallel branch scope by BranchBComplete below (mirrors $.research_degraded_local -> branch_b_degraded) since a Parallel branch cannot write an outer-scope JSONPath directly. Deliberately NOT routed through MarkModelZooDegraded / PublishModelZooFailureImmediate and does NOT touch $.research_degraded_local: sf-pipeline-policy.md §2.3a treats a correctness VERDICT (here: the arena's own conclusion that nothing on the leaderboard clears the promotion bar this cycle) as distinct from a stage failure, and folding it into research_predictor_degraded/degraded_summary would render a CORRECT refusal as though the stage had broken — exactly the ambiguity alpha-engine-config-I11106 exists to remove. NOTHING about what may be promoted changes here: ModelZooSelect already wrote its arena-cycle artifact and (correctly) promoted nothing before exiting 0; this state only makes that refusal legible instead of indistinguishable from a crash.",
               "Result": true,
               "ResultPath": "$.model_zoo_unservable",
               "Next": "PublishModelZooUnservableNotice"
