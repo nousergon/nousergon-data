@@ -13,8 +13,8 @@
 # (config#2106) — no bespoke copy of the concurrency-lock/launch-with-
 # fallback/terminate-on-failure logic.
 #
-# IAM (iam-policy.json): ec2:RunInstances + iam:PassRole (scoped to the
-# EXISTING alpha-engine-executor-role — reused, not a new profile; see
+# IAM (iam-policy.json): ec2:RunInstances + iam:PassRole (scoped to
+# nousergon-data-collection-box-role since alpha-engine-config-I11019 — see
 # index.py's IAM PROFILE docstring section) + ssm:SendCommand +
 # sns:Publish/ssm:GetParameter/s3 (the spot-quota-exceeded alert path
 # `nousergon_lib.spot_dispatch.launch_with_fallback` calls internally on

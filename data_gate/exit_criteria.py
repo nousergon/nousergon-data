@@ -57,6 +57,7 @@ __all__ = [
     "SCHEDULE_WEEKLY",
     "V1_DATA_STAGE_KEY",
     "collect_cycles",
+    "read_code_identity_delta",
     "read_consecutive_cycles",
     "read_cost_baseline_measured",
     "read_empty_fresh_free",
@@ -375,6 +376,96 @@ def read_consecutive_cycles(cycles: CycleSet, *, required: int) -> Reading:
         evidence=(cycles.schedule, "data_collection/runs/"),
         source=_SOURCE_CYCLES,
         as_of=rows[0][0].label if rows else None,
+    )
+
+
+def read_code_identity_delta(cycles: CycleSet) -> Reading:
+    """The collector's OWN code identity, cycle over cycle — visibility only.
+
+    `alpha-engine-config-I10931`: the schedule pulls whatever is on `main` at
+    fire time with no pin. `weekly_collector.py` already measures `code_sha`
+    honestly for every recorded unit — `run_units.recorded_entry` defaults to
+    `nousergon_lib.run_identity.resolve_code_sha()`, which is `git rev-parse
+    HEAD` on the box's own post-pull tree (or a validated `$NE_DATA_CODE_SHA`),
+    never an env default and never guessed. Established by reading that code
+    path, not re-derived per call. So this reader does NOT need to make
+    `code_sha` honest — it only needs to make the delta VISIBLE.
+
+    Compares the most recent populated cycle against the one before it and
+    renders whether the tree that ran changed. `met` is always True: a code
+    change between cycles is not itself a defect (I10931's own "immediate
+    mitigation" section: pinning to a stale sha is a worse failure mode than
+    running `main`), and giving this a floor would be the "widen the floor to
+    make it pass" anti-pattern applied to a visibility gap rather than a real
+    threshold. It exists to be READ on the board, not to gate anything.
+    """
+    if cycles.unmeasurable:
+        return Reading(
+            met=False,
+            detail=f"cannot compare code identity across cycles of {cycles.schedule}: {cycles.reason}",
+            evidence=(cycles.schedule,),
+            unmeasurable=True,
+            source=_SOURCE_CYCLES,
+        )
+    shas_by_cycle: list[tuple[Cycle, set[str]]] = []
+    for cycle in cycles.cycles:
+        shas: set[str] = set()
+        for docs in cycle.manifests.values():
+            for _key, doc in docs:
+                if doc.get("trigger") == "scheduled" and doc.get("status") == "ok":
+                    sha = str(doc.get("code_sha") or "").strip()
+                    if sha:
+                        shas.add(sha)
+        shas_by_cycle.append((cycle, shas))
+
+    populated = [(cycle, shas) for cycle, shas in shas_by_cycle if shas]
+    if not populated:
+        return Reading(
+            met=True,
+            detail=(
+                f"no ok scheduled-trigger manifest over the last {len(cycles.cycles)} cycle(s) of "
+                f"{cycles.schedule} carries a code_sha — nothing to compare yet"
+            ),
+            evidence=(cycles.schedule, "data_collection/runs/"),
+            source=_SOURCE_CYCLES,
+        )
+    current_cycle, current_shas = populated[0]
+    if len(populated) < 2:
+        return Reading(
+            met=True,
+            detail=(
+                f"{current_cycle.label} ran {sorted(current_shas)} — only one populated cycle in "
+                f"the last {len(cycles.cycles)} of {cycles.schedule}; no earlier cycle to compare"
+            ),
+            evidence=(cycles.schedule, "data_collection/runs/"),
+            source=_SOURCE_CYCLES,
+            as_of=current_cycle.label,
+        )
+    previous_cycle, previous_shas = populated[1]
+    if len(current_shas) > 1 or len(previous_shas) > 1:
+        detail = (
+            f"{current_cycle.label} recorded {len(current_shas)} distinct code_sha across its ok "
+            f"units ({sorted(current_shas)}); {previous_cycle.label} recorded {len(previous_shas)} "
+            f"({sorted(previous_shas)}) — a single cycle running more than one tree is its own "
+            "finding, not just a delta"
+        )
+    elif current_shas == previous_shas:
+        detail = (
+            f"{current_cycle.label} ran the same code as {previous_cycle.label} "
+            f"({next(iter(current_shas))})"
+        )
+    else:
+        detail = (
+            f"collector code changed between {previous_cycle.label} "
+            f"({next(iter(previous_shas))}) and {current_cycle.label} "
+            f"({next(iter(current_shas))}) — first production run of this tree"
+        )
+    return Reading(
+        met=True,
+        detail=detail,
+        evidence=(cycles.schedule, "data_collection/runs/"),
+        source=_SOURCE_CYCLES,
+        as_of=current_cycle.label,
     )
 
 

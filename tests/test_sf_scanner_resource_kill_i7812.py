@@ -164,7 +164,13 @@ def test_membership_intact_fail_opens_onto_scanners_own_convergence_point(branch
     assert rule["Next"] == "ScannerResourceKillDegraded"
 
     degraded = branch_a["ScannerResourceKillDegraded"]
-    assert degraded["Result"] is True
+    # alpha-engine-config-I11073: names itself like every other route.
+    assert "Result" not in degraded
+    assert degraded["Parameters"]["degraded"] is True
+    assert degraded["Parameters"]["routes.$"] == (
+        "States.Format('{},{}',$.research_degraded_local.routes,"
+        "'ScannerResourceKillDegraded')"
+    )
     assert degraded["ResultPath"] == "$.research_degraded_local"
     assert degraded["Next"] == branch_a["Scanner"]["Next"] == "CheckSkipRegimeSubstrate"
 

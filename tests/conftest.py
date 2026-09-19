@@ -142,3 +142,43 @@ def recent_trading_day() -> str:
     test function).
     """
     return recent_trading_day_str()
+
+
+def stub_empty_reference_maps(mock_s3) -> None:
+    """Make a bare ``MagicMock()`` S3 client answer ``GetObject`` for
+    ``data/sector_map.json`` / ``data/sub_sector_etf_map.json`` with a
+    valid, empty JSON body, delegating every other key to the mock's
+    default auto-generated response.
+
+    `alpha-engine-config-I10923`: ``features.compute._load_sector_map`` /
+    ``_load_sub_sector_etf_map`` used to swallow ANY read failure
+    (including a bare ``MagicMock()``'s un-JSON-decodable default
+    ``Body.read()``) into an empty map — which is exactly the silent
+    degrade that issue fixes. They now raise
+    ``ReferenceMapUnavailable`` instead, which is correct, but it means a
+    `daily_append`/`compute_and_write` test whose S3 double doesn't care
+    about these two keys needs an explicit, valid (if empty) answer for
+    them rather than free-riding on the swallow. Call this right after
+    constructing the mock client; it does not affect any other key the
+    test DOES stub, since ``get_object.side_effect`` is only consulted
+    when no more specific stub already applies to the call.
+    """
+    import json as _json
+    from io import BytesIO
+    from unittest.mock import MagicMock
+
+    _stubbed_keys = {"data/sector_map.json", "data/sub_sector_etf_map.json"}
+    _real_side_effect = mock_s3.get_object.side_effect
+    _real_return_value = mock_s3.get_object.return_value
+
+    def _side_effect(*args, **kwargs):
+        key = kwargs.get("Key")
+        if key in _stubbed_keys:
+            body = MagicMock()
+            body.read.return_value = _json.dumps({}).encode("utf-8")
+            return {"Body": body}
+        if _real_side_effect is not None:
+            return _real_side_effect(*args, **kwargs)
+        return _real_return_value
+
+    mock_s3.get_object.side_effect = _side_effect

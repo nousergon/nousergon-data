@@ -37,6 +37,7 @@ from features.feature_engineer import (
     compute_features,
 )
 from features.factor_momentum import update_factor_momentum_latest
+from features.cross_sectional import FACTOR_LOADING_SOURCES
 from features.compute import (
     DEFAULT_BUCKET,
     UNIVERSE_BENCHMARK_PROXIES,
@@ -103,6 +104,31 @@ from nousergon_lib.series_contract import (
 )
 
 log = logging.getLogger(__name__)
+
+# `alpha-engine-config-I10939`. `factor_momentum_ratio` and the 9 Barra
+# `*_zscore` loading columns are FEATURES-set members that cannot be
+# computed per-ticker — they are cross-sectional, ranked over the whole
+# universe panel — so the per-ticker write loop below always force-sets
+# them to NaN as a schema-align placeholder (see the `_stored_col in
+# FEATURES` block a few hundred lines down), then two SECOND PASSES after
+# the write loop (`update_factor_momentum_latest`,
+# `update_factor_loading_zscores_latest`) fill in the real values over the
+# freshly-written rows. Counting write-time NaN on these columns toward
+# per-ticker coverage (`n_ok`/`n_partial`) is a category error: the value
+# is EXPECTED to be NaN at that instant and is not yet decidable per
+# ticker — it is exactly the "legitimately expected NaN, declared as such"
+# case `feedback_no_silent_fails` asks for, not a degraded row. Measured
+# 2026-09-15/16 (D18/D32): because this went uncounted-for, `n_ok` read 0
+# on a ~910-ticker universe EVERY run since these columns were backfilled
+# into storage — not a regression, a metric that never measured what its
+# name says once these columns existed. Excluded from the write-time
+# coverage check here; the second passes' own aggregate coverage is
+# recorded separately below (`cross_sectional_coverage`) rather than
+# folded into `n_ok`, since neither second pass reports PER-TICKER
+# attribution today (`tickers_written`/`tickers_all_nan` counts only).
+_DEFERRED_SECOND_PASS_FEATURES: frozenset[str] = frozenset(
+    {"factor_momentum_ratio", *FACTOR_LOADING_SOURCES.values()}
+)
 
 # OHLCV_COLS + PROVENANCE_COL are the canonical universe-library schema —
 # re-exported from store.arctic_store so the chokepoint
@@ -1639,11 +1665,17 @@ def _daily_append_impl(
     closes = _load_daily_closes(s3, bucket, date_str)
 
     # ── 2. Load supporting data ──────────────────────────────────────────────
+    # `alpha-engine-config-I10923`: both loaders RAISE
+    # (`features.compute.ReferenceMapUnavailable`) rather than degrading to
+    # an empty map — an absent/unreadable D01 reference map used to silently
+    # fall every ticker's sector feature to its neutral default here, with
+    # no recording surface. Was: "Best-effort: an empty map (file not yet
+    # written by the weekly collector) degrades sub_sector_vs_benchmark_* to
+    # neutral 0.0."
     sector_map = _load_sector_map(s3, bucket)
     # sub_sector_etf_map (config#934): ticker → sub-sector benchmark ETF
     # (SMH/IGV/…), defaulting to the sector ETF for sub-industries with no
-    # liquid proxy. Best-effort: an empty map (file not yet written by the
-    # weekly collector) degrades sub_sector_vs_benchmark_* to neutral 0.0.
+    # liquid proxy.
     sub_sector_etf_map = _load_sub_sector_etf_map(s3, bucket)
     # The distinct NON-sector sub-sector ETF symbols this run must keep fresh
     # in ArcticDB (the XL* sector ETFs are already handled by the sector-ETF
@@ -2522,9 +2554,16 @@ def _daily_append_impl(
                 # (feedback_no_silent_fails). Increment is deferred until
                 # after universe_lib.update() so an exception rolls back
                 # cleanly into n_err.
+                # `alpha-engine-config-I10939`: the deferred second-pass
+                # columns (`factor_momentum_ratio`, the 9 Barra `*_zscore`
+                # loadings) are EXPECTED NaN at this instant — see the
+                # `_DEFERRED_SECOND_PASS_FEATURES` module docstring — and are
+                # excluded here so a legitimately-not-yet-computed value does
+                # not mark every ticker in the universe "partial".
                 nan_features = [
                     f for f in FEATURES
-                    if f in today_row.columns and today_row[f].isna().iloc[0]
+                    if f in today_row.columns and f not in _DEFERRED_SECOND_PASS_FEATURES
+                    and today_row[f].isna().iloc[0]
                 ]
 
                 # Match stored schema dtype per-column. ArcticDB rejects
@@ -2954,6 +2993,7 @@ def _daily_append_impl(
         # over a slim trailing panel and update it in place. Best-effort +
         # OBSERVE: the function never raises; gate off via the env var if it
         # ever misbehaves. Skipped on dry_run (no writes happened).
+        fm_result: dict | None = None
         if os.environ.get("FACTOR_MOMENTUM_DAILY_ENABLED", "true").lower() != "false":
             try:
                 fm_result = update_factor_momentum_latest(
@@ -2963,6 +3003,7 @@ def _daily_append_impl(
                 log.info("Factor-momentum daily update: %s", json.dumps(fm_result, default=str))
             except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
                 log.warning("Factor-momentum daily update FAILED (OBSERVE, non-fatal): %s", exc)
+                fm_result = {"status": "error", "error": str(exc), "tickers_written": 0}
 
         # ── C.1: factor-loading z-score daily go-forward second pass ─────────
         # The 9 *_zscore Barra loadings (C.3 / predictor risk_model_persist)
@@ -2970,6 +3011,7 @@ def _daily_append_impl(
         # S3 feature store already runs apply_factor_zscores in compute.py;
         # this pass keeps ArcticDB (predictor training + C.2b F+D persistence)
         # in sync. Best-effort + gated; never fails the daily pipeline.
+        flz_result: dict | None = None
         if os.environ.get("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "true").lower() != "false":
             try:
                 from features.cross_sectional import update_factor_loading_zscores_latest
@@ -2985,6 +3027,47 @@ def _daily_append_impl(
                 log.warning(
                     "Factor-loading z-score daily update FAILED (non-fatal): %s", exc,
                 )
+                flz_result = {"status": "error", "error": str(exc), "tickers_written": 0}
+
+        # ── I10939: honest cross-sectional coverage, recorded SEPARATELY ─────
+        # from n_ok/n_partial rather than folded into them. Neither second
+        # pass reports PER-TICKER attribution today (only aggregate
+        # `tickers_written`/`tickers_all_nan`/`tickers_computed` counts), so
+        # this cannot correct n_ok per ticker — it is instead the board-
+        # visible signal deliverable 4 asks for: how many of the universe's
+        # tickers actually got a real `factor_momentum_ratio` / `*_zscore`
+        # value THIS run, versus how many are still carrying the write-time
+        # NaN placeholder because a second pass didn't run, errored, or
+        # legitimately had no finite value to give (short history / no
+        # loadings — the `tickers_all_nan` case, itself a declared-expected
+        # outcome, not a defect).
+        n_universe = len(stock_tickers)
+        cross_sectional_coverage = {
+            "factor_momentum": {
+                "status": (fm_result or {}).get("status", "not_run"),
+                "tickers_written": int((fm_result or {}).get("tickers_written") or 0),
+                "tickers_all_nan": int((fm_result or {}).get("tickers_all_nan") or 0),
+                "universe_size": n_universe,
+            },
+            "factor_loading_zscore": {
+                "status": (flz_result or {}).get("status", "not_run"),
+                "tickers_written": int((flz_result or {}).get("tickers_written") or 0),
+                "tickers_all_nan": int((flz_result or {}).get("tickers_all_nan") or 0),
+                "universe_size": n_universe,
+            },
+        }
+        for _label, _cov in cross_sectional_coverage.items():
+            if _cov["status"] not in ("ok",) and _cov["status"] != "not_run":
+                log.warning(
+                    "cross_sectional_coverage[%s]: second pass did not complete "
+                    "cleanly (status=%s) — factor_momentum_ratio/*_zscore stay "
+                    "at their write-time NaN placeholder for tickers it did not "
+                    "reach this run",
+                    _label, _cov["status"],
+                )
+        # I10939 deliverable 4: board-visible, not just a log line.
+        result["cross_sectional_coverage"] = cross_sectional_coverage
+        result["deferred_second_pass_features"] = sorted(_DEFERRED_SECOND_PASS_FEATURES)
 
         # Producer-side post-write validation. Catches the partial-write
         # class (2026-04-21 ASGN/MOH) that the per-ticker error-rate gate
