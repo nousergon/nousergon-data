@@ -27,6 +27,7 @@ from unittest.mock import MagicMock, patch
 import pandas as pd
 import pytest
 
+from tests.conftest import stub_empty_reference_maps
 
 _DAILY_APPEND = Path(__file__).parent.parent / "builders" / "daily_append.py"
 
@@ -304,6 +305,7 @@ def _patch_targets(monkeypatch, *, universe_symbols: list[str], closes_tickers: 
     # Disable boto3 client construction outside the metric helper —
     # daily_append calls boto3.client("s3") at function entry.
     mock_s3 = MagicMock()
+    stub_empty_reference_maps(mock_s3)  # I10923: loaders now raise, not swallow
     monkeypatch.setattr("builders.daily_append.boto3.client", lambda *a, **k: mock_s3)
 
     return universe_lib, macro_lib

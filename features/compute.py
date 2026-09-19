@@ -294,30 +294,77 @@ def admits_universe_write(ticker: str) -> bool:
 
 # ── S3 data loading (self-contained, no predictor imports) ───────────────────
 
+
+class ReferenceMapUnavailable(RuntimeError):
+    """A weekly-produced reference map (D01) could not be loaded.
+
+    `alpha-engine-config-I10923`. `_load_sector_map` / `_load_sub_sector_etf_map`
+    used to swallow ANY load failure into an empty map and a `log.warning` —
+    no recording surface (nothing reads a log line, nothing counts it, no
+    clause grades it). An empty map does not fail the run: every ticker's
+    sector/sub-sector feature silently falls to its neutral default, the
+    column is populated, nothing is red, and the model trains on it — the
+    `avg_volume_20d` shape, where a units mismatch silently failed 901/903
+    tickers' liquidity gate for months with no visible symptom.
+
+    This repo is a PRODUCER (`AGENTS.md`: "the fleet's fail-loud default has
+    no graceful-degrade carve-out on any writer here") and both call sites
+    (`features/compute.py::compute_and_write`,
+    `builders/daily_append.py::daily_append`) write the resulting sector
+    features into the feature store, so they ARE writers. Raising is the
+    fix, not a tightened degrade: `constituents_sector_map` /
+    `constituents_sub_sector_etf_map` now carry their own registry rows
+    (`alpha-engine-config-I10898`) precisely so a stale/missing map is
+    diagnosable from THAT producer's own manifest — check it before assuming
+    this is a transient S3 hiccup. Mirrors the established
+    `collectors/alternative.py` "no silent narrowing" idiom for a missing
+    constituents artifact.
+    """
+
+
 def _load_sector_map(s3, bucket: str) -> dict[str, str]:
-    """Load ticker -> sector ETF mapping from S3."""
+    """Load ticker -> sector ETF mapping from S3.
+
+    Raises :class:`ReferenceMapUnavailable` on any failure
+    (`alpha-engine-config-I10923`) — see that class for why an empty map is
+    never returned as a legitimate substitute.
+    """
+    key = "data/sector_map.json"
     try:
-        obj = s3.get_object(Bucket=bucket, Key="data/sector_map.json")
+        obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as exc:
-        log.warning("Failed to load sector_map.json: %s", exc)
-        return {}
+        raise ReferenceMapUnavailable(
+            f"sector_map.json unreadable at s3://{bucket}/{key} ({exc}) — "
+            "refusing to compute sector-relative features against an implicit "
+            "empty sector map (alpha-engine-config-I10923); check D01's "
+            "(constituents_sector_map) own manifest before assuming this is "
+            "a transient S3 read failure"
+        ) from exc
 
 
 def _load_sub_sector_etf_map(s3, bucket: str) -> dict[str, str]:
     """Load ticker -> sub-sector benchmark ETF mapping from S3 (config#934).
 
-    Best-effort/non-blocking, mirroring _load_sector_map: a missing file
-    (e.g. before the weekly collector has written it, or on an S3 read
-    failure) returns an empty map, which degrades every ticker's
-    sub_sector_vs_benchmark_* to its neutral default rather than raising.
+    Raises :class:`ReferenceMapUnavailable` on any failure
+    (`alpha-engine-config-I10923`) — see that class for why an empty map is
+    never returned as a legitimate substitute. Previously
+    best-effort/non-blocking, degrading every ticker's
+    ``sub_sector_vs_benchmark_*`` to its neutral default with no recording
+    surface; that swallow is the defect this fixes.
     """
+    key = "data/sub_sector_etf_map.json"
     try:
-        obj = s3.get_object(Bucket=bucket, Key="data/sub_sector_etf_map.json")
+        obj = s3.get_object(Bucket=bucket, Key=key)
         return json.loads(obj["Body"].read())
     except Exception as exc:
-        log.warning("Failed to load sub_sector_etf_map.json: %s", exc)
-        return {}
+        raise ReferenceMapUnavailable(
+            f"sub_sector_etf_map.json unreadable at s3://{bucket}/{key} ({exc}) — "
+            "refusing to compute sub-sector-benchmark features against an "
+            "implicit empty map (alpha-engine-config-I10923); check D01's "
+            "(constituents_sub_sector_etf_map) own manifest before assuming "
+            "this is a transient S3 read failure"
+        ) from exc
 
 
 # Shared S3 parquet loaders live in store.parquet_loader so non-feature

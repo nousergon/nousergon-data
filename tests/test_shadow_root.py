@@ -326,6 +326,10 @@ def _patch_daily_append(monkeypatch, today_ts, symbols):
     monkeypatch.setenv("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "false")
     monkeypatch.setattr(_da, "_load_daily_closes", lambda *a, **k: closes)
     monkeypatch.setattr(_da, "_load_sector_map", lambda *a, **k: {})
+    # I10923: _load_sub_sector_etf_map now raises rather than swallowing to
+    # {} on a read failure — this fixture's S3 double isn't stubbed for that
+    # key, so patch it directly like its sector_map sibling above.
+    monkeypatch.setattr(_da, "_load_sub_sector_etf_map", lambda *a, **k: {})
     monkeypatch.setattr(_da, "_load_cached_fundamentals", lambda *a, **k: {})
     monkeypatch.setattr(_da, "_load_cached_alternative", lambda *a, **k: {})
     monkeypatch.setattr(_da, "get_macro_lib", lambda *a, **k: macro_lib)
