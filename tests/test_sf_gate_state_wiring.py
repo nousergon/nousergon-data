@@ -60,19 +60,24 @@ _SCHEMA_PATH = (
 #: ``tests/test_pipeline_gates.py``. Neither repo's CI can read the other, so
 #: this pin is what makes a one-sided edit fail loudly instead of silently
 #: forking the contract.
-_SCHEMA_SHA256 = "6287e392be263af8a31ffae8a6dac7f3bdd7e0a032d282dd85527fca907f0fa0"
+_SCHEMA_SHA256 = "0024e1bcc3ea66d7b5becdf9c1d9b6f22646ea16a74e4c09e63f2eaef3c4101f"
 
 #: The states whose payload must carry it — every surface presenting the run's
 #: results (§2.3a rule 3). Adding a third reporting surface adds a row here.
 _SURFACES = ("ReportCard", "Director")
 
 #: The boolean degradation families, each seeded false at InitializeInput and set
-#: true by exactly one Pass state.
+#: true by exactly one Pass state. ``parity_verdict_unknown`` (alpha-engine-config
+#: -I11103) is not a degradation family in the same sense — it is set on the
+#: cadence-skip path, never by a Catch — but it shares every structural property
+#: this tuple pins: seeded false, present in both polarities, carried on both
+#: surfaces, and read via And(IsPresent, BooleanEquals) wherever it is read.
 _FAMILIES = (
     "gate_degraded",
     "health_check_degraded",
     "parity_degraded",
     "research_predictor_degraded",
+    "parity_verdict_unknown",
 )
 
 

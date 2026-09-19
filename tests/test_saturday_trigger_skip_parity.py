@@ -12,12 +12,15 @@ Three properties, and the third is the one that keeps this honest:
 
 1. **The flag is present**, so a CFN edit cannot silently re-enable a stage
    that has failed 11 of 13 attempts without someone seeing this test change.
-2. **One flag is sufficient.** `CheckSkipParity` routes to `CheckSkipEvaluator`,
-   which is past `PitParityCompare` — compare is reachable only via the
-   Parallel's exit path. If a future edit makes compare independently
-   reachable, `skip_parity` alone would leave it running with no passes to
-   compare and it would emit verdict UNKNOWN forever. This test asserts the
-   topology that makes one flag enough.
+2. **One flag is sufficient.** `CheckSkipParity` routes to
+   `MarkParityVerdictUnknownByCadence` (alpha-engine-config-I11103's Pass state,
+   which stamps `$.parity_verdict_unknown` and changes nothing about the
+   topology) and then to `CheckSkipEvaluator`, which is past
+   `PitParityCompare` — compare is reachable only via the Parallel's exit
+   path. If a future edit makes compare independently reachable, `skip_parity`
+   alone would leave it running with no passes to compare and it would emit
+   verdict UNKNOWN forever. This test asserts the topology that makes one flag
+   enough.
 3. **The disable names its re-enable issue.** A skip with no tracked path back
    is a silent removal. `alpha-engine-config-I7309` carries the blockers
    (the walk-forward pass cannot finish inside any budget, and places zero
@@ -103,12 +106,20 @@ def test_skip_parity_alone_also_bypasses_the_compare_stage() -> None:
     gate = find(doc["States"], "CheckSkipParity")
     assert gate, "CheckSkipParity disappeared"
     targets = [c["Next"] for c in gate["Choices"]]
-    assert targets == ["CheckSkipEvaluator"], (
+    assert targets == ["MarkParityVerdictUnknownByCadence"], (
         f"CheckSkipParity's skip route now goes to {targets} instead of "
-        "CheckSkipEvaluator — verify it still bypasses PitParityCompare, or "
-        "add skip_pit_parity_compare to the cadence Input"
+        "MarkParityVerdictUnknownByCadence — verify it still bypasses "
+        "PitParityCompare, or add skip_pit_parity_compare to the cadence Input"
     )
     assert gate["Default"] == "ParityParallel"
+
+    marker = find(doc["States"], "MarkParityVerdictUnknownByCadence")
+    assert marker, "MarkParityVerdictUnknownByCadence disappeared"
+    assert marker["Next"] == "CheckSkipEvaluator", (
+        "alpha-engine-config-I11103's marker must not change the skip "
+        "topology — it stamps $.parity_verdict_unknown and continues straight "
+        "to CheckSkipEvaluator, which is past PitParityCompare"
+    )
 
 
 def test_disable_names_its_reenable_issue() -> None:

@@ -197,9 +197,12 @@ class TestBacktesterTransition:
         assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
         assert _success("CheckPortfolioOptimizerBacktestStatus") == "CheckSkipParity"
 
-        # skip_parity short-circuit reaches the Evaluator gate directly.
+        # skip_parity short-circuit reaches the Evaluator gate via
+        # MarkParityVerdictUnknownByCadence (alpha-engine-config-I11103),
+        # which stamps $.parity_verdict_unknown and changes nothing else.
         skip_parity = states["CheckSkipParity"]
-        assert skip_parity["Choices"][0]["Next"] == "CheckSkipEvaluator"
+        assert skip_parity["Choices"][0]["Next"] == "MarkParityVerdictUnknownByCadence"
+        assert states["MarkParityVerdictUnknownByCadence"]["Next"] == "CheckSkipEvaluator"
         # Default = run the parity family (alpha-engine-config#6030:
         # ParityParallel → compare join); the compare's success terminal
         # hands off to CheckSkipEvaluator.

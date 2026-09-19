@@ -291,14 +291,16 @@ class TestChainOrdering:
         assert states["CheckSkipParity"]["Default"] == "ParityParallel"
 
     def test_skip_parity_honors_skip_flag(self, states):
-        """{"skip_parity": true} must route to CheckSkipEvaluator
-        (mirrors the skip_backtester / skip_evaluator shape)."""
+        """{"skip_parity": true} must route to MarkParityVerdictUnknownByCadence
+        and on to CheckSkipEvaluator (alpha-engine-config-I11103 inserted the
+        marker between them without changing the skip topology)."""
         choices = states["CheckSkipParity"]["Choices"]
         assert len(choices) == 1
         c = choices[0]
         variables = {cond["Variable"] for cond in c["And"]}
         assert variables == {"$.skip_parity"}
-        assert c["Next"] == "CheckSkipEvaluator"
+        assert c["Next"] == "MarkParityVerdictUnknownByCadence"
+        assert states["MarkParityVerdictUnknownByCadence"]["Next"] == "CheckSkipEvaluator"
 
     def test_parallel_join_chain(self, states):
         """ParityParallel → AggregateParityBranchOutcomes →

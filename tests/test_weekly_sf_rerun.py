@@ -593,6 +593,22 @@ class TestStageTableLockstep:
                     "update the config#2362 Option A additive gate"
                 )
                 continue
+            if stage.name == "parity":
+                # alpha-engine-config-I11103 inserted MarkParityVerdictUnknownByCadence
+                # between CheckSkipParity and CheckSkipEvaluator to stamp
+                # $.parity_verdict_unknown; it is a Pass with no Catch, so
+                # CheckSkipEvaluator (the row's witness) remains reachable —
+                # only one hop further, which the immediate-Next check below
+                # cannot see. Checked structurally instead.
+                assert skip_targets == {"MarkParityVerdictUnknownByCadence"}, (
+                    "CheckSkipParity's skip route changed — update STAGES / "
+                    "this structural exception (alpha-engine-config-I11103)"
+                )
+                assert all_states["MarkParityVerdictUnknownByCadence"]["Next"] == "CheckSkipEvaluator", (
+                    "MarkParityVerdictUnknownByCadence no longer lands on the "
+                    "parity row's witness (CheckSkipEvaluator)"
+                )
+                continue
             if stage.name == "pit_parity_compare":
                 # the compare's skip route overshoots its witness to the
                 # evaluator gate — like backtester_stage_only, checked
