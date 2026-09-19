@@ -99,7 +99,10 @@ def test_branch_b_starts_at_init_predictor_degraded(parallel):
 def test_init_research_degraded_seeds_false(branch_a):
     st = branch_a["InitResearchDegradedFlag"]
     assert st["Type"] == "Pass"
-    assert st["Result"] is False
+    # alpha-engine-config-I11073: an object, not a bare boolean. `routes` is the
+    # accumulator every Mark*Degraded state appends its own name to, seeded here
+    # so the first route's Parameters.$ read of it cannot throw States.Runtime.
+    assert st["Result"] == {"degraded": False, "routes": ""}
     assert st["ResultPath"] == "$.research_degraded_local"
     assert st["Next"] == "CheckSkipScanner"
 
@@ -107,7 +110,7 @@ def test_init_research_degraded_seeds_false(branch_a):
 def test_init_predictor_degraded_seeds_false(branch_b):
     st = branch_b["InitPredictorDegradedFlag"]
     assert st["Type"] == "Pass"
-    assert st["Result"] is False
+    assert st["Result"] == {"degraded": False, "routes": ""}
     assert st["ResultPath"] == "$.research_degraded_local"
     assert st["Next"] == "CheckSkipPredictorTraining"
 
@@ -144,7 +147,14 @@ _BRANCH_A_MARK_STATES = {
 def test_branch_a_mark_state_shape(branch_a, name, next_target):
     st = branch_a[name]
     assert st["Type"] == "Pass"
-    assert st["Result"] is True
+    # alpha-engine-config-I11073: each route sets the flag AND appends its own
+    # name. A bare `Result: True` discards the route identity at the one state
+    # that knows it, and ten routes then share one indistinguishable boolean.
+    assert "Result" not in st
+    assert st["Parameters"]["degraded"] is True
+    assert st["Parameters"]["routes.$"] == (
+        f"States.Format('{{}},{{}}',$.research_degraded_local.routes,'{name}')"
+    )
     assert st["ResultPath"] == "$.research_degraded_local"
     assert st["Next"] == next_target
 
@@ -210,6 +220,7 @@ def test_branch_a_owner_catch_routes_through_a_mark_state(branch_a, owner):
     assert target.startswith("Mark") and target.endswith("Degraded")
     assert target in branch_a
     assert branch_a[target]["ResultPath"] == "$.research_degraded_local"
+    assert branch_a[target]["Parameters"]["degraded"] is True
 
 
 def test_no_state_writes_the_old_dead_thinktank_path(branch_a, branch_b, states):
@@ -249,7 +260,12 @@ def test_publish_model_zoo_failure_routes_through_mark_model_zoo_degraded(branch
 def test_mark_model_zoo_degraded_shape(branch_b):
     st = branch_b["MarkModelZooDegraded"]
     assert st["Type"] == "Pass"
-    assert st["Result"] is True
+    assert "Result" not in st
+    assert st["Parameters"]["degraded"] is True
+    assert st["Parameters"]["routes.$"] == (
+        "States.Format('{},{}',$.research_degraded_local.routes,"
+        "'MarkModelZooDegraded')"
+    )
     assert st["ResultPath"] == "$.research_degraded_local"
     assert st["Next"] == "BranchBComplete"
 
@@ -265,7 +281,13 @@ def test_branch_a_complete_hoists_local_flag(branch_a):
     assert st["Parameters"]["branch_a"]["branch_a_status"] == "OK"
     assert (
         st["Parameters"]["branch_a"]["branch_a_degraded.$"]
-        == "$.research_degraded_local"
+        == "$.research_degraded_local.degraded"
+    )
+    # alpha-engine-config-I11073: the names leave the branch here or nowhere —
+    # a Parallel branch is its own JSONPath scope.
+    assert (
+        st["Parameters"]["branch_a"]["branch_a_routes.$"]
+        == "$.research_degraded_local.routes"
     )
 
 
@@ -273,6 +295,9 @@ def test_branch_a_failed_sets_degraded_false(branch_a):
     st = branch_a["BranchAFailed"]
     assert st["Parameters"]["branch_a"]["branch_a_status"] == "FAILED"
     assert st["Parameters"]["branch_a"]["branch_a_degraded"] is False
+    # Every terminal must set every field the join extracts, or the post-join
+    # Parameters.$ throws States.Runtime on whichever path ran.
+    assert st["Parameters"]["branch_a"]["branch_a_routes"] == ""
 
 
 def test_branch_b_complete_hoists_local_flag(branch_b):
@@ -280,7 +305,13 @@ def test_branch_b_complete_hoists_local_flag(branch_b):
     assert st["Parameters"]["branch_b"]["branch_b_status"] == "OK"
     assert (
         st["Parameters"]["branch_b"]["branch_b_degraded.$"]
-        == "$.research_degraded_local"
+        == "$.research_degraded_local.degraded"
+    )
+    # alpha-engine-config-I11073: the names leave the branch here or nowhere —
+    # a Parallel branch is its own JSONPath scope.
+    assert (
+        st["Parameters"]["branch_b"]["branch_b_routes.$"]
+        == "$.research_degraded_local.routes"
     )
 
 
@@ -288,12 +319,16 @@ def test_branch_b_failed_sets_degraded_false(branch_b):
     st = branch_b["BranchBFailed"]
     assert st["Parameters"]["branch_b"]["branch_b_status"] == "FAILED"
     assert st["Parameters"]["branch_b"]["branch_b_degraded"] is False
+    # Every terminal must set every field the join extracts, or the post-join
+    # Parameters.$ throws States.Runtime on whichever path ran.
+    assert st["Parameters"]["branch_b"]["branch_b_routes"] == ""
 
 
 def test_predictor_training_skipped_sets_degraded_false(branch_b):
     st = branch_b["PredictorTrainingSkipped"]
     assert st["Result"]["branch_b"]["branch_b_status"] == "OK"
     assert st["Result"]["branch_b"]["branch_b_degraded"] is False
+    assert st["Result"]["branch_b"]["branch_b_routes"] == ""
 
 
 # ---------------------------------------------------------------------------
@@ -344,11 +379,20 @@ def test_set_research_predictor_degraded_shape(states):
     assert st["Type"] == "Pass"
     assert st["Result"] is True
     assert st["ResultPath"] == "$.research_predictor_degraded"
+    # alpha-engine-config-I11073: the family boolean now hands off to the state
+    # that names WHICH routes fired, which hands back to the summary. A Pass has
+    # exactly one ResultPath, so this is three states, not one.
+    assert st["Next"] == "SetResearchPredictorDegradedRoutes"
+    routes = states["SetResearchPredictorDegradedRoutes"]
+    assert routes["Type"] == "Pass"
+    assert routes["ResultPath"] == "$.research_predictor_degraded_routes"
+    assert routes["Next"] == "SetResearchPredictorDegradedSummary"
     # alpha-engine-config-I7812: the family flag still routes through its own
     # summary; that summary now continues into the resource-kill reason fork,
     # whose Default is the unchanged CheckSkipBacktester.
     assert_degraded_continuation(
-        states, "SetResearchPredictorDegraded", "CheckScannerResourceKillReason"
+        states, "SetResearchPredictorDegraded", "CheckScannerResourceKillReason",
+        via="SetResearchPredictorDegradedRoutes",
     )
     fork = states["CheckScannerResourceKillReason"]
     assert fork["Type"] == "Choice"

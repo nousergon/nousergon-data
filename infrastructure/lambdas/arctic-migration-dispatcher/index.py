@@ -53,15 +53,17 @@ own P1-filing fallback, and the on-box runner (scripts/run_arctic_migrations.py)
 sends the richer, outcome-specific Telegram receipt once the actual migration
 work concludes. This Lambda's job is launch only.
 
-IAM PROFILE — reuses `alpha-engine-executor-profile` (the SAME profile
-data-spot-dispatcher's box already runs under), NOT a new profile: the issue's
-own gotcha says to reuse an existing data-plane profile when scopes match
-rather than minting a new IAM surface, and this profile already carries the
-ArcticDB S3 read/write the migration rewrite needs. If a future migration
-needs a broader grant (e.g. the flow-doctor DynamoDB dedup store — see the
-runner's Telegram notify path, which degrades gracefully without it today),
-that is a SEPARATE operator IAM step, called out in the PR body, not bundled
-here.
+IAM PROFILE — `nousergon-data-collection-box-profile` (alpha-engine-config-
+I11019, superseding the original `alpha-engine-executor-profile` default).
+The box writes `arcticdb/{universe,macro,universe_schema_meta}` under
+`s3://alpha-engine-research/`; `alpha-engine-executor-role` held bucket-wide
+PutObject/DeleteObject on that bucket (a whole-bucket wildcard, not scoped
+to what this workload writes) — exactly the condition the scoped-identity
+requirement (alpha-engine-config-I10756) exists to forbid on a workload that
+rewrites the price universe in place. `nousergon-data-collection-box-role`
+carries the grants D42 needs and nothing bucket-wide (nous-ergon-ops-PR1330,
+merged 2026-09-18) — see `data_gate/config/writer_identities.yaml`'s D42 row
+for the sequencing note on when that declaration follows this deployment.
 
 Managed OUTSIDE CloudFormation (same as every sibling dispatcher): operator-
 deployed via `deploy.sh --bootstrap`. Merging the PR that ships this file has
@@ -123,7 +125,9 @@ KEY_NAME = os.environ.get("ARCTIC_MIGRATION_KEY_NAME", "alpha-engine-key")
 SECURITY_GROUP = os.environ.get("ARCTIC_MIGRATION_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
 # Reuse the executor profile (ArcticDB S3 read/write already granted) — see
 # module docstring's IAM PROFILE section.
-IAM_PROFILE = os.environ.get("ARCTIC_MIGRATION_IAM_PROFILE", "alpha-engine-executor-profile")
+IAM_PROFILE = os.environ.get(
+    "ARCTIC_MIGRATION_IAM_PROFILE", "nousergon-data-collection-box-profile"
+)
 VOLUME_SIZE_GB = int(os.environ.get("ARCTIC_MIGRATION_VOLUME_SIZE_GB", "60"))
 
 MIGRATION_REPO = os.environ.get("ARCTIC_MIGRATION_REPO", "nousergon/nousergon-data")

@@ -35,7 +35,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: features/compute.py
-    line: 893
+    line: 940
     reason: >-
       (a) failure mode swallowed: the exact-date S3 fundamentals key missing
       or unreadable. (c) recording surface: none needed at this step —
@@ -43,7 +43,7 @@ entries:
       fallback a few lines below, whose own failure IS recorded loud
       (log.warning at ~line 911) and whose total-absence outcome is ALSO
       recorded (log.info at ~line 913). Read-side cache lookup, not a
-      writer — nothing is persisted here.
+      writer — nothing is persisted here. (Shifted +47 by alpha-engine-config-I10923's ReferenceMapUnavailable class + the two loaders' raise-on-failure rewrite; site unchanged.)
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: weekly_collector.py
