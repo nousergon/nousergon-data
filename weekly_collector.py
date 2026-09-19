@@ -2669,6 +2669,37 @@ def _self_heal_chronic_polygon_gaps(
     return summary
 
 
+def _daily_closes_written_keys(
+    dc_result: dict, s3_prefix: str, target_date: str
+) -> list[str]:
+    """The ``staging/daily_closes/{date}.parquet`` key(s) a
+    ``daily_closes.collect`` call actually wrote.
+
+    `alpha-engine-config-I10942` deliverable 3. ``morning_daily_closes``'s
+    phase marker declared ``artifact_keys: []`` on the 2026-09-16 shadow run
+    while the underlying window-mode call had just written nine parquet
+    files — ``_maybe_phase`` is marker-only (see its docstring) and this
+    call site never told it what got written. Window mode
+    (``window_days > 1``) reports each date it touched under
+    ``dc_result["per_date"]``; single-date mode's ``dc_result`` IS that one
+    date's own result, keyed on ``target_date``. Only dates whose own
+    per-date status is ``ok``/``ok_dry_run`` are counted — a best-effort
+    backfill miss (see ``_collect_window``'s target-driven fatality) did not
+    write a parquet and must not be declared as if it had.
+    """
+    prefix = s3_prefix.rstrip("/")
+    per_date = (dc_result or {}).get("per_date")
+    if isinstance(per_date, dict):
+        return sorted(
+            f"{prefix}/{d}.parquet"
+            for d, r in per_date.items()
+            if isinstance(r, dict) and r.get("status") in ("ok", "ok_dry_run")
+        )
+    if (dc_result or {}).get("status") in ("ok", "ok_dry_run"):
+        return [f"{prefix}/{target_date}.parquet"]
+    return []
+
+
 def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     """Morning polygon enrichment: overwrite the prior trading day's parquet
     + ArcticDB row with polygon's authoritative OHLCV+VWAP.
@@ -2867,18 +2898,44 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     # corporate-action backfills.
     window_days = int(daily_cfg.get("window_days", 1))
     skip_if_canonical = bool(daily_cfg.get("skip_if_canonical", False))
+    daily_closes_s3_prefix = daily_cfg.get("s3_prefix", "staging/daily_closes/")
     try:
-        with _maybe_phase(reg, "morning_daily_closes"):
+        with _maybe_phase(reg, "morning_daily_closes") as dc_ctx:
             dc_result = daily_closes.collect(
                 bucket=bucket,
                 tickers=tickers,
                 run_date=target_date,
-                s3_prefix=daily_cfg.get("s3_prefix", "staging/daily_closes/"),
+                s3_prefix=daily_closes_s3_prefix,
                 dry_run=dry_run,
                 source="polygon_only",
                 window_days=window_days,
                 skip_if_canonical=skip_if_canonical,
             )
+            # `alpha-engine-config-I10942`. `daily_closes.collect` in window
+            # mode does NOT raise on a target-date failure — `_collect_window`
+            # returns `status="error"` as a VALUE so a best-effort backfill
+            # miss on an older date never aborts the run ("Fatality is
+            # TARGET-driven" in that function). `_maybe_phase` is marker-only
+            # (see its docstring) and records `ok` unless this block raises,
+            # so a returned failure has to be re-raised HERE or the phase
+            # marker says `ok` on a run whose own trading day never got
+            # written — exactly the 2026-09-16 shadow shape. Mirrors
+            # `_phase_collect`'s own `result.get("status") == "error"` check.
+            dc_status = (dc_result or {}).get("status")
+            if dc_status not in ("ok", "ok_dry_run", "skipped"):
+                raise _CollectorError(
+                    "morning_daily_closes",
+                    run_units.describe_mode_failure("morning_daily_closes", dc_result),
+                    dc_result,
+                )
+            if dc_ctx is not None and not dry_run:
+                # Declare what this phase actually wrote — an empty
+                # `artifact_keys` on a phase that wrote nine parquet files is
+                # a false declaration (I10942 deliverable 3).
+                for written_key in _daily_closes_written_keys(
+                    dc_result, daily_closes_s3_prefix, target_date
+                ):
+                    dc_ctx.record_artifact(written_key)
         results["collectors"]["daily_closes"] = dc_result
         # ── Vendor cross-check: no silent non-measurement ────────────────────
         # alpha-engine-config-I10783 / nousergon-data-PR1712. The divergence
