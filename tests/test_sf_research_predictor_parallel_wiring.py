@@ -541,6 +541,9 @@ class TestBranchBContents:
         # so AggregateBranchOutcomes' Parameters.$ extraction never throws).
         assert set(skipped["Result"]["branch_b"]) == {
             "branch_b_status", "skipped", "branch_b_degraded",
+            # alpha-engine-config-I11073: every terminal carries the route
+            # accumulator the join extracts, empty where no route fired.
+            "branch_b_routes",
         }
         assert skipped["Result"]["branch_b"]["branch_b_degraded"] is False
         # Contract equivalence with the real success terminal.
@@ -809,7 +812,8 @@ class TestPerBranchErrorIsolation:
         # definition-derived form of this invariant.
         ok = branch_a["BranchAComplete"]["Parameters"]["branch_a"]
         assert ok["branch_a_status"] == "OK"
-        assert ok["branch_a_degraded.$"] == "$.research_degraded_local"
+        assert ok["branch_a_degraded.$"] == "$.research_degraded_local.degraded"
+        assert ok["branch_a_routes.$"] == "$.research_degraded_local.routes"
         assert "ResultPath" not in branch_a["BranchAComplete"]
         bad = branch_a["BranchAFailed"]["Parameters"]["branch_a"]
         assert bad["branch_a_status"] == "FAILED"
@@ -827,7 +831,8 @@ class TestPerBranchErrorIsolation:
         # definition-derived form of this invariant.
         ok = branch_b["BranchBComplete"]["Parameters"]["branch_b"]
         assert ok["branch_b_status"] == "OK"
-        assert ok["branch_b_degraded.$"] == "$.research_degraded_local"
+        assert ok["branch_b_degraded.$"] == "$.research_degraded_local.degraded"
+        assert ok["branch_b_routes.$"] == "$.research_degraded_local.routes"
         assert "ResultPath" not in branch_b["BranchBComplete"]
         bad = branch_b["BranchBFailed"]["Parameters"]["branch_b"]
         assert bad["branch_b_status"] == "FAILED"

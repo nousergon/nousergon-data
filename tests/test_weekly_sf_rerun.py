@@ -665,6 +665,12 @@ class TestStageTableLockstep:
             # alpha-engine-config-I6891 gave this fold a summary sibling too;
             # it inherits the exclusion for the same reason.
             "SetResearchPredictorDegradedSummary",
+            # alpha-engine-config-I11073 added a third state to the same fold:
+            # SetResearchPredictorDegradedRoutes, which writes only the NAMES of
+            # the routes that fired. It is an observation of the granular Mark*
+            # states already mapped below, dispatches nothing and writes no
+            # artifact, so it inherits the exclusion for the same reason.
+            "SetResearchPredictorDegradedRoutes",
             # Branch INITIALISERS, surfaced by the substring predicate below.
             # They set the branch's degraded flag to FALSE at branch start —
             # entering one says the branch began, never that anything degraded,
