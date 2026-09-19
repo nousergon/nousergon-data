@@ -43,7 +43,7 @@ import pytest
 # two originally cross-importing this file — has one discoverable
 # chokepoint. See conftest.recent_trading_day_str's docstring for the
 # incident history (2026-05-04, 2026-06-22, 2026-07-03).
-from tests.conftest import recent_trading_day_str
+from tests.conftest import recent_trading_day_str, stub_empty_reference_maps
 
 
 _DAILY_APPEND = Path(__file__).parent.parent / "builders" / "daily_append.py"
@@ -182,6 +182,7 @@ def _patch_targets(
     universe_lib.write_batch.side_effect = _spy_write_batch
 
     mock_s3 = MagicMock()
+    stub_empty_reference_maps(mock_s3)  # I10923: loaders now raise, not swallow
     monkeypatch.setattr("builders.daily_append.boto3.client", lambda *a, **k: mock_s3)
 
     return universe_lib, macro_lib, write_calls
