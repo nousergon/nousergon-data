@@ -29,6 +29,22 @@ DEFINITION = REPO / "infrastructure" / "step_function.json"
 HANDLER = REPO / "infrastructure" / "lambdas" / "weekly-coverage-sweep" / "index.py"
 
 
+
+def _matched_literal(rule: dict) -> str:
+    """The outcome literal a Choice rule matches.
+
+    alpha-engine-config-I9693: the rules are now ``And``-wrapped with an
+    ``IsPresent`` guard, because this Choice's predecessor changed from the
+    sweep Task (which pinned the field via ResultSelector) to the vacuity
+    Choice (which pins nothing). Read through the conjunction rather than off
+    the rule, so the shape of the guard is free to change and the literal set
+    these tests are about stays the thing under test.
+    """
+    for conjunct in rule.get("And", [rule]):
+        if "StringEquals" in conjunct:
+            return conjunct["StringEquals"]
+    raise AssertionError(f"no StringEquals in Choice rule: {rule}")
+
 @pytest.fixture(scope="module")
 def states() -> dict:
     return json.loads(DEFINITION.read_text())["States"]
@@ -68,7 +84,7 @@ def test_every_handler_outcome_literal_has_a_choice_branch(states: dict, handler
     assert literals == {"clean", "findings", "deferred", "unavailable"}
 
     choice = states["CheckWeeklyCoverageSweepOutcome"]
-    branched = {c["StringEquals"] for c in choice["Choices"]}
+    branched = {_matched_literal(c) for c in choice["Choices"]}
     # ``unavailable`` is deliberately the Default rather than a branch: an
     # outcome the Choice does not recognise is an unknown state of the
     # coverage surface, and unknown is never rendered green.
@@ -81,7 +97,10 @@ def test_the_deferred_branch_reaches_its_own_terminal(states: dict) -> None:
     "the sweep ran and could not establish coverage" unreadable in the
     execution history, which is the first place an operator looks."""
     choice = states["CheckWeeklyCoverageSweepOutcome"]
-    target = next(c["Next"] for c in choice["Choices"] if c["StringEquals"] == "deferred")
+    target = next(
+        c["Next"] for c in choice["Choices"]
+        if _matched_literal(c) == "deferred"
+    )
     assert target == "WeeklyCoverageSweepDeferred"
 
     deferred = states[target]

@@ -76,6 +76,15 @@ _STATUS_EMOJI: dict[str, str] = {
 # must also not read as a generic failure). Distinct emoji, distinct label.
 _DEGRADED_EMOJI = "\U0001f7e0"  # 🟠
 
+# The weekly SF's deliberate `Error: "VacuousRun"` Fail terminal
+# (alpha-engine-config-I9693). Same doctrine as DegradedRun one level up: an
+# execution that entered none of the declared spine stages now FAILS rather
+# than reporting SUCCEEDED, and it must not then read as a crash either. Five
+# consecutive Saturdays were "recovered" by an all-skipped rerun that reported
+# green; rendering the honest terminal as a generic red would trade one
+# misreading for another.
+_VACUOUS_EMOJI = "\U0001f6d1"  # 🛑
+
 # Every severity this notifier can emit is exempt from the fleet-shared daily
 # alert budget. Justified by the producer being BOUNDED, not by the traffic
 # being important: this Lambda mirrors the lifecycle of a fixed set of state
@@ -216,6 +225,16 @@ def _is_degraded_run(describe_resp: dict | None) -> bool:
     return (describe_resp.get("error") or "") == "DegradedRun"
 
 
+def _is_vacuous_run(describe_resp: dict | None) -> bool:
+    """True when a FAILED execution is the deliberate ``VacuousRun`` Fail
+    terminal — the execution entered none of the pipeline's declared spine
+    stages (``alpha-engine-config-I9693``). Reads the same ``Error`` field the
+    definition stamps, for the same reason :func:`_is_degraded_run` does."""
+    if not describe_resp:
+        return False
+    return (describe_resp.get("error") or "") == "VacuousRun"
+
+
 def _normalize_cause_snippet(snippet: str, *, max_chars: int = _CAUSE_MAX_CHARS) -> str:
     """Collapse embedded newlines and cap length for a single Telegram line.
 
@@ -284,8 +303,16 @@ def _build_message(
         label = f"{label} (partial run — {skipped_stages} stage(s) skipped)"
     sm_name = sm_arn.rsplit(":", 1)[-1] if sm_arn else ""
     is_degraded = status == "FAILED" and _is_degraded_run(describe_resp)
-    display_status = "DEGRADED" if is_degraded else status
-    emoji = _DEGRADED_EMOJI if is_degraded else _STATUS_EMOJI.get(status, "\U0001f4e8")
+    is_vacuous = status == "FAILED" and _is_vacuous_run(describe_resp)
+    if is_vacuous:
+        display_status = "NO WORK DONE"
+        emoji = _VACUOUS_EMOJI
+    elif is_degraded:
+        display_status = "DEGRADED"
+        emoji = _DEGRADED_EMOJI
+    else:
+        display_status = status
+        emoji = _STATUS_EMOJI.get(status, "\U0001f4e8")
     exec_name = detail.get("name", "") or "(unknown execution)"
     hollow_suspect = False
     detailed_failure_cause: str | None = None
