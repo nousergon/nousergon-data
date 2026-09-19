@@ -25,10 +25,25 @@ model_zoo_unservable=false into both completion markers while the arena's own
 decision block read "unservable".
 
 So the verdict is no longer scraped from a log stream at all. ReadModelZooArenaCycle
-reads arena/model/{run_date}.json — the artifact ModelZooSelect writes before it
-exits 0 — and CheckModelZooVerdict switches on its decision.status. Absence of
-that field is UNKNOWN and degrades honestly (sf-pipeline-policy.md §2.3a); it is
-never resolved to the passing value.
+reads arena/model/{run_date}.verdict — a plain-text projection of the same
+validated decision.status, written by emit_cycle in the same call as the cycle
+JSON — and CheckModelZooVerdict compares the WHOLE body against one word.
+
+It is a bare word rather than the cycle JSON because neither alternative is safe
+inside Step Functions, both measured on 2026-09-19:
+
+  * States.StringToJson on the cycle body raises States.Runtime on a malformed
+    artifact, and that error is NOT CATCHABLE. Verified against live Step
+    Functions, including from inside a Parallel whose Catch names States.ALL.
+    An earlier revision of this change shipped that parse and would have taken
+    the whole weekly run down on a bad artifact.
+  * String-matching the rendered cycle JSON re-introduces the class being
+    removed: decision.comparisons[].status is a second "status" field in the
+    same document, so a substring match is a false-positive surface.
+
+Absence, an unreadable object and an unrecognised word are all UNKNOWN and
+degrade honestly (sf-pipeline-policy.md §2.3a); none resolves to the passing
+value.
 
 These are structural walks over the definition, not live executions.
 """
@@ -164,26 +179,81 @@ def test_no_verdict_is_decided_by_matching_standard_output_content(branch_b):
 
 
 def test_arena_read_uses_the_dated_key_never_latest(branch_b):
-    """latest.json is whatever ran most recently, which on a recovery arc need
-    not be the cycle being recovered. The read must key on $.run_date."""
+    """latest.verdict is whatever ran most recently, which on a recovery arc
+    need not be the cycle being recovered. The read must key on $.run_date."""
     params = branch_b["ReadModelZooArenaCycle"]["Parameters"]
     assert params["Bucket"] == "alpha-engine-research"
     key = params["Key.$"]
-    assert key == "States.Format('arena/model/{}.json', $.run_date)"
+    assert key == "States.Format('arena/model/{}.verdict', $.run_date)"
     assert "latest" not in key
 
 
-def test_arena_body_is_parsed_in_result_selector_so_the_failure_is_catchable(branch_b):
-    """States.StringToJson in a Pass's Parameters raises States.Runtime, which a
-    Pass cannot Catch — a malformed artifact would kill the whole Parallel and
-    with it the run. In a Task's ResultSelector the same failure is an ordinary
-    Task error, and the Catch below absorbs it."""
+def test_nothing_on_this_path_parses_producer_bytes_inside_asl(branch_b):
+    """THE OTHER REGRESSION GUARD. States.StringToJson raises States.Runtime on
+    a malformed input, and States.Runtime is NOT CATCHABLE — measured against
+    live Step Functions on 2026-09-19, including from inside a Parallel whose
+    Catch names States.ALL. So a parse of producer bytes anywhere on this path
+    is a way for one bad artifact to fail the entire weekly run, and no Catch
+    can be added to make it safe. The parse belongs at the producer, where a
+    malformed value is an ordinary Python exception; the SF gets a bare word."""
     state = branch_b["ReadModelZooArenaCycle"]
     assert state["Type"] == "Task"
     assert state["Resource"] == "arn:aws:states:::aws-sdk:s3:getObject"
-    assert state["ResultSelector"]["cycle.$"] == "States.StringToJson($.Body)"
     assert state["ResultPath"] == "$.model_zoo_arena"
-    assert state.get("Catch"), "the parse must be guarded, or a bad artifact fails the run"
+    assert "ResultSelector" not in state, (
+        "a ResultSelector here is where the uncatchable intrinsic lived"
+    )
+    assert state.get("Catch"), "a missing object must still be caught"
+
+    import json as _json
+    for name in ("ReadModelZooArenaCycle", "CheckModelZooVerdict",
+                 "ExtractModelZooVerdictAbsent", "ExtractModelZooVerdictUnreadable"):
+        assert "StringToJson" not in _json.dumps(branch_b[name].get("Parameters", {})), name
+        assert "StringToJson" not in _json.dumps(branch_b[name].get("ResultSelector", {})), name
+
+
+def test_the_verdict_is_compared_whole_never_as_a_substring(branch_b):
+    """A substring match over a rendered document is the class this change
+    removes — the cycle JSON carries decision.comparisons[].status as a second
+    `status` field. The projection is one word and is compared as one word."""
+    for rule in branch_b["CheckModelZooVerdict"]["Choices"]:
+        conds = rule.get("And") or [rule]
+        for cond in conds:
+            assert "StringMatches" not in cond, cond
+            assert cond["Variable"] == "$.model_zoo_arena.Body"
+
+
+def test_every_status_the_contract_allows_has_an_arm(branch_b):
+    """The producer refuses to write a status outside arena_cycle.schema.json's
+    decision.status enum, so every word it CAN write must be routed explicitly.
+    A word with no arm falls to Default, which is the UNKNOWN edge — correct,
+    but it would degrade every run rather than name the drift."""
+    # Read from the INSTALLED nousergon-lib, not a sibling checkout: a path
+    # guess is wrong in a worktree and wrong in CI, and it would skip — which
+    # for a drift guard is the same as not existing.
+    from nousergon_lib.contracts import load_schema
+
+    enum = set(
+        load_schema("arena_cycle")["properties"]["decision"]
+        ["properties"]["status"]["enum"]
+    )
+    routed = {
+        cond["StringEquals"]
+        for r in branch_b["CheckModelZooVerdict"]["Choices"]
+        for cond in (r.get("And") or [r])
+        if "StringEquals" in cond
+    }
+    assert routed == enum, (
+        f"arms {sorted(routed)} vs contract enum {sorted(enum)} — the two "
+        f"vocabularies must not drift (alpha-engine-config-I11101)"
+    )
+
+
+def test_an_unrecognised_word_is_unknown_not_a_clean_completion(branch_b):
+    """Default is the UNKNOWN edge, not BranchBComplete. The producer already
+    refuses an out-of-vocabulary status, so reaching Default means the two
+    vocabularies have drifted — exactly when guessing is worst."""
+    assert branch_b["CheckModelZooVerdict"]["Default"] == "ExtractModelZooVerdictAbsent"
 
 
 def test_an_unreadable_verdict_degrades_honestly_and_never_reads_as_servable(branch_b):
@@ -206,7 +276,7 @@ def test_an_unreadable_verdict_degrades_honestly_and_never_reads_as_servable(bra
     rules = branch_b["CheckModelZooVerdict"]["Choices"]
     absent = [r for r in rules if r.get("IsPresent") is False]
     assert len(absent) == 1, "the absent-verdict case must be stated, not left to Default"
-    assert absent[0]["Variable"] == "$.model_zoo_arena.cycle.decision.status"
+    assert absent[0]["Variable"] == "$.model_zoo_arena.Body"
     assert absent[0]["Next"] == "ExtractModelZooVerdictAbsent"
     # Two producers, not one: $.model_zoo_arena_error exists only on the Catch
     # path, and tests/test_sf_field_reachability.py holds a state to fields
@@ -217,7 +287,6 @@ def test_an_unreadable_verdict_degrades_honestly_and_never_reads_as_servable(bra
     assert rules.index(absent[0]) == 0, (
         "Choice is first-match; the absence arm must precede any value test"
     )
-    assert branch_b["CheckModelZooVerdict"]["Default"] == "BranchBComplete"
 
 
 def test_only_an_explicit_unservable_status_declares_the_slot_unservable(branch_b):
@@ -226,9 +295,14 @@ def test_only_an_explicit_unservable_status_declares_the_slot_unservable(branch_
     choice = branch_b["CheckModelZooVerdict"]
     to_declared = [r for r in choice["Choices"] if r.get("Next") == "ModelZooUnservableDeclared"]
     assert len(to_declared) == 1
-    assert to_declared[0]["Variable"] == "$.model_zoo_arena.cycle.decision.status"
-    assert to_declared[0]["StringEquals"] == "unservable"
-    assert choice["Default"] == "BranchBComplete"
+    (guard, value) = to_declared[0]["And"]
+    assert guard == {"Variable": "$.model_zoo_arena.Body", "IsPresent": True}
+    assert value == {"Variable": "$.model_zoo_arena.Body", "StringEquals": "unservable"}
+    clean = {
+        r["And"][1]["StringEquals"]
+        for r in choice["Choices"] if r.get("Next") == "BranchBComplete"
+    }
+    assert clean == {"decided", "held", "unmeasurable", "bootstrap"}
 
 
 def test_wait_for_model_zoo_captures_standard_output_content(branch_b):
