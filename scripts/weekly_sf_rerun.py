@@ -121,6 +121,22 @@ from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
     _walk_states,  # noqa: F401 — re-exported: tests/test_weekly_sf_rerun.py calls mod._walk_states directly
 )
 
+# The definition-derived vacuity analysis (alpha-engine-config-I11075) lives
+# with the other definition derivations, in the run-scope Lambda module — the
+# same sys.path-insert shape scripts/fault_injection_run.py uses for
+# groom-inject-mock. It is imported, never re-implemented: a second copy of a
+# reachability walk is a second thing to keep true of the live definition.
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent
+        / "infrastructure" / "lambdas" / "weekly-run-scope"),
+)
+from run_scope import (  # noqa: E402 — see sys.path insertion above
+    disabling_flags_for_input,
+    enabled_spine_stages,
+)
+from nousergon_lib.pipeline_status.registry import stage_order_for  # noqa: E402
+
 DEFAULT_STATE_MACHINE_ARN = (
     "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 )
@@ -1053,6 +1069,12 @@ class RerunPlan:
     chain: list = field(default_factory=list)
     witnessed_by: dict = field(default_factory=dict)
 
+    # alpha-engine-config-I11075: the operator's named reason for dispatching a
+    # rerun that can enter no spine stage. Emitted into the execution input so
+    # describe-execution answers "who decided this empty run was right, and
+    # why" without anyone having to find the terminal that launched it.
+    accept_vacuous_reason: str = ""
+
     def rerun_input(self) -> dict:
         """The emitted StartExecution input.
 
@@ -1115,6 +1137,8 @@ class RerunPlan:
         out["pipeline_role"] = EMITTED_ROLE
         out.update(declared)
         out.update(self.skip_flags)
+        if self.accept_vacuous_reason:
+            out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
         return out
 
 
@@ -1691,6 +1715,76 @@ def refuse_fallback_run_date_without_acceptance(plan: "RerunPlan", accept: bool)
     )
 
 
+class VacuousRerunError(Exception):
+    """The proposed rerun can enter NO declared spine stage.
+
+    alpha-engine-config-I9693: three straight Saturday runs FAILED and every
+    recovery was an all-skipped rerun that terminated SUCCEEDED, so the weekly
+    cadence produced nothing between 2026-08-15 and the fix while every surface
+    reading the terminal state showed green. The recovery loop converges here
+    naturally — each rerun derives skips from what the previous one witnessed,
+    so the skip set only ever grows, and the last rerun in a chain is the one
+    that runs nothing at all.
+
+    nousergon-data-PR1808 made the SF itself terminate ``VacuousRun`` (a Fail)
+    on an execution that enters no spine stage, so it pages rather than
+    resolves. This is the same predicate moved AHEAD of the dispatch: a ~50
+    minute execution and a CRITICAL page, both spent establishing something the
+    input already said.
+    """
+
+
+def refuse_vacuous_rerun(
+    sm_def: dict, sm_arn: str, rerun_input: dict, accept_reason: str | None
+) -> tuple:
+    """Refuse (SystemExit) a --start whose input can enter no spine stage.
+
+    Returns the enterable spine stages so the caller can report them. The
+    escape hatch is ``--accept-vacuous-rerun REASON``: named and reasoned, per
+    I9693 deliverable 3, and the reason rides into the execution input so
+    ``describe-execution`` carries it for as long as the execution is retained.
+    Accepting does NOT make the run substantive — the SF still terminates
+    ``VacuousRun`` — it records who decided to spend the dispatch and why.
+    """
+    spine = stage_order_for(sm_arn)
+    if not spine:
+        raise VacuousRerunError(
+            f"no declared spine for {sm_arn.rsplit(':', 1)[-1]!r} in "
+            "nousergon_lib.pipeline_status.registry.PIPELINE_STAGE_ORDER — "
+            "a pipeline whose substantive stages are undeclared cannot be "
+            "judged vacuous, and treating that as 'nothing was expected, so "
+            "it passed' is the exact defect this guard exists for. Declare "
+            "the spine before re-running this pipeline through this script."
+        )
+    enterable = enabled_spine_stages(sm_def, rerun_input, spine)
+    if enterable:
+        return enterable
+    attribution = disabling_flags_for_input(sm_def, rerun_input, spine)
+    lines = []
+    for stage in spine:
+        flags = attribution.get(stage, ())
+        lines.append(
+            f"    {stage}: {', '.join(flags) if flags else 'the skip set as a whole'}"
+        )
+    detail = "\n".join(lines)
+    if accept_reason:
+        return enterable
+    raise SystemExit(
+        "FATAL (vacuous rerun, alpha-engine-config-I11075 / I9693): this "
+        f"input can enter NONE of the {len(spine)} declared spine stages of "
+        f"{sm_arn.rsplit(':', 1)[-1]} — it would run for its full wall clock "
+        "and produce nothing, then terminate VacuousRun and page.\n"
+        "  disabled by:\n"
+        f"{detail}\n"
+        "  Every stage the cycle needs is already switched off, which means "
+        "the recovery is FINISHED, not pending — the remaining failure is not "
+        "re-runnable by skipping more. Investigate what the chain never "
+        "completed (the plan above names it), or, if dispatching an empty run "
+        "really is what you want, re-run with "
+        "--accept-vacuous-rerun 'why this empty run is the right action'."
+    )
+
+
 def _predictor_manifest_date(s3) -> str:
     """HeadObject the live weights manifest; return LastModified DATE."""
     try:
@@ -1845,6 +1939,17 @@ def main(argv: list | None = None) -> int:
             "being recovered (alpha-engine-config-I7443)."
         ),
     )
+    ap.add_argument(
+        "--accept-vacuous-rerun", metavar="REASON", default="",
+        help=(
+            "required to --start an input that can enter NONE of the declared "
+            "spine stages. Such a run produces nothing and terminates "
+            "VacuousRun; thirteen of them are what made the weekly cadence "
+            "produce nothing for four weeks (alpha-engine-config-I9693). The "
+            "REASON is mandatory and rides into the execution input as "
+            "vacuous_rerun_accepted_reason (alpha-engine-config-I11075)."
+        ),
+    )
     ap.add_argument("--region", default="us-east-1")
     args = ap.parse_args(argv)
 
@@ -1956,6 +2061,39 @@ def main(argv: list | None = None) -> int:
             _print_plan(plan, source_arn, source_status, name, args.state_machine_arn)
             raise SystemExit(2)
 
+    # Vacuity pre-flight (alpha-engine-config-I11075). Computed against the
+    # EMITTED input — cadence-declared skips included — so the verdict is about
+    # the document that would actually be dispatched, not the derived subset.
+    # Reported here so --dry-run shows it; ENFORCED below, after the plan is
+    # printed, because a refusal an operator cannot read the plan behind is a
+    # refusal they will work around.
+    spine = stage_order_for(args.state_machine_arn)
+    if not spine:
+        raise VacuousRerunError(
+            f"no declared spine for {args.state_machine_arn.rsplit(':', 1)[-1]!r} "
+            "in nousergon_lib.pipeline_status.registry.PIPELINE_STAGE_ORDER — "
+            "declare it before re-running this pipeline through this script "
+            "(alpha-engine-config-I11075)."
+        )
+    enterable = enabled_spine_stages(sm_def, plan.rerun_input(), spine)
+    if enterable:
+        plan.notes.append(
+            "spine stages this input can still enter: " + ", ".join(enterable)
+        )
+    else:
+        plan.accept_vacuous_reason = args.accept_vacuous_rerun
+        plan.warnings.append(
+            "VACUOUS: this input can enter NO declared spine stage — it would "
+            "run its full wall clock, produce nothing, and terminate "
+            "VacuousRun (alpha-engine-config-I11075 / I9693)."
+            + (
+                f" ACCEPTED: {args.accept_vacuous_rerun!r}, emitted as "
+                "vacuous_rerun_accepted_reason."
+                if args.accept_vacuous_rerun else
+                " --start refuses it without --accept-vacuous-rerun REASON."
+            )
+        )
+
     _print_plan(plan, source_arn, source_status, name, args.state_machine_arn)
 
     if not args.start:
@@ -1969,6 +2107,14 @@ def main(argv: list | None = None) -> int:
     # for exactly this reason on 2026-08-16). --dry-run always shows it
     # above; --start additionally refuses unless explicitly acknowledged.
     refuse_fallback_run_date_without_acceptance(plan, args.accept_fallback_run_date)
+
+    # alpha-engine-config-I11075: a rerun that can enter no spine stage is the
+    # skip-to-green shape I9693 measured thirteen times — refused before the
+    # dispatch, not diagnosed ~50 minutes later by the SF's own VacuousRun
+    # terminal (nousergon-data-PR1808).
+    refuse_vacuous_rerun(
+        sm_def, args.state_machine_arn, plan.rerun_input(), args.accept_vacuous_rerun
+    )
 
     # --- pre-start guards ---------------------------------------------------
     running = list_all_executions(sf, args.state_machine_arn, status_filter="RUNNING")

@@ -260,6 +260,285 @@ def work_entry(definition: dict, entry: str | None) -> tuple[str | None, list[st
 
 
 # ---------------------------------------------------------------------------
+# 1b. Flag-constrained reachability — what CAN run, before the run
+#     (alpha-engine-config-I11075)
+# ---------------------------------------------------------------------------
+#
+# Section 1 above answers "which gate governs this stage" for a run that has
+# already happened. This section answers the PRE-FLIGHT question: given only a
+# proposed StartExecution input, can this execution enter any substantive stage
+# at all, or is it a skip-to-green rerun that will terminate SUCCEEDED (or, since
+# nousergon-data-PR1808, VacuousRun) having produced nothing?
+#
+# Two cheaper instruments were built against the live definition and the real
+# rerun inputs, MEASURED INERT, and removed (alpha-engine-config-I11075):
+#
+#   * plain forward reachability with the skip flags applied. Under an
+#     all-flags-true skip set it still leaves MorningEnrich, DataPhase1,
+#     Backtester, EvaluatorDiagnostics and EvaluatorOptimize reachable, because
+#     `ResumeAfterSubstrateRelaunch` is a Choice on `$.error.phase` whose arms
+#     jump straight INTO those five work states, bypassing their CheckSkip
+#     gates. A walk that cannot decide that Choice must follow all of its arms,
+#     and the refusal then never fires.
+#   * "every declared skip_* flag is true". `watch-rerun-2026-09-11-1` set 25 of
+#     the 31 flags the definition declares and was still vacuous, so the
+#     predicate is both wrong and trivially evaded by leaving one observability
+#     stage on.
+#
+# What makes the walk decidable is three-valued evaluation of Choice rules
+# against the PROPOSED INPUT plus a writer analysis of the definition:
+#
+#   * every `skip_*` flag, and 40 other tested roots, are written by NO state in
+#     this machine (measured: `_writable_roots` over the whole nominal flow) —
+#     so their absence from the input is a FACT, not an unknown, and a rule that
+#     tests them evaluates definitively;
+#   * `$.error.phase` IS writable, but only by the error normalizers behind the
+#     Catch edges this walk deliberately excludes. Once no stage is enterable,
+#     no reachable state writes it, the resume arms evaluate FALSE, and the loop
+#     that defeated plain reachability disappears;
+#   * anything still undecidable stays UNKNOWN and BOTH arms are followed. The
+#     walk therefore OVER-approximates what can run, so an empty result is a
+#     proof of vacuity and never a false accusation.
+#
+# Nothing here is hand-listed. A stage added to the spine without a gate is
+# reachable under an all-flags-true input, which is what
+# `tests/test_weekly_sf_rerun_vacuity.py` asserts against.
+
+#: A rule's truth value is TRUE, FALSE, or this — "the input does not settle it".
+UNKNOWN = None
+
+
+def _writable_roots(body: dict) -> set:
+    """Top-level ``$.<root>`` names this single state can write.
+
+    ``ResultPath`` names the write target directly. ``ResultPath: null``
+    discards the result, so the state writes nothing. An ABSENT ``ResultPath``
+    means the state's output REPLACES the whole document: for a ``Pass`` that is
+    exactly the roots of its ``Parameters``/``Result`` (a pure pass-through
+    writes nothing), and for anything else it is unknowable, reported as
+    ``"*"`` — which makes every root writable and collapses the analysis to
+    plain reachability rather than silently trusting a stale fact.
+    """
+    result_path = body.get("ResultPath", "ABSENT")
+    if result_path is None:
+        return set()
+    if isinstance(result_path, str):
+        if result_path == "$":
+            return {"*"}
+        if result_path.startswith("$."):
+            return {result_path[2:].split(".")[0]}
+        return {"*"}
+    if body.get("Type") == "Pass":
+        shape = body.get("Parameters")
+        if not isinstance(shape, dict):
+            shape = body.get("Result")
+        if isinstance(shape, dict):
+            return {k.split(".")[0] for k in shape}
+        if shape is None:
+            return set()
+        return {"*"}
+    if body.get("Type") in ("Task", "Parallel", "Map"):
+        return {"*"}
+    return set()
+
+
+def _input_lookup(execution_input: dict, variable: str) -> tuple:
+    """``(present, value)`` for a ``$.a.b`` Variable against an input document."""
+    cursor = execution_input
+    for segment in variable[2:].split("."):
+        if isinstance(cursor, dict) and segment in cursor:
+            cursor = cursor[segment]
+        else:
+            return False, None
+    return True, cursor
+
+
+def evaluate_rule(rule: dict, execution_input: dict, writable: set):
+    """Three-valued evaluation of one Choice rule against a proposed input.
+
+    Returns ``True``, ``False`` or :data:`UNKNOWN`. UNKNOWN is returned whenever
+    the input cannot settle the rule — including for any operator this does not
+    model. Every unmodelled case must widen reachability, never narrow it, or
+    the refusal built on top becomes a false accusation.
+    """
+    if "And" in rule:
+        values = [evaluate_rule(r, execution_input, writable) for r in rule["And"]]
+        if False in values:
+            return False
+        return UNKNOWN if UNKNOWN in values else True
+    if "Or" in rule:
+        values = [evaluate_rule(r, execution_input, writable) for r in rule["Or"]]
+        if True in values:
+            return True
+        return UNKNOWN if UNKNOWN in values else False
+    if "Not" in rule:
+        value = evaluate_rule(rule["Not"], execution_input, writable)
+        return UNKNOWN if value is UNKNOWN else (not value)
+
+    variable = rule.get("Variable")
+    if not isinstance(variable, str) or not variable.startswith("$."):
+        return UNKNOWN
+    present, value = _input_lookup(execution_input, variable)
+    if not present:
+        if "*" in writable or variable[2:].split(".")[0] in writable:
+            # A state this walk can reach may create it before the Choice runs.
+            return UNKNOWN
+        # No reachable state writes it and the input does not carry it: absent.
+        if "IsPresent" in rule:
+            return not bool(rule["IsPresent"])
+        return False
+    if "IsPresent" in rule:
+        return bool(rule["IsPresent"])
+    if "BooleanEquals" in rule:
+        return bool(value) is bool(rule["BooleanEquals"])
+    if "StringEquals" in rule:
+        return value == rule["StringEquals"]
+    if "NumericEquals" in rule:
+        return value == rule["NumericEquals"]
+    return UNKNOWN
+
+
+def _nominal_targets(body: dict) -> list:
+    """Forward edges plus the entry states of nested Parallel/Map blocks.
+
+    :func:`_successors` is the gate-attribution walk and stays top-level-only on
+    purpose. A pre-flight walk must descend, or every stage inside
+    ``ResearchPredictorParallel`` reads as unreachable and a fully enabled
+    cadence input would be judged vacuous.
+    """
+    targets = []
+    for key in ("Next", "Default"):
+        value = body.get(key)
+        if isinstance(value, str):
+            targets.append(value)
+    for choice in body.get("Choices") or []:
+        nxt = choice.get("Next")
+        if isinstance(nxt, str):
+            targets.append(nxt)
+    for branch in body.get("Branches") or []:
+        start = branch.get("StartAt")
+        if isinstance(start, str):
+            targets.append(start)
+    iterator = body.get("Iterator") or body.get("ItemProcessor")
+    if isinstance(iterator, dict) and isinstance(iterator.get("StartAt"), str):
+        targets.append(iterator["StartAt"])
+    return targets
+
+
+def reachable_states(definition: dict, execution_input: dict) -> frozenset:
+    """Every state this input COULD enter, on the nominal (Catch-free) flow.
+
+    A least fixpoint: a state joins the set, its writable roots join the writer
+    set, and a larger writer set can only turn a decided Choice rule back into
+    UNKNOWN — i.e. can only ADD reachability. Monotone, so the iteration
+    terminates and the result over-approximates in the safe direction.
+    """
+    states = flatten_states(definition.get("States", {}))
+    start = definition.get("StartAt")
+    if not isinstance(start, str) or start not in states:
+        raise ValueError(
+            "state machine definition has no resolvable StartAt — refusing to "
+            "report an empty reachable set, which every caller would read as "
+            "'this run does nothing'"
+        )
+    reach = {start}
+    writable: set = set()
+    changed = True
+    while changed:
+        changed = False
+        for name in sorted(reach):
+            body = states[name]
+            roots = _writable_roots(body)
+            if not roots <= writable:
+                writable |= roots
+                changed = True
+            if body.get("Type") == "Choice":
+                targets = []
+                settled = False
+                for choice in body.get("Choices") or []:
+                    verdict = evaluate_rule(choice, execution_input, writable)
+                    if verdict is False:
+                        continue
+                    nxt = choice.get("Next")
+                    if isinstance(nxt, str):
+                        targets.append(nxt)
+                    if verdict is True:
+                        # Step Functions takes the FIRST matching rule; every
+                        # rule after it is unreachable through this state.
+                        settled = True
+                        break
+                if not settled and isinstance(body.get("Default"), str):
+                    targets.append(body["Default"])
+            else:
+                targets = _nominal_targets(body)
+            for target in targets:
+                if target in states and target not in reach:
+                    reach.add(target)
+                    changed = True
+    return frozenset(reach)
+
+
+def enabled_spine_stages(definition: dict, execution_input: dict, spine) -> tuple:
+    """The declared spine stages this input can still enter, in spine order.
+
+    An empty result is the vacuity proof: the execution can enter no stage whose
+    entry is what "the pipeline ran" MEANS, so it can only terminate having
+    produced nothing.
+    """
+    if not spine:
+        raise ValueError(
+            "no declared spine for this pipeline — a pipeline with no spine "
+            "cannot be judged vacuous or substantive, and reporting 'nothing "
+            "was expected, so it passed' is the defect this guard exists for"
+        )
+    reach = reachable_states(definition, execution_input)
+    return tuple(stage for stage in spine if stage in reach)
+
+
+def declared_skip_flags(definition: dict) -> tuple:
+    """Every ``skip_*`` flag the definition's CheckSkip gates test, sorted."""
+    return tuple(sorted({gate["flag"] for gate in derive_gates(definition).values()}))
+
+
+def ungated_spine_stages(definition: dict, spine) -> tuple:
+    """Spine stages still enterable when EVERY declared skip flag is set.
+
+    This is the coverage instrument for the whole guard. A spine stage that no
+    combination of declared flags can switch off is a stage the vacuity verdict
+    is structurally unable to reason about, and a stage added to
+    ``PIPELINE_STAGE_ORDER`` without a gate shows up here rather than silently
+    weakening the refusal. It must be empty.
+    """
+    all_true = {flag: True for flag in declared_skip_flags(definition)}
+    return enabled_spine_stages(definition, all_true, spine)
+
+
+def disabling_flags_for_input(definition: dict, execution_input: dict, spine) -> dict:
+    """Per spine stage this input CANNOT enter, which of its own flags did it.
+
+    Attribution is by counterfactual against the input in hand: a flag is named
+    for a stage when clearing that one flag — and nothing else — puts the stage
+    back in the enterable set. This is what a refusal message needs, and it is
+    derived per input rather than declared, because a stage's attribution is not
+    a constant: with other stages left enabled, ``MorningEnrich`` stays
+    enterable through the substrate-relaunch resume path no matter what
+    ``skip_morning_enrich`` says, and only becomes unenterable once the rest of
+    the pipeline is off too. A stage disabled by the CONJUNCTION rather than by
+    any single flag maps to an empty tuple, which is the honest answer.
+    """
+    disabled = set(spine) - set(enabled_spine_stages(definition, execution_input, spine))
+    mapping = {stage: [] for stage in spine if stage in disabled}
+    for flag in declared_skip_flags(definition):
+        if not execution_input.get(flag):
+            continue
+        without = {k: v for k, v in execution_input.items() if k != flag}
+        for stage in enabled_spine_stages(definition, without, spine):
+            if stage in mapping:
+                mapping[stage].append(flag)
+    return {stage: tuple(flags) for stage, flags in mapping.items()}
+
+
+# ---------------------------------------------------------------------------
 # 2. The execution half — what the run actually did
 # ---------------------------------------------------------------------------
 
