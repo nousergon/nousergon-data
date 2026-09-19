@@ -544,7 +544,17 @@ class TestBranchBContents:
             # alpha-engine-config-I11073: every terminal carries the route
             # accumulator the join extracts, empty where no route fired.
             "branch_b_routes",
+            # alpha-engine-config-I11106: same unconditional-existence rule
+            # as branch_b_degraded — fixed false here because this path
+            # never reaches the model-zoo rotation, so there is nothing to
+            # declare unservable, and AggregateBranchOutcomes' Parameters.$
+            # extraction must never throw on whichever terminal ran.
+            "branch_b_model_zoo_unservable",
         }
+        assert (
+            skipped["Result"]["branch_b"]["branch_b_model_zoo_unservable"]
+            is False
+        )
         assert skipped["Result"]["branch_b"]["branch_b_degraded"] is False
         # Contract equivalence with the real success terminal.
         complete = branch_b["BranchBComplete"]
@@ -1071,7 +1081,16 @@ class TestPostJoinAggregationAndFailure:
         # CheckSkipBacktester on a clean run (see
         # tests/test_sf_research_predictor_degraded_wiring.py for the fold
         # itself).
-        assert c["Default"] == "CheckResearchPredictorDegraded"
+        # alpha-engine-config-I11106 spliced SetModelZooUnservable ahead of
+        # it — a second, non-routing fold (a straight Pass, InputPath ->
+        # ResultPath) copying branch B's model_zoo_unservable out to top
+        # scope for the completion markers. The clean run still falls
+        # through the whole chain to CheckSkipBacktester.
+        assert c["Default"] == "SetModelZooUnservable"
+        assert (
+            states["SetModelZooUnservable"]["Next"]
+            == "CheckResearchPredictorDegraded"
+        )
 
     def test_extract_parallel_branch_error_routes_to_handle_failure(
         self, states
@@ -1204,7 +1223,15 @@ class TestInboundRewireAndDownstreamUnchanged:
         # alpha-engine-config#6722: CheckResearchPredictorDegraded (the
         # branch-degraded fold) is spliced onto this edge but still falls
         # through unconditionally to CheckSkipBacktester on a clean run.
-        assert states["CheckBranchOutcomes"]["Default"] == "CheckResearchPredictorDegraded"
+        # alpha-engine-config-I11106: SetModelZooUnservable is spliced AHEAD
+        # of it — a second fold, copying branch B's model_zoo_unservable out
+        # to top scope so the completion markers can embed it. It is a
+        # straight Pass (InputPath -> ResultPath), no Choice, so it cannot
+        # alter routing: the clean run still falls through this whole chain
+        # to CheckSkipBacktester unconditionally, which is what this test is
+        # named for.
+        assert states["CheckBranchOutcomes"]["Default"] == "SetModelZooUnservable"
+        assert states["SetModelZooUnservable"]["Next"] == "CheckResearchPredictorDegraded"
         assert states["CheckResearchPredictorDegraded"]["Default"] == "CheckSkipBacktester"
         # config#2362 Option A: CheckSkipBacktester's Default now falls
         # through the additive CheckSkipBacktesterStageOnly gate before
