@@ -3979,14 +3979,11 @@
             },
             "ReadModelZooArenaCycle": {
               "Type": "Task",
-              "Comment": "alpha-engine-config-I11101 deliverable 4: the DURABLE source of the M slot's verdict. ModelZooSelect writes arena/model/{date}.json (and latest.json) before it exits 0 — its decision block carries status=\"unservable\" together with the per-arm ineligible reasons — so the fact this branch needs is already recorded by its producer, and reading it here replaces the StringMatches-on-stdout interim CheckModelZooStatus documents. | THE DATED KEY, NEVER latest.json: latest.json is whatever ran most recently, which on a recovery arc need not be this cycle; $.run_date is the trading day every arena prefix keys off (alpha-engine-config-I8809, PARTITION FAMILY = trading_day). | PARSED IN ResultSelector ON PURPOSE: States.StringToJson inside a Pass's Parameters raises States.Runtime, which a Pass cannot Catch, so a malformed artifact would kill the whole Parallel and with it the run; in a Task's ResultSelector the identical failure is an ordinary Task error the Catch below absorbs. | STATE SIZE: the cycle artifact measured 13,196 bytes on 2026-09-18 against a branch effective input of ~108 KB (the figure alpha-engine-config-I8194 measured when ParityParallel hit States.DataLimitExceeded), so the peak here is ~121 KB of the 256 KB ceiling. It is transient: BranchBComplete carries no ResultPath, so its Parameters envelope is the branch's entire output and none of this crosses the join.",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: the DURABLE source of the M slot's verdict. ModelZooSelect's emit_cycle writes arena/model/{date}.verdict — the plain-text word from the same validated decision block as arena/model/{date}.json, in the same call — before it exits 0. | WHY A BARE WORD AND NOT THE CYCLE JSON, all three measured rather than argued: (1) matching the workload's stdout marker fails on log length — SSM caps StandardOutputContent at ~24,000 characters and the marker is emitted LAST because the verdict is not known until the end; on watch-rerun-2026-09-18-1 the log was 28,759 bytes, the marker fell 4.7 KB outside the window, and the run stamped model_zoo_unservable=false while the arena said \"unservable\". (2) States.StringToJson on the cycle body raises States.Runtime on a malformed artifact and that error is NOT CATCHABLE — verified against live Step Functions on 2026-09-19, including from inside a Parallel whose Catch names States.ALL, so an earlier revision of THIS state would have taken the whole weekly run down on a bad artifact. (3) String-matching the rendered cycle JSON re-introduces the class being removed: decision.comparisons[].status is a second 'status' field in the same document. A bare word compared whole has none of those failure modes. | THE DATED KEY, NEVER latest.verdict: latest is whatever ran most recently, which on a recovery arc need not be this cycle; $.run_date is the trading day every arena prefix keys off (alpha-engine-config-I8809, PARTITION FAMILY = trading_day). | STATE SIZE: one word, versus the 17 KB the cycle artifact measured on 2026-09-18 — which also removes the States.DataLimitExceeded headroom question this state used to carry (alpha-engine-config-I8194).",
               "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
               "Parameters": {
                 "Bucket": "alpha-engine-research",
-                "Key.$": "States.Format('arena/model/{}.json', $.run_date)"
-              },
-              "ResultSelector": {
-                "cycle.$": "States.StringToJson($.Body)"
+                "Key.$": "States.Format('arena/model/{}.verdict', $.run_date)"
               },
               "ResultPath": "$.model_zoo_arena",
               "TimeoutSeconds": 60,
@@ -4019,7 +4016,7 @@
               "Comment": "alpha-engine-config-I11101 deliverable 4: the arena cycle object for $.run_date was read and parsed, but carries no decision.status. SEPARATE from ExtractModelZooVerdictUnreadable because $.model_zoo_arena_error exists only on that state's Catch path and this one has no error to carry — tests/test_sf_field_reachability.py proves a state may only reference fields EVERY reaching path produces, and folding the two causes into one Pass violated exactly that. Same destination, same honesty: sf-pipeline-policy.md §2.3a makes an unestablished verdict UNKNOWN, which degrades, never the passing value.",
               "Parameters": {
                 "phase": "CheckModelZooVerdict",
-                "source": "arena cycle parsed but decision.status is absent",
+                "source": "verdict object read but its body is absent or not a known status word",
                 "poll.$": "$.model_zoo_poll"
               },
               "ResultPath": "$.model_zoo_error",
@@ -4030,29 +4027,89 @@
               "Comment": "alpha-engine-config-I11101 deliverable 4: normalises BOTH ways the M slot's verdict can go missing — the arena cycle object unreadable/unparseable (ReadModelZooArenaCycle's Catch) and the object present but carrying no decision.status (CheckModelZooVerdict's IsPresent arm) — into the $.model_zoo_error shape PublishModelZooFailureImmediate formats. Exists for the same reason ExtractModelZooSelectError does: jumping straight to that notifier without producing $.model_zoo_error died with States.Runtime live on 2026-07-10 (config#2160). | sf-pipeline-policy.md §2.3a: this is the UNKNOWN path, not the unservable one. A ModelZooSelect that exited 0 whose verdict cannot then be established is a producer-contract breach, so the run degrades honestly rather than stamping model_zoo_unservable=false — which is precisely the false \"false\" the stdout-scraping interim wrote into both completion markers on watch-rerun-2026-09-18-1.",
               "Parameters": {
                 "phase": "ReadModelZooArenaCycle",
-                "source": "arena/model/{run_date}.json carries no readable decision.status",
+                "source": "arena/model/{run_date}.verdict could not be read",
                 "arena_error.$": "$.model_zoo_arena_error",
                 "poll.$": "$.model_zoo_poll"
               },
               "ResultPath": "$.model_zoo_error",
               "Next": "PublishModelZooFailureImmediate"
             },
-            "CheckModelZooVerdict": {
+                        "CheckModelZooVerdict": {
               "Type": "Choice",
-              "Comment": "alpha-engine-config-I11101 deliverable 4: consumes arena/model/{date}.json::decision.status. The IsPresent:false arm is FIRST and explicit (Choice order is first-match) because a cycle artifact that parsed but carries no decision.status is the same UNKNOWN as one that would not parse, and sf-pipeline-policy.md §2.3a forbids resolving an absent verdict to the passing value. Only an explicit \"unservable\" reaches ModelZooUnservableDeclared; every other DECIDED status (a real promotion, or a decided no-move) is the ordinary clean completion the Default carries to BranchBComplete, exactly as the pre-I11106 unconditional Success edge did.",
+              "Comment": "alpha-engine-config-I11101 deliverable 4: consumes arena/model/{run_date}.verdict, whose entire body is one word from arena_cycle.schema.json's decision.status enum (decided | held | unmeasurable | unservable | bootstrap). StringEquals on the WHOLE body, never a substring: a substring match over a rendered document is the defect class this change removes. | The IsPresent:false arm is FIRST and explicit (Choice order is first-match) because a body that is absent is the same UNKNOWN as an object that would not read, and sf-pipeline-policy.md 2.3a forbids resolving an absent verdict to the passing value. | An UNRECOGNISED word also routes to UNKNOWN rather than falling through to the clean edge — the producer already refuses to write a status outside the schema enum, so reaching that arm means the two vocabularies have drifted, which is precisely when guessing is worst. Only the four decided outcomes reach BranchBComplete, each named. Each value arm carries its own IsPresent:true inside And[] rather than leaning on the absence arm above it: Choice IS first-match, so the ordering alone would be correct at runtime, but tests/test_sf_choice_guards.py's config#2275 guard requires the guard in the rule that dereferences — and it is right to, because an unguarded dereference of an absent field is States.Runtime, which no Catch can absorb.",
               "Choices": [
                 {
-                  "Variable": "$.model_zoo_arena.cycle.decision.status",
+                  "Variable": "$.model_zoo_arena.Body",
                   "IsPresent": false,
                   "Next": "ExtractModelZooVerdictAbsent"
                 },
                 {
-                  "Variable": "$.model_zoo_arena.cycle.decision.status",
-                  "StringEquals": "unservable",
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "StringEquals": "unservable"
+                    }
+                  ],
                   "Next": "ModelZooUnservableDeclared"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "StringEquals": "decided"
+                    }
+                  ],
+                  "Next": "BranchBComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "StringEquals": "held"
+                    }
+                  ],
+                  "Next": "BranchBComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "StringEquals": "unmeasurable"
+                    }
+                  ],
+                  "Next": "BranchBComplete"
+                },
+                {
+                  "And": [
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.model_zoo_arena.Body",
+                      "StringEquals": "bootstrap"
+                    }
+                  ],
+                  "Next": "BranchBComplete"
                 }
               ],
-              "Default": "BranchBComplete"
+              "Default": "ExtractModelZooVerdictAbsent"
             },
             "ModelZooUnservableDeclared": {
               "Type": "Pass",

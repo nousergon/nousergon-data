@@ -748,7 +748,16 @@ class TestBranchBContents:
         # verdict out of arena/model/{run_date}.json first. BranchBComplete is
         # still where a decided cycle lands, via CheckModelZooVerdict's Default.
         assert nexts["Success"] == "ReadModelZooArenaCycle"
-        assert branch_b["CheckModelZooVerdict"]["Default"] == "BranchBComplete"
+        # Default is the UNKNOWN edge, NOT BranchBComplete: the producer refuses
+        # to write a status outside the contract enum, so an unrecognised word
+        # means the two vocabularies drifted (alpha-engine-config-I11101).
+        assert branch_b["CheckModelZooVerdict"]["Default"] == "ExtractModelZooVerdictAbsent"
+        clean = {
+            r["And"][1]["StringEquals"]
+            for r in branch_b["CheckModelZooVerdict"]["Choices"]
+            if r.get("Next") == "BranchBComplete"
+        }
+        assert clean == {"decided", "held", "unmeasurable", "bootstrap"}
         # alpha-engine-config-I5687: bounded And[] loop-back, mirroring
         # DataPhase2/ThinkTank.
         bounded = next(c for c in check["Choices"] if "And" in c)
