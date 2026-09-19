@@ -1,45 +1,69 @@
 {
   "schema_version": 1,
-  "_doc": "Budgets/quotas SSoT for the expense-collector Lambda + console Expenses page. Live copy: s3://alpha-engine-research/config/expense_budgets.json (operator-edited: aws s3 cp expense_budgets.seed.json s3://alpha-engine-research/config/expense_budgets.json — or edit the live object directly). monthly_budget_usd null = no budget line (row shows spend without over/under pacing). fixed_monthly_usd on a key with no live adapter renders a flat-subscription row, so future subscriptions are config-only additions.",
-  "updated": "2026-09-08",
+  "_doc": "SCHEMA EXAMPLE ONLY \u2014 not the live budget. This repository is PUBLIC and these are vendor spend figures, so the real numbers are not published here (repository-tiering-policy.md: a price belongs in a private repo). The SSoT is alpha-engine-config/private-docs/EXPENSE_BUDGETS.yaml, published to s3://alpha-engine-research/config/expense_budgets.json by sync-expense-budgets.yml on merge. Bootstrapping a fresh deployment: write your own values to that key. Every provider requires `owner`, `revisit` and `sized_against` (cost-management-policy.md 2.6) \u2014 a budget nobody can defend is a number, not a control.",
+  "updated": "2026-09-19",
   "providers": {
     "aws": {
       "label": "AWS",
-      "monthly_budget_usd": 100.0
+      "monthly_budget_usd": 0.0,
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "anthropic_api": {
       "label": "Anthropic API",
-      "monthly_budget_usd": 10.0,
-      "note": "small carve-out (2026-07-19 decision, config-I2997) — every direct-Anthropic call site except EvalJudge Batches migrated to OpenRouter; EvalJudge Batches is a deliberate sole exception (50% batch discount has no OpenRouter equivalent). Live MTD spend at time of this change was $5.16 (source=client_telemetry, projected month-end $8.64), all attributable to EvalJudge post-migration — budget set to $10 to cover that pace without flagging the retained exception as overage. Revisit if EvalJudge batch volume changes materially."
+      "monthly_budget_usd": 0.0,
+      "note": "small carve-out (2026-07-19 decision, config-I2997) \u2014 every direct-Anthropic call site except EvalJudge Batches migrated to OpenRouter; EvalJudge Batches is a deliberate sole exception (50% batch discount has no OpenRouter equivalent). Live MTD spend at time of this change was $5.16 (source=client_telemetry, projected month-end $8.64), all attributable to EvalJudge post-migration \u2014 budget set to $10 to cover that pace without flagging the retained exception as overage. Revisit if EvalJudge batch volume changes materially.",
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "claude_max": {
       "label": "Claude Max 20x subscription",
-      "fixed_monthly_usd": 200.0,
-      "note": "flat subscription — weekly WET pacing lives on the LLM Usage tab"
+      "fixed_monthly_usd": 0.0,
+      "note": "flat subscription \u2014 weekly WET pacing lives on the LLM Usage tab",
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "openrouter": {
       "label": "OpenRouter",
-      "monthly_budget_usd": 20.0
+      "monthly_budget_usd": 0.0,
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "deepseek": {
       "label": "DeepSeek",
-      "monthly_budget_usd": 35.0,
-      "note": "Raised from $10 (set 2026-07-17, b9f287e9) — stale: that number predates three material widenings of DeepSeek's real routing footprint that were never revisited against it. (1) 2026-08-14 (config-I6562/-I7326): director/retro.py's retro judge was silently broken for 24 days (OpenRouter 400 on every call) and incurred ~$0 real DeepSeek spend; the fix routes it through krepis.router's `high` group, whose primary resolves to deepseek-v4-pro. (2) 2026-08-25 (config-I8350): reconcile-llm-model-registry had been red since 08-22 with DeepSeek pricing understated ~3x (in 0.435->1.32, out 0.87->3.96 per-unit) — corrected, but confirms DeepSeek is high's primary and one of ultra's arms. (3) 2026-09-04 (config-I9975, crucible v2 phase-0 router arc): `med` now serves from DeepSeek alone; `low`/`high`/`ultra` are deepseek+zhipu. None of that is misrouting — llm-provider-model-policy.md LPM-1 already prices the PRC/DeepSeek jurisdiction acceptance at ~$2K/mo at full volume, so a $10 placeholder was never meant to be the ceiling. 2026-09 MTD $2.71 -> projected $10.16 is the FIRST full month reflecting (3), 4 days in; $35 gives ~3.4x headroom over that projection while the new steady-state settles. Re-exam tracked as alpha-engine-config-I10279 (2026-10-08) against a full month of post-I9975 data."
+      "monthly_budget_usd": 0.0,
+      "note": "Raised from $10 (set 2026-07-17, b9f287e9) \u2014 stale: that number predates three material widenings of DeepSeek's real routing footprint that were never revisited against it. (1) 2026-08-14 (config-I6562/-I7326): director/retro.py's retro judge was silently broken for 24 days (OpenRouter 400 on every call) and incurred ~$0 real DeepSeek spend; the fix routes it through krepis.router's `high` group, whose primary resolves to deepseek-v4-pro. (2) 2026-08-25 (config-I8350): reconcile-llm-model-registry had been red since 08-22 with DeepSeek pricing understated ~3x (in 0.435->1.32, out 0.87->3.96 per-unit) \u2014 corrected, but confirms DeepSeek is high's primary and one of ultra's arms. (3) 2026-09-04 (config-I9975, crucible v2 phase-0 router arc): `med` now serves from DeepSeek alone; `low`/`high`/`ultra` are deepseek+zhipu. None of that is misrouting \u2014 llm-provider-model-policy.md LPM-1 already prices the PRC/DeepSeek jurisdiction acceptance at ~$2K/mo at full volume, so a $10 placeholder was never meant to be the ceiling. 2026-09 MTD $2.71 -> projected $10.16 is the FIRST full month reflecting (3), 4 days in; $35 gives ~3.4x headroom over that projection while the new steady-state settles. Re-exam tracked as alpha-engine-config-I10279 (2026-10-08) against a full month of post-I9975 data.",
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "neon": {
       "label": "Neon Postgres",
-      "monthly_budget_usd": 15.0,
-      "note": "mtd_cost_usd is the real bill: compute (CU-hours x $0.106), storage (GB-months x $0.35), public egress above the per-project 500 GB allowance (x $0.10/GB) and extra branches, all read from Neon's invoice-aligned consumption-history v2 metrics (available on Launch; only the v1 endpoints are Scale-gated). Launch has NO flat monthly fee — do NOT set fixed_monthly_usd here: the neon adapter deliberately ignores it and reports it as detail.fixed_monthly_usd_ignored, because a hardcoded figure outranking a measured one is the config#2913 defect."
+      "monthly_budget_usd": 0.0,
+      "note": "mtd_cost_usd is the real bill: compute (CU-hours x $0.106), storage (GB-months x $0.35), public egress above the per-project 500 GB allowance (x $0.10/GB) and extra branches, all read from Neon's invoice-aligned consumption-history v2 metrics (available on Launch; only the v1 endpoints are Scale-gated). Launch has NO flat monthly fee \u2014 do NOT set fixed_monthly_usd here: the neon adapter deliberately ignores it and reports it as detail.fixed_monthly_usd_ignored, because a hardcoded figure outranking a measured one is the config#2913 defect.",
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "github_org": {
       "label": "GitHub (nousergon org)",
-      "monthly_budget_usd": 5.0,
-      "included_minutes": 3000
+      "monthly_budget_usd": 0.0,
+      "included_minutes": 3000,
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     },
     "github_user": {
       "label": "GitHub (cipher813)",
       "monthly_budget_usd": null,
-      "included_minutes": null
+      "included_minutes": null,
+      "owner": "<owner>",
+      "revisit": "<YYYY-MM-DD>",
+      "sized_against": "<what this number was measured against>"
     }
   }
 }
