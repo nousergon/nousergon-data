@@ -14,12 +14,23 @@ edge sets the branch-local $.model_zoo_unservable and continues to BranchBComple
 without ever touching MarkModelZooDegraded / $.research_degraded_local /
 $.degraded_summary — a genuine failure/timeout is completely unchanged.
 
+alpha-engine-config-I11101 deliverable 4 (2026-09-19) replaced HOW that split is
+made. The first implementation read the marker with StringMatches on the SSM
+poll's StandardOutputContent, and it failed on its first real run: SSM caps
+StandardOutputContent at ~24,000 characters and appends "--output truncated--",
+the model-zoo-select log on watch-rerun-2026-09-18-1 was 28,759 bytes, and
+MODEL_ZOO_SELECT_OUTCOME is its LAST line. The marker sat 4.7 KB past the SF's
+horizon, the unservable arm never matched, and the run stamped
+model_zoo_unservable=false into both completion markers while the arena's own
+decision block read "unservable".
+
+So the verdict is no longer scraped from a log stream at all. ReadModelZooArenaCycle
+reads arena/model/{run_date}.json — the artifact ModelZooSelect writes before it
+exits 0 — and CheckModelZooVerdict switches on its decision.status. Absence of
+that field is UNKNOWN and degrades honestly (sf-pipeline-policy.md §2.3a); it is
+never resolved to the passing value.
+
 These are structural walks over the definition, not live executions.
-KNOWN-FRAGILE, ACCEPTED: the underlying Choice string-matches
-StandardOutputContent (the same idiom as ParityReplayResourceKill /
-PitParityCompareResourceKill) rather than reading the durable
-arena/model/{date}.json::decision.status artifact — alpha-engine-config-I11101
-deliverable 4 tracks moving it onto that structured read.
 """
 from __future__ import annotations
 
@@ -109,72 +120,122 @@ def test_unservable_declared_never_touches_research_degraded_local(branch_b):
         assert "research_degraded_local" not in json.dumps(params)
 
 
-def test_check_model_zoo_status_routes_unservable_before_plain_success(branch_b):
-    """The unservable Choice rule must be checked BEFORE the bare
-    Status==Success rule (Choice evaluates rules in order; first match wins),
-    or the unservable marker would never be reached."""
+def test_success_poll_goes_to_the_arena_read_not_a_stdout_match(branch_b):
+    """The one Success arm hands off to ReadModelZooArenaCycle. There is no
+    longer a second Success arm racing it, so Choice ordering is not what keeps
+    the unservable case reachable — the artifact read is."""
     rules = branch_b["CheckModelZooStatus"]["Choices"]
-    unservable_idx = next(
-        i for i, r in enumerate(rules) if r.get("Next") == "ModelZooUnservableDeclared"
-    )
-    plain_success_idx = next(
-        i
-        for i, r in enumerate(rules)
-        if r.get("Next") == "BranchBComplete"
-        and r.get("Variable") == "$.model_zoo_poll.Status"
-    )
-    assert unservable_idx < plain_success_idx
-
-
-def test_non_zero_exit_still_reaches_mark_model_zoo_degraded(branch_b):
-    """A genuine ModelZooSelect failure/timeout — unchanged by this issue —
-    must still reach MarkModelZooDegraded via the existing fail-open chain."""
-    path = _first_path_to(branch_b, "ModelZooSelectLivenessGate", "MarkModelZooDegraded")
-    assert path[-1] == "MarkModelZooDegraded"
-    # And the existing convergence point is on that path.
-    assert "PublishModelZooFailureImmediate" in path
-
-
-def test_success_without_marker_takes_the_unchanged_normal_path(branch_b):
-    """A Success poll whose StandardOutputContent does NOT carry the
-    declared-unservable marker must take the same bare Status==Success edge
-    that existed before alpha-engine-config-I11106 — unabsorbed by the new
-    unservable rule."""
-    rules = branch_b["CheckModelZooStatus"]["Choices"]
-    plain_success = next(
+    success_rules = [
         r
         for r in rules
         if r.get("Variable") == "$.model_zoo_poll.Status"
         and r.get("StringEquals") == "Success"
-    )
-    assert plain_success["Next"] == "BranchBComplete"
-    assert "And" not in plain_success, (
-        "the plain Success rule must remain a bare single-condition rule; "
-        "any additional condition belongs on the unservable rule ahead of it, "
-        "never grafted onto this one"
-    )
-
-
-def test_unservable_marker_match_is_anchored_on_the_full_literal(branch_b):
-    """§ known-fragile-pattern guard: the StringMatches literal must be the
-    FULL contract marker, never a bare '*unservable*' or similar loose match
-    (alpha-engine-config-I11101 records a false match on this idiom escalating
-    a recoverable failure into a hard weekly failure elsewhere in this SF)."""
-    rules = branch_b["CheckModelZooStatus"]["Choices"]
-    unservable_rule = next(r for r in rules if r.get("Next") == "ModelZooUnservableDeclared")
-    conds = unservable_rule["And"]
-    (string_match,) = [c for c in conds if "StringMatches" in c]
-    assert string_match["StringMatches"] == "*MODEL_ZOO_SELECT_OUTCOME: unservable*"
-    (is_present,) = [
-        c for c in conds if c.get("Variable") == "$.model_zoo_poll.StandardOutputContent"
-        and "IsPresent" in c
     ]
-    assert is_present["IsPresent"] is True
+    assert len(success_rules) == 1, (
+        "exactly one Success arm: a second one re-creates the ordering hazard "
+        "the artifact read exists to remove"
+    )
+    assert success_rules[0]["Next"] == "ReadModelZooArenaCycle"
+
+
+def test_no_verdict_is_decided_by_matching_standard_output_content(branch_b):
+    """THE REGRESSION GUARD, and the reason this file exists in its current
+    form. SSM truncates StandardOutputContent at ~24,000 characters, so any
+    Choice that decides a VERDICT by matching text in it is correct only while
+    the log stays short — measured broken on watch-rerun-2026-09-18-1 at 28,759
+    bytes. A StandardOutputContent match may still classify a FAILURE (the
+    resource-kill idiom); it may never establish an outcome."""
+    offenders = []
+    for name, state in branch_b.items():
+        if state.get("Type") != "Choice":
+            continue
+        for rule in state.get("Choices", []) or []:
+            for cond in [rule] + (rule.get("And") or []) + (rule.get("Or") or []):
+                if (
+                    cond.get("Variable") == "$.model_zoo_poll.StandardOutputContent"
+                    and "StringMatches" in cond
+                ):
+                    offenders.append((name, cond["StringMatches"], rule.get("Next")))
+    assert not offenders, (
+        "model-zoo verdict decided by matching truncatable SSM stdout: "
+        f"{offenders} — read arena/model/{{run_date}}.json::decision.status instead "
+        "(alpha-engine-config-I11101 deliverable 4)"
+    )
+
+
+def test_arena_read_uses_the_dated_key_never_latest(branch_b):
+    """latest.json is whatever ran most recently, which on a recovery arc need
+    not be the cycle being recovered. The read must key on $.run_date."""
+    params = branch_b["ReadModelZooArenaCycle"]["Parameters"]
+    assert params["Bucket"] == "alpha-engine-research"
+    key = params["Key.$"]
+    assert key == "States.Format('arena/model/{}.json', $.run_date)"
+    assert "latest" not in key
+
+
+def test_arena_body_is_parsed_in_result_selector_so_the_failure_is_catchable(branch_b):
+    """States.StringToJson in a Pass's Parameters raises States.Runtime, which a
+    Pass cannot Catch — a malformed artifact would kill the whole Parallel and
+    with it the run. In a Task's ResultSelector the same failure is an ordinary
+    Task error, and the Catch below absorbs it."""
+    state = branch_b["ReadModelZooArenaCycle"]
+    assert state["Type"] == "Task"
+    assert state["Resource"] == "arn:aws:states:::aws-sdk:s3:getObject"
+    assert state["ResultSelector"]["cycle.$"] == "States.StringToJson($.Body)"
+    assert state["ResultPath"] == "$.model_zoo_arena"
+    assert state.get("Catch"), "the parse must be guarded, or a bad artifact fails the run"
+
+
+def test_an_unreadable_verdict_degrades_honestly_and_never_reads_as_servable(branch_b):
+    """sf-pipeline-policy.md §2.3a: absence is UNKNOWN, never a pass. Both ways
+    the verdict can go missing — the object unreadable, or present but carrying
+    no decision.status — converge on the model-zoo fail-open group."""
+    (catch,) = branch_b["ReadModelZooArenaCycle"]["Catch"]
+    assert catch["ErrorEquals"] == ["States.ALL"]
+    assert catch["Next"] == "ExtractModelZooVerdictUnreadable"
+    assert _first_path_to(
+        branch_b, "ExtractModelZooVerdictUnreadable", "MarkModelZooDegraded"
+    )[-1] == "MarkModelZooDegraded"
+    # The notifier formats $.model_zoo_error; jumping to it without producing
+    # that field died with States.Runtime live on 2026-07-10 (config#2160), and
+    # tests/test_sf_field_reachability.py is the standing guard.
+    unreadable = branch_b["ExtractModelZooVerdictUnreadable"]
+    assert unreadable["ResultPath"] == "$.model_zoo_error"
+    assert unreadable["Next"] == "PublishModelZooFailureImmediate"
+
+    rules = branch_b["CheckModelZooVerdict"]["Choices"]
+    absent = [r for r in rules if r.get("IsPresent") is False]
+    assert len(absent) == 1, "the absent-verdict case must be stated, not left to Default"
+    assert absent[0]["Variable"] == "$.model_zoo_arena.cycle.decision.status"
+    assert absent[0]["Next"] == "ExtractModelZooVerdictAbsent"
+    # Two producers, not one: $.model_zoo_arena_error exists only on the Catch
+    # path, and tests/test_sf_field_reachability.py holds a state to fields
+    # EVERY reaching path produces.
+    for name in ("ExtractModelZooVerdictAbsent", "ExtractModelZooVerdictUnreadable"):
+        assert branch_b[name]["ResultPath"] == "$.model_zoo_error"
+        assert branch_b[name]["Next"] == "PublishModelZooFailureImmediate"
+    assert rules.index(absent[0]) == 0, (
+        "Choice is first-match; the absence arm must precede any value test"
+    )
+    assert branch_b["CheckModelZooVerdict"]["Default"] == "BranchBComplete"
+
+
+def test_only_an_explicit_unservable_status_declares_the_slot_unservable(branch_b):
+    """Every other DECIDED status — a real promotion, or a decided no-move — is
+    the ordinary clean completion, exactly as the pre-I11106 Success edge was."""
+    choice = branch_b["CheckModelZooVerdict"]
+    to_declared = [r for r in choice["Choices"] if r.get("Next") == "ModelZooUnservableDeclared"]
+    assert len(to_declared) == 1
+    assert to_declared[0]["Variable"] == "$.model_zoo_arena.cycle.decision.status"
+    assert to_declared[0]["StringEquals"] == "unservable"
+    assert choice["Default"] == "BranchBComplete"
 
 
 def test_wait_for_model_zoo_captures_standard_output_content(branch_b):
-    """The Choice cannot read StandardOutputContent unless WaitForModelZoo's
-    ResultSelector actually carries it forward from the raw SSM response."""
+    """Still carried forward — the FAILURE paths (ExtractModelZooSelectError,
+    the liveness gate) read it for diagnostics. It is no longer what decides
+    the slot's verdict; see
+    test_no_verdict_is_decided_by_matching_standard_output_content."""
     selector = branch_b["WaitForModelZoo"]["ResultSelector"]
     assert selector["StandardOutputContent.$"] == "$.StandardOutputContent"
 

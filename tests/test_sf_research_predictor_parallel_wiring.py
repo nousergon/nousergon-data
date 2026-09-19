@@ -743,7 +743,12 @@ class TestBranchBContents:
         nexts = {
             c["StringEquals"]: c["Next"] for c in check["Choices"] if "StringEquals" in c
         }
-        assert nexts["Success"] == "BranchBComplete"
+        # alpha-engine-config-I11101 deliverable 4: a Success poll no longer
+        # goes straight to BranchBComplete — it goes and reads the slot's
+        # verdict out of arena/model/{run_date}.json first. BranchBComplete is
+        # still where a decided cycle lands, via CheckModelZooVerdict's Default.
+        assert nexts["Success"] == "ReadModelZooArenaCycle"
+        assert branch_b["CheckModelZooVerdict"]["Default"] == "BranchBComplete"
         # alpha-engine-config-I5687: bounded And[] loop-back, mirroring
         # DataPhase2/ThinkTank.
         bounded = next(c for c in check["Choices"] if "And" in c)
