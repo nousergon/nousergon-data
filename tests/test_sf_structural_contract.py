@@ -129,6 +129,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.PublishResearchFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "ResearchPredictorParallel.PublishPredictorFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
         "ResearchPredictorParallel.PublishModelZooFailureImmediate": "sns:publish immediate-failure notifier — SDK call, not a wait",
+        "ResearchPredictorParallel.PublishModelZooUnservableNotice": "sns:publish declared-unservable notifier — SDK call, not a wait (alpha-engine-config-I11106)",
         "PublishReportCardDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
         "PublishParityDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I6025)",
         "PublishParityCompareDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config#6030)",
