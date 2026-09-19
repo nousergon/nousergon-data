@@ -223,10 +223,25 @@ def test_bootstrap_success_after_a_relaunch_resumes_instead_of_restarting(states
 
 def test_the_recovery_is_measurable_on_the_completion_artifact(states):
     """principles.md #7: an auto-recovery no number reports is unobserved.
-    The count rides the durable completion marker the console already reads."""
+    The count rides the durable completion marker the console already reads.
+
+    alpha-engine-config-I11106: the second assertion used to be
+    ``body.rstrip().endswith("$.run_date, $.substrate_relaunch_attempts)")``,
+    which pinned the count to being the LAST States.Format argument. That is
+    positional coupling, not the invariant this test is named for — it breaks
+    the next time any field joins the marker, which is exactly what happened
+    when ``model_zoo_unservable`` was threaded onto it. The invariant is that
+    the count is ON the marker: the placeholder is in the body template AND
+    the path is among the Format arguments. Both are asserted below, so the
+    guard is not weakened — a marker that drops the count still fails here.
+    """
     body = states["WriteCompletionMarker"]["Parameters"]["Body.$"]
     assert '"substrate_relaunches":{}' in body
-    assert body.rstrip().endswith("$.run_date, $.substrate_relaunch_attempts)")
+    args = body.rstrip().rstrip(")").split(",")
+    assert any(a.strip() == "$.substrate_relaunch_attempts" for a in args), (
+        "substrate_relaunch_attempts is not among the completion marker's "
+        f"States.Format arguments: {body}"
+    )
 
 
 def test_parallel_branch_sites_are_knowingly_out_of_scope(doc):
