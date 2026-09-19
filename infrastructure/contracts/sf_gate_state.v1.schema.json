@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://schemas.nousergon.ai/alpha-engine/sf_gate_state/v1",
-  "title": "sf_gate_state-1.0.0",
-  "description": "The weekly Step Function's correctness-gate state, threaded into the ReportCard and Director Lambda payloads (alpha-engine-config-I7282, sf-pipeline-policy.md 2.3a rule 3). PRODUCER: nousergon-data/infrastructure/step_function.json (states ReportCard and Director). CONSUMER: crucible-evaluator grading/pipeline_gates.py::read_gate_state. This file is duplicated verbatim in both repos; each repo pins its copy by sha256 in its own contract test so a one-sided edit fails loudly (the copies cannot be checked against each other from inside one repo's CI).",
+  "title": "sf_gate_state-1.1.0",
+  "description": "The weekly Step Function's correctness-gate state, threaded into the ReportCard and Director Lambda payloads (alpha-engine-config-I7282, sf-pipeline-policy.md 2.3a rule 3). PRODUCER: nousergon-data/infrastructure/step_function.json (states ReportCard and Director). CONSUMER: crucible-evaluator grading/pipeline_gates.py::read_gate_state. This file is duplicated verbatim in both repos; each repo pins its copy by sha256 in its own contract test so a one-sided edit fails loudly (the copies cannot be checked against each other from inside one repo's CI). | alpha-engine-config-I11073 (1.1.0, ADDITIVE and backward compatible): research_predictor_degraded_routes names WHICH of the ten ResearchPredictorParallel fail-open routes fired. schema_version stays 1 because this object's own rule is that schema_version bumps only on a BREAKING change, and an optional added property is not one -- every payload written before this field existed still validates, and the consumer needs no version branch. The minor version is carried in `title`, which the consumer stamps onto every block it emits, so a reader of an archived report card can still tell which contract produced it.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -33,7 +33,12 @@
     },
     "research_predictor_degraded": {
       "type": "boolean",
-      "description": "A ResearchPredictorParallel internal fail-open route fired. Present in both polarities."
+      "description": "A ResearchPredictorParallel internal fail-open route fired. Present in both polarities. Says THAT one fired, never WHICH -- read research_predictor_degraded_routes for that."
+    },
+    "research_predictor_degraded_routes": {
+      "type": "array",
+      "items": {"type": "string"},
+      "description": "The SF state names of the ResearchPredictorParallel fail-open routes that fired on this run, in the order they fired (alpha-engine-config-I11073). Ten routes share the research_predictor_degraded boolean -- MarkScannerDegraded, ScannerResourceKillDegraded, MarkRegimeSubstrateDegraded, MarkChallengerShadowDegraded, MarkRegimeRetrospectiveEvalDegraded, MarkEvalJudgeDegraded, MarkEvalRollingMeanDegraded, MarkRationaleClusteringDegraded, MarkCounterfactualDegraded, MarkModelZooDegraded -- so without this a reader cannot tell a run whose ChallengerShadow arm lost its predictions file from one whose model-zoo rotation timed out. Seeded [] at InitializeInput, so it is present in BOTH polarities on a producer at or above 1.1.0: [] means no route fired and is a MEASUREMENT, while ABSENT means the producer predates this field and is not a measurement. A consumer must never render the two the same. OPTIONAL in the schema precisely so a pre-1.1.0 payload keeps validating; the consumer distinguishes them by presence, not by schema version."
     },
     "lib_pin_drift": {
       "$ref": "#/$defs/probe",

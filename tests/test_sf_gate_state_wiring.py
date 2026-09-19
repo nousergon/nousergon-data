@@ -60,7 +60,7 @@ _SCHEMA_PATH = (
 #: ``tests/test_pipeline_gates.py``. Neither repo's CI can read the other, so
 #: this pin is what makes a one-sided edit fail loudly instead of silently
 #: forking the contract.
-_SCHEMA_SHA256 = "5f4c4a7736238103aa64d9cf989eddfd87840612a6872b266ce1e5578c2439b6"
+_SCHEMA_SHA256 = "6287e392be263af8a31ffae8a6dac7f3bdd7e0a032d282dd85527fca907f0fa0"
 
 #: The states whose payload must carry it — every surface presenting the run's
 #: results (§2.3a rule 3). Adding a third reporting surface adds a row here.
@@ -271,3 +271,153 @@ def test_a_measured_run_also_validates():
                               "violations": [], "boundary_count": 12},
     }
     jsonschema.validate(measured, json.loads(_SCHEMA_PATH.read_text()))
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11073 — the named ResearchPredictorParallel routes
+#
+# ``research_predictor_degraded`` is one boolean over TEN distinct fail-open
+# routes. On run_date 2026-09-04 and 2026-09-11 the route that fired was
+# ``MarkChallengerShadowDegraded``; nothing on any rendered surface named it,
+# and the Director filed two P0 investigations that had to be root-caused from
+# the raw SF execution history instead. These tests pin the whole class: every
+# route names itself, the names cross the Parallel join, and they reach both
+# reporting surfaces — so adding an eleventh route without wiring its name in
+# fails here rather than on a Saturday.
+# ---------------------------------------------------------------------------
+
+#: The ten fail-open routes inside ``ResearchPredictorParallel``. This literal is
+#: the point: it is what makes ADDING a route without naming it a test failure.
+_RP_ROUTES = (
+    "MarkScannerDegraded",
+    "ScannerResourceKillDegraded",
+    "MarkRegimeSubstrateDegraded",
+    "MarkChallengerShadowDegraded",
+    "MarkRegimeRetrospectiveEvalDegraded",
+    "MarkEvalJudgeDegraded",
+    "MarkEvalRollingMeanDegraded",
+    "MarkRationaleClusteringDegraded",
+    "MarkCounterfactualDegraded",
+    "MarkModelZooDegraded",
+)
+
+_RP_LOCAL = "$.research_degraded_local"
+_RP_ROUTES_FIELD = "research_predictor_degraded_routes"
+
+
+@pytest.fixture(scope="module")
+def rp_branch_states(states) -> dict:
+    """Every state inside ``ResearchPredictorParallel``, both branches, flat."""
+    flat = {}
+    for branch in states["ResearchPredictorParallel"]["Branches"]:
+        flat.update(branch["States"])
+    return flat
+
+
+def test_every_research_predictor_route_is_accounted_for(rp_branch_states):
+    """The set of states writing the branch-local marker is exactly the seeds
+    plus the ten named routes — no route may exist that this file has not seen."""
+    writers = {
+        name for name, state in rp_branch_states.items()
+        if state.get("ResultPath") == _RP_LOCAL
+    }
+    seeds = {"InitResearchDegradedFlag", "InitPredictorDegradedFlag"}
+    assert writers == seeds | set(_RP_ROUTES), (
+        "the ResearchPredictorParallel fail-open route set changed. Every route "
+        "must append its own name (alpha-engine-config-I11073) or the report "
+        "card can only say that SOMETHING fail-opened."
+    )
+
+
+@pytest.mark.parametrize("route", _RP_ROUTES)
+def test_each_route_appends_its_own_name(rp_branch_states, route):
+    state = rp_branch_states[route]
+    assert "Result" not in state, (
+        f"{route} writes a bare Result — it discards which route fired at the "
+        "one state that knows."
+    )
+    params = state["Parameters"]
+    assert params["degraded"] is True
+    assert params["routes.$"] == (
+        f"States.Format('{{}},{{}}',{_RP_LOCAL}.routes,'{route}')"
+    ), (
+        f"{route} must APPEND to the accumulator, not overwrite it: two routes "
+        "fire in one run (measured 2026-09-12, alpha-engine-config-I10540) and "
+        "an overwrite keeps only the last."
+    )
+
+
+@pytest.mark.parametrize("seed", ["InitResearchDegradedFlag",
+                                  "InitPredictorDegradedFlag"])
+def test_the_branch_local_marker_is_seeded_in_both_fields(rp_branch_states, seed):
+    """Seeded BEFORE any route can fire, or the first route's ``Parameters.$``
+    read of ``.routes`` throws States.Runtime on the very run it exists to
+    describe."""
+    assert rp_branch_states[seed]["Result"] == {"degraded": False, "routes": ""}
+
+
+@pytest.mark.parametrize("branch,terminal", [("a", "BranchAComplete"),
+                                             ("b", "BranchBComplete")])
+def test_route_names_cross_the_parallel_join(rp_branch_states, states,
+                                             branch, terminal):
+    """A Parallel branch is its own JSONPath scope: the terminal is the only
+    place the names can leave it, and AggregateBranchOutcomes the only place
+    both branches' names can meet."""
+    payload = rp_branch_states[terminal]["Parameters"][f"branch_{branch}"]
+    assert payload[f"branch_{branch}_routes.$"] == f"{_RP_LOCAL}.routes"
+    assert payload[f"branch_{branch}_degraded.$"] == f"{_RP_LOCAL}.degraded"
+
+    agg = states["AggregateBranchOutcomes"]["Parameters"]
+    assert agg[f"branch_{branch}_routes.$"].endswith(f"branch_{branch}_routes")
+
+
+def test_the_named_routes_state_is_the_sole_writer_and_is_on_the_path(states):
+    """One writer, reached on the degraded path, before the summary."""
+    writers = [
+        name for name, state in states.items()
+        if state.get("ResultPath") == f"$.{_RP_ROUTES_FIELD}"
+    ]
+    assert writers == ["SetResearchPredictorDegradedRoutes"]
+    assert states["SetResearchPredictorDegraded"]["Next"] == \
+        "SetResearchPredictorDegradedRoutes"
+    assert states["SetResearchPredictorDegradedRoutes"]["Next"] == \
+        "SetResearchPredictorDegradedSummary", (
+        "the named-routes state must not change the fail-open path's "
+        "continuation — it is an observation, never a branch."
+    )
+    assert states["SetResearchPredictorDegradedRoutes"]["Parameters"]["routes.$"] == (
+        "States.StringSplit(States.Format('{},{}',"
+        "$.branch_outcomes.branch_a_routes,$.branch_outcomes.branch_b_routes),',')"
+    )
+
+
+def test_the_named_routes_field_is_seeded_not_absent(floor):
+    """The alpha-engine-config-I7282 idiom, and principles.md #7: a clean run
+    must emit ``[]`` — a MEASUREMENT that no route fired — and never nothing."""
+    assert floor[_RP_ROUTES_FIELD] == {"routes": []}
+
+
+@pytest.mark.parametrize("surface", _SURFACES)
+def test_both_surfaces_carry_the_named_routes(states, surface):
+    gate_state = states[surface]["Parameters"]["Payload"]["gate_state"]
+    assert gate_state[f"{_RP_ROUTES_FIELD}.$"] == f"$.{_RP_ROUTES_FIELD}.routes", (
+        f"{surface} renders the run's results without being able to name which "
+        "ResearchPredictorParallel route fail-opened (sf-pipeline-policy.md "
+        "§2.3a rule 3)."
+    )
+
+
+def test_a_degraded_run_naming_its_routes_validates():
+    """The polarity the boolean could never express: two routes, both named."""
+    payload = {
+        "schema_version": 1,
+        "gate_degraded": False,
+        "health_check_degraded": False,
+        "parity_degraded": False,
+        "research_predictor_degraded": True,
+        "research_predictor_degraded_routes": ["MarkChallengerShadowDegraded",
+                                               "MarkModelZooDegraded"],
+        "lib_pin_drift": {"status": "MEASURED", "has_drift": False},
+        "pipeline_contract": {"status": "UNKNOWN", "reason": "gate_did_not_run"},
+    }
+    jsonschema.validate(payload, json.loads(_SCHEMA_PATH.read_text()))

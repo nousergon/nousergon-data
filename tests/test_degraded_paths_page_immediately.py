@@ -180,6 +180,43 @@ _NO_IMMEDIATE_PAGE: dict[tuple[str, str], str] = {
     ),
 }
 
+#: alpha-engine-config-I11073 brought the ten ResearchPredictorParallel fail-open
+#: routes into this audit's reach for the first time. They previously wrote a
+#: bare ``Result: true`` and carried no ``degraded`` key, so ``_degraded_setters``
+#: matched none of them and the audit was blind to the whole family — the
+#: detection blindness outranked the paths it hid. Making each route name itself
+#: gave them a ``Parameters`` block, which is what surfaced them here.
+#:
+#: The PATHS have not changed, and they are exempt for the reason
+#: ``SetResearchPredictorDegradedSummary`` above is already exempt for: each of
+#: these states is the CONTINUATION of a Catch that has ALREADY published —
+#: ``PublishResearchFailureImmediate`` (branch A), ``PublishModelZooFailure
+#: Immediate`` / ``PublishPredictorFailureImmediate`` (branch B). The page fires
+#: BEFORE the state, and ``_reaches_a_publish`` only walks forward. A publish
+#: here would be a second email about the same event, seconds later.
+_RP_ROUTE_PAGED_BY_ITS_OWN_CATCH = (
+    "Continuation of a Catch that already published inside "
+    "ResearchPredictorParallel (Publish{Research,Predictor,ModelZoo}"
+    "FailureImmediate). The page fires BEFORE this state; publishing again "
+    "would be a second email about the same event."
+)
+
+_NO_IMMEDIATE_PAGE.update({
+    ("step_function.json", route): _RP_ROUTE_PAGED_BY_ITS_OWN_CATCH
+    for route in (
+        "MarkScannerDegraded",
+        "ScannerResourceKillDegraded",
+        "MarkRegimeSubstrateDegraded",
+        "MarkChallengerShadowDegraded",
+        "MarkRegimeRetrospectiveEvalDegraded",
+        "MarkEvalJudgeDegraded",
+        "MarkEvalRollingMeanDegraded",
+        "MarkRationaleClusteringDegraded",
+        "MarkCounterfactualDegraded",
+        "MarkModelZooDegraded",
+    )
+})
+
 
 def _states(definition: str) -> dict:
     return json.loads((_INFRA / definition).read_text(encoding="utf-8"))["States"]
