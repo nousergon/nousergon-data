@@ -1103,3 +1103,128 @@ class TestHandlerReconcileMode:
         s3, store = env
         with pytest.raises(ValueError, match="unknown expense-collector event mode"):
             index.handler({"mode": "bogus"}, None)
+
+
+# ---------------------------------------------------------------------------
+# Cost Explorer call budget (alpha-engine-config-I11201, residual of -I10389)
+# ---------------------------------------------------------------------------
+#
+# `ce:GetCostAndUsage` and `ce:GetCostForecast` are billed PER REQUEST at
+# $0.01. In 2026-09-03..09-06 an unbounded caller issued 44,167 of them for
+# $441.67 -- more than either of the account's two prior FULL months' bills.
+# This Lambda is the only CE caller in the fleet that runs UNATTENDED on a
+# schedule, and until I11201 its call count was bounded only by its cron.
+#
+# These tests exist because the fleet has repeatedly shipped guards that were
+# never shown to fire. Each one therefore asserts on the CLIENT's own request
+# log -- what was actually sent -- not merely that an exception was raised.
+
+class _CountingCE:
+    """A Cost Explorer fake that records every request it is handed.
+
+    `FakeCE` above answers requests; this one also remembers them, which is
+    the only way to distinguish "the budget raised" from "the budget raised
+    AFTER paying for the call it was supposed to refuse".
+    """
+
+    def __init__(self, deny: bool = False):
+        self.calls: list[str] = []
+        self.deny = deny
+
+    def get_cost_and_usage(self, **kw):
+        self.calls.append("get_cost_and_usage")
+        if self.deny:
+            raise RuntimeError("AccessDeniedException")
+        return {"ResultsByTime": [{"Groups": [
+            {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "8.10"}}},
+        ]}]}
+
+    def get_cost_forecast(self, **kw):
+        self.calls.append("get_cost_forecast")
+        return {"Total": {"Amount": "25.00"}}
+
+
+class TestCostExplorerCallBudget:
+    def test_the_default_budget_has_no_headroom_for_a_loop(self):
+        """A `collect` invocation makes exactly two CE calls. A budget with
+        room to spare cannot tell a loop from normal operation."""
+        assert index.CE_CALL_BUDGET == 2
+
+    def test_a_normal_collect_fits_the_default_budget_exactly(self):
+        raw = _CountingCE()
+        ce = index._BudgetedCostExplorer(raw, budget=index.CE_CALL_BUDGET)
+        row = index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast"]
+        assert ce.calls == 2
+        assert row["mtd_cost_usd"] == pytest.approx(8.10)
+
+    def test_the_over_budget_call_never_reaches_the_client(self):
+        """The whole point: the request is refused BEFORE it is billed."""
+        raw = _CountingCE()
+        ce = index._BudgetedCostExplorer(raw, budget=1)
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert raw.calls == ["get_cost_and_usage"], (
+            "the forecast call was past the budget and must never have been sent"
+        )
+
+    def test_a_budget_of_zero_refuses_the_first_call(self):
+        raw = _CountingCE()
+        ce = index._BudgetedCostExplorer(raw, budget=0)
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert raw.calls == []
+
+    def test_a_denied_read_still_counts_against_the_budget(self):
+        """A denial is billed like any other request, so an unbounded retry on
+        one is exactly the 2026-09 burst's shape."""
+        raw = _CountingCE(deny=True)
+        ce = index._BudgetedCostExplorer(raw, budget=1)
+        with pytest.raises(RuntimeError, match="AccessDenied"):
+            index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert ce.calls == 1
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert raw.calls == ["get_cost_and_usage"]
+
+    def test_an_unbilled_operation_is_not_metered(self):
+        """Only per-request-billed operations count. Metering everything would
+        make the budget a throttle on the client rather than on spend."""
+        class _WithFreeCall(_CountingCE):
+            def get_caller_identity(self, **kw):
+                self.calls.append("get_caller_identity")
+                return {}
+
+        raw = _WithFreeCall()
+        ce = index._BudgetedCostExplorer(raw, budget=0)
+        ce.get_caller_identity()
+        assert ce.calls == 0
+
+    def test_the_module_has_no_unbudgeted_cost_explorer_client(self):
+        """A raw `boto3.client("ce", ...)` anywhere else is an unbudgeted
+        caller, which is the entire defect. The one permitted occurrence is
+        inside `_ce_client`, and the budget it reads is env-overridable."""
+        src = Path(index.__file__).read_text()
+        assert src.count('boto3.client("ce"') == 1
+        factory = src.split("def _ce_client(")[1].split("\ndef ")[0]
+        assert 'boto3.client("ce"' in factory
+        assert 'os.environ.get("EXPENSE_CE_CALL_BUDGET"' in src
+
+    def test_a_breach_fails_the_whole_collect_rather_than_one_row(self, env, monkeypatch):
+        """Every other provider failure degrades one row so the rollup still
+        publishes. A budget breach must NOT: recording it as one row's error
+        field is how the 2026-09 burst ran four days instead of four minutes.
+        """
+        monkeypatch.setattr(index, "CE_CALL_BUDGET", 1)
+        monkeypatch.setattr(index, "_ce_client",
+                            lambda budget=None: index._BudgetedCostExplorer(
+                                _CountingCE(), budget=1))
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.handler({}, None)
+
+    def test_a_breach_fails_the_whole_reconcile_rather_than_one_row(self, env, monkeypatch):
+        monkeypatch.setattr(index, "_ce_client",
+                            lambda budget=None: index._BudgetedCostExplorer(
+                                _CountingCE(), budget=0))
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.handler({"mode": "reconcile"}, None)

@@ -123,6 +123,24 @@ COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
 ALERT_STATE_PREFIX = "expenses/alert_state/"
 RECONCILIATION_PREFIX = "expenses/reconciliation/"
 
+# Cost Explorer per-invocation call budget (alpha-engine-config-I11201, the
+# residual of -I10389). `ce:GetCostAndUsage` and `ce:GetCostForecast` are
+# billed PER REQUEST at $0.01 -- three orders of magnitude above a typical AWS
+# read -- and 2026-09-03..09-06 an unbounded caller issued 44,167 of them for
+# $441.67, more than either of the account's two prior FULL months' bills.
+#
+# This Lambda is the only CE caller in the fleet that runs UNATTENDED on a
+# schedule, so it is the one that can repeat that burst with nobody reading
+# its output. Its call count was previously bounded only by its cron, which is
+# a property of the SCHEDULE, not a control: any retry-on-transient added
+# later multiplies it silently.
+#
+# Sized with NO HEADROOM for the calls that actually exist -- `collect` makes
+# two (`get_cost_and_usage` + `get_cost_forecast`), `reconcile` makes one. A
+# budget with room to spare cannot tell a loop from normal operation. Raise
+# `EXPENSE_CE_CALL_BUDGET` deliberately if a third call is genuinely added.
+CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "2"))
+
 # Month-close reconciliation (alpha-engine-config#2849) — |delta_pct| beyond
 # this is "visible drift", not rounding/timing noise. Matches the console's
 # highlight threshold in shared/expense_view.py (kept in lockstep — a
@@ -544,6 +562,86 @@ def _load_ssm(names: list[str]) -> dict[str, str]:
 # Provider adapters
 # ---------------------------------------------------------------------------
 
+class CostExplorerCallBudgetExceeded(RuntimeError):
+    """This invocation asked Cost Explorer more times than its declared budget.
+
+    Raised BEFORE the request is made, so the over-budget call is never billed.
+    Deliberately NOT a provider-adapter failure: every other exception in this
+    module degrades one row and lets the rollup publish, because one provider
+    outage must not blank the others. This one escapes both `fenced` helpers
+    and fails the whole invocation, because it does not mean "AWS did not
+    answer" -- it means THIS CODE IS LOOPING ON A BILLED API, and the correct
+    response to that is to stop, loudly, while the loop is still cheap.
+    """
+
+
+class _BudgetedCostExplorer:
+    """Counting proxy over a boto3 ``ce`` client, one per invocation.
+
+    Wraps the client rather than the two call sites so that a THIRD CE call
+    added later is budgeted by construction -- the failure mode this exists to
+    prevent is a new caller nobody remembered to cap. Every attribute lookup
+    that names a billable Cost Explorer operation is metered; a failed request
+    still counts, since a denial is billed like any other request and an
+    unbounded retry on one is exactly the 2026-09 burst's shape.
+    """
+
+    #: Per-request-billed operations. An operation absent here passes through
+    #: unmetered, so the list is deliberately broad rather than the two in use.
+    BILLED = frozenset({
+        "get_cost_and_usage", "get_cost_and_usage_with_resources",
+        "get_cost_forecast", "get_usage_forecast", "get_dimension_values",
+        "get_tags", "get_reservation_coverage", "get_savings_plans_coverage",
+        "list_cost_allocation_tags", "get_cost_categories",
+    })
+
+    def __init__(self, client, *, budget: int) -> None:
+        self._client = client
+        self._budget = budget
+        self._calls = 0
+
+    @property
+    def calls(self) -> int:
+        return self._calls
+
+    @property
+    def budget(self) -> int:
+        return self._budget
+
+    def __getattr__(self, name: str):
+        attr = getattr(self._client, name)
+        if name not in self.BILLED:
+            return attr
+
+        def _metered(*args, **kwargs):
+            if self._calls >= self._budget:
+                raise CostExplorerCallBudgetExceeded(
+                    f"Cost Explorer call budget of {self._budget} exhausted for this "
+                    f"invocation, on `{name}`. ce is billed per request at $0.01 -- "
+                    "raising rather than spending past the declared budget "
+                    "(alpha-engine-config-I11201). If a third CE call is genuinely "
+                    "needed, raise EXPENSE_CE_CALL_BUDGET deliberately."
+                )
+            self._calls += 1
+            return attr(*args, **kwargs)
+
+        return _metered
+
+
+def _ce_client(budget: int | None = None):
+    """The ONLY way this module gets a Cost Explorer client.
+
+    A raw, unwrapped Cost Explorer client constructed anywhere else would be
+    an unbudgeted caller, which is the whole defect (I11201), so this factory
+    holds the module's only such construction and `test_handler.py`'s
+    `TestCostExplorerCallBudget` asserts that by reading this file.
+    """
+    return _BudgetedCostExplorer(
+        boto3.client("ce", region_name="us-east-1"),
+        budget=CE_CALL_BUDGET if budget is None else budget,
+    )
+
+
 def _ce_unblended_by_service(ce, start: str, end: str) -> dict[str, float]:
     """Shared Cost Explorer ``get_cost_and_usage`` call (grouped by SERVICE,
     MONTHLY granularity) — used both for the live current-month MTD read
@@ -564,8 +662,8 @@ def _ce_unblended_by_service(ce, start: str, end: str) -> dict[str, float]:
     return by_service
 
 
-def collect_aws(mw: dict, budgets: dict) -> dict:
-    ce = boto3.client("ce", region_name="us-east-1")
+def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
+    ce = _ce_client() if ce is None else ce
     start = mw["start"].strftime("%Y-%m-%d")
     now = _now_utc()
     end = (now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -611,6 +709,11 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
             Metric="UNBLENDED_COST", Granularity="MONTHLY")
         row["projected_month_end_usd"] = round(float(fc["Total"]["Amount"]), 2)
         row["detail"]["projection_source"] = "ce_forecast_monthly"
+    except CostExplorerCallBudgetExceeded:
+        # NOT an unavailable forecast. Degrading to the straight-line fallback
+        # here would convert "this code is looping on a billed API" into a
+        # detail field nobody reads (alpha-engine-config-I11201 deliverable 3).
+        raise
     except Exception as exc:  # noqa: BLE001 — forecast is an enhancement; the
         # straight-line fallback below is the recorded degradation surface.
         logger.info("CE forecast unavailable (straight-line fallback): %s", exc)
@@ -1235,8 +1338,8 @@ def _reconciliation_row(key: str, prior_doc: dict | None, actual_final: float | 
     }
 
 
-def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None) -> dict:
-    ce = boto3.client("ce", region_name="us-east-1")
+def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, ce=None) -> dict:
+    ce = _ce_client() if ce is None else ce
     by_service = _ce_unblended_by_service(
         ce, prior_mw["start"].strftime("%Y-%m-%d"), prior_mw["end"].strftime("%Y-%m-%d"))
     return _reconciliation_row("aws", prior_doc, round(sum(by_service.values()), 2))
@@ -1342,6 +1445,12 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
     def fenced(key: str, fn) -> None:
         try:
             providers[key] = fn()
+        except CostExplorerCallBudgetExceeded:
+            # Escapes the fence deliberately (alpha-engine-config-I11201): a
+            # budget breach is not a provider outage, it is this code looping
+            # on a $0.01-per-request API. Recording it as one row's `note` is
+            # how the 2026-09 burst ran four days instead of four minutes.
+            raise
         except Exception as exc:  # noqa: BLE001 — one provider's re-query outage
             # must not blank the others' reconciliation rows.
             logger.exception("reconciliation for %s failed", key)
@@ -1506,6 +1615,8 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # failure's recording surface is this row's error field (+ CW logs).
         try:
             rows.append(fn())
+        except CostExplorerCallBudgetExceeded:
+            raise  # see the reconciliation fence's rationale (I11201)
         except Exception as exc:  # noqa: BLE001 — see fence rationale above
             logger.exception("provider %s failed", key)
             rows.append(_row(key, label, status="error", error=str(exc)[:300]))
