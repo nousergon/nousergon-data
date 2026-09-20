@@ -1228,3 +1228,54 @@ class TestCostExplorerCallBudget:
                                 _CountingCE(), budget=0))
         with pytest.raises(index.CostExplorerCallBudgetExceeded):
             index.handler({"mode": "reconcile"}, None)
+
+
+# ── the retry bound is part of the CE safeguard (I11206) ───────────────────
+#
+# Brian's ruling 2026-09-20 exempted this Lambda's role from the Cost Explorer
+# breaker "as long as we have the safeguards in place not to get runaway cost
+# accumulation". There are TWO, and neither substitutes for the other:
+#
+#   per INVOCATION   CE_CALL_BUDGET = 2, tested above
+#   per DAY          how many invocations there can be
+#
+# The second was AWS's default of 185 retries over a 24h event age, never set.
+# Each retry is a fresh invocation with a fresh budget, and the CE calls happen
+# EARLY in the handler, so a failure anywhere after them re-pays for them:
+# 185 x 2 ticks x 2 calls = 740 calls/day = $7.40/day, ~$222/month against a
+# $139 account budget. That is I10389's exact shape one level up.
+
+
+def _deploy_sh() -> str:
+    return (Path(__file__).parent / "deploy.sh").read_text()
+
+
+class TestTheScheduleRetryBoundIsDeclared:
+    def test_the_retry_bound_is_declared_not_left_to_the_aws_default(self):
+        src = _deploy_sh()
+        assert "SCHED_MAX_RETRIES=2" in src
+        assert "SCHED_MAX_EVENT_AGE_SECONDS=3600" in src
+
+    def test_every_schedule_carries_the_bound_on_create_AND_update(self):
+        """A redeploy must not silently restore 185. RetryPolicy is part of the
+        TARGET, which both branches pass, so this asserts the target string
+        carries it and that both branches use that string."""
+        src = _deploy_sh()
+        assert src.count('"RetryPolicy":{"MaximumRetryAttempts":%s') == 1
+        assert src.count('--target "${target}"') == 2, (
+            "create-schedule and update-schedule must both pass the same target"
+        )
+
+    def test_the_bound_keeps_worst_case_ce_spend_inside_the_line(self):
+        """The arithmetic, pinned. 17 services share a $139 ceiling and Cost
+        Explorer's line is $6; a sustained failure loop must reach that line's
+        ALERT rather than the month's budget."""
+        src = _deploy_sh()
+        retries = int(src.split("SCHED_MAX_RETRIES=")[1].split("\n")[0])
+        invocations_per_day = (retries + 1) * 2  # two schedule ticks
+        calls_per_day = invocations_per_day * index.CE_CALL_BUDGET
+        usd_per_month = calls_per_day * 0.01 * 30
+        assert usd_per_month < 6.00, (
+            f"worst case ${usd_per_month:.2f}/mo exceeds the $6 Cost Explorer "
+            f"line; the breaker exemption (I11206) was granted on this bound"
+        )

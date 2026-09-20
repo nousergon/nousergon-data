@@ -91,6 +91,37 @@ SCHED_INPUTS=(
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
+# Retry bound (alpha-engine-config-I11206, Brian's ruling 2026-09-20: exempt
+# the collector from the Cost Explorer breaker "as long as we have the
+# safeguards in place not to get runaway cost accumulation").
+#
+# EventBridge Scheduler's DEFAULT IS 185 RETRIES over a 24h event age, and it
+# had never been set here. Each retry is a FRESH INVOCATION carrying a fresh
+# `CE_CALL_BUDGET`, and the two Cost Explorer calls happen EARLY in the
+# handler -- so a failure anywhere after them re-pays for them.
+#
+#   185 retries x 2 ticks/day x 2 CE calls = 740 calls/day = $7.40/day
+#   ~$222/month, against a $139 ACCOUNT budget and a $6 Cost Explorer line.
+#
+# That is the 2026-09 incident's exact shape (alpha-engine-config-I10389): a
+# per-call cap that says nothing about call COUNT. The per-invocation budget
+# added in I11201 bounds each run; this bounds how many runs there can be.
+# Both are needed, and neither substitutes for the other.
+#
+#   2 retries + 1 original x 2 ticks x 2 calls = 12 calls/day = $0.12/day
+#
+# Two is enough for a genuine transient (the provider adapters are already
+# fenced, so a retry here means the rollup WRITE or the SSM/S3 read failed)
+# and small enough that a sustained failure loop reaches the $6 line's alert
+# rather than the month's budget. A dead collector is caught separately, by
+# aws_spend_monitor.py's staleness clause on `expenses/latest.json`.
+#
+# DECLARED HERE AND GRADED DAILY: `sync_cost_controls.py --check` reads the
+# live schedules and reds if either exceeds this bound, so a console edit or
+# an un-flagged redeploy cannot quietly restore 185.
+SCHED_MAX_RETRIES=2
+SCHED_MAX_EVENT_AGE_SECONDS=3600
+
 # alpha-engine-config-I5815 splits the old monolithic --bootstrap in two, along
 # the line that actually matters: which grants the caller needs.
 #
@@ -255,8 +286,12 @@ if $RECONCILE_SCHEDULES; then
     name="${SCHED_NAMES[$i]}"
     cron="${SCHED_CRONS[$i]}"
     input_json="${SCHED_INPUTS[$i]}"
-    target=$(printf '{"Arn":"%s","RoleArn":"%s","Input":%s}' \
-      "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')")
+    # RetryPolicy is part of the TARGET, so it is set on every create AND
+    # update -- a redeploy cannot silently restore the 185 default
+    # (alpha-engine-config-I11206).
+    target=$(printf '{"Arn":"%s","RoleArn":"%s","Input":%s,"RetryPolicy":{"MaximumRetryAttempts":%s,"MaximumEventAgeInSeconds":%s}}' \
+      "${FN_ARN}" "${SCHED_ROLE_ARN}" "$(printf '%s' "${input_json}" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')" \
+      "${SCHED_MAX_RETRIES}" "${SCHED_MAX_EVENT_AGE_SECONDS}")
     if aws scheduler get-schedule --name "${name}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
       echo "  Updating Scheduler rule: ${name} → ${cron}"
       run aws scheduler update-schedule --name "${name}" --state "$(pause_state "${name}")" --schedule-expression "${cron}" \
