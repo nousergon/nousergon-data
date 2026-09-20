@@ -131,6 +131,18 @@ class ContractSchema:
     path: pathlib.Path
     provenance_fields: frozenset[str]
     pattern: "re.Pattern[str]"
+    #: ``"deterministic"`` (the default, byte-equal) or ``"vendor_live"``.
+    #: Brian ruling 2026-09-20, `alpha-engine-config-I11203`.
+    comparison_class: str = "deterministic"
+    #: For a `vendor_live` key: the band inside which a value difference is
+    #: DRIFT rather than a breach, and the key-set coverage floor.
+    value_band_relative: float = 0.0
+    value_band_absolute: float = 0.0
+    coverage_floor: float = 1.0
+
+    @property
+    def is_vendor_live(self) -> bool:
+        return self.comparison_class == "vendor_live"
 
 
 def _key_pattern_regex(template: str) -> "re.Pattern[str]":
@@ -184,12 +196,36 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
         # pattern so `resolve_contract`'s first-match loop is unchanged.
         templates = [declared] if isinstance(declared, str) else list(declared)
         provenance = _provenance_fields(schema)
+        comparison_class = str(schema.get("x-comparison-class") or "deterministic")
+        if comparison_class not in _COMPARISON_CLASSES:
+            raise ValueError(
+                f"{path.name}: x-comparison-class must be one of {sorted(_COMPARISON_CLASSES)}, "
+                f"got {comparison_class!r}"
+            )
+        vendor_live = schema.get("x-vendor-live") or {}
+        if comparison_class == "vendor_live" and not vendor_live:
+            raise ValueError(
+                f"{path.name}: x-comparison-class is 'vendor_live' but no x-vendor-live block "
+                "declares its value band and coverage floor. A class with no declared bounds "
+                "would pass everything (alpha-engine-config-I11203)."
+            )
+        band = vendor_live.get("value_band") or {}
         for template in templates:
             if not isinstance(template, str) or not template:
                 raise ValueError(
                     f"{path.name}: x-key-pattern entries must be non-empty strings, got {template!r}"
                 )
-            schemas.append(ContractSchema(path, provenance, _key_pattern_regex(template)))
+            schemas.append(
+                ContractSchema(
+                    path,
+                    provenance,
+                    _key_pattern_regex(template),
+                    comparison_class=comparison_class,
+                    value_band_relative=float(band.get("relative", 0.0)),
+                    value_band_absolute=float(band.get("absolute", 0.0)),
+                    coverage_floor=float(vendor_live.get("coverage_floor", 1.0)),
+                )
+            )
     return tuple(schemas)
 
 
@@ -503,6 +539,31 @@ def _json_breaches(live: Any, shadow: Any, rel: float, absolute: float, path: st
 #: ``"$.fetched_at: ..."`` -> ``"fetched_at"``. Provenance fields declared in
 #: a contract are top-level today (`fetched_at`, `revision`); a diff any
 #: deeper than that is never matched here and stays a data breach.
+#: The two comparison classes a contract may declare (Brian ruling 2026-09-20,
+#: `alpha-engine-config-I11203`). `deterministic` is the default and the
+#: pre-existing behaviour: byte-equal, which 918 of 959 keys already satisfy.
+_COMPARISON_CLASSES = frozenset({"deterministic", "vendor_live"})
+
+#: A MEMBERSHIP diff — a key present on one side only. Matched on the exact
+#: generated suffix, not by parsing the value, because `_json_breaches`
+#: produces these strings itself. Same idiom as `_TOP_LEVEL_FIELD_RE` below:
+#: this module already classifies diffs by their rendered shape.
+_MEMBERSHIP_DIFF_RE = re.compile(r": only in (live|shadow)$")
+
+#: A CARDINALITY diff — a list whose length differs. Never forgiven for a
+#: vendor_live key: the ruling grades values approximately and SHAPE exactly.
+_CARDINALITY_DIFF_RE = re.compile(r": length \d+ live vs \d+ shadow$")
+
+
+def classify_diff(diff: str) -> str:
+    """``"membership"`` | ``"cardinality"`` | ``"value"`` for one rendered diff."""
+    if _MEMBERSHIP_DIFF_RE.search(diff):
+        return "membership"
+    if _CARDINALITY_DIFF_RE.search(diff):
+        return "cardinality"
+    return "value"
+
+
 _TOP_LEVEL_FIELD_RE = re.compile(r"^\$\.([A-Za-z0-9_]+)\b")
 
 
@@ -571,11 +632,20 @@ def compare_bytes(
                 "verdict": "unmeasurable",
                 "unmeasurable_reason": f"json would not parse: {type(exc).__name__}: {exc}",
             }
-        all_diffs = _json_breaches(live_doc, shadow_doc, rel, absolute)
+        # A `vendor_live` key is compared with ITS OWN declared band
+        # (alpha-engine-config-I11203, Brian ruling 2026-09-20). The band is
+        # not a loosening of the global tolerance: it applies only where a
+        # contract declares the class, and `deterministic` keys keep the
+        # 1e-6/1e-9 defaults untouched.
+        vendor_live = contract is not None and contract.is_vendor_live
+        compare_rel = contract.value_band_relative if vendor_live else rel
+        compare_abs = contract.value_band_absolute if vendor_live else absolute
+
+        all_diffs = _json_breaches(live_doc, shadow_doc, compare_rel, compare_abs)
         breaches, provenance_diffs = _split_json_diffs(all_diffs, provenance_fields)
-        return {
+
+        body = {
             "comparator": "json",
-            "verdict": "match" if not breaches else "mismatch",
             "values": {"breaches": len(breaches), "examples": breaches[:10]},
             "provenance_diffs": {"count": len(provenance_diffs), "examples": provenance_diffs[:10]},
             "row_count": {
@@ -583,6 +653,51 @@ def compare_bytes(
                 "shadow": len(shadow_doc) if isinstance(shadow_doc, (list, dict)) else 1,
             },
         }
+
+        if not vendor_live:
+            body["verdict"] = "match" if not breaches else "mismatch"
+            return body
+
+        # The ruling grades a vendor_live key on SCHEMA CONFORMANCE, KEY-SET
+        # COVERAGE and ROW COUNT, with values inside the band. So:
+        #
+        #   * value diffs OUTSIDE the band stay breaches -- the band already
+        #     absorbed everything inside it;
+        #   * cardinality diffs stay breaches, always. Shape is graded exactly;
+        #   * membership diffs are counted, not forgiven: a ticker delisted
+        #     between two fetches is expected, a producer dropping half the
+        #     universe is not. Coverage is graded against the declared floor.
+        membership = [d for d in breaches if classify_diff(d) == "membership"]
+        non_membership = [d for d in breaches if classify_diff(d) != "membership"]
+
+        # Denominator: the live side's key count is what coverage is measured
+        # against -- "how much of what v1 published did the shadow reproduce".
+        denominator = body["row_count"]["live"] or 1
+        covered = max(denominator - len(membership), 0)
+        ratio = covered / denominator
+        floor = contract.coverage_floor
+        coverage_ok = ratio >= floor
+
+        body["vendor_drift"] = {
+            "class": "vendor_live",
+            "band": {"relative": compare_rel, "absolute": compare_abs},
+            "absorbed_note": (
+                "value differences inside the declared band are drift between two fetches "
+                "of a moving number, not a producer defect"
+            ),
+            "membership_diffs": len(membership),
+            "membership_examples": membership[:10],
+        }
+        body["coverage"] = {
+            "ratio": round(ratio, 6),
+            "floor": floor,
+            "met": coverage_ok,
+            "denominator": denominator,
+            "missing": len(membership),
+        }
+        body["values"] = {"breaches": len(non_membership), "examples": non_membership[:10]}
+        body["verdict"] = "match" if (not non_membership and coverage_ok) else "mismatch"
+        return body
     live_digest = hashlib.sha256(live).hexdigest()
     shadow_digest = hashlib.sha256(shadow).hexdigest()
     return {

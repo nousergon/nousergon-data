@@ -83,6 +83,13 @@ __all__ = [
     "unit_cadence",
 ]
 
+#: The annotation, after the em dash of `trigger.schedule`, that marks a
+#: trigger as not firing. Matched case-insensitively on the WORD so
+#: "DISABLED live", "disabled until cutover" and "DISABLED (I1701)" all read
+#: alike; a schedule that merely mentions the word inside a longer sentence
+#: before the em dash is unaffected, because only the annotation is searched.
+_DISABLED_ANNOTATION_RE = re.compile(r"\bDISABLED\b", re.IGNORECASE)
+
 #: How long after a fire the run's manifest may legitimately still be absent.
 #: The longest standalone collection (weekly: phase-one + alternative-phase-two
 #: + RAG ingestion) is measured at roughly 3 hours end to end; 6 hours keeps a
@@ -106,7 +113,7 @@ _RATE = re.compile(r"^rate\(")
 class Cadence:
     """What a unit declares about when it runs."""
 
-    kind: str  # "scheduled" | "on_demand" | "continuous" | "undeclared"
+    kind: str  # "scheduled" | "on_demand" | "continuous" | "undeclared" | "disabled"
     source: str
     weekdays: frozenset[int] = frozenset()
     hour: int = 0
@@ -160,7 +167,31 @@ def unit_cadence(raw: dict) -> Cadence:
         return Cadence(kind="on_demand", source=f"trigger.kind={kind}")
     if trigger.get("cadence_minutes"):
         return Cadence(kind="continuous", source=f"trigger.cadence_minutes={trigger['cadence_minutes']}")
-    text = str(trigger.get("schedule") or "").split(" — ")[0].strip()
+    raw_schedule = str(trigger.get("schedule") or "")
+    text, _, annotation = raw_schedule.partition(" — ")
+    text = text.strip()
+
+    # A DECLARED-DISABLED trigger (alpha-engine-config-I11194).
+    #
+    # Two descriptors record their live state in the annotation after the em
+    # dash: D33 `"cron(0 9 ? * MON-FRI *) — DISABLED live"` and D38
+    # `"rate(15 minutes) — DISABLED live"`. Both were verified DISABLED on the
+    # live EventBridge rule / Scheduler entry, 2026-09-20.
+    #
+    # This parser used to `.split(" — ")[0]` and throw the annotation away, so
+    # it computed a due instant from a trigger that does not fire, found no
+    # manifest, and reported the unit as "either did not execute or executed
+    # without recording itself". It executed NEITHER way: it was not asked to.
+    # The descriptor held the fact that would have made the clause correct and
+    # the reader discarded it before looking.
+    #
+    # Graded in `clauses.py` as its own state, never MET: a unit that is off is
+    # not healthy, it is off (`observability-policy` §8.3 DISABLED).
+    if _DISABLED_ANNOTATION_RE.search(annotation):
+        return Cadence(
+            kind="disabled",
+            source=f"trigger.schedule={raw_schedule.strip()!r}",
+        )
     if not text:
         return Cadence(
             kind="undeclared",

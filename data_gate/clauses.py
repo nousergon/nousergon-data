@@ -205,9 +205,45 @@ def is_unconnected(clause: Clause) -> bool:
     return isinstance(clause, UnconnectedClause)
 
 
+@dataclass(frozen=True)
+class DisabledTriggerClause(Clause):
+    """A unit's ``run_record`` clause when its own descriptor declares the
+    trigger DISABLED (`alpha-engine-config-I11194`).
+
+    D33 declares ``"cron(0 9 ? * MON-FRI *) — DISABLED live"`` and D38
+    ``"rate(15 minutes) — DISABLED live"``; both were verified DISABLED on the
+    live EventBridge rule and Scheduler entry on 2026-09-20. Before this,
+    `unit_cadence` split the annotation off, computed a due instant from a
+    trigger that does not fire, and reported *"either did not execute or
+    executed without recording itself"*. It executed neither way.
+
+    Graded exactly as :class:`UnconnectedClause` is, and for the same reason:
+
+    * never MET — "switched off" is not health;
+    * never UNMET — it is a declared state, not an open finding, so
+      `read.evaluate` excludes it from every gate;
+    * rendered as ``DISABLED`` (`observability-policy` §8.3).
+
+    Only the ``run_record`` column changes. Every other column of the unit is
+    still graded: a disabled unit still owes a schema, a registry row and an
+    observability row.
+
+    **This is not a pass.** The moment the trigger is enabled — the annotation
+    removed from the descriptor — the clause reverts to ordinary grading and a
+    missing manifest is a finding again.
+    """
+
+    disabled_source: str = ""
+
+
+def is_disabled_trigger(clause: Clause) -> bool:
+    return isinstance(clause, DisabledTriggerClause)
+
+
 def is_ungraded(clause: Clause) -> bool:
-    """Published on the board, graded by no gate: RETIRED or UNCONNECTED."""
-    return is_retired(clause) or is_unconnected(clause)
+    """Published on the board, graded by no gate: RETIRED, UNCONNECTED or a
+    DECLARED-DISABLED trigger."""
+    return is_retired(clause) or is_unconnected(clause) or is_disabled_trigger(clause)
 
 
 def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase: str) -> Clause:
@@ -285,6 +321,19 @@ def _clause_phase(unit: Unit, column: str) -> str:
     return f"data-phase{declared}"
 
 
+def _disabled_trigger_cadence(unit: Unit):
+    """The unit's cadence when its descriptor declares the trigger DISABLED.
+
+    Returns ``None`` for every other unit, so the ordinary grading path is
+    untouched. Kept as a function rather than inlined so the one condition has
+    one name and one place to change (`alpha-engine-config-I11194`).
+    """
+    from data_gate.cadence import unit_cadence
+
+    cadence = unit_cadence(unit.raw)
+    return cadence if cadence.kind == "disabled" else None
+
+
 def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Clause:
     name = base_clause_name(unit.unit_id, column)
     phase = _clause_phase(unit, column)
@@ -294,6 +343,22 @@ def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: d
         return _retired(unit, name, requirement, phase)
     if column == "consumers" and unit.connection == "unconnected":
         return _clause_consumers_unconnected(unit, name, requirement, phase)
+    if column == "run_record":
+        disabled = _disabled_trigger_cadence(unit)
+        if disabled is not None:
+            return DisabledTriggerClause(
+                name,
+                requirement,
+                False,
+                f"DISABLED: {unit.unit_id}'s own descriptor declares its trigger not firing "
+                f"({disabled.source}). A unit that is not asked to run leaves no manifest, and "
+                "that is not the same fact as a unit that ran without recording itself. Graded "
+                "by no gate until the trigger is enabled.",
+                (unit.path.relative_to(unit.path.parents[2]).as_posix(),),
+                phase=phase,
+                source="registry.d/units (trigger.schedule annotation)",
+                disabled_source=disabled.source,
+            )
     reading = ev.read_base(store, unit, column, trading_day=trading_day)
 
     if reading.unmeasurable:
