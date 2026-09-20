@@ -577,9 +577,26 @@ def collect_aws(mw: dict, budgets: dict) -> dict:
         return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
     by_service = _ce_unblended_by_service(ce, start, end)
     mtd = round(sum(by_service.values()), 2)
+    # EVERY service, not the top 8. The truncation was free to remove — this
+    # data already came back in the single CE call above and was being thrown
+    # away — and it was actively blocking budget work: on 2026-09-20 seven
+    # budget lines (DynamoDB, Lambda, SNS, EventBridge, KMS, Step Functions,
+    # SSM) had to be REASONED from AWS list pricing rather than measured,
+    # because every one of them fell below the 8th-largest service ($4.35) and
+    # so was invisible here. A budget you cannot measure is a budget you cannot
+    # tighten, and cushions cannot be sized in cents against a number that does
+    # not exist.
+    #
+    # `top_services_usd` is KEPT, unchanged, because the console Expenses page
+    # and aws_spend_monitor.py both read that key. Removing it to "clean up"
+    # would break two consumers for no gain.
     top = dict(sorted(by_service.items(), key=lambda kv: -kv[1])[:8])
     row.update(mtd_cost_usd=mtd,
-               detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()}},
+               detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()},
+                       "all_services_usd": {k: round(v, 4)
+                                            for k, v in sorted(by_service.items(),
+                                                               key=lambda kv: -kv[1])},
+                       "service_count": len(by_service)},
                note="Cost Explorer data lags ~24h")
     try:
         # CE's MONTHLY-granularity forecast over a partial-month window returns
