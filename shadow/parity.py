@@ -174,10 +174,22 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
             schema = json.loads(path.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, OSError):
             continue
-        template = schema.get("x-key-pattern")
-        if not template:
+        declared = schema.get("x-key-pattern")
+        if not declared:
             continue
-        schemas.append(ContractSchema(path, _provenance_fields(schema), _key_pattern_regex(template)))
+        # A contract may document SEVERAL keys — `metron_closes` covers both
+        # `market_data/eod_closes/{date}.json` and its `latest.json` sidecar,
+        # which are the same artifact under two names. A string stays a string
+        # (alpha-engine-config-I11203); a list yields one ContractSchema per
+        # pattern so `resolve_contract`'s first-match loop is unchanged.
+        templates = [declared] if isinstance(declared, str) else list(declared)
+        provenance = _provenance_fields(schema)
+        for template in templates:
+            if not isinstance(template, str) or not template:
+                raise ValueError(
+                    f"{path.name}: x-key-pattern entries must be non-empty strings, got {template!r}"
+                )
+            schemas.append(ContractSchema(path, provenance, _key_pattern_regex(template)))
     return tuple(schemas)
 
 

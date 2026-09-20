@@ -1,27 +1,74 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Technical Rating Ledger (per-date entry)",
-  "description": "market_data/technicals/rating_history/{YYYY-MM-DD}.json (metron-ops#297 part 2) — one immutable per-trading-day entry written by collectors/technical_rating_ledger.py::collect_rating_ledger, covering every symbol in the published close_history (not just held symbols). PRODUCER TEST: tests/test_technical_rating_ledger.py.",
+  "description": "market_data/technicals/rating_history/{YYYY-MM-DD}.json (metron-ops#297 part 2) \u2014 one immutable per-trading-day entry written by collectors/technical_rating_ledger.py::collect_rating_ledger, covering every symbol in the published close_history (not just held symbols). PRODUCER TEST: tests/test_technical_rating_ledger.py.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "as_of", "rating_version", "basis", "ratings"],
+  "required": [
+    "schema_version",
+    "as_of",
+    "rating_version",
+    "basis",
+    "ratings"
+  ],
   "properties": {
-    "schema_version": {"type": "integer", "const": 1},
-    "as_of": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
-    "rating_version": {"type": "integer", "minimum": 1},
-    "basis": {"type": "string", "enum": ["live", "backfill"]},
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "as_of": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "x-provenance": true
+    },
+    "rating_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "basis": {
+      "type": "string",
+      "enum": [
+        "live",
+        "backfill"
+      ]
+    },
     "ratings": {
       "type": "object",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["score", "label", "close"],
+        "required": [
+          "score",
+          "label",
+          "close"
+        ],
         "properties": {
-          "score": {"type": "number", "minimum": -1, "maximum": 1},
-          "label": {"type": "string", "enum": ["Strong Sell", "Sell", "Neutral", "Buy", "Strong Buy"]},
-          "close": {"type": "number", "exclusiveMinimum": 0, "description": "The close value as rated (close_history is dividend-adjusted and revised retroactively -- this is the value AS OF the rating run, never rewritten)."}
+          "score": {
+            "type": "number",
+            "minimum": -1,
+            "maximum": 1
+          },
+          "label": {
+            "type": "string",
+            "enum": [
+              "Strong Sell",
+              "Sell",
+              "Neutral",
+              "Buy",
+              "Strong Buy"
+            ]
+          },
+          "close": {
+            "type": "number",
+            "exclusiveMinimum": 0,
+            "description": "The close value as rated (close_history is dividend-adjusted and revised retroactively -- this is the value AS OF the rating run, never rewritten)."
+          }
         }
       }
     }
-  }
+  },
+  "x-key-pattern": [
+    "market_data/technicals/rating_history/*",
+    "market_data/technicals/rating_history/_manifest.json"
+  ]
 }
