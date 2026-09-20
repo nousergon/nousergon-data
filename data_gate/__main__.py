@@ -39,6 +39,7 @@ import os
 import sys
 
 from data_gate import read as read_module
+from data_gate.cadence import latest_trading_day_on_or_before
 from data_gate.sources import GITHUB_TOKEN_ENV
 from data_gate.store import open_store
 
@@ -135,7 +136,7 @@ def _read_command(args) -> int:
     trading_day = (
         dt.date.fromisoformat(args.trading_day)
         if args.trading_day
-        else dt.datetime.now(dt.timezone.utc).date()
+        else latest_trading_day_on_or_before(dt.datetime.now(dt.timezone.utc).date())
     )
     store = open_store(
         args.store,
