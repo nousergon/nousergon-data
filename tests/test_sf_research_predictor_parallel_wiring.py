@@ -655,12 +655,65 @@ class TestBranchBContents:
         assert extract_resolve["ResultPath"] == "$.model_zoo_error"
         assert extract_resolve["Parameters"]["poll.$"] == "$.resolve_zoo_poll"
         assert extract_resolve["Next"] == "PublishModelZooFailureImmediate"
-        # ParseZooSpecs lifts the JSON array into $.parsed_zoo.zoo_specs.
+        # ParseZooSpecs lifts the delimited spec list into
+        # $.parsed_zoo.zoo_specs (alpha-engine-config-I11160 — it was a JSON
+        # array parsed with States.StringToJson; see the dedicated tests below
+        # for why that could fail the whole run).
         parse = branch_b["ParseZooSpecs"]
         assert parse["Type"] == "Pass"
-        assert "StringToJson" in parse["Parameters"]["zoo_specs.$"]
+        assert "StringSplit" in parse["Parameters"]["zoo_specs.$"]
         assert "Catch" not in parse  # a Pass cannot carry a Catch (AWS schema)
         assert parse["Next"] == "ModelZooTrainMap"
+
+    # ── alpha-engine-config-I11160 ──────────────────────────────────────────
+
+    def test_the_spec_list_is_split_never_parsed(self, branch_b):
+        """States.Runtime from an intrinsic is NOT CATCHABLE — verified against
+        live Step Functions on 2026-09-19, twice: directly, and with the same
+        parse inside a Parallel whose Catch names States.ALL, which also
+        failed. A Pass cannot carry a Catch at all (the assertion two lines
+        above already said so), so States.StringToJson HERE meant one byte of
+        non-JSON on an SSM stdout stream failed the ENTIRE weekly run, in a
+        branch whose every other state is deliberately best-effort. Two
+        concrete routes: SSM truncates StandardOutputContent at ~24,000
+        characters and a truncated JSON array is not JSON; and any library line
+        reaching stdout prepends garbage.
+
+        States.StringSplit is TOTAL — it cannot raise on any input — so a
+        polluted stream now yields wrong spec ids that fail inside the Map's
+        own per-spec isolation, which is catchable and fail-open."""
+        expr = branch_b["ParseZooSpecs"]["Parameters"]["zoo_specs.$"]
+        assert "StringToJson" not in expr
+        assert expr.startswith("States.StringSplit(")
+        assert "$.resolve_zoo_poll.StandardOutputContent" in expr
+
+    def test_the_delimiter_is_a_character_set_including_a_real_newline(self, branch_b):
+        """Both characters are load-bearing, and the newline must be a REAL
+        newline. MEASURED against live Step Functions:
+
+            States.StringSplit('alpha,beta\n', ',')    -> ['alpha', 'beta\n']
+            States.StringSplit('alpha,beta\n', ',<LF>') -> ['alpha', 'beta']
+
+        so a trailing newline would otherwise ride on the LAST element and
+        corrupt the last spec id. The literal two-character sequence
+        backslash-n does NOT work: Step Functions rejects it at
+        CreateStateMachine with SCHEMA_VALIDATION_FAILED ('must be a valid
+        JSONPath or a valid intrinsic function call'), measured the same day.
+        The producer also writes no trailing newline; neither half alone is
+        sufficient."""
+        import re
+
+        expr = branch_b["ParseZooSpecs"]["Parameters"]["zoo_specs.$"]
+        # The delimiter literal itself CONTAINS a comma, so split on the
+        # quoted argument, never on the last comma.
+        m = re.search(r",\s*'(.*)'\)\s*$", expr, re.DOTALL)
+        assert m, f"could not find the quoted delimiter in {expr!r}"
+        chars = m.group(1)
+        assert "\n" in chars, (
+            f"delimiter {chars!r} carries no REAL newline — the two-character "
+            f"escape is rejected by Step Functions at CreateStateMachine"
+        )
+        assert "," in chars
 
     def test_model_zoo_train_map_per_spec_isolation(self, branch_b):
         """THE robustness property: the Map fans out one spot PER spec, and each
