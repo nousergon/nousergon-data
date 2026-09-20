@@ -298,10 +298,16 @@ def test_shadow_weekday_is_in_the_allowlist(monkeypatch):
 
 
 def test_shadow_weekday_renders_the_four_shadow_runs_then_parity_in_order(monkeypatch):
-    """Same subshell + && pipeline-element shape as weekly-phase-one: one exit
-    code for all five legs, and each of the four boundary invocations gets the
-    SAME weekly_collector.py flags the scheduled workloads above it use, plus
-    `--date` pinning it to the requested historical trading day."""
+    """One subshell, five legs in the declared order, one exit code -- and each
+    of the four boundary invocations gets the SAME weekly_collector.py flags the
+    scheduled workloads above it use, plus `--date` pinning it to the requested
+    historical trading day.
+
+    The legs are NO LONGER `&&`-chained (alpha-engine-config-I11200): each runs
+    independently and records its exit code, so the comparator always runs. The
+    order assertion below is about SEQUENCE, not about any leg gating the next.
+    `test_shadow_legs_independent.py` owns the independence property itself.
+    """
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     workload, cmd = index._resolve_workload(
         {"workload": "shadow-weekday", "trading_day": "2026-09-14"}
@@ -315,15 +321,19 @@ def test_shadow_weekday_renders_the_four_shadow_runs_then_parity_in_order(monkey
         "--morning-arctic-append --date 2026-09-14",
         "--daily --skip-arctic-append --date 2026-09-14",
         "--daily-arctic-append --date 2026-09-14",
-        "python -m shadow parity --trading-day 2026-09-14 "
-        "--store s3://alpha-engine-research/data_collection",
+        "python -m shadow parity --trading-day 2026-09-14 --legs-file $LEGS",
     ]
     positions = [cmd.index(leg) for leg in legs]
     assert positions == sorted(positions), "legs must run in the declared order"
     # Every shadow-run leg AND the parity comparison target the requested
     # trading day, not "today" (4 `shadow run` legs + 1 `shadow parity`).
     assert cmd.count("--trading-day 2026-09-14") == 5
-    assert cmd.count("&&") == 4  # five legs, four joins — any leg's failure halts the chain
+    assert "--store s3://alpha-engine-research/data_collection" in cmd
+    # Each producer leg records its outcome, and the workload still fails when
+    # any of them did: the four recorded legs plus the comparator's own code.
+    assert cmd.count(">> $LEGS") == 4
+    assert cmd.count("RC_ALL=$RC") == 4
+    assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL" in cmd
 
     rendered = index._bootstrap_command("shadow-weekday", cmd, "tok")
     assert f"{cmd} 2>&1 | tee -a" in rendered
