@@ -244,9 +244,50 @@ def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase
     )
 
 
+#: The phase a kept-unconnected unit's `schema_contract` clause is deferred to.
+#: Plan §3 ("a key with no surviving consumer after phase 4 gets **no** new
+#: contract") read together with §8's per-unit rows, which route D02 and D14 —
+#: both R7 keeps — to "P2 contract (no reader yet, so after keyed readers)".
+_UNCONNECTED_SCHEMA_CONTRACT_PHASE = 2
+
+
+def _clause_phase(unit: Unit, column: str) -> str:
+    """The phase a unit's `column` clause is graded in.
+
+    Normally the descriptor's own `clause_phase` map. The ONE case this
+    function exists for is `schema_contract` on a unit that is unconnected by
+    a RECORDED keep (`consumers_decision`, Brian R7 2026-09-14, restated
+    2026-09-15 — `alpha-engine-config-I11186`).
+
+    The requirement is *"publishes a versioned schema with a producer test
+    that validates a real fixture, **and every consumer pins a copy**"*. On a
+    unit ruled to have no consumer, the second half can never be satisfied by
+    any amount of work, so the clause graded red in phase 1 for work that is
+    not phase-1 work and, on eight units, not work at all until a reader
+    exists. Its sibling `consumers` clause already reads the SAME absence as a
+    closed decision (`UnconnectedClause`) — two clauses on one unit
+    disagreeing in direction about one fact.
+
+    Plan §3 settles which way: contracts are built *for keys with a surviving
+    consumer* in phase 1, and the kept zero-consumer remainder in phase 2. So
+    the clause is DEFERRED, not carved out — it is still graded, still red
+    until a contract exists, and it lands in the phase the plan schedules it
+    in. `max` so a descriptor that already declares a later phase keeps it:
+    this only ever moves a clause later, never earlier.
+    """
+    declared = unit.clause_phase[column]
+    if (
+        column == "schema_contract"
+        and unit.connection == "unconnected"
+        and unit.consumers_decision
+    ):
+        declared = max(declared, _UNCONNECTED_SCHEMA_CONTRACT_PHASE)
+    return f"data-phase{declared}"
+
+
 def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Clause:
     name = base_clause_name(unit.unit_id, column)
-    phase = f"data-phase{unit.clause_phase[column]}"
+    phase = _clause_phase(unit, column)
     cell = unit.cells[column]
     requirement = ev.BASE_REQUIREMENTS[column].format(unit=unit.unit_id, title=unit.title)
     if unit.retired:
