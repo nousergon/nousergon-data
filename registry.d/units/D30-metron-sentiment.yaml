@@ -30,7 +30,7 @@ trigger:
   kind: "step-functions"
   owner: "ne-postclose-trading-pipeline"
   successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
-  schedule: "weekdays 16:45 America/New_York"
+  schedule: "weekdays 16:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - market_data/sentiment/latest.json
