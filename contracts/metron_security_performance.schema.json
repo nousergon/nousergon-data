@@ -97,5 +97,13 @@
       }
     }
   },
-  "x-key-pattern": "market_data/security_performance/latest.json"
+  "x-key-pattern": "market_data/security_performance/latest.json",
+  "x-comparison-class": "vendor_live",
+  "x-vendor-live": {
+    "value_band": {
+      "relative": 0.05,
+      "absolute": 0.0
+    },
+    "coverage_floor": 0.98
+  }
 }

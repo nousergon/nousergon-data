@@ -54,5 +54,13 @@
   "x-key-pattern": [
     "market_data/eod_closes/{date}.json",
     "market_data/eod_closes/latest.json"
-  ]
+  ],
+  "x-comparison-class": "vendor_live",
+  "x-vendor-live": {
+    "value_band": {
+      "relative": 0.005,
+      "absolute": 0.0
+    },
+    "coverage_floor": 0.99
+  }
 }

@@ -27,5 +27,13 @@
       }
     }
   },
-  "x-key-pattern": "market_data/earnings/latest.json"
+  "x-key-pattern": "market_data/earnings/latest.json",
+  "x-comparison-class": "vendor_live",
+  "x-vendor-live": {
+    "value_band": {
+      "relative": 0.0,
+      "absolute": 0.0
+    },
+    "coverage_floor": 0.98
+  }
 }
