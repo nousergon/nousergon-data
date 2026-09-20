@@ -520,6 +520,21 @@ class TestHandler:
         assert rows["aws"]["pace"] == "under"  # 25.00 < 50 budget
         assert rows["aws"]["detail"]["top_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
 
+        # EVERY service is reported, not just the top 8. Seven budget lines had
+        # to be REASONED rather than measured on 2026-09-20 because they fell
+        # below the 8th-largest service and were invisible here. Cent-level
+        # cushions cannot be sized against a number that is not published.
+        detail = rows["aws"]["detail"]
+        assert detail["service_count"] == len(detail["all_services_usd"])
+        assert set(detail["top_services_usd"]) <= set(detail["all_services_usd"]), \
+            "top_services_usd must be a SUBSET of all_services_usd"
+        # 4dp, not 2dp: a $0.004/month service rounds to $0.00 at two decimals,
+        # which is indistinguishable from a service that cost nothing at all.
+        assert detail["all_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
+        # and the published total still reconciles to the per-service sum
+        assert sum(detail["all_services_usd"].values()) == pytest.approx(
+            rows["aws"]["mtd_cost_usd"], abs=0.01)
+
         # Anthropic: client-telemetry fallback sums cost_usd, tolerating nulls
         ant = rows["anthropic_api"]
         assert ant["source"] == "client_telemetry"
