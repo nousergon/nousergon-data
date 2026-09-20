@@ -725,6 +725,28 @@ def _count_schema_drift(counter: list[int], *, on_drift=None):
         raise
 
 
+def _active_shadow_root():
+    """The active shadow root, or ``None`` in an ordinary production run.
+
+    Imported lazily and defensively (`alpha-engine-config-I11200`). This module
+    is imported by production collectors that have no reason to carry the
+    shadow package, and `shadow.__init__` pulls in the writer-side interceptor;
+    a module-scope import here would make a replay-only concern a hard
+    dependency of every ArcticDB append.
+
+    Returns ``None`` — production semantics, grade against today — on any
+    import failure. That is the SAFE direction: a missing shadow package means
+    there is no replay, so the strict reference date is correct. It is not a
+    swallow that hides a producer fault; a genuine shadow run cannot reach this
+    code without having already imported `shadow.root` to activate the root.
+    """
+    try:
+        from shadow.root import active_root
+    except Exception:  # pragma: no cover - production has no shadow package concern
+        return None
+    return active_root()
+
+
 def _scan_universe_and_emit_freshness_receipt(
     s3,
     bucket: str,
@@ -829,7 +851,42 @@ def _scan_universe_and_emit_freshness_receipt(
 
     from nousergon_lib.dates import trading_days_stale
     today = datetime.now(timezone.utc).date()
-    today_iso = today.isoformat()
+
+    # STALENESS REFERENCE DATE (alpha-engine-config-I11200).
+    #
+    # In production this is today: every universe symbol's last row must be
+    # within `max_stale_trading_days` NYSE sessions of NOW, and that is the
+    # whole point of the guard.
+    #
+    # Under an ACTIVE SHADOW ROOT the run is a declared REPLAY of a completed
+    # trading day, and "now" is the wrong reference. Measured 2026-09-20: a
+    # `shadow-weekday` replay of 2026-09-14 died here with
+    #
+    #     UniverseFreshnessViolation: 909 symbol(s) older than 3 trading-day(s)
+    #       threshold: PG(4 trading-d, last=2026-09-14), ...
+    #
+    # Every one of the 909 carried `last=2026-09-14` — the exact day being
+    # replayed — graded 4 trading days stale because 2026-09-14 was 4 sessions
+    # before the wall clock. The data was exactly as fresh as the replay
+    # requires; the arithmetic was against the wrong date. A replay of any day
+    # more than `max_stale_trading_days` sessions old could therefore never
+    # complete, which made `-I11027`'s acceptance criteria unsatisfiable.
+    #
+    # This does NOT widen the threshold. Production is unchanged — no shadow
+    # root is ever active there, and `shadow.root.activate` is reachable only
+    # through `python -m shadow run`. The guard still refuses a replay whose
+    # rows are stale RELATIVE TO THE DAY BEING REPLAYED, which is the property
+    # it exists to enforce.
+    reference_date = today
+    shadow_root = _active_shadow_root()
+    if shadow_root is not None:
+        reference_date = shadow_root.trading_day
+        log.info(
+            "universe-freshness: shadow replay active — grading staleness against the "
+            "replayed trading day %s, not today %s (alpha-engine-config-I11200)",
+            reference_date.isoformat(), today.isoformat(),
+        )
+    reference_iso = reference_date.isoformat()
 
     def _last_date_for(sym: str) -> tuple[str, "pd.Timestamp | None", "str | None"]:
         try:
@@ -860,7 +917,7 @@ def _scan_universe_and_emit_freshness_receipt(
 
     ages = []  # (sym, last_date_iso, trading_days_stale)
     for sym, last_date, _ in rows:
-        age_trading_days = trading_days_stale(last_date.date(), today_iso)
+        age_trading_days = trading_days_stale(last_date.date(), reference_iso)
         ages.append((sym, last_date.date().isoformat(), age_trading_days))
 
     # ── DECLARED-PROXY COVERAGE (alpha-engine-config-I10704) ────────────────
