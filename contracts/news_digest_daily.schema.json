@@ -2,34 +2,68 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/news_digest_daily.schema.json",
   "title": "Daily news digest (data/news_digest_daily/{run_id}.json + latest.json, schema_version 1, D36)",
-  "description": "Producer: data/derived/news_digest.py::build_digest/write_digest (collectors/daily_news.py::collect). Consumer (HARD requirement): morning-signal src/morning_signal/news_context.py::load_news_context/_format_digest — raises when the digest cannot be loaded, is stale, or renders empty. Also read by crucible-research thinktank/context.py (v1, retiring). Matches the CONTRACT docstring already committed in news_digest.py verbatim (data-collector plan P-07, alpha-engine-config-I10870, D36).",
+  "description": "Producer: data/derived/news_digest.py::build_digest/write_digest (collectors/daily_news.py::collect). Consumer (HARD requirement): morning-signal src/morning_signal/news_context.py::load_news_context/_format_digest \u2014 raises when the digest cannot be loaded, is stale, or renders empty. Also read by crucible-research thinktank/context.py (v1, retiring). Matches the CONTRACT docstring already committed in news_digest.py verbatim (data-collector plan P-07, alpha-engine-config-I10870, D36).",
   "type": "object",
   "additionalProperties": true,
-  "required": ["schema_version", "date", "generated_at", "sections"],
+  "required": [
+    "schema_version",
+    "date",
+    "generated_at",
+    "sections"
+  ],
   "properties": {
-    "schema_version": { "const": 1 },
-    "date": { "type": "string", "description": "YYYY-MM-DD — morning-signal's staleness check compares this to the run date and REJECTS a mismatch" },
-    "generated_at": { "type": "string", "description": "ISO-8601 UTC" },
+    "schema_version": {
+      "const": 1
+    },
+    "date": {
+      "type": "string",
+      "description": "YYYY-MM-DD \u2014 morning-signal's staleness check compares this to the run date and REJECTS a mismatch"
+    },
+    "generated_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC",
+      "x-provenance": true
+    },
     "sections": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["portfolio", "macro", "tech"],
-      "description": "morning-signal's formatter is generic over section names/keys beyond these three, and tolerates missing per-item fields other than title — but the producer always emits exactly these three.",
+      "required": [
+        "portfolio",
+        "macro",
+        "tech"
+      ],
+      "description": "morning-signal's formatter is generic over section names/keys beyond these three, and tolerates missing per-item fields other than title \u2014 but the producer always emits exactly these three.",
       "properties": {
         "portfolio": {
           "type": "array",
           "items": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["title"],
+            "required": [
+              "title"
+            ],
             "properties": {
-              "ticker": { "type": "string" },
-              "title": { "type": "string" },
-              "source": { "type": "string" },
-              "published": { "type": "string" },
-              "excerpt": { "type": "string" },
-              "sentiment": { "type": "number" },
-              "url": { "type": "string" }
+              "ticker": {
+                "type": "string"
+              },
+              "title": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "published": {
+                "type": "string"
+              },
+              "excerpt": {
+                "type": "string"
+              },
+              "sentiment": {
+                "type": "number"
+              },
+              "url": {
+                "type": "string"
+              }
             }
           }
         },
@@ -38,13 +72,25 @@
           "items": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["title"],
+            "required": [
+              "title"
+            ],
             "properties": {
-              "title": { "type": "string" },
-              "source": { "type": "string" },
-              "published": { "type": "string" },
-              "excerpt": { "type": "string" },
-              "url": { "type": "string" }
+              "title": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "published": {
+                "type": "string"
+              },
+              "excerpt": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
             }
           }
         },
@@ -53,17 +99,30 @@
           "items": {
             "type": "object",
             "additionalProperties": true,
-            "required": ["title"],
+            "required": [
+              "title"
+            ],
             "properties": {
-              "title": { "type": "string" },
-              "source": { "type": "string" },
-              "published": { "type": "string" },
-              "excerpt": { "type": "string" },
-              "url": { "type": "string" }
+              "title": {
+                "type": "string"
+              },
+              "source": {
+                "type": "string"
+              },
+              "published": {
+                "type": "string"
+              },
+              "excerpt": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
             }
           }
         }
       }
     }
-  }
+  },
+  "x-key-pattern": "data/news_digest_daily/latest.json"
 }

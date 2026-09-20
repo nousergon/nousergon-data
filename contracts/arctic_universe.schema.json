@@ -2,25 +2,92 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/arctic_universe.schema.json",
   "title": "ArcticDB `universe` library -- one symbol frame row (v1)",
-  "description": "Column/dtype/index contract for the ArcticDB `universe` library (nousergon_lib.arcticdb.UNIVERSE_LIB), read read-only via load_universe_ohlcv/open_universe_lib -> _load_arctic_frames. One row per (symbol, trading day): a tz-naive DatetimeIndex date value plus the OHLCV_COLUMNS ('Open','High','Low','Close','Volume'). _load_arctic_frames normalizes to a monotonic DatetimeIndex, tz-stripped, duplicate index values collapsed keep=last. Bitemporal columns (settled, as_of, source_tier, valid_date, knowledge_time) are ADDITIVE (config#2459) -- absent on rows written before that change, present is never required. `VWAP` and `atr_14_pct` are likewise ADDITIVE and nullable -- both are written by builders/daily_append.py (VWAP from `_load_daily_closes`'s polygon-sourced `vw` field, null on yfinance/FRED rows per the 2026-04-17 VWAP-centralization decision; atr_14_pct from features/feature_engineer.py::compute_features, NaN during the <14-row ATR warmup window) and are absent on rows written before this contract update. Consumer: crucible (v2 data.daily, first-class), crucible/crucible/data/sources.py::ArcticPriceSource.load_panel -> normalize_panel, which renames Open/High/Low/Close/Volume -> open_raw/high_raw/low_raw/close_raw/volume_raw (PANEL_COLUMNS) and raises MissingSourceError on any missing OHLCV column -- never zero-fills; crucible-executor's `price_cache.load_atr_14_pct` hard-fails when `atr_14_pct` is absent from the frame entirely (column-level, not row-level -- NaN values are handled downstream). v1 predictor/research until phase 4 (retiring). Plan §3 boundary table row 3.",
+  "description": "Column/dtype/index contract for the ArcticDB `universe` library (nousergon_lib.arcticdb.UNIVERSE_LIB), read read-only via load_universe_ohlcv/open_universe_lib -> _load_arctic_frames. One row per (symbol, trading day): a tz-naive DatetimeIndex date value plus the OHLCV_COLUMNS ('Open','High','Low','Close','Volume'). _load_arctic_frames normalizes to a monotonic DatetimeIndex, tz-stripped, duplicate index values collapsed keep=last. Bitemporal columns (settled, as_of, source_tier, valid_date, knowledge_time) are ADDITIVE (config#2459) -- absent on rows written before that change, present is never required. `VWAP` and `atr_14_pct` are likewise ADDITIVE and nullable -- both are written by builders/daily_append.py (VWAP from `_load_daily_closes`'s polygon-sourced `vw` field, null on yfinance/FRED rows per the 2026-04-17 VWAP-centralization decision; atr_14_pct from features/feature_engineer.py::compute_features, NaN during the <14-row ATR warmup window) and are absent on rows written before this contract update. Consumer: crucible (v2 data.daily, first-class), crucible/crucible/data/sources.py::ArcticPriceSource.load_panel -> normalize_panel, which renames Open/High/Low/Close/Volume -> open_raw/high_raw/low_raw/close_raw/volume_raw (PANEL_COLUMNS) and raises MissingSourceError on any missing OHLCV column -- never zero-fills; crucible-executor's `price_cache.load_atr_14_pct` hard-fails when `atr_14_pct` is absent from the frame entirely (column-level, not row-level -- NaN values are handled downstream). v1 predictor/research until phase 4 (retiring). Plan \u00a73 boundary table row 3.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["symbol", "index_date", "Open", "High", "Low", "Close", "Volume"],
+  "required": [
+    "symbol",
+    "index_date",
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume"
+  ],
   "properties": {
-    "symbol": {"type": "string", "minLength": 1, "description": "ArcticDB symbol key (ticker); library.list_symbols()."},
-    "index_date": {"type": "string", "format": "date", "description": "The frame's DatetimeIndex value for this row, tz-naive, no intraday component after normalization."},
-    "Open": {"type": "number", "exclusiveMinimum": 0},
-    "High": {"type": "number", "exclusiveMinimum": 0},
-    "Low": {"type": "number", "exclusiveMinimum": 0},
-    "Close": {"type": "number", "exclusiveMinimum": 0},
-    "Volume": {"type": "number", "minimum": 0},
-    "VWAP": {"type": ["number", "null"], "exclusiveMinimum": 0, "description": "Raw price, bare name (grandfathered alongside Open/High/Low/Close/Volume -- not a features/registry.py CATALOG entry, so outside the units-suffix contract). Polygon volume-weighted VWAP; null on yfinance/FRED-sourced rows (no true VWAP available). Producer: builders/daily_append.py::_load_daily_closes."},
-    "atr_14_pct": {"type": ["number", "null"], "description": "ATR(14) / Close, decimal pct (`_pct` suffix). Producer: features/feature_engineer.py::compute_features, written into the universe row by builders/daily_append.py. Null during the ATR warmup window (<14 rows of history). Registered feature: features/registry.py::CATALOG."},
-    "settled": {"type": "boolean"},
-    "as_of": {"type": "string"},
-    "source_tier": {"type": "string"},
-    "valid_date": {"type": "string", "format": "date"},
-    "knowledge_time": {"type": "string"},
-    "source": {"type": "string", "description": "Vendor provenance (polygon/yfinance/fred); PROVENANCE_COL."}
-  }
+    "symbol": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ArcticDB symbol key (ticker); library.list_symbols()."
+    },
+    "index_date": {
+      "type": "string",
+      "format": "date",
+      "description": "The frame's DatetimeIndex value for this row, tz-naive, no intraday component after normalization."
+    },
+    "Open": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "High": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "Low": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "Close": {
+      "type": "number",
+      "exclusiveMinimum": 0
+    },
+    "Volume": {
+      "type": "number",
+      "minimum": 0
+    },
+    "VWAP": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "exclusiveMinimum": 0,
+      "description": "Raw price, bare name (grandfathered alongside Open/High/Low/Close/Volume -- not a features/registry.py CATALOG entry, so outside the units-suffix contract). Polygon volume-weighted VWAP; null on yfinance/FRED-sourced rows (no true VWAP available). Producer: builders/daily_append.py::_load_daily_closes."
+    },
+    "atr_14_pct": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "ATR(14) / Close, decimal pct (`_pct` suffix). Producer: features/feature_engineer.py::compute_features, written into the universe row by builders/daily_append.py. Null during the ATR warmup window (<14 rows of history). Registered feature: features/registry.py::CATALOG."
+    },
+    "settled": {
+      "type": "boolean"
+    },
+    "as_of": {
+      "type": "string",
+      "x-provenance": true
+    },
+    "source_tier": {
+      "type": "string"
+    },
+    "valid_date": {
+      "type": "string",
+      "format": "date"
+    },
+    "knowledge_time": {
+      "type": "string"
+    },
+    "source": {
+      "type": "string",
+      "description": "Vendor provenance (polygon/yfinance/fred); PROVENANCE_COL."
+    }
+  },
+  "x-key-pattern": [
+    "builders/prune_audit/{trading_day}-*.json",
+    "reference/price_cache/*",
+    "arcticdb/universe (benchmark proxy series)",
+    "crucible-v2 store: data/{trading_day}/panel.parquet",
+    "crucible-v2 store: data/{trading_day}/coverage.json",
+    "crucible-v2 store: features/{version}/{trading_day}.parquet"
+  ]
 }

@@ -17,7 +17,8 @@
     },
     "as_of": {
       "type": "string",
-      "format": "date"
+      "format": "date",
+      "x-provenance": true
     },
     "source": {
       "type": "string",
@@ -95,5 +96,6 @@
         }
       }
     }
-  }
+  },
+  "x-key-pattern": "market_data/security_performance/latest.json"
 }

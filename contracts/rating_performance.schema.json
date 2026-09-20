@@ -1,23 +1,60 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Technical Rating Performance",
-  "description": "market_data/technicals/rating_performance.json (metron-ops#297 part 2) — realized near-term performance of the rating ledger, recomputed every EOD run by collectors/technical_rating_ledger.py::collect_rating_performance. Shared contract with the metron consumer (metron-ops#298). PRODUCER TEST: tests/test_technical_rating_ledger.py. Window and horizon keys are JSON strings of the integers listed in `windows`/`horizons`. A bucket's stats are null where n=0.",
+  "description": "market_data/technicals/rating_performance.json (metron-ops#297 part 2) \u2014 realized near-term performance of the rating ledger, recomputed every EOD run by collectors/technical_rating_ledger.py::collect_rating_performance. Shared contract with the metron consumer (metron-ops#298). PRODUCER TEST: tests/test_technical_rating_ledger.py. Window and horizon keys are JSON strings of the integers listed in `windows`/`horizons`. A bucket's stats are null where n=0.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "as_of_utc", "rating_version", "horizons", "windows", "segments", "ic_series"],
+  "required": [
+    "schema_version",
+    "as_of_utc",
+    "rating_version",
+    "horizons",
+    "windows",
+    "segments",
+    "ic_series"
+  ],
   "properties": {
-    "schema_version": {"type": "integer", "const": 1},
-    "as_of_utc": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"},
-    "rating_version": {"type": "integer", "minimum": 1},
-    "horizons": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
-    "windows": {"type": "array", "items": {"type": "integer", "minimum": 1}, "minItems": 1},
+    "schema_version": {
+      "type": "integer",
+      "const": 1
+    },
+    "as_of_utc": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "rating_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "horizons": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 1
+    },
+    "windows": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      },
+      "minItems": 1
+    },
     "segments": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "live": {"$ref": "#/$defs/segment"},
-        "backfill": {"$ref": "#/$defs/segment"},
-        "all": {"$ref": "#/$defs/segment"}
+        "live": {
+          "$ref": "#/$defs/segment"
+        },
+        "backfill": {
+          "$ref": "#/$defs/segment"
+        },
+        "all": {
+          "$ref": "#/$defs/segment"
+        }
       }
     },
     "ic_series": {
@@ -25,11 +62,28 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["date", "horizon", "ic"],
+        "required": [
+          "date",
+          "horizon",
+          "ic"
+        ],
         "properties": {
-          "date": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
-          "horizon": {"type": "integer", "minimum": 1},
-          "ic": {"type": ["number", "null"], "minimum": -1, "maximum": 1}
+          "date": {
+            "type": "string",
+            "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+          },
+          "horizon": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "ic": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "minimum": -1,
+            "maximum": 1
+          }
         }
       }
     }
@@ -38,46 +92,120 @@
     "segment": {
       "type": "object",
       "description": "Keyed by window (JSON string of an integer in `windows`).",
-      "additionalProperties": {"$ref": "#/$defs/window"}
+      "additionalProperties": {
+        "$ref": "#/$defs/window"
+      }
     },
     "window": {
       "type": "object",
       "description": "Keyed by horizon (JSON string of an integer in `horizons`).",
-      "additionalProperties": {"$ref": "#/$defs/horizon_stats"}
+      "additionalProperties": {
+        "$ref": "#/$defs/horizon_stats"
+      }
     },
     "horizon_stats": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["buckets", "spread_strong_buy_minus_strong_sell", "ic_mean", "ic_n_dates", "noise_floor_ic"],
+      "required": [
+        "buckets",
+        "spread_strong_buy_minus_strong_sell",
+        "ic_mean",
+        "ic_n_dates",
+        "noise_floor_ic"
+      ],
       "properties": {
         "buckets": {
           "type": "object",
           "additionalProperties": false,
-          "required": ["Strong Sell", "Sell", "Neutral", "Buy", "Strong Buy"],
+          "required": [
+            "Strong Sell",
+            "Sell",
+            "Neutral",
+            "Buy",
+            "Strong Buy"
+          ],
           "properties": {
-            "Strong Sell": {"$ref": "#/$defs/bucket"},
-            "Sell": {"$ref": "#/$defs/bucket"},
-            "Neutral": {"$ref": "#/$defs/bucket"},
-            "Buy": {"$ref": "#/$defs/bucket"},
-            "Strong Buy": {"$ref": "#/$defs/bucket"}
+            "Strong Sell": {
+              "$ref": "#/$defs/bucket"
+            },
+            "Sell": {
+              "$ref": "#/$defs/bucket"
+            },
+            "Neutral": {
+              "$ref": "#/$defs/bucket"
+            },
+            "Buy": {
+              "$ref": "#/$defs/bucket"
+            },
+            "Strong Buy": {
+              "$ref": "#/$defs/bucket"
+            }
           }
         },
-        "spread_strong_buy_minus_strong_sell": {"type": ["number", "null"]},
-        "ic_mean": {"type": ["number", "null"], "minimum": -1, "maximum": 1},
-        "ic_n_dates": {"type": "integer", "minimum": 0},
-        "noise_floor_ic": {"type": ["number", "null"], "minimum": -1, "maximum": 1}
+        "spread_strong_buy_minus_strong_sell": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "ic_mean": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        },
+        "ic_n_dates": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "noise_floor_ic": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": -1,
+          "maximum": 1
+        }
       }
     },
     "bucket": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["n", "mean_fwd", "hit_rate", "mean_excess"],
+      "required": [
+        "n",
+        "mean_fwd",
+        "hit_rate",
+        "mean_excess"
+      ],
       "properties": {
-        "n": {"type": "integer", "minimum": 0},
-        "mean_fwd": {"type": ["number", "null"]},
-        "hit_rate": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
-        "mean_excess": {"type": ["number", "null"]}
+        "n": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "mean_fwd": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "hit_rate": {
+          "type": [
+            "number",
+            "null"
+          ],
+          "minimum": 0,
+          "maximum": 1
+        },
+        "mean_excess": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     }
-  }
+  },
+  "x-key-pattern": "market_data/technicals/rating_performance.json"
 }
