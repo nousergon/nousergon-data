@@ -202,6 +202,15 @@ class TestQuartetPresence:
         )
 
 
+def marker_name_in(state: dict) -> bool:
+    """True when `state` has any edge to MarkParityVerdictUnknownByCadence."""
+    target = "MarkParityVerdictUnknownByCadence"
+    edges = [state.get("Next"), state.get("Default")]
+    edges += [c.get("Next") for c in state.get("Choices", []) or []]
+    edges += [c.get("Next") for c in state.get("Catch", []) or []]
+    return target in edges
+
+
 class TestChainOrdering:
     """... → CheckSkipBacktester → Backtester (backtest stage) →
     WaitForBacktester → CheckBacktesterStatus(success) → CheckSkipParity →
@@ -216,14 +225,55 @@ class TestChainOrdering:
         assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
 
     def test_skip_backtester_whole_pair_routes_to_evaluator_skipgate(self, states):
-        """{"skip_backtester": true} keeps its original whole-pair
-        semantics: skip BOTH backtest and parity → CheckSkipEvaluator."""
+        """{"skip_backtester": true} keeps its original whole-pair semantics:
+        skip BOTH backtest and parity, converging on CheckSkipEvaluator.
+
+        alpha-engine-config-I11103: it now converges there VIA
+        MarkParityVerdictUnknownByCadence instead of jumping straight to it.
+        The semantics are untouched — parity still never runs on this edge —
+        but the skip is now recorded rather than silent. See
+        test_the_pair_skip_records_the_parity_verdict_as_unknown below."""
         choices = states["CheckSkipBacktester"]["Choices"]
         assert len(choices) == 1
         c = choices[0]
         variables = {cond["Variable"] for cond in c["And"]}
         assert variables == {"$.skip_backtester"}
-        assert c["Next"] == "CheckSkipEvaluator"
+        assert c["Next"] == "MarkParityVerdictUnknownByCadence"
+        assert states["MarkParityVerdictUnknownByCadence"]["Next"] == "CheckSkipEvaluator"
+
+    def test_the_pair_skip_records_the_parity_verdict_as_unknown(self, states):
+        """alpha-engine-config-I11103, the defect this closes.
+
+        CheckSkipParity is reached normally ONLY from the backtester family's
+        own tail, so CheckSkipBacktester's skip arm — landing downstream of it
+        — routed around MarkParityVerdictUnknownByCadence, the one state whose
+        job is recording that parity was skipped by declaration.
+        parity_verdict_unknown therefore stayed at its InitializeInput floor of
+        false, which reads to a consumer as 'parity was evaluated and was
+        fine'.
+
+        MEASURED on watch-rerun-2026-09-18-3: 23 CheckSkip* gates entered,
+        CheckSkipParity not among them, and the run terminated carrying
+        parity_verdict_unknown=false on a cycle where every parity poll was
+        not_set. weekly_sf_rerun.py sets skip_backtester whenever the source
+        execution completed the backtester and re-applies skip_parity from the
+        scheduled trigger's Input, so both flags are set on EVERY recovery —
+        this was the normal case, not an edge one."""
+        marker = states["MarkParityVerdictUnknownByCadence"]
+        assert marker["ResultPath"] == "$.parity_verdict_unknown"
+        assert marker["Result"] is True
+
+        # Both declared ways of skipping parity must reach it. Rerouting this
+        # arm through CheckSkipParity was the other candidate and is REJECTED:
+        # with skip_parity unset it would RUN parity on a skip_backtester run,
+        # inverting the config#2362 whole-pair contract asserted above.
+        reaches = {
+            n for n, st in states.items()
+            if marker_name_in(st) 
+        }
+        assert {"CheckSkipBacktester", "CheckSkipParity"} <= reaches, (
+            f"only {sorted(reaches)} route to the marker; both declared skips must"
+        )
 
     def test_backtester_routes_to_wait_state(self, states):
         # alpha-engine-config-I5687: Backtester dispatches through the

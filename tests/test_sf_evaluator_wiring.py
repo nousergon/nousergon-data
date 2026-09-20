@@ -119,8 +119,14 @@ class TestSkipEvaluator:
 
 class TestSkipBacktesterRoutesThroughEvaluatorGate:
     def test_skip_backtester_reaches_evaluator_gate(self, states):
-        choice = states["CheckSkipBacktester"]["Choices"][0]
-        assert choice["Next"] == "CheckSkipEvaluator"
+        # alpha-engine-config-I11103: two hops now, via
+        # MarkParityVerdictUnknownByCadence. The name of this test is the
+        # contract — REACHES the evaluator gate — so it is asserted as a walk.
+        cur, hops = states["CheckSkipBacktester"]["Choices"][0]["Next"], 0
+        while cur != "CheckSkipEvaluator" and hops < 5:
+            cur = states[cur]["Next"]
+            hops += 1
+        assert cur == "CheckSkipEvaluator"
 
 
 # ── Task contract, per half ───────────────────────────────────────────────
