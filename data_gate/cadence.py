@@ -43,12 +43,42 @@ from zoneinfo import ZoneInfo
 
 from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeAccessIssue]
     is_trading_day,
+    previous_trading_day,
 )
+
+def latest_trading_day_on_or_before(calendar_date: dt.date) -> dt.date:
+    """The trading day a reading taken on ``calendar_date`` is ABOUT.
+
+    On a trading day that is the day itself: the board publishes at 23:30 UTC,
+    after the close, so the day's own manifests exist by then. Only a weekend
+    or a market holiday has no trading day of its own, and those resolve to the
+    preceding one.
+
+    `alpha-engine-config-I11191`. `data_gate read` previously defaulted to the
+    bare UTC calendar date, so a weekend reading graded every unit whose cadence
+    is neither `scheduled` nor `on_demand` against a `{run_manifest_prefix}/
+    {trading_day}/` partition that cannot exist. Measured 2026-09-20 (a Sunday):
+    D36 daily-news read UNMET -- "no run manifest for this trading day, under
+    runs/D36/2026-09-20/" -- while holding a clean `ok` manifest from that same
+    morning carrying `trading_day 2026-09-18`, `calendar_date 2026-09-20` and
+    273 rows. The producer's mapping was right and the reader's was absent.
+
+    Deliberately NOT `data_gate.report.previous_trading_day`, which is
+    STRICTLY-before. That is correct for the daily report, which reports on a
+    completed prior day; reusing it here would regress every weekday reading by
+    one day and grade Friday's manifests against Thursday's partitions.
+
+    Holiday-aware, because it defers to `nousergon_lib.trading_calendar` rather
+    than testing `weekday() >= 5`.
+    """
+    return calendar_date if is_trading_day(calendar_date) else previous_trading_day(calendar_date)
+
 
 __all__ = [
     "COMPLETION_GRACE",
     "Cadence",
     "latest_due_fire",
+    "latest_trading_day_on_or_before",
     "parse_cron",
     "unit_cadence",
 ]
