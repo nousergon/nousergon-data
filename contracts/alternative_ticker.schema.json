@@ -2,15 +2,27 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/alternative_ticker.schema.json",
   "title": "Per-ticker alternative data (market_data/weekly/{date}/alternative/{ticker}.json, D15)",
-  "description": "Producer: collectors/alternative.py::_fetch_all_alternative / _process_one_ticker (data-collector plan P-07, alpha-engine-config-I10870, D15). Consumer: SELF-CONSUMED — nousergon-data features/compute.py::_load_cached_alternative -> _alt_entry_from_payload, the only reader of this key (no cross-repo boundary). Schema pins the fields _alt_entry_from_payload actually projects onto the feature store: eps_revision.{surprise_pct,days_since_earnings,revision_4w,streak}, analyst_consensus.earnings_surprises[].surprise_pct (fallback when eps_revision.surprise_pct is absent), options_flow.{put_call_ratio,iv_rank,expected_move_pct}.",
+  "description": "Producer: collectors/alternative.py::_fetch_all_alternative / _process_one_ticker (data-collector plan P-07, alpha-engine-config-I10870, D15). Consumer: SELF-CONSUMED \u2014 nousergon-data features/compute.py::_load_cached_alternative -> _alt_entry_from_payload, the only reader of this key (no cross-repo boundary). Schema pins the fields _alt_entry_from_payload actually projects onto the feature store: eps_revision.{surprise_pct,days_since_earnings,revision_4w,streak}, analyst_consensus.earnings_surprises[].surprise_pct (fallback when eps_revision.surprise_pct is absent), options_flow.{put_call_ratio,iv_rank,expected_move_pct}.",
   "type": "object",
   "additionalProperties": true,
-  "required": ["ticker", "fetched_at"],
+  "required": [
+    "ticker",
+    "fetched_at"
+  ],
   "properties": {
-    "ticker": { "type": "string" },
-    "fetched_at": { "type": "string", "description": "ISO-8601 UTC timestamp" },
+    "ticker": {
+      "type": "string"
+    },
+    "fetched_at": {
+      "type": "string",
+      "description": "ISO-8601 UTC timestamp",
+      "x-provenance": true
+    },
     "analyst_consensus": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "additionalProperties": true,
       "properties": {
         "earnings_surprises": {
@@ -20,12 +32,27 @@
             "type": "object",
             "additionalProperties": true,
             "properties": {
-              "date": { "type": "string" },
-              "actual": { "type": ["number", "null"] },
-              "estimated": { "type": ["number", "null"] },
+              "date": {
+                "type": "string"
+              },
+              "actual": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "estimated": {
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
               "surprise_pct": {
-                "type": ["number", "null"],
-                "description": "percent-point number (e.g. -0.8873 for -0.887%), NOT a decimal pct — _alt_entry_from_payload divides by 100 before it reaches the feature store's _pct convention"
+                "type": [
+                  "number",
+                  "null"
+                ],
+                "description": "percent-point number (e.g. -0.8873 for -0.887%), NOT a decimal pct \u2014 _alt_entry_from_payload divides by 100 before it reaches the feature store's _pct convention"
               }
             }
           }
@@ -33,30 +60,91 @@
       }
     },
     "eps_revision": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "additionalProperties": true,
       "properties": {
-        "surprise_pct": { "type": ["number", "null"] },
-        "days_since_earnings": { "type": ["number", "null"] },
-        "revision_4w": { "type": ["number", "null"] },
-        "streak": { "type": ["number", "null"] }
+        "surprise_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "days_since_earnings": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "revision_4w": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "streak": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     },
     "options_flow": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "additionalProperties": true,
       "properties": {
-        "put_call_ratio": { "type": ["number", "null"] },
-        "iv_rank": { "type": ["number", "null"] },
-        "expected_move_pct": { "type": ["number", "null"] }
+        "put_call_ratio": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "iv_rank": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "expected_move_pct": {
+          "type": [
+            "number",
+            "null"
+          ]
+        }
       }
     },
-    "insider_activity": { "type": ["object", "null"], "additionalProperties": true },
+    "insider_activity": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    },
     "institutional": {
-      "type": ["object", "null"],
+      "type": [
+        "object",
+        "null"
+      ],
       "additionalProperties": true,
       "description": "static placeholder since 2026-07-25 (_fetch_institutional removed, OOM); accumulation/funds_increasing/funds_decreasing"
     },
-    "news": { "type": ["object", "null"], "additionalProperties": true }
-  }
+    "news": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "additionalProperties": true
+    }
+  },
+  "x-key-pattern": [
+    "market_data/weekly/{date}/alternative/{ticker}.json",
+    "market_data/weekly/{date}/alternative/manifest.json",
+    "market_data/weekly/{date}/alternative/scope.json"
+  ]
 }

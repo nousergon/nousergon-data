@@ -2,28 +2,73 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/universe_classification.schema.json",
   "title": "Universe classification (market_data/universe_classification/{run_date,latest}.json, schema_version 1)",
-  "description": "Producer: collectors/universe_classification.py::collect (UNIVERSE_CLASSIFICATION_SCHEMA_VERSION). Sector/country/industry per ticker via yfinance Ticker.info, keyed over the full constituents.json universe. Consumer: crucible/data/universe.py, crucible-executor. Plan §3 boundary table row 4.",
+  "description": "Producer: collectors/universe_classification.py::collect (UNIVERSE_CLASSIFICATION_SCHEMA_VERSION). Sector/country/industry per ticker via yfinance Ticker.info, keyed over the full constituents.json universe. Consumer: crucible/data/universe.py, crucible-executor. Plan \u00a73 boundary table row 4.",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "as_of", "source", "ticker_count", "ok_count", "data"],
+  "required": [
+    "schema_version",
+    "as_of",
+    "source",
+    "ticker_count",
+    "ok_count",
+    "data"
+  ],
   "properties": {
-    "schema_version": {"const": 1},
-    "as_of": {"type": "string", "format": "date"},
-    "source": {"type": "string", "const": "yfinance"},
-    "ticker_count": {"type": "integer", "minimum": 0},
-    "ok_count": {"type": "integer", "minimum": 0},
+    "schema_version": {
+      "const": 1
+    },
+    "as_of": {
+      "type": "string",
+      "format": "date",
+      "x-provenance": true
+    },
+    "source": {
+      "type": "string",
+      "const": "yfinance"
+    },
+    "ticker_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "ok_count": {
+      "type": "integer",
+      "minimum": 0
+    },
     "data": {
       "type": "object",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["sector", "country", "industry"],
+        "required": [
+          "sector",
+          "country",
+          "industry"
+        ],
         "properties": {
-          "sector": {"type": ["string", "null"]},
-          "country": {"type": ["string", "null"]},
-          "industry": {"type": ["string", "null"]}
+          "sector": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "country": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "industry": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         }
       }
     }
-  }
+  },
+  "x-key-pattern": [
+    "market_data/universe_classification/{date}.json",
+    "market_data/universe_classification/latest.json"
+  ]
 }
