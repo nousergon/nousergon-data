@@ -88,6 +88,18 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
     diff.add_argument("--max-keys-per-prefix", type=int, default=50)
     diff.add_argument("--dry-run", action="store_true", help="compare and render, publish nothing")
+    diff.add_argument(
+        "--legs-file",
+        default=None,
+        help=(
+            "JSON file recording what the PRODUCER legs did: a list of "
+            '{\"name\": str, \"exit_code\": int} objects. The dispatcher writes it after '
+            "running the legs independently, so the report can say which legs ran rather "
+            "than leaving a reader to assume all of them did (alpha-engine-config-I11200). "
+            "Absent, the report records `legs_known: false` -- which is NOT the same claim "
+            "as every leg having succeeded."
+        ),
+    )
 
     arctic = sub.add_parser(
         "arctic-parity",
@@ -124,8 +136,55 @@ def _run(args) -> int:
     return 0
 
 
+def _read_legs(path: "str | None") -> list[dict]:
+    """The producer legs' outcomes, as the dispatcher recorded them.
+
+    `alpha-engine-config-I11200`. Raises rather than degrading: a legs file
+    the caller NAMED and that cannot be read is a broken contract, and
+    returning `[]` would render as `legs_known: false` -- indistinguishable
+    from "the comparator was run on its own", which is a different fact. The
+    whole point of this block is to stop a reader assuming every leg ran.
+    """
+    if not path:
+        return []
+    text = open(path, encoding="utf-8").read().strip()
+    if not text:
+        raise ValueError(
+            f"--legs-file {path!r} is empty. A named-but-empty legs file would publish "
+            "`legs_known: false`, which claims the comparator was not told what the legs "
+            "did -- a different fact from 'no leg ran' (alpha-engine-config-I11200)."
+        )
+    if text.lstrip().startswith("["):
+        legs = json.loads(text)
+        if not isinstance(legs, list) or not all(isinstance(leg, dict) for leg in legs):
+            raise ValueError(f"--legs-file {path!r}: JSON form must be a list of objects")
+    else:
+        # `name<TAB>exit_code` per line. The dispatcher writes this form
+        # because its workload string is `.format()`ed and a literal `{` would
+        # need doubling through two layers of quoting for no gain.
+        legs = []
+        for lineno, line in enumerate(text.splitlines(), 1):
+            line = line.strip()
+            if not line:
+                continue
+            parts = line.split("\t")
+            if len(parts) != 2:
+                raise ValueError(
+                    f"--legs-file {path!r} line {lineno}: expected 'name<TAB>exit_code', got {line!r}"
+                )
+            legs.append({"name": parts[0], "exit_code": int(parts[1])})
+    for leg in legs:
+        if "name" not in leg or "exit_code" not in leg:
+            raise ValueError(
+                f"--legs-file {path!r}: every entry needs 'name' and 'exit_code', got {leg!r}"
+            )
+        leg["ok"] = int(leg["exit_code"]) == 0
+    return legs
+
+
 def _parity(args) -> int:
     trading_day = dt.date.fromisoformat(args.trading_day)
+    legs = _read_legs(getattr(args, "legs_file", None))
     store = open_store(args.store, dry_run=args.dry_run)
     try:
         report = parity_module.run_parity(
@@ -135,6 +194,7 @@ def _parity(args) -> int:
             rel_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
             max_keys_per_prefix=args.max_keys_per_prefix,
+            legs=legs,
         )
     except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
         print(f"shadow parity: the comparison failed: {type(exc).__name__}: {exc}", file=sys.stderr)
