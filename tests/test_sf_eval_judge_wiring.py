@@ -237,10 +237,17 @@ class TestSkipBacktesterPreservesEvalJudge:
     def test_skip_backtester_routes_to_evaluator_gate_not_health(self, states):
         skip = states["CheckSkipBacktester"]
         choice = skip["Choices"][0]
-        # The skip-true branch hits CheckSkipEvaluator (decoupled flag
+        # The skip-true branch reaches CheckSkipEvaluator (decoupled flag
         # 2026-05-07). CheckSkipEvaluator's both branches still converge
         # to CheckSkipEvalJudge, so eval-judge stays reachable.
-        assert choice["Next"] == "CheckSkipEvaluator"
+        #
+        # alpha-engine-config-I11103: it now reaches it in TWO hops, via
+        # MarkParityVerdictUnknownByCadence. Asserted as reachability rather
+        # than as a literal target, because what this test is about is
+        # eval-judge staying reachable behind skip_backtester — not which
+        # state the arm names.
+        assert choice["Next"] == "MarkParityVerdictUnknownByCadence"
+        assert states["MarkParityVerdictUnknownByCadence"]["Next"] == "CheckSkipEvaluator"
         # Critically NOT routed to SaturdayHealthCheck — that was the
         # 2026-05-03 silent-bypass bug.
         assert choice["Next"] != "SaturdayHealthCheck"

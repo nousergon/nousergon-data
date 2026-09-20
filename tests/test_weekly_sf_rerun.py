@@ -539,7 +539,15 @@ class TestStageTableLockstep:
             gate = all_states[stage.gate]
             skip_targets = {c["Next"] for c in gate["Choices"]}
             if stage.name == "backtester":
-                assert skip_targets == {"CheckSkipEvaluator"}, (
+                # alpha-engine-config-I11103: the overshoot TARGET moved to
+                # MarkParityVerdictUnknownByCadence, whose Next is
+                # CheckSkipEvaluator. The overshoot ITSELF is unchanged - the
+                # arm still jumps past CheckSkipParity and every fine-grained
+                # parity gate - so BACKTESTER_OVERSHADOWED and derive_plan's
+                # DROP logic are correct as written and were deliberately NOT
+                # touched. This is a tripwire on the target, so it moves with
+                # the target.
+                assert skip_targets == {"MarkParityVerdictUnknownByCadence"}, (
                     "CheckSkipBacktester's overshoot target changed — "
                     "revisit BACKTESTER_OVERSHADOWED + the DROP logic"
                 )
