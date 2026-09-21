@@ -47,11 +47,13 @@ __all__ = [
     "EXECUTOR_WRITES_KEY",
     "PHASE1_COST_BASELINE_KEY",
     "PHASE1_COST_BASELINE_WEEKS",
+    "PHASE1_EXIT_CONSECUTIVE",
     "PHASE2_EOD_COVERAGE_DAYS",
     "PHASE2_EMPTY_FRESH_CYCLES",
     "PHASE2_VENDOR_CYCLES",
     "PHASE3_SATURDAYS",
     "PHASE3_TRADING_DAYS",
+    "RELIABILITY_STREAK_TARGET",
     "SCHEDULE_EOD",
     "SCHEDULE_MORNING",
     "SCHEDULE_WEEKLY",
@@ -88,9 +90,38 @@ CYCLE_COUNTS: dict[str, int] = {
     SCHEDULE_WEEKLY: 4,
 }
 
-#: Plan §6 phase-1 exit: "5 consecutive EOD and 5 morning successes plus 2
-#: Saturdays with complete manifests".
-PHASE1_CONSECUTIVE: dict[str, int] = {
+#: Brian's ruling, 2026-09-21 (verbatim), on why phase 1's own exit no longer
+#: needs a repeat count: *"it sounds like the only time gate we should have
+#: here is for v2 phase 4 deleting the v1 pipelines, so a time gate here
+#: makes sense. as such we should be able to work up to this point without
+#: time gates."* Answering the point that nothing at the data-phase1 exit is
+#: irreversible (the cutover's rollback is one PR revert) — the one
+#: irreversible step in the programme is Crucible v2 phase 4 deleting the v1
+#: pipelines and Lambdas (`alpha-engine-config-I10655`), so THAT is where a
+#: repeat count belongs, not here.
+#:
+#: Phase 1's own exit now asks for ONE complete cycle of each schedule —
+#: proof the standalone collector ran end to end at all — never a streak.
+#: "Complete" keeps its exact prior meaning (`read_consecutive_cycles`:
+#: every `verify_units` entry holds an ok scheduled-trigger manifest for that
+#: fire); only the repeat count changed.
+PHASE1_EXIT_CONSECUTIVE: dict[str, int] = {
+    SCHEDULE_EOD: 1,
+    SCHEDULE_MORNING: 1,
+    SCHEDULE_WEEKLY: 1,
+}
+
+#: Plan §6 phase-1 exit's ORIGINAL figures — "5 consecutive EOD and 5
+#: morning successes plus 2 Saturdays with complete manifests" — ratified as
+#: the reliability bar Crucible v2 phase 4 gates its irreversible v1-pipeline
+#: deletion on (`alpha-engine-config-I10655`), per Brian's 2026-09-21 ruling.
+#: No longer phase 1's OWN exit count (see :data:`PHASE1_EXIT_CONSECUTIVE`
+#: above) — read instead by the standing reliability-streak clauses
+#: (`clauses.py::_clause_reliability_streak`), published under the
+#: `data-collection-reliability` gate for Crucible v2 to read as its own
+#: irreversible-action precondition, the same shape `data-cutover-ready`
+#: already uses for the cutover itself.
+RELIABILITY_STREAK_TARGET: dict[str, int] = {
     SCHEDULE_EOD: 5,
     SCHEDULE_MORNING: 5,
     SCHEDULE_WEEKLY: 2,

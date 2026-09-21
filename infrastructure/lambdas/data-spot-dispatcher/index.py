@@ -77,13 +77,44 @@ DISPATCH_ENABLED = (
 )
 
 # ── Spot launch config (env-overridable; defaults mirror spot_data_weekly.sh) ──
-# c5/c5a/m5 .large for the fetch+append compute; the lib CLI rotates on capacity
-# error. Cheap-first order biases pool selection toward price. spot_data_weekly.sh
-# uses c5.large for the Saturday data spot — same family here.
+# Widened 3 -> 9 types across 3 families (alpha-engine-config-I11340 item 5).
+#
+# The three originals (c5.large, c5a.large, m5.large) are a narrow capacity
+# surface: `launch_with_fallback` rotates instance_type x subnet, so the
+# number of distinct pools it can fall through is what decides whether a
+# capacity dip escalates to on-demand. Measured against September CE data:
+# `BoxUsage:c5.large` (on-demand) ran CONCURRENTLY with `SpotUsage:c5.large`
+# for 946 combined hours in August (> the 744 hours in the month) — proof
+# spot capacity for this one type was unavailable often enough that the
+# dispatcher fell back to on-demand for a large share of the month.
+#
+# This mirrors the already-shipped, already-measured diversification pattern
+# `crucible-v2.yaml`'s `InstanceTypeCandidates` parameter documents
+# (alpha-engine-config-I10344/I10734) and `weekly-freshness-spot-dispatcher`'s
+# own widening (alpha-engine-config-I7133, 4 -> 10 types): more (type, subnet)
+# pools to rotate through before falling back to on-demand.
+#
+# Every addition is x86_64 (the AMI below is x86_64 AL2023), 2 vCPU, and the
+# same 4 GiB class as c5.large, drawn from the set this repo's own
+# `spot_data_weekly.sh`/`_spot_common.sh` ALLOWED_INSTANCE_TYPES already
+# treats as offered in this account's subnets — no new, unevidenced type is
+# introduced. Two silicon vendors (Intel/no-suffix, AMD `a`) x three
+# generations (5, 6) across three families (c: compute, m: general, r: memory)
+# so a capacity dip in any one pool leaves eight siblings to rotate through
+# before on-demand.
+#
+# NEEDS AN IAM CHANGE: this role's `ec2:InstanceType` Condition previously
+# enumerated exactly the 3 original types (config#11227), so it must be
+# widened to the same 9 IN THE SAME CHANGE SET (see iam-policy.json) — an
+# operator-gated `deploy.sh --apply-iam`, per this file's own deploy.sh
+# comment ("widening the pool means editing BOTH the default and this
+# policy, then --apply-iam").
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
-        "DATA_SPOT_INSTANCE_TYPES", "c5.large,c5a.large,m5.large"
+        "DATA_SPOT_INSTANCE_TYPES",
+        "c5.large,c5a.large,c6i.large,m5.large,m5a.large,m6i.large,"
+        "r5.large,r5a.large,r6i.large",
     ).split(",")
     if t.strip()
 ]
