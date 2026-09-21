@@ -12,10 +12,41 @@
       "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-scheduled-groom-dispatcher:*"
     },
     {
-      "Sid": "LaunchGroomSpot",
+      "Sid": "RunInstancesInstanceScopedByTagAndType",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/Name": "alpha-engine-groom-spot",
+          "ec2:InstanceType": [
+            "c6g.large",
+            "c7g.large",
+            "m6g.large",
+            "m7g.large",
+            "t4g.large"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "RunInstancesLaunchDependencies",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:subnet/*",
+        "arn:aws:ec2:us-east-1:711398986525:security-group/*",
+        "arn:aws:ec2:us-east-1:711398986525:network-interface/*",
+        "arn:aws:ec2:us-east-1:711398986525:volume/*",
+        "arn:aws:ec2:us-east-1:711398986525:key-pair/*",
+        "arn:aws:ec2:us-east-1:711398986525:launch-template/*",
+        "arn:aws:ec2:us-east-1::image/*"
+      ]
+    },
+    {
+      "Sid": "DescribeIsNotResourceScopable",
       "Effect": "Allow",
       "Action": [
-        "ec2:RunInstances",
         "ec2:DescribeInstances",
         "ec2:DescribeInstanceStatus",
         "ec2:DescribeSpotInstanceRequests"
