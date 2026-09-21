@@ -98,6 +98,7 @@ import calendar
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -199,6 +200,27 @@ def _http_json(url: str, headers: dict | None = None) -> dict:
     except urllib.error.HTTPError as exc:
         snippet = exc.read()[:300].decode("utf-8", "replace")
         raise RuntimeError(f"HTTP {exc.code} from {url}: {snippet}") from exc
+
+
+_HTTP_STATUS_RE = re.compile(r"^HTTP (\d+)\b")
+
+
+def _log_provider_failed(key: str, exc: Exception) -> None:
+    """One stable, greppable ERROR line per provider adapter failure —
+    ``alpha-engine-config-I10013`` deliverable 1's CloudWatch metric filter
+    matches this exact literal prefix (``infrastructure/cloudwatch/
+    metric_filters/alpha-engine-expense-collector-provider-failed.json`` in
+    ``nous-ergon-ops``). Logged IN ADDITION to the caller's own
+    ``logger.exception`` traceback, never in place of it: a metric filter
+    needs a substring that never varies in shape, and a traceback's first
+    line already varies per exception type (S3 error, JSON decode error, a
+    bug) where ``_http_json``'s ``"HTTP <code> from ..."`` shape does not
+    apply. ``status`` is that HTTP code when the failure came through
+    ``_http_json``, else ``"n/a"`` for a non-HTTP failure.
+    """
+    match = _HTTP_STATUS_RE.match(str(exc))
+    status = match.group(1) if match else "n/a"
+    logger.error("provider_failed provider=%s status=%s", key, status)
 
 
 def _month_window(now: datetime) -> dict:
@@ -732,10 +754,36 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
     admin_key = secrets.get(SSM_ANTHROPIC_ADMIN)
     if admin_key:
         starting = mw["start"].strftime("%Y-%m-%dT00:00:00Z")
-        url = ("https://api.anthropic.com/v1/organizations/cost_report"
-               f"?starting_at={starting}&limit=31")
+        # alpha-engine-config-I10013: the Admin API 400s with "Invalid date
+        # range: ending date must be after starting date" whenever
+        # ending_at is omitted and no full day has elapsed since
+        # starting_at — measured live at 00:15 AND 12:15 UTC on 2026-08-01
+        # and 2026-09-01 (both scheduled `_collect` runs that day), never on
+        # any other date. starting_at is always the 1st of the CURRENT
+        # month, so on that one calendar day the window's only bucket is
+        # still in progress and an unbounded query resolves to zero width.
+        # Always send an explicit ending_at, strictly after starting_at: the
+        # closed reconciliation boundary when `end` is given (prior-month
+        # read), otherwise the start of TOMORROW relative to `now` — never
+        # "today" — so the range can never collapse to zero width even
+        # seconds into a new month, at any month boundary (including
+        # Dec -> Jan).
+        #
+        # Also renamed from `ending_before`: the current Admin API (verified
+        # live 2026-09-21 against platform.claude.com/docs/en/api/beta/
+        # organization/cost_report/retrieve) documents the param as
+        # `ending_at`, not `ending_before` — the old name was simply never
+        # sent when `end` was None, which is the common (non-reconciliation)
+        # path and why this went unnoticed until the zero-width case above.
         if end is not None:
-            url += f"&ending_before={end.strftime('%Y-%m-%dT00:00:00Z')}"
+            ending = end
+        else:
+            now_ref = mw.get("now") or _now_utc()
+            ending = (now_ref.replace(hour=0, minute=0, second=0, microsecond=0)
+                     + timedelta(days=1))
+        url = ("https://api.anthropic.com/v1/organizations/cost_report"
+               f"?starting_at={starting}&limit=31"
+               f"&ending_at={ending.strftime('%Y-%m-%dT00:00:00Z')}")
         headers = {"x-api-key": admin_key, "anthropic-version": "2023-06-01"}
         total, page, pages = 0.0, None, 0
         while pages < 10:
@@ -1453,6 +1501,7 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
             raise
         except Exception as exc:  # noqa: BLE001 — one provider's re-query outage
             # must not blank the others' reconciliation rows.
+            _log_provider_failed(key, exc)
             logger.exception("reconciliation for %s failed", key)
             providers[key] = _reconciliation_row(key, prior_doc, None, status="error",
                                                  note=str(exc)[:300])
@@ -1618,6 +1667,7 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         except CostExplorerCallBudgetExceeded:
             raise  # see the reconciliation fence's rationale (I11201)
         except Exception as exc:  # noqa: BLE001 — see fence rationale above
+            _log_provider_failed(key, exc)
             logger.exception("provider %s failed", key)
             rows.append(_row(key, label, status="error", error=str(exc)[:300]))
 
