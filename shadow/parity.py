@@ -1177,7 +1177,72 @@ def _compare_one_key(
     )
     body["shadow_key"] = shadow_key
     body["live_version"] = live_version
+    if not body.get("detail"):
+        summary = _verdict_detail(body)
+        if summary:
+            body["detail"] = summary
     return KeyResult(live_key, unit_ids, body.pop("verdict"), body.pop("comparator"), body)
+
+
+def _verdict_detail(body: dict[str, Any]) -> str:
+    """One line saying why this row reads the way it does.
+
+    `alpha-engine-config-I11203`: every `shadow_missing` / `both_missing` row
+    already carried a `detail` and every MISMATCH row carried an empty one,
+    with the diagnosis sitting in `values.examples`. The information was never
+    lost — but a reader, or a renderer, that shows `detail` as the missing-row
+    cases do saw nothing on the rows that most needed explaining. All 34
+    mismatches on the 2026-09-18 report were blank.
+
+    Built from the counts already computed, so it cannot disagree with them,
+    and it names the band when one was applied — the number a reader needs in
+    order to judge whether a `match` was earned or merely forgiven.
+    """
+    parts: list[str] = []
+    breaches = int((body.get("values") or {}).get("breaches") or 0)
+    if breaches:
+        parts.append(f"{breaches} value breach{'es' if breaches != 1 else ''}")
+
+    coverage = body.get("coverage") or {}
+    if coverage:
+        missing = int(coverage.get("missing") or 0)
+        if missing:
+            parts.append(
+                f"{missing} key{'s' if missing != 1 else ''} only in live "
+                f"(coverage {coverage.get('ratio')} vs floor {coverage.get('floor')})"
+            )
+        elif not coverage.get("met", True):
+            parts.append(f"coverage {coverage.get('ratio')} below floor {coverage.get('floor')}")
+
+    drift = body.get("vendor_drift") or {}
+    extra = int(drift.get("extra_in_shadow") or 0)
+    if extra:
+        parts.append(f"{extra} key{'s' if extra != 1 else ''} only in shadow")
+
+    schema = body.get("schema") or {}
+    if schema and not schema.get("match", True):
+        only_live = len(schema.get("only_live") or [])
+        only_shadow = len(schema.get("only_shadow") or [])
+        dtypes = len(schema.get("dtype_changes") or {})
+        parts.append(
+            f"schema differs ({only_live} columns only in live, "
+            f"{only_shadow} only in shadow, {dtypes} dtype change"
+            f"{'s' if dtypes != 1 else ''})"
+        )
+
+    rows = body.get("row_count") or {}
+    if rows and rows.get("live") != rows.get("shadow"):
+        parts.append(f"row count {rows.get('live')} live vs {rows.get('shadow')} shadow")
+
+    if not parts:
+        return ""
+    if drift.get("class"):
+        band = drift.get("band") or {}
+        parts.append(
+            f"graded as {drift['class']} (band rel={band.get('relative')}, "
+            f"abs={band.get('absolute')})"
+        )
+    return "; ".join(parts)
 
 
 # ---------------------------------------------------------------------------
