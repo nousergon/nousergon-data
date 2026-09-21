@@ -276,14 +276,15 @@ STAGES: tuple[Stage, ...] = (
             # rather than a new single-purpose Stage row.
             "SetMutexAcquireDegradedFlag", "SetMutexAcquireDegradedFlagSummary",
             "PublishMutexAcquireDegraded",
-            # alpha-engine-config-I11112: WeeklyPreflight is the SAME kind of
-            # pre-workload precondition gate as the four pairs above — its
-            # own inability to run every REQUIRED check (a missing
-            # capability, not a confirmed system violation) fails open
-            # through this same Pass+Publish shape, folded into this bucket
-            # rather than a new single-purpose Stage row.
-            "WeeklyPreflightGateDegradedFromProbe", "WeeklyPreflightGateDegraded",
-            "SetWeeklyPreflightGateDegradedSummary", "PublishWeeklyPreflightGateDegraded",
+            # alpha-engine-config-I11112: WeeklyPreflightBlindSpotDeclared and
+            # its Pass/Publish siblings are DELIBERATELY NOT here (and not
+            # named "*Degraded") — a capability gap this probe cannot reach
+            # is a VERDICT about the environment (mirrors
+            # ModelZooUnservableDeclared, sf-pipeline-policy.md §2.3a), not a
+            # stage degradation, and a rerun has nothing to redo on the
+            # strength of it: the gap is a static fact about the Lambda's
+            # environment that a rerun does not change. See
+            # WeeklyPreflightGate's Choice comment in step_function.json.
         }),
         emit_skip=False,
         note=(

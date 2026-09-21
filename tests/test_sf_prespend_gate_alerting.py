@@ -199,14 +199,22 @@ def test_gate_degraded_threads_into_completion_email(states):
 
 
 def test_only_degraded_passes_set_gate_degraded(states):
-    """The completion-email marker must be SF-controlled: exactly the six
+    """The completion-email marker must be SF-controlled: exactly the five
     gate-degraded Pass states (config#2348 added the evaluator pair;
     alpha-engine-config#6722 added SetMutexAcquireDegradedFlag for the
     mutex-acquire infra-error fail-open, the same pre-spend-precondition
-    family as the other four; alpha-engine-config-I11112 added
-    WeeklyPreflightGateDegraded for the SAME family — WeeklyPreflight is
-    another pre-spend gate probe whose own coverage gap fails open) may
-    write $.gate_degraded."""
+    family as the other four) may write $.gate_degraded.
+
+    alpha-engine-config-I11112's WeeklyPreflightBlindSpotDeclared is
+    DELIBERATELY NOT here: every existing writer of $.gate_degraded ALSO
+    sets $.degraded_summary.degraded=true (verified on origin/main) and the
+    whole family's completion email (NotifyCompleteGatesDegraded) asserts
+    'SUCCESS not in Subject' BECAUSE the run terminates DegradedRun — correct
+    for a rare, transient probe failure. WeeklyPreflight's capability-gap
+    case is a VERDICT about the environment (mirrors ModelZooUnservableDeclared,
+    §2.3a) and must render as a clean completion, so it uses its own
+    $.weekly_preflight_blind_spot field instead — see
+    test_sf_weekly_preflight_wiring.py for its dedicated wiring pins."""
     writers = [
         name for name, st in states.items()
         if st.get("ResultPath") == "$.gate_degraded"
@@ -217,7 +225,6 @@ def test_only_degraded_passes_set_gate_degraded(states):
         "LibPinGateDegraded",
         "PipelineContractGateDegraded",
         "SetMutexAcquireDegradedFlag",
-        "WeeklyPreflightGateDegraded",
     ]
 
 

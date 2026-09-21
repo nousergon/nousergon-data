@@ -64,7 +64,6 @@ _FAMILY_BY_STATE = {
     "SetReportCardDegradedSummary": "report_card",
     "SetScannerLeaderboardResourceKillSummary": "scanner_leaderboard",
     "SetMutexAcquireDegradedFlagSummary": "mutex_acquire",
-    "SetWeeklyPreflightGateDegradedSummary": "weekly_preflight_gate",
     "NotifyCompleteDegraded": "completion_notify",
     "NotifyShellRunCompleteDegraded": "preflight_notify",
 }

@@ -148,7 +148,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "HandleFailure": "sns:publish failure notifier — SDK call, not a wait",
         "PublishEvaluatorGateDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
         "PublishEvaluatorDirectorGateDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait",
-        "PublishWeeklyPreflightGateDegraded": "sns:publish degraded-gate notifier — SDK call, not a wait (alpha-engine-config-I11112)",
+        "PublishWeeklyPreflightBlindSpotNotice": "sns:publish verdict notifier — SDK call, not a wait (alpha-engine-config-I11112)",
         # lambda:invoke — synchronous gate Lambda, seconds-scale.
         "WeeklyRunDayGate": "lambda:invoke synchronous gate call — SDK call, not a wait",
         # dynamodb:putItem — single-item write, sub-second.
