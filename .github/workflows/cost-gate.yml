@@ -1,17 +1,20 @@
 name: cost-gate
 
-# alpha-engine-config-I11228 deliverable 2 — report-only pre-merge cost gate.
+# alpha-engine-config-I11228 deliverable 2 — pre-merge cost gate. BLOCKING.
 #
-# Runs `nousergon-cost-gate` (nousergon_lib.cost_gate, shipped from
-# nousergon-lib v0.124.140) over the PR's diff and reports what it would find
-# under a per-service cost SSoT. `--warn-only` is load-bearing here: this
-# repo holds the fleet's largest CloudFormation stack, and a first pass over
-# real history turns up unmapped `AWS::*::*` resource types the gate cannot
-# yet grade — those must never fail a PR. `--warn-only` downgrades a findings
-# exit (1) to 0; a could-not-grade exit (2) is unaffected and still reds the
-# job, which is deliberate: "the gate could not run" must never look like
-# "the gate ran clean". Promoting this to blocking (dropping --warn-only) is
-# gated on 0 findings against main — see the PR body.
+# Runs `nousergon-cost-gate` (nousergon_lib.cost_gate, nousergon-lib
+# v0.124.142) over the PR's diff: a change that adds a billable capability,
+# an always-on resource of an unmapped type, or a schedule with no bounded
+# retry policy fails here rather than after it has spent. Exit 1 = findings,
+# exit 2 = could not grade; both fail the job, because "the gate could not
+# run" must never look like "the gate ran clean".
+#
+# It ran report-only for one sweep. The exit condition was 0 findings on
+# main, measured before the flag came off: 0 findings over the last 300
+# commits at v0.124.142 (an earlier release raised false positives there on
+# component ids containing a colon; that release grades `Action` values by
+# document context). All resource types this repo's templates declare were
+# already mapped.
 #
 # `--repo-visibility public`: this repo's scheduled workflows run on free,
 # unlimited GitHub-hosted Actions minutes (scm-platform-policy rule 2) and
@@ -19,7 +22,7 @@ name: cost-gate
 # touches a cron.
 #
 # The gate is installed from nousergon-lib in ITS OWN step, pinned to the
-# v0.124.140 tag with --no-deps, deliberately isolated from this repo's
+# v0.124.142 tag with --no-deps, deliberately isolated from this repo's
 # requirements.txt pin (v0.124.139, held in cross-repo lockstep by
 # tests/test_lib_pin_lockstep.py and per-Lambda CI guards) — bumping that
 # pin is a separate, guarded change and not part of this PR.
@@ -93,21 +96,20 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install cost gate (nousergon-lib v0.124.140, isolated from repo requirements.txt pin)
+      - name: Install cost gate (nousergon-lib v0.124.142, isolated from repo requirements.txt pin)
         run: |
           set -euo pipefail
-          pip install --quiet --no-deps "git+https://github.com/nousergon/nousergon-lib@v0.124.140"
+          pip install --quiet --no-deps "git+https://github.com/nousergon/nousergon-lib@v0.124.142"
           pip install --quiet pyyaml
 
-      - name: Run cost gate (report-only)
+      - name: Run cost gate
         run: |
           set -euo pipefail
           nousergon-cost-gate \
             --base "${{ steps.base.outputs.base }}" \
             --head HEAD \
             --root . \
-            --repo-visibility public \
-            --warn-only
+            --repo-visibility public
 
   notify-main-failure:
     needs: [cost-gate]
