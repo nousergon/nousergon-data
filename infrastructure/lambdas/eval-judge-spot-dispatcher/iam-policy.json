@@ -12,10 +12,46 @@
       "Resource": "arn:aws:logs:us-east-1:711398986525:log-group:/aws/lambda/alpha-engine-research-eval-judge-spot-dispatcher:*"
     },
     {
-      "Sid": "LaunchEvalJudgeSpot",
+      "Sid": "RunInstancesInstanceScopedByTagAndType",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:us-east-1:711398986525:instance/*",
+      "Condition": {
+        "StringEquals": {
+          "aws:RequestTag/Name": "alpha-engine-eval-judge-spot",
+          "ec2:InstanceType": [
+            "c5.large",
+            "m5.large",
+            "c6i.large",
+            "c5a.large",
+            "m6i.large",
+            "m5a.large",
+            "c6a.large",
+            "m6a.large",
+            "r5.large",
+            "r6i.large"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "RunInstancesLaunchDependencies",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": [
+        "arn:aws:ec2:us-east-1:711398986525:subnet/*",
+        "arn:aws:ec2:us-east-1:711398986525:security-group/*",
+        "arn:aws:ec2:us-east-1:711398986525:network-interface/*",
+        "arn:aws:ec2:us-east-1:711398986525:volume/*",
+        "arn:aws:ec2:us-east-1:711398986525:key-pair/*",
+        "arn:aws:ec2:us-east-1:711398986525:launch-template/*",
+        "arn:aws:ec2:us-east-1::image/*"
+      ]
+    },
+    {
+      "Sid": "DescribeIsNotResourceScopable",
       "Effect": "Allow",
       "Action": [
-        "ec2:RunInstances",
         "ec2:DescribeInstances",
         "ec2:DescribeInstanceStatus"
       ],

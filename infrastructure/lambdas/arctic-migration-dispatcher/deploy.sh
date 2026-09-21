@@ -35,6 +35,25 @@
 #   bash infrastructure/lambdas/arctic-migration-dispatcher/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/arctic-migration-dispatcher/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/arctic-migration-dispatcher/deploy.sh --smoke     # invoke once with a synthetic event (fires a REAL spot box)
+#
+# alpha-engine-config-I11227: iam-policy.json's `ec2:RunInstances` grant was
+# `Resource: "*"` with NO condition, so this role could launch any instance
+# type in the account — a p5.48xlarge is ~$98/h and the cost-control loop's
+# first alert is ~1.5 days out. It now mirrors the shape four sibling
+# dispatcher roles already carry: an instance-resource statement conditioned
+# on `aws:RequestTag/Name` = `alpha-engine-arctic-migration-spot` plus
+# `ec2:InstanceType` in the set this dispatcher actually launches
+# (c5.large, c5a.large, m5.large), and a
+# separate, unconditioned statement for the non-instance resources
+# RunInstances also authorises (subnet, security group, network interface,
+# volume, key pair, image, launch template) — a Condition applies to EVERY
+# Resource in its statement, so they cannot share one.
+#
+# The allow-list is the code default of `ARCTIC_MIGRATION_INSTANCE_TYPES`, which
+# is UNSET on the live function (measured 2026-09-20), so the default is what
+# runs. Widening the pool means editing BOTH the default and this policy, then
+# `--apply-iam`; the flagless CI auto-deploy path above is code-only and will
+# NOT apply it.
 
 set -euo pipefail
 
