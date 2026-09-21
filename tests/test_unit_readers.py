@@ -594,8 +594,14 @@ def test_the_board_renders_retired_as_its_own_console_state(board):
     assert retired_rows and all(r["console_state"] == "RETIRED" for r in retired_rows)
     assert document["clauses_retired"] == len(retired_rows)
     assert document["clauses_total"] == document["clauses_met"] + document["clauses_unmet"] + document["transparency_gap"]
+    # `alpha-engine-config-I10793`/`-I10788`: STANDING rows (Brian's 2026-09-21
+    # ruling) are a fourth published-but-excluded category, alongside RETIRED
+    # and UNCONNECTED — none of the three is counted in `clauses_total`.
     assert len(document["rows"]) == (
-        document["clauses_total"] + document["clauses_retired"] + document["clauses_unconnected"]
+        document["clauses_total"]
+        + document["clauses_retired"]
+        + document["clauses_unconnected"]
+        + document["clauses_standing"]
     )
     assert CONSOLE_STATE["RETIRED"] not in {"HEALTHY", "DEGRADED", "UNREPORTED"}
 

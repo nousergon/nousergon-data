@@ -182,6 +182,12 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 "data.phase1.",
                 "data.phase2.",
                 "data.phase3.",
+                # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21
+                # ruling: the three reliability-streak STANDING clauses,
+                # published under `data-collection-reliability` for Crucible
+                # v2 phase 4's irreversible v1-pipeline deletion — a
+                # data-phase exit precondition, not a per-unit audit cell.
+                "data.standing.",
             )
         )
         and not name.endswith(".completeness")

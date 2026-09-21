@@ -486,7 +486,8 @@ def _board_line(board: dict[str, Any]) -> str:
         f"{board.get('clauses_unmet', '?')} unmet, "
         f"{board.get('transparency_gap', '?')} UNMEASURABLE "
         f"({board.get('clauses_retired', '?')} retired, "
-        f"{board.get('clauses_unconnected', '?')} unconnected, graded by no gate)"
+        f"{board.get('clauses_unconnected', '?')} unconnected, "
+        f"{board.get('clauses_standing', 0)} standing, graded by no gate)"
     )
 
 
@@ -549,6 +550,18 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
                 _md_cell(history),
             )
         )
+
+    # `alpha-engine-config-I10793`/`-I10788` (Brian's 2026-09-21 ruling): a
+    # standing clause is read and rendered every day but gates no phase, so it
+    # never appears in the ladder table above (which is built from each
+    # phase's OWN gated clause list). Surfaced here, explicitly, so the daily
+    # report never hides a real reading behind the exclusion that keeps it
+    # from blocking a later phase.
+    standing_rows = [r for r in (inputs.board.get("rows") or []) if r.get("standing")]
+    if standing_rows:
+        lines += ["", "### standing (measured daily, gates no phase)", ""]
+        for row in standing_rows:
+            lines.append(f"- **{row.get('state', '?')}** `{row.get('clause', '?')}`: {row.get('detail', '')}")
 
     lines += ["", "### what moved since the previous dated reading", ""]
     if inputs.moved_absent:
