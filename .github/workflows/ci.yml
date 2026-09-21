@@ -94,10 +94,20 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov
+          pip install pytest pytest-cov pytest-xdist
 
+      # config-I11309: 8,540+ tests in one process cost 12-13m of a 17-27m
+      # cycle, and strict-up-to-date restarts every open PR's cycle on every
+      # merge. `--dist loadfile` keeps each test FILE on one worker (module-
+      # level state — fixtures, monkeypatched globals, tmp paths reused
+      # across a file's tests — stays single-threaded per file), so this is
+      # not the same hazard as `--dist load`'s free-for-all scheduling.
+      # pytest-cov combines each worker's coverage data natively; verified
+      # locally 3x that the combined TOTAL matches a serial run within
+      # 0.1pt. `-ra` keeps failure/skip summaries; `-v`'s 8,540 interleaved
+      # per-test lines added noise with parallel workers reordering output.
       - name: Run tests
-        run: pytest tests/ -v --cov=. --cov-report=term-missing
+        run: pytest tests/ -n auto --dist loadfile -ra --cov=. --cov-report=term-missing
 
       # Changelog mirror Lambdas live outside tests/ (pytest testpaths) and each
       # stubs boto3 in sys.modules, so they can't share a pytest process. Run
