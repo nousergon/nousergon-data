@@ -7,6 +7,7 @@
     "region": "us-east-1 - the only region in this account carrying EventBridge rules or Scheduler schedules (us-west-2 / us-east-2 / eu-west-1 verified empty 2026-08-07)"
   },
   "not_paused": {
+    "nousergon-data-collection/data-collection-shadow-sameday": "EventBridge Scheduler schedule, group nousergon-data-collection, CloudFormation-managed (infrastructure/cloudformation/nousergon-data-collection.yaml, ShadowSamedayState). Weekday shadow-sameday parity run, alpha-engine-config-I11233: invokes alpha-engine-data-spot-dispatcher directly (not via a state machine) at 18:30 ET. Born ENABLED, unlike the four CollectionState/DailyHealState schedules above it in the same stack - it writes only to staging/shadow/, never market_data/*, so it carries none of the double-write risk their DISABLED-until-cutover default guards against. Granted by a new lambda:InvokeFunction statement on alpha-engine-eventbridge-sfn-role (nous-ergon-ops infrastructure/iam/), scoped to that one function.",
     "alpha-engine-saturday": "weekly SF trigger (ne-weekly-freshness-pipeline) - explicitly kept",
     "alpha-engine-weekday": "preopen SF trigger (ne-preopen-trading-pipeline) - explicitly kept",
     "alpha-engine-eod-backstop-daily": "postclose SF backstop trigger - the scheduled half of the kept postclose pipeline (its primary trigger is the daemon shutdown, which is on-box)",
