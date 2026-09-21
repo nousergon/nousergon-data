@@ -60,7 +60,7 @@ def test_collect_reports_written_keys_and_rows_only_for_uploaded_tickers(monkeyp
     what was actually uploaded, matching `refreshed` (the published count)."""
     import pandas as pd
 
-    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day):
+    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day, short_fetch_retries=None):
         # AAPL succeeds (5 rows written); MSFT fails the refresh.
         return 1, ["MSFT"], [("AAPL", 5)]
 
