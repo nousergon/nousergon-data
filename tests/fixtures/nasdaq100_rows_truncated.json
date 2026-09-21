@@ -1,0 +1,58 @@
+{
+  "data": {
+    "data": {
+      "rows": [
+        {
+          "symbol": "AAPL",
+          "sector": "",
+          "companyName": "Apple Inc. Common Stock",
+          "marketCap": "4,938,674,890,254",
+          "lastSalePrice": "$338.455",
+          "netChange": "$2.325",
+          "percentageChange": "+0.69%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMAT",
+          "sector": "",
+          "companyName": "Applied Materials, Inc. Common Stock",
+          "marketCap": "367,157,857,004",
+          "lastSalePrice": "$462.65",
+          "netChange": "$18.08",
+          "percentageChange": "+4.07%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMGN",
+          "sector": "",
+          "companyName": "Amgen Inc. Common Stock",
+          "marketCap": "212,143,998,762",
+          "lastSalePrice": "$392.42",
+          "netChange": "$6.77",
+          "percentageChange": "+1.76%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CMCSA",
+          "sector": "",
+          "companyName": "Comcast Corporation Class A Common Stock",
+          "marketCap": "81,742,843,459",
+          "lastSalePrice": "$22.985",
+          "netChange": "$0.245",
+          "percentageChange": "+1.08%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "INTC",
+          "sector": "",
+          "companyName": "Intel Corporation Common Stock",
+          "marketCap": "643,695,041,092",
+          "lastSalePrice": "$121.7755",
+          "netChange": "$13.1755",
+          "percentageChange": "+12.13%",
+          "deltaIndicator": "up"
+        }
+      ]
+    }
+  }
+}
