@@ -160,7 +160,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 # A cap is added here only against a MEASURED overrun, per
 # that issue's deliverable 3 ("measure the first run rather than guessing"); an
 # entry invented ahead of evidence is a number nothing checks.
-_WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
+_WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000, "shadow-sameday": 18000}
 
 
 # Parity time windows, per workload (alpha-engine-config-I10892 deliverable 3).
@@ -188,6 +188,7 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000}
 # that are correct and admit runs that are not.
 _WORKLOAD_PARITY_WINDOW: dict[str, "tuple[str, str] | None"] = {
     "shadow-weekday": None,
+    "shadow-sameday": None,
     "shadow-parity": None,
     "arctic-parity": None,
 }
@@ -434,6 +435,75 @@ _WORKLOADS: dict[str, str] = {
         "--daily-arctic-append --date {trading_day}; "
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day {trading_day} --legs-file $LEGS "
+        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
+    ),
+    # SAME-DAY shadow run (Brian ruling 2026-09-21, alpha-engine-config-I11203).
+    #
+    # `shadow-weekday` above REPLAYS a completed day, and the 2026-09-18 report
+    # measured what that costs: of 957 keys, 18 mismatched and every one of them
+    # was the world moving between the day and the replay, not the collector
+    # disagreeing with v1. A replay dispatched two days later re-fetched live
+    # vendors and re-read inputs that had since been overwritten, so the
+    # comparison conflated "the implementation differs" with "the world moved".
+    # Comparing two implementations means holding the inputs fixed; running them
+    # on the SAME day is how you do that when concurrency is available, and here
+    # it is.
+    #
+    # THE TRADING DAY IS RESOLVED ON THE BOX, not templated in by the Lambda.
+    # That is the whole difference from `shadow-weekday`, and it is why this key
+    # is deliberately NOT in `_WORKLOADS_REQUIRING_TRADING_DAY`: an EventBridge
+    # Scheduler rule carries a STATIC input and cannot compute today's date, and
+    # `_resolve_workload` refuses — correctly — to default a replay's day to
+    # "today". So the box asks `dates.default_run_date()`, the same function
+    # every scheduled collector uses to key its own run.
+    #
+    # NOT wired into the data-collection state machine, and this is not an
+    # oversight: that SF's contract is `verify_units` over LIVE run manifests
+    # under `data_collection/runs/{unit}/{day}/`, and every byte a shadow run
+    # writes is under `staging/shadow/{day}/` by construction. It has no live
+    # completeness claim to make, which is the same reasoning `shadow-weekday`
+    # records for staying off the schedule. A standalone Scheduler rule pointed
+    # at this dispatcher is the honest shape.
+    #
+    # THE GUARD IS `default_run_date() == today in ET`, and it does two jobs.
+    # `dates.default_run_date()` returns the last session whose 4:00 PM ET close
+    # HAS OCCURRED, so comparing it to today's ET date refuses:
+    #
+    #   * a non-trading day — the rule fires Mon-Fri and NYSE holidays fall
+    #     inside that. MEASURED: Saturday -> TD=Fri != Sat, exits 0;
+    #     Thanksgiving -> TD=Wed != Thu, exits 0. Running anyway would replay
+    #     the previous session under today's date and publish a parity report
+    #     keyed to a day on which nothing was collected.
+    #   * a PRE-CLOSE fire — 12:00 ET Monday gives TD=Friday != Monday, exits 0.
+    #     That case was not designed for and is the more valuable half: a
+    #     same-day run started before the close would grade a complete v2 run
+    #     against a v1 day that has not finished, and every key v1 had yet to
+    #     write would read `live_missing`.
+    #
+    # MEASURED 2026-09-21 against `dates.default_run_date` for all four cases;
+    # `test_shadow_sameday_guard_refuses_non_sessions_and_pre_close` pins them.
+    "shadow-sameday": (
+        "( set -e; "
+        "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
+        "TODAY=$(TZ=America/New_York date +%F); "
+        'if [ "$TD" != "$TODAY" ]; then '
+        'echo "shadow-sameday: $TODAY is not an NYSE trading day (latest is $TD) — nothing to run"; '
+        "exit 0; fi; "
+        "set +e; LEGS=/tmp/shadow_legs_$TD.tsv; : > $LEGS; RC_ALL=0; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date $TD; "
+        "RC=$?; printf 'morning-enrich\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--morning-arctic-append --date $TD; "
+        "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--daily --skip-arctic-append --date $TD; "
+        "RC=$?; printf 'post-market-data\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--daily-arctic-append --date $TD; "
+        "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow parity --trading-day $TD --legs-file $LEGS "
         "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
