@@ -959,6 +959,48 @@ def test_every_check_declares_its_capabilities():
         assert caps <= known, f"{name}: unknown capability {sorted(caps - known)}"
 
 
+def test_every_check_declares_required():
+    """alpha-engine-config-I11112: a new check may not silently be exempt
+    from the required-skip accounting — mirrors
+    test_every_check_declares_its_capabilities for CHECK_REQUIRED."""
+    listed = {fn.__name__ for fn in sfp.CHECKS}
+    declared = set(sfp.CHECK_REQUIRED)
+    assert listed == declared, (
+        "CHECKS and CHECK_REQUIRED disagree; add the missing entry "
+        f"(only in CHECKS: {sorted(listed - declared)}; "
+        f"only in CHECK_REQUIRED: {sorted(declared - listed)})"
+    )
+    for name, required in sfp.CHECK_REQUIRED.items():
+        assert isinstance(required, bool), f"{name}: CHECK_REQUIRED value must be a bool"
+
+
+def test_summarize_results_flags_only_required_skips():
+    """The function I11112 pulls the Lambda handler's counting logic into —
+    only a skip of a REQUIRED check inflates required_skip_count."""
+    results = [
+        sfp.CheckResult(name="sf_iam_reachability", status="ok", message=""),
+        sfp.CheckResult(name="arctic_connectivity", status="skip", message="Not run: ... arctic"),
+        sfp.CheckResult(name="tool_contracts", status="skip", message="Not run: ... checkout"),
+    ]
+    summary = sfp.summarize_results(results)
+    assert summary["ran_count"] == 1
+    assert summary["skip_count"] == 2
+    # Both check_arctic_connectivity and check_tool_contracts are declared
+    # required=True in CHECK_REQUIRED today.
+    assert summary["required_skip_count"] == 2
+    assert sorted(summary["required_skip_names"]) == ["arctic_connectivity", "tool_contracts"]
+
+
+def test_summarize_results_undeclared_check_defaults_required():
+    """An undeclared check name (not in CHECK_REQUIRED) defaults to
+    required=True — the safe direction, mirroring CHECK_CAPABILITIES'
+    undeclared-defaults-to-FULL_CAPABILITIES convention."""
+    results = [sfp.CheckResult(name="brand_new_check", status="skip", message="")]
+    summary = sfp.summarize_results(results)
+    assert summary["required_skip_count"] == 1
+    assert summary["required_skip_names"] == ["brand_new_check"]
+
+
 def test_lambda_profile_runs_at_least_one_check():
     """A gate observing nothing is not a gate (principles.md §2.7)."""
     eligible = [

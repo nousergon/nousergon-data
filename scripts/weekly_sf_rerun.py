@@ -276,6 +276,14 @@ STAGES: tuple[Stage, ...] = (
             # rather than a new single-purpose Stage row.
             "SetMutexAcquireDegradedFlag", "SetMutexAcquireDegradedFlagSummary",
             "PublishMutexAcquireDegraded",
+            # alpha-engine-config-I11112: WeeklyPreflight is the SAME kind of
+            # pre-workload precondition gate as the four pairs above — its
+            # own inability to run every REQUIRED check (a missing
+            # capability, not a confirmed system violation) fails open
+            # through this same Pass+Publish shape, folded into this bucket
+            # rather than a new single-purpose Stage row.
+            "WeeklyPreflightGateDegradedFromProbe", "WeeklyPreflightGateDegraded",
+            "SetWeeklyPreflightGateDegradedSummary", "PublishWeeklyPreflightGateDegraded",
         }),
         emit_skip=False,
         note=(

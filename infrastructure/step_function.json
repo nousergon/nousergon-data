@@ -471,9 +471,74 @@
           },
           "Comment": "Preflight returned a payload WITHOUT has_violation (partial/malformed result). Fail-closed: a preflight that cannot produce a verdict must not proceed, unlike the advisory gates (LibPinDriftCheck/PipelineContractCheck) which fail-open. The preflight is the last check before spend \u2014 failing open here defeats its purpose.",
           "Next": "ExtractWeeklyPreflightError"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_preflight_result.Payload.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.weekly_preflight_result.Payload.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I11112: fires when the preflight RAN, found no confirmed violation (has_violation is false, above), but could not execute one or more REQUIRED checks (degraded=true \u2014 the Lambda-eligible profile's CAP_ARCTIC/CAP_REPO_MODULES/CAP_POLYGON/CAP_CHECKOUT skips). sf-pipeline-policy.md \u00a75's pre-spend-gate-probe carve-out: the probe's OWN coverage gap fails open, but visibly (a degraded flag plus alert), never silently as a clean OK. Mirrors LibPinDriftGate's absence arm -> LibPinGateDegradedFromProbe -> LibPinGateDegraded convention. Placed AFTER both has_violation arms so a confirmed violation or a malformed payload still take precedence \u2014 FAIL always outranks DEGRADED.",
+          "Next": "WeeklyPreflightGateDegradedFromProbe"
         }
       ],
       "Default": "CheckMutexRole"
+    },
+    "WeeklyPreflightGateDegradedFromProbe": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11112: normalizes the gate's OWN reported cause onto a single guaranteed-present path so PublishWeeklyPreflightGateDegraded can interpolate it, mirroring LibPinGateDegradedFromProbe (alpha-engine-config-I7302). Entered from WeeklyPreflightGate's degraded arm, which fires when the probe Lambda SUCCEEDED, found no confirmed violation, but could not execute one or more REQUIRED checks. Dereferences only $.weekly_preflight_result.Payload, guaranteed present because WeeklyPreflightGate already evaluated IsPresent against a child of it, so this normalizer cannot itself raise a missing-field States.Runtime; States.JsonToString carries the WHOLE payload rather than named fields, so required_skip_names/skip_count/ran_count all render without adding a dereference per field.",
+      "Parameters": {
+        "cause": "required_checks_unreachable",
+        "detail.$": "States.JsonToString($.weekly_preflight_result.Payload)"
+      },
+      "ResultPath": "$.weekly_preflight_gate_degraded_cause",
+      "Next": "WeeklyPreflightGateDegraded"
+    },
+    "WeeklyPreflightGateDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11112: the weekly preflight could not execute every REQUIRED check (its own environment lacks a capability \u2014 arctic/repo_modules/polygon/checkout), never a confirmed system violation (that is has_violation=true, handled above and unchanged). Still fail-open \u2014 availability over gating for a weekly pipeline, sf-pipeline-policy.md \u00a75 \u2014 but VISIBLE: gate_degraded=true threads into the completion email via the existing CheckGateDegradedNotify convention, and PublishWeeklyPreflightGateDegraded alerts NOW (mirroring LibPinGateDegraded's fail-open+alert shape, config#2278). Proceeds to CheckMutexRole \u2014 the SAME target WeeklyPreflightGate's Default already uses on a clean OK, so this arm changes what the run KNOWS, never where it goes.",
+      "Result": true,
+      "ResultPath": "$.gate_degraded",
+      "Next": "SetWeeklyPreflightGateDegradedSummary"
+    },
+    "SetWeeklyPreflightGateDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11112: writes $.degraded_summary that CheckDegradedOutcome and the DegradedRun terminal read, mirroring SetLibPinGateDegradedSummary (alpha-engine-config-I6891/I10540) byte-for-byte in shape. reasons.$ ACCUMULATES a family-keyed entry via States.JsonMerge so an earlier or later degraded family on the same execution is not overwritten \u2014 $.degraded_summary.reasons is floored to {} in InitializeInput. Deliberately carries NO stage_error: this setter is reached only via a Choice (never a Catch), so an unguarded stage_error.$ would throw States.Runtime the same way test_degraded_terminal_derives_its_cause.py guards against for the sibling gates. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date \u2014 it carries $.run_date into the degraded-summary record, same as SetLibPinGateDegradedSummary's identical line. Named here because the contract test requires every state touching a run-date variable to state which family it means.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_preflight_gate_fail_open",
+        "run_date.$": "$.run_date",
+        "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"weekly_preflight_gate\":\"weekly_preflight_gate_fail_open\"}'), false)"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishWeeklyPreflightGateDegraded"
+    },
+    "PublishWeeklyPreflightGateDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11112: fail-open + alert, mirroring PublishLibPinGateDegraded (config#2278) exactly. Subject is a hardcoded constant (config#1819 discipline \u2014 never States.Format against input); Message is States.Format over $.weekly_preflight_gate_degraded_cause.cause/.detail, two scalars written by the normalizer Pass immediately upstream, so no possibly-absent path is dereferenced inside the notifier. Best-effort Catch: a publish failure must not halt the fail-open path this alert decorates.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 Preflight Gate DEGRADED (Proceeding, Coverage Gap)",
+        "Message.$": "States.Format('WeeklyPreflight ran but could not execute every REQUIRED check.\n\nCause: {}\nProbe output: {}\n\nThis is a capability gap in this probe\\'s own environment (ArcticDB, the repo collector modules, the Polygon key, or sibling checkouts \u2014 see alpha-engine-config-I11112), not a confirmed violation of the system it probes \u2014 a genuine violation still halts via has_violation, unchanged. Proceeding FAIL-OPEN: the spend for this run is NOT protected against whatever the unreached checks would have caught. The completion email will carry the gates-degraded marker.\n\nView pipeline status: https://dashboard.nousergon.ai/pipeline-status', $.weekly_preflight_gate_degraded_cause.cause, $.weekly_preflight_gate_degraded_cause.detail)"
+      },
+      "ResultPath": "$.weekly_preflight_gate_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.weekly_preflight_gate_degraded_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
     },
     "ExtractWeeklyPreflightError": {
       "Type": "Pass",

@@ -199,11 +199,14 @@ def test_gate_degraded_threads_into_completion_email(states):
 
 
 def test_only_degraded_passes_set_gate_degraded(states):
-    """The completion-email marker must be SF-controlled: exactly the five
+    """The completion-email marker must be SF-controlled: exactly the six
     gate-degraded Pass states (config#2348 added the evaluator pair;
     alpha-engine-config#6722 added SetMutexAcquireDegradedFlag for the
     mutex-acquire infra-error fail-open, the same pre-spend-precondition
-    family as the other four) may write $.gate_degraded."""
+    family as the other four; alpha-engine-config-I11112 added
+    WeeklyPreflightGateDegraded for the SAME family — WeeklyPreflight is
+    another pre-spend gate probe whose own coverage gap fails open) may
+    write $.gate_degraded."""
     writers = [
         name for name, st in states.items()
         if st.get("ResultPath") == "$.gate_degraded"
@@ -214,6 +217,7 @@ def test_only_degraded_passes_set_gate_degraded(states):
         "LibPinGateDegraded",
         "PipelineContractGateDegraded",
         "SetMutexAcquireDegradedFlag",
+        "WeeklyPreflightGateDegraded",
     ]
 
 

@@ -2192,6 +2192,89 @@ CHECK_CAPABILITIES: "dict[str, frozenset[str]]" = {
 }
 
 
+# ── Required-vs-optional declaration (alpha-engine-config-I11112) ────────────
+#
+# A capability-gated SKIP is not a violation (see CHECK_CAPABILITIES above),
+# but it is also not silence-worthy: every check in CHECKS today encodes a
+# real production incident (see this module's docstring), so an environment
+# that cannot run one has an OBSERVED GAP, not a clean bill of health. This
+# table is what lets a caller (the WeeklyPreflight Lambda's handler) tell
+# "checked, fine" apart from "could not check" without inventing the
+# distinction ad hoc at the call site.
+#
+# True = REQUIRED: this environment's inability to run the check is itself
+# reportable — the caller must not render an aggregate status of "OK" while
+# any required check is skipped (I11112's "5 of 15" defect). False = OPTIONAL:
+# a skip here is expected and never escalates the aggregate status.
+#
+# Every entry in CHECKS MUST appear here for the same reason CHECK_CAPABILITIES
+# is pinned — tests/test_sf_preflight.py::test_every_check_declares_required
+# enforces it. An undeclared check defaults to REQUIRED (the safe direction:
+# a check that forgets to declare itself optional is merely noisier, never
+# silently invisible).
+#
+# All fifteen are True today. This module's own docstring is explicit that
+# none of the ten skipping checks are dead weight ("Do not fix this by
+# deleting the skipping assertions... the defect is that they are
+# unreachable, not that they are wrong" — I11112 Non-inferable §2). A future
+# check that is genuinely advisory (e.g. a freshness check whose staleness
+# is expected to self-heal next cycle with no risk to the run) is the
+# intended user of False; none exists yet.
+CHECK_REQUIRED: "dict[str, bool]" = {
+    "check_sf_iam_reachability": True,
+    "check_arctic_connectivity": True,
+    "check_constituents_fetch": True,
+    "check_universe_drift": True,
+    "check_universe_sample_freshness": True,
+    "check_polygon_grouped_coverage": True,
+    "check_predicted_missing_from_closes": True,
+    "check_backfill_source_freshness": True,
+    "check_postflight_contracts": True,
+    "check_price_cards_cover_all_models": True,
+    "check_recursion_budget_for_response_format": True,
+    "check_tool_contracts": True,
+    "check_definition_input_coherence": True,
+    "check_lambda_memory_headroom": True,
+    "check_skip_flag_artifact_coherence": True,
+}
+
+
+def summarize_results(results: "list[CheckResult]") -> dict:
+    """Single source of truth for the run/skip/warn/fail/required-skip
+    counts every caller (the Lambda handler, the CLI) keys its aggregate
+    status off. Pulled out of the Lambda handler (I11112) so the CLI and
+    any future caller cannot drift from what the handler classifies as a
+    REQUIRED gap.
+
+    ``required_skip_count`` / ``required_skip_names`` are the fields that
+    make a partial run distinguishable from a clean one: a check skipped
+    for a missing capability is not a failure (CHECK_CAPABILITIES already
+    keeps it out of ``fail_count``), but a REQUIRED check skipped is a
+    reportable gap in what this run observed, per ``CHECK_REQUIRED`` above.
+    """
+    result_dicts = [asdict(r) for r in results]
+    fail_results = [r for r in result_dicts if r.get("status") == "fail"]
+    warn_results = [r for r in result_dicts if r.get("status") == "warn"]
+    skip_results = [r for r in result_dicts if r.get("status") == "skip"]
+    ran_count = len(result_dicts) - len(skip_results)
+    required_skips = [
+        r for r in skip_results
+        if CHECK_REQUIRED.get(f"check_{r['name']}", True)
+    ]
+    return {
+        "result_dicts": result_dicts,
+        "fail_results": fail_results,
+        "warn_results": warn_results,
+        "skip_results": skip_results,
+        "ran_count": ran_count,
+        "fail_count": len(fail_results),
+        "warn_count": len(warn_results),
+        "skip_count": len(skip_results),
+        "required_skip_count": len(required_skips),
+        "required_skip_names": [r["name"] for r in required_skips],
+    }
+
+
 def _previous_trading_day_str() -> str:
     """Resolve the prior trading day. Avoids importing weekly_collector
     (which transitively imports boto3 + every collector module) so
