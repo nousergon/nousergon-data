@@ -32,6 +32,7 @@ __all__ = [
     "OBSERVABILITY_ROWS_DIR",
     "UnattributableSimulation",
     "WRITER_IDENTITIES_PATH",
+    "partial_exclusion_reading",
     "read_artifact_registry",
     "read_consumers",
     "read_identity",
@@ -228,6 +229,48 @@ def read_observability_row(unit: Unit, *, rows_dir: pathlib.Path | None = None) 
 
 
 # ---------------------------------------------------------------------------
+# partial_exclusion — a descriptor-declared not-applicable, ANY base column.
+# ---------------------------------------------------------------------------
+
+
+def partial_exclusion_reading(unit: Unit, column: str) -> Reading | None:
+    """A unit whose descriptor declares this column not-applicable, or ``None``.
+
+    `alpha-engine-config-I11245`: five ``artifact_registry`` clauses read
+    UNMEASURABLE not because nobody looked, but because the descriptor already
+    says there is nothing this column can grade for this unit (an on-demand
+    tool with no schedule, a manual tool with no artifact of its own, a
+    component-2 exclusion) — a fact `descriptors.py` already validates under
+    `partial_exclusion` (closed `na_code` taxonomy, non-empty `reason`) but
+    that no reader consumed. Mirrors the guard-class ``not_applicable``
+    precedent in `clauses.py::_clause_guard`: a declared N/A with a code from
+    the closed taxonomy is a real answer, graded MET, never silently
+    defaulted and never UNMEASURABLE — the descriptor was read, not skipped.
+
+    ONE mechanism for every column, not a `ComponentTwoClause` alongside it:
+    `alpha-engine-config-I10810`'s D47 `run_record`/`identity` findings are
+    the same "descriptor already says this is N/A, no reader consumed it"
+    shape as the original `artifact_registry` defect — `partial_exclusion`
+    is column-scoped (`columns: [...]`) precisely so a unit can name several
+    at once under one `na_code`/`reason` pair, rather than growing a second
+    declaration shape per column. Called by every column-specific reader that
+    wants to honor it (`read_artifact_registry` here, `read_identity` below,
+    `evidence.py::read_run_record`) — never inlined a second time.
+    """
+    block = unit.raw.get("partial_exclusion")
+    if not isinstance(block, dict) or column not in (block.get("columns") or []):
+        return None
+    code = block["na_code"]
+    reason = str(block["reason"]).strip()
+    return Reading(
+        met=True,
+        detail=f"not applicable: {code} — {reason}",
+        evidence=(_descriptor_ref(unit),),
+        source="registry.d/units (partial_exclusion)",
+    )
+
+
+# ---------------------------------------------------------------------------
 # artifact_registry — the enforced ARTIFACT_REGISTRY copy.
 # ---------------------------------------------------------------------------
 
@@ -241,10 +284,42 @@ def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
     ``store.artifact_registry_source``. A store with no source configured —
     tests, a local run without ``--artifact-registry`` — is UNMEASURABLE by
     construction.
+
+    A unit declaring `partial_exclusion` naming this column (see
+    `partial_exclusion_reading`) is graded from that declaration alone and
+    never reaches the S3/ArcticDB checks below.
     """
+    excluded = partial_exclusion_reading(unit, "artifact_registry")
+    if excluded is not None:
+        return excluded
+
     keys, libraries, ungradable = s3_write_targets(unit)
     declared_rows = [r for r in (_declared_row_id(e) for e in unit.raw.get("registry_rows") or []) if r]
-    not_graded = ungradable + [f"arcticdb/{lib} (ArcticDB library; graded by the in-region probe)" for lib in libraries]
+
+    # `alpha-engine-config-I11245`: an ArcticDB-only write was always dropped
+    # into `not_graded` and never checked against anything — even when the
+    # unit's OWN descriptor already names the real evidence surface the gate
+    # CAN read for it (`arcticdb_evidence.via`, the in-region probe record
+    # `data_collection/probes/arctic/{trading_day}.json`, ArcticDB itself
+    # being unreadable from the laptop or the gate's identity, I9771). That
+    # evidence key is a real, already-published, already-grandfathered S3
+    # object — the same key-checking logic every other column already uses,
+    # sourced from the unit's own declaration rather than invented here. A
+    # unit with library writes and no declared evidence key still falls
+    # through to `not_graded`/UNMEASURABLE, honestly, rather than being waved
+    # through.
+    arctic_evidence_key = ""
+    if libraries:
+        arctic_evidence_key = str((unit.raw.get("arcticdb_evidence") or {}).get("via") or "").strip()
+        if arctic_evidence_key:
+            keys = [*keys, arctic_evidence_key]
+
+    not_graded = ungradable + [
+        f"arcticdb/{lib} (ArcticDB library; graded by the in-region probe"
+        + (f", evidenced via {arctic_evidence_key}" if arctic_evidence_key else "")
+        + ")"
+        for lib in libraries
+    ]
     source_obj = getattr(store, "artifact_registry_source", None)
     evidence_base = (_descriptor_ref(unit),)
     if not keys and not declared_rows:
@@ -557,7 +632,15 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
        whole-bucket wildcard).
     3. ``s3:DeleteObject`` on the same probe → NOT allowed (catches bucket-wide
        Delete).
+
+    A unit declaring `partial_exclusion` naming ``identity`` (see
+    `partial_exclusion_reading`) is graded from that declaration alone and
+    never reaches the IAM simulation below — a component-2 unit like D47
+    has no writer identity of its own to scope (`alpha-engine-config-I10810`).
     """
+    excluded = partial_exclusion_reading(unit, "identity")
+    if excluded is not None:
+        return excluded
     path = identities_path or WRITER_IDENTITIES_PATH
     config = _load_identities(path)
     runs_on = str((unit.raw.get("trigger") or {}).get("runs_on") or "")
