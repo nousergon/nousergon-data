@@ -53,6 +53,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
 from pathlib import Path
@@ -73,6 +74,53 @@ class ConstituentsUnavailable(RuntimeError):
     narrow rather than an ``except Exception`` that also swallows a schema
     change or a permissions error (alpha-engine-config-I7435).
     """
+
+
+# Weight units in the SSGA holdings file are PERCENT (e.g. 7.12 for 7.12%),
+# not fractions. Nothing in the file declares that, so units are DETECTED from
+# the raw sum: a units flip upstream would otherwise be silently renormalised
+# away and every downstream contribution would be off by 100x while still
+# summing to 1.0 (alpha-engine-config-I11295).
+#
+# Detection is by BAND, not by a single floor, and a sum in NEITHER band
+# raises. A floor alone (">= 50 means percent, else fractions") reads a
+# broken percent file summing to 30 as fractions summing to 30 — nonsense in
+# either unit, accepted as one of them. There is no third reading of a weight
+# column worth guessing at.
+#
+# The bands are not centred on 1.0 / 100.0 because an EQUITY-only roster
+# never sums to the whole index: cash, futures and settlement rows carry real
+# index weight and are dropped by _SSGA_TICKER_RE, so ~97-99.5% is the normal
+# observed sum. Below the lower bound the parse or the filter is wrong.
+_WEIGHT_SUM_BANDS: tuple[tuple[str, float, float], ...] = (
+    ("percent", 90.0, 101.0),
+    ("fraction", 0.90, 1.01),
+)
+
+
+@dataclass(frozen=True)
+class SsgaWeights:
+    """Per-constituent index weight, as published by the fund's own holdings file.
+
+    ``weight_map`` values are FRACTIONS normalised to sum to 1.0 **within each
+    index**, so a ticker's weight is relative to its own index and not to the
+    combined S&P 500 + S&P 400 roster. ``index_of`` names that index, which is
+    what makes the normalisation interpretable — a consumer renormalising or
+    filtering to one index must not have to re-derive membership from counts
+    (the ordering-contract failure mode of alpha-engine-config-I6946).
+
+    ``raw_sum_by_index`` is the PRE-normalisation sum in the file's own units,
+    kept so a units flip or a layout drift is visible rather than absorbed.
+
+    ``method`` records provenance: ``ssga_holdings_file`` when weights came
+    from the live file, ``cache_no_weights`` when the local cache was served
+    and carries none. A consumer must never read an absent weight as zero.
+    """
+
+    weight_map: dict[str, float] = field(default_factory=dict)
+    index_of: dict[str, str] = field(default_factory=dict)
+    raw_sum_by_index: dict[str, float] = field(default_factory=dict)
+    method: str = "cache_no_weights"
 
 
 # GICS sector name → sector ETF symbol
@@ -172,9 +220,10 @@ def collect(
     if run_date is None:
         run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
-    tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
-        _fetch_constituents()
-    )
+    (
+        tickers, sector_map, sector_etf_map, sub_industry_map,
+        sp500_count, sp400_count, weights,
+    ) = _fetch_constituents()
 
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
@@ -248,13 +297,26 @@ def collect(
         "sp500_count": sp500_count,
         "sp400_count": sp400_count,
         "total_count": len(tickers),
+        # Per-constituent index weight (alpha-engine-config-I11295). Fractions
+        # normalised WITHIN each index, so `index_of` is what makes a value
+        # interpretable and travels with it. `weight_method` is provenance a
+        # consumer must honour rather than infer: on a cache-served run it
+        # reads `cache_no_weights` and `weight_map` is empty, which means
+        # UNKNOWN weight, never zero weight.
+        "weight_map": weights.weight_map,
+        "index_of": weights.index_of,
+        "weight_method": weights.method,
+        "weight_sum_raw_sp500": weights.raw_sum_by_index.get("S&P 500"),
+        "weight_sum_raw_sp400": weights.raw_sum_by_index.get("S&P 400"),
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
     if dry_run:
         logger.info(
-            "[dry-run] constituents: %d tickers (%d S&P500, %d S&P400), %d sector mappings",
+            "[dry-run] constituents: %d tickers (%d S&P500, %d S&P400), "
+            "%d sector mappings, %d weights (%s)",
             len(tickers), sp500_count, sp400_count, len(sector_etf_map),
+            len(weights.weight_map), weights.method,
         )
         return {
             "status": "ok_dry_run",
@@ -352,6 +414,8 @@ def collect(
         "sector_map_count": len(sector_etf_map),
         "sub_industry_map_count": len(sub_industry_map),
         "sub_sector_etf_map_count": len(sub_sector_etf_map),
+        "weight_map_count": len(weights.weight_map),
+        "weight_method": weights.method,
     }
 
 
@@ -388,47 +452,112 @@ def _select_constituents_table(tables: list[pd.DataFrame], index_name: str) -> p
     return max(candidates, key=len)
 
 
-def _fetch_ssga_membership() -> tuple[list[str], int, int]:
-    """Fetch current S&P 500 + S&P 400 membership from SPY/MDY's daily
-    holdings files (config#2812 — see module docstring for why this replaced
-    Wikipedia as the membership source).
+def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
+    """Fetch current S&P 500 + S&P 400 membership AND per-constituent weight
+    from SPY/MDY's daily holdings files (config#2812 — see module docstring for
+    why this replaced Wikipedia as the membership source).
 
-    Returns (tickers, sp500_count, sp400_count). Raises on any fetch/parse
-    failure — caller falls back to the local cache.
+    Returns (tickers, sp500_count, sp400_count, weights). Raises on any
+    fetch/parse failure — caller falls back to the local cache.
+
+    The ``Weight`` column has always been in the bytes this function downloads
+    (see the schema comment on ``_SSGA_HOLDINGS_URLS``); it was read and
+    discarded until alpha-engine-config-I11295. Contribution to an index's move
+    is ``weight_at_prior_close x return``, so weight was the only absent term
+    in any index-relative attribution — the returns side already exists
+    full-population in ``collectors/daily_closes.py``.
     """
     tickers: list[str] = []
     sp500_count = 0
     sp400_count = 0
+    weight_map: dict[str, float] = {}
+    index_of: dict[str, str] = {}
+    raw_sum_by_index: dict[str, float] = {}
     for index_name, url in _SSGA_HOLDINGS_URLS.items():
         resp = requests.get(url, headers=_HEADERS, timeout=30)
         resp.raise_for_status()
         # SSGA's holdings sheet has a 4-row banner (fund name/date/disclaimer)
         # above the real header row.
         df = pd.read_excel(BytesIO(resp.content), skiprows=4, engine="openpyxl")
-        if "Ticker" not in df.columns:
-            raise RuntimeError(
-                f"SSGA holdings file for {index_name} missing 'Ticker' column "
-                f"(columns: {list(df.columns)}). Layout drift — extractor needs update."
-            )
+        for required in ("Ticker", "Weight"):
+            if required not in df.columns:
+                raise RuntimeError(
+                    f"SSGA holdings file for {index_name} missing {required!r} column "
+                    f"(columns: {list(df.columns)}). Layout drift — extractor needs update."
+                )
         raw_tickers = df["Ticker"].astype(str).str.strip()
-        batch = [t for t in raw_tickers if _SSGA_TICKER_RE.match(t)]
-        # BRK.A/BRK.B style share-class dot → hyphen, matching the yfinance
-        # convention the rest of the pipeline expects (was also done for the
-        # Wikipedia source).
-        batch = [t.replace(".", "-") for t in batch]
+        raw_weights = pd.to_numeric(df["Weight"], errors="coerce")
+        # Filter and weight-key in ONE pass over the same rows, so a ticker and
+        # its weight can never come from different rows. Share-class dot →
+        # hyphen matches the yfinance convention the rest of the pipeline
+        # expects (was also done for the Wikipedia source).
+        batch: list[str] = []
+        batch_weights: dict[str, float] = {}
+        for raw_ticker, raw_weight in zip(raw_tickers, raw_weights):
+            if not _SSGA_TICKER_RE.match(raw_ticker):
+                continue
+            ticker = raw_ticker.replace(".", "-")
+            batch.append(ticker)
+            if pd.notna(raw_weight):
+                # A ticker appearing twice in one fund's file (share classes are
+                # distinct tickers, so this would be a genuine duplicate row)
+                # accumulates rather than overwrites.
+                batch_weights[ticker] = batch_weights.get(ticker, 0.0) + float(raw_weight)
         if not batch:
             raise RuntimeError(
                 f"SSGA holdings file for {index_name} yielded zero valid tickers "
                 f"after filtering ({len(raw_tickers)} raw rows) — parse likely broken."
             )
+        missing_weight = [t for t in batch if t not in batch_weights]
+        if missing_weight:
+            raise RuntimeError(
+                f"SSGA holdings file for {index_name}: {len(missing_weight)} of "
+                f"{len(batch)} member rows carry no numeric Weight "
+                f"(sample: {missing_weight[:10]}). A member with no weight cannot "
+                f"be read as zero weight — refusing to publish a partial roster."
+            )
+        raw_sum = sum(batch_weights.values())
+        # Units are DETECTED, never assumed — see _WEIGHT_SUM_BANDS.
+        units = next(
+            (name for name, lo, hi in _WEIGHT_SUM_BANDS if lo <= raw_sum <= hi),
+            None,
+        )
+        if units is None:
+            raise RuntimeError(
+                f"SSGA holdings file for {index_name}: equity weights sum to "
+                f"{raw_sum!r}, which is neither percent "
+                f"({_WEIGHT_SUM_BANDS[0][1]}-{_WEIGHT_SUM_BANDS[0][2]}) nor "
+                f"fractions ({_WEIGHT_SUM_BANDS[1][1]}-{_WEIGHT_SUM_BANDS[1][2]}) "
+                f"over {len(batch_weights)} equity rows. Refusing to guess the "
+                f"units of a weight column — the parse, the equity filter or the "
+                f"file's own units have changed."
+            )
+        # Normalise WITHIN the index. Cross-index normalisation would make a
+        # ticker's weight depend on the other fund's roster, which is not what
+        # 'weight in the S&P 500' means.
+        normalised = {t: w / raw_sum for t, w in batch_weights.items()}
         tickers.extend(batch)
-        logger.info("Fetched %d tickers from %s (SSGA %s holdings)",
-                    len(batch), index_name, "SPY" if index_name == "S&P 500" else "MDY")
+        weight_map.update(normalised)
+        index_of.update({t: index_name for t in batch})
+        raw_sum_by_index[index_name] = raw_sum
+        logger.info(
+            "Fetched %d tickers from %s (SSGA %s holdings), weights raw sum "
+            "%.4f (detected units: %s)",
+            len(batch), index_name, "SPY" if index_name == "S&P 500" else "MDY",
+            raw_sum, units,
+        )
         if index_name == "S&P 500":
             sp500_count = len(batch)
         else:
             sp400_count = len(batch)
-    return list(dict.fromkeys(tickers)), sp500_count, sp400_count  # dedupe, preserve order
+    weights = SsgaWeights(
+        weight_map=weight_map,
+        index_of=index_of,
+        raw_sum_by_index=raw_sum_by_index,
+        method="ssga_holdings_file",
+    )
+    # dedupe, preserve order
+    return list(dict.fromkeys(tickers)), sp500_count, sp400_count, weights
 
 
 def _fetch_wikipedia_sectors() -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
@@ -523,22 +652,28 @@ def _fetch_wikipedia_sectors() -> tuple[dict[str, str], dict[str, str], dict[str
 
 
 def _fetch_constituents() -> tuple[
-    list[str], dict[str, str], dict[str, str], dict[str, str], int, int
+    list[str], dict[str, str], dict[str, str], dict[str, str], int, int, SsgaWeights
 ]:
     """
     Fetch constituent membership from SSGA (SPY/MDY holdings) and GICS
     sector/sub-industry classification from Wikipedia (config#2812).
 
     Returns:
-        (tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count)
+        (tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count,
+         sp400_count, weights)
         - tickers: SSGA-sourced S&P 500 + S&P 400 membership (ground truth)
         - sector_map: {ticker: GICS_sector_name}, filtered to ``tickers``
         - sector_etf_map: {ticker: sector_ETF_symbol}, filtered to ``tickers``
         - sub_industry_map: {ticker: GICS_sub_industry_name} (best-effort,
           additive — a ticker missing here does not block collect()).
+        - weights: SsgaWeights — per-constituent index weight, normalised
+          within each index (alpha-engine-config-I11295). The 7th element was
+          APPENDED rather than folded into an existing map, so every in-repo
+          unpack site fails loudly on the shape change instead of silently
+          binding the wrong value.
     """
     try:
-        tickers, sp500_count, sp400_count = _fetch_ssga_membership()
+        tickers, sp500_count, sp400_count, weights = _fetch_ssga_membership()
         wiki_sector_map, wiki_sector_etf_map, wiki_sub_industry_map = _fetch_wikipedia_sectors()
 
         # Filter the Wikipedia-derived maps down to SSGA's membership list —
@@ -560,9 +695,19 @@ def _fetch_constituents() -> tuple[
             "gics_sector": [sector_map.get(t, "") for t in tickers],
             "sector_etf": [sector_etf_map.get(t, "") for t in tickers],
             "gics_sub_industry": [sub_industry_map.get(t, "") for t in tickers],
+            # Cached weights are deliberately served as `cache_no_weights` on
+            # read (see _load_from_cache): a stale weight presented as current
+            # is worse than an absent one, because a consumer cannot tell.
+            # They are written anyway so a cache-served run can still be
+            # diagnosed after the fact.
+            "index_weight": [weights.weight_map.get(t, "") for t in tickers],
+            "index_name": [weights.index_of.get(t, "") for t in tickers],
         }).to_csv(_CACHE_PATH, index=False)
 
-        return tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count
+        return (
+            tickers, sector_map, sector_etf_map, sub_industry_map,
+            sp500_count, sp400_count, weights,
+        )
 
     except Exception as e:
         logger.warning("Constituents fetch failed (%s); trying local cache...", e)
@@ -581,7 +726,7 @@ def _fetch_constituents() -> tuple[
 
 
 def _load_from_cache() -> tuple[
-    list[str], dict[str, str], dict[str, str], dict[str, str], int, int
+    list[str], dict[str, str], dict[str, str], dict[str, str], int, int, SsgaWeights
 ]:
     """Read the local cache and reconstruct ticker list + sector maps.
 
@@ -627,7 +772,16 @@ def _load_from_cache() -> tuple[
         "Loaded %d tickers from cache (sector_map=%d, sector_etf_map=%d, sub_industry_map=%d)",
         len(tickers), len(sector_map), len(sector_etf_map), len(sub_industry_map),
     )
-    return tickers, sector_map, sector_etf_map, sub_industry_map, 0, 0
+    # Weights are NOT served from the cache. The cache exists for a source
+    # outage, and a weight is only meaningful as of a date: contribution is
+    # `weight_at_prior_close x return`, so yesterday's weight presented as
+    # today's is a wrong answer wearing a right one's clothes. An absent
+    # weight is declarable and a consumer can refuse; a stale one cannot be
+    # detected downstream. `cache_no_weights` says so out loud.
+    return (
+        tickers, sector_map, sector_etf_map, sub_industry_map, 0, 0,
+        SsgaWeights(method="cache_no_weights"),
+    )
 
 
 def _build_sub_sector_etf_map(

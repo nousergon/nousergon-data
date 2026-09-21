@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from unittest.mock import MagicMock, patch
 
+from collectors.constituents import SsgaWeights
+
 import pytest
 
 
@@ -16,6 +18,7 @@ def test_check_drift_no_drift_returns_ok():
         ["AAPL", "MSFT", "NVDA"],  # tickers
         {}, {}, {},                   # sector_map, sector_etf_map, sub_industry_map
         2, 1,                        # sp500_count, sp400_count
+        SsgaWeights(),               # weights (I11295)
     ))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL", "MSFT", "NVDA", "GOOG"]
@@ -37,6 +40,7 @@ def test_check_drift_missing_tickers_detected():
         ["AAPL", "MSFT", "BNY", "P", "SN"],
         {}, {}, {},
         3, 2,
+        SsgaWeights(),
     ))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL", "MSFT"]
@@ -54,7 +58,7 @@ def test_check_drift_under_threshold_passes():
     """max_stragglers tolerance: 1 missing with cap=2 → status=ok."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -73,7 +77,7 @@ def test_check_drift_skip_list_excluded_from_diff():
     is stripped from BOTH sides of the comparison."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "SPY", "VIX"], {}, {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL", "SPY", "VIX"], {}, {}, {}, 1, 0, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -89,7 +93,7 @@ def test_check_drift_sector_etf_excluded():
     """XLK / XLF / XL* prefixes excluded from drift comparison."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "XLK", "XLF"], {}, {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL", "XLK", "XLF"], {}, {}, {}, 1, 0, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
 
@@ -113,7 +117,7 @@ def test_check_drift_membership_fetch_failure_returns_error():
 def test_check_drift_arctic_failure_returns_error():
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0, SsgaWeights()))
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
          patch("validators.constituents_drift_check._open_universe_lib",
                side_effect=Exception("ArcticDB unreachable")):
@@ -125,7 +129,7 @@ def test_check_drift_arctic_failure_returns_error():
 def test_main_exit_code_ok():
     from validators.constituents_drift_check import main
 
-    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
@@ -138,7 +142,7 @@ def test_main_exit_code_ok():
 def test_main_exit_code_drift_detected():
     from validators.constituents_drift_check import main
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "BNY"], {}, {}, {}, 1, 1, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
@@ -167,7 +171,7 @@ def _capture_alert_message(*, tickers, arctic, sp500=1, sp400=1):
 
     from validators import constituents_drift_check as mod
 
-    fake_fetch = MagicMock(return_value=(tickers, {}, {}, {}, sp500, sp400))
+    fake_fetch = MagicMock(return_value=(tickers, {}, {}, {}, sp500, sp400, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = arctic
 
@@ -300,7 +304,7 @@ def _client_error(code: str) -> Exception:
 def _drift(s3, run_date):
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
@@ -346,7 +350,7 @@ def test_without_a_run_date_the_check_gates_unconditionally():
 def test_no_drift_is_ok_regardless_of_whether_the_run_collected():
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL"], {}, {}, {}, 1, 0, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     s3 = _S3(False)
@@ -363,7 +367,7 @@ def test_deferred_drift_publishes_no_alert():
     does by itself, and a page nobody can act on is the cry-wolf surface."""
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1))
+    fake_fetch = MagicMock(return_value=(["AAPL", "SUI"], {}, {}, {}, 1, 1, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL"]
     published: list = []
@@ -423,7 +427,7 @@ def test_collection_ran_probes_the_dated_constituents_artifact():
 def test_result_names_the_membership_source_not_wikipedia():
     from validators.constituents_drift_check import check_drift
 
-    fake_fetch = MagicMock(return_value=(["AAPL", "MSFT"], {}, {}, {}, 2, 0))
+    fake_fetch = MagicMock(return_value=(["AAPL", "MSFT"], {}, {}, {}, 2, 0, SsgaWeights()))
     fake_lib = MagicMock()
     fake_lib.list_symbols.return_value = ["AAPL", "MSFT"]
     with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
