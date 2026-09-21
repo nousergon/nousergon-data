@@ -1226,6 +1226,10 @@ def _fetch_all_alternative(ticker: str, run_date: str, bucket: str) -> dict:
     """Fetch all alternative data sources for a single ticker."""
     result = {
         "ticker": ticker,
+        # PROVENANCE (alpha-engine-config-I11216 deliverable 5): when this
+        # fetch actually ran, not a content-selecting window. Correct as
+        # wall clock — forcing it to `run_date` would make a replay
+        # indistinguishable from the original run.
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
@@ -1255,7 +1259,7 @@ def _fetch_all_alternative(ticker: str, run_date: str, bucket: str) -> dict:
     }
 
     # 6. News (Yahoo RSS + EDGAR 8-K)
-    result["news"] = _fetch_news(ticker)
+    result["news"] = _fetch_news(ticker, run_date)
 
     return result
 
@@ -1817,9 +1821,20 @@ def _fetch_insider(ticker: str, run_date: str) -> dict:
 
 # ---- 6. News ----
 
-def _fetch_news(ticker: str) -> dict:
-    """Fetch news from Yahoo RSS and EDGAR 8-K."""
+def _fetch_news(ticker: str, run_date: str) -> dict:
+    """Fetch news from Yahoo RSS and EDGAR 8-K.
+
+    ``run_date`` anchors both the 72h Yahoo RSS recency filter and the 3-day
+    EDGAR 8-K search window — CONTENT, not provenance (alpha-engine-config-
+    I11216 deliverable 5): a wall-clock anchor makes a replay of a past
+    ``run_date`` select articles/filings relative to the REPLAY time, not the
+    collected day, exactly the defect class fixed in
+    ``metron_market_data.py``. Mirrors ``_fetch_insider``'s existing
+    ``today = datetime.strptime(run_date, "%Y-%m-%d")`` anchor in this same
+    file — the pattern the fix propagates from, not a new one.
+    """
     result = {"articles": [], "sec_filings_8k": []}
+    today = datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
 
     # Yahoo RSS
     try:
@@ -1827,14 +1842,14 @@ def _fetch_news(ticker: str) -> dict:
         url = f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={ticker}&region=US&lang=en-US"
         feed = feedparser.parse(url)
 
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=72)
+        cutoff = today - timedelta(hours=72)
         for entry in feed.entries[:10]:
             try:
                 pub = entry.get("published_parsed") or entry.get("updated_parsed")
                 if pub:
                     pub_dt = datetime(*pub[:6], tzinfo=timezone.utc)
                 else:
-                    pub_dt = datetime.now(timezone.utc)
+                    pub_dt = today
                 if pub_dt < cutoff:
                     continue
                 result["articles"].append({
@@ -1852,8 +1867,8 @@ def _fetch_news(ticker: str) -> dict:
 
     # EDGAR 8-K
     try:
-        end_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-        start_date = (datetime.now(timezone.utc) - timedelta(days=3)).strftime("%Y-%m-%d")
+        end_date = today.strftime("%Y-%m-%d")
+        start_date = (today - timedelta(days=3)).strftime("%Y-%m-%d")
         url = (
             f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
             f"&dateRange=custom&startdt={start_date}&enddt={end_date}&forms=8-K"

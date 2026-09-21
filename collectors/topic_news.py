@@ -188,11 +188,21 @@ def fetch_topic(
     hours: int = DEFAULT_LOOKBACK_HOURS,
     per_topic_cap: int = DEFAULT_PER_TOPIC_CAP,
     feedparser_module: Any = None,
+    as_of: datetime | None = None,
 ) -> list[dict[str, str]]:
     """Fetch one topic's curated feeds → deduped, recency-capped Article list.
 
     ``feedparser_module`` is injectable for testing — production leaves it
     None and the module is lazy-imported.
+
+    ``as_of`` is the recency-filter anchor (CONTENT: it decides which entries
+    survive the ``hours`` cutoff) and is never the wall clock when the caller
+    knows the run date (alpha-engine-config-I11216). ``None`` falls back to
+    ``datetime.now(timezone.utc)`` — acceptable per the ``prices.py:258``
+    precedent, for a caller with no run-date concept of its own (e.g. an
+    ad-hoc/operator invocation). ``collectors.daily_news.collect`` — the only
+    scheduled caller — passes an explicit anchor derived from its own
+    ``run_date``.
     """
     feeds = TOPIC_FEEDS.get(topic)
     if not feeds:
@@ -204,7 +214,8 @@ def fetch_topic(
 
         feedparser_module = feedparser
 
-    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    anchor = as_of if as_of is not None else datetime.now(timezone.utc)
+    cutoff = anchor - timedelta(hours=hours)
     collected: list[dict[str, str]] = []
     for source, url in feeds:
         collected.extend(
@@ -227,6 +238,7 @@ def fetch_topics(
     hours: int = DEFAULT_LOOKBACK_HOURS,
     per_topic_cap: int = DEFAULT_PER_TOPIC_CAP,
     feedparser_module: Any = None,
+    as_of: datetime | None = None,
 ) -> dict[str, list[dict[str, str]]]:
     """Fetch all requested topics (default: ``macro`` + ``tech``).
 
@@ -234,6 +246,9 @@ def fetch_topics(
     returns ``[]`` for that key without affecting the others. The whole call
     never raises on network/parse failure — the worst case is an all-empty
     result, which the digest builder treats as "no topic news today".
+
+    ``as_of`` — see ``fetch_topic``: the recency anchor, not the wall clock,
+    when the caller has a run date (alpha-engine-config-I11216).
     """
     if topics is None:
         topics = ["macro", "tech"]
@@ -243,6 +258,7 @@ def fetch_topics(
             hours=hours,
             per_topic_cap=per_topic_cap,
             feedparser_module=feedparser_module,
+            as_of=as_of,
         )
         for topic in topics
     }

@@ -209,3 +209,72 @@ def test_curated_feeds_are_https_and_nonempty():
         for name, url in feeds:
             assert name and isinstance(name, str)
             assert url.startswith("https://"), f"{topic} feed {url} not https"
+
+
+# ── alpha-engine-config-I11216 deliverable 5: as_of anchors the recency
+# filter, not the wall clock ─────────────────────────────────────────────
+
+class _FixedNow(datetime):
+    """``datetime`` subclass whose ``.now()`` returns a controllable fixed
+    instant; everything else behaves like the real class. Lets a test move
+    "the wall clock" without touching real system time."""
+
+    _fixed: datetime = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+def test_recency_filter_uses_as_of_not_wall_clock(monkeypatch):
+    """Moving the wall clock while holding ``as_of`` fixed must not change
+    the output — proves the recency cutoff is anchored on the explicit
+    ``as_of`` parameter, not ``datetime.now()``
+    (alpha-engine-config-I11216 deliverable 5).
+
+    The published entry sits 2h before ``as_of`` (well inside the 24h
+    lookback measured from ``as_of``) but 50h before one of the two fake
+    "now" values (outside a 24h lookback measured from the wall clock) —
+    so the defect (cutoff computed from ``datetime.now()``) would make this
+    entry appear in one run and vanish in the other.
+    """
+    urls = _macro_urls()
+    as_of = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    published = as_of - timedelta(hours=2)
+    fp = _FakeFeedparser({
+        urls[0]: [_entry(title="anchored", link="https://x/anchored", published=published)],
+    })
+
+    monkeypatch.setattr(topic_news, "datetime", _FixedNow)
+
+    _FixedNow._fixed = as_of  # wall clock == as_of (e.g. a live run)
+    out_a = topic_news.fetch_topic("macro", hours=24, feedparser_module=fp, as_of=as_of)
+
+    _FixedNow._fixed = as_of + timedelta(hours=50)  # replay two-plus days later
+    out_b = topic_news.fetch_topic("macro", hours=24, feedparser_module=fp, as_of=as_of)
+
+    assert out_a == out_b
+    assert [a["title"] for a in out_a] == ["anchored"]
+
+
+def test_fetch_topics_threads_as_of_to_each_topic(monkeypatch):
+    """``fetch_topics`` must pass its ``as_of`` through to every topic, not
+    just default to the wall clock per-topic (alpha-engine-config-I11216
+    deliverable 5)."""
+    seen: list[datetime | None] = []
+    real_fetch_topic = topic_news.fetch_topic
+
+    def _spy(topic, *, hours=topic_news.DEFAULT_LOOKBACK_HOURS,
+             per_topic_cap=topic_news.DEFAULT_PER_TOPIC_CAP,
+             feedparser_module=None, as_of=None):
+        seen.append(as_of)
+        return real_fetch_topic(
+            topic, hours=hours, per_topic_cap=per_topic_cap,
+            feedparser_module=feedparser_module, as_of=as_of,
+        )
+
+    monkeypatch.setattr(topic_news, "fetch_topic", _spy)
+    anchor = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    fp = _FakeFeedparser({})
+    topic_news.fetch_topics(feedparser_module=fp, as_of=anchor)
+    assert seen == [anchor, anchor]
