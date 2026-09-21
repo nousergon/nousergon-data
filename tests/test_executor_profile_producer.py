@@ -142,7 +142,7 @@ class _PutCapturingS3(_FakeS3):
         return {}
 
 
-def test_main_writes_the_metric_document(monkeypatch):
+def test_main_writes_the_metric_document(monkeypatch, capsys):
     s3 = _PutCapturingS3({})
 
     class _FakeBoto3:
@@ -166,6 +166,43 @@ def test_main_writes_the_metric_document(monkeypatch):
     assert run_record["producer"] == "executor_profile"
     assert run_record["status"] == "ok"
     assert run_record["error"] is None
+
+    # alpha-engine-config-I11274 (CodeQL: clear-text logging of sensitive
+    # information — the sibling finding on cost_monthly.py, same class
+    # normalized here even though this producer's own metric carries no
+    # ARNs/principals today). Stdout carries the S3 key, the coverage count
+    # and a status word only.
+    out = capsys.readouterr().out
+    assert m.DEFAULT_KEY in out
+    assert "days_covered=0" in out
+
+
+def test_stdout_never_carries_a_cloudtrail_write_event_even_if_the_metric_grew_one(
+    monkeypatch, capsys
+):
+    """Regression guard for the class, not just today's shape:
+    `build_metric` deliberately excludes `WriteCount.write_events` (the raw
+    CloudTrail records, which carry principal ARNs and object keys). This
+    pins the PRINT side independently, so a future change that folds
+    `write_events` into the metric dict does not silently start leaking it
+    to this public repo's Actions log — it would have to touch this
+    assertion too."""
+    key = "AWSLogs/711398986525/CloudTrail/us-east-1/2026/09/01/obj.json.gz"
+    record = _record("PutObject", "market_data/weekly/2026-09-01/bundle.json", _EXECUTOR)
+    s3 = _PutCapturingS3({key: [record]})
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None):
+            return s3
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+    rc = m.main(["--days", "1"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "alpha-engine-executor-role" not in out
+    assert "market_data/weekly" not in out
+    assert "arn:aws" not in out
 
 
 def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):

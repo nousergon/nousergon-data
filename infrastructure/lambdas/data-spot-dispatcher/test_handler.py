@@ -181,6 +181,60 @@ def test_spot_capacity_exhausted_still_falls_back_to_on_demand(monkeypatch):
     assert calls == [True, False]
 
 
+def test_every_launch_carries_the_cost_allocation_tag(monkeypatch):
+    """alpha-engine-config-I10788: every launched instance — spot, the
+    on-demand fallback, AND force_on_demand — carries `component=data-
+    collection` in the SAME RunInstances TagSpecifications entry as the
+    Name tag, unconditionally, so the resource class the issue's scope
+    measurement found carrying no cost tag at all now does."""
+    seen_extra_tags = []
+
+    def launch_impl(types_, subnets, *, spot, extra_tags=None, **kw):
+        seen_extra_tags.append(extra_tags)
+        return "i-tagged"
+
+    index, ssm, ec2 = _load(monkeypatch, launch_impl=launch_impl)
+
+    instance_id, market = index._launch_instance()
+    assert instance_id == "i-tagged"
+    assert seen_extra_tags[-1] == {"component": "data-collection"}
+
+    # force_on_demand path (spot-interruption retry) also carries it.
+    instance_id, market = index._launch_instance(force_on_demand=True)
+    assert seen_extra_tags[-1] == {"component": "data-collection"}
+
+
+def test_cost_tag_survives_alongside_per_run_identity_tags(monkeypatch):
+    """The handler's per-run identity tags (execution_id, run_date,
+    pipeline_role -> config#5504) and the cost tag are DISTINCT keys, so
+    neither one drops the other when both are present on the same launch."""
+
+    def launch_impl(types_, subnets, *, spot, **kw):
+        return "i-both"
+
+    index, ssm, ec2 = _load(monkeypatch, launch_impl=launch_impl)
+
+    seen_extra_tags = []
+    real_launch = sys.modules["nousergon_lib.ec2_spot"].launch
+
+    def wrapped(types_, subnets, *, extra_tags=None, **kw):
+        seen_extra_tags.append(extra_tags)
+        return real_launch(types_, subnets, extra_tags=extra_tags, **kw)
+
+    sys.modules["nousergon_lib.ec2_spot"].launch = wrapped
+
+    result = index.handler(
+        {"workload": "morning-enrich", "execution_id": "exec-1", "run_date": "2026-09-21"}, None
+    )
+
+    assert result["data_spot"]["launched"] is True
+    assert seen_extra_tags[-1] == {
+        "execution-id": "exec-1",
+        "run-date": "2026-09-21",
+        "component": "data-collection",
+    }
+
+
 def test_handler_happy_path_dispatches_bootstrap(monkeypatch):
     def launch_impl(types_, subnets, *, spot, **kw):
         return "i-spotbox"

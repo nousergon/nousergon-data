@@ -1,6 +1,6 @@
 name: Data-collection phase-exit metrics
 
-# Schedules the two phase-exit metric producers nothing schedules today
+# Schedules the phase-exit metric producers nothing schedules today
 # (alpha-engine-config-I11058; producers landed CLI-only in
 # nousergon-data-PR1797 / alpha-engine-config-I11035, -I11036).
 #
@@ -10,6 +10,24 @@ name: Data-collection phase-exit metrics
 # and `data.phase2.executor_collection_writes_zero` read were never written,
 # and both clauses report UNMEASURABLE forever (`alpha-engine-config-I11035`,
 # `-I11036`).
+#
+# ── `cost_monthly` is a THIRD job here, not a separate workflow ─────────
+#
+# `alpha-engine-config-I10788` added `data_gate.producers.cost_monthly`
+# (the 4-week tagged-cost baseline `data.phase1.cost_baseline_measured`
+# reads). It runs as a job in THIS workflow — not a new `cost-monthly-
+# metrics.yml` — so it reuses this role's trust policy exactly as pinned
+# (`job_workflow_ref` already covers `phase-exit-metrics.yml`), avoiding a
+# SECOND operator-gated `update-assume-role-policy` on top of the one
+# `alpha-engine-config-I11061` already needed. The `WriteOnlyItsOwnMetric
+# AndRunRecordPrefixes`-style inline-policy grant this job needs is
+# additive and auto-applies on merge (`nous-ergon-ops-PR<N>`, same
+# session) — no operator step for `cost_monthly` at all.
+#
+# It carries its own `timeout-minutes` and no `needs:` on the other two
+# jobs — independent, per `alpha-engine-config-I11261` (the
+# `executor_profile` job already hit its 15-minute cap once; a slow
+# neighbour must not gate or be gated by this one).
 #
 # ── Cadence: mirrors the collector's own daily cadence ─────────────────────
 #
@@ -153,11 +171,81 @@ jobs:
       - name: Run executor_profile producer
         run: python -m data_gate.producers.executor_profile
 
+  cost_monthly:
+    name: cost_monthly metric (4-week baseline)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      # `alpha-engine-config-I11272`: no CUR/Data Export exists in the
+      # account yet, and provisioning one is operator-gated. Until the
+      # operator runs it AND sets these two repository variables, this
+      # job must not page daily for a by-design pending state — but it
+      # must also never render a metric document, or a $0/absent state
+      # would read as measured. Skip LOUDLY (a visible ::notice, a green
+      # job) rather than fail, and rather than pass silently with no
+      # output at all.
+      - name: CUR export provisioned?
+        id: cur_provisioned
+        run: |
+          if [ -z "${{ vars.CUR_EXPORT_BUCKET }}" ] || [ -z "${{ vars.CUR_EXPORT_NAME }}" ]; then
+            echo "::notice::cost_monthly SKIPPED — CUR/Data Export not yet provisioned (alpha-engine-config-I11272): CUR_EXPORT_BUCKET/CUR_EXPORT_NAME repository variables are unset. No metric document is written this run — that is deliberate, not a pass: writing one now would render a false \$0/absent baseline instead of an honest not-yet-measured state."
+            echo "provisioned=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "provisioned=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}."; exit 1 ;; esac
+
+      - name: Run cost_monthly producer
+        if: steps.cur_provisioned.outputs.provisioned == 'true'
+        run: >
+          python -m data_gate.producers.cost_monthly
+          --days 28
+          --cur-bucket "${{ vars.CUR_EXPORT_BUCKET }}"
+          --cur-export-name "${{ vars.CUR_EXPORT_NAME }}"
+
   # Required of every scheduled workflow in this repo by
   # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
   # naming every other job and an `if` gated to the default branch.
   notify-main-failure:
-    needs: [v1_data_stage, executor_profile]
+    needs: [v1_data_stage, executor_profile, cost_monthly]
     if: failure() && github.ref == 'refs/heads/main'
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
