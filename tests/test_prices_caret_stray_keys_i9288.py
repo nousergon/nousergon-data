@@ -221,7 +221,7 @@ def test_collect_does_not_mark_partial_from_stray_caret_key(monkeypatch):
         refresh_calls.append(list(stale))
         # Simulate every requested ticker refreshing cleanly — the point of
         # this test is that ^VIX3M never reaches this call at all.
-        return len(stale), [], [(t, 1) for t in stale]
+        return len(stale), [], [(t, 1) for t in stale], []
 
     monkeypatch.setattr(prices, "_refresh_stale", _fake_refresh_stale)
 

@@ -62,7 +62,7 @@ def test_collect_reports_written_keys_and_rows_only_for_uploaded_tickers(monkeyp
 
     def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day):
         # AAPL succeeds (5 rows written); MSFT fails the refresh.
-        return 1, ["MSFT"], [("AAPL", 5)]
+        return 1, ["MSFT"], [("AAPL", 5)], []
 
     monkeypatch.setattr(prices, "_refresh_stale", _fake_refresh_stale)
     monkeypatch.setattr(

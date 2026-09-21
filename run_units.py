@@ -149,9 +149,18 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     # way D12/D13 already do for their own collectors, instead of leaving the
     # loss visible only in the `reason` string on a `partial` (now `failed`)
     # manifest.
+    # alpha-engine-config-I11230 follow-up: `insufficient_history` (tickers the
+    # guard refused to overwrite ONLY because their own history has never
+    # reached the maturity bar — a recent listing, not a fetch failure) is
+    # declared separately from `failed` so the manifest can tell "we lost data"
+    # from "a young ticker has no growth margin" apart — both are counted, only
+    # one drives `status`.
     ("phase1", "prices"): PhaseUnit(
         "D03", "refreshed", "phase1",
-        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+        rejected_keys=(
+            ("failed", "short_fetch_guard_refused"),
+            ("insufficient_history", "insufficient_listing_history"),
+        ),
     ),
     ("phase1", "fred_macro_history"): PhaseUnit("D04", "rows", "phase1"),
     ("phase1", "macro"): PhaseUnit("D05", "rows", "phase1"),
@@ -189,7 +198,10 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("daily", "daily_closes"): PhaseUnit("D19", "tickers_captured", "daily"),
     ("daily", "prices"): PhaseUnit(
         "D03", "refreshed", "daily",
-        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+        rejected_keys=(
+            ("failed", "short_fetch_guard_refused"),
+            ("insufficient_history", "insufficient_listing_history"),
+        ),
     ),
     ("daily", "metron_market_data"): PhaseUnit("D20", "closes", "daily"),
     ("daily", "metron_market_data_history"): PhaseUnit("D21", "close_series", "daily"),

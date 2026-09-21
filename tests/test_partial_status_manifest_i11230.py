@@ -98,14 +98,18 @@ def _manifests(s3: FakeS3) -> list[dict]:
 
 
 def test_prices_partial_result_names_the_failed_tickers(monkeypatch):
+    # NEWA/NEWB here are a genuine vendor/fetch failure (a mature-ticker
+    # regression, or a raised exception) — deliberately NOT the recently-listed
+    # short-history shape (that class is `insufficient_history`, covered
+    # separately below and never reaches `failed_tickers`).
     def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day):
-        return 2, ["FDXF", "HONA"], [("AAPL", 2514), ("MSFT", 2514)]
+        return 2, ["NEWA", "NEWB"], [("AAPL", 2514), ("MSFT", 2514)], []
 
     monkeypatch.setattr(prices, "_refresh_stale", _fake_refresh_stale)
-    monkeypatch.setattr(prices, "_find_stale_fast", lambda *a, **k: ["AAPL", "MSFT", "FDXF", "HONA"])
+    monkeypatch.setattr(prices, "_find_stale_fast", lambda *a, **k: ["AAPL", "MSFT", "NEWA", "NEWB"])
 
     result = prices.collect(
-        bucket="alpha-engine-research", tickers=["AAPL", "MSFT", "FDXF", "HONA"],
+        bucket="alpha-engine-research", tickers=["AAPL", "MSFT", "NEWA", "NEWB"],
         s3_prefix="predictor/price_cache/", dry_run=False, reference_date="2026-09-18",
     )
 
@@ -115,15 +119,15 @@ def test_prices_partial_result_names_the_failed_tickers(monkeypatch):
     # manifest's failure text — without this the manifest says "no detail
     # reported", the exact gap the issue names.
     assert "reason" in result
-    assert "FDXF" in result["reason"]
-    assert "HONA" in result["reason"]
+    assert "NEWA" in result["reason"]
+    assert "NEWB" in result["reason"]
     assert "2 of" in result["reason"] and "tickers failed to refresh" in result["reason"]
 
 
 def test_a_clean_refresh_never_gets_a_reason_key(monkeypatch):
     monkeypatch.setattr(
         prices, "_refresh_stale",
-        lambda *a, **k: (1, [], [("AAPL", 2514)]),
+        lambda *a, **k: (1, [], [("AAPL", 2514)], []),
     )
     monkeypatch.setattr(prices, "_find_stale_fast", lambda *a, **k: ["AAPL"])
     result = prices.collect(
@@ -132,6 +136,105 @@ def test_a_clean_refresh_never_gets_a_reason_key(monkeypatch):
     )
     assert result["status"] == "ok"
     assert "reason" not in result
+
+
+def test_a_run_whose_only_loss_is_insufficient_history_stays_ok(monkeypatch):
+    """The coordinator's flagged risk: if FDXF/HONA/Q/SOLS-shaped tickers are
+    persistent, EVERY daily run would read `partial` -> `failed` on D03's
+    manifest, blocking the 5-consecutive-complete-cycle phase-1 exit forever.
+    They are not persistent in production (measured 2026-09-21: zero
+    `Short-fetch REFUSED` log hits for any of the four in 30 days), but the
+    guard against it is structural regardless: a run whose ONLY losses are
+    `insufficient_history` (never `failed_tickers`) must read `ok`."""
+    monkeypatch.setattr(
+        prices, "_refresh_stale",
+        lambda *a, **k: (
+            0, [], [],
+            [
+                {"ticker": "FDXF", "existing_rows": 81, "fetched_rows": 79},
+                {"ticker": "HONA", "existing_rows": 68, "fetched_rows": 66},
+            ],
+        ),
+    )
+    monkeypatch.setattr(prices, "_find_stale_fast", lambda *a, **k: ["FDXF", "HONA"])
+    result = prices.collect(
+        bucket="b", tickers=["FDXF", "HONA"], s3_prefix="predictor/price_cache/",
+        reference_date="2026-09-18",
+    )
+    assert result["status"] == "ok"
+    assert "reason" not in result
+    assert result["insufficient_history"] == 2
+    assert result["insufficient_history_tickers"] == [
+        {"ticker": "FDXF", "existing_rows": 81, "fetched_rows": 79},
+        {"ticker": "HONA", "existing_rows": 68, "fetched_rows": 66},
+    ]
+
+
+def test_a_run_with_both_kinds_of_loss_is_still_partial_from_failed_alone():
+    """`insufficient_history` never masks a REAL failure sitting alongside it."""
+    import weekly_collector
+
+    s3 = FakeS3({"reference/price_cache/AAPL.parquet": 4096})
+    reg = FakeRegistry(s3, mode="daily")
+    collector_result = {
+        "status": "partial",
+        "refreshed": 1,
+        "stale": 4,
+        "failed": 1,
+        "failed_tickers": ["REALFAIL"],
+        "insufficient_history": 2,
+        "insufficient_history_tickers": [
+            {"ticker": "FDXF", "existing_rows": 81, "fetched_rows": 79},
+            {"ticker": "HONA", "existing_rows": 68, "fetched_rows": 66},
+        ],
+        "total": 4,
+        "reason": "1 of 4 tickers failed to refresh: REALFAIL",
+        "written": {"AAPL": 2514},
+    }
+    result = weekly_collector._phase_collect(
+        reg, "prices", lambda: collector_result, supports_auto_skip=False,
+        extra_outputs=weekly_collector._prices_extra_outputs("reference/price_cache/"),
+    )
+    assert result == collector_result
+    m = _manifests(s3)[0]
+    assert m["status"] == "failed"
+    reasons = {r.get("reason") for r in m.get("rows_rejected", [])}
+    assert "short_fetch_guard_refused" in reasons
+    assert "insufficient_listing_history" in reasons
+
+
+def test_a_run_whose_only_loss_is_insufficient_history_writes_an_ok_manifest():
+    """End to end through `_phase_collect`: the manifest itself, not just the
+    collector's own dict, must read `ok` -- this is what unblocks the
+    standalone state machine's `VerifyRunManifests` 5-consecutive-cycle count
+    on a day a young ticker's history merely hiccups."""
+    import weekly_collector
+
+    s3 = FakeS3({"reference/price_cache/AAPL.parquet": 4096})
+    reg = FakeRegistry(s3, mode="daily")
+    collector_result = {
+        "status": "ok",
+        "refreshed": 1,
+        "stale": 3,
+        "failed": 0,
+        "failed_tickers": [],
+        "insufficient_history": 2,
+        "insufficient_history_tickers": [
+            {"ticker": "FDXF", "existing_rows": 81, "fetched_rows": 79},
+            {"ticker": "HONA", "existing_rows": 68, "fetched_rows": 66},
+        ],
+        "total": 3,
+        "written": {"AAPL": 2514},
+    }
+    result = weekly_collector._phase_collect(
+        reg, "prices", lambda: collector_result, supports_auto_skip=False,
+        extra_outputs=weekly_collector._prices_extra_outputs("reference/price_cache/"),
+    )
+    assert result["status"] == "ok"
+    m = _manifests(s3)[0]
+    assert m["status"] == "ok"
+    reasons = {r.get("reason") for r in m.get("rows_rejected", [])}
+    assert reasons == {"insufficient_listing_history"}
 
 
 # ---------------------------------------------------------------------------
