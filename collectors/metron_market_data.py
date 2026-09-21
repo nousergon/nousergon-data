@@ -278,12 +278,43 @@ MediansUniverseSource = Callable[[], list[str]]
 # ── Universe read ───────────────────────────────────────────────────────────
 
 
+#: The unit whose run manifest records when the universe was read. D22 is the
+#: reference collector (`collect_reference`), the earliest consumer of the
+#: universe in a trading day's run, so its start is the instant an inferred pin
+#: is taken from (`alpha-engine-config-I11216`).
+UNIVERSE_PIN_UNIT_ID = "D22"
+
+
 def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> list[dict]:
     """Read one Metron universe artifact's ``holdings`` list. Fail-soft per artifact: a
     missing object / no creds / parse error contributes nothing (logged) rather than
-    aborting the caller's union."""
+    aborting the caller's union.
+
+    Under a shadow replay the object is read at the VERSION the replayed day's
+    run actually saw, not at whatever is current now
+    (`alpha-engine-config-I11216`). The universe is overwritten in place about
+    three times a day, so an unpinned replay grades one day's holdings against
+    another's: on 2026-09-18, replayed on 09-20, that put 15 symbols in v1's
+    output and none in the shadow's, across four unrelated artifacts. Outside a
+    replay there is no pin and this reads the current object, which is what
+    production means.
+    """
+    pin = None
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        from shadow.pinned_inputs import pin_for
+
+        pin = pin_for(s3_client, bucket, key, unit_id=UNIVERSE_PIN_UNIT_ID)
+    except Exception as exc:  # noqa: BLE001 - production carries no shadow package
+        logger.debug("[metron_market_data] no input pinning available for %s (%s)", key, exc)
+    try:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if pin is not None and pin.is_pinned:
+            kwargs["VersionId"] = pin.version_id
+            logger.info(
+                "[metron_market_data] %s pinned to version %s (%s: %s)",
+                key, pin.version_id, pin.basis, pin.detail,
+            )
+        obj = s3_client.get_object(**kwargs)
         data = json.loads(obj["Body"].read())
         return [
             {"yf_symbol": str(h["yf_symbol"]).strip(), "currency": str(h.get("currency", "USD")).strip()}
