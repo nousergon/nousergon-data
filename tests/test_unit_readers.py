@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from data_gate import clauses as clause_module
+from data_gate import evidence
 from data_gate import unit_readers
 from data_gate.descriptors import DescriptorError, Unit, load_units
 from data_gate.read import CONSOLE_STATE, GATES, _board_document, evaluate, load_phases
@@ -144,6 +145,46 @@ def test_a_declared_off_row_on_an_in_service_unit_is_parked_not_met(units):
     assert not reading.met and "parked" in reading.detail
 
 
+def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units):
+    """D35 (on-demand, no schedule) already declares `partial_exclusion` naming
+    `artifact_registry` — the descriptor was always right; the reader ignored
+    it (alpha-engine-config-I11245)."""
+    unit = _unit(units, "D35")
+    reading = unit_readers.read_artifact_registry(EmptyStore(), unit)
+    assert reading.met and not reading.unmeasurable
+    assert "not applicable: N/A-NOT-RUN" in reading.detail
+
+
+def test_a_declared_arctic_evidence_key_is_graded_like_any_other_key(units):
+    """D13 writes only ArcticDB libraries and declares no `registry_rows`, but
+    its `arcticdb_evidence.via` names the in-region probe record — a real,
+    already-published S3 key. Once the registry grandfathers that prefix, the
+    unit reads MET through the same key-checking path every other unit uses,
+    not a special case (alpha-engine-config-I11245)."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source(
+        {
+            "artifacts": [],
+            "grandfathered_paths": [{"path_prefix": "data_collection/probes/arctic/", "reason": "probe"}],
+        }
+    )
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D13"))
+    assert reading.met, reading.detail
+    assert "data_collection/probes/arctic" in reading.detail
+
+
+def test_withholding_the_arctic_evidence_prefix_is_unmet_not_unmeasurable(units):
+    """The same D13 unit with NO grandfathered coverage for its declared probe
+    key reads UNMET (a real missing evidence key), never UNMEASURABLE — the
+    descriptor named something to grade; the registry just doesn't cover it
+    yet."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source({"artifacts": [], "grandfathered_paths": []})
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D13"))
+    assert not reading.met and not reading.unmeasurable
+    assert "data_collection/probes/arctic" in reading.detail
+
+
 def test_a_denied_registry_read_is_unmeasurable_naming_the_grant(units):
     class _Client:
         def get_object(self, **_kwargs):
@@ -156,6 +197,80 @@ def test_a_denied_registry_read_is_unmeasurable_naming_the_grant(units):
     reading = unit_readers.read_artifact_registry(store, _unit(units, "D19"))
     assert reading.unmeasurable and not reading.met
     assert "DataGateReadPublishedArtifactRegistry" in reading.detail
+
+
+def test_no_non_retired_unit_reads_artifact_registry_unmeasurable_for_declaring_nothing_gradable(units):
+    """`alpha-engine-config-I11245`: five units (D13, D35, D42, D43, D47) used to
+    read `artifact_registry` UNMEASURABLE forever — not because a source was
+    unreachable, but because the descriptor itself declared no S3 key
+    template and no `registry_rows`, a state a real registry read can never
+    fix. A unit either points at real evidence (`registry_rows`, a gradable
+    `writes` key, or the ArcticDB `arcticdb_evidence.via` probe pointer) or
+    declares the column not-applicable via `partial_exclusion` with a closed
+    `na_code` — so a sixth unit cannot be born into this same UNMEASURABLE
+    trap. A present-but-empty registry (no rows, no grandfathered prefixes)
+    isolates this from every OTHER way a reading can be UNMEASURABLE (a
+    denied read, no source configured) or UNMET (a real missing key) — those
+    are exercised by the tests above.
+    """
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source({"artifacts": [], "grandfathered_paths": []})
+    offenders = []
+    for unit in units:
+        if unit.retired:
+            continue
+        reading = unit_readers.read_artifact_registry(store, unit)
+        if reading.unmeasurable and "declares no S3 key template and no registry_rows" in reading.detail:
+            offenders.append(unit.unit_id)
+    assert not offenders, (
+        f"{offenders} declare nothing this column can ever grade — add registry_rows/writes "
+        "pointing at real evidence, or a partial_exclusion with a closed na_code"
+    )
+
+
+def test_every_partial_exclusion_column_reads_met_never_unmeasurable(units):
+    """`alpha-engine-config-I11245` / `-I10810`: `partial_exclusion` now has
+    FOUR `read_base`-or-equivalent-wired consumers (`read_artifact_registry`,
+    `evidence.read_run_record`, `read_identity`,
+    `standalone.read_survives_phase4`) — D47's `run_record`/`identity`/
+    `survives_phase4` are the same "descriptor already says N/A, no reader
+    consumed it" shape the original `artifact_registry` defect was. This
+    sweeps every unit's declared `partial_exclusion.columns` that names one
+    of these four against the reader that grades it, using a store that
+    would read UNMEASURABLE (or worse, raise) for any unit that reached the
+    real evidence checks — so a declared exclusion always short-circuits.
+
+    Deliberately does NOT require every declared column to be one of these
+    four: `detector`/`console_entity`/`schema_contract` also appear in some
+    units' `partial_exclusion.columns` (D35, D43) but are graded by a
+    DIFFERENT, pre-existing mechanism this reader package does not own —
+    `partial_exclusion` documents the unit's whole excluded-column set even
+    where only a subset routes through `partial_exclusion_reading` today.
+    """
+    from data_gate import standalone
+
+    store = EmptyStore()  # no artifact_registry_source, no iam_client, no manifests, no
+    # scheduler/sfn client: every real evidence path below would read UNMEASURABLE if reached.
+    dispatch = {
+        "artifact_registry": lambda unit: unit_readers.read_artifact_registry(store, unit),
+        "run_record": lambda unit: evidence.read_run_record(store, unit, trading_day=TRADING_DAY),
+        "identity": lambda unit: unit_readers.read_identity(store, unit),
+        "survives_phase4": lambda unit: standalone.read_survives_phase4(store, unit, trading_day=TRADING_DAY),
+    }
+    checked = 0
+    for unit in units:
+        block = unit.raw.get("partial_exclusion")
+        if not isinstance(block, dict):
+            continue
+        for column in block.get("columns") or []:
+            if column not in dispatch:
+                continue
+            reading = dispatch[column](unit)
+            checked += 1
+            assert reading.met and not reading.unmeasurable, (unit.unit_id, column, reading.detail)
+    # D35 + D43 (artifact_registry, pre-existing) + D47 (all four columns) = 6, the floor as
+    # of this PR. A drop below it means a declared exclusion silently stopped being declared.
+    assert checked >= 6, f"only {checked} partial_exclusion columns were exercised"
 
 
 def test_open_store_attaches_the_published_registry_to_an_s3_store():
@@ -282,6 +397,17 @@ class _Simulator:
 def test_no_iam_client_is_unmeasurable_never_met(units):
     reading = unit_readers.read_identity(EmptyStore(), _unit(units, "D19"))
     assert reading.unmeasurable and not reading.met
+
+
+def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units):
+    """D47 (component 2, plan §8.1) has no writer identity of its own to
+    simulate — it declares `partial_exclusion` naming `identity`
+    (alpha-engine-config-I10810) instead. Graded from the declaration alone,
+    never reaching the IAM simulation (no client configured on `EmptyStore`,
+    which would otherwise read UNMEASURABLE)."""
+    reading = unit_readers.read_identity(EmptyStore(), _unit(units, "D47"))
+    assert reading.met and not reading.unmeasurable
+    assert "not applicable: N/A-NOT-IMPL" in reading.detail
 
 
 def test_a_role_scoped_to_the_declared_prefixes_reads_met(units):

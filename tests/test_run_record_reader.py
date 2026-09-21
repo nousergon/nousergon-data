@@ -98,6 +98,17 @@ def test_a_denied_listing_is_unmeasurable_never_unmet(units):
     assert "could not list" in reading.detail
 
 
+def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units, tmp_path):
+    """D47 (component 2, plan §8.1) has no `data_collection/runs/D47/` prefix
+    of its own to list — it declares `partial_exclusion` naming `run_record`
+    (alpha-engine-config-I10810) instead. Even a DENIED store never reaches
+    the listing: the declaration is graded first."""
+    reading = evidence.read_run_record(DeniedStore(), units["D47"], trading_day=TRADING_DAY)
+    assert reading.met is True
+    assert reading.unmeasurable is False
+    assert "not applicable: N/A-NOT-IMPL" in reading.detail
+
+
 # ── 2. A record on BOTH paths ───────────────────────────────────────────────
 
 

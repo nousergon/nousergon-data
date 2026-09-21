@@ -77,6 +77,58 @@ def default_run_date(now: datetime | None = None) -> str:
         return fallback
 
 
+def default_session_date(now: datetime | None = None) -> str:
+    """Resolve the default artifact-keying date on the EVENT-TIME axis — the
+    session a moment falls WITHIN, not the last one that has fully closed.
+
+    ``default_run_date()`` above resolves to ``nousergon_lib.dates.now_dual()
+    .trading_day``, the *knowledge/as-of* axis: the newest session whose data a
+    computation may safely use. That is right for a writer settling an EOD
+    close. It is wrong for a writer recording an IN-SESSION observation — an
+    intraday timer tick — because during a live session the two axes differ by
+    exactly one session: at 11:00 UTC on a Monday the as-of axis still reads
+    Friday (Monday's own close hasn't happened yet), so an intraday manifest
+    keyed by ``default_run_date()`` files itself under the PREVIOUS session's
+    folder for the entire session, every trading day (measured live,
+    `alpha-engine-config-I10810`: D37's ``data_run_manifest.v1`` objects
+    written 2026-09-21 all carried ``trading_day: "2026-09-18"``, three
+    sessions stale, because the 04:55Z run started long before that day's own
+    16:00 ET close).
+
+    Returns the NYSE session ``now`` belongs to via the fleet-canonical
+    ``nousergon_lib.dates.session_date()`` chokepoint — the same event-time
+    axis `nousergon_lib`'s own docstring names as the fix for exactly this
+    off-by-one class (config#1610). Falls back to the calendar UTC date only
+    if the lib lookup raises — date defaulting must never block a collection
+    run.
+
+    Args:
+        now: optional timezone-aware moment (mainly for tests). Defaults to
+            the current moment inside ``session_date``.
+
+    Returns:
+        ISO ``YYYY-MM-DD`` string.
+    """
+    try:
+        from nousergon_lib.dates import session_date as _session_date
+
+        sd = _session_date(now) if now is not None else _session_date()
+        log.info("default_session_date: resolved session_date=%s", sd)
+        return sd.isoformat()
+    except Exception:  # noqa: BLE001 — date defaulting must not block a run
+        ref = now or datetime.now(timezone.utc)
+        if ref.tzinfo is None:
+            ref = ref.replace(tzinfo=timezone.utc)
+        fallback = ref.astimezone(timezone.utc).strftime("%Y-%m-%d")
+        log.warning(
+            "default_session_date: could not resolve session_date via "
+            "nousergon_lib.dates.session_date; fell back to calendar date %s",
+            fallback,
+            exc_info=True,
+        )
+        return fallback
+
+
 # ---------------------------------------------------------------------------
 # alpha-engine-config-I10893 — history fetches are bounded by the trading day.
 #

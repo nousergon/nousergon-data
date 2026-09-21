@@ -48,7 +48,7 @@ from datetime import date, datetime, timezone
 from typing import Any, Callable
 
 import run_units
-from dates import default_run_date
+from dates import default_run_date, default_session_date
 from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
 from validators import expectations
@@ -2796,7 +2796,12 @@ def main(argv: list[str] | None = None) -> int:
             "D37",
             _intraday_body,
             trigger="scheduled",
-            trading_day=args.date or default_run_date(),
+            # `default_session_date()`, NOT `default_run_date()`: this is an
+            # in-session write (a 5-minute intraday tick), and the manifest
+            # must key on the session `now` falls WITHIN, not the last one
+            # that has fully closed — see the function's own docstring
+            # (alpha-engine-config-I10810).
+            trading_day=args.date or default_session_date(),
             bucket=args.bucket,
             write=not args.dry_run,
         )

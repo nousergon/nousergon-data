@@ -200,7 +200,25 @@ def _grade_schedule(store: GateStore, unit: Unit, schedule: dict, live: dict, as
 def read_survives_phase4(
     store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None
 ) -> Reading:
-    """See the module docstring."""
+    """See the module docstring.
+
+    A unit declaring `partial_exclusion` naming ``survives_phase4`` (see
+    `unit_readers.partial_exclusion_reading`) is graded from that
+    declaration alone. Checked FIRST, not left to fall out of the
+    ``read_run_record`` reuse below: D47 (component 2, plan §8.1) reused this
+    module's own `read_run_record(...)` call to decide "does it still fire",
+    so once `read_run_record` started honoring D47's `partial_exclusion` for
+    `run_record` (`alpha-engine-config-I11245`/`-I10810`), this reader would
+    otherwise have inherited that MET incidentally, worded as if a "latest
+    due run recorded" — true in outcome, wrong in reasoning. Explicit beats
+    inherited (imported here, not at module top: `unit_readers` imports
+    `Reading` from `evidence`, which this module also imports from).
+    """
+    from data_gate import unit_readers
+
+    excluded = unit_readers.partial_exclusion_reading(unit, "survives_phase4")
+    if excluded is not None:
+        return excluded
     schedules = covering_schedules(unit.unit_id)
     trigger = unit.raw.get("trigger") or {}
     kind = str(trigger.get("kind") or "")

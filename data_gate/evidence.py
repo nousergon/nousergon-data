@@ -572,7 +572,20 @@ def read_run_record(
       already say what happened.
     * **An ArcticDB unit's evidence is the probe**, and a withheld probe is
       UNMEASURABLE rather than MET — see :func:`_read_arctic_probe`.
+
+    A unit declaring `partial_exclusion` naming ``run_record`` (see
+    `unit_readers.partial_exclusion_reading`) is graded from that declaration
+    alone and never reaches the manifest listing below — D47, a component-2
+    exclusion (plan §8.1), has no `data_collection/runs/` prefix of its own to
+    list (`alpha-engine-config-I10810`). Imported here, not at module top:
+    `unit_readers` imports `Reading` from this module (same reason `read_base`
+    below imports it lazily).
     """
+    from data_gate import unit_readers
+
+    excluded = unit_readers.partial_exclusion_reading(unit, "run_record")
+    if excluded is not None:
+        return excluded
     cadence = unit_cadence(unit.raw)
     unit_prefix = f"{_store_relative(unit.run_manifest_prefix)}/"
     try:
