@@ -115,7 +115,7 @@ def test_reference_producer_write_validates():
         sector_source=lambda syms: {"AAPL": "Technology"},
         country_source=lambda syms: {"AAPL": "United States"},
         benchmark_source=lambda: {"Technology": 0.30},
-        earnings_source=lambda syms: {"AAPL": "2026-07-30"},
+        earnings_source=lambda syms, as_of: {"AAPL": "2026-07-30"},
     )
     puts = _puts(s3)
     assert validate_metron_sectors(puts[f"{mmd.SECTORS_PREFIX}latest.json"]) == []
@@ -145,7 +145,7 @@ def test_earnings_hand_built_fixture_validates():
 
 def test_macro_producer_write_validates():
     s3 = _universe_s3(_UNIVERSE)
-    macro_src = lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)]}
+    macro_src = lambda ids, as_of: {"FEDFUNDS": [("2026-06-01", 5.33)]}
     rel_src = lambda ids, run_date: (
         {"FEDFUNDS": "2026-07-30"},
         [{"date": "2026-07-30", "kind": "fomc", "series_id": "FEDFUNDS", "label": "FOMC decision"}],
