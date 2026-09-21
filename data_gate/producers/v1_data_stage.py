@@ -203,7 +203,17 @@ def main(argv: list[str] | None = None) -> int:
             sfn, state_machine_arn=args.state_machine_arn, cutover=cutover, scan_cap=args.scan_cap
         )
         metric = build_metric(cutover_utc=args.cutover_utc, count=count)
-        print(json.dumps(metric, indent=2, sort_keys=True))
+        # NEVER the full document (same class as alpha-engine-config-I11274's
+        # CodeQL finding on cost_monthly.py): this repo is PUBLIC and its
+        # GitHub Actions logs are public, and `metric` carries
+        # `data_stage_execution_arns` — full Step Functions execution ARNs,
+        # embedding the account ID. Those stay in the S3 document (kept for
+        # auditability per this module's own docstring); a public log gets a
+        # fixed, non-sensitive summary only.
+        print(
+            f"{args.key}: executions_since_cutover={count.executions_since_cutover}, "
+            "status=ok"
+        )
     except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
         if not args.no_write:
             write_run_record(

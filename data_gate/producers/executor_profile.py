@@ -292,7 +292,15 @@ def main(argv: list[str] | None = None) -> int:
             end=end,
         )
         metric = build_metric(count=count)
-        print(json.dumps(metric, indent=2, sort_keys=True))
+        # Same public-log posture as the sibling producers (alpha-engine-
+        # config-I11274): `build_metric` today emits only counts and dates
+        # (no principals, ARNs or bucket paths — `WriteCount.write_events`,
+        # which DOES carry raw CloudTrail records, is deliberately excluded
+        # from it), so this print is not an active leak. Normalized anyway
+        # so a future field added to the metric can't silently start being
+        # printed to this PUBLIC repo's Actions log without a deliberate
+        # decision to widen this line.
+        print(f"{args.key}: days_covered={count.days_covered}, status=ok")
     except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
         if not args.no_write:
             write_run_record(

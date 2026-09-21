@@ -58,12 +58,29 @@ def test_cfn_lint_is_clean(stack):
 
 
 def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
-    sched = stack.schedules(tpl)
+    """alpha-engine-config-I11233 adds a FIFTH schedule that targets the
+    dispatcher Lambda directly rather than a state machine — asserted
+    separately below rather than folded in here, so this test keeps meaning
+    exactly what its name says."""
+    sched = [s for s in stack.schedules(tpl) if s["target_kind"] == "state_machine"]
     assert [s["name"] for s in sched] == [
         "data-collection-daily-heal", "data-collection-eod", "data-collection-morning", "data-collection-weekly",
     ]
     assert {s["group"] for s in sched} == {"nousergon-data-collection"}
     assert len({s["target_ref"] for s in sched}) == 4
+
+
+def test_shadow_sameday_targets_the_dispatcher_lambda_directly(stack, tpl):
+    """alpha-engine-config-I11233: the only schedule in this stack with no
+    state machine of its own — it invokes alpha-engine-data-spot-dispatcher
+    directly, using the dispatcher's own {"workload": ...} contract rather
+    than the collection/workloads/verify_units shape every state-machine-
+    targeting schedule uses."""
+    sched = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-shadow-sameday"]
+    assert sched["target_kind"] == "lambda"
+    assert sched["target_ref"] is None
+    assert sched["group"] == "nousergon-data-collection"
+    assert sched["input"] == {"workload": "shadow-sameday"}
 
 
 def test_schedule_names_are_unique_without_their_group(stack, tpl):
@@ -79,11 +96,20 @@ def test_schedule_names_are_unique_without_their_group(stack, tpl):
 def test_ships_disabled(stack, tpl):
     """alpha-engine-config-I10739 deliverable 2: nothing double-writes market_data/*
     while the v1 SFs still run. The enable PR changes this test's expectation
-    for CollectionState in the same change that flips the Default."""
+    for CollectionState in the same change that flips the Default.
+
+    ShadowSamedayState is deliberately EXCLUDED from this invariant
+    (alpha-engine-config-I11233): that schedule writes only to
+    staging/shadow/, never market_data/*, so it carries none of the
+    double-write risk this test guards and is born ENABLED instead."""
     defaults = stack.parameter_defaults(tpl)
     assert defaults["CollectionState"] == "DISABLED"
     assert defaults["DailyHealState"] == "DISABLED"
-    assert {s["declared_state"] for s in stack.schedules(tpl)} == {"DISABLED"}
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    assert {
+        s["declared_state"] for name, s in by_name.items() if name != "data-collection-shadow-sameday"
+    } == {"DISABLED"}
+    assert by_name["data-collection-shadow-sameday"]["declared_state"] == "ENABLED"
 
 
 def test_daily_heal_has_its_own_state_switch(stack, tpl):
@@ -112,12 +138,23 @@ def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
 
 
 def test_every_schedule_verifies_units_and_none_verifies_keys(stack, tpl):
-    """No machine keeps the "no key verification" posture: an SSM exit code was
-    never a completion claim, and the morning enrich is what the predictor reads
-    next. Every schedule names at least one unit, and every named unit has a
-    descriptor — a unit nobody declared would grade nothing and read as a pass."""
+    """No STATE-MACHINE-TARGETING schedule keeps the "no key verification"
+    posture: an SSM exit code was never a completion claim, and the morning
+    enrich is what the predictor reads next. Every such schedule names at
+    least one unit, and every named unit has a descriptor — a unit nobody
+    declared would grade nothing and read as a pass.
+
+    alpha-engine-config-I11233's shadow-sameday schedule is EXCLUDED
+    deliberately, not by omission: it targets the dispatcher Lambda directly
+    (no state machine, no collection/workloads/verify_units contract) and its
+    completion claim is graded downstream by data.cutover_ready.parity, not
+    by this stack's verify_units machinery — asserted explicitly below rather
+    than left as a silent gap in the loop."""
     declared = stack.declared_units()
     for s in stack.schedules(tpl):
+        if s["target_kind"] == "lambda":
+            assert "verify_units" not in s["input"], f"{s['name']} unexpectedly declares verify_units"
+            continue
         units = s["input"]["verify_units"]
         assert units, f"{s['name']} verifies no units"
         assert not set(units) - declared, f"{s['name']}: undeclared {sorted(set(units) - declared)}"
@@ -282,7 +319,12 @@ def test_no_dependency_on_a_v1_pipeline(stack):
 def test_pause_manifest_disagreement_is_reported_both_ways(stack, tpl):
     sched = stack.schedules(tpl)
     empty = {"pending": {}, "paused": {}, "not_paused": {}}
-    assert len(stack.pause_manifest_problems(sched, empty)) == 4
+    # One problem per schedule against a manifest naming none of them — DISABLED
+    # ones for missing pending/paused, ENABLED ones (shadow-sameday,
+    # alpha-engine-config-I11233) for missing not_paused. Asserted against
+    # len(sched) rather than a literal count so a new schedule changes this
+    # test's expectation with it instead of silently drifting past it.
+    assert len(stack.pause_manifest_problems(sched, empty)) == len(sched)
     enabled = [dict(s, declared_state="ENABLED") for s in sched]
     listed_pending = {"pending": {s["qualified_name"]: "x" for s in sched}, "not_paused": {}}
     problems = stack.pause_manifest_problems(enabled, listed_pending)
@@ -524,5 +566,5 @@ def test_deploy_script_verifies_its_own_effect():
     deploy_at = script.index("aws cloudformation deploy")
     assert "check-live" in script[deploy_at:], "a deploy must be followed by the live comparison"
     assert "--no-fail-on-empty-changeset" in script
-    for p in ("CollectionState=", "DailyHealState="):
+    for p in ("CollectionState=", "DailyHealState=", "ShadowSamedayState="):
         assert p in script, f"{p} must be passed explicitly so the template Default is authoritative"
