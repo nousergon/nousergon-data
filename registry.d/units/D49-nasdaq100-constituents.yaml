@@ -48,7 +48,11 @@ promotes_when: >-
     market_data/index_constituents/NDX.json exists with a current as_of. Flip
     lifecycle to in-service and declare the cadence in the same PR.
 trigger:
-  kind: "none"
+  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
+  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
+  # only way it runs today. There is no "none" kind, and inventing one would
+  # be a fallback guess where the generator deliberately refuses to make one.
+  kind: "manual"
   runs_on: "ec2-spot"
   detail: >-
     NOT YET SCHEDULED. Belongs on the weekly membership cadence beside D01
@@ -58,8 +62,13 @@ trigger:
   # data_gate/cadence.py would otherwise grade this unit against a cadence
   # nothing honours.
 writes:
+  # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
+  # templated key against a contract's x-key-pattern, and a bare `*` resolves
+  # to NOTHING — a glob would declare a write whose contract cannot be found,
+  # which is what
+  # test_declared_contracts_are_reachable_from_their_keys.py exists to catch.
   - market_data/index_constituents/NDX.json
-  - "market_data/weekly/*/NDX.json"
+  - "market_data/weekly/{date}/NDX.json"
 consumers:
   - "nousergon-data:collectors/index_contributions.py (D48, alpha-engine-config-I11297)"
 consumers_reason: >-

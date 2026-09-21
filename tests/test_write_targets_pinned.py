@@ -79,6 +79,16 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
         (),
         (),
     ),
+    # alpha-engine-config-I11296. Same shape, same deferral, filed separately as
+    # alpha-engine-config-I11307.
+    "D49": (
+        (
+            "market_data/index_constituents/NDX.json",
+            "market_data/weekly/{date}/NDX.json",
+        ),
+        (),
+        (),
+    ),
     "D03": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D04": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D05": (
