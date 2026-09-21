@@ -65,5 +65,11 @@ NOT_DISPATCHABLE_MODULES: dict[str, str] = {
         "a helper the collectors read under `shadow run` so a shadow run reads "
         "its own phase markers rather than v1's (alpha-engine-config-I10891)"
     ),
+    "pinned_inputs": (
+        "a resolver the collectors call under `shadow run` so a replay reads "
+        "each mutable input at the VERSION the replayed day's run actually "
+        "read (alpha-engine-config-I11216); it answers a question and launches "
+        "nothing, and outside a replay it answers 'unpinned' immediately"
+    ),
     "dispatch": "this declaration itself",
 }

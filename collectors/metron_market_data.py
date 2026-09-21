@@ -278,12 +278,62 @@ MediansUniverseSource = Callable[[], list[str]]
 # ── Universe read ───────────────────────────────────────────────────────────
 
 
+#: The unit whose run manifest records when the universe was read. D22 is the
+#: reference collector (`collect_reference`), the earliest consumer of the
+#: universe in a trading day's run, so its start is the instant an inferred pin
+#: is taken from (`alpha-engine-config-I11216`).
+UNIVERSE_PIN_UNIT_ID = "D22"
+
+
 def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> list[dict]:
     """Read one Metron universe artifact's ``holdings`` list. Fail-soft per artifact: a
     missing object / no creds / parse error contributes nothing (logged) rather than
-    aborting the caller's union."""
+    aborting the caller's union.
+
+    Under a shadow replay the object is read at the VERSION the replayed day's
+    run actually saw, not at whatever is current now
+    (`alpha-engine-config-I11216`). The universe is overwritten in place about
+    three times a day, so an unpinned replay grades one day's holdings against
+    another's: on 2026-09-18, replayed on 09-20, that put 15 symbols in v1's
+    output and none in the shadow's, across four unrelated artifacts. Outside a
+    replay there is no pin and this reads the current object, which is what
+    production means.
+    """
+    pin = None
     try:
-        obj = s3_client.get_object(Bucket=bucket, Key=key)
+        from shadow.pinned_inputs import pin_for
+
+        pin = pin_for(s3_client, bucket, key, unit_id=UNIVERSE_PIN_UNIT_ID)
+    except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
+        # DELIBERATE degrade, recorded at WARNING rather than debug.
+        # (a) Failure mode swallowed: the pin could not be resolved at all —
+        #     `shadow.pinned_inputs` would not import, or the manifest/version
+        #     lookup raised. NOT the ordinary "no replay is running" case,
+        #     which `pin_for` answers as an `unpinned` Pin without raising.
+        # (b) The primary deliverable survives: the universe is still read,
+        #     from the CURRENT object, which is exactly what production does.
+        # (c) Recording surface: this WARNING line, in the collector's own log
+        #     and its CloudWatch group. It is at WARNING and not debug on
+        #     purpose — inside a shadow replay this means the run silently went
+        #     back to reading today's inputs, which is the defect
+        #     `alpha-engine-config-I11216` exists to remove, and the parity
+        #     report would then show membership diffs with no stated cause.
+        logger.warning(
+            "[metron_market_data] input pinning unavailable for %s (%s) — reading the "
+            "CURRENT object. Harmless in production; inside a shadow replay this means "
+            "the run is reading today's inputs rather than the replayed day's "
+            "(alpha-engine-config-I11216).",
+            key, exc,
+        )
+    try:
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+        if pin is not None and pin.is_pinned:
+            kwargs["VersionId"] = pin.version_id
+            logger.info(
+                "[metron_market_data] %s pinned to version %s (%s: %s)",
+                key, pin.version_id, pin.basis, pin.detail,
+            )
+        obj = s3_client.get_object(**kwargs)
         data = json.loads(obj["Body"].read())
         return [
             {"yf_symbol": str(h["yf_symbol"]).strip(), "currency": str(h.get("currency", "USD")).strip()}
