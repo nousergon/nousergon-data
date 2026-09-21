@@ -23,7 +23,7 @@ import importlib.util
 import io
 import json
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -202,6 +202,34 @@ def test_d37_writes_one_manifest_per_tick_with_both_declared_keys(sink, metron, 
         ("market_data/intraday/latest.json", 13),
         ("market_data/intraday/technical_ratings.json", 6),
     }
+
+
+def test_d37_default_trading_day_uses_session_date_not_last_closed(sink, metron, monkeypatch):
+    """No ``--date`` (the real systemd-timer invocation): the manifest must key
+    on the session `now` falls WITHIN, never the last one that has fully
+    closed — `alpha-engine-config-I10810`, measured live: D37's manifests
+    written all day Monday 2026-09-21 carried ``trading_day: "2026-09-18"``
+    (three sessions stale) because ``default_run_date()`` resolves the
+    as-of/knowledge axis (``last_closed_trading_day``), which doesn't advance
+    to Monday until Monday's own 16:00 ET close. ``default_session_date()``
+    (``nousergon_lib.dates.session_date()``) resolves the event-time axis
+    instead, so a mid-session Monday tick keys under Monday."""
+    import nousergon_lib.dates as lib_dates
+
+    monkeypatch.setattr(sys, "argv", ["metron_market_data"])
+    monkeypatch.setattr(metron, "collect_intraday", lambda **kw: {  # noqa: ARG005
+        "status": "ok", "universe": 3, "quotes": 3, "indices": 1, "fund_proxies": 0, "ratings": 3,
+    })
+    # The as-of axis (last CLOSED session) is stuck on Friday; the event-time
+    # axis (the session `now` falls within) is Monday itself.
+    monkeypatch.setattr(lib_dates, "last_closed_trading_day", lambda *_a, **_kw: date(2026, 9, 18))
+    monkeypatch.setattr(lib_dates, "session_date", lambda *_a, **_kw: date(2026, 9, 21))
+
+    assert metron.main(["--only-intraday"]) == 0
+
+    manifest = sink.only
+    assert sink.only_key.startswith("data_collection/runs/D37/2026-09-21/")
+    assert manifest["trading_day"] == "2026-09-21"
 
 
 def test_d37_off_session_tick_is_recorded_as_not_applicable(sink, metron, monkeypatch):
