@@ -94,6 +94,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_run_manifest.v1` record (that shape is `collectors/`'s, owned by
     # alpha-engine-config-I10941/I10942/I10939), so no new registry row.
     "data_gate/producers/_run_record.py": 1,
+    # alpha-engine-config-I10788 — the third phase-exit-metrics.yml producer,
+    # scheduled as its `cost_monthly` job: one metric-document PUT,
+    # data_collection/metrics/cost/monthly/latest.json (plus the shared
+    # _run_record.py PUT above, already counted there). GRANDFATHERED in
+    # alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml
+    # (`data_collection/metrics/cost/monthly/`), not REGISTERED like its two
+    # siblings, because no CUR/Data Export exists in the account yet
+    # (alpha-engine-config-I11272) — re-evaluate for a REGISTERED row once
+    # that lands and a scheduled run first writes the key.
+    "data_gate/producers/cost_monthly.py": 1,
     # alpha-engine-config-I10780 (data-collector plan P-13) — the EOD-spine
     # cardinality guard's single daily reading,
     # s3://alpha-engine-research/data_collection/metrics/eod_completeness/{trading_day}.json
