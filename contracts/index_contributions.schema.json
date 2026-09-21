@@ -2,59 +2,108 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/index_contributions.schema.json",
   "title": "Per-constituent index contribution (market_data/index_contributions/{index}/{date}.json, v1)",
-  "description": "Producer: collectors/index_contributions.py::collect (alpha-engine-config-I11297). Joins per-constituent index weight (collectors/constituents.py for SPX, market_data/index_constituents/NDX.json for NDX) with per-name daily returns from the ArcticDB universe library, so a consumer can explain an index's daily move by name. Consumer: metron (api/services/benchmark_gap.py, metron-ops-I346), which reads latest.json to decompose the holdings-vs-benchmark return gap. Carries an explicit payload schema_version, unlike the older constituents.json contract.",
+  "description": "Producer: collectors/index_contributions.py::collect (alpha-engine-config-I11297). Joins per-constituent index weight (collectors/constituents.py for SPX, market_data/index_constituents/NDX.json for NDX) with per-name daily returns from the ArcticDB universe library, so a consumer can explain an index's daily move by name. Consumer: metron (api/services/benchmark_gap.py, metron-ops-I346), which reads latest.json to decompose the holdings-vs-benchmark return gap. Carries an explicit payload schema_version, unlike the older constituents.json contract. UNITS, stated because a consumer already reverse-engineered the wrong convention from an inconsistent worked example: `weight_prior_close` is the ONLY fraction in this artifact. `return_pct` and `index_return_pct` are PERCENT (28.8 means +28.8%). `contribution_pp`, `explained_pp` and `residual_pp` are PERCENTAGE POINTS. Percent and percentage points are the same numeric scale, so EVERY field except `weight_prior_close` divides by 100 to become a fraction -- there is no mixed convention. The identity is `weight_prior_close x return_pct = contribution_pp`: 0.0121 x 28.8 = 0.348.",
   "x-key-pattern": "market_data/index_contributions/{index}/{date}.json",
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "schema_version", "index", "proxy_symbol", "as_of", "prior_close_date",
-    "index_return_pct", "weight_method", "residual_pp", "explained_pp",
-    "coverage", "members_missing_return", "constituents", "fetched_at"
+    "schema_version",
+    "index",
+    "proxy_symbol",
+    "as_of",
+    "prior_close_date",
+    "index_return_pct",
+    "weight_method",
+    "residual_pp",
+    "explained_pp",
+    "coverage",
+    "members_missing_return",
+    "constituents",
+    "fetched_at"
   ],
   "properties": {
-    "schema_version": {"type": "integer", "minimum": 1},
-    "index": {"type": "string", "enum": ["SPX", "NDX"]},
-    "index_label": {"type": "string", "minLength": 1},
+    "schema_version": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "index": {
+      "type": "string",
+      "enum": [
+        "SPX",
+        "NDX"
+      ]
+    },
+    "index_label": {
+      "type": "string",
+      "minLength": 1
+    },
     "proxy_symbol": {
       "type": "string",
       "minLength": 1,
       "description": "The TRADEABLE ETF proxy whose close-to-close move `index_return_pct` is. The index values ^GSPC/^IXIC/^NDX/^RUT carry a separate index licence, which is why the fleet carries proxies; this field travels with the number so a consumer cannot misattribute the proxy's move to the index itself."
     },
-    "as_of": {"type": "string", "format": "date"},
+    "as_of": {
+      "type": "string",
+      "format": "date"
+    },
     "prior_close_date": {
       "type": "string",
       "format": "date",
       "description": "The previous TRADING day, read off the proxy's own observed series rather than a calendar. Contribution to the move is prior-close weight times the return between these two dates, so a consumer that recomputes must use this pair and not infer one."
     },
-    "index_return_pct": {"type": "number"},
+    "index_return_pct": {
+      "type": "number",
+      "description": "The proxy's close-to-close move in PERCENT (2.0 means +2.0%), not a fraction."
+    },
     "weight_method": {
       "type": "string",
       "description": "Weight provenance carried unchanged from the weight producer. The Nasdaq-100 weights read 'modified_cap_approx' until a licensed feed lands; an approximation that does not travel with its data gets absorbed as fact, so a consumer must render this rather than infer it."
     },
-    "weights_as_of": {"type": ["string", "null"]},
+    "weights_as_of": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
     "residual_pp": {
       "type": "number",
       "description": "index_return_pct minus explained_pp, NAMED rather than hidden in rounding. The sum never ties exactly: cash and futures rows carry index weight the equity roster cannot account for, members with no return sit here, and approximate weights contribute error. A consumer reconciling against this artifact needs the gap stated."
     },
-    "explained_pp": {"type": "number"},
+    "explained_pp": {
+      "type": "number",
+      "description": "Sum of contribution_pp, in PERCENTAGE POINTS."
+    },
     "coverage": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["weight_with_return", "members", "members_missing_return"],
+      "required": [
+        "weight_with_return",
+        "members",
+        "members_missing_return"
+      ],
       "properties": {
         "weight_with_return": {
           "type": "number",
           "minimum": 0,
           "maximum": 1,
-          "description": "Fraction of index weight for which a return was actually available. The producer refuses to publish below its coverage floor, so a consumer can trust this is above it — but must still render it, because a component emitting nothing is not healthy and neither is one whose coverage silently slipped."
+          "description": "Fraction of index weight for which a return was actually available. The producer refuses to publish below its coverage floor, so a consumer can trust this is above it \u2014 but must still render it, because a component emitting nothing is not healthy and neither is one whose coverage silently slipped."
         },
-        "members": {"type": "integer", "minimum": 0},
-        "members_missing_return": {"type": "integer", "minimum": 0}
+        "members": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "members_missing_return": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     },
     "members_missing_return": {
       "type": "array",
-      "items": {"type": "string", "minLength": 1},
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
       "description": "Members whose return was unavailable for this session. They are NOT given a zero contribution -- their weight falls into residual_pp, where it stays visible."
     },
     "constituents": {
@@ -62,12 +111,31 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["symbol", "weight_prior_close", "return_pct", "contribution_pp"],
+        "required": [
+          "symbol",
+          "weight_prior_close",
+          "return_pct",
+          "contribution_pp"
+        ],
         "properties": {
-          "symbol": {"type": "string", "minLength": 1},
-          "weight_prior_close": {"type": "number", "minimum": 0, "maximum": 1},
-          "return_pct": {"type": "number"},
-          "contribution_pp": {"type": "number"}
+          "symbol": {
+            "type": "string",
+            "minLength": 1
+          },
+          "weight_prior_close": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 1,
+            "description": "Index weight at the PRIOR close, as a FRACTION in [0,1]. The only fraction in this artifact."
+          },
+          "return_pct": {
+            "type": "number",
+            "description": "The constituent's close-to-close move in PERCENT (28.8 means +28.8%), not a fraction. Divide by 100 for a fraction-domain return."
+          },
+          "contribution_pp": {
+            "type": "number",
+            "description": "weight_prior_close x return_pct, in PERCENTAGE POINTS. Divide by 100 for the fraction-domain contribution the shared attribution library works in."
+          }
         }
       }
     },

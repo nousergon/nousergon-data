@@ -274,3 +274,47 @@ def test_publish_writes_dated_and_latest_for_each_index() -> None:
     latest = json.loads(written["market_data/index_contributions/SPX/latest.json"])
     assert dated == latest
     assert dated["schema_version"] == ic.SCHEMA_VERSION
+
+
+def test_the_units_identity_holds_exactly() -> None:
+    """`weight_prior_close x return_pct = contribution_pp`, asserted as an
+    IDENTITY rather than a remembered scale.
+
+    This test exists because a downstream consumer reverse-engineered the wrong
+    convention from an inconsistent worked example in the issue body and
+    concluded `return_pct` was already a fraction. It is PERCENT. Every field
+    here except `weight_prior_close` is on the 100-scale, so a consumer divides
+    all of them by 100 and none of them selectively.
+
+    A test that encodes the same misreading as the code passes while both are
+    wrong, which is exactly what happened on the consumer side — so this asserts
+    the relationship between the fields, not the magnitude of any one of them.
+    """
+    payload = ic.compute_contributions(
+        ic.IndexSpec(index="NDX", label="Nasdaq 100", proxy_symbol="QQQ"),
+        _weights({"APP": 0.0121, "REST": 0.9879}, method="modified_cap_approx"),
+        {
+            # +28.8% on the day.
+            "APP": [("2026-09-21", 128.8), ("2026-09-18", 100.0)],
+            "REST": [("2026-09-21", 101.0), ("2026-09-18", 100.0)],
+        },
+        [("2026-09-21", 101.3), ("2026-09-18", 100.0)],
+    )
+    app = next(c for c in payload["constituents"] if c["symbol"] == "APP")
+
+    assert app["weight_prior_close"] == pytest.approx(0.0121)
+    assert app["return_pct"] == pytest.approx(28.8)
+    assert app["contribution_pp"] == pytest.approx(0.34848)
+
+    # The identity, for every constituent, not just the interesting one.
+    for c in payload["constituents"]:
+        assert c["contribution_pp"] == pytest.approx(
+            c["weight_prior_close"] * c["return_pct"]
+        )
+
+    # And the fraction-domain value a consumer must reach is contribution_pp/100,
+    # which equals weight x (return_pct/100) — the same divide-by-100 applied to
+    # both fields, never to one of them.
+    assert app["contribution_pp"] / 100.0 == pytest.approx(
+        app["weight_prior_close"] * (app["return_pct"] / 100.0)
+    )
