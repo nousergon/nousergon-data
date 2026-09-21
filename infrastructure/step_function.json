@@ -7095,7 +7095,7 @@
         }
       ],
       "ResultPath": "$.director_result",
-      "Next": "DirectorComplete"
+      "Next": "CheckDirectorSubResults"
     },
     "CheckSkipAggregateCosts": {
       "Type": "Choice",
@@ -7462,6 +7462,20 @@
             }
           ],
           "Comment": "alpha-engine-config-I7194. The sixth flag family, and the second one folded into the generic combined notifier rather than given a per-combination Task of its own \u2014 the generalization config#2276's comment predicted and config#6722 already applied to research_predictor_degraded. LAST in the list on purpose, for the same reason the scanner-leaderboard rule above it is: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification. This rule exists so a run whose ONLY degradation is the cost aggregation cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun \u2014 which is what it would have done from the top level, where the branch-local $.research_degraded_local hoist that used to carry it does not reach.",
+          "Next": "NormalizeMultipleDegradedContext"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.director_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I11299. The SEVENTH flag family, folded into the generic combined notifier on exactly the reasoning the sixth was. Set ONLY by DirectorSubStatusDegraded, from the Director's own enclosing status \u2014 sf-pipeline-policy.md \u00a72.3b: a stage that returns named sub-results returns a status no better than the worst of them. LAST in the list on purpose, for the same reason the two rules above it are: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf, a Branch A fail-open or the cost aggregation matches one of those rules and gets that (more consequential) notification, while PublishDirectorSubStatusDegraded has already named this one. Not floored in InitializeInput, matching $.scanner_leaderboard_degraded and $.aggregate_costs_degraded: no Parameters block dereferences it, so the IsPresent guard (config#2275) is the whole contract.",
           "Next": "NormalizeMultipleDegradedContext"
         }
       ],
@@ -8836,9 +8850,48 @@
       ],
       "Next": "CheckDegradedOutcome"
     },
+    "CheckDirectorSubResults": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I11299 (sf-pipeline-policy.md \u00a72.3b, clause SFP-2.3b-stage-status-is-the-worst-substatus). The Director returns ONE enclosing status over four independently-statused legs \u2014 retro, director_loop, director_issues, deploy_success \u2014 and every \u00a72.3 mechanism in this definition (the Catch above, the Mark*Degraded states, the completion marker) reads only the enclosing one. MEASURED on three of the four 2026-09-19 executions that entered Director \u2014 the scheduled run (3c2fe2f8-\u2026_d0e3eae8-\u2026) and watch-rerun-2026-09-18-1 and -3, the last two terminating ExecutionSucceeded with degraded_summary.degraded false: status 'ok' over retro 'error', a self-grading REFUSAL by the retro judge (its own root cause is alpha-engine-config-I8202, registry invariant 15 comparing entry ids rather than served models \u2014 a SEPARATE fix, and neither substitutes for the other). No RetroGrade was published for at least two consecutive weekly cycles with nothing anywhere going red \u2014 alpha-engine-config-I10169 one stage over. crucible-evaluator director/substatus.py now demotes the enclosing status to 'degraded' when any leg errors or reports a word in neither vocabulary; this Choice is the consumer that makes it visible to the state machine. IsPresent-guarded per config#2275, and $.director_result is written by the IMMEDIATE predecessor's ResultPath, which is the one-hop floor tests/test_sf_choice_guards.py traces. A Director that ran on an OLDER image still returns 'ok' and takes the Default \u2014 the edge is inert rather than broken, so the two repos may land in either order. 'disabled', 'dry_run' and every other status likewise take the Default: this rule fires on exactly one string.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.director_result.Payload.status",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.director_result.Payload.status",
+              "StringEquals": "degraded"
+            }
+          ],
+          "Next": "DirectorSubStatusDegraded"
+        }
+      ],
+      "Default": "DirectorComplete"
+    },
+    "DirectorSubStatusDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11299: the SF-controlled visible flag CheckGateDegradedNotify reads, set BEFORE the summary so the flag is on the execution record whatever happens downstream. Shape mirrors MarkAggregateCostsDegraded / ScannerLeaderboardDegraded / ReportCardDegraded exactly.",
+      "Result": true,
+      "ResultPath": "$.director_degraded",
+      "Next": "SetDirectorSubStatusDegradedSummary"
+    },
+    "SetDirectorSubStatusDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11299: mirrors SetAggregateCostsDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 the single chokepoint that state's own Comment names, which a fail-open route added later inherits by writing this path and touching nothing there. So a weekly cycle that published no RetroGrade now terminates DegradedRun (Option-A, alpha-engine-config#2699 ported by I6891) instead of ExecutionSucceeded with degraded false. Deliberately carries NO stage_error: the sibling convention is uniform and this setter is reached from a CHOICE, which writes no $.<stage>_error, so an unguarded stage_error.$ would throw States.Runtime here \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. Continuation is DirectorComplete, the same edge the clean path takes, so this changes what the run SAYS, never where it goes. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a summary payload. | alpha-engine-config-I10540: reasons.$ ACCUMULATES a family-keyed entry via States.JsonMerge instead of last-write-wins whole-object replacement; $.degraded_summary.reasons is floored to {} in InitializeInput so the first setter on any execution never merges onto a missing path.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_director_substatus_degraded",
+        "run_date.$": "$.run_date",
+        "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"director\":\"weekly_director_substatus_degraded\"}'), false)"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "DirectorComplete"
+    },
     "DirectorComplete": {
       "Type": "Pass",
-      "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
+      "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY on Director's success edge \u2014 alpha-engine-config-I11299 inserted CheckDirectorSubResults between the two, so this state is now reached by two routes (clean, and via the \u00a72.3b degraded fold), but BOTH descend from that one edge and neither is reachable from a bypass or from the Catch, which is the property the witness asserts. A Director whose stage status is degraded still COMPLETED: the rerun deriver must not re-run a stage that wrote its plan, and the honest terminal is CheckDegradedOutcome's job, not this one's.",
       "Next": "CheckSkipScannerLeaderboard"
     },
     "BacktesterLivenessGate": {

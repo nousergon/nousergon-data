@@ -252,7 +252,11 @@ class TestFailureIsolation:
         assert _through_normalizers(
             states, matching[0]["Next"]
         ) == "NotifyCompleteMultipleDegraded"
-        assert gate["Choices"][-1] is matching[0]
+        # alpha-engine-config-I11299 registered a SEVENTH family
+        # ($.director_degraded) after this one, also LAST-on-purpose. What
+        # this test pins is that nothing MORE consequential sits below the
+        # cost-aggregation rule, not the literal final index.
+        assert gate["Choices"].index(matching[0]) >= len(gate["Choices"]) - 2
         assert gate["Default"] == "NotifyComplete"
         # The notifier's constant Message must name the flag it now covers —
         # config#1819 forbids formatting the live set into the text, so the

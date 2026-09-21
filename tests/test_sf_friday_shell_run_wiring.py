@@ -1134,7 +1134,12 @@ class TestConsolidatedNotify:
         assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["CheckSkipDirector"]["Default"] == "Director"
         director = states["Director"]
-        assert director["Next"] == "DirectorComplete"
+        # alpha-engine-config-I11299: Director's success edge now passes through
+        # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
+        # whose degraded branch converges on it too. The witness property is
+        # unchanged: every route here descends from that ONE success edge.
+        assert director["Next"] == "CheckDirectorSubResults"
+        assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
         assert all(c["ResultPath"] == "$.error" for c in director["Catch"])

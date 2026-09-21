@@ -287,6 +287,13 @@ _DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
             # family — also read LAST, folded into the generic combined
             # notifier rather than given a per-combination Task of its own.
             "$.aggregate_costs_degraded",
+            # alpha-engine-config-I11299: the Director's own enclosing
+            # status, demoted to "degraded" by crucible-evaluator
+            # director/substatus.py when a named sub-result errors
+            # (sf-pipeline-policy.md §2.3b). Read LAST for the same reason
+            # the two above it are, and folded into the generic combined
+            # notifier rather than given a per-combination Task.
+            "$.director_degraded",
         }
     ),
     "step_function_daily.json": frozenset({"$.degraded_summary"}),

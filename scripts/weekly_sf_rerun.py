@@ -722,7 +722,17 @@ STAGES: tuple[Stage, ...] = (
         # → FailExecution) — no witness is entered, so the stage re-runs.
         # PublishDirectorDegraded is RETAINED for pre-fix execution
         # histories only; new executions never enter it.
-        degraded_witness=frozenset({"PublishDirectorDegraded"}),
+        # alpha-engine-config-I11299: DirectorSubStatusDegraded is the §2.3b
+        # fold — the stage SUCCEEDED and wrote its plan while one of its
+        # named legs errored. It is a degraded witness, not a re-run
+        # trigger: DirectorComplete is still entered on that route, so the
+        # deriver reads the stage as complete. Listed so the lockstep test
+        # sees every *Degraded state on the Director path, which is what
+        # stops a future fold from silently meaning "re-run the advisory".
+        degraded_witness=frozenset({
+            "PublishDirectorDegraded", "DirectorSubStatusDegraded",
+            "SetDirectorSubStatusDegradedSummary",
+        }),
     ),
     Stage(
         "scanner_leaderboard", "skip_scanner_leaderboard",
