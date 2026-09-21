@@ -45,9 +45,14 @@ PAUSE_MANIFEST = INFRA / "automation_pause.json"
 
 STACK_NAME = "nousergon-data-collection"
 DEFINITION_PREFIX = "infrastructure/nousergon-data-collection/"
-STATE_PARAMETERS = ("CollectionState", "DailyHealState")
+STATE_PARAMETERS = ("CollectionState", "DailyHealState", "ShadowSamedayState")
 MARKET_TZ = "America/New_York"
-INPUT_FIELDS = {"collection", "workloads", "require_trading_day", "verify_units"}
+STATE_MACHINE_INPUT_FIELDS = {"collection", "workloads", "require_trading_day", "verify_units"}
+# alpha-engine-config-I11233: ShadowSamedaySchedule targets the dispatcher
+# Lambda directly rather than a state machine, so its Input is the
+# dispatcher's own direct-invoke contract, not the collection/workloads/
+# verify_units shape every state-machine-targeting schedule uses.
+LAMBDA_INPUT_FIELDS = {"workload"}
 UNITS_DIR = REPO_ROOT / "registry.d" / "units"
 COMPLETE = {"CREATE_COMPLETE", "UPDATE_COMPLETE"}
 _ACCOUNT_LITERAL = re.compile(r"(?<!\d)\d{12}(?!\d)")
@@ -112,6 +117,8 @@ def schedules(tpl: dict) -> list[dict]:
         )
         state = p["State"]
         state_param = state["Ref"] if isinstance(state, dict) else None
+        target_arn = p["Target"].get("Arn") or {}
+        target_ref = target_arn.get("Ref") if isinstance(target_arn, dict) else None
         out.append(
             {
                 "logical_id": logical,
@@ -123,7 +130,14 @@ def schedules(tpl: dict) -> list[dict]:
                 "expression": p["ScheduleExpression"],
                 "timezone": p.get("ScheduleExpressionTimezone"),
                 "flexible_mode": p.get("FlexibleTimeWindow", {}).get("Mode"),
-                "target_ref": (p["Target"].get("Arn") or {}).get("Ref"),
+                "target_ref": target_ref,
+                # A schedule either Refs a state machine in this stack (Arn:
+                # {Ref: <logical id>}) or Subs the dispatcher Lambda's ARN
+                # directly (Arn: {Fn::Sub: "...function:${DispatcherFunctionName}"}).
+                # target_ref is None for the latter, which is what distinguishes
+                # them — alpha-engine-config-I11233 is the first of the second kind.
+                "target_kind": "state_machine" if target_ref else "lambda",
+                "target_arn_raw": target_arn,
                 "input": json.loads(p["Target"]["Input"]),
             }
         )
@@ -259,10 +273,31 @@ def lint() -> list[str]:
             problems.append(f"{where}: ScheduleExpressionTimezone must be {MARKET_TZ}")
         if s["flexible_mode"] != "OFF":
             problems.append(f"{where}: FlexibleTimeWindow must be OFF")
+        if s["target_kind"] == "lambda":
+            # alpha-engine-config-I11233: invokes the dispatcher directly, so
+            # there is no state machine to check membership against and no
+            # collection/workloads/verify_units contract to hold it to — its
+            # own {"workload": ...} contract is checked below instead.
+            raw = s["target_arn_raw"]
+            sub = raw.get("Fn::Sub") if isinstance(raw, dict) else None
+            if not sub or "${DispatcherFunctionName}" not in sub:
+                problems.append(
+                    f"{where}: lambda-target schedule does not Sub ${{DispatcherFunctionName}}"
+                )
+            if set(s["input"]) != LAMBDA_INPUT_FIELDS:
+                problems.append(
+                    f"{where}: Input fields {sorted(s['input'])} != {sorted(LAMBDA_INPUT_FIELDS)}"
+                )
+            workload = s["input"].get("workload")
+            if workload not in workloads:
+                problems.append(f"{where}: workload {workload!r} not in the dispatcher's _WORKLOADS")
+            continue
         if s["target_ref"] not in machines:
             problems.append(f"{where}: target is not a state machine in this stack")
-        if set(s["input"]) != INPUT_FIELDS:
-            problems.append(f"{where}: Input fields {sorted(s['input'])} != {sorted(INPUT_FIELDS)}")
+        if set(s["input"]) != STATE_MACHINE_INPUT_FIELDS:
+            problems.append(
+                f"{where}: Input fields {sorted(s['input'])} != {sorted(STATE_MACHINE_INPUT_FIELDS)}"
+            )
         unknown = [w for w in s["input"].get("workloads", []) if w not in workloads]
         if unknown or not s["input"].get("workloads"):
             problems.append(f"{where}: workloads {unknown or '[]'} not in the dispatcher's _WORKLOADS")
