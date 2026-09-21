@@ -15,6 +15,9 @@ import pytest
 import sf_preflight as sfp
 
 
+from collectors import constituents
+
+
 def _ctx(bucket: str = "test-bucket") -> sfp.PreflightContext:
     return sfp.PreflightContext(
         bucket=bucket,
@@ -36,11 +39,14 @@ def test_constituents_fetch_ok_populates_context():
         {},  # sub_industry_map
         500,  # sp500_count
         400,  # sp400_count
+        constituents.SsgaWeights(),  # weights (I11295)
     )
     # Actually use realistic-shape data: deduped tickers + complete sector_map.
     real_tickers = [f"T{i}" for i in range(900)]
     real_sectors = {t: "Industrials" for t in real_tickers}
-    fake_return = (real_tickers, real_sectors, {}, {}, 500, 400)
+    fake_return = (
+        real_tickers, real_sectors, {}, {}, 500, 400, constituents.SsgaWeights()
+    )
 
     with patch("collectors.constituents._fetch_constituents", return_value=fake_return):
         result = sfp.check_constituents_fetch(ctx)
@@ -51,7 +57,7 @@ def test_constituents_fetch_ok_populates_context():
 
 def test_constituents_fetch_fails_on_zero_tickers():
     ctx = _ctx()
-    with patch("collectors.constituents._fetch_constituents", return_value=([], {}, {}, {}, 0, 0)):
+    with patch("collectors.constituents._fetch_constituents", return_value=([], {}, {}, {}, 0, 0, constituents.SsgaWeights())):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
     assert "0 tickers" in result.message
@@ -65,7 +71,9 @@ def test_constituents_fetch_fails_on_unmapped_tickers():
     # Sector map is missing 50 tickers — collect() would hard-fail at write time.
     sectors = {t: "Industrials" for t in tickers[:850]}
     with patch("collectors.constituents._fetch_constituents",
-               return_value=(tickers, sectors, {}, {}, 500, 400)):
+               return_value=(
+                   tickers, sectors, {}, {}, 500, 400, constituents.SsgaWeights()
+               )):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
     assert "sector_map missing" in result.message
@@ -77,7 +85,10 @@ def test_constituents_fetch_fails_on_sp500_count_drift():
     tickers = [f"T{i}" for i in range(400)]
     with patch(
         "collectors.constituents._fetch_constituents",
-        return_value=(tickers, {t: "Industrials" for t in tickers}, {}, {}, 0, 400),
+        return_value=(
+            tickers, {t: "Industrials" for t in tickers}, {}, {}, 0, 400,
+            constituents.SsgaWeights(),
+        ),
     ):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
