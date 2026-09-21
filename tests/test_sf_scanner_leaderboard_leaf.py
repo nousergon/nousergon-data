@@ -48,7 +48,12 @@ def test_the_leaf_runs_after_report_card_and_director(states):
     a state wired anywhere."""
     assert states["ReportCard"]["Next"] == "CheckSkipDirector"
     assert states["CheckSkipDirector"]["Default"] == "Director"
-    assert states["Director"]["Next"] == "DirectorComplete"
+    # alpha-engine-config-I11299: Director's success edge now passes through
+    # CheckDirectorSubResults (§2.3b); both of its routes converge on
+    # DirectorComplete, so the ordering this test pins is unchanged.
+    assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+    assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
+    assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
     # Every edge that previously ended the advisory tail now enters the gate.
     assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
     assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
@@ -204,11 +209,15 @@ def test_the_terminal_notify_can_never_call_a_degraded_leaf_a_success(states):
     # appended one further rule after this one — $.aggregate_costs_degraded,
     # the tail's sixth and least consequential family — so the property this
     # pins is "after every more consequential family", not "physically last".
-    assert gate["Choices"].index(matching[0]) == len(gate["Choices"]) - 2
-    assert any(
-        cond.get("Variable") == "$.aggregate_costs_degraded"
-        for cond in (gate["Choices"][-1].get("And") or [gate["Choices"][-1]])
-    )
+    # alpha-engine-config-I11299 registered a SEVENTH family after the cost
+    # aggregation one, so the leaf rule is now third from last.
+    assert gate["Choices"].index(matching[0]) == len(gate["Choices"]) - 3
+    tail_vars = {
+        cond.get("Variable")
+        for rule in gate["Choices"][-2:]
+        for cond in (rule.get("And") or [rule])
+    }
+    assert tail_vars == {"$.aggregate_costs_degraded", "$.director_degraded"}
     assert gate["Default"] == "NotifyComplete"
     assert states["NotifyCompleteScannerLeaderboardDegraded"]["Next"] == "CheckDegradedOutcome"
 

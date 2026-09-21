@@ -1281,6 +1281,25 @@ alert_classes:
       observability surface, not a lifecycle notice like the info case above.
 
   # ── data plane (nousergon-data) ──
+  - class: weekly_cost_coverage_gap
+    # alpha-engine-config-I11298, Brian ruling 2026-09-21 ("proceed with rec
+    # b"): a cost fan-in coverage gap no longer FAILS the weekly run, so this
+    # notice is what carries it to a reader. Emitted by the
+    # PublishCostCoverageGap state on the CostCoverageError Catch of
+    # AggregateCosts.
+    source: "nousergon-data/infrastructure/step_function.json::PublishCostCoverageGap"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED tracked-only (observability-policy.md §7.2): a page is for what
+    # is actionable NOW and cannot wait for the next time Brian looks at the
+    # console. A cost-attribution gap is accounting — it feeds no report card,
+    # no champion promotion and no signal set (§3's fail-hard test) — so it
+    # goes to the surface, never to a page. §7.4 remediation path: the drain
+    # files/updates the owning issue for the named missing producer; the
+    # standing owner for a gap on the director-plan callsite is
+    # alpha-engine-config-I11298.
+    tier: tracked-only
   - class: data_constituents_drift
     source: "alpha-engine-data/validators/constituents_drift_check.py"
     severities: [dynamic]

@@ -23,7 +23,7 @@ name: cost-gate
 #
 # The gate is installed from nousergon-lib in ITS OWN step, pinned to the
 # v0.124.142 tag with --no-deps, deliberately isolated from this repo's
-# requirements.txt pin (v0.124.139, held in cross-repo lockstep by
+# requirements.txt pin (v0.124.149, held in cross-repo lockstep by
 # tests/test_lib_pin_lockstep.py and per-Lambda CI guards) — bumping that
 # pin is a separate, guarded change and not part of this PR.
 #

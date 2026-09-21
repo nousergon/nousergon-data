@@ -7,7 +7,7 @@
       "Type": "Pass",
       "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer. | 2026-08-20 (alpha-engine-config-I7812): the floor also seeds scanner_resource_kill=false, for the same two reasons the I7282 degraded families are seeded here. (a) HAZARD: BranchAComplete/BranchAFailed hoist it via Parameters.$, which throws States.Runtime on any path that never set it \u2014 and it is set only by ScannerResourceKill, i.e. only on a Scanner resource kill. (b) BOTH POLARITIES (sf-pipeline-policy.md \u00a72.3a rule 3): a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: the one Choice that reads it (CheckScannerResourceKillReason) is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected. | 2026-08-27 (alpha-engine-config-I8809, Brian ruling: dual-write): the floor now stamps THREE date fields, not one. $.calendar_date is date($$.Execution.StartTime) and NEVER changes - it is the execution's own wall-clock day, the right key for anything asking 'when did this fire' (the run-day gate, the mutex slot, an artifact-LastModified freshness comparison). $.run_date starts EQUAL to it and is OVERWRITTEN by NormalizeRunDates with the cycle's TRADING day; it is the right key for anything asking 'which cycle is this' (every artifact prefix, every stage-coverage verdict). $.run_date_family names which of the two $.run_date currently holds, seeded 'calendar_date' here and set to 'trading_day' by NormalizeRunDates - BOTH POLARITIES (sf-pipeline-policy.md 2.3a rule 3): a field that appears only on the normalized path cannot be distinguished from a normalizer that broke. WHY: one weekly cycle was written across TWO S3 partitions - MEASURED on 2026-08-22, 28 _stage_coverage verdicts under 2026-08-21 and 11 under 2026-08-22, same cycle - because this state stamped the CALENDAR date and each consumer then decided for itself whether to normalize. crucible-backtester/infrastructure/_spot_common.sh normalizes; the nousergon-data launchers thread the un-normalized EXECUTION_RUN_DATE (config-I8155). weekly-coverage-sweep reads ONE partition, so its first production firing (2026-08-29) would have reported 28 stages absent. | alpha-engine-config-I11073: the floor seeds research_predictor_degraded_routes={\"routes\":[]} so the ReportCard and Director JSONPaths resolve on EVERY path, including the ones that never enter ResearchPredictorParallel. Nested under a `routes` key because a Pass state's Parameters template must be a JSON object, so SetResearchPredictorDegradedRoutes cannot write a bare array; the payload unwraps it at the contract boundary. | alpha-engine-config-I11106: the floor also seeds model_zoo_unservable=false. Written true ONLY by ModelZooUnservableDeclared (inside ResearchPredictorParallel branch B, on a Success poll whose StandardOutputContent carries the MODEL_ZOO_SELECT_OUTCOME v1 declared-unservable marker) and folded to top scope by SetModelZooUnservable. Deliberately independent of research_predictor_degraded/degraded_summary (sf-pipeline-policy.md \u00a72.3a): the arena correctly refusing to promote is a VERDICT, not a stage failure, and must render as a clean completion. BOTH POLARITIES: seeded here so WriteCompletionMarker/WriteCompletionMarkerDegraded can read it on every path, not only the declared-unservable one.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"parity_verdict_unknown\":false,\"research_predictor_degraded\":false,\"research_predictor_degraded_routes\":{\"routes\":[]},\"model_zoo_unservable\":false,\"scanner_resource_kill\":false,\"weekly_preflight_blind_spot\":{\"present\":false,\"required_skip_count\":0,\"required_skip_names\":[]},\"degraded_summary\":{\"degraded\":false,\"reasons\":{},\"run_date\":null},\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"parity_verdict_unknown\":false,\"research_predictor_degraded\":false,\"research_predictor_degraded_routes\":{\"routes\":[]},\"model_zoo_unservable\":false,\"director_retro_refused\":false,\"cost_coverage_gap\":false,\"scanner_resource_kill\":false,\"weekly_preflight_blind_spot\":{\"present\":false,\"required_skip_count\":0,\"required_skip_names\":[]},\"degraded_summary\":{\"degraded\":false,\"reasons\":{},\"run_date\":null},\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -7095,7 +7095,7 @@
         }
       ],
       "ResultPath": "$.director_result",
-      "Next": "DirectorComplete"
+      "Next": "CheckDirectorRetroRefused"
     },
     "CheckSkipAggregateCosts": {
       "Type": "Choice",
@@ -7169,6 +7169,14 @@
       "Catch": [
         {
           "ErrorEquals": [
+            "CostCoverageError"
+          ],
+          "Comment": "BRIAN RULING 2026-09-21 (recorded on alpha-engine-config-I11298), his words: \"proceed with rec b\". (b) as it was put to him: when AggregateCosts finds a cost-coverage gap, the weekly run ends SUCCEEDED with a named cost_coverage_gap sub-status and its own lower-severity alert; cost attribution is accounting and does not feed the report card, the champion promotion or the signal set, which is what sf-pipeline-policy.md \u00a73's fail-hard test covers. What it trades, as stated to him: a cost gap no longer forces attention by failing the run, so the separate alert has to do that job. MEASURED motivation: the 2026-09-19 SCHEDULED execution raised exactly this error at 19,450s of a 19,451s run and 5h24m of completed work was recorded as a failed weekly cycle (alpha-engine-config-I11298). ORDERED FIRST and narrowed to this ONE error name on purpose \u2014 the error string is what the live history reports (TaskFailed event 7718: error \"CostCoverageError\"), and widening it would let a BROKEN AGGREGATOR masquerade as a coverage gap. Everything else \u2014 an ordinary Lambda fault, a timeout, a malformed result, CostCoverageUnmeasured (which cost_coverage.py keeps deliberately distinct as a fault in the CHECK, not a finding about the pipeline) and CostCaptureStaleError \u2014 falls to the States.ALL Catch below and still terminates DegradedRun. That split is \u00a72.3a rule 2: a missing verdict propagates as UNKNOWN, never as pass, so a check that could not run may not take the clean terminal a check that ran and found something does.",
+          "Next": "MarkCostCoverageGap",
+          "ResultPath": "$.aggregate_costs_error"
+        },
+        {
+          "ErrorEquals": [
             "States.ALL"
           ],
           "Comment": "Cost-telemetry aggregation is observability \u2014 failure must NOT halt the pipeline. The next Saturday SF will retry over a fresh _cost_raw partition; the prior week's parquet (or the manual-trigger fallback via scripts/aggregate_costs.py) remains available. alpha-engine-config#6722: this Catch matches sf-pipeline-policy.md \u00a75's NAMED cost-aggregation carve-out verbatim ('Health-check and cost-aggregation stages may fail-open ... They must still set a degraded flag'). alpha-engine-config-I7194: the flag it sets is now $.aggregate_costs_degraded, its own top-level family, because the branch-local $.research_degraded_local this path used to thread exists only inside the Parallel and is hoisted as branch_a_degraded \u2014 which would attribute a cost-aggregation failure to a Parallel that no longer contains the aggregator.",
@@ -7177,6 +7185,54 @@
         }
       ],
       "ResultPath": "$.aggregate_costs_result",
+      "Next": "CheckShellRunNotify"
+    },
+    "MarkCostCoverageGap": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11298, Brian ruling 2026-09-21 (\"proceed with rec b\"): THE SOLE WRITER of the top-level $.cost_coverage_gap the completion markers embed. Mirrors SetModelZooUnservable / SetDirectorRetroRefused exactly, and is DELIBERATELY independent of $.degraded_summary and of every Mark*Degraded state \u2014 the whole content of the ruling is that an accounting gap NAMES itself on a run that terminates SUCCEEDED, rather than converting a completed 5.4-hour belief-refresh cycle into a FAILED execution that has to be rerun end to end. Floored false in InitializeInput because the markers dereference it unguarded through States.JsonToString.",
+      "Result": true,
+      "ResultPath": "$.cost_coverage_gap",
+      "Next": "SetCostCoverageGapDetail"
+    },
+    "SetCostCoverageGapDetail": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11298: carries the aggregator's OWN verdict onto a named path a reader goes to, without parsing it. The missing / observed / stages_entered lists exist only inside the raised error's message text, and destructuring them here would need States.StringToJson over PRODUCER BYTES \u2014 a States.Runtime raised from an intrinsic is NOT catchable, by a Task's Catch or by an enclosing Parallel's (measured twice live, 2026-09-19), so a malformed cause would kill the very run this ruling exists to let finish. The Error name and the Cause string are copied verbatim instead; the Cause is the aggregator's full verdict, including missing, observed and stages_entered, exactly as cost_coverage.py wrote it. Deliberately NOT $.degraded_summary: nothing here may set degraded. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a detail payload so a reader knows WHICH CYCLE the gap belongs to.",
+      "Parameters": {
+        "gap": true,
+        "run_date.$": "$.run_date",
+        "error.$": "$.aggregate_costs_error.Error",
+        "verdict.$": "$.aggregate_costs_error.Cause"
+      },
+      "ResultPath": "$.cost_coverage_gap_detail",
+      "Next": "PublishCostCoverageGap"
+    },
+    "PublishCostCoverageGap": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11298: the lower-severity notice the ruling makes load-bearing \u2014 with the run no longer failing, this is what carries the gap to a reader. Alert class weekly_cost_coverage_gap, severity warning, tier tracked-only, intake bus (infrastructure/overseer/playbooks.yaml::alert_classes; observability-policy.md \u00a77.2 \u2014 a page is for what is actionable NOW and cannot wait for the next time Brian looks at the console, and an accounting gap is not that; \u00a77.4 \u2014 a notify-only class declares its remediation path, which that row does). Constants-only Subject/Message (config#1819): the aggregator's Cause is unbounded producer text and States.Format-ing it into an SNS body is forbidden, so the notice names the CONDITION and points at $.cost_coverage_gap_detail on the execution record, which carries the missing producers verbatim. TopicArn.$ is $.sns_topic_arn because tests/test_sf_sns_arn_single_source.py pins every publish state to exactly that \u2014 MEASURED 2026-09-21: on a scheduled run that resolves to alpha-engine-alerts-muted, which has ZERO subscribers, so this notice currently reaches neither Brian nor the response bus. That is a destination problem outside this definition (the mute is Brian ruling I9751 item 3a for the v2 build window) and it is named in the PR body, not worked around here by hand-carrying a second ARN. Best-effort Catch so a publish failure cannot block the clean terminal it decorates. | alpha-engine-config-I11332, Brian ruling 2026-09-21 (\"proceed with rec b\"): MessageAttributes carries alert_class = weekly_cost_coverage_gap, String \u2014 the ROUTING KEY the alert-drain's subscription to alpha-engine-alerts-muted filters on (FilterPolicyScope: MessageAttributes), so a declared tracked-only class reaches the drain while the pipeline's 28 per-stage notices on that same topic stay muted. The name, DataType and value are fixed by I11332 so the two halves agree; the value is the class id exactly as infrastructure/overseer/playbooks.yaml declares it, and tests/test_sf_cost_coverage_gap_wiring.py derives the expectation from that file rather than from a hand-kept list. config#1819 is NOT engaged: it forbids States.Format-ing RUN DATA into a notification, and this is a compile-time constant that carries no execution state \u2014 every field here is still a literal, and there is no `.$` anywhere in this state's Parameters but the topic.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 cost coverage GAP (run completed; spend attributed to nothing)",
+        "Message": "AggregateCosts found a fan-in coverage gap: at least one stage of this weekly cycle ran and emitted no cost record, so its LLM spend is attributed to nothing. Read $.cost_coverage_gap_detail.verdict on the execution record for the exact missing / observed / stages_entered sets, and $.cost_coverage_gap on the completion marker. THE RUN ITSELF COMPLETED: per Brian's 2026-09-21 ruling (alpha-engine-config-I11298) a cost-attribution gap no longer fails the cycle \u2014 cost attribution is accounting and feeds no report card, champion promotion or signal set. What is lost is one cycle's cost attribution, and AlphaEngine/Cost is short by whatever that stage spent. View pipeline status: https://dashboard.nousergon.ai/pipeline-status",
+        "MessageAttributes": {
+          "alert_class": {
+            "DataType": "String",
+            "StringValue": "weekly_cost_coverage_gap"
+          }
+        }
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.cost_coverage_gap_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort notice \u2014 a publish failure must not block the clean terminal this ruling grants. $.cost_coverage_gap and $.cost_coverage_gap_detail are already set, so the marker still names the gap.",
+          "ResultPath": "$.cost_coverage_gap_notify_error",
+          "Next": "CheckShellRunNotify"
+        }
+      ],
       "Next": "CheckShellRunNotify"
     },
     "MarkAggregateCostsDegraded": {
@@ -7463,6 +7519,20 @@
           ],
           "Comment": "alpha-engine-config-I7194. The sixth flag family, and the second one folded into the generic combined notifier rather than given a per-combination Task of its own \u2014 the generalization config#2276's comment predicted and config#6722 already applied to research_predictor_degraded. LAST in the list on purpose, for the same reason the scanner-leaderboard rule above it is: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf or a Branch A fail-open matches one of the rules above and gets that (more consequential) notification. This rule exists so a run whose ONLY degradation is the cost aggregation cannot reach NotifyComplete's \"All steps completed successfully\" while terminating in DegradedRun \u2014 which is what it would have done from the top level, where the branch-local $.research_degraded_local hoist that used to carry it does not reach.",
           "Next": "NormalizeMultipleDegradedContext"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.director_degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I11299. The SEVENTH flag family, folded into the generic combined notifier on exactly the reasoning the sixth was. Set ONLY by DirectorSubStatusDegraded, from the Director's own enclosing status \u2014 sf-pipeline-policy.md \u00a72.3b: a stage that returns named sub-results returns a status no better than the worst of them. LAST in the list on purpose, for the same reason the two rules above it are: a run that also degraded a gate, a health check, the parity verdict, the report card, the leaf, a Branch A fail-open or the cost aggregation matches one of those rules and gets that (more consequential) notification, while PublishDirectorSubStatusDegraded has already named this one. Not floored in InitializeInput, matching $.scanner_leaderboard_degraded and $.aggregate_costs_degraded: no Parameters block dereferences it, so the IsPresent guard (config#2275) is the whole contract.",
+          "Next": "NormalizeMultipleDegradedContext"
         }
       ],
       "Default": "NotifyComplete"
@@ -7607,7 +7677,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.weekly_preflight_blind_spot))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "TimeoutSeconds": 60,
       "Retry": [
@@ -8836,9 +8906,75 @@
       ],
       "Next": "CheckDegradedOutcome"
     },
+    "CheckDirectorRetroRefused": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I11299 \u2014 sf-pipeline-policy.md \u00a72.3a rules 2 and 3. A retro REFUSAL is a guard declining BY DESIGN: crucible-evaluator director/retro.py refuses to publish a RetroGrade when the judge resolved to the model that produced the plan it was asked to grade (root cause alpha-engine-config-I8202, fixed there). Nothing went wrong \u2014 what it leaves behind is an ABSENT VERDICT, and \u00a72.3a rule 2 says a missing verdict propagates as a named non-pass rather than as a pass, while rule 3 says every surface presenting the run's results carries that state. It is deliberately NOT a degradation: \u00a72.3b's third paragraph is what permits a nested non-pass not to degrade the stage while forbidding it to be silent. Treating a correct refusal as a failure is the shape corrected for the M slot on 2026-09-19 (nousergon-data-PR1816/PR1818: model_zoo_unservable terminates ExecutionSucceeded with degraded false and the refusal NAMED), and this is that precedent applied to the Director's retro leg \u2014 a 5.4-hour weekly cycle must not terminate Fail, and must not page, because a guard did its job. ORDERED BEFORE CheckDirectorSubResults and orthogonal to it: a run whose retro refused AND whose deploy-success leg errored records BOTH, because they are independent fields rather than one status string. Reads a BOOLEAN the producer emits on every fan-out summary (false included) rather than measuring an array's length, which a Choice cannot do. IsPresent-guarded per config#2275; a Director on an older image emits no such field and takes the Default, so this edge is inert rather than broken.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.director_result.Payload.retro_refused",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.director_result.Payload.retro_refused",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "SetDirectorRetroRefused"
+        }
+      ],
+      "Default": "CheckDirectorSubResults"
+    },
+    "SetDirectorRetroRefused": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11299: THE SOLE WRITER of the top-level $.director_retro_refused that WriteCompletionMarker / WriteCompletionMarkerDegraded and their calendar mirrors embed. Mirrors SetModelZooUnservable's shape and its reasoning verbatim: this flag is DELIBERATELY independent of $.degraded_summary and of every Mark*Degraded state \u2014 a judge correctly refusing to publish a self-graded RetroGrade is a VERDICT, not a stage failure, and must render as a clean completion that NAMES the refusal. Floored false in InitializeInput because the completion markers dereference it unguarded through States.JsonToString.",
+      "Result": true,
+      "ResultPath": "$.director_retro_refused",
+      "Next": "CheckDirectorSubResults"
+    },
+    "CheckDirectorSubResults": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I11299 (sf-pipeline-policy.md \u00a72.3b, clause SFP-2.3b-stage-status-is-the-worst-substatus). The Director returns ONE enclosing status over four independently-statused legs \u2014 retro, director_loop, director_issues, deploy_success \u2014 and every \u00a72.3 mechanism in this definition (the Catch above, the Mark*Degraded states, the completion marker) reads only the enclosing one. MEASURED on three of the four 2026-09-19 executions that entered Director \u2014 the scheduled run (3c2fe2f8-\u2026_d0e3eae8-\u2026) and watch-rerun-2026-09-18-1 and -3, the last two terminating ExecutionSucceeded with degraded_summary.degraded false: status 'ok' over retro 'error', a self-grading REFUSAL by the retro judge (its own root cause is alpha-engine-config-I8202, registry invariant 15 comparing entry ids rather than served models \u2014 a SEPARATE fix, and neither substitutes for the other). No RetroGrade was published for at least two consecutive weekly cycles with nothing anywhere going red \u2014 alpha-engine-config-I10169 one stage over. crucible-evaluator director/substatus.py now demotes the enclosing status to 'degraded' when any leg errors or reports a word in neither vocabulary; this Choice is the consumer that makes it visible to the state machine. IsPresent-guarded per config#2275, and $.director_result is written by the IMMEDIATE predecessor's ResultPath, which is the one-hop floor tests/test_sf_choice_guards.py traces. A Director that ran on an OLDER image still returns 'ok' and takes the Default \u2014 the edge is inert rather than broken, so the two repos may land in either order. 'disabled', 'dry_run' and every other status likewise take the Default: this rule fires on exactly one string.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.director_result.Payload.status",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.director_result.Payload.status",
+              "StringEquals": "degraded"
+            }
+          ],
+          "Next": "DirectorSubStatusDegraded"
+        }
+      ],
+      "Default": "DirectorComplete"
+    },
+    "DirectorSubStatusDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11299: the SF-controlled visible flag CheckGateDegradedNotify reads, set BEFORE the summary so the flag is on the execution record whatever happens downstream. Shape mirrors MarkAggregateCostsDegraded / ScannerLeaderboardDegraded / ReportCardDegraded exactly.",
+      "Result": true,
+      "ResultPath": "$.director_degraded",
+      "Next": "SetDirectorSubStatusDegradedSummary"
+    },
+    "SetDirectorSubStatusDegradedSummary": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11299: mirrors SetAggregateCostsDegradedSummary. $.degraded_summary is what CheckDegradedOutcome reads to route to WriteCompletionMarkerDegraded \u2014 the single chokepoint that state's own Comment names, which a fail-open route added later inherits by writing this path and touching nothing there. So a weekly cycle that published no RetroGrade now terminates DegradedRun (Option-A, alpha-engine-config#2699 ported by I6891) instead of ExecutionSucceeded with degraded false. Deliberately carries NO stage_error: the sibling convention is uniform and this setter is reached from a CHOICE, which writes no $.<stage>_error, so an unguarded stage_error.$ would throw States.Runtime here \u2014 the exact failure tests/test_degraded_terminal_derives_its_cause.py exists to prevent. Continuation is DirectorComplete, the same edge the clean path takes, so this changes what the run SAYS, never where it goes. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day (pass-through). This state does not KEY on the date; it carries $.run_date into a summary payload. | alpha-engine-config-I10540: reasons.$ ACCUMULATES a family-keyed entry via States.JsonMerge instead of last-write-wins whole-object replacement; $.degraded_summary.reasons is floored to {} in InitializeInput so the first setter on any execution never merges onto a missing path.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "weekly_director_substatus_degraded",
+        "run_date.$": "$.run_date",
+        "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"director\":\"weekly_director_substatus_degraded\"}'), false)"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "DirectorComplete"
+    },
     "DirectorComplete": {
       "Type": "Pass",
-      "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY via Director's success edge.",
+      "Comment": "config#6054: success-only witness for the rerun deriver (scripts/weekly_sf_rerun.py). Director's success and every bypass path previously converged on CheckShellRunNotify, so no state uniquely witnessed 'Director actually completed' \u2014 the I6055-class trap: a rerun could mark a bypassed Director complete and skip it. Entered ONLY on Director's success edge \u2014 alpha-engine-config-I11299 inserted CheckDirectorSubResults between the two, so this state is now reached by two routes (clean, and via the \u00a72.3b degraded fold), but BOTH descend from that one edge and neither is reachable from a bypass or from the Catch, which is the property the witness asserts. A Director whose stage status is degraded still COMPLETED: the rerun deriver must not re-run a stage that wrote its plan, and the honest terminal is CheckDegradedOutcome's job, not this one's.",
       "Next": "CheckSkipScannerLeaderboard"
     },
     "BacktesterLivenessGate": {
@@ -9461,7 +9597,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.weekly_preflight_blind_spot))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "ResultPath": "$.degraded_marker_result",
       "TimeoutSeconds": 60,
@@ -9916,7 +10052,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.calendar_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.weekly_preflight_blind_spot))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "TimeoutSeconds": 60,
       "Retry": [
@@ -9950,7 +10086,7 @@
         "Bucket": "alpha-engine-research",
         "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.calendar_date)",
         "ContentType": "application/json",
-        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.weekly_preflight_blind_spot))"
+        "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
       "ResultPath": "$.completion_marker_calendar_result",
       "TimeoutSeconds": 60,

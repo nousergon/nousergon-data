@@ -246,3 +246,53 @@ def assert_observe_only_tail(states: dict, entry: str) -> None:
             terminals.add(name)
         stack.extend(nexts)
     assert terminals, f"no terminal reachable from {entry}"
+
+
+def notify_target(states: dict, data: dict) -> str:
+    """Which completion notifier a partial flag payload actually reaches.
+
+    Evaluates ``CheckShellRunNotify`` -> ``CheckGateDegradedNotify`` with ASL
+    short-circuit semantics. Flat ``IsPresent``-guarded ``And`` rules only (no
+    ``Or``-in-``And``) — the style ``CheckGateDegradedNotify`` uses throughout.
+    A Choice payload carries only the flags that are actually SET: an absent
+    flag is IsPresent-guarded, never present-as-false, and an unguarded
+    dereference of an absent one fails here rather than as a ``States.Runtime``
+    at the last state of an otherwise successful weekly run.
+
+    Lifted here by ``alpha-engine-config-I11299`` (``shared-code-policy``: the
+    second adoption lifts, and this is the fifth). Four test modules —
+    ``test_sf_report_card_degraded_wiring``, ``test_sf_health_check_honesty_wiring``,
+    ``test_sf_parity_gate_notify_wiring``, ``test_sf_research_predictor_degraded_wiring``
+    — still carry their own private ``_notify_target``; sweeping them onto this
+    one is tracked as ``alpha-engine-config-I11324``, and deliberately not
+    bundled with a §2.3b behaviour change.
+    """
+
+    def eval_rule(rule: dict) -> bool:
+        if "And" in rule:
+            return all(eval_rule(op) for op in rule["And"])
+        var = rule["Variable"].lstrip("$.")
+        present = var in data
+        if "IsPresent" in rule:
+            return present == rule["IsPresent"]
+        assert present, f"unguarded dereference of {var} in drill payload {data}"
+        return data[var] == rule["BooleanEquals"]
+
+    cur = "CheckShellRunNotify"
+    while states[cur]["Type"] in ("Choice", "Pass"):
+        if states[cur]["Type"] == "Pass":
+            # alpha-engine-config#5950: a normalizer Pass may sit between the
+            # gate and its notifier, flooring the optional diagnostic fields
+            # the notifier dereferences. It has no Choices, so it cannot change
+            # WHICH notifier is reached — walk through it rather than widening
+            # the allowed-target list, which would let a future Pass hide a
+            # wrong destination from a caller.
+            cur = states[cur]["Next"]
+            continue
+        for rule in states[cur]["Choices"]:
+            if eval_rule(rule):
+                cur = rule["Next"]
+                break
+        else:
+            cur = states[cur]["Default"]
+    return cur
