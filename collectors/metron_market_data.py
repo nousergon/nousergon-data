@@ -304,8 +304,27 @@ def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> lis
         from shadow.pinned_inputs import pin_for
 
         pin = pin_for(s3_client, bucket, key, unit_id=UNIVERSE_PIN_UNIT_ID)
-    except Exception as exc:  # noqa: BLE001 - production carries no shadow package
-        logger.debug("[metron_market_data] no input pinning available for %s (%s)", key, exc)
+    except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
+        # DELIBERATE degrade, recorded at WARNING rather than debug.
+        # (a) Failure mode swallowed: the pin could not be resolved at all —
+        #     `shadow.pinned_inputs` would not import, or the manifest/version
+        #     lookup raised. NOT the ordinary "no replay is running" case,
+        #     which `pin_for` answers as an `unpinned` Pin without raising.
+        # (b) The primary deliverable survives: the universe is still read,
+        #     from the CURRENT object, which is exactly what production does.
+        # (c) Recording surface: this WARNING line, in the collector's own log
+        #     and its CloudWatch group. It is at WARNING and not debug on
+        #     purpose — inside a shadow replay this means the run silently went
+        #     back to reading today's inputs, which is the defect
+        #     `alpha-engine-config-I11216` exists to remove, and the parity
+        #     report would then show membership diffs with no stated cause.
+        logger.warning(
+            "[metron_market_data] input pinning unavailable for %s (%s) — reading the "
+            "CURRENT object. Harmless in production; inside a shadow replay this means "
+            "the run is reading today's inputs rather than the replayed day's "
+            "(alpha-engine-config-I11216).",
+            key, exc,
+        )
     try:
         kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
         if pin is not None and pin.is_pinned:
