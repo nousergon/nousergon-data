@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/index_contributions.schema.json",
+  "title": "Per-constituent index contribution (market_data/index_contributions/{index}/{date}.json, v1)",
+  "description": "Producer: collectors/index_contributions.py::collect (alpha-engine-config-I11297). Joins per-constituent index weight (collectors/constituents.py for SPX, market_data/index_constituents/NDX.json for NDX) with per-name daily returns from the ArcticDB universe library, so a consumer can explain an index's daily move by name. Consumer: metron (api/services/benchmark_gap.py, metron-ops-I346), which reads latest.json to decompose the holdings-vs-benchmark return gap. Carries an explicit payload schema_version, unlike the older constituents.json contract.",
+  "x-key-pattern": "market_data/index_contributions/{index}/{date}.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "index", "proxy_symbol", "as_of", "prior_close_date",
+    "index_return_pct", "weight_method", "residual_pp", "explained_pp",
+    "coverage", "members_missing_return", "constituents", "fetched_at"
+  ],
+  "properties": {
+    "schema_version": {"type": "integer", "minimum": 1},
+    "index": {"type": "string", "enum": ["SPX", "NDX"]},
+    "index_label": {"type": "string", "minLength": 1},
+    "proxy_symbol": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The TRADEABLE ETF proxy whose close-to-close move `index_return_pct` is. The index values ^GSPC/^IXIC/^NDX/^RUT carry a separate index licence, which is why the fleet carries proxies; this field travels with the number so a consumer cannot misattribute the proxy's move to the index itself."
+    },
+    "as_of": {"type": "string", "format": "date"},
+    "prior_close_date": {
+      "type": "string",
+      "format": "date",
+      "description": "The previous TRADING day, read off the proxy's own observed series rather than a calendar. Contribution to the move is prior-close weight times the return between these two dates, so a consumer that recomputes must use this pair and not infer one."
+    },
+    "index_return_pct": {"type": "number"},
+    "weight_method": {
+      "type": "string",
+      "description": "Weight provenance carried unchanged from the weight producer. The Nasdaq-100 weights read 'modified_cap_approx' until a licensed feed lands; an approximation that does not travel with its data gets absorbed as fact, so a consumer must render this rather than infer it."
+    },
+    "weights_as_of": {"type": ["string", "null"]},
+    "residual_pp": {
+      "type": "number",
+      "description": "index_return_pct minus explained_pp, NAMED rather than hidden in rounding. The sum never ties exactly: cash and futures rows carry index weight the equity roster cannot account for, members with no return sit here, and approximate weights contribute error. A consumer reconciling against this artifact needs the gap stated."
+    },
+    "explained_pp": {"type": "number"},
+    "coverage": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["weight_with_return", "members", "members_missing_return"],
+      "properties": {
+        "weight_with_return": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1,
+          "description": "Fraction of index weight for which a return was actually available. The producer refuses to publish below its coverage floor, so a consumer can trust this is above it — but must still render it, because a component emitting nothing is not healthy and neither is one whose coverage silently slipped."
+        },
+        "members": {"type": "integer", "minimum": 0},
+        "members_missing_return": {"type": "integer", "minimum": 0}
+      }
+    },
+    "members_missing_return": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Members whose return was unavailable for this session. They are NOT given a zero contribution -- their weight falls into residual_pp, where it stays visible."
+    },
+    "constituents": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["symbol", "weight_prior_close", "return_pct", "contribution_pp"],
+        "properties": {
+          "symbol": {"type": "string", "minLength": 1},
+          "weight_prior_close": {"type": "number", "minimum": 0, "maximum": 1},
+          "return_pct": {"type": "number"},
+          "contribution_pp": {"type": "number"}
+        }
+      }
+    },
+    "fetched_at": {
+      "type": "string",
+      "x-provenance": true,
+      "description": "Wall-clock stamp of the run, not a data value (alpha-engine-config-I10894): shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs`, because a shadow run and its live counterpart never run at the same instant."
+    }
+  }
+}
