@@ -111,7 +111,7 @@ def test_price_cache_refresh_requests_d_bounded_window_and_publishes_no_d_plus_1
                         _recording_download(_ohlcv("2016-09-14", D_PLUS_1), calls))
     s3 = _FakeS3()
 
-    refreshed, failed, written, insufficient = prices._refresh_stale(
+    refreshed, failed, written = prices._refresh_stale(
         s3, "b", "predictor/price_cache/", ["A"], "10y", 50, trading_day=D,
     )
 
@@ -167,7 +167,7 @@ def test_collect_threads_reference_date_as_the_trading_day(monkeypatch):
 
     def _fake_refresh(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day):
         captured["trading_day"] = trading_day
-        return 0, list(stale), [], []
+        return 0, list(stale), []
 
     monkeypatch.setattr(prices, "_refresh_stale", _fake_refresh)
     prices.collect(bucket="b", tickers=["A"], reference_date=D)

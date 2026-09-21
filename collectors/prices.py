@@ -142,7 +142,7 @@ def collect(
     # trading day, never on wall-clock time — a ``--date D`` run executed on
     # D+1 must not fetch (or publish) the partial D+1 session.
     trading_day = str(reference_date) if reference_date is not None else default_run_date()
-    refreshed, failed_tickers, written, insufficient_history = _refresh_stale(
+    refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
         trading_day=trading_day,
     )
@@ -158,10 +158,6 @@ def collect(
             logger.warning("Price validation failed (non-fatal): %s", e)
 
     result = {
-        # alpha-engine-config-I11230 follow-up: `insufficient_history` is
-        # DISJOINT from `failed_tickers` and deliberately excluded from this
-        # decision — a run whose only losses are recently-listed tickers below
-        # the guard's maturity bar stays `ok`, never `partial`.
         "status": "ok" if not failed_tickers else "partial",
         "refreshed": refreshed,
         "stale": len(stale),
@@ -174,12 +170,6 @@ def collect(
         # for every key's row count. `written_keys()` below turns this into
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
-        # alpha-engine-config-I11230 follow-up: recently-listed tickers the
-        # short-fetch guard refused to overwrite because their OWN history has
-        # never reached the maturity bar (I9256's guard, not a fetch failure).
-        # Bounded to 20 like `failed_tickers` (alpha-engine-config-I10941).
-        "insufficient_history": len(insufficient_history),
-        "insufficient_history_tickers": insufficient_history[:20],
     }
     if failed_tickers:
         # alpha-engine-config-I11230 deliverable 2: `_DegradedRun` (the
@@ -452,23 +442,14 @@ def _refresh_stale(
     The replacement recording surface is the aggregated ``log_yf_coverage``
     record emitted before returning.
 
-    Returns ``(refreshed, failed_tickers, written, insufficient_history)``:
-
-    - ``written`` is the ``[(ticker, row_count)]`` list for every ticker
-      actually uploaded this run, appended ONLY after ``s3.upload_file``
-      succeeds (never a copy of ``stale``, never a count of attempts).
-      ``alpha-engine-config-I11026``: the per-symbol key set D03 publishes is
-      knowable only from what this run wrote, so the caller (``collect()``)
-      hands this straight to the run manifest via the ``extra_outputs``
-      callable form rather than the descriptor's declared (and here
-      nonexistent) fixed key list.
-    - ``insufficient_history`` (``alpha-engine-config-I11230`` follow-up) is
-      the disjoint counterpart to ``failed_tickers``: a ticker the short-fetch
-      guard refused to overwrite, but ONLY because that ticker's own stored
-      history has never reached ``_SHORT_FETCH_ROW_THRESHOLD`` (a recent
-      listing/spin-off), never a real fetch regression on a mature ticker.
-      See the guard's own comment below for why the two are graded
-      differently.
+    Returns ``(refreshed, failed_tickers, written)`` — ``written`` is the
+    ``[(ticker, row_count)]`` list for every ticker actually uploaded this
+    run, appended ONLY after ``s3.upload_file`` succeeds (never a copy of
+    ``stale``, never a count of attempts). ``alpha-engine-config-I11026``:
+    the per-symbol key set D03 publishes is knowable only from what this run
+    wrote, so the caller (``collect()``) hands this straight to the run
+    manifest via the ``extra_outputs`` callable form rather than the
+    descriptor's declared (and here nonexistent) fixed key list.
     """
     import time
 
@@ -481,7 +462,6 @@ def _refresh_stale(
     refreshed = 0
     failed_tickers: list[str] = []
     written: list[tuple[str, int]] = []
-    insufficient_history: list[dict] = []
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -579,47 +559,6 @@ def _refresh_stale(
                             s3, bucket, s3_prefix, ticker
                         )
                         if existing_rows is not None and len(new_df) < existing_rows:
-                            if existing_rows < _SHORT_FETCH_ROW_THRESHOLD:
-                                # alpha-engine-config-I11230 follow-up (measured
-                                # 2026-09-21): a ticker whose OWN accumulated
-                                # history has never reached the maturity bar (a
-                                # recent listing/spin-off — e.g. FDXF/HONA/Q/SOLS,
-                                # all under 235 rows against yfinance's live
-                                # history on the day this was measured) has NO
-                                # growth margin: any day-to-day fetch variance at
-                                # all trips this same shrink check, not just a
-                                # genuine vendor failure. Declared, bounded,
-                                # expected — recorded separately so it does not
-                                # count toward `partial` (`collect()` sums only
-                                # `failed_tickers` into the status decision). It
-                                # is NOT a silent swallow: it is logged, it lands
-                                # in the manifest's `rows_rejected` (see
-                                # `run_units.py`'s D03 `PhaseUnit`), and it ages
-                                # OUT on its own the day `existing_rows` first
-                                # reaches the threshold — this branch is then
-                                # structurally unreachable for that ticker. A
-                                # MATURE ticker (`existing_rows >=` the
-                                # threshold) that regresses is untouched by this
-                                # branch and still counts as `failed` below
-                                # (`tests/test_prices_short_fetch_guard.py`
-                                # pins both sides).
-                                logger.warning(
-                                    "Insufficient listing history for %s: %d "
-                                    "existing rows (below the %d-row maturity "
-                                    "bar) vs %d rows this fetch — not uploading "
-                                    "(existing history preserved); expected for "
-                                    "a recently listed symbol, not counted "
-                                    "toward this run's failure rate. See "
-                                    "alpha-engine-config-I11230.",
-                                    ticker, existing_rows,
-                                    _SHORT_FETCH_ROW_THRESHOLD, len(new_df),
-                                )
-                                insufficient_history.append({
-                                    "ticker": ticker,
-                                    "existing_rows": existing_rows,
-                                    "fetched_rows": len(new_df),
-                                })
-                                continue
                             logger.error(
                                 "Short-fetch REFUSED for %s: yfinance returned %d rows "
                                 "for period=%s but the existing price-cache parquet has "
@@ -686,4 +625,4 @@ def _refresh_stale(
              "misses retry next refresh; persistent misses are delisting/rename "
              "candidates for universe pruning",
     )
-    return refreshed, failed_tickers, written, insufficient_history
+    return refreshed, failed_tickers, written

@@ -67,7 +67,7 @@ def test_short_fetch_does_not_overwrite_a_full_price_cache(monkeypatch):
     s3 = _FakeS3({"reference/price_cache/VIX3M.parquet": _parquet_bytes(full)})
     _patch_download(monkeypatch, _ohlcv(1))
 
-    refreshed, failed, written, insufficient = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50, trading_day="2026-09-14",
     )
 
@@ -80,7 +80,7 @@ def test_full_fetch_still_uploads(monkeypatch):
     s3 = _FakeS3({"reference/price_cache/VIX.parquet": _parquet_bytes(_ohlcv(2500))})
     _patch_download(monkeypatch, _ohlcv(2515))
 
-    refreshed, failed, written, insufficient = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["VIX"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
@@ -93,50 +93,12 @@ def test_short_fetch_for_a_brand_new_ticker_is_allowed(monkeypatch):
     s3 = _FakeS3({})
     _patch_download(monkeypatch, _ohlcv(26))
 
-    refreshed, failed, written, insufficient = _prices._refresh_stale(
+    refreshed, failed, written = _prices._refresh_stale(
         s3, "alpha-engine-research", "predictor/price_cache/", ["NEWCO"], "10y", 50, trading_day="2026-09-14",
     )
     assert refreshed == 1
     assert failed == []
     assert s3.uploads == ["reference/price_cache/NEWCO.parquet"]
-
-
-def test_short_fetch_below_the_maturity_bar_is_insufficient_history_not_failed(monkeypatch):
-    """alpha-engine-config-I11230 follow-up, measured 2026-09-21 against the
-    2026-09-18 shadow defect's four tickers (FDXF/HONA/Q/SOLS): all four have
-    genuinely short real history (68-231 rows against live yfinance on the
-    measurement date, all under `_SHORT_FETCH_ROW_THRESHOLD`). A ticker whose
-    OWN stored history has never reached the maturity bar has no growth
-    margin — day-to-day fetch variance alone can trip the same shrink check a
-    real vendor failure does. That is a declared, bounded, expected rejection,
-    not a fetch failure: it must not land in `failed`."""
-    full = _ohlcv(81)  # FDXF's measured shape: well under the 400-row bar
-    s3 = _FakeS3({"reference/price_cache/FDXF.parquet": _parquet_bytes(full)})
-    _patch_download(monkeypatch, _ohlcv(79))  # a 2-row regression, no margin
-
-    refreshed, failed, written, insufficient = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["FDXF"], "10y", 50, trading_day="2026-09-14",
-    )
-
-    assert s3.uploads == [], "still refused -- the existing history is preserved"
-    assert refreshed == 0
-    assert failed == [], "must NOT count toward partial/failed"
-    assert insufficient == [{"ticker": "FDXF", "existing_rows": 81, "fetched_rows": 79}]
-
-
-def test_a_mature_ticker_that_regresses_is_still_failed_never_insufficient_history(monkeypatch):
-    """Guard against over-broadening: `existing_rows >= the maturity bar` must
-    stay `failed`, even though the shrink arithmetic is the identical shape —
-    the measured VIX3M case (2515 existing rows) is the reference."""
-    s3 = _FakeS3({"reference/price_cache/VIX.parquet": _parquet_bytes(_ohlcv(2500))})
-    _patch_download(monkeypatch, _ohlcv(50))
-
-    refreshed, failed, written, insufficient = _prices._refresh_stale(
-        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX"], "10y", 50, trading_day="2026-09-14",
-    )
-
-    assert failed == ["VIX"]
-    assert insufficient == [], "a MATURE ticker's regression is never reclassified away"
 
 
 def test_unreadable_existing_parquet_raises_rather_than_overwriting(monkeypatch):
