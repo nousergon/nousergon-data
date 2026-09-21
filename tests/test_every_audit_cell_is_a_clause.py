@@ -90,7 +90,12 @@ BASELINE_UNIT_IDS: frozenset[str] = frozenset({
 #: unpinned remainder would let a new unit appear with no acknowledgement
 #: anywhere, which is the drift this file exists to make impossible — just in
 #: the opposite direction from a unit going missing.
-POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset()
+POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset({
+    # D48, per-constituent index contribution (alpha-engine-config-I11297).
+    # Registered here rather than folded into AUDIT_SUMMARY: the audit is a
+    # frozen 2026-09-14 baseline and scored no such unit.
+    "D48",
+})
 
 AUDIT_UNITS = 46
 AUDIT_CELLS = AUDIT_UNITS * len(AUDIT_COLUMNS)

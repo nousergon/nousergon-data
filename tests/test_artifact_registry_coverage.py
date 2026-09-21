@@ -333,6 +333,19 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # installed) per "never register a freshness entry ahead of its producer" — registering
     # now would report a false state=missing. Tracked in metron-ops#111.
     "collectors/crypto_balances.py": 1,
+    # alpha-engine-config-I11297 — per-constituent index contribution
+    # decomposition, ONE put_object site writing two keys in a loop
+    # (market_data/index_contributions/{index}/{date}.json and
+    # .../latest.json, for index in SPX/NDX). Consumer is Metron
+    # (metron-ops-I346), which reads latest.json to explain the
+    # holdings-vs-benchmark return gap by name.
+    #
+    # The ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is
+    # scheduled, per "never register a freshness entry ahead of its producer"
+    # — the timer/SF wiring is operational assembly and lands in the ops repo,
+    # tracked separately. Registering now would report a false state=missing
+    # every cycle, which is the opposite of the signal the registry exists for.
+    "collectors/index_contributions.py": 1,
     # alpha-engine-config-I10783 (data-collector plan P-16) —
     # write_vendor_divergence_metric's one PUT site:
     # data_collection/metrics/vendor_divergence/{trading_day}.json, written by
