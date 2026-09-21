@@ -258,6 +258,22 @@ jobs:
             --store "$STORE_URI" \
             $FAIL_ON_UNMET_FLAG
 
+      # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21 ruling: a
+      # sixth invocation, same contract, publishing the three reliability-
+      # streak STANDING clauses (never counted in phase1/2/3 above) as their
+      # own dated artifact — `data_collection/gates/data-collection-reliability/
+      # {date}/gate.json` and `.../latest.json` — the SAME shape
+      # `data-cutover-ready` already publishes for the cutover itself.
+      # Crucible v2 phase 4 gates its irreversible v1-pipeline deletion
+      # (`alpha-engine-config-I10655`) on THIS gate's own `met`, never on a
+      # numbered data-phase gate.
+      - name: Read the data-collection-reliability gate
+        id: gate_read_reliability
+        run: |
+          python -m data_gate read --gate data-collection-reliability \
+            --store "$STORE_URI" \
+            $FAIL_ON_UNMET_FLAG
+
   # ── FAILURE ALERTING ─────────────────────────────────────────────────────
   # Simplified under I10906: with the verdict no longer coupled to the job's
   # exit code, `failure()` on this job now means exactly one thing — the

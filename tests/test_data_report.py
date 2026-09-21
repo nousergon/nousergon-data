@@ -364,6 +364,44 @@ def test_the_report_quotes_the_board_totals_it_did_not_compute():
     assert "92" in update
 
 
+def test_the_board_line_mentions_standing_when_present():
+    board = dict(BOARD, clauses_standing=1)
+    assert "1 standing" in report_module._board_line(board)
+
+
+def test_the_board_line_defaults_standing_to_zero_when_absent():
+    """`alpha-engine-config-I10793`/`-I10788`: a board document from before
+    this landed carries no `clauses_standing` key at all — the report must
+    not raise on it."""
+    assert "0 standing" in report_module._board_line(BOARD)
+
+
+def test_the_full_update_surfaces_a_standing_row_with_its_real_state():
+    board = dict(
+        BOARD,
+        clauses_standing=1,
+        rows=[
+            {
+                "clause": "data.phase1.cost_baseline_measured",
+                "state": "UNMET",
+                "standing": True,
+                "detail": "metrics/cost/monthly/latest.json: no cost document",
+            }
+        ],
+    )
+    inputs = _inputs(_live_shaped_store(**{"gates/board/latest.json": board}))
+    update = report_module.render_full_update(inputs, now=NOW)
+    assert "### standing (measured daily, gates no phase)" in update
+    assert "data.phase1.cost_baseline_measured" in update
+    assert "UNMET" in update
+
+
+def test_the_full_update_has_no_standing_section_when_none_are_standing():
+    inputs = _inputs(_live_shaped_store())
+    update = report_module.render_full_update(inputs, now=NOW)
+    assert "### standing" not in update
+
+
 def test_an_unreadable_ladder_raises_rather_than_reporting_an_empty_board():
     """A report that could not read the ladder has nothing to say. Rendering a
     message about an absent ladder is a surface reporting its own outage as the

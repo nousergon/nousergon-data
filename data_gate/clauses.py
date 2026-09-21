@@ -240,10 +240,75 @@ def is_disabled_trigger(clause: Clause) -> bool:
     return isinstance(clause, DisabledTriggerClause)
 
 
+@dataclass(frozen=True)
+class StandingClause(Clause):
+    """A clause read and rendered every day, with its REAL state — never
+    forced, never hidden — but graded by no gate, ever.
+
+    Mirrors `crucible/crucible/gate.py`'s ``standing_slo_clauses()``
+    (`af86cf6`, 2026-09-13), the shared gate engine's second adopter having
+    the same shape of ruling put to it first: three phase-2 clauses whose
+    floor was a CALENDAR — none could be turned green by anything the system
+    did, only by waiting — left the exit gate but did not stop being
+    measured. `nousergon_lib.gates` (`Clause`/`GateResult`) needed no change
+    then and needs none now: a clause already renders on the full board
+    (`clauses.py::generate`) regardless of which gate grades it, and
+    `read.evaluate`'s existing `is_ungraded` exclusion (RETIRED, UNCONNECTED,
+    DISABLED-trigger) already proves a clause can be excluded from every
+    phase's MET/UNMET/UNMEASURABLE arithmetic while staying on the board.
+    ``StandingClause`` is the same exclusion, for a fourth reason.
+
+    Brian's ruling, 2026-09-21 (verbatim): *"i'm not clear why we need to
+    time gate anything, why not just collect the data when it is ready but
+    not block subsequent issues"*.
+
+    Unlike :class:`RetiredClause`/:class:`UnconnectedClause`/
+    :class:`DisabledTriggerClause` — each of which is ALWAYS ``met=False``,
+    because the state itself (retired, unconnected, disabled) is the whole
+    fact — a standing clause carries its reading's REAL ``met``/
+    ``unmeasurable``/``detail``, unmodified. It can and eventually will read
+    MET, honestly, once the data it waits for exists; until then it reads
+    UNMET (or UNMEASURABLE) exactly as an ordinary clause would. The ONLY
+    thing this wrapper changes is that `is_ungraded` now excludes it from
+    every gate's clause list — "no data is never rendered as green" cuts
+    both ways: it is never hidden, and it never blocks a LATER phase's own
+    work on a wait that phase cannot shorten.
+    """
+
+    ruling: str = ""
+
+
+def is_standing(clause: Clause) -> bool:
+    return isinstance(clause, StandingClause)
+
+
+def _standing_clause(name: str, requirement: str, reading: ev.Reading, *, phase: str, ruling: str) -> Clause:
+    """A clause graded by no gate but read and rendered with its real state.
+
+    See :class:`StandingClause`. ``unmeasurable`` and ``met`` are carried
+    from ``reading`` verbatim — never forced — the opposite discipline from
+    :func:`_retired`/:func:`_clause_consumers_unconnected`, which force
+    ``met=False`` because their state IS the fact.
+    """
+    return StandingClause(
+        name,
+        requirement,
+        reading.met,
+        reading.detail,
+        reading.evidence,
+        unmeasurable=reading.unmeasurable,
+        phase=phase,
+        source=reading.source,
+        as_of=reading.as_of,
+        ruling=ruling,
+    )
+
+
 def is_ungraded(clause: Clause) -> bool:
-    """Published on the board, graded by no gate: RETIRED, UNCONNECTED or a
-    DECLARED-DISABLED trigger."""
-    return is_retired(clause) or is_unconnected(clause) or is_disabled_trigger(clause)
+    """Published on the board, graded by no gate: RETIRED, UNCONNECTED, a
+    DECLARED-DISABLED trigger, or a STANDING clause (a real reading excluded
+    from every phase's gate arithmetic by ruling, not by its own state)."""
+    return is_retired(clause) or is_unconnected(clause) or is_disabled_trigger(clause) or is_standing(clause)
 
 
 def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase: str) -> Clause:
@@ -993,14 +1058,39 @@ def _exit_clause(name: str, requirement: str, reading: ev.Reading, *, phase: str
     )
 
 
+#: Brian's ruling, 2026-09-21 (verbatim): *"it sounds like the only time gate
+#: we should have here is for v2 phase 4 deleting the v1 pipelines, so a time
+#: gate here makes sense. as such we should be able to work up to this point
+#: without time gates."* Phase 1's own exit no longer needs a STREAK — one
+#: complete cycle proves the standalone collector runs end to end at all —
+#: and the ratified 5/5/2 streak targets move to the standing reliability
+#: rows below, published for Crucible v2 phase 4's irreversible v1-pipeline
+#: deletion (`alpha-engine-config-I10655`) to gate on instead.
+RELIABILITY_STREAK_RULING = (
+    "Brian, 2026-09-21: \"it sounds like the only time gate we should have here is for v2 "
+    "phase 4 deleting the v1 pipelines, so a time gate here makes sense. as such we should "
+    "be able to work up to this point without time gates.\" One complete cycle proves the "
+    "standalone collector; the ratified streak (5 EOD / 5 morning / 2 weekly) is published "
+    "as the reliability bar Crucible v2 phase 4 gates its irreversible v1-pipeline deletion "
+    "on (alpha-engine-config-I10655), never a data-phase exit requirement."
+)
+
+#: The dedicated, non-numbered gate the three reliability-streak rows publish
+#: under — `data_gate/read.py::GATES`. Named here, once, so the clause
+#: constructor and the gate registration can never name it differently.
+RELIABILITY_GATE = "data-collection-reliability"
+
+
 def _clause_phase1_consecutive_eod_cycles(cycles: xc.CycleSet) -> Clause:
-    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_EOD]
+    required = xc.PHASE1_EXIT_CONSECUTIVE[xc.SCHEDULE_EOD]
     return _exit_clause(
         "data.phase1.consecutive_eod_cycles",
         (
-            f"{required} CONSECUTIVE complete EOD cycles ending at the latest due fire — every "
-            "unit the schedule verifies recorded an ok scheduled-trigger manifest inside the "
-            "cycle (plan §6 phase-1 exit)"
+            f"{required} complete EOD cycle ending at the latest due fire — every unit the "
+            "schedule verifies recorded an ok scheduled-trigger manifest inside the cycle, "
+            "proving the standalone collector ran end to end (plan §6 phase-1 exit, narrowed "
+            "from a streak by Brian's 2026-09-21 ruling — the streak is now a standing "
+            "reliability row, not a phase-1 exit requirement)"
         ),
         xc.read_consecutive_cycles(cycles, required=required),
         phase="data-phase1",
@@ -1008,12 +1098,12 @@ def _clause_phase1_consecutive_eod_cycles(cycles: xc.CycleSet) -> Clause:
 
 
 def _clause_phase1_consecutive_morning_cycles(cycles: xc.CycleSet) -> Clause:
-    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_MORNING]
+    required = xc.PHASE1_EXIT_CONSECUTIVE[xc.SCHEDULE_MORNING]
     return _exit_clause(
         "data.phase1.consecutive_morning_cycles",
         (
-            f"{required} CONSECUTIVE complete morning cycles ending at the latest due fire "
-            "(plan §6 phase-1 exit)"
+            f"{required} complete morning cycle ending at the latest due fire (plan §6 phase-1 "
+            "exit, narrowed from a streak by Brian's 2026-09-21 ruling)"
         ),
         xc.read_consecutive_cycles(cycles, required=required),
         phase="data-phase1",
@@ -1021,15 +1111,62 @@ def _clause_phase1_consecutive_morning_cycles(cycles: xc.CycleSet) -> Clause:
 
 
 def _clause_phase1_consecutive_weekly_cycles(cycles: xc.CycleSet) -> Clause:
-    required = xc.PHASE1_CONSECUTIVE[xc.SCHEDULE_WEEKLY]
+    required = xc.PHASE1_EXIT_CONSECUTIVE[xc.SCHEDULE_WEEKLY]
     return _exit_clause(
         "data.phase1.consecutive_weekly_cycles",
         (
-            f"{required} CONSECUTIVE Saturdays of the weekly schedule with complete manifests "
-            "(plan §6 phase-1 exit)"
+            f"{required} complete Saturday of the weekly schedule with complete manifests "
+            "(plan §6 phase-1 exit, narrowed from a streak by Brian's 2026-09-21 ruling)"
         ),
         xc.read_consecutive_cycles(cycles, required=required),
         phase="data-phase1",
+    )
+
+
+def _clause_reliability_streak(name: str, cycles: xc.CycleSet, *, schedule_label: str) -> Clause:
+    """One standing reliability row: the REAL current streak, graded against
+    the plan's ORIGINAL ratified target — never a data-phase exit clause.
+
+    Published under :data:`RELIABILITY_GATE`, not any numbered `data-phaseN`
+    gate: `read.evaluate`'s ceiling-based selection already excludes a
+    non-`data-phaseN` phase tag from every numbered gate structurally, and
+    `RELIABILITY_GATE` is registered as its OWN `ceiling=None` gate (mirrors
+    `data-cutover-ready`) so Crucible v2 phase 4 can read a real MET/UNMET
+    verdict — `evaluate` special-cases a `StandingClause` whose own `phase`
+    matches the requested gate exactly, so this row is excluded from
+    data-phase1/2/3 (never blocks them) but graded BY its own gate (so v2
+    phase 4 has something to read).
+    """
+    required = xc.RELIABILITY_STREAK_TARGET[schedule_label]
+    return _standing_clause(
+        name,
+        (
+            f"the RATIFIED reliability streak for {schedule_label} — {required} consecutive "
+            "complete cycles ending at the latest due fire — published for Crucible v2 phase "
+            "4's irreversible v1-pipeline deletion (alpha-engine-config-I10655) to gate on. "
+            "Never a data-phase exit requirement (Brian's 2026-09-21 ruling)."
+        ),
+        xc.read_consecutive_cycles(cycles, required=required),
+        phase=RELIABILITY_GATE,
+        ruling=RELIABILITY_STREAK_RULING,
+    )
+
+
+def _clause_reliability_eod_streak(cycles: xc.CycleSet) -> Clause:
+    return _clause_reliability_streak(
+        "data.standing.eod_reliability_streak", cycles, schedule_label=xc.SCHEDULE_EOD
+    )
+
+
+def _clause_reliability_morning_streak(cycles: xc.CycleSet) -> Clause:
+    return _clause_reliability_streak(
+        "data.standing.morning_reliability_streak", cycles, schedule_label=xc.SCHEDULE_MORNING
+    )
+
+
+def _clause_reliability_weekly_streak(cycles: xc.CycleSet) -> Clause:
+    return _clause_reliability_streak(
+        "data.standing.weekly_reliability_streak", cycles, schedule_label=xc.SCHEDULE_WEEKLY
     )
 
 
@@ -1059,16 +1196,47 @@ def _clause_phase1_v1_data_stage_quiet(store: ev.GateStore) -> Clause:
     )
 
 
+#: Brian's ruling, 2026-09-21 (verbatim), on why this clause is STANDING and
+#: not a phase-1/2/3 exit gate — see :class:`StandingClause`:
+#:
+#:     "i'm not clear why we need to time gate anything, why not just collect
+#:     the data when it is ready but not block subsequent issues"
+#:
+#: Measured that day: the `component` cost-allocation tag went Active
+#: 2026-09-21T14:59Z and the CUR export `nous-ergon-fleet-cur` was created
+#: 16:50Z, so 28 days of tagged spend cannot exist before ~2026-10-20 no
+#: matter what phase 1 builds — while every OTHER phase-1 clause can clear
+#: by ~2026-10-04. The ladder refuses to exit a later phase ahead of an
+#: earlier one, so as an exit clause this alone would have held phases 1, 2
+#: AND 3 shut for ~16 days over a vendor billing-export lag, not a defect.
+#: Same shape as his 2026-09-13 crucible ruling (`af86cf6`) that turned
+#: phase-2's three calendar-floored clauses into standing rows.
+COST_BASELINE_STANDING_RULING = (
+    "Brian, 2026-09-21: \"i'm not clear why we need to time gate anything, why not just "
+    "collect the data when it is ready but not block subsequent issues\" — the "
+    f"{xc.PHASE1_COST_BASELINE_WEEKS}-week tagged cost baseline is measured and reported "
+    "every day; it blocks no phase (plan R6: proposed at phase-1 exit, ratified at "
+    "phase-3, from the SAME document data.cost.monthly grades against the ceiling)."
+)
+
+
 def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
-    return _exit_clause(
+    """Plan §6 phase-1 exit's cost-baseline row — STANDING, not gating, since
+    Brian's 2026-09-21 ruling (:data:`COST_BASELINE_STANDING_RULING`,
+    :class:`StandingClause`). Read and rendered every day with its real
+    state; excluded from every phase's MET/UNMET/UNMEASURABLE arithmetic.
+    """
+    return _standing_clause(
         "data.phase1.cost_baseline_measured",
         (
             f"a {xc.PHASE1_COST_BASELINE_WEEKS}-week tagged cost baseline has been MEASURED "
             "(plan §6 phase-1 exit) — a different question from data.cost.monthly, which grades "
-            "the same document against the ratified ceiling at phase 3"
+            "the same document against the ratified ceiling at phase 3. STANDING since Brian's "
+            "2026-09-21 ruling: reported daily, gates no phase."
         ),
         xc.read_cost_baseline_measured(store, weeks=xc.PHASE1_COST_BASELINE_WEEKS),
         phase="data-phase1",
+        ruling=COST_BASELINE_STANDING_RULING,
     )
 
 
@@ -1267,6 +1435,9 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase1_consecutive_eod_cycles(eod))
     clauses.append(_clause_phase1_consecutive_morning_cycles(morning))
     clauses.append(_clause_phase1_consecutive_weekly_cycles(weekly))
+    clauses.append(_clause_reliability_eod_streak(eod))
+    clauses.append(_clause_reliability_morning_streak(morning))
+    clauses.append(_clause_reliability_weekly_streak(weekly))
     clauses.append(_clause_board_collector_code_identity(weekly))
     clauses.append(_clause_phase1_v1_data_stage_quiet(store))
     clauses.append(_clause_phase1_cost_baseline_measured(store))
