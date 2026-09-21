@@ -54,7 +54,7 @@ from collectors.nlp.loughran_mcdonald import (
     LmDictUnavailable,
     ensure_lm_master_dict,
 )
-from dates import default_run_date
+from dates import default_run_date, default_session_date
 from validators import expectations
 
 logger = logging.getLogger(__name__)
@@ -205,10 +205,14 @@ def collect(
         s3_client = boto3.client("s3")
 
     # PROVENANCE-acceptable fallback (alpha-engine-config-I11216, mirrors the
-    # documented ``collectors/prices.py:258`` shape): ``run_date`` is the
-    # explicit anchor on every scheduled path (the SF passes ``args.date`` or
-    # ``default_run_date()`` — see ``main`` below); ``None`` here only serves
-    # an ad-hoc/operator invocation of ``collect`` with no date of its own.
+    # documented ``collectors/prices.py:258`` shape): ``run_date`` is always
+    # exactly ``args.date`` (``main`` passes it straight through, never
+    # ``default_run_date()``/``default_session_date()`` — those only key the
+    # run manifest, below). ``None`` here means either an ad-hoc invocation
+    # with no date of its own, or the real scheduled path (the systemd timer
+    # passes no ``--date``), and both fall back to the literal UTC calendar
+    # date at run time — the published ``aggregate_date``/``filed_date``/
+    # ``digest_date`` keys below are NEVER on the trading-day axis.
     agg_date = (
         Date.fromisoformat(run_date)
         if run_date
@@ -647,7 +651,18 @@ def main() -> int:
         "D36",
         _body,
         trigger="scheduled",
-        trading_day=args.date or default_run_date(),
+        # `default_session_date()`, NOT `default_run_date()`: D36 runs at
+        # 04:00 America/Los_Angeles, hours before that day's own NYSE close,
+        # so the last-CLOSED-session axis stays on the PREVIOUS session for
+        # the unit's entire calendar day, every trading day (the same class
+        # already fixed for D37 in this PR — see `dates.default_session_date`'s
+        # docstring). This does NOT change what `collect()` above publishes:
+        # its `aggregate_date`/`filed_date`/`digest_date` keys come from
+        # `agg_date`, which is sourced from `args.date` or (on this scheduled
+        # path) the literal UTC calendar `datetime.now(...).date()` — never
+        # from `default_run_date()` — so only the run-manifest FOLDER moves,
+        # no published artifact key changes (alpha-engine-config-I10810).
+        trading_day=args.date or default_session_date(),
         bucket=args.bucket,
         write=not args.dry_run,
     )
