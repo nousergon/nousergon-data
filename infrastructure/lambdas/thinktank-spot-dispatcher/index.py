@@ -77,10 +77,22 @@ DISPATCH_ENABLED = (
 # bound, not CPU-bound (the Lambda peaked at 394MB of 1024MB), so the smallest
 # standard tier is right; the multi-type list exists for capacity resilience,
 # not performance.
+#
+# Widened 4 -> 9 types across 3 families (alpha-engine-config-I11340 item 5),
+# same set and same rationale as `data-spot-dispatcher/index.py`'s widening —
+# CloudTrail (2026-09-21) shows this role as one of the two c5.large launchers
+# behind August's on-demand/spot c5.large concurrency (946 combined hours >
+# the 744 in the month). Every addition is x86_64, 2 vCPU, 4 GiB class,
+# drawn from the same already-evidenced set this repo's own
+# `spot_data_weekly.sh`/`_spot_common.sh` ALLOWED_INSTANCE_TYPES treats as
+# offered in this account's subnets. NEEDS AN IAM CHANGE (see iam-policy.json)
+# in the same change set — operator-gated `deploy.sh --apply-iam`.
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
-        "THINKTANK_SPOT_INSTANCE_TYPES", "c5.large,m5.large,c6i.large,c5a.large"
+        "THINKTANK_SPOT_INSTANCE_TYPES",
+        "c5.large,c5a.large,c6i.large,m5.large,m5a.large,m6i.large,"
+        "r5.large,r5a.large,r6i.large",
     ).split(",")
     if t.strip()
 ]
