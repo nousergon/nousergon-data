@@ -45,6 +45,16 @@ Parameters:
     Default: DISABLED
     AllowedValues: [DISABLED, ENABLED]
     Description: State of the daily-heal schedule (paused by ruling 2026-08-07).
+  ShadowSamedayState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: >-
+      State of the shadow-sameday schedule. Born ENABLED, unlike
+      CollectionState/DailyHealState above: the workload writes only under
+      staging/shadow/, never market_data/*, so it carries none of the
+      double-write risk the other schedules' DISABLED default guards against
+      (alpha-engine-config-I11233).
   DefinitionS3Bucket:
     Type: String
     Default: alpha-engine-research
@@ -322,6 +332,57 @@ Resources:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
         Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": false, "verify_units": ["D33"]}'
+
+  # Weekday shadow-sameday parity run (alpha-engine-config-I11233). Targets
+  # the dispatcher LAMBDA DIRECTLY, not a state machine — the only schedule in
+  # this stack that does, because the workload's own guard already resolves
+  # the trading day and exits 0 on a non-trading day, so no SF wrapper adds
+  # anything. `alpha-engine-eventbridge-sfn-role` (nous-ergon-ops
+  # infrastructure/iam/alpha-engine-eventbridge-sfn-role/) carries a
+  # lambda:InvokeFunction grant scoped to this one function; that grant lands
+  # (and auto-applies on merge) before this schedule's PR merges, so the
+  # first fire is never the first test of the permission.
+  #
+  # 18:30 ET: after this stack's own 16:45 ET EodSchedule and after v1's
+  # postclose writes (measured starting 16:00 ET), leaving a wide margin
+  # before either could still be writing. The workload's own 18000s (5h) cap
+  # means a worst-case finish ~23:30 ET, comfortably inside the weekday
+  # window and with no other schedule in this stack running after it.
+  #
+  # Born ENABLED (ShadowSamedayState, default ENABLED) rather than sharing
+  # CollectionState: it writes only to staging/shadow/ (7-day lifecycle
+  # expiry, no new retention rule needed) and never to market_data/*, so it
+  # carries none of the double-write risk CollectionState's DISABLED default
+  # exists to prevent — Brian ruling 2026-09-21 (alpha-engine-config-I11203)
+  # chose a same-day run over a replay to close I11203's parity clause, and
+  # this is that run's trigger.
+  #
+  # No require_trading_day, no verify_units: this schedule's Input is the
+  # dispatcher's own direct-invoke contract (`{"workload": ...}`), not the
+  # collection/workloads/verify_units shape the state-machine-targeting
+  # schedules above use — there is no state machine here to pass
+  # require_trading_day/verify_units to, and the workload's own guard already
+  # covers the trading-day check. The completion claim is graded downstream,
+  # by data.cutover_ready.parity reading data_collection/parity/{trading
+  # day}.json, not by this stack's own verify_units machinery
+  # (alpha-engine-config-I11233 closes-when).
+  ShadowSamedaySchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: data-collection-shadow-sameday
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref ShadowSamedayState
+      ScheduleExpression: 'cron(30 18 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"workload": "shadow-sameday"}'
 
   # Failure alarms are NOT declared here. The fleet's alarms come from files
   # (nous-ergon-ops infrastructure/cloudwatch/alarms/ne-data-collection-*-failed.json,

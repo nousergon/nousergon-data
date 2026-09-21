@@ -87,7 +87,7 @@ echo "==> Stage definition s3://$BUCKET/$KEY"
 aws s3 cp "$DEFINITION" "s3://$BUCKET/$KEY" --region "$REGION" --only-show-errors
 
 echo "==> Deploy stack $STACK_NAME"
-aws cloudformation deploy --region "$REGION" --stack-name "$STACK_NAME" --template-file "$TEMPLATE" --no-fail-on-empty-changeset --parameter-overrides "DefinitionS3Key=$KEY" "CollectionState=$(field param-CollectionState)" "DailyHealState=$(field param-DailyHealState)" --tags "git-sha=$GIT_SHA" "template-sha256=$(field template-sha256)" "definition-sha256=$(field definition-sha256)" component=nousergon-data-collection
+aws cloudformation deploy --region "$REGION" --stack-name "$STACK_NAME" --template-file "$TEMPLATE" --no-fail-on-empty-changeset --parameter-overrides "DefinitionS3Key=$KEY" "CollectionState=$(field param-CollectionState)" "DailyHealState=$(field param-DailyHealState)" "ShadowSamedayState=$(field param-ShadowSamedayState)" --tags "git-sha=$GIT_SHA" "template-sha256=$(field template-sha256)" "definition-sha256=$(field definition-sha256)" component=nousergon-data-collection
 
 # "No changes to deploy" is also what a correct re-apply prints. Prove the
 # effect instead of trusting the exit code: the live stack must carry THIS
