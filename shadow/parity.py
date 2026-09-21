@@ -922,6 +922,19 @@ class ParityReport:
     rel_tolerance: float
     absolute_tolerance: float
     generated_at: str
+    #: What the PRODUCER legs did, when the caller knows (`--legs-file`).
+    #: Empty when the comparator was run on its own over an existing prefix.
+    #:
+    #: `alpha-engine-config-I11200`. `shadow-weekday` chained its legs with
+    #: `&&`, so one leg's non-zero exit skipped every later leg AND the
+    #: comparator. Measured twice on 2026-09-20: the 09-14 dispatch died in
+    #: leg 2 on a freshness guard, the 09-18 dispatch died at the end of leg 3
+    #: on `features=degraded` -- two unrelated causes, and NEITHER produced a
+    #: report, though the 09-18 run had already written 1,977 objects the
+    #: comparator could read. Running the legs independently means a report
+    #: always exists; carrying their outcomes here is what stops it being read
+    #: as if every leg had run.
+    legs: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def summary(self) -> dict[str, int]:
@@ -959,6 +972,11 @@ class ParityReport:
             "shadow_prefix": self.shadow_prefix,
             "code_sha": self.code_sha,
             "tolerance": {"relative": self.rel_tolerance, "absolute": self.absolute_tolerance},
+            # DECLARED, never inferred. An empty list means "the comparator was
+            # not told", which is NOT the same claim as "every leg ran" -- a
+            # reader that cannot tell those apart is the state I11200 describes.
+            "legs": self.legs,
+            "legs_known": bool(self.legs),
             "met": self.met,
             "summary": self.summary,
             "excluded_units": self.excluded,
@@ -1262,6 +1280,7 @@ def run_parity(
     absolute_tolerance: float = DEFAULT_ABSOLUTE_TOLERANCE,
     max_keys_per_prefix: int = 50,
     now: dt.datetime | None = None,
+    legs: list[dict[str, Any]] | None = None,
 ) -> ParityReport:
     """Diff every declared key of every live-v1-producer unit and build the report."""
     root = ShadowRoot(trading_day)
@@ -1499,4 +1518,5 @@ def run_parity(
         rel_tolerance=rel_tolerance,
         absolute_tolerance=absolute_tolerance,
         generated_at=stamp.replace("+00:00", "Z"),
+        legs=list(legs or []),
     )
