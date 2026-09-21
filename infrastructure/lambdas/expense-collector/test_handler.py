@@ -890,7 +890,10 @@ class TestReconcileAnthropic:
             pmw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None, prior_doc)
         assert row["actual_final"] == pytest.approx(3.50)
         assert "starting_at=2026-06-01" in seen_urls[0]
-        assert "ending_before=2026-07-01" in seen_urls[0]
+        # I10013: renamed from `ending_before` — the current Admin API
+        # (platform.claude.com/docs/en/api/beta/organization/cost_report/
+        # retrieve) documents `ending_at`, not `ending_before`.
+        assert "ending_at=2026-07-01" in seen_urls[0]
 
     def test_admin_api_amounts_are_cents_not_dollars(self, monkeypatch):
         """Regression for the 100x overstatement found live 2026-07-20
@@ -920,6 +923,129 @@ class TestReconcileAnthropic:
                                     "projected_month_end_usd": None}]}
         row = index.reconcile_anthropic(pmw, {}, {}, s3, prior_doc)
         assert row["actual_final"] == pytest.approx(5.0)
+
+
+class TestCollectAnthropicDateRange:
+    """alpha-engine-config-I10013: the Admin API 400s with "Invalid date
+    range: ending date must be after starting date" whenever `ending_at` is
+    omitted and no full day has elapsed since `starting_at` — measured live
+    at both scheduled `_collect` runs (00:15 and 12:15 UTC) on 2026-08-01 and
+    2026-09-01, and on no other date. `collect_anthropic` must always send an
+    explicit `ending_at` strictly after `starting_at`, at every month
+    boundary — including the 1st of the month and Dec -> Jan, where a naive
+    "start of this month" default would collide with `starting_at` itself."""
+
+    def _fake_http(self, seen_urls):
+        def _fn(url, headers=None):
+            seen_urls.append(url)
+            return {"data": [], "has_more": False}
+        return _fn
+
+    def test_ending_at_always_present_and_after_starting_at(self, monkeypatch):
+        """Live-collect path (no `end` passed): mid-month, `now` far from a
+        boundary — the un-pathological case must still carry an explicit,
+        later `ending_at` rather than omitting the param."""
+        now = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert "starting_at=2026-07-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2026-07-18T00:00:00Z" in seen_urls[0]
+
+    def test_first_of_month_early_morning_does_not_collapse_the_window(self, monkeypatch):
+        """The exact live failure shape: `now` on the 1st, minutes past
+        midnight UTC (2026-09-01T00:15:54Z, the 00:15 scheduled run).
+        `starting_at` and a naive same-day `ending_at` would be equal (or
+        `ending_at` earlier); the fix must push `ending_at` to the START OF
+        THE NEXT DAY so it is always strictly after `starting_at`."""
+        now = datetime(2026, 9, 1, 0, 15, 54, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert "starting_at=2026-09-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2026-09-02T00:00:00Z" in seen_urls[0]
+
+    def test_first_of_month_midday_still_after_starting_at(self, monkeypatch):
+        """The second live failure timestamp: 12:15:53 UTC on the 1st — still
+        the same calendar day as `starting_at`, so still must not omit or
+        collapse `ending_at`."""
+        now = datetime(2026, 8, 1, 12, 15, 53, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert "starting_at=2026-08-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2026-08-02T00:00:00Z" in seen_urls[0]
+
+    def test_december_to_january_boundary(self, monkeypatch):
+        """Year rollover: `now` on Dec 31 means "tomorrow" is Jan 1 of the
+        NEXT year — `timedelta(days=1)` must cross that boundary correctly
+        rather than wrapping back within December."""
+        now = datetime(2026, 12, 31, 23, 50, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert "starting_at=2026-12-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2027-01-01T00:00:00Z" in seen_urls[0]
+
+    def test_reconciliation_still_uses_the_closed_month_boundary(self, monkeypatch):
+        """The reconciliation path (`end` explicitly given) must keep using
+        that CLOSED-month boundary verbatim, not the "tomorrow" default that
+        only applies to the live open-ended read."""
+        pmw = index._prior_month_window(datetime(2027, 1, 15, tzinfo=timezone.utc))
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic({**pmw, "elapsed_frac": 1.0}, {},
+                                {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None,
+                                end=pmw["end"], last_day=31)
+        assert "starting_at=2026-12-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2027-01-01T00:00:00Z" in seen_urls[0]
+
+
+class TestLogProviderFailed:
+    """alpha-engine-config-I10013 deliverable 1/4: the fail-loud contract is
+    one STABLE, greppable line the CloudWatch metric filter can match — not
+    the traceback's first line, which varies by exception type."""
+
+    def test_http_error_carries_the_status_code(self, caplog):
+        exc = RuntimeError("HTTP 403 from https://api.github.com/x: {\"message\":\"Forbidden\"}")
+        with caplog.at_level("ERROR"):
+            index._log_provider_failed("github_org", exc)
+        assert "provider_failed provider=github_org status=403" in caplog.text
+
+    def test_non_http_error_reports_n_a_status(self, caplog):
+        exc = ValueError("Expecting value: line 1 column 1 (char 0)")
+        with caplog.at_level("ERROR"):
+            index._log_provider_failed("neon", exc)
+        assert "provider_failed provider=neon status=n/a" in caplog.text
+
+    def test_collect_fence_emits_the_stable_line_alongside_the_traceback(self, monkeypatch, caplog):
+        """The line must survive through the real `_collect` fence, not just
+        the helper in isolation — and the traceback logging must remain."""
+        mw = index._month_window(NOW)
+
+        def _boom(*a, **k):
+            raise RuntimeError("HTTP 400 from https://api.anthropic.com/x: bad range")
+
+        monkeypatch.setattr(index, "collect_anthropic", _boom)
+        rows: list[dict] = []
+
+        def fenced(key, label, fn):
+            try:
+                rows.append(fn())
+            except Exception as exc:  # noqa: BLE001 — mirrors the real fence
+                index._log_provider_failed(key, exc)
+                index.logger.exception("provider %s failed", key)
+                rows.append(index._row(key, label, status="error", error=str(exc)[:300]))
+
+        with caplog.at_level("ERROR"):
+            fenced("anthropic_api", "Anthropic API", lambda: index.collect_anthropic(mw, {}, {}, None))
+        assert "provider_failed provider=anthropic_api status=400" in caplog.text
+        assert "provider anthropic_api failed" in caplog.text
+        assert rows[0]["status"] == "error"
 
 
 class TestReconcileCounterDiff:
