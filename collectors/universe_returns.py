@@ -65,6 +65,7 @@ from polygon_client import PolygonForbiddenError
 
 from collectors.research_db_upload import upload_research_db
 from dates import default_run_date
+from shadow.root import active_root
 
 logger = logging.getLogger(__name__)
 
@@ -257,13 +258,31 @@ def collect(
     _ensure_table(db_path)
     # CONTENT, not provenance (alpha-engine-config-I11216 deliverable 5):
     # `today` drives the whole backfill window (`_trading_days_to_process`'s
-    # lookback walk and `_get_existing_dates`' completeness gate), so it must
-    # anchor on `run_date` when the caller supplied one, not the wall clock —
-    # `run_date` already existed on this signature but, before this fix, was
-    # threaded ONLY to the S3 upload stamp below, never to the date window
-    # that decides which rows get computed (the exact
-    # fix-not-propagated-to-analogous-sites class this issue is about).
-    today = date.fromisoformat(run_date) if run_date else date.today()
+    # lookback walk and `_get_existing_dates`' completeness gate). It must
+    # anchor on `run_date` ONLY for a DECLARED replay (`active_root()` —
+    # `python -m shadow run` activates this before a single collector line
+    # runs, per `shadow/root.py`) — that is what makes a replay of day D
+    # reproduce D's content on any wall clock.
+    #
+    # On the LIVE weekly path `run_date` is *always* populated too
+    # (`weekly_collector.py`'s `args.date or default_run_date()` collapses
+    # "explicit --date" and "the default trading day" into the same string
+    # before this function ever sees it) — so `run_date` truthiness alone
+    # cannot distinguish a replay from a live run (alpha-engine-config
+    # weekly-sf-first-pass-register-260921 §2.2, "the code cannot tell a
+    # replay from a live run"). A live run wants the REAL wall clock here: it gates which
+    # forward-return windows have "closed" (`_build_rows_for_date` below),
+    # and anchoring it to Friday's `run_date` on a Saturday run would treat a
+    # forward date that lands exactly on Friday as still-open when Friday's
+    # close has, in fact, already happened — silently dropping otherwise-
+    # computable rows every week. `alpha-engine-config-I11216` fixed the
+    # replay-determinism defect; this restores the pre-PR1837 live-run
+    # behavior alongside it.
+    today = (
+        date.fromisoformat(run_date)
+        if run_date and active_root() is not None
+        else date.today()
+    )
     existing = _get_existing_dates(db_path, today=today)
 
     dates_to_process = _trading_days_to_process(
