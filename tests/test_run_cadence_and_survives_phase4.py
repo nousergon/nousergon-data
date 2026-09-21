@@ -323,3 +323,16 @@ def test_d43_in_region_runs_declare_the_component_identity(units):
 def test_an_on_demand_unit_has_no_schedule_to_lose(units):
     reading = standalone.read_survives_phase4(EmptyStore(), units["D43"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True and reading.detail.startswith("not applicable")
+
+
+def test_a_partial_exclusion_column_is_graded_explicitly_not_inherited(units):
+    """D47 (component 2, plan §8.1) declares `partial_exclusion` naming
+    `survives_phase4` directly (`alpha-engine-config-I10810`) — checked before
+    this reader falls through to its own internal `read_run_record(...)`
+    reuse, which would otherwise inherit D47's `run_record` exclusion
+    incidentally (worded as if a "current run" existed) rather than declaring
+    this column's exclusion on its own terms. `EmptyStore` supplies no
+    scheduler/sfn client, so a fall-through would read UNMEASURABLE, not MET."""
+    reading = standalone.read_survives_phase4(EmptyStore(), units["D47"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is True and not reading.unmeasurable
+    assert "not applicable: N/A-NOT-IMPL" in reading.detail

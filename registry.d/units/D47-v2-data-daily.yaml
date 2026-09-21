@@ -62,21 +62,36 @@ contract:
   # D47 stays excluded from every other clause per the `notes` block below.
 registry_rows: []
 partial_exclusion:
-  # alpha-engine-config-I11245: `artifact_registry` read UNMEASURABLE — D47's
-  # `writes` are prose describing the crucible-v2 store, not S3 key templates
-  # or ArcticDB libraries this reader can grade, and it declares no
-  # registry_rows because there is no data-collector artifact to register.
-  # Plan §8.1 EXCLUSION stands: D47 is component 2, its row/identity/store
-  # live on the crucible board, and this repo grades only its single
-  # input-contract clause (P-07, under `contract` above) — never a second
-  # verdict on an artifact that isn't this repo's to publish.
+  # alpha-engine-config-I11245 (`artifact_registry`) / -I10810 (`run_record`,
+  # `identity`, `survives_phase4`): all four read UNMEASURABLE (or, for
+  # `survives_phase4`, an incidentally-inherited MET worded as if a "current
+  # run" existed) for the SAME reason — D47's `writes` are prose describing
+  # the crucible-v2 store, not S3 key templates or ArcticDB libraries any of
+  # these readers can grade; it declares no registry_rows (nothing to
+  # register), no `data_collection/runs/D47/` prefix (nothing to list), and
+  # no writer identity of its own to simulate (nothing to scope).
+  # `survives_phase4` (`data_gate/standalone.py::read_survives_phase4`)
+  # reuses `read_run_record` internally to decide "does it still fire" — once
+  # `run_record` is excluded, that reuse would otherwise inherit the MET
+  # incidentally rather than declaring it, so it is named here too and
+  # checked explicitly, first, in that reader. Plan §8.1 EXCLUSION stands:
+  # D47 is component 2, its row/identity/store live on the crucible board,
+  # and this repo grades only its single input-contract clause (P-07, under
+  # `contract` above) — never a second verdict on an artifact that isn't this
+  # repo's to publish. One `partial_exclusion` block names every column this
+  # shape applies to, rather than a parallel not-applicable mechanism per
+  # column.
   columns:
     - artifact_registry
+    - run_record
+    - identity
+    - survives_phase4
   na_code: "N/A-NOT-IMPL"
   reason: >-
       component 2 — its row, identity and store live on the crucible board (plan §8.1
-      EXCLUSION); this repo grades no artifact for it, only the input-contract clause
-      already declared under `contract`
+      EXCLUSION); this repo grades no artifact, run record, writer identity or
+      standalone-survival state for it, only the input-contract clause already
+      declared under `contract`
 run_manifest_prefix: data_collection/runs/D47
 detectors:
   - kind: "crucible-gate"

@@ -16,6 +16,7 @@ import pytest
 import yaml
 
 from data_gate import clauses as clause_module
+from data_gate import evidence
 from data_gate import unit_readers
 from data_gate.descriptors import DescriptorError, Unit, load_units
 from data_gate.read import CONSOLE_STATE, GATES, _board_document, evaluate, load_phases
@@ -227,6 +228,51 @@ def test_no_non_retired_unit_reads_artifact_registry_unmeasurable_for_declaring_
     )
 
 
+def test_every_partial_exclusion_column_reads_met_never_unmeasurable(units):
+    """`alpha-engine-config-I11245` / `-I10810`: `partial_exclusion` now has
+    FOUR `read_base`-or-equivalent-wired consumers (`read_artifact_registry`,
+    `evidence.read_run_record`, `read_identity`,
+    `standalone.read_survives_phase4`) — D47's `run_record`/`identity`/
+    `survives_phase4` are the same "descriptor already says N/A, no reader
+    consumed it" shape the original `artifact_registry` defect was. This
+    sweeps every unit's declared `partial_exclusion.columns` that names one
+    of these four against the reader that grades it, using a store that
+    would read UNMEASURABLE (or worse, raise) for any unit that reached the
+    real evidence checks — so a declared exclusion always short-circuits.
+
+    Deliberately does NOT require every declared column to be one of these
+    four: `detector`/`console_entity`/`schema_contract` also appear in some
+    units' `partial_exclusion.columns` (D35, D43) but are graded by a
+    DIFFERENT, pre-existing mechanism this reader package does not own —
+    `partial_exclusion` documents the unit's whole excluded-column set even
+    where only a subset routes through `partial_exclusion_reading` today.
+    """
+    from data_gate import standalone
+
+    store = EmptyStore()  # no artifact_registry_source, no iam_client, no manifests, no
+    # scheduler/sfn client: every real evidence path below would read UNMEASURABLE if reached.
+    dispatch = {
+        "artifact_registry": lambda unit: unit_readers.read_artifact_registry(store, unit),
+        "run_record": lambda unit: evidence.read_run_record(store, unit, trading_day=TRADING_DAY),
+        "identity": lambda unit: unit_readers.read_identity(store, unit),
+        "survives_phase4": lambda unit: standalone.read_survives_phase4(store, unit, trading_day=TRADING_DAY),
+    }
+    checked = 0
+    for unit in units:
+        block = unit.raw.get("partial_exclusion")
+        if not isinstance(block, dict):
+            continue
+        for column in block.get("columns") or []:
+            if column not in dispatch:
+                continue
+            reading = dispatch[column](unit)
+            checked += 1
+            assert reading.met and not reading.unmeasurable, (unit.unit_id, column, reading.detail)
+    # D35 + D43 (artifact_registry, pre-existing) + D47 (all four columns) = 6, the floor as
+    # of this PR. A drop below it means a declared exclusion silently stopped being declared.
+    assert checked >= 6, f"only {checked} partial_exclusion columns were exercised"
+
+
 def test_open_store_attaches_the_published_registry_to_an_s3_store():
     store = open_store("s3://alpha-engine-research/data_collection", dry_run=True)
     assert store.artifact_registry_source.uri.endswith("_freshness_monitor/ARTIFACT_REGISTRY.yaml")
@@ -351,6 +397,17 @@ class _Simulator:
 def test_no_iam_client_is_unmeasurable_never_met(units):
     reading = unit_readers.read_identity(EmptyStore(), _unit(units, "D19"))
     assert reading.unmeasurable and not reading.met
+
+
+def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units):
+    """D47 (component 2, plan §8.1) has no writer identity of its own to
+    simulate — it declares `partial_exclusion` naming `identity`
+    (alpha-engine-config-I10810) instead. Graded from the declaration alone,
+    never reaching the IAM simulation (no client configured on `EmptyStore`,
+    which would otherwise read UNMEASURABLE)."""
+    reading = unit_readers.read_identity(EmptyStore(), _unit(units, "D47"))
+    assert reading.met and not reading.unmeasurable
+    assert "not applicable: N/A-NOT-IMPL" in reading.detail
 
 
 def test_a_role_scoped_to_the_declared_prefixes_reads_met(units):

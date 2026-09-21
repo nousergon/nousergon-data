@@ -111,6 +111,15 @@ def test_the_board_does_not_count_an_undeclared_empty_run_for_any_unit(tmp_path,
     for unit in units:
         if unit.retired or run_units.empty_declaration(unit.raw) is not None:
             continue
+        excluded = unit.raw.get("partial_exclusion")
+        if isinstance(excluded, dict) and "run_record" in (excluded.get("columns") or []):
+            # `alpha-engine-config-I10810`: a unit whose `run_record` is a
+            # declared not-applicable (D47, component 2, plan §8.1) never
+            # looks at `data_collection/runs/<unit>/` at all — grading it
+            # from a stray/synthetic manifest there would be testing a
+            # listing this reader deliberately never performs. See
+            # `test_run_record_reader.py`'s own coverage of this exclusion.
+            continue
         store = _store_with(tmp_path / unit.unit_id, unit, _manifest(unit_id=unit.unit_id))
         reading = evidence.read_run_record(store, unit, trading_day=TRADING_DAY, now=_AS_OF)
         assert not reading.met, f"{unit.unit_id}: an empty `ok` manifest was counted as a run"

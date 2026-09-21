@@ -32,6 +32,7 @@ __all__ = [
     "OBSERVABILITY_ROWS_DIR",
     "UnattributableSimulation",
     "WRITER_IDENTITIES_PATH",
+    "partial_exclusion_reading",
     "read_artifact_registry",
     "read_consumers",
     "read_identity",
@@ -228,12 +229,12 @@ def read_observability_row(unit: Unit, *, rows_dir: pathlib.Path | None = None) 
 
 
 # ---------------------------------------------------------------------------
-# artifact_registry — the enforced ARTIFACT_REGISTRY copy.
+# partial_exclusion — a descriptor-declared not-applicable, ANY base column.
 # ---------------------------------------------------------------------------
 
 
-def _partial_exclusion_reading(unit: Unit, column: str) -> Reading | None:
-    """A unit whose descriptor declares this column not-applicable.
+def partial_exclusion_reading(unit: Unit, column: str) -> Reading | None:
+    """A unit whose descriptor declares this column not-applicable, or ``None``.
 
     `alpha-engine-config-I11245`: five ``artifact_registry`` clauses read
     UNMEASURABLE not because nobody looked, but because the descriptor already
@@ -245,6 +246,16 @@ def _partial_exclusion_reading(unit: Unit, column: str) -> Reading | None:
     precedent in `clauses.py::_clause_guard`: a declared N/A with a code from
     the closed taxonomy is a real answer, graded MET, never silently
     defaulted and never UNMEASURABLE — the descriptor was read, not skipped.
+
+    ONE mechanism for every column, not a `ComponentTwoClause` alongside it:
+    `alpha-engine-config-I10810`'s D47 `run_record`/`identity` findings are
+    the same "descriptor already says this is N/A, no reader consumed it"
+    shape as the original `artifact_registry` defect — `partial_exclusion`
+    is column-scoped (`columns: [...]`) precisely so a unit can name several
+    at once under one `na_code`/`reason` pair, rather than growing a second
+    declaration shape per column. Called by every column-specific reader that
+    wants to honor it (`read_artifact_registry` here, `read_identity` below,
+    `evidence.py::read_run_record`) — never inlined a second time.
     """
     block = unit.raw.get("partial_exclusion")
     if not isinstance(block, dict) or column not in (block.get("columns") or []):
@@ -259,6 +270,11 @@ def _partial_exclusion_reading(unit: Unit, column: str) -> Reading | None:
     )
 
 
+# ---------------------------------------------------------------------------
+# artifact_registry — the enforced ARTIFACT_REGISTRY copy.
+# ---------------------------------------------------------------------------
+
+
 def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
     """Every published S3 key has a registry row or a grandfathered prefix, and
     every row the descriptor names exists and is not parked.
@@ -270,10 +286,10 @@ def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
     construction.
 
     A unit declaring `partial_exclusion` naming this column (see
-    `_partial_exclusion_reading`) is graded from that declaration alone and
+    `partial_exclusion_reading`) is graded from that declaration alone and
     never reaches the S3/ArcticDB checks below.
     """
-    excluded = _partial_exclusion_reading(unit, "artifact_registry")
+    excluded = partial_exclusion_reading(unit, "artifact_registry")
     if excluded is not None:
         return excluded
 
@@ -616,7 +632,15 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
        whole-bucket wildcard).
     3. ``s3:DeleteObject`` on the same probe → NOT allowed (catches bucket-wide
        Delete).
+
+    A unit declaring `partial_exclusion` naming ``identity`` (see
+    `partial_exclusion_reading`) is graded from that declaration alone and
+    never reaches the IAM simulation below — a component-2 unit like D47
+    has no writer identity of its own to scope (`alpha-engine-config-I10810`).
     """
+    excluded = partial_exclusion_reading(unit, "identity")
+    if excluded is not None:
+        return excluded
     path = identities_path or WRITER_IDENTITIES_PATH
     config = _load_identities(path)
     runs_on = str((unit.raw.get("trigger") or {}).get("runs_on") or "")
