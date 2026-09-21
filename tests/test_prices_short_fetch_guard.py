@@ -101,6 +101,32 @@ def test_short_fetch_for_a_brand_new_ticker_is_allowed(monkeypatch):
     assert s3.uploads == ["reference/price_cache/NEWCO.parquet"]
 
 
+def test_short_fetch_on_a_young_ticker_is_still_failed_never_excused(monkeypatch):
+    """alpha-engine-config-I11230 follow-up (measured 2026-09-21, reverted
+    commit 8aa1d7e6): a prior revision of this fix excused a shrinking
+    refresh whenever the ticker's OWN existing history was also small
+    (< `_SHORT_FETCH_ROW_THRESHOLD`), reasoning that a recently-listed
+    ticker has "no growth margin". That was wrong on the guard's own
+    condition — `len(new_df) < existing_rows` is a real regression
+    regardless of the ticker's age, and excusing it for young tickers
+    re-introduced exactly the defect I11230 exists to remove, just scoped to
+    the youngest tickers. A refusal is `partial`, full stop: a young ticker
+    (81 existing rows, the measured FDXF shape) whose fetch comes back
+    SHORTER (10 rows) is a genuine loss and must be reported as `failed`,
+    identically to a mature ticker's regression."""
+    young = _ohlcv(81)
+    s3 = _FakeS3({"reference/price_cache/FDXF.parquet": _parquet_bytes(young)})
+    _patch_download(monkeypatch, _ohlcv(10))
+
+    refreshed, failed, written = _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", ["FDXF"], "10y", 50, trading_day="2026-09-14",
+    )
+
+    assert s3.uploads == [], "the existing (larger) history must be preserved"
+    assert refreshed == 0
+    assert failed == ["FDXF"], "a young ticker's regression is still a failure, not excused"
+
+
 def test_unreadable_existing_parquet_raises_rather_than_overwriting(monkeypatch):
     class _BrokenS3(_FakeS3):
         def get_object(self, Bucket, Key):

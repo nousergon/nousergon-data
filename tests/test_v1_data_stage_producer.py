@@ -156,6 +156,17 @@ def test_main_writes_the_metric_document(monkeypatch, capsys):
     assert run_record["error"] is None
     assert run_record["detail"]["executions_since_cutover"] == 1
 
+    # alpha-engine-config-I11274 (CodeQL: clear-text logging of sensitive
+    # information — the sibling finding on cost_monthly.py, same class here.
+    # This repo is PUBLIC). Stdout carries the S3 key, the count and a
+    # status word — never the execution ARN(s) `body["data_stage_execution_
+    # arns"]` DOES carry (they embed the account ID).
+    out = capsys.readouterr().out
+    assert "e1" not in out
+    assert "arn:aws" not in out
+    assert m.DEFAULT_KEY in out
+    assert "executions_since_cutover=1" in out
+
 
 def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):
     class _BrokenSFN:

@@ -142,7 +142,17 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     # ── weekly, phase 1 ────────────────────────────────────────────────────
     ("phase1", "constituents"): PhaseUnit("D01", "count", "phase1"),
     ("phase1", "historical_constituents"): PhaseUnit("D02", "n_changes", "phase1"),
-    ("phase1", "prices"): PhaseUnit("D03", "refreshed", "phase1"),
+    # alpha-engine-config-I11230 deliverable 2: `collectors/prices.py::collect`
+    # already reports its own not-published count under `failed` (tickers the
+    # short-fetch guard refused to overwrite, or a batch download that raised)
+    # — declared here so the manifest's `rows_rejected` names them, the same
+    # way D12/D13 already do for their own collectors, instead of leaving the
+    # loss visible only in the `reason` string on a `partial` (now `failed`)
+    # manifest.
+    ("phase1", "prices"): PhaseUnit(
+        "D03", "refreshed", "phase1",
+        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+    ),
     ("phase1", "fred_macro_history"): PhaseUnit("D04", "rows", "phase1"),
     ("phase1", "macro"): PhaseUnit("D05", "rows", "phase1"),
     ("phase1", "short_interest"): PhaseUnit("D06", "ok_count", "phase1"),
@@ -177,7 +187,10 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("phase2", "alternative"): PhaseUnit("D15", "tickers_processed", "phase2"),
     # ── weekday EOD ───────────────────────────────────────────────────────
     ("daily", "daily_closes"): PhaseUnit("D19", "tickers_captured", "daily"),
-    ("daily", "prices"): PhaseUnit("D03", "refreshed", "daily"),
+    ("daily", "prices"): PhaseUnit(
+        "D03", "refreshed", "daily",
+        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+    ),
     ("daily", "metron_market_data"): PhaseUnit("D20", "closes", "daily"),
     ("daily", "metron_market_data_history"): PhaseUnit("D21", "close_series", "daily"),
     ("daily", "metron_reference_data"): PhaseUnit("D22", "sectors", "daily"),
