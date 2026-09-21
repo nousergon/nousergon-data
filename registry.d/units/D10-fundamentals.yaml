@@ -41,7 +41,7 @@ contract:
   schema: "contracts/fundamentals_snapshot.schema.json"
   producer_test: tests/test_fundamentals_snapshot_contract.py
   consumer_pins:
-    - "crucible-dashboard:tests/contracts/fundamentals_snapshot.schema.json"
+    - "crucible-dashboard:tests/contracts/fundamentals_snapshot_s3_key_template.json (KEY-TEMPLATE pin, not the body schema — health_checker.py's `fundamentals` freshness check reads only the object key's embedded date, never the body)"
   # P-07 (alpha-engine-config-I10873, I10934): D10 is CONNECTED
   # (crucible-dashboard health_checker.py's `fundamentals` freshness check
   # genuinely reads `archive/fundamentals/` — verified 2026-09-16, NOT the
@@ -49,13 +49,27 @@ contract:
   # D03/D10; that claim does not hold for D10). Producer side built the
   # I10873 PR: a versioned schema for the flat ticker-keyed snapshot + a
   # producer test against the REAL `collect()` write body (both the
-  # real-data and NEUTRAL sentinel shapes) and a hand-built fixture. The
-  # I10934 companion PR (crucible-dashboard) pins
-  # `tests/contracts/fundamentals_snapshot.schema.json` (copy of this file)
-  # + a contract test exercising health_checker.py's `fundamentals` check
-  # (it reads the object KEY's date, not the body — the test validates
-  # schema-conformant real/NEUTRAL fixtures separately) and the pin is
-  # declared above.
+  # real-data and NEUTRAL sentinel shapes) and a hand-built fixture.
+  #
+  # CORRECTED 2026-09-21 (same I10934 session): the first companion
+  # crucible-dashboard PR pinned a byte-copy of THIS FILE's schema (the
+  # BODY shape). That was half a contract — health_checker.py has no
+  # `get_object`/`_fetch_s3_json` call for this prefix, so a body change
+  # cannot break it; the S3 key template / date format is what can. The
+  # pin above now points at a key-template fixture instead
+  # (`archive/fundamentals/{date}.json`, byte-copied from this
+  # descriptor's own `writes` field below) and crucible-dashboard's
+  # contract test builds keys from it and drives the real
+  # `_find_latest_prefix` reader.
+  #
+  # A genuine BODY reader of this schema DOES exist —
+  # crucible-research's `agents/sector_teams/quant_tools.py::
+  # read_fundamentals_from_s3` (`get_object` + `json.loads`, verified
+  # against that repo's origin/main 2026-09-21) — but pinning it is out
+  # of scope for this PR (a crucible-research change, not a
+  # nousergon-data or crucible-dashboard one); filed as
+  # alpha-engine-config-I11276. `consumer_pins` above will gain a second
+  # entry once that PR lands — the list is additive, not exclusive.
 registry_rows:
   - fundamentals_snapshot
 run_manifest_prefix: data_collection/runs/D10
