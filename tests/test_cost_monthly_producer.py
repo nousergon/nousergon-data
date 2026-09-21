@@ -243,7 +243,7 @@ def test_main_refuses_to_run_without_cur_location(monkeypatch):
     assert "CUR" in run_record["error"]
 
 
-def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch):
+def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, capsys):
     key = "cur/x/data/BILLING_PERIOD=2026-09/part-0.parquet"
     payload = _parquet_bytes([_row(5.0, "2026-09-01")])
 
@@ -287,3 +287,72 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch):
     run_record = json.loads(s3.puts[1]["Body"])
     assert s3.puts[1]["Key"].startswith("data_collection/runs/cost_monthly/")
     assert run_record["status"] == "ok"
+
+    # alpha-engine-config-I11274 (CodeQL: clear-text logging of sensitive
+    # information, this repo is PUBLIC). Stdout carries the S3 key, the
+    # coverage count and a status word — never the dollar baseline, the
+    # CUR bucket/export name, or the tag value, all of which the document
+    # written above (body) DOES carry.
+    out = capsys.readouterr().out
+    assert "5.0" not in out and "$" not in out
+    assert "curbucket" not in out
+    assert "cur/x" not in out
+    assert "component" not in out and "data-collection" not in out
+    assert m.DEFAULT_KEY in out
+    assert "days_covered=1" in out
+
+
+def test_stdout_never_carries_the_metric_document_or_argument_values(monkeypatch, capsys):
+    """Direct regression for the CodeQL finding on this module's old
+    `print(json.dumps(metric, ...))` line: stdout must never contain a
+    dollar figure or any of `main()`'s own CUR/tag argument values,
+    regardless of how large the baseline or how identifying the export
+    name is."""
+    key = "cur/secret-project/data/BILLING_PERIOD=2026-09/part-0.parquet"
+    payload = _parquet_bytes([_row(123456.78, "2026-09-01")])
+
+    class _FullS3(_PutCapturingS3):
+        def get_paginator(self, name):
+            class _Paginator:
+                def paginate(self, Bucket, Prefix):
+                    if Prefix == "cur/secret-project/data/BILLING_PERIOD=2026-09/":
+                        return [{"Contents": [{"Key": key}]}]
+                    return [{"Contents": []}]
+
+            return _Paginator()
+
+        def get_object(self, Bucket, Key):
+            class _Body:
+                def read(self_inner):
+                    return payload
+
+            return {"Body": _Body()}
+
+    s3 = _FullS3()
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None):
+            return s3
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+
+    rc = m.main(
+        [
+            "--days",
+            "1",
+            "--cur-bucket",
+            "nous-ergon-fleet-cur-exports-test",
+            "--cur-export-name",
+            "cur/secret-project",
+            "--tag-value",
+            "data-collection",
+        ]
+    )
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "123456" not in out
+    assert "nous-ergon-fleet-cur-exports-test" not in out
+    assert "secret-project" not in out
+    assert "baseline" not in out
+    assert "cur_source" not in out

@@ -336,7 +336,14 @@ def main(argv: list[str] | None = None) -> int:
             cur_bucket=args.cur_bucket,
             cur_prefix=args.cur_export_name,
         )
-        print(json.dumps(metric, indent=2, sort_keys=True))
+        # NEVER the full document (alpha-engine-config-I11274, CodeQL "Clear-
+        # text logging of sensitive information" on this exact line): this
+        # repo is PUBLIC and its GitHub Actions logs are public, and `metric`
+        # carries the dollar baseline plus the CUR export's bucket/prefix
+        # (`cur_source`) and the cost-attribution tag value — all of it
+        # written to S3 already, none of it fit for a public log. Print a
+        # fixed, non-sensitive summary only.
+        print(f"{args.key}: days_covered={window.days_covered}, status=ok")
     except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
         if not args.no_write:
             write_run_record(
