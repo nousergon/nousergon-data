@@ -255,7 +255,15 @@ def collect(
     sector_map = _load_sector_map(s3, bucket, sector_map_key)
 
     _ensure_table(db_path)
-    today = date.today()
+    # CONTENT, not provenance (alpha-engine-config-I11216 deliverable 5):
+    # `today` drives the whole backfill window (`_trading_days_to_process`'s
+    # lookback walk and `_get_existing_dates`' completeness gate), so it must
+    # anchor on `run_date` when the caller supplied one, not the wall clock —
+    # `run_date` already existed on this signature but, before this fix, was
+    # threaded ONLY to the S3 upload stamp below, never to the date window
+    # that decides which rows get computed (the exact
+    # fix-not-propagated-to-analogous-sites class this issue is about).
+    today = date.fromisoformat(run_date) if run_date else date.today()
     existing = _get_existing_dates(db_path, today=today)
 
     dates_to_process = _trading_days_to_process(
@@ -284,7 +292,7 @@ def collect(
 
     for eval_date in dates_to_process:
         try:
-            rows = _build_rows_for_date(eval_date, client, sector_map)
+            rows = _build_rows_for_date(eval_date, client, sector_map, today=today)
             if not rows:
                 errors.append({"date": eval_date, "error": "no rows computed"})
                 continue
@@ -483,6 +491,11 @@ def _get_existing_dates(db_path: str, today: date | None = None) -> set[str]:
     the module docstring. This function's 5d/21d gating is therefore
     correct as written: nothing beyond 21d is stored anymore, so nothing
     beyond 21d needs its own completeness gate.
+
+    ``today`` is explicit-parameter CONTENT (alpha-engine-config-I11216
+    deliverable 5, ``prices.py:258`` shape): ``collect`` always passes its
+    own run_date-anchored ``today``; the wall-clock fallback here serves
+    only a caller with no date of its own.
     """
     today = today or date.today()
     conn = sqlite3.connect(db_path)
@@ -629,8 +642,19 @@ def _build_rows_for_date(
     eval_date: str,
     polygon_client,
     sector_map: dict[str, str] | None,
+    *,
+    today: date | None = None,
 ) -> list[dict]:
-    """Build universe_returns rows for a single eval_date."""
+    """Build universe_returns rows for a single eval_date.
+
+    ``today`` is the "as of" instant deciding which forward windows have
+    closed and are therefore fetchable — CONTENT, not provenance (alpha-
+    engine-config-I11216 deliverable 5). ``collect`` always passes its own
+    (run_date-anchored) ``today`` explicitly; ``None`` here is the
+    ``prices.py:258``-style fallback for a caller with no date of its own
+    (e.g. a direct/test invocation), never the production path.
+    """
+    today = today if today is not None else date.today()
     eval_dt = date.fromisoformat(eval_date)
     fwd_1d = _add_trading_days(eval_dt, 1)
     fwd_3d = _add_trading_days(eval_dt, 3)
@@ -643,7 +667,6 @@ def _build_rows_for_date(
     fwd_90d = _add_trading_days(eval_dt, 90)
 
     # Check that forward dates are in the past (returns can be computed)
-    today = date.today()
     if fwd_5d >= today:
         logger.debug("Skipping %s: 5d forward date %s is in the future", eval_date, fwd_5d)
         return []
