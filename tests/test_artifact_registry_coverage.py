@@ -328,6 +328,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # two new S3 paths still need an ARTIFACT_REGISTRY.yaml grandfather —
     # companion config PR, same as config#2020 did for sub_industry_map.
     "collectors/constituents.py": 4,
+    # alpha-engine-config-I11296 — NDX (Nasdaq-100) membership + per-
+    # constituent weight, sibling artifact to constituents.py (not folded
+    # into it — see collectors/nasdaq100.py module docstring). One PUT
+    # call site, looped over two keys: market_data/index_constituents/
+    # NDX.json (the I11297-consumer "latest" path) and market_data/
+    # weekly/{date}/NDX.json (dated PIT snapshot). Needs an
+    # ARTIFACT_REGISTRY.yaml grandfathered_paths entry for
+    # "market_data/index_constituents/" — filed as alpha-engine-config-
+    # I11296's companion follow-up (see PR body); not yet registered.
+    "collectors/nasdaq100.py": 1,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering

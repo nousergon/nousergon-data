@@ -1,0 +1,158 @@
+# Unit descriptor — data collector unit D49 (Nasdaq-100 membership + weights).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# WHY THIS FILE EXISTS: the data gate's writer-inventory clause caught
+# `collectors/nasdaq100.py` as a write site with no descriptor and no declared
+# parent, which is exactly what `data_gate/config/writer_inventory.yaml`'s own
+# header says that clause is for — "a new collector with no descriptor turns the
+# board red on its own" is "the only mechanism in this design that notices a
+# unit nobody registered". This unit has no parent; it is its own producer. So
+# the response is the descriptor, not an entry in the scope that hides it.
+#
+# LIFECYCLE IS `pending`, AND THAT IS THE POINT. The module is complete and
+# unit-tested but NOTHING RUNS IT: it has no trigger yet. Declaring
+# `in-service` would claim a component the console's discovery cannot find, and
+# declaring a cadence would make the freshness monitor report a false
+# `state=missing` every cycle — the opposite of the signal it exists for.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D49
+component_id: "data-collector-d49-nasdaq100-constituents"
+owning_repo: "nousergon-data"
+title: "Nasdaq-100 membership + per-constituent weight"
+component: 1
+lifecycle: pending
+owner: brian
+code_path: "collectors/nasdaq100.py:328"
+pending_since: "2026-09-21"
+lifecycle_reexam: "2026-10-05"
+lifecycle_reason: >-
+    Producer module merged without a trigger. It is a weekly-cadence membership
+    producer like D01, and the natural home is the existing weekly collector
+    run rather than a new timer; that wiring is operational assembly and is
+    tracked with the sibling contribution producer's scheduling work in
+    alpha-engine-config-I11306. Until it lands the unit writes nothing.
+lifecycle_owner: brian
+promotes_when: >-
+    The weekly run invokes collectors.nasdaq100.collect and
+    market_data/index_constituents/NDX.json exists with a current as_of. Flip
+    lifecycle to in-service and declare the cadence in the same PR.
+trigger:
+  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
+  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
+  # only way it runs today. There is no "none" kind, and inventing one would
+  # be a fallback guess where the generator deliberately refuses to make one.
+  kind: "manual"
+  runs_on: "ec2-spot"
+  detail: >-
+    NOT YET SCHEDULED. Belongs on the weekly membership cadence beside D01
+    (constituents), which sources S&P membership from the SSGA holdings files
+    the same way this unit sources Nasdaq-100 membership.
+  # No `schedule` key: a `pending` row may not declare a cadence, and
+  # data_gate/cadence.py would otherwise grade this unit against a cadence
+  # nothing honours.
+writes:
+  # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
+  # templated key against a contract's x-key-pattern, and a bare `*` resolves
+  # to NOTHING — a glob would declare a write whose contract cannot be found,
+  # which is what
+  # test_declared_contracts_are_reachable_from_their_keys.py exists to catch.
+  - market_data/index_constituents/NDX.json
+  - "market_data/weekly/{date}/NDX.json"
+consumers:
+  - "nousergon-data:collectors/index_contributions.py (D48, alpha-engine-config-I11297)"
+consumers_reason: >-
+    The declared consumer is D48, the per-constituent index contribution
+    producer, which reads this file's weight_map for the NDX leg. Downstream of
+    that is metron (metron-ops-I346), but it reads D48's artifact rather than
+    this one — so the pin below names the direct reader, not the eventual one.
+contract:
+  schema: contracts/ndx_constituents.schema.json
+  producer_test: tests/test_nasdaq100.py
+  consumer_pins:
+    - "nousergon-data:collectors/index_contributions.py::_default_weights_source (D48)"
+registry_rows: []
+# alpha-engine-config-I11307: the ARTIFACT_REGISTRY row for these two key
+# templates is filed separately and deferred until this producer is scheduled,
+# per this repo's "never register a freshness entry ahead of its producer"
+# convention. The pinned PUT count in tests/test_artifact_registry_coverage.py
+# already accounts for the write site.
+run_manifest_prefix: data_collection/runs/D49
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: ABSENT
+    note: "deferred with the registry row — alpha-engine-config-I11307"
+freshness:
+  family: "weekly-membership"
+  status: proposed
+  ratified_at: "alpha-engine-config-I11306 (with the trigger)"
+completeness:
+  denominator: "Nasdaq-100 published membership (101 securities, dual share classes)"
+  floor: 1.0
+  status: proposed
+  note: >-
+    Enforced IN THE PRODUCER: a membership count outside [100, 102] raises before
+    any write. 101 is the published cardinality — 100 companies, 101 securities —
+    so a hard-coded 100 would fail on the dual-class pair.
+guards:
+  empty_fresh:
+    state: present
+    note: "count-range refusal before write; an empty roster cannot be published"
+  cardinality:
+    state: present
+    note: "membership count outside [100, 102] raises (_validate_membership_count)"
+  units:
+    state: present
+    note: >-
+        weights are normalised fractions over the weighted subset, with the raw sum
+        recorded; weight_method distinguishes the source rung.
+  pit:
+    state: present
+    note: >-
+        dated snapshot at market_data/weekly/{date}/NDX.json alongside the latest
+        pointer, so membership becomes point-in-time from the first run.
+  vendor_fallback:
+    state: present
+    note: >-
+        Declared rung ladder with the selected rung recorded as weight_method, and
+        invesco_status recording the measured 406 rather than hiding the fallback.
+        MEASURED 2026-09-21: the Invesco host refuses this client on every path,
+        including the plain HTML product pages, so rung 2 is what actually runs and
+        weights are modified_cap_approx until a licensed feed lands.
+  success_without_output:
+    state: present
+    note: "count-range and market-cap-coverage checks precede the write"
+audit:
+  source: "alpha-engine-config-I11296 (unit added after the 2026-09-14 baseline)"
+  baseline_date: "2026-09-21"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: PRESENT
+    artifact_registry: ABSENT
+    observability_row: ABSENT
+    run_record: ABSENT
+    detector: ABSENT
+    console_entity: UNVERIFIED
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1

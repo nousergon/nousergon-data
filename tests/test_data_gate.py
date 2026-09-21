@@ -133,12 +133,17 @@ def test_the_board_is_red_at_birth(board):
         for c in board
         if c.name.startswith("data.D") and ".guard." not in c.name and not c.name.endswith(".completeness")
     ]
-    # 414 -> 423: D48 (per-constituent index contribution,
-    # alpha-engine-config-I11297) adds its nine clauses. The pin exists to force
+    # 414 -> 423 -> 432: D48 (per-constituent index contribution,
+    # alpha-engine-config-I11297) and now D49 (Nasdaq-100 membership + weights,
+    # alpha-engine-config-I11296) each add their nine clauses. Both branches
+    # pinned 423 independently, which was right for each alone and wrong once
+    # both landed — the conflict here IS the pin working: it forces the second
+    # unit to be acknowledged rather than absorbed into a total nobody re-reads.
+    # The pin exists to force
     # this line to be edited deliberately when a unit is added, so the edit is
     # the acknowledgement — a new producer's clauses must be COUNTED as red, not
     # absorbed into a total nobody re-reads.
-    assert len(base) == 423
+    assert len(base) == 432
     # A declared not-applicable (an on-demand unit with no invocation to record,
     # no scheduled trigger for phase 4 to remove, or a `partial_exclusion`
     # naming a column no artifact/registry/identity read could ever grade for
