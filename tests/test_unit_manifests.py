@@ -176,6 +176,137 @@ def test_d36_exception_propagates_after_the_record_is_durable(sink, daily_news, 
     assert "polygon exploded" in manifest["reason"]
 
 
+def test_d36_default_trading_day_uses_session_date_not_last_closed(sink, monkeypatch):
+    """No ``--date`` (the real systemd-timer invocation, 04:00 America/Los_Angeles,
+    hours before that day's own NYSE close): the manifest must key on the session
+    ``now`` falls WITHIN, never the last one that has fully closed —
+    `alpha-engine-config-I10810`, same defect class as D37 (`nousergon-data-PR1844`).
+    Measured live: every D36 object written 2026-09-18 through 2026-09-21 sat under
+    ``runs/D36/2026-09-18/``; ``runs/D36/2026-09-21/`` (Monday, a trading day)
+    stayed empty."""
+    from collectors import daily_news as module
+    import nousergon_lib.dates as lib_dates
+
+    monkeypatch.setattr(sys, "argv", ["daily_news"])
+    monkeypatch.setattr(module, "collect", lambda *a, **kw: _daily_news_result())  # noqa: ARG005
+    # The as-of axis (last CLOSED session) is stuck on Friday; the event-time
+    # axis (the session `now` falls within) is Monday itself.
+    monkeypatch.setattr(lib_dates, "last_closed_trading_day", lambda *_a, **_kw: date(2026, 9, 18))
+    monkeypatch.setattr(lib_dates, "session_date", lambda *_a, **_kw: date(2026, 9, 21))
+
+    assert module.main() == 0
+
+    manifest = sink.only
+    assert sink.only_key.startswith("data_collection/runs/D36/2026-09-21/")
+    assert manifest["trading_day"] == "2026-09-21"
+
+
+def test_d36_default_trading_day_does_not_move_any_published_artifact_key(sink, monkeypatch):
+    """Switching the run-manifest's `trading_day` to `default_session_date()`
+    must NOT move `collect()`'s own `aggregate_date`/`filed_date`/`digest_date`
+    keys — those come from `run_date=args.date` (``None`` on the scheduled
+    path, falling back to the literal UTC calendar date inside `collect()`),
+    never from `default_run_date()`/`default_session_date()`. This asserts the
+    published keys `collect()` reports are exactly what a mock returns,
+    independent of the manifest's own `trading_day` field."""
+    from collectors import daily_news as module
+
+    monkeypatch.setattr(sys, "argv", ["daily_news", "--date", "2026-09-14"])
+    captured_run_date: dict = {}
+
+    def _collect(*_a, run_date=None, **_kw):
+        captured_run_date["run_date"] = run_date
+        return _daily_news_result()
+
+    monkeypatch.setattr(module, "collect", _collect)
+
+    assert module.main() == 0
+
+    manifest = sink.only
+    # The manifest's own trading_day (from --date, unaffected by this change).
+    assert manifest["trading_day"] == "2026-09-14"
+    # collect() received the SAME --date value, not something derived from
+    # default_session_date() — the published-artifact date axis is untouched.
+    assert captured_run_date["run_date"] == "2026-09-14"
+    assert {o["key"] for o in manifest["outputs"]} == {
+        "data/news_aggregates_daily/2026-09-14/aggregates.parquet",
+        "data/news_articles_daily/2026-09-14/articles.parquet",
+        "data/news_digest_daily/latest.json",
+    }
+
+
+# D36's cadence is `continuous` (`data_gate/cadence.py`'s third shape: runs at
+# least daily, so the gate's own trading day is the right day) — the ONLY
+# other unit sharing that cadence is D37, which cannot fall on this test's
+# open finding because it is gated to `in_us_market_window` and never runs on
+# a weekend or holiday. D36 has no such gate: it runs every calendar day.
+#
+# `data_gate/cadence.py::latest_trading_day_on_or_before` (owned by the
+# `data_gate` track, NOT edited here) computes the folder the gate expects a
+# continuous-cadence unit's manifest under, for a given calendar date, as
+# ``calendar_date if is_trading_day(calendar_date) else previous_trading_day``
+# — i.e. on a non-trading day it looks BACKWARD to the last session.
+# `nousergon_lib.dates.session_date()` (the event-time axis this PR now uses
+# for D36's `trading_day`) resolves a non-trading day FORWARD, to the next
+# session ("Saturday -> Mon: the upcoming session", per its own docstring).
+# The two axes agree on every TRADING day (both mean "today") and disagree on
+# every NON-trading day (backward vs forward) — measured below over a real
+# Thu-to-Tue week spanning a weekend, plus one NYSE holiday.
+_D36_WEEK_SEQUENCE = [
+    # (calendar_date, is a trading day, expect producer/reader agreement)
+    (date(2026, 9, 17), True, True),   # Thu
+    (date(2026, 9, 18), True, True),   # Fri
+    (date(2026, 9, 19), False, False),  # Sat — KNOWN GAP, see below
+    (date(2026, 9, 20), False, False),  # Sun — KNOWN GAP, see below
+    (date(2026, 9, 21), True, True),   # Mon
+    (date(2026, 9, 22), True, True),   # Tue
+    (date(2026, 1, 1), False, False),  # New Year's Day (NYSE holiday) — KNOWN GAP
+]
+
+
+@pytest.mark.parametrize("calendar_date,is_trading,agrees", _D36_WEEK_SEQUENCE)
+def test_d36_producer_and_reader_trading_day_axes_over_a_real_week(calendar_date, is_trading, agrees):
+    """Documents, rather than patches, the open finding above: on every TRADING
+    day the axes agree (this PR's fix makes D36's weekday manifests visible to
+    the gate); on every NON-trading day (weekend or holiday) they now disagree,
+    which is a REGRESSION relative to `default_run_date()`'s old behavior on
+    those two days specifically (it coincided with the reader's backward-looking
+    axis by chance). Net effect measured over a full week: 5/7 days newly
+    correct (every weekday, previously 0/5 correct) vs 2/7 days newly
+    incorrect (Sat/Sun, previously 2/2 correct) — a clear net improvement, not
+    a complete fix.
+
+    This is a `data_gate` reader question, not a `nousergon-data` one: fixing
+    it means `latest_trading_day_on_or_before` mirroring `session_date()`'s
+    OWN forward-looking non-trading-day semantics for `continuous`-cadence
+    units, rather than deriving one independently via `is_trading_day`
+    branching. Filed as an open finding on `alpha-engine-config-I10810` for
+    the `data_gate` owner — NOT patched here."""
+    from zoneinfo import ZoneInfo
+
+    from data_gate.cadence import latest_trading_day_on_or_before
+    from nousergon_lib.dates import session_date
+    from nousergon_lib.trading_calendar import is_trading_day
+
+    assert is_trading_day(calendar_date) is is_trading
+
+    # The producer's own reference moment: 04:00 America/Los_Angeles on the
+    # calendar day the systemd timer fires.
+    local_run_time = datetime(
+        calendar_date.year, calendar_date.month, calendar_date.day, 4, 0,
+        tzinfo=ZoneInfo("America/Los_Angeles"),
+    )
+    producer_folder = session_date(local_run_time)
+    reader_expected_folder = latest_trading_day_on_or_before(calendar_date)
+
+    assert (producer_folder == reader_expected_folder) is agrees, (
+        f"{calendar_date} ({'trading day' if is_trading else 'non-trading day'}): "
+        f"producer folder (session_date) = {producer_folder}, "
+        f"reader-expected folder (latest_trading_day_on_or_before) = "
+        f"{reader_expected_folder} — expected agreement={agrees}"
+    )
+
+
 # ──────────────────────────── D37 — metron-intraday ─────────────────────────
 
 
