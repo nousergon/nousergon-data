@@ -598,7 +598,7 @@ spot_assert_instance_types_allowed() {
     if [ -z "$_bad" ]; then return 0; fi
     echo "ERROR: instance type(s) not on the spot-launch allow-list:${_bad}" >&2
     echo "       allow-list: ${ALLOWED_INSTANCE_TYPES}" >&2
-    echo "       declared in: nous-ergon-ops/infrastructure/iam/spot-launch-declared-instance-types.json" >&2
+    echo "       declared in: the nous-ergon-ops repo, spot-launch-declared-instance-types (beside the role policies)" >&2
     echo "       mirrored in: this script's ALLOWED_INSTANCE_TYPES constant" >&2
     echo "       ec2:RunInstances would refuse this launch with UnauthorizedOperation" >&2
     echo "       (alpha-engine-config-I11227). Add the type to the declared file and to" >&2
