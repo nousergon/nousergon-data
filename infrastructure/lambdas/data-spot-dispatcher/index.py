@@ -466,10 +466,23 @@ _WORKLOADS: dict[str, str] = {
     # records for staying off the schedule. A standalone Scheduler rule pointed
     # at this dispatcher is the honest shape.
     #
-    # A non-trading day exits 0 WITHOUT running: the rule fires Mon-Fri and
-    # NYSE holidays fall inside that. Running anyway would replay the previous
-    # session under today's date and publish a parity report keyed to a day
-    # nothing collected.
+    # THE GUARD IS `default_run_date() == today in ET`, and it does two jobs.
+    # `dates.default_run_date()` returns the last session whose 4:00 PM ET close
+    # HAS OCCURRED, so comparing it to today's ET date refuses:
+    #
+    #   * a non-trading day — the rule fires Mon-Fri and NYSE holidays fall
+    #     inside that. MEASURED: Saturday -> TD=Fri != Sat, exits 0;
+    #     Thanksgiving -> TD=Wed != Thu, exits 0. Running anyway would replay
+    #     the previous session under today's date and publish a parity report
+    #     keyed to a day on which nothing was collected.
+    #   * a PRE-CLOSE fire — 12:00 ET Monday gives TD=Friday != Monday, exits 0.
+    #     That case was not designed for and is the more valuable half: a
+    #     same-day run started before the close would grade a complete v2 run
+    #     against a v1 day that has not finished, and every key v1 had yet to
+    #     write would read `live_missing`.
+    #
+    # MEASURED 2026-09-21 against `dates.default_run_date` for all four cases;
+    # `test_shadow_sameday_guard_refuses_non_sessions_and_pre_close` pins them.
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
