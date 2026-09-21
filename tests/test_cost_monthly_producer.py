@@ -54,6 +54,48 @@ def _row(cost, usage_date, component="data-collection", other_component=None):
     }
 
 
+# The `bcm-data-exports create-export` QueryStatement, codified in
+# nous-ergon-ops/infrastructure/billing/cur-export/export.json
+# (alpha-engine-config-I11272). Mirrored here as a LITERAL rather than read
+# cross-repo (this repo's CI has no checkout of nous-ergon-ops) so a change
+# to either side's column names fails THIS test rather than silently
+# drifting apart. If you change `export.json`'s QueryStatement, update this
+# constant in the SAME PR that changes it, and vice versa.
+#
+# CUR 2.0 / Data Exports has NO `resource_tags_user_component` column —
+# `resource_tags` is a MAP, and a key is selected with the dot operator and
+# ALIASED: `resource_tags.user_component AS resource_tags_user_component`
+# (docs.aws.amazon.com/cur/latest/userguide/dataexports-data-query.html,
+# verified 2026-09-21). The alias is what makes this producer need no code
+# change once the export exists — confirmed by this test, not assumed.
+_CODIFIED_CUR_EXPORT_QUERY_STATEMENT = (
+    "SELECT bill_billing_period_start_date, line_item_usage_start_date, "
+    "line_item_unblended_cost, resource_tags.user_component AS "
+    "resource_tags_user_component, resource_tags.user_system AS "
+    "resource_tags_user_system FROM COST_AND_USAGE_REPORT"
+)
+
+
+def test_producers_expected_columns_are_the_names_the_codified_export_aliases_to():
+    """Pins `cost_monthly.py`'s column expectations against the exact aliased
+    names `nous-ergon-fleet-cur`'s QueryStatement produces. A change to
+    either side's naming that is not mirrored to the other fails here,
+    before it fails silently at 4am against a real CUR object with a
+    KeyError this module raises as a 'schema mismatch'."""
+    query = _CODIFIED_CUR_EXPORT_QUERY_STATEMENT
+    assert f"AS {m._USAGE_START_COLUMN}" not in query  # not aliased — a base CUR column
+    assert m._USAGE_START_COLUMN in query
+    assert m._COST_COLUMN in query
+    tag_column = m._tag_column("component")
+    assert tag_column == "resource_tags_user_component"
+    assert f"resource_tags.user_component AS {tag_column}" in query
+    # The `system` alias also selected (unused today) so an alpha-engine-
+    # config-I10905 ruling toward `system` needs no export edit, only
+    # `--tag-key system` — confirm the alias exists under that name too.
+    system_column = m._tag_column("system")
+    assert f"resource_tags.user_system AS {system_column}" in query
+
+
 def test_iter_billing_periods_spans_month_boundary():
     periods = m.iter_billing_periods(dt.date(2026, 8, 25), dt.date(2026, 9, 3))
     assert periods == ["2026-08", "2026-09"]
