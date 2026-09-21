@@ -9,6 +9,7 @@ own Wave 1 PRs; here we test the daily orchestrator shape: universe assembly
 from __future__ import annotations
 
 import json
+from datetime import datetime, timezone
 from io import BytesIO
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -455,3 +456,90 @@ def test_default_stays_fail_soft_on_empty_digest(
 
     assert out["status"] == "ok"
     assert out["digest_total"] == 0
+
+
+# ── alpha-engine-config-I11216 deliverable 5: the topic-digest anchor is
+# run_date, not the wall clock ───────────────────────────────────────────
+
+class _FixedNow(datetime):
+    """``datetime`` subclass whose ``.now()`` returns a controllable fixed
+    instant — lets a test move "the wall clock" without touching real time."""
+
+    _fixed: datetime = datetime(2000, 1, 1, tzinfo=timezone.utc)
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls._fixed if tz is None else cls._fixed.astimezone(tz)
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_topic_digest_anchor_is_run_date_not_wall_clock(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure, monkeypatch,
+):
+    """Moving the wall clock while holding ``run_date`` fixed must not change
+    the ``as_of`` passed to ``topic_news.fetch_topics`` — proves the digest's
+    topic window is anchored on the collected day, not real time
+    (alpha-engine-config-I11216 deliverable 5). Without the fix, a replay of
+    2026-09-18 run on 2026-09-20 would select a different `hours`-wide slice
+    of topic headlines than the original 2026-09-18 run did.
+    """
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 1
+    mock_write.return_value = ("k1", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 1
+    mock_articles.return_value = ("k2", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [], "macro": [], "tech": []}}
+    mock_write_digest.return_value = "k3"
+
+    monkeypatch.setattr(daily_news, "datetime", _FixedNow)
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+
+    _FixedNow._fixed = datetime(2026, 9, 18, 12, 0, tzinfo=timezone.utc)
+    daily_news.collect("b", s3_client=s3, run_date="2026-09-18")
+    as_of_a = mock_topics.call_args.kwargs["as_of"]
+
+    _FixedNow._fixed = datetime(2026, 9, 20, 9, 0, tzinfo=timezone.utc)
+    daily_news.collect("b", s3_client=s3, run_date="2026-09-18")
+    as_of_b = mock_topics.call_args.kwargs["as_of"]
+
+    assert as_of_a == as_of_b
+    assert as_of_a is not None
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_topic_digest_anchor_defaults_to_wall_clock_on_live_run(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """Without ``run_date`` (the live/scheduled path), ``as_of`` stays
+    ``None`` — this fix changes replay content only, never live-run
+    behavior."""
+    mock_agg.return_value = _fake_aggregator()
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 1
+    mock_write.return_value = ("k1", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 1
+    mock_articles.return_value = ("k2", art_df)
+    mock_topics.return_value = {"macro": [], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [], "macro": [], "tech": []}}
+    mock_write_digest.return_value = "k3"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    daily_news.collect("b", s3_client=s3)  # no run_date
+
+    assert mock_topics.call_args.kwargs["as_of"] is None

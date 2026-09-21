@@ -823,6 +823,12 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
                 )
                 return summary
 
+            # PROVENANCE-equivalent, not CONTENT (alpha-engine-config-I11216
+            # deliverable 5): this is a real-time DB-health check (no
+            # `run_date` on this function's signature; not an artifact
+            # write), grading whether TODAY, right now, "score_date old
+            # enough to expect resolution" holds — replaying it is
+            # meaningless, there is no artifact to reproduce.
             today = date.today()
             outcome_dates = {
                 r[0] for r in conn.execute(
@@ -1487,6 +1493,10 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     from nousergon_lib.trading_calendar import count_trading_days
 
     h = forward_days
+    # PROVENANCE-equivalent, not CONTENT (alpha-engine-config-I11216
+    # deliverable 5): a CloudWatch gauge of the REAL current grading lag,
+    # not an artifact write — no `run_date` on this signature, nothing here
+    # to replay.
     today = date.today()
 
     summary: dict = {"status": "ok", "forward_days": h}
