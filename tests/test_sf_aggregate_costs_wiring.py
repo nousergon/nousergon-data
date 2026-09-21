@@ -316,6 +316,13 @@ class TestEdges:
             # SetAggregateCostsDegradedSummary — which is already downstream
             # of the aggregator, so it adds no path that bypasses it.
             "PublishAggregateCostsDegraded",
+            # alpha-engine-config-I11298 (Brian ruling 2026-09-21, "proceed
+            # with rec b"): the CostCoverageError route. Reachable ONLY
+            # from AggregateCosts' own named Catch, via MarkCostCoverageGap
+            # -> SetCostCoverageGapDetail, so like the fail-open route above
+            # it is already downstream of the aggregator and adds no path
+            # that bypasses it.
+            "PublishCostCoverageGap",
         }
         offenders = []
         for name, st in sf["States"].items():

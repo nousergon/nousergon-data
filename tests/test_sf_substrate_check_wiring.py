@@ -133,7 +133,8 @@ class TestChainOrdering:
         # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
         # whose degraded branch converges on it too. The witness property is
         # unchanged: every route here descends from that ONE success edge.
-        assert states["Director"]["Next"] == "CheckDirectorSubResults"
+        assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+        assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
         assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"

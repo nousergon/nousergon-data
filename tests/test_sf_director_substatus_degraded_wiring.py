@@ -56,6 +56,7 @@ from tests.sf_degraded_summary_helpers import (
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
+_REFUSAL_CHOICE = "CheckDirectorRetroRefused"
 _CHOICE = "CheckDirectorSubResults"
 _SETTER = "DirectorSubStatusDegraded"
 _FLAG = "$.director_degraded"
@@ -76,8 +77,10 @@ def states() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def test_director_success_edge_goes_through_the_substatus_choice(states):
-    assert states["Director"]["Next"] == _CHOICE
+def test_director_success_edge_goes_through_the_substatus_choices(states):
+    assert states["Director"]["Next"] == _REFUSAL_CHOICE
+    assert states[_REFUSAL_CHOICE]["Default"] == _CHOICE
+    assert states["SetDirectorRetroRefused"]["Next"] == _CHOICE
 
 
 def test_the_director_catch_is_untouched(states):
@@ -240,3 +243,89 @@ def test_a_director_degraded_run_never_reaches_plain_notify_complete(states, oth
 def test_a_clean_run_still_reaches_notify_complete(states):
     """The rule must not widen: absent flag = never degraded."""
     assert notify_target(states, {}) == "NotifyComplete"
+
+
+# ---------------------------------------------------------------------------
+# 4. a GUARD REFUSAL is not an error — §2.3a rules 2-3
+# ---------------------------------------------------------------------------
+
+_REFUSAL_FLAG = "$.director_retro_refused"
+
+
+def test_the_refusal_choice_is_ispresent_guarded_and_reads_a_boolean(states):
+    """A Choice cannot measure an array's length, so the producer emits a
+    BOOLEAN on every fan-out summary — false included — and this reads it."""
+    choice = states[_REFUSAL_CHOICE]
+    assert choice["Type"] == "Choice"
+    assert len(choice["Choices"]) == 1
+    rule = choice["Choices"][0]["And"]
+    assert rule[0] == {
+        "Variable": "$.director_result.Payload.retro_refused", "IsPresent": True,
+    }
+    assert rule[1] == {
+        "Variable": "$.director_result.Payload.retro_refused", "BooleanEquals": True,
+    }
+    assert choice["Choices"][0]["Next"] == "SetDirectorRetroRefused"
+    assert choice["Default"] == _CHOICE
+
+
+def test_a_refusal_never_touches_the_degraded_machinery(states):
+    """The correction this clause turns on: a guard declining BY DESIGN must
+    not terminate a complete 5.4-hour weekly cycle ``Fail`` and page Brian.
+
+    sf-pipeline-policy.md §2.3a rule 2 (a missing verdict propagates as a
+    named non-pass, never as a pass) and rule 3 (every surface carrying the
+    run's results carries that state); §2.3b's third paragraph is what
+    permits a nested non-pass not to degrade the stage. The precedent is
+    exact: ``model_zoo_unservable`` (nousergon-data-PR1816/PR1818) terminates
+    ``ExecutionSucceeded`` with ``degraded: false`` and the refusal NAMED.
+    """
+    setter = states["SetDirectorRetroRefused"]
+    assert setter["Type"] == "Pass"
+    assert setter["Result"] is True
+    assert setter["ResultPath"] == _REFUSAL_FLAG
+    assert setter["Next"] == _CHOICE
+    # It writes NOTHING else — in particular not the degraded summary.
+    assert "Parameters" not in setter
+    # And no Mark*Degraded / Set*Summary state READS or WRITES the flag. The
+    # completion markers legitimately embed it (§2.3a rule 3), so they are
+    # excluded by name rather than by a substring that would also catch them.
+    machinery = {
+        k: v
+        for k, v in states.items()
+        if "Degraded" in k
+        and k != "SetDirectorRetroRefused"
+        and not k.startswith("WriteCompletionMarker")
+    }
+    assert _REFUSAL_FLAG not in json.dumps(machinery)
+    assert "director_retro_refused" not in json.dumps(machinery)
+
+
+def test_the_refusal_is_named_on_every_completion_marker(states):
+    """§2.3a rule 3. The marker is the surface the operator's notice and the
+    console read; a refusal invisible there is the silence I11299 names."""
+    for marker in (
+        "WriteCompletionMarker",
+        "WriteCompletionMarkerDegraded",
+        "WriteCompletionMarkerCalendar",
+        "WriteCompletionMarkerDegradedCalendar",
+    ):
+        body = states[marker]["Parameters"]["Body.$"]
+        assert '"director_retro_refused":{}' in body, marker
+        assert "States.JsonToString($.director_retro_refused)" in body, marker
+
+
+def test_the_refusal_flag_is_floored_so_the_markers_never_throw(states):
+    """The markers dereference it UNGUARDED through ``States.JsonToString``;
+    without the floor a clean run throws ``States.Runtime`` at its last
+    state — the config-I2767 shape."""
+    floor = states["InitializeInput"]["Parameters"]["merged.$"]
+    assert '\\"director_retro_refused\\":false' in floor or '"director_retro_refused":false' in floor
+
+
+def test_a_refusal_and_an_error_are_recorded_independently(states):
+    """Ordered BEFORE the degraded Choice and orthogonal to it, so a run whose
+    retro refused AND whose deploy-success leg errored records both."""
+    assert states["Director"]["Next"] == _REFUSAL_CHOICE
+    assert states[_REFUSAL_CHOICE]["Default"] == _CHOICE
+    assert states["SetDirectorRetroRefused"]["Next"] == _CHOICE

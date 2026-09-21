@@ -414,6 +414,29 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # ── alpha-engine-config-I11298, Brian ruling 2026-09-21 ────────
+        "AggregateCosts": (
+            "Brian ruling 2026-09-21 (recorded on alpha-engine-config-I11298), "
+            "his words: \"proceed with rec b\". A cost fan-in coverage gap "
+            "ends the weekly run SUCCEEDED with a named $.cost_coverage_gap "
+            "sub-status and its own lower-severity notice, NOT with a "
+            "degraded flag — so not writing one is the content of the "
+            "ruling rather than an omission. Cost attribution is "
+            "accounting: it feeds no report card, no champion promotion "
+            "and no signal set, which is what sf-pipeline-policy.md \u00a73's "
+            "fail-hard test covers. The sub-status is NOT silent \u2014 it is "
+            "on the execution record, on all four completion markers, and "
+            "on PublishCostCoverageGap (alert class "
+            "weekly_cost_coverage_gap, tier tracked-only). This exemption "
+            "is scoped to the ONE named error: every other AggregateCosts "
+            "failure still falls to the States.ALL Catch and still sets "
+            "$.aggregate_costs_degraded. KEYED ON THE OWNER STATE, which "
+            "is this map's only key shape, so it nominally covers both of "
+            "AggregateCosts' Catch routes \u2014 but the other one writes "
+            "that flag and passes the walker on its own merits with or "
+            "without this entry, so the exemption does work for exactly "
+            "one route."
+        ),
         # ── alpha-engine-config-I8809 ──────────────────────────────────
         "NormalizeRunDates": (
             "the fail-open IS the flag. NormalizeRunDatesDegraded leaves "

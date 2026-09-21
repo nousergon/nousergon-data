@@ -51,7 +51,8 @@ def test_the_leaf_runs_after_report_card_and_director(states):
     # alpha-engine-config-I11299: Director's success edge now passes through
     # CheckDirectorSubResults (§2.3b); both of its routes converge on
     # DirectorComplete, so the ordering this test pins is unchanged.
-    assert states["Director"]["Next"] == "CheckDirectorSubResults"
+    assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+    assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
     assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
     # Every edge that previously ended the advisory tail now enters the gate.
     assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"

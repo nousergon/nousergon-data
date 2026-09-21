@@ -1138,7 +1138,8 @@ class TestConsolidatedNotify:
         # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
         # whose degraded branch converges on it too. The witness property is
         # unchanged: every route here descends from that ONE success edge.
-        assert director["Next"] == "CheckDirectorSubResults"
+        assert director["Next"] == "CheckDirectorRetroRefused"
+        assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
         assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert all(c["Next"] == "NormalizeFailureContext" for c in director["Catch"])
