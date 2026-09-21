@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/price_cache.schema.json",
+  "title": "Adjusted daily OHLCV price cache (reference/price_cache/{sym}.parquet)",
+  "description": "Producer: weekly_collector.py via builders/_price_cache_writeboth.py. Consumers: crucible-research feature builders, crucible-predictor, the daily_closes delta in sf_preflight.py. One parquet per ticker, indexed by `Date` (datetime64[ns]), one row per trading day, split- and dividend-ADJUSTED. This file is a PARQUET frame, not a JSON document: the `properties` block below documents the frame's columns so the column set and its dtypes are declared somewhere, and JSON Schema validation is never run against it. What reads this contract today is `shadow/parity.py`, via `x-key-pattern` and `x-comparison-class`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "Open",
+    "High",
+    "Low",
+    "Close",
+    "Volume"
+  ],
+  "properties": {
+    "Open": {
+      "type": "number",
+      "description": "Adjusted session open. float64."
+    },
+    "High": {
+      "type": "number",
+      "description": "Adjusted session high. float64."
+    },
+    "Low": {
+      "type": "number",
+      "description": "Adjusted session low. float64."
+    },
+    "Close": {
+      "type": "number",
+      "description": "Adjusted session close. float64."
+    },
+    "Volume": {
+      "type": "number",
+      "description": "Session volume. float64, not integer — the adjustment divides it."
+    }
+  },
+  "x-key-pattern": "reference/price_cache/{sym}.parquet",
+  "x-comparison-class": "vendor_live",
+  "x-vendor-live": {
+    "value_band": {
+      "relative": 0.0001,
+      "absolute": 0.0
+    },
+    "coverage_floor": 1.0,
+    "note": "Every value in this frame is a RE-DERIVED number: the vendor serves raw prices and a running adjustment factor, and the whole history is recomputed from the factor on each fetch. Two fetches days apart therefore differ in the last significant figures of every historical bar. MEASURED on the 2026-09-18 parity run (alpha-engine-config-I11203): the largest drift across the eleven mismatching tickers was 1.09e-6 relative (`reference/price_cache/O.parquet`, 2016-11-01 Open, 35.804776688 live vs 35.804737662 shadow), which is just OUTSIDE the 1e-6 global default and is why every one of them failed. The 1e-4 band is two orders of magnitude above the measured drift and four below a one-cent move on a $100 bar, so it absorbs re-derivation noise without admitting a real price error. The coverage floor is 1.0 deliberately: this frame's key set is trading days, which are not vendor-variable — a missing DATE is a producer defect, never drift."
+  }
+}

@@ -510,44 +510,104 @@ def _jsonable(value: Any) -> Any:
     return str(value)
 
 
-def _json_breaches(live: Any, shadow: Any, rel: float, absolute: float, path: str = "$") -> list[str]:
+@dataclass(frozen=True)
+class JsonDiff:
+    """One difference between two JSON documents, with the STRUCTURE that
+    produced it — not only its rendered string.
+
+    ``_json_breaches`` used to return rendered strings and everything
+    downstream re-derived meaning from them with regexes
+    (``_MEMBERSHIP_DIFF_RE``, ``_CARDINALITY_DIFF_RE``). That cost a measured
+    defect on 2026-09-20: coverage was graded against
+    ``row_count.live`` — the TOP-LEVEL key count of the document, 3 for
+    ``{schema_version, as_of, earnings}`` — while the membership diffs it
+    subtracted lived at ``$.earnings.<ticker>``, ~900 of them. Sixteen missing
+    tickers out of three "rows" produced ``covered = max(3 - 16, 0) = 0`` and a
+    coverage ratio of 0.0, so `market_data/earnings/latest.json` and
+    `market_data/sectors/latest.json` failed with ZERO value breaches, purely on
+    a nonsense denominator.
+
+    The walker already knows the container a membership diff came out of, so it
+    now says so. ``parent_size_live`` is the size of the live container at
+    ``parent_path``: the only correct denominator for "how much of what v1
+    published did the shadow reproduce".
+    """
+
+    path: str
+    kind: str  # "membership" | "cardinality" | "value"
+    rendered: str
+    side: str = ""  # membership only: "live" (missing from shadow) | "shadow" (extra)
+    parent_path: str = ""  # membership only
+    parent_size_live: int = 0  # membership only
+
+
+def _json_diffs(
+    live: Any, shadow: Any, rel: float, absolute: float, path: str = "$"
+) -> list[JsonDiff]:
+    """Every difference between two JSON documents, structurally classified."""
     if isinstance(live, dict) and isinstance(shadow, dict):
-        out: list[str] = []
+        out: list[JsonDiff] = []
         for key in sorted(set(live) | set(shadow)):
+            child = f"{path}.{key}"
             if key not in live:
-                out.append(f"{path}.{key}: only in shadow")
+                out.append(
+                    JsonDiff(
+                        child,
+                        "membership",
+                        f"{child}: only in shadow",
+                        side="shadow",
+                        parent_path=path,
+                        parent_size_live=len(live),
+                    )
+                )
             elif key not in shadow:
-                out.append(f"{path}.{key}: only in live")
+                out.append(
+                    JsonDiff(
+                        child,
+                        "membership",
+                        f"{child}: only in live",
+                        side="live",
+                        parent_path=path,
+                        parent_size_live=len(live),
+                    )
+                )
             else:
-                out.extend(_json_breaches(live[key], shadow[key], rel, absolute, f"{path}.{key}"))
+                out.extend(_json_diffs(live[key], shadow[key], rel, absolute, child))
         return out
     if isinstance(live, list) and isinstance(shadow, list):
         if len(live) != len(shadow):
-            return [f"{path}: length {len(live)} live vs {len(shadow)} shadow"]
+            return [
+                JsonDiff(
+                    path,
+                    "cardinality",
+                    f"{path}: length {len(live)} live vs {len(shadow)} shadow",
+                )
+            ]
         out = []
         for index, (a, b) in enumerate(zip(live, shadow, strict=True)):
-            out.extend(_json_breaches(a, b, rel, absolute, f"{path}[{index}]"))
+            out.extend(_json_diffs(a, b, rel, absolute, f"{path}[{index}]"))
         return out
     if isinstance(live, (int, float)) and isinstance(shadow, (int, float)):
-        return [] if _numeric_close(live, shadow, rel, absolute) else [
-            f"{path}: {live!r} live vs {shadow!r} shadow"
-        ]
-    return [] if live == shadow else [f"{path}: {live!r} live vs {shadow!r} shadow"]
+        if _numeric_close(live, shadow, rel, absolute):
+            return []
+        return [JsonDiff(path, "value", f"{path}: {live!r} live vs {shadow!r} shadow")]
+    if live == shadow:
+        return []
+    return [JsonDiff(path, "value", f"{path}: {live!r} live vs {shadow!r} shadow")]
 
 
-#: A top-level field name out of one `_json_breaches` path string, e.g.
-#: ``"$.fetched_at: ..."`` -> ``"fetched_at"``. Provenance fields declared in
-#: a contract are top-level today (`fetched_at`, `revision`); a diff any
-#: deeper than that is never matched here and stays a data breach.
+def _json_breaches(live: Any, shadow: Any, rel: float, absolute: float, path: str = "$") -> list[str]:
+    """The rendered form of :func:`_json_diffs`, for callers wanting strings."""
+    return [diff.rendered for diff in _json_diffs(live, shadow, rel, absolute, path)]
+
+
+
 #: The two comparison classes a contract may declare (Brian ruling 2026-09-20,
 #: `alpha-engine-config-I11203`). `deterministic` is the default and the
 #: pre-existing behaviour: byte-equal, which 918 of 959 keys already satisfy.
 _COMPARISON_CLASSES = frozenset({"deterministic", "vendor_live"})
 
-#: A MEMBERSHIP diff — a key present on one side only. Matched on the exact
-#: generated suffix, not by parsing the value, because `_json_breaches`
-#: produces these strings itself. Same idiom as `_TOP_LEVEL_FIELD_RE` below:
-#: this module already classifies diffs by their rendered shape.
+#: A MEMBERSHIP diff — a key present on one side only.
 _MEMBERSHIP_DIFF_RE = re.compile(r": only in (live|shadow)$")
 
 #: A CARDINALITY diff — a list whose length differs. Never forgiven for a
@@ -556,7 +616,13 @@ _CARDINALITY_DIFF_RE = re.compile(r": length \d+ live vs \d+ shadow$")
 
 
 def classify_diff(diff: str) -> str:
-    """``"membership"`` | ``"cardinality"`` | ``"value"`` for one rendered diff."""
+    """``"membership"`` | ``"cardinality"`` | ``"value"`` for one RENDERED diff.
+
+    Kept for callers holding only a report's rendered strings (the published
+    reports carry no structure). Inside this module the classification now
+    comes from :class:`JsonDiff.kind`, which the walker sets from the data
+    rather than re-deriving from the string it just printed.
+    """
     if _MEMBERSHIP_DIFF_RE.search(diff):
         return "membership"
     if _CARDINALITY_DIFF_RE.search(diff):
@@ -564,22 +630,80 @@ def classify_diff(diff: str) -> str:
     return "value"
 
 
+#: A top-level field name out of one diff path, e.g. ``"$.fetched_at"`` ->
+#: ``"fetched_at"``. Provenance fields declared in a contract are top-level
+#: today (`fetched_at`, `revision`, `as_of_utc`); a diff any deeper than that
+#: is never matched here and stays a data breach.
 _TOP_LEVEL_FIELD_RE = re.compile(r"^\$\.([A-Za-z0-9_]+)\b")
 
 
 def _split_json_diffs(
-    diffs: list[str], provenance_fields: frozenset[str]
-) -> tuple[list[str], list[str]]:
-    """Route each `_json_breaches` diff into (data breaches, provenance diffs)."""
-    breaches: list[str] = []
-    provenance: list[str] = []
+    diffs: list[JsonDiff], provenance_fields: frozenset[str]
+) -> tuple[list[JsonDiff], list[JsonDiff]]:
+    """Route each diff into (data breaches, provenance diffs)."""
+    breaches: list[JsonDiff] = []
+    provenance: list[JsonDiff] = []
     for diff in diffs:
-        match = _TOP_LEVEL_FIELD_RE.match(diff)
+        match = _TOP_LEVEL_FIELD_RE.match(diff.path)
         if match and match.group(1) in provenance_fields:
             provenance.append(diff)
         else:
             breaches.append(diff)
     return breaches, provenance
+
+
+
+
+def _grade_coverage(
+    missing: list[JsonDiff], doc_size: int, floor: float
+) -> dict[str, Any]:
+    """Coverage of the live key set the SHADOW failed to reproduce.
+
+    The denominator is the size of the live containers the missing keys came
+    out of, summed over the distinct containers involved — never the
+    document's top-level key count, which is what this graded against until
+    2026-09-20 and which produced ratios of 0.0 on documents with zero value
+    breaches (`market_data/earnings/latest.json`: 16 missing tickers measured
+    against 3 top-level fields).
+
+    With no missing keys there is no container to measure, so the document's
+    own size is reported as the basis and the ratio is 1.0 by construction.
+    """
+    if not missing:
+        return {
+            "ratio": 1.0,
+            "floor": floor,
+            "met": 1.0 >= floor,
+            "denominator": doc_size,
+            "denominator_basis": "document (no missing keys to measure)",
+            "missing": 0,
+        }
+    sizes = {diff.parent_path: diff.parent_size_live for diff in missing}
+    denominator = sum(sizes.values())
+    basis = "+".join(f"{path}({size})" for path, size in sorted(sizes.items()))
+    if denominator <= 0:
+        # Every container the missing keys came from is EMPTY on the live
+        # side, which cannot happen for a key that is "only in live" and can
+        # only mean "only in shadow" extras. Reported as unmeasured rather
+        # than divided by a substituted 1, which would invent a ratio.
+        return {
+            "ratio": 0.0,
+            "floor": floor,
+            "met": False,
+            "denominator": 0,
+            "denominator_basis": f"{basis} — no live keys to cover",
+            "missing": len(missing),
+        }
+    covered = max(denominator - len(missing), 0)
+    ratio = covered / denominator
+    return {
+        "ratio": round(ratio, 6),
+        "floor": floor,
+        "met": ratio >= floor,
+        "denominator": denominator,
+        "denominator_basis": basis,
+        "missing": len(missing),
+    }
 
 
 def compare_bytes(
@@ -598,8 +722,24 @@ def compare_bytes(
     reported under ``provenance_diffs`` and never counts toward
     ``values.breaches`` or the row's verdict. ``None`` is the red default —
     every field compares as data.
+
+    A contract declaring ``x-comparison-class: vendor_live`` is additionally
+    graded with ITS OWN band and coverage floor (Brian ruling 2026-09-20,
+    `alpha-engine-config-I11203`), for BOTH comparators. The parquet half of
+    that was missing from the first implementation, which left every
+    `reference/price_cache/*.parquet` row mismatching on ~1e-6 relative
+    re-derivation drift that no contract could reach.
     """
     provenance_fields = contract.provenance_fields if contract is not None else frozenset()
+    vendor_live = contract is not None and contract.is_vendor_live
+    compare_rel = contract.value_band_relative if vendor_live else rel
+    compare_abs = contract.value_band_absolute if vendor_live else absolute
+    band = {"relative": compare_rel, "absolute": compare_abs}
+    absorbed_note = (
+        "value differences inside the declared band are drift between two fetches "
+        "of a moving number, not a producer defect"
+    )
+
     if key.endswith(".parquet"):
         import pandas as pd
 
@@ -612,16 +752,55 @@ def compare_bytes(
                 "verdict": "unmeasurable",
                 "unmeasurable_reason": f"parquet would not parse: {type(exc).__name__}: {exc}",
             }
-        body = _compare_frames(live_frame, shadow_frame, rel, absolute, provenance_fields)
-        matched = (
-            body["row_count"]["live"] == body["row_count"]["shadow"]
-            and body["schema"]["match"]
-            and not body["symbol_set"]["only_live"]
-            and not body["symbol_set"]["only_shadow"]
-            and body["values"]["breaches"] == 0
+        body = _compare_frames(
+            live_frame, shadow_frame, compare_rel, compare_abs, provenance_fields
         )
+        schema_ok = body["schema"]["match"]
+        if not vendor_live:
+            matched = (
+                body["row_count"]["live"] == body["row_count"]["shadow"]
+                and schema_ok
+                and not body["symbol_set"]["only_live"]
+                and not body["symbol_set"]["only_shadow"]
+                and body["values"]["breaches"] == 0
+            )
+            body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
+            return body
+
+        # The vendor_live grading, in the frame's own terms: SHAPE exactly
+        # (the column set and its dtypes), MEMBERSHIP against the declared
+        # coverage floor (a symbol the vendor dropped between two fetches is
+        # expected; a producer losing half the universe is not), VALUES inside
+        # the declared band. Row count is NOT graded separately — for a frame
+        # it is the symbol set restated, and grading it twice would fail a key
+        # the floor deliberately admits.
+        only_live = list(body["symbol_set"]["only_live"])
+        denominator = int(body["symbol_set"]["live"])
+        covered = max(denominator - len(only_live), 0)
+        ratio = (covered / denominator) if denominator > 0 else 0.0
+        floor = contract.coverage_floor
+        body["vendor_drift"] = {
+            "class": "vendor_live",
+            "band": band,
+            "absorbed_note": absorbed_note,
+            "membership_diffs": len(only_live) + len(body["symbol_set"]["only_shadow"]),
+            "membership_examples": (
+                [f"{s}: only in live" for s in only_live[:10]]
+                + [f"{s}: only in shadow" for s in list(body["symbol_set"]["only_shadow"])[:10]]
+            )[:10],
+        }
+        body["coverage"] = {
+            "ratio": round(ratio, 6),
+            "floor": floor,
+            "met": ratio >= floor and denominator > 0,
+            "denominator": denominator,
+            "denominator_basis": f"{body['symbol_set']['basis']}({denominator})",
+            "missing": len(only_live),
+        }
+        matched = schema_ok and body["coverage"]["met"] and body["values"]["breaches"] == 0
         body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
         return body
+
     if key.endswith(".json"):
         try:
             live_doc = json.loads(live.decode("utf-8"))
@@ -632,24 +811,22 @@ def compare_bytes(
                 "verdict": "unmeasurable",
                 "unmeasurable_reason": f"json would not parse: {type(exc).__name__}: {exc}",
             }
-        # A `vendor_live` key is compared with ITS OWN declared band
-        # (alpha-engine-config-I11203, Brian ruling 2026-09-20). The band is
-        # not a loosening of the global tolerance: it applies only where a
-        # contract declares the class, and `deterministic` keys keep the
-        # 1e-6/1e-9 defaults untouched.
-        vendor_live = contract is not None and contract.is_vendor_live
-        compare_rel = contract.value_band_relative if vendor_live else rel
-        compare_abs = contract.value_band_absolute if vendor_live else absolute
-
-        all_diffs = _json_breaches(live_doc, shadow_doc, compare_rel, compare_abs)
+        all_diffs = _json_diffs(live_doc, shadow_doc, compare_rel, compare_abs)
         breaches, provenance_diffs = _split_json_diffs(all_diffs, provenance_fields)
 
-        body = {
+        doc_size = len(live_doc) if isinstance(live_doc, (list, dict)) else 1
+        body: dict[str, Any] = {
             "comparator": "json",
-            "values": {"breaches": len(breaches), "examples": breaches[:10]},
-            "provenance_diffs": {"count": len(provenance_diffs), "examples": provenance_diffs[:10]},
+            "values": {
+                "breaches": len(breaches),
+                "examples": [d.rendered for d in breaches[:10]],
+            },
+            "provenance_diffs": {
+                "count": len(provenance_diffs),
+                "examples": [d.rendered for d in provenance_diffs[:10]],
+            },
             "row_count": {
-                "live": len(live_doc) if isinstance(live_doc, (list, dict)) else 1,
+                "live": doc_size,
                 "shadow": len(shadow_doc) if isinstance(shadow_doc, (list, dict)) else 1,
             },
         }
@@ -666,38 +843,33 @@ def compare_bytes(
         #   * cardinality diffs stay breaches, always. Shape is graded exactly;
         #   * membership diffs are counted, not forgiven: a ticker delisted
         #     between two fetches is expected, a producer dropping half the
-        #     universe is not. Coverage is graded against the declared floor.
-        membership = [d for d in breaches if classify_diff(d) == "membership"]
-        non_membership = [d for d in breaches if classify_diff(d) != "membership"]
-
-        # Denominator: the live side's key count is what coverage is measured
-        # against -- "how much of what v1 published did the shadow reproduce".
-        denominator = body["row_count"]["live"] or 1
-        covered = max(denominator - len(membership), 0)
-        ratio = covered / denominator
-        floor = contract.coverage_floor
-        coverage_ok = ratio >= floor
+        #     universe is not. Coverage is graded against the declared floor,
+        #     and only keys MISSING FROM THE SHADOW count against it -- a key
+        #     the shadow has and live does not is an extra, reported under
+        #     `vendor_drift`, never a coverage loss.
+        membership = [d for d in breaches if d.kind == "membership"]
+        missing = [d for d in membership if d.side == "live"]
+        extra = [d for d in membership if d.side == "shadow"]
+        non_membership = [d for d in breaches if d.kind != "membership"]
 
         body["vendor_drift"] = {
             "class": "vendor_live",
-            "band": {"relative": compare_rel, "absolute": compare_abs},
-            "absorbed_note": (
-                "value differences inside the declared band are drift between two fetches "
-                "of a moving number, not a producer defect"
-            ),
+            "band": band,
+            "absorbed_note": absorbed_note,
             "membership_diffs": len(membership),
-            "membership_examples": membership[:10],
+            "membership_examples": [d.rendered for d in membership[:10]],
+            "extra_in_shadow": len(extra),
         }
-        body["coverage"] = {
-            "ratio": round(ratio, 6),
-            "floor": floor,
-            "met": coverage_ok,
-            "denominator": denominator,
-            "missing": len(membership),
+        body["coverage"] = _grade_coverage(missing, doc_size, contract.coverage_floor)
+        body["values"] = {
+            "breaches": len(non_membership),
+            "examples": [d.rendered for d in non_membership[:10]],
         }
-        body["values"] = {"breaches": len(non_membership), "examples": non_membership[:10]}
-        body["verdict"] = "match" if (not non_membership and coverage_ok) else "mismatch"
+        body["verdict"] = (
+            "match" if (not non_membership and body["coverage"]["met"]) else "mismatch"
+        )
         return body
+
     live_digest = hashlib.sha256(live).hexdigest()
     shadow_digest = hashlib.sha256(shadow).hexdigest()
     return {
@@ -709,6 +881,8 @@ def compare_bytes(
         ),
         "sha256": {"live": live_digest, "shadow": shadow_digest},
     }
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -1058,6 +1232,43 @@ def _manifest_output_keys(manifest: dict[str, Any], prefix_value: str) -> set[st
     }
 
 
+def _dedupe_rows(rows: list[KeyResult]) -> list[KeyResult]:
+    """One row per S3 key, attributed to every unit that declared it.
+
+    `expand_writes` dedupes TARGETS on `(kind, value)`, which cannot see that a
+    key declared explicitly by one unit is also enumerated inside another
+    unit's prefix family. Measured on the 2026-09-18 report
+    (`alpha-engine-config-I11203`): `market_data/close_history/consolidated.json`
+    and `market_data/technicals/rating_history/_manifest.json` each appeared
+    TWICE, so `summary.total` read 959 for 957 distinct keys and every
+    percentage computed from it was wrong by that much.
+
+    The duplicate rows are by construction the same comparison of the same two
+    objects, so the first is kept and the later ones contribute only their unit
+    attribution. A verdict DISAGREEMENT between two rows would mean the same
+    bytes graded two ways; it is recorded on the surviving row rather than
+    silently resolved.
+    """
+    merged: dict[str, KeyResult] = {}
+    order: list[str] = []
+    for row in rows:
+        existing = merged.get(row.key)
+        if existing is None:
+            merged[row.key] = row
+            order.append(row.key)
+            continue
+        for unit_id in row.unit_ids:
+            if unit_id not in existing.unit_ids:
+                existing.unit_ids.append(unit_id)
+        existing.unit_ids.sort()
+        if row.verdict != existing.verdict:
+            existing.body["duplicate_verdict_conflict"] = (
+                f"a second row for this key graded {row.verdict!r} against "
+                f"{existing.verdict!r}; the first is reported"
+            )
+    return [merged[name] for name in order]
+
+
 def run_parity(
     *,
     trading_day: dt.date,
@@ -1302,7 +1513,7 @@ def run_parity(
         bucket=bucket,
         shadow_prefix=root.prefix,
         code_sha=code_sha,
-        rows=rows,
+        rows=_dedupe_rows(rows),
         excluded=sorted(excluded, key=lambda e: e["unit_id"]),
         rel_tolerance=rel_tolerance,
         absolute_tolerance=absolute_tolerance,
