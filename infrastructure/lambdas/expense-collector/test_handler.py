@@ -1011,7 +1011,7 @@ class TestLogProviderFailed:
     the traceback's first line, which varies by exception type."""
 
     def test_http_error_carries_the_status_code(self, caplog):
-        exc = RuntimeError("HTTP 403 from https://api.github.com/x: {\"message\":\"Forbidden\"}")
+        exc = RuntimeError("HTTP 403 from https://example-provider.test/x: {\"message\":\"Forbidden\"}")
         with caplog.at_level("ERROR"):
             index._log_provider_failed("github_org", exc)
         assert "provider_failed provider=github_org status=403" in caplog.text
@@ -1028,7 +1028,7 @@ class TestLogProviderFailed:
         mw = index._month_window(NOW)
 
         def _boom(*a, **k):
-            raise RuntimeError("HTTP 400 from https://api.anthropic.com/x: bad range")
+            raise RuntimeError("HTTP 400 from https://example-provider.test/x: bad range")
 
         monkeypatch.setattr(index, "collect_anthropic", _boom)
         rows: list[dict] = []
