@@ -46,7 +46,7 @@ import argparse
 import json
 import logging
 from datetime import date as Date
-from datetime import datetime, timezone
+from datetime import datetime, time as _time, timezone
 from typing import Any
 
 import run_units
@@ -204,10 +204,30 @@ def collect(
 
         s3_client = boto3.client("s3")
 
+    # PROVENANCE-acceptable fallback (alpha-engine-config-I11216, mirrors the
+    # documented ``collectors/prices.py:258`` shape): ``run_date`` is the
+    # explicit anchor on every scheduled path (the SF passes ``args.date`` or
+    # ``default_run_date()`` — see ``main`` below); ``None`` here only serves
+    # an ad-hoc/operator invocation of ``collect`` with no date of its own.
     agg_date = (
         Date.fromisoformat(run_date)
         if run_date
         else datetime.now(timezone.utc).date()
+    )
+    # The topic-news recency filter is CONTENT (alpha-engine-config-I11216
+    # deliverable 5): it must anchor on the day being collected, not the wall
+    # clock, or a replay of D run on D+N pulls D+N's "last `hours`" headlines
+    # under D's stamp. Only override the anchor when ``run_date`` was given
+    # explicitly — the live/scheduled path (no ``run_date``) keeps its exact
+    # existing wall-clock behavior (``as_of=None`` inside ``fetch_topics``),
+    # so this fix changes replay content only, never live-run content. There
+    # is no intraday precision in ``agg_date`` (date-only), so a replay
+    # anchors at end-of-day UTC on the collected date — inclusive of
+    # everything that could have published that day.
+    topic_as_of = (
+        datetime.combine(agg_date, _time.max, tzinfo=timezone.utc)
+        if run_date
+        else None
     )
 
     universe = assemble_universe(bucket, s3_client)
@@ -411,7 +431,7 @@ def collect(
         try:
             from collectors.topic_news import fetch_topics
 
-            topics = fetch_topics(["macro", "tech"], hours=hours)
+            topics = fetch_topics(["macro", "tech"], hours=hours, as_of=topic_as_of)
         except Exception as e:  # noqa: BLE001 — topic fetch is best-effort; degrade to empty
             topic_status = "error"
             topics = {}
