@@ -159,6 +159,115 @@ def test_the_notice_exists_and_is_constants_only(states):
     assert publish["Catch"][0]["ErrorEquals"] == ["States.ALL"]
 
 
+def _playbooks() -> dict:
+    import yaml
+
+    return yaml.safe_load(
+        (pathlib.Path(__file__).parent.parent / "infrastructure" / "overseer" / "playbooks.yaml").read_text()
+    )
+
+
+def _tracked_only_bus_classes() -> dict:
+    """Every DECLARED class routed to the drain by I11332's filter policy.
+
+    DERIVED from ``playbooks.yaml``, never hand-kept — deliverable 3 of
+    ``alpha-engine-config-I11332``, and the reason it is written that way: an
+    allow list kept in step with a declared set by hand is a defect class this
+    fleet hit three times this month.
+    """
+    return {
+        c["class"]: c
+        for c in _playbooks()["alert_classes"]
+        if c.get("tier") == "tracked-only" and c.get("intake") == "bus"
+    }
+
+
+def _publish_states(states: dict) -> dict:
+    return {
+        n: st
+        for n, st in states.items()
+        if st.get("Resource") == "arn:aws:states:::sns:publish"
+    }
+
+
+def test_the_routing_attribute_matches_the_contract_exactly(states):
+    """``alpha-engine-config-I11332``, Brian ruling 2026-09-21 ("proceed with
+    rec b").
+
+    The question put to him: this notice publishes to ``$.sns_topic_arn``,
+    which on a scheduled run is ``alpha-engine-alerts-muted`` — ZERO
+    subscriptions — so it reaches nobody, which is the unmet CONDITION of his
+    I11298 ruling (a cost gap no longer fails the run, so the alert has to do
+    that job). He ruled (b): the drain subscribes to that topic with a FILTER
+    POLICY admitting only declared tracked-only classes, rather than
+    wholesale — because the same topic carries the pipeline's 28 per-stage
+    notices, and a wholesale subscription is the flood he ruled against on
+    2026-08-21.
+
+    The name, DataType and value are FIXED by that issue so this half and the
+    ``nous-ergon-ops`` subscription half cannot drift apart. This test is the
+    nousergon-data side of that contract.
+    """
+    attrs = states[_PUBLISH]["Parameters"]["MessageAttributes"]
+    assert attrs == {
+        "alert_class": {
+            "DataType": "String",
+            "StringValue": "weekly_cost_coverage_gap",
+        }
+    }
+
+
+def test_every_tracked_only_bus_class_carries_its_routing_attribute(states):
+    """The property, over the DERIVED set.
+
+    A class declared ``tier: tracked-only`` + ``intake: bus`` is one the
+    filter policy admits; if its publish state carries no ``alert_class``
+    attribute the message is filtered OUT and the class is a control that
+    emits to nobody — the exact condition I11332 exists to end.
+    """
+    declared = _tracked_only_bus_classes()
+    assert declared, "no tracked-only/bus class is declared — the derivation broke"
+    publishers = _publish_states(states)
+    for class_id, row in declared.items():
+        state_name = row["source"].rsplit("::", 1)[-1]
+        if state_name not in publishers:
+            # The class is emitted from somewhere other than this definition
+            # (a Lambda, a script). Not this test's business.
+            continue
+        attrs = publishers[state_name].get("Parameters", {}).get("MessageAttributes") or {}
+        assert attrs.get("alert_class", {}).get("StringValue") == class_id, (
+            f"{state_name} declares alert class {class_id!r} as tracked-only/bus "
+            f"but carries no matching alert_class attribute — the drain's filter "
+            f"policy would drop it (alpha-engine-config-I11332)"
+        )
+        assert attrs["alert_class"]["DataType"] == "String"
+
+
+def test_no_per_stage_notice_carries_a_routing_attribute(states):
+    """The other half, and the one the build-window mute depends on.
+
+    ``alpha-engine-config-I9751`` item 3a muted the v1 pipeline's per-stage
+    notices deliberately. An ``alert_class`` attribute on one of those would
+    walk it straight through the filter policy and into the drain — Brian's
+    2026-08-21 flood, re-created by an attribute nobody thought of as a
+    routing decision.
+    """
+    declared = _tracked_only_bus_classes()
+    routed_states = {row["source"].rsplit("::", 1)[-1] for row in declared.values()}
+    offenders = []
+    for name, st in _publish_states(states).items():
+        if name in routed_states:
+            continue
+        attrs = st.get("Parameters", {}).get("MessageAttributes") or {}
+        if attrs:
+            offenders.append(name)
+    assert not offenders, (
+        f"{offenders} carry MessageAttributes but declare no tracked-only/bus "
+        f"alert class — they would pass the drain's filter policy and re-create "
+        f"the per-stage flood the build-window mute exists to prevent"
+    )
+
+
 def test_the_notice_declares_an_alert_class(states):
     """observability-policy.md §7.4: a notify-only class declares its
     remediation path. The row lives in this repo, which is what the
