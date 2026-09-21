@@ -383,10 +383,16 @@ def test_gitleaks_pin_moves_in_lockstep_with_spot_common():
 def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
     """The four chained legs plus the ArcticDB seed cannot fit the shared
     7200 s default. SSM executionTimeout and the box's hard-stop timer must
-    both carry the larger cap, and every other workload keeps the default."""
+    both carry the larger cap, and every other workload keeps the default.
+
+    `shadow-sameday` runs the SAME four legs plus parity and carries the SAME
+    cap: it differs from `shadow-weekday` only in resolving its trading day on
+    the box rather than from the event, which changes nothing about how long
+    the chain takes (alpha-engine-config-I11203)."""
     index, ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     for workload, cmd in _every_resolved_workload(index):
-        expected = 18000 if workload == "shadow-weekday" else index.MAX_RUNTIME_SECONDS
+        chained = workload in ("shadow-weekday", "shadow-sameday")
+        expected = 18000 if chained else index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
         assert index._bootstrap_spec(workload).max_runtime_seconds == expected
         index._send_bootstrap("i-x", workload, cmd, "tok")
@@ -402,6 +408,7 @@ def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch)
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     assert index._WORKLOAD_PARITY_WINDOW == {
         "shadow-weekday": None,
+        "shadow-sameday": None,
         "shadow-parity": None,
         "arctic-parity": None,
     }
