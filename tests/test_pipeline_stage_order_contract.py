@@ -152,7 +152,17 @@ _NEW = "LaunchSomeNewDailySpot"
 
 #: A synthetic definition built from the spine as imported, so these tests
 #: grade the merge-order LOGIC and never the live state of the definitions.
-_BASE_DEFINITION = frozenset(PIPELINE_STAGE_ORDER[_EOD]) | {"MarketHoursBlocked"}
+#: alpha-engine-config-I11267: excludes any REAL pending stage the pinned
+#: library already declares for _EOD (e.g. WaitForCollectionManifests) — this
+#: baseline must represent "landed states only" so the synthetic `_NEW`
+#: mutation below is the ONLY not-yet-landed stage these tests reason about.
+#: Without the exclusion, a real pending declaration landing in the library
+#: makes `_BASE_DEFINITION` silently include a stage that is NOT actually
+#: defined, and `stale_pending_stages` correctly (per its own contract) flags
+#: it as stale — a false failure with no code change in this repo at all.
+_BASE_DEFINITION = (
+    frozenset(PIPELINE_STAGE_ORDER[_EOD]) - registry.pending_definition_stages_for(_EOD)
+) | {"MarketHoursBlocked"}
 
 
 def _declare(monkeypatch, *, pending: bool) -> None:
@@ -198,9 +208,19 @@ def test_the_spine_is_a_subset_and_not_the_state_list(pipeline):
     If someone later 'tightens' this file into an equality check, the spine
     becomes unmaintainable and the pressure will be to delete the guard. The
     asymmetry is deliberate and is asserted so it survives.
+
+    alpha-engine-config-I11267: a PENDING_DEFINITION_STAGES entry is declared
+    in the library AHEAD of its state landing here — by design, per
+    `test_every_spine_stage_exists_in_the_live_definition`'s own tolerance —
+    so it must be excluded from "the spine" this subset check reasons about,
+    or a library-first pending declaration alone (no code change in THIS
+    repo at all) fails this test. A RETIRING_DEFINITION_STAGES entry is NOT
+    excluded: it is still live in the current definition today and only
+    tolerated as absent once this repo actually removes it.
     """
     names = _names_for(pipeline)
-    spine = set(PIPELINE_STAGE_ORDER[pipeline])
+    pending = registry.pending_definition_stages_for(pipeline)
+    spine = set(PIPELINE_STAGE_ORDER[pipeline]) - pending
     assert spine < names, (
         f"{pipeline}: the spine is not a PROPER subset of the definition's "
         f"states ({len(spine)} vs {len(names)}). The spine is a judgment about "

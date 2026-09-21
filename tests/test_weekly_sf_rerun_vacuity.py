@@ -65,7 +65,13 @@ def sf_def() -> dict:
 
 @pytest.fixture(scope="module")
 def spine(mod) -> tuple:
-    return mod.stage_order_for(WEEKLY_ARN)
+    """The LANDED spine — excludes stages the pinned nousergon-lib has
+    declared ahead of (PENDING_DEFINITION_STAGES) or behind (RETIRING_
+    DEFINITION_STAGES) this repo's own step_function.json
+    (alpha-engine-config-I11267). The raw `stage_order_for()` is what
+    production code must never feed directly into a vacuity/coverage
+    judgment — see `weekly_sf_rerun._landed_spine`'s docstring for why."""
+    return mod._landed_spine(WEEKLY_ARN)
 
 
 def _input(name: str) -> dict:

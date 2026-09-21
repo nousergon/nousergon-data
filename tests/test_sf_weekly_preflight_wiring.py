@@ -227,6 +227,155 @@ def test_pipeline_contract_gate_defers_to_preflight(states):
     )
 
 
+# --------------------------------------------------------------------------
+# alpha-engine-config-I11112 — a capability-gap skip is a VERDICT about the
+# probe's own environment (mirrors ModelZooUnservableDeclared,
+# sf-pipeline-policy.md §2.3a), not a stage degradation, and must terminate
+# the run SUCCEEDED. Every OTHER pre-spend gate in this family (LibPin/
+# PipelineContract/Evaluator/EvaluatorDirector) sets $.degraded_summary and
+# therefore terminates at the DegradedRun Fail state (config-I6891) — correct
+# for a rare, transient probe failure, wrong for a persistent, tracked
+# capability gap that would otherwise Fail-and-page every Saturday. These
+# tests pin the PROPERTY (where the run ends up), mirroring
+# test_sf_model_zoo_unservable_wiring.py's _first_path_to walk rather than a
+# fresh helper.
+# --------------------------------------------------------------------------
+
+
+def _edges(state: dict) -> list[str]:
+    out = []
+    if "Next" in state:
+        out.append(state["Next"])
+    if "Default" in state:
+        out.append(state["Default"])
+    for rule in state.get("Choices", []) or []:
+        if "Next" in rule:
+            out.append(rule["Next"])
+    for catch in state.get("Catch", []) or []:
+        if "Next" in catch:
+            out.append(catch["Next"])
+    return out
+
+
+def _first_terminal(states: dict, start: str, max_steps: int = 400) -> tuple[str, list[str]]:
+    """DFS from `start` to the first Succeed or Fail state reached, returning
+    (terminal_name, path). Fails loudly on an undefined state name or on
+    exceeding max_steps, mirroring test_sf_model_zoo_unservable_wiring.py's
+    _first_path_to."""
+    seen: set[str] = set()
+    stack = [[start]]
+    while stack:
+        path = stack.pop()
+        node = path[-1]
+        if node in seen or len(path) > max_steps:
+            continue
+        seen.add(node)
+        state = states.get(node)
+        assert state is not None, f"path {path} references undefined state {node!r}"
+        if state.get("Type") in ("Succeed", "Fail") and node != start:
+            return node, path
+        for nxt in _edges(state):
+            stack.append(path + [nxt])
+    raise AssertionError(f"no Succeed/Fail terminal reached from {start!r} within {max_steps} steps")
+
+
+def test_blind_spot_declared_converges_on_the_clean_continuation(states):
+    """A run whose ONLY degradation is WeeklyPreflight's unreachable-checks
+    skip must rejoin the SAME continuation as a fully clean preflight
+    (WeeklyPreflightGate's Default -> CheckMutexRole) within the blind-spot
+    Pass/Publish pair itself, and must never write $.degraded_summary or
+    $.gate_degraded along the way — those fields are what route a run to
+    the DegradedRun Fail terminal via CheckDegradedOutcome (config-I6891),
+    verified for the sibling gates by test_only_degraded_passes_set_gate_degraded.
+
+    Deliberately NOT a full graph walk to whatever terminal DFS finds first:
+    downstream Parallel branches (e.g. ResearchPredictorParallel) have their
+    OWN unrelated Catch->Fail edges that a naive walk reaches regardless of
+    what WeeklyPreflight decided, which would make this test's outcome an
+    accident of traversal order rather than a fact about the blind-spot arm.
+    The three-state chain below (Declared -> Notice -> CheckMutexRole, and
+    Notice's Catch -> CheckMutexRole) is the ENTIRE blind-spot-specific
+    routing; once it reaches CheckMutexRole it is indistinguishable from any
+    other clean run, which is the property that matters.
+    """
+    chain = ["WeeklyPreflightBlindSpotFromProbe", "WeeklyPreflightBlindSpotDeclared", "PublishWeeklyPreflightBlindSpotNotice"]
+    for name in chain:
+        st = states[name]
+        assert st.get("ResultPath") != "$.degraded_summary", f"{name} writes $.degraded_summary"
+        assert st.get("ResultPath") != "$.gate_degraded", f"{name} writes $.gate_degraded"
+
+    notice = states["PublishWeeklyPreflightBlindSpotNotice"]
+    assert notice["Next"] == "CheckMutexRole", (
+        "PublishWeeklyPreflightBlindSpotNotice must rejoin the clean-preflight "
+        f"continuation at CheckMutexRole, got {notice['Next']}"
+    )
+    (catch,) = notice["Catch"]
+    assert catch["Next"] == "CheckMutexRole", (
+        "a best-effort notice failure must still rejoin CheckMutexRole, "
+        f"got {catch['Next']}"
+    )
+    assert states["WeeklyPreflightGate"]["Default"] == "CheckMutexRole", (
+        "the clean-preflight Default must be the SAME target the blind-spot "
+        "arm converges on, or 'converges on the clean continuation' is not "
+        "actually true"
+    )
+
+
+def test_blind_spot_declared_does_not_reuse_gate_degraded_family(states):
+    """WeeklyPreflightBlindSpotDeclared's own ResultPath must be its
+    dedicated field, not the shared $.gate_degraded flag every OTHER
+    pre-spend gate uses (that flag's consequence — DegradedRun — does not
+    apply to a capability-gap VERDICT)."""
+    declared = states["WeeklyPreflightBlindSpotDeclared"]
+    assert declared["ResultPath"] == "$.weekly_preflight_blind_spot"
+    assert declared["Parameters"]["present"] is True
+
+
+def test_real_preflight_violation_still_reaches_a_fail_terminal(states):
+    """Mirror of the above: a REQUIRED check that RUNS and finds a genuine
+    violation (has_violation=true) is unaffected by the blind-spot arm and
+    still halts — reaches a Fail terminal, never a Succeed one."""
+    terminal, path = _first_terminal(states, "ExtractWeeklyPreflightError")
+    assert states[terminal]["Type"] == "Fail", (
+        f"a confirmed preflight violation must reach a Fail terminal, "
+        f"reached {terminal!r} (Type={states[terminal]['Type']}) via {path}"
+    )
+
+
+def test_weekly_preflight_blind_spot_floored_both_polarities(sf):
+    """sf-pipeline-policy.md §2.3a rule 3: the field must be present (and
+    false/present:false) on a clean run too, or a consumer cannot tell
+    'no blind spot' from 'the declaring state never ran because of a bug'."""
+    import re
+    merged = sf["States"]["InitializeInput"]["Parameters"]["merged.$"]
+    m = re.search(r"StringToJson\('(\{.*?\})'\)", merged)
+    assert m, "InitializeInput's innermost defaults blob was not found"
+    floor = json.loads(m.group(1))
+    assert floor["weekly_preflight_blind_spot"] == {
+        "present": False,
+        "required_skip_count": 0,
+        "required_skip_names": [],
+    }
+
+
+def test_completion_markers_carry_the_blind_spot_field(states):
+    """Both completion-marker writers (clean and degraded twins) must embed
+    $.weekly_preflight_blind_spot, mirroring how $.model_zoo_unservable is
+    already embedded in all four — a field written only on the bad path
+    cannot be distinguished from a producer that broke."""
+    for name in (
+        "WriteCompletionMarker",
+        "WriteCompletionMarkerCalendar",
+        "WriteCompletionMarkerDegraded",
+        "WriteCompletionMarkerDegradedCalendar",
+    ):
+        body = states[name]["Parameters"]["Body.$"]
+        assert "weekly_preflight_blind_spot" in body, f"{name} does not embed weekly_preflight_blind_spot"
+        assert "States.JsonToString($.weekly_preflight_blind_spot)" in body, (
+            f"{name} must render weekly_preflight_blind_spot via JsonToString, like model_zoo_unservable"
+        )
+
+
 def test_pipeline_contract_degraded_defers_to_preflight(states):
     """The degraded path from PipelineContractGate must also route into the
     composed pre-spend gate chain, not bypass it straight to CheckMutexRole.
