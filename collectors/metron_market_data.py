@@ -247,9 +247,19 @@ FxHistorySource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
 SectorSource = Callable[[list[str]], dict[str, str]]
 CountrySource = Callable[[list[str]], dict[str, str]]
 BenchmarkWeightsSource = Callable[[], dict[str, float]]
-EarningsSource = Callable[[list[str]], dict[str, str]]
+# Earnings and macro additionally take the RUN DATE, and every implementation must
+# select its window from that argument rather than from the wall clock
+# (alpha-engine-config-I11216). Both artifacts are windowed views of a moving
+# vendor feed -- "the next earnings date on or after X", "two years of
+# observations ending at X" -- so a source reading `utcnow()` silently makes a
+# replay of trading day D produce D+N's content under D's `as_of` stamp. Measured
+# 2026-09-20 replaying 2026-09-18: 15 symbols whose earnings fell on 09-18/09-19
+# vanished from `market_data/earnings/latest.json`, and every FRED series came
+# back one observation short. The anchor is in the SIGNATURE, not defaulted
+# inside the callee, so an unanchored source cannot be written by accident.
+EarningsSource = Callable[[list[str], date], dict[str, str]]
 # A macro source maps FRED series ids → {series_id: [(date_iso, value), …]} ascending.
-MacroSource = Callable[[list[str]], dict[str, list[tuple[str, float]]]]
+MacroSource = Callable[[list[str], date], dict[str, list[tuple[str, float]]]]
 # A fundamentals source maps yf_symbols → {yf_symbol: {info_key: value}}.
 FundamentalsSource = Callable[[list[str]], dict[str, dict]]
 # An analyst source maps yf_symbols → {yf_symbol: {consensus_rating, mean_target, …}}.
@@ -778,15 +788,37 @@ def _yfinance_spy_weights() -> dict[str, float]:
     return {_FUNDS_SECTOR_KEY[k]: float(v) for k, v in raw.items() if k in _FUNDS_SECTOR_KEY}
 
 
+def _run_date_anchor(run_date: str) -> date:
+    """The run date as a ``date``, for the windowed sources.
+
+    RAISES on an unparseable run date rather than falling back to the wall
+    clock (alpha-engine-config-I11216). A fallback here would restore exactly
+    the defect this function exists to remove, and would do it silently, on the
+    one path where the caller believed it had pinned the day. `run_date`
+    reaches this only from `default_run_date()` or an explicit `--date`, both
+    of which are already ISO.
+    """
+    return date.fromisoformat(run_date)
+
+
 @_yf_quiet
-def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
-    """Next (earliest upcoming) earnings date per held symbol via yfinance →
-    ``{yf_symbol: date_iso}``. Fail-soft: no resolvable date → omitted."""
+def _yfinance_earnings(yf_symbols: list[str], as_of: date) -> dict[str, str]:
+    """Next earnings date ON OR AFTER ``as_of``, per held symbol, via yfinance →
+    ``{yf_symbol: date_iso}``. Fail-soft: no resolvable date → omitted.
+
+    ``as_of`` is the RUN DATE and is never the wall clock
+    (alpha-engine-config-I11216). "Upcoming" is relative to the day being
+    collected: replaying 2026-09-18 on 2026-09-20 with `utcnow()` dropped the
+    15 symbols that reported on 09-18/09-19 -- ANF, CRM, CRUS, DECK, DOCS,
+    DOCU, DUOL, HL, NBIX, PBF, QLYS, SMCI, TOELY, UAL, VEEV -- from an artifact
+    still stamped `as_of: 2026-09-18`.
+    """
     try:
         import pandas as pd
         import yfinance as yf
     except ImportError:  # pragma: no cover
         return {}
+    anchor = pd.Timestamp(as_of)
     out: dict[str, str] = {}
     for sym in yf_symbols:
         try:
@@ -794,8 +826,7 @@ def _yfinance_earnings(yf_symbols: list[str]) -> dict[str, str]:
             if df is None or df.empty:
                 continue
             idx = pd.to_datetime(df.index)
-            today = pd.Timestamp.utcnow().tz_localize(None)
-            future = sorted(d for d in idx.tz_localize(None) if d >= today)
+            future = sorted(d for d in idx.tz_localize(None) if d >= anchor)
             if future:
                 out[sym] = future[0].date().isoformat()
         except Exception as e:
@@ -948,7 +979,7 @@ def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
     return out
 
 
-def _fred_series_history(series_ids: list[str], api_key: str, *, lookback_years: int = 2) -> dict[str, list[tuple[str, float]]]:
+def _fred_series_history(series_ids: list[str], as_of: date, api_key: str, *, lookback_years: int = 2) -> dict[str, list[tuple[str, float]]]:
     """~``lookback_years`` of daily/monthly observations per FRED series id →
     ``{series_id: [(date, value), …]}`` ascending. stdlib urllib; fail-soft per series."""
     if not api_key:
@@ -957,7 +988,12 @@ def _fred_series_history(series_ids: list[str], api_key: str, *, lookback_years:
     import urllib.parse
     import urllib.request
     from datetime import date as _date
-    today = datetime.now(timezone.utc).date()
+    # The observation window is anchored to the RUN DATE, never the wall clock
+    # (alpha-engine-config-I11216): `observation_start` two years before
+    # `utcnow()` slides by the replay lag, which is why every FRED series came
+    # back one observation short when 2026-09-18 was replayed on 2026-09-20
+    # (`$.series.DGS10: length 498 live vs 497 shadow`).
+    today = as_of
     try:
         start = today.replace(year=today.year - lookback_years).isoformat()
     except ValueError:  # Feb 29
@@ -1354,7 +1390,7 @@ def collect_reference(
     sectors = sector_source(yf_symbols) if sector_source else (fetched_sectors or {})
     countries = country_source(yf_symbols) if country_source else (fetched_countries or {})
     spy_weights = (benchmark_source or _yfinance_spy_weights)()
-    earnings = (earnings_source or _yfinance_earnings)(yf_symbols)
+    earnings = (earnings_source or _yfinance_earnings)(yf_symbols, _run_date_anchor(run_date))
     sectors_artifact = {"schema_version": SECTORS_SCHEMA_VERSION, "as_of": run_date,
                         "sectors": dict(sorted(sectors.items())),
                         "countries": dict(sorted(countries.items())),
@@ -1406,9 +1442,9 @@ def collect_macro(
         if api_key is None:
             from nousergon_lib.secrets import get_secret
             api_key = get_secret("FRED_API_KEY", required=False, default="")
-        series = _fred_series_history(METRON_MACRO_SERIES, api_key)
+        series = _fred_series_history(METRON_MACRO_SERIES, _run_date_anchor(run_date), api_key)
     else:
-        series = macro_source(METRON_MACRO_SERIES)
+        series = macro_source(METRON_MACRO_SERIES, _run_date_anchor(run_date))
     if not series:
         return {"status": "skipped", "reason": "no macro series (FRED key unset or fetch failed)"}
     # v2: next-release dates + the macro event calendar. Best-effort — a FRED hiccup leaves

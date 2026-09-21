@@ -491,7 +491,7 @@ class TestPriceCacheStaleness(TestCloseHistoryPriceCacheSource):
 class TestMacro:
     def test_writes_macro_series_artifact(self):
         s3 = _universe_s3(_UNIVERSE)  # macro doesn't read the universe; reuse the fake S3
-        macro_src = lambda ids: {"FEDFUNDS": [("2026-05-01", 5.33), ("2026-06-01", 5.33)],
+        macro_src = lambda ids, as_of: {"FEDFUNDS": [("2026-05-01", 5.33), ("2026-06-01", 5.33)],
                                  "VIXCLS": [("2026-06-10", 14.2), ("2026-06-11", 13.8)]}
         result = mmd.collect_macro(bucket="b", run_date="2026-06-11", s3_client=s3, macro_source=macro_src)
         assert result["status"] == "ok" and result["series"] == 2
@@ -505,16 +505,16 @@ class TestMacro:
     def test_macro_dry_run_and_no_series(self):
         s3 = _universe_s3(_UNIVERSE)
         r = mmd.collect_macro(bucket="b", run_date="2026-06-11", dry_run=True, s3_client=s3,
-                              macro_source=lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)]})
+                              macro_source=lambda ids, as_of: {"FEDFUNDS": [("2026-06-01", 5.33)]})
         assert r["status"] == "ok_dry_run"
         s3.put_object.assert_not_called()
-        assert mmd.collect_macro(bucket="b", s3_client=s3, macro_source=lambda ids: {})["status"] == "skipped"
+        assert mmd.collect_macro(bucket="b", s3_client=s3, macro_source=lambda ids, as_of: {})["status"] == "skipped"
 
     def test_macro_publishes_next_release_and_events(self):
         # v2 (metron-ops#49): next_release per series + the macro event calendar, via an
         # injected release_source (no FRED network in tests).
         s3 = _universe_s3(_UNIVERSE)
-        macro_src = lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)], "UNRATE": [("2026-05-01", 4.1)]}
+        macro_src = lambda ids, as_of: {"FEDFUNDS": [("2026-06-01", 5.33)], "UNRATE": [("2026-05-01", 4.1)]}
         rel_src = lambda ids, run_date: (
             {"FEDFUNDS": "2026-07-29", "UNRATE": "2026-07-02"},
             [{"date": "2026-07-02", "kind": "release", "series_id": "UNRATE", "label": "Employment Situation"},
@@ -534,7 +534,7 @@ class TestMacro:
         # series artifact still written (best-effort calendar never blocks the primary data).
         s3 = _universe_s3(_UNIVERSE)
         mmd.collect_macro(bucket="b", run_date="2026-06-11", s3_client=s3,
-                          macro_source=lambda ids: {"FEDFUNDS": [("2026-06-01", 5.33)]})
+                          macro_source=lambda ids, as_of: {"FEDFUNDS": [("2026-06-01", 5.33)]})
         art = _puts(s3)["market_data/macro/latest.json"]
         assert art["next_release"] == {} and art["release_events"] == []
 
@@ -547,7 +547,7 @@ class TestReference:
             sector_source=lambda syms: {"AAPL": "Technology", "1299.HK": "Financial Services"},
             country_source=lambda syms: {"AAPL": "United States", "1299.HK": "Hong Kong"},
             benchmark_source=lambda: {"Technology": 0.30, "Financial Services": 0.13},
-            earnings_source=lambda syms: {"AAPL": "2026-07-30"},
+            earnings_source=lambda syms, as_of: {"AAPL": "2026-07-30"},
         )
         assert result["status"] == "ok" and result["sectors"] == 2 and result["countries"] == 2 and result["earnings"] == 1
         puts = _puts(s3)
@@ -570,7 +570,7 @@ class TestReference:
 
         with mock.patch.object(mmd, "_yfinance_classification", fake_classify), \
              mock.patch.object(mmd, "_yfinance_spy_weights", lambda: {}), \
-             mock.patch.object(mmd, "_yfinance_earnings", lambda s: {}):
+             mock.patch.object(mmd, "_yfinance_earnings", lambda s, as_of: {}):
             result = mmd.collect_reference(bucket="b", run_date="2026-06-11", s3_client=s3)
         assert calls["n"] == 1  # one shared pass, not one per dimension
         assert result["sectors"] == 1 and result["countries"] == 1
@@ -581,11 +581,11 @@ class TestReference:
         s3 = _universe_s3(_UNIVERSE)
         r = mmd.collect_reference(bucket="b", run_date="2026-06-11", dry_run=True, s3_client=s3,
                                   sector_source=lambda s: {"AAPL": "Technology"}, country_source=lambda s: {"AAPL": "United States"},
-                                  benchmark_source=lambda: {}, earnings_source=lambda s: {})
+                                  benchmark_source=lambda: {}, earnings_source=lambda s, as_of: {})
         assert r["status"] == "ok_dry_run"
         s3.put_object.assert_not_called()
         s3b = _universe_s3({"holdings": [], "currencies": []})
-        assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, country_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s: {})["status"] == "skipped"
+        assert mmd.collect_reference(bucket="b", s3_client=s3b, sector_source=lambda s: {}, country_source=lambda s: {}, benchmark_source=lambda: {}, earnings_source=lambda s, as_of: {})["status"] == "skipped"
 
 
 class TestFundamentals:
