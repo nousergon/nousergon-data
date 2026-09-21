@@ -42,14 +42,28 @@ def _fake_html(
     return df.to_html(index=False)
 
 
-def _fake_ssga_bytes(tickers: list[str]) -> bytes:
+def _fake_ssga_bytes(tickers: list[str], weights: list[float] | None = None) -> bytes:
     """Build a minimal SSGA-holdings-shaped xlsx: a 4-row banner ahead of
     the real header row (mirrors ``skiprows=4`` in
-    ``_fetch_ssga_membership``), then a ``Ticker`` column. Only the column
-    that function actually reads is required."""
+    ``_fetch_ssga_membership``), then the ``Ticker`` and ``Weight`` columns
+    that function reads.
+
+    ``Weight`` is in PERCENT, as the real file publishes it. Default spreads
+    100% evenly across ``tickers`` so the raw sum clears
+    ``_WEIGHT_RAW_SUM_MIN_PCT``; pass ``weights`` to model a specific
+    distribution or a deliberately broken one.
+
+    A fixture missing a column the real file always carries is an unfaithful
+    fixture — it was missing ``Weight`` until alpha-engine-config-I11295, and
+    that is precisely why nothing noticed the column was being discarded.
+    """
     buf = BytesIO()
+    if weights is None:
+        weights = [100.0 / len(tickers)] * len(tickers) if tickers else []
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
-        pd.DataFrame({"Ticker": tickers}).to_excel(writer, index=False, startrow=4)
+        pd.DataFrame({"Ticker": tickers, "Weight": weights}).to_excel(
+            writer, index=False, startrow=4
+        )
     return buf.getvalue()
 
 
@@ -104,9 +118,10 @@ def test_sector_map_covers_both_sp500_and_sp400() -> None:
     )
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
-            constituents._fetch_constituents()
-        )
+        (
+            tickers, sector_map, sector_etf_map, sub_industry_map,
+            sp500_count, sp400_count, _weights,
+        ) = constituents._fetch_constituents()
 
     assert sp500_count == 2
     assert sp400_count == 2
@@ -139,7 +154,7 @@ def test_membership_is_ssga_sourced_not_wikipedia() -> None:
         return fake_get(url, **kwargs)
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get_with_stale_wiki):
-        tickers, sector_map, _, _, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, _, _, _, _, _ = constituents._fetch_constituents()
 
     assert set(tickers) == {"AAPL", "MSFT", "WSO"}
     assert "JHG" not in tickers, (
@@ -166,9 +181,10 @@ def test_sub_industry_map_captured_alongside_sector_map() -> None:
     )
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
-            constituents._fetch_constituents()
-        )
+        (
+            tickers, sector_map, sector_etf_map, sub_industry_map,
+            sp500_count, sp400_count, _weights,
+        ) = constituents._fetch_constituents()
 
     assert sub_industry_map["AAPL"] == "Technology Hardware, Storage & Peripherals"
     assert sub_industry_map["MSFT"] == "Systems Software"
@@ -189,7 +205,7 @@ def test_sub_industry_map_empty_when_column_absent_does_not_raise() -> None:
                                sp400_sectors=["Financials"])
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, _, sub_industry_map, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, _, sub_industry_map, _, _, _ = constituents._fetch_constituents()
 
     assert set(tickers) == {"AAPL", "JHG"}
     assert sector_map == {"AAPL": "Information Technology", "JHG": "Financials"}
@@ -225,7 +241,7 @@ def test_cache_persists_sub_industry_map() -> None:
             assert row_by_ticker["JHG"]["gics_sub_industry"] == "Asset Management & Custody Banks"
 
             # Fallback from cache must also reconstruct sub_industry_map.
-            _, _, _, sub_industry_map, _, _ = constituents._load_from_cache()
+            _, _, _, sub_industry_map, _, _, _ = constituents._load_from_cache()
             assert sub_industry_map == {
                 "AAPL": "Systems Software",
                 "JHG": "Asset Management & Custody Banks",
@@ -246,6 +262,7 @@ def test_collect_raises_when_sector_coverage_gap_exceeds_tolerance(tmp_path) -> 
             {},
             2,
             len(unmapped),
+            constituents.SsgaWeights(),
         )
 
     with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch):
@@ -266,6 +283,7 @@ def test_collect_warns_but_proceeds_within_sector_gap_tolerance(tmp_path) -> Non
             {},
             2,
             1,
+            constituents.SsgaWeights(),
         )
 
     with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch):
@@ -349,9 +367,10 @@ def test_cache_fallback_returns_full_sector_map(tmp_path, monkeypatch) -> None:
         raise RuntimeError("simulated outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, sub_industry_map, sp500_count, sp400_count = (
-            constituents._fetch_constituents()
-        )
+        (
+            tickers, sector_map, sector_etf_map, sub_industry_map,
+            sp500_count, sp400_count, _weights,
+        ) = constituents._fetch_constituents()
 
     assert tickers == ["AAPL", "MSFT", "JHG"]
     assert sector_map == {
@@ -375,7 +394,7 @@ def test_cache_fallback_handles_legacy_ticker_only_schema(tmp_path, monkeypatch)
         raise RuntimeError("simulated outage")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sector_map, sector_etf_map, _, _, _ = constituents._fetch_constituents()
+        tickers, sector_map, sector_etf_map, _, _, _, _ = constituents._fetch_constituents()
 
     assert tickers == ["AAPL", "MSFT"]
     assert sector_map == {}
@@ -416,6 +435,10 @@ def test_ssga_membership_filters_non_equity_rows() -> None:
         "Ticker": ["AAPL", "-", "CASH_USD", "2602335D", None, "MSFT"],
         "Name": ["APPLE INC", "US DOLLAR", "U.S. Dollar", "CONTRA HOLOGIC",
                  "Legal disclaimer text...", "MICROSOFT CORP"],
+        # Cash/contra/disclaimer rows carry weight in the real file too; the
+        # equity filter drops them, which is exactly why the raw sum is
+        # recorded before normalisation.
+        "Weight": [60.0, 1.5, 1.0, 0.2, None, 37.3],
     })
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         noisy.to_excel(writer, index=False, startrow=4)
@@ -440,6 +463,7 @@ def test_ssga_membership_filters_non_equity_rows_both_legs_populated() -> None:
     buf = BytesIO()
     noisy = pd.DataFrame({
         "Ticker": ["AAPL", "-", "CASH_USD", "2602335D", None, "MSFT"],
+        "Weight": [60.0, 1.5, 1.0, 0.2, None, 37.3],
     })
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         noisy.to_excel(writer, index=False, startrow=4)
@@ -452,7 +476,7 @@ def test_ssga_membership_filters_non_equity_rows_both_legs_populated() -> None:
         raise AssertionError(f"unexpected URL: {url}")
 
     with patch("collectors.constituents.requests.get", side_effect=fake_get):
-        tickers, sp500_count, sp400_count = constituents._fetch_ssga_membership()
+        tickers, sp500_count, sp400_count, _weights = constituents._fetch_ssga_membership()
 
     assert set(tickers) == {"AAPL", "MSFT", "JHG", "WSO"}
     assert sp500_count == 2
