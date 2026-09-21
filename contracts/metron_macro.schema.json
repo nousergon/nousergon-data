@@ -76,5 +76,14 @@
       }
     }
   },
-  "x-key-pattern": "market_data/macro/latest.json"
+  "x-key-pattern": "market_data/macro/latest.json",
+  "x-comparison-class": "vendor_live",
+  "x-vendor-live": {
+    "value_band": {
+      "relative": 0.01,
+      "absolute": 0.0
+    },
+    "coverage_floor": 1.0,
+    "note": "FRED series are revised and extended between fetches. The band covers a revised level; it deliberately does NOT cover a series whose LENGTH differs, which is a different as-of window and is graded exactly."
+  }
 }
