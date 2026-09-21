@@ -125,6 +125,34 @@ IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "alpha-engine-executor-pro
 # /tmp-100% failure mode that motivated this move (config#1767 gotcha).
 VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
 
+# Cost-allocation tag (alpha-engine-config-I10788). Per the binding plan
+# (`data_collection_plan_260914.md` §2 objective 8, `data_gate.clauses`'
+# `data.cost.monthly` literal text) the key/value is `component=data-collection`.
+# `alpha-engine-config-I10905` (gate:decision, OPEN/unruled as of 2026-09-21)
+# asks whether `component` or `system` should be the fleet-wide key — this
+# constant follows the plan's literal text as the stated ASSUMPTION per this
+# issue's dispatch instructions, not a resolution of I10905. `component` was
+# activated as a cost-allocation tag key in Billing 2026-09-21 (previously
+# INACTIVE — `aws ce list-cost-allocation-tags` showed only `system` Active),
+# so tagged spend under this key starts accruing in the cost-and-usage export
+# from this date forward, never retroactively.
+#
+# Applied on EVERY launch (spot AND on-demand, no conditional), unconditionally
+# merged into `extra_tags` in `_launch_instance` so it rides the SAME
+# `RunInstances` `TagSpecifications` entry atomically — same reasoning
+# `krepis.ec2_spot`'s own extra_tags docstring gives for per-run identity tags:
+# a separate post-launch `create_tags` call leaves a window where the box is
+# observably untagged.
+#
+# COVERS THE INSTANCE ONLY. `krepis.ec2_spot._build_launch_kwargs` puts
+# `TagSpecifications` under `ResourceType: "instance"` only — the EBS volume
+# created by the same `BlockDeviceMappings` entry carries no TagSpecifications
+# at all, fleet-wide, for every caller of this shared launch helper. Fixing
+# that is a `krepis` library change, out of this file's (and this repo's)
+# ownership; filed as alpha-engine-config-I10788's follow-up (see PR body).
+COST_TAG_KEY = "component"
+COST_TAG_VALUE = "data-collection"
+
 DATA_REPO = os.environ.get("DATA_SPOT_REPO", "nousergon/nousergon-data")
 DATA_BRANCH = os.environ.get("DATA_SPOT_BRANCH", "main")
 # Private config package weekly_collector.py resolves via resolve_experiment_config
@@ -1159,7 +1187,17 @@ def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = No
     extra_tags (config#5504): per-run identity tags (execution_id, run_date,
     pipeline_role) ride the SAME RunInstances call atomically via krepis.ec2_spot's
     extra_tags kwarg — never a separate post-launch create_tags call subject to a
-    race. When omitted, the box is launched with only the Name tag."""
+    race. When omitted, the box is launched with only the Name tag and the cost
+    tag below.
+
+    Cost-allocation tag (alpha-engine-config-I10788): every launch — spot or
+    on-demand, every branch below — carries COST_TAG_KEY=COST_TAG_VALUE,
+    merged into the SAME extra_tags dict so it rides the SAME atomic
+    RunInstances call as the per-run identity tags. Unconditional: this is the
+    resource class the issue's scope measurement found carrying no cost tag
+    at all, and it is where nearly all of this component's spend is."""
+    tags = dict(extra_tags or {})
+    tags[COST_TAG_KEY] = COST_TAG_VALUE
     common = dict(
         image_id=AMI_ID,
         key_name=KEY_NAME,
@@ -1168,7 +1206,7 @@ def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = No
         volume_size_gb=VOLUME_SIZE_GB,
         shutdown_behavior="terminate",
         tag_name="alpha-engine-data-spot",
-        extra_tags=extra_tags,
+        extra_tags=tags,
         region=REGION,
     )
     if force_on_demand:
