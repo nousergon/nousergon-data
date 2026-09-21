@@ -215,13 +215,26 @@ def collect_rating_ledger(
         # path that ever writes today's date.
         live_written = False
         live_skipped_reason = None
+        already_live = existing_by_date.get(run_date, {}).get("basis") == "live"
         if ref_calendar[-1] != run_date:
             # close_history has no bar for run_date (holiday, or the close not yet
             # published): a rating computed now would be the PRIOR session's rating stamped
             # with run_date, and "live" dates are immutable — so never write it.
             live_skipped_reason = f"no close for {run_date} (latest {ref_calendar[-1]})"
             logger.warning("[technical_rating_ledger] live write skipped: %s", live_skipped_reason)
-        elif existing_by_date.get(run_date, {}).get("basis") != "live":
+        elif already_live:
+            # alpha-engine-config-I11231: a re-run for a date v1 already published
+            # live — the immutability contract, correctly declining to rewrite it.
+            # NOT a failure: `skip_reason` below is only surfaced as `auto_skipped`
+            # when nothing else was written this cycle either (see the return
+            # statement) so `_phase_collect` routes this to `not_applicable` with
+            # `run_units.NOT_RUN_NO_NEW_DATA_DECLARED` ("a target date already
+            # published" — the lib's own example) instead of raising
+            # `EmptyProduction`. A cycle that ALSO backfilled trailing dates this
+            # run is not an auto-skip — it published something — so that case is
+            # left to record `ok` exactly as before.
+            live_skipped_reason = "target date already live-published, immutable"
+        else:
             ratings_by_date = _rate_universe_at_dates(series, [run_date])
             entry = {
                 "schema_version": LEDGER_SCHEMA_VERSION, "as_of": run_date,
@@ -245,10 +258,23 @@ def collect_rating_ledger(
         logger.error("[technical_rating_ledger] ledger write failed: %s", e)
         return {"status": "error", "error": str(e)}
 
-    return {
+    result = {
         "status": "ok", "backfill_written": backfill_written, "live_written": live_written,
         "live_skipped_reason": live_skipped_reason, "total_dates": len(existing_by_date),
     }
+    # alpha-engine-config-I11231: nothing published this cycle, and the reason is
+    # the immutability contract correctly declining a rewrite -- not an empty
+    # production. Signalling it this way (rather than leaving the caller to infer
+    # it from backfill_written==0 and live_written==False) is what lets
+    # `_record_phase_lineage` route it to `not_applicable` instead of
+    # `EmptyProduction`. If backfill_written is also 0 for a DIFFERENT reason
+    # (e.g. every trailing date already backfilled) that is fine: the predicate
+    # below only cares whether run_date's own already-live state is why nothing
+    # moved, which is the one case this issue is about.
+    if not backfill_written and not live_written and already_live:
+        result["auto_skipped"] = True
+        result["skip_reason"] = "target date already live-published, immutable"
+    return result
 
 
 # ── Scorer: realized near-term performance ───────────────────────────────────────────

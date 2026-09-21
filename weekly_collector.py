@@ -244,7 +244,8 @@ class _CollectorError(RuntimeError):
 
 
 class _DegradedRun(RuntimeError):
-    """A phase that produced its artifact with a KNOWN defect in it.
+    """A phase that produced its artifact with a KNOWN defect in it, OR
+    published only PART of what it was asked to.
 
     `alpha-engine-config-I10784` (P-17). ``degraded`` is a real third outcome
     for the PROCESS — the EOD Step Function reads this process's exit code to
@@ -255,17 +256,25 @@ class _DegradedRun(RuntimeError):
     contract says a run that produced a partial or defective artifact is
     ``failed``.
 
+    `alpha-engine-config-I11230` reuses this same class for a collector's own
+    ``status="partial"`` (e.g. `collectors/prices.py`: N of ~900 tickers
+    failed a refresh, the rest wrote fine) — the manifest-vs-process split is
+    identical, and the fix is "do not invent a fourth state" (I11230's own
+    recommendation).
+
     So the two claims are separated here rather than conflated. This exception
     is raised from inside the manifest wrapper AFTER the phase's lineage is
     recorded, which makes the manifest say ``failed`` and carry the defect as
     its reason; :func:`_phase_collect` catches it outside the wrapper and
-    returns the collector's ORIGINAL ``degraded`` result, so the aggregator,
-    the alert text and the exit code are byte-for-byte what they were.
+    returns the collector's ORIGINAL ``degraded``/``partial`` result, so the
+    aggregator, the alert text and the exit code are byte-for-byte what they
+    were.
     """
 
     def __init__(self, name: str, result: dict) -> None:
         detail = result.get("error") or result.get("detail") or result.get("reason") or "no detail reported"
-        super().__init__(f"{name} produced a DEGRADED artifact: {detail}")
+        kind = "DEGRADED" if result.get("status") == "degraded" else "PARTIAL"
+        super().__init__(f"{name} produced a {kind} artifact: {detail}")
         self.name = name
         self.result = result
 
@@ -304,6 +313,45 @@ class _PhaseNotRun(RuntimeError):
         super().__init__(f"{name} did not run: {reason}")
         self.name = name
         self.reason = reason
+
+
+#: The closed vocabulary of `status` values a collector dispatched through
+#: `_phase_collect` may return from `run_fn()` itself (never the synthetic
+#: `{"status": "ok", "auto_skipped": True}` `_phase_body` manufactures for its
+#: own registry-level cache-hit — that path never reaches this check).
+#:
+#: `alpha-engine-config-I11230` deliverable 4. Before this existed,
+#: `collectors/prices.py::collect` (and, swept the same day, `alternative.py`,
+#: `signal_returns.py`, `fred_history.py::backfill_to_s3`) could each return
+#: `status="partial"` and `_phase_body`/`_record_phase_lineage` would branch on
+#: neither `"error"` nor `"degraded"` for it — the manifest wrapper completed
+#: normally and recorded `status: ok`, exactly as if every ticker/step had
+#: succeeded. Measured 2026-09-21: the 2026-09-18 shadow replay's D03 manifest
+#: read `ok` with 4 of 930 price_cache parquets silently absent
+#: (`alpha-engine-config-I11203`).
+#:
+#: Kept here rather than per-collector so a NEW status value introduced by any
+#: collector fails loud at this one choke point (`_CollectorError`, an
+#: "error" marker) instead of silently completing as `ok` the way `"partial"`
+#: did. Grows only by adding a member here AND deciding, in the same PR, what
+#: `_phase_body`/`_record_phase_lineage` do with it -- never by defaulting an
+#: unrecognized value to a completion claim.
+_KNOWN_COLLECTOR_STATUSES = frozenset({
+    "ok",          # clean: published (or nothing needed publishing)
+    "ok_dry_run",  # dry-run: identified work, wrote nothing
+    "error",       # producer-detected failure -> _CollectorError, below
+    "degraded",    # artifact published, a KNOWN defect is in it (I7572)
+    "partial",     # SOME of the unit's work failed; the rest published --
+                   # given the SAME manifest treatment as "degraded" (I11230):
+                   # raised as _DegradedRun in _record_phase_lineage so the
+                   # per-unit manifest reads "failed" naming the loss, while
+                   # the PROCESS posture (the collector's own returned dict,
+                   # the aggregate status, the exit code) is unchanged.
+    "skipped",     # the collector itself declined to run this cycle (e.g. an
+                   # empty universe) -- falls through to record_empty_production
+                   # below when nothing was published, exactly like any other
+                   # non-run that recorded no output.
+})
 
 
 #: The manifest context of the whole-mode unit currently executing, if any.
@@ -862,7 +910,17 @@ def _record_phase_lineage(
     # the metric that explain it — `observability-policy` §3.1: the failure path
     # writes the same telemetry as the success path, except the completion
     # claim.
-    if result.get("status") == "degraded":
+    #
+    # `alpha-engine-config-I11230`: "partial" (SOME of the unit's work failed,
+    # the rest published) gets the SAME treatment as "degraded" here, for the
+    # same reason `_DegradedRun`'s own docstring gives — the manifest's
+    # contract has no room for a fourth status, and a run that lost part of
+    # its output is exactly what "produced its artifact with a KNOWN defect in
+    # it" means. `_phase_collect` catches `_DegradedRun` and returns the
+    # collector's ORIGINAL "partial" result unchanged, so the aggregate status
+    # and exit code this run already produces are untouched — only the
+    # PER-UNIT manifest moves, from a false `ok` to `failed` naming the loss.
+    if result.get("status") in ("degraded", "partial"):
         raise _DegradedRun(name, result)
 
     # `alpha-engine-config-I11011`: a phase that completed having published
@@ -989,7 +1047,25 @@ def _phase_body(
                                       "or --force-phases, a skipped shadow unit is not evidence")
             return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
         result = run_fn() or {}
-        if result.get("status") == "error":
+        # alpha-engine-config-I11230 deliverable 4: the status vocabulary this
+        # function branches on below is closed. A collector returning anything
+        # outside it (a typo, a new status nobody wired here yet) must fail
+        # loud rather than fall through every branch below and reach the
+        # manifest wrapper's success path uncontested — which is exactly how
+        # "partial" reached an `ok` D03 manifest before this existed.
+        _status = result.get("status")
+        if _status not in _KNOWN_COLLECTOR_STATUSES:
+            raise _CollectorError(
+                name,
+                f"{name} returned status={_status!r}, outside the closed vocabulary "
+                f"_phase_collect branches on ({sorted(_KNOWN_COLLECTOR_STATUSES)}). "
+                "Classify it explicitly at _KNOWN_COLLECTOR_STATUSES (and decide what "
+                "_phase_body/_record_phase_lineage do with it) rather than letting an "
+                "unrecognized status fall through to a completion claim "
+                "(alpha-engine-config-I11230).",
+                result,
+            )
+        if _status == "error":
             raise _CollectorError(name, result.get("error"), result)
         # `degraded` is verified exactly like `ok` (alpha-engine-config-I7572):
         # its whole meaning is "the artifact WAS produced, and something in it

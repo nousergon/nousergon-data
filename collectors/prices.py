@@ -171,6 +171,21 @@ def collect(
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
     }
+    if failed_tickers:
+        # alpha-engine-config-I11230 deliverable 2: `_DegradedRun` (the
+        # manifest-level handler for `status="partial"`) reads
+        # `error`/`detail`/`reason` for the failure it records on D03's
+        # manifest — without this key it falls back to "no detail reported",
+        # which is exactly the "carrying neither the failed tickers nor a
+        # reason" gap the issue names. Bounded to the same 20-ticker sample as
+        # `failed_tickers` above (never the full ~900-ticker universe —
+        # alpha-engine-config-I10941).
+        _sample = ", ".join(failed_tickers[:20])
+        _more = f" (+{len(failed_tickers) - 20} more)" if len(failed_tickers) > 20 else ""
+        result["reason"] = (
+            f"{len(failed_tickers)} of {len(all_tickers)} tickers failed to refresh: "
+            f"{_sample}{_more}"
+        )
     if validation:
         result["validation"] = validation
     return result

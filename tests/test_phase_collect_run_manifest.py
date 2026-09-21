@@ -222,6 +222,65 @@ def test_an_auto_skip_publishes_nothing_and_says_so_rather_than_reading_as_empty
     assert m["guards"][0]["verdict"] == "not_applicable"
 
 
+def test_a_collector_self_reported_auto_skip_routes_the_same_as_a_registry_one():
+    """`alpha-engine-config-I11231`: the immutable-date no-op in
+    `technical_rating_ledger.collect_rating_ledger` discovers its own auto-skip
+    AT EXECUTION TIME (a live read against S3), not from the phase registry's
+    prior-marker cache-hit check — so it signals it by setting `auto_skipped`/
+    `skip_reason` on its OWN returned dict, with `supports_auto_skip=False`
+    (no framework-level cache-hit check at all, matching the real D26 call
+    site). `_record_phase_lineage` must treat this identically to the
+    registry-driven auto-skip above: `not_applicable` /
+    `no_new_data_declared`, never `EmptyProduction`.
+    """
+    s3 = FakeS3()
+    reg = FakeRegistry(s3)  # skipped=False: the registry itself never skips this phase
+    result = weekly_collector._phase_collect(
+        reg, "metron_rating_ledger",
+        lambda: {
+            "status": "ok",
+            "auto_skipped": True,
+            "skip_reason": "target date already live-published, immutable",
+            "backfill_written": 0,
+            "live_written": False,
+        },
+        supports_auto_skip=False,
+    )
+    assert result["status"] == "ok"
+    assert result["auto_skipped"] is True
+    m = _manifests(s3)[0]
+    assert m["status"] == "not_applicable"
+    # The manifest's `reason` is the lib's closed-list member itself; the
+    # human-readable detail (the collector's own `skip_reason`) rides on the
+    # guard/log text instead, verified via `caplog`.
+    assert m["reason"] == "no_new_data_declared"
+    assert m["outputs"] == []
+    assert m["rows_out"] == 0
+
+
+def test_the_collector_self_reported_skip_reason_reaches_the_log(caplog):
+    """The detail behind `no_new_data_declared` — WHY this cycle had nothing new
+    — must still be discoverable, even though it does not live in `reason`."""
+    s3 = FakeS3()
+    reg = FakeRegistry(s3)
+    with caplog.at_level("INFO"):
+        weekly_collector._phase_collect(
+            reg, "metron_rating_ledger",
+            lambda: {
+                "status": "ok",
+                "auto_skipped": True,
+                "skip_reason": "target date already live-published, immutable",
+                "backfill_written": 0,
+                "live_written": False,
+            },
+            supports_auto_skip=False,
+        )
+    assert any(
+        "target date already live-published, immutable" in r.message
+        for r in caplog.records
+    )
+
+
 def test_dry_run_writes_no_manifest():
     """`reg is None` is the dry-run path and its posture is unchanged."""
     result = weekly_collector._phase_collect(None, "daily_closes", lambda: {"status": "ok"})
