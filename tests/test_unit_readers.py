@@ -144,6 +144,46 @@ def test_a_declared_off_row_on_an_in_service_unit_is_parked_not_met(units):
     assert not reading.met and "parked" in reading.detail
 
 
+def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units):
+    """D35 (on-demand, no schedule) already declares `partial_exclusion` naming
+    `artifact_registry` — the descriptor was always right; the reader ignored
+    it (alpha-engine-config-I11245)."""
+    unit = _unit(units, "D35")
+    reading = unit_readers.read_artifact_registry(EmptyStore(), unit)
+    assert reading.met and not reading.unmeasurable
+    assert "not applicable: N/A-NOT-RUN" in reading.detail
+
+
+def test_a_declared_arctic_evidence_key_is_graded_like_any_other_key(units):
+    """D13 writes only ArcticDB libraries and declares no `registry_rows`, but
+    its `arcticdb_evidence.via` names the in-region probe record — a real,
+    already-published S3 key. Once the registry grandfathers that prefix, the
+    unit reads MET through the same key-checking path every other unit uses,
+    not a special case (alpha-engine-config-I11245)."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source(
+        {
+            "artifacts": [],
+            "grandfathered_paths": [{"path_prefix": "data_collection/probes/arctic/", "reason": "probe"}],
+        }
+    )
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D13"))
+    assert reading.met, reading.detail
+    assert "data_collection/probes/arctic" in reading.detail
+
+
+def test_withholding_the_arctic_evidence_prefix_is_unmet_not_unmeasurable(units):
+    """The same D13 unit with NO grandfathered coverage for its declared probe
+    key reads UNMET (a real missing evidence key), never UNMEASURABLE — the
+    descriptor named something to grade; the registry just doesn't cover it
+    yet."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source({"artifacts": [], "grandfathered_paths": []})
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D13"))
+    assert not reading.met and not reading.unmeasurable
+    assert "data_collection/probes/arctic" in reading.detail
+
+
 def test_a_denied_registry_read_is_unmeasurable_naming_the_grant(units):
     class _Client:
         def get_object(self, **_kwargs):
@@ -156,6 +196,35 @@ def test_a_denied_registry_read_is_unmeasurable_naming_the_grant(units):
     reading = unit_readers.read_artifact_registry(store, _unit(units, "D19"))
     assert reading.unmeasurable and not reading.met
     assert "DataGateReadPublishedArtifactRegistry" in reading.detail
+
+
+def test_no_non_retired_unit_reads_artifact_registry_unmeasurable_for_declaring_nothing_gradable(units):
+    """`alpha-engine-config-I11245`: five units (D13, D35, D42, D43, D47) used to
+    read `artifact_registry` UNMEASURABLE forever — not because a source was
+    unreachable, but because the descriptor itself declared no S3 key
+    template and no `registry_rows`, a state a real registry read can never
+    fix. A unit either points at real evidence (`registry_rows`, a gradable
+    `writes` key, or the ArcticDB `arcticdb_evidence.via` probe pointer) or
+    declares the column not-applicable via `partial_exclusion` with a closed
+    `na_code` — so a sixth unit cannot be born into this same UNMEASURABLE
+    trap. A present-but-empty registry (no rows, no grandfathered prefixes)
+    isolates this from every OTHER way a reading can be UNMEASURABLE (a
+    denied read, no source configured) or UNMET (a real missing key) — those
+    are exercised by the tests above.
+    """
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source({"artifacts": [], "grandfathered_paths": []})
+    offenders = []
+    for unit in units:
+        if unit.retired:
+            continue
+        reading = unit_readers.read_artifact_registry(store, unit)
+        if reading.unmeasurable and "declares no S3 key template and no registry_rows" in reading.detail:
+            offenders.append(unit.unit_id)
+    assert not offenders, (
+        f"{offenders} declare nothing this column can ever grade — add registry_rows/writes "
+        "pointing at real evidence, or a partial_exclusion with a closed na_code"
+    )
 
 
 def test_open_store_attaches_the_published_registry_to_an_s3_store():

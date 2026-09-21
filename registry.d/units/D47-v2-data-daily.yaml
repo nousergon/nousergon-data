@@ -61,6 +61,22 @@ contract:
   # fix to how the existing contract is DECLARED, not a change to what is graded —
   # D47 stays excluded from every other clause per the `notes` block below.
 registry_rows: []
+partial_exclusion:
+  # alpha-engine-config-I11245: `artifact_registry` read UNMEASURABLE — D47's
+  # `writes` are prose describing the crucible-v2 store, not S3 key templates
+  # or ArcticDB libraries this reader can grade, and it declares no
+  # registry_rows because there is no data-collector artifact to register.
+  # Plan §8.1 EXCLUSION stands: D47 is component 2, its row/identity/store
+  # live on the crucible board, and this repo grades only its single
+  # input-contract clause (P-07, under `contract` above) — never a second
+  # verdict on an artifact that isn't this repo's to publish.
+  columns:
+    - artifact_registry
+  na_code: "N/A-NOT-IMPL"
+  reason: >-
+      component 2 — its row, identity and store live on the crucible board (plan §8.1
+      EXCLUSION); this repo grades no artifact for it, only the input-contract clause
+      already declared under `contract`
 run_manifest_prefix: data_collection/runs/D47
 detectors:
   - kind: "crucible-gate"

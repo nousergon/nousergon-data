@@ -134,11 +134,16 @@ def test_the_board_is_red_at_birth(board):
     ]
     assert len(base) == 414
     # A declared not-applicable (an on-demand unit with no invocation to record,
-    # or no scheduled trigger for phase 4 to remove — alpha-engine-config-I10870/
-    # I10871) is MET off the descriptor plus a real listing, not off a reader
-    # grading evidence; it is held to the `not applicable:` prefix instead.
+    # no scheduled trigger for phase 4 to remove, or a `partial_exclusion`
+    # naming a column no artifact/registry read could ever grade for this
+    # unit — alpha-engine-config-I10870/I10871/I11245) is MET off the
+    # descriptor plus a real listing, not off a reader grading evidence; it is
+    # held to the `not applicable:` prefix instead, so it MET's even against
+    # this test's empty/no-source board.
     declared_na = [c for c in base if c.met and c.detail.startswith("not applicable")]
-    assert all(c.name.endswith((".run_record", ".survives_phase4")) for c in declared_na), declared_na
+    assert all(c.name.endswith((".run_record", ".survives_phase4", ".artifact_registry")) for c in declared_na), (
+        declared_na
+    )
     met = [c for c in base if c.met and c not in declared_na]
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
     # where a schema, a producer test AND a consumer pin all exist.

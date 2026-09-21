@@ -459,6 +459,35 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
     if completeness.get("status") == "not_applicable":
         _check_na("completeness", completeness, unit_id)
 
+    partial_exclusion = document.get("partial_exclusion")
+    if partial_exclusion is not None:
+        # `alpha-engine-config-I11245`: a unit can declare that one or more of
+        # the nine base columns is not applicable to it (an on-demand tool
+        # with no freshness/registry/alarm surface, a unit whose artifact
+        # lives entirely under another unit's contract, ...). This is the
+        # SAME closed-taxonomy discipline `_check_na` already holds guards,
+        # freshness and completeness to — a declaration with no code from
+        # `NA_TAXONOMY` or no reason is an unnamed degradation, not a real
+        # answer, and `read_artifact_registry` refuses to honor it silently.
+        columns = partial_exclusion.get("columns")
+        if not isinstance(columns, list) or not columns:
+            raise DescriptorError(
+                f"{path.name}: partial_exclusion.columns must be a non-empty list of audit "
+                "columns — a partial_exclusion block naming nothing excludes nothing."
+            )
+        unknown_columns = [c for c in columns if c not in AUDIT_COLUMNS]
+        if unknown_columns:
+            raise DescriptorError(
+                f"{path.name}: partial_exclusion.columns names {unknown_columns}, which are not "
+                f"among the audit's scored columns {list(AUDIT_COLUMNS)}."
+            )
+        _check_na("partial_exclusion", partial_exclusion, unit_id)
+        if not str(partial_exclusion.get("reason") or "").strip():
+            raise DescriptorError(
+                f"{path.name}: partial_exclusion has no `reason`. A not-applicable state with "
+                "no evidence behind it is a claim, and the board renders claims as findings."
+            )
+
     if document["lifecycle"] == "retired":
         # `alpha-engine-config-I10823` deliverable 6. A retired unit's clauses
         # stop grading and render RETIRED with this block's reason — so a
