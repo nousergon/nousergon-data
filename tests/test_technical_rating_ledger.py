@@ -193,6 +193,35 @@ class TestCollectRatingLedger:
         assert result["backfill_written"] == 0
         # Never a second PUT to the same immutable date key.
         assert s3.put_count(f"{trl.RATING_LEDGER_PREFIX}{run_date}.json") == 1
+        # alpha-engine-config-I11231: a correct immutable-date no-op must signal
+        # `auto_skipped` so `_phase_collect`/`_record_phase_lineage` route it to
+        # `not_applicable` (`no_new_data_declared`) rather than `EmptyProduction`
+        # — the collector published nothing, but not because it is broken.
+        assert result["status"] == "ok"
+        assert result["auto_skipped"] is True
+        assert result["skip_reason"] == "target date already live-published, immutable"
+
+    def test_a_replay_that_also_backfills_is_not_an_auto_skip(self, monkeypatch):
+        """The date itself is already live, but the trailing backfill window still
+        has missing dates -- this run DID publish something, so it must read `ok`
+        with no `auto_skipped`, never a false not_applicable on a cycle that wrote
+        real output."""
+        monkeypatch.setattr(trl, "LEDGER_BACKFILL_MIN_DATES", 5)
+        dates = _session_dates(300)
+        run_date = dates[-1]
+        series = {"SPY": _linear_series(300)}
+        manifest = {
+            "schema_version": 1,
+            "dates": [{"date": run_date, "basis": "live", "rating_version": RATING_VERSION}],
+        }
+        s3 = _FakeS3({
+            trl.mmd.CONSOLIDATED_CLOSE_HISTORY_KEY: _consolidated(series),
+            trl.RATING_LEDGER_MANIFEST_KEY: manifest,
+        })
+        result = trl.collect_rating_ledger(bucket="b", run_date=run_date, s3_client=s3)
+        assert result["live_written"] is False
+        assert result["backfill_written"] == 5
+        assert "auto_skipped" not in result
 
     def test_live_write_skipped_when_run_date_has_no_close(self, monkeypatch):
         # A run_date past the last published bar would otherwise stamp the PRIOR
