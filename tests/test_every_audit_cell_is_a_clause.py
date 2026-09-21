@@ -95,6 +95,9 @@ POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset({
     # Registered here rather than folded into AUDIT_SUMMARY: the audit is a
     # frozen 2026-09-14 baseline and scored no such unit.
     "D48",
+    # D49, Nasdaq-100 membership + weights (alpha-engine-config-I11296). Same
+    # reasoning; it is D48's weight source for the NDX leg.
+    "D49",
 })
 
 AUDIT_UNITS = 46
