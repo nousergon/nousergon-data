@@ -390,17 +390,52 @@ _WORKLOADS: dict[str, str] = {
     # completion-check contract for LIVE producers, and every byte this
     # workload writes is, by construction, under the shadow prefix and never a
     # live key — there is no live completeness claim for this workload to make.
+    # LEGS RUN INDEPENDENTLY, COMPARATOR ALWAYS (alpha-engine-config-I11200).
+    #
+    # This was `leg1 && leg2 && leg3 && leg4 && parity` until 2026-09-20.
+    # `weekly_collector` exits 1 on anything less than fully `ok` -- its
+    # declared fail-loud contract, correct for production where a degraded
+    # feature store must halt the pipeline. Chained with `&&`, that same
+    # contract meant `shadow parity` ran only if EVERY collector on EVERY leg
+    # was perfectly ok, and it never once was:
+    #
+    #   09-14 dispatch  died in leg 2 (UniverseFreshnessViolation)   no report
+    #   09-18 dispatch  died end of leg 3 (features=degraded)        no report
+    #
+    # Two unrelated causes, zero reports -- and the 09-18 run had already
+    # written 1,977 objects the comparator could read. Dispatching
+    # `shadow-parity` by hand over that prefix produced a complete 959-key
+    # report in minutes: the proof that only the `&&` was in the way.
+    #
+    # A production halt-the-pipeline contract was being used as a sequencing
+    # operator for a diagnostic tool. Each leg now records its exit code to a
+    # legs file and the comparator ALWAYS runs, so a partial run NAMES its
+    # gaps instead of looking complete.
+    #
+    # The legs file is `name<TAB>exit_code` per line, not JSON: this string is
+    # `.format()`ed, and a literal `{` would have to be doubled through two
+    # layers of quoting for no gain. `shadow parity --legs-file` reads both.
+    #
+    # `set +e` is scoped to this subshell; the tail still exits non-zero when a
+    # leg failed, so the dispatcher's own success/failure reporting is
+    # unchanged. What changes is that the comparator runs first.
     "shadow-weekday": (
-        "( python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
-        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date {trading_day} "
-        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
-        "--morning-arctic-append --date {trading_day} "
-        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
-        "--daily --skip-arctic-append --date {trading_day} "
-        "&& python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
-        "--daily-arctic-append --date {trading_day} "
-        "&& python -m shadow parity --trading-day {trading_day} "
-        "--store s3://alpha-engine-research/data_collection )"
+        "( set +e; LEGS=/tmp/shadow_legs_{trading_day}.tsv; : > $LEGS; RC_ALL=0; "
+        "python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date {trading_day}; "
+        "RC=$?; printf 'morning-enrich\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--morning-arctic-append --date {trading_day}; "
+        "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--daily --skip-arctic-append --date {trading_day}; "
+        "RC=$?; printf 'post-market-data\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day {trading_day} --module weekly_collector -- "
+        "--daily-arctic-append --date {trading_day}; "
+        "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow parity --trading-day {trading_day} --legs-file $LEGS "
+        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
     # alpha-engine-config-I10920: the two parity COMPARATORS, each launchable on
     # its own rather than only as the tail of the five-hour `shadow-weekday`
