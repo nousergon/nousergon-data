@@ -71,6 +71,7 @@ from validators.price_validator import (
     validate_feature_record,
 )
 from nousergon_lib.yfinance_quiet import quiet_yfinance
+from shadow.root import active_root
 
 logger = logging.getLogger(__name__)
 
@@ -1825,16 +1826,31 @@ def _fetch_news(ticker: str, run_date: str) -> dict:
     """Fetch news from Yahoo RSS and EDGAR 8-K.
 
     ``run_date`` anchors both the 72h Yahoo RSS recency filter and the 3-day
-    EDGAR 8-K search window — CONTENT, not provenance (alpha-engine-config-
-    I11216 deliverable 5): a wall-clock anchor makes a replay of a past
-    ``run_date`` select articles/filings relative to the REPLAY time, not the
-    collected day, exactly the defect class fixed in
-    ``metron_market_data.py``. Mirrors ``_fetch_insider``'s existing
-    ``today = datetime.strptime(run_date, "%Y-%m-%d")`` anchor in this same
-    file — the pattern the fix propagates from, not a new one.
+    EDGAR 8-K search window ONLY for a DECLARED replay (``active_root()`` —
+    set by ``python -m shadow run`` before a single collector line runs, per
+    ``shadow/root.py``) — CONTENT, not provenance (alpha-engine-config-I11216
+    deliverable 5): a wall-clock anchor makes a replay of a past ``run_date``
+    select articles/filings relative to the REPLAY time, not the collected
+    day, exactly the defect class fixed in ``metron_market_data.py``.
+
+    On the LIVE weekly path ``run_date`` is a real date TOO (``weekly_
+    collector.py``'s ``args.date or default_run_date()`` populates it on
+    every invocation, live or replay), so ``run_date`` truthiness alone
+    cannot tell the two apart. A live run wants the actual wall clock here —
+    it is collecting whatever is fresh at the moment it runs, not
+    reproducing a specific past day — so the anchor only moves off the wall
+    clock when a replay is actually active. This mirrors ``_fetch_insider``'s
+    existing unconditional ``today = datetime.strptime(run_date, ...)``
+    anchor in this same file, which predates this fix and carries the same
+    live-run risk in miniature (90-day lookback, weekend-only exposure) —
+    tracked separately, not changed here (out of this PR's scope).
     """
     result = {"articles": [], "sec_filings_8k": []}
-    today = datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    today = (
+        datetime.strptime(run_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if active_root() is not None
+        else datetime.now(timezone.utc)
+    )
 
     # Yahoo RSS
     try:
