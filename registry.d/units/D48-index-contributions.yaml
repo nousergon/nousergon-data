@@ -50,9 +50,13 @@ promotes_when: >-
     alpha-engine-config-I11306 has landed the post-close trigger and the
     `observability.d/` row reads in-service, and at least one trading day's
     market_data/index_contributions/{SPX,NDX}/latest.json exists with that day's
-    as_of. Flip lifecycle to in-service and declare the cadence in the same PR.
+    trading_day. Flip lifecycle to in-service and declare the cadence in the same PR.
 trigger:
-  kind: "none"
+  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
+  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
+  # only way it runs today. There is no "none" kind, and inventing one would
+  # be a fallback guess where the generator deliberately refuses to make one.
+  kind: "manual"
   runs_on: "ec2-spot"
   detail: >-
     NOT YET SCHEDULED — alpha-engine-config-I11306. Must run post-close on
@@ -64,8 +68,13 @@ trigger:
   # data_gate/cadence.py would otherwise grade this unit against a cadence
   # nothing honours.
 writes:
-  - "market_data/index_contributions/SPX/*"
-  - "market_data/index_contributions/NDX/*"
+  # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
+  # templated key against a contract's x-key-pattern, and a bare `*` resolves
+  # to NOTHING — so a glob here would declare a write whose contract could not
+  # be found, which is the exact gap
+  # test_declared_contracts_are_reachable_from_their_keys.py exists to catch.
+  - "market_data/index_contributions/{index}/{date}.json"
+  - "market_data/index_contributions/{index}/latest.json"
 consumers:
   - "metron:api/services/benchmark_gap.py (metron-ops-I346, reads latest.json)"
 consumers_reason: >-

@@ -10,7 +10,7 @@
     "schema_version",
     "index",
     "proxy_symbol",
-    "as_of",
+    "trading_day",
     "prior_close_date",
     "index_return_pct",
     "weight_method",
@@ -41,10 +41,6 @@
       "type": "string",
       "minLength": 1,
       "description": "The TRADEABLE ETF proxy whose close-to-close move `index_return_pct` is. The index values ^GSPC/^IXIC/^NDX/^RUT carry a separate index licence, which is why the fleet carries proxies; this field travels with the number so a consumer cannot misattribute the proxy's move to the index itself."
-    },
-    "as_of": {
-      "type": "string",
-      "format": "date"
     },
     "prior_close_date": {
       "type": "string",
@@ -143,6 +139,11 @@
       "type": "string",
       "x-provenance": true,
       "description": "Wall-clock stamp of the run, not a data value (alpha-engine-config-I10894): shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs`, because a shadow run and its live counterpart never run at the same instant."
+    },
+    "trading_day": {
+      "type": "string",
+      "format": "date",
+      "description": "The trading session this decomposition describes. Named `trading_day` rather than `as_of` deliberately: across the fleet `as_of` names a RUN timestamp and is declared x-provenance so a re-production is not graded as a mismatch. This is a DATA value \u2014 re-producing a given session must yield the same date, and a shadow run that produced the WRONG day must be flagged rather than excluded from comparison. `fetched_at` remains the sole provenance field."
     }
   }
 }

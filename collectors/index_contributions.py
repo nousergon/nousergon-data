@@ -46,6 +46,15 @@ as one day. The proxy trades on exactly the days the index is computed, so its
 two most recent observed dates at or before ``run_date`` ARE the pair — no
 holiday calendar to disagree with.
 
+THE SESSION FIELD IS ``trading_day``, NOT ``as_of``. Across the fleet ``as_of``
+names a RUN timestamp and is declared ``x-provenance`` so a re-production of the
+same artifact is not graded as a data mismatch
+(``tests/test_declared_contracts_are_reachable_from_their_keys.py``). The session
+this artifact describes is a DATA value: re-producing 2026-09-21 must yield
+2026-09-21, and a shadow run that produced the wrong day has to be flagged, not
+excluded from comparison. Naming it ``trading_day`` keeps it gradable and leaves
+``fetched_at`` as the one provenance field.
+
 FAIL LOUD. A member with no return is counted in
 ``coverage.members_missing_return`` and falls into the residual; it is never a
 silent zero. Below ``COVERAGE_FLOOR`` of index weight the run RAISES rather
@@ -128,7 +137,7 @@ WeightsSource = Callable[[str], Weights]
 
 
 def _proxy_date_pair(proxy_series: list[tuple[str, float]], proxy_symbol: str) -> tuple[str, str]:
-    """The (as_of, prior_close_date) pair, read off the proxy's own series.
+    """The (trading_day, prior_close_date) pair, read off the proxy's own series.
 
     Raises rather than reaching for a calendar: if the proxy has fewer than two
     observed closes we do not know what "the previous trading day" was, and
@@ -209,7 +218,7 @@ def compute_contributions(
         "index": spec.index,
         "index_label": spec.label,
         "proxy_symbol": spec.proxy_symbol,
-        "as_of": as_of,
+        "trading_day": as_of,
         "prior_close_date": prior_date,
         "index_return_pct": index_return_pct,
         "weight_method": weights.method,
@@ -243,7 +252,7 @@ def collect(
     from the laptop is dominated by S3 round-trip latency — a 20-40 minute
     in-region job measured 3+ hours locally on 2026-07-15.
 
-    ``run_date`` bounds the window; the actual ``as_of`` is whatever the proxy
+    ``run_date`` bounds the window; the actual ``trading_day`` is whatever the proxy
     last traded on at or before it, so a run on a holiday or a weekend
     publishes the prior session rather than failing or inventing a day.
     """
@@ -291,7 +300,7 @@ def collect(
             logger.info(
                 "[dry-run] index_contributions %s %s: index %+.4f%%, explained %+.4f%%, "
                 "residual %+.4f%%, %d constituents, coverage %.4f (%s)",
-                index, payload["as_of"], payload["index_return_pct"],
+                index, payload["trading_day"], payload["index_return_pct"],
                 payload["explained_pp"], payload["residual_pp"],
                 len(payload["constituents"]),
                 payload["coverage"]["weight_with_return"], payload["weight_method"],
@@ -307,7 +316,7 @@ def collect(
     for index, payload in results.items():
         body = json.dumps(payload, indent=2)
         for s3_path in (
-            f"{INDEX_CONTRIBUTIONS_PREFIX}{index}/{payload['as_of']}.json",
+            f"{INDEX_CONTRIBUTIONS_PREFIX}{index}/{payload['trading_day']}.json",
             f"{INDEX_CONTRIBUTIONS_PREFIX}{index}/latest.json",
         ):
             s3.put_object(
@@ -316,7 +325,7 @@ def collect(
             written.append(s3_path)
         logger.info(
             "Wrote index_contributions for %s %s (%d constituents, residual %+.4f pp)",
-            index, payload["as_of"], len(payload["constituents"]),
+            index, payload["trading_day"], len(payload["constituents"]),
             payload["residual_pp"],
         )
 

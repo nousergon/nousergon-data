@@ -58,7 +58,7 @@ def test_weights_are_taken_as_of_the_prior_close() -> None:
         {"AAPL": [("2026-09-21", 110.0), ("2026-09-18", 100.0)]},
         [("2026-09-21", 110.0), ("2026-09-18", 100.0)],
     )
-    assert payload["as_of"] == "2026-09-21"
+    assert payload["trading_day"] == "2026-09-21"
     assert payload["prior_close_date"] == "2026-09-18"
     assert payload["constituents"][0]["weight_prior_close"] == pytest.approx(1.0)
 
