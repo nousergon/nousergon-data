@@ -47,7 +47,8 @@
 # dispatcher roles already carry: an instance-resource statement conditioned
 # on `aws:RequestTag/Name` = `alpha-engine-data-spot` plus
 # `ec2:InstanceType` in the set this dispatcher actually launches
-# (c5.large, c5a.large, m5.large), and a
+# (c5.large, c5a.large, c6i.large, m5.large, m5a.large, m6i.large, r5.large,
+# r5a.large, r6i.large — widened alpha-engine-config-I11340 item 5), and a
 # separate, unconditioned statement for the non-instance resources
 # RunInstances also authorises (subnet, security group, network interface,
 # volume, key pair, image, launch template) — a Condition applies to EVERY
