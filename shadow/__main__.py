@@ -96,8 +96,23 @@ def _parser() -> argparse.ArgumentParser:
             '{\"name\": str, \"exit_code\": int} objects. The dispatcher writes it after '
             "running the legs independently, so the report can say which legs ran rather "
             "than leaving a reader to assume all of them did (alpha-engine-config-I11200). "
-            "Absent, the report records `legs_known: false` -- which is NOT the same claim "
-            "as every leg having succeeded."
+            "Absent, the report records `legs_known: {sameday: false, morning: false}` -- "
+            "which is NOT the same claim as every leg having succeeded."
+        ),
+    )
+    diff.add_argument(
+        "--legs-group",
+        choices=list(parity_module.LEGS_GROUPS),
+        default=parity_module.DEFAULT_LEGS_GROUP,
+        help=(
+            "Which DISPATCH these legs came from (alpha-engine-config-I11352). The same "
+            "trading day's report is written twice: once by `shadow-sameday` at 18:30 ET on "
+            "D with the post-market legs, and once by `shadow-morning` at 07:45 ET on D+1 "
+            "with v1's two morning legs, whose keys do not exist until then. The second run "
+            "MERGES -- it rewrites this group's leg entries and its own comparison, and "
+            "keeps the other group's entries -- so `legs_known` reads per group and a "
+            "missing morning dispatch renders as `morning: false` rather than as silence. "
+            f"Default {parity_module.DEFAULT_LEGS_GROUP!r}."
         ),
     )
 
@@ -182,10 +197,36 @@ def _read_legs(path: "str | None") -> list[dict]:
     return legs
 
 
+def _previous_legs(store, key: str) -> list[dict]:
+    """The `legs` block of the report already published for this trading day.
+
+    An absent or unparseable prior report yields `[]` — the deliberate,
+    narrow swallow here is (a) "no earlier dispatch wrote this day's report",
+    which is the ordinary first-write case and not an error; (b) the report
+    being produced is unaffected; (c) it is recorded in the published document
+    itself, as `legs_known.<group>: false` for every group that did not write.
+    """
+    try:
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+    except Exception:  # noqa: BLE001 - see the docstring's (a)/(b)/(c)
+        return []
+    legs = document.get("legs")
+    return [leg for leg in legs if isinstance(leg, dict)] if isinstance(legs, list) else []
+
+
 def _parity(args) -> int:
     trading_day = dt.date.fromisoformat(args.trading_day)
+    group = getattr(args, "legs_group", parity_module.DEFAULT_LEGS_GROUP)
     legs = _read_legs(getattr(args, "legs_file", None))
     store = open_store(args.store, dry_run=args.dry_run)
+    key = parity_module.parity_key(trading_day)
+    # `alpha-engine-config-I11352`: MERGE, never overwrite. The comparison
+    # itself is rewritten wholesale (that is what the morning dispatch is for
+    # — the morning legs' keys did not exist at 18:30 ET), but the OTHER
+    # dispatch's leg outcomes survive.
+    legs, legs_known = parity_module.merge_legs(
+        _previous_legs(store, key), legs, group=group
+    )
     try:
         report = parity_module.run_parity(
             trading_day=trading_day,
@@ -195,13 +236,14 @@ def _parity(args) -> int:
             absolute_tolerance=args.absolute_tolerance,
             max_keys_per_prefix=args.max_keys_per_prefix,
             legs=legs,
+            legs_known=legs_known,
+            store=store,
         )
     except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
         print(f"shadow parity: the comparison failed: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_UNMEASURED
     document = report.as_dict()
     payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
-    key = parity_module.parity_key(trading_day)
     if not args.dry_run:
         store.put_bytes(key, payload)
     print(_render(report, key, dry_run=args.dry_run))

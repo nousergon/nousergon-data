@@ -51,6 +51,10 @@
       }
     }
   },
+  "x-settling-bar": {
+    "basis": "key_date",
+    "rationale": "market_data/eod_closes/{date}.json is one trading day's closes keyed by ticker ($.closes.<ticker>.close / .bar_date); when the key names the report's trading_day the whole document is the unsettled bar. Only VALUE diffs are absorbed — a ticker present on one side only stays a membership breach and still counts against the coverage floor (alpha-engine-config-I11351)."
+  },
   "x-key-pattern": [
     "market_data/eod_closes/{date}.json",
     "market_data/eod_closes/latest.json"

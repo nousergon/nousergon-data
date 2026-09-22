@@ -1166,20 +1166,39 @@ def _parity_report(trading_day, *, met=True, matched=3, total=3, exceptions=None
     ).encode()
 
 
-def test_parity_fresh_prior_day_report_is_graded_not_absent():
-    """The bug this issue fixes: a shadow run for the day BEFORE the gate's own
-    trading day must be found and graded, never treated as absent just because
-    it is not filed under the gate's own trading_day key."""
+def test_parity_fresh_prior_day_report_is_found_but_grades_unmeasurable_for_todays_day():
+    """A shadow run for the day BEFORE the gate's own trading day must still be
+    FOUND — never treated as absent just because it is not filed under the
+    gate's own key (alpha-engine-config-I10857) — but it is not a reading about
+    the gate's day.
+
+    Corrected by alpha-engine-config-I11355: this used to grade MET on
+    yesterday's numbers, which is how every weekday reading came to publish a
+    verdict for a day nothing had been measured on. It is UNMEASURABLE now, and
+    it names both dates so the next action is legible as "make the read follow
+    the parity publish", not "fix parity"."""
     from nousergon_lib.trading_calendar import previous_trading_day
 
     report_day = previous_trading_day(TRADING_DAY)
     key = evidence.parity_store_key(report_day)
     store = EmptyStore({key: _parity_report(report_day)})
     reading = evidence.read_parity(store, trading_day=TRADING_DAY)
+    assert reading.unmeasurable is True
+    assert reading.met is False
+    assert key in reading.evidence
+    assert report_day.isoformat() in reading.detail
+    assert TRADING_DAY.isoformat() in reading.detail
+
+
+def test_parity_grades_a_report_filed_for_the_gates_own_trading_day():
+    """The shape the post-parity read produces, and the only one that can be
+    MET (`alpha-engine-config-I11233` closes-when 2)."""
+    key = evidence.parity_store_key(TRADING_DAY)
+    store = EmptyStore({key: _parity_report(TRADING_DAY)})
+    reading = evidence.read_parity(store, trading_day=TRADING_DAY)
     assert reading.unmeasurable is False
     assert reading.met is True
     assert key in reading.evidence
-    assert report_day.isoformat() in reading.detail
 
 
 def test_parity_stale_report_reads_unmet_naming_age():
@@ -1210,7 +1229,9 @@ def test_parity_never_selects_a_report_dated_after_the_gate_day():
         }
     )
     reading = evidence.read_parity(store, trading_day=TRADING_DAY)
-    assert reading.met is True
+    # UNMEASURABLE rather than MET since I11355 — the point of this test is
+    # WHICH report was selected, and the past one still is.
+    assert reading.unmeasurable is True
     assert evidence.parity_store_key(past_day) in reading.evidence
     assert evidence.parity_store_key(future_day) not in reading.evidence
 

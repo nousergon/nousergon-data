@@ -60,14 +60,20 @@ __all__ = [
     "DEFAULT_RELATIVE_TOLERANCE",
     "PARITY_KEY_TEMPLATE",
     "PARITY_SCHEMA_VERSION",
+    "SETTLING_BASES",
     "ContractSchema",
     "KeyResult",
     "ParityReport",
     "compare_bytes",
+    "LEGS_GROUPS",
     "expand_writes",
+    "grade_prior_day_settled",
+    "key_names_trading_day",
+    "merge_legs",
     "parity_key",
     "resolve_contract",
     "run_parity",
+    "settling_basis",
 ]
 
 #: Where the report is published, relative to the `data_collection` store root
@@ -77,7 +83,19 @@ __all__ = [
 #: writes there by construction rather than by two files agreeing.
 PARITY_KEY_TEMPLATE = evidence.PARITY_KEY_TEMPLATE
 
-PARITY_SCHEMA_VERSION = "data_parity_report.v1"
+#: v2 (`alpha-engine-config-I11351`/`-I11352`) adds the `settling_bar` block and
+#: `prior_day_settled` / `summary.settling_bar_keys`, and turns `legs_known`
+#: from a bare boolean into one boolean PER DISPATCH GROUP. `data_gate.evidence
+#: .read_parity` accepts both versions — the reports the cutover gate reads
+#: today were published under v1 and are not invalidated by the bump.
+PARITY_SCHEMA_VERSION = "data_parity_report.v2"
+
+#: The dispatch groups a `legs` entry may belong to. `sameday` is the 18:30 ET
+#: post-market dispatch on day D; `morning` is the 07:45 ET D+1 dispatch that
+#: runs v1's two morning legs for the PREVIOUS session and rewrites the same
+#: report (`alpha-engine-config-I11352`).
+LEGS_GROUPS: tuple[str, ...] = ("sameday", "morning")
+DEFAULT_LEGS_GROUP = "sameday"
 
 #: Value tolerance. Relative by default because prices, ratios and z-scores
 #: share a report; the absolute floor exists so a value near zero does not red
@@ -139,6 +157,11 @@ class ContractSchema:
     value_band_relative: float = 0.0
     value_band_absolute: float = 0.0
     coverage_floor: float = 1.0
+    #: ``""`` (this key has no settling bar), or one of :data:`SETTLING_BASES`.
+    #: Declared by the contract's own ``x-settling-bar`` block, never
+    #: hand-listed here — the same rule every other per-key fact in this module
+    #: follows (`alpha-engine-config-I11351`).
+    settling_basis: str = ""
 
     @property
     def is_vendor_live(self) -> bool:
@@ -210,6 +233,21 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
                 "would pass everything (alpha-engine-config-I11203)."
             )
         band = vendor_live.get("value_band") or {}
+        settling = schema.get("x-settling-bar") or {}
+        settling_basis = str(settling.get("basis") or "")
+        if settling and settling_basis not in SETTLING_BASES:
+            raise ValueError(
+                f"{path.name}: x-settling-bar.basis must be one of {sorted(SETTLING_BASES)}, "
+                f"got {settling_basis!r}. A settling-bar declaration with no basis would "
+                "silently grade nothing, which is the state I11351 exists to end."
+            )
+        if settling and not str(settling.get("rationale") or "").strip():
+            raise ValueError(
+                f"{path.name}: x-settling-bar needs a `rationale` naming WHY this key's "
+                "trading-day cells are a vendor-state measurement rather than a producer "
+                "defect. A forgiveness with no written reason is a widened band wearing a "
+                "different name (alpha-engine-config-I11351)."
+            )
         for template in templates:
             if not isinstance(template, str) or not template:
                 raise ValueError(
@@ -224,9 +262,158 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
                     value_band_relative=float(band.get("relative", 0.0)),
                     value_band_absolute=float(band.get("absolute", 0.0)),
                     coverage_floor=float(vendor_live.get("coverage_floor", 1.0)),
+                    settling_basis=settling_basis,
                 )
             )
     return tuple(schemas)
+
+
+#: How a contract may declare WHICH cells of its key are the trading day's own,
+#: still-settling bar (`alpha-engine-config-I11351`). Three bases, because the
+#: three shapes this repo publishes carry the date in three different places:
+#:
+#: * ``row_date`` — the artifact is INDEXED BY DATE and holds history. Only the
+#:   row whose index is the report's `trading_day` is settling
+#:   (`reference/price_cache/{sym}.parquet`).
+#: * ``key_date`` — the artifact is indexed by something else (ticker) and the
+#:   KEY names one trading day, so the whole artifact IS that day's bar. It is
+#:   settling only when the key names the report's own trading day
+#:   (`staging/daily_closes/{date}.parquet`, `features/{date}/*.parquet`,
+#:   `market_data/eod_closes/{date}.json`).
+#: * ``same_day_snapshot`` — an undated, overwritten-in-place `latest`-style
+#:   artifact whose whole content is a same-day derivation of the session's bar
+#:   (`market_data/technicals/latest.json`).
+#:
+#: This is NOT a wider tolerance and it never touches `x-vendor-live.band`: the
+#: trading-day cells are a different measurement (two fetches of a number the
+#: vendor is still revising), so they get their own named surface and are
+#: excluded from `values.breaches` — while membership, schema, row count and
+#: coverage stay strict for every row INCLUDING the trading day.
+SETTLING_BASES: frozenset[str] = frozenset({"row_date", "key_date", "same_day_snapshot"})
+
+#: An ISO date appearing as a whole path segment or as a filename stem.
+#: `staging/daily_closes/2026-09-21.parquet`, `features/2026-09-21/x.parquet`
+#: and `market_data/eod_closes/2026-09-21.json` all match; a key that merely
+#: contains the digits inside a longer token does not.
+_KEY_DATE_RE = re.compile(r"(?:^|/)(\d{4}-\d{2}-\d{2})(?:/|\.|$)")
+
+
+def key_names_trading_day(live_key: str, trading_day: dt.date) -> bool:
+    """Whether ``live_key`` names ``trading_day`` as a path segment or stem."""
+    return any(found == trading_day.isoformat() for found in _KEY_DATE_RE.findall(live_key))
+
+
+def settling_basis(
+    live_key: str, contract: "ContractSchema | None", trading_day: "dt.date | None"
+) -> str:
+    """The settling basis in force for this key on this report, or ``""``.
+
+    ``""`` — the red default — for a key whose contract declares nothing, for a
+    comparison run without a trading day, and for a `key_date` key whose own
+    key names some OTHER day (`features/metron_supplemental/`, or yesterday's
+    `staging/daily_closes` seen from today's report). Nothing is forgiven by
+    default; the forgiveness has to be declared AND applicable.
+    """
+    if contract is None or trading_day is None or not contract.settling_basis:
+        return ""
+    if contract.settling_basis == "key_date" and not key_names_trading_day(live_key, trading_day):
+        return ""
+    return contract.settling_basis
+
+
+def _relative_difference(live: Any, shadow: Any) -> float | None:
+    """``|live - shadow| / |live|`` for two numbers, else ``None``.
+
+    ``None`` — not ``0.0`` and not ``inf`` — when the pair is non-numeric or
+    the live side is zero. A substituted number here would be read as a
+    measured drift, and `max_rel_*` is published precisely so a reader can
+    judge how far the unsettled bar moved.
+    """
+    try:
+        a, b = float(live), float(shadow)
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(a) or math.isnan(b) or a == 0.0:
+        return None
+    return abs(a - b) / abs(a)
+
+
+class _SettlingCollector:
+    """The trading-day cells of one key, and how far they moved.
+
+    Deliberately NOT a counter on the breach path: a settling cell is recorded
+    here and never reaches `values.breaches`, so the two numbers can be added
+    up by a reader without double-counting, and a key with only settling cells
+    grades `match` while still printing what it absorbed.
+    """
+
+    def __init__(self, basis: str, date: "dt.date | None") -> None:
+        self.basis = basis
+        self.date = date.isoformat() if date is not None else None
+        self.cells = 0
+        self.examples: list[dict[str, Any]] = []
+        #: ``None``, never ``0.0``, until something measurable is recorded — a
+        #: zero here would read as "measured, and it did not move" when the
+        #: truth is "nothing comparable was measured" (principle 7).
+        self.max_rel: float | None = None
+        self.max_rel_close: float | None = None
+        self.max_rel_volume: float | None = None
+
+    def _note_move(self, column: Any, rel: float | None) -> None:
+        if rel is None:
+            return
+        self.max_rel = rel if self.max_rel is None else max(self.max_rel, rel)
+        name = "" if column is None else str(column).lower()
+        if "close" in name:
+            self.max_rel_close = rel if self.max_rel_close is None else max(self.max_rel_close, rel)
+        if "volume" in name:
+            self.max_rel_volume = (
+                rel if self.max_rel_volume is None else max(self.max_rel_volume, rel)
+            )
+
+    def record(self, *, row: Any, column: Any, live: Any, shadow: Any) -> None:
+        """One settling CELL of a frame, with both sides in hand."""
+        self.cells += 1
+        if len(self.examples) < 10:
+            self.examples.append(
+                {
+                    "row": None if row is None else str(row),
+                    "column": None if column is None else str(column),
+                    "live": _jsonable(live),
+                    "shadow": _jsonable(shadow),
+                }
+            )
+        self._note_move(column, _relative_difference(live, shadow))
+
+    def record_json(self, diff: "JsonDiff") -> None:
+        """One settling VALUE diff of a JSON document.
+
+        The walker renders a value diff to a string rather than carrying the
+        two sides, so `max_rel*` cannot be computed from it and stay ``None``
+        — the rendered pair is in `examples`, and a fabricated 0.0 would be
+        worse than an honest absence.
+        """
+        self.cells += 1
+        if len(self.examples) < 10:
+            self.examples.append({"path": diff.path, "rendered": diff.rendered})
+
+    def as_block(self) -> dict[str, Any]:
+        return {
+            "basis": self.basis,
+            "date": self.date,
+            "cells": self.cells,
+            "examples": self.examples,
+            "max_rel": self.max_rel,
+            "max_rel_close": self.max_rel_close,
+            "max_rel_volume": self.max_rel_volume,
+            "note": (
+                "cells on the report's own trading day, whose bar the vendor was still "
+                "settling when the two sides fetched it. Recorded, never counted in "
+                "values.breaches, and re-graded strictly on the next day's report "
+                "(prior_day_settled). Membership, schema, row count and coverage stay "
+                "strict for this row (alpha-engine-config-I11351)."
+            ),
+        }
 
 
 def resolve_contract(live_key: str) -> ContractSchema | None:
@@ -359,8 +546,26 @@ def _numeric_close(a: Any, b: Any, rel: float, absolute: float) -> bool:
     return math.isclose(af, bf, rel_tol=rel, abs_tol=absolute)
 
 
+def _row_is_day(row_key: Any, iso: str) -> bool:
+    """Whether a frame's row key IS the trading day ``iso``.
+
+    The index of a price-cache frame is a pandas Timestamp, whose ``str()`` is
+    ``'2026-09-21 00:00:00'``; a date index stringifies as ``'2026-09-21'``.
+    Both are matched by comparing the first ten characters, which is also why
+    a non-date row key (a ticker) can never accidentally match.
+    """
+    return str(row_key)[:10] == iso
+
+
 def _compare_frames(
-    live, shadow, rel: float, absolute: float, provenance_columns: frozenset[str] = frozenset()
+    live,
+    shadow,
+    rel: float,
+    absolute: float,
+    provenance_columns: frozenset[str] = frozenset(),
+    settling: "_SettlingCollector | None" = None,
+    settling_whole_frame: bool = False,
+    prior_day: "dt.date | None" = None,
 ) -> dict[str, Any]:
     import pandas as pd  # local: pandas import is ~1s and the CLI may never need it
 
@@ -426,6 +631,10 @@ def _compare_frames(
         }
         out["provenance_diffs"] = {"count": 0, "examples": []}
         return out
+    settling_iso = settling.date if settling is not None else None
+    prior_iso = prior_day.isoformat() if prior_day is not None else None
+    prior_rows = 0
+    prior_breaches = 0
     shared_columns = [c for c in indexed_live.columns if c in indexed_shadow.columns]
     # Provenance columns (I10894) are declared by the contract, never
     # hand-listed here — a column absent from `provenance_columns` is DATA,
@@ -444,19 +653,39 @@ def _compare_frames(
                     {"row": str(row_key), "column": None, "reason": "duplicate row key"}
                 )
             continue
+        # A row is SETTLING when the whole frame is the trading day's bar
+        # (`key_date`/`same_day_snapshot` — the frame is ticker-indexed and the
+        # KEY carries the date) or when this row's own index IS that date
+        # (`row_date`). Everything else keeps the strict band.
+        row_settling = settling is not None and (
+            settling_whole_frame or (settling_iso is not None and _row_is_day(row_key, settling_iso))
+        )
+        row_is_prior = prior_iso is not None and _row_is_day(row_key, prior_iso)
+        if row_is_prior:
+            prior_rows += 1
         for col in data_columns:
             compared += 1
-            if not _numeric_close(live_row[col], shadow_row[col], rel, absolute):
-                breach_count += 1
-                if len(breaches) < 50:
-                    breaches.append(
-                        {
-                            "row": str(row_key),
-                            "column": str(col),
-                            "live": _jsonable(live_row[col]),
-                            "shadow": _jsonable(shadow_row[col]),
-                        }
-                    )
+            if _numeric_close(live_row[col], shadow_row[col], rel, absolute):
+                continue
+            if row_settling:
+                # Recorded, NOT a breach. The membership/schema/row-count
+                # checks above already ran over this same row unchanged.
+                settling.record(
+                    row=row_key, column=col, live=live_row[col], shadow=shadow_row[col]
+                )
+                continue
+            if row_is_prior:
+                prior_breaches += 1
+            breach_count += 1
+            if len(breaches) < 50:
+                breaches.append(
+                    {
+                        "row": str(row_key),
+                        "column": str(col),
+                        "live": _jsonable(live_row[col]),
+                        "shadow": _jsonable(shadow_row[col]),
+                    }
+                )
         for col in prov_columns:
             if not _numeric_close(live_row[col], shadow_row[col], rel, absolute):
                 provenance_diff_count += 1
@@ -475,6 +704,18 @@ def _compare_frames(
         "examples": breaches[:10],
     }
     out["provenance_diffs"] = {"count": provenance_diff_count, "examples": provenance_diffs[:10]}
+    if prior_iso is not None:
+        # Deliverable 2: the row this key's PREVIOUS report could only record
+        # as settling is, on this report, an ordinary historical row graded on
+        # the strict band. Counted here rather than re-derived from the capped
+        # `examples` list, which saturates at 50 and would silently read as
+        # "settled" on a key with more breaches than that.
+        out["prior_day"] = {
+            "date": prior_iso,
+            "rows_compared": prior_rows,
+            "breaches": prior_breaches,
+            "settled": prior_rows > 0 and prior_breaches == 0,
+        }
     return out
 
 
@@ -714,6 +955,8 @@ def compare_bytes(
     rel: float,
     absolute: float,
     contract: "ContractSchema | None" = None,
+    trading_day: "dt.date | None" = None,
+    prior_day: "dt.date | None" = None,
 ) -> dict[str, Any]:
     """Compare one key's two payloads. Returns the row body; never raises for data.
 
@@ -739,6 +982,14 @@ def compare_bytes(
         "value differences inside the declared band are drift between two fetches "
         "of a moving number, not a producer defect"
     )
+    basis = settling_basis(key, contract, trading_day)
+    settling = _SettlingCollector(basis, trading_day) if basis else None
+    # The prior day is re-graded only where this report actually holds that
+    # day's row: a `row_date` key carries its own history. A `key_date` or
+    # `same_day_snapshot` key does not (yesterday's bar lives at yesterday's
+    # key, or has been overwritten in place), and claiming otherwise would put
+    # a `settled: true` on a row that was never compared.
+    prior = prior_day if (contract is not None and contract.settling_basis == "row_date") else None
 
     if key.endswith(".parquet"):
         import pandas as pd
@@ -753,8 +1004,17 @@ def compare_bytes(
                 "unmeasurable_reason": f"parquet would not parse: {type(exc).__name__}: {exc}",
             }
         body = _compare_frames(
-            live_frame, shadow_frame, compare_rel, compare_abs, provenance_fields
+            live_frame,
+            shadow_frame,
+            compare_rel,
+            compare_abs,
+            provenance_fields,
+            settling=settling,
+            settling_whole_frame=basis in {"key_date", "same_day_snapshot"},
+            prior_day=prior,
         )
+        if settling is not None:
+            body["settling_bar"] = settling.as_block()
         schema_ok = body["schema"]["match"]
         if not vendor_live:
             matched = (
@@ -814,6 +1074,29 @@ def compare_bytes(
         all_diffs = _json_diffs(live_doc, shadow_doc, compare_rel, compare_abs)
         breaches, provenance_diffs = _split_json_diffs(all_diffs, provenance_fields)
 
+        # A JSON document has no row index, so `row_date` cannot be evaluated
+        # over one — the two bases that CAN are the two that say "this whole
+        # document is the trading day's bar". A `row_date` declaration landing
+        # on a JSON key is recorded rather than silently applied or silently
+        # dropped: it means the contract and the artifact disagree.
+        if settling is not None and basis == "row_date":
+            body_note = (
+                "x-settling-bar.basis is 'row_date' but this key is a JSON document with no "
+                "row index; no cell was graded as settling. Declare 'key_date' or "
+                "'same_day_snapshot' instead (alpha-engine-config-I11351)."
+            )
+            settling = None
+        else:
+            body_note = ""
+        if settling is not None:
+            # VALUE diffs only. A key present on one side alone (membership) or
+            # a list whose length differs (cardinality) is SHAPE, graded
+            # exactly, whatever the bar was doing — the binding constraint on
+            # I11351 and the same rule the vendor_live class already follows.
+            for diff in [d for d in breaches if d.kind == "value"]:
+                settling.record_json(diff)
+            breaches = [d for d in breaches if d.kind != "value"]
+
         doc_size = len(live_doc) if isinstance(live_doc, (list, dict)) else 1
         body: dict[str, Any] = {
             "comparator": "json",
@@ -830,6 +1113,10 @@ def compare_bytes(
                 "shadow": len(shadow_doc) if isinstance(shadow_doc, (list, dict)) else 1,
             },
         }
+        if settling is not None:
+            body["settling_bar"] = settling.as_block()
+        if body_note:
+            body["settling_bar_declaration_problem"] = body_note
 
         if not vendor_live:
             body["verdict"] = "match" if not breaches else "mismatch"
@@ -935,6 +1222,20 @@ class ParityReport:
     #: always exists; carrying their outcomes here is what stops it being read
     #: as if every leg had run.
     legs: list[dict[str, Any]] = field(default_factory=list)
+    #: Which dispatch groups told this report what their legs did. One boolean
+    #: per group in :data:`LEGS_GROUPS` (`alpha-engine-config-I11352`): the
+    #: same-day dispatch and the D+1 morning dispatch write the SAME report, so
+    #: one bare boolean could not say that the morning legs had not run yet
+    #: without also erasing the same-day ones.
+    legs_known: dict[str, bool] = field(default_factory=dict)
+    #: Deliverable 2 of `alpha-engine-config-I11351`: whether the bar this
+    #: key's PREVIOUS report could only record as settling is, by now, settled
+    #: on both sides. ``{}`` when no previous report was available to read.
+    prior_day_settled: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def settling_bar_keys(self) -> int:
+        return sum(1 for row in self.rows if int((row.body.get("settling_bar") or {}).get("cells") or 0))
 
     @property
     def summary(self) -> dict[str, int]:
@@ -948,9 +1249,18 @@ class ParityReport:
             "unmeasurable": 0,
             "in_region_only": 0,
             "live_superseded": 0,
+            # Declared at zero like every other verdict: a count that only
+            # appears when non-zero cannot be told apart from health when it is
+            # absent (alpha-engine-config-I11231).
+            "not_applicable": 0,
         }
         for row in self.rows:
             counts[row.verdict] = counts.get(row.verdict, 0) + 1
+        # NOT a verdict — a breakdown OF `match`. Named in
+        # `data_gate.evidence.SUMMARY_NON_VERDICT_FIELDS` so the gate reader
+        # never mistakes it for an exception count and reads every report as
+        # UNMET (`alpha-engine-config-I11351` deliverable 3).
+        counts["settling_bar_keys"] = self.settling_bar_keys
         return counts
 
     @property
@@ -976,12 +1286,54 @@ class ParityReport:
             # not told", which is NOT the same claim as "every leg ran" -- a
             # reader that cannot tell those apart is the state I11200 describes.
             "legs": self.legs,
-            "legs_known": bool(self.legs),
+            "legs_known": self.legs_known or {
+                group: any(leg.get("dispatch") == group for leg in self.legs)
+                for group in LEGS_GROUPS
+            },
+            "prior_day_settled": self.prior_day_settled,
             "met": self.met,
             "summary": self.summary,
             "excluded_units": self.excluded,
             "keys": [row.as_dict() for row in self.rows],
         }
+
+
+def merge_legs(
+    previous: list[dict[str, Any]], incoming: list[dict[str, Any]], *, group: str
+) -> tuple[list[dict[str, Any]], dict[str, bool]]:
+    """This dispatch's legs, merged into whatever the other dispatch recorded.
+
+    `alpha-engine-config-I11352`. The same-day dispatch (18:30 ET on D) and the
+    morning dispatch (07:45 ET on D+1) both publish `parity/{D}.json`, and the
+    second one rewrites the comparison — the whole point, since the morning
+    legs' keys only exist by then. What must NOT be rewritten is the other
+    group's leg outcomes: a morning re-run that replaced `legs` wholesale would
+    erase the record that the post-market legs ran at all, which is exactly the
+    silence `I11200` created this block to end.
+
+    So: entries whose `dispatch` is THIS group are replaced; every other entry
+    is kept, in its original order, ahead of the new ones. An entry from a
+    pre-I11352 report carries no `dispatch` at all and is attributed to the
+    default group, because that is the only dispatch that existed when it was
+    written — dropping it would lose a measurement, and keeping it unlabelled
+    would make it un-replaceable forever.
+
+    Returns ``(legs, legs_known)``; `legs_known` carries one boolean per group
+    in :data:`LEGS_GROUPS`, so a report can say the morning legs have not run
+    yet without saying the same-day ones did not.
+    """
+    if group not in LEGS_GROUPS:
+        raise ValueError(f"legs group must be one of {list(LEGS_GROUPS)}, got {group!r}")
+    kept: list[dict[str, Any]] = []
+    for leg in previous:
+        entry = dict(leg)
+        entry.setdefault("dispatch", DEFAULT_LEGS_GROUP)
+        if entry["dispatch"] != group:
+            kept.append(entry)
+    fresh = [dict(leg, dispatch=group) for leg in incoming]
+    merged = kept + fresh
+    known = {g: any(leg.get("dispatch") == g for leg in merged) for g in LEGS_GROUPS}
+    return merged, known
 
 
 class S3Reader:
@@ -1124,6 +1476,9 @@ def _compare_one_key(
     rel,
     absolute,
     expected: dict[str, Any] | None = None,
+    trading_day: "dt.date | None" = None,
+    prior_day: "dt.date | None" = None,
+    shadow_manifests: dict[str, dict[str, Any]] | None = None,
 ) -> KeyResult:
     """Grade one key. ``expected`` is v1's manifest output record for this
     trading day (:func:`recorded_live_version`); with it, the live side is the
@@ -1168,12 +1523,16 @@ def _compare_one_key(
             {"detail": "the shadow run wrote it; v1 did not", "shadow_key": shadow_key},
         )
     if shadow is None:
-        return KeyResult(
-            live_key, unit_ids, "shadow_missing", "none",
-            {"detail": "v1 wrote it; the shadow run did not", "shadow_key": shadow_key},
-        )
+        return _absent_shadow_result(live_key, unit_ids, shadow_key, shadow_manifests or {})
     body = compare_bytes(
-        live_key, live, shadow, rel=rel, absolute=absolute, contract=resolve_contract(live_key)
+        live_key,
+        live,
+        shadow,
+        rel=rel,
+        absolute=absolute,
+        contract=resolve_contract(live_key),
+        trading_day=trading_day if trading_day is not None else root.trading_day,
+        prior_day=prior_day,
     )
     body["shadow_key"] = shadow_key
     body["live_version"] = live_version
@@ -1182,6 +1541,75 @@ def _compare_one_key(
         if summary:
             body["detail"] = summary
     return KeyResult(live_key, unit_ids, body.pop("verdict"), body.pop("comparator"), body)
+
+
+def _absent_shadow_result(
+    live_key: str,
+    unit_ids: list[str],
+    shadow_key: str,
+    shadow_manifests: dict[str, dict[str, Any]],
+) -> KeyResult:
+    """Why the shadow key is absent, read from the OWNING UNIT'S OWN MANIFEST.
+
+    `alpha-engine-config-I11231` closes-when 2. "v1 wrote it; the shadow run
+    did not" was the same sentence for three different facts, and the report
+    had the answer to all three sitting one read away:
+
+    * the unit DECLINED to run, correctly. D26 (`market_data/technicals/
+      rating_history/_manifest.json`) recorded `status: not_applicable,
+      reason: no_new_data_declared` on 2026-09-21 — an immutable-date no-op, not
+      a producer that lost a key. Graded `not_applicable`, carrying the
+      manifest's own `reason` and `run_id`.
+    * the unit RAN AND FAILED. The four `reference/price_cache/{FDXF,HONA,Q,
+      SOLS}.parquet` rows the same night were `short_fetch_guard_refused`.
+      Still `shadow_missing` — the key IS missing — but the detail now names
+      the cause instead of leaving a reader to go find the manifest.
+    * anything else — no manifest at all, or a manifest saying `ok` — keeps the
+      pre-existing wording, which is the honest one for "it should be there".
+
+    `not_applicable` is never `match`, so it is never parity evidence and can
+    never make the gate MET (plan §4.1 rule 2). It is a different NEXT ACTION
+    from `shadow_missing`, which is the whole reason it is its own verdict:
+    one says read the declaration, the other says fix the producer.
+    """
+    owning = [(unit_id, shadow_manifests[unit_id]) for unit_id in unit_ids if unit_id in shadow_manifests]
+    statuses = {str(manifest.get("status") or "") for _, manifest in owning}
+
+    def _cite(manifest: dict[str, Any]) -> str:
+        reason = str(manifest.get("reason") or "").strip() or "(no reason recorded)"
+        return f"{reason} (run_id {manifest.get('run_id') or 'unknown'})"
+
+    # EVERY owning unit, not any: a key two units write is only a declared no-op
+    # when BOTH declined. One unit declaring itself not applicable while the
+    # other ran and produced nothing is a missing key, and saying otherwise
+    # would turn a real gap into a green declaration.
+    if owning and statuses == {"not_applicable"}:
+        return KeyResult(
+            live_key, unit_ids, "not_applicable", "none",
+            {
+                "detail": (
+                    "the shadow run declared this unit not applicable for the trading day: "
+                    + "; ".join(f"{unit_id}: {_cite(manifest)}" for unit_id, manifest in owning)
+                    + ". v1 wrote the key; the shadow correctly did not, so there is nothing "
+                    "to diff and this is not a producer gap"
+                ),
+                "shadow_key": shadow_key,
+                "shadow_run_status": {unit_id: "not_applicable" for unit_id, _ in owning},
+            },
+        )
+
+    failed = [(unit_id, manifest) for unit_id, manifest in owning if str(manifest.get("status")) == "failed"]
+    detail = "v1 wrote it; the shadow run did not"
+    if failed:
+        detail += " — the owning unit's shadow run FAILED: " + "; ".join(
+            f"{unit_id}: {_cite(manifest)}" for unit_id, manifest in failed
+        )
+    body: dict[str, Any] = {"detail": detail, "shadow_key": shadow_key}
+    if owning:
+        body["shadow_run_status"] = {
+            unit_id: str(manifest.get("status") or "") for unit_id, manifest in owning
+        }
+    return KeyResult(live_key, unit_ids, "shadow_missing", "none", body)
 
 
 def _verdict_detail(body: dict[str, Any]) -> str:
@@ -1233,6 +1661,27 @@ def _verdict_detail(body: dict[str, Any]) -> str:
     rows = body.get("row_count") or {}
     if rows and rows.get("live") != rows.get("shadow"):
         parts.append(f"row count {rows.get('live')} live vs {rows.get('shadow')} shadow")
+
+    settling = body.get("settling_bar") or {}
+    cells = int(settling.get("cells") or 0)
+    if cells:
+        moves = []
+        if settling.get("max_rel_close") is not None:
+            moves.append(f"max rel close {settling['max_rel_close']:.3g}")
+        if settling.get("max_rel_volume") is not None:
+            moves.append(f"max rel volume {settling['max_rel_volume']:.3g}")
+        parts.append(
+            f"{cells} settling-bar cell{'s' if cells != 1 else ''} on {settling.get('date')} "
+            f"({settling.get('basis')}), not counted as breaches"
+            + (f" — {', '.join(moves)}" if moves else "")
+        )
+
+    prior = body.get("prior_day") or {}
+    if prior:
+        parts.append(
+            f"prior day {prior.get('date')} re-graded strictly: "
+            f"{prior.get('breaches')} breach(es) over {prior.get('rows_compared')} row(s)"
+        )
 
     if not parts:
         return ""
@@ -1346,8 +1795,20 @@ def run_parity(
     max_keys_per_prefix: int = 50,
     now: dt.datetime | None = None,
     legs: list[dict[str, Any]] | None = None,
+    legs_known: dict[str, bool] | None = None,
+    store: Any | None = None,
 ) -> ParityReport:
-    """Diff every declared key of every live-v1-producer unit and build the report."""
+    """Diff every declared key of every live-v1-producer unit and build the report.
+
+    ``store`` is the same `GateStore` the report is published to. It is read —
+    never written — for exactly one thing: the PREVIOUS trading day's report,
+    which names the keys that day could only grade as settling. Absent, the
+    report says so under `prior_day_settled` rather than omitting the block,
+    because "we did not look" and "nothing was unsettled" are different facts.
+    """
+    from nousergon_lib.trading_calendar import previous_trading_day
+
+    prior_day = previous_trading_day(trading_day)
     root = ShadowRoot(trading_day)
     reader = reader or S3Reader(bucket)
     units = units if units is not None else load_units()
@@ -1486,6 +1947,9 @@ def run_parity(
                         _compare_one_key(
                             reader, root, member, unit_ids, rel_tolerance, absolute_tolerance,
                             expected=_expected(member, unit_ids),
+                            trading_day=trading_day,
+                            prior_day=prior_day,
+                            shadow_manifests=shadow_manifests,
                         )
                     )
                 continue
@@ -1519,6 +1983,9 @@ def run_parity(
                     _compare_one_key(
                         reader, root, member, unit_ids, rel_tolerance, absolute_tolerance,
                         expected=_expected(member, unit_ids),
+                        trading_day=trading_day,
+                        prior_day=prior_day,
+                        shadow_manifests=shadow_manifests,
                     )
                 )
             if max(len(live_keys), len(shadow_keys)) >= max_keys_per_prefix:
@@ -1539,6 +2006,9 @@ def run_parity(
             _compare_one_key(
                 reader, root, target.value, unit_ids, rel_tolerance, absolute_tolerance,
                 expected=_expected(target.value, unit_ids),
+                trading_day=trading_day,
+                prior_day=prior_day,
+                shadow_manifests=shadow_manifests,
             )
         )
 
@@ -1572,16 +2042,124 @@ def run_parity(
                 }
             )
 
+    deduped = _dedupe_rows(rows)
     stamp = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0).isoformat()
     return ParityReport(
         trading_day=trading_day,
         bucket=bucket,
         shadow_prefix=root.prefix,
         code_sha=code_sha,
-        rows=_dedupe_rows(rows),
+        rows=deduped,
         excluded=sorted(excluded, key=lambda e: e["unit_id"]),
         rel_tolerance=rel_tolerance,
         absolute_tolerance=absolute_tolerance,
         generated_at=stamp.replace("+00:00", "Z"),
         legs=list(legs or []),
+        legs_known=dict(legs_known or {}),
+        prior_day_settled=grade_prior_day_settled(store, prior_day=prior_day, rows=deduped),
     )
+
+
+#: Why one key that carried a `settling_bar` block yesterday cannot be re-graded
+#: on today's report. Each is a PROPERTY OF THE ARTIFACT, not of the read, and
+#: each is published so the `prior_day_settled` denominator is auditable rather
+#: than quietly shrinking to the keys that happened to work.
+_PRIOR_UNMEASURABLE_REASONS = {
+    "not_in_this_report": (
+        "this report has no row for the key at all — the unit was out of this run's scope, "
+        "or the key is no longer declared"
+    ),
+    "no_prior_row": (
+        "the key carries no row indexed by the previous trading day, so that day's bar is "
+        "not in this artifact. A `key_date` artifact files each day under its OWN key and a "
+        "`same_day_snapshot` is overwritten in place, so neither can ever be re-graded from "
+        "the next day's report — only a `row_date` artifact (reference/price_cache/*.parquet) "
+        "carries the history that makes the re-grade possible"
+    ),
+    "row_not_compared": (
+        "the key has a row_date settling basis but this report compared no row for the "
+        "previous trading day (the two sides did not share that row)"
+    ),
+}
+
+
+def grade_prior_day_settled(
+    store: Any, *, prior_day: dt.date, rows: list[KeyResult]
+) -> dict[str, Any]:
+    """Whether yesterday's unsettled bars settled, measured on today's report.
+
+    Deliverable 2 of `alpha-engine-config-I11351`. Yesterday's report names the
+    keys whose trading-day cells could not be graded; on THIS report that same
+    row is an ordinary historical row held to the strict band. The pairing is
+    what turns "we could not measure today's bar" into a measured claim one day
+    later.
+
+    Never silently empty: with no store handed in, or no report for the
+    previous trading day, the block says which, and a key that cannot be
+    re-graded is counted as `unmeasurable` with its reason named — never as
+    settled.
+    """
+    if store is None:
+        return {
+            "trading_day": prior_day.isoformat(),
+            "available": False,
+            "reason": "no store was handed to the comparator, so the previous report was not read",
+        }
+    prior_key = parity_key(prior_day)
+    try:
+        raw = store.get_bytes(prior_key)
+        document = json.loads(raw.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - recorded as an unavailable block, never swallowed
+        # (a) the failure swallowed is "the previous report is absent or
+        # unreadable"; (b) the primary deliverable — this day's parity report —
+        # is unaffected; (c) it is recorded here, in the published report.
+        return {
+            "trading_day": prior_day.isoformat(),
+            "report": prior_key,
+            "available": False,
+            "reason": f"{type(exc).__name__}: {exc}",
+        }
+
+    settling_yesterday = [
+        str(row.get("key") or "")
+        for row in document.get("keys") or []
+        if int((row.get("settling_bar") or {}).get("cells") or 0)
+    ]
+    by_key = {row.key: row for row in rows}
+    settled: list[str] = []
+    unsettled: list[dict[str, Any]] = []
+    unmeasurable: dict[str, list[str]] = {}
+    for key in settling_yesterday:
+        row = by_key.get(key)
+        if row is None:
+            unmeasurable.setdefault("not_in_this_report", []).append(key)
+            continue
+        prior = row.body.get("prior_day")
+        if not prior:
+            unmeasurable.setdefault("no_prior_row", []).append(key)
+            continue
+        if not prior.get("rows_compared"):
+            unmeasurable.setdefault("row_not_compared", []).append(key)
+            continue
+        if prior.get("settled"):
+            settled.append(key)
+        else:
+            unsettled.append({"key": key, "breaches": prior.get("breaches")})
+    return {
+        "trading_day": prior_day.isoformat(),
+        "report": prior_key,
+        "available": True,
+        "keys_with_settling_bar": len(settling_yesterday),
+        "settled": len(settled),
+        "unsettled": len(unsettled),
+        "unmeasurable": sum(len(keys) for keys in unmeasurable.values()),
+        "unmeasurable_reasons": {
+            reason: {
+                "count": len(keys),
+                "why": _PRIOR_UNMEASURABLE_REASONS[reason],
+                "examples": sorted(keys)[:10],
+            }
+            for reason, keys in sorted(unmeasurable.items())
+        },
+        "unsettled_examples": sorted(unsettled, key=lambda e: str(e["key"]))[:10],
+    }

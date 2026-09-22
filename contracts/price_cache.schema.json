@@ -34,6 +34,10 @@
       "description": "Session volume. float64, not integer — the adjustment divides it."
     }
   },
+  "x-settling-bar": {
+    "basis": "row_date",
+    "rationale": "The frame is indexed by bar date and carries ~2,500 rows of settled history plus the session that is still settling at the vendor. On a SAME-DAY shadow run the two fetches are hours apart (v1 at 16:06 ET, six minutes after the bell; the shadow at 18:41 ET), so the trading day's own row differs on Volume in 920/920 files and Close in 442 while every historical row agrees inside the 1e-4 band. Only the row whose index IS the report's trading_day is graded as settling; every earlier row keeps the strict band (alpha-engine-config-I11351)."
+  },
   "x-key-pattern": "reference/price_cache/{sym}.parquet",
   "x-comparison-class": "vendor_live",
   "x-vendor-live": {

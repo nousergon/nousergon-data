@@ -97,6 +97,10 @@
       }
     }
   },
+  "x-settling-bar": {
+    "basis": "same_day_snapshot",
+    "rationale": "market_data/security_performance/latest.json is an undated in-place snapshot of per-security return/performance computed from the session's own bar; same reasoning and the same prior_day_settled gotcha as market_data/technicals/latest.json (alpha-engine-config-I11351)."
+  },
   "x-key-pattern": "market_data/security_performance/latest.json",
   "x-comparison-class": "vendor_live",
   "x-vendor-live": {

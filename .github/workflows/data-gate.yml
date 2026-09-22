@@ -113,10 +113,50 @@ name: Data-collection gate (read-only)
 # `--gate` arguments are the single source those PRs update here, not
 # duplicated per trigger.
 
+#
+# CADENCE, CORRECTED (alpha-engine-config-I11355). The 23:30 UTC cron fires
+# BEFORE the day's parity report exists: `shadow-sameday` launches 22:30:34Z
+# and took 73 minutes on its first scheduled night, publishing
+# `parity/2026-09-21.json` at 23:43:04Z, while this gate's own reading for
+# 2026-09-21 was written at 23:09Z citing `parity/2026-09-18.json`. Every
+# weekday reading was structurally one report behind, and `-I11233`
+# closes-when 2 — "the parity clause reads a report whose trading day IS the
+# gate's own" — could never be satisfied by that ordering.
+#
+# So two reads now FOLLOW the publish:
+#   * 01:30 UTC Tue-Sat, after the same-day report for the previous session;
+#   * 12:30 UTC Mon-Fri, after `shadow-morning` (11:45Z) rewrites that same
+#     report with v1's two morning legs (`-I11352`).
+# Both pass `--trading-day yesterday` — the latest trading day on or before
+# YESTERDAY UTC, which is the session a post-midnight read is actually about.
+# Not `previous_trading_day(today)`: a Saturday 01:30 read is about FRIDAY, and
+# that expression returns Thursday. The rule lives in
+# `data_gate/__main__.py::resolve_trading_day` with a test on it, never in a
+# shell expression here.
+#
+# The 23:30 UTC and Saturday 18:00 UTC crons STAY as the backstop, and every
+# read now records `trigger` on its dated `gate.json`, so a day whose
+# post-publish read never fired is visible as a `schedule` reading carrying a
+# stale report rather than as a normal reading.
+#
+# EVENT-DRIVEN IS THE SOTA SHAPE AND IS NOT WIRED HERE. The issue asks for the
+# parity publish itself to dispatch this workflow. That needs a GitHub
+# credential on the data-spot box with `actions:write` on this repository; the
+# box holds one PAT (SSM, used to clone the private config repo) whose scope
+# could not be verified in this session, and minting or re-scoping a
+# credential is an IAM/secret change this work does not make. `data_gate/
+# read.py::TRIGGERS` declares `parity-published` now so the event-driven
+# artifact and the cron artifact are the same shape, and so "no reading has
+# ever carried parity-published" is a legible gap rather than silence.
+
 on:
   schedule:
     - cron: '30 23 * * *'
     - cron: '0 18 * * 6'
+    # After the same-day parity publish (~23:43 UTC on the session day).
+    - cron: '30 1 * * 2-6'
+    # After the shadow-morning rewrite (11:45 UTC on the next session).
+    - cron: '30 12 * * 1-5'
   push:
     branches: [main]
     paths:
@@ -167,6 +207,14 @@ jobs:
       # triggers); `true`/`false` on workflow_dispatch. Only the literal
       # string `true` appends the flag below.
       FAIL_ON_UNMET_FLAG: ${{ (github.event_name == 'workflow_dispatch' && inputs.fail_on_unmet == true) && '--fail-on-unmet' || '' }}
+      # alpha-engine-config-I11355. The two POST-PARITY crons run after
+      # midnight UTC relative to the session they are about, so they must file
+      # under `yesterday` and are recorded as `post-parity`; everything else
+      # keeps today's behaviour. `data_gate/read.py::TRIGGERS` is the closed
+      # vocabulary and refuses anything else, so a typo here fails the read
+      # rather than publishing an unsummable column.
+      GATE_TRIGGER: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'post-parity' || (github.event_name == 'schedule' && 'schedule' || (github.event_name == 'push' && 'push' || 'manual')) }}
+      GATE_TRADING_DAY: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'yesterday' || 'today' }}
     steps:
       # Every configuration input this job cannot run without, checked in one
       # place with the exact command that fixes each. Without it an unset
@@ -213,6 +261,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-phase0 \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
       # Second invocation, same contract, `data-cutover-ready`'s own exit
@@ -224,6 +274,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-cutover-ready \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
       # Three more invocations, same contract, same "BOTH READS, ONE BOARD"
@@ -242,6 +294,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-phase1 \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
       - name: Read the data-phase2 gate
@@ -249,6 +303,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-phase2 \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
       - name: Read the data-phase3 gate
@@ -256,6 +312,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-phase3 \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
       # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21 ruling: a
@@ -272,6 +330,8 @@ jobs:
         run: |
           python -m data_gate read --gate data-collection-reliability \
             --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY" \
+            --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
 
   # ── FAILURE ALERTING ─────────────────────────────────────────────────────

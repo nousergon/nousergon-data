@@ -64,6 +64,10 @@
       }
     }
   },
+  "x-settling-bar": {
+    "basis": "key_date",
+    "rationale": "Ticker-indexed and dated by the path segment, same shape as staging/daily_closes: every indicator in features/{date}/*.parquet reads the last bar, so on a same-day run the whole file is a derivation of the unsettled session (24,961 technical / 3,328 interaction / 508 alternative / 4 macro breaches measured on 2026-09-21). Graded as settling only when the key names the report's trading_day — features/metron_supplemental/ carries no date and is never settling (alpha-engine-config-I11351)."
+  },
   "x-key-pattern": [
     "features/{date}/technical.parquet",
     "features/{date}/fundamental.parquet",
