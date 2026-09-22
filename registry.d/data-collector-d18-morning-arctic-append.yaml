@@ -39,9 +39,12 @@ signals:
     status: emitted
     reason: unit descriptor's own audit.cells.detector reads PRESENT (baseline_date 2026-09-14); re-measured,
       not re-asserted, at the next data-gate read.
-log_location: s3:alpha-engine-research/_ssm_logs/data-spot/d18/
-log_location_reason: The unit's spot workload logs to the SSM capture path, per the owning pipeline 'ne-preopen-trading-pipeline'
-  (plan §4.4). Not yet independently re-resolved per unit.
+log_location: s3:alpha-engine-research/data_collection/logs/{workload}/{trading_day}/{instance_id}.log
+log_location_reason: The unit's spot box ships its WHOLE run log to this key on exit and every 60s while
+  running (alpha-engine-config-I11353), and each of the unit's run manifests records the exact object
+  under `log_location`. Owning pipeline 'ne-preopen-trading-pipeline' (plan §4.4). The `_ssm_logs/data-spot/`
+  path this row used to name was retired with that change; CloudWatch remains a capped live tail, never
+  the record.
 alert_channel: sns:alpha-engine-alerts, via the owning pipeline's NotifyFailure state
 alert_channel_reason: Declared from the owning pipeline's ASL definition (plan §4.6).
 severity_source: binary — the owning pipeline's/workflow's own terminal status

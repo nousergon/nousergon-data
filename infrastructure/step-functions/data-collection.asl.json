@@ -238,7 +238,7 @@
           "WorkloadFailed": {
             "Type": "Fail",
             "Error": "DataCollectionWorkloadFailed",
-            "Cause": "A data-spot workload failed on its on-demand retry. The execution history names the workload, the SSM status and the dispatcher error; the box log is under s3://alpha-engine-research/_ssm_logs/data-spot/<workload>/."
+            "Cause": "A data-spot workload failed on its on-demand retry. The execution history names the workload, the SSM status and the dispatcher error; the box log is under s3://alpha-engine-research/data_collection/logs/<workload>/<trading-day>/<instance-id>.log, and each run manifest's log_location names the exact object (alpha-engine-config-I11353)."
           },
           "WorkloadSucceeded": {
             "Type": "Succeed"
