@@ -51,7 +51,7 @@ import boto3
 import pandas as pd
 import requests
 
-from dates import bar_settlement_guard_entry
+from dates import SETTLED_AFTER_ET, bar_settlement_guard_entry
 from nousergon_lib.secrets import get_secret
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
@@ -235,14 +235,33 @@ def _coalesce_by_source_priority(
 
 
 def _is_post_close_write(last_modified: datetime, run_date: str) -> bool:
-    """Return True if ``last_modified`` is at or after the NYSE close for ``run_date``.
+    """Is an existing parquet for ``run_date`` authoritative enough to skip?
 
-    NYSE closes at 16:00 America/New_York. ``zoneinfo`` resolves EST/EDT
-    automatically so this is correct year-round without explicit DST logic.
+    True when ``last_modified`` is at or after :data:`dates.SETTLED_AFTER_ET`
+    on ``run_date`` — the hour the session's official closing print is final.
+    ``zoneinfo`` resolves EST/EDT automatically, so this is correct year-round
+    with no explicit DST logic.
+
+    **This threshold was 16:00 ET — the bare NYSE close — and that was wrong**
+    (alpha-engine-config-I11354). The bar for D is not final when D's session
+    ends. Measured 2026-09-21 across 920 of 920 price-cache files, a 16:06 ET
+    fetch against a refetch at 18:41 ET: ``Volume`` short on all 920 (median
+    20.5 %, max 62.3 %, never high) and ``Close`` off on 442 (median 2.7 bps,
+    max 16.4 bps). A parquet written six minutes after the close therefore
+    satisfied the old predicate, was declared authoritative, and made every
+    later pass for D **skip** — so the unsettled bar could never be replaced by
+    a same-source re-run.
+
+    The name is kept (``post_close``) rather than renamed to ``post_settlement``
+    to keep this a single revertible change; the predicate, not the vocabulary,
+    is what was wrong. ``dates.SETTLED_AFTER_ET`` is the one place the hour is
+    declared, and it is itself a stated assumption resting on a one-day bracket
+    — alpha-engine-config-I11356 measures it properly.
     """
     run_day = datetime.strptime(run_date, "%Y-%m-%d").date()
-    close_et = datetime.combine(run_day, dtime(16, 0), tzinfo=_NYSE_TZ)
-    return last_modified >= close_et
+    hh, mm = (int(part) for part in SETTLED_AFTER_ET.split(":"))
+    settled_et = datetime.combine(run_day, dtime(hh, mm), tzinfo=_NYSE_TZ)
+    return last_modified >= settled_et
 
 
 _VALID_SOURCES = ("auto", "yfinance_only", "polygon_only")
@@ -1029,23 +1048,21 @@ def collect(
                 existing_rows_for_merge = []
         elif not dry_run and _is_post_close_write(last_modified, run_date):
             logger.info(
-                "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
-                run_date, last_modified.isoformat(), source,
+                "Daily closes already exist for %s (written %s, at or after the "
+                "%s ET settlement hour, source=%s) — skipping",
+                run_date, last_modified.isoformat(), SETTLED_AFTER_ET, source,
             )
             return {
                 "status": "ok",
                 "tickers_captured": 0,
                 "skipped": True,
                 "source": source,
-                # alpha-engine-config-I11354: this branch is the one that
-                # PERPETUATES an unsettled bar. `_is_post_close_write` treats
-                # anything at or after 16:00 ET as authoritative, so a parquet
-                # written at 16:06 ET — six minutes after the close, with a
-                # Volume median 20.5 % short — makes every later pass for D
-                # skip, including the 07:30 ET D+1 morning enrich. There is no
-                # self-heal. The verdict is graded on the EXISTING object's
-                # write time, not on this run's clock, because the existing
-                # object is what stays published.
+                # alpha-engine-config-I11354: the verdict is graded on the
+                # EXISTING object's write time, not on this run's clock,
+                # because the existing object is what stays published. Since
+                # the skip predicate is now the settlement hour, reaching this
+                # branch at all means the reading is `settled` — a `provisional`
+                # verdict here would be a contradiction, and the test pins it.
                 "guards": [
                     bar_settlement_guard_entry(last_modified, run_date, key=key)
                 ],

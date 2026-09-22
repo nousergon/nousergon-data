@@ -543,10 +543,17 @@ class TestSkipCanonicalDefaultsFalse:
         """When skip_if_canonical=False (default), the existing-parquet
         canonical-extraction code path must not run. yfinance_only mode
         should still hit the legacy post-close skip-on-exists return.
+
+        alpha-engine-config-I11354: the fixture's write time moved from 22:00 UTC
+        (18:00 EDT) to 22:30 UTC (18:30 EDT). This test is about which BRANCH
+        runs, not about the skip threshold — and 18:00 ET is now before
+        ``dates.SETTLED_AFTER_ET``, so the old fixture stopped exercising the
+        skip return for a reason unrelated to what it asserts. The new time is
+        past settlement, which is the state this test always meant to set up.
         """
         s3 = _existing_parquet_with_sources(
             {"AAPL": {"Close": 150.0, "source": "yfinance"}},
-            last_modified=datetime(2026, 5, 8, 22, 0, 0, tzinfo=timezone.utc),
+            last_modified=datetime(2026, 5, 8, 22, 30, 0, tzinfo=timezone.utc),
         )
         with patch("collectors.daily_closes.boto3.client", return_value=s3):
             with patch.object(
