@@ -1500,6 +1500,10 @@ class TestHappyPathTraversal:
             "EvaluatorDirectorDeployDriftGate",
             "WeeklyPreflight",
             "WeeklyPreflightGate",
+            # alpha-engine-config-I11112: the clean arm's count-recording Pass
+            # (ran/skip/warn onto $.weekly_preflight_blind_spot) before the
+            # mutex — one extra state in the visited order, same target.
+            "WeeklyPreflightFullyObserved",
             "CheckMutexRole",
             "CheckSpotDispatchNeeded",
             "DispatchWeeklyFreshnessSpot",

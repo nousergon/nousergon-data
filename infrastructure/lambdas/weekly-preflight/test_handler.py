@@ -34,6 +34,37 @@ class _Result:
     elapsed_seconds: float = 0.0
 
 
+class _RecordingCloudWatch:
+    """Captures PutMetricData instead of calling AWS.
+
+    Installed as ``sys.modules["boto3"]`` for every test in this file. Not
+    optional hygiene: without it `_emit_preflight_metrics` would attempt a
+    real `cloudwatch:PutMetricData` from the test runner and sit through
+    botocore's retry ladder on every handler test.
+    """
+
+    def __init__(self):
+        self.calls = []
+
+    def client(self, name, *args, **kwargs):
+        assert name == "cloudwatch", name
+        return self
+
+    def put_metric_data(self, Namespace=None, MetricData=None):  # noqa: N803
+        self.calls.append({"Namespace": Namespace, "MetricData": MetricData})
+
+    def metrics(self):
+        """Flatten the most recent call into {MetricName: Value}."""
+        assert self.calls, "no PutMetricData call was made"
+        return {m["MetricName"]: m["Value"] for m in self.calls[-1]["MetricData"]}
+
+
+def _install_boto3_stub():
+    cw = _RecordingCloudWatch()
+    sys.modules["boto3"] = cw
+    return cw
+
+
 def _install_stub(results, n_fail=None, raises=None, required=None):
     """Install a stub sf_preflight module and return the recorded call kwargs.
 
@@ -104,9 +135,17 @@ def _install_stub(results, n_fail=None, raises=None, required=None):
 
 
 class WeeklyPreflightHandlerTests(unittest.TestCase):
+    def setUp(self):
+        self._real_boto3 = sys.modules.get("boto3")
+        self.cw = _install_boto3_stub()
+
     def tearDown(self):
         sys.modules.pop("sf_preflight", None)
         sys.modules.pop("index", None)
+        if self._real_boto3 is not None:
+            sys.modules["boto3"] = self._real_boto3
+        else:
+            sys.modules.pop("boto3", None)
 
     def _handler(self):
         sys.modules.pop("index", None)
@@ -294,3 +333,118 @@ class WeeklyPreflightExecutionInputForwardingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PreflightMetricEmissionTests(unittest.TestCase):
+    """alpha-engine-config-I11112 deliverable 4.
+
+    The 2026-09-19 run carried `skip_count: 10` in its Payload and NOTHING
+    KEYED ON IT — the counts were discoverable only by opening that one
+    execution in the Step Functions console. These tests pin that every
+    terminal branch publishes the counts as a CloudWatch series instead.
+    """
+
+    def setUp(self):
+        self._real_boto3 = sys.modules.get("boto3")
+        self.cw = _install_boto3_stub()
+
+    def tearDown(self):
+        sys.modules.pop("sf_preflight", None)
+        sys.modules.pop("index", None)
+        if self._real_boto3 is not None:
+            sys.modules["boto3"] = self._real_boto3
+        else:
+            sys.modules.pop("boto3", None)
+
+    def _handler(self):
+        sys.modules.pop("index", None)
+        import index
+        return index.handler
+
+    def test_the_2026_09_19_shape_emits_a_visible_skip_series(self):
+        """Five ran, ten skipped — the run that reported OK. The metrics must
+        make that legible without reading the payload."""
+        results = (
+            [_Result(f"ran_{i}", "ok") for i in range(5)]
+            + [_Result(f"gated_{i}", "skip") for i in range(10)]
+        )
+        _install_stub(results)
+        out = self._handler()({"run_date": "2026-09-18"}, None)
+
+        self.assertEqual(out["status"], "DEGRADED")
+        m = self.cw.metrics()
+        self.assertEqual(m["ChecksRan"], 5.0)
+        self.assertEqual(m["ChecksSkipped"], 10.0)
+        self.assertEqual(m["RequiredChecksSkipped"], 10.0)
+        self.assertEqual(m["AssertionsDeclared"], 15.0)
+        self.assertEqual(m["ChecksFailed"], 0.0)
+
+    def test_a_clean_run_emits_the_same_series(self):
+        """A series with points only on bad weeks cannot show a preflight
+        quietly shrinking: the baseline has to be emitted too."""
+        _install_stub([_Result(f"ran_{i}", "ok") for i in range(15)])
+        out = self._handler()({"run_date": "2026-09-18"}, None)
+
+        self.assertEqual(out["status"], "OK")
+        m = self.cw.metrics()
+        self.assertEqual(m["ChecksRan"], 15.0)
+        self.assertEqual(m["ChecksSkipped"], 0.0)
+        self.assertEqual(m["RequiredChecksSkipped"], 0.0)
+
+    def test_a_failing_run_emits_the_series(self):
+        _install_stub([_Result("a", "ok"), _Result("b", "fail")])
+        out = self._handler()({"run_date": "2026-09-18"}, None)
+
+        self.assertEqual(out["status"], "FAIL")
+        self.assertEqual(self.cw.metrics()["ChecksFailed"], 1.0)
+
+    def test_metrics_go_to_the_namespace_the_iam_grant_allows(self):
+        """`PutAlphaEngineMetrics` on this Lambda's role is conditioned on
+        `AlphaEngine`/`AlphaEngine/*`. A namespace outside it would be denied
+        at runtime and the series would silently never exist — which is the
+        defect class, not a fix for it."""
+        _install_stub([_Result("a", "ok")])
+        self._handler()({"run_date": "2026-09-18"}, None)
+        ns = self.cw.calls[-1]["Namespace"]
+        self.assertTrue(
+            ns == "AlphaEngine" or ns.startswith("AlphaEngine/"),
+            f"namespace {ns!r} is outside the role's PutMetricData condition",
+        )
+
+    def test_emission_failure_never_changes_the_verdict(self):
+        """An observer that can change the outcome of the thing it observes
+        is a new failure mode bolted onto the one it reports."""
+        class _Exploding:
+            def client(self, *a, **k):
+                raise RuntimeError("no credentials")
+
+        _install_stub([_Result(f"ran_{i}", "ok") for i in range(15)])
+        sys.modules["boto3"] = _Exploding()
+        out = self._handler()({"run_date": "2026-09-18"}, None)
+
+        self.assertEqual(out["status"], "OK")
+        self.assertFalse(out["has_violation"])
+        self.assertFalse(out["metrics"]["emitted"])
+        self.assertIn("no credentials", out["metrics"]["error"])
+
+    def test_an_import_failure_still_emits_a_zero_series(self):
+        """The loudest 'ran nothing' case, and the only one no payload field
+        can describe — the console must see ChecksRan=0 rather than an
+        absence it cannot tell from a weekend with no run."""
+        sys.modules.pop("sf_preflight", None)
+        real_import = __builtins__["__import__"] if isinstance(__builtins__, dict) else __builtins__.__import__
+
+        def _blocked(name, *args, **kwargs):
+            if name == "sf_preflight":
+                raise ImportError("no module named sf_preflight")
+            return real_import(name, *args, **kwargs)
+
+        import builtins
+        builtins.__import__ = _blocked
+        try:
+            out = self._handler()({"run_date": "2026-09-18"}, None)
+        finally:
+            builtins.__import__ = real_import
+
+        self.assertEqual(out["status"], "ERROR")
+        self.assertEqual(self.cw.metrics()["ChecksRan"], 0.0)
