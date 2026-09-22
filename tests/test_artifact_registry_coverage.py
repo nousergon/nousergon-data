@@ -328,11 +328,34 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # two new S3 paths still need an ARTIFACT_REGISTRY.yaml grandfather —
     # companion config PR, same as config#2020 did for sub_industry_map.
     "collectors/constituents.py": 4,
+    # alpha-engine-config-I11296 — NDX (Nasdaq-100) membership + per-
+    # constituent weight, sibling artifact to constituents.py (not folded
+    # into it — see collectors/nasdaq100.py module docstring). One PUT
+    # call site, looped over two keys: market_data/index_constituents/
+    # NDX.json (the I11297-consumer "latest" path) and market_data/
+    # weekly/{date}/NDX.json (dated PIT snapshot). Needs an
+    # ARTIFACT_REGISTRY.yaml grandfathered_paths entry for
+    # "market_data/index_constituents/" — filed as alpha-engine-config-
+    # I11296's companion follow-up (see PR body); not yet registered.
+    "collectors/nasdaq100.py": 1,
     # crypto/holdings.json — Metron crypto-page wallet balances (metron-ops#111). The
     # ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is live (IAM + timer
     # installed) per "never register a freshness entry ahead of its producer" — registering
     # now would report a false state=missing. Tracked in metron-ops#111.
     "collectors/crypto_balances.py": 1,
+    # alpha-engine-config-I11297 — per-constituent index contribution
+    # decomposition, ONE put_object site writing two keys in a loop
+    # (market_data/index_contributions/{index}/{date}.json and
+    # .../latest.json, for index in SPX/NDX). Consumer is Metron
+    # (metron-ops-I346), which reads latest.json to explain the
+    # holdings-vs-benchmark return gap by name.
+    #
+    # The ARTIFACT_REGISTRY freshness row is DEFERRED until the producer is
+    # scheduled, per "never register a freshness entry ahead of its producer"
+    # — the timer/SF wiring is operational assembly and lands in the ops repo,
+    # tracked separately. Registering now would report a false state=missing
+    # every cycle, which is the opposite of the signal the registry exists for.
+    "collectors/index_contributions.py": 1,
     # alpha-engine-config-I10783 (data-collector plan P-16) —
     # write_vendor_divergence_metric's one PUT site:
     # data_collection/metrics/vendor_divergence/{trading_day}.json, written by

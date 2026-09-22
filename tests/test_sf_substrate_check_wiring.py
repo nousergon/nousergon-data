@@ -129,7 +129,13 @@ class TestChainOrdering:
         # alpha-engine-config-I7813: both edges now pass through the
         # observe-only scanner leaderboard leaf's gate before the notify gate.
         assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
-        assert states["Director"]["Next"] == "DirectorComplete"
+        # alpha-engine-config-I11299: Director's success edge now passes through
+        # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
+        # whose degraded branch converges on it too. The witness property is
+        # unchanged: every route here descends from that ONE success edge.
+        assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+        assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
+        assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
         assert states["CheckSkipScannerLeaderboard"]["Default"] == "ScannerLeaderboard"
         # alpha-engine-config-I7194: the leaf now hands off to the

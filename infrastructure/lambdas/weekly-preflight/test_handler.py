@@ -34,12 +34,27 @@ class _Result:
     elapsed_seconds: float = 0.0
 
 
-def _install_stub(results, n_fail=None, raises=None):
-    """Install a stub sf_preflight module and return the recorded call kwargs."""
+def _install_stub(results, n_fail=None, raises=None, required=None):
+    """Install a stub sf_preflight module and return the recorded call kwargs.
+
+    ``required`` is the set of bare check names (e.g. "arctic_connectivity")
+    this stub's ``summarize_results`` treats as REQUIRED — i.e. a skip of one
+    of them is a reportable gap (I11112's CHECK_REQUIRED). Defaults to "every
+    name in results", the same safe default sf_preflight.CHECK_REQUIRED uses
+    for an undeclared check, so a test that doesn't care about the
+    required/optional distinction gets the conservative behaviour.
+    """
     recorded = {}
     stub = types.ModuleType("sf_preflight")
     stub.LAMBDA_CAPABILITIES = frozenset({"aws"})
     stub.FULL_CAPABILITIES = frozenset({"aws", "arctic", "repo_modules", "checkout", "polygon"})
+    all_names = {r.name for r in results}
+    required_names = required if required is not None else all_names
+    # Every result name is declared explicitly (True or False) — passing
+    # required=set() means "everything here is declared OPTIONAL", not
+    # "nothing is declared" (which would fall through to the safe
+    # undeclared-defaults-to-True direction and defeat the test).
+    stub.CHECK_REQUIRED = {f"check_{n}": (n in required_names) for n in all_names}
 
     def run_preflight(bucket=None, capabilities=None, run_date=None, skip_flags=None):
         recorded["bucket"] = bucket
@@ -55,7 +70,35 @@ def _install_stub(results, n_fail=None, raises=None):
         fails = n_fail if n_fail is not None else sum(1 for r in results if r.status == "fail")
         return fails, results
 
+    def summarize_results(rs):
+        # Pins the CONTRACT summarize_results must satisfy, not sf_preflight's
+        # own implementation — this is a stub the handler is tested against.
+        dicts = [
+            {"name": r.name, "status": r.status, "message": r.message,
+             "details": r.details, "elapsed_seconds": r.elapsed_seconds}
+            for r in rs
+        ]
+        fail_r = [d for d in dicts if d["status"] == "fail"]
+        warn_r = [d for d in dicts if d["status"] == "warn"]
+        skip_r = [d for d in dicts if d["status"] == "skip"]
+        required_skip = [
+            d for d in skip_r if stub.CHECK_REQUIRED.get(f"check_{d['name']}", True)
+        ]
+        return {
+            "result_dicts": dicts,
+            "fail_results": fail_r,
+            "warn_results": warn_r,
+            "skip_results": skip_r,
+            "ran_count": len(dicts) - len(skip_r),
+            "fail_count": len(fail_r),
+            "warn_count": len(warn_r),
+            "skip_count": len(skip_r),
+            "required_skip_count": len(required_skip),
+            "required_skip_names": [d["name"] for d in required_skip],
+        }
+
     stub.run_preflight = run_preflight
+    stub.summarize_results = summarize_results
     sys.modules["sf_preflight"] = stub
     return recorded
 
@@ -84,17 +127,74 @@ class WeeklyPreflightHandlerTests(unittest.TestCase):
         self.assertFalse(out["has_violation"])
 
     def test_skips_are_not_violations(self):
+        """A skip never HALTS the run — has_violation stays False whether the
+        skipped check is required (I11112: it becomes DEGRADED) or optional
+        (it stays OK). Neither case is a confirmed violation."""
         recorded = _install_stub([
             _Result("sf_iam_reachability", "ok"),
             _Result("arctic_connectivity", "skip", "Not run: ... arctic"),
             _Result("tool_contracts", "skip", "Not run: ... checkout"),
         ])
         out = self._handler()({}, None)
-        self.assertEqual(out["status"], "OK")
+        self.assertIn(out["status"], ("OK", "DEGRADED"))
         self.assertFalse(out["has_violation"])
         self.assertEqual(out["skip_count"], 2)
         self.assertEqual(out["ran_count"], 1)
         self.assertEqual(recorded["capabilities"], frozenset({"aws"}))
+
+    def test_required_skip_degrades_status_without_halting(self):
+        """alpha-engine-config-I11112: the defect this fix closes. A run of
+        5/15 checks (10 REQUIRED skips) must not report status="OK" — but
+        must also not HALT, per sf-pipeline-policy.md §5's pre-spend-gate-
+        probe carve-out (the probe's own coverage gap fails open, visibly)."""
+        _install_stub(
+            [
+                _Result("sf_iam_reachability", "ok"),
+                _Result("arctic_connectivity", "skip", "Not run: ... arctic"),
+                _Result("constituents_fetch", "skip", "Not run: ... repo_modules"),
+            ],
+            required={"sf_iam_reachability", "arctic_connectivity", "constituents_fetch"},
+        )
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "DEGRADED")
+        self.assertFalse(out["has_violation"], "a coverage gap fails OPEN, never halts")
+        self.assertTrue(out["degraded"])
+        self.assertEqual(out["required_skip_count"], 2)
+        self.assertEqual(
+            sorted(out["required_skip_names"]),
+            ["arctic_connectivity", "constituents_fetch"],
+        )
+        self.assertIn("stage_coverage", out, "DEGRADED still records stage coverage, like OK")
+
+    def test_optional_skip_stays_ok(self):
+        """A skip declared optional (CHECK_REQUIRED[...] = False) never
+        escalates the aggregate status — only a REQUIRED skip does."""
+        _install_stub(
+            [
+                _Result("sf_iam_reachability", "ok"),
+                _Result("some_advisory_check", "skip", "Not run: ... arctic"),
+            ],
+            required=set(),
+        )
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "OK")
+        self.assertFalse(out["degraded"])
+        self.assertEqual(out["required_skip_count"], 0)
+
+    def test_real_failure_outranks_required_skip(self):
+        """A confirmed violation still hard-fails even alongside required
+        skips — FAIL is strictly worse than DEGRADED, never demoted to it."""
+        _install_stub(
+            [
+                _Result("sf_iam_reachability", "fail", "role cannot invoke"),
+                _Result("arctic_connectivity", "skip", "Not run: ... arctic"),
+            ],
+            required={"sf_iam_reachability", "arctic_connectivity"},
+        )
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "FAIL")
+        self.assertTrue(out["has_violation"])
+        self.assertEqual(out["required_skip_count"], 1)
 
     def test_all_skipped_is_an_error_not_a_pass(self):
         """Zero checks run is an unobserved gate, never a green one."""

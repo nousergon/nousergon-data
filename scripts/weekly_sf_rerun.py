@@ -135,7 +135,44 @@ from run_scope import (  # noqa: E402 — see sys.path insertion above
     disabling_flags_for_input,
     enabled_spine_stages,
 )
-from nousergon_lib.pipeline_status.registry import stage_order_for  # noqa: E402
+from nousergon_lib.pipeline_status.registry import (  # noqa: E402
+    pending_definition_stages_for,
+    stage_order_for,
+)
+
+
+def _landed_spine(sm_arn: str) -> tuple[str, ...]:
+    """The declared spine, MINUS stages the pinned library has declared ahead
+    of this repo's own definitions (PENDING_DEFINITION_STAGES).
+
+    alpha-engine-config-I11267 added ``PENDING_DEFINITION_STAGES`` precisely
+    so a consumer repo is not forced into merge-order lockstep with the
+    library — a pending stage the pinned lib names is one this repo has not
+    landed a state for YET, and a stage that cannot exist cannot be entered.
+    Feeding the RAW ``stage_order_for()`` tuple into the vacuity guard would
+    count that stage as part of "what a substantive run must enter" and
+    understate every real execution's coverage by exactly the number of
+    not-yet-landed stages — a false vacuity/coverage refusal, the identical
+    failure mode this guard exists to prevent, just introduced from the other
+    direction. The library's OWN ``undefined_spine_stages`` already applies
+    this same tolerance (`tests/test_pipeline_stage_order_contract.py` pins
+    it); this mirrors it for the two vacuity-guard call sites in this script.
+
+    Deliberately does NOT also exclude ``RETIRING_DEFINITION_STAGES``: a
+    retiring stage is the OPPOSITE direction — its definition "may be either
+    still present or already dropped" (registry.py's own docstring), i.e. it
+    is real and enterable TODAY and only tolerated as ABSENT once the repo
+    actually removes it. Excluding it here would understate today's
+    substantive spine by a stage the live definition still has, which a
+    first cut of this fix did (MorningEnrich/DataPhase1 are the two live
+    RETIRING_DEFINITION_STAGES entries for this pipeline right now) —
+    measured via test_every_declared_spine_stage_is_switchable_off's
+    hardcoded count regressing from 17 to 15.
+    """
+    spine = stage_order_for(sm_arn)
+    pending = pending_definition_stages_for(sm_arn)
+    return tuple(s for s in spine if s not in pending)
+
 
 DEFAULT_STATE_MACHINE_ARN = (
     "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
@@ -276,6 +313,15 @@ STAGES: tuple[Stage, ...] = (
             # rather than a new single-purpose Stage row.
             "SetMutexAcquireDegradedFlag", "SetMutexAcquireDegradedFlagSummary",
             "PublishMutexAcquireDegraded",
+            # alpha-engine-config-I11112: WeeklyPreflightBlindSpotDeclared and
+            # its Pass/Publish siblings are DELIBERATELY NOT here (and not
+            # named "*Degraded") — a capability gap this probe cannot reach
+            # is a VERDICT about the environment (mirrors
+            # ModelZooUnservableDeclared, sf-pipeline-policy.md §2.3a), not a
+            # stage degradation, and a rerun has nothing to redo on the
+            # strength of it: the gap is a static fact about the Lambda's
+            # environment that a rerun does not change. See
+            # WeeklyPreflightGate's Choice comment in step_function.json.
         }),
         emit_skip=False,
         note=(
@@ -676,7 +722,17 @@ STAGES: tuple[Stage, ...] = (
         # → FailExecution) — no witness is entered, so the stage re-runs.
         # PublishDirectorDegraded is RETAINED for pre-fix execution
         # histories only; new executions never enter it.
-        degraded_witness=frozenset({"PublishDirectorDegraded"}),
+        # alpha-engine-config-I11299: DirectorSubStatusDegraded is the §2.3b
+        # fold — the stage SUCCEEDED and wrote its plan while one of its
+        # named legs errored. It is a degraded witness, not a re-run
+        # trigger: DirectorComplete is still entered on that route, so the
+        # deriver reads the stage as complete. Listed so the lockstep test
+        # sees every *Degraded state on the Director path, which is what
+        # stops a future fold from silently meaning "re-run the advisory".
+        degraded_witness=frozenset({
+            "PublishDirectorDegraded", "DirectorSubStatusDegraded",
+            "SetDirectorSubStatusDegradedSummary",
+        }),
     ),
     Stage(
         "scanner_leaderboard", "skip_scanner_leaderboard",
@@ -1787,7 +1843,7 @@ def refuse_vacuous_rerun(
     Accepting does NOT make the run substantive — the SF still terminates
     ``VacuousRun`` — it records who decided to spend the dispatch and why.
     """
-    spine = stage_order_for(sm_arn)
+    spine = _landed_spine(sm_arn)
     if not spine:
         raise VacuousRerunError(
             f"no declared spine for {sm_arn.rsplit(':', 1)[-1]!r} in "
@@ -2124,7 +2180,7 @@ def main(argv: list | None = None) -> int:
     # Reported here so --dry-run shows it; ENFORCED below, after the plan is
     # printed, because a refusal an operator cannot read the plan behind is a
     # refusal they will work around.
-    spine = stage_order_for(args.state_machine_arn)
+    spine = _landed_spine(args.state_machine_arn)
     if not spine:
         raise VacuousRerunError(
             f"no declared spine for {args.state_machine_arn.rsplit(':', 1)[-1]!r} "

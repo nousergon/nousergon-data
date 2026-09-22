@@ -52,6 +52,11 @@ _FAMILY_BY_STATE = {
     "SetResearchPredictorDegradedSummary": "research_predictor",
     "SetScannerResourceKillDegradedSummary": "research_predictor",
     "SetAggregateCostsDegradedSummary": "aggregate_costs",
+    # alpha-engine-config-I11299 (sf-pipeline-policy.md §2.3b): its own family
+    # key, deliberately not folded onto any other — a Director leg that errored
+    # is a distinct cause from a cost-aggregation fail-open, and the terminal
+    # marker must be able to name which.
+    "SetDirectorSubStatusDegradedSummary": "director",
     "SetScannerLeaderboardDegradedSummary": "scanner_leaderboard",
     "SetLibPinGateDegradedSummary": "lib_pin_gate",
     "SetPipelineContractGateDegradedSummary": "pipeline_contract_gate",

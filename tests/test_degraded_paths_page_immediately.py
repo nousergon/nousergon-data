@@ -107,6 +107,32 @@ _NO_IMMEDIATE_PAGE: dict[tuple[str, str], str] = {
     ): "Same as the daily mutex path.",
     (
         "step_function.json",
+        "SetDirectorSubStatusDegradedSummary",
+    ): (
+        "STAGED, with the follow-up tracked as alpha-engine-config-I11322 — "
+        "not a claim that this path should stay silent. The robust shape is "
+        "PublishAggregateCostsDegraded's (alpha-engine-config-I8336) and it is "
+        "what this family should have: $.director_degraded is registered LAST "
+        "in CheckGateDegradedNotify, so it folds into "
+        "NotifyCompleteMultipleDegraded, which deliberately names no specific "
+        "family. What the robust path COSTS is a three-repo lockstep: a named "
+        "sns:publish is a new SUBSTANTIVE Task state, and "
+        "tests/test_pipeline_status_registry_source_check.py requires every "
+        "one of those to carry a nousergon_lib.pipeline_status.registry entry "
+        "MERGED AND PINNED in the same PR as the SF JSON change — against a "
+        "lib version that is written by merge-time autobump, so the pin cannot "
+        "be authored before the lib PR merges. Why staging is correct HERE: "
+        "the honest terminal is what alpha-engine-config-I11299's Closes-when "
+        "asks for and it lands whole — the run ends DegradedRun with "
+        "degraded_summary.reasons.director naming this leg, the completion "
+        "email says the run degraded, and the Director Lambda already logs the "
+        "refusal at ERROR and emits AlphaEngine/Director RetroJudgeSelfGraded. "
+        "The gap is NAMING the family in the first email, which is a "
+        "refinement of a signal that now exists at all, where before this "
+        "change there was none."
+    ),
+    (
+        "step_function.json",
         "SetResearchPredictorDegradedSummary",
     ): (
         "The post-Parallel HOIST of a fact that already paged. Every fail-open "

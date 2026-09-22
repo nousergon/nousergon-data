@@ -1,0 +1,1018 @@
+{
+  "data": {
+    "data": {
+      "rows": [
+        {
+          "symbol": "AAPL",
+          "sector": "",
+          "companyName": "Apple Inc. Common Stock",
+          "marketCap": "4,938,674,890,254",
+          "lastSalePrice": "$338.455",
+          "netChange": "$2.325",
+          "percentageChange": "+0.69%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMAT",
+          "sector": "",
+          "companyName": "Applied Materials, Inc. Common Stock",
+          "marketCap": "367,157,857,004",
+          "lastSalePrice": "$462.65",
+          "netChange": "$18.08",
+          "percentageChange": "+4.07%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMGN",
+          "sector": "",
+          "companyName": "Amgen Inc. Common Stock",
+          "marketCap": "212,143,998,762",
+          "lastSalePrice": "$392.42",
+          "netChange": "$6.77",
+          "percentageChange": "+1.76%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CMCSA",
+          "sector": "",
+          "companyName": "Comcast Corporation Class A Common Stock",
+          "marketCap": "81,742,843,459",
+          "lastSalePrice": "$22.985",
+          "netChange": "$0.245",
+          "percentageChange": "+1.08%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "INTC",
+          "sector": "",
+          "companyName": "Intel Corporation Common Stock",
+          "marketCap": "643,695,041,092",
+          "lastSalePrice": "$121.7755",
+          "netChange": "$13.1755",
+          "percentageChange": "+12.13%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "KLAC",
+          "sector": "",
+          "companyName": "KLA Corporation Common Stock",
+          "marketCap": "240,156,364,183",
+          "lastSalePrice": "$183.81",
+          "netChange": "$6.82",
+          "percentageChange": "+3.85%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "PCAR",
+          "sector": "",
+          "companyName": "PACCAR Inc. Common Stock",
+          "marketCap": "60,231,941,572",
+          "lastSalePrice": "$114.55",
+          "netChange": "$1.51",
+          "percentageChange": "-1.30%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "CTAS",
+          "sector": "",
+          "companyName": "Cintas Corporation Common Stock",
+          "marketCap": "78,796,691,955",
+          "lastSalePrice": "$196.88",
+          "netChange": "$0.76",
+          "percentageChange": "-0.38%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "PAYX",
+          "sector": "",
+          "companyName": "Paychex, Inc. Common Stock",
+          "marketCap": "40,976,912,247",
+          "lastSalePrice": "$115.10",
+          "netChange": "$1.04",
+          "percentageChange": "-0.90%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "LRCX",
+          "sector": "",
+          "companyName": "Lam Research Corporation Common Stock",
+          "marketCap": "376,459,922,850",
+          "lastSalePrice": "$301.56",
+          "netChange": "$13.45",
+          "percentageChange": "+4.67%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ADSK",
+          "sector": "",
+          "companyName": "Autodesk, Inc. Common Stock",
+          "marketCap": "45,714,570,000",
+          "lastSalePrice": "$218.73",
+          "netChange": "$1.78",
+          "percentageChange": "+0.82%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ROST",
+          "sector": "",
+          "companyName": "Ross Stores, Inc. Common Stock",
+          "marketCap": "73,881,518,015",
+          "lastSalePrice": "$231.62",
+          "netChange": "$5.01",
+          "percentageChange": "+2.21%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MNST",
+          "sector": "",
+          "companyName": "Monster Beverage Corporation",
+          "marketCap": "130,443,592,168",
+          "lastSalePrice": "$44.39",
+          "netChange": "$0.32",
+          "percentageChange": "-0.72%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "MSFT",
+          "sector": "",
+          "companyName": "Microsoft Corporation Common Stock",
+          "marketCap": "3,694,097,498,590",
+          "lastSalePrice": "$497.48",
+          "netChange": "$3.70",
+          "percentageChange": "+0.75%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ADBE",
+          "sector": "",
+          "companyName": "Adobe Inc. Common Stock",
+          "marketCap": "98,764,837,500",
+          "lastSalePrice": "$248.465",
+          "netChange": "$0.455",
+          "percentageChange": "-0.18%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "FAST",
+          "sector": "",
+          "companyName": "Fastenal Company Common Stock",
+          "marketCap": "56,583,105,325",
+          "lastSalePrice": "$49.25",
+          "netChange": "$0.24",
+          "percentageChange": "+0.49%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CSCO",
+          "sector": "",
+          "companyName": "Cisco Systems, Inc. Common Stock (DE)",
+          "marketCap": "431,949,817,806",
+          "lastSalePrice": "$109.56",
+          "netChange": "$0.05",
+          "percentageChange": "+0.05%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "REGN",
+          "sector": "",
+          "companyName": "Regeneron Pharmaceuticals, Inc. Common Stock",
+          "marketCap": "82,200,291,969",
+          "lastSalePrice": "$798.41",
+          "netChange": "$13.56",
+          "percentageChange": "+1.73%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "IDXX",
+          "sector": "",
+          "companyName": "IDEXX Laboratories, Inc. Common Stock",
+          "marketCap": "40,702,263,581",
+          "lastSalePrice": "$516.215",
+          "netChange": "$4.565",
+          "percentageChange": "+0.89%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "VRTX",
+          "sector": "",
+          "companyName": "Vertex Pharmaceuticals Incorporated Common Stock",
+          "marketCap": "129,870,842,848",
+          "lastSalePrice": "$511.63",
+          "netChange": "$3.29",
+          "percentageChange": "+0.65%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ODFL",
+          "sector": "",
+          "companyName": "Old Dominion Freight Line, Inc. Common Stock",
+          "marketCap": "36,144,332,781",
+          "lastSalePrice": "$173.575",
+          "netChange": "$0.575",
+          "percentageChange": "+0.33%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "QCOM",
+          "sector": "",
+          "companyName": "QUALCOMM Incorporated Common Stock",
+          "marketCap": "201,833,954,938",
+          "lastSalePrice": "$192.13",
+          "netChange": "$14.41",
+          "percentageChange": "+8.11%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "GILD",
+          "sector": "",
+          "companyName": "Gilead Sciences, Inc. Common Stock",
+          "marketCap": "187,630,014,055",
+          "lastSalePrice": "$151.325",
+          "netChange": "$1.215",
+          "percentageChange": "+0.81%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "SNPS",
+          "sector": "",
+          "companyName": "Synopsys, Inc. Common Stock",
+          "marketCap": "76,819,465,916",
+          "lastSalePrice": "$400.67",
+          "netChange": "$15.70",
+          "percentageChange": "+4.08%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "SBUX",
+          "sector": "",
+          "companyName": "Starbucks Corporation Common Stock",
+          "marketCap": "107,627,400,000",
+          "lastSalePrice": "$94.4001",
+          "netChange": "$1.4299",
+          "percentageChange": "-1.49%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "INTU",
+          "sector": "",
+          "companyName": "Intuit Inc. Common Stock",
+          "marketCap": "80,897,681,920",
+          "lastSalePrice": "$302.67",
+          "netChange": "$0.52",
+          "percentageChange": "-0.17%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "MCHP",
+          "sector": "",
+          "companyName": "Microchip Technology Incorporated Common Stock",
+          "marketCap": "40,424,282,001",
+          "lastSalePrice": "$74.445",
+          "netChange": "$1.175",
+          "percentageChange": "+1.60%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ORLY",
+          "sector": "",
+          "companyName": "O'Reilly Automotive, Inc. Common Stock",
+          "marketCap": "67,511,822,896",
+          "lastSalePrice": "$83.455",
+          "netChange": "$1.255",
+          "percentageChange": "-1.48%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "COST",
+          "sector": "",
+          "companyName": "Costco Wholesale Corporation Common Stock",
+          "marketCap": "397,561,008,634",
+          "lastSalePrice": "$896.46",
+          "netChange": "$1.15",
+          "percentageChange": "+0.13%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CPRT",
+          "sector": "",
+          "companyName": "Copart, Inc. (DE) Common Stock",
+          "marketCap": "27,093,873,021",
+          "lastSalePrice": "$29.145",
+          "netChange": "$0.135",
+          "percentageChange": "-0.46%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "ASML",
+          "sector": "",
+          "companyName": "ASML Holding N.V. New York Registry Shares",
+          "marketCap": "659,256,915,983",
+          "lastSalePrice": "$1,710.50",
+          "netChange": "$30.58",
+          "percentageChange": "+1.82%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "TTWO",
+          "sector": "",
+          "companyName": "Take-Two Interactive Software, Inc. Common Stock",
+          "marketCap": "39,021,883,552",
+          "lastSalePrice": "$208.695",
+          "netChange": "$3.245",
+          "percentageChange": "+1.58%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMZN",
+          "sector": "",
+          "companyName": "Amazon.com, Inc. Common Stock",
+          "marketCap": "2,779,309,418,097",
+          "lastSalePrice": "$258.648",
+          "netChange": "$4.938",
+          "percentageChange": "+1.95%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MSTR",
+          "sector": "",
+          "companyName": "Strategy Inc Common Stock Class A",
+          "marketCap": "63,645,074,524",
+          "lastSalePrice": "$165.601",
+          "netChange": "$11.681",
+          "percentageChange": "+7.59%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "NVDA",
+          "sector": "",
+          "companyName": "NVIDIA Corporation Common Stock",
+          "marketCap": "5,471,302,500,000",
+          "lastSalePrice": "$227.285",
+          "netChange": "$5.015",
+          "percentageChange": "+2.26%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "BKNG",
+          "sector": "",
+          "companyName": "Booking Holdings Inc. Common Stock",
+          "marketCap": "126,908,166,450",
+          "lastSalePrice": "$169.04",
+          "netChange": "$1.14",
+          "percentageChange": "+0.68%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ISRG",
+          "sector": "",
+          "companyName": "Intuitive Surgical, Inc. Common Stock",
+          "marketCap": "141,141,641,742",
+          "lastSalePrice": "$399.275",
+          "netChange": "$5.945",
+          "percentageChange": "+1.51%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MRVL",
+          "sector": "",
+          "companyName": "Marvell Technology, Inc. Common Stock",
+          "marketCap": "223,548,117,000",
+          "lastSalePrice": "$255.00",
+          "netChange": "$10.75",
+          "percentageChange": "+4.40%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ADI",
+          "sector": "",
+          "companyName": "Analog Devices, Inc. Common Stock",
+          "marketCap": "184,507,992,108",
+          "lastSalePrice": "$380.815",
+          "netChange": "$5.095",
+          "percentageChange": "+1.36%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AEP",
+          "sector": "",
+          "companyName": "American Electric Power Company, Inc. Common Stock",
+          "marketCap": "65,632,544,757",
+          "lastSalePrice": "$120.36",
+          "netChange": "$0.36",
+          "percentageChange": "+0.30%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AMD",
+          "sector": "",
+          "companyName": "Advanced Micro Devices, Inc. Common Stock",
+          "marketCap": "990,732,778,239",
+          "lastSalePrice": "$607.14",
+          "netChange": "$47.32",
+          "percentageChange": "+8.45%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ADP",
+          "sector": "",
+          "companyName": "Automatic Data Processing, Inc. Common Stock",
+          "marketCap": "107,602,584,944",
+          "lastSalePrice": "$270.86",
+          "netChange": "$0.36",
+          "percentageChange": "-0.13%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "CDNS",
+          "sector": "",
+          "companyName": "Cadence Design Systems, Inc. Common Stock",
+          "marketCap": "80,814,075,850",
+          "lastSalePrice": "$293.45",
+          "netChange": "$10.55",
+          "percentageChange": "+3.73%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CSX",
+          "sector": "",
+          "companyName": "CSX Corporation Common Stock",
+          "marketCap": "85,352,781,801",
+          "lastSalePrice": "$45.995",
+          "netChange": "$1.105",
+          "percentageChange": "-2.35%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "HON",
+          "sector": "",
+          "companyName": "Honeywell International Inc. Common Stock",
+          "marketCap": "65,273,795,060",
+          "lastSalePrice": "$205.95",
+          "netChange": "$0.51",
+          "percentageChange": "-0.25%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "MAR",
+          "sector": "",
+          "companyName": "Marriott International Class A Common Stock",
+          "marketCap": "88,853,504,973",
+          "lastSalePrice": "$340.74",
+          "netChange": "$1.82",
+          "percentageChange": "+0.54%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MU",
+          "sector": "",
+          "companyName": "Micron Technology, Inc. Common Stock",
+          "marketCap": "1,174,303,469,650",
+          "lastSalePrice": "$1,039.825",
+          "netChange": "$24.025",
+          "percentageChange": "+2.37%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "XEL",
+          "sector": "",
+          "companyName": "Xcel Energy Inc. Common Stock",
+          "marketCap": "44,961,177,346",
+          "lastSalePrice": "$71.98",
+          "netChange": "$0.32",
+          "percentageChange": "-0.44%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "EXC",
+          "sector": "",
+          "companyName": "Exelon Corporation Common Stock",
+          "marketCap": "43,380,472,963",
+          "lastSalePrice": "$42.025",
+          "netChange": "$0.045",
+          "percentageChange": "-0.11%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "PEP",
+          "sector": "",
+          "companyName": "PepsiCo, Inc. Common Stock",
+          "marketCap": "177,142,450,855",
+          "lastSalePrice": "$129.79",
+          "netChange": "$0.04",
+          "percentageChange": "+0.03%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ROP",
+          "sector": "",
+          "companyName": "Roper Technologies, Inc. Common Stock",
+          "marketCap": "36,533,982,856",
+          "lastSalePrice": "$369.36",
+          "netChange": "$3.38",
+          "percentageChange": "-0.91%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "TER",
+          "sector": "",
+          "companyName": "Teradyne, Inc. Common Stock",
+          "marketCap": "59,309,426,920",
+          "lastSalePrice": "$379.47",
+          "netChange": "$8.00",
+          "percentageChange": "+2.15%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "TXN",
+          "sector": "",
+          "companyName": "Texas Instruments Incorporated Common Stock",
+          "marketCap": "245,768,651,018",
+          "lastSalePrice": "$268.955",
+          "netChange": "$2.315",
+          "percentageChange": "+0.87%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "WDC",
+          "sector": "",
+          "companyName": "Western Digital Corporation Common Stock",
+          "marketCap": "160,154,090,030",
+          "lastSalePrice": "$443.80",
+          "netChange": "$2.44",
+          "percentageChange": "+0.55%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "WMT",
+          "sector": "",
+          "companyName": "Walmart Inc. Common Stock",
+          "marketCap": "853,433,083,144",
+          "lastSalePrice": "$107.565",
+          "netChange": "$0.835",
+          "percentageChange": "+0.78%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AXON",
+          "sector": "",
+          "companyName": "Axon Enterprise, Inc. Common Stock",
+          "marketCap": "36,523,529,410",
+          "lastSalePrice": "$449.59",
+          "netChange": "$1.83",
+          "percentageChange": "+0.41%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MDLZ",
+          "sector": "",
+          "companyName": "Mondelez International, Inc. Class A Common Stock",
+          "marketCap": "77,025,191,240",
+          "lastSalePrice": "$60.34",
+          "netChange": "$0.51",
+          "percentageChange": "-0.84%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "NFLX",
+          "sector": "",
+          "companyName": "Netflix, Inc. Common Stock",
+          "marketCap": "305,267,161,921",
+          "lastSalePrice": "$73.31",
+          "netChange": "$1.52",
+          "percentageChange": "+2.12%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "STX",
+          "sector": "",
+          "companyName": "Seagate Technology Holdings PLC Ordinary Shares (Ireland)",
+          "marketCap": "199,474,597,069",
+          "lastSalePrice": "$872.59",
+          "netChange": "$13.80",
+          "percentageChange": "+1.61%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ALNY",
+          "sector": "",
+          "companyName": "Alnylam Pharmaceuticals, Inc. Common Stock",
+          "marketCap": "32,937,114,396",
+          "lastSalePrice": "$245.895",
+          "netChange": "$6.335",
+          "percentageChange": "+2.64%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "GOOGL",
+          "sector": "",
+          "companyName": "Alphabet Inc. Class A Common Stock",
+          "marketCap": "4,357,671,300,000",
+          "lastSalePrice": "$356.29",
+          "netChange": "$6.75",
+          "percentageChange": "+1.93%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "MPWR",
+          "sector": "",
+          "companyName": "Monolithic Power Systems, Inc. Common Stock",
+          "marketCap": "62,026,328,880",
+          "lastSalePrice": "$1,262.16",
+          "netChange": "$44.36",
+          "percentageChange": "+3.64%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "DXCM",
+          "sector": "",
+          "companyName": "DexCom, Inc. Common Stock",
+          "marketCap": "33,528,503,970",
+          "lastSalePrice": "$89.03",
+          "netChange": "$0.32",
+          "percentageChange": "-0.36%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "TMUS",
+          "sector": "",
+          "companyName": "T-Mobile US, Inc. Common Stock",
+          "marketCap": "178,991,348,703",
+          "lastSalePrice": "$167.09",
+          "netChange": "$1.09",
+          "percentageChange": "-0.65%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "MELI",
+          "sector": "",
+          "companyName": "MercadoLibre, Inc. Common Stock",
+          "marketCap": "92,623,057,254",
+          "lastSalePrice": "$1,827.245",
+          "netChange": "$39.855",
+          "percentageChange": "+2.23%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "KDP",
+          "sector": "",
+          "companyName": "Keurig Dr Pepper Inc. Common Stock",
+          "marketCap": "41,893,029,580",
+          "lastSalePrice": "$30.785",
+          "netChange": "$0.175",
+          "percentageChange": "-0.57%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "NBIS",
+          "sector": "",
+          "companyName": "Nebius Group N.V. Class A Ordinary Shares",
+          "marketCap": "63,724,222,375",
+          "lastSalePrice": "$234.40",
+          "netChange": "$10.86",
+          "percentageChange": "+4.86%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "AVGO",
+          "sector": "",
+          "companyName": "Broadcom Inc. Common Stock",
+          "marketCap": "1,717,910,047,667",
+          "lastSalePrice": "$359.875",
+          "netChange": "$2.915",
+          "percentageChange": "+0.82%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "FTNT",
+          "sector": "",
+          "companyName": "Fortinet, Inc. Common Stock",
+          "marketCap": "128,106,403,814",
+          "lastSalePrice": "$174.60",
+          "netChange": "$4.76",
+          "percentageChange": "+2.80%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "TSLA",
+          "sector": "",
+          "companyName": "Tesla, Inc. Common Stock",
+          "marketCap": "1,475,274,438,081",
+          "lastSalePrice": "$373.53",
+          "netChange": "$9.26",
+          "percentageChange": "+2.54%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "NXPI",
+          "sector": "",
+          "companyName": "NXP Semiconductors N.V. Common Stock",
+          "marketCap": "58,154,101,808",
+          "lastSalePrice": "$230.49",
+          "netChange": "$2.50",
+          "percentageChange": "+1.10%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "FANG",
+          "sector": "",
+          "companyName": "Diamondback Energy, Inc. Common Stock",
+          "marketCap": "52,832,194,681",
+          "lastSalePrice": "$188.52",
+          "netChange": "$3.90",
+          "percentageChange": "-2.03%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "META",
+          "sector": "",
+          "companyName": "Meta Platforms, Inc. Class A Common Stock",
+          "marketCap": "1,894,503,954,346",
+          "lastSalePrice": "$743.445",
+          "netChange": "$78.22",
+          "percentageChange": "+11.76%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "PANW",
+          "sector": "",
+          "companyName": "Palo Alto Networks, Inc. Common Stock",
+          "marketCap": "301,760,281,800",
+          "lastSalePrice": "$368.9001",
+          "netChange": "$5.3201",
+          "percentageChange": "+1.46%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "WDAY",
+          "sector": "",
+          "companyName": "Workday, Inc. Class A Common Stock",
+          "marketCap": "46,645,550,000",
+          "lastSalePrice": "$193.39",
+          "netChange": "$0.48",
+          "percentageChange": "-0.25%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "GOOG",
+          "sector": "",
+          "companyName": "Alphabet Inc. Class C Capital Stock",
+          "marketCap": "4,309,423,950,000",
+          "lastSalePrice": "$352.365",
+          "netChange": "$7.955",
+          "percentageChange": "+2.31%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "PYPL",
+          "sector": "",
+          "companyName": "PayPal Holdings, Inc. Common Stock",
+          "marketCap": "45,117,006,495",
+          "lastSalePrice": "$52.73",
+          "netChange": "$0.32",
+          "percentageChange": "+0.61%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "SHOP",
+          "sector": "",
+          "companyName": "Shopify Inc. Class A Subordinate Voting Shares",
+          "marketCap": "172,679,777,192",
+          "lastSalePrice": "$133.3099",
+          "netChange": "$4.8099",
+          "percentageChange": "+3.74%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "LITE",
+          "sector": "",
+          "companyName": "Lumentum Holdings Inc. Common Stock",
+          "marketCap": "85,782,801,000",
+          "lastSalePrice": "$956.13",
+          "netChange": "$25.22",
+          "percentageChange": "+2.71%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CCEP",
+          "sector": "",
+          "companyName": "Coca-Cola Europacific Partners plc Ordinary Shares",
+          "marketCap": "45,686,522,145",
+          "lastSalePrice": "$100.50",
+          "netChange": "$0.73",
+          "percentageChange": "+0.73%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "BKR",
+          "sector": "",
+          "companyName": "Baker Hughes Company Class A Common Stock",
+          "marketCap": "57,207,806,712",
+          "lastSalePrice": "$57.89",
+          "netChange": "$0.64",
+          "percentageChange": "+1.12%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "PDD",
+          "sector": "",
+          "companyName": "PDD Holdings Inc. American Depositary Shares",
+          "marketCap": "113,003,445,118",
+          "lastSalePrice": "$79.39",
+          "netChange": "$0.49",
+          "percentageChange": "+0.62%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CRWD",
+          "sector": "",
+          "companyName": "CrowdStrike Holdings, Inc. Class A Common Stock",
+          "marketCap": "253,485,309,486",
+          "lastSalePrice": "$247.59",
+          "netChange": "$9.94",
+          "percentageChange": "+4.18%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "DDOG",
+          "sector": "",
+          "companyName": "Datadog, Inc. Class A Common Stock",
+          "marketCap": "86,619,668,040",
+          "lastSalePrice": "$241.23",
+          "netChange": "$11.31",
+          "percentageChange": "+4.92%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "RKLB",
+          "sector": "",
+          "companyName": "Rocket Lab Corporation Common Stock",
+          "marketCap": "43,710,910,627",
+          "lastSalePrice": "$69.61",
+          "netChange": "$5.04",
+          "percentageChange": "+7.81%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "PLTR",
+          "sector": "",
+          "companyName": "Palantir Technologies Inc. Class A Common Stock",
+          "marketCap": "436,573,219,990",
+          "lastSalePrice": "$181.7959",
+          "netChange": "$4.1559",
+          "percentageChange": "+2.34%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ABNB",
+          "sector": "",
+          "companyName": "Airbnb, Inc. Class A Common Stock",
+          "marketCap": "100,003,196,751",
+          "lastSalePrice": "$167.04",
+          "netChange": "$0.82",
+          "percentageChange": "+0.49%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "DASH",
+          "sector": "",
+          "companyName": "DoorDash, Inc. Class A Common Stock",
+          "marketCap": "83,875,648,155",
+          "lastSalePrice": "$194.34",
+          "netChange": "$1.40",
+          "percentageChange": "+0.73%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "APP",
+          "sector": "",
+          "companyName": "Applovin Corporation Class A Common Stock",
+          "marketCap": "110,278,949,564",
+          "lastSalePrice": "$329.53",
+          "netChange": "$21.47",
+          "percentageChange": "+6.97%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "CEG",
+          "sector": "",
+          "companyName": "Constellation Energy Corporation Common Stock ",
+          "marketCap": "93,631,039,511",
+          "lastSalePrice": "$264.12",
+          "netChange": "$9.41",
+          "percentageChange": "+3.69%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "WBD",
+          "sector": "",
+          "companyName": "Warner Bros. Discovery, Inc. Series A Common Stock ",
+          "marketCap": "77,553,867,877",
+          "lastSalePrice": "$30.865",
+          "netChange": "$3.065",
+          "percentageChange": "+11.03%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "GEHC",
+          "sector": "",
+          "companyName": "GE HealthCare Technologies Inc. Common Stock ",
+          "marketCap": "29,124,729,529",
+          "lastSalePrice": "$64.48",
+          "netChange": "$0.35",
+          "percentageChange": "+0.55%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "LIN",
+          "sector": "",
+          "companyName": "Linde plc Ordinary Shares",
+          "marketCap": "211,322,526,322",
+          "lastSalePrice": "$457.31",
+          "netChange": "$3.09",
+          "percentageChange": "-0.67%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "ARM",
+          "sector": "",
+          "companyName": "Arm Holdings plc American Depositary Shares",
+          "marketCap": "339,026,305,038",
+          "lastSalePrice": "$318.6172",
+          "netChange": "$43.0072",
+          "percentageChange": "+15.60%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "TRI",
+          "sector": "",
+          "companyName": "Thomson Reuters Corporation Common Shares",
+          "marketCap": "41,533,050,000",
+          "lastSalePrice": "$95.40",
+          "netChange": "$1.01",
+          "percentageChange": "+1.07%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "FER",
+          "sector": "",
+          "companyName": "Ferrovial N.V. Ordinary Shares",
+          "marketCap": "40,185,312,738",
+          "lastSalePrice": "$55.865",
+          "netChange": "$0.825",
+          "percentageChange": "+1.50%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "ALAB",
+          "sector": "",
+          "companyName": "Astera Labs, Inc. Common Stock",
+          "marketCap": "57,244,879,767",
+          "lastSalePrice": "$332.1758",
+          "netChange": "$28.9258",
+          "percentageChange": "+9.54%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "SNDK",
+          "sector": "",
+          "companyName": "Sandisk Corporation Common Stock",
+          "marketCap": "255,031,151,752",
+          "lastSalePrice": "$1,741.225",
+          "netChange": "$50.595",
+          "percentageChange": "-2.82%",
+          "deltaIndicator": "down"
+        },
+        {
+          "symbol": "CRWV",
+          "sector": "",
+          "companyName": "CoreWeave, Inc. Class A Common Stock",
+          "marketCap": "47,685,854,609",
+          "lastSalePrice": "$86.4464",
+          "netChange": "$5.0864",
+          "percentageChange": "+6.25%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "SPCX",
+          "sector": "",
+          "companyName": "Space Exploration Technologies Corp. Class A Common Stock",
+          "marketCap": "2,091,049,258,780",
+          "lastSalePrice": "$153.985",
+          "netChange": "$1.275",
+          "percentageChange": "+0.83%",
+          "deltaIndicator": "up"
+        },
+        {
+          "symbol": "HONA",
+          "sector": "",
+          "companyName": "Honeywell Aerospace Inc. Common Stock ",
+          "marketCap": "53,075,318,565",
+          "lastSalePrice": "$167.16",
+          "netChange": "$3.56",
+          "percentageChange": "+2.18%",
+          "deltaIndicator": "up"
+        }
+      ]
+    }
+  }
+}

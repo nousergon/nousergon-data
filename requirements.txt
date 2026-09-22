@@ -147,7 +147,7 @@ arcticdb>=6.26.0
 # `contracts` already pulled the same package, but naming the extra the
 # module actually belongs to is what keeps that true if either moves.
 # `crucible` pins the same pair for the same reason: nousergon-lib[github-app,gates].
-nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.139
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.149
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

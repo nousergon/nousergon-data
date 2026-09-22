@@ -64,6 +64,31 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
         (),
     ),
     "D02": (("market_data/historical_constituents.json",), (), ()),
+    # alpha-engine-config-I11297. Templated keys rather than globs, so each
+    # resolves to contracts/index_contributions.schema.json. The matching
+    # ARTIFACT_REGISTRY row is DEFERRED with the producer's schedule
+    # (alpha-engine-config-I11306) under this repo's "never register a freshness
+    # entry ahead of its producer" rule — registering it now would report a
+    # false state=missing every cycle. That deferral is the deliberate answer to
+    # this pin's "confirm the matching row in the same change", not an omission.
+    "D48": (
+        (
+            "market_data/index_contributions/{index}/latest.json",
+            "market_data/index_contributions/{index}/{date}.json",
+        ),
+        (),
+        (),
+    ),
+    # alpha-engine-config-I11296. Same shape, same deferral, filed separately as
+    # alpha-engine-config-I11307.
+    "D49": (
+        (
+            "market_data/index_constituents/NDX.json",
+            "market_data/weekly/{date}/NDX.json",
+        ),
+        (),
+        (),
+    ),
     "D03": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D04": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D05": (

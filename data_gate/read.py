@@ -167,6 +167,16 @@ GATES: dict[str, int | None] = {
     "data-phase1": 1,
     "data-phase2": 2,
     "data-phase3": 3,
+    # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21 ruling: a
+    # second `ceiling=None` gate, alongside `data-cutover-ready`, publishing
+    # the three reliability-streak STANDING clauses
+    # (`clauses.py::RELIABILITY_GATE`) as their own artifact — Crucible v2
+    # phase 4 gates its irreversible v1-pipeline deletion
+    # (`alpha-engine-config-I10655`) on this, never on a numbered data-phase
+    # gate. Never a ceiling: a numbered rung's own `<= ceiling` selection
+    # already cannot match a non-`data-phaseN` phase tag, so this gate is
+    # reached only by its own exact name, exactly like `data-cutover-ready`.
+    clause_module.RELIABILITY_GATE: None,
 }
 
 
@@ -225,7 +235,19 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
     unconnected = [c for c in all_clauses if clause_module.is_unconnected(c)]
     gradable = [c for c in all_clauses if not clause_module.is_ungraded(c)]
     if ceiling is None:
-        selected = [c for c in gradable if c.phase == gate]
+        # `alpha-engine-config-I10793`/`-I10788`: a STANDING clause whose OWN
+        # declared `phase` names THIS exact gate is graded by it — "graded by
+        # no gate" (`is_ungraded`) means no NUMBERED data-phase gate, never
+        # "graded by nothing at all". A numbered gate's `<= ceiling` branch
+        # below needs no equivalent carve-out: `_phase_number` already returns
+        # `None` for a non-`data-phaseN` tag like `RELIABILITY_GATE`, so a
+        # standing clause published under its own gate can never match a
+        # numbered ceiling regardless of this branch.
+        selected = [
+            c
+            for c in all_clauses
+            if c.phase == gate and (not clause_module.is_ungraded(c) or clause_module.is_standing(c))
+        ]
     else:
         selected = [
             c
@@ -348,11 +370,17 @@ def _board_document(
     per_unit, connection_counts = _connection_summary(units if units is not None else load_units())
     rows = []
     for clause in clauses:
+        standing = clause_module.is_standing(clause)
         if clause_module.is_retired(clause):
             state = "RETIRED"
         elif clause_module.is_unconnected(clause):
             state = "UNCONNECTED"
         else:
+            # A STANDING clause (`alpha-engine-config-I10793`/`-I10788`, Brian's
+            # 2026-09-21 ruling) renders its REAL state here — MET, UNMET or
+            # UNMEASURABLE, exactly like an ordinary clause. "No data is never
+            # rendered as green" cuts both ways: standing is a fact about
+            # which gate counts it, never a euphemism for its own reading.
             state = "UNMEASURABLE" if clause.unmeasurable else ("MET" if clause.met else "UNMET")
         unit_id = _row_unit_id(clause.name)
         row = {
@@ -369,30 +397,43 @@ def _board_document(
             "evidence": sorted(clause.evidence),
             "source": clause.source,
             "as_of": clause.as_of,
+            # `alpha-engine-config-I10793`/`-I10788`: True for a clause read
+            # and rendered every day with its real state but graded by NO
+            # gate (`clauses.StandingClause`). Distinct from `state`, which
+            # stays real — this field is the only place "excluded from
+            # gating" is recorded, so a consumer can tell "measured, not
+            # gating" apart from "measured, gating, currently green/red".
+            "standing": standing,
         }
+        if standing:
+            row["standing_ruling"] = getattr(clause, "ruling", "")
         if unit_id in per_unit:
             row.update(per_unit[unit_id])
         rows.append(row)
-    unmeasurable = sum(1 for r in rows if r["state"] == "UNMEASURABLE")
+    unmeasurable = sum(1 for r in rows if r["state"] == "UNMEASURABLE" and not r["standing"])
     retired = sum(1 for r in rows if r["state"] == "RETIRED")
     unconnected = sum(1 for r in rows if r["state"] == "UNCONNECTED")
+    standing_count = sum(1 for r in rows if r["standing"])
     return {
         "schema_version": "data_board.v1",
         "board": "data-collection",
         "trading_day": trading_day.isoformat(),
         "generated_utc": generated_utc,
         "store": store_uri,
-        # The graded denominator: RETIRED and UNCONNECTED rows are published
-        # but excluded.
-        "clauses_total": len(rows) - retired - unconnected,
+        # The graded denominator: RETIRED, UNCONNECTED and STANDING rows are
+        # published but excluded — none of the three is graded by any gate.
+        "clauses_total": len(rows) - retired - unconnected - standing_count,
         "clauses_retired": retired,
         "clauses_unconnected": unconnected,
+        "clauses_standing": standing_count,
         "connection_counts": connection_counts,
-        "clauses_met": sum(1 for r in rows if r["state"] == "MET"),
-        "clauses_unmet": sum(1 for r in rows if r["state"] == "UNMET"),
+        "clauses_met": sum(1 for r in rows if r["state"] == "MET" and not r["standing"]),
+        "clauses_unmet": sum(1 for r in rows if r["state"] == "UNMET" and not r["standing"]),
         # The transparency gap (observability-policy §8.4). Published even at
         # zero: a coverage figure that only appears when non-zero cannot be told
-        # apart from health when it is absent.
+        # apart from health when it is absent. A standing clause's own
+        # UNMEASURABLE state (if it ever reads one) is excluded here too — it
+        # is graded by no gate, so it cannot widen a gap no gate is reading.
         "transparency_gap": unmeasurable,
         "rows": rows,
     }
@@ -458,7 +499,7 @@ def render(result: GateResult, board: dict, *, dry_run: bool) -> str:
         f"board: {board['clauses_met']} met / {board['clauses_unmet']} unmet / "
         f"{board['transparency_gap']} unmeasurable of {board['clauses_total']} graded clauses "
         f"({board['clauses_retired']} RETIRED, {board['clauses_unconnected']} UNCONNECTED, "
-        "graded by no gate)"
+        f"{board.get('clauses_standing', 0)} STANDING, graded by no gate)"
     )
     counts = board["connection_counts"]
     lines.append(
@@ -467,6 +508,17 @@ def render(result: GateResult, board: dict, *, dry_run: bool) -> str:
         f"of {counts['units_total']}"
     )
     lines.append(f"transparency gap (UNREPORTED): {board['transparency_gap']} — objective is 0")
+    # `alpha-engine-config-I10793`/`-I10788`: a STANDING clause is graded by no
+    # gate, so `result.render()` above (the SPECIFIC gate's own clause list)
+    # never shows it — printed here instead, with its real state, so `data_gate
+    # read` never hides a real reading behind the exclusion that keeps it from
+    # blocking a phase (Brian's 2026-09-21 ruling).
+    standing_rows = [r for r in board["rows"] if r.get("standing")]
+    if standing_rows:
+        lines.append(f"standing (measured daily, gates no phase): {len(standing_rows)}")
+        for row in standing_rows:
+            marker = "x" if row["state"] == "MET" else ("?" if row["state"] == "UNMEASURABLE" else " ")
+            lines.append(f"  [{marker}] {row['clause']}: {row['detail']}")
     if dry_run:
         lines.append("dry run: nothing was written")
     return "\n".join(lines)

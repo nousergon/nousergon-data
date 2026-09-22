@@ -20,6 +20,30 @@ reconciled against the audit's §5 summary table — an INDEPENDENT tally the au
 published beside the rows. A transcription error changes a count, and a count
 that does not add up fails here. Re-reading the same 46 rows to compare them
 with themselves would not have caught that.
+
+**THE AUDIT IS A FROZEN BASELINE, NOT A LIVING REGISTER** (Brian ruling
+2026-09-21, `alpha-engine-config-I11319`). The audit is dated in its own
+filename and its whole value here is that it was taken independently at a point
+in time. Units added after it are registered, generate their nine clauses and
+count in the board's denominator — but they are NOT audit cells, because no
+audit scored them, and amending a dated document to include units that did not
+exist when it was written would make it a record of nothing.
+
+So this file grades two populations, deliberately:
+
+* `BASELINE_UNIT_IDS` — the 46 the audit scored. `AUDIT_SUMMARY` and the totals
+  are reconciled over exactly these, and the drift check is unchanged: a
+  baseline unit that disappears from `registry.d/units/` still fails here,
+  which is the whole reason the constants are hard-coded.
+* `POST_BASELINE_UNIT_IDS` — units registered since. Pinned, so adding one is
+  still a deliberate act that cannot slip in silently; their clauses are
+  required to exist, and their self-declared `audit.cells` are NOT folded into
+  the audit's published tallies.
+
+The alternative considered and rejected was editing `AUDIT_SUMMARY` to absorb
+each new unit. That would have satisfied the test while destroying it: a
+constant maintained to match the descriptors it checks checks nothing, and every
+future unit would re-open the same question.
 """
 
 from __future__ import annotations
@@ -48,23 +72,85 @@ AUDIT_SUMMARY: dict[str, dict[str, int]] = {
     "survives_phase4": {"PRESENT": 7, "ABSENT": 0, "BROKEN": 37, "UNVERIFIED": 2},
 }
 
+#: The unit ids the 2026-09-14 audit scored. Frozen with `AUDIT_SUMMARY` and
+#: part of the same independent reading: the summary's counts are only
+#: interpretable against a known population, so pinning the totals without
+#: pinning WHICH units they cover would let a swap (one unit out, one in) keep
+#: every count intact.
+BASELINE_UNIT_IDS: frozenset[str] = frozenset({
+    "D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D09", "D10",
+    "D11", "D12", "D13", "D14", "D15", "D15L", "D16", "D17", "D18", "D19",
+    "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29",
+    "D30", "D31", "D32", "D33", "D34", "D35", "D36", "D37", "D38", "D39",
+    "D40", "D41", "D42", "D43", "D46", "D47",
+})
+
+#: Units registered AFTER the audit baseline (`alpha-engine-config-I11319`).
+#: Pinned rather than inferred as "whatever is not in the baseline": an
+#: unpinned remainder would let a new unit appear with no acknowledgement
+#: anywhere, which is the drift this file exists to make impossible — just in
+#: the opposite direction from a unit going missing.
+POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset({
+    # D48, per-constituent index contribution (alpha-engine-config-I11297).
+    # Registered here rather than folded into AUDIT_SUMMARY: the audit is a
+    # frozen 2026-09-14 baseline and scored no such unit.
+    "D48",
+    # D49, Nasdaq-100 membership + weights (alpha-engine-config-I11296). Same
+    # reasoning; it is D48's weight source for the NDX leg.
+    "D49",
+})
+
 AUDIT_UNITS = 46
 AUDIT_CELLS = AUDIT_UNITS * len(AUDIT_COLUMNS)
 
 
 def test_the_audit_has_forty_six_units():
-    units = load_units()
-    assert len(units) == AUDIT_UNITS, (
-        f"{len(units)} descriptors against the audit's {AUDIT_UNITS} units. A unit without a "
-        "descriptor is a unit the board renders complete without."
+    """The baseline population, unchanged. A baseline unit that loses its
+    descriptor still fails here — that is the drift check, and it is not
+    weakened by letting the register grow past the audit."""
+    assert len(BASELINE_UNIT_IDS) == AUDIT_UNITS
+    declared = {unit.unit_id for unit in load_units()}
+    missing = BASELINE_UNIT_IDS - declared
+    assert not missing, (
+        f"baseline unit(s) with no descriptor: {sorted(missing)}. A unit without a descriptor "
+        "is a unit the board renders complete without."
+    )
+
+
+def test_every_descriptor_is_either_baseline_or_pinned_as_post_baseline():
+    """Adding a unit stays a deliberate act. Post-baseline units are legal
+    (`alpha-engine-config-I11319`) but must be named in
+    `POST_BASELINE_UNIT_IDS`, or a new unit could appear with no
+    acknowledgement anywhere — the same invisible drift as one going missing,
+    from the other direction."""
+    declared = {unit.unit_id for unit in load_units()}
+    unaccounted = declared - BASELINE_UNIT_IDS - POST_BASELINE_UNIT_IDS
+    assert not unaccounted, (
+        f"descriptor(s) in neither population pin: {sorted(unaccounted)}. A unit added after the "
+        "2026-09-14 audit baseline is registered by adding its id to POST_BASELINE_UNIT_IDS in "
+        "this file — NOT by editing AUDIT_SUMMARY, which is the audit's independent reading and "
+        "checks nothing once it is maintained to match the descriptors."
+    )
+    retired = POST_BASELINE_UNIT_IDS - declared
+    assert not retired, (
+        f"POST_BASELINE_UNIT_IDS names unit(s) with no descriptor: {sorted(retired)} — remove the "
+        "pin when the unit goes, so the pin cannot outlive what it registers."
     )
 
 
 def test_every_cell_has_exactly_one_base_clause():
+    """Baseline cells are exactly 414 and each maps to one clause; EVERY
+    descriptor, baseline or not, contributes its nine and no duplicates."""
     units = load_units()
     names = base_clause_names(units)
-    assert len(names) == AUDIT_CELLS == 414
     assert len(set(names)) == len(names), "duplicate base clause name"
+
+    baseline = [u for u in units if u.unit_id in BASELINE_UNIT_IDS]
+    baseline_names = base_clause_names(baseline)
+    assert len(baseline_names) == AUDIT_CELLS == 414
+
+    # The register's own population, which grows: nine clauses per descriptor.
+    assert len(names) == len(units) * len(AUDIT_COLUMNS)
 
     expected = {
         base_clause_name(unit.unit_id, column) for unit in units for column in unit.cells
@@ -104,6 +190,12 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 "data.phase1.",
                 "data.phase2.",
                 "data.phase3.",
+                # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21
+                # ruling: the three reliability-streak STANDING clauses,
+                # published under `data-collection-reliability` for Crucible
+                # v2 phase 4's irreversible v1-pipeline deletion — a
+                # data-phase exit precondition, not a per-unit audit cell.
+                "data.standing.",
             )
         )
         and not name.endswith(".completeness")
@@ -114,7 +206,10 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
 
 def test_the_transcription_reconciles_with_the_audits_own_summary():
     """Per column, then in total. A transcription slip moves a count."""
-    units = load_units()
+    # Baseline units ONLY. A post-baseline unit's cells are its own
+    # self-assessment, not something the audit published a count for, and
+    # folding them in would move a tally the audit is the sole authority on.
+    units = [u for u in load_units() if u.unit_id in BASELINE_UNIT_IDS]
     measured: dict[str, collections.Counter] = {
         column: collections.Counter() for column in AUDIT_COLUMNS
     }

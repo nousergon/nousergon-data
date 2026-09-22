@@ -15,6 +15,9 @@ import pytest
 import sf_preflight as sfp
 
 
+from collectors import constituents
+
+
 def _ctx(bucket: str = "test-bucket") -> sfp.PreflightContext:
     return sfp.PreflightContext(
         bucket=bucket,
@@ -36,11 +39,14 @@ def test_constituents_fetch_ok_populates_context():
         {},  # sub_industry_map
         500,  # sp500_count
         400,  # sp400_count
+        constituents.SsgaWeights(),  # weights (I11295)
     )
     # Actually use realistic-shape data: deduped tickers + complete sector_map.
     real_tickers = [f"T{i}" for i in range(900)]
     real_sectors = {t: "Industrials" for t in real_tickers}
-    fake_return = (real_tickers, real_sectors, {}, {}, 500, 400)
+    fake_return = (
+        real_tickers, real_sectors, {}, {}, 500, 400, constituents.SsgaWeights()
+    )
 
     with patch("collectors.constituents._fetch_constituents", return_value=fake_return):
         result = sfp.check_constituents_fetch(ctx)
@@ -51,7 +57,7 @@ def test_constituents_fetch_ok_populates_context():
 
 def test_constituents_fetch_fails_on_zero_tickers():
     ctx = _ctx()
-    with patch("collectors.constituents._fetch_constituents", return_value=([], {}, {}, {}, 0, 0)):
+    with patch("collectors.constituents._fetch_constituents", return_value=([], {}, {}, {}, 0, 0, constituents.SsgaWeights())):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
     assert "0 tickers" in result.message
@@ -65,7 +71,9 @@ def test_constituents_fetch_fails_on_unmapped_tickers():
     # Sector map is missing 50 tickers — collect() would hard-fail at write time.
     sectors = {t: "Industrials" for t in tickers[:850]}
     with patch("collectors.constituents._fetch_constituents",
-               return_value=(tickers, sectors, {}, {}, 500, 400)):
+               return_value=(
+                   tickers, sectors, {}, {}, 500, 400, constituents.SsgaWeights()
+               )):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
     assert "sector_map missing" in result.message
@@ -77,7 +85,10 @@ def test_constituents_fetch_fails_on_sp500_count_drift():
     tickers = [f"T{i}" for i in range(400)]
     with patch(
         "collectors.constituents._fetch_constituents",
-        return_value=(tickers, {t: "Industrials" for t in tickers}, {}, {}, 0, 400),
+        return_value=(
+            tickers, {t: "Industrials" for t in tickers}, {}, {}, 0, 400,
+            constituents.SsgaWeights(),
+        ),
     ):
         result = sfp.check_constituents_fetch(ctx)
     assert result.status == "fail"
@@ -957,6 +968,48 @@ def test_every_check_declares_its_capabilities():
     for name, caps in sfp.CHECK_CAPABILITIES.items():
         assert caps, f"{name}: declare at least one capability"
         assert caps <= known, f"{name}: unknown capability {sorted(caps - known)}"
+
+
+def test_every_check_declares_required():
+    """alpha-engine-config-I11112: a new check may not silently be exempt
+    from the required-skip accounting — mirrors
+    test_every_check_declares_its_capabilities for CHECK_REQUIRED."""
+    listed = {fn.__name__ for fn in sfp.CHECKS}
+    declared = set(sfp.CHECK_REQUIRED)
+    assert listed == declared, (
+        "CHECKS and CHECK_REQUIRED disagree; add the missing entry "
+        f"(only in CHECKS: {sorted(listed - declared)}; "
+        f"only in CHECK_REQUIRED: {sorted(declared - listed)})"
+    )
+    for name, required in sfp.CHECK_REQUIRED.items():
+        assert isinstance(required, bool), f"{name}: CHECK_REQUIRED value must be a bool"
+
+
+def test_summarize_results_flags_only_required_skips():
+    """The function I11112 pulls the Lambda handler's counting logic into —
+    only a skip of a REQUIRED check inflates required_skip_count."""
+    results = [
+        sfp.CheckResult(name="sf_iam_reachability", status="ok", message=""),
+        sfp.CheckResult(name="arctic_connectivity", status="skip", message="Not run: ... arctic"),
+        sfp.CheckResult(name="tool_contracts", status="skip", message="Not run: ... checkout"),
+    ]
+    summary = sfp.summarize_results(results)
+    assert summary["ran_count"] == 1
+    assert summary["skip_count"] == 2
+    # Both check_arctic_connectivity and check_tool_contracts are declared
+    # required=True in CHECK_REQUIRED today.
+    assert summary["required_skip_count"] == 2
+    assert sorted(summary["required_skip_names"]) == ["arctic_connectivity", "tool_contracts"]
+
+
+def test_summarize_results_undeclared_check_defaults_required():
+    """An undeclared check name (not in CHECK_REQUIRED) defaults to
+    required=True — the safe direction, mirroring CHECK_CAPABILITIES'
+    undeclared-defaults-to-FULL_CAPABILITIES convention."""
+    results = [sfp.CheckResult(name="brand_new_check", status="skip", message="")]
+    summary = sfp.summarize_results(results)
+    assert summary["required_skip_count"] == 1
+    assert summary["required_skip_names"] == ["brand_new_check"]
 
 
 def test_lambda_profile_runs_at_least_one_check():

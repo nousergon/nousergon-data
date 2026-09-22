@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/ndx_constituents.schema.json",
+  "title": "Nasdaq-100 constituents + weights (market_data/index_constituents/NDX.json, v1)",
+  "description": "Producer: collectors/nasdaq100.py::collect (alpha-engine-config-I11296). Membership from Nasdaq's own published list; per-constituent weight computed from the fleet's licensed fundamentals market-cap archive rather than a scraped cap string. Consumer: collectors/index_contributions.py (D48, alpha-engine-config-I11297), which reads weight_map for the NDX leg of the per-constituent contribution decomposition. Written to market_data/index_constituents/NDX.json (latest) and market_data/weekly/{date}/NDX.json (point-in-time), identical bodies. Sibling to constituents.json, which covers the S&P indices; historical_constituents.py's S&P replay is untouched by this file. UNITS: weight_map values are FRACTIONS normalised to sum 1.0 over the WEIGHTED SUBSET (not over all members) -- see weight_map and unweighted_tickers, which must be read together.",
+  "x-key-pattern": "market_data/index_constituents/NDX.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "date", "index", "tickers", "index_of", "weight_map", "raw_sum",
+    "weight_method", "constituent_count", "weighted_count",
+    "unweighted_tickers", "market_cap_source", "invesco_status", "fetched_at"
+  ],
+  "properties": {
+    "date": {"type": "string", "format": "date"},
+    "index": {"type": "string", "const": "NDX"},
+    "tickers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "minItems": 100,
+      "maxItems": 102,
+      "description": "Published membership. 101 securities, not 100: the Nasdaq-100 holds 100 companies but 101 securities because of a dual share class. A consumer hard-coding 100 fails on that pair, which is why the producer raises outside [100, 102] rather than trimming."
+    },
+    "index_of": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "const": "NDX"},
+      "description": "The index each weighted ticker belongs to. Constant here, and present so a consumer can treat this artifact and constituents.json through one shape rather than special-casing per file."
+    },
+    "weight_map": {
+      "type": "object",
+      "additionalProperties": {"type": "number", "minimum": 0, "maximum": 1},
+      "description": "Per-constituent index weight as FRACTIONS summing to 1.0 over the WEIGHTED SUBSET — the members for which a market cap was available — NOT over all members. A member absent from this map is in unweighted_tickers and has UNKNOWN weight, never zero weight. Reading weight_map alone therefore overstates each weight by the reciprocal of coverage; a consumer that cares must check weighted_count against constituent_count."
+    },
+    "raw_sum": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Pre-normalisation weight sum in the source's own units. The only place a units flip or a coverage collapse stays visible: normalisation would otherwise absorb it and the weights would still sum to 1.0 while being wrong."
+    },
+    "weight_method": {
+      "type": "string",
+      "description": "Which rung of the source ladder actually produced these weights, and therefore how much to trust them. 'modified_cap_approx' means the Nasdaq-100's MODIFIED market-cap weighting — annual reconstitution plus special rebalances that cap the mega-caps — was approximated by plain cap weighting, so the error is real and bounded but not zero. 'cache_no_weights' means none are present. This value must reach every downstream consumer unchanged: an approximation that does not travel with its data gets absorbed as fact."
+    },
+    "constituent_count": {"type": "integer", "minimum": 100, "maximum": 102},
+    "weighted_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Members that got a weight. Compare against constituent_count for coverage — equality is the only case in which weight_map describes the whole index."
+    },
+    "unweighted_tickers": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "description": "Members with no market cap available, and therefore no weight. Named rather than silently dropped: an absent weight is unknown, and a consumer reading it as zero would drop a real constituent's contribution while still appearing to reconcile."
+    },
+    "market_cap_source": {
+      "type": ["string", "null"],
+      "description": "The archive key the market caps came from, so a weight can be traced to the snapshot that produced it."
+    },
+    "invesco_status": {
+      "type": "string",
+      "description": "Outcome of rung 1, the fund-issuer holdings file that is the direct analogue of the SSGA source trusted for the S&P indices. MEASURED 2026-09-21: 'unavailable_406' — the Invesco host refuses this client on every path tried, including the plain HTML product pages, which is host-level bot protection rather than a wrong URL. Recorded in the payload so the fallback is visible in the data and not only in a commit message; if this ever reads OK, weights stop being an approximation."
+    },
+    "fetched_at": {
+      "type": "string",
+      "x-provenance": true,
+      "description": "Wall-clock stamp of the fetch, not a data value (alpha-engine-config-I10894): shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs`, because a shadow run and its live counterpart never fetch at the same instant."
+    }
+  }
+}

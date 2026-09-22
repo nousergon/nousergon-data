@@ -1,0 +1,172 @@
+# Unit descriptor — data collector unit D48 (per-constituent index contribution).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2) — a hand-maintained monitored-things list drifts, and its drift is
+# invisible because the missing rows produce no signal.
+#
+# WHY THIS FILE EXISTS AT ALL, rather than an entry in
+# `data_gate/config/writer_inventory.yaml`: that file's own header says a new
+# collector with no descriptor turning the board red "is the only mechanism in
+# this design that notices a unit nobody registered", and that attributing a
+# module to a parent ATTRIBUTES its writes rather than excusing them. This unit
+# has no parent — it is its own producer — so the honest response to the gate
+# was to write the descriptor, not to widen the scope that hides it.
+#
+# LIFECYCLE IS `pending`, AND THAT IS THE POINT. The module is complete and
+# unit-tested but NOTHING RUNS IT: the trigger and the ops-side rows are
+# operational assembly and land in the ops repos, tracked as
+# alpha-engine-config-I11306. Declaring `in-service` here would claim a
+# component the console's discovery cannot find, and declaring a cadence would
+# make the freshness monitor report a false `state=missing` every cycle — the
+# opposite of the signal it exists for. `pending` says "registered, not yet
+# running", which is a work item with an address rather than a silent gap.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D48
+component_id: "data-collector-d48-index-contributions"
+owning_repo: "nousergon-data"
+title: "per-constituent index contribution"
+component: 1
+lifecycle: pending
+owner: brian
+code_path: "collectors/index_contributions.py:1"
+pending_since: "2026-09-21"
+lifecycle_reexam: "2026-10-05"
+lifecycle_reason: >-
+    Producer module merged without a trigger. Scheduling and the ops-side
+    observability/authority rows are operational assembly and belong in the ops
+    repos, tracked as alpha-engine-config-I11306. Until that lands the unit
+    writes nothing, which I11306 states plainly rather than leaving to be
+    discovered.
+lifecycle_owner: brian
+promotes_when: >-
+    alpha-engine-config-I11306 has landed the post-close trigger and the
+    `observability.d/` row reads in-service, and at least one trading day's
+    market_data/index_contributions/{SPX,NDX}/latest.json exists with that day's
+    trading_day. Flip lifecycle to in-service and declare the cadence in the same PR.
+trigger:
+  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
+  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
+  # only way it runs today. There is no "none" kind, and inventing one would
+  # be a fallback guess where the generator deliberately refuses to make one.
+  kind: "manual"
+  runs_on: "ec2-spot"
+  detail: >-
+    NOT YET SCHEDULED — alpha-engine-config-I11306. Must run post-close on
+    trading days, chained after the day's closes reach ArcticDB, and IN-REGION:
+    the job reads the ~900-ticker close archive, and a read that size from
+    outside the bucket's region is dominated by S3 round-trip latency (measured
+    2026-07-15: a 20-40 minute in-region job took 3+ hours locally).
+  # No `schedule` key: a `pending` row may not declare a cadence, and
+  # data_gate/cadence.py would otherwise grade this unit against a cadence
+  # nothing honours.
+writes:
+  # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
+  # templated key against a contract's x-key-pattern, and a bare `*` resolves
+  # to NOTHING — so a glob here would declare a write whose contract could not
+  # be found, which is the exact gap
+  # test_declared_contracts_are_reachable_from_their_keys.py exists to catch.
+  - "market_data/index_contributions/{index}/{date}.json"
+  - "market_data/index_contributions/{index}/latest.json"
+consumers:
+  - "metron:api/services/benchmark_gap.py (metron-ops-I346, reads latest.json)"
+consumers_reason: >-
+    The consumer is cross-repo and lands alongside this producer rather than
+    after it: metron-ops-I346 is the reason this artifact exists. Metron is a
+    pure S3 consumer and makes no market-data calls of its own, which is why the
+    weight-times-return join lives here and not there.
+contract:
+  schema: contracts/index_contributions.schema.json
+  producer_test: tests/test_index_contributions.py
+  consumer_pins:
+    - "metron:tests (benchmark-gap fixture pinned to schema_version 1, metron-ops-I346)"
+registry_rows: []
+# alpha-engine-config-I11297 / I11306: the ARTIFACT_REGISTRY freshness row is
+# DEFERRED until the producer is scheduled, per this repo's "never register a
+# freshness entry ahead of its producer" convention. Registering now would
+# report a false state=missing on every cycle. The pinned PUT count in
+# tests/test_artifact_registry_coverage.py carries the same deferral.
+run_manifest_prefix: data_collection/runs/D48
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: ABSENT
+    note: "deferred with the registry row — alpha-engine-config-I11306"
+freshness:
+  family: "eod-spine"
+  status: proposed
+  ratified_at: "alpha-engine-config-I11306 (with the trigger)"
+completeness:
+  denominator: "index membership (constituents.json weight_map, index_constituents/NDX.json)"
+  floor: 0.97
+  status: proposed
+  note: >-
+    Enforced IN THE PRODUCER as COVERAGE_FLOOR, not only proposed on this board:
+    collect() raises rather than publishing when less than this fraction of
+    index weight has a usable return. A decomposition missing a tenth of the
+    index explains nothing and must not reach a consumer looking authoritative.
+guards:
+  empty_fresh:
+    state: present
+    note: >-
+        An empty weight map is refused rather than published as an index that moved
+        0% (index_contributions.py, the `not weights.weight_map` branch) — which is
+        what makes constituents' own cache_no_weights declaration load-bearing.
+  cardinality:
+    state: present
+    note: "COVERAGE_FLOOR refusal plus coverage.members_missing_return in the payload"
+  units:
+    state: present
+    note: >-
+        contracts/index_contributions.schema.json bounds weights to [0,1] fractions
+        and names contribution_pp/return_pct as percentage points; the producer
+        consumes weights as fractions and emits pp, tested in
+        tests/test_index_contributions.py.
+  pit:
+    state: present
+    note: >-
+        Weights are taken as of the PRIOR close and the trading-day pair is read off
+        the proxy's own observed series rather than a calendar, so a multi-day return
+        cannot be labelled as one day (a proxy with fewer than two closes raises).
+  vendor_fallback:
+    state: absent
+    note: >-
+        Single path: weights from the weight producers, returns from ArcticDB. There is
+        no second vendor to fall back to, and the honest response to a missing input is
+        the refusal above rather than a substitute.
+  success_without_output:
+    state: present
+    note: >-
+        collect() raises when no index produced a publishable decomposition, and
+        returns status=partial (never `ok`) when one index failed — the per-index
+        soft-fail records the error in the return value rather than swallowing it.
+audit:
+  source: "alpha-engine-config-I11297 (unit added after the 2026-09-14 baseline)"
+  baseline_date: "2026-09-21"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: PRESENT
+    artifact_registry: ABSENT
+    observability_row: ABSENT
+    run_record: ABSENT
+    detector: ABSENT
+    console_entity: UNVERIFIED
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1

@@ -154,9 +154,10 @@ def check_drift(
         only_in_arctic (list), within_threshold (bool).
     """
     try:
-        tickers, _sector_map, _sector_etf_map, _sub_industry_map, sp500_count, sp400_count = (
-            _fetch_constituents()
-        )
+        (
+            tickers, _sector_map, _sector_etf_map, _sub_industry_map,
+            sp500_count, sp400_count, _weights,
+        ) = _fetch_constituents()
     except Exception as exc:
         logger.exception("Index-membership constituents fetch failed")
         return {

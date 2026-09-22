@@ -94,16 +94,40 @@ phases:
           - data.D*.artifact_registry
           - data.D*.run_record
           - data.D*.consumers
-      - criterion: 5 consecutive ne-data-collection-eod successes
+      - criterion: 1 complete ne-data-collection-eod cycle, proving the standalone collector ran end to end
         clause: data.phase1.consecutive_eod_cycles
-      - criterion: 5 consecutive ne-data-collection-morning successes
+      - criterion: 1 complete ne-data-collection-morning cycle
         clause: data.phase1.consecutive_morning_cycles
-      - criterion: 2 Saturdays of ne-data-collection-weekly with complete manifests
+      - criterion: 1 complete Saturday of ne-data-collection-weekly with complete manifests
         clause: data.phase1.consecutive_weekly_cycles
       - criterion: v1 Step Functions data-stage executions since the cutover = 0
         clause: data.phase1.v1_data_stage_quiet
-      - criterion: a 4-week tagged cost baseline measured
-        clause: data.phase1.cost_baseline_measured
+    notes: >-
+      The EOD/morning/weekly exit criteria above ask for ONE complete cycle, not a streak —
+      Brian's ruling, 2026-09-21 (verbatim): "it sounds like the only time gate we should have
+      here is for v2 phase 4 deleting the v1 pipelines, so a time gate here makes sense. as
+      such we should be able to work up to this point without time gates." Answering the point
+      that nothing at this exit is irreversible (the cutover's rollback is one PR revert) while
+      Crucible v2 phase 4 deleting the v1 pipelines and Lambdas IS
+      (alpha-engine-config-I10655) — so the repeat count moved there. The plan's ORIGINAL
+      ratified streak (5 EOD / 5 morning / 2 weekly) is now published as standing reliability
+      rows under the `data-collection-reliability` gate (`data_gate/clauses.py::RELIABILITY_GATE`),
+      read and rendered every day with the real streak, graded by no data-phase gate — Crucible
+      v2 phase 4 gates its irreversible deletion on THAT gate's own artifact, the same shape
+      it already uses for `data-cutover-ready`.
+
+      "a 4-week tagged cost baseline measured" is NOT an exit criterion of this rung —
+      Brian's ruling, 2026-09-21 (verbatim): "i'm not clear why we need to time gate
+      anything, why not just collect the data when it is ready but not block subsequent
+      issues". The `component` cost-allocation tag went Active 2026-09-21T14:59Z and the
+      CUR export `nous-ergon-fleet-cur` was created 16:50Z, so 28 days of tagged spend
+      cannot exist before ~2026-10-20 while every OTHER phase-1 criterion above can clear
+      by ~2026-10-04 — as an exit clause this alone would have held phases 1, 2 AND 3 shut
+      for ~16 days on a vendor billing-export lag, not a defect. `data.phase1.cost_baseline_measured`
+      is now a STANDING clause (`data_gate/clauses.py::StandingClause`) — read and rendered
+      every day with its real state, on the board and in `data_gate read`'s output, but
+      graded by no gate. Same shape as Brian's 2026-09-13 crucible ruling (`af86cf6`) that
+      turned three calendar-floored phase-2 clauses into standing SLO rows.
 
   - id: data-phase2
     number: 2
@@ -165,3 +189,16 @@ sub_gates:
       clean); pre-cutover parity per published key. `crucible gate --gate
       phase4` gains one clause that reads this gate's own artifact, coupling
       components 1 and 2 through a published artifact rather than through code.
+  - id: data-collection-reliability
+    within: null
+    reads: >-
+      `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21 ruling. Not "within" any
+      numbered rung — a STANDING gate, published daily alongside the ladder, never a ceiling
+      over it. Three clauses, each the real current streak against the plan's ORIGINAL
+      ratified target (5 consecutive complete EOD cycles, 5 morning, 2 Saturdays of weekly)
+      graded by NO data-phase gate (`data_gate/clauses.py::StandingClause`,
+      `RELIABILITY_GATE`). Published as `data_collection/gates/data-collection-reliability/latest.json`
+      (current) and `.../{date}/gate.json` (dated history), `gate.v1` schema — the SAME shape
+      `data-cutover-ready` already publishes. Crucible v2 phase 4 gates its irreversible
+      v1-pipeline deletion (`alpha-engine-config-I10655`) on this gate's own `met` field, the
+      same way it already reads `data-cutover-ready`'s artifact for the cutover itself.

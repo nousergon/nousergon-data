@@ -20,6 +20,7 @@ import yaml
 
 from data_gate import clauses as clause_module
 from data_gate import descriptors, evidence
+from data_gate import exit_criteria as xc
 from data_gate.descriptors import REPO_ROOT, DescriptorError, load_units
 from data_gate.inventory import load_inventory_scope, scan
 from data_gate.read import GATES, BOARD_KEY, _board_document, evaluate, load_phases, run
@@ -132,13 +133,30 @@ def test_the_board_is_red_at_birth(board):
         for c in board
         if c.name.startswith("data.D") and ".guard." not in c.name and not c.name.endswith(".completeness")
     ]
-    assert len(base) == 414
+    # 414 -> 423 -> 432: D48 (per-constituent index contribution,
+    # alpha-engine-config-I11297) and now D49 (Nasdaq-100 membership + weights,
+    # alpha-engine-config-I11296) each add their nine clauses. Both branches
+    # pinned 423 independently, which was right for each alone and wrong once
+    # both landed — the conflict here IS the pin working: it forces the second
+    # unit to be acknowledged rather than absorbed into a total nobody re-reads.
+    # The pin exists to force
+    # this line to be edited deliberately when a unit is added, so the edit is
+    # the acknowledgement — a new producer's clauses must be COUNTED as red, not
+    # absorbed into a total nobody re-reads.
+    assert len(base) == 432
     # A declared not-applicable (an on-demand unit with no invocation to record,
-    # or no scheduled trigger for phase 4 to remove — alpha-engine-config-I10870/
-    # I10871) is MET off the descriptor plus a real listing, not off a reader
-    # grading evidence; it is held to the `not applicable:` prefix instead.
+    # no scheduled trigger for phase 4 to remove, or a `partial_exclusion`
+    # naming a column no artifact/registry/identity read could ever grade for
+    # this unit — alpha-engine-config-I10870/I10871/I11245/I10810) is MET off
+    # the descriptor plus a real listing, not off a reader grading evidence;
+    # it is held to the `not applicable:` prefix instead, so it MET's even
+    # against this test's empty/no-source board. D47's `partial_exclusion`
+    # (component 2, plan §8.1) adds `.identity` to the set this PR wave lands.
     declared_na = [c for c in base if c.met and c.detail.startswith("not applicable")]
-    assert all(c.name.endswith((".run_record", ".survives_phase4")) for c in declared_na), declared_na
+    assert all(
+        c.name.endswith((".run_record", ".survives_phase4", ".artifact_registry", ".identity"))
+        for c in declared_na
+    ), declared_na
     met = [c for c in base if c.met and c not in declared_na]
     # Only `schema_contract` has a real reader in phase 0, and it reads MET only
     # where a schema, a producer test AND a consumer pin all exist.
@@ -157,6 +175,222 @@ def test_the_board_is_red_at_birth(board):
     # structurally, or when RETIRED bookkeeping is wrong.
     eligible = [c for c in base if c.name.endswith(tree_readers) and not clause_module.is_retired(c)]
     assert len(met) <= len(eligible), "more clauses read MET than have a real reader backing them"
+
+
+# ---------------------------------------------------------------------------
+# Standing clauses (alpha-engine-config-I10793 / -I10788, Brian's 2026-09-21
+# ruling): "i'm not clear why we need to time gate anything, why not just
+# collect the data when it is ready but not block subsequent issues" — a
+# clause measured and reported every day, blocking no phase, ever.
+# ---------------------------------------------------------------------------
+
+
+def test_the_cost_baseline_clause_is_standing_and_carries_its_real_state(board):
+    """Against an empty store (no cost document at all), the clause reads its
+    REAL state — UNMET, "no cost document" — never forced, never hidden."""
+    clause = next(c for c in board if c.name == "data.phase1.cost_baseline_measured")
+    assert clause_module.is_standing(clause)
+    assert clause.met is False
+    assert clause.unmeasurable is False
+    assert "no cost document" in clause.detail
+    assert clause.ruling.startswith("Brian, 2026-09-21")
+
+
+def _write_cost_document(tmp_path, *, days_covered: int) -> LocalStore:
+    store = LocalStore(tmp_path)
+    store.put_bytes(
+        "metrics/cost/monthly/latest.json",
+        json.dumps({"baseline": 42.0, "days_covered": days_covered, "as_of": "2026-10-20T00:00:00Z"}).encode(),
+    )
+    return store
+
+
+def test_a_standing_clause_reads_met_once_its_evidence_exists(tmp_path, units, phases):
+    """Unlike RetiredClause/UnconnectedClause/DisabledTriggerClause — always
+    `met=False` because the STATE is the fact — a StandingClause carries
+    whatever its reading says. Once 28 days of cost data exist, it reads
+    MET, honestly, same as an ordinary clause would."""
+    store = _write_cost_document(tmp_path, days_covered=28)
+    generated = clause_module.generate(store, units, phases, trading_day=TRADING_DAY)
+    clause = next(c for c in generated if c.name == "data.phase1.cost_baseline_measured")
+    assert clause_module.is_standing(clause)
+    assert clause.met is True
+    assert "baseline=42.0" in clause.detail
+
+
+def test_a_standing_clause_never_changes_any_gates_met(board):
+    """The whole point of the ruling: this clause's state — MET or UNMET —
+    must never be able to hold a phase shut. Proven by construction, not by
+    the current data: even MET, it is excluded from `evaluate`'s selection,
+    and (today) UNMET, it does not appear in `data-phase1`'s own clause list
+    at all — a phase-1 read that were somehow blind to this exclusion would
+    show it as UNMET among `result.clauses` below, which it does not."""
+    result = evaluate(EmptyStore(), gate="data-phase1", trading_day=TRADING_DAY, all_clauses=board)
+    assert "data.phase1.cost_baseline_measured" not in {c.name for c in result.clauses}
+    # And the reverse: still on the full board, for every gate to see if it wanted to.
+    assert any(c.name == "data.phase1.cost_baseline_measured" for c in board)
+
+
+def test_is_ungraded_excludes_standing_from_every_gate(board):
+    for gate in GATES:
+        result = evaluate(EmptyStore(), gate=gate, trading_day=TRADING_DAY, all_clauses=board)
+        assert "data.phase1.cost_baseline_measured" not in {c.name for c in result.clauses}, gate
+
+
+def test_the_board_document_counts_standing_separately_and_shows_real_state(board):
+    document = _board_document(board, trading_day=TRADING_DAY, generated_utc="2026-09-21T00:00:00Z", store_uri=None)
+    row = next(r for r in document["rows"] if r["clause"] == "data.phase1.cost_baseline_measured")
+    assert row["standing"] is True
+    assert row["state"] == "UNMET"  # the REAL state — never a euphemism, never hidden
+    assert "standing_ruling" in row and row["standing_ruling"].startswith("Brian, 2026-09-21")
+    assert document["clauses_standing"] >= 1
+    # Excluded from the graded denominator, same as RETIRED/UNCONNECTED.
+    assert row["clause"] not in {
+        c.name
+        for c in board
+        if c.met and not clause_module.is_ungraded(c) and c.name != "data.phase1.cost_baseline_measured"
+    }
+
+
+def test_render_lists_the_standing_clause_even_though_no_gate_grades_it(board):
+    """`data_gate read --gate data-phase1`'s printed output must never hide a
+    real reading behind the exclusion that keeps it from blocking a phase —
+    `result.render()` (the gate's OWN clause list) cannot show it, so `render`
+    prints it separately."""
+    from data_gate.read import render
+
+    result = evaluate(EmptyStore(), gate="data-phase1", trading_day=TRADING_DAY, all_clauses=board)
+    document = _board_document(board, trading_day=TRADING_DAY, generated_utc="2026-09-21T00:00:00Z", store_uri=None)
+    text = render(result, document, dry_run=True)
+    assert "data.phase1.cost_baseline_measured" not in result.render()
+    assert "data.phase1.cost_baseline_measured" in text
+    assert "standing (measured daily, gates no phase)" in text
+
+
+# ---------------------------------------------------------------------------
+# Reliability streaks (alpha-engine-config-I10793/-I10788, Brian's second
+# 2026-09-21 ruling): "it sounds like the only time gate we should have here
+# is for v2 phase 4 deleting the v1 pipelines ... we should be able to work
+# up to this point without time gates." Phase 1's own exit narrows from a
+# streak to ONE complete cycle; the ratified streak (5/5/2) becomes a
+# standing row published for Crucible v2 phase 4 to gate its irreversible
+# v1-pipeline deletion on.
+# ---------------------------------------------------------------------------
+
+
+def _cycles(schedule: str, *, complete: int, total: int) -> xc.CycleSet:
+    """A `CycleSet` with `complete` OK cycles, most recent first, followed by
+    an incomplete one — enough to prove a threshold without touching a store."""
+    import types
+
+    units = [types.SimpleNamespace(unit_id="D19")]
+    cycles = []
+    now = dt.datetime(2026, 9, 21, 20, 45, tzinfo=dt.timezone.utc)
+    for i in range(total):
+        fire = now - dt.timedelta(days=i)
+        if i < complete:
+            manifests = {"D19": [(f"k{i}", {"trigger": "scheduled", "status": "ok"})]}
+        else:
+            manifests = {"D19": []}
+        cycles.append(xc.Cycle(fire=fire, manifests=manifests))
+    return xc.CycleSet(schedule=schedule, units=units, cycles=cycles)
+
+
+def test_the_exit_clause_needs_exactly_one_complete_cycle():
+    """Brian's ruling narrows the phase-1 exit from a streak to ONE cycle —
+    proven against the reader directly, not inferred from the constant."""
+    assert xc.PHASE1_EXIT_CONSECUTIVE[xc.SCHEDULE_EOD] == 1
+    one_complete = _cycles(xc.SCHEDULE_EOD, complete=1, total=3)
+    clause = clause_module._clause_phase1_consecutive_eod_cycles(one_complete)
+    assert clause.met is True
+    assert clause.phase == "data-phase1"
+    assert not clause_module.is_standing(clause)
+
+    zero_complete = _cycles(xc.SCHEDULE_EOD, complete=0, total=3)
+    clause = clause_module._clause_phase1_consecutive_eod_cycles(zero_complete)
+    assert clause.met is False
+
+
+def test_the_standing_row_renders_the_true_streak_against_the_ratified_target():
+    """The plan's ORIGINAL target (5/5/2) is preserved on the standing row —
+    a 3-cycle streak reads UNMET against 5, honestly, never inflated to MET
+    just because phase 1's own exit only needed one."""
+    assert xc.RELIABILITY_STREAK_TARGET[xc.SCHEDULE_EOD] == 5
+    three_complete = _cycles(xc.SCHEDULE_EOD, complete=3, total=6)
+    clause = clause_module._clause_reliability_eod_streak(three_complete)
+    assert clause_module.is_standing(clause)
+    assert clause.met is False
+    assert "3 consecutive complete cycle(s)" in clause.detail
+    assert "against the 5 the plan's exit names" in clause.detail
+    assert clause.phase == clause_module.RELIABILITY_GATE
+    assert clause.ruling.startswith("Brian, 2026-09-21")
+
+    five_complete = _cycles(xc.SCHEDULE_EOD, complete=5, total=6)
+    clause = clause_module._clause_reliability_eod_streak(five_complete)
+    assert clause.met is True
+
+
+def test_an_absent_reading_renders_absent_never_green_for_the_reliability_row():
+    """An unmeasurable cycle window (denied/failed listing) is UNMEASURABLE on
+    the standing row too — never MET, never silently dropped."""
+    unreadable = xc.CycleSet(schedule=xc.SCHEDULE_EOD, units=[], unreadable="AccessDenied")
+    clause = clause_module._clause_reliability_eod_streak(unreadable)
+    assert clause_module.is_standing(clause)
+    assert clause.met is False
+    assert clause.unmeasurable is True
+
+
+def test_a_reliability_streak_never_moves_any_data_phase_gates_met(board):
+    """However the streak reads — MET or UNMET — it is excluded from
+    data-phase1/2/3's own clause list, structurally, so it can never hold or
+    pass a numbered phase on its own account."""
+    names = {"data.standing.eod_reliability_streak", "data.standing.morning_reliability_streak",
+             "data.standing.weekly_reliability_streak"}
+    for gate in ("data-phase1", "data-phase2", "data-phase3"):
+        result = evaluate(EmptyStore(), gate=gate, trading_day=TRADING_DAY, all_clauses=board)
+        assert not (names & {c.name for c in result.clauses}), gate
+
+
+def test_the_reliability_gate_reads_the_three_streaks_and_only_them(board):
+    result = evaluate(EmptyStore(), gate=clause_module.RELIABILITY_GATE, trading_day=TRADING_DAY, all_clauses=board)
+    assert {c.name for c in result.clauses} == {
+        "data.standing.eod_reliability_streak",
+        "data.standing.morning_reliability_streak",
+        "data.standing.weekly_reliability_streak",
+    }
+
+
+def test_the_reliability_gate_is_published_alongside_the_ladder(tmp_path):
+    """The same `run()` pipeline that publishes `data-cutover-ready` publishes
+    `data-collection-reliability` — the artifact Crucible v2 phase 4 reads."""
+    from data_gate.store import LocalStore
+
+    store = LocalStore(tmp_path)
+    result, ladder, board_doc = run(store, gate="data-collection-reliability", trading_day=TRADING_DAY)
+    assert result.gate == "data-collection-reliability"
+    assert {c.name for c in result.clauses} == {
+        "data.standing.eod_reliability_streak",
+        "data.standing.morning_reliability_streak",
+        "data.standing.weekly_reliability_streak",
+    }
+    dated = json.loads(store.get_bytes(f"gates/data-collection-reliability/{TRADING_DAY.isoformat()}/gate.json"))
+    assert dated["gate"] == "data-collection-reliability"
+    assert dated["schema_version"] == "gate.v1"
+    assert {c["name"] for c in dated["clauses"]} == {
+        "data.standing.eod_reliability_streak",
+        "data.standing.morning_reliability_streak",
+        "data.standing.weekly_reliability_streak",
+    }
+    # The whole-board `latest.json` (current state, rewritten every read) also
+    # carries these three rows, marked `standing` — the single board every
+    # gate's read shares (`run()`'s own "BOTH READS, ONE BOARD" contract).
+    board_latest = json.loads(store.get_bytes("gates/board/latest.json"))
+    standing_rows = [r for r in board_latest["rows"] if r.get("standing")]
+    assert {r["clause"] for r in standing_rows} >= {
+        "data.standing.eod_reliability_streak",
+        "data.standing.morning_reliability_streak",
+        "data.standing.weekly_reliability_streak",
+    }
 
 
 # ---------------------------------------------------------------------------

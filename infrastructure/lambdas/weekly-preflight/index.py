@@ -21,8 +21,21 @@ which would have halted the Saturday pipeline by construction.
 
 Usage:
     Invoked by Step Functions. Returns:
-    {"status": "OK", "has_violation": false}              → proceed
-    {"status": "FAIL", "has_violation": true, ...}        → halt via ExtractWeeklyPreflightError
+    {"status": "OK", "has_violation": false}                          → proceed, fully observed
+    {"status": "DEGRADED", "has_violation": false, "degraded": true}  → proceed, gap disclosed
+    {"status": "FAIL", "has_violation": true, ...}                    → halt via ExtractWeeklyPreflightError
+
+alpha-engine-config-I11112: a Lambda-eligible run of 5/15 checks (10 skipped
+for missing CAP_ARCTIC/CAP_REPO_MODULES/CAP_POLYGON/CAP_CHECKOUT) previously
+returned status="OK" — a skip is not a pass (principles.md §2.7), and this
+Lambda cannot see the two-thirds of the check suite its environment lacks.
+DEGRADED is the honest middle state: ``has_violation`` stays the SOLE switch
+WeeklyPreflightGate reads to halt the run (a REQUIRED check that could not
+run is this probe's OWN degradation, not a confirmed violation of the system
+it is probing — sf-pipeline-policy.md §5's pre-spend-gate-probe carve-out:
+"the probe's own failure must not halt the run, but routes through a
+degraded flag plus alert, never silently"). A required check that actually
+RAN and found a violation still hard-fails via has_violation, unchanged.
 """
 
 from __future__ import annotations
@@ -174,11 +187,18 @@ def handler(event: dict, context) -> dict:
             "traceback": traceback.format_exc(),
         }
 
-    result_dicts = [asdict(r) for r in results]
-    fail_results = [r for r in result_dicts if r.get("status") == "fail"]
-    warn_results = [r for r in result_dicts if r.get("status") == "warn"]
-    skip_results = [r for r in result_dicts if r.get("status") == "skip"]
-    ran_count = len(result_dicts) - len(skip_results)
+    # I11112: sf_preflight.summarize_results is the SOLE source of the
+    # run/skip/warn/fail/required-skip counts — this handler used to compute
+    # them inline and never checked whether a skip was REQUIRED, which is
+    # exactly how "5 of 15 ran" rendered as status="OK".
+    summary = sfp.summarize_results(results)
+    result_dicts = summary["result_dicts"]
+    fail_results = summary["fail_results"]
+    warn_results = summary["warn_results"]
+    skip_results = summary["skip_results"]
+    ran_count = summary["ran_count"]
+    required_skip_count = summary["required_skip_count"]
+    required_skip_names = summary["required_skip_names"]
 
     if n_fail > 0:
         return {
@@ -188,6 +208,8 @@ def handler(event: dict, context) -> dict:
             "warn_count": len(warn_results),
             "skip_count": len(skip_results),
             "ran_count": ran_count,
+            "required_skip_count": required_skip_count,
+            "required_skip_names": required_skip_names,
             "failures": [r["name"] for r in fail_results],
             "results": result_dicts,
         }
@@ -205,15 +227,47 @@ def handler(event: dict, context) -> dict:
                 "capabilities; the gate observed nothing"
             ),
             "skip_count": len(skip_results),
+            "required_skip_count": required_skip_count,
+            "required_skip_names": required_skip_names,
             "results": result_dicts,
+        }
+
+    # I11112: a REQUIRED check that could not run is a gap in what THIS
+    # PROBE observed, not a confirmed violation of the system it probes —
+    # sf-pipeline-policy.md §5's pre-spend-gate-probe carve-out applies
+    # (fail-open, but visibly: a degraded flag plus alert, never silent).
+    # has_violation stays False so WeeklyPreflightGate's existing Choice
+    # keeps proceeding to CheckMutexRole; the NEW WeeklyPreflightGate arm
+    # reads "degraded" to route through the alert + $.gate_degraded flag
+    # before continuing, mirroring LibPinGateDegraded/PipelineContractCheck's
+    # existing fail-open-with-alert convention rather than inventing a new
+    # shape. A required check that RAN and found a real violation still
+    # hard-fails above via has_violation — this branch is reached only when
+    # every check that ran passed.
+    if required_skip_count > 0:
+        return {
+            "status": "DEGRADED",
+            "has_violation": False,
+            "degraded": True,
+            "degraded_reason": "required_checks_unreachable",
+            "warn_count": len(warn_results),
+            "skip_count": len(skip_results),
+            "ran_count": ran_count,
+            "required_skip_count": required_skip_count,
+            "required_skip_names": required_skip_names,
+            "results": result_dicts,
+            "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date),
         }
 
     return {
         "status": "OK",
         "has_violation": False,
+        "degraded": False,
         "warn_count": len(warn_results),
         "skip_count": len(skip_results),
         "ran_count": ran_count,
+        "required_skip_count": 0,
+        "required_skip_names": [],
         "results": result_dicts,
         "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date),
     }

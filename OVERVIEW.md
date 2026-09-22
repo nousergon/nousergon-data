@@ -25,6 +25,7 @@ Centralized data collection — price universe, macro, alternative data, feature
 | 2y slim cache (inference) | [`collectors/slim_cache.py`](collectors/slim_cache.py) |
 | FRED macro + market breadth | [`collectors/macro.py`](collectors/macro.py) |
 | Forward returns (full population) | [`collectors/universe_returns.py`](collectors/universe_returns.py) |
+| Per-constituent index contribution (SPX/NDX) | [`collectors/index_contributions.py`](collectors/index_contributions.py) |
 | Per-ticker alternative data (Phase 2) | [`collectors/alternative.py`](collectors/alternative.py) |
 | Short interest (FINRA, bi-monthly) | [`collectors/short_interest.py`](collectors/short_interest.py) |
 | Fundamentals | [`collectors/fundamentals.py`](collectors/fundamentals.py) |
