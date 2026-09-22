@@ -69,3 +69,79 @@ def test_the_guard_is_not_merely_a_weekday_check():
     pre_close = dt.datetime.fromisoformat("2026-09-21T16:00:00+00:00")
     assert pre_close.astimezone(ET).weekday() < 5, "it IS a weekday"
     assert _guard_runs("2026-09-21T16:00:00+00:00") is False
+
+
+# ── alpha-engine-config-I11352: the D+1 morning guard ────────────────────────
+#
+# `shadow-morning` runs v1's two MORNING legs on v1's own cadence — 07:45 ET,
+# fifteen minutes after MorningSchedule's 07:30 — for the PREVIOUS NYSE
+# session. Its guard is two questions, and conflating them is the bug:
+#
+#     IS_SESSION=$(python -c "... is_trading_day(now in ET) ...")
+#     TD=$(python -c 'from dates import default_run_date; print(default_run_date())')
+#     TODAY=$(TZ=America/New_York date +%F)
+#     [ "$IS_SESSION" != "1" ] && exit 0      # v1 does not run either
+#     [ "$TD" = "$TODAY" ]     && exit 0      # the close already happened
+#
+# The second alone is NOT enough, and that is the whole reason the calendar is
+# consulted directly: on Thanksgiving `default_run_date()` returns Wednesday, a
+# perfectly valid previous session, so `$TD != $TODAY` passes and the run would
+# proceed against a v1 morning run that never fired.
+
+from nousergon_lib.trading_calendar import is_trading_day  # noqa: E402
+
+
+def _morning_guard(moment_utc: str) -> tuple[bool, str | None]:
+    """The shell guard's decision, in Python: (runs?, the trading day)."""
+    now = dt.datetime.fromisoformat(moment_utc)
+    today_et = now.astimezone(ET).date()
+    trading_day = default_run_date(now=now)
+    if not is_trading_day(today_et):
+        return False, None
+    if trading_day == today_et.isoformat():
+        return False, None
+    return True, trading_day
+
+
+@pytest.mark.parametrize(
+    "label,moment,runs,trading_day",
+    [
+        # 07:45 ET Monday 2026-09-21 — the intended firing time. Targets the
+        # PREVIOUS session, Friday the 18th, which is what v1's 07:30 run wrote.
+        ("monday pre-open", "2026-09-21T11:45:00+00:00", True, "2026-09-18"),
+        # 07:45 ET Tuesday — the ordinary weekday case, targeting yesterday.
+        ("tuesday pre-open", "2026-09-22T11:45:00+00:00", True, "2026-09-21"),
+        # A Monday 07:45 run targets FRIDAY, not "yesterday" (issue deliverable 3).
+        ("monday targets friday", "2026-09-28T11:45:00+00:00", True, "2026-09-25"),
+        # Thanksgiving 2026-11-26 — a WEEKDAY the Mon-Fri rule fires on, and
+        # the case `$TD != $TODAY` alone gets wrong.
+        ("nyse holiday", "2026-11-26T12:45:00+00:00", False, None),
+        # 18:30 ET — a late fire, after the close. `default_run_date()` is now
+        # today, so this would duplicate `shadow-sameday`'s target.
+        ("after the close", "2026-09-21T22:30:00+00:00", False, None),
+    ],
+)
+def test_shadow_morning_guard_refuses_holidays_and_post_close_fires(
+    label, moment, runs, trading_day
+):
+    assert _morning_guard(moment) == (runs, trading_day), label
+
+
+def test_the_morning_guard_is_not_default_run_date_alone():
+    """On Thanksgiving `default_run_date()` gives Wednesday — a real session —
+    so the sameday guard's `!=` comparison PASSES and only the direct calendar
+    question refuses. This is the case the second half exists for."""
+    thanksgiving = "2026-11-26T12:45:00+00:00"
+    now = dt.datetime.fromisoformat(thanksgiving)
+    assert default_run_date(now=now) != now.astimezone(ET).strftime("%Y-%m-%d")
+    assert _morning_guard(thanksgiving)[0] is False
+
+
+def test_the_morning_guard_is_not_weekday_arithmetic():
+    """Holidays have bitten this repo before (`_previous_business_days` in
+    collectors/daily_closes.py). The day AFTER Thanksgiving is a session and
+    its previous session is Wednesday, skipping Thursday — which naive
+    `today - 1 business day` also happens to get right, and which naive
+    `today - 1 day` does not."""
+    runs, trading_day = _morning_guard("2026-11-27T12:45:00+00:00")
+    assert (runs, trading_day) == (True, "2026-11-25")
