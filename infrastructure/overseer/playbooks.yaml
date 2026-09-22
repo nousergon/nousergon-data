@@ -794,6 +794,55 @@ alert_classes:
     response: drain-queue
     # DECLARED: shadow-optimizer divergence, named in I6751's NOTIFY-SILENT row.
     tier: notify-silent
+  - class: executor_short_sell_guard_blind
+    source: "alpha-engine/executor/daemon.py::short_sell_guard"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page. The in-flight-sell guard SUBTRACTS this value from the
+    # held quantity, so a failed read falling back to 0 overstates what may
+    # be sold and makes the check PASS. That is the direction of the
+    # 2026-04-22 PFE incident the guard exists to prevent (three duplicate
+    # SELL 77s each passing held=155, summing to short 76).
+    tier: page
+    operator_reason: >-
+      Unlike every other row in this block, the safe state here is NOT
+      already reached when the alert fires: the order may already have been
+      placed against a guard that ran blind. The human action is a broker
+      reconcile of the named ticker before the next session, and no
+      automation can do it — deciding whether an unexpected position is a
+      duplicate fill or a legitimate one is a judgement over broker state.
+      drain-queue still owns triage of WHY the read failed.
+  - class: executor_intraday_reconcile_failed
+    source: "alpha-engine/executor/daemon.py::intraday_reconcile"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # Cash freed by a hard-risk exit is not redeployed for the rest of the
+    # session. Book-affecting, and nothing else records it.
+    tier: notify-silent
+    operator_reason: >-
+      Deliberately NOT page, unlike its siblings here. The omission is
+      bounded and self-correcting — the next morning planner redeploys the
+      idle cash — so the cost is one session of drag, not an unsafe book.
+      drain-queue triage of the underlying error is the closed loop; waking
+      a human mid-session buys nothing they can act on.
+  - class: executor_regime_leg_blind
+    source: "alpha-engine/executor/main.py::regime_leg"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # Fires ONLY when the leg's own enable flag is on, so it cannot page on
+    # an observe-only leg. With the flag on, a protective bear/drawdown
+    # override that should have fired did not, and the whole book was sized
+    # against an unadjusted regime.
+    tier: page
+    operator_reason: >-
+      The book is already sized and written by the time this is known, so
+      the safe state is not reached by waiting. The human decision is
+      whether to intervene on a book built without a protective override
+      that was switched ON — a risk-posture call, reserved, and one no
+      automation may make. Emits at most once per leg per run_date.
   - class: executor_optimizer_held_book
     source: "alpha-engine/executor/optimizer_shadow.py::_alert_shadow_failure"
     severities: [error]
