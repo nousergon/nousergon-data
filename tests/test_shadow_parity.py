@@ -526,7 +526,16 @@ def test_a_report_carrying_breach_examples_still_serialises():
         reader=reader,
         units=_one_unit("D17"),
     )
-    assert report.summary["mismatch"] == 1
+    # `staging/daily_closes/{date}.parquet` carries an `x-settling-bar` basis of
+    # `key_date` (alpha-engine-config-I11351): the file is ticker-indexed and its
+    # own key names the report's trading day, so the whole artifact IS that day's
+    # still-settling bar and its value cells are recorded rather than counted as
+    # breaches. The numpy-serialisation invariant this test exists for is
+    # unchanged — the settling examples go through the same `_jsonable` path.
+    assert report.summary["mismatch"] == 0
+    assert report.summary["settling_bar_keys"] == 1
+    example = report.rows[0].body["settling_bar"]["examples"][0]
+    assert isinstance(example["live"], float) and isinstance(example["shadow"], float)
     json.dumps(report.as_dict())  # the publish path; must not raise
 
 
@@ -897,8 +906,15 @@ def test_a_recorded_version_still_catches_a_real_difference():
         versions={(_CLOSE_KEY, "v-day"): ("e-day", _parquet(_frame(["AAPL"], [146.80])))},
     )
     row = _run_d17(reader).rows[0]
-    assert row.verdict == "mismatch"
+    # The key is `key_date`-settling on its own trading day (I11351), so the
+    # difference is RECORDED rather than counted as a breach — and the recorded
+    # pair is a stronger assertion than the verdict was: it names which live
+    # object was graded (146.80, the manifest's VersionId) rather than the
+    # current one (150.18).
     assert row.body["live_version"]["basis"] == "manifest_version_id"
+    settling = row.body["settling_bar"]
+    assert settling["cells"] == 1
+    assert settling["examples"][0]["live"] == 146.80
 
 
 def test_etag_differs_and_no_version_id_recorded_is_live_superseded_never_mismatch():
@@ -945,8 +961,10 @@ def test_a_manifest_with_no_output_record_for_the_key_keeps_todays_behaviour():
         {_CLOSE_KEY: "e-next-day"},
     )
     row = _run_d17(reader).rows[0]
-    assert row.verdict == "mismatch"
     assert row.body["live_version"] == {"basis": "unrecorded"}
+    # Recorded as a settling cell, not a breach (I11351); the graded live side
+    # is the CURRENT object, which is what "keeps today's behaviour" means here.
+    assert row.body["settling_bar"]["examples"][0]["live"] == 2.0
 
 
 @pytest.mark.parametrize(
@@ -967,8 +985,11 @@ def test_an_unmeasured_record_keeps_todays_behaviour(etag, version_id, capture):
         {_CLOSE_KEY: "e-next-day"},
     )
     row = _run_d17(reader).rows[0]
-    assert row.verdict == "mismatch"
     assert row.body["live_version"]["basis"] == "unrecorded"
+    # Recorded as a settling cell rather than a breach (I11351 — the key is
+    # `key_date`-settling on its own trading day); the graded live side is still
+    # the current object, which is what this test is about.
+    assert row.body["settling_bar"]["examples"][0]["live"] == 2.0
     assert reader.version_gets == []
 
 
@@ -986,9 +1007,18 @@ def test_a_live_superseded_report_conforms_to_the_schema():
     report = _run_d17(reader)
     schema = json.loads((REPO_ROOT / "contracts" / "data_parity_report.schema.json").read_text(encoding="utf-8"))
     jsonschema.validate(report.as_dict(), schema)
-    assert set(report.summary) - {"total"} <= set(
+    # Every summary key is either a VERDICT count or one of the declared
+    # non-verdict breakdowns. `settling_bar_keys` (I11351) is the second kind:
+    # it counts a subset of `match`, and `data_gate.evidence` must skip it when
+    # rolling `summary` up into exception counts or every same-day report reads
+    # UNMET on the very number the split exists to make legible. The two
+    # spellings are pinned together here rather than left to agree by habit.
+    from data_gate.evidence import SUMMARY_NON_VERDICT_FIELDS
+
+    assert set(report.summary) - {"total", "settling_bar_keys"} <= set(
         schema["$defs"]["keyResult"]["properties"]["verdict"]["enum"]
     )
+    assert "settling_bar_keys" in SUMMARY_NON_VERDICT_FIELDS
 
 
 def test_s3_reader_get_with_meta_fetches_a_version_and_treats_no_such_version_as_absent():
@@ -1041,3 +1071,109 @@ def test_the_report_schema_accepts_excluded_class_and_provenance_diffs():
     )
     jsonschema.validate(report.as_dict(), schema)
     assert any(e["class"] == "out_of_run_scope" for e in report.excluded)
+
+
+# ---------------------------------------------------------------------------
+# An absent shadow key has THREE causes, and the manifest already knows which
+# (`alpha-engine-config-I11231` closes-when 2)
+# ---------------------------------------------------------------------------
+#
+# "v1 wrote it; the shadow run did not" was one sentence for three different
+# facts. On the 2026-09-21 report D26's `market_data/technicals/rating_history/
+# _manifest.json` read that way while D26's OWN shadow manifest said
+# `status: not_applicable, reason: no_new_data_declared` — a correct
+# immutable-date no-op — and the four `reference/price_cache/{FDXF,HONA,Q,SOLS}
+# .parquet` rows read the same way while their unit had failed on
+# `short_fetch_guard_refused`. The answer was one read away in both cases.
+
+
+def _status_manifest_bytes(unit_id: str, status: str, reason: str, run_id: str = "R1") -> bytes:
+    return json.dumps(
+        {
+            "schema_version": "data_run_manifest.v1",
+            "unit_id": unit_id,
+            "finished": "2026-09-12T20:00:00Z",
+            "run_id": run_id,
+            "status": status,
+            "reason": reason,
+            "outputs": [],
+        }
+    ).encode("utf-8")
+
+
+def _absent_shadow_row(status: str, reason: str) -> parity.KeyResult:
+    live_key = "staging/daily_closes/2026-09-12.parquet"
+    reader = _FakeReader(
+        {
+            live_key: _parquet(_frame(["AAPL"], [1.0])),
+            _shadow_manifest_key("D17"): _status_manifest_bytes("D17", status, reason),
+        }
+    )
+    report = parity.run_parity(
+        trading_day=TRADING_DAY,
+        bucket="alpha-engine-research",
+        reader=reader,
+        units=_one_unit("D17"),
+    )
+    return report, report.rows[0]
+
+
+def test_a_declared_no_op_grades_not_applicable_carrying_the_manifests_own_reason():
+    report, row = _absent_shadow_row("not_applicable", "no_new_data_declared")
+    assert row.verdict == "not_applicable"
+    assert "no_new_data_declared" in row.body["detail"]
+    assert "run_id R1" in row.body["detail"]
+    assert row.body["shadow_run_status"] == {"D17": "not_applicable"}
+    assert report.summary["not_applicable"] == 1
+    assert report.summary["shadow_missing"] == 0
+    # A declared no-op is still not parity evidence: nothing was diffed.
+    assert report.met is False
+
+
+def test_a_failed_unit_stays_shadow_missing_but_names_the_failure():
+    report, row = _absent_shadow_row("failed", "short_fetch_guard_refused")
+    assert row.verdict == "shadow_missing"
+    assert row.body["detail"].startswith("v1 wrote it; the shadow run did not")
+    assert "short_fetch_guard_refused" in row.body["detail"]
+    assert row.body["shadow_run_status"] == {"D17": "failed"}
+    assert report.summary["shadow_missing"] == 1
+
+
+def test_an_ok_unit_that_produced_nothing_keeps_the_unexplained_wording():
+    """`ok` and no key is the case that SHOULD read as a plain gap — the
+    manifest offers no exculpation, so none is invented."""
+    _report, row = _absent_shadow_row("ok", "")
+    assert row.verdict == "shadow_missing"
+    assert row.body["detail"] == "v1 wrote it; the shadow run did not"
+    assert row.body["shadow_run_status"] == {"D17": "ok"}
+
+
+def test_not_applicable_is_a_declared_verdict_in_the_published_schema():
+    schema = json.loads(
+        (REPO_ROOT / "contracts" / "data_parity_report.schema.json").read_text(encoding="utf-8")
+    )
+    assert "not_applicable" in schema["$defs"]["keyResult"]["properties"]["verdict"]["enum"]
+
+
+def test_one_unit_declining_does_not_excuse_a_key_two_units_write():
+    """`staging/daily_closes` is written by D17 AND D19 (plan §2 row 5). A
+    declared no-op by one of them while the other ran is a MISSING key, and
+    grading it `not_applicable` would turn a real gap into a green
+    declaration."""
+    result = parity._absent_shadow_result(
+        "staging/daily_closes/2026-09-12.parquet",
+        ["D17", "D19"],
+        ROOT.key("staging/daily_closes/2026-09-12.parquet"),
+        {
+            "D17": {"status": "not_applicable", "reason": "no_new_data_declared", "run_id": "R1"},
+            "D19": {"status": "ok", "reason": "", "run_id": "R2"},
+        },
+    )
+    assert result.verdict == "shadow_missing"
+
+
+def test_no_manifest_at_all_keeps_the_pre_existing_wording():
+    result = parity._absent_shadow_result("some/key.json", ["D99"], "shadow/some/key.json", {})
+    assert result.verdict == "shadow_missing"
+    assert result.body["detail"] == "v1 wrote it; the shadow run did not"
+    assert "shadow_run_status" not in result.body
