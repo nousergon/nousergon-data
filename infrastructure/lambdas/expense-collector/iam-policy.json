@@ -14,7 +14,10 @@
     {
       "Sid": "ProviderKeySSM",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter", "ssm:GetParameters"],
+      "Action": [
+        "ssm:GetParameter",
+        "ssm:GetParameters"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/OPENROUTER_API_KEY",
         "arn:aws:ssm:us-east-1:711398986525:parameter/symposion/DEEPSEEK_API_KEY",
@@ -25,9 +28,19 @@
       ]
     },
     {
+      "Sid": "SpendMonitorDispatchPAT",
+      "Effect": "Allow",
+      "Action": [
+        "ssm:GetParameter"
+      ],
+      "Resource": "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/saturday_sf_watch/github_pat"
+    },
+    {
       "Sid": "TelegramSecretsSSM",
       "Effect": "Allow",
-      "Action": ["ssm:GetParameter"],
+      "Action": [
+        "ssm:GetParameter"
+      ],
       "Resource": [
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID",
@@ -37,19 +50,27 @@
     {
       "Sid": "CostExplorerRead",
       "Effect": "Allow",
-      "Action": ["ce:GetCostAndUsage", "ce:GetCostForecast"],
+      "Action": [
+        "ce:GetCostAndUsage",
+        "ce:GetCostForecast"
+      ],
       "Resource": "*"
     },
     {
       "Sid": "ExpenseArtifactsReadWrite",
       "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Action": [
+        "s3:GetObject",
+        "s3:PutObject"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research/expenses/*"
     },
     {
       "Sid": "BudgetsAndCostRawRead",
       "Effect": "Allow",
-      "Action": ["s3:GetObject"],
+      "Action": [
+        "s3:GetObject"
+      ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/config/expense_budgets.json",
         "arn:aws:s3:::alpha-engine-research/decision_artifacts/_cost_raw/*"
@@ -58,11 +79,17 @@
     {
       "Sid": "PrefixList",
       "Effect": "Allow",
-      "Action": ["s3:ListBucket"],
+      "Action": [
+        "s3:ListBucket"
+      ],
       "Resource": "arn:aws:s3:::alpha-engine-research",
       "Condition": {
         "StringLike": {
-          "s3:prefix": ["expenses/*", "decision_artifacts/_cost_raw/*", "config/expense_budgets.json"]
+          "s3:prefix": [
+            "expenses/*",
+            "decision_artifacts/_cost_raw/*",
+            "config/expense_budgets.json"
+          ]
         }
       }
     },

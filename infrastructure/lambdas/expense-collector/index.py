@@ -113,6 +113,55 @@ logger = logging.getLogger()
 logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 REGION = os.environ.get("AWS_REGION", "us-east-1")
+
+# --------------------------------------------------------------------------
+# SPEND-MONITOR repository_dispatch (alpha-engine-config-I11374)
+# --------------------------------------------------------------------------
+# GitHub DROPS `schedule:` events under load. Measured 2026-09-22:
+# `alpha-engine-config/.github/workflows/aws-spend-monitor.yml` declares
+# cron("10 14 * * *") and its 14:10Z fire had still not arrived at 15:17Z;
+# the previous day's landed at 19:17Z, 5h07m late; `scheduled_workflow_health`
+# reports ~16 fleet workflows delivering 0 of 1 declared daily fires.
+#
+# That is not cosmetic. FIVE rows in alpha-engine-config's
+# COST_CONTROL_REGISTRY.yaml take their evidence from that workflow's latest
+# SCHEDULE-triggered run, and check_cost_control_health.py's
+# EXCLUDED_EVIDENCE_EVENTS = {"workflow_dispatch"} deliberately refuses a
+# hand-dispatched run as cadence evidence — so a dropped cron leaves five cost
+# controls reading `failing` with nothing anyone can do about it by hand.
+#
+# WHY THIS LAMBDA AND NOT A NEW SCHEDULE. Brian's 2026-08-07 automation pause
+# (alpha-engine-config-I6617) removes the schedule from every automatic AWS
+# process bar a named few, and its scope is exactly "EventBridge rules or
+# Scheduler schedules". A NEW schedule would need a new, individually-ruled
+# pause exception. This Lambda's twice-daily schedule is ALREADY un-paused by
+# Brian's 2026-08-11 ruling (config#6613), is in the same cost domain, and
+# fires TWICE a day rather than once. The manifest states this precedent for
+# the weekly-SF silence dead-man: "that check was given THIS trigger rather
+# than a new one of its own, so it needed no `pending` entry".
+#
+# The GHA cron is deliberately LEFT IN PLACE for now. This path is unproven,
+# and `aws-spend-monitor.yml` is the only automatic route from a cost breach
+# to Brian (alpha-engine-config-I11223) — replacing an unreliable trigger with
+# an unproven one, in one step, is how that route goes dark. Removing the cron
+# is a follow-up gated on this dispatch being observed to work.
+SPEND_MONITOR_DISPATCH_ENABLED = (
+    os.environ.get("SPEND_MONITOR_DISPATCH_ENABLED", "true").lower() == "true"
+)
+SPEND_MONITOR_DISPATCH_REPO = os.environ.get(
+    "SPEND_MONITOR_DISPATCH_REPO", "nousergon/alpha-engine-config")
+SPEND_MONITOR_DISPATCH_EVENT_TYPE = os.environ.get(
+    "SPEND_MONITOR_DISPATCH_EVENT_TYPE", "aws-spend-monitor")
+# Reuses the sf-watch dispatcher's fine-grained PAT rather than minting a
+# second secret: that PAT already dispatches to this exact repo
+# (saturday-sf-watch-dispatcher's DISPATCH_REPO defaults to
+# nousergon/alpha-engine-config), so the capability is identical and no new
+# secret has to be created by hand. The parameter NAME is dispatcher-specific
+# and that is a wart — a dedicated `/alpha-engine/expense_collector/github_pat`
+# is tracked as a follow-up on alpha-engine-config-I11374.
+GITHUB_PAT_SSM_PARAM = os.environ.get(
+    "GITHUB_PAT_SSM_PARAM", "/alpha-engine/saturday_sf_watch/github_pat")
+_DISPATCH_TIMEOUT_SEC = 10
 BUCKET = os.environ.get("EXPENSE_BUCKET", "alpha-engine-research")
 
 BUDGETS_KEY = os.environ.get("EXPENSE_BUDGETS_KEY", "config/expense_budgets.json")
@@ -1612,6 +1661,62 @@ def write_snapshot(s3, counters: dict) -> None:
 # Handler
 # ---------------------------------------------------------------------------
 
+def _dispatch_spend_monitor() -> dict:
+    """Fire `repository_dispatch` so aws-spend-monitor.yml runs on a trigger
+    GitHub does not drop (alpha-engine-config-I11374).
+
+    BEST-EFFORT AND NON-FATAL, deliberately. By the time this runs the primary
+    deliverable — the expense rollup in S3 — has already landed, and this
+    Lambda is itself a named exception to the automation pause because it is
+    "the only guard against the credit exhaustion that took every autonomous
+    lane dark for three days". Raising here would fail a run whose real work
+    succeeded, and take that guard down to fix a secondary notification path.
+
+    It is NOT silent: every outcome is logged and returned in the handler's
+    result dict, so a dispatch that stops working shows up in the Lambda's own
+    output rather than being swallowed (fail-loud's recording-surface clause —
+    the swallowed failure mode is "GitHub unreachable / PAT rejected", the
+    primary deliverable survives because it already completed, and the
+    recording surface is this return value plus the WARNING log line).
+    """
+    if not SPEND_MONITOR_DISPATCH_ENABLED:
+        logger.info("spend-monitor dispatch disabled by env")
+        return {"dispatched": False, "reason": "disabled"}
+    try:
+        ssm = boto3.client("ssm", region_name=REGION)
+        pat = ssm.get_parameter(
+            Name=GITHUB_PAT_SSM_PARAM, WithDecryption=True)["Parameter"]["Value"]
+        payload = {
+            "event_type": SPEND_MONITOR_DISPATCH_EVENT_TYPE,
+            "client_payload": {"source": "alpha-engine-expense-collector"},
+        }
+        req = urllib.request.Request(
+            f"https://api.github.com/repos/{SPEND_MONITOR_DISPATCH_REPO}/dispatches",
+            data=json.dumps(payload).encode("utf-8"),
+            method="POST",
+            headers={
+                "Authorization": f"Bearer {pat}",
+                "Accept": "application/vnd.github+json",
+                "Content-Type": "application/json",
+                "User-Agent": "expense-collector",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_DISPATCH_TIMEOUT_SEC) as resp:
+            status_code = resp.status
+        logger.info(
+            "spend-monitor repository_dispatch sent to %s (type=%s, http=%s)",
+            SPEND_MONITOR_DISPATCH_REPO, SPEND_MONITOR_DISPATCH_EVENT_TYPE,
+            status_code,
+        )
+        return {"dispatched": True, "status_code": status_code,
+                "event_type": SPEND_MONITOR_DISPATCH_EVENT_TYPE}
+    except Exception as exc:  # noqa: BLE001 — secondary path, recorded not raised
+        logger.warning(
+            "spend-monitor repository_dispatch FAILED (non-fatal, the rollup "
+            "already landed): %s: %s", type(exc).__name__, exc)
+        return {"dispatched": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """Dispatches on ``event.get("mode")`` — one Lambda, two EventBridge
     Scheduler rules with different ``Input`` (this codebase's established
@@ -1733,7 +1838,12 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # not a provider blip: raise so the Lambda error metric pages.
         raise RuntimeError(f"all provider adapters failed: "
                            f"{[(r['key'], r['error']) for r in err_rows]}")
+    # alpha-engine-config-I11374 — LAST, after every write and alert, so a
+    # GitHub outage can never cost the rollup or the over-budget page.
+    spend_monitor_dispatch = _dispatch_spend_monitor()
+
     return {"period": mw["period"], "providers": len(rows),
             "errors": [(r["key"], r["error"]) for r in err_rows],
             "totals": totals, "alerts": alert_result,
-            "balance_alerts": balance_alert_result}
+            "balance_alerts": balance_alert_result,
+            "spend_monitor_dispatch": spend_monitor_dispatch}
