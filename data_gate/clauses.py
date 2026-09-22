@@ -1001,7 +1001,12 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
         f"P-11 (alpha-engine-config-I10778), and the most recent report is within "
         f"{ev.PARITY_FRESHNESS_TRADING_DAYS} trading days of this gate's own trading day "
         "(alpha-engine-config-I10857) — a shadow run is a one-off for a completed day, "
-        "never keyed to the gate's own running day"
+        "never keyed to the gate's own running day. The detail prints the three-way split "
+        "(match / settling-only / mismatch): a key whose only difference is the trading "
+        "day's own unsettled bar grades `match` with a `settling_bar` block and is NOT a "
+        "producer mismatch, and the two numbers are legible separately so a reader can see "
+        "which half of the match count was earned on settled rows "
+        "(alpha-engine-config-I11351)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:

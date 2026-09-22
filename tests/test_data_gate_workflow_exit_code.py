@@ -73,7 +73,12 @@ def test_scheduled_triggers_are_unchanged_cron_and_push_only():
     loaded = _load_workflow()
     on_block = loaded["doc"].get("on") or loaded["doc"].get(True)
     crons = {entry["cron"] for entry in on_block["schedule"]}
-    assert crons == {"30 23 * * *", "0 18 * * 6"}
+    # The two 23:30/Saturday crons are the BACKSTOP and are unchanged; the two
+    # added by alpha-engine-config-I11355 are the reads that follow the parity
+    # publish (01:30 UTC Tue-Sat after the same-day report, 12:30 UTC Mon-Fri
+    # after the shadow-morning rewrite). Pinned here as a set so a cadence
+    # change is a deliberate edit to this line.
+    assert crons == {"30 23 * * *", "0 18 * * 6", "30 1 * * 2-6", "30 12 * * 1-5"}
     assert on_block["push"]["branches"] == ["main"]
 
 

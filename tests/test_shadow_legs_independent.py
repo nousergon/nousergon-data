@@ -156,10 +156,21 @@ def test_the_report_carries_legs_and_legs_known():
         rel_tolerance=1e-6,
         absolute_tolerance=1e-9,
         generated_at="2026-09-20T19:07:24Z",
-        legs=[{"name": "post-market-data", "exit_code": 1, "ok": False}],
+        legs=[
+            {
+                "name": "post-market-data",
+                "exit_code": 1,
+                "ok": False,
+                "dispatch": "sameday",
+            }
+        ],
     )
     body = report.as_dict()
-    assert body["legs_known"] is True
+    # PER DISPATCH GROUP since alpha-engine-config-I11352: the same-day and the
+    # D+1 morning dispatch write the same report, so one bare boolean could not
+    # say the morning legs had not run yet without also erasing the same-day
+    # ones. The I11200 claim is unchanged for each group.
+    assert body["legs_known"] == {"sameday": True, "morning": False}
     assert body["legs"][0]["name"] == "post-market-data"
     assert body["legs"][0]["ok"] is False
 
@@ -181,7 +192,9 @@ def test_a_report_with_no_legs_says_so_rather_than_implying_completeness():
         generated_at="2026-09-20T19:07:24Z",
     ).as_dict()
     assert body["legs"] == []
-    assert body["legs_known"] is False, (
-        "a report that was not told what the legs did must say so; silence reads as "
-        "'every leg ran', which is the assumption I11200 exists to stop"
+    assert body["legs_known"] == {"sameday": False, "morning": False}, (
+        "a report that was not told what the legs did must say so, for EVERY dispatch "
+        "group; silence reads as 'every leg ran', which is the assumption I11200 exists "
+        "to stop, and I11352 splits the claim per group so a missing morning dispatch "
+        "cannot hide behind a same-day one"
     )

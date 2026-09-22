@@ -1198,6 +1198,24 @@ PARITY_KEY_PREFIX = "parity/"
 #: enforces it, per `alpha-engine-config-I10857` deliverable 1.
 PARITY_FRESHNESS_TRADING_DAYS = 5
 
+#: Every `data_parity_report` version this reader has a rendering for. v2
+#: (`alpha-engine-config-I11351`) adds the `settling_bar` block, the
+#: `prior_day_settled` summary and a per-dispatch-group `legs_known`; v1 stays
+#: readable because the reports already published — including the ones the
+#: cutover gate reads today — were written under it, and a bump that made them
+#: unreadable would red the clause for a reason that is not a parity fact.
+PARITY_SCHEMA_VERSIONS: frozenset[str] = frozenset(
+    {"data_parity_report.v1", "data_parity_report.v2"}
+)
+
+#: `summary` keys that are NOT verdict counts, so an `exceptions` roll-up must
+#: skip them. `settling_bar_keys` is a BREAKDOWN of `match`, not a class of
+#: failure: counting it as an exception would make every same-day report read
+#: UNMET on the very number I11351 added to make it readable.
+SUMMARY_NON_VERDICT_FIELDS: frozenset[str] = frozenset(
+    {"total", "match", "settling_bar_keys"}
+)
+
 
 def parity_store_key(trading_day: dt.date) -> str:
     return PARITY_KEY_TEMPLATE.format(trading_day=trading_day.isoformat())
@@ -1300,6 +1318,46 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
         )
 
     report_day, key = candidates[-1]
+
+    # `alpha-engine-config-I11355`. The gate's cron fires at 23:30 UTC and the
+    # same-day parity publishes at ~23:43 UTC (shadow-sameday launches 22:30Z
+    # and ran 73 minutes on its first scheduled night), so EVERY weekday
+    # reading was one report behind — `gate.json` for 2026-09-21 cited
+    # `parity/2026-09-18.json` — and `-I11233` closes-when 2, "the parity
+    # clause reads a report whose trading day IS the gate's own", could never
+    # be satisfied by that ordering.
+    #
+    # A reading on yesterday's numbers is NOT a reading about today, and
+    # rendering it as MET or UNMET publishes a verdict for a day nothing was
+    # measured on. It is UNMEASURABLE, naming both dates — which is never MET
+    # (plan §4.1 rule 2) and, unlike a quiet UNMET, says the next action is
+    # "make the read follow the publish", not "fix parity".
+    #
+    # The `PARITY_FRESHNESS_TRADING_DAYS` window stays as the OUTER bound
+    # below, and deliberately keeps grading UNMET rather than UNMEASURABLE: a
+    # report days old means no shadow run is happening at all, which IS a
+    # finding about cutover readiness rather than a gap in this read.
+    if report_day != trading_day:
+        age_trading_days = _trading_days_between(report_day, trading_day)
+        if age_trading_days <= PARITY_FRESHNESS_TRADING_DAYS:
+            return Reading(
+                met=False,
+                detail=(
+                    f"the most recent parity report is for trading_day "
+                    f"{report_day.isoformat()} ({key}) while this gate's trading day is "
+                    f"{trading_day.isoformat()} — {age_trading_days} trading day(s) behind. "
+                    "The clause is UNMEASURABLE for the gate's own day: yesterday's parity "
+                    "numbers are not a reading about today, and publishing them as MET or "
+                    "UNMET would put a verdict on a day nothing was measured on "
+                    "(alpha-engine-config-I11355). The gate read is triggered again after "
+                    "the same-day parity publishes; a reading still showing this means the "
+                    "later trigger did not fire or the shadow run did not publish."
+                ),
+                evidence=(key,),
+                unmeasurable=True,
+                source="data_collection store",
+            )
+
     floor = subtract_trading_days(trading_day, PARITY_FRESHNESS_TRADING_DAYS)
     if report_day < floor:
         age_trading_days = _trading_days_between(report_day, trading_day)
@@ -1338,12 +1396,13 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     document = read.document or {}
     as_of = str(document.get("generated_at") or "")
     version = str(document.get("schema_version") or "")
-    if version != "data_parity_report.v1":
+    if version not in PARITY_SCHEMA_VERSIONS:
         return Reading(
             met=False,
             detail=(
-                f"{key} carries schema_version {version!r}, not 'data_parity_report.v1'. A "
-                "document nobody defined a rendering for is a finding, not a reading."
+                f"{key} carries schema_version {version!r}, not one of "
+                f"{sorted(PARITY_SCHEMA_VERSIONS)}. A document nobody defined a rendering "
+                "for is a finding, not a reading."
             ),
             evidence=(key,),
             source="data_collection store",
@@ -1365,13 +1424,24 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     summary = document.get("summary") or {}
     total = int(summary.get("total") or 0)
     matched = int(summary.get("match") or 0)
+    settling = int(summary.get("settling_bar_keys") or 0)
     exceptions = {
         name: int(count)
         for name, count in summary.items()
-        if name not in {"total", "match"} and int(count or 0)
+        if name not in SUMMARY_NON_VERDICT_FIELDS and int(count or 0)
     }
     met = bool(document.get("met")) and total > 0 and matched == total and not exceptions
-    detail = f"{matched}/{total} published keys match (report {key}, trading_day {report_day.isoformat()})"
+    mismatch = int(summary.get("mismatch") or 0)
+    # The THREE-WAY split (`alpha-engine-config-I11351` deliverable 3). A
+    # settling-only key already grades `match` — its trading-day cells were
+    # never breaches — so printing only `match/total` hides which half of the
+    # number was earned on settled rows and which was a bar the vendor was
+    # still revising. Both numbers on the gate row, and therefore on the daily
+    # report the gate row renders into.
+    detail = (
+        f"{matched}/{total} published keys match ({settling} settling-only, "
+        f"{mismatch} mismatch) (report {key}, trading_day {report_day.isoformat()})"
+    )
     if exceptions:
         detail += "; " + ", ".join(f"{name}={count}" for name, count in sorted(exceptions.items()))
     if document.get("met") and not met:

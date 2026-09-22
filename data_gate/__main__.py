@@ -61,7 +61,30 @@ def _parser() -> argparse.ArgumentParser:
     reader.add_argument(
         "--trading-day",
         default=None,
-        help="ISO date the reading is filed under; defaults to today UTC",
+        help=(
+            "ISO date the reading is filed under, or one of the two literals below; "
+            "defaults to `today`. `today` = the latest trading day on or before today "
+            "UTC. `yesterday` = the latest trading day on or before YESTERDAY UTC, which "
+            "is the session a read taken after midnight UTC is actually about "
+            "(alpha-engine-config-I11355): the same-day parity for session D publishes at "
+            "~23:43 UTC on D and the morning dispatch rewrites it at 11:45 UTC on D+1, so "
+            "every read that follows a publish runs on the NEXT UTC calendar day and must "
+            "not file itself under that day. It is a literal rather than arithmetic in the "
+            "workflow because a Saturday 01:30 UTC read is about FRIDAY, and "
+            "`previous_trading_day(latest_on_or_before(Saturday))` returns Thursday."
+        ),
+    )
+    reader.add_argument(
+        "--trigger",
+        default="manual",
+        choices=sorted(read_module.TRIGGERS),
+        help=(
+            "What caused this read, recorded on the dated `gates/<gate>/{date}/gate.json` "
+            "(alpha-engine-config-I11355 deliverable 2). Without it a reading taken before "
+            "the day's parity published is indistinguishable from one taken after, so a "
+            "day whose post-publish read never ran reads as an ordinary reading rather "
+            "than as a gap."
+        ),
     )
     reader.add_argument(
         "--artifact-registry",
@@ -132,11 +155,25 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def resolve_trading_day(value: "str | None", *, today: dt.date) -> dt.date:
+    """The trading day a reading is filed under, from the flag and today's date.
+
+    `alpha-engine-config-I11355`. Two literals plus an explicit ISO date; the
+    literals exist so the calendar rule lives in Python with a test on it
+    rather than in a shell expression inside a workflow, where a Saturday
+    01:30 UTC read (about FRIDAY) is exactly the case a naive
+    `previous_trading_day` gets wrong.
+    """
+    if not value or value == "today":
+        return latest_trading_day_on_or_before(today)
+    if value == "yesterday":
+        return latest_trading_day_on_or_before(today - dt.timedelta(days=1))
+    return dt.date.fromisoformat(value)
+
+
 def _read_command(args) -> int:
-    trading_day = (
-        dt.date.fromisoformat(args.trading_day)
-        if args.trading_day
-        else latest_trading_day_on_or_before(dt.datetime.now(dt.timezone.utc).date())
+    trading_day = resolve_trading_day(
+        args.trading_day, today=dt.datetime.now(dt.timezone.utc).date()
     )
     store = open_store(
         args.store,
@@ -146,7 +183,11 @@ def _read_command(args) -> int:
     )
     try:
         result, _ladder, board = read_module.run(
-            store, gate=args.gate, trading_day=trading_day, dry_run=args.dry_run
+            store,
+            gate=args.gate,
+            trading_day=trading_day,
+            dry_run=args.dry_run,
+            trigger=getattr(args, "trigger", "manual"),
         )
     except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
         # Deliberate, and narrow in effect: the failure mode is "the measurement

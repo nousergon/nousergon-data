@@ -468,8 +468,14 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
     the chain takes (alpha-engine-config-I11203)."""
     index, ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     for workload, cmd in _every_resolved_workload(index):
-        chained = workload in ("shadow-weekday", "shadow-sameday")
-        expected = 18000 if chained else index.MAX_RUNTIME_SECONDS
+        if workload in ("shadow-weekday", "shadow-sameday"):
+            expected = 18000
+        elif workload == "shadow-morning":
+            # Two legs plus the comparator, measured at 6 min on 2026-09-21 —
+            # a tenth of the chained workloads' budget, not a copy of it.
+            expected = 3600
+        else:
+            expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
         assert index._bootstrap_spec(workload).max_runtime_seconds == expected
         index._send_bootstrap("i-x", workload, cmd, "tok")
@@ -486,6 +492,7 @@ def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch)
     assert index._WORKLOAD_PARITY_WINDOW == {
         "shadow-weekday": None,
         "shadow-sameday": None,
+        "shadow-morning": None,
         "shadow-parity": None,
         "arctic-parity": None,
     }

@@ -55,6 +55,14 @@ Parameters:
       staging/shadow/, never market_data/*, so it carries none of the
       double-write risk the other schedules' DISABLED default guards against
       (alpha-engine-config-I11233).
+  ShadowMorningState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [DISABLED, ENABLED]
+    Description: >-
+      State of the shadow-morning schedule. Born ENABLED for the same reason
+      ShadowSamedayState is: the workload writes only under staging/shadow/,
+      never market_data/* (alpha-engine-config-I11352).
   DefinitionS3Bucket:
     Type: String
     Default: alpha-engine-research
@@ -383,6 +391,43 @@ Resources:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
         Input: '{"workload": "shadow-sameday"}'
+
+  # Weekday D+1 shadow-morning parity run (alpha-engine-config-I11352). The
+  # other half of ShadowSamedaySchedule above, and the same shape in every
+  # respect — direct Lambda target, same SchedulerRoleName grant, own State
+  # parameter, no require_trading_day/verify_units because the workload's own
+  # guard resolves the day and this stack's verify_units machinery grades LIVE
+  # run manifests, which a shadow run does not write.
+  #
+  # 07:45 ET, and the fifteen minutes are the whole point: MorningSchedule
+  # above fires v1's morning-enrich + morning-arctic-append at 07:30 ET for the
+  # PREVIOUS session, and parity needs v1's copy of those keys to already exist
+  # or every one of them reads `live_missing`.
+  #
+  # Why not 18:30 ET on day D, where these two legs used to run as part of
+  # shadow-sameday: Polygon's grouped-daily bar for session D is final the next
+  # morning, so the 2026-09-21 same-day dispatch ran them against a bar the
+  # vendor had not published and BOTH failed (D17 target-date error, D18
+  # NoSuchKey on the parquet D17 never wrote). Comparing two implementations
+  # means running the same leg at the same vendor state v1 sees, and for these
+  # two legs that state is a D+1 fact.
+  ShadowMorningSchedule:
+    Type: AWS::Scheduler::Schedule
+    Properties:
+      Name: data-collection-shadow-morning
+      GroupName: !Ref CollectionScheduleGroup
+      State: !Ref ShadowMorningState
+      ScheduleExpression: 'cron(45 7 ? * MON-FRI *)'
+      ScheduleExpressionTimezone: America/New_York
+      FlexibleTimeWindow:
+        Mode: 'OFF'
+      Target:
+        Arn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
+        Input: '{"workload": "shadow-morning"}'
 
   # Failure alarms are NOT declared here. The fleet's alarms come from files
   # (nous-ergon-ops infrastructure/cloudwatch/alarms/ne-data-collection-*-failed.json,
