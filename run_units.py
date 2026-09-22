@@ -47,6 +47,7 @@ from nousergon_lib.run_manifest import DEFAULT_MANIFEST_PREFIX, S3ManifestSink
 
 __all__ = [
     "LOG_LOCATION_ENV",
+    "RUN_LOG_S3_ENV",
     "MANIFEST_BUCKET",
     "MODE_ROWS",
     "MODE_UNITS",
@@ -73,6 +74,7 @@ __all__ = [
     "resolve_log_location",
     "recorded_entry",
     "resolve_trigger",
+    "truncate_reason",
     "unit_for",
 ]
 
@@ -81,6 +83,13 @@ __all__ = [
 #: the process did not measure.
 TRIGGER_ENV = "NE_DATA_TRIGGER"
 LOG_LOCATION_ENV = "NE_DATA_LOG_LOCATION"
+
+#: The S3 URI of THIS run's whole shipped log, exported by the data-spot
+#: dispatcher's bootstrap wrapper (`infrastructure/lambdas/data-spot-dispatcher/
+#: index.py::RUN_LOG_ENV`, alpha-engine-config-I11353). It is the durable
+#: record; the CloudWatch stream below is a capped live tail — measured
+#: 2026-09-21 as 1,025,054 bytes over a 73-minute run, ending three minutes in.
+RUN_LOG_S3_ENV = "ALPHA_ENGINE_RUN_LOG_S3"
 
 #: The durable log location every scheduled collector workload already writes
 #: to (`observability-policy` §6.2; plan §4.4 "log capture"). Used when the box
@@ -554,14 +563,26 @@ def resolve_trigger(default: str) -> str:
 def resolve_log_location() -> str:
     """Where this run's FULL logs are (`observability-policy` §6.2).
 
-    The box shell exports the CloudWatch stream or the SSM capture key it is
-    writing to. Off a box, the answer is the host and pid, which is a true
-    statement about where the logs are rather than a CloudWatch group this run
-    never wrote to.
+    Four answers, in falling order of how specific a claim they make:
+
+    1. ``NE_DATA_LOG_LOCATION`` — an explicit override from the launcher.
+    2. ``ALPHA_ENGINE_RUN_LOG_S3`` — the S3 object this box's bootstrap wrapper
+       is shipping the whole run log to (alpha-engine-config-I11353). Preferred
+       over the CloudWatch group below because it is the RECORD: the stream is
+       capped at ~1 MB and the object is not.
+    3. The CloudWatch group, when the box declared itself but exported no log
+       URI — a box running code from before I11353 landed.
+    4. Off a box: host and pid. A true statement about where the logs are,
+       rather than a CloudWatch group this run never wrote to. The daily report
+       counts a ``local:`` manifest on a non-ok run as a DETECTION GAP row
+       (`data_gate.report`), never as silence.
     """
     declared = os.environ.get(LOG_LOCATION_ENV)
     if declared:
         return declared
+    shipped = os.environ.get(RUN_LOG_S3_ENV)
+    if shipped:
+        return shipped
     if os.environ.get("NE_DATA_INSTANCE_TYPE"):
         return _DEFAULT_LOG_GROUP
     return f"local:{socket.gethostname()}:{os.getpid()}"
@@ -711,6 +732,24 @@ def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
 #: EXPLICIT bound is what fires first (alpha-engine-config-I10941).
 REASON_MAX_LEN = 1800
 
+#: How a truncated reason is SPLIT (alpha-engine-config-I11353). Head-only was
+#: the 2026-09-21 defect: `collectors/daily_closes.py::collect` scans a window
+#: and the TARGET date — the one that failed — is the LAST entry in the result,
+#: so a head cut drops precisely the cause and keeps ten `ok` dates nobody
+#: needed. 3:5 head:tail keeps enough of the header to identify the mode and
+#: enough of the tail to carry the failing entry.
+#:
+#: The 1,800-char ceiling above is NOT raised to the 4,000 the issue proposes,
+#: and that is deliberate rather than a shortfall: `run_unit` cuts the final
+#: string at 2,000 chars, HEAD-ONLY and with no marker, so a 4,000-char
+#: head+tail reason would be re-truncated by the library back to its head and
+#: lose the tail this change exists to keep — reintroducing the same defect one
+#: layer down, silently. Lifting the library's cut to the same head+tail shape
+#: is filed separately; until it lands, 1,800 is the largest budget this layer
+#: can actually deliver.
+REASON_HEAD_RATIO = 3
+REASON_TAIL_RATIO = 5
+
 
 def elide_bulk(value: Any, max_items: int = 20, _depth: int = 0) -> Any:
     """Recursively replace an over-long list/tuple with a count placeholder.
@@ -777,10 +816,44 @@ def describe_mode_failure(mode: str, result: dict, *, max_len: int = REASON_MAX_
     else:
         header = f"{mode} returned status={status!r} (no sub-collector reported non-ok)"
     reason = f"{header} | full_result(elided)={elide_bulk(result)!r}"
+    return truncate_reason(reason, max_len=max_len)
+
+
+def truncate_reason(reason: str, *, max_len: int = REASON_MAX_LEN) -> str:
+    """Bound ``reason`` to ``max_len``, keeping BOTH ends.
+
+    `alpha-engine-config-I11353`. The previous form kept the head alone, and
+    the 2026-09-21 `morning_daily_closes` manifest is what that costs: the
+    window scan renders 2026-09-08…09-18 as `ok` first and the failing target
+    date LAST, so the cut landed before the only entry anyone was reading the
+    field for. Whatever a producer puts first, the thing that went wrong is
+    usually what it says last.
+
+    The marker names the exact number of characters removed
+    (``reason_truncated_bytes``) rather than only that a cut happened, so a
+    reader can tell "two lines elided" from "this field is 4% of the story".
+    """
     if len(reason) <= max_len:
         return reason
-    cut = reason[: max_len - 60]
-    return f"{cut} …[reason_truncated: true, full length {len(reason)} chars]"
+    total = REASON_HEAD_RATIO + REASON_TAIL_RATIO
+    # Reserve the marker's own length first, measured rather than guessed: the
+    # dropped count appears INSIDE the marker, so a fixed reserve is wrong by
+    # however many digits it has.
+    probe = (
+        f" …[reason_truncated: true, reason_truncated_bytes: {len(reason)}, "
+        f"full length {len(reason)} chars]… "
+    )
+    budget = max(0, max_len - len(probe))
+    head_len = budget * REASON_HEAD_RATIO // total
+    tail_len = budget - head_len
+    head = reason[:head_len]
+    tail = reason[len(reason) - tail_len :] if tail_len else ""
+    dropped = len(reason) - head_len - tail_len
+    marker = (
+        f" …[reason_truncated: true, reason_truncated_bytes: {dropped}, "
+        f"full length {len(reason)} chars]… "
+    )
+    return f"{head}{marker}{tail}"[:max_len]
 
 
 class EntryRunFailed(Exception):

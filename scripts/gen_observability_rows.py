@@ -182,9 +182,14 @@ def _log_location(unit_id: str, trigger: dict[str, Any]) -> tuple[str, str]:
         )
     if kind in ("step-functions", "on-demand-dispatch"):
         return (
-            f"s3:alpha-engine-research/_ssm_logs/data-spot/{unit_id.lower()}/",
-            f"The unit's spot workload logs to the SSM capture path, per the owning pipeline "
-            f"{owner!r} (plan §4.4). Not yet independently re-resolved per unit.",
+            "s3:alpha-engine-research/data_collection/logs/{workload}/{trading_day}/"
+            "{instance_id}.log",
+            f"The unit's spot box ships its WHOLE run log to this key on exit and every "
+            f"60s while running (alpha-engine-config-I11353), and each of the unit's run "
+            f"manifests records the exact object under `log_location`. Owning pipeline "
+            f"{owner!r} (plan §4.4). The `_ssm_logs/data-spot/` path this row used to name "
+            f"was retired with that change; CloudWatch remains a capped live tail, never "
+            f"the record.",
         )
     return (
         "unknown",
