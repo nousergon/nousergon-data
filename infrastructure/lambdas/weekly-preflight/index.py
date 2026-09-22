@@ -105,6 +105,95 @@ def _resolve_run_dates(event: dict) -> dict:
     }
 
 
+# ── Preflight-assertion metrics (alpha-engine-config-I11112 deliverable 4) ───
+#
+# THE DEFECT THIS CLOSES. On 2026-09-19 this gate ran 5 of 15 assertions and
+# returned `status: OK, warn_count: 0`. `skip_count: 10` was present in the
+# Payload and NOTHING KEYED ON IT. The counts existed for exactly one reader:
+# a human opening that one execution's `weekly_preflight_result.Payload` in
+# the Step Functions console, after the fact, knowing to look.
+#
+# A count that lives only inside one execution's payload is not observable
+# (principles.md §2.7 / observability-policy.md §8.3). As a metric SERIES,
+# "the preflight quietly stopped running checks" is a step change on a graph
+# and an alarmable condition; as a payload field it is an archaeology task.
+#
+# NO IAM CHANGE, therefore no operator step: the role's existing
+# `PutAlphaEngineMetrics` statement already allows `cloudwatch:PutMetricData`
+# under the `AlphaEngine/*` namespace condition, so this deploys by the merge
+# button alone (`lambda-deploy-on-merge` -> `deploy.sh`, code-only path).
+#
+# BEST-EFFORT BY CONSTRUCTION, and this is the one legitimate swallow here:
+#   (a) failure mode swallowed — a `PutMetricData` throttle/permission/network
+#       error inside the pre-spend gate;
+#   (b) the primary deliverable (the gate's verdict) is untouched: an observer
+#       that can change the outcome of the thing it observes is a new failure
+#       mode bolted onto the one it reports — the same rule
+#       `_assert_stage_coverage` below already follows;
+#   (c) recording surface — a loud `ERROR` line in
+#       `/aws/lambda/alpha-engine-weekly-preflight`, plus the ABSENCE of the
+#       series itself, which is precisely what the `cloudwatch-metrics`
+#       console adapter renders as UNREPORTED rather than green.
+_METRIC_NAMESPACE = os.environ.get("PREFLIGHT_METRIC_NAMESPACE", "AlphaEngine/WeeklyPreflight")
+# The dimension VALUE is the Lambda's own function name, deliberately: the
+# console's `cloudwatch-metrics` adapter uses the dimension value verbatim as
+# the component id (§3.6, never slug-minted), and `alpha-engine-weekly-
+# preflight` is already a row in nous-ergon-ops' observability registry. So
+# this series MERGES onto the component that already exists (§2.5) instead of
+# rendering a second, unregistered row for the same thing.
+_METRIC_PROFILE = os.environ.get("PREFLIGHT_METRIC_PROFILE", "alpha-engine-weekly-preflight")
+
+
+def _emit_preflight_metrics(
+    *,
+    status: str,
+    ran_count: int,
+    skip_count: int,
+    warn_count: int,
+    fail_count: int,
+    required_skip_count: int,
+    declared_count: int,
+) -> dict:
+    """Publish this invocation's assertion counts as a CloudWatch series.
+
+    ``ChecksRan`` is deliberately the metric a console adapter reads as
+    "invocations": zero is NOT green. `AssertionsDeclared` alongside it is
+    what makes `ran == declared` checkable by a reader who does not know how
+    many assertions there are supposed to be this week — the 2026-09-19 run
+    reported neither, so "5 of 15" was not a number anyone could see.
+    """
+    try:
+        import boto3
+
+        boto3.client("cloudwatch").put_metric_data(
+            Namespace=_METRIC_NAMESPACE,
+            MetricData=[
+                {
+                    "MetricName": name,
+                    "Dimensions": [{"Name": "Profile", "Value": _METRIC_PROFILE}],
+                    "Value": float(value),
+                    "Unit": "Count",
+                }
+                for name, value in (
+                    ("ChecksRan", ran_count),
+                    ("ChecksSkipped", skip_count),
+                    ("ChecksWarned", warn_count),
+                    ("ChecksFailed", fail_count),
+                    ("RequiredChecksSkipped", required_skip_count),
+                    ("AssertionsDeclared", declared_count),
+                )
+            ],
+        )
+        return {"emitted": True, "namespace": _METRIC_NAMESPACE, "status": status}
+    except Exception as exc:  # noqa: BLE001 - see (a)/(b)/(c) above
+        print(
+            f"ERROR: preflight metric emission failed (status={status}, "
+            f"ran={ran_count}, skipped={skip_count}, required_skipped="
+            f"{required_skip_count}): {exc}"
+        )
+        return {"emitted": False, "error": str(exc), "status": status}
+
+
 def handler(event: dict, context) -> dict:
     """
     AWS Lambda handler for the weekly preflight.
@@ -150,6 +239,15 @@ def handler(event: dict, context) -> dict:
         # individual check functions, so this never fails at module level.
         import sf_preflight as sfp  # type: ignore[import-untyped]
     except ImportError as exc:
+        # I11112: emit the zero-series too. A gate that could not even import
+        # its checks is the LOUDEST case of "ran nothing", and it is the one
+        # case where no payload field can say so — the console must see
+        # ChecksRan=0 rather than an absence it cannot distinguish from a
+        # weekend with no run.
+        _emit_preflight_metrics(
+            status="ERROR", ran_count=0, skip_count=0, warn_count=0,
+            fail_count=0, required_skip_count=0, declared_count=0,
+        )
         return {
             "status": "ERROR",
             "has_violation": True,
@@ -180,6 +278,11 @@ def handler(event: dict, context) -> dict:
             skip_flags=skip_flags,
         )
     except Exception as exc:
+        _emit_preflight_metrics(
+            status="ERROR", ran_count=0, skip_count=0, warn_count=0,
+            fail_count=0, required_skip_count=0,
+            declared_count=len(getattr(sfp, "CHECKS", ()) or ()),
+        )
         return {
             "status": "ERROR",
             "has_violation": True,
@@ -199,10 +302,26 @@ def handler(event: dict, context) -> dict:
     ran_count = summary["ran_count"]
     required_skip_count = summary["required_skip_count"]
     required_skip_names = summary["required_skip_names"]
+    declared_count = len(getattr(sfp, "CHECKS", ()) or ()) or len(result_dicts)
+
+    def _metrics(status: str) -> dict:
+        """I11112 deliverable 4 — one call per terminal branch, so the series
+        is complete by construction rather than by remembering."""
+        return _emit_preflight_metrics(
+            status=status,
+            ran_count=ran_count,
+            skip_count=len(skip_results),
+            warn_count=len(warn_results),
+            fail_count=n_fail,
+            required_skip_count=required_skip_count,
+            declared_count=declared_count,
+        )
 
     if n_fail > 0:
+        metrics = _metrics("FAIL")
         return {
             "status": "FAIL",
+            "metrics": metrics,
             "has_violation": True,
             "fail_count": n_fail,
             "warn_count": len(warn_results),
@@ -219,8 +338,10 @@ def handler(event: dict, context) -> dict:
     # only happen if CHECKS or CHECK_CAPABILITIES drifted such that no
     # check is eligible under LAMBDA_CAPABILITIES.
     if ran_count == 0:
+        metrics = _metrics("ERROR")
         return {
             "status": "ERROR",
+            "metrics": metrics,
             "has_violation": True,
             "error": (
                 "preflight ran 0 checks — every check was skipped for missing "
@@ -245,8 +366,10 @@ def handler(event: dict, context) -> dict:
     # hard-fails above via has_violation — this branch is reached only when
     # every check that ran passed.
     if required_skip_count > 0:
+        metrics = _metrics("DEGRADED")
         return {
             "status": "DEGRADED",
+            "metrics": metrics,
             "has_violation": False,
             "degraded": True,
             "degraded_reason": "required_checks_unreachable",
@@ -259,8 +382,10 @@ def handler(event: dict, context) -> dict:
             "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date),
         }
 
+    metrics = _metrics("OK")
     return {
         "status": "OK",
+        "metrics": metrics,
         "has_violation": False,
         "degraded": False,
         "warn_count": len(warn_results),

@@ -58,9 +58,20 @@ def test_preflight_positioned_before_mutex_and_spot(states):
 
     gate = states["WeeklyPreflightGate"]
     assert gate["Type"] == "Choice"
-    assert gate["Default"] == "CheckMutexRole", (
-        "WeeklyPreflightGate default (pass) must go to CheckMutexRole, "
-        f"got {gate['Default']}"
+    # alpha-engine-config-I11112 deliverable 4: the clean arm records the
+    # run's assertion counts on $.weekly_preflight_blind_spot before
+    # continuing, so a reader of the completion marker can tell "every
+    # declared assertion executed" from "the gate never ran". It is a Pass
+    # with no side effects and the SAME onward target.
+    clean = gate["Default"]
+    assert clean == "WeeklyPreflightFullyObserved", (
+        f"WeeklyPreflightGate default (pass) must go to the clean count "
+        f"declarer, got {clean}"
+    )
+    assert states[clean]["Type"] == "Pass"
+    assert states[clean]["Next"] == "CheckMutexRole", (
+        "the clean count declarer must continue to CheckMutexRole, "
+        f"got {states[clean]['Next']}"
     )
 
 
@@ -314,10 +325,11 @@ def test_blind_spot_declared_converges_on_the_clean_continuation(states):
         "a best-effort notice failure must still rejoin CheckMutexRole, "
         f"got {catch['Next']}"
     )
-    assert states["WeeklyPreflightGate"]["Default"] == "CheckMutexRole", (
-        "the clean-preflight Default must be the SAME target the blind-spot "
-        "arm converges on, or 'converges on the clean continuation' is not "
-        "actually true"
+    clean = states["WeeklyPreflightGate"]["Default"]
+    assert states[clean]["Next"] == "CheckMutexRole", (
+        "the clean-preflight path must converge on the SAME target the "
+        "blind-spot arm does, or 'converges on the clean continuation' is "
+        f"not actually true (clean arm {clean!r} -> {states[clean]['Next']!r})"
     )
 
 
@@ -355,6 +367,13 @@ def test_weekly_preflight_blind_spot_floored_both_polarities(sf):
         "present": False,
         "required_skip_count": 0,
         "required_skip_names": [],
+        # I11112 deliverable 4: the three counts are floored at 0 so a run
+        # that never reached the gate is not indistinguishable from one that
+        # ran every assertion — a clean run overwrites these with the real
+        # counts (15 today), and 0 means "no observation", not "all clear".
+        "ran_count": 0,
+        "skip_count": 0,
+        "warn_count": 0,
     }
 
 
@@ -395,3 +414,35 @@ def test_pipeline_contract_degraded_defers_to_preflight(states):
             f"PublishPipelineContractGateDegraded must route to EvaluatorDeployDriftCheck, "
             f"got {n} (one or more paths bypass the composed pre-spend chain)"
         )
+
+
+# ── I11112 deliverable 4: the counts are named on BOTH polarities ───────────
+
+
+def test_assertion_counts_recorded_on_both_polarities(states):
+    """The 2026-09-19 run reported `status: OK, warn_count: 0` having run 5
+    of 15 assertions. `skip_count: 10` was in the Payload and nothing keyed
+    on it. Both arms must now lift ran/skip/warn onto
+    $.weekly_preflight_blind_spot, or the question "is the preflight still
+    running the checks it used to" is answerable only on a bad week.
+    """
+    for name in ("WeeklyPreflightFullyObserved", "WeeklyPreflightBlindSpotDeclared"):
+        params = states[name]["Parameters"]
+        assert states[name]["ResultPath"] == "$.weekly_preflight_blind_spot", name
+        for field in ("ran_count", "skip_count", "warn_count"):
+            key = f"{field}.$"
+            assert key in params, f"{name} does not carry {field}"
+            assert params[key] == f"$.weekly_preflight_result.Payload.{field}", (
+                f"{name}.{key} must read the probe's own Payload, got "
+                f"{params[key]!r}"
+            )
+
+
+def test_clean_arm_declares_absence_rather_than_omitting_the_field(states):
+    """present/required_skip_count/required_skip_names must be stated on the
+    clean arm too (sf-pipeline-policy.md §2.3a rule 3), not left to the
+    floor — the floor also covers "the gate never ran"."""
+    params = states["WeeklyPreflightFullyObserved"]["Parameters"]
+    assert params["present"] is False
+    assert params["required_skip_count"] == 0
+    assert params["required_skip_names"] == []

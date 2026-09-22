@@ -810,17 +810,52 @@ def _resolve_governing_repo(checkout: str) -> str | None:
     repo recognized by _sibling_repo is ``alpha-engine-<name>`` (same
     convention).
     """
-    # Direct 1:1 mapping — checkout name == repo name.
-    # If a newer convention diverges, expand this table.
-    known = {
-        "alpha-engine-dashboard": "alpha-engine-dashboard",
-        "alpha-engine-data": "alpha-engine-data",
-        "alpha-engine-predictor": "alpha-engine-predictor",
-        "alpha-engine-research": "alpha-engine-research",
-        "alpha-engine-backtester": "alpha-engine-backtester",
-        "alpha-engine-evaluator": "alpha-engine-evaluator",
-    }
-    return known.get(checkout)
+    # alpha-engine-config-I11112: this used to be a 1:1 identity table
+    # ("checkout name == repo name"), which stopped being true when the repos
+    # were renamed to crucible-* and the box's checkout directories were not.
+    # _SIBLING_REPO_ALIASES is now the single place that mapping lives, so a
+    # rename is one edit rather than two tables that can disagree silently.
+    if checkout in _SIBLING_REPO_ALIASES:
+        return checkout
+    return None
+
+
+# alpha-engine-config-I11112, MEASURED 2026-09-22 against the live definition:
+# ``check_tool_contracts`` reported ``ok`` having checked ZERO commands, on
+# every environment including one with full capabilities. ``_parse_checkout_repo``
+# expects a bare argv string whose parts[0] ends ``/.venv/bin/python`` — but
+# every ``commands.$`` in this definition is a ``States.Array('line','line',...)``
+# intrinsic, so ``parts[0]`` is the literal ``States.Array('set`` and the walker
+# ``continue``s past all of them. Vacuous green: "0 command(s) checked; all flags
+# match pinned versions".
+#
+# This scanner reads the whole value instead of its first token, so it finds the
+# invocation wherever inside the intrinsic it lives. ``check_tool_contracts``'s
+# own non-vacuity guard (below) is what keeps a future definition-shape change
+# from silently re-emptying it, and
+# ``tests/test_sf_tool_contract_commands.py`` pins it at MERGE time against the
+# committed definition (alpha-engine-config-I11313, the CAP_CHECKOUT half of
+# I11112 deliverable 3).
+_PYTHON_INVOCATION_RE = __import__("re").compile(
+    r"/(?P<checkout>[A-Za-z0-9_.-]+)/\.venv/bin/python\b"
+)
+
+
+def scan_command_checkouts(command_value: str) -> "list[str]":
+    """Every checkout directory whose venv python this ``commands.$`` value
+    invokes, in order of appearance, de-duplicated.
+
+    Shape-agnostic on purpose: a bare argv string, a ``States.Array(...)``
+    intrinsic and a ``States.Format(...)`` wrapper all parse, because what
+    identifies the governing repo is the ``<checkout>/.venv/bin/python`` path
+    segment and nothing else about the surrounding syntax.
+    """
+    seen: "list[str]" = []
+    for m in _PYTHON_INVOCATION_RE.finditer(command_value or ""):
+        checkout = m.group("checkout")
+        if checkout not in seen:
+            seen.append(checkout)
+    return seen
 
 
 def _read_pinned_version(requirements_path) -> str | None:
@@ -909,9 +944,19 @@ def check_tool_contracts(ctx: PreflightContext) -> CheckResult:
             for key, val in node.items():
                 if key == "commands.$" and isinstance(val, str):
                     parts = val.split()
-                    checkout = _parse_checkout_repo(parts)
-                    if checkout is None:
+                    # I11112: scan the WHOLE value, not just parts[0] — every
+                    # commands.$ here is a States.Array(...) intrinsic, and
+                    # reading only the first token found nothing in any of
+                    # them (vacuous "0 command(s) checked" green). _parse_
+                    # checkout_repo stays as the bare-argv fast path so the
+                    # older shape still resolves.
+                    checkouts = scan_command_checkouts(val)
+                    legacy = _parse_checkout_repo(parts)
+                    if legacy is not None and legacy not in checkouts:
+                        checkouts.append(legacy)
+                    if not checkouts:
                         continue
+                    checkout = checkouts[0]
                     checked += 1
                     repo_name = _resolve_governing_repo(checkout)
                     if repo_name is None:
@@ -992,6 +1037,27 @@ def check_tool_contracts(ctx: PreflightContext) -> CheckResult:
             )
 
     elapsed = time.time() - t0
+
+    # I11112: a check that examined NOTHING is not a pass. This assertion
+    # reported "0 command(s) checked; all flags match pinned versions" on
+    # every environment for as long as the definition has used States.Array
+    # for commands.$ — green, forever, over an empty set. principles.md §2.7:
+    # no data is never rendered as green.
+    if checked == 0:
+        return CheckResult(
+            name="tool_contracts",
+            status="fail",
+            message=(
+                "parsed ZERO shell-out commands from the weekly SF definition "
+                "— this check observed nothing and must not report ok. Either "
+                "the definition stopped shelling out to a checkout venv, or "
+                "the commands.$ shape changed and scan_command_checkouts no "
+                "longer matches it (alpha-engine-config-I11112)."
+            ),
+            details={"checked": 0},
+            elapsed_seconds=elapsed,
+        )
+
     if failures:
         return CheckResult(
             name="tool_contracts",
@@ -1720,15 +1786,57 @@ def check_lambda_memory_headroom(ctx: PreflightContext) -> CheckResult:
 # + recursion-budget incidents) ───────────────────────────────────────────────
 
 
+# alpha-engine-config-I11112, MEASURED 2026-09-22: every CAP_CHECKOUT check
+# resolved its inputs through ``_sibling_repo("alpha-engine-research")`` — and
+# no directory of that name exists anywhere on the fleet. The repos were
+# renamed to ``crucible-*``; the CHECKOUT DIRECTORIES on the weekly spot box
+# were not. So these three checks were dead TWICE OVER: capability-gated out
+# of the Lambda, and pointed at a path that no longer exists even on a host
+# that has CAP_CHECKOUT. Granting the capability alone would have changed
+# nothing.
+#
+# The alias table is the fix and it is deliberately two-way: the SF definition
+# and the box both still say ``alpha-engine-*``, so a lookup must resolve
+# either spelling to whichever directory is actually present. Ordered
+# current-name-first: after a future rename the NEW name wins and the legacy
+# entry is what keeps an un-migrated box working, never the other way round.
+_SIBLING_REPO_ALIASES: "dict[str, tuple[str, ...]]" = {
+    "alpha-engine-research": ("crucible-research", "alpha-engine-research"),
+    "alpha-engine-dashboard": ("crucible-dashboard", "alpha-engine-dashboard"),
+    "alpha-engine-predictor": ("crucible-predictor", "alpha-engine-predictor"),
+    "alpha-engine-backtester": ("crucible-backtester", "alpha-engine-backtester"),
+    "alpha-engine-evaluator": ("crucible-evaluator", "alpha-engine-evaluator"),
+    "alpha-engine-executor": ("crucible-executor", "alpha-engine-executor"),
+    "alpha-engine-data": ("nousergon-data", "alpha-engine-data"),
+    "alpha-engine-config": ("alpha-engine-config",),
+    # The definition ALREADY mixes both spellings — measured 2026-09-22, it
+    # names `alpha-engine-dashboard` (19 invocations) and `crucible-research`
+    # (1) side by side. A table keyed on only one of them makes the other an
+    # "unknown checkout" failure, so both spellings are keys.
+    "crucible-research": ("crucible-research", "alpha-engine-research"),
+    "crucible-dashboard": ("crucible-dashboard", "alpha-engine-dashboard"),
+    "crucible-predictor": ("crucible-predictor", "alpha-engine-predictor"),
+    "crucible-backtester": ("crucible-backtester", "alpha-engine-backtester"),
+    "crucible-evaluator": ("crucible-evaluator", "alpha-engine-evaluator"),
+    "crucible-executor": ("crucible-executor", "alpha-engine-executor"),
+    "nousergon-data": ("nousergon-data", "alpha-engine-data"),
+}
+
+
 def _sibling_repo(name: str) -> "Path | None":
-    """Resolve a sibling clone of an alpha-engine-* repo from this file's
-    location. Returns None if the sibling isn't checked out — checks that
-    depend on it then SKIP rather than fail (operator may be running the
-    preflight in an environment without sibling clones)."""
+    """Resolve a sibling clone of a fleet repo from this file's location.
+
+    Returns None if no spelling of the sibling is checked out — checks that
+    depend on it then SKIP rather than fail (an operator may be running the
+    preflight in an environment without sibling clones).
+    """
     from pathlib import Path
-    here = Path(__file__).resolve().parent  # alpha-engine-data
-    candidate = here.parent / name
-    return candidate if candidate.is_dir() else None
+    here = Path(__file__).resolve().parent  # this repo's root
+    for candidate_name in _SIBLING_REPO_ALIASES.get(name, (name,)):
+        candidate = here.parent / candidate_name
+        if candidate.is_dir():
+            return candidate
+    return None
 
 
 _ANTHROPIC_SNAPSHOT_RE = __import__("re").compile(r"-\d{8}$")
@@ -1753,7 +1861,30 @@ def check_price_cards_cover_all_models(ctx: PreflightContext) -> CheckResult:
     card in alpha-engine-config/cost/model_pricing.yaml.
 
     Pure file I/O, zero LLM cost. Skips if sibling repos aren't checked
-    out (CI / restricted environments)."""
+    out (CI / restricted environments).
+
+    ⚠ alpha-engine-config-I11112, MEASURED 2026-09-22 — THIS CHECK WOULD NOT
+    HAVE CAUGHT I11100, even with CAP_CHECKOUT granted. Two reasons, both
+    verified against the live fleet:
+
+      * it grades ``alpha-engine-config/cost/model_pricing.yaml``, the v1
+        RESEARCH rate card. The table ``krepis.cost.record_llm_call``
+        actually consults is ``krepis/src/krepis/model_pricing.yaml``. They
+        are different files with different contents; ``glm-5.3`` missing
+        from the latter is what dropped ``director-plan``'s cost record, and
+        this check never looks there.
+      * its two input paths — ``alpha-engine-config/research/universe.yaml``
+        and ``<research>/graph/research_graph.py`` — do not exist any more.
+        With both gone it discovers zero runtime model names and returns
+        ``warn``, never ``fail``.
+
+    The class is now owned at MERGE time by ``alpha-engine-config``'s
+    ``tests/test_registry_price_card_coverage.py``, which reads the live
+    ``LLM_MODEL_REGISTRY.yaml`` against krepis' own pricing table through
+    ``krepis.cost.unpriced_live_primaries``. This copy is retained rather
+    than deleted (I11112 Non-inferable §2) and demoted to
+    ``CHECK_REQUIRED = False``; repointing it at the same shared rule, or
+    retiring it, is tracked separately."""
     import time
     import yaml as _yaml
     from pathlib import Path
@@ -2216,13 +2347,19 @@ CHECK_CAPABILITIES: "dict[str, frozenset[str]]" = {
 # a check that forgets to declare itself optional is merely noisier, never
 # silently invisible).
 #
-# All fifteen are True today. This module's own docstring is explicit that
-# none of the ten skipping checks are dead weight ("Do not fix this by
-# deleting the skipping assertions... the defect is that they are
-# unreachable, not that they are wrong" — I11112 Non-inferable §2). A future
-# check that is genuinely advisory (e.g. a freshness check whose staleness
-# is expected to self-heal next cycle with no risk to the run) is the
-# intended user of False; none exists yet.
+# Thirteen of fifteen are True. The two False entries are NOT deletions and
+# NOT "this check is wrong" — I11112 Non-inferable §2 forbids both ("the
+# defect is that they are unreachable, not that they are wrong"). They are
+# checks whose FAILURE CLASS is now owned by a merge-time CI test, which is
+# strictly earlier than preflight (§2.2: everything cheaply knowable before
+# spend must be known before spend). The runtime copy stays as a redundant
+# backstop; its skip no longer degrades the run, because the class is
+# already covered by something that ran days ago on the PR that introduced
+# the risk.
+#
+# Each False MUST name the test that took over. An entry without one is a
+# check quietly demoted to invisible, which is the defect this table exists
+# to prevent.
 CHECK_REQUIRED: "dict[str, bool]" = {
     "check_sf_iam_reachability": True,
     "check_arctic_connectivity": True,
@@ -2233,8 +2370,24 @@ CHECK_REQUIRED: "dict[str, bool]" = {
     "check_predicted_missing_from_closes": True,
     "check_backfill_source_freshness": True,
     "check_postflight_contracts": True,
-    "check_price_cards_cover_all_models": True,
-    "check_recursion_budget_for_response_format": True,
+    # OWNED AT MERGE TIME by alpha-engine-config's
+    # tests/test_registry_price_card_coverage.py, which imports
+    # krepis.cost.unpriced_live_primaries (the single declared source of the
+    # rule) and reads the live LLM_MODEL_REGISTRY.yaml in the repo that owns
+    # it. See this check's docstring for why the runtime copy could never
+    # have caught I11100 in the first place.
+    "check_price_cards_cover_all_models": False,
+    # OWNED AT MERGE TIME by crucible-research's
+    # tests/test_recursion_budget_contract.py — the same static scan, on
+    # every PR touching agents/sector_teams/*.py, in the repo that owns
+    # those files (alpha-engine-config-I11313 deliverable 2).
+    "check_recursion_budget_for_response_format": False,
+    # STAYS REQUIRED. tests/test_sf_tool_contract_commands.py took over only
+    # the half that is static in THIS repo (the definition parses, names a
+    # resolvable checkout, and is non-vacuous). The flag-versus-pinned-
+    # version half reads requirements files in five SIBLING repos, which no
+    # CI job here has, so it still belongs on the weekly spot box's
+    # FULL_CAPABILITIES run (alpha-engine-config-I11312).
     "check_tool_contracts": True,
     "check_definition_input_coherence": True,
     "check_lambda_memory_headroom": True,

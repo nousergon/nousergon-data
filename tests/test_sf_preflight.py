@@ -398,7 +398,23 @@ def test_tool_contracts_read_pinned_version_none():
 
 
 def test_tool_contracts_skips_non_venv_commands():
-    """Commands that don't match the .venv/bin/python pattern are skipped."""
+    """A definition whose commands.$ match no `.venv/bin/python` is NOT a
+    pass — alpha-engine-config-I11112 reversed this expectation.
+
+    This test previously asserted `status == "ok"` with `checked == 0`, and
+    that assertion was the defect written down: measured against the LIVE
+    definition, every real `commands.$` is a `States.Array(...)` intrinsic
+    that the old parser also failed to match, so the check returned
+    `ok / 0 command(s) checked` on every environment forever. A check that
+    examined nothing now fails (principles.md §2.7).
+
+    The graceful-skip property this test was protecting is still real and
+    still tested — it lives one level down, in `scan_command_checkouts`
+    returning `[]` for an unrecognised command
+    (`tests/test_sf_tool_contract_commands.py::
+    test_scanner_handles_both_definition_shapes`). What changed is what the
+    CHECK does with an all-empty result.
+    """
     ctx = _ctx()
     from unittest.mock import patch, MagicMock
 
@@ -408,9 +424,11 @@ def test_tool_contracts_skips_non_venv_commands():
     }
     with patch("boto3.client", return_value=fake_sfn):
         result = sfp.check_tool_contracts(ctx)
-    # commands.$ exists but has no .venv pattern — should skip gracefully
-    assert result.status == "ok"
+    # commands.$ exists but has no .venv pattern — nothing was examined, so
+    # the check must say so rather than report a pass over an empty set.
+    assert result.status == "fail"
     assert result.details.get("checked", 0) == 0
+    assert "ZERO" in result.message
 
 
 # ── check_definition_input_coherence (I4494 Leg 3) ─────────────────────────
