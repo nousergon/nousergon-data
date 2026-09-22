@@ -372,6 +372,7 @@ def test_prior_day_settled_grades_a_settled_bar():
     }
     block = parity.grade_prior_day_settled(
         _Store({parity.parity_key(PRIOR_DAY): _prior_report(PRICE_KEY)}),
+        trading_day=TRADING_DAY,
         prior_day=PRIOR_DAY,
         rows=[_row(PRICE_KEY, body)],
     )
@@ -391,6 +392,7 @@ def test_prior_day_settled_grades_a_bar_that_did_not_settle():
     assert body["prior_day"]["breaches"] == 1
     block = parity.grade_prior_day_settled(
         _Store({parity.parity_key(PRIOR_DAY): _prior_report(PRICE_KEY)}),
+        trading_day=TRADING_DAY,
         prior_day=PRIOR_DAY,
         rows=[_row(PRICE_KEY, body)],
     )
@@ -399,13 +401,17 @@ def test_prior_day_settled_grades_a_bar_that_did_not_settle():
 
 
 def test_a_key_that_cannot_be_regraded_is_named_never_counted_as_settled():
-    """A `key_date` artifact files each day under its OWN key and a
-    `same_day_snapshot` is overwritten in place, so neither can be re-graded
-    from the next day's report. That is a property of the artifact, published
-    rather than hidden by a shrinking denominator."""
+    """A `row_date` key genuinely missing its previous-day row on either side
+    (`no_prior_row`) and a key no longer present in today's report at all
+    (`not_in_this_report`) are named, never silently counted as settled. This
+    is a `row_date` fixture -- `key_date` (re-graded via `prior_day_settled`,
+    alpha-engine-config-I11360) and `same_day_snapshot`
+    (`overwritten_in_place`, unregradeable) are pinned in
+    `tests/test_shadow_parity.py`."""
     daily = "staging/daily_closes/2026-09-21.parquet"
     block = parity.grade_prior_day_settled(
         _Store({parity.parity_key(PRIOR_DAY): _prior_report(daily, "gone/from/this/report.json")}),
+        trading_day=TRADING_DAY,
         prior_day=PRIOR_DAY,
         rows=[_row(daily, {"settling_bar": {"cells": 4}})],
     )
@@ -416,13 +422,13 @@ def test_a_key_that_cannot_be_regraded_is_named_never_counted_as_settled():
 
 
 def test_no_previous_report_says_so_rather_than_reading_as_nothing_was_unsettled():
-    block = parity.grade_prior_day_settled(_Store({}), prior_day=PRIOR_DAY, rows=[])
+    block = parity.grade_prior_day_settled(_Store({}), trading_day=TRADING_DAY, prior_day=PRIOR_DAY, rows=[])
     assert block["available"] is False
     assert block["report"] == "parity/2026-09-18.json"
     assert "FileNotFoundError" in block["reason"]
 
 
 def test_no_store_at_all_is_recorded_as_not_looked():
-    block = parity.grade_prior_day_settled(None, prior_day=PRIOR_DAY, rows=[])
+    block = parity.grade_prior_day_settled(None, trading_day=TRADING_DAY, prior_day=PRIOR_DAY, rows=[])
     assert block["available"] is False
     assert "not read" in block["reason"]

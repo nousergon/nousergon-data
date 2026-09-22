@@ -1006,7 +1006,11 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
         "day's own unsettled bar grades `match` with a `settling_bar` block and is NOT a "
         "producer mismatch, and the two numbers are legible separately so a reader can see "
         "which half of the match count was earned on settled rows "
-        "(alpha-engine-config-I11351)"
+        "(alpha-engine-config-I11351). A `key_date` key's settling-forgiven bar is re-graded "
+        "STRICTLY one report later, against the D-1 live/shadow pair; an unsettled re-grade "
+        "reads UNMET here even when every other count is clean, because it is a producer "
+        "defect the previous day's report could only record as settling, not a fact about "
+        "today's own snapshot (alpha-engine-config-I11360)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:
