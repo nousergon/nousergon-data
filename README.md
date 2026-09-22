@@ -45,6 +45,13 @@ flowchart LR
     P2 --> S3stage[(S3 staging)]
 ```
 
+**Known data-quality windows.** Some date ranges of already-published
+artifacts carry a measured defect that was ruled on and deliberately left in
+place. They are declared in `data_quality/windows.py` and rendered at
+[`DATA_QUALITY_WINDOWS.md`](DATA_QUALITY_WINDOWS.md). Anything grading a
+result over historical dates should call
+`data_quality.overlapping(artifact, start, end)` first.
+
 Quality gates run automatically after each refresh: OHLC ordering, zero-price, extreme returns, zero-volume, volume-spikes, trading-day gaps. Anomalies surface in per-step completion emails.
 
 ## Configuration

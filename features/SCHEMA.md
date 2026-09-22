@@ -57,6 +57,16 @@ Two repositories read from the feature store today:
 | **Predictor** (training + inference) | alpha-engine-predictor | ArcticDB universe library → `model/meta_model.py` META_FEATURES | All bare-named fields treated as predictor input. Normalized / ratio shape per §3. |
 | **Research scanner** | alpha-engine-research | `fetch_data_node` (graph) + `scanner_orchestrator._build_technical_scores_from_feature_store` | `_raw` suffix required for ABSOLUTE-quantity gates (avg_volume_20d_raw for the liquidity gate). Returns / ratios / pcts consumed at native shape. |
 
+**Reading historical dates — check the known-defect register first.**
+Some date ranges of `features/{date}/*` carry a measured defect that was
+ruled on and deliberately left in place; they are declared in
+`data_quality/windows.py` and rendered at
+[`DATA_QUALITY_WINDOWS.md`](../DATA_QUALITY_WINDOWS.md). A consumer that
+GRADES a result over historical data calls
+`data_quality.overlapping(artifact, start, end)` and either refuses or
+attaches the caveat to its output. Reading the Markdown is not the control —
+a human having read a page is exactly the mechanism that fails.
+
 A third consumer (executor for trade features? backtester for parity
 features?) appearing in the future triggers a per-`[[feedback_lift_invariants_to_chokepoint_after_second_recurrence]]`
 lift of this contract from alpha-engine-data into
@@ -461,6 +471,7 @@ Before landing a new alpha-bearing column through the private pack:
 | 2026-07-01 | alpha-engine-config#1032 (private-edge divergence policy, config#1031) — private feature-pack loading mechanism (`features/private_pack.py`) + `compute=PRIVATE_PACK_COMPUTE` schema-contract sentinel (§3b) shipped. No alpha-bearing column has landed through it yet; only the throwaway fixture in `tests/fixtures/dummy_private_pack.py` exercises the mechanism. |
 | 2026-07-08 | alpha-engine-config#939 — 3 of the 7 originally-listed feature gaps shipped (the other 4 had already landed): `vwap_divergence_pct` (VWAP divergence), `cmf_20_ratio` (Chaikin Money Flow — buying/selling pressure, chosen over MFI-14 / Chaikin A/D for its bounded range and fewest edge cases), `hy_oas_credit_spread_pct` (credit spreads, FRED `BAMLH0A0HYM2` / `HYOAS`, deliberately named distinct from crucible-predictor's separate regime-substrate `hy_oas_level`). All 3 computed from already-ingested data; no new data source. |
 | 2026-07-08 | config#2006 — the config#939 widening (92→95 cols) shipped with no restate for the existing static-schema universe symbols; the first live `daily_append` failed per-ticker with `StreamDescriptorMismatch`. Fix: full-history restate + the §6 column-add rollout contract + the `test_daily_append_schema_evolution_2006.py` CI tripwire that reproduces the failure against a real old-schema library and pins the restate recovery. |
+| 2026-09-22 | The known-data-quality-window register (`data_quality/windows.py` + `DATA_QUALITY_WINDOWS.md`) landed, opened by the `unsettled-session-bar-2026` window: dated feature-store artifacts through 2026-09-22 were built from the ~16:06 ET unsettled session bar (2.7 bps median Close drift, 20.5 % median Volume shortfall, measured over 920/920 tickers). Forward fix in PR1863/PR1867/PR1868 moved collection to the 18:15 ET settlement hour; Brian ruled no backfill of the historical residue, so it is declared rather than tracked as work. |
 
 ---
 
