@@ -23,7 +23,7 @@ component_id: "data-collector-d39-inst-ownership"
 owning_repo: "nousergon-data"
 title: inst_ownership
 component: 1
-lifecycle: pending
+lifecycle: in-service
 owner: brian
 code_path: "data/derived/inst_ownership.py:1305"
 trigger:
@@ -139,5 +139,16 @@ clause_phase:
   console_entity: 3
   survives_phase4: 1
 notes: >-
-    observability.d row still reads `pending` though nousergon-data-PR1689 MERGED. P-08
-    flips it. A lifecycle that lapsed is BROKEN, not absent.
+    Lifecycle flipped pending -> in-service 2026-09-22 (alpha-engine-config-I11394),
+    acting on this descriptor's own note: "observability.d row still reads `pending`
+    though nousergon-data-PR1689 MERGED. P-08 flips it. A lifecycle that lapsed is
+    BROKEN, not absent." Every condition for in-service was already met and had been
+    for some time: the producer PR is merged, `.github/workflows/inst-ownership-weekly.yml`
+    runs it on `cron(40 12 ? * SAT *)` (declared in `trigger.schedule` above), and both
+    write keys are already covered by the `thinktank_inst_ownership` ARTIFACT_REGISTRY
+    row. Nothing about the unit changed here; the label caught up with it.
+
+    Surfaced by alpha-engine-config's producer<->registry contract check, which was
+    taught to exempt genuinely-pending units from needing a registry row and refuses
+    that exemption to any unit carrying a real `trigger.schedule` — something runs
+    this one, so "pending" was never the honest label.
