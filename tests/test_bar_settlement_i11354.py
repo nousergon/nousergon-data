@@ -55,9 +55,11 @@ def test_fetch_at_1606_et_on_the_trading_day_is_provisional():
 
 
 def test_fetch_at_1645_et_the_standalone_postclose_time_is_provisional():
-    """`data-collection-eod` fires at 16:45 ET — 39 minutes later than v1 and
-    still ~1.5 h short of settlement. The standalone collector inherits the
-    defect; this is the reading Brian's schedule ruling turns on."""
+    """16:45 ET was `data-collection-eod`'s time — 39 minutes later than v1 and
+    still ~1.5 h short of settlement, so the standalone collector inherited the
+    defect. That schedule has since moved to 18:15 ET (the constant below), but
+    the reading at 16:45 stays pinned here: it is the evidence the move rests on,
+    and a grader that stopped calling 16:45 provisional would un-justify it.""" 
     assert dates.bar_settlement(_et(2026, 9, 21, 16, 45), "2026-09-21") == "provisional"
 
 
@@ -156,8 +158,12 @@ def test_an_unparseable_fetch_time_raises_rather_than_defaulting():
 
 
 def test_the_guard_ships_in_observe_mode_with_a_promotion_criterion():
-    """`sf-pipeline-policy.md` §7a. Enforcing today would refuse every write the
-    16:45 ET schedule makes — i.e. halt EOD collection instead of measuring it."""
+    """`sf-pipeline-policy.md` §7a. Enforcing when this shipped would have
+    refused every write the then-16:45 ET schedule made — i.e. halted EOD
+    collection instead of measuring it. The schedule has since moved to the
+    settlement hour, which is the FIRST of the three promotion conditions; the
+    other two (10 clean cycles, and I11356's 3-day sample) are still open, so
+    the guard stays in observe."""
     guard = dates.BAR_SETTLEMENT_GUARD
     assert guard.name == "bar_settlement"
     assert guard.mode.value == "observe"
