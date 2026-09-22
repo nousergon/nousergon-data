@@ -47,6 +47,7 @@ from collectors import CaretTickerError
 from dates import (
     FutureBarError,
     assert_no_bar_after,
+    bar_settlement_guard_entry,
     clip_to_trading_day,
     default_run_date,
     history_window,
@@ -142,6 +143,11 @@ def collect(
     # trading day, never on wall-clock time — a ``--date D`` run executed on
     # D+1 must not fetch (or publish) the partial D+1 session.
     trading_day = str(reference_date) if reference_date is not None else default_run_date()
+    # alpha-engine-config-I11354: the moment this run's vendor fetch opens.
+    # Taken HERE rather than inside the batch loop because the whole refresh is
+    # one fetch window and its OPENING edge is the conservative one — a run that
+    # starts before the bar settles does not become settled because it ran long.
+    fetch_started_at = datetime.now(timezone.utc)
     short_fetch_retries: dict[str, int] = {}
     refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
@@ -171,6 +177,16 @@ def collect(
         # for every key's row count. `written_keys()` below turns this into
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
+        # alpha-engine-config-I11354: grade THIS run's bar on the settlement
+        # clock and carry the verdict on D03's manifest. Observe mode — the
+        # reading never moves the exit code; it is what a promotion to enforce
+        # (and Brian's ruling on the 16:45 ET `data-collection-eod` schedule)
+        # will be argued from. `_record_collector_guards` folds this on.
+        "guards": [
+            bar_settlement_guard_entry(
+                fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
+            )
+        ],
     }
     if short_fetch_retries:
         # alpha-engine-config-I11287: never silent — every ticker that

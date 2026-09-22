@@ -51,6 +51,7 @@ import boto3
 import pandas as pd
 import requests
 
+from dates import bar_settlement_guard_entry
 from nousergon_lib.secrets import get_secret
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
@@ -820,6 +821,13 @@ def collect(
             f"nousergon_lib.trading_calendar, not this guard."
         )
 
+    # alpha-engine-config-I11354: the moment this run's vendor fetch opens, the
+    # conservative (earliest) edge of the fetch window. Graded against
+    # `dates.SETTLED_AFTER_ET` and carried on D19's manifest below. Taken before
+    # the window fan-out so a single-date call and each per-date call inside a
+    # window are graded identically.
+    fetch_started_at = datetime.now(timezone.utc)
+
     if window_days > 1:
         return _collect_window(
             bucket=bucket,
@@ -1024,7 +1032,24 @@ def collect(
                 "Daily closes already exist for %s (post-close at %s, source=%s) — skipping",
                 run_date, last_modified.isoformat(), source,
             )
-            return {"status": "ok", "tickers_captured": 0, "skipped": True, "source": source}
+            return {
+                "status": "ok",
+                "tickers_captured": 0,
+                "skipped": True,
+                "source": source,
+                # alpha-engine-config-I11354: this branch is the one that
+                # PERPETUATES an unsettled bar. `_is_post_close_write` treats
+                # anything at or after 16:00 ET as authoritative, so a parquet
+                # written at 16:06 ET — six minutes after the close, with a
+                # Volume median 20.5 % short — makes every later pass for D
+                # skip, including the 07:30 ET D+1 morning enrich. There is no
+                # self-heal. The verdict is graded on the EXISTING object's
+                # write time, not on this run's clock, because the existing
+                # object is what stays published.
+                "guards": [
+                    bar_settlement_guard_entry(last_modified, run_date, key=key)
+                ],
+            }
         elif not dry_run:
             logger.warning(
                 "Existing %s was written pre-close at %s — refusing to skip; "
@@ -1347,6 +1372,9 @@ def collect(
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
             "vendor_divergence": vendor_divergence_record,
+            "guards": [
+                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
+            ],
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1375,6 +1403,12 @@ def collect(
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
             "vendor_divergence": vendor_divergence_record,
+            # alpha-engine-config-I11354: D19's settlement verdict, folded onto
+            # the run manifest by `weekly_collector._record_collector_guards`.
+            # Observe mode — never moves the exit code.
+            "guards": [
+                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
+            ],
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1664,6 +1698,14 @@ def _collect_window(
                 ", ".join(aggregate["backfill_failed_dates"]),
             )
         aggregate["status"] = "ok"
+    # alpha-engine-config-I11354: the window's settlement verdict is the TARGET
+    # date's — the target is the date downstream reads, and a settled backfill
+    # date says nothing about it. Folded up here rather than concatenating every
+    # per-date reading, which would put N verdicts for N different days on one
+    # manifest and make "was this run's artifact settled?" unanswerable.
+    _target_guards = (_target or {}).get("guards")
+    if _target_guards:
+        aggregate["guards"] = list(_target_guards)
     return aggregate
 
 
