@@ -18,4 +18,4 @@ embit>=0.7.0
 # 250 MB unzipped / 50 MB direct-upload ceiling. `nousergon_lib/__init__.py` is
 # three lines and pulls nothing heavy at import, so cold start pays for the
 # module it uses, not for the library.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.149
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.150

@@ -524,13 +524,22 @@ def _resolve_log(store: Any, log_location: str, store_uri: str) -> str | None:
             "neither confirm nor deny it, which is not the same as it being there"
         )
     key = log_location[len(base) :]
-    try:
-        store.get_bytes(key)
-    except (FileNotFoundError, KeyError):
-        return f"`{log_location}` does not exist — the run log was never shipped"
-    except Exception as exc:  # noqa: BLE001 — a denial is a finding, not an absence
-        return f"`{log_location}` could not be read: {type(exc).__name__}: {exc}"
-    return None
+    # alpha-engine-config-I11359: a gzip-enabled run's manifest still names the
+    # PLAIN key (the launcher writes the literal it decided before the run
+    # started), but `krepis.spot_bootstrap.RunLog(gzip=True)`'s final trap
+    # writes `<key>.gz` and DELETES the plain object once it lands. So a
+    # manifest's declared key going missing is not on its own "never shipped"
+    # — try the compressed sibling before calling it unresolved.
+    for candidate in (f"{key}.gz", key):
+        try:
+            store.get_bytes(candidate)
+        except (FileNotFoundError, KeyError):
+            continue
+        except Exception as exc:  # noqa: BLE001 — a denial is a finding, not an absence
+            return f"`{log_location}` could not be read: {type(exc).__name__}: {exc}"
+        else:
+            return None
+    return f"`{log_location}` does not exist — the run log was never shipped"
 
 
 def read_unresolved_logs(

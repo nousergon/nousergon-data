@@ -1396,7 +1396,15 @@ rc=$?
 [ "$rc" -eq 0 ] || fail "workload {workload} exited $rc"
 echo "[data-spot] workload {workload} complete"
 """
-    spec = _bootstrap_spec(workload, run_log=RunLog(local_path=log, s3_uri=s3_log))
+    # gzip=True (alpha-engine-config-I11359): periodic pushes stay plain
+    # (append semantics, readable mid-run), and the final EXIT/TERM-trap push
+    # writes `<s3_uri>.gz`, deleting the plain object once it lands. A
+    # 73-minute shadow run's log is ~1 MB+, five runs a weekday — the
+    # compressed final object is what a post-mortem reads days later, so it
+    # costs nothing that matters. `run_units.resolve_log_location()` and the
+    # `-I11353` data-report detector both try `.log.gz` before `.log` to
+    # account for the swap.
+    spec = _bootstrap_spec(workload, run_log=RunLog(local_path=log, s3_uri=s3_log, gzip=True))
     return prelude + "\n" + render_bootstrap(spec) + "\n" + tail
 
 

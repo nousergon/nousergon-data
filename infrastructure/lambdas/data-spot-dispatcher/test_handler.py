@@ -277,6 +277,9 @@ def test_bootstrap_is_the_shared_renderers_output(monkeypatch):
         run_log=_REAL_SPOT_BOOTSTRAP.RunLog(
             local_path="/var/log/data-spot-morning-enrich.log",
             s3_uri=index._run_log_uri("morning-enrich", "2026-09-21", "i-x"),
+            # alpha-engine-config-I11359: `_bootstrap_command` turns this on;
+            # mirrored here or `render_bootstrap(spec)` diverges from `cmd`.
+            gzip=True,
         ),
     )
     assert _REAL_SPOT_BOOTSTRAP.render_bootstrap(spec) in cmd

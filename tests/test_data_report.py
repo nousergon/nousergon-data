@@ -618,6 +618,25 @@ def test_a_failed_run_whose_shipped_log_exists_is_not_a_finding():
     assert (found, problems) == ([], [])
 
 
+def test_a_gzipped_shipped_log_is_not_a_finding():
+    """alpha-engine-config-I11359: `krepis.spot_bootstrap.RunLog(gzip=True)`'s
+    final trap writes `<s3_uri>.gz` and DELETES the plain object — the
+    manifest still names the plain key (decided before the run started), so
+    only the `.gz` sibling exists on disk. That must resolve, not read as
+    "never shipped"."""
+    uri = "s3://example-bucket/data_collection/logs/shadow-sameday/2026-09-21/i-x.log"
+    store = FakeStore(
+        {
+            "runs/D17/2026-09-21/01ABC.json": _manifest(log_location=uri),
+            "logs/shadow-sameday/2026-09-21/i-x.log.gz": {"_": "gzip bytes stand-in"},
+        }
+    )
+    found, problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert (found, problems) == ([], [])
+
+
 def test_a_manifest_naming_an_s3_key_that_is_not_there_is_a_finding():
     """The loudest case: the manifest looks resolvable and is not."""
     uri = "s3://example-bucket/data_collection/logs/shadow-sameday/2026-09-21/i-x.log"
