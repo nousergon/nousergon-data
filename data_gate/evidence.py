@@ -1318,6 +1318,46 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
         )
 
     report_day, key = candidates[-1]
+
+    # `alpha-engine-config-I11355`. The gate's cron fires at 23:30 UTC and the
+    # same-day parity publishes at ~23:43 UTC (shadow-sameday launches 22:30Z
+    # and ran 73 minutes on its first scheduled night), so EVERY weekday
+    # reading was one report behind — `gate.json` for 2026-09-21 cited
+    # `parity/2026-09-18.json` — and `-I11233` closes-when 2, "the parity
+    # clause reads a report whose trading day IS the gate's own", could never
+    # be satisfied by that ordering.
+    #
+    # A reading on yesterday's numbers is NOT a reading about today, and
+    # rendering it as MET or UNMET publishes a verdict for a day nothing was
+    # measured on. It is UNMEASURABLE, naming both dates — which is never MET
+    # (plan §4.1 rule 2) and, unlike a quiet UNMET, says the next action is
+    # "make the read follow the publish", not "fix parity".
+    #
+    # The `PARITY_FRESHNESS_TRADING_DAYS` window stays as the OUTER bound
+    # below, and deliberately keeps grading UNMET rather than UNMEASURABLE: a
+    # report days old means no shadow run is happening at all, which IS a
+    # finding about cutover readiness rather than a gap in this read.
+    if report_day != trading_day:
+        age_trading_days = _trading_days_between(report_day, trading_day)
+        if age_trading_days <= PARITY_FRESHNESS_TRADING_DAYS:
+            return Reading(
+                met=False,
+                detail=(
+                    f"the most recent parity report is for trading_day "
+                    f"{report_day.isoformat()} ({key}) while this gate's trading day is "
+                    f"{trading_day.isoformat()} — {age_trading_days} trading day(s) behind. "
+                    "The clause is UNMEASURABLE for the gate's own day: yesterday's parity "
+                    "numbers are not a reading about today, and publishing them as MET or "
+                    "UNMET would put a verdict on a day nothing was measured on "
+                    "(alpha-engine-config-I11355). The gate read is triggered again after "
+                    "the same-day parity publishes; a reading still showing this means the "
+                    "later trigger did not fire or the shadow run did not publish."
+                ),
+                evidence=(key,),
+                unmeasurable=True,
+                source="data_collection store",
+            )
+
     floor = subtract_trading_days(trading_day, PARITY_FRESHNESS_TRADING_DAYS)
     if report_day < floor:
         age_trading_days = _trading_days_between(report_day, trading_day)

@@ -36,7 +36,40 @@ from nousergon_lib.gates import (
 from data_gate import clauses as clause_module
 from data_gate.descriptors import CONNECTION_STATES, REPO_ROOT, load_units
 
-__all__ = ["BOARD_KEY", "DataPhase", "ExitCriterion", "GATES", "evaluate", "load_phases", "run"]
+__all__ = [
+    "BOARD_KEY",
+    "DataPhase",
+    "ExitCriterion",
+    "GATES",
+    "TRIGGERS",
+    "evaluate",
+    "load_phases",
+    "run",
+]
+
+#: What caused a gate read, recorded on the dated `gates/<gate>/{date}/
+#: gate.json` (`alpha-engine-config-I11355` deliverable 2).
+#:
+#: * ``schedule`` — the 23:30 UTC daily / 18:00 UTC Saturday backstop crons.
+#:   These fire BEFORE the same-day parity publishes (~23:43 UTC), so a reading
+#:   carrying this trigger and a stale report is the EXPECTED shape, not a
+#:   normal reading: the parity clause reads UNMEASURABLE and says so.
+#: * ``post-parity`` — a cron placed after the parity publish (01:30 UTC
+#:   Tue–Sat for the same-day report, 12:30 UTC Mon–Fri for the morning
+#:   rewrite). This is the reading whose parity clause can be MET or UNMET on
+#:   the gate's own trading day.
+#: * ``parity-published`` — RESERVED for the event-driven dispatch the issue
+#:   asks for as SOTA: `shadow parity` dispatching this workflow after a
+#:   successful put. Not wired today, because the data-spot box holds no
+#:   verified GitHub credential with `actions:write` on this repository and
+#:   creating one is an IAM/secret change this work does not make. The value is
+#:   declared now so the artifact the crons write and the artifact the event
+#:   will write are the same shape, and the gap is legible as
+#:   "no reading ever carried parity-published" rather than as silence.
+#: * ``push`` / ``manual`` — the `push` trigger and a human dispatch.
+TRIGGERS: frozenset[str] = frozenset(
+    {"schedule", "post-parity", "parity-published", "push", "manual"}
+)
 
 PHASES_PATH = REPO_ROOT / "data_gate" / "config" / "phases.yaml"
 
@@ -446,13 +479,22 @@ def run(
     trading_day: dt.date,
     dry_run: bool = False,
     now: dt.datetime | None = None,
+    trigger: str = "manual",
 ) -> tuple[GateResult, dict, dict]:
     """Evaluate, publish, and return the reading plus the ladder document.
 
     Publishing is three objects: the dated gate reading (history, never
     overwritten), the ladder (current state, rewritten every read) and the board
     (one row per clause). Under ``dry_run`` nothing is written at all.
+
+    ``trigger`` is recorded on the dated reading (`alpha-engine-config-I11355`).
     """
+    if trigger not in TRIGGERS:
+        raise ValueError(
+            f"unknown trigger {trigger!r}; the declared triggers are {sorted(TRIGGERS)}. An "
+            "undeclared value would make the `trigger` column unsummable, which is the "
+            "whole reason it is recorded."
+        )
     units = load_units()
     phases = load_phases()
     all_clauses = clause_module.generate(store, units, phases, trading_day=trading_day)
@@ -482,9 +524,17 @@ def run(
     )
 
     if not dry_run:
+        # `trigger` is added here rather than inside `GateResult.to_dict()`:
+        # that shape lives in `nousergon_lib.gates` and is shared by every
+        # gate in the fleet, and this is a data-collection-specific fact about
+        # WHEN the read was taken (alpha-engine-config-I11355). Lifting it into
+        # the library is the right move on the second adopter (`policy-shared-
+        # code`), not the first.
+        reading = result.to_dict()
+        reading["trigger"] = trigger
         store.put_bytes(
             gate_key(gate, trading_day.isoformat()),
-            json.dumps(result.to_dict(), indent=2, sort_keys=True).encode("utf-8"),
+            json.dumps(reading, indent=2, sort_keys=True).encode("utf-8"),
         )
         store.put_bytes("gates/ladder.json", ladder_bytes)
         store.put_bytes(BOARD_KEY, json.dumps(board, indent=2, sort_keys=True).encode("utf-8"))
