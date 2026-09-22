@@ -390,23 +390,47 @@ class TestChoiceRouting:
                 states, evaluate(choice, _payload(junk))
             ) == "HandleFailure", junk
 
+    # The producer's verdicts, enumerated in crucible-predictor
+    # inference/trading_day_gate.py::check_market_hours. One added there
+    # without a rule here would land on Default (fail closed) — safe, but
+    # this asserts the known ones are each explicitly handled rather than
+    # falling through.
+    _UNIVERSAL_VERDICTS = {
+        "PROCEED",
+        "PROCEED_OVERRIDE",
+        "BLOCKED",
+        "OVERRIDE_MALFORMED",
+    }
+
     @pytest.mark.parametrize("name", _BOTH)
     def test_every_verdict_the_lambda_can_emit_is_routed(self, defs, name):
-        # The producer's four verdicts, enumerated in crucible-predictor
-        # inference/trading_day_gate.py::check_market_hours. A fifth added
-        # there without a rule here would land on Default (fail closed) — safe,
-        # but this asserts the four known ones are each explicitly handled
-        # rather than falling through.
         choice = defs[name]["States"]["MarketHoursGateChoice"]
         handled = {
             c["StringEquals"] for c in choice["Choices"] if "StringEquals" in c
         }
-        assert handled == {
-            "PROCEED",
-            "PROCEED_OVERRIDE",
-            "BLOCKED",
-            "OVERRIDE_MALFORMED",
-        }
+        expected = set(self._UNIVERSAL_VERDICTS)
+        if name == _PREOPEN:
+            # alpha-engine-config-I11384. PROCEED_REMEDIATION is preopen-ONLY,
+            # and the asymmetry is the contract rather than an omission: the
+            # postclose chain stops the box and reconciles the book, and what
+            # an unfilled book should mean there is a different question that
+            # has not been answered. The Lambda enforces the same split from
+            # its own side — it is handed `pipeline` as a LITERAL in each
+            # state machine's gate payload and only ever emits this verdict
+            # for "preopen" — so a postclose rule here would be dead code
+            # AND a claim the producer does not make.
+            expected.add("PROCEED_REMEDIATION")
+        assert handled == expected
+
+    def test_the_postclose_chain_does_not_route_a_remediation(self, defs):
+        # The other half of the asymmetry, asserted rather than left implicit:
+        # if PROCEED_REMEDIATION ever reached the postclose Choice it must
+        # fail CLOSED on Default, not find a rule nobody reasoned about.
+        states = defs[_POSTCLOSE]["States"]
+        assert _through_normalizers(
+            states,
+            evaluate(states["MarketHoursGateChoice"], _payload("PROCEED_REMEDIATION")),
+        ) == "HandleFailure"
 
 
 class TestOverrideIsRecorded:
@@ -577,3 +601,80 @@ class TestNoOtherGuardAlreadyCoveredThis:
         params = defs[_PREOPEN]["States"]["TradingDayGate"]["Parameters"]
         assert params["Payload"]["action"] == "check_trading_day"
         assert params["Payload"].get("now") is None
+
+
+class TestRemediationIsRecorded:
+    """alpha-engine-config-I11384 — the same-day repair path.
+
+    Brian, 2026-09-22: a fix affecting intraday trading is deployed and rerun
+    the SAME session, never held to the close. The gate refused exactly that
+    on 2026-09-22 at 11:45 ET, on a fix already merged and verified, and
+    needed a hand-typed override to proceed.
+    """
+
+    def test_a_remediation_proceeds_through_a_notify_not_straight_through(
+        self, defs
+    ):
+        states = defs[_PREOPEN]["States"]
+        nxt = evaluate(
+            states["MarketHoursGateChoice"], _payload("PROCEED_REMEDIATION")
+        )
+        assert nxt == "RecordMarketHoursRemediation", (
+            "a crossed boundary is announced, never silent — the same rule "
+            "PROCEED_OVERRIDE has carried since I7111"
+        )
+        record = states[nxt]
+        assert record["Resource"] == "arn:aws:states:::sns:publish"
+        assert record["Next"] == "CheckMutexRole"
+
+    def test_a_notify_failure_does_not_convert_a_repair_into_a_refusal(self, defs):
+        # The verdict was already decided and is in execution history; SNS is
+        # the announcement, not the record.
+        record = defs[_PREOPEN]["States"]["RecordMarketHoursRemediation"]
+        catch = record["Catch"][0]
+        assert catch["ErrorEquals"] == ["States.ALL"]
+        assert catch["Next"] == "CheckMutexRole"
+
+    def test_the_evidence_travels_into_the_announcement(self, defs):
+        # A page saying "a boundary was crossed" without saying what granted
+        # it is an alert nobody can act on.
+        record = defs[_PREOPEN]["States"]["RecordMarketHoursRemediation"]
+        msg = record["Parameters"]["Message.$"]
+        assert "$.market_hours_gate.Payload" in msg
+        assert "$$.Execution.Id" in msg
+
+    def test_it_is_not_terminal_and_not_a_succeed(self, defs):
+        # sf-pipeline-policy §2.3 — the same shape the refusal states carry.
+        record = defs[_PREOPEN]["States"]["RecordMarketHoursRemediation"]
+        assert record["Type"] == "Task"
+        assert record.get("End") is not True
+
+    def test_the_postclose_chain_has_no_such_state(self, defs):
+        assert "RecordMarketHoursRemediation" not in defs[_POSTCLOSE]["States"]
+
+
+class TestPipelineLiteralIsUnspoofable:
+    """`pipeline` decides eligibility, so it may never come from the caller."""
+
+    def test_each_definition_declares_its_own_pipeline(self, defs):
+        assert (
+            defs[_PREOPEN]["States"]["MarketHoursGate"]["Parameters"]["Payload"][
+                "pipeline"
+            ]
+            == "preopen"
+        )
+        assert (
+            defs[_POSTCLOSE]["States"]["MarketHoursGate"]["Parameters"]["Payload"][
+                "pipeline"
+            ]
+            == "postclose"
+        )
+
+    @pytest.mark.parametrize("name", _BOTH)
+    def test_it_is_a_literal_never_a_path_from_execution_input(self, defs, name):
+        payload = defs[name]["States"]["MarketHoursGate"]["Parameters"]["Payload"]
+        assert "pipeline.$" not in payload, (
+            "a `.$` form would read it from the execution, letting any caller "
+            "claim to be the preopen chain and unlock PROCEED_REMEDIATION"
+        )
+        assert isinstance(payload["pipeline"], str)

@@ -1,11 +1,11 @@
 {
-  "Comment": "Alpha Engine Weekday Pipeline — morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 5:15 AM PT (America/Los_Angeles, DST-aware); schedule is CFN-canonical in cloudformation/alpha-engine-orchestration.yaml — do not hand-edit here. MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it — fixes the 2026-04-17→2026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only. alpha-engine-config-I2717/I2722 (2026-07-16): the universe-gap + chronic-polygon-gap self-heal (formerly ChronicGapSelfHeal) and the PredictorHealthCheck/PredictorDriftCheck observability producers were REMOVED from this SF entirely — the heal now runs standalone (weekly_collector.py --daily-heal, EventBridge 09:00 UTC weekdays) and the two health checks now fire on their own direct EventBridge triggers (13:40 UTC weekdays), both off this critical path. See infrastructure/cloudformation/alpha-engine-orchestration.yaml. alpha-engine-config-I6494: after MorningArcticAppend, CheckSkipScanner → Scanner invokes alpha-engine-research-scanner:live (same entrypoint as the Saturday weekly SF) before PredictorInference so weekday universe_membership/{date} + factor profiles stay fresh without running the full Saturday pipeline (distinct from I5489 weekday weekly-SF exercise).",
+  "Comment": "Alpha Engine Weekday Pipeline \u2014 morning polygon enrichment, predictor inference, executor start. Runs Mon-Fri 5:15 AM PT (America/Los_Angeles, DST-aware); schedule is CFN-canonical in cloudformation/alpha-engine-orchestration.yaml \u2014 do not hand-edit here. MorningEnrich (added 2026-04-24) overwrites the prior trading day's ArcticDB row with polygon's authoritative OHLCV+VWAP before predictor inference reads it \u2014 fixes the 2026-04-17\u21922026-04-23 silent VWAP outage where the EOD yfinance pass was the only source. EOD yfinance collection runs via the post-close EOD SF on ae-trading. Policy: all SSM steps run on ae-trading (trading_instance_id); ae-dashboard is reserved for Streamlit + nginx + spot-launcher only. alpha-engine-config-I2717/I2722 (2026-07-16): the universe-gap + chronic-polygon-gap self-heal (formerly ChronicGapSelfHeal) and the PredictorHealthCheck/PredictorDriftCheck observability producers were REMOVED from this SF entirely \u2014 the heal now runs standalone (weekly_collector.py --daily-heal, EventBridge 09:00 UTC weekdays) and the two health checks now fire on their own direct EventBridge triggers (13:40 UTC weekdays), both off this critical path. See infrastructure/cloudformation/alpha-engine-orchestration.yaml. alpha-engine-config-I6494: after MorningArcticAppend, CheckSkipScanner \u2192 Scanner invokes alpha-engine-research-scanner:live (same entrypoint as the Saturday weekly SF) before PredictorInference so weekday universe_membership/{date} + factor profiles stay fresh without running the full Saturday pipeline (distinct from I5489 weekday weekly-SF exercise).",
   "StartAt": "InitializeInput",
   "TimeoutSeconds": 7200,
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns often omit sns_topic_arn. Mirrors the Saturday SF InitializeInput pattern — States.JsonMerge with user-input as the second arg lets explicit values win. | alpha-engine-config-I6494: also stamps run_date = date($$.Execution.StartTime) so the weekday Scanner state (same alpha-engine-research-scanner:live entrypoint as the Saturday SF) keys universe_membership/{date} + factor profiles off ONE date. User-passed run_date still wins. Preopen always starts after UTC midnight for its trading day (America/Los_Angeles cron(15 5) MON-FRI), so the StartTime date IS the trading day; Scanner additionally normalizes via trading_calendar.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + trading_instance_id explicitly; manual reruns often omit sns_topic_arn. Mirrors the Saturday SF InitializeInput pattern \u2014 States.JsonMerge with user-input as the second arg lets explicit values win. | alpha-engine-config-I6494: also stamps run_date = date($$.Execution.StartTime) so the weekday Scanner state (same alpha-engine-research-scanner:live entrypoint as the Saturday SF) keys universe_membership/{date} + factor profiles off ONE date. User-passed run_date still wins. Preopen always starts after UTC midnight for its trading day (America/Los_Angeles cron(15 5) MON-FRI), so the StartTime date IS the trading day; Scanner additionally normalizes via trading_calendar.",
       "Parameters": {
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
@@ -14,14 +14,15 @@
     },
     "MarketHoursGate": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I7111 (Brian ruling 2026-08-13, option c) — the \"no trading-pipeline start during NYSE market hours\" boundary, sited on the PIPELINE rather than on one caller's IAM role. alpha-engine-config#2932 ruled it onto alpha-engine-sf-watch-executor-role, enforced by a Lambda flipping that role's inline policy every 5 minutes between two codified variants. The Lambda never existed in account 711398986525 (measured 2026-08-12: no function, no EventBridge rule), so the boundary was never once in force — and being caller-scoped it could not have covered the in-session operator starts at 09:32 PT on 2026-08-07 or 08:32 PT on 2026-07-27 either. IAM has NO time-of-day condition key; that absence is why the ruled mechanism needed a Lambda to simulate one, and why the simulation could silently not exist for three weeks. A guard state binds every principal: the scheduler, the Overseer's overseer-sf-watch lane, and the operator. Neither existing guard covers this — AcquireMutex keys on the same UTC MINUTE and TradingDayGate on the calendar DAY; neither is a time-of-day boundary. Same zero-infra posture as TradingDayGate: pure calendar math on alpha-engine-predictor-inference, returning BEFORE PredictorPreflight is constructed, so no S3/ArcticDB/model problem can take out the boundary. `now` is $$.Execution.StartTime rather than the Lambda's own clock, so the verdict is a property of the execution: deterministic, replayable, and immune to a slow cold start pushing a refused run past the close. `execution_input` is passed whole because an ASL \"override.$\": \"$.market_hours_override\" parameter throws States.Runtime on every run that does not carry one.",
+      "Comment": "alpha-engine-config-I7111 (Brian ruling 2026-08-13, option c) \u2014 the \"no trading-pipeline start during NYSE market hours\" boundary, sited on the PIPELINE rather than on one caller's IAM role. alpha-engine-config#2932 ruled it onto alpha-engine-sf-watch-executor-role, enforced by a Lambda flipping that role's inline policy every 5 minutes between two codified variants. The Lambda never existed in account 711398986525 (measured 2026-08-12: no function, no EventBridge rule), so the boundary was never once in force \u2014 and being caller-scoped it could not have covered the in-session operator starts at 09:32 PT on 2026-08-07 or 08:32 PT on 2026-07-27 either. IAM has NO time-of-day condition key; that absence is why the ruled mechanism needed a Lambda to simulate one, and why the simulation could silently not exist for three weeks. A guard state binds every principal: the scheduler, the Overseer's overseer-sf-watch lane, and the operator. Neither existing guard covers this \u2014 AcquireMutex keys on the same UTC MINUTE and TradingDayGate on the calendar DAY; neither is a time-of-day boundary. Same zero-infra posture as TradingDayGate: pure calendar math on alpha-engine-predictor-inference, returning BEFORE PredictorPreflight is constructed, so no S3/ArcticDB/model problem can take out the boundary. `now` is $$.Execution.StartTime rather than the Lambda's own clock, so the verdict is a property of the execution: deterministic, replayable, and immune to a slow cold start pushing a refused run past the close. `execution_input` is passed whole because an ASL \"override.$\": \"$.market_hours_override\" parameter throws States.Runtime on every run that does not carry one. | alpha-engine-config-I11384: `pipeline` is a LITERAL here, never read from execution_input, so no caller can claim to be the preopen chain. Only the preopen chain is eligible for PROCEED_REMEDIATION \u2014 the postclose chain stops the box and reconciles the book, and what an unfilled book should mean THERE is a different question that has not been answered. This payload carries 'postclose' precisely so that exclusion is structural rather than a comment.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
         "Payload": {
           "action": "check_market_hours",
           "now.$": "$$.Execution.StartTime",
-          "execution_input.$": "$$.Execution.Input"
+          "execution_input.$": "$$.Execution.Input",
+          "pipeline": "preopen"
         }
       },
       "TimeoutSeconds": 60,
@@ -53,20 +54,20 @@
     },
     "MarketHoursGateChoice": {
       "Type": "Choice",
-      "Comment": "alpha-engine-config-I7111 — the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement — the boundary must be refusable deliberately, never bypassable accidentally — and it routes through a notify state so a crossed boundary is announced rather than silent.",
+      "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
       "Choices": [
         {
           "Not": {
             "Variable": "$.market_hours_gate.Payload.verdict",
             "IsPresent": true
           },
-          "Comment": "alpha-engine-config-I7111 / config-I2767, added 2026-08-13. This rule must come FIRST and must be IsPresent-guarded. A Choice rule comparing a path that does not exist raises States.Runtime — it does NOT fall through to Default — so this Choice's own comment claiming an absent verdict 'fails CLOSED via Default' described behaviour ASL does not have. The 2026-08-13 preopen run proved it: verdict absent, States.Runtime at this state, execution dead 48s in with no SNS alert of any kind and no orders placed. Matching here short-circuits before any StringEquals touches the missing path, which is exactly how TradingDayGateChoice has been written since config-I2767.",
+          "Comment": "alpha-engine-config-I7111 / config-I2767, added 2026-08-13. This rule must come FIRST and must be IsPresent-guarded. A Choice rule comparing a path that does not exist raises States.Runtime \u2014 it does NOT fall through to Default \u2014 so this Choice's own comment claiming an absent verdict 'fails CLOSED via Default' described behaviour ASL does not have. The 2026-08-13 preopen run proved it: verdict absent, States.Runtime at this state, execution dead 48s in with no SNS alert of any kind and no orders placed. Matching here short-circuits before any StringEquals touches the missing path, which is exactly how TradingDayGateChoice has been written since config-I2767.",
           "Next": "StampMarketHoursVerdictMissing"
         },
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
-          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET — the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
+          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
           "Next": "CheckMutexRole"
         },
         {
@@ -77,8 +78,14 @@
         },
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED_REMEDIATION",
+          "Comment": "alpha-engine-config-I11384. In-session start with NO override, granted because today's book is demonstrably unfilled \u2014 the order book is absent, or carries zero approved entries AND zero urgent exits, or the day's optimizer shadow log is not shadow_status=ok. Brian's standing rule (2026-09-22): a fix affecting intraday trading is deployed and rerun the SAME session, never held to the close; it generalises his 2026-08-13 ruling that a failed preopen is always relaunched while the session is open. The gate refused exactly this on 2026-09-22 at 11:45 ET, on a fix that had already been merged and verified, and needed a hand-typed override to proceed \u2014 an operator step an agent could have run itself, which is a defect and not a request. Granted on S3 EVIDENCE, never on a caller's claim: a self-declared remediation flag would be an override with extra steps, and I7111's whole point is that the boundary binds the operator too. The probe fails to False on every error, so it can only ever make this gate STRICTER. Announced like an override \u2014 never silent.",
+          "Next": "RecordMarketHoursRemediation"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "BLOCKED",
-          "Comment": "In-session start with no override — the boundary doing its job.",
+          "Comment": "In-session start with no override \u2014 the boundary doing its job.",
           "Next": "NotifyMarketHoursBlocked"
         },
         {
@@ -92,7 +99,7 @@
     },
     "StampMarketHoursVerdictMissing": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I7111. Preopen posture: an unevaluable gate REFUSES. Routes into the existing unverified pair, which ends in the MarketHoursUnverified Fail. Stamping $.market_hours_gate_error is what makes that reachable: NotifyMarketHoursUnverified formats it with States.JsonToString, and on a missing path that call would itself raise States.Runtime — replacing one silent runtime death with another.",
+      "Comment": "alpha-engine-config-I7111. Preopen posture: an unevaluable gate REFUSES. Routes into the existing unverified pair, which ends in the MarketHoursUnverified Fail. Stamping $.market_hours_gate_error is what makes that reachable: NotifyMarketHoursUnverified formats it with States.JsonToString, and on a missing path that call would itself raise States.Runtime \u2014 replacing one silent runtime death with another.",
       "Result": {
         "Error": "MarketHoursGateContractViolation",
         "Cause": "alpha-engine-config-I7111: the market-hours gate Lambda returned successfully but its payload carried no `verdict` key, so this execution cannot establish that it is starting outside the NYSE session. This is a contract violation by our own producer, not an invoke failure, so the Task's Catch never fires and $.market_hours_gate_error would otherwise be absent. Measured 2026-08-13 (execution 59c0ce46): the `live` alias of alpha-engine-predictor-inference was frozen at a version predating action=check_market_hours, so the invoke fell through to the default predict branch and answered the gate with {statusCode, body}. The full payload received is in $.market_hours_gate."
@@ -102,12 +109,12 @@
     },
     "RecordMarketHoursOverride": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I7111 — the override's audit surface. A crossed boundary is announced on the alert topic AND left in execution history with who authorised it, why, and until when. Catch continues to the pipeline: the authorisation was already validated and recorded, so a notify-side failure must not silently convert an approved recovery into a refusal.",
+      "Comment": "alpha-engine-config-I7111 \u2014 the override's audit surface. A crossed boundary is announced on the alert topic AND left in execution history with who authorised it, why, and until when. Catch continues to the pipeline: the authorisation was already validated and recorded, so a notify-side failure must not silently convert an approved recovery into a refusal.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — market-hours boundary OVERRIDDEN (authorised in-session start)",
-        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session under an explicit market-hours override (alpha-engine-config-I7111). Execution: {}. Gate verdict: {}. This is a deliberate, time-boxed authorisation, not a bypass — the same record is in $.market_hours_gate in execution history.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 market-hours boundary OVERRIDDEN (authorised in-session start)",
+        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session under an explicit market-hours override (alpha-engine-config-I7111). Execution: {}. Gate verdict: {}. This is a deliberate, time-boxed authorisation, not a bypass \u2014 the same record is in $.market_hours_gate in execution history.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
       },
       "TimeoutSeconds": 60,
       "ResultPath": "$.market_hours_override_notify",
@@ -116,7 +123,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "SNS delivery is the announcement, not the record — the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
           "Next": "CheckMutexRole"
         }
@@ -125,11 +132,11 @@
     },
     "NotifyMarketHoursBlocked": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I7111 — a refusal is loud. sf-pipeline-policy §2.3: a run that did not do its work must not read as a clean success to a status-keyed watcher, so this notifies and then ends in a Fail rather than a Succeed-skip. The message carries the exact override shape so the operator does not have to find it.",
+      "Comment": "alpha-engine-config-I7111 \u2014 a refusal is loud. sf-pipeline-policy \u00a72.3: a run that did not do its work must not read as a clean success to a status-keyed watcher, so this notifies and then ends in a Fail rather than a Succeed-skip. The message carries the exact override shape so the operator does not have to find it.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — REFUSED (start inside NYSE market hours)",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (start inside NYSE market hours)",
         "Message.$": "States.Format('Refused to start a trading pipeline inside the NYSE regular session (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
       },
       "TimeoutSeconds": 60,
@@ -139,7 +146,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "SNS delivery is the announcement, not the record — the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
           "Next": "MarketHoursBlocked"
         }
@@ -149,15 +156,15 @@
     "MarketHoursBlocked": {
       "Type": "Fail",
       "Error": "MarketHoursBoundary",
-      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session — the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
     },
     "NotifyMarketHoursOverrideMalformed": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I7111 — a rejected override is its own terminal, distinct from MarketHoursBlocked, because it calls for a different operator action: fix the override, not wait for the close. Kept separate rather than folded in so a status-keyed watcher can tell the two apart from the Error alone.",
+      "Comment": "alpha-engine-config-I7111 \u2014 a rejected override is its own terminal, distinct from MarketHoursBlocked, because it calls for a different operator action: fix the override, not wait for the close. Kept separate rather than folded in so a status-keyed watcher can tell the two apart from the Error alone.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — REFUSED (market-hours override is not usable)",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (market-hours override is not usable)",
         "Message.$": "States.Format('A market-hours override was offered and rejected (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
       },
       "TimeoutSeconds": 60,
@@ -167,7 +174,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "SNS delivery is the announcement, not the record — the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
           "Next": "MarketHoursOverrideMalformed"
         }
@@ -177,16 +184,16 @@
     "MarketHoursOverrideMalformed": {
       "Type": "Fail",
       "Error": "MarketHoursOverrideMalformed",
-      "Cause": "alpha-engine-config-I7111: the execution input carried a market_hours_override that is not a usable authorisation — missing or blank reason/authorized_by/expires_at, a non-object, an unparseable expires_at, an expires_at at or before the execution start, or one more than 24h after it. The specific rejection is in $.market_hours_gate.Payload.override.rejection. Deliberately fails closed even when the market is shut: a half-typed override is a mis-authorisation, and it is better found on the run where it did not matter."
+      "Cause": "alpha-engine-config-I7111: the execution input carried a market_hours_override that is not a usable authorisation \u2014 missing or blank reason/authorized_by/expires_at, a non-object, an unparseable expires_at, an expires_at at or before the execution start, or one more than 24h after it. The specific rejection is in $.market_hours_gate.Payload.override.rejection. Deliberately fails closed even when the market is shut: a half-typed override is a mis-authorisation, and it is better found on the run where it did not matter."
     },
     "NotifyMarketHoursUnverified": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I7111 — the preopen gate fails CLOSED when it cannot be evaluated. sf-pipeline-policy §1.2 makes the cost of NOT trading a first-class input, and that is exactly why this is safe here: alpha-engine-predictor-inference is also the PredictorInference stage of this same pipeline, so its unavailability already means no predictions and no planner. There is nothing left for a fail-open to rescue, and a boundary that disappears whenever a Lambda is down repeats the failure class I7111 was filed for.",
+      "Comment": "alpha-engine-config-I7111 \u2014 the preopen gate fails CLOSED when it cannot be evaluated. sf-pipeline-policy \u00a71.2 makes the cost of NOT trading a first-class input, and that is exactly why this is safe here: alpha-engine-predictor-inference is also the PredictorInference stage of this same pipeline, so its unavailability already means no predictions and no planner. There is nothing left for a fail-open to rescue, and a boundary that disappears whenever a Lambda is down repeats the failure class I7111 was filed for.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — REFUSED (market-hours gate could not be evaluated)",
-        "Message.$": "States.Format('The market-hours gate Lambda failed after retries, so this execution cannot establish that it is starting outside the NYSE session (alpha-engine-config-I7111). Refusing to start. Execution: {}. Error: {}. Note that PredictorInference invokes the SAME Lambda later in this pipeline, so a run admitted here could not have produced predictions anyway — failing closed at the gate costs no trading day that was not already lost, and keeps the boundary from evaporating whenever its evaluator is unavailable.', $$.Execution.Id, States.JsonToString($.market_hours_gate_error))"
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 REFUSED (market-hours gate could not be evaluated)",
+        "Message.$": "States.Format('The market-hours gate Lambda failed after retries, so this execution cannot establish that it is starting outside the NYSE session (alpha-engine-config-I7111). Refusing to start. Execution: {}. Error: {}. Note that PredictorInference invokes the SAME Lambda later in this pipeline, so a run admitted here could not have produced predictions anyway \u2014 failing closed at the gate costs no trading day that was not already lost, and keeps the boundary from evaporating whenever its evaluator is unavailable.', $$.Execution.Id, States.JsonToString($.market_hours_gate_error))"
       },
       "TimeoutSeconds": 60,
       "ResultPath": "$.market_hours_unverified_notify",
@@ -195,7 +202,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "SNS delivery is the announcement, not the record — the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
           "Next": "MarketHoursUnverified"
         }
@@ -209,7 +216,7 @@
     },
     "CheckMutexRole": {
       "Type": "Choice",
-      "Comment": "L274 SF MutualExclusionGuard — gate at SF entry point. Allowlist all unattended cadence-roles (currently: daily / weekly / eod / shell-run / exercise) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations — that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell. Trigger of record: 2026-05-26 duplicate-EventBridge-target incident (PR #322 closed the SPECIFIC dup-target shape via CI; this mutex closes the broader class — operator double-paste / EB internal retry-on-throttle / cross-region replay / future shapes the CI chokepoint misses).",
+      "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point. Allowlist all unattended cadence-roles (currently: daily / weekly / eod / shell-run / exercise) acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay roles bypass entirely (operator-initiated runs are deliberately concurrent with cadence runs). Closes the architectural hole the L286a/b producer-side universe_writer_lock covers for manual daily_append invocations \u2014 that lock guards the data writer; this Choice guards the SF entry point. Together they cover both halves of single-writer-per-cadence-cell. Trigger of record: 2026-05-26 duplicate-EventBridge-target incident (PR #322 closed the SPECIFIC dup-target shape via CI; this mutex closes the broader class \u2014 operator double-paste / EB internal retry-on-throttle / cross-region replay / future shapes the CI chokepoint misses).",
       "Choices": [
         {
           "And": [
@@ -249,7 +256,7 @@
     },
     "AcquireMutex": {
       "Type": "Task",
-      "Comment": "L274 — DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException → MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window — a successfully-acquired key is naturally single-use because no future execution can land in the same past minute-bucket. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Comment": "L274 \u2014 DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException \u2192 MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window \u2014 a successfully-acquired key is naturally single-use because no future execution can land in the same past minute-bucket. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
       "Parameters": {
         "TableName": "alpha-engine-sf-execution-mutex",
@@ -278,7 +285,7 @@
           "ErrorEquals": [
             "DynamoDB.ConditionalCheckFailedException"
           ],
-          "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert (HandleFailure picks it up via MutexConflict's terminal Fail).",
+          "Comment": "Mutex held by another concurrent execution in the same minute bucket \u2014 the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert (HandleFailure picks it up via MutexConflict's terminal Fail).",
           "Next": "MutexConflict",
           "ResultPath": "$.mutex_conflict"
         },
@@ -286,7 +293,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all — now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block a real trading cadence run. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability hung off a primary path' carve-out, the primary deliverable survives a mutex-side failure. The error is captured in $.mutex_error for forensic review via SF execution history; CW alarm wiring deferred (operator-decision when first non-Conditional-Check mutex error appears). alpha-engine-config#6722: previously proceeded with no degraded flag at all \u2014 now routes through SetMutexAcquireDegradedFlag (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag) so CheckDegradedOutcome's terminal reflects it.",
           "Next": "SetMutexAcquireDegradedFlag",
           "ResultPath": "$.mutex_error"
         }
@@ -296,7 +303,7 @@
     },
     "SetMutexAcquireDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error — NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation — Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDaemonDegradedFlag/SetDeployDriftDegradedFlag, config#6692 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation \u2014 Next still leads to DeployDriftCheck exactly as before. Last-write-wins if a later stage also degrades (same convention SetDaemonDegradedFlag documents); does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "daily_mutex_acquire_fail_open",
@@ -347,7 +354,7 @@
     },
     "DeployDriftGate": {
       "Type": "Choice",
-      "Comment": "alpha-engine-config#6615 (sf-pipeline-policy §3, Brian's 2026-08-09 ruling): the drift probe's has_drift was a single union of sf_drift (a drifted SF definition — trading-correctness-critical, per deploy_drift.py's own docstring) and cf_drift (CloudFormation stack terminal-state/template drift — orchestration metadata). Treating both as one signal fail-closed the whole pipeline on 2026-08-05/06/07 when alpha-engine-orchestration sat in UPDATE_ROLLBACK_FAILED with sf_drift=false throughout — 3 lost trading days on a condition that never touched the deployed SF definition. This Choice now evaluates the two families separately: sf_drift=true (or either field missing — fail CLOSED on unknown, unchanged from the has_drift convention) still halts via HandleFailure; cf_drift=true alone routes to SetDeployDriftDegradedFlag, which threads a $.degraded_summary (PR1251/config#6692 Option-A shape) through the unmodified happy path to TradingDayGate so CheckDegradedOutcome later marks the run DEGRADED instead of a plain SUCCEEDED completion.",
+      "Comment": "alpha-engine-config#6615 (sf-pipeline-policy \u00a73, Brian's 2026-08-09 ruling): the drift probe's has_drift was a single union of sf_drift (a drifted SF definition \u2014 trading-correctness-critical, per deploy_drift.py's own docstring) and cf_drift (CloudFormation stack terminal-state/template drift \u2014 orchestration metadata). Treating both as one signal fail-closed the whole pipeline on 2026-08-05/06/07 when alpha-engine-orchestration sat in UPDATE_ROLLBACK_FAILED with sf_drift=false throughout \u2014 3 lost trading days on a condition that never touched the deployed SF definition. This Choice now evaluates the two families separately: sf_drift=true (or either field missing \u2014 fail CLOSED on unknown, unchanged from the has_drift convention) still halts via HandleFailure; cf_drift=true alone routes to SetDeployDriftDegradedFlag, which threads a $.degraded_summary (PR1251/config#6692 Option-A shape) through the unmodified happy path to TradingDayGate so CheckDegradedOutcome later marks the run DEGRADED instead of a plain SUCCEEDED completion.",
       "Choices": [
         {
           "And": [
@@ -360,7 +367,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "sf_drift=true is a drifted SF definition — the deployed state machine no longer matches alpha-engine-data@main HEAD. Trading-correctness-critical per sf-pipeline-policy §3: halts, never degrades, regardless of cf_drift.",
+          "Comment": "sf_drift=true is a drifted SF definition \u2014 the deployed state machine no longer matches alpha-engine-data@main HEAD. Trading-correctness-critical per sf-pipeline-policy \u00a73: halts, never degrades, regardless of cf_drift.",
           "Next": "HandleFailure"
         },
         {
@@ -368,7 +375,7 @@
             "Variable": "$.drift_result.Payload.sf_drift",
             "IsPresent": true
           },
-          "Comment": "config-I2767, preserved post-split: sf_drift missing means the gate cannot verify SF-definition freshness — fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
+          "Comment": "config-I2767, preserved post-split: sf_drift missing means the gate cannot verify SF-definition freshness \u2014 fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
           "Next": "HandleFailure"
         },
         {
@@ -376,7 +383,7 @@
             "Variable": "$.drift_result.Payload.cf_drift",
             "IsPresent": true
           },
-          "Comment": "config-I2767, preserved post-split: cf_drift missing means the gate cannot classify a drift signal as halt-vs-degrade — fail CLOSED rather than silently defaulting to either a pass or a degrade.",
+          "Comment": "config-I2767, preserved post-split: cf_drift missing means the gate cannot classify a drift signal as halt-vs-degrade \u2014 fail CLOSED rather than silently defaulting to either a pass or a degrade.",
           "Next": "HandleFailure"
         },
         {
@@ -390,7 +397,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "alpha-engine-config#6615: cf_drift=true without sf_drift=true is CloudFormation stack-state/template drift only — orchestration metadata, not a trading-correctness failure. sf-pipeline-policy §3 degrades loudly instead of halting: trade on the last verified frozen SHA with a degraded flag + page.",
+          "Comment": "alpha-engine-config#6615: cf_drift=true without sf_drift=true is CloudFormation stack-state/template drift only \u2014 orchestration metadata, not a trading-correctness failure. sf-pipeline-policy \u00a73 degrades loudly instead of halting: trade on the last verified frozen SHA with a degraded flag + page.",
           "Next": "SetDeployDriftDegradedFlag"
         },
         {
@@ -404,7 +411,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "alpha-engine-config-I7799 (Brian ruling 2026-08-20, option b). sf_drift above is now a comparison of the DEPLOYED preopen definition body against the repo's, so it halts only when the orchestration about to run differs from what main describes. deploy_stamp_stale carries what the old SHA-stamp comparison used to say: this repo has merged something it has not deployed. That is still real — a merged Lambda, collector or script this pipeline INVOKES but does not embed is genuinely undeployed — so it DEGRADES and pages rather than halting, which is the §3 halt-vs-degrade split applied one layer down from the 2026-08-05/07 CFN case (config-I6615). Evaluated AFTER the cf_drift branch so a cf_drift degrade is not relabelled by it, and before Default. NOT IsPresent-guarded toward failure, deliberately: an absent key means an older predictor Lambda that has not yet shipped I7799, and that Lambda's sf_drift IS the stamp comparison — so the coverage this branch adds is not lost during a rollout, it is still being enforced one branch up, more strictly.",
+          "Comment": "alpha-engine-config-I7799 (Brian ruling 2026-08-20, option b). sf_drift above is now a comparison of the DEPLOYED preopen definition body against the repo's, so it halts only when the orchestration about to run differs from what main describes. deploy_stamp_stale carries what the old SHA-stamp comparison used to say: this repo has merged something it has not deployed. That is still real \u2014 a merged Lambda, collector or script this pipeline INVOKES but does not embed is genuinely undeployed \u2014 so it DEGRADES and pages rather than halting, which is the \u00a73 halt-vs-degrade split applied one layer down from the 2026-08-05/07 CFN case (config-I6615). Evaluated AFTER the cf_drift branch so a cf_drift degrade is not relabelled by it, and before Default. NOT IsPresent-guarded toward failure, deliberately: an absent key means an older predictor Lambda that has not yet shipped I7799, and that Lambda's sf_drift IS the stamp comparison \u2014 so the coverage this branch adds is not lost during a rollout, it is still being enforced one branch up, more strictly.",
           "Next": "SetDeployDriftDegradedFlag"
         }
       ],
@@ -412,7 +419,7 @@
     },
     "SetDeployDriftDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6615 + I7799. The NON-HALTING branch of DeployDriftGate: the deployed preopen DEFINITION matches main (sf_drift=false), and at least one condition that is real but not trading-correctness-critical is true — cf_drift (CloudFormation stack terminal-state or template drift, orchestration metadata) and/or deploy_stamp_stale (this repo has merged something it has not deployed, which reaches a Lambda/collector/script the pipeline INVOKES but does not embed). Both degrade rather than halt per sf-pipeline-policy §3, and WHICH one fired is carried in $.drift_result.Payload rather than in this state's static reason — a Choice cannot format a message per-branch, and a second state pair would have to be registered in nousergon_lib.pipeline_status before it could render. Sets $.degraded_summary the same way SetDaemonDegradedFlag/SetDataSpotDegradedFlag do (config#6692 Option-A parity) so CheckDegradedOutcome routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun instead of a plain SUCCEEDED marker. Does NOT change the run's continuation — Next is PublishDeployDriftDegraded then straight on to TradingDayGate, exactly the path a clean drift check would take. If a later stage also degrades, that state's write to $.degraded_summary wins as the most-recent cause; degraded=true is preserved either way.",
+      "Comment": "alpha-engine-config#6615 + I7799. The NON-HALTING branch of DeployDriftGate: the deployed preopen DEFINITION matches main (sf_drift=false), and at least one condition that is real but not trading-correctness-critical is true \u2014 cf_drift (CloudFormation stack terminal-state or template drift, orchestration metadata) and/or deploy_stamp_stale (this repo has merged something it has not deployed, which reaches a Lambda/collector/script the pipeline INVOKES but does not embed). Both degrade rather than halt per sf-pipeline-policy \u00a73, and WHICH one fired is carried in $.drift_result.Payload rather than in this state's static reason \u2014 a Choice cannot format a message per-branch, and a second state pair would have to be registered in nousergon_lib.pipeline_status before it could render. Sets $.degraded_summary the same way SetDaemonDegradedFlag/SetDataSpotDegradedFlag do (config#6692 Option-A parity) so CheckDegradedOutcome routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun instead of a plain SUCCEEDED marker. Does NOT change the run's continuation \u2014 Next is PublishDeployDriftDegraded then straight on to TradingDayGate, exactly the path a clean drift check would take. If a later stage also degrades, that state's write to $.degraded_summary wins as the most-recent cause; degraded=true is preserved either way.",
       "Parameters": {
         "degraded": true,
         "reason": "deploy_drift_nonhalting",
@@ -424,12 +431,12 @@
     },
     "PublishDeployDriftDegraded": {
       "Type": "Task",
-      "Comment": "config#6615 + I7799: best-effort SNS alert that DeployDriftGate degraded the run WITHOUT halting it — the deployed preopen definition matches main, so trading proceeds, but a non-halting condition (cf_drift and/or deploy_stamp_stale) is true and must not pass silently. The message names which, from the probe payload, rather than asserting a cause it cannot know: §2.3's rule that the notification carries the ACTUAL condition is what made the old CloudFormation-only wording wrong the moment a second condition could route here. Its own Catch also routes to TradingDayGate so even an SNS failure cannot halt the run (mirrors PublishDataSpotFailureImmediate — config#1767). The message interpolates ONLY fields both the pre- and post-I7799 probe emit (cf_drift_reason, sf_drift_reason) and carries deploy_stamp_stale inside the JsonToString payload instead: a States.Format on an absent path raises States.Runtime, and this state's Catch would then swallow the alert into TradingDayGate — the notification would be lost precisely during the rollout window where an old predictor Lambda is still answering.",
+      "Comment": "config#6615 + I7799: best-effort SNS alert that DeployDriftGate degraded the run WITHOUT halting it \u2014 the deployed preopen definition matches main, so trading proceeds, but a non-halting condition (cf_drift and/or deploy_stamp_stale) is true and must not pass silently. The message names which, from the probe payload, rather than asserting a cause it cannot know: \u00a72.3's rule that the notification carries the ACTUAL condition is what made the old CloudFormation-only wording wrong the moment a second condition could route here. Its own Catch also routes to TradingDayGate so even an SNS failure cannot halt the run (mirrors PublishDataSpotFailureImmediate \u2014 config#1767). The message interpolates ONLY fields both the pre- and post-I7799 probe emit (cf_drift_reason, sf_drift_reason) and carries deploy_stamp_stale inside the JsonToString payload instead: a States.Format on an absent path raises States.Runtime, and this state's Catch would then swallow the alert into TradingDayGate \u2014 the notification would be lost precisely during the rollout window where an old predictor Lambda is still answering.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — DEGRADED (deploy drift, non-halting; trading proceeds)",
-        "Message.$": "States.Format('DeployDriftGate degraded this run WITHOUT halting it: the deployed preopen DEFINITION matches main (sf_drift=false), so orchestration semantics are known and trading proceeds on the last verified frozen SHA. At least one non-halting condition is true — cf_drift (CloudFormation stack state/template) and/or deploy_stamp_stale (nousergon-data has merged something it has not deployed, reaching code this pipeline invokes but does not embed). Both are sf-pipeline-policy §3 degrade-and-proceed conditions (config#6615, I7799). This execution will complete DEGRADED, not SUCCEEDED. cf_drift_reason={}, sf_drift_reason={}. Full probe (carries deploy_stamp_stale): {}', $.drift_result.Payload.cf_drift_reason, $.drift_result.Payload.sf_drift_reason, States.JsonToString($.drift_result.Payload))"
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 DEGRADED (deploy drift, non-halting; trading proceeds)",
+        "Message.$": "States.Format('DeployDriftGate degraded this run WITHOUT halting it: the deployed preopen DEFINITION matches main (sf_drift=false), so orchestration semantics are known and trading proceeds on the last verified frozen SHA. At least one non-halting condition is true \u2014 cf_drift (CloudFormation stack state/template) and/or deploy_stamp_stale (nousergon-data has merged something it has not deployed, reaching code this pipeline invokes but does not embed). Both are sf-pipeline-policy \u00a73 degrade-and-proceed conditions (config#6615, I7799). This execution will complete DEGRADED, not SUCCEEDED. cf_drift_reason={}, sf_drift_reason={}. Full probe (carries deploy_stamp_stale): {}', $.drift_result.Payload.cf_drift_reason, $.drift_result.Payload.sf_drift_reason, States.JsonToString($.drift_result.Payload))"
       },
       "ResultPath": "$.deploy_drift_degraded_notify",
       "TimeoutSeconds": 60,
@@ -446,7 +453,7 @@
     },
     "TradingDayGate": {
       "Type": "Task",
-      "Comment": "NYSE trading-day gate, run BEFORE StartExecutorEC2. Invokes the predictor Lambda (action=check_trading_day) — pure calendar math, no box dependency. Replaces the prior on-box SSM trading_calendar check whose stdout was unreliably captured on a just-cold-booted instance (2026-06-30 false trading-day-check failure alert; config#1430). On holiday the box is never booted.",
+      "Comment": "NYSE trading-day gate, run BEFORE StartExecutorEC2. Invokes the predictor Lambda (action=check_trading_day) \u2014 pure calendar math, no box dependency. Replaces the prior on-box SSM trading_calendar check whose stdout was unreliably captured on a just-cold-booted instance (2026-06-30 false trading-day-check failure alert; config#1430). On holiday the box is never booted.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
@@ -504,7 +511,7 @@
             "Variable": "$.trading_day_gate.Payload.is_trading_day",
             "IsPresent": true
           },
-          "Comment": "config-I2767: a gate payload WITHOUT is_trading_day is a contract violation from our own Lambda — fail CLOSED and loud (HandleFailure) rather than silently proceeding to trade (or silently skipping) on an unverifiable trading-day verdict.",
+          "Comment": "config-I2767: a gate payload WITHOUT is_trading_day is a contract violation from our own Lambda \u2014 fail CLOSED and loud (HandleFailure) rather than silently proceeding to trade (or silently skipping) on an unverifiable trading-day verdict.",
           "Next": "HandleFailure"
         }
       ],
@@ -512,11 +519,11 @@
     },
     "TradingDayGateFailed": {
       "Type": "Task",
-      "Comment": "Trading-day gate Lambda failed for infrastructure reasons — alert and proceed (assume trading day). Predictor inference + downstream remain gated on enrichment success.",
+      "Comment": "Trading-day gate Lambda failed for infrastructure reasons \u2014 alert and proceed (assume trading day). Predictor inference + downstream remain gated on enrichment success.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — Trading Day Gate Failed (Proceeding)",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 Trading Day Gate Failed (Proceeding)",
         "Message.$": "States.Format('Trading-day gate Lambda failed (infra error, not a holiday detection). Pipeline proceeding as trading day. Error: {}', States.JsonToString($.trading_day_gate_error))"
       },
       "TimeoutSeconds": 60,
@@ -525,12 +532,12 @@
     },
     "NotifyHolidaySkip": {
       "Type": "Task",
-      "Comment": "Notify that the pipeline was skipped — TradingDayGate reported is_trading_day=false (NYSE holiday/weekend). The executor box was never started (gate runs before StartExecutorEC2).",
+      "Comment": "Notify that the pipeline was skipped \u2014 TradingDayGate reported is_trading_day=false (NYSE holiday/weekend). The executor box was never started (gate runs before StartExecutorEC2).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — Skipped (Market Holiday)",
-        "Message": "Daily pipeline skipped — NYSE is closed today (market holiday or weekend). No inference or trading. The executor box was not started."
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 Skipped (Market Holiday)",
+        "Message": "Daily pipeline skipped \u2014 NYSE is closed today (market holiday or weekend). No inference or trading. The executor box was not started."
       },
       "TimeoutSeconds": 60,
       "ResultPath": "$.holiday_notify",
@@ -538,7 +545,7 @@
     },
     "StartExecutorEC2": {
       "Type": "Task",
-      "Comment": "Start ae-trading (t3.small) early — needed for both DailyData (data collection) and RunMorningPlanner (executor). No-op if already running.",
+      "Comment": "Start ae-trading (t3.small) early \u2014 needed for both DailyData (data collection) and RunMorningPlanner (executor). No-op if already running.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -568,7 +575,7 @@
     },
     "WaitForInstanceReady": {
       "Type": "Wait",
-      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped→running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped\u2192running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
       "Seconds": 15,
       "Next": "InitSSMPollCounter"
     },
@@ -583,7 +590,7 @@
     },
     "DescribeInstanceInfo": {
       "Type": "Task",
-      "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning — Ssm.InvalidInstanceIdException at the first SSM step because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckSkipMorningEnrich (the first morning work gate; the NYSE holiday check now runs BEFORE the box boots via TradingDayGate, config#1430) when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
+      "Comment": "Poll SSM-agent registration on the trading instance. Replaces the prior fixed Wait 60s, which was insufficient on cold-boot t3.small (race observed 2026-05-05 morning \u2014 Ssm.InvalidInstanceIdException at the first SSM step because PingStatus had not yet flipped to Online when the SSM SendCommand fired). SSMReadyChoice routes to CheckSkipMorningEnrich (the first morning work gate; the NYSE holiday check now runs BEFORE the box boots via TradingDayGate, config#1430) when PingStatus=Online or HandleFailure when the bounded retry budget (~3 min) is exhausted.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
       "Parameters": {
         "Filters": [
@@ -619,7 +626,7 @@
     },
     "SSMReadyChoice": {
       "Type": "Choice",
-      "Comment": "PingStatus=Online → CodeFreshnessGate (config#1811; the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails — agent not registering after 3 min indicates a real boot problem, not just timing).",
+      "Comment": "PingStatus=Online \u2192 CodeFreshnessGate (config#1811; the NYSE holiday gate already ran pre-boot via TradingDayGate, config#1430). Otherwise wait + retry up to 12 attempts (~3 min total budget). Hard-fail when budget exhausted (per feedback_no_silent_fails \u2014 agent not registering after 3 min indicates a real boot problem, not just timing).",
       "Choices": [
         {
           "And": [
@@ -657,7 +664,7 @@
     },
     "CodeFreshnessGate": {
       "Type": "Task",
-      "Comment": "config#1811 Part A — verify the three repo checkouts on ae-trading (alpha-engine, alpha-engine-data, alpha-engine-config) are on branch main at origin/main's SHA BEFORE any pipeline work runs, with one in-place self-heal (ownership reclaim + checkout -f main + reset --hard). Front-loads the check the executor's deploy-drift preflight only makes at RunMorningPlanner time — on 2026-07-06 a boot-pull failure (root-owned files in the checkout) left the box on a stray branch 4 commits stale, and the pipeline burned ~40 min of MorningEnrich/ArcticAppend/PredictorInference before that preflight refused. The executor-repo AST syntax gate mirrors boot-pull's deploy gate but FAILS the pipeline instead of rolling back: at pipeline time, neither stale nor broken code may proceed (fail-loud). Runs as root via SSM (bare chown), git as ec2-user. The executor's in-process check_deploy_drift stays as defense-in-depth. 2026-07-08 preopen failure: this gate and boot-pull.service (the systemd oneshot that runs the SAME `git fetch/checkout -f main/reset --hard` on the same 3 repos at every daily boot) are two concurrent git writers — the gate fires the instant SSM reports Online, which can be WHILE boot-pull's `git reset --hard` still holds alpha-engine-data/.git/index.lock, so the gate's checkout/reset died with 'Another git process seems to be running' (exit 128 -> COMMAND_FAILED, no orders placed). The fetch + self-heal git ops now go through git_retry(), which retries ONLY on git's lock-contention signature (up to 30x5s=150s > boot-pull's 120s TimeoutStartSec) and FAILS LOUD on any other error or if the lock persists past budget — serializing the gate behind boot-pull without swallowing a genuinely stale/broken box. Class fix landed (config#1944): git_retry now runs each git op under `flock -w 150 /home/ec2-user/.ae-git-sync.lock` — the SAME advisory lock inode boot-pull.sh and ChronicGapSelfHeal acquire — a window-free kernel mutex (auto-releases on process death, unlike a stranded .git/index.lock). The lock path is in ec2-user's HOME because /var/lock is root:root 0755 (boot-pull runs as ec2-user); every actor flocks it as ec2-user so the open always succeeds. The lock-signature retry is RETAINED as the transition-window fallback: during the 1-2 boots after this ships, an older on-disk boot-pull that isn't yet flock-aware can still hold index.lock, and the retry outwaits it. config#1955: once the box is verified on origin/main, the resolved crucible-executor HEAD is frozen to /home/ec2-user/.frozen_executor_sha — the T0 pin that executor/preflight.py::check_deploy_drift validates against later (RunMorningPlanner reads it as EXPECTED_EXECUTOR_SHA; the systemd-restarted RunDaemon reads the file directly, since its process env can't inherit the SSM shell). This kills the deploy-drift TOCTOU: a benign mid-pipeline merge to origin/main can no longer retroactively fail an already-freshness-validated run. 2026-07-20 preopen FailExecution (recurrence of the same concurrent-writer class as 2026-07-08, but on the one self-heal op left outside the protocol): the self-heal's ownership-reclaim `chown -R ec2-user:ec2-user $d` recursed into $d/.venv and raced boot-pull.service's concurrent `pip install -r requirements.txt` — which runs OUTSIDE the shared git flock (the flock guards only fetch/checkout/reset, not the pip step) — dying with `chown: cannot access '.../nousergon_lib-0.116.0.dist-info': No such file or directory` (rc=1 under `set -eo pipefail` -> COMMAND_FAILED -> HandleFailure -> FailExecution, no orders). Root cause: the reclaim (whose ONLY purpose is to let the subsequent ec2-user git ops write a possibly root-owned tree — git never touches the gitignored .venv) reimplemented ownership reclaim more crudely than boot-pull.sh, which already solved this exact race by (a) detecting foreign ownership FIRST (`find $repo -not -user ec2-user -print -quit`) so the clean path chowns nothing, and (b) chowning NON-FATALLY (`|| WARN`) so a transient pip-churn ENOENT can't abort the boot. The gate's reclaim now mirrors that proven form verbatim: detect-then-chown, non-fatal. This is NOT a fail-loud regression — a genuinely unreclaimable root-owned tree still fails LOUD one line later at `git_retry -C $d reset --hard origin/main` (under pipefail), which is the true gate the 2026-07-06 root-owned-checkout incident exists to catch. Pinned by test_sf_code_freshness_lock_retry_wiring.py::test_self_heal_reclaim_is_detect_guarded_and_nonfatal. alpha-engine-config-I8684: the freeze is taken under the SAME /home/ec2-user/.ae-git-sync.lock flock every other git writer on this box takes, and it ASSERTS HEAD == origin/main immediately before writing, rather than freezing whatever HEAD happens to be. Before this, the CODE-STALE-AFTER-HEAL recheck above and the freeze here were two unsynchronised reads with a concurrent writer free to run between them, so the gate could pass, have HEAD moved underneath it, and then freeze the moved SHA - after which executor/preflight.py::check_deploy_drift validated CONSISTENTLY against the wrong commit and raised nothing. Measured 2026-08-25: boot-pull.service's deploy-gate rollback (crucible-executor-PR494) landed after this recheck, the gate froze 20ca44aa (#492) while origin/main was c5edc712 (#493), the preopen reported SUCCESS and the session traded stale code with no signal anywhere. The next morning the same two writers finished in the other order and the pipeline failed at CODE-STALE-AFTER-HEAL instead. A race whose outcome is a lost session one day and silent stale trading the next is not a flake to retry - the writers are serialised and the invariant is asserted at the point it is recorded. | alpha-engine-config-I9829: this gate now waits for boot-pull.service to leave 'activating' before it reads the checkouts. On 2026-09-02 the gate's SSM command was sent at 12:16:01, six seconds after boot-pull.service started and 31 seconds before it finished, and its fetch of alpha-engine-config returned 403 because boot-pull had not yet reached the step that removes the credential dotfile shadowing the App helper. The git_retry loop only retries the 'Another git process seems to be running' lock message, so a 403 fell straight through and failed the session. The wait is bounded at 120s and NEVER halts on expiry - it proceeds and says so, because this gate is the enforcing layer and adding a second halt branch here would trade one lost session for another. alpha-engine-config-I10950: ne-preopen-trading-pipeline execution b84df578-c80b-453d-a855-69fdcc3a70ba FAILED 2026-09-17T05:15:41-07:00 (CheckCodeFreshnessStatus -> HandleFailure -> FailExecution, no trading) on `git-credential-nousergon-app: token cache MISS for repo=alpha-engine-config: no cached entry` / `remote: Repository not found.` / `fatal: repository 'https://github.com/nousergon/alpha-engine-config.git/' not found` (rc=1) from the fetch loop. Both boxes' remotes are configured with no trailing slash — the slash in the fatal message is git's own rendering, not a misconfiguration. Credential path measured healthy immediately after: fresh App tokens for all four repos returned HTTP 200 and `git ls-remote` rc=0 from both the expired-cache and empty-cache branches; installation 144861175 is repository_selection=all, contents:write, not suspended; no GitHub status incident that day. The SAME fetch succeeded 24 SECONDS LATER: boot-pull on the same box ran `git ls-remote .../alpha-engine-config.git HEAD` at 12:16:05Z and got a SHA, having failed at 12:15:41Z — a transient remote/auth condition that clears in seconds, not a stale or broken box. git_retry's ONE prior retry class (lock contention, up to 30x5s=150s) never matched this signature, so it fell through to fail-loud immediately. git_retry now retries a SECOND, distinct class — transient remote/auth/network failures (`Repository not found`, `Authentication failed`, `could not read Username`, `The requested URL returned error: 5`, `Could not resolve host`, `Failed to connect`, `Connection timed out`, `RPC failed`, `early EOF`, `remote end hung up`, `unable to access`) — bounded to 4 attempts with 5s/10s/20s backoff (~35s total), erasing the checkout's own cached App-token entry (keyed off `git -C $d remote get-url origin`, NOT the checkout directory name — alpha-engine's origin is nousergon/crucible-executor, alpha-engine-data's is nousergon/nousergon-data) before each retry so a bad cached token cannot be served twice, and echoing repo/attempt/class so a recurrence is diagnosable from the SSM stdout alone. Arithmetic: the gate's non-git work (bp_wait up to 120s worst-case but typically <5s since boot-pull is usually already terminal by SSM-Online, the syntax-import check, the freeze) plus 3 git_retry calls (fetch loop is 3 sequential invocations, one per repo) leaves comfortable headroom under executionTimeout=300/TimeoutSeconds=300/360 for a SINGLE transient-class occurrence (~35s); a remote outage spanning multiple repos or exceeding the bounded budget still fails loud via COMMAND_FAILED, preserving the fail-loud contract for a genuinely broken box. Everything else — a malformed URL, a real 404 on a renamed/deleted repo, a permanently revoked installation — keeps failing loud on the FIRST attempt, exactly as before.",
+      "Comment": "config#1811 Part A \u2014 verify the three repo checkouts on ae-trading (alpha-engine, alpha-engine-data, alpha-engine-config) are on branch main at origin/main's SHA BEFORE any pipeline work runs, with one in-place self-heal (ownership reclaim + checkout -f main + reset --hard). Front-loads the check the executor's deploy-drift preflight only makes at RunMorningPlanner time \u2014 on 2026-07-06 a boot-pull failure (root-owned files in the checkout) left the box on a stray branch 4 commits stale, and the pipeline burned ~40 min of MorningEnrich/ArcticAppend/PredictorInference before that preflight refused. The executor-repo AST syntax gate mirrors boot-pull's deploy gate but FAILS the pipeline instead of rolling back: at pipeline time, neither stale nor broken code may proceed (fail-loud). Runs as root via SSM (bare chown), git as ec2-user. The executor's in-process check_deploy_drift stays as defense-in-depth. 2026-07-08 preopen failure: this gate and boot-pull.service (the systemd oneshot that runs the SAME `git fetch/checkout -f main/reset --hard` on the same 3 repos at every daily boot) are two concurrent git writers \u2014 the gate fires the instant SSM reports Online, which can be WHILE boot-pull's `git reset --hard` still holds alpha-engine-data/.git/index.lock, so the gate's checkout/reset died with 'Another git process seems to be running' (exit 128 -> COMMAND_FAILED, no orders placed). The fetch + self-heal git ops now go through git_retry(), which retries ONLY on git's lock-contention signature (up to 30x5s=150s > boot-pull's 120s TimeoutStartSec) and FAILS LOUD on any other error or if the lock persists past budget \u2014 serializing the gate behind boot-pull without swallowing a genuinely stale/broken box. Class fix landed (config#1944): git_retry now runs each git op under `flock -w 150 /home/ec2-user/.ae-git-sync.lock` \u2014 the SAME advisory lock inode boot-pull.sh and ChronicGapSelfHeal acquire \u2014 a window-free kernel mutex (auto-releases on process death, unlike a stranded .git/index.lock). The lock path is in ec2-user's HOME because /var/lock is root:root 0755 (boot-pull runs as ec2-user); every actor flocks it as ec2-user so the open always succeeds. The lock-signature retry is RETAINED as the transition-window fallback: during the 1-2 boots after this ships, an older on-disk boot-pull that isn't yet flock-aware can still hold index.lock, and the retry outwaits it. config#1955: once the box is verified on origin/main, the resolved crucible-executor HEAD is frozen to /home/ec2-user/.frozen_executor_sha \u2014 the T0 pin that executor/preflight.py::check_deploy_drift validates against later (RunMorningPlanner reads it as EXPECTED_EXECUTOR_SHA; the systemd-restarted RunDaemon reads the file directly, since its process env can't inherit the SSM shell). This kills the deploy-drift TOCTOU: a benign mid-pipeline merge to origin/main can no longer retroactively fail an already-freshness-validated run. 2026-07-20 preopen FailExecution (recurrence of the same concurrent-writer class as 2026-07-08, but on the one self-heal op left outside the protocol): the self-heal's ownership-reclaim `chown -R ec2-user:ec2-user $d` recursed into $d/.venv and raced boot-pull.service's concurrent `pip install -r requirements.txt` \u2014 which runs OUTSIDE the shared git flock (the flock guards only fetch/checkout/reset, not the pip step) \u2014 dying with `chown: cannot access '.../nousergon_lib-0.116.0.dist-info': No such file or directory` (rc=1 under `set -eo pipefail` -> COMMAND_FAILED -> HandleFailure -> FailExecution, no orders). Root cause: the reclaim (whose ONLY purpose is to let the subsequent ec2-user git ops write a possibly root-owned tree \u2014 git never touches the gitignored .venv) reimplemented ownership reclaim more crudely than boot-pull.sh, which already solved this exact race by (a) detecting foreign ownership FIRST (`find $repo -not -user ec2-user -print -quit`) so the clean path chowns nothing, and (b) chowning NON-FATALLY (`|| WARN`) so a transient pip-churn ENOENT can't abort the boot. The gate's reclaim now mirrors that proven form verbatim: detect-then-chown, non-fatal. This is NOT a fail-loud regression \u2014 a genuinely unreclaimable root-owned tree still fails LOUD one line later at `git_retry -C $d reset --hard origin/main` (under pipefail), which is the true gate the 2026-07-06 root-owned-checkout incident exists to catch. Pinned by test_sf_code_freshness_lock_retry_wiring.py::test_self_heal_reclaim_is_detect_guarded_and_nonfatal. alpha-engine-config-I8684: the freeze is taken under the SAME /home/ec2-user/.ae-git-sync.lock flock every other git writer on this box takes, and it ASSERTS HEAD == origin/main immediately before writing, rather than freezing whatever HEAD happens to be. Before this, the CODE-STALE-AFTER-HEAL recheck above and the freeze here were two unsynchronised reads with a concurrent writer free to run between them, so the gate could pass, have HEAD moved underneath it, and then freeze the moved SHA - after which executor/preflight.py::check_deploy_drift validated CONSISTENTLY against the wrong commit and raised nothing. Measured 2026-08-25: boot-pull.service's deploy-gate rollback (crucible-executor-PR494) landed after this recheck, the gate froze 20ca44aa (#492) while origin/main was c5edc712 (#493), the preopen reported SUCCESS and the session traded stale code with no signal anywhere. The next morning the same two writers finished in the other order and the pipeline failed at CODE-STALE-AFTER-HEAL instead. A race whose outcome is a lost session one day and silent stale trading the next is not a flake to retry - the writers are serialised and the invariant is asserted at the point it is recorded. | alpha-engine-config-I9829: this gate now waits for boot-pull.service to leave 'activating' before it reads the checkouts. On 2026-09-02 the gate's SSM command was sent at 12:16:01, six seconds after boot-pull.service started and 31 seconds before it finished, and its fetch of alpha-engine-config returned 403 because boot-pull had not yet reached the step that removes the credential dotfile shadowing the App helper. The git_retry loop only retries the 'Another git process seems to be running' lock message, so a 403 fell straight through and failed the session. The wait is bounded at 120s and NEVER halts on expiry - it proceeds and says so, because this gate is the enforcing layer and adding a second halt branch here would trade one lost session for another. alpha-engine-config-I10950: ne-preopen-trading-pipeline execution b84df578-c80b-453d-a855-69fdcc3a70ba FAILED 2026-09-17T05:15:41-07:00 (CheckCodeFreshnessStatus -> HandleFailure -> FailExecution, no trading) on `git-credential-nousergon-app: token cache MISS for repo=alpha-engine-config: no cached entry` / `remote: Repository not found.` / `fatal: repository 'https://github.com/nousergon/alpha-engine-config.git/' not found` (rc=1) from the fetch loop. Both boxes' remotes are configured with no trailing slash \u2014 the slash in the fatal message is git's own rendering, not a misconfiguration. Credential path measured healthy immediately after: fresh App tokens for all four repos returned HTTP 200 and `git ls-remote` rc=0 from both the expired-cache and empty-cache branches; installation 144861175 is repository_selection=all, contents:write, not suspended; no GitHub status incident that day. The SAME fetch succeeded 24 SECONDS LATER: boot-pull on the same box ran `git ls-remote .../alpha-engine-config.git HEAD` at 12:16:05Z and got a SHA, having failed at 12:15:41Z \u2014 a transient remote/auth condition that clears in seconds, not a stale or broken box. git_retry's ONE prior retry class (lock contention, up to 30x5s=150s) never matched this signature, so it fell through to fail-loud immediately. git_retry now retries a SECOND, distinct class \u2014 transient remote/auth/network failures (`Repository not found`, `Authentication failed`, `could not read Username`, `The requested URL returned error: 5`, `Could not resolve host`, `Failed to connect`, `Connection timed out`, `RPC failed`, `early EOF`, `remote end hung up`, `unable to access`) \u2014 bounded to 4 attempts with 5s/10s/20s backoff (~35s total), erasing the checkout's own cached App-token entry (keyed off `git -C $d remote get-url origin`, NOT the checkout directory name \u2014 alpha-engine's origin is nousergon/crucible-executor, alpha-engine-data's is nousergon/nousergon-data) before each retry so a bad cached token cannot be served twice, and echoing repo/attempt/class so a recurrence is diagnosable from the SSM stdout alone. Arithmetic: the gate's non-git work (bp_wait up to 120s worst-case but typically <5s since boot-pull is usually already terminal by SSM-Online, the syntax-import check, the freeze) plus 3 git_retry calls (fetch loop is 3 sequential invocations, one per repo) leaves comfortable headroom under executionTimeout=300/TimeoutSeconds=300/360 for a SINGLE transient-class occurrence (~35s); a remote outage spanning multiple repos or exceeding the bounded budget still fails loud via COMMAND_FAILED, preserving the fail-loud contract for a genuinely broken box. Everything else \u2014 a malformed URL, a real 404 on a renamed/deleted repo, a permanently revoked installation \u2014 keeps failing loud on the FIRST attempt, exactly as before.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -696,7 +703,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5,
-          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the script ran), and the script is idempotent by construction (git fetch / checkout -f / reset --hard, all serialized under the .ae-git-sync.lock flock) — re-issue just re-runs the same freshness check."
+          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the script ran), and the script is idempotent by construction (git fetch / checkout -f / reset --hard, all serialized under the .ae-git-sync.lock flock) \u2014 re-issue just re-runs the same freshness check."
         }
       ],
       "Catch": [
@@ -724,7 +731,7 @@
     },
     "WaitForCodeFreshness": {
       "Type": "Task",
-      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 36 × ~10s ≈ 6 min, past the 300s executionTimeout.",
+      "Comment": "Liveness-aware poll iteration (config#1811) \u2014 see WaitForMorningEnrich. max_attempts 36 \u00d7 ~10s \u2248 6 min, past the 300s executionTimeout.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
@@ -778,7 +785,7 @@
     },
     "CheckCodeFreshnessStatus": {
       "Type": "Choice",
-      "Comment": "SUCCESS → the box is verified on current main across all 3 repos → CorrectnessVerdictGate (alpha-engine-config-I9466), the last preflight before the pipeline proper. COMMAND_FAILED (Default) → HandleFailure — code stale after self-heal, or broken syntax on main; either way NOTHING may run (~2 min into the pipeline, not 40). INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → CodeFreshnessPollTimeout.",
+      "Comment": "SUCCESS \u2192 the box is verified on current main across all 3 repos \u2192 CorrectnessVerdictGate (alpha-engine-config-I9466), the last preflight before the pipeline proper. COMMAND_FAILED (Default) \u2192 HandleFailure \u2014 code stale after self-heal, or broken syntax on main; either way NOTHING may run (~2 min into the pipeline, not 40). INSTANCE_UNRESPONSIVE \u2192 stamp \u2192 force-stop \u2192 HandleFailure. POLL_BUDGET_EXHAUSTED \u2192 CodeFreshnessPollTimeout.",
       "Choices": [
         {
           "Variable": "$.code_freshness_poll.verdict",
@@ -810,7 +817,7 @@
     },
     "StampCodeFreshnessUnresponsive": {
       "Type": "Pass",
-      "Comment": "The trading box went unresponsive during the code-freshness gate (right after reporting PingStatus=Online — a fast wedge). Stamp, force-stop, alert.",
+      "Comment": "The trading box went unresponsive during the code-freshness gate (right after reporting PingStatus=Online \u2014 a fast wedge). Stamp, force-stop, alert.",
       "Parameters": {
         "Error": "CodeFreshnessInstanceUnresponsive",
         "Cause.$": "$.code_freshness_poll.detail"
@@ -830,7 +837,7 @@
     },
     "CorrectnessVerdictGate": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I9466 — sf-pipeline-policy.md §2.3a rule 1, the consumer half. Measured 2026-08-31: this pipeline's 84 states gated on MarketHoursGate, DeployDriftGate, TradingDayGate, CodeFreshnessGate and CheckPredictorCoverage/FinalCoverageGate, and NOT ONE read a correctness verdict; crucible-executor contained no reference to an attestation, a verdict or a correctness artifact anywhere in its tree. config/executor_params.json — min_score, max_position_pct, atr_multiplier, the time-decay ladder — is produced by the weekly backtester's optimizer from the very simulation arithmetic that backtest/{run_date}/attestation.json exists to attest, so the system has been placing orders sized by parameters whose arithmetic may never have been checked. §2.3a: a missing DATA artifact makes a consumer fail visibly, while a missing VERDICT makes every consumer succeed as though the check had passed. WHY SSM AND NOT A NATIVE S3 READ: arn:aws:states:::aws-sdk:s3:getObject would be fewer states, but alpha-engine-step-functions-role's s3:GetObject is scoped to three keys (ops/daily_data_spot/*, predictor/weights/meta/manifest.json, universe_membership/latest.json) and grants nothing on backtest/ or config/. Widening it is an IAM change in another repo, which would make this PR undeployable by the merge button alone — the aws iam put-role-policy post-merge step that alpha-engine-config-I1906 was closed as 'fixed' without anyone ever running. The trading box's instance profile already reads the whole bucket, and this SendCommand/poll triad is the shape CodeFreshnessGate already uses, so the gate runs where the permission already exists and the definition is the only thing that changes. PLACEMENT: after CodeFreshnessGate (the earliest point at which SSM on a verified-fresh box is available) and before CheckSkipMorningEnrich, so a non-PASS verdict is known ~2 minutes in, ahead of every spot launch — §1.1's fail-fast/fail-cheap ordering. OBSERVE MODE (§7a, clause SFP-7a-new-guard-observes-first): --mode observe is declared HERE, in the definition an operator reads, not in a config file on the box. In observe mode the script ALWAYS exits 0, so this state cannot halt a trading session on its first production run — which matters because the system is trading live paper with IB Gateway up and orders placed every session. It is loud regardless: the verdict and the full operator message go to stdout every run, in both polarities. The promotion criterion lives in the guard's own module (executor/correctness_verdict.py::PROMOTION_CRITERION) and promotion is a one-word diff here: observe → enforce. EXIT CODES: 0 pass/observe, 3 FAIL, 4 UNKNOWN, 5 STALE_BINDING. The three non-PASS causes stay DISTINCT all the way to the operator because they call for three different actions — roll executor_params back, re-run the Backtester, or fix a pipeline-ordering defect — and collapsing them into one generic 'gate failed' is how a pipeline teaches its operator that its alerts are not worth reading. WHAT IS AND IS NOT WITHHELD (§2.3a rule 4, Brian ruling 2026-08-22 / alpha-engine-config-I8187): the withheld set is exactly one action, opening a new position. Exits, stops, time-decay exits, urgent exits, unintended-short covers and order cancels are NEVER gated — blocking an exit does not withhold a guarantee, it strips the risk management off a book sized by exactly the parameters in doubt. Even under enforce, this state failing routes to HandleFailure BEFORE the daemon starts, so no position is opened and none is stranded mid-session.",
+      "Comment": "alpha-engine-config-I9466 \u2014 sf-pipeline-policy.md \u00a72.3a rule 1, the consumer half. Measured 2026-08-31: this pipeline's 84 states gated on MarketHoursGate, DeployDriftGate, TradingDayGate, CodeFreshnessGate and CheckPredictorCoverage/FinalCoverageGate, and NOT ONE read a correctness verdict; crucible-executor contained no reference to an attestation, a verdict or a correctness artifact anywhere in its tree. config/executor_params.json \u2014 min_score, max_position_pct, atr_multiplier, the time-decay ladder \u2014 is produced by the weekly backtester's optimizer from the very simulation arithmetic that backtest/{run_date}/attestation.json exists to attest, so the system has been placing orders sized by parameters whose arithmetic may never have been checked. \u00a72.3a: a missing DATA artifact makes a consumer fail visibly, while a missing VERDICT makes every consumer succeed as though the check had passed. WHY SSM AND NOT A NATIVE S3 READ: arn:aws:states:::aws-sdk:s3:getObject would be fewer states, but alpha-engine-step-functions-role's s3:GetObject is scoped to three keys (ops/daily_data_spot/*, predictor/weights/meta/manifest.json, universe_membership/latest.json) and grants nothing on backtest/ or config/. Widening it is an IAM change in another repo, which would make this PR undeployable by the merge button alone \u2014 the aws iam put-role-policy post-merge step that alpha-engine-config-I1906 was closed as 'fixed' without anyone ever running. The trading box's instance profile already reads the whole bucket, and this SendCommand/poll triad is the shape CodeFreshnessGate already uses, so the gate runs where the permission already exists and the definition is the only thing that changes. PLACEMENT: after CodeFreshnessGate (the earliest point at which SSM on a verified-fresh box is available) and before CheckSkipMorningEnrich, so a non-PASS verdict is known ~2 minutes in, ahead of every spot launch \u2014 \u00a71.1's fail-fast/fail-cheap ordering. OBSERVE MODE (\u00a77a, clause SFP-7a-new-guard-observes-first): --mode observe is declared HERE, in the definition an operator reads, not in a config file on the box. In observe mode the script ALWAYS exits 0, so this state cannot halt a trading session on its first production run \u2014 which matters because the system is trading live paper with IB Gateway up and orders placed every session. It is loud regardless: the verdict and the full operator message go to stdout every run, in both polarities. The promotion criterion lives in the guard's own module (executor/correctness_verdict.py::PROMOTION_CRITERION) and promotion is a one-word diff here: observe \u2192 enforce. EXIT CODES: 0 pass/observe, 3 FAIL, 4 UNKNOWN, 5 STALE_BINDING. The three non-PASS causes stay DISTINCT all the way to the operator because they call for three different actions \u2014 roll executor_params back, re-run the Backtester, or fix a pipeline-ordering defect \u2014 and collapsing them into one generic 'gate failed' is how a pipeline teaches its operator that its alerts are not worth reading. WHAT IS AND IS NOT WITHHELD (\u00a72.3a rule 4, Brian ruling 2026-08-22 / alpha-engine-config-I8187): the withheld set is exactly one action, opening a new position. Exits, stops, time-decay exits, urgent exits, unintended-short covers and order cancels are NEVER gated \u2014 blocking an exit does not withhold a guarantee, it strips the risk management off a book sized by exactly the parameters in doubt. Even under enforce, this state failing routes to HandleFailure BEFORE the daemon starts, so no position is opened and none is stranded mid-session.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -857,7 +864,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5,
-          "Comment": "Same dispatch-API-transient class CodeFreshnessGate retries. Safe to widen: fires only when the SendCommand API call itself failed BEFORE the script ran, and the script is a pure read of two S3 objects — re-issuing it re-reads the same two keys, places no order, cancels nothing and writes nothing."
+          "Comment": "Same dispatch-API-transient class CodeFreshnessGate retries. Safe to widen: fires only when the SendCommand API call itself failed BEFORE the script ran, and the script is a pure read of two S3 objects \u2014 re-issuing it re-reads the same two keys, places no order, cancels nothing and writes nothing."
         }
       ],
       "Catch": [
@@ -885,7 +892,7 @@
     },
     "WaitForCorrectnessVerdict": {
       "Type": "Task",
-      "Comment": "Liveness-aware poll iteration — see WaitForCodeFreshness. max_attempts 18 × ~10s ≈ 3 min, past the 120s executionTimeout. ResponseCode is threaded through so CheckCorrectnessVerdictStatus can tell FAIL (3) from UNKNOWN (4) from STALE_BINDING (5) rather than collapsing all three into COMMAND_FAILED.",
+      "Comment": "Liveness-aware poll iteration \u2014 see WaitForCodeFreshness. max_attempts 18 \u00d7 ~10s \u2248 3 min, past the 120s executionTimeout. ResponseCode is threaded through so CheckCorrectnessVerdictStatus can tell FAIL (3) from UNKNOWN (4) from STALE_BINDING (5) rather than collapsing all three into COMMAND_FAILED.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
@@ -939,7 +946,7 @@
     },
     "CheckCorrectnessVerdictStatus": {
       "Type": "Choice",
-      "Comment": "SUCCESS → CheckSkipMorningEnrich (the pipeline proper). Under --mode observe the script always exits 0, so SUCCESS is the only branch reachable today and the three stamp branches are DORMANT until promotion — which is exactly what §7a asks for: the halt branch exists, is reviewed, and is not taken while observing. On promotion to enforce they arm with no further wiring. Each non-PASS cause gets its OWN terminal stamp because each has a different unblocking step.",
+      "Comment": "SUCCESS \u2192 CheckSkipMorningEnrich (the pipeline proper). Under --mode observe the script always exits 0, so SUCCESS is the only branch reachable today and the three stamp branches are DORMANT until promotion \u2014 which is exactly what \u00a77a asks for: the halt branch exists, is reviewed, and is not taken while observing. On promotion to enforce they arm with no further wiring. Each non-PASS cause gets its OWN terminal stamp because each has a different unblocking step.",
       "Choices": [
         {
           "Variable": "$.correctness_verdict_poll.verdict",
@@ -1005,30 +1012,30 @@
     },
     "StampCorrectnessVerdictFail": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message — including the UNBLOCK step and the list of what is STILL RUNNING — is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
+      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message \u2014 including the UNBLOCK step and the list of what is STILL RUNNING \u2014 is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
       "Result": {
         "Error": "CorrectnessVerdictFAIL",
-        "Cause": "The weekly backtester's known-answer battery FAILED, so the simulation arithmetic that produced config/executor_params.json is not trustworthy and NEW ENTRIES are withheld. Exits, stops, time-decay exits, urgent exits and order cancels are NOT gated — the book is managed as normal. UNBLOCK: roll config/executor_params.json back to the last cycle whose attestation PASSed, then re-run today's preopen (weekday_sf_rerun.py). Do NOT clear this by re-running the backtester until the failing known-answer check is understood."
+        "Cause": "The weekly backtester's known-answer battery FAILED, so the simulation arithmetic that produced config/executor_params.json is not trustworthy and NEW ENTRIES are withheld. Exits, stops, time-decay exits, urgent exits and order cancels are NOT gated \u2014 the book is managed as normal. UNBLOCK: roll config/executor_params.json back to the last cycle whose attestation PASSed, then re-run today's preopen (weekday_sf_rerun.py). Do NOT clear this by re-running the backtester until the failing known-answer check is understood."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
     },
     "StampCorrectnessVerdictUnknown": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message — including the UNBLOCK step and the list of what is STILL RUNNING — is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
+      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message \u2014 including the UNBLOCK step and the list of what is STILL RUNNING \u2014 is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
       "Result": {
         "Error": "CorrectnessVerdictUNKNOWN",
-        "Cause": "Nobody checked this cycle's arithmetic — backtest/latest/attestation.json is absent, unreadable, or carries a verdict outside the closed vocabulary. sf-pipeline-policy §2.3a rule 2: a missing verdict is UNKNOWN, never a pass, and there is no older verdict to fall back to. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so it writes backtest/{run_date}/attestation.json and the latest/ pointer, then re-run today's preopen."
+        "Cause": "Nobody checked this cycle's arithmetic \u2014 backtest/latest/attestation.json is absent, unreadable, or carries a verdict outside the closed vocabulary. sf-pipeline-policy \u00a72.3a rule 2: a missing verdict is UNKNOWN, never a pass, and there is no older verdict to fall back to. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so it writes backtest/{run_date}/attestation.json and the latest/ pointer, then re-run today's preopen."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
     },
     "StampCorrectnessVerdictStaleBinding": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message — including the UNBLOCK step and the list of what is STILL RUNNING — is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
+      "Comment": "alpha-engine-config-I9466. A distinct terminal stamp so the operator reads WHICH correctness cause halted the session and what clears it, not a generic gate failure. The full operator message \u2014 including the UNBLOCK step and the list of what is STILL RUNNING \u2014 is on stdout from executor/correctness_verdict.py::operator_message and is carried in the poll's StatusDetails/StandardErrorContent.",
       "Result": {
         "Error": "CorrectnessVerdictSTALE_BINDING",
-        "Cause": "backtest/latest/attestation.json and config/executor_params.json were written by DIFFERENT weekly cycles, so the parameters in use this session are unattested. This is a pipeline-ordering defect, not a numbers defect — one of the two artifacts was written without the other. A verdict is never inherited across cycles. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so both artifacts are written by one execution, then re-run today's preopen."
+        "Cause": "backtest/latest/attestation.json and config/executor_params.json were written by DIFFERENT weekly cycles, so the parameters in use this session are unattested. This is a pipeline-ordering defect, not a numbers defect \u2014 one of the two artifacts was written without the other. A verdict is never inherited across cycles. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so both artifacts are written by one execution, then re-run today's preopen."
       },
       "ResultPath": "$.error",
       "Next": "HandleFailure"
@@ -1040,7 +1047,7 @@
     },
     "StampCorrectnessVerdictUnresponsive": {
       "Type": "Pass",
-      "Comment": "The trading box went unresponsive during the correctness gate. Stamp, force-stop, alert — same handling as StampCodeFreshnessUnresponsive.",
+      "Comment": "The trading box went unresponsive during the correctness gate. Stamp, force-stop, alert \u2014 same handling as StampCodeFreshnessUnresponsive.",
       "Parameters": {
         "Error": "CorrectnessVerdictInstanceUnresponsive",
         "Cause.$": "$.correctness_verdict_poll.detail"
@@ -1060,7 +1067,7 @@
     },
     "ForceStopUnresponsiveInstance": {
       "Type": "Task",
-      "Comment": "config#1811 — deterministic remediation for INSTANCE_UNRESPONSIVE: the box is wedged (the 2026-07-06 config#1807 shape: memory-pressure stall, SSM agent dark, in-box executionTimeout unable to fire) and every remaining pipeline step needs this same host, so force-stop it NOW rather than leave it thrashing with IB Gateway credentials on it. Validated as the actual recovery action in the 2026-07-06 incident. $.error was stamped by the per-loop Stamp state before arriving here; this state's own result/error use separate ResultPaths so the stamped cause survives into HandleFailure's SNS alert. A stop failure still routes to HandleFailure — alerting is the priority, the stop is best-effort remediation.",
+      "Comment": "config#1811 \u2014 deterministic remediation for INSTANCE_UNRESPONSIVE: the box is wedged (the 2026-07-06 config#1807 shape: memory-pressure stall, SSM agent dark, in-box executionTimeout unable to fire) and every remaining pipeline step needs this same host, so force-stop it NOW rather than leave it thrashing with IB Gateway credentials on it. Validated as the actual recovery action in the 2026-07-06 incident. $.error was stamped by the per-loop Stamp state before arriving here; this state's own result/error use separate ResultPaths so the stamped cause survives into HandleFailure's SNS alert. A stop failure still routes to HandleFailure \u2014 alerting is the priority, the stop is best-effort remediation.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id",
@@ -1149,7 +1156,7 @@
     },
     "CoverageGapChoice": {
       "Type": "Choice",
-      "Comment": "If buy_candidates have unscored tickers, re-invoke the predictor with --tickers. Otherwise advance to the morning-planner skip-gate. alpha-engine-config-I2722 (2026-07-16): PredictorHealthCheck was removed from this SF and re-homed onto its own direct EventBridge trigger (13:40 UTC weekdays) — see infrastructure/cloudformation/alpha-engine-orchestration.yaml PredictorHealthCheckTrigger.",
+      "Comment": "If buy_candidates have unscored tickers, re-invoke the predictor with --tickers. Otherwise advance to the morning-planner skip-gate. alpha-engine-config-I2722 (2026-07-16): PredictorHealthCheck was removed from this SF and re-homed onto its own direct EventBridge trigger (13:40 UTC weekdays) \u2014 see infrastructure/cloudformation/alpha-engine-orchestration.yaml PredictorHealthCheckTrigger.",
       "Choices": [
         {
           "And": [
@@ -1170,7 +1177,7 @@
             "Variable": "$.coverage_result.Payload.has_gap",
             "IsPresent": true
           },
-          "Comment": "config-I2767: a coverage payload WITHOUT has_gap means prediction coverage is unverifiable — fail CLOSED and loud (HandleFailure) rather than trading on unknown coverage.",
+          "Comment": "config-I2767: a coverage payload WITHOUT has_gap means prediction coverage is unverifiable \u2014 fail CLOSED and loud (HandleFailure) rather than trading on unknown coverage.",
           "Next": "HandleFailure"
         }
       ],
@@ -1213,7 +1220,7 @@
     },
     "RecheckCoverage": {
       "Type": "Task",
-      "Comment": "Second coverage check after ReinvokePredictor. If the gap persists (e.g. some ticker genuinely cannot be scored), bail out instead of looping — HandleFailure fires the SNS alert.",
+      "Comment": "Second coverage check after ReinvokePredictor. If the gap persists (e.g. some ticker genuinely cannot be scored), bail out instead of looping \u2014 HandleFailure fires the SNS alert.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-predictor-inference:live",
@@ -1247,7 +1254,7 @@
     },
     "FinalCoverageGate": {
       "Type": "Choice",
-      "Comment": "After one re-invocation attempt, either coverage is complete (proceed) or we have a deeper problem (fail). No further retry loop — prevents runaway invocations if a ticker is un-scorable by the model. alpha-engine-config-I2722 (2026-07-16): the Default target moved from PredictorHealthCheck (removed from this SF) to the morning-planner skip-gate — see CoverageGapChoice's comment.",
+      "Comment": "After one re-invocation attempt, either coverage is complete (proceed) or we have a deeper problem (fail). No further retry loop \u2014 prevents runaway invocations if a ticker is un-scorable by the model. alpha-engine-config-I2722 (2026-07-16): the Default target moved from PredictorHealthCheck (removed from this SF) to the morning-planner skip-gate \u2014 see CoverageGapChoice's comment.",
       "Choices": [
         {
           "And": [
@@ -1268,7 +1275,7 @@
             "Variable": "$.coverage_recheck_result.Payload.has_gap",
             "IsPresent": true
           },
-          "Comment": "config-I2767: recheck payload WITHOUT has_gap — same fail-closed routing as a confirmed gap.",
+          "Comment": "config-I2767: recheck payload WITHOUT has_gap \u2014 same fail-closed routing as a confirmed gap.",
           "Next": "HandleFailure"
         }
       ],
@@ -1276,7 +1283,7 @@
     },
     "RunMorningPlanner": {
       "Type": "Task",
-      "Comment": "Run morning order-book planner via SSM. alpha-engine-config-I7047 sweep (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture — found by the I7047 guard test, which asserts zero occurrences of the anti-pattern in ANY nousergon-data SF definition, not just the two Saturday health-observe stages the issue named. Unlike WeeklySubstrateHealthCheck's instance, this one was a plain `commands` JSON array (not `commands.$`/States.Array), so it was not exhibiting the ASL `\\'`-escape-collapse bug specifically — but it is the same anti-pattern this fleet is retiring in favor of krepis (17+ sibling stages), so it is migrated for consistency rather than left as a second, differently-shaped copy. Behavior-preserving: `source .venv/bin/activate` is kept (subprocess inherits the activated PATH so a bare `python` invocation still resolves to this venv's interpreter) — only the krepis wrapper binary itself is called by absolute path, per fleet convention.",
+      "Comment": "Run morning order-book planner via SSM. alpha-engine-config-I7047 sweep (2026-08-12): migrated off the inline `trap 'aws s3 cp ... EXIT'` log-ship wrapper to krepis.ssm_log_capture \u2014 found by the I7047 guard test, which asserts zero occurrences of the anti-pattern in ANY nousergon-data SF definition, not just the two Saturday health-observe stages the issue named. Unlike WeeklySubstrateHealthCheck's instance, this one was a plain `commands` JSON array (not `commands.$`/States.Array), so it was not exhibiting the ASL `\\'`-escape-collapse bug specifically \u2014 but it is the same anti-pattern this fleet is retiring in favor of krepis (17+ sibling stages), so it is migrated for consistency rather than left as a second, differently-shaped copy. Behavior-preserving: `source .venv/bin/activate` is kept (subprocess inherits the activated PATH so a bare `python` invocation still resolves to this venv's interpreter) \u2014 only the krepis wrapper binary itself is called by absolute path, per fleet convention.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -1325,7 +1332,7 @@
     },
     "WaitForMorningPlanner": {
       "Type": "Task",
-      "Comment": "Liveness-aware poll iteration (config#1811) — see WaitForMorningEnrich. max_attempts 30 × ~15s ≈ 7.5 min, past the 600s executionTimeout.",
+      "Comment": "Liveness-aware poll iteration (config#1811) \u2014 see WaitForMorningEnrich. max_attempts 30 \u00d7 ~15s \u2248 7.5 min, past the 600s executionTimeout.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-ssm-liveness-poller",
@@ -1379,7 +1386,7 @@
     },
     "CheckMorningPlannerStatus": {
       "Type": "Choice",
-      "Comment": "Branches on the ssm-liveness-poller verdict (config#1811). COMMAND_FAILED (Default) → HandleFailure — the 2026-07-06 deploy-drift refusal surfaced here with rc=1. INSTANCE_UNRESPONSIVE → stamp → force-stop → HandleFailure. POLL_BUDGET_EXHAUSTED → MorningPlannerPollTimeout.",
+      "Comment": "Branches on the ssm-liveness-poller verdict (config#1811). COMMAND_FAILED (Default) \u2192 HandleFailure \u2014 the 2026-07-06 deploy-drift refusal surfaced here with rc=1. INSTANCE_UNRESPONSIVE \u2192 stamp \u2192 force-stop \u2192 HandleFailure. POLL_BUDGET_EXHAUSTED \u2192 MorningPlannerPollTimeout.",
       "Choices": [
         {
           "Variable": "$.planner_poll.verdict",
@@ -1460,7 +1467,7 @@
           "MaxAttempts": 2,
           "IntervalSeconds": 5,
           "BackoffRate": 1.5,
-          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the command ran), and the dispatched command (`sudo systemctl restart alpha-engine-daemon.service`) is idempotent at the OS level — re-issuing a restart cannot start a second daemon process."
+          "Comment": "config#2308: closes the same Ssm.SdkClientException dispatch-API-transient gap already covered on the getCommandInvocation poll states. Safe to widen: fires only when the SendCommand API call itself failed (BEFORE the command ran), and the dispatched command (`sudo systemctl restart alpha-engine-daemon.service`) is idempotent at the OS level \u2014 re-issuing a restart cannot start a second daemon process."
         }
       ],
       "Catch": [
@@ -1468,7 +1475,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "alpha-engine-config#6692: daemon restart failure is still non-fatal to the RUN itself — systemd boot trigger is backup, so control still proceeds (no HandleFailure/abort). What changed is the TERMINAL: this Catch now routes through SetDaemonDegradedFlag -> CheckDegradedOutcome (Option-A parity with step_function_eod.json's RunDaemon-equivalent) instead of straight to WriteCompletionMarker, so a daemon-restart-failure morning ends DEGRADED/FAILED (status-keyed watchers engage) rather than a plain SUCCEEDED execution with a normal marker and only an SNS trace.",
+          "Comment": "alpha-engine-config#6692: daemon restart failure is still non-fatal to the RUN itself \u2014 systemd boot trigger is backup, so control still proceeds (no HandleFailure/abort). What changed is the TERMINAL: this Catch now routes through SetDaemonDegradedFlag -> CheckDegradedOutcome (Option-A parity with step_function_eod.json's RunDaemon-equivalent) instead of straight to WriteCompletionMarker, so a daemon-restart-failure morning ends DEGRADED/FAILED (status-keyed watchers engage) rather than a plain SUCCEEDED execution with a normal marker and only an SNS trace.",
           "Next": "SetDaemonDegradedFlag",
           "ResultPath": "$.daemon_error"
         }
@@ -1478,7 +1485,7 @@
     },
     "SetDaemonDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): the daemon failed to restart — systemd boot trigger remains the backup so the run is NOT aborted here, but this execution must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary, checked once by CheckDegradedOutcome, to route to the DegradedRun terminal (Type: Fail) instead of the normal PipelineComplete path. Does not clobber $.daemon_error (set by RunDaemon's own Catch ResultPath) or any earlier $.degraded_summary from the data-spot fail-open path — if both stages degraded, this state's write simply wins as the most-recent cause; degraded=true is preserved either way.",
+      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): the daemon failed to restart \u2014 systemd boot trigger remains the backup so the run is NOT aborted here, but this execution must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary, checked once by CheckDegradedOutcome, to route to the DegradedRun terminal (Type: Fail) instead of the normal PipelineComplete path. Does not clobber $.daemon_error (set by RunDaemon's own Catch ResultPath) or any earlier $.degraded_summary from the data-spot fail-open path \u2014 if both stages degraded, this state's write simply wins as the most-recent cause; degraded=true is preserved either way.",
       "Parameters": {
         "degraded": true,
         "reason": "run_daemon_restart_failed",
@@ -1490,12 +1497,12 @@
     },
     "PublishDaemonFailureImmediate": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the daemon restart failed. sf-pipeline-policy.md §5 names this fail-open explicitly — 'the daemon systemd restart must not abort the trading chain (the boot trigger is the daemon's backup); both set the degraded flag §2.3 requires AND page immediately' — and the second half was never built. Without it the only signal is the terminal, which on a run that degrades early is up to an hour later. That the boot trigger is a backup is the reason this fails OPEN; it is not a reason to stay quiet, because a backup that also failed is exactly what an operator needs to hear about before the open. Catch mirrors the sibling publishes: an SNS failure must not hard-fail a pipeline that deliberately continued.",
+      "Comment": "alpha-engine-config-I6903: best-effort SNS alert that the daemon restart failed. sf-pipeline-policy.md \u00a75 names this fail-open explicitly \u2014 'the daemon systemd restart must not abort the trading chain (the boot trigger is the daemon's backup); both set the degraded flag \u00a72.3 requires AND page immediately' \u2014 and the second half was never built. Without it the only signal is the terminal, which on a run that degrades early is up to an hour later. That the boot trigger is a backup is the reason this fails OPEN; it is not a reason to stay quiet, because a backup that also failed is exactly what an operator needs to hear about before the open. Catch mirrors the sibling publishes: an SNS failure must not hard-fail a pipeline that deliberately continued.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Daemon Restart — FAILED (fail-open, systemd boot trigger is the backup)",
-        "Message.$": "States.Format('The RunDaemon systemd restart failed; the pipeline continued on the assumption that the boot trigger starts the daemon instead. VERIFY the daemon is running before the open — if the boot trigger also missed, the book is unmanaged. Detail: {}', States.JsonToString($.daemon_error))"
+        "Subject": "Alpha Engine Weekday Daemon Restart \u2014 FAILED (fail-open, systemd boot trigger is the backup)",
+        "Message.$": "States.Format('The RunDaemon systemd restart failed; the pipeline continued on the assumption that the boot trigger starts the daemon instead. VERIFY the daemon is running before the open \u2014 if the boot trigger also missed, the book is unmanaged. Detail: {}', States.JsonToString($.daemon_error))"
       },
       "ResultPath": "$.daemon_failure_notify",
       "TimeoutSeconds": 60,
@@ -1512,7 +1519,7 @@
     },
     "CheckDegradedOutcome": {
       "Type": "Choice",
-      "Comment": "alpha-engine-config#6692: Option-A parity with step_function_eod.json's CheckDegradedOutcome (Brian's 2026-07-28 ruling) — the ONE place that decides which terminal this execution reaches. $.degraded_summary is set either by SetDataSpotDegradedFlag (the data-spot fail-open path, which still lets the run continue to Scanner/PredictorInference/RunMorningPlanner/RunDaemon) or by SetDaemonDegradedFlag (RunDaemon's restart-failure Catch, which still lets systemd's boot trigger be the backup) — either stage degrading downgrades the whole execution's terminal even though neither path aborts the run mid-pipeline. Reached from RunDaemon's normal Next, RunDaemon's Catch (via SetDaemonDegradedFlag), and CheckSkipRunDaemon's skip-gate edge, so every route to the terminal is covered.",
+      "Comment": "alpha-engine-config#6692: Option-A parity with step_function_eod.json's CheckDegradedOutcome (Brian's 2026-07-28 ruling) \u2014 the ONE place that decides which terminal this execution reaches. $.degraded_summary is set either by SetDataSpotDegradedFlag (the data-spot fail-open path, which still lets the run continue to Scanner/PredictorInference/RunMorningPlanner/RunDaemon) or by SetDaemonDegradedFlag (RunDaemon's restart-failure Catch, which still lets systemd's boot trigger be the backup) \u2014 either stage degrading downgrades the whole execution's terminal even though neither path aborts the run mid-pipeline. Reached from RunDaemon's normal Next, RunDaemon's Catch (via SetDaemonDegradedFlag), and CheckSkipRunDaemon's skip-gate edge, so every route to the terminal is covered.",
       "Choices": [
         {
           "And": [
@@ -1525,7 +1532,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "config-I2767-style guard (mirrors step_function_eod.json's CheckDegradedOutcome): $.degraded_summary is only assigned on a degraded path — a fully-green day never sets it, so an unguarded dereference would throw States.Runtime at the last state. Absent flag = never degraded = WriteCompletionMarker via Default, which is the semantically exact reading.",
+          "Comment": "config-I2767-style guard (mirrors step_function_eod.json's CheckDegradedOutcome): $.degraded_summary is only assigned on a degraded path \u2014 a fully-green day never sets it, so an unguarded dereference would throw States.Runtime at the last state. Absent flag = never degraded = WriteCompletionMarker via Default, which is the semantically exact reading.",
           "Next": "WriteCompletionMarkerDegraded"
         }
       ],
@@ -1533,7 +1540,7 @@
     },
     "WriteCompletionMarkerDegraded": {
       "Type": "Task",
-      "Comment": "alpha-engine-config#6692: DEGRADED-status parity marker with step_function_eod.json's WriteCompletionMarkerDegraded (Brian's 2026-07-28 Option-A ruling). Written on the degraded outcome (RunDaemon restart failure and/or the data-spot fail-open path), immediately before the DegradedRun Fail terminal. Same S3 bucket/key as the normal marker (registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline, cadence weekday_sf — no new IAM grant needed, the existing marker PutObject grant already covers the _sf_completion/ne-preopen-trading-pipeline/* prefix) — the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage. No swallow-all Catch here (mirrors WriteCompletionMarker's convention): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun — and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
+      "Comment": "alpha-engine-config#6692: DEGRADED-status parity marker with step_function_eod.json's WriteCompletionMarkerDegraded (Brian's 2026-07-28 Option-A ruling). Written on the degraded outcome (RunDaemon restart failure and/or the data-spot fail-open path), immediately before the DegradedRun Fail terminal. Same S3 bucket/key as the normal marker (registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline, cadence weekday_sf \u2014 no new IAM grant needed, the existing marker PutObject grant already covers the _sf_completion/ne-preopen-trading-pipeline/* prefix) \u2014 the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage. No swallow-all Catch here (mirrors WriteCompletionMarker's convention): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -1551,7 +1558,7 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "Next": "DegradedRun"
@@ -1559,12 +1566,12 @@
     "DegradedRun": {
       "Type": "Fail",
       "Error": "DegradedRun",
-      "CausePath": "States.Format('Preopen pipeline DEGRADED — reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this daily SF via alpha-engine-config#6692: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. The run was never aborted mid-pipeline — only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
-      "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here. It WAS an enumeration, and it drifted — 5 states set $.degraded_summary in this definition (SetDaemonDegradedFlag, SetDataSpotDegradedFlag, SetDeployDriftDegradedFlag, SetMutexAcquireDegradedFlag, SetScannerDegradedFlag) and the hardcoded string named two. On 2026-08-11 the preopen terminal asserted 'run_daemon_restart_failed and/or daily_data_spot_fail_open' when neither fired; the real reason, daily_scanner_fail_open, appeared nowhere, and the message sent the operator hunting for a PublishDataSpotFailureImmediate event that could not exist on that path. An enumeration that drifts is worse than boilerplate because it reads as specific (sf-pipeline-policy.md §2.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not — a defensive fallback here would let that guarantee lapse silently. JsonToString takes the WHOLE summary rather than $.degraded_summary.stage_error, which not every path sets."
+      "CausePath": "States.Format('Preopen pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699), ported to this daily SF via alpha-engine-config#6692: a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. The run was never aborted mid-pipeline \u2014 only the honesty of the terminal changes.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
+      "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here. It WAS an enumeration, and it drifted \u2014 5 states set $.degraded_summary in this definition (SetDaemonDegradedFlag, SetDataSpotDegradedFlag, SetDeployDriftDegradedFlag, SetMutexAcquireDegradedFlag, SetScannerDegradedFlag) and the hardcoded string named two. On 2026-08-11 the preopen terminal asserted 'run_daemon_restart_failed and/or daily_data_spot_fail_open' when neither fired; the real reason, daily_scanner_fail_open, appeared nowhere, and the message sent the operator hunting for a PublishDataSpotFailureImmediate event that could not exist on that path. An enumeration that drifts is worse than boilerplate because it reads as specific (sf-pipeline-policy.md \u00a72.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not \u2014 a defensive fallback here would let that guarantee lapse silently. JsonToString takes the WHOLE summary rather than $.degraded_summary.stage_error, which not every path sets."
     },
     "WriteCompletionMarker": {
       "Type": "Task",
-      "Comment": "config#2857: SF-envelope completion marker — an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Reached only via RunDaemon/CheckSkipRunDaemon's success Next (including RunDaemon's own best-effort daemon-restart-failure Catch, which is still an overall pipeline SUCCESS) — NotifyHolidaySkip (NYSE closed, no run occurred) and TradingDayGateFailed/HandleFailure are NOT redirected here, so a holiday skip or a real failure never satisfies the SLA. cycle_key is the execution-start date (no run_date is threaded through this SF today, unlike the Saturday SF) — safe because this pipeline always starts well after UTC midnight for its trading day. Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline (cadence weekday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable — exactly the ambiguity this feature exists to surface, not mask.",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Reached only via RunDaemon/CheckSkipRunDaemon's success Next (including RunDaemon's own best-effort daemon-restart-failure Catch, which is still an overall pipeline SUCCESS) \u2014 NotifyHolidaySkip (NYSE closed, no run occurred) and TradingDayGateFailed/HandleFailure are NOT redirected here, so a holiday skip or a real failure never satisfies the SLA. cycle_key is the execution-start date (no run_date is threaded through this SF today, unlike the Saturday SF) \u2014 safe because this pipeline always starts well after UTC midnight for its trading day. Registered in ARTIFACT_REGISTRY.yaml as sf_completion_ne_preopen_trading_pipeline (cadence weekday_sf). No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
@@ -1581,14 +1588,14 @@
           "MaxAttempts": 3,
           "IntervalSeconds": 2,
           "BackoffRate": 2.0,
-          "Comment": "Transient S3 fault coverage — mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
       "Next": "PipelineComplete"
     },
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate. Input {\"skip_morning_enrich\": true} routes past the entire data phase (enrich + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipScanner (alpha-engine-config-I6494 — Scanner still runs on ArcticDB/carried fundamentals when the spot data phase is skipped); missing flag = run as normal. The old on-trading MorningEnrich/MorningArcticAppend SSM states were relocated to the data spot (LaunchMorningEnrichSpot ...) so the always-on ae-trading box no longer does the ~30-50 min data fetch + ArcticDB append (config#1767).",
+      "Comment": "Per-task rerun gate. Input {\"skip_morning_enrich\": true} routes past the entire data phase (enrich + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipScanner (alpha-engine-config-I6494 \u2014 Scanner still runs on ArcticDB/carried fundamentals when the spot data phase is skipped); missing flag = run as normal. The old on-trading MorningEnrich/MorningArcticAppend SSM states were relocated to the data spot (LaunchMorningEnrichSpot ...) so the always-on ae-trading box no longer does the ~30-50 min data fetch + ArcticDB append (config#1767).",
       "Choices": [
         {
           "And": [
@@ -1685,7 +1692,7 @@
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — FAILED",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 FAILED",
         "Message.$": "States.Format('Weekday pipeline failed. State: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status', States.JsonToString($))"
       },
       "TimeoutSeconds": 60,
@@ -1699,7 +1706,7 @@
     },
     "LaunchMorningEnrichSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run MorningEnrich (polygon daily_closes fetch + prune) on an ephemeral spot box, NOT on ae-trading. Returns {data_spot:{launched,instance_id,command_id,...}}. The Arctic write of the enriched row happens in the following MorningArcticAppend spot workload — both run on the spot box (S3/ArcticDB), never the trading box. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) — the dispatcher then skips spot entirely for that attempt.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run MorningEnrich (polygon daily_closes fetch + prune) on an ephemeral spot box, NOT on ae-trading. Returns {data_spot:{launched,instance_id,command_id,...}}. The Arctic write of the enriched row happens in the following MorningArcticAppend spot workload \u2014 both run on the spot box (S3/ArcticDB), never the trading box. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) \u2014 the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
@@ -1757,7 +1764,7 @@
             "Variable": "$.morning_enrich_launch.Payload.data_spot.launched",
             "IsPresent": true
           },
-          "Comment": "config-I2767: a dispatcher payload WITHOUT data_spot.launched means the morning-data launch is unverifiable — route into the existing fail-open-but-LOUD data-spot failure notifier (config#1767 #4: a data-spot failure must never block daemon start), not a silent not-launched skip and not a HALT.",
+          "Comment": "config-I2767: a dispatcher payload WITHOUT data_spot.launched means the morning-data launch is unverifiable \u2014 route into the existing fail-open-but-LOUD data-spot failure notifier (config#1767 #4: a data-spot failure must never block daemon start), not a silent not-launched skip and not a HALT.",
           "Next": "ExtractDataSpotError"
         }
       ],
@@ -1812,7 +1819,7 @@
     },
     "CheckMorningEnrichSpotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> init the Arctic-append retry counter then the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckMorningEnrichRetryBudget (one relaunch retry, config#2542, before ExtractDataSpotError -> CONTINUE fail-open: a data fetch failure must not block daemon start, config#1767 #4). NOTE this is the inverse of the OLD on-trading CheckMorningEnrichStatus, which HandleFailure'd — the data phase is now decoupled/fail-open, no longer gating the daemon.",
+      "Comment": "Success -> init the Arctic-append retry counter then the Arctic append spot workload; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckMorningEnrichRetryBudget (one relaunch retry, config#2542, before ExtractDataSpotError -> CONTINUE fail-open: a data fetch failure must not block daemon start, config#1767 #4). NOTE this is the inverse of the OLD on-trading CheckMorningEnrichStatus, which HandleFailure'd \u2014 the data phase is now decoupled/fail-open, no longer gating the daemon.",
       "Choices": [
         {
           "Variable": "$.morning_enrich_poll.Status",
@@ -1839,7 +1846,7 @@
     },
     "CheckMorningEnrichRetryBudget": {
       "Type": "Choice",
-      "Comment": "config#2542: mirrors step_function_eod.json's CheckDataSpotRetryBudget (PR813). A terminal non-Success status on the morning-enrich spot poll is presumed transient AWS spot interruption until proven otherwise — retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption falls through to the existing fail-open path rather than looping indefinitely. $.morning_enrich_retry is always initialized by InitMorningEnrichRetryCounter before this state is reachable.",
+      "Comment": "config#2542: mirrors step_function_eod.json's CheckDataSpotRetryBudget (PR813). A terminal non-Success status on the morning-enrich spot poll is presumed transient AWS spot interruption until proven otherwise \u2014 retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption falls through to the existing fail-open path rather than looping indefinitely. $.morning_enrich_retry is always initialized by InitMorningEnrichRetryCounter before this state is reachable.",
       "Choices": [
         {
           "Variable": "$.morning_enrich_retry.attempts",
@@ -1851,7 +1858,7 @@
     },
     "IncrementMorningEnrichRetry": {
       "Type": "Pass",
-      "Comment": "config#2542: force_on_demand flips to true for the retry — a box already lost to spot interruption once must not gamble on spot again. Mirrors IncrementDataSpotRetry.",
+      "Comment": "config#2542: force_on_demand flips to true for the retry \u2014 a box already lost to spot interruption once must not gamble on spot again. Mirrors IncrementDataSpotRetry.",
       "Parameters": {
         "attempts.$": "States.MathAdd($.morning_enrich_retry.attempts, 1)",
         "force_on_demand": true
@@ -1866,7 +1873,7 @@
     },
     "InitMorningArcticAppendRetryCounter": {
       "Type": "Pass",
-      "Comment": "config#2542: retry budget for the Arctic-append sub-phase — the actual write price_cache.py's load_atr_14_pct/load_daily_vwap depend on. Mirrors InitMorningEnrichRetryCounter and step_function_eod.json's InitDataSpotArcticRetryCounter (PR813), including force_on_demand.",
+      "Comment": "config#2542: retry budget for the Arctic-append sub-phase \u2014 the actual write price_cache.py's load_atr_14_pct/load_daily_vwap depend on. Mirrors InitMorningEnrichRetryCounter and step_function_eod.json's InitDataSpotArcticRetryCounter (PR813), including force_on_demand.",
       "Result": {
         "attempts": 0,
         "force_on_demand": false
@@ -1876,7 +1883,7 @@
     },
     "LaunchMorningArcticAppendSpot": {
       "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the ArcticDB daily_append (builders/daily_append.py via weekly_collector --morning-arctic-append) on the ephemeral spot box. The Arctic/S3 write runs ON THE SPOT via its alpha-engine-executor-profile, NOT on the trading box (config#1767 #1). force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) — the dispatcher then skips spot entirely for that attempt.",
+      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the ArcticDB daily_append (builders/daily_append.py via weekly_collector --morning-arctic-append) on the ephemeral spot box. The Arctic/S3 write runs ON THE SPOT via its alpha-engine-executor-profile, NOT on the trading box (config#1767 #1). force_on_demand.$ is false on the first attempt and true on the post-interruption retry (config#2542) \u2014 the dispatcher then skips spot entirely for that attempt.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-data-spot-dispatcher",
@@ -1913,7 +1920,7 @@
     },
     "CheckMorningArcticAppendSpotLaunched": {
       "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false kill-switch -> continue. alpha-engine-config-I7811 (Brian ruling 2026-08-20): the Scanner state and its CheckSkipScanner / SetScannerDegradedFlag / PublishScannerFailureImmediate siblings were REMOVED from this pipeline — the scanner forms its two cuts WEEKLY, on step_function.json's ResearchPredictorParallel/Scanner, and those feed research and the predictor for the week. Next is now CheckSkipPredictorInference directly. The predictor is unaffected: inference/stages/load_universe.py walks back MEMBERSHIP_MAX_AGE_DAYS=10 for universe_membership, and a weekly cut is at most 7 days old. I6494 Ruling A put the Scanner here on 2026-08-04 to satisfy that same freshness gate, which it never needed to.",
+      "Comment": "launched:true -> poll; launched:false kill-switch -> continue. alpha-engine-config-I7811 (Brian ruling 2026-08-20): the Scanner state and its CheckSkipScanner / SetScannerDegradedFlag / PublishScannerFailureImmediate siblings were REMOVED from this pipeline \u2014 the scanner forms its two cuts WEEKLY, on step_function.json's ResearchPredictorParallel/Scanner, and those feed research and the predictor for the week. Next is now CheckSkipPredictorInference directly. The predictor is unaffected: inference/stages/load_universe.py walks back MEMBERSHIP_MAX_AGE_DAYS=10 for universe_membership, and a weekly cut is at most 7 days old. I6494 Ruling A put the Scanner here on 2026-08-04 to satisfy that same freshness gate, which it never needed to.",
       "Choices": [
         {
           "And": [
@@ -1934,7 +1941,7 @@
             "Variable": "$.arctic_append_launch.Payload.data_spot.launched",
             "IsPresent": true
           },
-          "Comment": "config-I2767: malformed dispatcher payload — same fail-open-but-loud routing as CheckMorningEnrichSpotLaunched (config#1767 #4).",
+          "Comment": "config-I2767: malformed dispatcher payload \u2014 same fail-open-but-loud routing as CheckMorningEnrichSpotLaunched (config#1767 #4).",
           "Next": "ExtractDataSpotError"
         }
       ],
@@ -2043,7 +2050,7 @@
     },
     "ExtractDataSpotError": {
       "Type": "Pass",
-      "Comment": "FAIL-OPEN normalizer (config#1767 #4). A data-spot launch/poll failure or non-Success terminal status lands here. Record the failure as DATA (not a thrown error), best-effort alert, then CONTINUE to the predictor/daemon path — a data-phase failure must NOT block daemon start. Mirrors the Saturday ResearchPredictorParallel branch-error pattern (record-as-data, do not hard-fail the pipeline).",
+      "Comment": "FAIL-OPEN normalizer (config#1767 #4). A data-spot launch/poll failure or non-Success terminal status lands here. Record the failure as DATA (not a thrown error), best-effort alert, then CONTINUE to the predictor/daemon path \u2014 a data-phase failure must NOT block daemon start. Mirrors the Saturday ResearchPredictorParallel branch-error pattern (record-as-data, do not hard-fail the pipeline).",
       "Parameters": {
         "phase": "DataSpot",
         "source": "CheckMorningEnrich/ArcticAppendSpotStatus or launch Catch"
@@ -2053,7 +2060,7 @@
     },
     "SetDataSpotDegradedFlag": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): threads a $.degraded_summary flag onto the data-spot fail-open path WITHOUT changing its fail-open continuation — Next still leads to PublishDataSpotFailureImmediate and on to CheckSkipScanner exactly as before, so the run still proceeds to Scanner/PredictorInference/RunMorningPlanner/RunDaemon. The flag is only read much later by CheckDegradedOutcome (via RunDaemon's success Next or CheckSkipRunDaemon's skip edge), which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution — closing the gap where a morning data-spot failure left only an SNS trace and a normal completion marker. Does not clobber $.data_spot_error (set by the preceding ExtractDataSpotError ResultPath).",
+      "Comment": "alpha-engine-config#6692 (Option-A parity with step_function_eod.json's SetDegradedFlag, Brian's 2026-07-28 ruling): threads a $.degraded_summary flag onto the data-spot fail-open path WITHOUT changing its fail-open continuation \u2014 Next still leads to PublishDataSpotFailureImmediate and on to CheckSkipScanner exactly as before, so the run still proceeds to Scanner/PredictorInference/RunMorningPlanner/RunDaemon. The flag is only read much later by CheckDegradedOutcome (via RunDaemon's success Next or CheckSkipRunDaemon's skip edge), which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution \u2014 closing the gap where a morning data-spot failure left only an SNS trace and a normal completion marker. Does not clobber $.data_spot_error (set by the preceding ExtractDataSpotError ResultPath).",
       "Parameters": {
         "degraded": true,
         "reason": "daily_data_spot_fail_open",
@@ -2065,11 +2072,11 @@
     },
     "PublishDataSpotFailureImmediate": {
       "Type": "Task",
-      "Comment": "Best-effort SNS alert that the data spot failed — surfaces the miss WITHOUT blocking the daemon. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline (mirrors Saturday PublishResearchFailureImmediate).",
+      "Comment": "Best-effort SNS alert that the data spot failed \u2014 surfaces the miss WITHOUT blocking the daemon. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline (mirrors Saturday PublishResearchFailureImmediate).",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Data Spot — FAILED (fail-open, daemon continues)",
+        "Subject": "Alpha Engine Weekday Data Spot \u2014 FAILED (fail-open, daemon continues)",
         "Message.$": "States.Format('Weekday data-spot phase failed but the pipeline continued to daemon start (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
       },
       "ResultPath": "$.data_spot_failure_notify",
@@ -2084,6 +2091,29 @@
         }
       ],
       "Next": "CheckSkipPredictorInference"
+    },
+    "RecordMarketHoursRemediation": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11384 \u2014 the remediation's audit surface. Same shape as RecordMarketHoursOverride: a crossed boundary is announced on the alert topic AND left in execution history, here with the S3 evidence that granted it rather than a human's name. Catch continues to the pipeline: the verdict was already decided and recorded, so a notify-side failure must not convert a sanctioned same-day repair into a refusal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekday Pipeline \u2014 in-session REMEDIATION start (today's book was unfilled)",
+        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session as a same-day REMEDIATION, with no operator override (alpha-engine-config-I11384). Today produced no tradeable book, so this run is installing a corrected plan rather than acting on a stale one. Execution: {}. Gate verdict + the S3 evidence that granted it: {}.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_remediation_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the verdict and its evidence are in $.market_hours_gate in execution history either way.",
+          "ResultPath": "$.market_hours_remediation_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
     }
   }
 }

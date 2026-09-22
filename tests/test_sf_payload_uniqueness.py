@@ -306,7 +306,15 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # "override.$": "$.market_hours_override" parameter would throw
     # States.Runtime on every run that carries no override, i.e. every
     # normal day.
-    "MarketHoursGate": frozenset({"action", "now.$", "execution_input.$"}),
+    # `pipeline` is a LITERAL (no `.$`), and that is the whole point:
+    # alpha-engine-config-I11384 lets the preopen chain — and ONLY the preopen
+    # chain — reach PROCEED_REMEDIATION, so if this key could be read from the
+    # execution input any caller could claim to be it. The literal-vs-path
+    # distinction is asserted directly in
+    # tests/test_sf_market_hours_gate_wiring.py::TestPipelineLiteralIsUnspoofable.
+    "MarketHoursGate": frozenset(
+        {"action", "now.$", "execution_input.$", "pipeline"}
+    ),
     "PredictorInference": frozenset({"action"}),
     "CheckPredictorCoverage": frozenset({"action"}),
     "ReinvokePredictor": frozenset({"action", "tickers.$"}),
