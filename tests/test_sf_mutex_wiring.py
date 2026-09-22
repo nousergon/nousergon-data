@@ -310,7 +310,15 @@ class TestMutexWiring:
         # further down (see test_sf_prespend_gate_alerting.py for the quartet).
         assert saturday_sf["States"]["EvaluatorDirectorDeployDriftGate"]["Default"] == "WeeklyPreflight"
         assert saturday_sf["States"]["WeeklyPreflight"]["Next"] == "WeeklyPreflightGate"
-        assert saturday_sf["States"]["WeeklyPreflightGate"]["Default"] == "CheckMutexRole"
+        # alpha-engine-config-I11112: the Default arm now records the run's
+        # assertion counts in WeeklyPreflightFullyObserved (a Pass) before
+        # continuing to the SAME target. Follow it rather than pinning the
+        # literal, so this test keeps asserting "the clean path reaches the
+        # mutex" instead of "the clean path has exactly one hop".
+        clean = saturday_sf["States"]["WeeklyPreflightGate"]["Default"]
+        assert clean == "WeeklyPreflightFullyObserved"
+        assert saturday_sf["States"][clean]["Type"] == "Pass"
+        assert saturday_sf["States"][clean]["Next"] == "CheckMutexRole"
 
     def test_weekday_initialize_input_routes_to_check_mutex_role(self, weekday_sf):
         # alpha-engine-config-I7111: MarketHoursGate is now composed ahead of
