@@ -917,7 +917,7 @@ class TestReconcileAnthropic:
         PRIOR month's last day (30 for June), not ``now.day`` (17, in July)."""
         pmw = index._prior_month_window(NOW)
         cost_jsonl = json.dumps({"cost_usd": 5.0}).encode()
-        store = {f"decision_artifacts/_cost_raw/2026-06-30/run/a.jsonl": cost_jsonl}
+        store = {"decision_artifacts/_cost_raw/2026-06-30/run/a.jsonl": cost_jsonl}
         s3 = FakeS3(store)
         prior_doc = {"providers": [{"key": "anthropic_api", "mtd_cost_usd": 4.0,
                                     "projected_month_end_usd": None}]}
@@ -1199,7 +1199,7 @@ class TestRunReconciliation:
         monkeypatch.setattr(index, "reconcile_aws", _boom)
         monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
         monkeypatch.setattr(index, "_http_json", http_router({}))
-        result = index.run_reconciliation(s3, NOW, {}, {})
+        index.run_reconciliation(s3, NOW, {}, {})
         doc = json.loads(s3.store["expenses/reconciliation/2026-06.json"])
         assert doc["providers"]["aws"]["status"] == "error"
         assert "CE down" in doc["providers"]["aws"]["note"]
@@ -1405,3 +1405,74 @@ class TestTheScheduleRetryBoundIsDeclared:
             f"worst case ${usd_per_month:.2f}/mo exceeds the $6 Cost Explorer "
             f"line; the breaker exemption (I11206) was granted on this bound"
         )
+
+
+# --------------------------------------------------------------------------
+# SPEND-MONITOR repository_dispatch (alpha-engine-config-I11374)
+# --------------------------------------------------------------------------
+
+def test_dispatch_is_non_fatal_and_records_the_failure():
+    """The rollup has already landed when this runs. A GitHub outage must not
+    fail a run whose real work succeeded — but it must not be silent either."""
+    import index
+
+    def _boom(*a, **kw):
+        raise RuntimeError("github unreachable")
+
+    orig = index.boto3.client
+    index.boto3.client = _boom
+    try:
+        out = index._dispatch_spend_monitor()
+    finally:
+        index.boto3.client = orig
+
+    assert out["dispatched"] is False
+    assert "RuntimeError" in out["error"]
+    assert "github unreachable" in out["error"]
+
+
+def test_dispatch_can_be_switched_off_without_a_deploy(monkeypatch):
+    import index
+
+    monkeypatch.setattr(index, "SPEND_MONITOR_DISPATCH_ENABLED", False)
+    out = index._dispatch_spend_monitor()
+    assert out == {"dispatched": False, "reason": "disabled"}
+
+
+def test_dispatch_targets_the_spend_monitor_workflow_in_the_config_repo():
+    """The event type must match the `repository_dispatch: types:` the
+    receiving workflow declares, or the dispatch is accepted by GitHub and
+    starts nothing — the failure mode with no error to see."""
+    import index
+
+    assert index.SPEND_MONITOR_DISPATCH_REPO == "nousergon/alpha-engine-config"
+    assert index.SPEND_MONITOR_DISPATCH_EVENT_TYPE == "aws-spend-monitor"
+
+
+def test_the_pat_grant_exists_in_the_iam_policy():
+    """`_dispatch_spend_monitor` reads a SecureString the role must be allowed
+    to read; without the Sid the dispatch AccessDenies on every run."""
+    import json
+    import pathlib
+
+    policy = json.loads(
+        (pathlib.Path(__file__).resolve().parent / "iam-policy.json").read_text())
+    sids = {s.get("Sid"): s for s in policy["Statement"]}
+    assert "SpendMonitorDispatchPAT" in sids, sorted(sids)
+    grant = sids["SpendMonitorDispatchPAT"]
+    assert grant["Action"] == ["ssm:GetParameter"]
+    # Scoped to ONE parameter — never a prefix wildcard.
+    assert grant["Resource"].endswith("/alpha-engine/saturday_sf_watch/github_pat")
+    assert "*" not in grant["Resource"]
+
+
+def test_collect_reports_the_dispatch_outcome_in_its_result():
+    """A swallowed failure needs a recording surface. The handler's own return
+    value is it, so the outcome is visible in the invocation result."""
+    import inspect
+
+    import index
+
+    src = inspect.getsource(index._collect)
+    assert "_dispatch_spend_monitor()" in src
+    assert "spend_monitor_dispatch" in src
