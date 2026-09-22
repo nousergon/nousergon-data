@@ -808,6 +808,17 @@ alert_classes:
     # executor_optimizer_shadow_rebalance, which is divergence in a shadow
     # that is NOT driving the book.
     tier: page
+    operator_reason: >-
+      overseer-policy.md invariant 4: this is a closed loop through
+      drain-queue, and the page is the deliberate extra. The optimizer
+      raising means the day's trading decision is already suppressed and the
+      book already held with stops — the safe state is reached WITHOUT a
+      human, so nothing is waiting on one to be safe. What a human is needed
+      for is the diagnosis, and the window is the session: on 2026-09-22 the
+      cause was a mandatory-turnover floor that under-stated what the sector
+      and %ADV caps forced, and no automated remediation can distinguish
+      that from a genuine solver defect. T0-T3 triage owns the loop; the
+      page exists so the triage starts while the market is still open.
   - class: executor_optimizer_log_unusable
     source: "alpha-engine/executor/main.py::optimizer_cutover"
     severities: [error]
@@ -819,6 +830,13 @@ alert_classes:
     # fire without the other (the sentinel write can fail, or the log can be
     # unusable for a reason that raised nothing).
     tier: page
+    operator_reason: >-
+      Same disposition as executor_optimizer_held_book, from the consumer
+      side: the empty order book IS the safe state and is reached without a
+      human. The page buys same-session diagnosis, not safety. Distinct
+      class because this one fires on an unusable log that raised nothing at
+      all — a state no exception handler sees, and therefore one no
+      auto-remediation can be written against.
   - class: executor_order_book_rationale_write
     source: "alpha-engine/executor/main.py"
     severities: [warning]
