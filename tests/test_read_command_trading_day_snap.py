@@ -88,10 +88,24 @@ def test_the_read_command_uses_the_snap_and_not_the_bare_calendar_date():
 
     from data_gate import __main__ as main_module
 
-    src = inspect.getsource(main_module._read_command)
-    assert "latest_trading_day_on_or_before" in src, (
-        "_read_command no longer routes its trading-day default through the snap"
+    # The default now goes through `resolve_trading_day`, which
+    # `alpha-engine-config-I11355` added so the two post-parity crons could ask
+    # for `yesterday` without a shell expression owning the calendar rule. The
+    # invariant is unchanged and is asserted BOTH ways: `_read_command` must
+    # route through the helper, and the helper must use the snap.
+    command_src = inspect.getsource(main_module._read_command)
+    assert "resolve_trading_day" in command_src, (
+        "_read_command no longer routes its trading-day default through the resolver"
     )
-    assert "else dt.datetime.now(dt.timezone.utc).date()" not in src, (
+    assert "else dt.datetime.now(dt.timezone.utc).date()" not in command_src, (
         "_read_command defaults to the bare UTC calendar date again (I11191)"
     )
+    resolver_src = inspect.getsource(main_module.resolve_trading_day)
+    assert "latest_trading_day_on_or_before" in resolver_src, (
+        "resolve_trading_day no longer routes through the snap (I11191)"
+    )
+    # And the behaviour, not only the spelling: a Sunday still resolves to the
+    # Friday, which is the measured defect this file exists for.
+    assert main_module.resolve_trading_day(
+        None, today=dt.date(2026, 9, 20)
+    ) == dt.date(2026, 9, 18)
