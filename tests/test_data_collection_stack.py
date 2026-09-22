@@ -70,17 +70,40 @@ def test_four_schedules_each_driving_its_own_state_machine(stack, tpl):
     assert len({s["target_ref"] for s in sched}) == 4
 
 
-def test_shadow_sameday_targets_the_dispatcher_lambda_directly(stack, tpl):
-    """alpha-engine-config-I11233: the only schedule in this stack with no
-    state machine of its own — it invokes alpha-engine-data-spot-dispatcher
-    directly, using the dispatcher's own {"workload": ...} contract rather
-    than the collection/workloads/verify_units shape every state-machine-
-    targeting schedule uses."""
-    sched = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-shadow-sameday"]
+@pytest.mark.parametrize(
+    "name,workload",
+    [
+        ("data-collection-shadow-sameday", "shadow-sameday"),
+        ("data-collection-shadow-morning", "shadow-morning"),
+    ],
+)
+def test_the_shadow_schedules_target_the_dispatcher_lambda_directly(stack, tpl, name, workload):
+    """alpha-engine-config-I11233 / -I11352: the two schedules in this stack
+    with no state machine of their own — each invokes
+    alpha-engine-data-spot-dispatcher directly, using the dispatcher's own
+    {"workload": ...} contract rather than the
+    collection/workloads/verify_units shape every state-machine-targeting
+    schedule uses."""
+    sched = {s["name"]: s for s in stack.schedules(tpl)}[name]
     assert sched["target_kind"] == "lambda"
     assert sched["target_ref"] is None
     assert sched["group"] == "nousergon-data-collection"
-    assert sched["input"] == {"workload": "shadow-sameday"}
+    assert sched["input"] == {"workload": workload}
+
+
+def test_the_morning_shadow_fires_after_v1s_own_morning_run(stack, tpl):
+    """alpha-engine-config-I11352. The fifteen minutes ARE the mechanism: v1's
+    MorningSchedule writes the keys at 07:30 ET and parity grades against them,
+    so a shadow morning run that fired first would read `live_missing` on every
+    key it produced. Both crons live in this template and are asserted against
+    each other rather than each against a remembered literal."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    assert by_name["data-collection-morning"]["expression"] == "cron(30 7 ? * MON-FRI *)"
+    assert by_name["data-collection-shadow-morning"]["expression"] == "cron(45 7 ? * MON-FRI *)"
+    assert by_name["data-collection-shadow-morning"]["timezone"] == "America/New_York"
+    # And it is NOT the same-day slot: the two morning legs moved off 18:30 ET
+    # precisely because Polygon's grouped-daily bar for session D is a D+1 fact.
+    assert by_name["data-collection-shadow-sameday"]["expression"] == "cron(30 18 ? * MON-FRI *)"
 
 
 def test_schedule_names_are_unique_without_their_group(stack, tpl):
@@ -98,18 +121,22 @@ def test_ships_disabled(stack, tpl):
     while the v1 SFs still run. The enable PR changes this test's expectation
     for CollectionState in the same change that flips the Default.
 
-    ShadowSamedayState is deliberately EXCLUDED from this invariant
-    (alpha-engine-config-I11233): that schedule writes only to
-    staging/shadow/, never market_data/*, so it carries none of the
-    double-write risk this test guards and is born ENABLED instead."""
+    The two SHADOW schedules are deliberately EXCLUDED from this invariant
+    (alpha-engine-config-I11233, -I11352): each writes only to
+    staging/shadow/, never market_data/*, so they carry none of the
+    double-write risk this test guards and are born ENABLED instead. The
+    exclusion is a NAMED set, not a substring match — a future schedule called
+    `data-collection-shadow-anything` does not inherit the carve-out."""
+    shadow = {"data-collection-shadow-sameday", "data-collection-shadow-morning"}
     defaults = stack.parameter_defaults(tpl)
     assert defaults["CollectionState"] == "DISABLED"
     assert defaults["DailyHealState"] == "DISABLED"
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    assert shadow <= set(by_name), sorted(by_name)
     assert {
-        s["declared_state"] for name, s in by_name.items() if name != "data-collection-shadow-sameday"
+        s["declared_state"] for name, s in by_name.items() if name not in shadow
     } == {"DISABLED"}
-    assert by_name["data-collection-shadow-sameday"]["declared_state"] == "ENABLED"
+    assert {by_name[name]["declared_state"] for name in shadow} == {"ENABLED"}
 
 
 def test_daily_heal_has_its_own_state_switch(stack, tpl):

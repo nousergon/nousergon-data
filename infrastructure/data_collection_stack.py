@@ -45,7 +45,12 @@ PAUSE_MANIFEST = INFRA / "automation_pause.json"
 
 STACK_NAME = "nousergon-data-collection"
 DEFINITION_PREFIX = "infrastructure/nousergon-data-collection/"
-STATE_PARAMETERS = ("CollectionState", "DailyHealState", "ShadowSamedayState")
+STATE_PARAMETERS = (
+    "CollectionState",
+    "DailyHealState",
+    "ShadowSamedayState",
+    "ShadowMorningState",
+)
 MARKET_TZ = "America/New_York"
 STATE_MACHINE_INPUT_FIELDS = {"collection", "workloads", "require_trading_day", "verify_units"}
 # alpha-engine-config-I11233: ShadowSamedaySchedule targets the dispatcher

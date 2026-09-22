@@ -219,7 +219,16 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 # A cap is added here only against a MEASURED overrun, per
 # that issue's deliverable 3 ("measure the first run rather than guessing"); an
 # entry invented ahead of evidence is a number nothing checks.
-_WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000, "shadow-sameday": 18000}
+#: `shadow-morning` gets 3600, not the 18000 its two siblings carry: it runs
+#: TWO legs plus the comparator, and the pair took 6 minutes on 2026-09-21
+#: before failing. A cap ten times the observed run and a fifth of the chained
+#: workloads' — the point of a per-workload cap is that it is per workload
+#: (alpha-engine-config-I11352).
+_WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
+    "shadow-weekday": 18000,
+    "shadow-sameday": 18000,
+    "shadow-morning": 3600,
+}
 
 
 # Parity time windows, per workload (alpha-engine-config-I10892 deliverable 3).
@@ -248,13 +257,26 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {"shadow-weekday": 18000, "shado
 _WORKLOAD_PARITY_WINDOW: dict[str, "tuple[str, str] | None"] = {
     "shadow-weekday": None,
     "shadow-sameday": None,
+    "shadow-morning": None,
     "shadow-parity": None,
     "arctic-parity": None,
 }
 
 
 def _max_runtime_seconds(workload: "str | None") -> int:
-    return max(MAX_RUNTIME_SECONDS, _WORKLOAD_MAX_RUNTIME_SECONDS.get(workload or "", 0))
+    """The declared cap for ``workload``, or the shared default.
+
+    An entry OVERRIDES the default in both directions (alpha-engine-config-
+    I11352). It used to be `max(default, declared)`, which silently ignored any
+    declaration below 7200 — so `shadow-morning`'s deliberate 3600, chosen
+    because it runs two legs that measured 6 minutes rather than the five-hour
+    chain its siblings run, would have been read as 7200 and the per-workload
+    map would have been a one-way ratchet nothing said it was. A cap is a
+    statement about THIS workload; a floor that overrides it makes every
+    tightening inert.
+    """
+    declared = _WORKLOAD_MAX_RUNTIME_SECONDS.get(workload or "")
+    return MAX_RUNTIME_SECONDS if declared is None else declared
 
 
 # gitleaks pin for the DLP boot gate. It moves in LOCKSTEP with
@@ -542,6 +564,14 @@ _WORKLOADS: dict[str, str] = {
     #
     # MEASURED 2026-09-21 against `dates.default_run_date` for all four cases;
     # `test_shadow_sameday_guard_refuses_non_sessions_and_pre_close` pins them.
+    #
+    # IT RUNS THE TWO POST-MARKET LEGS ONLY (alpha-engine-config-I11352). It
+    # used to run all four, including v1's two MORNING legs — twelve hours
+    # before v1 runs them, against a Polygon grouped-daily bar that is a D+1
+    # fact. Both failed on the first scheduled run. The morning legs moved to
+    # the `shadow-morning` key below, on v1's own cadence; this one's parity
+    # call now declares `--legs-group sameday` so a report carrying only this
+    # group renders the morning group as unknown rather than as silence.
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -551,18 +581,93 @@ _WORKLOADS: dict[str, str] = {
         "exit 0; fi; "
         "set +e; LEGS=/tmp/shadow_legs_$TD.tsv; : > $LEGS; RC_ALL=0; "
         "python -m shadow run --trading-day $TD --module weekly_collector -- "
-        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date $TD; "
-        "RC=$?; printf 'morning-enrich\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
-        "python -m shadow run --trading-day $TD --module weekly_collector -- "
-        "--morning-arctic-append --date $TD; "
-        "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
-        "python -m shadow run --trading-day $TD --module weekly_collector -- "
         "--daily --skip-arctic-append --date $TD; "
         "RC=$?; printf 'post-market-data\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow run --trading-day $TD --module weekly_collector -- "
         "--daily-arctic-append --date $TD; "
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
-        "python -m shadow parity --trading-day $TD --legs-file $LEGS "
+        "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
+        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
+    ),
+    # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
+    # `shadow-sameday` above, split out because v1 runs these two legs TWELVE
+    # HOURS LATER than the same-day dispatch was running them.
+    #
+    # WHAT THE SPLIT FIXES, measured on the first scheduled `shadow-sameday`
+    # (2026-09-21, launched 22:30:34Z): `morning-enrich` exited 1 (D17,
+    # `morning_daily_closes` status='error') and `morning-arctic-append` exited
+    # 1 a twentieth of a second later (D18, `NoSuchKey` — it reads the
+    # daily-closes parquet the failed leg never wrote). Neither is a collector
+    # defect. `collectors/daily_closes.py::collect` in window mode is
+    # TARGET-DRIVEN: the aggregate is `error` when `per_date[target_date]` is
+    # not ok, and the phase manifest shows 2026-09-08…09-18 all ok at 928
+    # tickers while the run failed on target 2026-09-21 itself. Polygon's
+    # grouped-daily bar for session D is not final until the next morning —
+    # which is exactly why v1 schedules these legs at `cron(30 7 ? * MON-FRI *)`
+    # (`nousergon-data-collection.yaml` MorningSchedule) for the PREVIOUS
+    # session, and why running them at 18:30 ET on D graded v2 against a bar
+    # the vendor had not published.
+    #
+    # 07:45 ET, fifteen minutes after v1's own 07:30 fire, so v1's copy of the
+    # keys exists to compare against rather than reading `live_missing` on
+    # every one of them.
+    #
+    # THE GUARD IS TWO QUESTIONS, and conflating them is the bug this key would
+    # otherwise ship with:
+    #
+    #   * IS TODAY A SESSION? A weekday NYSE holiday fires this Mon-Fri rule and
+    #     v1's MorningSchedule (`require_trading_day: true`) does NOT run, so
+    #     there would be no v1 copy to compare against. `default_run_date()`
+    #     alone cannot answer this at 07:45 — on Thanksgiving it returns
+    #     Wednesday, which is a perfectly valid previous session, so the
+    #     `!=` comparison `shadow-sameday` uses passes and the run proceeds
+    #     wrongly. Asked directly, of the NYSE calendar, for TODAY.
+    #   * IS THIS ACTUALLY PRE-OPEN? `default_run_date() == today` means the
+    #     16:00 ET close has already occurred, i.e. this fired late enough to be
+    #     an evening run. The morning legs must target the PREVIOUS session; a
+    #     late fire would target today and duplicate `shadow-sameday`.
+    #
+    # `nousergon_lib.trading_calendar` answers the first, NOT weekday
+    # arithmetic — holidays have bitten this repo before (see
+    # `_previous_business_days` in `collectors/daily_closes.py`). The TD itself
+    # comes from `dates.default_run_date()`, the same chokepoint every
+    # scheduled collector keys its run by, so the shadow and v1 agree on which
+    # session this is by construction rather than by two calendars agreeing.
+    #
+    # `--skip-chronic-heal` stays on the enrich leg: a shadow must never heal
+    # live data.
+    #
+    # The comparator runs LAST and rewrites `parity/{TD}.json` with
+    # `--legs-group morning`, so the D report carries both groups' legs rather
+    # than the morning group's keys being silently absent. Same
+    # legs-independent shape as the two workloads above
+    # (alpha-engine-config-I11200): `set +e`, one legs file, the comparator
+    # ALWAYS runs.
+    "shadow-morning": (
+        "( set -e; "
+        "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
+        "TODAY=$(TZ=America/New_York date +%F); "
+        "IS_SESSION=$(python -c \"import datetime, zoneinfo; "
+        "from nousergon_lib.trading_calendar import is_trading_day; "
+        "print(int(is_trading_day(datetime.datetime.now("
+        "zoneinfo.ZoneInfo('America/New_York')).date())))\"); "
+        'if [ "$IS_SESSION" != "1" ]; then '
+        'echo "shadow-morning: $TODAY is not an NYSE session — v1\'s 07:30 morning run '
+        'does not fire either, so there is nothing to compare against"; '
+        "exit 0; fi; "
+        'if [ "$TD" = "$TODAY" ]; then '
+        'echo "shadow-morning: default_run_date() is $TD = today, so the 16:00 ET close '
+        'has already occurred — this is not a pre-open fire; refusing"; '
+        "exit 0; fi; "
+        "set +e; LEGS=/tmp/shadow_morning_legs_$TD.tsv; : > $LEGS; RC_ALL=0; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--morning-enrich --skip-chronic-heal --skip-arctic-append --date $TD; "
+        "RC=$?; printf 'morning-enrich\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow run --trading-day $TD --module weekly_collector -- "
+        "--morning-arctic-append --date $TD; "
+        "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
+        "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group morning "
         "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
