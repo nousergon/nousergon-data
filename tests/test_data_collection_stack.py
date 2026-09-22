@@ -106,6 +106,61 @@ def test_the_morning_shadow_fires_after_v1s_own_morning_run(stack, tpl):
     assert by_name["data-collection-shadow-sameday"]["expression"] == "cron(30 18 ? * MON-FRI *)"
 
 
+def test_the_eod_schedule_fires_at_the_declared_settlement_hour(stack, tpl):
+    """alpha-engine-config-I11354. The EOD collection fires at
+    ``dates.SETTLED_AFTER_ET``, not at some remembered literal.
+
+    It was ``cron(45 16 …)`` — 16:45 ET, chosen as "after the 16:00 close and
+    outside the v1 postclose window". Both still hold at 18:15, but after the
+    close is not after the bar is final: measured 2026-09-21 across 920 of 920
+    price-cache files, a 16:06 ET fetch was short on ``Volume`` for every one of
+    them (median 20.5 %, max 62.3 %, never high) and off on ``Close`` for 442
+    (median 2.73 bps, max 16.39) against a refetch at 18:41 ET.
+
+    Asserted against the constant rather than against ``"cron(15 18 …)"`` so
+    that when alpha-engine-config-I11356's 3-day sample moves the hour, the
+    schedule and the two code paths reading the same constant move together or
+    this test fails. That is the whole point: one declared hour, three call
+    sites, no literal drifting off on its own.
+    """
+    from dates import SETTLED_AFTER_ET
+
+    hh, mm = (int(p) for p in SETTLED_AFTER_ET.split(":"))
+    eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]
+    assert eod["expression"] == f"cron({mm} {hh} ? * MON-FRI *)"
+    # An exchange clock, not UTC — the settlement hour moves with US DST and a
+    # UTC cron would be an hour wrong for half the year.
+    assert eod["timezone"] == "America/New_York"
+
+
+def test_the_eod_schedule_leaves_the_morning_run_a_full_overnight(stack, tpl):
+    """The later start must not push EOD collection into the next morning's run.
+
+    The EOD workload takes the dispatcher's 7200s default
+    (``_WORKLOAD_MAX_RUNTIME_SECONDS`` declares overrides only for the three
+    shadow workloads), so a worst-case finish is 18:15 + 2h = 20:15 ET.
+    MorningSchedule fires at 07:30 ET, 13h15m after the EOD start — 10h45m of
+    slack past the cap. Asserted from the two crons in this template against the
+    declared cap rather than from a remembered margin.
+    """
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    eod_h, eod_m = _cron_hour_minute(by_name["data-collection-eod"]["expression"])
+    morn_h, morn_m = _cron_hour_minute(by_name["data-collection-morning"]["expression"])
+    gap_minutes = (24 * 60) - (eod_h * 60 + eod_m) + (morn_h * 60 + morn_m)
+    assert gap_minutes == 13 * 60 + 15
+    # The dispatcher's default cap, in minutes. EOD declares no override.
+    assert gap_minutes > 7200 // 60
+
+
+def _cron_hour_minute(expression: str) -> tuple[int, int]:
+    """``cron(M H ? * MON-FRI *)`` -> ``(H, M)``."""
+    import re
+
+    m = re.fullmatch(r"cron\((\d+) (\d+) \?.*\)", expression)
+    assert m, f"unexpected schedule expression shape: {expression!r}"
+    return int(m.group(2)), int(m.group(1))
+
+
 def test_schedule_names_are_unique_without_their_group(stack, tpl):
     """CloudFormation's AWS::EarlyValidation::ResourceExistenceCheck compares a
     schedule's Name WITHOUT its group. The first create (2026-09-14) named one
@@ -487,9 +542,14 @@ def test_check_live_clean_when_live_matches(stack, tpl):
 
 def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
     cfn = _Cfn("UPDATE_ROLLBACK_COMPLETE", {"template-sha256": "old", "definition-sha256": "old"})
+    # The expression comes from the TEMPLATE, not a literal: this test is about
+    # the console-flip (State) finding, and a hard-coded cron silently became a
+    # second, unintended expression-drift finding the moment the schedule moved
+    # (alpha-engine-config-I11354 moved it 16:45 ET -> 18:15 ET).
+    _eod_expr = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["expression"]
     sched = _scheduler_matching(
         stack, tpl,
-        **{"data-collection-eod": {"State": "ENABLED", "ScheduleExpression": "cron(45 16 ? * MON-FRI *)"}},
+        **{"data-collection-eod": {"State": "ENABLED", "ScheduleExpression": _eod_expr}},
     )
     findings = stack.live_findings(cfn, sched)
     assert any("UPDATE_ROLLBACK_COMPLETE" in x for x in findings)

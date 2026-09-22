@@ -227,12 +227,42 @@ def _live_store(root, scheduler, sfn):
     return store
 
 
+def _eod_fire_utc(day: dt.date = TUESDAY) -> dt.datetime:
+    """The instant `data-collection-eod` is due on ``day``, from the TEMPLATE.
+
+    Derived, not written down. `standalone.read_survives_phase4` selects the
+    execution covering the schedule's due fire, so every fixture instant below
+    is relative to that fire — and when the schedule moves, they all have to
+    move with it. They used to be literals pinned to the 16:45 ET slot, and
+    alpha-engine-config-I11354's move to 18:15 ET broke three tests here for a
+    reason that had nothing to do with what they assert. Reading the cron means
+    the next move (alpha-engine-config-I11356 may bring one) cannot do that
+    again.
+    """
+    from zoneinfo import ZoneInfo
+
+    sched = next(s for s in standalone._stack_schedules() if s["name"] == "data-collection-eod")
+    minute, hour = sched["expression"].removeprefix("cron(").split(" ")[:2]
+    local = dt.datetime.combine(
+        day, dt.time(int(hour), int(minute)), tzinfo=ZoneInfo(sched["timezone"]),
+    )
+    return local.astimezone(UTC)
+
+
+#: The scheduled run: starts 3s after the fire, runs 45 minutes.
+_EOD_START = _eod_fire_utc() + dt.timedelta(seconds=3)
+_EOD_STOP = _EOD_START + dt.timedelta(minutes=45)
+
 EOD_EXECUTION = {
     "executionArn": "arn:aws:states:us-east-1:000000000000:execution:ne-data-collection-eod:x",
     "status": "SUCCEEDED",
-    "startDate": dt.datetime(2026, 9, 15, 20, 45, 3, tzinfo=UTC),
-    "stopDate": dt.datetime(2026, 9, 15, 21, 30, tzinfo=UTC),
+    "startDate": _EOD_START,
+    "stopDate": _EOD_STOP,
 }
+
+
+def _iso(moment: dt.datetime) -> str:
+    return moment.astimezone(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def test_the_stack_definition_maps_units_to_schedules():
@@ -263,15 +293,69 @@ def test_survives_phase4_is_unmet_while_the_schedule_is_disabled(tmp_path, units
 
 
 def test_survives_phase4_is_met_on_a_standalone_manifest_inside_a_succeeded_execution(tmp_path, units):
-    _write(tmp_path, "D19", "2026-09-15", "RUN1", started="2026-09-15T20:50:00Z", finished="2026-09-15T21:05:00Z")
+    # Inside the execution window: 5 minutes after it starts, 15 minutes long.
+    _write(
+        tmp_path, "D19", "2026-09-15", "RUN1",
+        started=_iso(_EOD_START + dt.timedelta(minutes=5)),
+        finished=_iso(_EOD_START + dt.timedelta(minutes=20)),
+    )
     store = _live_store(tmp_path, _Scheduler(), _Sfn({"ne-data-collection-eod": [EOD_EXECUTION]}))
     reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True, reading.detail
     assert EOD_EXECUTION["executionArn"] in reading.evidence
 
 
+def test_a_fire_after_1759_et_is_still_graded_for_its_own_trading_day(tmp_path, units):
+    """alpha-engine-config-I11354. The grading ceiling must not exclude a legal
+    fire time.
+
+    `latest_due_fire` returns the newest fire whose ``fire + COMPLETION_GRACE``
+    (6h) has passed, and the reading instant used to be `gate_moment`, clamped to
+    23:59:59 ET on the trading day. Any schedule firing later than 23:59:59 minus
+    6h — i.e. later than **17:59 ET** — therefore had its own fire pushed past the
+    ceiling on every read, and the clause silently graded the PREVIOUS day's run,
+    for ever, with no signal that it had.
+
+    Latent while the EOD schedule fired at 16:45 ET. Moving it to 18:15 ET (the
+    settlement hour) crossed the boundary and turned it into a live defect. The
+    grace is a COMPLETION allowance, so the instant by which D's fire should have
+    finished is legitimately `end of D + grace`; that is the ceiling now.
+
+    This asserts the property directly, independent of where the EOD schedule
+    happens to sit today: a fire at 18:15 ET on Tuesday is graded for TUESDAY.
+    """
+    _write(
+        tmp_path, "D19", "2026-09-15", "RUN1",
+        started=_iso(_EOD_START + dt.timedelta(minutes=5)),
+        finished=_iso(_EOD_START + dt.timedelta(minutes=20)),
+    )
+    store = _live_store(tmp_path, _Scheduler(), _Sfn({"ne-data-collection-eod": [EOD_EXECUTION]}))
+    reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    # The fire named in the detail is TUESDAY's, never Monday's.
+    assert TUESDAY.isoformat() in reading.detail, reading.detail
+    assert (TUESDAY - dt.timedelta(days=1)).isoformat() not in reading.detail
+    assert reading.met is True
+
+
+def test_the_ceiling_still_refuses_a_fire_that_has_not_had_its_grace(tmp_path, units):
+    """The widening is bounded: it adds the completion grace to the END of the
+    trading day, it does not remove the clock. Read at 19:00 ET on the trading
+    day itself — after the 18:15 fire but long before its 6h grace — and the
+    clause must still be looking at the PREVIOUS day, not demanding a run that
+    is legitimately still in flight."""
+    during = dt.datetime(2026, 9, 15, 23, 0, tzinfo=UTC)  # 19:00 ET Tuesday
+    store = _live_store(tmp_path, _Scheduler(), _Sfn({"ne-data-collection-eod": [EOD_EXECUTION]}))
+    reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=during)
+    assert TUESDAY.isoformat() not in reading.detail, reading.detail
+
+
 def test_a_hand_run_outside_the_execution_does_not_count(tmp_path, units):
-    _write(tmp_path, "D19", "2026-09-15", "HAND", started="2026-09-15T23:00:00Z", finished="2026-09-15T23:05:00Z")
+    # Deliberately OUTSIDE the execution window — half an hour after it stopped.
+    _write(
+        tmp_path, "D19", "2026-09-15", "HAND",
+        started=_iso(_EOD_STOP + dt.timedelta(minutes=30)),
+        finished=_iso(_EOD_STOP + dt.timedelta(minutes=35)),
+    )
     store = _live_store(tmp_path, _Scheduler(), _Sfn({"ne-data-collection-eod": [EOD_EXECUTION]}))
     reading = standalone.read_survives_phase4(store, units["D19"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is False and "no scheduled-trigger manifest" in reading.detail

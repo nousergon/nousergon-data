@@ -191,9 +191,37 @@ Resources:
       Name: nousergon-data-collection
 
   # Weekday end-of-day collection. Replaces ne-postclose-trading-pipeline's
-  # LaunchPostMarketDataSpot + LaunchPostMarketArcticAppendSpot. 16:45 ET: after
-  # the 16:00 close and outside the v1 postclose window, so the cutover day has
-  # no overlap. `verify_units` is every manifest-emitting unit its two collector
+  # LaunchPostMarketDataSpot + LaunchPostMarketArcticAppendSpot.
+  #
+  # 18:15 ET (alpha-engine-config-I11354), was 16:45 ET. The 16:45 slot was
+  # chosen to sit after the 16:00 close and outside the v1 postclose window —
+  # both still true at 18:15 — but "after the close" is not "after the bar is
+  # final". Measured 2026-09-21 over 920 of 920 price-cache files, a 16:06 ET
+  # fetch against a refetch at 18:41 ET: Volume short on ALL 920 (median 20.5 %,
+  # max 62.3 %, and never high) and Close off on 442 (median 2.73 bps, max
+  # 16.39). A third fetch at 22:36 ET matched the 18:41 Close on 30/30 sampled
+  # tickers to the last printed digit, so the official closing print is final
+  # well before 18:15 while consolidated Volume keeps accruing all evening.
+  # 18:15 is `dates.SETTLED_AFTER_ET` — the same constant `dates.bar_settlement`
+  # grades D03/D19 manifests against and the same one
+  # `collectors/daily_closes.py::_is_post_close_write` uses to decide whether an
+  # existing parquet is authoritative. Three call sites, one declared hour.
+  #
+  # The hour itself rests on a ONE-day bracket (16:06 unsettled, 18:41 settled)
+  # and is a stated assumption until alpha-engine-config-I11356's 3-day sample
+  # at 16:45/17:30/18:15/18:45 ET measures it. If that sample says 17:30
+  # suffices, this cron and the constant move together.
+  #
+  # Runtime budget: the workload keeps the dispatcher's 7200s default
+  # (`DATA_SPOT_MAX_RUNTIME_SECONDS`; `_WORKLOAD_MAX_RUNTIME_SECONDS` declares
+  # overrides only for the three shadow workloads), so a worst-case finish is
+  # ~20:15 ET. MorningSchedule below fires at 07:30 ET the next day — 13h15m
+  # after this start, 10h45m of slack past the cap — so the later start cannot
+  # push EOD collection into the morning run. The readiness wait
+  # (`DATA_SPOT_SSM_ONLINE_BUDGET_SEC`, 300s) is spent before the workload
+  # clock and is unchanged by moving the start.
+  #
+  # `verify_units` is every manifest-emitting unit its two collector
   # workloads run (run_units.PHASE_UNITS ("daily", *) minus the arctic append the
   # --skip-arctic-append flag defers, plus MODE_UNITS["daily_arctic_append"]): the
   # completion claim covers every key each of them publishes, not the two Metron
@@ -209,7 +237,7 @@ Resources:
       Name: data-collection-eod
       GroupName: !Ref CollectionScheduleGroup
       State: !Ref CollectionState
-      ScheduleExpression: 'cron(45 16 ? * MON-FRI *)'
+      ScheduleExpression: 'cron(15 18 ? * MON-FRI *)'
       ScheduleExpressionTimezone: America/New_York
       FlexibleTimeWindow:
         Mode: 'OFF'
@@ -351,11 +379,22 @@ Resources:
   # (and auto-applies on merge) before this schedule's PR merges, so the
   # first fire is never the first test of the permission.
   #
-  # 18:30 ET: after this stack's own 16:45 ET EodSchedule and after v1's
-  # postclose writes (measured starting 16:00 ET), leaving a wide margin
-  # before either could still be writing. The workload's own 18000s (5h) cap
-  # means a worst-case finish ~23:30 ET, comfortably inside the weekday
+  # 18:30 ET: after v1's postclose writes (measured starting 16:00 ET), leaving
+  # a wide margin before v1 could still be writing. The workload's own 18000s
+  # (5h) cap means a worst-case finish ~23:30 ET, comfortably inside the weekday
   # window and with no other schedule in this stack running after it.
+  #
+  # CUTOVER PREREQUISITE (alpha-engine-config-I11363), introduced by moving
+  # EodSchedule above from 16:45 ET to 18:15 ET: this sameday shadow now starts
+  # FIFTEEN MINUTES after EodSchedule instead of an hour and three quarters.
+  # Today that is inert — CollectionState ships DISABLED, so EodSchedule does
+  # not fire and this run compares only against v1's 16:00 ET postclose. It stops
+  # being inert on the phase-4 cutover PR that flips CollectionState to ENABLED:
+  # a live EOD collection still writing market_data/* at 18:30 ET would be read
+  # mid-write by this parity run, which is parity noise, not a producer defect.
+  # The cutover PR moves this schedule (or gates it on the EOD run's completion
+  # marker) in the same change. Stated here rather than fixed here so the
+  # schedule move stays one revertible line.
   #
   # Born ENABLED (ShadowSamedayState, default ENABLED) rather than sharing
   # CollectionState: it writes only to staging/shadow/ (7-day lifecycle
