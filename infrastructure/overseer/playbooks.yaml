@@ -794,6 +794,31 @@ alert_classes:
     response: drain-queue
     # DECLARED: shadow-optimizer divergence, named in I6751's NOTIFY-SILENT row.
     tier: notify-silent
+  - class: executor_optimizer_held_book
+    source: "alpha-engine/executor/optimizer_shadow.py::_alert_shadow_failure"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page, against the severity-derived default. The optimizer
+    # refusing to solve suppresses the ENTIRE day's trading decision, and the
+    # window to act on it is the session — it cannot wait for the next
+    # console look. On 2026-09-22 this condition was silent and surfaced only
+    # when a human read a dashboard warning hours later
+    # (alpha-engine-config-I11369). Distinct from
+    # executor_optimizer_shadow_rebalance, which is divergence in a shadow
+    # that is NOT driving the book.
+    tier: page
+  - class: executor_optimizer_log_unusable
+    source: "alpha-engine/executor/main.py::optimizer_cutover"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page, same reasoning: use_portfolio_optimizer=True and no
+    # usable log means the order book is deliberately EMPTY for the session.
+    # The consumer-side twin of executor_optimizer_held_book — either can
+    # fire without the other (the sentinel write can fail, or the log can be
+    # unusable for a reason that raised nothing).
+    tier: page
   - class: executor_order_book_rationale_write
     source: "alpha-engine/executor/main.py"
     severities: [warning]
