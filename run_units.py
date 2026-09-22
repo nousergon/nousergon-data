@@ -576,6 +576,18 @@ def resolve_log_location() -> str:
        rather than a CloudWatch group this run never wrote to. The daily report
        counts a ``local:`` manifest on a non-ok run as a DETECTION GAP row
        (`data_gate.report`), never as silence.
+
+    Deliberately does NOT try to guess between ``<uri>`` and ``<uri>.gz``
+    (`alpha-engine-config-I11359`, `krepis.spot_bootstrap.RunLog(gzip=True)`):
+    this function runs ON THE BOX, called from inside the very process the
+    bootstrap script's ``exec > >(tee …)`` wraps — strictly BEFORE the
+    EXIT/TERM-trap that performs the plain-to-gz swap can fire, since that
+    trap only runs after this Python process (and the shell around it) has
+    already exited. A suffix check here would never observe ``.log.gz`` and
+    would be dead code asserting a fact it can never be run early enough to
+    know. The literal this returns is the key the launcher decided before the
+    run started; resolving which suffix ACTUALLY exists once the run is over
+    is a reader's question, answered by ``data_gate/report.py::_resolve_log``.
     """
     declared = os.environ.get(LOG_LOCATION_ENV)
     if declared:
@@ -726,10 +738,26 @@ def manifest_sink(bucket: str, s3_client=None) -> S3ManifestSink:
 # `run_manifest.run_unit`'s own note): a manifest that failed to write is a run
 # that did not happen as far as every downstream reader is concerned.
 
-#: `nousergon_lib.run_manifest.run_unit` bounds the final `reason` field to
-#: 2000 chars (`f"{type(exc).__name__}: {exc}"[:2000]`) with no marker when it
-#: cuts. `describe_mode_failure` below stays well under that so its own,
-#: EXPLICIT bound is what fires first (alpha-engine-config-I10941).
+#: `nousergon_lib.run_manifest.run_unit` (>= v0.124.150) bounds the final
+#: `reason` field to `REASON_MAX_LEN = 2000` too, and — since I11358 — no
+#: longer cuts head-only or silently: it keeps BOTH ends (3:5 head:tail, same
+#: split this module uses) behind an explicit ` …[reason_truncated: N
+#: bytes]… ` marker. So the library layer losing the tail is no longer the
+#: reason this stays under 2,000 (alpha-engine-config-I11383: that reason is
+#: now false and the comment it replaced said so). The reason that IS true at
+#: this commit: `run_manifest.run_unit` wraps whatever this module returns as
+#: `f"{type(exc).__name__}: {exc}"` before its own cut ever runs — the
+#: exception class name plus `": "` is instrumentation overhead this layer
+#: does not control and did not budget for. 1,800 leaves ~200 chars of
+#: headroom for that wrapper (`test_the_budget_stays_under_the_librarys_own_cut`
+#: asserts the arithmetic), which keeps this layer's own head:tail split as
+#: the ONE truncation that fires in the normal case — a reason built here at
+#: 1,800 chars never reaches the library's 2,000-char cut at all. Raising the
+#: cap now that the library preserves tails would buy nothing: any content
+#: past ~1,970 chars total (post-wrapper) gets re-cut by the library anyway,
+#: just wearing a second, nested marker instead of a cleaner single one. 1,800
+#: stays the right number for a different reason than the one that used to be
+#: written here.
 REASON_MAX_LEN = 1800
 
 #: How a truncated reason is SPLIT (alpha-engine-config-I11353). Head-only was
@@ -737,7 +765,10 @@ REASON_MAX_LEN = 1800
 #: and the TARGET date — the one that failed — is the LAST entry in the result,
 #: so a head cut drops precisely the cause and keeps ten `ok` dates nobody
 #: needed. 3:5 head:tail keeps enough of the header to identify the mode and
-#: enough of the tail to carry the failing entry.
+#: enough of the tail to carry the failing entry. `nousergon-lib` >= v0.124.150
+#: adopted the same 3:5 split for its own cut, on second adoption
+#: (`policy-shared-code`) — see the note on `REASON_MAX_LEN` above for how the
+#: two layers now interact.
 #:
 #: The 1,800-char ceiling above is NOT raised to the 4,000 the issue proposes,
 #: and that is deliberate rather than a shortfall: `run_unit` cuts the final

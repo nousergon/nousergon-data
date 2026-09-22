@@ -38,7 +38,7 @@ This drift class has bitten production multiple times:
     Lambda canary failed at 17:22 UTC with the same
     ``nousergon_lib.secrets`` ModuleNotFoundError.
 
-This test re-greps all three files on every CI run so a future single-file
+This test re-greps all four files on every CI run so a future single-file
 bump fails here, not in a canary.
 """
 
@@ -160,21 +160,34 @@ def test_requirements_and_dockerfile_pins_match():
     """Dockerfile dropped from this lockstep (alpha-engine-config-I10779): it
     was the root ``Dockerfile``, which built ONLY the now-deleted D15L
     (``alpha-engine-data-collector``) Lambda image — no other component built
-    from it. The remaining three surfaces (requirements.txt,
-    requirements-daily-news.txt, deploy-infrastructure.yml) still carry
-    independent copies of the pin and still need it asserted."""
+    from it. The remaining four surfaces (requirements.txt,
+    requirements-daily-news.txt, deploy-infrastructure.yml,
+    pause-reconcile.yml) still carry independent copies of the pin and still
+    need it asserted.
+
+    ``pause-reconcile.yml`` was added here for alpha-engine-config-I11383: it
+    carried its own hardcoded ``pip install`` pin at ``v0.124.82`` — 67
+    versions behind ``requirements.txt`` — completely undetected by this test,
+    which is the known blind spot alpha-engine-config-I7623 reports. A guard
+    that has missed a surface for 67 versions is the defect, not the drift it
+    failed to catch; it is enumerated below rather than left for the next
+    audit to rediscover."""
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
     deploy_infra_pin = _read_pin(
         ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
     )
-    assert req_pin == daily_news_pin == deploy_infra_pin, (
+    pause_reconcile_pin = _read_pin(
+        ".github/workflows/pause-reconcile.yml", _LAMBDA_PIN_RE
+    )
+    assert req_pin == daily_news_pin == deploy_infra_pin == pause_reconcile_pin, (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
         f"requirements-daily-news.txt={daily_news_pin!r}, "
-        f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}. "
-        f"All three must move in lockstep — the slim daily-news file "
+        f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}, "
+        f".github/workflows/pause-reconcile.yml={pause_reconcile_pin!r}. "
+        f"All four must move in lockstep — the slim daily-news file "
         f"carries an independent copy of the pin, and the deploy-infrastructure "
-        f"workflow's drift-check step installs its own copy directly."
+        f"and pause-reconcile workflows each install their own copy directly."
     )
 
 

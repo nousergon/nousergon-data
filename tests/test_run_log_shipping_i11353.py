@@ -141,8 +141,13 @@ def test_describe_mode_failure_keeps_the_tail_too():
     assert "THE CAUSE" in out[-400:]
 
 
-def test_the_budget_stays_under_the_librarys_own_silent_cut():
-    """`nousergon_lib.run_manifest.run_unit` cuts the final string at 2,000
-    chars, head-only and with no marker. A reason longer than that would have
-    its tail removed one layer down — silently, which is the whole defect."""
+def test_the_budget_stays_under_the_librarys_own_cut():
+    """`nousergon_lib.run_manifest.run_unit` (>= v0.124.150) still cuts the
+    final string at 2,000 chars, but no longer head-only or silently
+    (`alpha-engine-config-I11358`): it keeps both ends behind an explicit
+    marker, same as this module. Staying under it is no longer about
+    preventing silent tail loss — it's about not paying for a second, nested
+    truncation the library would otherwise perform on top of this layer's
+    own, since `run_unit` wraps the reason in `f"{type(exc).__name__}: {exc}"`
+    before its cut runs."""
     assert run_units.REASON_MAX_LEN + len("_CollectorError: ") < 2000

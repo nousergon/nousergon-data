@@ -16,8 +16,8 @@
 # only the LAMBDA_CAPABILITIES profile (AWS control plane), and every check
 # needing more is reported status="skip" rather than executed.
 aws-assume-role-lib
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.149
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.150
 # alpha-engine-config-I8155: this Lambda records its own coverage verdict via
 # krepis.stage_coverage. Pin the released contract that refuses a blank SF
 # execution run_date and uses no cycle-date fallback.
-krepis==0.59.54  # bumped 0.59.41 -> 0.59.54: nousergon-lib v0.124.116 (root requirements.txt) floors krepis>=0.59.52; alpha-engine-config-I10226 lockstep gap, run 34309659890
+krepis==0.59.65  # bumped 0.59.54 -> 0.59.65: alpha-engine-config-I11359, RunLog(gzip=True) (krepis-PR229). Prior history: bumped 0.59.41 -> 0.59.54: nousergon-lib v0.124.116 (root requirements.txt) floors krepis>=0.59.52; alpha-engine-config-I10226 lockstep gap, run 34309659890
