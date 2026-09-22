@@ -135,9 +135,10 @@ DISPATCH_ENABLED = (
 # spot_backtest.sh — same AMI/instance-type family/subnets the nested spots
 # THIS box itself launches already use, so a c5.large-class launcher is
 # consistent with the rest of the fleet's Saturday spend). ───────────────────
-# Widened 4 -> 10 types across 6 families (alpha-engine-config-I7133).
+# Widened 4 -> 10 types across 6 families (alpha-engine-config-I7133), then
+# ORDERED current-generation-first (alpha-engine-config-I11427).
 #
-# The four originals are all 2-vCPU x86 compute/general types of adjacent
+# The original four were all 2-vCPU x86 compute/general types of adjacent
 # generations, which is a NARROW capacity surface: `launch_with_fallback`
 # rotates instance_type x subnet, so the number of distinct pools it can fall
 # through is what decides whether a capacity dip is survivable. Measured
@@ -155,16 +156,38 @@ DISPATCH_ENABLED = (
 # are strictly more memory. All 10 verified offered in 5 of the 6 subnets'
 # AZs on 2026-08-12.
 #
-# No IAM change needed: this Lambda's LaunchWeeklyFreshnessSpot statement is
-# `ec2:RunInstances` on `Resource: "*"` with no instance-type Condition, so
-# there is no config#2271-style enumeration to keep in lockstep here (unlike
-# alert-drain-dispatcher / ci-watch-dispatcher, which do enumerate).
+# ORDER is a COST property, not a style question. `launch_with_fallback` hands
+# this list to `krepis.ec2_spot.launch`, which walks instance_type x subnet IN
+# ORDER, and the on-demand rung buys the FIRST entry. Measured August 2026:
+# `BoxUsage:c5.large` $38.83 / 456.8 hrs ran CONCURRENTLY with
+# `SpotUsage:c5.large` $15.70 / 489.0 hrs — 945.8 hours against 744 in the
+# month, a ~48% escalation to on-demand, all of it billed at the head of this
+# list. Leading with `c6i.large` costs nothing (same on-demand rate as
+# `c5.large`) and puts the deepest current-generation us-east-1 c-family pool
+# first on the spot rung too. Generation rungs descend 6 -> 5, and each rung
+# alternates Intel/AMD so no rung is single-vendor
+# (alpha-engine-config-I11427; same order property as the shell launchers,
+# alpha-engine-config-I11412).
+#
+# This list IS governed by an allow-list, contrary to the older comment here:
+# alpha-engine-config-I11227 replaced the unconditioned `Resource: "*"` grant
+# with `RunInstancesInstanceScopedByTagAndType` in this directory's
+# `iam-policy.json`, which enumerates `ec2:InstanceType`. A type named here
+# but absent there raises `UnauthorizedOperation`, which
+# `krepis.ec2_spot.launch` treats as a NON-capacity error and re-raises as
+# `SpotLaunchError` WITHOUT rotating — i.e. it converts a survivable capacity
+# dip into a hard weekly-SF failure. The two are held in lockstep by
+# `tests/test_weekly_spot_pool_breadth.py::test_the_default_is_not_refused_by_the_roles_own_iam_allow_list`.
+# Adding a type is therefore TWO edits plus `deploy.sh --apply-iam` (the CI
+# auto-deploy path is code-only and will NOT apply the policy), which is why
+# the generation-7 rung (`c7i.large` / `c7a.large`) is deliberately NOT here
+# yet — see alpha-engine-config-I11433.
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "WEEKLY_SPOT_INSTANCE_TYPES",
-        "c5.large,m5.large,c6i.large,c5a.large,m6i.large,"
-        "m5a.large,c6a.large,m6a.large,r5.large,r6i.large",
+        "c6i.large,c6a.large,m6i.large,m6a.large,r6i.large,"
+        "c5.large,c5a.large,m5.large,m5a.large,r5.large",
     ).split(",")
     if t.strip()
 ]
