@@ -1177,3 +1177,251 @@ def test_no_manifest_at_all_keeps_the_pre_existing_wording():
     assert result.verdict == "shadow_missing"
     assert result.body["detail"] == "v1 wrote it; the shadow run did not"
     assert "shadow_run_status" not in result.body
+
+
+# ---------------------------------------------------------------------------
+# `alpha-engine-config-I11360`: the D-1 re-grade of a `key_date` key.
+# ---------------------------------------------------------------------------
+
+PRIOR_DAY = dt.date(2026, 9, 11)
+PRIOR_ROOT = ShadowRoot(PRIOR_DAY)
+D17_LIVE_KEY = "staging/daily_closes/2026-09-12.parquet"
+D17_PRIOR_LIVE_KEY = "staging/daily_closes/2026-09-11.parquet"
+
+
+def test_rebased_key_date_key_swaps_exactly_one_date_segment():
+    assert (
+        parity.rebased_key_date_key(D17_LIVE_KEY, TRADING_DAY, PRIOR_DAY) == D17_PRIOR_LIVE_KEY
+    )
+    assert (
+        parity.rebased_key_date_key(D17_PRIOR_LIVE_KEY, PRIOR_DAY, TRADING_DAY) == D17_LIVE_KEY
+    )
+    # `trading_day` does not appear in this key at all — nothing to rewrite.
+    assert parity.rebased_key_date_key("market_data/technicals/latest.json", TRADING_DAY, PRIOR_DAY) is None
+
+
+def test_prior_day_key_date_regrade_reads_inside_the_staging_retention_window():
+    """Both operands of the D-1 re-grade sit under the bucket's `staging/`
+    prefix -- the live key literally, the shadow key because
+    `SHADOW_ROOT_TEMPLATE` is `staging/shadow/{trading_day}/` -- and that
+    prefix expires at 7 days (verified LIVE against the bucket 2026-09-22,
+    `alpha-engine-config-I11360`; see `parity.STAGING_PREFIX_RETENTION_DAYS`).
+    A report for D reads D-1's pair at most a handful of calendar days after
+    it was written; pinned here against the largest gap `previous_trading_day`
+    actually produces across a decade, rather than assumed.
+    """
+    assert D17_PRIOR_LIVE_KEY.startswith("staging/")
+    assert PRIOR_ROOT.key(D17_PRIOR_LIVE_KEY).startswith("staging/")
+
+    from nousergon_lib.trading_calendar import previous_trading_day
+
+    max_gap = 0
+    cursor = dt.date(2020, 1, 2)
+    horizon = dt.date(2030, 1, 1)
+    while cursor < horizon:
+        prior = previous_trading_day(cursor)
+        max_gap = max(max_gap, (cursor - prior).days)
+        cursor += dt.timedelta(days=1)
+    assert max_gap == 4  # measured; a Fri->Tue gap over a Monday holiday
+    assert max_gap < parity.STAGING_PREFIX_RETENTION_DAYS
+
+
+def _daily_closes_report(reader, *, prior_payload_live=None, prior_payload_shadow=None):
+    return parity.run_parity(
+        trading_day=TRADING_DAY,
+        bucket="alpha-engine-research",
+        reader=reader,
+        units=_one_unit("D17"),
+    )
+
+
+def test_key_date_prior_day_pair_matching_reads_settled():
+    d_frame = _parquet(_frame(["AAPL"], [1.0]))
+    prior_frame = _parquet(_frame(["AAPL"], [2.0]))
+    reader = _FakeReader(
+        {
+            D17_LIVE_KEY: d_frame,
+            ROOT.key(D17_LIVE_KEY): d_frame,
+            D17_PRIOR_LIVE_KEY: prior_frame,
+            PRIOR_ROOT.key(D17_PRIOR_LIVE_KEY): prior_frame,
+        }
+    )
+    report = _daily_closes_report(reader)
+    assert report.summary["mismatch"] == 0
+    row = report.rows[0]
+    assert row.key == D17_LIVE_KEY
+    assert row.verdict == "match"  # D's own snapshot is unaffected either way
+    prior = row.body["prior_day_settled"]
+    assert prior == {
+        "date": "2026-09-11",
+        "key": D17_PRIOR_LIVE_KEY,
+        "shadow_key": PRIOR_ROOT.key(D17_PRIOR_LIVE_KEY),
+        "available": True,
+        "verdict": "match",
+        "settled": True,
+        "breaches": 0,
+    }
+
+
+def test_key_date_prior_day_pair_mismatching_reads_unsettled_but_does_not_flip_todays_verdict():
+    d_frame = _parquet(_frame(["AAPL"], [1.0]))
+    prior_live = _parquet(_frame(["AAPL"], [2.0]))
+    prior_shadow = _parquet(_frame(["AAPL"], [2.5]))  # beyond the default tolerance
+    reader = _FakeReader(
+        {
+            D17_LIVE_KEY: d_frame,
+            ROOT.key(D17_LIVE_KEY): d_frame,
+            D17_PRIOR_LIVE_KEY: prior_live,
+            PRIOR_ROOT.key(D17_PRIOR_LIVE_KEY): prior_shadow,
+        }
+    )
+    report = _daily_closes_report(reader)
+    row = report.rows[0]
+    # D's own row is untouched: `summary`/`met` grade D's snapshot only.
+    assert row.verdict == "match"
+    assert report.met is True
+    assert report.summary["total"] == 1
+    prior = row.body["prior_day_settled"]
+    assert prior["available"] is True
+    assert prior["verdict"] == "mismatch"
+    assert prior["settled"] is False
+    assert prior["breaches"] == 1
+
+
+def test_key_date_prior_day_pair_absent_on_both_sides_is_unavailable_not_settled():
+    """No D-1 data at all (e.g. the very first day of the shadow run's
+    history) is a real gap, never a substituted `settled: true`."""
+    d_frame = _parquet(_frame(["AAPL"], [1.0]))
+    reader = _FakeReader({D17_LIVE_KEY: d_frame, ROOT.key(D17_LIVE_KEY): d_frame})
+    report = _daily_closes_report(reader)
+    prior = report.rows[0].body["prior_day_settled"]
+    assert prior["available"] is False
+    assert prior["settled"] is None
+    assert prior["verdict"] == "both_missing"
+    assert "unmeasurable_reason" in prior
+
+
+def test_key_date_prior_day_settled_is_reported_conforming_to_schema():
+    import jsonschema
+
+    d_frame = _parquet(_frame(["AAPL"], [1.0]))
+    prior_frame = _parquet(_frame(["AAPL"], [2.0]))
+    reader = _FakeReader(
+        {
+            D17_LIVE_KEY: d_frame,
+            ROOT.key(D17_LIVE_KEY): d_frame,
+            D17_PRIOR_LIVE_KEY: prior_frame,
+            PRIOR_ROOT.key(D17_PRIOR_LIVE_KEY): prior_frame,
+        }
+    )
+    report = _daily_closes_report(reader)
+    schema = json.loads(
+        (REPO_ROOT / "contracts" / "data_parity_report.schema.json").read_text(encoding="utf-8")
+    )
+    jsonschema.validate(report.as_dict(), schema)
+
+
+def test_grade_prior_day_settled_reads_the_key_date_field_off_todays_rebased_key():
+    """`grade_prior_day_settled` looks at YESTERDAY's report to find keys with
+    a settling_bar, then must look up TODAY's row under the REBASED (D-dated)
+    key for a `key_date` basis -- never yesterday's own key, which today's
+    report never carries as a row of its own."""
+    yesterdays_document = {
+        "keys": [
+            {
+                "key": D17_PRIOR_LIVE_KEY,
+                "settling_bar": {"basis": "key_date", "cells": 3},
+            }
+        ]
+    }
+
+    class _Store:
+        def get_bytes(self, key: str) -> bytes:
+            return json.dumps(yesterdays_document).encode("utf-8")
+
+    todays_row_match = parity.KeyResult(
+        D17_LIVE_KEY, ["D17"], "match", "parquet",
+        {"prior_day_settled": {"date": "2026-09-11", "available": True, "settled": True, "breaches": 0}},
+    )
+    result = parity.grade_prior_day_settled(
+        _Store(), trading_day=TRADING_DAY, prior_day=PRIOR_DAY, rows=[todays_row_match]
+    )
+    assert result["settled"] == 1
+    assert result["unsettled"] == 0
+    assert result["unmeasurable"] == 0
+
+    todays_row_mismatch = parity.KeyResult(
+        D17_LIVE_KEY, ["D17"], "match", "parquet",
+        {"prior_day_settled": {"date": "2026-09-11", "available": True, "settled": False, "breaches": 2}},
+    )
+    result = parity.grade_prior_day_settled(
+        _Store(), trading_day=TRADING_DAY, prior_day=PRIOR_DAY, rows=[todays_row_mismatch]
+    )
+    assert result["unsettled"] == 1
+    assert result["unsettled_examples"][0]["key"] == D17_PRIOR_LIVE_KEY
+
+
+def test_grade_prior_day_settled_names_same_day_snapshot_as_overwritten_in_place():
+    yesterdays_document = {
+        "keys": [
+            {
+                "key": "market_data/technicals/latest.json",
+                "settling_bar": {"basis": "same_day_snapshot", "cells": 5},
+            }
+        ]
+    }
+
+    class _Store:
+        def get_bytes(self, key: str) -> bytes:
+            return json.dumps(yesterdays_document).encode("utf-8")
+
+    result = parity.grade_prior_day_settled(
+        _Store(), trading_day=TRADING_DAY, prior_day=PRIOR_DAY, rows=[]
+    )
+    reasons = result["unmeasurable_reasons"]
+    assert set(reasons) == {"overwritten_in_place"}
+    assert reasons["overwritten_in_place"]["count"] == 1
+
+
+def test_grade_prior_day_settled_no_longer_claims_key_date_can_never_be_regraded():
+    assert "key_date" not in parity._PRIOR_UNMEASURABLE_REASONS["no_prior_row"]
+
+
+def test_cutover_gate_reads_unsettled_prior_day_as_unmet():
+    """Deliverable 3: an unsettled `key_date` D-1 re-grade reads UNMET on the
+    cutover gate's parity clause even when every other count is clean, and
+    the clause detail names it (alpha-engine-config-I11360)."""
+    from data_gate import evidence as ev
+
+    class _Store:
+        uri = "file://test"
+
+        def __init__(self, documents: dict[str, dict]) -> None:
+            self.documents = documents
+
+        def list_keys(self, prefix: str = ""):
+            return [k for k in sorted(self.documents) if k.startswith(prefix)]
+
+        def get_bytes(self, key: str) -> bytes:
+            return json.dumps(self.documents[key]).encode("utf-8")
+
+    document = {
+        "schema_version": "data_parity_report.v2",
+        "trading_day": TRADING_DAY.isoformat(),
+        "generated_at": f"{TRADING_DAY.isoformat()}T23:43:04Z",
+        "met": True,
+        "summary": {"total": 1, "match": 1, "settling_bar_keys": 0},
+        "prior_day_settled": {
+            "trading_day": PRIOR_DAY.isoformat(),
+            "available": True,
+            "keys_with_settling_bar": 1,
+            "settled": 0,
+            "unsettled": 1,
+            "unmeasurable": 0,
+        },
+        "keys": [],
+    }
+    store = _Store({parity.parity_key(TRADING_DAY): document})
+    reading = ev.read_parity(store, trading_day=TRADING_DAY)
+    assert reading.met is False
+    assert "prior_day_settled.unsettled=1" in reading.detail

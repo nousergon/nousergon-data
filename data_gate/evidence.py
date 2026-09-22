@@ -1282,6 +1282,13 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     The report's own `met` is not taken on trust: this reader re-derives the
     exception counts from `summary`, so a report claiming `met: true` while
     carrying unmeasurable rows reads UNMET and says which counts contradict it.
+
+    **`prior_day_settled.unsettled` also reads UNMET** (`alpha-engine-config-
+    I11360`). A `key_date` key's D-1 pair re-grade lives outside `summary` —
+    it grades D-1's bar, not D's — so a report can carry `met: true` and zero
+    exceptions while still naming a producer defect in the previous trading
+    day's data that only this D-1 re-grade could catch. Rolled into `met` and
+    named in `detail` here, never into `summary.mismatch` itself.
     """
     try:
         keys = list(store.list_keys(PARITY_KEY_PREFIX))
@@ -1432,6 +1439,18 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     }
     met = bool(document.get("met")) and total > 0 and matched == total and not exceptions
     mismatch = int(summary.get("mismatch") or 0)
+    # A `key_date` key's D-1 pair re-grade (`alpha-engine-config-I11360`,
+    # deliverable 3) is NOT a row on this report and never touches `summary`
+    # — it grades a DIFFERENT trading day's bar (D-1) than the row it sits
+    # on (D). An unsettled pair is therefore counted here explicitly, on the
+    # SAME footing as a strict mismatch: it means a producer defect in D-1's
+    # published bar survived D-1's own report (settling-forgiven there) and
+    # is now a MEASURED difference, which is exactly what this gate exists to
+    # catch. Never silently rolled into `mismatch` itself — that count is the
+    # report's own per-key verdict tally and stays that.
+    prior_day_settled = document.get("prior_day_settled") or {}
+    prior_unsettled = int(prior_day_settled.get("unsettled") or 0)
+    met = met and prior_unsettled == 0
     # The THREE-WAY split (`alpha-engine-config-I11351` deliverable 3). A
     # settling-only key already grades `match` — its trading-day cells were
     # never breaches — so printing only `match/total` hides which half of the
@@ -1444,6 +1463,13 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     )
     if exceptions:
         detail += "; " + ", ".join(f"{name}={count}" for name, count in sorted(exceptions.items()))
+    if prior_unsettled:
+        detail += (
+            f"; prior_day_settled.unsettled={prior_unsettled} — a key_date key's D-1 pair, "
+            f"forgiven as settling on {prior_day_settled.get('trading_day')}'s report, "
+            "re-graded strictly on this report and still mismatches (alpha-engine-config-I11360); "
+            "read as a mismatch for this gate"
+        )
     if document.get("met") and not met:
         detail += (
             " — the report claims met:true while carrying the exceptions above, so it is "

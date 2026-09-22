@@ -212,7 +212,7 @@
         },
         "unmeasurable_reasons": {
           "type": "object",
-          "description": "Per reason: count, why, and up to ten example keys. A `key_date` or `same_day_snapshot` artifact can never be re-graded this way -- it files each day under its own key, or is overwritten in place -- and that is a property of the artifact, published rather than hidden by a shrinking denominator."
+          "description": "Per reason: count, why, and up to ten example keys. A `same_day_snapshot` artifact is overwritten in place and can never be re-graded this way without a versioned read (`overwritten_in_place`, alpha-engine-config-I11360 deliverable 2) -- a property of the artifact, published rather than hidden by a shrinking denominator. A `key_date` artifact IS re-graded, via each key's own `prior_day_settled` field (alpha-engine-config-I11360); `prior_pair_unreadable` names the rare case where that re-grade itself came back neither match nor mismatch."
         },
         "unsettled_examples": {
           "type": "array"
@@ -472,6 +472,50 @@
             },
             "settled": {
               "type": "boolean"
+            }
+          }
+        },
+        "prior_day_settled": {
+          "type": "object",
+          "description": "This report's STRICT re-grade of the D-1-dated key pair for a `key_date` key -- the whole artifact yesterday's report could only record as settling (alpha-engine-config-I11360). Present only on the CURRENT (D-dated) row for a key whose settling_bar.basis is `key_date`; the D-1 pair itself is read from the live D-1 key and the D-1 SHADOW RUN's own output, never today's shadow root. `data_gate.evidence.SUMMARY_NON_VERDICT_FIELDS` and `ParityReport.summary`/`met` are unaffected by this field -- it never becomes a second row or a second verdict for the D key.",
+          "required": [
+            "date",
+            "available"
+          ],
+          "properties": {
+            "date": {
+              "type": "string",
+              "pattern": "^\\d{4}-\\d{2}-\\d{2}$"
+            },
+            "key": {
+              "type": "string"
+            },
+            "shadow_key": {
+              "type": "string"
+            },
+            "available": {
+              "type": "boolean",
+              "description": "True only when the D-1 pair produced an ordinary strict match/mismatch outcome."
+            },
+            "verdict": {
+              "type": "string",
+              "description": "The underlying KeyResult verdict the D-1 pair graded as (match, mismatch, live_missing, shadow_missing, both_missing, unmeasurable, live_superseded, not_applicable)."
+            },
+            "settled": {
+              "type": [
+                "boolean",
+                "null"
+              ],
+              "description": "true when the D-1 pair matched under the contract's own band, false when it mismatched, null when `available` is false -- never a substituted false for an unmeasured pair."
+            },
+            "breaches": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Present only when `available` is true."
+            },
+            "unmeasurable_reason": {
+              "type": "string",
+              "description": "Present only when `available` is false."
             }
           }
         },

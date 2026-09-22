@@ -61,6 +61,7 @@ __all__ = [
     "PARITY_KEY_TEMPLATE",
     "PARITY_SCHEMA_VERSION",
     "SETTLING_BASES",
+    "STAGING_PREFIX_RETENTION_DAYS",
     "ContractSchema",
     "KeyResult",
     "ParityReport",
@@ -71,6 +72,7 @@ __all__ = [
     "key_names_trading_day",
     "merge_legs",
     "parity_key",
+    "rebased_key_date_key",
     "resolve_contract",
     "run_parity",
     "settling_basis",
@@ -291,6 +293,23 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
 #: coverage stay strict for every row INCLUDING the trading day.
 SETTLING_BASES: frozenset[str] = frozenset({"row_date", "key_date", "same_day_snapshot"})
 
+#: The lifecycle rule both operands of the `key_date` D-1 re-grade sit under
+#: (`alpha-engine-config-I11360`), verified LIVE against the bucket on
+#: 2026-09-22 (`aws s3api get-bucket-lifecycle-configuration --bucket
+#: alpha-engine-research`), not merely read off the IaC declaration:
+#: `expire-staging-after-7-days`, `Filter.Prefix: "staging/"`,
+#: `Expiration.Days: 7`, no narrower override for `staging/shadow/`. The live
+#: key literally sits under `staging/` (`staging/daily_closes/{date}.parquet`);
+#: the shadow key does too, because `shadow.root.SHADOW_ROOT_TEMPLATE` is
+#: `staging/shadow/{trading_day}/` — so BOTH expire together, 7 days after
+#: they were written on D-1. A scheduled report for D reads that pair at most
+#: a few calendar days later (D's own report publishes same-day or the next
+#: morning); `tests/test_shadow_parity.py
+#: ::test_prior_day_key_date_regrade_reads_inside_the_staging_retention_window`
+#: pins the largest observed trading-day gap (4 calendar days, 2020-2029) well
+#: inside this window rather than assuming it.
+STAGING_PREFIX_RETENTION_DAYS = 7
+
 #: An ISO date appearing as a whole path segment or as a filename stem.
 #: `staging/daily_closes/2026-09-21.parquet`, `features/2026-09-21/x.parquet`
 #: and `market_data/eod_closes/2026-09-21.json` all match; a key that merely
@@ -301,6 +320,28 @@ _KEY_DATE_RE = re.compile(r"(?:^|/)(\d{4}-\d{2}-\d{2})(?:/|\.|$)")
 def key_names_trading_day(live_key: str, trading_day: dt.date) -> bool:
     """Whether ``live_key`` names ``trading_day`` as a path segment or stem."""
     return any(found == trading_day.isoformat() for found in _KEY_DATE_RE.findall(live_key))
+
+
+def rebased_key_date_key(key: str, from_date: dt.date, to_date: dt.date) -> str | None:
+    """``key`` with its ``from_date`` path segment swapped for ``to_date``.
+
+    `alpha-engine-config-I11360`. Used in both directions: D's key to D-1's
+    (to fetch the D-1 pair for the re-grade) and D-1's key back to D's (to
+    find, on TODAY's report, the row the re-grade result was attached to,
+    when reading YESTERDAY's report in :func:`grade_prior_day_settled`).
+
+    ``None`` when ``from_date`` does not appear as exactly one whole path
+    segment — never guessed. A `key_date` key is only ever passed here after
+    :func:`key_names_trading_day` already confirmed one match against the
+    matching date, so `None` here means the caller's precondition did not
+    hold, not that no rewrite was possible.
+    """
+    iso = from_date.isoformat()
+    starts = [m.start(1) for m in _KEY_DATE_RE.finditer(key) if m.group(1) == iso]
+    if len(starts) != 1:
+        return None
+    start = starts[0]
+    return key[:start] + to_date.isoformat() + key[start + len(iso) :]
 
 
 def settling_basis(
@@ -1783,6 +1824,137 @@ def _dedupe_rows(rows: list[KeyResult]) -> list[KeyResult]:
     return [merged[name] for name in order]
 
 
+def _prior_day_settled_field(
+    prior_result: "KeyResult", *, prior_day: dt.date, prior_live_key: str, prior_shadow_key: str
+) -> dict[str, Any]:
+    """The per-key `prior_day_settled` block for one `key_date` row's D-1 re-grade.
+
+    ``available`` is true only for an ordinary strict `match`/`mismatch`
+    outcome — a `key_date` artifact whose whole content IS one trading day's
+    bar, so anything else (missing, superseded, itself unmeasurable) is not a
+    settled/unsettled fact about the value cells, and ``settled`` stays
+    ``None`` rather than a substituted ``False`` that would read as a
+    measured breach.
+    """
+    verdict = prior_result.verdict
+    available = verdict in {"match", "mismatch"}
+    field: dict[str, Any] = {
+        "date": prior_day.isoformat(),
+        "key": prior_live_key,
+        "shadow_key": prior_shadow_key,
+        "available": available,
+        "verdict": verdict,
+        "settled": (verdict == "match") if available else None,
+    }
+    if available:
+        breaches = int((prior_result.body.get("values") or {}).get("breaches") or 0)
+        coverage = prior_result.body.get("coverage") or {}
+        if not coverage.get("met", True):
+            breaches += int(coverage.get("missing") or 0)
+        field["breaches"] = breaches
+    else:
+        field["unmeasurable_reason"] = (
+            prior_result.body.get("unmeasurable_reason")
+            or prior_result.body.get("detail")
+            or f"the D-1 pair graded {verdict!r}, which is not a strict match/mismatch outcome"
+        )
+    return field
+
+
+def _attach_key_date_prior_day_settled(
+    rows: list["KeyResult"],
+    *,
+    reader: S3Reader,
+    unit_by_id: dict[str, Unit],
+    trading_day: dt.date,
+    prior_day: dt.date,
+    rel_tolerance: float,
+    absolute_tolerance: float,
+) -> None:
+    """Deliverable 1 of `alpha-engine-config-I11360`.
+
+    For every `key_date` row on report D, additionally read and strictly
+    compare the D-1-dated key pair (live `.../{D-1}...` vs the D-1 SHADOW RUN's
+    own output at `staging/shadow/{D-1}/...` — never today's shadow root,
+    which never touched D-1's data) and record the result under a per-key
+    `prior_day_settled` field, mutating each row's body in place.
+
+    **Chosen over a synthetic row keyed by the D-1 key** (the issue's other
+    named option): a synthetic row would add a member to `ParityReport.rows`
+    that no `writes[]` entry declared for trading day D, inflating
+    `summary.total` and coupling "did D's own snapshot match" to "did D-1's
+    settle" through the same strict `ParityReport.met` — every existing
+    single-trading-day test fixture would need a second day of fixture data
+    or `met` would flip UNMET on a `both_missing` D-1 pair that was never in
+    scope. A per-key field keeps exactly one row per S3 key `expand_writes`
+    actually declared for D, leaves `summary`/`met` computed exactly as
+    before, and still gives the cutover gate a place to read the D-1 verdict
+    from (`data_gate.evidence.read_parity`, deliverable 3).
+
+    `key_date` only: `same_day_snapshot` is overwritten in place and cannot be
+    re-graded without a versioned read (deliverable 2); `row_date` already
+    carries its own history in the SAME row's `prior_day` block.
+    """
+    prior_root = ShadowRoot(prior_day)
+    prior_shadow_manifests = _latest_manifests_by_unit(reader, prior_root.key("data_collection/runs/"))
+    prior_manifest_cache: dict[str, list[dict[str, Any]]] = {}
+
+    def _expected_prior(live_key: str, owners: list[str]) -> dict[str, Any] | None:
+        manifests: list[dict[str, Any]] = []
+        for unit_id in owners:
+            unit = unit_by_id.get(unit_id)
+            if unit is None:
+                continue
+            if unit_id not in prior_manifest_cache:
+                prior_manifest_cache[unit_id] = list(
+                    _latest_manifests_by_unit(
+                        reader, f"{unit.run_manifest_prefix}/{prior_day.isoformat()}/"
+                    ).values()
+                )
+            manifests.extend(prior_manifest_cache[unit_id])
+        return recorded_live_version(manifests, live_key)
+
+    for row in rows:
+        if (row.body.get("settling_bar") or {}).get("basis") != "key_date":
+            continue
+        prior_live_key = rebased_key_date_key(row.key, trading_day, prior_day)
+        if prior_live_key is None:
+            # Unreachable in practice: `settling_bar.basis == "key_date"` is
+            # only ever set (`settling_basis`) after `key_names_trading_day`
+            # already matched `trading_day` as exactly one path segment of
+            # this same key. Recorded rather than silently skipped, because
+            # a mismatch here means that classifier and this rewrite have
+            # drifted apart.
+            row.body["prior_day_settled"] = {
+                "date": prior_day.isoformat(),
+                "available": False,
+                "unmeasurable_reason": (
+                    f"could not locate {trading_day.isoformat()!r} as a single path segment of "
+                    f"{row.key!r} to substitute {prior_day.isoformat()!r} in its place"
+                ),
+            }
+            continue
+        prior_shadow_key = prior_root.key(prior_live_key)
+        prior_result = _compare_one_key(
+            reader,
+            prior_root,
+            prior_live_key,
+            row.unit_ids,
+            rel_tolerance,
+            absolute_tolerance,
+            expected=_expected_prior(prior_live_key, row.unit_ids),
+            trading_day=trading_day,
+            prior_day=None,
+            shadow_manifests=prior_shadow_manifests,
+        )
+        row.body["prior_day_settled"] = _prior_day_settled_field(
+            prior_result,
+            prior_day=prior_day,
+            prior_live_key=prior_live_key,
+            prior_shadow_key=prior_shadow_key,
+        )
+
+
 def run_parity(
     *,
     trading_day: dt.date,
@@ -2043,6 +2215,15 @@ def run_parity(
             )
 
     deduped = _dedupe_rows(rows)
+    _attach_key_date_prior_day_settled(
+        deduped,
+        reader=reader,
+        unit_by_id=unit_by_id,
+        trading_day=trading_day,
+        prior_day=prior_day,
+        rel_tolerance=rel_tolerance,
+        absolute_tolerance=absolute_tolerance,
+    )
     stamp = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0).isoformat()
     return ParityReport(
         trading_day=trading_day,
@@ -2056,7 +2237,9 @@ def run_parity(
         generated_at=stamp.replace("+00:00", "Z"),
         legs=list(legs or []),
         legs_known=dict(legs_known or {}),
-        prior_day_settled=grade_prior_day_settled(store, prior_day=prior_day, rows=deduped),
+        prior_day_settled=grade_prior_day_settled(
+            store, trading_day=trading_day, prior_day=prior_day, rows=deduped
+        ),
     )
 
 
@@ -2070,29 +2253,60 @@ _PRIOR_UNMEASURABLE_REASONS = {
         "or the key is no longer declared"
     ),
     "no_prior_row": (
-        "the key carries no row indexed by the previous trading day, so that day's bar is "
-        "not in this artifact. A `key_date` artifact files each day under its OWN key and a "
-        "`same_day_snapshot` is overwritten in place, so neither can ever be re-graded from "
-        "the next day's report — only a `row_date` artifact (reference/price_cache/*.parquet) "
-        "carries the history that makes the re-grade possible"
+        "the key has a row_date settling basis, but no row indexed by the previous trading "
+        "day is present on EITHER side of this report — the two sides never shared that row "
+        "(e.g. a newly listed or delisted ticker), not a shape this basis cannot re-grade"
     ),
     "row_not_compared": (
         "the key has a row_date settling basis but this report compared no row for the "
         "previous trading day (the two sides did not share that row)"
     ),
+    "overwritten_in_place": (
+        "the key has a same_day_snapshot settling basis — an undated artifact overwritten in "
+        "place — so the previous trading day's bar no longer exists anywhere to re-read. "
+        "Re-grading it would need a versioned read (the S3 VersionId pattern "
+        "`alpha-engine-config-I10892` already uses for `_read_live_as_recorded`); noted as the "
+        "future fix and left, never silently forgiven (alpha-engine-config-I11360 deliverable 2)"
+    ),
+    "prior_pair_unreadable": (
+        "the key has a key_date settling basis and this report DID attempt the D-1 pair "
+        "re-grade (alpha-engine-config-I11360), but that re-grade did not come back a plain "
+        "match/mismatch (missing on one side, superseded, or itself unmeasurable) — see this "
+        "report's own row for the D-dated key, its `prior_day_settled.unmeasurable_reason`, "
+        "for what actually happened"
+    ),
 }
 
 
 def grade_prior_day_settled(
-    store: Any, *, prior_day: dt.date, rows: list[KeyResult]
+    store: Any, *, trading_day: dt.date, prior_day: dt.date, rows: list[KeyResult]
 ) -> dict[str, Any]:
     """Whether yesterday's unsettled bars settled, measured on today's report.
 
-    Deliverable 2 of `alpha-engine-config-I11351`. Yesterday's report names the
-    keys whose trading-day cells could not be graded; on THIS report that same
-    row is an ordinary historical row held to the strict band. The pairing is
-    what turns "we could not measure today's bar" into a measured claim one day
+    Deliverable 2 of `alpha-engine-config-I11351`, extended by
+    `alpha-engine-config-I11360` to `key_date` keys. Yesterday's report names
+    the keys whose trading-day cells could not be graded; on THIS report that
+    day's bar is re-read and held to the strict band. The pairing is what
+    turns "we could not measure today's bar" into a measured claim one day
     later.
+
+    Two different SHAPES carry that re-grade, because a `row_date` key and a
+    `key_date` key disagree on WHERE yesterday's row lives:
+
+    * `row_date` (`reference/price_cache/*.parquet`) carries its own history,
+      so the re-grade sits in `prior_day` on the SAME key's row — looked up
+      here by that exact key string.
+    * `key_date` (`staging/daily_closes/{date}.parquet`,
+      `features/{date}/*.parquet`, `market_data/eod_closes/{date}.json`)
+      files each day under its OWN dated key, so yesterday's key does not
+      exist as a row on today's report at all. The re-grade instead sits in
+      `prior_day_settled` on the row for TODAY's key — `rebased_key_date_key`
+      maps yesterday's key forward to find it
+      (`shadow.parity._attach_key_date_prior_day_settled` populated it).
+
+    `same_day_snapshot` (`market_data/technicals/latest.json` and friends) has
+    neither shape: the artifact is overwritten in place, so it is always
+    `overwritten_in_place`-unmeasurable, by construction.
 
     Never silently empty: with no store handed in, or no report for the
     previous trading day, the block says which, and a key that cannot be
@@ -2120,27 +2334,58 @@ def grade_prior_day_settled(
             "reason": f"{type(exc).__name__}: {exc}",
         }
 
-    settling_yesterday = [
-        str(row.get("key") or "")
+    settling_yesterday_rows = [
+        row
         for row in document.get("keys") or []
         if int((row.get("settling_bar") or {}).get("cells") or 0)
     ]
+    settling_yesterday = [str(row.get("key") or "") for row in settling_yesterday_rows]
+    basis_by_key = {
+        str(row.get("key") or ""): str((row.get("settling_bar") or {}).get("basis") or "")
+        for row in settling_yesterday_rows
+    }
     by_key = {row.key: row for row in rows}
     settled: list[str] = []
     unsettled: list[dict[str, Any]] = []
     unmeasurable: dict[str, list[str]] = {}
     for key in settling_yesterday:
-        row = by_key.get(key)
+        basis = basis_by_key.get(key, "")
+        if basis == "same_day_snapshot":
+            # Never re-graded, whether or not this report happens to carry a
+            # row for the key at all — the artifact is overwritten in place,
+            # a property of the ARTIFACT, not of whether it was in scope
+            # today. Checked before the row lookup so it is never shadowed
+            # by `not_in_this_report`.
+            unmeasurable.setdefault("overwritten_in_place", []).append(key)
+            continue
+        lookup_key = key
+        if basis == "key_date":
+            lookup_key = rebased_key_date_key(key, prior_day, trading_day) or key
+        row = by_key.get(lookup_key)
         if row is None:
             unmeasurable.setdefault("not_in_this_report", []).append(key)
             continue
-        prior = row.body.get("prior_day")
-        if not prior:
-            unmeasurable.setdefault("no_prior_row", []).append(key)
-            continue
-        if not prior.get("rows_compared"):
-            unmeasurable.setdefault("row_not_compared", []).append(key)
-            continue
+        if basis == "key_date":
+            prior = row.body.get("prior_day_settled")
+            if not prior:
+                # `_attach_key_date_prior_day_settled` runs over every
+                # `key_date` row this report has, so an absent field here
+                # means the row itself no longer carries a key_date
+                # settling_bar today (e.g. the contract changed) rather than
+                # a normal unmeasurable outcome.
+                unmeasurable.setdefault("not_in_this_report", []).append(key)
+                continue
+            if not prior.get("available"):
+                unmeasurable.setdefault("prior_pair_unreadable", []).append(key)
+                continue
+        else:
+            prior = row.body.get("prior_day")
+            if not prior:
+                unmeasurable.setdefault("no_prior_row", []).append(key)
+                continue
+            if not prior.get("rows_compared"):
+                unmeasurable.setdefault("row_not_compared", []).append(key)
+                continue
         if prior.get("settled"):
             settled.append(key)
         else:
