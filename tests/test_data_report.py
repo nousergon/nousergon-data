@@ -22,6 +22,7 @@ read out of `spec[True]["schedule"]`.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import json
 import pathlib
@@ -559,3 +560,150 @@ def test_the_tracker_comment_is_posted_before_the_headline_is_rendered(monkeypat
 
     assert delivered == []
     assert "runs/report.daily/2026-09-18/2026-09-21/message.txt" not in store.written
+
+
+# ── alpha-engine-config-I11353: a failed run with no readable log is RED ─────
+#
+# 2026-09-21: three shadow legs failed, every manifest they wrote recorded
+# `log_location: "local:ip-172-31-33-124.ec2.internal:<pid>"` on a host that
+# was terminated minutes later, and nothing anywhere said so. The row below is
+# rendered every day — including the day it is clean, which is what makes its
+# own disappearance visible.
+
+
+class _Unit:
+    """The one property `read_unresolved_logs` reads off a unit descriptor."""
+
+    def __init__(self, unit_id: str) -> None:
+        self.unit_id = unit_id
+        self.run_manifest_prefix = f"data_collection/runs/{unit_id}"
+
+
+_UNITS = [_Unit("D17"), _Unit("D18")]
+_DAY = dt.date(2026, 9, 21)
+
+
+def _manifest(status="failed", log_location="local:ip-172-31-33-124.ec2.internal:4242"):
+    return {
+        "schema_version": "data_run_manifest.v1",
+        "unit_id": "D17",
+        "status": status,
+        "log_location": log_location,
+    }
+
+
+def test_a_failed_run_pointing_at_a_dead_host_is_a_named_finding():
+    store = FakeStore({"runs/D17/2026-09-21/01ABC.json": _manifest()})
+    found, problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert problems == []
+    assert len(found) == 1
+    assert found[0].unit_id == "D17"
+    assert found[0].manifest_key == "runs/D17/2026-09-21/01ABC.json"
+    assert "dies with the box" in found[0].reason
+
+
+def test_a_failed_run_whose_shipped_log_exists_is_not_a_finding():
+    uri = "s3://example-bucket/data_collection/logs/shadow-sameday/2026-09-21/i-x.log"
+    store = FakeStore(
+        {
+            "runs/D17/2026-09-21/01ABC.json": _manifest(log_location=uri),
+            "logs/shadow-sameday/2026-09-21/i-x.log": {"_": "bytes stand in for a log"},
+        }
+    )
+    found, problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert (found, problems) == ([], [])
+
+
+def test_a_manifest_naming_an_s3_key_that_is_not_there_is_a_finding():
+    """The loudest case: the manifest looks resolvable and is not."""
+    uri = "s3://example-bucket/data_collection/logs/shadow-sameday/2026-09-21/i-x.log"
+    store = FakeStore({"runs/D17/2026-09-21/01ABC.json": _manifest(log_location=uri)})
+    found, _problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert len(found) == 1
+    assert "was never shipped" in found[0].reason
+
+
+def test_a_denied_log_read_is_a_finding_and_says_denied():
+    """Absent and denied are different facts with different owners."""
+    uri = "s3://example-bucket/data_collection/logs/w/2026-09-21/i-x.log"
+    store = FakeStore(
+        {"runs/D17/2026-09-21/01ABC.json": _manifest(log_location=uri)},
+        denied={"logs/w/2026-09-21/i-x.log"},
+    )
+    found, _problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert len(found) == 1
+    assert "could not be read" in found[0].reason
+    assert "AccessDenied" in found[0].reason
+
+
+def test_an_ok_run_is_not_checked():
+    store = FakeStore({"runs/D17/2026-09-21/01ABC.json": _manifest(status="ok")})
+    found, _problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert found == []
+
+
+def test_a_listing_failure_is_a_named_problem_not_an_empty_result():
+    class Blind(FakeStore):
+        def list_keys(self, prefix: str = ""):
+            raise RuntimeError("s3 listing exploded")
+
+    found, problems = report_module.read_unresolved_logs(
+        Blind({}), trading_day=_DAY, units=_UNITS
+    )
+    assert found == []
+    assert len(problems) == 2
+    assert "listing failed" in problems[0]
+
+
+def _inputs_with_logs(unresolved=(), problems=()):
+    base = _inputs(_live_shaped_store())
+    return dataclasses.replace(
+        base, unresolved_logs=tuple(unresolved), unresolved_log_problems=tuple(problems)
+    )
+
+
+def test_the_full_update_renders_the_clean_case_as_a_stated_none():
+    """A section that disappears when clean cannot be missed when it vanishes
+    for the wrong reason."""
+    update = report_module.render_full_update(_inputs_with_logs(), now=NOW)
+    assert "### failed runs whose log does not resolve" in update
+    assert "names a log this job could read" in update
+
+
+def test_the_full_update_tables_each_unresolved_log():
+    row = report_module.UnresolvedLog(
+        unit_id="D17",
+        manifest_key="runs/D17/2026-09-21/01ABC.json",
+        log_location="local:ip-172-31-33-124.ec2.internal:4242",
+        reason="the box has not been redeployed",
+    )
+    update = report_module.render_full_update(_inputs_with_logs([row]), now=NOW)
+    assert "runs/D17/2026-09-21/01ABC.json" in update
+    assert "ip-172-31-33-124" in update
+
+
+def test_a_blind_check_renders_BLIND_never_a_clean_row():
+    update = report_module.render_full_update(
+        _inputs_with_logs(problems=["runs/D17/2026-09-21/: listing failed (RuntimeError: x)"]),
+        now=NOW,
+    )
+    assert "BLIND" in update
+    assert "names a log this job could read" not in update
+
+
+def test_the_headline_carries_the_count():
+    row = report_module.UnresolvedLog("D17", "k", "local:x", "why")
+    message = report_module.render_message(
+        _inputs_with_logs([row]), now=NOW, update_url="https://example/u"
+    )
+    assert "1 failed run(s) whose log does not resolve" in message

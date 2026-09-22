@@ -266,9 +266,20 @@ def test_bootstrap_is_the_shared_renderers_output(monkeypatch):
     """alpha-engine-config-I7372 — asserted by containment, never restated."""
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     cmd = index._bootstrap_command(
-        "morning-enrich", "python weekly_collector.py --morning-enrich", "tok"
+        "morning-enrich",
+        "python weekly_collector.py --morning-enrich",
+        "tok",
+        instance_id="i-x",
+        trading_day="2026-09-21",
     )
-    assert _REAL_SPOT_BOOTSTRAP.render_bootstrap(index._bootstrap_spec()) in cmd
+    spec = index._bootstrap_spec(
+        "morning-enrich",
+        run_log=_REAL_SPOT_BOOTSTRAP.RunLog(
+            local_path="/var/log/data-spot-morning-enrich.log",
+            s3_uri=index._run_log_uri("morning-enrich", "2026-09-21", "i-x"),
+        ),
+    )
+    assert _REAL_SPOT_BOOTSTRAP.render_bootstrap(spec) in cmd
     # The silent interpreter fallback this handler carried, and the
     # SSM-liveness watchdog it never had.
     assert "PYTHON_BIN" not in cmd
@@ -319,8 +330,12 @@ def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(m
     assert phase1 < prune
     assert "&&" in cmd[phase1:prune]
     rendered = index._bootstrap_command("weekly-phase-one", cmd, "tok")
-    assert f"{cmd} 2>&1 | tee -a" in rendered
-    assert "rc=${PIPESTATUS[0]}" in rendered
+    assert f"\n{cmd}\nrc=$?" in rendered
+    # No pipe any more: the renderer's run-log block `exec`s this shell's
+    # stdout through tee, so the collector runs unpiped and `$?` IS its own
+    # exit code (alpha-engine-config-I11353).
+    assert "| tee -a" not in rendered.split("_run_log_shipper_loop")[-1]
+    assert "rc=${PIPESTATUS[0]}" not in rendered
 
 
 # ── alpha-engine-config-I11002: D34 (chronic-gap-heal) had no successor ──────
@@ -338,8 +353,12 @@ def test_chronic_gap_heal_is_in_the_allowlist_and_needs_no_trading_day(monkeypat
     assert workload == "chronic-gap-heal"
     assert cmd == "python weekly_collector.py --chronic-gap-heal"
     rendered = index._bootstrap_command("chronic-gap-heal", cmd, "tok")
-    assert f"{cmd} 2>&1 | tee -a" in rendered
-    assert "rc=${PIPESTATUS[0]}" in rendered
+    assert f"\n{cmd}\nrc=$?" in rendered
+    # No pipe any more: the renderer's run-log block `exec`s this shell's
+    # stdout through tee, so the collector runs unpiped and `$?` IS its own
+    # exit code (alpha-engine-config-I11353).
+    assert "| tee -a" not in rendered.split("_run_log_shipper_loop")[-1]
+    assert "rc=${PIPESTATUS[0]}" not in rendered
 
 
 # ── alpha-engine-config-I10778, plan P-11: the pre-cutover shadow run ────────
@@ -390,8 +409,12 @@ def test_shadow_weekday_renders_the_four_shadow_runs_then_parity_in_order(monkey
     assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL" in cmd
 
     rendered = index._bootstrap_command("shadow-weekday", cmd, "tok")
-    assert f"{cmd} 2>&1 | tee -a" in rendered
-    assert "rc=${PIPESTATUS[0]}" in rendered
+    assert f"\n{cmd}\nrc=$?" in rendered
+    # No pipe any more: the renderer's run-log block `exec`s this shell's
+    # stdout through tee, so the collector runs unpiped and `$?` IS its own
+    # exit code (alpha-engine-config-I11353).
+    assert "| tee -a" not in rendered.split("_run_log_shipper_loop")[-1]
+    assert "rc=${PIPESTATUS[0]}" not in rendered
 
 
 def _every_resolved_workload(index):
@@ -417,7 +440,7 @@ def test_every_workload_boot_installs_gitleaks_and_gates_on_dlp_preflight(monkey
         preflight = rendered.index("python -m krepis.session_dlp preflight || fail")
         installed = rendered.index('command -v gitleaks >/dev/null 2>&1 || fail')
         venv = rendered.index("source .venv/bin/activate")
-        run = rendered.index(f"{cmd} 2>&1 | tee -a")
+        run = rendered.index(f"\n{cmd}\nrc=$?")
         assert venv < installed < preflight < run, workload
         assert "KREPIS_DLP_DISABLED" not in rendered
 
@@ -1154,8 +1177,12 @@ def test_standalone_comparator_renders_the_requested_trading_day(monkeypatch, wo
     assert cmd == expected
     assert "{trading_day}" not in cmd
     rendered = index._bootstrap_command(workload, cmd, "tok")
-    assert f"{cmd} 2>&1 | tee -a" in rendered
-    assert "rc=${PIPESTATUS[0]}" in rendered
+    assert f"\n{cmd}\nrc=$?" in rendered
+    # No pipe any more: the renderer's run-log block `exec`s this shell's
+    # stdout through tee, so the collector runs unpiped and `$?` IS its own
+    # exit code (alpha-engine-config-I11353).
+    assert "| tee -a" not in rendered.split("_run_log_shipper_loop")[-1]
+    assert "rc=${PIPESTATUS[0]}" not in rendered
 
 
 @pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
@@ -1191,3 +1218,109 @@ def test_standalone_comparator_writes_no_live_key(monkeypatch, workload):
     assert "market_data" not in cmd
     assert cmd.count("s3://") == 1
     assert "--store s3://alpha-engine-research/data_collection" in cmd
+
+
+# ── alpha-engine-config-I11353: the run log outlives the box ─────────────────
+#
+# The 2026-09-21 shadow-sameday box wrote 1,025,054 bytes to the SSM CloudWatch
+# stream and the stream STOPPED there — three minutes into a 73-minute run,
+# before all three of the leg failures it was being read for. The box's log then
+# died with the instance, and every run manifest recorded
+# `log_location: local:ip-172-31-33-124.ec2.internal:<pid>`, a host that no
+# longer exists. These tests pin the four properties that end that class.
+
+
+def _rendered(index, workload="shadow-sameday", instance_id="i-09e64cb257b556b82",
+              trading_day="2026-09-21"):
+    _w, cmd = index._resolve_workload({"workload": workload})
+    return cmd, index._bootstrap_command(
+        workload, cmd, "tok", instance_id=instance_id, trading_day=trading_day
+    )
+
+
+def test_run_log_key_is_workload_trading_day_and_instance(monkeypatch):
+    """One key per box per trading day, addressable from the manifest alone."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    expected = (
+        "s3://alpha-engine-research/data_collection/logs/"
+        "shadow-sameday/2026-09-21/i-09e64cb257b556b82.log"
+    )
+    assert index._run_log_uri("shadow-sameday", "2026-09-21", "i-09e64cb257b556b82") == expected
+    _cmd, rendered = _rendered(index)
+    assert expected in rendered
+
+
+def test_the_manifest_writer_is_told_the_same_key_the_shipper_writes(monkeypatch):
+    """ONE literal, exported and shipped to. A manifest that names a key the
+    shipper did not write is worse than `local:` — it reads as resolvable."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    uri = index._run_log_uri("shadow-sameday", "2026-09-21", "i-09e64cb257b556b82")
+    _cmd, rendered = _rendered(index)
+    assert f"{index.RUN_LOG_ENV}={uri}" in rendered
+    # The writer's half of the same contract is asserted by
+    # tests/test_run_log_shipping_i11353.py, which can import run_units —
+    # this module stubs nousergon_lib, so run_units is unimportable here.
+    assert index.RUN_LOG_ENV == "ALPHA_ENGINE_RUN_LOG_S3"
+
+
+def test_every_workload_ships_its_log_on_exit_failure_and_sigterm(monkeypatch):
+    """The trap covers all three paths, on EVERY workload — a clean finish, a
+    non-zero exit, and the SIGTERM the spot hard-timeout unit sends."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    for workload, cmd in _every_resolved_workload(index):
+        rendered = index._bootstrap_command(
+            workload, cmd, "tok", instance_id="i-x", trading_day="2026-09-21"
+        )
+        # Fires on success AND failure: the ship is unconditional inside the
+        # EXIT trap, and only the `fail` branch is conditional on rc.
+        assert "trap 'rc=$?; _ship_if_available; [ \"$rc\" -eq 0 ] || fail" in rendered, workload
+        # The renderer's own signal trap — a spot reclaim or the hard-timeout
+        # unit's SIGTERM ships before the shell dies.
+        assert "trap '_stop_run_log_shipper; _ship_run_log' TERM INT" in rendered, workload
+        # And periodically, so a SIGKILL still leaves at most one interval.
+        assert "_run_log_shipper_loop &" in rendered, workload
+        # `fail` itself ships too, for the `|| fail` call sites that clear the
+        # EXIT trap before shutting the box down.
+        assert 'fail() { trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; _ship_if_available;' in rendered, workload
+        assert "set -uo pipefail" in rendered, workload
+
+
+def test_the_whole_script_is_captured_not_only_the_collector(monkeypatch):
+    """`exec > >(tee …)` before the workload, so provisioning, the DLP gate and
+    the collector all land in one object. The old form tee'd the collector
+    alone, so a failure in the venv build left nothing durable at all."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    _cmd, rendered = _rendered(index)
+    exec_at = rendered.index("exec > >(tee -a /var/log/data-spot-shadow-sameday.log)")
+    venv_at = rendered.index("python3.12 -m venv .venv")
+    assert exec_at < venv_at
+
+
+def test_a_spec_with_no_run_log_exports_nothing_and_keeps_local(monkeypatch):
+    """`local:` stays the honest answer when no log is being shipped — the
+    daily report renders that as a detection gap, never as fine."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    spec = index._bootstrap_spec("morning-enrich")
+    assert spec.run_log is None
+    assert index.RUN_LOG_ENV not in spec.exports
+
+
+def test_the_dispatch_result_names_the_log(monkeypatch):
+    """A failed execution's history must NAME the log, not leave a reader to
+    reconstruct the key from an instance id and a guess at the partition."""
+    index, ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-0abc")
+    monkeypatch.setattr(index, "_wait_ssm_online", lambda iid: None)
+    monkeypatch.setattr(index, "_run_log_trading_day", lambda declared=None: "2026-09-21")
+    out = index.handler({"workload": "morning-enrich"}, None)["data_spot"]
+    assert out["log_location"] == (
+        "s3://alpha-engine-research/data_collection/logs/"
+        "morning-enrich/2026-09-21/i-0abc.log"
+    )
+    assert out["log_location"] in ssm.sent[-1]["Parameters"]["commands"][0]
+
+
+def test_the_trading_day_partition_prefers_the_declared_day(monkeypatch):
+    """A templated workload files its log under the day it is replaying, not
+    under the day the box happened to boot."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert index._run_log_trading_day("2026-09-14") == "2026-09-14"

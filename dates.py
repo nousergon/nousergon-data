@@ -34,6 +34,8 @@ from __future__ import annotations
 import logging
 from datetime import datetime, timezone
 
+from nousergon_lib.guard_mode import GuardMode, GuardStaging
+
 log = logging.getLogger(__name__)
 
 
@@ -256,3 +258,188 @@ def assert_no_bar_after(
         "publish a later (possibly pre-close) session — see "
         "alpha-engine-config-I10893."
     )
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11354 — the bar for D is not final when D's session
+# ends.
+#
+# `assert_no_bar_after` above bounds a series on the DATE axis: nothing later
+# than D may be published for a run serving D. It says nothing about the CLOCK
+# — a run for D that fetches D's own bar six minutes after the 16:00 ET close
+# passes it and still publishes an unsettled number.
+#
+# Measured 2026-09-21 (`s3://alpha-engine-research/data_collection/parity/
+# 2026-09-21.json`, one trading day, 920 of 920 price-cache files):
+#
+#   * v1's postclose data stage fetched D's bar at 16:06 ET. Refetched at
+#     18:41 ET, `Volume` differed on 920/920 files (median 20.5 % short, p90
+#     36.0 %, max 62.3 %, and NEVER high) and `Close` on 442/920 (median
+#     2.7 bps, p90 6.4 bps, max 16.4 bps). Every breach was on D's own row;
+#     all 2,512 earlier rows agreed inside 1e-4.
+#   * The 18:41 ET bar was then checked against a third fetch at 22:36 ET on a
+#     30-ticker sample: `Close` identical on 30/30 to the last printed digit.
+#     `Volume` still moved (median 0.9 %, max 13.2 %).
+#
+# So: the official closing print is FINAL well before 18:15 ET, and
+# consolidated volume is not final that evening at all. This module grades the
+# price axis, which is what every feature, technical and trading decision
+# depends on. A same-evening volume is provisional by construction and is not
+# something a later cron fixes.
+# ---------------------------------------------------------------------------
+
+#: The ET wall-clock time from which day D's official closing print is treated
+#: as final. Declared, not inferred.
+#:
+#: **Evidence is ONE trading day** (2026-09-21): 16:06 ET unsettled, 18:41 ET
+#: settled on `Close`. 18:15 is the conservative point inside that bracket —
+#: the consolidated tape is final by ~17:30 ET and the vendor publishes the
+#: official close by then. The 3-day sample at 16:45 / 17:30 / 18:15 / 18:45
+#: that would turn a one-day bracket into a measured threshold is tracked as
+#: `alpha-engine-config-I11356`; until it lands this constant is a stated
+#: assumption, not a measurement.
+SETTLED_AFTER_ET = "18:15"
+
+#: The exchange clock every settlement judgement is made on. Never UTC: the
+#: 18:15 boundary is an exchange-local fact and moves with US DST.
+_SETTLEMENT_TZ = "America/New_York"
+
+#: Verdict vocabulary for :func:`bar_settlement`. Closed on purpose — a third
+#: value would have to mean something to every manifest reader.
+BAR_SETTLED = "settled"
+BAR_PROVISIONAL = "provisional"
+
+
+def bar_settlement(
+    fetched_at_utc: "datetime | str", trading_day: "date | datetime | str",
+) -> str:
+    """Was day ``trading_day``'s bar already settled when it was fetched?
+
+    Returns :data:`BAR_SETTLED` (``"settled"``) when ``fetched_at_utc`` falls
+    at or after :data:`SETTLED_AFTER_ET` on ``trading_day`` in
+    ``America/New_York`` — including any moment on a LATER calendar day, which
+    is the backfill / rerun case. Returns :data:`BAR_PROVISIONAL`
+    (``"provisional"``) otherwise, which covers both the postclose window
+    (after the 16:00 ET close, before the print settles) and a fetch made
+    before the session has even closed.
+
+    This is a GRADER, not a guard: it never raises and never trims. The verdict
+    rides on the run manifest (`alpha-engine-config-I11354`, observe mode) so a
+    consumer can tell an unsettled artifact from a settled one, and so a
+    promotion to enforce has a count of clean cycles behind it rather than an
+    argument.
+
+    Args:
+        fetched_at_utc: when the vendor fetch for this run began. A naive
+            ``datetime`` is read as UTC (consistent with the rest of this
+            module); an ISO string is parsed, with a trailing ``Z`` accepted.
+        trading_day: the session the artifact is keyed on.
+
+    Raises:
+        ValueError: on an unparseable ``fetched_at_utc``. A run that cannot say
+            WHEN it fetched must not be graded ``settled`` by default — this is
+            a producer repo and a silent ``provisional`` would be a fabricated
+            reading, not a degraded one.
+    """
+    from datetime import time as _time
+    from zoneinfo import ZoneInfo
+
+    if isinstance(fetched_at_utc, str):
+        raw = fetched_at_utc.strip()
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        moment = datetime.fromisoformat(raw)
+    elif isinstance(fetched_at_utc, datetime):
+        moment = fetched_at_utc
+    else:
+        raise ValueError(
+            f"bar_settlement: fetched_at_utc must be a datetime or an ISO "
+            f"string, got {type(fetched_at_utc)!r}"
+        )
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+
+    d = as_trading_day(trading_day)
+    local = moment.astimezone(ZoneInfo(_SETTLEMENT_TZ))
+    hh, mm = (int(part) for part in SETTLED_AFTER_ET.split(":"))
+    if local.date() > d:
+        return BAR_SETTLED
+    if local.date() < d:
+        return BAR_PROVISIONAL
+    return BAR_SETTLED if local.timetz().replace(tzinfo=None) >= _time(hh, mm) else BAR_PROVISIONAL
+
+
+#: Observe-mode staging for the ``bar_settlement`` reading
+#: (`sf-pipeline-policy.md` §7a). It ships OBSERVE because promoting it to
+#: ENFORCE today would refuse every D03/D19 write the 16:45 ET
+#: `data-collection-eod` schedule makes — i.e. it would halt the fleet's EOD
+#: collection rather than report on it. Moving that schedule is a pipeline-
+#: timing decision reserved to Brian; this guard is the measurement he rules
+#: from.
+BAR_SETTLEMENT_GUARD = GuardStaging(
+    name="bar_settlement",
+    mode=GuardMode.OBSERVE,
+    promotion_criterion=(
+        "The standalone postclose schedule fetches at or after "
+        f"{SETTLED_AFTER_ET} ET (Brian's ruling on alpha-engine-config-I11354), "
+        "AND 10 consecutive scheduled D03+D19 runs record verdict='settled', "
+        "AND the 3-day settlement-time sample (alpha-engine-config-I11356) "
+        f"confirms {SETTLED_AFTER_ET} ET rather than the one-day 2026-09-21 "
+        "bracket this threshold currently rests on."
+    ),
+    tracked_issue="alpha-engine-config-I11354",
+)
+
+
+def bar_settlement_guard_entry(
+    fetched_at_utc: "datetime | str",
+    trading_day: "date | datetime | str",
+    *,
+    key: str | None = None,
+) -> dict:
+    """One ``result["guards"]`` entry carrying this run's settlement verdict.
+
+    Shaped for ``weekly_collector._record_collector_guards``, the generic hook
+    that folds a collector's self-graded readings onto its run manifest — so
+    recording this needs no change to ``run_units.py`` or to the manifest
+    writer, only a ``guards`` key on the collector's result dict.
+
+    ``value`` is the fetch moment's ET clock as a float hour (``18.25`` for
+    18:15 ET) and ``baseline`` is :data:`SETTLED_AFTER_ET` in the same unit, so
+    the console can render the margin without re-parsing the detail string.
+    """
+    from zoneinfo import ZoneInfo
+
+    verdict = bar_settlement(fetched_at_utc, trading_day)
+    moment = fetched_at_utc
+    if isinstance(moment, str):
+        raw = moment.strip()
+        if raw.endswith(("Z", "z")):
+            raw = raw[:-1] + "+00:00"
+        moment = datetime.fromisoformat(raw)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    local = moment.astimezone(ZoneInfo(_SETTLEMENT_TZ))
+    hh, mm = (int(part) for part in SETTLED_AFTER_ET.split(":"))
+    return {
+        "guard": BAR_SETTLEMENT_GUARD.name,
+        "mode": BAR_SETTLEMENT_GUARD.mode.value,
+        "verdict": verdict,
+        "detail": (
+            f"fetch for trading_day {as_trading_day(trading_day).isoformat()} began "
+            f"{local.isoformat()} ({local.tzname()}); settlement threshold "
+            f"{SETTLED_AFTER_ET} ET. Verdict {verdict}. "
+            + (
+                "The official closing print is final at this hour."
+                if verdict == BAR_SETTLED
+                else "Close may still move (measured 2026-09-21: median 2.7 bps, "
+                     "max 16.4 bps between a 16:06 ET and an 18:41 ET fetch) and "
+                     "Volume is short (median 20.5 %, max 62.3 %, never high)."
+            )
+            + " Consolidated Volume is NOT final at any evening hour — see "
+              "alpha-engine-config-I11354."
+        ),
+        "key": key,
+        "value": round(local.hour + local.minute / 60 + local.second / 3600, 4),
+        "baseline": round(hh + mm / 60, 4),
+    }

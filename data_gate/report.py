@@ -89,10 +89,12 @@ __all__ = [
     "ROLLING_ISSUE_TITLE",
     "STALE_AFTER",
     "UndeliveredError",
+    "UnresolvedLog",
     "deliver",
     "manifest_key",
     "previous_trading_day",
     "read_inputs",
+    "read_unresolved_logs",
     "render_full_update",
     "render_history_body",
     "render_message",
@@ -344,6 +346,13 @@ class DataReportInputs:
     history_absent: dict[str, str]
     staleness_line: str | None
     console_url: str | None
+    #: Non-ok run manifests of :attr:`trading_day` whose `log_location` does
+    #: not resolve to a readable object (alpha-engine-config-I11353). EMPTY is
+    #: a real, reportable answer — rendered as a stated "none", never omitted.
+    unresolved_logs: tuple[UnresolvedLog, ...] = ()
+    #: Why the check above could not be completed, per prefix. A blind check
+    #: renders as BLIND, never as a clean row.
+    unresolved_log_problems: tuple[str, ...] = ()
 
 
 def read_inputs(
@@ -366,6 +375,14 @@ def read_inputs(
     """
     moment = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
     reads = _JsonReads(store)
+
+    # Deliberately NOT wrapped in a try/except that would let the whole check
+    # vanish: `read_unresolved_logs` already returns its own failures as named
+    # problems, and an exception escaping it is a defect this report should
+    # fail on rather than deliver around.
+    unresolved_logs, unresolved_log_problems = read_unresolved_logs(
+        store, trading_day=trading_day
+    )
 
     ladder = read_required(reads, LADDER_KEY)
     board = read_required(reads, BOARD_KEY)
@@ -449,7 +466,119 @@ def read_inputs(
             label="gates/ladder.json",
         ),
         console_url=console_url,
+        unresolved_logs=tuple(unresolved_logs),
+        unresolved_log_problems=tuple(unresolved_log_problems),
     )
+
+
+# ── detection gap: a failed run whose log cannot be read ────────────────────
+#
+# `alpha-engine-config-I11353`. On 2026-09-21 three shadow legs failed and
+# every manifest they wrote recorded `log_location:
+# "local:ip-172-31-33-124.ec2.internal:<pid>"` — a host terminated minutes
+# later. Nothing anywhere said so. A failed run whose log cannot be read is not
+# an absence, it is a hole in the recording surface, and principle 7 forbids
+# rendering it as nothing: it gets a NAMED row on the daily report, every day,
+# until it resolves.
+#
+# The check is deliberately over NON-OK manifests only. A successful run whose
+# log went nowhere is a smaller defect and would drown this row in volume on
+# the day the fix ships but the boxes have not yet been redeployed.
+
+#: What the log_location of a shipped run looks like, relative to the store.
+LOG_PREFIX = "logs/"
+
+
+@dataclass(frozen=True)
+class UnresolvedLog:
+    """One non-ok run manifest whose ``log_location`` does not resolve."""
+
+    unit_id: str
+    manifest_key: str
+    log_location: str
+    reason: str
+
+
+def _resolve_log(store: Any, log_location: str, store_uri: str) -> str | None:
+    """``None`` when the log resolves; otherwise WHY it does not.
+
+    Three distinct answers, because they have three different owners: a
+    `local:`/`cloudwatch:` location is a box running code that predates the
+    shipper (a deploy gap), a `s3://` location outside this store is a
+    misconfiguration, and a key inside the store that is not there is a
+    shipper failure.
+    """
+    if not log_location:
+        return "the manifest declares no log_location at all"
+    if not log_location.startswith("s3://"):
+        scheme = log_location.split(":", 1)[0]
+        return (
+            f"`{log_location}` is a {scheme}: location, which dies with the box "
+            "(or is capped) — the box has not been redeployed with the S3 run-log "
+            "shipper (alpha-engine-config-I11353)"
+        )
+    base = (store_uri or "").rstrip("/") + "/"
+    if not log_location.startswith(base):
+        return (
+            f"`{log_location}` is outside this store ({base}) — this report can "
+            "neither confirm nor deny it, which is not the same as it being there"
+        )
+    key = log_location[len(base) :]
+    try:
+        store.get_bytes(key)
+    except (FileNotFoundError, KeyError):
+        return f"`{log_location}` does not exist — the run log was never shipped"
+    except Exception as exc:  # noqa: BLE001 — a denial is a finding, not an absence
+        return f"`{log_location}` could not be read: {type(exc).__name__}: {exc}"
+    return None
+
+
+def read_unresolved_logs(
+    store: Any, *, trading_day: dt.date, units: Any = None
+) -> tuple[list[UnresolvedLog], list[str]]:
+    """Every non-ok run manifest of ``trading_day`` whose log does not resolve.
+
+    Returns ``(findings, problems)``. ``problems`` carries listing/parse
+    failures by name: this check going blind must not read as it having found
+    nothing, which is the same conflation it exists to end one level up.
+
+    Lists per unit prefix, the way `data_gate.evidence.manifests_since` does —
+    one bounded listing per unit per day rather than a walk of the whole
+    `runs/` tree, whose size grows without bound.
+    """
+    from data_gate.descriptors import load_units  # noqa: PLC0415 — lazy, like the rest of this module
+    from data_gate.evidence import _store_relative  # noqa: PLC0415
+
+    findings: list[UnresolvedLog] = []
+    problems: list[str] = []
+    store_uri = str(getattr(store, "uri", "") or "")
+    day = trading_day.isoformat()
+    for unit in units if units is not None else load_units():
+        base = f"{_store_relative(unit.run_manifest_prefix)}/{day}/"
+        try:
+            keys = [k for k in store.list_keys(base) if k.endswith(".json")]
+        except Exception as exc:  # noqa: BLE001 — named, never swallowed
+            problems.append(f"{base}: listing failed ({type(exc).__name__}: {exc})")
+            continue
+        for key in sorted(keys):
+            try:
+                doc = json.loads(store.get_bytes(key))
+            except Exception as exc:  # noqa: BLE001 — named, never swallowed
+                problems.append(f"{key}: unreadable ({type(exc).__name__}: {exc})")
+                continue
+            if not isinstance(doc, dict) or doc.get("status") == "ok":
+                continue
+            why = _resolve_log(store, str(doc.get("log_location") or ""), store_uri)
+            if why is not None:
+                findings.append(
+                    UnresolvedLog(
+                        unit_id=str(doc.get("unit_id") or unit.unit_id),
+                        manifest_key=key,
+                        log_location=str(doc.get("log_location") or ""),
+                        reason=why,
+                    )
+                )
+    return findings, problems
 
 
 def _read_reason(read: Read) -> str:
@@ -563,6 +692,33 @@ def render_full_update(inputs: DataReportInputs, *, now: dt.datetime) -> str:
         for row in standing_rows:
             lines.append(f"- **{row.get('state', '?')}** `{row.get('clause', '?')}`: {row.get('detail', '')}")
 
+    # `alpha-engine-config-I11353`. A failed run whose log cannot be read is a
+    # hole in the recording surface, and it is rendered EVERY day — including
+    # the day it is clean, which is what makes the row's own absence visible.
+    lines += ["", "### failed runs whose log does not resolve", ""]
+    if inputs.unresolved_log_problems:
+        lines.append(
+            "- **BLIND: this check could not be completed — "
+            + "; ".join(inputs.unresolved_log_problems[:4])
+            + "**"
+        )
+    if inputs.unresolved_logs:
+        lines += ["| unit | manifest | log_location | why |", "| --- | --- | --- | --- |"]
+        for row in inputs.unresolved_logs:
+            lines.append(
+                "| {} | `{}` | `{}` | {} |".format(
+                    _md_cell(row.unit_id),
+                    _md_cell(row.manifest_key),
+                    _md_cell(row.log_location or "(none)"),
+                    _md_cell(row.reason),
+                )
+            )
+    elif not inputs.unresolved_log_problems:
+        lines.append(
+            f"- none — every non-ok run manifest under `runs/*/{inputs.trading_day.isoformat()}/` "
+            "names a log this job could read"
+        )
+
     lines += ["", "### what moved since the previous dated reading", ""]
     if inputs.moved_absent:
         lines.append(f"- **{inputs.moved_absent}**")
@@ -636,6 +792,19 @@ def render_message(inputs: DataReportInputs, *, now: dt.datetime, update_url: st
 
     for gate, reason in sorted(inputs.history_absent.items()):
         lines.append(escape(f"ABSENT: {gate} — {reason}"))
+
+    # `alpha-engine-config-I11353`. A COUNT in the headline, the rows in the
+    # full update — but never silence: a failed run nobody can post-mortem is
+    # exactly the thing a reader must learn without opening anything.
+    if inputs.unresolved_log_problems:
+        lines.append(escape("BLIND: the failed-run log check could not be completed"))
+    elif inputs.unresolved_logs:
+        lines.append(
+            escape(
+                f"{len(inputs.unresolved_logs)} failed run(s) whose log does not resolve "
+                "— not post-mortemable"
+            )
+        )
 
     lines.append(f'<a href="{escape(update_url)}">full update</a>')
     console = _console_link(inputs)

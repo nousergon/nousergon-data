@@ -59,7 +59,7 @@ import uuid
 
 import boto3
 from krepis import alerts
-from krepis.spot_bootstrap import SpotBootstrapSpec, render_bootstrap
+from krepis.spot_bootstrap import RunLog, SpotBootstrapSpec, render_bootstrap
 from nousergon_lib import ec2_spot
 from nousergon_lib.ec2_spot import SpotCapacityExhausted, SpotQuotaExceededError
 
@@ -1051,7 +1051,11 @@ def _completion_check(event: dict, s3_client=None) -> dict:
     }
 
 
-def _bootstrap_spec(workload: "str | None" = None) -> SpotBootstrapSpec:
+def _bootstrap_spec(
+    workload: "str | None" = None,
+    *,
+    run_log: "RunLog | None" = None,
+) -> SpotBootstrapSpec:
     """The part of this box's provisioning krepis renders.
 
     ``nousergon-data`` is public and was already cloned from a plain URL, so
@@ -1059,8 +1063,24 @@ def _bootstrap_spec(workload: "str | None" = None) -> SpotBootstrapSpec:
     the tail, where the PAT is read on the BOX from SSM — the renderer bakes
     URLs in as launcher-side literals, so expressing that clone here would
     mean this Lambda reading the secret and embedding it in an SSM document.
+
+    ``run_log`` (alpha-engine-config-I11353) turns on the renderer's own
+    whole-script capture: ``exec > >(tee -a …)`` over every line this script
+    and its children emit, a background shipper pushing to the SAME key every
+    60 s, a flush-before-read on the final copy, and a ``TERM``/``INT`` trap.
+    This dispatcher used to hand-roll a strictly weaker version of all four —
+    the collector's output only, one copy at exit, no periodic push, and no
+    signal trap — which is why the 2026-09-21 box lost 70 of its 73 minutes.
+    The shared primitive is used rather than the local copy improved, per the
+    fleet's mirror-don't-fork rule.
     """
+    # The manifest writer's log_location, from the SAME literal the shipper
+    # writes to. Absent (a spec rendered with no run log) the writer keeps
+    # `local:`, which the daily report counts as a detection gap rather than
+    # rendering as fine — never silently.
+    run_log_exports = {RUN_LOG_ENV: run_log.s3_uri} if run_log is not None else {}
     return SpotBootstrapSpec(
+        run_log=run_log,
         repo_url=f"https://github.com/{DATA_REPO}.git",
         checkout="/home/ec2-user/alpha-engine-data",
         branch=DATA_BRANCH,
@@ -1102,21 +1122,82 @@ def _bootstrap_spec(workload: "str | None" = None) -> SpotBootstrapSpec:
             "KREPIS_APPCONFIG_ENVIRONMENT": os.environ.get(
                 "DATA_SPOT_APPCONFIG_ENVIRONMENT", "production"
             ),
+            **run_log_exports,
         },
     )
 
 
-def _bootstrap_command(workload: str, collector_cmd: str, run_token: str) -> str:
+#: Bucket + prefix the box's whole run log lands under
+#: (alpha-engine-config-I11353). It is under ``data_collection/`` and NOT the
+#: historical ``_ssm_logs/`` tree on purpose: the run manifests this log is the
+#: evidence for live at ``data_collection/runs/…``, and the daily report's
+#: log-resolution row (`data_gate.report`) lists one prefix, not two.
+RUN_LOG_BUCKET = os.environ.get("DATA_COLLECTION_RUN_LOG_BUCKET", "alpha-engine-research")
+RUN_LOG_PREFIX = os.environ.get("DATA_COLLECTION_RUN_LOG_PREFIX", "data_collection/logs")
+
+#: The env var the box exports and ``run_units.resolve_log_location()`` reads,
+#: so every manifest the run writes points at the object this same launch
+#: named. ONE literal, computed launcher-side, used for the key AND for the
+#: variable — the manifest cannot name a key the shipper did not write.
+RUN_LOG_ENV = "ALPHA_ENGINE_RUN_LOG_S3"
+
+
+def _run_log_trading_day(declared: "str | None" = None) -> str:
+    """The trading day this run's log is filed under.
+
+    ``declared`` is ``event["trading_day"]`` for the workloads that carry one.
+    Otherwise this resolves the last CLOSED NYSE session through the same
+    ``nousergon_lib.dates.now_dual()`` chokepoint ``dates.default_run_date()``
+    uses on the box, so a 07:45 ET morning launch files under the previous
+    session and an 18:30 ET same-day launch files under today — matching what
+    the collector itself keys its manifests by.
+
+    Falls back to the UTC calendar date rather than raising: a log that lands
+    one partition off is recoverable, a launch refused over a log path is not.
+    """
+    if declared:
+        return declared
+    try:
+        from nousergon_lib.dates import now_dual
+
+        return str(now_dual().trading_day)
+    except Exception as exc:  # noqa: BLE001 — a log path must never block a launch
+        import datetime as _dt
+
+        fallback = _dt.datetime.now(_dt.timezone.utc).date().isoformat()
+        logger.warning(
+            "run-log trading day: now_dual() unavailable (%s) — filing under the UTC date %s",
+            exc,
+            fallback,
+        )
+        return fallback
+
+
+def _run_log_uri(workload: str, trading_day: str, instance_id: str) -> str:
+    """``s3://…/data_collection/logs/{workload}/{trading_day}/{instance_id}.log``."""
+    return (
+        f"s3://{RUN_LOG_BUCKET}/{RUN_LOG_PREFIX}/{workload}/{trading_day}/{instance_id}.log"
+    )
+
+
+def _bootstrap_command(
+    workload: str,
+    collector_cmd: str,
+    run_token: str,
+    *,
+    instance_id: str = "unknown-instance",
+    trading_day: "str | None" = None,
+) -> str:
     """The async SSM RunShellScript body: install runtime, clone alpha-engine-data
     + alpha-engine-config (private config.yaml), build the venv, run the collector,
     self-terminate.
 
     Runs as root on the box. Composed (alpha-engine-config-I7372) as a PRELUDE
-    this Lambda owns (tee'd log, ``fail()``, EXIT trap), then
-    ``krepis.spot_bootstrap.render_bootstrap()`` (watchdog unit, hard-timeout
-    timer, interpreter, public clone), then a TAIL (private config clone, venv,
-    the collector run). It used to render all of it inline and carried its own
-    copy of the silent interpreter fallback
+    this Lambda owns (``fail()``, EXIT trap), then
+    ``krepis.spot_bootstrap.render_bootstrap()`` (run-log capture + shipper,
+    watchdog unit, hard-timeout timer, interpreter, public clone), then a TAIL
+    (private config clone, venv, the collector run). It used to render all of
+    it inline and carried its own copy of the silent interpreter fallback
     (``command -v python3.12 ... || PYTHON_BIN=python3``) plus a hand-written
     timer and no SSM-liveness watchdog — invisible to the fleet's Bash-only
     fork scanner because this is a ``.py`` file.
@@ -1125,16 +1206,30 @@ def _bootstrap_command(workload: str, collector_cmd: str, run_token: str) -> str
     an abort inside it never reaches a ``|| fail`` and would otherwise skip the
     log upload and the shutdown. The box self-terminates on completion
     (InstanceInitiatedShutdownBehavior=terminate).
+
+    **CloudWatch is the live tail, not the record** (alpha-engine-config-I11353).
+    ``CloudWatchOutputConfig`` on the SSM command caps the ``…/stdout`` stream
+    at ~1 MB: the 2026-09-21 ``shadow-sameday`` box (i-09e64cb257b556b82) wrote
+    1,025,054 bytes / 4,848 lines and the stream STOPPED at 22:37:07Z, three
+    minutes into a 73-minute run, before every one of the three leg failures it
+    was being read for. The authoritative record is the S3 object named by
+    :func:`_run_log_uri`, shipped by ``krepis.spot_bootstrap``'s run-log block
+    every 60 s and again from the EXIT / TERM / INT traps, and recorded as
+    ``log_location`` in every run manifest the box writes.
     """
     log = f"/var/log/data-spot-{workload}.log"
-    s3_log = (
-        f"s3://alpha-engine-research/_ssm_logs/data-spot/{workload}/"
-        f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{run_token}.log"
-    )
+    resolved_day = _run_log_trading_day(trading_day)
+    s3_log = _run_log_uri(workload, resolved_day, instance_id)
+    # `_ship_run_log` / `_stop_run_log_shipper` are defined by the renderer's
+    # run-log block, which comes AFTER this prelude — so a failure in the
+    # prelude itself (or in the watchdog block above the run-log block) reaches
+    # a trap whose shipper does not exist yet. Probe rather than assume: a
+    # `command not found` inside an EXIT trap would skip the shutdown.
     prelude = f"""set -uo pipefail
 mkdir -p "$(dirname {log})"
-fail() {{ trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true; shutdown -h now; exit 1; }}
-trap 'rc=$?; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
+_ship_if_available() {{ if declare -F _ship_run_log >/dev/null 2>&1; then _stop_run_log_shipper 2>/dev/null || true; _ship_run_log || true; fi; }}
+fail() {{ trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; _ship_if_available; shutdown -h now; exit 1; }}
+trap 'rc=$?; _ship_if_available; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
 """
     tail = f"""set +e
 set -uo pipefail
@@ -1185,14 +1280,19 @@ python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks b
 # requirements.txt` above); this gate catches future drift the same way the
 # DLP gate above does: fail closed at boot, not at the first LLM call.
 python -c "import openai" || fail "openai package (flow-doctor diagnosis router wire) not installed"
-{collector_cmd} 2>&1 | tee -a {log}
-rc=${{PIPESTATUS[0]}}
-trap - EXIT
-aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
+# No `| tee` here: the renderer's run-log block already `exec`'d this shell's
+# stdout+stderr through tee, so every line of the collector is captured with
+# the provisioning that preceded it. Piping again would double every line AND
+# put tee's exit status in the way of the collector's
+# (bugclass_a_pipe_into_tee_discards_the_exit_code_260920) — `set -o pipefail`
+# is on, but the shorter path has no pipe to get wrong.
+{collector_cmd}
+rc=$?
 [ "$rc" -eq 0 ] || fail "workload {workload} exited $rc"
 echo "[data-spot] workload {workload} complete"
 """
-    return prelude + "\n" + render_bootstrap(_bootstrap_spec(workload)) + "\n" + tail
+    spec = _bootstrap_spec(workload, run_log=RunLog(local_path=log, s3_uri=s3_log))
+    return prelude + "\n" + render_bootstrap(spec) + "\n" + tail
 
 
 def _launch_instance(force_on_demand: bool = False, extra_tags: dict | None = None) -> tuple[str, str]:
@@ -1295,7 +1395,13 @@ def _wait_ssm_online(instance_id: str) -> None:
     )
 
 
-def _send_bootstrap(instance_id: str, workload: str, collector_cmd: str, run_token: str) -> str:
+def _send_bootstrap(
+    instance_id: str,
+    workload: str,
+    collector_cmd: str,
+    run_token: str,
+    trading_day: "str | None" = None,
+) -> str:
     """Fire the async, detached SSM command that runs the collector + self-terminates."""
     ssm = boto3.client("ssm", region_name=REGION)
     resp = ssm.send_command(
@@ -1303,7 +1409,15 @@ def _send_bootstrap(instance_id: str, workload: str, collector_cmd: str, run_tok
         DocumentName="AWS-RunShellScript",
         Comment=f"data-spot {workload} — config#1767",
         Parameters={
-            "commands": [_bootstrap_command(workload, collector_cmd, run_token)],
+            "commands": [
+                _bootstrap_command(
+                    workload,
+                    collector_cmd,
+                    run_token,
+                    instance_id=instance_id,
+                    trading_day=trading_day,
+                )
+            ],
             # Execution timeout (NOT the start timeout) — without this SSM kills
             # the command at the 3600s default, guillotining the append tail.
             "executionTimeout": [str(_max_runtime_seconds(workload))],
@@ -1398,6 +1512,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         return {"data_spot": {"launched": False, "reason": "disabled", "workload": workload}}
 
     run_token = uuid.uuid4().hex
+    # Resolved BEFORE the launch so the log URI this call returns is the one
+    # the box was told to write — the SF and the run manifests then quote the
+    # same string, and a reader never has to guess which partition a failed
+    # run's log landed in (alpha-engine-config-I11353).
+    run_log_day = _run_log_trading_day(str(event.get("trading_day") or "").strip() or None)
     instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags or None)
     logger.info("launched data-spot box %s (%s) for %s", instance_id, market, workload)
     # Once the box is up, ANY failure before the bootstrap command is delivered
@@ -1405,13 +1524,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # SSM-online or an SSM SendCommand error tears the box down.
     try:
         _wait_ssm_online(instance_id)
-        command_id = _send_bootstrap(instance_id, workload, collector_cmd, run_token)
+        command_id = _send_bootstrap(
+            instance_id, workload, collector_cmd, run_token, trading_day=run_log_day
+        )
     except Exception:
         _terminate_instance(instance_id)
         raise
+    log_location = _run_log_uri(workload, run_log_day, instance_id)
     logger.info(
-        "data-spot dispatched: instance=%s market=%s command=%s workload=%s run_token=%s",
-        instance_id, market, command_id, workload, run_token,
+        "data-spot dispatched: instance=%s market=%s command=%s workload=%s run_token=%s log=%s",
+        instance_id, market, command_id, workload, run_token, log_location,
     )
     return {
         "data_spot": {
@@ -1421,5 +1543,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             "command_id": command_id,
             "workload": workload,
             "run_token": run_token,
+            # Returned so a failed execution's history NAMES the log, rather
+            # than a reader having to reconstruct the key from the instance id.
+            "log_location": log_location,
         }
     }

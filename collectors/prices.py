@@ -47,6 +47,7 @@ from collectors import CaretTickerError
 from dates import (
     FutureBarError,
     assert_no_bar_after,
+    bar_settlement_guard_entry,
     clip_to_trading_day,
     default_run_date,
     history_window,
@@ -142,9 +143,15 @@ def collect(
     # trading day, never on wall-clock time — a ``--date D`` run executed on
     # D+1 must not fetch (or publish) the partial D+1 session.
     trading_day = str(reference_date) if reference_date is not None else default_run_date()
+    # alpha-engine-config-I11354: the moment this run's vendor fetch opens.
+    # Taken HERE rather than inside the batch loop because the whole refresh is
+    # one fetch window and its OPENING edge is the conservative one — a run that
+    # starts before the bar settles does not become settled because it ran long.
+    fetch_started_at = datetime.now(timezone.utc)
+    short_fetch_retries: dict[str, int] = {}
     refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
-        trading_day=trading_day,
+        trading_day=trading_day, short_fetch_retries=short_fetch_retries,
     )
 
     # ── Validate refreshed tickers ─────────────────────────────────────────
@@ -170,7 +177,22 @@ def collect(
         # for every key's row count. `written_keys()` below turns this into
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
+        # alpha-engine-config-I11354: grade THIS run's bar on the settlement
+        # clock and carry the verdict on D03's manifest. Observe mode — the
+        # reading never moves the exit code; it is what a promotion to enforce
+        # (and Brian's ruling on the 16:45 ET `data-collection-eod` schedule)
+        # will be argued from. `_record_collector_guards` folds this on.
+        "guards": [
+            bar_settlement_guard_entry(
+                fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
+            )
+        ],
     }
+    if short_fetch_retries:
+        # alpha-engine-config-I11287: never silent — every ticker that
+        # entered the short-fetch guard's bounded retry is named here with
+        # its attempt count, whether or not the retry recovered it.
+        result["short_fetch_retries"] = dict(short_fetch_retries)
     if failed_tickers:
         # alpha-engine-config-I11230 deliverable 2: `_DegradedRun` (the
         # manifest-level handler for `status="partial"`) reads
@@ -317,6 +339,113 @@ def _find_stale_fast(
 _SHORT_FETCH_ROW_THRESHOLD = 400
 
 
+# ── Short-fetch guard: bounded single-ticker retry (alpha-engine-config-
+# I11287) ─────────────────────────────────────────────────────────────────
+# A short answer is frequently a transient vendor glitch, not a real
+# regression (measured: ^VIX3M's two 2026-09-15 guard hits were traced to a
+# stray caret-embedded ticker literal fixed same-day by I9288 — but the
+# guard itself is a general defense against ANY vendor's intermittent short
+# reply, caret or not, and that class stays live). Today the only recovery
+# path is the weekly SF re-running the ENTIRE ~5,474s DataPhase1 stage
+# (`infrastructure/step_function.json::DataPhase1RetryGate`) for one bad
+# ticker out of ~900. A few extra seconds re-fetching just that ticker here
+# is far cheaper than redoing 91 minutes of work — but "retry the flaky
+# call" must itself be bounded on BOTH axes (attempts per ticker, and
+# tickers-per-run), never just the first: a per-call cap that says nothing
+# about call count is the defect class this fleet has already paid for
+# (bugclass_a_per_call_cap_that_says_nothing_about_call_count_260921).
+_SHORT_FETCH_RETRY_ATTEMPTS = 3
+# Backoff applied before each of the 3 dedicated re-fetch attempts, with
+# +/-25% jitter at call time (avoids every retried ticker hammering the
+# vendor on the same cadence). Fixed schedule, not a config knob: this
+# guard fired twice in 30 days fleet-wide, so a tunable is over-engineering
+# for the observed rate.
+_SHORT_FETCH_RETRY_BACKOFF_SECONDS = (2.0, 4.0, 8.0)
+# Hard cap on how many DISTINCT tickers may enter the retry path in one
+# run. Bounds total added time even if a systemic vendor issue makes the
+# guard fire broadly instead of on 1-2 tickers: worst case is
+# `_SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN` tickers each exhausting all 3
+# attempts — (2+4+8)s backoff + ~3 single-symbol `yf.download` calls
+# (bounded by the vendor's own per-call latency, typically low single-digit
+# seconds) per ticker, i.e. roughly 10 * 30s ~= 5 minutes added, against a
+# ~5,474s DataPhase1 stage. A ticker that exhausts the run-level budget is
+# refused immediately, exactly as before this change, with a WARNING
+# naming that the budget (not the ticker's own attempts) was the limiter.
+_SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN = 10
+
+
+def _sleep_seconds(seconds: float) -> None:
+    """Thin wrapper around ``time.sleep`` so tests can monkeypatch retry
+    backoff to zero without changing the production delay."""
+    import time
+
+    time.sleep(seconds)
+
+
+def _retry_short_fetch_ticker(
+    ticker: str,
+    yf_sym: str,
+    window_start,
+    window_end_excl,
+    trading_day: "str | date",
+) -> tuple["pd.DataFrame | None", int]:
+    """Re-fetch a SINGLE ticker up to ``_SHORT_FETCH_RETRY_ATTEMPTS`` times
+    after the batch fetch answered short.
+
+    Never raises: a download error on a retry attempt is logged and treated
+    as "this attempt found nothing", identically to a short/empty answer —
+    the caller (the short-fetch guard) reports the persistent refusal
+    exactly as it did before this change if every attempt fails.
+
+    Returns ``(best_df, attempts_made)``. ``best_df`` is the LONGEST clean
+    frame seen across attempts (never worse than giving up after one try),
+    or ``None`` if every attempt errored or came back empty.
+    """
+    import random
+
+    best_df: "pd.DataFrame | None" = None
+    attempts_made = 0
+    for attempt_idx, base_delay in enumerate(_SHORT_FETCH_RETRY_BACKOFF_SECONDS, start=1):
+        attempts_made = attempt_idx
+        _sleep_seconds(base_delay * random.uniform(0.75, 1.25))
+        try:
+            raw = yf.download(
+                tickers=yf_sym,
+                start=window_start.isoformat(),
+                end=window_end_excl.isoformat(),
+                interval="1d",
+                auto_adjust=True,
+                progress=False,
+                threads=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - a failed attempt is not fatal, logged and retried
+            logger.warning(
+                "Short-fetch retry %d/%d for %s failed: %s",
+                attempt_idx, _SHORT_FETCH_RETRY_ATTEMPTS, ticker, exc,
+            )
+            continue
+
+        if raw is None or raw.empty or "Close" not in raw.columns:
+            continue
+        df = raw.dropna(subset=["Close"])
+        if df.empty:
+            continue
+
+        idx = pd.to_datetime(df.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert("UTC").tz_localize(None)
+        df.index = idx
+        df = clip_to_trading_day(
+            df.sort_index(), trading_day, label=f"price_cache_refresh_retry[{ticker}]",
+        )
+        if best_df is None or len(df) > len(best_df):
+            best_df = df
+        if len(best_df) >= _SHORT_FETCH_ROW_THRESHOLD:
+            break
+
+    return best_df, attempts_made
+
+
 def _is_missing_object(s3, exc: Exception) -> bool:
     """True when ``exc`` means "this S3 key does not exist" (and nothing else).
 
@@ -425,8 +554,17 @@ def _refresh_stale(
     batch_size: int,
     *,
     trading_day: "str | date",
+    short_fetch_retries: "dict[str, int] | None" = None,
 ) -> tuple[int, list[str], list[tuple[str, int]]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
+
+    ``short_fetch_retries`` (alpha-engine-config-I11287), if given, is
+    populated in place with ``{ticker: attempts_made}`` for every ticker
+    that entered the short-fetch guard's bounded retry path this run —
+    whether the retry recovered the ticker or it still reads failed. Kept
+    as an optional out-parameter rather than a new return value so the
+    ``(refreshed, failed_tickers, written)`` 3-tuple every existing caller
+    and test unpacks stays unchanged.
 
     ``trading_day`` (required, alpha-engine-config-I10893) bounds every fetch
     to ``[trading_day − fetch_period, trading_day]`` via explicit
@@ -462,6 +600,8 @@ def _refresh_stale(
     refreshed = 0
     failed_tickers: list[str] = []
     written: list[tuple[str, int]] = []
+    _retry_counts: "dict[str, int]" = short_fetch_retries if short_fetch_retries is not None else {}
+    _retry_budget_remaining = _SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -559,15 +699,59 @@ def _refresh_stale(
                             s3, bucket, s3_prefix, ticker
                         )
                         if existing_rows is not None and len(new_df) < existing_rows:
-                            logger.error(
-                                "Short-fetch REFUSED for %s: yfinance returned %d rows "
-                                "for period=%s but the existing price-cache parquet has "
-                                "%d — not uploading (existing history preserved). "
-                                "See alpha-engine-config-I9256.",
-                                ticker, len(new_df), fetch_period, existing_rows,
-                            )
-                            failed_tickers.append(ticker)
-                            continue
+                            original_len = len(new_df)
+                            attempts_made = 0
+                            # alpha-engine-config-I11287: absorb a transient
+                            # short answer here, bounded on BOTH axes — a
+                            # fixed attempt count per ticker AND a run-level
+                            # cap on how many DIFFERENT tickers may retry at
+                            # all, so a systemic vendor issue cannot turn
+                            # into an unbounded loop across ~900 tickers.
+                            if _retry_budget_remaining > 0:
+                                _retry_budget_remaining -= 1
+                                retried_df, attempts_made = _retry_short_fetch_ticker(
+                                    ticker, yf_sym, window_start, window_end_excl, trading_day,
+                                )
+                                _retry_counts[ticker] = attempts_made
+                                if retried_df is not None and len(retried_df) >= existing_rows:
+                                    logger.info(
+                                        "Short-fetch guard: %s recovered after %d retr%s "
+                                        "(%d rows, was %d) — uploading.",
+                                        ticker, attempts_made,
+                                        "y" if attempts_made == 1 else "ies",
+                                        len(retried_df), original_len,
+                                    )
+                                    new_df = retried_df
+                                else:
+                                    recovered_len = len(retried_df) if retried_df is not None else original_len
+                                    logger.error(
+                                        "Short-fetch REFUSED for %s after %d retr%s: "
+                                        "yfinance returned %d rows (best of %d/%d attempts) "
+                                        "for period=%s but the existing price-cache parquet "
+                                        "has %d — not uploading (existing history "
+                                        "preserved). See alpha-engine-config-I9256, "
+                                        "alpha-engine-config-I11287.",
+                                        ticker, attempts_made,
+                                        "y" if attempts_made == 1 else "ies",
+                                        recovered_len, attempts_made, _SHORT_FETCH_RETRY_ATTEMPTS,
+                                        fetch_period, existing_rows,
+                                    )
+                                    failed_tickers.append(ticker)
+                                    continue
+                            else:
+                                _retry_counts[ticker] = 0
+                                logger.error(
+                                    "Short-fetch REFUSED for %s: yfinance returned %d rows "
+                                    "for period=%s but the existing price-cache parquet has "
+                                    "%d — not uploading (existing history preserved). "
+                                    "Retry budget for this run (%d tickers) already "
+                                    "exhausted. See alpha-engine-config-I9256, "
+                                    "alpha-engine-config-I11287.",
+                                    ticker, original_len, fetch_period, existing_rows,
+                                    _SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN,
+                                )
+                                failed_tickers.append(ticker)
+                                continue
 
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
