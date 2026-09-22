@@ -61,6 +61,14 @@ def _patch_download(monkeypatch, frame: pd.DataFrame):
     )
 
 
+@pytest.fixture(autouse=True)
+def _no_retry_backoff(monkeypatch):
+    """The I11287 bounded retry sleeps between attempts in production; every
+    test in this file exercises the guard synchronously, so backoff is
+    zeroed here rather than each test eating up to 14s of real sleep."""
+    monkeypatch.setattr(_prices, "_sleep_seconds", lambda seconds: None)
+
+
 def test_short_fetch_does_not_overwrite_a_full_price_cache(monkeypatch):
     """The measured VIX3M case: 1-row answer vs a 2515-row parquet."""
     full = _ohlcv(2515)
@@ -137,3 +145,142 @@ def test_unreadable_existing_parquet_raises_rather_than_overwriting(monkeypatch)
         _prices._existing_parquet_rows(
             s3, "alpha-engine-research", "predictor/price_cache/", "VIX3M",
         )
+
+
+# ── alpha-engine-config-I11287: bounded single-ticker retry ────────────────
+# A short answer is frequently transient (measured: this guard fired for
+# ^VIX3M twice in 30 days — traced to a stray caret-embedded ticker literal
+# fixed same-day by I9288, but the guard itself is a general defense the
+# retry below applies to regardless of WHY a given answer came back short).
+
+
+def _patch_download_sequence(monkeypatch, frames: list[pd.DataFrame]):
+    """Each call to ``yf.download`` returns the next frame in ``frames``;
+    the last frame repeats once the sequence is exhausted."""
+    calls: list[dict] = []
+
+    def _fake(*args, **kwargs):
+        calls.append(kwargs)
+        idx = min(len(calls) - 1, len(frames) - 1)
+        return frames[idx]
+
+    monkeypatch.setattr(_prices.yf, "download", _fake, raising=True)
+    return calls
+
+
+def test_short_fetch_recovers_after_a_transient_retry(monkeypatch):
+    """Batch fetch answers short once; the SECOND call (first dedicated
+    retry) answers full — the ticker must be refreshed, not failed, and the
+    retry count recorded for visibility."""
+    full = _ohlcv(2515)
+    s3 = _FakeS3({"reference/price_cache/VIX3M.parquet": _parquet_bytes(full)})
+    calls = _patch_download_sequence(monkeypatch, [_ohlcv(1), _ohlcv(2520)])
+
+    retries: dict[str, int] = {}
+    refreshed, failed, written = _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50,
+        trading_day="2026-09-14", short_fetch_retries=retries,
+    )
+
+    assert refreshed == 1
+    assert failed == []
+    assert s3.uploads == ["reference/price_cache/VIX3M.parquet"]
+    assert retries == {"VIX3M": 1}, "recovered on the first dedicated retry attempt"
+    assert len(calls) == 2, "one batch call + exactly one retry call, no more"
+
+
+def test_short_fetch_retry_exhausted_still_reads_partial_with_count_recorded(monkeypatch):
+    """A persistently short answer (every attempt, batch + all 3 retries)
+    must still end up `failed` exactly as before this change — the retry
+    is insurance against a TRANSIENT glitch, never an excuse."""
+    full = _ohlcv(2515)
+    s3 = _FakeS3({"reference/price_cache/VIX3M.parquet": _parquet_bytes(full)})
+    calls = _patch_download_sequence(monkeypatch, [_ohlcv(1)])  # always short
+
+    retries: dict[str, int] = {}
+    refreshed, failed, written = _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", ["VIX3M"], "10y", 50,
+        trading_day="2026-09-14", short_fetch_retries=retries,
+    )
+
+    assert s3.uploads == []
+    assert refreshed == 0
+    assert failed == ["VIX3M"]
+    assert retries == {"VIX3M": _prices._SHORT_FETCH_RETRY_ATTEMPTS}
+    assert len(calls) == 1 + _prices._SHORT_FETCH_RETRY_ATTEMPTS
+
+
+def test_retry_budget_is_bounded_across_the_whole_run(monkeypatch):
+    """More refusing tickers than the run-level retry budget must NOT retry
+    them all — bounding total added time regardless of how many tickers
+    the guard fires on (a per-call cap that says nothing about call count
+    is the defect class this fleet has already paid for)."""
+    n_tickers = _prices._SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN + 5
+    tickers = [f"T{i:02d}" for i in range(n_tickers)]
+    objects = {
+        f"reference/price_cache/{t}.parquet": _parquet_bytes(_ohlcv(500)) for t in tickers
+    }
+    s3 = _FakeS3(objects)
+    _patch_download(monkeypatch, _ohlcv(1))  # every ticker's batch answer is short
+
+    retries: dict[str, int] = {}
+    refreshed, failed, written = _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", tickers, "10y", 50,
+        trading_day="2026-09-14", short_fetch_retries=retries,
+    )
+
+    assert refreshed == 0
+    assert sorted(failed) == sorted(tickers), "every ticker still ends up failed, budget or not"
+    retried = [t for t, n in retries.items() if n > 0]
+    assert len(retried) == _prices._SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN, (
+        "only the budgeted number of DISTINCT tickers may enter the retry path"
+    )
+
+
+def test_worst_case_added_sleep_time_is_bounded(monkeypatch):
+    """Names the number the PR body cites: worst case is
+    MAX_TICKERS_PER_RUN tickers each exhausting every backoff step."""
+    slept: list[float] = []
+    monkeypatch.setattr(_prices, "_sleep_seconds", lambda seconds: slept.append(seconds))
+
+    n_tickers = _prices._SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN + 3
+    tickers = [f"T{i:02d}" for i in range(n_tickers)]
+    objects = {
+        f"reference/price_cache/{t}.parquet": _parquet_bytes(_ohlcv(500)) for t in tickers
+    }
+    s3 = _FakeS3(objects)
+    _patch_download(monkeypatch, _ohlcv(1))
+
+    _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", tickers, "10y", 50,
+        trading_day="2026-09-14",
+    )
+
+    worst_case_backoff_seconds = sum(_prices._SHORT_FETCH_RETRY_BACKOFF_SECONDS)
+    # +25% jitter ceiling per call, per the retry helper's `uniform(0.75, 1.25)`
+    bound = _prices._SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN * worst_case_backoff_seconds * 1.25
+    assert sum(slept) <= bound, "total sleep must stay within the documented worst case"
+    assert len(slept) <= (
+        _prices._SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN * _prices._SHORT_FETCH_RETRY_ATTEMPTS
+    )
+
+
+def test_a_non_transient_caret_ticker_error_is_never_retried(monkeypatch):
+    """`CaretTickerError` (alpha-engine-config-I10904) is a run-level
+    contract violation, not a per-ticker miss — it must propagate exactly
+    as before this change, and the retry helper must never be invoked for
+    it (retrying a malformed ticker literal cannot make it valid)."""
+    called = []
+    monkeypatch.setattr(
+        _prices, "_retry_short_fetch_ticker",
+        lambda *a, **k: called.append(1) or (None, 0),
+    )
+    _patch_download(monkeypatch, _ohlcv(2500))  # long enough to clear the guard
+
+    s3 = _FakeS3({})
+    with pytest.raises(_prices.CaretTickerError):
+        _prices._refresh_stale(
+            s3, "alpha-engine-research", "predictor/price_cache/", ["^BADTICK"], "10y", 50,
+            trading_day="2026-09-14",
+        )
+    assert called == [], "a non-transient contract violation must never enter the retry path"

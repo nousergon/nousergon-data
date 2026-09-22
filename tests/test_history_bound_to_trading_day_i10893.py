@@ -165,7 +165,7 @@ def test_collect_threads_reference_date_as_the_trading_day(monkeypatch):
     monkeypatch.setattr(prices, "_find_stale_fast", lambda *a, **k: ["A"])
     captured: dict = {}
 
-    def _fake_refresh(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day):
+    def _fake_refresh(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day, short_fetch_retries=None):
         captured["trading_day"] = trading_day
         return 0, list(stale), []
 
