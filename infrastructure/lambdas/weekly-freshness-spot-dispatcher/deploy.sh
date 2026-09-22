@@ -66,6 +66,15 @@
 # runs. Widening the pool means editing BOTH the default and this policy, then
 # `--apply-iam`; the flagless CI auto-deploy path above is code-only and will
 # NOT apply it.
+#
+# alpha-engine-config-I11427: that BOTH is no longer a comment. The two are
+# held in lockstep by
+# `tests/test_weekly_spot_pool_breadth.py::test_the_default_is_not_refused_by_the_roles_own_iam_allow_list`
+# (and its converse, which refuses a grant no rotation entry uses). Note the
+# ORDER the two edits must reach production in: `krepis.ec2_spot.launch`
+# re-raises `UnauthorizedOperation` as a non-capacity `SpotLaunchError`
+# WITHOUT rotating, so widen the policy and `--apply-iam` FIRST, then merge
+# the default — the reverse order is an outage on the next capacity dip.
 
 set -euo pipefail
 
