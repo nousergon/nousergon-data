@@ -1,4 +1,5 @@
 """alpha-engine-weekly-freshness-spot-dispatcher — launch the Saturday weekly
+# scratch probe for alpha-engine-config-I11435; never merged
 pipeline's LAUNCHER box on a fresh, ephemeral EC2 spot instead of the
 always-on dashboard box (nousergon/alpha-engine-config#2248).
 
