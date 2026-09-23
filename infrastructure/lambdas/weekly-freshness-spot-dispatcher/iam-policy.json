@@ -29,7 +29,9 @@
             "c6a.large",
             "m6a.large",
             "r5.large",
-            "r6i.large"
+            "r6i.large",
+            "c7i.large",
+            "c7a.large"
           ]
         }
       }

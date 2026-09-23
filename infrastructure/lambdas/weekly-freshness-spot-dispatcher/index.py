@@ -164,10 +164,12 @@ DISPATCH_ENABLED = (
 # month, a ~48% escalation to on-demand, all of it billed at the head of this
 # list. Leading with `c6i.large` costs nothing (same on-demand rate as
 # `c5.large`) and puts the deepest current-generation us-east-1 c-family pool
-# first on the spot rung too. Generation rungs descend 6 -> 5, and each rung
-# alternates Intel/AMD so no rung is single-vendor
-# (alpha-engine-config-I11427; same order property as the shell launchers,
-# alpha-engine-config-I11412).
+# first on the spot rung too. The generation-7 c-family pair follows the
+# gen-6 head, so the on-demand rung (the FIRST entry) is unchanged while the
+# spot rung gains two more pools before it falls back to the m/r families and
+# generation 5 (alpha-engine-config-I11433). Each rung alternates Intel/AMD
+# so no rung is single-vendor (alpha-engine-config-I11427; same order
+# property as the shell launchers, alpha-engine-config-I11412).
 #
 # This list IS governed by an allow-list, contrary to the older comment here:
 # alpha-engine-config-I11227 replaced the unconditioned `Resource: "*"` grant
@@ -179,15 +181,17 @@ DISPATCH_ENABLED = (
 # dip into a hard weekly-SF failure. The two are held in lockstep by
 # `tests/test_weekly_spot_pool_breadth.py::test_the_default_is_not_refused_by_the_roles_own_iam_allow_list`.
 # Adding a type is therefore TWO edits plus `deploy.sh --apply-iam` (the CI
-# auto-deploy path is code-only and will NOT apply the policy), which is why
-# the generation-7 rung (`c7i.large` / `c7a.large`) is deliberately NOT here
-# yet — see alpha-engine-config-I11433.
+# auto-deploy path is code-only and will NOT apply the policy). The
+# generation-7 rung (`c7i.large` / `c7a.large`, both 2 vCPU / 4 GiB / x86_64)
+# landed that way under alpha-engine-config-I11433: the role's condition was
+# widened live BEFORE this default named the types, because the reverse
+# order is an outage that opens on merge.
 INSTANCE_TYPES = [
     t.strip()
     for t in os.environ.get(
         "WEEKLY_SPOT_INSTANCE_TYPES",
-        "c6i.large,c6a.large,m6i.large,m6a.large,r6i.large,"
-        "c5.large,c5a.large,m5.large,m5a.large,r5.large",
+        "c6i.large,c6a.large,c7i.large,c7a.large,m6i.large,m6a.large,"
+        "r6i.large,c5.large,c5a.large,m5.large,m5a.large,r5.large",
     ).split(",")
     if t.strip()
 ]
