@@ -474,6 +474,65 @@ artifacts:
     assert spec.run_calendar == "trading_days"
 
 
+def test_load_registry_threads_absence_expected(fake_s3):
+    """alpha-engine-config-I10614: `absence_expected` must survive the
+    _SPEC_FIELDS strip. It did not until 2026-09-23 — the tests below built
+    ArtifactSpec directly, so the live registry's declared-absent row kept
+    landing in the CRITICAL digest's [never-written] block."""
+    fake_s3._registry_body = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+artifacts:
+  - artifact_id: predictor_predictions
+    s3_key_template: "predictor/predictions/{date}.json"
+    cadence: weekday_sf
+    sla_minutes_after_cron: 60
+    severity: warning
+    owner_repo: alpha-engine-predictor
+    created_at: "2025-01-01"
+  - artifact_id: predictor_commitment_window_state
+    s3_key_template: "predictor/commitment/window_state.json"
+    cadence: event_driven
+    liveness_via: predictor_predictions
+    absence_expected: true
+    sla_minutes_after_cron: 1440
+    severity: warning
+    owner_repo: alpha-engine-predictor
+    created_at: "2026-09-12"
+"""
+    import index
+    specs = {s.artifact_id: s for s in index.load_registry(fake_s3, "buck", "key")}
+    assert specs["predictor_commitment_window_state"].absence_expected is True
+    assert specs["predictor_predictions"].absence_expected is False
+
+
+# Fields on ArtifactSpec that the registry YAML does not carry, so the loader
+# has no reason to pass them through. Each needs a reason.
+_SPEC_FIELDS_NOT_FROM_YAML = {
+    # a typed CompletenessCheck predicate built in code (config#3086); no
+    # registry row declares one and the YAML scalar form would not construct it
+    "completeness",
+}
+
+
+def test_spec_fields_cover_every_artifact_spec_field():
+    """A field added to ArtifactSpec and left off _SPEC_FIELDS is silently
+    stripped at load time and reads as its default forever — how
+    `absence_expected` went dark. Fail here instead."""
+    import dataclasses
+
+    from nousergon_lib.artifact_freshness import ArtifactSpec
+
+    import index
+    declared = {f.name for f in dataclasses.fields(ArtifactSpec)}
+    missing = declared - index._SPEC_FIELDS - _SPEC_FIELDS_NOT_FROM_YAML
+    assert not missing, (
+        f"ArtifactSpec fields stripped by the loader: {sorted(missing)} — add "
+        f"them to index._SPEC_FIELDS, or to _SPEC_FIELDS_NOT_FROM_YAML with a reason"
+    )
+
+
 # ── handler — alerts disabled (OBSERVE mode) ────────────────────────────────
 
 
