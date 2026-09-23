@@ -104,15 +104,6 @@
       "issue": "alpha-engine-config-I6984",
       "re_exam": "2026-10-12"
     },
-    "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor": {
-      "reason": "invocations-floor on the ci-watch-liveness-probe reclaim leg (config#3173, mirrors sf-watch's two reclaim legs); silenced while both ci-watch reclaim rules are paused. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
-      "watches": [
-        "alpha-engine-ci-watch-spot-interruption",
-        "alpha-engine-ci-watch-instance-terminated"
-      ],
-      "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
-    },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-errors": {
       "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
       "watches": [

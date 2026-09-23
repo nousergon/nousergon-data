@@ -151,13 +151,18 @@ fi
 
 # ----- Apply alarms only -----------------------------------------------------
 # RETIRED as an alarm-creation path (alpha-engine-config-I7359, executing the
-# I7359 ownership ruling). ${FUNCTION_NAME}-errors is codified in the PRIVATE
-# nous-ergon-ops repo:
-#   infrastructure/cloudwatch/alarms/alpha-engine-pipeline-watchdog-errors.json
-# Edit it there; do not add put-metric-alarm back here —
+# I7359 ownership ruling). ${FUNCTION_NAME}'s alarms are codified in the PRIVATE
+# nous-ergon-ops repo under infrastructure/cloudwatch/alarms/ — errors are
+# watched by alpha-engine-lambda-errors-pipeline-watchdog.json and
+# alpha-engine-watch-plane-pipeline-watchdog-errors.json (both 300s). The
+# former ${FUNCTION_NAME}-errors alarm (86400s, same metric, routed to the
+# subscriber-less ${SNS_TOPIC_NAME} topic) was a duplicate and was retired
+# by alpha-engine-config-I11340.
+# Edit them there; do not add put-metric-alarm back here —
 # nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the build
 # if it reappears. To apply immediately from nous-ergon-ops:
-#   infrastructure/cloudwatch/apply.py --name alpha-engine-pipeline-watchdog-errors
+#   infrastructure/cloudwatch/apply.py --name alpha-engine-lambda-errors-pipeline-watchdog \
+#     alpha-engine-watch-plane-pipeline-watchdog-errors
 if $APPLY_ALARMS; then
   echo "  (no-op: alarms for ${FUNCTION_NAME} are applied from nous-ergon-ops, alpha-engine-config-I7359)"
 fi
