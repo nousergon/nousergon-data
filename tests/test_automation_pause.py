@@ -757,7 +757,12 @@ def test_reconcile_monthly_is_paused_not_pending(manifest, module):
 ORIGINAL_ALARM_NAMES = {
     "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
     "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
-    "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor",
+    # alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor was
+    # the ninth. It left the set because the ALARM left the account, not
+    # because its suppression was undeclared: the Lambda it watched was
+    # retired 2026-09-01 (alpha-engine-config-I9756) and the alarm itself was
+    # deleted under alpha-engine-config-I11340. A declaration naming a
+    # deleted alarm is the `--check` finding in the other direction.
     "alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
     "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
     "alpha-engine-ssm-reachability-probe-dead",
@@ -1118,7 +1123,9 @@ def test_the_fourteen_hand_muted_alarms_are_all_declared(manifest, module):
         "alpha-engine-ssm-reachability-probe-unreachable",
         "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
         "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
-        "alpha-engine-watch-plane-ci-watch-liveness-probe-invocations-floor",
+        # -ci-watch-liveness-probe-invocations-floor was the fourteenth; the
+        # alarm was DELETED (alpha-engine-config-I11340 — its Lambda was
+        # retired 2026-09-01, I9756), so it is no longer declarable.
         "alpha-engine-watch-plane-overseer-intake-age",
         "alpha-engine-watch-plane-overseer-intake-dlq-depth",
         "alpha-engine-watch-plane-overseer-intake-dlq-severe-content",
