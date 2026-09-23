@@ -70,6 +70,11 @@ jobs:
               - 'infrastructure/spot_*.sh'
               - 'infrastructure/run_weekly_offcycle.sh'
               - 'scripts/weekly_sf_rerun.py'
+              - 'infrastructure/lambdas/weekly-freshness-spot-dispatcher/**'
+              - 'infrastructure/lambdas/eval-judge-spot-dispatcher/**'
+              - 'infrastructure/lambdas/weekly-preflight/**'
+              - 'infrastructure/lambdas/substrate-health-gate/**'
+              - 'infrastructure/lambdas/weekly-run-scope/**'
 
   rehearsal-path-guard:
     needs: label
