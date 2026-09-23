@@ -78,6 +78,27 @@ def _isolate_schema_meta_from_s3(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_entrant_seed_from_s3(monkeypatch):
+    """Keep ``weekly_collector._run_daily_arctic_append``'s index-entrant seed
+    (alpha-engine-config-I11444) from opening the real ArcticDB universe over S3
+    in every test that drives the EOD append. Stubbed to "no entrants" — the
+    step's own behaviour is exercised in test_index_entrant_seed.py, which holds
+    a reference to the real function taken at import time. Only patched when
+    ``weekly_collector`` is already imported, so this fixture never pulls that
+    module into tests that do not use it."""
+    import sys
+
+    wc = sys.modules.get("weekly_collector")
+    if wc is not None and hasattr(wc, "_seed_index_entrants"):
+        monkeypatch.setattr(
+            wc,
+            "_seed_index_entrants",
+            lambda *a, **k: {"status": "ok", "entrants": [], "seeded": [], "errors": []},
+        )
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_secrets_from_ssm(monkeypatch):
     """Force every test to read secrets from env only, not SSM.
 

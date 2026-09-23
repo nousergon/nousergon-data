@@ -4558,6 +4558,132 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     return results
 
 
+#: More declared members absent from the ArcticDB universe than this is not
+#: an index rebalance (an S&P quarterly reconstitution moves a handful of
+#: names; the 2026-09-21 change moved three), it is an outage or a wrong
+#: library, and seeding hundreds of symbols one backfill at a time inside the
+#: EOD append is the wrong response to either. Refused loudly instead.
+_ENTRANT_SEED_MAX = 25
+#: Wall-clock bound for the whole seed loop. A per-ticker backfill loads only
+#: the ticker's parquet plus its macro/ETF context (`builders.backfill.
+#: _PER_TICKER_CACHE_CONTEXT`), so one seed is seconds, not the ~20 minutes a
+#: full-cache load costs; this caps the pathological case so it can never eat
+#: the load-bearing append's budget.
+_ENTRANT_SEED_HARD_TIMEOUT_S = 600
+
+
+def _seed_index_entrants(
+    bucket: str,
+    expected_tickers: list[str],
+    dry_run: bool = False,
+) -> dict:
+    """Write a new index member's full history into the ArcticDB universe the
+    day it joins the declared membership (alpha-engine-config-I11444).
+
+    The class: a ticker added to the S&P 500/400 appears in the constituents
+    document the first morning it is a member, and `_run_daily` refreshes its
+    10y price-cache parquet that same evening — but nothing on a weekday wrote
+    its ArcticDB symbol. Only the Saturday DataPhase1 backfill did, and
+    `daily_append` appends only to symbols that already exist. So every
+    consumer that reads the SAME membership document (`latest_weekly.json`)
+    against the library saw a member with no symbol for up to a week. Measured
+    2026-09-21..23: BE joined the S&P 500 effective 2026-09-21; its parquet
+    landed 2026-09-21 20:06Z; its ArcticDB symbol's first version is
+    2026-09-23 01:17Z (the weekly rehearsal's backfill); Crucible v2's
+    `data.daily` failed both windows in between with `MissingSourceError`
+    naming exactly `['BE']`.
+
+    Entrants are ``admits_universe_write`` members of ``expected_tickers`` with
+    no universe symbol, excluding :data:`_MACRO_DAILY_TICKERS`: those ride
+    along in every append's expected scope but are not index members, and one
+    of them (XLRE) passes ``admits_universe_write`` yet is deliberately never a
+    universe symbol — measured 2026-09-23, it was the ONLY name the unfiltered
+    set produced, so without this every EOD run would try, and fail, to seed
+    it. Each is seeded with ``backfill(ticker_filter=...)`` —
+    the same per-ticker write path the chronic-gap heal and every manual seed
+    (I8094) already use, so the symbol lands with the identical schema.
+    Best-effort per ticker: one ticker's failure (``ticker_no_data`` when its
+    parquet refresh failed, say) is recorded and the rest proceed. Returns
+    ``status`` ``ok`` / ``ok_dry_run`` / ``error``; the caller logs and never
+    lets it fail the append.
+    """
+    from features.compute import admits_universe_write
+    from store.arctic_store import get_universe_lib
+
+    not_members = {t.lstrip("^") for t in _MACRO_DAILY_TICKERS}
+    wanted = {
+        t.lstrip("^") for t in expected_tickers
+        if admits_universe_write(t) and t.lstrip("^") not in not_members
+    }
+    present = set(get_universe_lib(bucket).list_symbols())
+    entrants = sorted(wanted - present)
+    summary: dict = {"entrants": entrants, "seeded": [], "errors": []}
+    if not entrants:
+        return {"status": "ok", **summary}
+    if len(entrants) > _ENTRANT_SEED_MAX:
+        return {
+            "status": "error",
+            "error": (
+                f"{len(entrants)} declared members are absent from the ArcticDB "
+                f"universe (cap {_ENTRANT_SEED_MAX}) — that is an outage or a wrong "
+                f"library, not an index rebalance; refusing to seed. First 20: "
+                f"{entrants[:20]}"
+            ),
+            **summary,
+        }
+    logger.info(
+        "Seeding %d index entrant(s) absent from the ArcticDB universe: %s",
+        len(entrants), entrants,
+    )
+    if dry_run:
+        return {"status": "ok_dry_run", **summary}
+
+    from builders.backfill import backfill as _backfill
+
+    for ticker in entrants:
+        try:
+            outcome = _backfill(bucket=bucket, ticker_filter=ticker, dry_run=False)
+        except Exception as exc:
+            logger.exception("Index-entrant seed failed for %s", ticker)
+            summary["errors"].append({"ticker": ticker, "reason": str(exc)})
+            continue
+        if outcome.get("status") == "ok":
+            summary["seeded"].append(ticker)
+        else:
+            summary["errors"].append(
+                {"ticker": ticker, "reason": outcome.get("error") or outcome.get("status")}
+            )
+    status = "ok" if not summary["errors"] else "error"
+    return {"status": status, **summary}
+
+
+def _run_entrant_seed_step(bucket: str, expected_tickers: list[str], dry_run: bool) -> dict:
+    """`_seed_index_entrants` under a hard wall-clock bound, never raising.
+
+    A seed failure is logged at ERROR (so it alerts) and recorded as a
+    swallowed best-effort step, but it never fails the append: the append is
+    load-bearing for reconcile and inference, and an unseeded entrant only
+    leaves the library where it was before this step existed.
+    """
+    try:
+        with _hard_timeout(_ENTRANT_SEED_HARD_TIMEOUT_S, "index-entrant seed"):
+            result = _seed_index_entrants(bucket, expected_tickers, dry_run=dry_run)
+    except _HardTimeout as exc:
+        result = {"status": "error", "error": f"hard timeout: {exc}"}
+    except Exception as exc:
+        result = {"status": "error", "error": f"{type(exc).__name__}: {exc}"}
+    if result.get("status") not in ("ok", "ok_dry_run"):
+        logger.error(
+            "Index-entrant seed did not complete — new members stay absent from the "
+            "ArcticDB universe until the next seed or Saturday backfill: %s",
+            result.get("error") or result.get("errors"),
+        )
+        _record_swallowed_step(
+            "index_entrant_seed", str(result.get("error") or result.get("errors")),
+        )
+    return result
+
+
 def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     """Standalone ArcticDB universe append for the EOD post-market path.
 
@@ -4600,6 +4726,13 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         results["completed_at"] = datetime.now(timezone.utc).isoformat()
         return results
 
+    # Seed any declared member the library has no symbol for BEFORE the append,
+    # so the append then writes today's row onto it like every other member
+    # (alpha-engine-config-I11444). `tickers` is the same `latest_weekly.json`
+    # membership Crucible v2's `data.daily` grades against, so the two cannot
+    # disagree about who is a member.
+    entrant_seed = _run_entrant_seed_step(bucket, tickers, dry_run)
+
     logger.info("=" * 60)
     logger.info("APPENDING: ArcticDB universe (daily-arctic-append state, %s)", run_date)
     logger.info("=" * 60)
@@ -4630,6 +4763,9 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         results["collectors"]["arcticdb"] = {"status": "error", "error": str(e)}
         results["status"] = "failed"
 
+    # Recorded AFTER `arcticdb` so a failed append's reason names the append,
+    # not a best-effort step that never decides this mode's status.
+    results["collectors"]["entrant_seed"] = entrant_seed
     results["completed_at"] = datetime.now(timezone.utc).isoformat()
     logger.info("ArcticDB append %s for %s", results["status"].upper(), run_date)
     return results
