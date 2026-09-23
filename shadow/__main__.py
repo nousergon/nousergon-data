@@ -89,6 +89,17 @@ def _parser() -> argparse.ArgumentParser:
     diff.add_argument("--max-keys-per-prefix", type=int, default=50)
     diff.add_argument("--dry-run", action="store_true", help="compare and render, publish nothing")
     diff.add_argument(
+        "--dispatch-gate",
+        action="store_true",
+        help=(
+            "After publishing, workflow_dispatch data-gate.yml for this trading day with "
+            "trigger=parity-published (alpha-engine-config-I11361). Set only by the "
+            "scheduled same-day and morning dispatches, so a manual or replay run never "
+            "moves the board. Never fatal: the outcome is recorded in the report as "
+            "`gate_dispatch` and the post-publish crons remain the backstop."
+        ),
+    )
+    diff.add_argument(
         "--legs-file",
         default=None,
         help=(
@@ -246,8 +257,33 @@ def _parity(args) -> int:
     payload = json.dumps(document, indent=2, sort_keys=True).encode("utf-8")
     if not args.dry_run:
         store.put_bytes(key, payload)
+        if getattr(args, "dispatch_gate", False):
+            _dispatch_gate(store, key, document, trading_day)
     print(_render(report, key, dry_run=args.dry_run))
     return EXIT_MET if report.met else EXIT_NOT_MET
+
+
+def _dispatch_gate(store, key: str, document: dict, trading_day: dt.date) -> None:
+    """`alpha-engine-config-I11361`: trigger the gate read off the publish.
+
+    Runs only AFTER the report is published, so the read it triggers can never
+    find an absent report. The outcome is then written into the same report as
+    `gate_dispatch`. That second put changes no comparison field, so a gate read
+    that somehow landed between the two puts grades the same keys either way.
+    """
+    from shadow.gate_dispatch import dispatch_gate_read
+
+    outcome = dispatch_gate_read(trading_day)
+    if outcome["ok"]:
+        print(f"shadow parity: dispatched data-gate.yml for {trading_day} (trigger parity-published)")
+    else:
+        print(
+            f"shadow parity: gate dispatch FAILED for {trading_day}: {outcome['error']} "
+            "(recorded in the report; the post-publish crons remain the backstop)",
+            file=sys.stderr,
+        )
+    document["gate_dispatch"] = outcome
+    store.put_bytes(key, json.dumps(document, indent=2, sort_keys=True).encode("utf-8"))
 
 
 def _render(report, key: str, *, dry_run: bool) -> str:

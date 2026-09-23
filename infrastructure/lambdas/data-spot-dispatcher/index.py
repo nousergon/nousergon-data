@@ -587,7 +587,7 @@ _WORKLOADS: dict[str, str] = {
         "--daily-arctic-append --date $TD; "
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
-        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
@@ -668,7 +668,7 @@ _WORKLOADS: dict[str, str] = {
         "--morning-arctic-append --date $TD; "
         "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group morning "
-        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; "
+        "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
         "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
     ),
     # alpha-engine-config-I10920: the two parity COMPARATORS, each launchable on

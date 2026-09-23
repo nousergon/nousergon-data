@@ -71,5 +71,11 @@ NOT_DISPATCHABLE_MODULES: dict[str, str] = {
         "read (alpha-engine-config-I11216); it answers a question and launches "
         "nothing, and outside a replay it answers 'unpinned' immediately"
     ),
+    "gate_dispatch": (
+        "a step inside `shadow parity --dispatch-gate` that dispatches "
+        "data-gate.yml after the report is published (alpha-engine-config-I11361); "
+        "it reads nothing to compare, and run alone it would trigger a gate read "
+        "for a report nobody just wrote"
+    ),
     "dispatch": "this declaration itself",
 }

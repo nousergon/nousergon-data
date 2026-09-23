@@ -218,6 +218,46 @@
           "type": "array"
         }
       }
+    },
+    "gate_dispatch": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "ok",
+        "error",
+        "workflow",
+        "inputs",
+        "dispatched_at"
+      ],
+      "description": "alpha-engine-config-I11361: whether publishing this report dispatched the data-gate.yml read (trigger `parity-published`) for its trading day. Written only by `shadow parity --dispatch-gate`, i.e. the scheduled same-day and morning dispatches; absent on a manual or replay run, which never asked for a dispatch. `ok: false` carries the reason and is never fatal: the two post-publish crons read the same report as the backstop.",
+      "properties": {
+        "ok": {
+          "type": "boolean"
+        },
+        "error": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "Present (non-null) only when `ok` is false."
+        },
+        "workflow": {
+          "type": "string"
+        },
+        "inputs": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "dispatched_at": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "description": "UTC ISO time the dispatch was accepted (HTTP 204); null when `ok` is false."
+        }
+      }
     }
   },
   "$defs": {

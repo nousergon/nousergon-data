@@ -139,15 +139,14 @@ name: Data-collection gate (read-only)
 # post-publish read never fired is visible as a `schedule` reading carrying a
 # stale report rather than as a normal reading.
 #
-# EVENT-DRIVEN IS THE SOTA SHAPE AND IS NOT WIRED HERE. The issue asks for the
-# parity publish itself to dispatch this workflow. That needs a GitHub
-# credential on the data-spot box with `actions:write` on this repository; the
-# box holds one PAT (SSM, used to clone the private config repo) whose scope
-# could not be verified in this session, and minting or re-scoping a
-# credential is an IAM/secret change this work does not make. `data_gate/
-# read.py::TRIGGERS` declares `parity-published` now so the event-driven
-# artifact and the cron artifact are the same shape, and so "no reading has
-# ever carried parity-published" is a legible gap rather than silence.
+# EVENT-DRIVEN, WITH THE CRONS AS BACKSTOP (alpha-engine-config-I11361). The
+# scheduled `shadow-sameday` and `shadow-morning` dispatches run
+# `shadow parity --dispatch-gate`, which after publishing `parity/{D}.json`
+# mints a token from the data-spot GitHub App (installed on this repository
+# only, narrowed at mint time to `actions: write`) and dispatches this workflow
+# with `trading_day: D` and `trigger: parity-published`. A failed dispatch is
+# recorded in the report as `gate_dispatch.ok: false` and is never fatal; the
+# two post-publish crons above then read the same report shortly after.
 
 on:
   schedule:
@@ -173,6 +172,22 @@ on:
           this on the cron/push triggers — see the I10906 correction above.
         type: boolean
         default: false
+      trading_day:
+        description: >-
+          ISO trading day to file this reading under (e.g. 2026-09-22). Empty
+          means `today`. Set by `shadow parity --dispatch-gate` to the day it
+          just published (alpha-engine-config-I11361).
+        type: string
+        default: ''
+      trigger:
+        description: >-
+          Recorded on each dated gate.json. `manual` for a human dispatch;
+          `parity-published` is what the parity publish sends.
+        type: choice
+        options:
+          - manual
+          - parity-published
+        default: manual
 
 concurrency:
   group: data-gate-read-main
@@ -213,8 +228,8 @@ jobs:
       # keeps today's behaviour. `data_gate/read.py::TRIGGERS` is the closed
       # vocabulary and refuses anything else, so a typo here fails the read
       # rather than publishing an unsummable column.
-      GATE_TRIGGER: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'post-parity' || (github.event_name == 'schedule' && 'schedule' || (github.event_name == 'push' && 'push' || 'manual')) }}
-      GATE_TRADING_DAY: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'yesterday' || 'today' }}
+      GATE_TRIGGER: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'post-parity' || (github.event_name == 'schedule' && 'schedule' || (github.event_name == 'push' && 'push' || ((github.event_name == 'workflow_dispatch' && inputs.trigger == 'parity-published') && 'parity-published' || 'manual'))) }}
+      GATE_TRADING_DAY: ${{ (github.event_name == 'schedule' && (github.event.schedule == '30 1 * * 2-6' || github.event.schedule == '30 12 * * 1-5')) && 'yesterday' || ((github.event_name == 'workflow_dispatch' && inputs.trading_day != '') && inputs.trading_day || 'today') }}
     steps:
       # Every configuration input this job cannot run without, checked in one
       # place with the exact command that fixes each. Without it an unset
