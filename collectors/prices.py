@@ -417,6 +417,15 @@ def _retry_short_fetch_ticker(
                 auto_adjust=True,
                 progress=False,
                 threads=False,
+                # yfinance >= 0.2.48 answers even a single ticker with
+                # (Price, Ticker) MultiIndex columns by default. `"Close" in
+                # columns` is still True on that frame but
+                # `dropna(subset=["Close"])` raises KeyError(['Close']), so
+                # before this every retry died on its first answer and the
+                # caller logged "Refresh failed for <T>: ['Close']" — HONA, Q,
+                # FDXF and SOLS on the 2026-09-23 rehearsal
+                # (alpha-engine-config-I11445).
+                multi_level_index=False,
             )
         except Exception as exc:  # noqa: BLE001 - a failed attempt is not fatal, logged and retried
             logger.warning(
@@ -425,19 +434,31 @@ def _retry_short_fetch_ticker(
             )
             continue
 
-        if raw is None or raw.empty or "Close" not in raw.columns:
-            continue
-        df = raw.dropna(subset=["Close"])
-        if df.empty:
-            continue
+        try:
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                raw = raw.copy()
+                raw.columns = raw.columns.get_level_values(0)
+            if "Close" not in raw.columns:
+                continue
+            df = raw.dropna(subset=["Close"])
+            if df.empty:
+                continue
 
-        idx = pd.to_datetime(df.index)
-        if idx.tz is not None:
-            idx = idx.tz_convert("UTC").tz_localize(None)
-        df.index = idx
-        df = clip_to_trading_day(
-            df.sort_index(), trading_day, label=f"price_cache_refresh_retry[{ticker}]",
-        )
+            idx = pd.to_datetime(df.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert("UTC").tz_localize(None)
+            df.index = idx
+            df = clip_to_trading_day(
+                df.sort_index(), trading_day, label=f"price_cache_refresh_retry[{ticker}]",
+            )
+        except Exception as exc:  # noqa: BLE001 - the docstring's never-raises contract
+            logger.warning(
+                "Short-fetch retry %d/%d for %s returned an unusable frame: %s",
+                attempt_idx, _SHORT_FETCH_RETRY_ATTEMPTS, ticker, exc,
+            )
+            continue
         if best_df is None or len(df) > len(best_df):
             best_df = df
         if len(best_df) >= _SHORT_FETCH_ROW_THRESHOLD:
