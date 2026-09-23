@@ -58,14 +58,11 @@ __all__ = [
 #:   Tue–Sat for the same-day report, 12:30 UTC Mon–Fri for the morning
 #:   rewrite). This is the reading whose parity clause can be MET or UNMET on
 #:   the gate's own trading day.
-#: * ``parity-published`` — RESERVED for the event-driven dispatch the issue
-#:   asks for as SOTA: `shadow parity` dispatching this workflow after a
-#:   successful put. Not wired today, because the data-spot box holds no
-#:   verified GitHub credential with `actions:write` on this repository and
-#:   creating one is an IAM/secret change this work does not make. The value is
-#:   declared now so the artifact the crons write and the artifact the event
-#:   will write are the same shape, and the gap is legible as
-#:   "no reading ever carried parity-published" rather than as silence.
+#: * ``parity-published`` — the event-driven read (alpha-engine-config-I11361):
+#:   `shadow parity --dispatch-gate` dispatches this workflow right after a
+#:   successful put, from the scheduled same-day and morning runs, with the
+#:   trading day it just published. The post-parity crons stay as the backstop
+#:   for a dispatch that failed (recorded in the report as `gate_dispatch`).
 #: * ``push`` / ``manual`` — the `push` trigger and a human dispatch.
 TRIGGERS: frozenset[str] = frozenset(
     {"schedule", "post-parity", "parity-published", "push", "manual"}

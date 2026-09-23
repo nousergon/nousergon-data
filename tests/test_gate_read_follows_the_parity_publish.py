@@ -190,12 +190,11 @@ def test_an_undeclared_trigger_is_refused_rather_than_published(tmp_path):
         )
 
 
-def test_parity_published_is_declared_even_though_nothing_emits_it_yet():
-    """The event-driven dispatch is the SOTA shape and is not wired (no
-    verified `actions:write` credential on the data-spot box). Declaring the
-    value now keeps the cron artifact and the future event artifact the same
-    shape, and makes "no reading has ever carried parity-published" a legible
-    gap rather than silence."""
+def test_parity_published_is_declared_alongside_the_cron_triggers():
+    """`shadow parity --dispatch-gate` emits `parity-published`
+    (`alpha-engine-config-I11361`, pinned end to end in
+    `test_parity_gate_dispatch.py`); the post-parity crons stay as the backstop,
+    so the event artifact and the cron artifact must be the same shape."""
     assert "parity-published" in read_module.TRIGGERS
     assert {"schedule", "post-parity", "push", "manual"} <= read_module.TRIGGERS
 
