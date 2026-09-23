@@ -210,6 +210,70 @@ def test_short_fetch_retry_exhausted_still_reads_partial_with_count_recorded(mon
     assert len(calls) == 1 + _prices._SHORT_FETCH_RETRY_ATTEMPTS
 
 
+def _as_yfinance_single_ticker(frame: pd.DataFrame, ticker: str) -> pd.DataFrame:
+    """yfinance >= 0.2.48's default single-ticker shape: (Price, Ticker) columns."""
+    out = frame.copy()
+    out.columns = pd.MultiIndex.from_product([out.columns, [ticker]], names=["Price", "Ticker"])
+    return out
+
+
+def test_retry_recovers_on_yfinance_multiindex_default(monkeypatch):
+    """alpha-engine-config-I11445: the 2026-09-23 rehearsal's HONA/Q/FDXF/SOLS.
+
+    The retry's single-ticker ``yf.download`` gets (Price, Ticker) MultiIndex
+    columns unless it passes ``multi_level_index=False``; on that frame
+    ``dropna(subset=["Close"])`` raised KeyError(['Close']) out of a helper
+    documented as never raising. This fake behaves like real yfinance: flat
+    only when asked to be."""
+    existing = _ohlcv(69)
+    s3 = _FakeS3({"reference/price_cache/HONA.parquet": _parquet_bytes(existing)})
+    calls: list[dict] = []
+
+    def _fake(*args, **kwargs):
+        calls.append(kwargs)
+        frame = _ohlcv(68) if len(calls) == 1 else _ohlcv(69)
+        if kwargs.get("group_by") == "ticker":  # the batch call: (Ticker, Price)
+            out = frame.copy()
+            out.columns = pd.MultiIndex.from_product([["HONA"], out.columns])
+            return out
+        if kwargs.get("multi_level_index", True):
+            return _as_yfinance_single_ticker(frame, "HONA")
+        return frame
+
+    monkeypatch.setattr(_prices.yf, "download", _fake, raising=True)
+
+    retries: dict[str, int] = {}
+    refreshed, failed, written = _prices._refresh_stale(
+        s3, "alpha-engine-research", "predictor/price_cache/", ["HONA"], "10y", 50,
+        trading_day="2026-09-14", short_fetch_retries=retries,
+    )
+
+    assert failed == []
+    assert refreshed == 1
+    assert written == [("HONA", 69)]
+    # A young listing never reaches the helper's 400-row early exit, so it
+    # spends every attempt and keeps the longest answer.
+    assert retries == {"HONA": _prices._SHORT_FETCH_RETRY_ATTEMPTS}
+
+
+def test_retry_helper_never_raises_on_a_multiindex_frame(monkeypatch):
+    """Even if a caller's yfinance ignores ``multi_level_index`` the helper
+    flattens the frame rather than raising."""
+    monkeypatch.setattr(
+        _prices.yf, "download",
+        lambda *a, **k: _as_yfinance_single_ticker(_ohlcv(500), "Q"), raising=True,
+    )
+    import datetime as _dt
+
+    df, attempts = _prices._retry_short_fetch_ticker(
+        "Q", "Q", _dt.date(2016, 8, 19), _dt.date(2026, 9, 15), "2026-09-14",
+    )
+
+    assert attempts == 1
+    assert df is not None and len(df) == 500
+    assert "Close" in df.columns and not isinstance(df.columns, pd.MultiIndex)
+
+
 def test_retry_budget_is_bounded_across_the_whole_run(monkeypatch):
     """More refusing tickers than the run-level retry budget must NOT retry
     them all — bounding total added time regardless of how many tickers

@@ -55,8 +55,9 @@ import logging
 import math
 import sqlite3
 import tempfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import boto3
 import pandas as pd
@@ -68,6 +69,29 @@ from dates import default_run_date
 from shadow.root import active_root
 
 logger = logging.getLogger(__name__)
+
+# The exchange's calendar, which is also Polygon's: a session stays "today"
+# (and its grouped-daily bar 403s "before end of day") until midnight ET.
+_MARKET_TZ = ZoneInfo("America/New_York")
+
+
+def _market_today(now: datetime | None = None) -> date:
+    """The live run's "today" on the exchange's calendar, not the box's.
+
+    The spot box runs in UTC, so between 00:00 UTC and midnight ET its
+    ``date.today()`` is already tomorrow while Polygon still treats the
+    session that just closed as the current one. Measured on the 2026-09-23
+    rehearsal (alpha-engine-config-I11445): launched at 00:00 UTC, i.e.
+    20:00 ET on 2026-09-22, the UTC anchor judged 2026-09-22 a closed forward
+    date, asked Polygon for it, got the before-EOD 403, and
+    `_grouped_daily_or_empty` re-raised because 2026-09-22 < 2026-09-23 —
+    so DataPhase1 exited 1. On the ET anchor the same run treats 2026-09-22
+    as still open, exactly as Polygon does.
+    """
+    moment = now if now is not None else datetime.now(_MARKET_TZ)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=ZoneInfo("UTC"))
+    return moment.astimezone(_MARKET_TZ).date()
 
 # -- Sector ETF mapping ------------------------------------------------------
 
@@ -277,11 +301,14 @@ def collect(
     # close has, in fact, already happened — silently dropping otherwise-
     # computable rows every week. `alpha-engine-config-I11216` fixed the
     # replay-determinism defect; this restores the pre-PR1837 live-run
-    # behavior alongside it.
+    # behavior alongside it. The live wall clock is read on the EXCHANGE's
+    # calendar (`_market_today`), never the UTC box's: a launch between
+    # 00:00 UTC and midnight ET would otherwise treat the session Polygon
+    # still calls "today" as closed (alpha-engine-config-I11445).
     today = (
         date.fromisoformat(run_date)
         if run_date and active_root() is not None
-        else date.today()
+        else _market_today()
     )
     existing = _get_existing_dates(db_path, today=today)
 
