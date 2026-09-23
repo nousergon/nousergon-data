@@ -104,3 +104,44 @@ def test_non_403_errors_are_not_caught():
     client = _Client(_Boom("connection reset"))
     with pytest.raises(_Boom):
         _grouped_daily_or_empty(client, "2026-08-18", today=_TODAY)
+
+
+# ── alpha-engine-config-I11445: the live "today" is the exchange's date ───────
+#
+# The 2026-09-23 rehearsal launched at 00:00 UTC = 20:00 ET on 2026-09-22. The
+# UTC box's date.today() said 2026-09-23, so 2026-09-22 read as a PAST date,
+# the before-EOD 403 Polygon returned for it re-raised, and DataPhase1 exited 1.
+
+
+def test_market_today_is_the_eastern_date_in_the_utc_evening_gap():
+    from datetime import datetime, timezone
+
+    from collectors.universe_returns import _market_today
+
+    at = datetime(2026, 9, 23, 0, 35, tzinfo=timezone.utc)  # 20:35 ET, 9/22
+    assert _market_today(at) == date(2026, 9, 22)
+
+
+def test_market_today_rolls_at_eastern_midnight():
+    from datetime import datetime, timezone
+
+    from collectors.universe_returns import _market_today
+
+    assert _market_today(datetime(2026, 9, 23, 3, 59, tzinfo=timezone.utc)) == date(2026, 9, 22)
+    assert _market_today(datetime(2026, 9, 23, 4, 1, tzinfo=timezone.utc)) == date(2026, 9, 23)
+    # The production slot (09:00 UTC) is unchanged.
+    assert _market_today(datetime(2026, 9, 19, 9, 0, tzinfo=timezone.utc)) == date(2026, 9, 19)
+
+
+def test_the_rehearsal_request_is_tolerated_on_the_eastern_anchor():
+    """The exact 2026-09-23 request: 9/22's grouped-daily at 20:35 ET."""
+    from datetime import datetime, timezone
+
+    from collectors.universe_returns import _market_today
+
+    today = _market_today(datetime(2026, 9, 23, 0, 35, tzinfo=timezone.utc))
+    client = _Client(PolygonForbiddenError(
+        "Polygon 403 on /v2/aggs/grouped/locale/us/market/stocks/2026-09-22: "
+        "Attempted to request today's data before end of day"
+    ))
+    assert _grouped_daily_or_empty(client, "2026-09-22", today=today) == {}
