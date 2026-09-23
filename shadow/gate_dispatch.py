@@ -9,8 +9,9 @@ crons (01:30Z / 12:30Z), up to ~1h47m after the report landed.
 
 This module is the event-driven half. After ``shadow parity --dispatch-gate``
 publishes ``parity/{D}.json`` it mints a short-lived installation token from
-a GitHub App installed on ``nousergon-data`` alone (Brian's ruling (a) on the
-issue), narrowed at mint time to ``actions: write`` on this one repository,
+the ``ne-groomer`` GitHub App (Brian's choice on 2026-09-23 over a new
+single-repo App), narrowed at mint time to ``actions: write`` on this one
+repository,
 and ``workflow_dispatch``-es ``data-gate.yml`` with ``trading_day=D`` and
 ``trigger=parity-published``.
 
@@ -20,11 +21,13 @@ printed to stderr and recorded in the published report as
 ``gate_dispatch: {ok: false, error: ...}``; the two post-publish crons stay
 as the backstop, so a missed dispatch costs latency, never a reading.
 
-The App credentials live at ``/alpha-engine/data-spot/github_app_id``,
-``..._installation_id`` and ``..._private_key``, the same three-name shape
-``nousergon_lib.github_app`` reads for the groomer under
-``/alpha-engine/groom/``. The box role is granted exactly those three
-parameters and nothing else under the prefix.
+The App credentials are the groomer's, at ``/alpha-engine/groom/github_app_id``,
+``..._installation_id`` and ``..._private_key``, which the box role already
+reads under its ``parameter/alpha-engine/*`` grant. ne-groomer is installed
+org-wide; ``workflow_dispatch`` needs its ``Actions`` permission at read and
+write, and until the installation carries write every mint fails and is
+recorded as ``gate_dispatch.ok: false``. The mint-time narrowing below is what
+keeps this box's token to one permission on one repository.
 """
 
 from __future__ import annotations
@@ -39,7 +42,7 @@ GATE_REPO_NAME = "nousergon-data"
 GATE_WORKFLOW = "data-gate.yml"
 GATE_REF = "main"
 GATE_TRIGGER = "parity-published"
-APP_SSM_PREFIX = "/alpha-engine/data-spot/"
+APP_SSM_PREFIX = "/alpha-engine/groom/"
 #: The only permission the minted token carries, whatever the installation
 #: itself was granted. Narrowing at mint time is what keeps a mis-scoped
 #: installation from becoming a mis-scoped token on the box.
