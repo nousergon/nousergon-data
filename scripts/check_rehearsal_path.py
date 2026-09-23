@@ -60,7 +60,32 @@ WEEKLY_CRITICAL_GLOBS: tuple[str, ...] = (
     "infrastructure/spot_*.sh",
     "infrastructure/run_weekly_offcycle.sh",
     "scripts/weekly_sf_rerun.py",
+    # alpha-engine-config-I11435: the in-repo Lambdas the weekly SF
+    # (infrastructure/step_function.json) invokes whose failure fails or
+    # degrades the Saturday run. nousergon-data-PR1879 changed the weekly
+    # box's spot rotation in the first of these and this check reported
+    # `skipping`. Every in-repo Lambda the weekly SF invokes must be either
+    # here or in WEEKLY_SF_LAMBDAS_NOT_CRITICAL below, pinned by
+    # tests/test_rehearsal_path_guard_lockstep.py.
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/**",
+    "infrastructure/lambdas/eval-judge-spot-dispatcher/**",
+    "infrastructure/lambdas/weekly-preflight/**",
+    "infrastructure/lambdas/substrate-health-gate/**",
+    "infrastructure/lambdas/weekly-run-scope/**",
 )
+
+# In-repo Lambdas the weekly SF invokes that are deliberately NOT
+# weekly-critical, each with the reason. A Lambda directory the weekly SF
+# reaches must appear here or in WEEKLY_CRITICAL_GLOBS, so a new weekly
+# stage that moves into a Lambda is decided explicitly rather than by
+# omission (alpha-engine-config-I11435 deliverable 4).
+WEEKLY_SF_LAMBDAS_NOT_CRITICAL: dict[str, str] = {
+    "weekly-coverage-sweep": (
+        "post-run observer: it reads what the run produced and pages on "
+        "gaps. Its Catch routes to WeeklyCoverageSweepUnavailable, which "
+        "pages; a regression cannot change what the run computes."
+    ),
+}
 
 # §7.1 mechanism names/aliases a `Rehearsal-path:` trailer may cite. Matched
 # case-insensitively as a substring so both the artifact and trigger names
