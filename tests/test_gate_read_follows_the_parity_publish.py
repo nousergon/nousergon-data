@@ -246,3 +246,15 @@ def test_the_post_publish_crons_run_after_the_publishes_they_follow():
         minutes[cron] = int(hour) * 60 + int(minute)
     assert minutes["30 1 * * 2-6"] == 90  # 01:30 UTC, ~1h47m after 23:43 UTC
     assert minutes["30 12 * * 1-5"] == 750  # 12:30 UTC, 45m after 11:45 UTC
+
+
+def test_the_job_timeout_covers_six_reads_at_the_measured_duration():
+    """Six sequential reads at the 4.0 min measured on 2026-09-23 plus the
+    install need ~25 min; the old 15-minute timeout cancelled every read that
+    day before `data-phase3` and the reliability gate ran, and a cancellation
+    pages nothing. Keep headroom above the measured worst case."""
+    job = _workflow()["jobs"]["read-gate"]
+    reads = [s for s in job["steps"] if "python -m data_gate read" in (s.get("run") or "")]
+    measured_worst_read_minutes = 4.0
+    install_minutes = 1.0
+    assert job["timeout-minutes"] >= len(reads) * measured_worst_read_minutes + install_minutes
