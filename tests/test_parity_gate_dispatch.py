@@ -2,9 +2,10 @@
 
 `alpha-engine-config-I11361`. `data_gate.read.TRIGGERS` declared
 `parity-published` from `-I11355` on, but nothing emitted it, so the gate read
-followed the same-day publish (~23:43Z) on a 01:30Z cron. Brian ruled option
-(a): a GitHub App installed on this repository only, its credentials in SSM
-under `/alpha-engine/data-spot/`, minted per run on the data-spot box.
+followed the same-day publish (~23:43Z) on a 01:30Z cron. The token is minted
+per run on the data-spot box from the existing `ne-groomer` App
+(`/alpha-engine/groom/`), Brian's choice on 2026-09-23 over a new single-repo
+App.
 
 Pinned here:
 
@@ -12,7 +13,7 @@ Pinned here:
    exactly the input set `data-gate.yml`'s `workflow_dispatch` declares, and
    the workflow turns it into `--trigger parity-published` for that day;
 2. the minted token is narrowed to `actions: write` on this one repository,
-   from the data-spot App's SSM prefix and not the groomer's;
+   from the ne-groomer App's SSM prefix;
 3. any failure (mint, HTTP, non-204) is recorded, never raised;
 4. the outcome lands in the published report as `gate_dispatch`, and the
    report still validates against its contract;
@@ -87,7 +88,7 @@ def test_the_dispatch_targets_this_repositorys_gate_workflow():
 
 
 # ---------------------------------------------------------------------------
-# 2 — the token is narrow, and it is the data-spot App's
+# 2 — the token is narrow, and it is ne-groomer's
 # ---------------------------------------------------------------------------
 
 
@@ -103,16 +104,16 @@ def test_the_minted_token_is_narrowed_to_actions_write_on_this_repo(monkeypatch)
     monkeypatch.setitem(sys.modules, "nousergon_lib.github_app", module)
 
     assert gate_dispatch.mint_token() == "ghs_test"
-    assert seen["ssm_prefix"] == "/alpha-engine/data-spot/"
+    assert seen["ssm_prefix"] == "/alpha-engine/groom/"
     assert seen["permissions"] == {"actions": "write"}
     assert seen["repositories"] == ["nousergon-data"]
 
 
-def test_the_ssm_prefix_is_not_the_groomers():
-    """The whole point of ruling (a) over reusing an existing identity: this
-    box's key can do one thing on one repository."""
-    assert gate_dispatch.APP_SSM_PREFIX != "/alpha-engine/groom/"
-    assert gate_dispatch.APP_SSM_PREFIX.startswith("/alpha-engine/")
+def test_the_groomer_key_is_narrowed_to_one_permission_on_one_repo():
+    """ne-groomer is installed org-wide, so the mint-time narrowing is the only
+    thing keeping this box's token off every other repository and permission."""
+    assert gate_dispatch.APP_SSM_PREFIX == "/alpha-engine/groom/"
+    assert gate_dispatch.TOKEN_PERMISSIONS == {"actions": "write"}
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +134,7 @@ def test_a_204_is_recorded_as_ok():
 
 def test_a_mint_failure_is_recorded_not_raised():
     def broken_mint():
-        raise RuntimeError("App credential unreadable at SSM /alpha-engine/data-spot/github_app_id")
+        raise RuntimeError("App credential unreadable at SSM /alpha-engine/groom/github_app_id")
 
     outcome = gate_dispatch.dispatch_gate_read(DAY, mint=broken_mint, post=lambda *a: 204)
     assert outcome["ok"] is False
