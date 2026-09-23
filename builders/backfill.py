@@ -70,7 +70,7 @@ from builders._price_cache_writeboth import (
 )
 from builders._constituents_loader import load_constituents_for_run_date
 from builders.daily_append import _scan_universe_and_emit_freshness_receipt
-from collectors.prices import _SUB_SECTOR_ETFS
+from collectors.prices import _ALWAYS_DOWNLOAD, _SUB_SECTOR_ETFS
 
 log = logging.getLogger(__name__)
 
@@ -85,6 +85,17 @@ log = logging.getLogger(__name__)
 # polygon-sourced daily_closes parquet.
 OHLCV_COLS = _CANONICAL_OHLCV_COLS
 PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
+
+#: The price-cache stems a single-ticker (``ticker_filter``) write reads
+#: besides the ticker itself: every macro / benchmark / sector-ETF series
+#: ``_extract_macro_series`` and ``compute_features`` consume. A per-ticker
+#: write never needs another STOCK's parquet — the cross-sectional second
+#: passes (factor momentum, loading z-scores) are full-universe only — so
+#: loading all ~930 parquets to write one symbol was pure cost, and it was
+#: also a hazard: ``_apply_daily_delta`` restates and marks-applied every
+#: registered split across whatever it was handed, while only the filtered
+#: ticker is written (alpha-engine-config-I11444).
+_PER_TICKER_CACHE_CONTEXT = frozenset({*_ALWAYS_DOWNLOAD, "HYOAS"})
 
 
 def _load_current_constituents(s3, bucket: str, run_date: str | None = None) -> set[str]:
@@ -105,8 +116,22 @@ def _load_current_constituents(s3, bucket: str, run_date: str | None = None) -> 
     return tickers
 
 
-def _load_full_cache(s3, bucket: str, prefix: str = PRICE_CACHE_LEGACY_PREFIX) -> dict[str, pd.DataFrame]:
+def _cache_key_stem(key: str) -> str:
+    return key.split("/")[-1].replace(".parquet", "")
+
+
+def _load_full_cache(
+    s3,
+    bucket: str,
+    prefix: str = PRICE_CACHE_LEGACY_PREFIX,
+    only: frozenset[str] | set[str] | None = None,
+) -> dict[str, pd.DataFrame]:
     """Load all 10-year price cache parquets from S3 (concurrent).
+
+    ``only``, when given, restricts the download to those ticker stems — the
+    per-ticker (``ticker_filter``) path passes the ticker plus
+    ``_PER_TICKER_CACHE_CONTEXT``. ``None`` (the weekly full backfill) loads
+    everything, unchanged.
 
     Wave-3 reader migration (ROADMAP L1401): when ``prefix`` is the
     production default the listing iterates both
@@ -117,6 +142,8 @@ def _load_full_cache(s3, bucket: str, prefix: str = PRICE_CACHE_LEGACY_PREFIX) -
     fallback chain.
     """
     keys = list_price_cache_keys(s3, bucket, prefix)
+    if only is not None:
+        keys = [k for k in keys if _cache_key_stem(k) in only]
 
     if not keys:
         log.error("No parquets found in s3://%s/%s (read-prefix chain)", bucket, prefix)
@@ -131,7 +158,7 @@ def _load_full_cache(s3, bucket: str, prefix: str = PRICE_CACHE_LEGACY_PREFIX) -
     errors = 0
 
     def _download(key: str) -> tuple[str, pd.DataFrame | None]:
-        ticker = key.split("/")[-1].replace(".parquet", "")
+        ticker = _cache_key_stem(key)
         try:
             df = _load_parquet_from_s3(s3, bucket, key)
             if df.empty:
@@ -1000,8 +1027,17 @@ def backfill(
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
     # ── 1. Load data ─────────────────────────────────────────────────────────
-    log.info("Loading full 10-year price cache...")
-    price_data = _load_full_cache(s3, bucket)
+    if ticker_filter:
+        log.info(
+            "Loading 10-year price cache for %s plus its %d macro/ETF context series...",
+            ticker_filter, len(_PER_TICKER_CACHE_CONTEXT),
+        )
+        price_data = _load_full_cache(
+            s3, bucket, only=_PER_TICKER_CACHE_CONTEXT | {ticker_filter},
+        )
+    else:
+        log.info("Loading full 10-year price cache...")
+        price_data = _load_full_cache(s3, bucket)
     if not price_data:
         return {"status": "error", "error": "no_price_data"}
 
@@ -1537,7 +1573,10 @@ def backfill(
 
     # ── 7. Validation (optional) ─────────────────────────────────────────────
     if validate and not dry_run:
-        _run_validation(universe_lib, price_data, macro, sector_map, fundamentals, alt_data)
+        _run_validation(
+            universe_lib, price_data, macro, sector_map, fundamentals, alt_data,
+            tickers=[ticker_filter] if ticker_filter else None,
+        )
 
     return result
 
@@ -1549,10 +1588,18 @@ def _run_validation(
     sector_map: dict[str, str],
     fundamentals: dict[str, dict],
     alt_data: dict[str, dict],
+    tickers: list[str] | None = None,
 ):
-    """Spot-check: recompute features inline for 10 tickers and compare to ArcticDB."""
-    symbols = universe_lib.list_symbols()
-    check_tickers = sorted(symbols)[:10]
+    """Spot-check: recompute features inline and compare to ArcticDB.
+
+    ``tickers`` names what to check; ``None`` checks the first 10 universe
+    symbols. A per-ticker backfill passes its own ticker, because it loads
+    only that ticker's parquet (``_PER_TICKER_CACHE_CONTEXT``).
+    """
+    if tickers is not None:
+        check_tickers = list(tickers)
+    else:
+        check_tickers = sorted(universe_lib.list_symbols())[:10]
 
     log.info("Running validation on %d tickers: %s", len(check_tickers), check_tickers)
 

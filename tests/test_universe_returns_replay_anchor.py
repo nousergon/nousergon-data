@@ -155,7 +155,8 @@ def test_collect_uses_wall_clock_on_a_live_run_no_declared_replay(monkeypatch):
     """
     assert ur.active_root() is None, "no shadow root should be active in this test"
 
-    monkeypatch.setattr(ur, "date", _FixedToday)
+    # The live wall clock is read on the exchange's calendar (I11445).
+    monkeypatch.setattr(ur, "_market_today", lambda now=None: _FixedToday._fixed)
     seen_today: list[date] = []
 
     def _fake_get_existing(db_path, today=None):
