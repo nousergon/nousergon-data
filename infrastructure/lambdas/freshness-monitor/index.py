@@ -103,7 +103,6 @@ from nousergon_lib.artifact_freshness import (
     resolve_current_cycle,
 )
 from nousergon_lib.trading_calendar import (
-    is_trading_day,
     last_closed_trading_day,
     previous_trading_day,
 )
@@ -343,6 +342,14 @@ _SPEC_FIELDS = frozenset(
         "produces",
         "depends_on",
         "liveness_via",
+        # alpha-engine-config-I10614 — never-written IS the healthy state for
+        # this row, so the never-written probe must skip it. Missing from this
+        # set until 2026-09-23: the loader stripped the key, every spec read
+        # `absence_expected=False`, and `predictor_commitment_window_state`
+        # kept appearing in the CRITICAL digest's [never-written] block despite
+        # the registry declaring it. The unit tests built ArtifactSpec
+        # directly and never went through this strip.
+        "absence_expected",
         # alpha-engine-config-I10805 / I10829 phase 2 — the row's wall-clock
         # local deadline. Native `ArtifactSpec.deadline_local` field as of
         # the pinned nousergon-lib >=0.124.129 (PR415): construction validates
