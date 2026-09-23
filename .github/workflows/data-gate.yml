@@ -210,7 +210,14 @@ jobs:
   read-gate:
     name: data-gate-read
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Six sequential reads. Each took ~2 min on 2026-09-22 and 3.2-4.0 min from
+    # 2026-09-23 on, so 15 minutes cancelled every read from 01:30Z that day
+    # partway through data-phase2/phase3 (runs 35806797260, 35825495053,
+    # 35894773097, 35895185107), before the reliability gate ever ran. A
+    # timeout surfaces as `cancelled`, which `notify-main-failure`'s
+    # `failure()` does not match, so nothing paged. Sized at ~1.5x the
+    # measured worst case (6 x 4.0 min + ~1 min install).
+    timeout-minutes: 40
     # alpha-engine-config-I10823: the `consumers` column resolves each declared
     # reader path on its repository's default branch through the GitHub
     # contents API, with this run's own short-lived token (`contents: read`
