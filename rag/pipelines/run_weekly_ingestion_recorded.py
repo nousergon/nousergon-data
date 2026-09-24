@@ -50,9 +50,17 @@ which keys ``rag/manifest/{date}.json``, ``rag/filing_changes/{date}.json`` and
 apart, even across midnight UTC. (Before I11514 each step read the wall clock
 itself and this wrapper had to guess the same value.)
 
-``--date`` defaults to today UTC, not `dates.default_run_date()`: the
-dispatcher's EventBridge Scheduler input is static and cannot carry a cycle
-date, and this default preserves the keys this workload has always written.
+**``--date`` defaults to the cycle date, never the UTC calendar day**
+(alpha-engine-config-I11475, Brian's ruling of 2026-09-24: the whole D16 key
+family is keyed by the SF cycle date, the same value v1's RAGIngestion passes
+from ``$.run_date`` since I11514). The data-collection weekly schedule's input
+is static and cannot carry a date, so the default is `dates.default_run_date()`
+— the last closed NYSE session, which is what the v1 SF's ``$.run_date``
+resolves to for the Saturday run (Friday), what `run_units.run_phase` keys
+every other unit in the same weekly execution by, and what the dispatcher's own
+run-log partition (`index.py::_run_log_trading_day`) resolves to. Before this,
+the default was today's UTC date, so the v2 path filed Saturday's run under
+Saturday while v1 filed the same cycle under Friday.
 
 Replaces ``bash rag/pipelines/run_weekly_ingestion.sh`` as the
 ``rag-weekly-ingestion`` workload command in
@@ -298,6 +306,20 @@ def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool, run_date: str) 
     return result
 
 
+def _default_cycle_date() -> str:
+    """The cycle date a scheduled run with no ``--date`` keys D16 by.
+
+    ``dates.default_run_date()`` (alpha-engine-config-I11475): the last closed
+    NYSE session, so a Saturday run is filed under Friday's cycle exactly as
+    v1's ``$.run_date`` files it. Imported here, not at module top, for the same
+    reason `run_units.run_phase` does: it keeps ``dates`` off the import path of
+    callers that always pass an explicit date.
+    """
+    from dates import default_run_date
+
+    return default_run_date()
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -308,11 +330,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="The manifest's trading_day, also passed to run_weekly_ingestion.sh as "
         "--run-date so every dated key it writes carries the same value "
-        "(alpha-engine-config-I11514). Default: today UTC.",
+        "(alpha-engine-config-I11514). Default: the cycle date, "
+        "dates.default_run_date() — the last closed NYSE session, never the UTC "
+        "calendar day (alpha-engine-config-I11475).",
     )
     args = parser.parse_args(argv)
 
-    trading_day = args.date or datetime.now(timezone.utc).date().isoformat()
+    trading_day = args.date or _default_cycle_date()
 
     def _entry(ctx: run_units.run_manifest.UnitRun) -> dict[str, Any]:
         return _body(ctx, dry_run=args.dry_run, run_date=trading_day)
