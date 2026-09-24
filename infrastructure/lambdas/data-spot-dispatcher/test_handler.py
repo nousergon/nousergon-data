@@ -50,34 +50,39 @@ class _SpotQuotaExceededError(_SpotLaunchError):
     pass
 
 
-def _install_stubs(launch_impl, boto_clients, publish_impl=None):
+def _install_stubs(monkeypatch, launch_impl, boto_clients, publish_impl=None):
+    # Every sys.modules write goes through monkeypatch.setitem so it is UNDONE
+    # at teardown. A bare `sys.modules[...] = stub` outlives this file: any test
+    # sharing the process afterwards (e.g. `pytest <this file> tests/`) imports
+    # the stub `nousergon_lib`/`krepis`/`boto3` instead of the real package and
+    # fails by import order (alpha-engine-config-I11229).
     ec2_spot_mod = types.ModuleType("nousergon_lib.ec2_spot")
     ec2_spot_mod.SpotLaunchError = _SpotLaunchError
     ec2_spot_mod.SpotCapacityExhausted = _SpotCapacityExhausted
     ec2_spot_mod.SpotQuotaExceededError = _SpotQuotaExceededError
     ec2_spot_mod.launch = launch_impl
-    sys.modules["nousergon_lib.ec2_spot"] = ec2_spot_mod
+    monkeypatch.setitem(sys.modules, "nousergon_lib.ec2_spot", ec2_spot_mod)
 
     # index.py's module-level `from nousergon_lib import ec2_spot` resolves the
     # TOP-LEVEL `nousergon_lib` name first — the hermetic_import_guard (and the
     # real import machinery) needs that stubbed too, not just the submodule.
     nousergon_lib_mod = types.ModuleType("nousergon_lib")
     nousergon_lib_mod.ec2_spot = ec2_spot_mod
-    sys.modules["nousergon_lib"] = nousergon_lib_mod
+    monkeypatch.setitem(sys.modules, "nousergon_lib", nousergon_lib_mod)
 
     krepis_mod = types.ModuleType("krepis")
     krepis_alerts_mod = types.ModuleType("krepis.alerts")
     krepis_alerts_mod.publish = publish_impl or (lambda *a, **kw: None)
     krepis_mod.alerts = krepis_alerts_mod
-    sys.modules["krepis"] = krepis_mod
-    sys.modules["krepis.alerts"] = krepis_alerts_mod
+    monkeypatch.setitem(sys.modules, "krepis", krepis_mod)
+    monkeypatch.setitem(sys.modules, "krepis.alerts", krepis_alerts_mod)
     # NOT stubbed — see the module-level import.
     krepis_mod.spot_bootstrap = _REAL_SPOT_BOOTSTRAP
-    sys.modules["krepis.spot_bootstrap"] = _REAL_SPOT_BOOTSTRAP
+    monkeypatch.setitem(sys.modules, "krepis.spot_bootstrap", _REAL_SPOT_BOOTSTRAP)
 
     boto3_mod = types.ModuleType("boto3")
     boto3_mod.client = lambda name, **kw: boto_clients[name]
-    sys.modules["boto3"] = boto3_mod
+    monkeypatch.setitem(sys.modules, "boto3", boto3_mod)
 
 
 class _FakeWaiter:
@@ -115,19 +120,30 @@ def _load(monkeypatch, *, launch_impl, publish_impl=None, env=None):
     ssm = _FakeSsm()
     ec2 = _FakeEc2()
     clients = {"ec2": ec2, "ssm": ssm}
-    _install_stubs(launch_impl, clients, publish_impl=publish_impl)
+    _install_stubs(monkeypatch, launch_impl, clients, publish_impl=publish_impl)
 
     from _shared.hermetic_import_guard import assert_hermetic_imports_satisfied
 
     assert_hermetic_imports_satisfied(__file__)
 
-    import importlib
+    # Load THIS Lambda's index.py by path, fresh against this test's stubs, and
+    # drop it again at teardown (alpha-engine-config-I11229). Two reasons:
+    #   * an `index` left in sys.modules keeps references to the stubs above
+    #     after they are restored;
+    #   * `import index` resolves through sys.path, and every Lambda has an
+    #     index.py. In a shared process, another test that puts its own
+    #     Lambda's directory at the front of sys.path makes the name resolve to
+    #     THAT handler (measured: `pytest <this file> tests/` loaded the
+    #     run-scope Lambda's index.py here).
+    import importlib.util
 
-    if "index" in sys.modules:
-        importlib.reload(sys.modules["index"])
-    else:
-        import index  # noqa: F401
-    return sys.modules["index"], ssm, ec2
+    spec = importlib.util.spec_from_file_location(
+        "index", os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, "index", module)
+    spec.loader.exec_module(module)
+    return module, ssm, ec2
 
 
 def test_spot_quota_exceeded_falls_back_to_on_demand_no_rotation_and_pages(monkeypatch):
@@ -1334,3 +1350,56 @@ def test_the_trading_day_partition_prefers_the_declared_day(monkeypatch):
     under the day the box happened to boot."""
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     assert index._run_log_trading_day("2026-09-14") == "2026-09-14"
+
+
+# ── Isolation: the stubs above must not outlive the test that installed them ──
+# (alpha-engine-config-I11229). This file used to assign stubs straight into
+# sys.modules, so `pytest <this file> tests/` in one process failed every
+# collector test that imported after it: `cannot import name 'run_manifest'
+# from 'nousergon_lib' (unknown location)`.
+
+_STUBBED_NAMES = (
+    "nousergon_lib",
+    "nousergon_lib.ec2_spot",
+    "krepis",
+    "krepis.alerts",
+    "krepis.spot_bootstrap",
+    "boto3",
+    "index",
+)
+_MISSING = object()
+
+
+def test_the_stubs_are_restored_when_the_test_ends():
+    before = {name: sys.modules.get(name, _MISSING) for name in _STUBBED_NAMES}
+    with pytest.MonkeyPatch.context() as mp:
+        index, _ssm, _ec2 = _load(mp, launch_impl=lambda t, s, **kw: "i-x")
+        # Inside the test the handler really does see the stubs...
+        assert sys.modules["nousergon_lib"].__spec__ is None
+        assert index.ec2_spot is sys.modules["nousergon_lib.ec2_spot"]
+        # ...and it is THIS Lambda's handler, whatever else is on sys.path.
+        assert os.path.samefile(
+            index.__file__, os.path.join(os.path.dirname(os.path.abspath(__file__)), "index.py")
+        )
+    # ...and once it ends, every entry is exactly what it was before.
+    after = {name: sys.modules.get(name, _MISSING) for name in _STUBBED_NAMES}
+    leaked = [name for name in _STUBBED_NAMES if after[name] is not before[name]]
+    assert leaked == [], f"sys.modules entries leaked past teardown: {leaked}"
+
+
+def test_the_real_nousergon_lib_still_resolves_after_this_file():
+    """Runs LAST in this file, i.e. after every stubbing test above: the name a
+    collector imports must resolve to the installed package, not a stub."""
+    import importlib
+    import importlib.util
+
+    lib = sys.modules.get("nousergon_lib")
+    assert lib is None or lib.__spec__ is not None, (
+        "a stub `nousergon_lib` (no __spec__) is still in sys.modules"
+    )
+    if importlib.util.find_spec("nousergon_lib") is None:
+        # deploy.sh's minimal preflight install omits the lib; the restoration
+        # itself is asserted by the test above regardless.
+        return
+    run_manifest = importlib.import_module("nousergon_lib.run_manifest")
+    assert run_manifest.__file__, "nousergon_lib.run_manifest has no file: not the real module"
