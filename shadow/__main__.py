@@ -1,11 +1,14 @@
-"""`python -m shadow run …`, `python -m shadow parity …` and
-`python -m shadow arctic-parity …`.
+"""`python -m shadow run …`, `python -m shadow parity …`,
+`python -m shadow arctic-parity …` and `python -m shadow prune …`.
 
-Three commands. `run` and `parity` are the two halves of plan §6.2 step 4;
+Four commands. `run` and `parity` are the two halves of plan §6.2 step 4;
 `arctic-parity` (`alpha-engine-config-I10819`) is the in-region follow-up that
 fills the `in_region_only` rows `parity` cannot measure from the laptop.
 **Run it on the data-spot box, never the laptop** — it opens ArcticDB
 directly, which is unreachable from here (`alpha-engine-config-I9771`).
+`prune` (`alpha-engine-config-I11447`) removes shadow ArcticDB libraries past
+the retention window; it opens ArcticDB too, so the same box rule applies, and
+it is a dry run unless `--apply` is passed.
 
 ``run`` is the output-root override. It activates the shadow root BEFORE the
 target module is imported — which is the whole reason it exists as a wrapper
@@ -140,7 +143,30 @@ def _parser() -> argparse.ArgumentParser:
     )
     arctic.add_argument("--relative-tolerance", type=float, default=parity_module.DEFAULT_RELATIVE_TOLERANCE)
     arctic.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
+
+    prune = sub.add_parser(
+        "prune",
+        help="delete shadow ArcticDB libraries older than the retention window (dry run unless --apply)",
+    )
+    prune.add_argument("--bucket", default=DEFAULT_BUCKET)
+    prune.add_argument("--keep-days", type=int, default=7)
+    prune.add_argument("--today", default=None, help="ISO date; defaults to today (UTC)")
+    prune.add_argument(
+        "--apply",
+        action="store_true",
+        help="actually delete. Without it the command only reports (alpha-engine-config-I11447)",
+    )
     return parser
+
+
+def _prune(args) -> int:
+    from shadow.retention import prune
+    from store.arctic_store import _get_arctic
+
+    today = dt.date.fromisoformat(args.today) if args.today else dt.datetime.now(dt.timezone.utc).date()
+    report = prune(_get_arctic(args.bucket), today=today, keep_days=args.keep_days, apply=args.apply)
+    print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
 
 
 def _run(args) -> int:
@@ -327,6 +353,8 @@ def main(argv: "list[str] | None" = None) -> int:
         return _run(args)
     if args.command == "arctic-parity":
         return _arctic_parity(args)
+    if args.command == "prune":
+        return _prune(args)
     return _parity(args)
 
 

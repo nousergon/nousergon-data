@@ -1839,144 +1839,87 @@ def _sibling_repo(name: str) -> "Path | None":
     return None
 
 
-_ANTHROPIC_SNAPSHOT_RE = __import__("re").compile(r"-\d{8}$")
-
-
-def _normalize_model_for_pricing(model_name: str) -> str:
-    """Strip Anthropic ``-YYYYMMDD`` snapshot suffix. Mirrors the function
-    in ``alpha-engine-research/graph/llm_cost_tracker.py`` (PR #77). Kept
-    here as a static copy so the preflight doesn't need to import the
-    research module (which transitively pulls in heavy deps)."""
-    return _ANTHROPIC_SNAPSHOT_RE.sub("", model_name)
-
-
 def check_price_cards_cover_all_models(ctx: PreflightContext) -> CheckResult:
-    """Catches the 2026-05-02 PR #77 class: cost-telemetry hard-fail when
-    a runtime model name (often a snapshot ID like ``claude-haiku-4-5-
-    20251001``) doesn't normalize to any price card.
+    """Every live model-registry group's primary has an active price card.
 
-    Walks every model name referenced by alpha-engine-research's runtime
-    config + hardcoded fallbacks, normalizes via the same logic the
-    Lambda uses (snapshot-suffix strip), and asserts each maps to a
-    card in alpha-engine-config/cost/model_pricing.yaml.
+    The class: a primary with no card makes ``krepis.cost.record_llm_call``
+    degrade that call's cost record to ``cost_source: "unpriced"`` (it used to
+    drop it; ``glm-5.3`` dropped ``director-plan``'s whole record for a week,
+    alpha-engine-config-I11100). Nothing downstream fails on an unpriced
+    record, so without this rule the spend is silently unattributed.
 
-    Pure file I/O, zero LLM cost. Skips if sibling repos aren't checked
-    out (CI / restricted environments).
+    Runs the SHARED rule, ``krepis.cost.unpriced_live_primaries``, against the
+    registry in the ``alpha-engine-config`` sibling and krepis' own packaged
+    pricing table: the same source ``alpha-engine-config``'s merge-time
+    ``tests/test_registry_price_card_coverage.py`` reads (alpha-engine-config-
+    I11112 Non-inferable §1). The merge-time test owns the class; this copy is
+    the runtime backstop for a registry edited outside a PR, which is why it
+    stays ``CHECK_REQUIRED = False`` (I11112 Non-inferable §2).
 
-    ⚠ alpha-engine-config-I11112, MEASURED 2026-09-22 — THIS CHECK WOULD NOT
-    HAVE CAUGHT I11100, even with CAP_CHECKOUT granted. Two reasons, both
-    verified against the live fleet:
+    alpha-engine-config-I11429: until 2026-09-24 this graded the v1 research
+    rate card (``alpha-engine-config/cost/model_pricing.yaml``), not the table
+    ``record_llm_call`` consults, and read two input paths that no longer
+    existed (``research/universe.yaml``, ``graph/research_graph.py``), so it
+    could only ever return ``warn``.
 
-      * it grades ``alpha-engine-config/cost/model_pricing.yaml``, the v1
-        RESEARCH rate card. The table ``krepis.cost.record_llm_call``
-        actually consults is ``krepis/src/krepis/model_pricing.yaml``. They
-        are different files with different contents; ``glm-5.3`` missing
-        from the latter is what dropped ``director-plan``'s cost record, and
-        this check never looks there.
-      * its two input paths — ``alpha-engine-config/research/universe.yaml``
-        and ``<research>/graph/research_graph.py`` — do not exist any more.
-        With both gone it discovers zero runtime model names and returns
-        ``warn``, never ``fail``.
-
-    The class is now owned at MERGE time by ``alpha-engine-config``'s
-    ``tests/test_registry_price_card_coverage.py``, which reads the live
-    ``LLM_MODEL_REGISTRY.yaml`` against krepis' own pricing table through
-    ``krepis.cost.unpriced_live_primaries``. This copy is retained rather
-    than deleted (I11112 Non-inferable §2) and demoted to
-    ``CHECK_REQUIRED = False``; repointing it at the same shared rule, or
-    retiring it, is tracked separately."""
+    Pure file I/O, zero LLM cost. Skips (``warn``) when the config sibling is
+    not checked out.
+    """
     import time
-    import yaml as _yaml
-    from pathlib import Path
     t0 = time.time()
+    name = "price_cards_cover_all_models"
 
     config_repo = _sibling_repo("alpha-engine-config")
-    research_repo = _sibling_repo("alpha-engine-research")
-    if config_repo is None or research_repo is None:
+    if config_repo is None:
         return CheckResult(
-            name="price_cards_cover_all_models",
+            name=name,
             status="warn",
-            message=(
-                f"Sibling repos not checked out (config={config_repo is not None}, "
-                f"research={research_repo is not None}) — skipped."
-            ),
+            message="alpha-engine-config sibling not checked out — skipped.",
             elapsed_seconds=time.time() - t0,
         )
 
-    pricing_path = config_repo / "cost" / "model_pricing.yaml"
-    if not pricing_path.is_file():
+    registry_path = config_repo / "private-docs" / "LLM_MODEL_REGISTRY.yaml"
+    if not registry_path.is_file():
         return CheckResult(
-            name="price_cards_cover_all_models",
+            name=name,
             status="fail",
-            message=f"Missing {pricing_path}",
-            elapsed_seconds=time.time() - t0,
-        )
-    pricing = _yaml.safe_load(pricing_path.read_text())
-    card_names = {c["model_name"] for c in pricing.get("cards", [])}
-
-    universe_path = config_repo / "research" / "universe.yaml"
-    runtime_models: dict[str, str] = {}
-    if universe_path.is_file():
-        universe = _yaml.safe_load(universe_path.read_text()) or {}
-        sector_cfg = universe.get("sector_teams") or {}
-        for k in ("per_stock_model", "strategic_model"):
-            v = sector_cfg.get(k) or universe.get(k)
-            if v:
-                runtime_models[f"sector_teams.{k}"] = v
-
-    # Also scan research_graph.py's hardcoded fallback dict — these names
-    # are used when track_llm_cost wiring is incomplete.
-    rg_path = research_repo / "graph" / "research_graph.py"
-    if rg_path.is_file():
-        src = rg_path.read_text()
-        # Parse _FALLBACK_AGENT_MODEL_NAMES dict literal — small enough that
-        # a regex is fine (vs full AST). Tolerates whitespace + quote style.
-        import re as _re
-        block = _re.search(
-            r"_FALLBACK_AGENT_MODEL_NAMES[^=]*=\s*\{(.*?)\}",
-            src, _re.DOTALL,
-        )
-        if block:
-            for m in _re.finditer(r'"([^"]+)"\s*:\s*"([^"]+)"', block.group(1)):
-                runtime_models[f"_FALLBACK_AGENT_MODEL_NAMES[{m.group(1)}]"] = m.group(2)
-
-    if not runtime_models:
-        return CheckResult(
-            name="price_cards_cover_all_models",
-            status="warn",
-            message="No runtime model names discovered — schema drift in research config?",
+            message=f"Missing {registry_path}",
             elapsed_seconds=time.time() - t0,
         )
 
-    misses: list[str] = []
-    for source, model_name in runtime_models.items():
-        normalized = _normalize_model_for_pricing(model_name)
-        if normalized not in card_names:
-            misses.append(f"{source}={model_name!r} (normalized={normalized!r})")
-
-    if misses:
+    try:
+        from krepis.cost import load_default_pricing, unpriced_live_primaries
+        from krepis.model_registry import load_registry
+    except ImportError as exc:
+        # The pin in requirements.txt carries the rule (krepis>=0.59.67), so
+        # this is an environment defect, not a skip.
         return CheckResult(
-            name="price_cards_cover_all_models",
+            name=name,
+            status="fail",
+            message=f"krepis.cost.unpriced_live_primaries unavailable: {exc}",
+            elapsed_seconds=time.time() - t0,
+        )
+
+    missing = unpriced_live_primaries(
+        load_registry(registry_path), load_default_pricing(),
+    )
+    if missing:
+        return CheckResult(
+            name=name,
             status="fail",
             message=(
-                f"{len(misses)} runtime model(s) have no matching price card — "
-                f"recompute_cost would raise PriceCardLookupError on the SF run"
+                f"{len(missing)} live group primary(ies) have no active price "
+                f"card — their cost records will land as cost_source=unpriced"
             ),
-            details={
-                "missing": misses,
-                "available_cards": sorted(card_names),
-            },
+            details={"missing": [str(m) for m in missing]},
             elapsed_seconds=time.time() - t0,
         )
 
     return CheckResult(
-        name="price_cards_cover_all_models",
+        name=name,
         status="ok",
-        message=(
-            f"All {len(runtime_models)} runtime model(s) map to price cards "
-            f"(after snapshot-suffix normalization)"
-        ),
-        details={"runtime_models": runtime_models},
+        message="Every live registry group's primary has an active price card",
+        details={"registry": str(registry_path)},
         elapsed_seconds=time.time() - t0,
     )
 
