@@ -769,7 +769,7 @@ def audit_action_jumps(
     for ticker, df in price_data.items():
         if df is None or df.empty or "Close" not in df.columns:
             continue
-        returns = df["Close"].pct_change().dropna()
+        returns = df["Close"].ffill().pct_change(fill_method=None).dropna()
         hits = returns[returns.abs() > screen_threshold]
         if hits.empty:
             continue

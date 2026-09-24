@@ -25,7 +25,8 @@ import random
 import re
 import time
 from collections import deque
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
+from email.utils import parsedate_to_datetime
 
 import pandas as pd
 import requests
@@ -61,6 +62,53 @@ def _scrub_api_key(msg: object) -> str:
 _POLYGON_MAX_ATTEMPTS = 4
 _POLYGON_BACKOFF_BASE = 1.0   # seconds; wait ≈ base * 2**attempt + U(0, base)
 _POLYGON_BACKOFF_CAP = 30.0   # seconds; never wait longer than this between tries
+
+# alpha-engine-config-I11470: 429 backoff. The free tier allows 5 calls a
+# minute and the key is shared across the fleet, so this client's own limiter
+# cannot see the calls that exhausted it. The 429 path used to sleep a flat
+# `Retry-After` (15s by default, since polygon rarely sends one) before EVERY
+# attempt, including the last: POOL's rename check on 2026-09-23 spent 60s in
+# four identical 15s waits, all inside the same minute's window, and then
+# failed. Now: exponential from 15s (15, 30, 60) with jitter, never shorter
+# than a server-sent `Retry-After`, and no sleep after the final attempt,
+# because nothing follows it. Worst case ~105s + jitter before the caller
+# gets `PolygonRateLimitError` — which spans one full rate-limit window.
+_POLYGON_429_BACKOFF_BASE = 15.0
+_POLYGON_429_BACKOFF_CAP = 60.0
+_POLYGON_429_JITTER = 5.0
+# A server-sent Retry-After longer than this is not honoured as-is: a single
+# wait that long is a stall, and the caller's own degrade path is better.
+_POLYGON_429_RETRY_AFTER_MAX = 120.0
+
+
+def _retry_after_seconds(value: str | None) -> float | None:
+    """Parse a ``Retry-After`` header: delta-seconds or an HTTP-date."""
+    if value is None:
+        return None
+    try:
+        return max(0.0, float(value))
+    except (TypeError, ValueError):
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(when.tzinfo)).total_seconds())
+
+
+def _rate_limit_wait(attempt: int, retry_after: str | None) -> float:
+    """Seconds to wait after the ``attempt``-th (0-based) 429.
+
+    Exponential (``base * 2**attempt``, capped) plus jitter, and never less
+    than the server's ``Retry-After`` (itself capped). See the constants."""
+    exp = min(_POLYGON_429_BACKOFF_BASE * (2 ** attempt), _POLYGON_429_BACKOFF_CAP)
+    server = _retry_after_seconds(retry_after)
+    floor = min(server, _POLYGON_429_RETRY_AFTER_MAX) if server is not None else 0.0
+    return max(exp, floor) + random.uniform(0, _POLYGON_429_JITTER)
 
 
 class PolygonRateLimitError(Exception):
@@ -191,9 +239,14 @@ class PolygonClient:
                 continue
 
             if resp.status_code == 429:
-                retry_after = int(resp.headers.get("Retry-After", 15))
-                logger.warning("Rate limited (429), waiting %ds", retry_after)
-                time.sleep(retry_after)
+                if last:
+                    break
+                wait = _rate_limit_wait(attempt, resp.headers.get("Retry-After"))
+                logger.warning(
+                    "Rate limited (429) on %s, waiting %.1fs (attempt %d/%d)",
+                    path, wait, attempt + 1, _POLYGON_MAX_ATTEMPTS,
+                )
+                time.sleep(wait)
                 self._call_times.clear()  # Reset window after forced wait
                 continue
             if resp.status_code == 403:
@@ -229,7 +282,7 @@ class PolygonClient:
                 raise requests.HTTPError(_scrub_api_key(exc), response=resp) from None
             return resp.json()
         raise PolygonRateLimitError(
-            f"Rate limited after {_POLYGON_MAX_ATTEMPTS} retries"
+            f"Rate limited (429) on {path} after {_POLYGON_MAX_ATTEMPTS} attempts"
         )
 
     def _backoff(self, attempt: int, reason: str, retry_after: str | None = None) -> None:

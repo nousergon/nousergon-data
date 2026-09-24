@@ -261,9 +261,9 @@ def _build_macro_features_df(macro: dict[str, pd.Series]) -> pd.DataFrame:
     if tnx is not None and irx is not None:
         df["yield_curve_slope"] = ((tnx.reindex(idx) - irx.reindex(idx)) / 10.0).astype("float32")
     if gld is not None:
-        df["gold_mom_5d"] = gld.reindex(idx).pct_change(5).astype("float32")
+        df["gold_mom_5d"] = gld.reindex(idx).ffill().pct_change(5, fill_method=None).astype("float32")
     if uso is not None:
-        df["oil_mom_5d"] = uso.reindex(idx).pct_change(5).astype("float32")
+        df["oil_mom_5d"] = uso.reindex(idx).ffill().pct_change(5, fill_method=None).astype("float32")
     if vix3m is not None:
         vix_r = vix.reindex(idx)
         vix3m_r = vix3m.reindex(idx)
