@@ -21,7 +21,10 @@ below. `infrastructure/lambdas/data-spot-dispatcher/test_handler.py` fails if
   `python -m shadow` subcommand;
 * a dispatchable workload is absent from `_WORKLOADS_REQUIRING_TRADING_DAY`
   (every one of these comparators is meaningless without a trading day, and a
-  missing day must be refused at dispatch rather than defaulted to "today").
+  missing day must be refused at dispatch rather than defaulted to "today"),
+  unless it is named in `DATE_FREE_WORKLOADS` with the reason it takes none;
+* a `DATE_FREE_WORKLOADS` key requires a trading day anyway, or is not
+  dispatchable at all.
 
 Deliberately import-free. The Lambda's test process loads this file BY PATH,
 outside the `shadow` package, so that asserting dispatcher coverage never
@@ -40,6 +43,17 @@ DISPATCHABLE_MODULES: dict[str, tuple[str, str]] = {
     "root": ("shadow-weekday", "shadow run"),
     "parity": ("shadow-parity", "shadow parity"),
     "arctic_parity": ("arctic-parity", "shadow arctic-parity"),
+    "retention": ("shadow-prune", "shadow prune"),
+}
+
+#: dispatchable workload key -> why it takes no trading day. Every comparator
+#: above is meaningless without one, so a missing day is refused at dispatch;
+#: a key listed here is the declared exception, with its reason.
+DATE_FREE_WORKLOADS: dict[str, str] = {
+    "shadow-prune": (
+        "retention measures each shadow library's own stamp against today on "
+        "the box (alpha-engine-config-I11447); there is no day to compare"
+    ),
 }
 
 #: module stem -> why it has no workload. A reason, never a blank: "it is a
@@ -78,10 +92,4 @@ NOT_DISPATCHABLE_MODULES: dict[str, str] = {
         "for a report nobody just wrote"
     ),
     "dispatch": "this declaration itself",
-    "retention": (
-        "the date rule and guarded delete behind `python -m shadow prune` "
-        "(alpha-engine-config-I11447); deleting libraries is destructive, so it "
-        "runs by hand on the data-spot box, dry run by default, and no dispatcher "
-        "workload may reach `--apply`"
-    ),
 }
