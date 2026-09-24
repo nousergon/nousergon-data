@@ -1853,6 +1853,34 @@ def _compare_one_key(
     return KeyResult(live_key, unit_ids, body.pop("verdict"), body.pop("comparator"), body)
 
 
+#: The per-key refusal record a collector folds onto its run manifest
+#: (``collectors/prices.py::refused_keys_guard_entries``, alpha-engine-config-
+#: I11547). Literals here rather than an import: this module must not pull in
+#: the collector import graph. ``tests/test_prices_shadow_recent_listings_
+#: i11547.py`` pins them against the producer's constants.
+WRITE_REFUSED_GUARD = "write_refused"
+WRITE_REFUSED_COMPLETE = "complete"
+
+
+def _refusal_record(manifest: dict[str, Any]) -> "tuple[bool, dict[str, str]] | None":
+    """``(complete, {refused key: detail})`` from a manifest's ``write_refused``
+    readings, or ``None`` when the unit records no per-key refusals at all.
+
+    ``complete`` is True only when the unkeyed summary reading says every
+    refused key is listed — a truncated list cannot rule a key OUT.
+    """
+    readings = [
+        g for g in (manifest.get("guards") or [])
+        if isinstance(g, dict) and g.get("guard") == WRITE_REFUSED_GUARD
+    ]
+    if not readings:
+        return None
+    summaries = [g for g in readings if not g.get("key")]
+    complete = bool(summaries) and all(g.get("verdict") == WRITE_REFUSED_COMPLETE for g in summaries)
+    keyed = {str(g["key"]): str(g.get("detail") or "") for g in readings if g.get("key")}
+    return complete, keyed
+
+
 def _absent_shadow_result(
     live_key: str,
     unit_ids: list[str],
@@ -1876,6 +1904,18 @@ def _absent_shadow_result(
       the cause instead of leaving a reader to go find the manifest.
     * anything else — no manifest at all, or a manifest saying `ok` — keeps the
       pre-existing wording, which is the honest one for "it should be there".
+
+    `alpha-engine-config-I11547`: a unit's failure is cited as THIS key's cause
+    only when it can be. The 2026-09-22 report listed AGNC/CORT/EAT/HUBS as
+    `shadow_missing` and blamed each on D03's failure — whose reason named
+    FDXF/HONA/Q/SOLS. The shadow D03 never attempted those four (they joined
+    the universe in the weekly rehearsal's constituents refresh AFTER the
+    shadow ran; the v1 manifest compared against was that rehearsal's re-run).
+    When the failed manifest carries a COMPLETE per-key refusal record
+    (`write_refused`) and this key is not in it, the failure does not explain
+    the absence and the detail says so. A key the record names is cited with
+    its own reason. A unit with no per-key record, or a truncated one, keeps
+    the unit-level citation, flagged as unattributed.
 
     `not_applicable` is never `match`, so it is never parity evidence and can
     never make the gate MET (plan §4.1 rule 2). It is a different NEXT ACTION
@@ -1910,15 +1950,46 @@ def _absent_shadow_result(
 
     failed = [(unit_id, manifest) for unit_id, manifest in owning if str(manifest.get("status")) == "failed"]
     detail = "v1 wrote it; the shadow run did not"
-    if failed:
-        detail += " — the owning unit's shadow run FAILED: " + "; ".join(
-            f"{unit_id}: {_cite(manifest)}" for unit_id, manifest in failed
+    cited: list[str] = []
+    not_explained: list[str] = []
+    attribution: dict[str, str] = {}
+    for unit_id, manifest in failed:
+        record = _refusal_record(manifest)
+        if record is None:
+            attribution[unit_id] = "unrecorded"
+            cited.append(f"{unit_id}: {_cite(manifest)}")
+            continue
+        complete, keyed = record
+        if live_key in keyed:
+            attribution[unit_id] = "refused_this_key"
+            cited.append(f"{unit_id}: refused this key ({keyed[live_key]}) — {_cite(manifest)}")
+        elif complete:
+            attribution[unit_id] = "not_this_key"
+            not_explained.append(f"{unit_id}: {_cite(manifest)}")
+        else:
+            attribution[unit_id] = "truncated"
+            cited.append(
+                f"{unit_id}: {_cite(manifest)} [its per-key refusal list is truncated, so "
+                "whether it refused this key is not recorded]"
+            )
+    if cited:
+        detail += " — the owning unit's shadow run FAILED: " + "; ".join(cited)
+    if not_explained:
+        detail += (
+            (" — and" if cited else " —")
+            + " the owning unit's shadow run also FAILED, but NOT on this key: "
+            + "; ".join(not_explained)
+            + ". Its manifest lists every key it refused and this is not one of them, so the "
+            "unit neither wrote nor refused it — the key was outside the population that run "
+            "attempted; compare the two runs' inputs rather than the failure"
         )
     body: dict[str, Any] = {"detail": detail, "shadow_key": shadow_key}
     if owning:
         body["shadow_run_status"] = {
             unit_id: str(manifest.get("status") or "") for unit_id, manifest in owning
         }
+    if attribution:
+        body["failure_attribution"] = attribution
     return KeyResult(live_key, unit_ids, "shadow_missing", "none", body)
 
 
