@@ -40,7 +40,10 @@ consumers:
 contract:
   schema: contracts/technicals.schema.json
   producer_test: tests/test_technical_rating_contracts.py
-  consumer_pins:
+  consumer_pins: []
+  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
+  # contract file the gate can resolve and compare — graded as a finding.
+  unpinned_consumers:
     - "metron:tests/contracts/"
 registry_rows:
   - metron_technicals

@@ -1695,7 +1695,10 @@ def _fetch_options(ticker: str, run_date: str) -> dict:
                         artifact=f"alternative/options_flow/{ticker}#iv_rank",
                     )
                     if not hist.empty and len(hist) >= 30:
-                        returns = hist["Close"].pct_change().dropna()
+                        # Gap handling explicit (alpha-engine-config-I11476):
+                        # ffill + fill_method=None is exactly the deprecated
+                        # pandas<3 default, so pandas 3 cannot change it.
+                        returns = hist["Close"].ffill().pct_change(fill_method=None).dropna()
                         rolling_vol = returns.rolling(20).std() * np.sqrt(252)
                         rolling_vol = rolling_vol.dropna()
                         if len(rolling_vol) >= 10:

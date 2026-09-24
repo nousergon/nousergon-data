@@ -13,6 +13,12 @@
    "new": "ECHO",
    "effective": "2026-06-25",
    "evidence": "EchoStar symbol change; identity preserved, no index change. Absent from the reference changes table."
+  },
+  {
+   "old": "EQR",
+   "new": "VMRK",
+   "effective": "2026-08-18",
+   "evidence": "Same instrument under a new symbol: reference/price_cache/VMRK.parquet (read 2026-09-24) carries ten years of history, and its 2,466 closes that overlap EQR.parquet match to within 0.03% (close ratio 0.99973-1.00000, dividend-adjustment drift only). Absent from the reference changes table, which lists AVB's 2026-08-17 removal but no change for EQR or VMRK. alpha-engine-config-I11470."
   }
  ]
 }

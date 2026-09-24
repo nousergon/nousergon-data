@@ -45,7 +45,11 @@ contract:
   schema: contracts/rating_ledger_entry.schema.json
   producer_test: tests/test_technical_rating_ledger.py
   consumer_pins:
-    - "nousergon-data:collectors/technical_rating_ledger.py:460 (D27, in-producer derivation)"
+    - repo: "nousergon-data"
+      path: "tests/test_technical_rating_ledger.py"
+      pins: "in_repo_reader"
+      read_site: "collectors/technical_rating_ledger.py::compute_rating_performance_from_ledger"
+      note: "D27, in-producer derivation; no cross-repo boundary"
   # P-07 (alpha-engine-config#10870): the sole declared consumer is D27, the
   # realized-performance scorer in this SAME repo/module — there is no cross-repo
   # boundary to pin a copy across. tests/test_technical_rating_ledger.py already

@@ -927,7 +927,7 @@ def compute_features(
     df["atr_14_pct"] = atr / close
 
     # realized_vol_20d
-    daily_returns = close.pct_change()
+    daily_returns = close.ffill().pct_change(fill_method=None)
     df["realized_vol_20d"] = daily_returns.rolling(_FC["realized_vol_window"]).std() * np.sqrt(_52w)
 
     # realized_vol_63d — 3-month realized vol (Stage 2 regime-conditioning).
