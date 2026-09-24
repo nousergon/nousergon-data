@@ -69,7 +69,7 @@ def latest_trading_day_on_or_before(calendar_date: dt.date) -> dt.date:
     one day and grade Friday's manifests against Thursday's partitions.
 
     Holiday-aware, because it defers to `nousergon_lib.trading_calendar` rather
-    than testing `weekday() >= 5`.
+    than stepping over Saturdays and Sundays only.
     """
     return calendar_date if is_trading_day(calendar_date) else previous_trading_day(calendar_date)
 
