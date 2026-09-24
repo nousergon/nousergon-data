@@ -570,6 +570,19 @@
             ]
           },
           "description": "For a key with no shadow object: what each owning unit's shadow run manifest for the trading day recorded. Present so a reader can tell a declared no-op from a failed leg from an unexplained gap without going to find the manifest (alpha-engine-config-I11231)."
+        },
+        "failure_attribution": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "refused_this_key",
+              "not_this_key",
+              "truncated",
+              "unrecorded"
+            ]
+          },
+          "description": "For a key with no shadow object whose owning unit's shadow run FAILED: whether that failure is this key's cause, read from the manifest's per-key `write_refused` record. `refused_this_key`: the run named this key. `not_this_key`: the run's COMPLETE refusal list does not name it, so the failure does not explain the absence. `truncated` / `unrecorded`: the run's list cannot rule the key in or out (alpha-engine-config-I11547)."
         }
       }
     },
