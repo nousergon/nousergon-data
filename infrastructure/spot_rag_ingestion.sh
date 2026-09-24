@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # infrastructure/spot_rag_ingestion.sh — RAGIngestion SF state runner.
-# Multi-source news sweep (SEC filings, 8-Ks, earnings, thesis, change
+# Multi-source news sweep (SEC filings, 8-Ks, thesis, Form 4, 13F, change
 # detection) on a dedicated spot EC2.
 #
 # Sources infrastructure/_spot_common.sh for shared spot infrastructure.
@@ -124,14 +124,13 @@ echo "RAG secrets fetched"
 echo "==> RAG smoke: preflight env-var check"
 \$PYTHON_BIN -m rag.preflight
 
-echo "==> RAG smoke: import all 5 RAG submodules"
+echo "==> RAG smoke: import all 4 RAG submodules"
 \$PYTHON_BIN -c "
 import rag.pipelines.ingest_sec_filings
 import rag.pipelines.ingest_8k_filings
-import rag.pipelines.ingest_earnings_finnhub
 import rag.pipelines.ingest_theses
 import rag.pipelines.filing_change_detection
-print('all 5 rag submodules imported OK')
+print('all 4 rag submodules imported OK')
 "
 
 echo "==> RAG smoke: run_weekly_ingestion.sh --dry-run"

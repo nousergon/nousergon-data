@@ -103,7 +103,7 @@ logger = logging.getLogger(__name__)
 # Why this exists: the held-position artifact is Metron's, and Metron holds
 # more than equities. Measured 2026-07-30, the live held set contained
 # ``912828YK0`` — a US Treasury CUSIP. Every ingestion source in this package
-# is equity-only (EDGAR by CIK, Finnhub earnings, Polygon news), so a CUSIP is
+# is equity-only (EDGAR by CIK, Polygon news), so a CUSIP is
 # a guaranteed wasted request PER SOURCE, PER RUN, forever, and lands in the
 # corpus as a permanent gap that no watermark can ever close.
 _TICKER_RE = re.compile(r"^[A-Z]{1,5}([.-][A-Z]{1,2})?$")

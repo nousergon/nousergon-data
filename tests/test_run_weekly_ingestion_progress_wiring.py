@@ -3,7 +3,7 @@ in ``rag/pipelines/run_weekly_ingestion.sh``.
 
 The Fleet Status console strip (crucible-dashboard views/48_Fleet_Status.py)
 reads ``health/rag_ingestion_progress/{run_date}.json`` and renders "step
-N/10: <label>" for the RAGIngestion chip while the weekly SF is RUNNING.
+N/9: <label>" for the RAGIngestion chip while the weekly SF is RUNNING.
 That contract depends entirely on this shell script calling
 ``rag.pipelines.emit_progress`` at every step boundary with the RIGHT
 (step, of, label) tuple, in order, BEFORE each step's actual pipeline
@@ -28,20 +28,19 @@ _SCRIPT = _REPO_ROOT / "rag" / "pipelines" / "run_weekly_ingestion.sh"
 
 # (step, of, label, following pipeline-module substring) — the label must
 # match what views/48_Fleet_Status.py's RAGIngestion chip renders verbatim
-# ("step 5/10: news"), and the module substring pins emit_progress firing
+# ("step 4/9: news"), and the module substring pins emit_progress firing
 # BEFORE that step's actual work, not after.
 _EXPECTED_STEPS = [
-    (0, 10, "preflight", "rag.preflight"),
-    (1, 10, "sec_filings", "rag.pipelines.ingest_sec_filings"),
-    (2, 10, "8k_events", "rag.pipelines.ingest_8k_filings"),
-    (3, 10, "earnings_transcripts", "rag.pipelines.ingest_earnings_finnhub"),
-    (4, 10, "thesis_history", "rag.pipelines.ingest_theses"),
-    (5, 10, "news", "rag.pipelines.assert_corpus_freshness"),
-    (6, 10, "form4_insider", "rag.pipelines.ingest_form4"),
-    (7, 10, "inst_ownership_13f", "rag.pipelines.ingest_13f"),
-    (8, 10, "analyst_pipeline", "rag.pipelines.run_analyst_pipeline"),
-    (9, 10, "filing_changes", "rag.pipelines.filing_change_detection"),
-    (10, 10, "manifest_emit", "rag.pipelines.emit_manifest"),
+    (0, 9, "preflight", "rag.preflight"),
+    (1, 9, "sec_filings", "rag.pipelines.ingest_sec_filings"),
+    (2, 9, "8k_events", "rag.pipelines.ingest_8k_filings"),
+    (3, 9, "thesis_history", "rag.pipelines.ingest_theses"),
+    (4, 9, "news", "rag.pipelines.assert_corpus_freshness"),
+    (5, 9, "form4_insider", "rag.pipelines.ingest_form4"),
+    (6, 9, "inst_ownership_13f", "rag.pipelines.ingest_13f"),
+    (7, 9, "analyst_pipeline", "rag.pipelines.run_analyst_pipeline"),
+    (8, 9, "filing_changes", "rag.pipelines.filing_change_detection"),
+    (9, 9, "manifest_emit", "rag.pipelines.emit_manifest"),
 ]
 
 
@@ -108,3 +107,12 @@ def test_progress_calls_count_matches_step_total(script_text: str):
         f"expected {len(_EXPECTED_STEPS)} emit_progress call sites, found "
         f"{len(calls)}"
     )
+
+
+def test_the_retired_transcripts_step_does_not_run(script_text: str):
+    """alpha-engine-config-I11472: earnings transcripts (Finnhub), formerly
+    step 3, were retired on 2026-09-24. Neither its module nor its progress
+    label may come back into the run by accident."""
+    assert "rag.pipelines.ingest_earnings_finnhub" not in script_text
+    assert '"earnings_transcripts"' not in script_text
+    assert not (_REPO_ROOT / "rag" / "pipelines" / "ingest_earnings_finnhub.py").exists()

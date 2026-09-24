@@ -244,9 +244,6 @@ shared_writers:
   - path: rag/pipelines/ingest_8k_filings.py
     parent_units: [D16]
     reason: A step of run_weekly_ingestion.sh.
-  - path: rag/pipelines/ingest_earnings_finnhub.py
-    parent_units: [D16]
-    reason: A step of run_weekly_ingestion.sh.
   - path: rag/pipelines/ingest_news.py
     parent_units: [D16]
     reason: A step of run_weekly_ingestion.sh.

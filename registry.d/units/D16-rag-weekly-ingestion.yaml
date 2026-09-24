@@ -33,8 +33,9 @@ trigger:
     nousergon-data-collection/data-collection-weekly, dispatcher workload
     `rag-weekly-ingestion` (alpha-engine-config-I10753). DISABLED until the
     phase-4 cutover PR; SAME script (`bash
-    rag/pipelines/run_weekly_ingestion.sh`, all 10 steps unchanged) the v1
-    RAGIngestion state ran. Also covers D46 (step 6, Form 4) — D46 has no
+    rag/pipelines/run_weekly_ingestion.sh`, less the earnings-transcripts step
+    retired 2026-09-24 by alpha-engine-config-I11472) the v1
+    RAGIngestion state ran. Also covers D46 (step 5, Form 4) — D46 has no
     separate dispatcher key.
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
@@ -159,10 +160,10 @@ notes: >-
     nousergon-data RAG-pipeline code, not the dispatcher/CFN/descriptor
     surface I10753 scopes). `rag/watermarks/v1/{source}.json` is NOT a
     zero-consumer output artifact in the audit's sense — it is operational
-    state the SEC/8-K/earnings/theses ingest steps read to fetch only the gap
+    state the SEC/8-K/theses ingest steps read to fetch only the gap
     since the last confirmed ingest (rag/pipelines/_watermarks.py); dropping
     the write would force a full-window refetch every Saturday. Only
-    `rag/corpus_freshness/latest.json` (assert_corpus_freshness.py, step 5,
+    `rag/corpus_freshness/latest.json` (assert_corpus_freshness.py, step 4,
     an assertion output with no operational read-back) is a true dead write;
     it continues as an accepted residual (write-but-unmonitored) until a
-    follow-up trims step 5's publish, tracked separately.
+    follow-up trims step 4's publish, tracked separately.

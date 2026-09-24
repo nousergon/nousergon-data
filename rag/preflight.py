@@ -45,7 +45,9 @@ class RAGPreflight(BasePreflight):
     Required env vars:
     - ``AWS_REGION`` — S3 client region (matches other modules)
     - ``VOYAGE_API_KEY`` — embedding provider for all 5 pipelines
-    - ``FINNHUB_API_KEY`` — earnings transcript ingestion (step 3)
+    - ``FINNHUB_API_KEY`` — analyst pipeline's Finnhub adapter (step 7). The
+      earnings-transcript step that also used it was retired 2026-09-24
+      (alpha-engine-config-I11472).
     - ``EDGAR_IDENTITY`` — SEC EDGAR User-Agent for filings (steps 1, 2)
     - ``RAG_DATABASE_URL`` — postgres+pgvector connection string (all pipelines)
 
