@@ -58,6 +58,8 @@ from dates import (
     history_window,
 )
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
+from shadow.interceptor import guard_baseline_reads
+from shadow.root import ShadowGuardViolation
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +88,92 @@ _ALWAYS_DOWNLOAD = [
     "XLK", "XLF", "XLE", "XLV", "XLI", "XLY", "XLP", "XLU", "XLB", "XLRE", "XLC",
     *_SUB_SECTOR_ETFS,
 ]
+
+
+# ── Why a ticker was not written (alpha-engine-config-I11547) ───────────────
+# Every ticker ``_refresh_stale`` does not upload is counted under exactly ONE
+# of these reasons, and ``collect()`` reports each count under its own result
+# key (declared in ``run_units.PHASE_UNITS`` as D03's ``rejected_keys``). Until
+# I11547 every one of them was recorded as ``short_fetch_guard_refused``,
+# because the manifest only saw the total — so on 2026-09-21..23 the shadow
+# D03 manifests blamed the short-fetch guard for four tickers it had ACCEPTED,
+# and the fetch window was investigated for a defect that sat in the shadow
+# interceptor. A reason is a claim about the cause; it is recorded only where
+# that cause was observed.
+FAIL_SHORT_FETCH = "short_fetch_guard_refused"
+FAIL_BEHIND_FETCH = "behind_fetch_guard_refused"
+FAIL_NO_DATA = "vendor_no_data"
+FAIL_BATCH_ERROR = "batch_fetch_error"
+FAIL_REFRESH_ERROR = "refresh_error"
+
+#: reason -> the ``collect()`` result key carrying its count. Mirrored as
+#: literals in ``run_units.PHASE_UNITS`` (D03) and in the result dict below;
+#: ``tests/test_prices_shadow_recent_listings_i11547.py`` pins the three together.
+FAILURE_RESULT_KEYS: dict[str, str] = {
+    FAIL_SHORT_FETCH: "failed_short_fetch_refused",
+    FAIL_BEHIND_FETCH: "failed_behind_fetch_refused",
+    FAIL_NO_DATA: "failed_vendor_no_data",
+    FAIL_BATCH_ERROR: "failed_batch_fetch_error",
+    FAIL_REFRESH_ERROR: "failed_refresh_error",
+}
+
+#: The per-key refusal record (``result["guards"]``) that lets a reader of the
+#: manifest — ``shadow/parity.py`` — tell WHICH keys a failed run refused,
+#: rather than attributing every absent key to the run's failure (the
+#: 2026-09-22 parity report blamed AGNC/CORT/EAT/HUBS on a failure that named
+#: FDXF/HONA/Q/SOLS). One keyed entry per refused key, for at most
+#: ``_REFUSED_KEYS_RECORD_CAP`` tickers, plus one unkeyed summary entry whose
+#: verdict says whether the keyed list is complete.
+REFUSED_KEYS_GUARD = "write_refused"
+REFUSED_KEYS_COMPLETE = "complete"
+REFUSED_KEYS_TRUNCATED = "truncated"
+_REFUSED_KEYS_RECORD_CAP = 50
+
+
+def refused_keys_guard_entries(failure_reasons: "dict[str, str]", s3_prefix: str) -> list[dict]:
+    """``result["guards"]`` entries naming every key this run did not write.
+
+    Empty when nothing failed. Keys are addressed under the same write
+    prefix(es) the upload uses, so they compare directly with the manifest's
+    ``outputs`` and with the live key a parity row is graded on.
+    """
+    if not failure_reasons:
+        return []
+    listed = list(failure_reasons.items())[:_REFUSED_KEYS_RECORD_CAP]
+    complete = len(listed) == len(failure_reasons)
+    entries: list[dict] = [
+        {
+            "guard": REFUSED_KEYS_GUARD,
+            "mode": "enforce",
+            "verdict": REFUSED_KEYS_COMPLETE if complete else REFUSED_KEYS_TRUNCATED,
+            "detail": (
+                f"{len(failure_reasons)} ticker(s) not written this run; "
+                + (
+                    f"every one is listed in this manifest's keyed {REFUSED_KEYS_GUARD!r} entries"
+                    if complete
+                    else f"only the first {len(listed)} are listed (cap {_REFUSED_KEYS_RECORD_CAP}), "
+                         "so an unlisted key may still have been refused"
+                )
+            ),
+            "key": None,
+            "value": float(len(failure_reasons)),
+            "baseline": None,
+        }
+    ]
+    for ticker, reason in listed:
+        for prefix in price_cache_write_prefixes(s3_prefix):
+            entries.append(
+                {
+                    "guard": REFUSED_KEYS_GUARD,
+                    "mode": "enforce",
+                    "verdict": "refused",
+                    "detail": f"{ticker}: {reason}",
+                    "key": f"{prefix}{ticker}.parquet",
+                    "value": None,
+                    "baseline": None,
+                }
+            )
+    return entries
 
 
 def collect(
@@ -157,10 +245,19 @@ def collect(
     # starts before the bar settles does not become settled because it ran long.
     fetch_started_at = datetime.now(timezone.utc)
     short_fetch_retries: dict[str, int] = {}
+    failure_reasons: dict[str, str] = {}
     refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
         trading_day=trading_day, short_fetch_retries=short_fetch_retries,
+        failure_reasons=failure_reasons,
     )
+    # A failed ticker with no observed cause is an error of the refresh, never
+    # a guard refusal — so the per-cause counts always sum to `failed`.
+    for ticker in failed_tickers:
+        failure_reasons.setdefault(ticker, FAIL_REFRESH_ERROR)
+    failure_counts = {reason: 0 for reason in FAILURE_RESULT_KEYS}
+    for reason in failure_reasons.values():
+        failure_counts[reason] += 1
 
     # ── Validate refreshed tickers ─────────────────────────────────────────
     validation = {}
@@ -178,6 +275,14 @@ def collect(
         "stale": len(stale),
         "failed": len(failed_tickers),
         "failed_tickers": failed_tickers[:20],
+        # alpha-engine-config-I11547: the same `failed` total, split by the
+        # cause actually observed (the five always sum to `failed`). D03's
+        # `rejected_keys` reads these, never the undifferentiated total.
+        "failed_short_fetch_refused": failure_counts[FAIL_SHORT_FETCH],
+        "failed_behind_fetch_refused": failure_counts[FAIL_BEHIND_FETCH],
+        "failed_vendor_no_data": failure_counts[FAIL_NO_DATA],
+        "failed_batch_fetch_error": failure_counts[FAIL_BATCH_ERROR],
+        "failed_refresh_error": failure_counts[FAIL_REFRESH_ERROR],
         "total": len(all_tickers),
         # alpha-engine-config-I11026: the per-ticker keys + row counts this
         # run actually uploaded — never a copy of `stale` (attempted, not
@@ -193,7 +298,8 @@ def collect(
         "guards": [
             bar_settlement_guard_entry(
                 fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
-            )
+            ),
+            *refused_keys_guard_entries(failure_reasons, s3_prefix),
         ],
     }
     if split_forced:
@@ -218,10 +324,13 @@ def collect(
         # alpha-engine-config-I10941).
         _sample = ", ".join(failed_tickers[:20])
         _more = f" (+{len(failed_tickers) - 20} more)" if len(failed_tickers) > 20 else ""
+        _by_reason = ", ".join(f"{reason}={count}" for reason, count in failure_counts.items() if count)
         result["reason"] = (
-            f"{len(failed_tickers)} of {len(all_tickers)} tickers failed to refresh: "
-            f"{_sample}{_more}"
+            f"{len(failed_tickers)} of {len(all_tickers)} tickers failed to refresh "
+            f"({_by_reason}): {_sample}{_more}"
         )
+        # Bounded like `failed_tickers` (alpha-engine-config-I10941).
+        result["failure_reasons"] = dict(list(failure_reasons.items())[:20])
     if validation:
         result["validation"] = validation
     return result
@@ -575,7 +684,11 @@ def _split_guard(
                 break
             if df is None:
                 try:
-                    obj = s3.get_object(Bucket=bucket, Key=key)
+                    # A write guard's baseline, not an input: it decides
+                    # whether to re-fetch and is never published
+                    # (alpha-engine-config-I11547).
+                    with guard_baseline_reads():
+                        obj = s3.get_object(Bucket=bucket, Key=key)
                     df = pd.read_parquet(_io.BytesIO(obj["Body"].read()))
                 except Exception as exc:  # noqa: BLE001 - unverifiable → re-fetch, logged below
                     reason = f"could not read s3://{bucket}/{key} to check the split: {exc}"
@@ -756,13 +869,22 @@ def _read_existing_parquet(
     unreadable parquet as absent would let a bad fetch overwrite a good history
     on a transient S3 error, which is the same silent-degrade the write guards
     below exist to stop. ``purpose`` names the guard in that error.
+
+    Every caller is a WRITE GUARD comparing the fetch with what it would
+    overwrite: the frame read here decides whether to publish and is never
+    published. Under a shadow root it is therefore a guard baseline
+    (``shadow.interceptor.guard_baseline_reads``) — read live, not recorded as
+    an input. Recorded as an input, it made the upload of the same key raise,
+    which is why every same-day shadow run refused FDXF, HONA, Q and SOLS while
+    v1 wrote them (alpha-engine-config-I11547).
     """
     import io as _io
 
     last_exc: Exception | None = None
     for prefix in price_cache_read_prefixes(s3_prefix):
         try:
-            obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{ticker}.parquet")
+            with guard_baseline_reads():
+                obj = s3.get_object(Bucket=bucket, Key=f"{prefix}{ticker}.parquet")
         except Exception as exc:  # noqa: BLE001 - classified below, never swallowed
             if _is_missing_object(s3, exc):
                 continue
@@ -899,8 +1021,19 @@ def _refresh_stale(
     *,
     trading_day: "str | date",
     short_fetch_retries: "dict[str, int] | None" = None,
+    failure_reasons: "dict[str, str] | None" = None,
 ) -> tuple[int, list[str], list[tuple[str, int]]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
+
+    ``failure_reasons`` (alpha-engine-config-I11547), if given, is populated in
+    place with ``{ticker: reason}`` — one of the ``FAIL_*`` constants — for
+    every ticker in ``failed_tickers``, naming the cause actually observed.
+    Same out-parameter shape as ``short_fetch_retries``, for the same reason.
+
+    A :class:`shadow.root.ShadowGuardViolation` propagates rather than becoming
+    a per-ticker failure: its own contract is "always fatal", and folding it
+    into a per-ticker miss is what let the I11547 violation read as four
+    short-fetch refusals on three consecutive shadow manifests.
 
     ``short_fetch_retries`` (alpha-engine-config-I11287), if given, is
     populated in place with ``{ticker: attempts_made}`` for every ticker
@@ -949,6 +1082,11 @@ def _refresh_stale(
     written: list[tuple[str, int]] = []
     _retry_counts: "dict[str, int]" = short_fetch_retries if short_fetch_retries is not None else {}
     _retry_budget_remaining = _SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN
+    _reasons: "dict[str, str]" = failure_reasons if failure_reasons is not None else {}
+
+    def _fail(ticker: str, reason: str) -> None:
+        failed_tickers.append(ticker)
+        _reasons[ticker] = reason
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -975,7 +1113,8 @@ def _refresh_stale(
                 is_multi = isinstance(raw.columns, pd.MultiIndex)
             except Exception as e:
                 logger.warning("yfinance batch failed for %s...: %s", batch[:3], e)
-                failed_tickers.extend(batch)
+                for ticker in batch:
+                    _fail(ticker, FAIL_BATCH_ERROR)
                 continue
 
             for ticker in batch:
@@ -983,11 +1122,11 @@ def _refresh_stale(
                 try:
                     new_df = (raw[yf_sym] if is_multi else raw).copy()
                     if "Close" not in new_df.columns or new_df.empty:
-                        failed_tickers.append(ticker)
+                        _fail(ticker, FAIL_NO_DATA)
                         continue
                     new_df = new_df.dropna(subset=["Close"])
                     if new_df.empty:
-                        failed_tickers.append(ticker)
+                        _fail(ticker, FAIL_NO_DATA)
                         continue
 
                     # Normalize index
@@ -1083,7 +1222,7 @@ def _refresh_stale(
                                         recovered_len, attempts_made, _SHORT_FETCH_RETRY_ATTEMPTS,
                                         fetch_period, existing_rows,
                                     )
-                                    failed_tickers.append(ticker)
+                                    _fail(ticker, FAIL_SHORT_FETCH)
                                     continue
                             else:
                                 _retry_counts[ticker] = 0
@@ -1097,7 +1236,7 @@ def _refresh_stale(
                                     ticker, original_len, fetch_period, existing_rows,
                                     _SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN,
                                 )
-                                failed_tickers.append(ticker)
+                                _fail(ticker, FAIL_SHORT_FETCH)
                                 continue
 
                     # ── Behind-fetch guard (alpha-engine-config-I11467) ─────
@@ -1131,7 +1270,7 @@ def _refresh_stale(
                                 ticker, fetched_last.isoformat(), cached_last.isoformat(),
                                 str(trading_day), expected_last.isoformat(),
                             )
-                            failed_tickers.append(ticker)
+                            _fail(ticker, FAIL_BEHIND_FETCH)
                             continue
                         logger.warning(
                             "%s: fetched series ends %s, before the expected last bar "
@@ -1171,9 +1310,11 @@ def _refresh_stale(
                     raise  # run-level contract violation, never a per-ticker miss
                 except CaretTickerError:
                     raise  # run-level contract violation, never a per-ticker miss (I10904)
+                except ShadowGuardViolation:
+                    raise  # always fatal by its own contract, never a per-ticker miss (I11547)
                 except Exception as e:
                     logger.warning("Refresh failed for %s: %s", ticker, e)
-                    failed_tickers.append(ticker)
+                    _fail(ticker, FAIL_REFRESH_ERROR)
 
             pct = 100 * min(batch_start + batch_size, len(stale)) / len(stale)
             logger.info(
