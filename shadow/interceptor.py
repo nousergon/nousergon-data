@@ -38,7 +38,10 @@ The split is decided HERE, for every client, in this order
    registry's auto-skip decision, ``shadow.run_state``) reads the shadow.
 3. **own-state key** — a key matching :data:`OWN_STATE_KEY_PATTERNS` reads the
    shadow wherever it is read from.
-4. **input** — everything else reads live, and is recorded.
+4. **guard baseline** — a read made inside :func:`guard_baseline_reads` reads
+   LIVE and is NOT recorded as an input (`alpha-engine-config-I11547`). See
+   that function for the one contract a caller takes on by entering it.
+5. **input** — everything else reads live, and is recorded.
 
 **An unclassified read of a key the run also writes RAISES.** A keyed write to
 a key this process previously read as a live *input* means the run consumed
@@ -67,6 +70,7 @@ __all__ = [
     "OWN_STATE_KEY_PATTERNS",
     "RunLedger",
     "classify_read",
+    "guard_baseline_reads",
     "install",
     "installed",
     "own_state_reads",
@@ -150,6 +154,7 @@ class RunLedger:
         self._lock = threading.Lock()
         self._own_writes: set[tuple[str, str]] = set()
         self._input_reads: set[tuple[str, str]] = set()
+        self._baseline_reads: set[tuple[str, str]] = set()
 
     def wrote(self, bucket: str, key: str) -> bool:
         with self._lock:
@@ -172,9 +177,19 @@ class RunLedger:
         with self._lock:
             self._input_reads.add((bucket, key))
 
+    def record_baseline_read(self, bucket: str, key: str) -> None:
+        """A live read made only to DECIDE whether to publish (never an input)."""
+        with self._lock:
+            self._baseline_reads.add((bucket, key))
+
+    def baseline_reads(self) -> frozenset[tuple[str, str]]:
+        with self._lock:
+            return frozenset(self._baseline_reads)
+
 
 _LEDGER = RunLedger()
 _SCOPE = threading.local()
+_BASELINE_SCOPE = threading.local()
 
 
 @contextmanager
@@ -196,8 +211,51 @@ def _in_own_state_scope() -> bool:
     return getattr(_SCOPE, "depth", 0) > 0
 
 
+@contextmanager
+def guard_baseline_reads():
+    """Keyed reads inside this block are a write guard's BASELINE: live, unrecorded.
+
+    `alpha-engine-config-I11547`. The price cache's write guards
+    (``collectors/prices.py``: the short-fetch guard, the behind-fetch guard,
+    the split guard) read the key they are about to overwrite, to decide
+    WHETHER the fresh fetch may replace it. Recorded as an input, that read
+    made the upload of the same key raise the read-then-write violation above
+    — so every same-day shadow run refused FDXF, HONA, Q and SOLS (the only
+    tickers under the 400-row threshold that makes the short-fetch guard read
+    at all), while v1, which has no interceptor, wrote them ``ok``.
+
+    Reading it as run state instead (:func:`own_state_reads`) would read the
+    shadow's own copy, which on a fresh daily root does not exist — the guard
+    would see "no history to regress" on every ticker and could never refuse
+    in a shadow run, so the rehearsal would stop exercising the guard that
+    production runs. A baseline read therefore stays LIVE, the object the
+    production guard compares against, and is simply not an input.
+
+    **The contract a caller takes on by entering this block:** the bytes it
+    reads may decide whether the run publishes, and must never become part of
+    WHAT it publishes. A value read here and then written back (a merge base,
+    a read-modify-write) is run state and belongs in
+    :data:`OWN_STATE_KEY_PATTERNS`, not here. Run state still wins inside this
+    block: a key the run already wrote, or an own-state key, reads the shadow.
+
+    Outside an active shadow root the interceptor is not consulted at all, so
+    this is the identity on the production path.
+    """
+    depth = getattr(_BASELINE_SCOPE, "depth", 0)
+    _BASELINE_SCOPE.depth = depth + 1
+    try:
+        yield
+    finally:
+        _BASELINE_SCOPE.depth = depth
+
+
+def _in_guard_baseline_scope() -> bool:
+    return getattr(_BASELINE_SCOPE, "depth", 0) > 0
+
+
 def classify_read(key: str, *, bucket: str, ledger: RunLedger) -> str:
-    """``own_write`` | ``own_state_scope`` | ``own_state:<name>`` | ``input``."""
+    """``own_write`` | ``own_state_scope`` | ``own_state:<name>`` |
+    ``guard_baseline`` | ``input``."""
     if ledger.wrote(bucket, key):
         return "own_write"
     if _in_own_state_scope():
@@ -205,6 +263,8 @@ def classify_read(key: str, *, bucket: str, ledger: RunLedger) -> str:
     for name, pattern, _why in OWN_STATE_KEY_PATTERNS:
         if pattern.match(key):
             return f"own_state:{name}"
+    if _in_guard_baseline_scope():
+        return "guard_baseline"
     return "input"
 
 
@@ -335,8 +395,12 @@ def rewrite_params(
         return api_params
     if operation_name in KEYED_READ_OPERATIONS:
         live_key = _live_key(api_params.get("Key", ""), root)
-        if classify_read(live_key, bucket=bucket, ledger=ledger) == "input":
+        classification = classify_read(live_key, bucket=bucket, ledger=ledger)
+        if classification == "input":
             ledger.record_input_read(bucket, live_key)
+            return api_params
+        if classification == "guard_baseline":
+            ledger.record_baseline_read(bucket, live_key)
             return api_params
         params = dict(api_params)
         params["Key"] = root.key(live_key)

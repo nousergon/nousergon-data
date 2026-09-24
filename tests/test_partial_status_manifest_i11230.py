@@ -98,7 +98,7 @@ def _manifests(s3: FakeS3) -> list[dict]:
 
 
 def test_prices_partial_result_names_the_failed_tickers(monkeypatch):
-    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day, short_fetch_retries=None):
+    def _fake_refresh_stale(s3, bucket, s3_prefix, stale, fetch_period, batch_size, *, trading_day, short_fetch_retries=None, failure_reasons=None):
         return 2, ["FDXF", "HONA"], [("AAPL", 2514), ("MSFT", 2514)]
 
     monkeypatch.setattr(prices, "_refresh_stale", _fake_refresh_stale)
@@ -153,6 +153,9 @@ def test_a_partial_prices_result_writes_a_failed_manifest_naming_the_loss():
         "stale": 930,
         "failed": 4,
         "failed_tickers": ["FDXF", "HONA", "Q", "SOLS"],
+        # alpha-engine-config-I11547: D03 declares its rejections BY CAUSE;
+        # the undifferentiated `failed` total is no longer read.
+        "failed_short_fetch_refused": 4,
         "total": 964,
         "reason": "4 of 964 tickers failed to refresh: FDXF, HONA, Q, SOLS",
         "written": {},
