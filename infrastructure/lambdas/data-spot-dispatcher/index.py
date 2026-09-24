@@ -218,11 +218,15 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 # A cap is added here only against a MEASURED overrun, per
 # that issue's deliverable 3 ("measure the first run rather than guessing"); an
 # entry invented ahead of evidence is a number nothing checks.
-#: `shadow-morning` gets 3600, not the 18000 its two siblings carry: it runs
-#: TWO legs plus the comparator, and the pair took 6 minutes on 2026-09-21
-#: before failing. A cap ten times the observed run and a fifth of the chained
-#: workloads' — the point of a per-workload cap is that it is per workload
-#: (alpha-engine-config-I11352).
+#: `shadow-morning` gets 7200, not the 18000 its two siblings carry: it runs
+#: TWO legs, the comparator, and the ArcticDB comparator after a bounded wait
+#: for v1's own append. MEASURED on 2026-09-22..24: the legs plus `parity` ran
+#: 45, 42 and 43 min (SSM stdout, dispatch 11:46Z, publish 12:29-12:31Z). The
+#: 3600 set by alpha-engine-config-I11352 was sized off a 6-minute FAILED run
+#: and sat at ~75% of cap before anything was added. alpha-engine-config-I11546
+#: adds up to `_SHADOW_MORNING_AWAIT_V1_SECONDS` (45 min) of waiting and ~2 min
+#: of ArcticDB comparison (measured 2026-09-17): ~96 min worst case, ~72 min on
+#: the measured days — under 7200 with room, and still per workload.
 #:
 #: The two end-of-day collection workloads get DECLARED caps instead of the
 #: shared 7200 s default (alpha-engine-config-I11363). That default was never a
@@ -241,7 +245,7 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     "shadow-weekday": 18000,
     "shadow-sameday": 18000,
-    "shadow-morning": 3600,
+    "shadow-morning": 7200,
     "post-market-data": 5400,
     "post-market-arctic-append": 3600,
 }
@@ -284,7 +288,8 @@ def _max_runtime_seconds(workload: "str | None") -> int:
 
     An entry OVERRIDES the default in both directions (alpha-engine-config-
     I11352). It used to be `max(default, declared)`, which silently ignored any
-    declaration below 7200 — so `shadow-morning`'s deliberate 3600, chosen
+    declaration below 7200 — so `shadow-morning`'s deliberate 3600 (since raised
+    to 7200 by alpha-engine-config-I11546, on measurement), chosen
     because it runs two legs that measured 6 minutes rather than the five-hour
     chain its siblings run, would have been read as 7200 and the per-workload
     map would have been a one-way ratchet nothing said it was. A cap is a
@@ -312,6 +317,18 @@ CW_LOG_GROUP = os.environ.get("DATA_SPOT_CW_LOG_GROUP", "/alpha-engine/data-spot
 # is the on-demand declared-benchmark-proxy load (alpha-engine-config-I10704);
 # the last two build the EDGAR point-in-time fundamentals (alpha-engine-config-I10733).
 # Any other value is rejected.
+#: How long `shadow-morning` waits for v1's own D18 (`morning-arctic-append`)
+#: manifest before its ArcticDB comparison refuses (alpha-engine-config-I11546).
+#: v1's append finished at 12:55, 12:54 and 12:52Z on 2026-09-22..24, ~25 min
+#: after this workload's parity report published (12:29-12:31Z); v1 has run
+#: that append for up to 38 min. 45 min covers the slowest append from the
+#: latest observed publish with room, and the workload's runtime cap above is
+#: sized to include it. Written as a LITERAL in the command below, because
+#: `_WORKLOADS` is AST-parsed as plain strings elsewhere
+#: (`infrastructure/data_collection_stack.py::dispatcher_workloads`); the two
+#: are pinned equal by `tests/test_shadow_morning_arctic_parity_i11546.py`.
+_SHADOW_MORNING_AWAIT_V1_SECONDS = 2700
+
 _WORKLOADS: dict[str, str] = {
     # weekday pre-open (was step_function_daily.json MorningEnrich)
     "morning-enrich": (
@@ -654,12 +671,36 @@ _WORKLOADS: dict[str, str] = {
     # `--skip-chronic-heal` stays on the enrich leg: a shadow must never heal
     # live data.
     #
-    # The comparator runs LAST and rewrites `parity/{TD}.json` with
+    # The comparator runs after the legs and rewrites `parity/{TD}.json` with
     # `--legs-group morning`, so the D report carries both groups' legs rather
     # than the morning group's keys being silently absent. Same
     # legs-independent shape as the two workloads above
     # (alpha-engine-config-I11200): `set +e`, one legs file, the comparator
     # ALWAYS runs.
+    #
+    # THEN `arctic-parity`, and only then the gate (alpha-engine-config-I11546).
+    # `parity` cannot open ArcticDB, so every report it publishes carries
+    # `arcticdb/universe` as `in_region_only`, which `evidence.read_parity`
+    # counts as an exception — the 09-21..09-23 reports all read UNMET on that
+    # one row alone, because nothing scheduled ever ran the in-region
+    # comparator. It fills that row in place on the same key. `--dispatch-gate`
+    # moved from `parity` onto it so the event-driven gate read sees the report
+    # WITH the ArcticDB verdict, not the one a minute before it.
+    #
+    # Ordering rules, each one load-bearing:
+    #   * it runs on `parity`'s NOT MET (exit 1) as well as MET — a NOT-MET
+    #     report is exactly the one whose ArcticDB row has something to say;
+    #   * it does NOT run when `parity` exited 2: nothing was published, and it
+    #     would otherwise rewrite the previous evening's same-day report;
+    #   * it waits for v1's D18 manifest for $TD to read `ok` first. ArcticDB
+    #     has no manifest-pinned version to grade against, and v1's
+    #     `morning-arctic-append` actually runs 12:22-12:55Z (the
+    #     `alpha-engine-weekday` schedule, 05:15 PT) — AFTER this report is
+    #     published at ~12:30Z. Measured 2026-09-22..24. Without the wait the
+    #     comparator would grade a universe library v1 is half-way through
+    #     rewriting. A timeout exits 2 with the report untouched.
+    #   * exit code: a failed leg first, then `parity`'s 2, then
+    #     `arctic-parity`'s code, which grades the WHOLE rewritten report.
     "shadow-morning": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -684,8 +725,13 @@ _WORKLOADS: dict[str, str] = {
         "--morning-arctic-append --date $TD; "
         "RC=$?; printf 'morning-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group morning "
-        "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
+        "--store s3://alpha-engine-research/data_collection; PARITY_RC=$?; ARCTIC_RC=2; "
+        "if [ $PARITY_RC -ne 2 ]; then "
+        "python -m shadow arctic-parity --trading-day $TD "
+        "--store s3://alpha-engine-research/data_collection "
+        "--await-live-unit D18 --await-timeout-seconds 2700 "
+        "--dispatch-gate; ARCTIC_RC=$?; fi; "
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PARITY_RC -eq 2 ] && exit $PARITY_RC; exit $ARCTIC_RC )"
     ),
     # alpha-engine-config-I10920: the two parity COMPARATORS, each launchable on
     # its own rather than only as the tail of the five-hour `shadow-weekday`

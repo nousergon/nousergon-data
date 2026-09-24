@@ -238,6 +238,11 @@ def test_the_flag_is_off_unless_asked_for():
         ["parity", "--trading-day", "2026-09-22", "--store", "/tmp/x", "--dispatch-gate"]
     )
     assert args.dispatch_gate is True
+    for command in ("parity", "arctic-parity"):
+        args = shadow_main._parser().parse_args(
+            [command, "--trading-day", "2026-09-22", "--store", "/tmp/x"]
+        )
+        assert args.dispatch_gate is False, command
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +256,13 @@ def test_only_the_scheduled_sameday_and_morning_parity_commands_dispatch(workloa
     for an old trading day would overwrite today's reading with it."""
     dispatching = {name for name, command in workloads.items() if command and "--dispatch-gate" in command}
     assert dispatching == {"shadow-sameday", "shadow-morning"}
-    for name in dispatching:
-        parity_segment = workloads[name].split("python -m shadow parity", 1)[1]
-        assert "--dispatch-gate" in parity_segment.split(";", 1)[0], name
+    # The flag sits on the LAST comparator to write the report: `parity` for
+    # the same-day run, `arctic-parity` for the morning run, which fills the
+    # ArcticDB row after `parity` publishes (alpha-engine-config-I11546).
+    for name, last in (
+        ("shadow-sameday", "python -m shadow parity"),
+        ("shadow-morning", "python -m shadow arctic-parity"),
+    ):
+        segment = workloads[name].split(last, 1)[1]
+        assert "--dispatch-gate" in segment.split(";", 1)[0], name
+        assert workloads[name].count("--dispatch-gate") == 1, name

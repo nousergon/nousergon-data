@@ -490,9 +490,11 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         if workload in ("shadow-weekday", "shadow-sameday"):
             expected = 18000
         elif workload == "shadow-morning":
-            # Two legs plus the comparator, measured at 6 min on 2026-09-21 —
-            # a tenth of the chained workloads' budget, not a copy of it.
-            expected = 3600
+            # Two legs plus both comparators and a bounded wait for v1's own
+            # append: measured 42-45 min before the ArcticDB leg, ~96 min worst
+            # case with it (alpha-engine-config-I11546) — still well under the
+            # chained workloads' budget, not a copy of it.
+            expected = 7200
         elif workload == "post-market-data":
             # alpha-engine-config-I11363: a DECLARED EOD cap, measured 30.4-45.7
             # min over 2026-09-15..23, not the inherited default.
