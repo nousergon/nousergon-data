@@ -29,7 +29,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 LAMBDAS_DIR="$(cd "${SCRIPT_DIR}/.." && pwd)"
 REPO_ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-source "${LAMBDAS_DIR}/_shared/apply_iam_policy.sh"
+source "${SCRIPT_DIR}/../_shared/apply_iam_policy.sh"
 FUNCTION_NAME="alpha-engine-collection-readiness-probe"
 ROLE_NAME="alpha-engine-collection-readiness-probe-role"
 POLICY_NAME="alpha-engine-collection-readiness-probe-policy"
@@ -53,7 +53,7 @@ for arg in "$@"; do
 done
 
 # shellcheck source=infrastructure/lambdas/_shared/deploy_run.sh
-source "${LAMBDAS_DIR}/_shared/deploy_run.sh"
+source "${SCRIPT_DIR}/../_shared/deploy_run.sh"
 
 # ----- 0. Validate handler + run unit tests ----------------------------------
 
@@ -64,7 +64,7 @@ print('index.py syntax OK')
 "
 
 # shellcheck source=infrastructure/lambdas/_shared/run_handler_tests.sh
-source "${LAMBDAS_DIR}/_shared/run_handler_tests.sh"
+source "${SCRIPT_DIR}/../_shared/run_handler_tests.sh"
 run_handler_tests "${SCRIPT_DIR}" -r "${SCRIPT_DIR}/requirements.txt"
 
 # ----- 1. Package: deps + handler + the SHARED predicate and descriptors ------
@@ -106,21 +106,10 @@ fi
 
 if $BOOTSTRAP; then
   echo "Bootstrapping ${FUNCTION_NAME}..."
-  if ! aws iam get-role --role-name "${ROLE_NAME}" --query 'Role.RoleName' --output text >/dev/null 2>&1; then
-    echo "  Creating IAM role: ${ROLE_NAME}"
-    run aws iam create-role \
-      --role-name "${ROLE_NAME}" \
-      --assume-role-policy-document "${TRUST_POLICY}" \
-      --query 'Role.RoleName' --output text
-  else
-    echo "  IAM role exists: ${ROLE_NAME}"
-  fi
-
-  echo "  Applying inline policy: ${POLICY_NAME}"
-  run aws iam put-role-policy \
-    --role-name "${ROLE_NAME}" \
-    --policy-name "${POLICY_NAME}" \
-    --policy-document "file://${SCRIPT_DIR}/iam-policy.json"
+  # Role + inline policy through the presence-gated helper, never a hand-rolled
+  # `get-role` probe: that makes AccessDenied and NoSuchEntity one observation
+  # (alpha-engine-config-I9045; tests/test_iam_role_creation_is_helper_gated.py).
+  apply_iam_policy "${ROLE_NAME}" "${POLICY_NAME}" "${SCRIPT_DIR}/iam-policy.json" "${TRUST_POLICY}"
 
   if ! $DRY_RUN; then
     echo "  Waiting 10s for IAM role propagation..."

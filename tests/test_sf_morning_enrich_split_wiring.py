@@ -93,6 +93,48 @@ class TestRemoval:
             f"{name} must not run from the v1 weekly SF — ne-data-collection-weekly owns it"
         )
 
+    def test_the_removed_list_is_the_two_quartets_by_construction(self):
+        """Non-vacuity WITHOUT git (CI's PR checkout is shallow, so the
+        origin/main comparison below skips there): the removed names are
+        exactly the split's two quartets, spelled by the naming convention
+        every poll-loop quartet in this SF follows. A typo in the list above
+        would make its absence pin pass vacuously; it cannot survive this."""
+        suffixes = (
+            "", "InitPollCount", "WaitFor", "CheckStatus", "Wait", "PollWait",
+            "MergePollCount", "RetryGate", "Reissue", "ExtractError",
+            "ExtractSubstrateLostError",
+        )
+
+        def spell(stage: str, suffix: str) -> str:
+            if suffix in ("", "Wait", "PollWait", "RetryGate", "Reissue"):
+                return stage + suffix
+            if suffix == "WaitFor":
+                return f"WaitFor{stage}"
+            if suffix == "CheckStatus":
+                return f"Check{stage}Status"
+            if suffix.startswith("Extract"):
+                return f"Extract{stage}{suffix.removeprefix('Extract')}"
+            head = suffix.removesuffix("PollCount")  # Init / Merge
+            return f"{head}{stage}PollCount"
+
+        derived = [spell("MorningEnrich", s) for s in suffixes]
+        derived += ["CheckSkipDataPhase1"] + [spell("DataPhase1", s) for s in suffixes]
+        assert sorted(_REMOVED_STATES) == sorted(derived)
+        # And the convention is real: a surviving quartet (RAGIngestion, inside
+        # ResearchPredictorParallel) is spelled exactly this way in the
+        # committed definition, so `spell` is not a convention invented here.
+        def walk(sts: dict, out: set) -> set:
+            for n, b in sts.items():
+                out.add(n)
+                for br in b.get("Branches", []):
+                    walk(br["States"], out)
+            return out
+
+        committed = walk(json.loads(_SF_PATH.read_text())["States"], set())
+        missing = [spell("RAGIngestion", s) for s in suffixes
+                   if spell("RAGIngestion", s) not in committed]
+        assert not missing, missing
+
     def test_the_removed_list_is_exactly_what_main_had(self):
         """Non-vacuity: every name above existed on the pre-cutover
         definition, so the absence pins test a real removal, not a typo."""
