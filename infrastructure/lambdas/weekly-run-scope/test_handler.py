@@ -25,8 +25,18 @@ are ~90% of its bytes and nothing here reads them):
     read when it ran. Unlike the two above it keeps the ``*Failed`` events
     (error name only), because the caught ChallengerShadow failure is only
     visible through them. Gzipped because the DataPhase poll loops make it
-    ~850 KB of JSON. Paired with this repo's own ``step_function.json``, not a
-    captured definition, so the test tracks the definition that deploys.
+    ~850 KB of JSON. Paired with ``definition_2026-09-23_rehearsal.json.gz``,
+    the definition it actually ran against (``step_function.json`` at
+    e4d87f3, the last change before the run; Comments stripped). It used to be
+    paired with this repo's own ``step_function.json`` so the test tracked the
+    definition that deploys, but a history is only readable against the graph
+    that produced it: alpha-engine-config-I11268 moved SubstrateHealthGate
+    off ``CheckSkipMorningEnrich``'s Default edge, and against the new graph
+    this history's recorded CheckSkipMorningEnrich -> SubstrateHealthGate
+    transition matches neither declared target, so MorningEnrich correctly
+    reads NOT_REACHED ("a definition edited mid-flight"). The synthetic-history
+    tests below still run against ``step_function.json``, so the deploying
+    definition stays covered.
 
 Synthetic payloads are used only for the degenerate cases. Every structural rule
 in ``run_scope.py`` was established by running it against these two files and
@@ -321,9 +331,15 @@ def repo_definition():
 
 
 @pytest.fixture(scope="module")
-def rehearsal_scope(repo_definition):
+def rehearsal_definition():
+    """The definition ``rehearsal-2026-09-23-2`` executed against."""
+    return _load("definition_2026-09-23_rehearsal.json.gz")
+
+
+@pytest.fixture(scope="module")
+def rehearsal_scope(rehearsal_definition):
     return build_run_scope(
-        repo_definition,
+        rehearsal_definition,
         _load("history_rehearsal_2026-09-23_at_run_scope.json.gz"),
         run_date="2026-09-23",
         input_flags={"skip_parity": True},
@@ -382,12 +398,12 @@ def test_the_rehearsal_scope_as_a_whole(rehearsal_scope):
     "history_rehearsal_2026-09-23_at_run_scope.json.gz",
 ])
 def test_a_parent_gate_row_is_only_ever_backed_by_an_observed_skip(
-    definition, repo_definition, history_name
+    definition, rehearsal_definition, history_name
 ):
     """The safety property of the parent_gate inference: it only names a flag
     whose gate this run was SEEN skipping, over a child gate the run never
     entered. A wrong parent flag is worse than NOT_REACHED."""
-    defn = repo_definition if history_name.endswith(".gz") else definition
+    defn = rehearsal_definition if history_name.endswith(".gz") else definition
     history = _load(history_name)
     scope = build_run_scope(defn, history, run_date="2026-08-14")
     gates = derive_gates(defn)
