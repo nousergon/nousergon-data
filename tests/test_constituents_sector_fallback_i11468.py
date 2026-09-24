@@ -196,3 +196,45 @@ def test_published_payload_validates_against_the_contract() -> None:
     )
     payload = _run_collect_capturing_writes(_YF_0923)["market_data/weekly/2026-09-23/constituents.json"]
     jsonschema.validate(payload, schema)
+
+
+def test_a_wikipedia_parse_break_raises_before_any_yfinance_call() -> None:
+    """More than the addition-lag tolerance missing from the Wikipedia pass is
+    a parse/layout break. It must raise without calling yfinance, so the whole
+    universe never moves onto yfinance's taxonomy."""
+    n = constituents._UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD + 1
+    unmapped = [f"NEW{i}" for i in range(n)]
+
+    def fake_fetch():
+        return (
+            ["AAPL", *unmapped], {"AAPL": "Information Technology"}, {"AAPL": "XLK"},
+            {}, 1, n, constituents.SsgaWeights(),
+        )
+
+    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch), \
+         patch("collectors.constituents._yfinance_classification") as yf, \
+         patch("collectors.constituents.boto3.client") as client:
+        with pytest.raises(constituents.SectorCoverageIncomplete) as excinfo:
+            constituents.collect(bucket="any", run_date="2026-09-23")
+    yf.assert_not_called()
+    client.return_value.put_object.assert_not_called()
+    assert f"{n} of {n + 1}" in str(excinfo.value)
+    assert "NEW0" in str(excinfo.value)
+
+
+def test_exactly_the_threshold_still_goes_to_the_fallback() -> None:
+    n = constituents._UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD
+    unmapped = [f"NEW{i}" for i in range(n)]
+
+    def fake_fetch():
+        return (
+            ["AAPL", *unmapped], {"AAPL": "Information Technology"}, {"AAPL": "XLK"},
+            {}, 1, n, constituents.SsgaWeights(),
+        )
+
+    rows = {t: {"sector": "Industrials", "industry": "Conglomerates"} for t in unmapped}
+    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch), \
+         patch("collectors.constituents._yfinance_classification", return_value=rows) as yf:
+        result = constituents.collect(bucket="any", dry_run=True)
+    assert result["status"] == "ok_dry_run"
+    yf.assert_called_once_with(unmapped)

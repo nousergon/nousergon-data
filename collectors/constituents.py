@@ -43,7 +43,9 @@ classified from yfinance ``Ticker.info`` (sector + industry, mapped onto GICS
 by ``_YF_SECTOR_TO_GICS`` / ``_YF_INDUSTRY_TO_GICS``), with each fallback
 recorded in the published ``sector_fallback`` field. Any member that is STILL
 unclassified after that raises ``SectorCoverageIncomplete`` before anything is
-written. There is no tolerance: every published constituent has a sector.
+written, so every published constituent has a sector. More than
+``_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD`` members missing from Wikipedia is a
+parse/layout break, not addition-lag, and raises before the fallback runs.
 
 ``sub_industry_map`` (config#934 narrow slice, 2026-07-09): the Wikipedia
 constituents tables already scraped here carry a "GICS Sub-Industry" column
@@ -211,6 +213,15 @@ class SectorCoverageIncomplete(RuntimeError):
     """
 
 
+# Wikipedia lags brand-new index ADDITIONS (config#2812: TOST + IESC on the
+# first live run; alpha-engine-config-I11468: AGNC, CORT, EAT, HUBS on
+# 2026-09-23). Up to this many members missing from the Wikipedia pass is
+# addition-lag and goes to the yfinance fallback below. More than this is a
+# parse/layout failure and raises BEFORE the fallback runs, so a Wikipedia
+# break can never move the whole universe onto yfinance's taxonomy.
+_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD = 10
+
+
 # yfinance ``info['sector']`` → GICS sector name (alpha-engine-config-I11468).
 # yfinance's sector taxonomy is Morningstar-derived, not GICS: the names
 # differ for six of the eleven sectors, so the mapping is spelled out and a
@@ -272,9 +283,23 @@ def collect(
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
 
+    # A gap this large is a Wikipedia parse/layout break, not addition-lag.
+    # Raise BEFORE the fallback: otherwise the whole universe (~900 names,
+    # ~6 min of yfinance calls) would quietly move onto yfinance's taxonomy.
+    unmapped = [t for t in tickers if t not in sector_map]
+    if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
+        raise SectorCoverageIncomplete(
+            f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
+            f"missing from the Wikipedia GICS pass (exceeds the "
+            f"{_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker addition-lag tolerance) — "
+            f"Wikipedia parse/layout break suspected; not falling back to yfinance "
+            f"for the universe. Sample: {unmapped[:10]}. Aborting before write."
+        )
+
     # alpha-engine-config-I11468: members Wikipedia has not classified yet
-    # (addition-lag) get a sector from yfinance; then EVERY member must have
-    # both a GICS sector and a sector ETF, or nothing is written.
+    # (addition-lag, at most the threshold above) get a sector from yfinance;
+    # then EVERY member must have both a GICS sector and a sector ETF, or
+    # nothing is written.
     sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
     _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
 
