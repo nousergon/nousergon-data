@@ -343,6 +343,76 @@ class TestScorerOracle:
         assert abs(stats["ic_mean"]) < 0.4
 
 
+class TestScorerHorizonOnReferenceCalendar:
+    """alpha-engine-config-I11549. A horizon is counted in REFERENCE-calendar (SPY)
+    sessions, never in a symbol's own bars. Counting a symbol's own bars gave four
+    non-US listings that trade on US Labor Day (2026-09-07) a "20th session" one US
+    session early, so v1 published an IC over those four names alone (0.4) for a rating
+    date whose 20-session horizon had not elapsed for the rest of the universe — and the
+    shadow, missing three of those listings' day-D bars, did not. That was the extra
+    ``ic_series`` entry on every same-day parity report (09-21, 09-22, 09-23)."""
+
+    HOLIDAY = "2026-09-07"  # US Labor Day: SPY has no bar, European listings do
+
+    def _fixture(self, *, foreign_day_d_bars: bool):
+        us_days = [d for d in _session_dates(40, "2026-08-24") if d != self.HOLIDAY]
+        day_d = us_days[20]  # the rating date us_days[0] is 20 US sessions before it
+        us_days = us_days[:21]
+        foreign_days = sorted(us_days + [self.HOLIDAY])
+        if not foreign_day_d_bars:
+            foreign_days = foreign_days[:-1]
+        series = {"SPY": [[d, 500.0 + i] for i, d in enumerate(us_days)]}
+        rng = random.Random(7)
+        for i in range(6):
+            series[f"US{i}"] = [[d, 100.0 * (1 + rng.uniform(-0.1, 0.1))] for d in us_days]
+        for i, sym in enumerate(("NOVN.SW", "RMS.PA", "SU.PA", "D05.SI")):
+            series[sym] = [[d, 50.0 + i + j * (0.1 * (i + 1))] for j, d in enumerate(foreign_days)]
+        rating_date = us_days[1]  # 19 US sessions before day D: horizon 20 NOT realized
+        ratings = {
+            sym: {"score": round(rng.uniform(-1, 1), 4), "label": "Neutral", "close": 1.0}
+            for sym in series
+        }
+        ledger = {
+            rating_date: {"schema_version": 1, "as_of": rating_date, "rating_version": RATING_VERSION,
+                          "basis": "backfill", "ratings": ratings},
+        }
+        return ledger, series, rating_date, day_d
+
+    def test_a_horizon_not_elapsed_on_the_us_calendar_yields_no_ic_even_for_holiday_trading_listings(self):
+        ledger, series, rating_date, _ = self._fixture(foreign_day_d_bars=True)
+        perf = trl.compute_rating_performance_from_ledger(ledger, series, horizons=(20,), windows=(20,))
+        assert [e for e in perf["ic_series"] if e["date"] == rating_date] == []
+        assert perf["segments"]["all"]["20"]["20"]["ic_n_dates"] == 0
+
+    def test_ic_series_does_not_depend_on_whether_foreign_day_d_bars_were_published_yet(self):
+        with_bars = trl.compute_rating_performance_from_ledger(
+            *self._fixture(foreign_day_d_bars=True)[:2], as_of_utc="t",
+        )
+        without_bars = trl.compute_rating_performance_from_ledger(
+            *self._fixture(foreign_day_d_bars=False)[:2], as_of_utc="t",
+        )
+        assert with_bars["ic_series"] == without_bars["ic_series"]
+
+    def test_a_missing_target_bar_is_left_out_not_replaced_by_a_later_bar(self):
+        # S_GAP has no bar on d1, so its "1-session" forward close would otherwise be d2's
+        # -- a 2-session return reported under horizon 1.
+        d0, d1, d2 = _session_dates(3, "2026-09-21")
+        series = {
+            "SPY": [[d0, 100.0], [d1, 101.0], [d2, 102.0]],
+            "S_GAP": [[d0, 100.0], [d2, 150.0]],
+            "A": [[d0, 100.0], [d1, 101.0], [d2, 102.0]],
+            "B": [[d0, 100.0], [d1, 99.0], [d2, 98.0]],
+        }
+        ratings = {sym: {"score": 0.1 * i, "label": "Neutral", "close": 100.0}
+                   for i, sym in enumerate(series)}
+        ledger = {d0: {"schema_version": 1, "as_of": d0, "rating_version": RATING_VERSION,
+                       "basis": "live", "ratings": ratings}}
+        rows = trl._extract_realized_rows(ledger, series, (1, 2))
+        assert {r["symbol"] for r in rows[1]} == {"SPY", "A", "B"}
+        gap_2 = [r for r in rows[2] if r["symbol"] == "S_GAP"]
+        assert len(gap_2) == 1 and gap_2[0]["fwd_return"] == pytest.approx(0.5)
+
+
 class TestScorerSegmentsAndWindows:
     def _fixture(self, n_dates: int = 30):
         dates = _session_dates(n_dates + 5)
