@@ -54,6 +54,7 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from data_gate import evidence
+from dates import BAR_SETTLEMENT_GUARD as _BAR_SETTLEMENT_GUARD
 from dates import VENDOR_FIRST_RELEASED_GUARD as _VENDOR_FIRST_RELEASED_GUARD
 from dates import VENDOR_PUBLISHED_AT_GUARD as _VENDOR_PUBLISHED_AT_GUARD
 from data_gate.descriptors import Unit, load_units
@@ -609,6 +610,10 @@ class _SettlingCollector:
         }
 
 
+#: The key `_compare_frames` hands its uncapped numeric-breach rows back
+#: under. `compare_bytes` pops it before the body is published.
+_NUMERIC_BREACH_ROWS = "_numeric_breach_rows"
+
 #: How `_key_pattern_regex` spells a `{placeholder}` segment.
 _PLACEHOLDER_REGEX = "[^/]+"
 
@@ -826,6 +831,11 @@ def _compare_frames(
     #: volume" from "something about what the row IS differs" without
     #: re-deriving it from the capped examples.
     identity_breach_count = 0
+    #: Row -> how many NUMERIC breaches it carries, uncapped. Not published:
+    #: `compare_bytes` hands it to `_grade_v1_cause`, whose row-scoped
+    #: evidence must cover every breaching row (alpha-engine-config-I11563),
+    #: which the capped `examples` cannot show.
+    numeric_breach_rows: dict[str, int] = {}
     breaches: list[dict[str, Any]] = []
     provenance_diff_count = 0
     provenance_diffs: list[dict[str, Any]] = []
@@ -893,6 +903,8 @@ def _compare_frames(
             breach_count += 1
             if not (_is_moving_numeric(live_row[col]) and _is_moving_numeric(shadow_row[col])):
                 identity_breach_count += 1
+            else:
+                numeric_breach_rows[str(row_key)] = numeric_breach_rows.get(str(row_key), 0) + 1
             if len(breaches) < 50:
                 breaches.append(
                     {
@@ -921,6 +933,7 @@ def _compare_frames(
         "examples": breaches[:10],
     }
     out["provenance_diffs"] = {"count": provenance_diff_count, "examples": provenance_diffs[:10]}
+    out[_NUMERIC_BREACH_ROWS] = numeric_breach_rows
     if prior_iso is not None:
         # Deliverable 2: the row this key's PREVIOUS report could only record
         # as settling is, on this report, an ordinary historical row graded on
@@ -1246,7 +1259,12 @@ def _grade_coverage(
 #    the shadow's manifest stamps the same key `settled`. Explains NUMERIC
 #    value breaches only, and only on a `key_date` key — an artifact whose
 #    whole content IS that one bar. A history artifact (`row_date`) carries
-#    earlier rows the stamp says nothing about.
+#    earlier rows the stamp says nothing about. ROW-SCOPED form
+#    (`alpha-engine-config-I11563`): when a run carried some rows over from
+#    the existing object, it stamps each of them (`<key>#<row>`) and the
+#    whole-key stamp is ambiguous. The evidence then holds only if EVERY row
+#    with a numeric breach reads `provisional` on v1's side and `settled` on
+#    the shadow's (`_row_bar_settlement`, `_provisional_row_evidence`).
 # 2. `vendor_published_after_v1_fetch` — the shadow has more trailing
 #    observations in a dated series than v1 (FRED `DGS10`: 498 live vs 499
 #    shadow), the shared prefix agrees, every extra observation is dated
@@ -1267,6 +1285,8 @@ def _grade_coverage(
 #: POSIX seconds (UTC), so it compares without re-parsing the detail text.
 #: Declared once, beside the settlement guard it complements.
 VENDOR_PUBLISHED_AT_GUARD = _VENDOR_PUBLISHED_AT_GUARD
+#: The settlement stamp `dates.bar_settlement_guard_entry` writes.
+BAR_SETTLEMENT_GUARD_NAME = _BAR_SETTLEMENT_GUARD.name
 VENDOR_FIRST_RELEASED_GUARD = _VENDOR_FIRST_RELEASED_GUARD
 
 #: The calendar a vendor's first-release DATES are stated in. The one vendor
@@ -1290,6 +1310,12 @@ class V1CauseContext:
 
     v1: "dict[str, Any] | None"
     shadow: "dict[str, Any] | None"
+    #: Every manifest on each side that recorded the key for the trading day,
+    #: the recording one included (`alpha-engine-config-I11563`). A row one
+    #: run CARRIED from the object an earlier run wrote is followed back
+    #: through these to the run that fetched it (`_row_bar_settlement`).
+    v1_history: "tuple[dict[str, Any], ...]" = ()
+    shadow_history: "tuple[dict[str, Any], ...]" = ()
 
 
 def manifest_recording(manifests: Iterable[dict[str, Any]], live_key: str) -> dict[str, Any] | None:
@@ -1301,6 +1327,20 @@ def manifest_recording(manifests: Iterable[dict[str, Any]], live_key: str) -> di
         if best is None or str(manifest.get("finished") or "") >= str(best.get("finished") or ""):
             best = manifest
     return best
+
+
+def manifests_recording(manifests: Iterable[dict[str, Any]], live_key: str) -> tuple[dict[str, Any], ...]:
+    """Every manifest whose `outputs` include ``live_key``, oldest `finished` first."""
+    return tuple(
+        sorted(
+            (
+                m
+                for m in manifests
+                if any(str(out.get("key") or "") == live_key for out in m.get("outputs") or [])
+            ),
+            key=lambda m: str(m.get("finished") or ""),
+        )
+    )
 
 
 def _manifest_ref(manifest: dict[str, Any]) -> dict[str, Any]:
@@ -1316,19 +1356,135 @@ def _bar_settlement_stamp(manifest: "dict[str, Any] | None", live_key: str) -> d
 
     Matched exactly or as a glob (`predictor/price_cache/*.parquet`). Two
     entries disagreeing for one key is not evidence of anything and returns
-    ``None``.
+    ``None``. A ROW's reading (``<key>#<row>``, `alpha-engine-config-I11563`)
+    is part of the key's evidence here: a whole-key stamp stands only when
+    every row reading agrees with it. Row by row, :func:`_row_bar_settlement`
+    reads them apart.
     """
     if manifest is None:
         return None
     found = [
         guard
         for guard in manifest.get("guards") or []
-        if str(guard.get("guard") or "") == "bar_settlement"
+        if str(guard.get("guard") or "") == BAR_SETTLEMENT_GUARD_NAME
         and guard.get("key")
         and (str(guard["key"]) == live_key or fnmatch.fnmatchcase(live_key, str(guard["key"])))
     ]
+    rows = _row_readings(manifest, live_key)
     verdicts = {str(guard.get("verdict") or "") for guard in found}
-    return found[-1] if len(verdicts) == 1 else None
+    verdicts |= {str(guard.get("verdict") or "") for readings in rows.values() for guard in readings}
+    return found[-1] if found and len(verdicts) == 1 else None
+
+
+def _row_readings(manifest: "dict[str, Any] | None", live_key: str) -> dict[str, list[dict[str, Any]]]:
+    """Row -> the `bar_settlement` readings a manifest recorded for that ROW of ``live_key``.
+
+    Keyed ``<live key>#<row>`` (`collectors.daily_closes.row_settlement_key`,
+    alpha-engine-config-I11563): the rows a run carried over from the existing
+    object rather than fetched.
+    """
+    prefix = f"{live_key}#"
+    rows: dict[str, list[dict[str, Any]]] = {}
+    for guard in (manifest or {}).get("guards") or []:
+        key = str(guard.get("key") or "")
+        if str(guard.get("guard") or "") == BAR_SETTLEMENT_GUARD_NAME and key.startswith(prefix):
+            rows.setdefault(key[len(prefix):], []).append(guard)
+    return rows
+
+
+#: How many earlier writes a carried row is followed back through before its
+#: settlement is called unproven. D17 carries from D19; D19 re-runs can carry
+#: from an earlier D19. Four is every write a trading day's key has ever had.
+_CARRY_CHAIN_LIMIT = 4
+
+
+@dataclass(frozen=True)
+class RowSettlement:
+    """One row's `bar_settlement`, as one side's manifests prove it."""
+
+    verdict: str
+    #: ``fetched`` — the row came from the run's own fetch, graded on when it
+    #: began. ``carried`` — the row came from the existing object, graded on
+    #: that object's write time; only ever reported for `provisional`, the one
+    #: verdict a write time proves on its own.
+    basis: str
+    #: The manifests the reading was followed through, recording run first.
+    trail: tuple[dict[str, Any], ...]
+
+
+def _predecessor(manifest: dict[str, Any], history: Iterable[dict[str, Any]]) -> dict[str, Any] | None:
+    """The write of the key this run found in place: the latest earlier run recording it."""
+    started = str(manifest.get("started") or "")
+    earlier = [
+        m
+        for m in history
+        if m is not manifest and started and str(m.get("finished") or "") and str(m["finished"]) <= started
+    ]
+    return max(earlier, key=lambda m: str(m.get("finished") or ""), default=None)
+
+
+def _row_bar_settlement(
+    manifest: "dict[str, Any] | None",
+    live_key: str,
+    row: str,
+    history: "tuple[dict[str, Any], ...]" = (),
+    *,
+    _depth: int = 0,
+) -> "tuple[RowSettlement | None, str]":
+    """``(reading, "")`` for one row of the object ``manifest`` recorded, or ``(None, why not)``.
+
+    `alpha-engine-config-I11563`. The rules, and why each is sound:
+
+    * A row the run did NOT stamp by itself was fetched by the run, so it
+      takes the run's whole-key fetch reading (``key == live_key``). Two
+      disagreeing whole-key readings (the pre-I11563 carried stamp) are
+      ambiguous: no row is proven.
+    * A row stamped ``<live_key>#<row>`` was carried from the existing object,
+      graded on that object's write time. `provisional` is proven by that
+      alone: nothing in an object written before the settlement hour can have
+      been fetched after it. `settled` is NOT: the object may itself have
+      carried the row from an earlier write. So a carried `settled` row is
+      followed back to the run that wrote the object it came from
+      (:func:`_predecessor`), and that run's reading of the row is the answer.
+      No predecessor, or a chain longer than :data:`_CARRY_CHAIN_LIMIT`, and
+      the row is unproven.
+    """
+    if manifest is None:
+        return None, "no manifest recorded the key"
+    carried = _row_readings(manifest, live_key).get(row) or []
+    if carried:
+        verdicts = {str(g.get("verdict") or "") for g in carried}
+        if len(verdicts) != 1:
+            return None, f"row {row}: the run's carried readings disagree"
+        (verdict,) = verdicts
+        if verdict == "provisional":
+            return RowSettlement(verdict, "carried", (manifest,)), ""
+        if _depth >= _CARRY_CHAIN_LIMIT:
+            return None, f"row {row}: carried through more than {_CARRY_CHAIN_LIMIT} writes"
+        source = _predecessor(manifest, history)
+        if source is None:
+            return None, (
+                f"row {row}: carried from an object no earlier run's manifest recorded, so its "
+                f"{verdict!r} reading (the object's write time) is not proven"
+            )
+        reading, why = _row_bar_settlement(source, live_key, row, history, _depth=_depth + 1)
+        if reading is None:
+            return None, why
+        return RowSettlement(reading.verdict, reading.basis, (manifest, *reading.trail)), ""
+    whole = [
+        g
+        for g in manifest.get("guards") or []
+        if str(g.get("guard") or "") == BAR_SETTLEMENT_GUARD_NAME and str(g.get("key") or "") == live_key
+    ]
+    verdicts = {str(g.get("verdict") or "") for g in whole}
+    if not whole:
+        return None, f"row {row}: the run that wrote it recorded no bar_settlement reading"
+    if len(verdicts) != 1:
+        return None, (
+            f"row {row}: the run's whole-key readings disagree and it named no row, so which rows "
+            "were fetched is not recorded"
+        )
+    return RowSettlement(next(iter(verdicts)), "fetched", (manifest,)), ""
 
 
 def _vendor_guard_value(manifest: "dict[str, Any] | None", guard_name: str, key: str) -> float | None:
@@ -1373,6 +1529,74 @@ def _provisional_bar_evidence(
             "v1_stamp": {k: v1_stamp.get(k) for k in ("key", "verdict", "detail")},
             "shadow_manifest": _manifest_ref(context.shadow or {}),
             "shadow_stamp": {k: shadow_stamp.get(k) for k in ("key", "verdict", "detail")},
+        },
+        "",
+    )
+
+
+#: How many explained rows a `v1_bar_provisional` row-scoped evidence block
+#: lists. The PROOF covers every breaching row; only the listing is capped.
+_ROW_EVIDENCE_LISTED = 25
+
+
+def _settlement_ref(reading: RowSettlement) -> dict[str, Any]:
+    return {
+        "verdict": reading.verdict,
+        "basis": reading.basis,
+        "via": [_manifest_ref(m) for m in reading.trail],
+    }
+
+
+def _provisional_row_evidence(
+    live_key: str,
+    context: V1CauseContext,
+    numeric_breach_rows: dict[str, int],
+    numeric: int,
+) -> tuple[dict[str, Any] | None, str]:
+    """Kind 1, row-scoped (`alpha-engine-config-I11563`), or ``(None, why not)``.
+
+    For a `key_date` frame whose whole-key stamp is ambiguous — v1's D17 file
+    was fetched `settled` but carried CPRI and SAM from D19's `provisional`
+    write — every row holding a numeric breach must, on its own, read
+    `provisional` on v1's side and `settled` on the shadow's
+    (:func:`_row_bar_settlement`). One row that does not, and nothing on the
+    key is explained. Rows with no breach are never looked at: they need no
+    explanation.
+    """
+    if not numeric_breach_rows:
+        return None, "the numeric breaches could not be attributed to rows"
+    if sum(numeric_breach_rows.values()) != numeric:
+        return None, "the numeric breaches do not all sit on a row"
+    explained: dict[str, dict[str, Any]] = {}
+    for row in sorted(numeric_breach_rows):
+        v1_row, why = _row_bar_settlement(context.v1, live_key, row, context.v1_history)
+        if v1_row is None:
+            return None, f"v1 side: {why}"
+        if v1_row.verdict != "provisional":
+            return None, f"row {row}: v1's manifests stamp it bar_settlement: {v1_row.verdict}, not provisional"
+        shadow_row, why = _row_bar_settlement(context.shadow, live_key, row, context.shadow_history)
+        if shadow_row is None:
+            return None, f"shadow side: {why}"
+        if shadow_row.verdict != "settled":
+            return None, (
+                f"row {row}: the shadow's manifests stamp it bar_settlement: {shadow_row.verdict}, "
+                "not settled, so both sides may have read an unsettled bar"
+            )
+        explained[row] = {
+            "breaches": numeric_breach_rows[row],
+            "v1": _settlement_ref(v1_row),
+            "shadow": _settlement_ref(shadow_row),
+        }
+    listed = dict(list(explained.items())[:_ROW_EVIDENCE_LISTED])
+    return (
+        {
+            "kind": "v1_bar_provisional",
+            "scope": "rows",
+            "rows": listed,
+            "rows_explained": len(explained),
+            "v1_manifest": _manifest_ref(context.v1 or {}),
+            "shadow_manifest": _manifest_ref(context.shadow or {}),
+            "explains": f"{numeric} numeric breach(es) on {len(explained)} row(s)",
         },
         "",
     )
@@ -1498,12 +1722,19 @@ def _grade_v1_cause(
     shadow_doc: Any = None,
     rel: float = 0.0,
     absolute: float = 0.0,
+    numeric_breach_rows: "dict[str, int] | None" = None,
 ) -> None:
     """Re-grade a `mismatch` body as `v1_cause` in place, when — and only when — proven.
 
-    Otherwise the body keeps `mismatch`; if any evidence was on hand but did
-    not cover every breach, `v1_cause_refused` says why, so an almost-proof is
-    visible rather than silently discarded.
+    Otherwise the body keeps `mismatch` and `v1_cause_refused` says why —
+    whether or not any evidence was on hand (`alpha-engine-config-I11563`: a
+    row with no evidence at all used to say nothing, so "never looked" and
+    "looked and found nothing" read the same). An almost-proof is visible
+    rather than silently discarded.
+
+    ``numeric_breach_rows`` is a frame's uncapped row -> numeric-breach count
+    (`_compare_frames`). With it, a key whose whole-key stamp is ambiguous can
+    still be proven ROW BY ROW (:func:`_provisional_row_evidence`).
     """
     if context is None or body.get("verdict") != "mismatch":
         return
@@ -1529,10 +1760,20 @@ def _grade_v1_cause(
             refusals.append(f"{identity} identity breach(es) (a non-numeric cell)")
         if numeric:
             proof, why = _provisional_bar_evidence(live_key, contract, context)
-            if proof is None:
-                refusals.append(why)
-            else:
+            if proof is not None:
                 evidence.append({**proof, "explains": f"{numeric} numeric breach(es)"})
+            elif numeric_breach_rows is not None and contract is not None and contract.settling_basis == "key_date":
+                # The whole key is not one provisional-vs-settled pair. It may
+                # still be one ROW BY ROW (alpha-engine-config-I11563).
+                row_proof, row_why = _provisional_row_evidence(
+                    live_key, context, numeric_breach_rows, numeric
+                )
+                if row_proof is None:
+                    refusals.extend([why, row_why])
+                else:
+                    evidence.append(row_proof)
+            else:
+                refusals.append(why)
     elif json_breaches is not None:
         numeric_values = [d for d in json_breaches if d.kind == "value" and d.numeric]
         for diff in json_breaches:
@@ -1566,7 +1807,9 @@ def _grade_v1_cause(
                 "counts it apart from match."
             ),
         }
-    elif evidence:
+    else:
+        if not refusals:
+            refusals.append("no breach on this key has v1_cause evidence")
         body["v1_cause_refused"] = sorted(set(refusals))[:10]
 
 
@@ -1641,6 +1884,7 @@ def compare_bytes(
             settling_whole_frame=basis in {"key_date", "same_day_snapshot"},
             prior_day=prior,
         )
+        breach_rows: dict[str, int] = body.pop(_NUMERIC_BREACH_ROWS, {})
         if settling is not None:
             body["settling_bar"] = settling.as_block()
         schema_ok = body["schema"]["match"]
@@ -1653,7 +1897,9 @@ def compare_bytes(
                 and body["values"]["breaches"] == 0
             )
             body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
-            _grade_v1_cause(body, live_key=key, contract=contract, context=v1_cause)
+            _grade_v1_cause(
+                body, live_key=key, contract=contract, context=v1_cause, numeric_breach_rows=breach_rows
+            )
             return body
 
         # The vendor_live grading, in the frame's own terms: SHAPE exactly
@@ -1688,7 +1934,9 @@ def compare_bytes(
         }
         matched = schema_ok and body["coverage"]["met"] and body["values"]["breaches"] == 0
         body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
-        _grade_v1_cause(body, live_key=key, contract=contract, context=v1_cause)
+        _grade_v1_cause(
+            body, live_key=key, contract=contract, context=v1_cause, numeric_breach_rows=breach_rows
+        )
         return body
 
     if key.endswith(".json"):
@@ -2493,7 +2741,12 @@ class _V1CauseManifests:
             self._shadow = _all_manifests_by_unit(self.reader, self._shadow_prefix)
         v1 = [m for unit_id in owners for m in self._v1_for(unit_id)]
         shadow = [m for unit_id in owners for m in self._shadow.get(unit_id, [])]
-        return V1CauseContext(v1=manifest_recording(v1, live_key), shadow=manifest_recording(shadow, live_key))
+        return V1CauseContext(
+            v1=manifest_recording(v1, live_key),
+            shadow=manifest_recording(shadow, live_key),
+            v1_history=manifests_recording(v1, live_key),
+            shadow_history=manifests_recording(shadow, live_key),
+        )
 
 
 def _manifest_output_keys(manifest: dict[str, Any], prefix_value: str) -> set[str]:

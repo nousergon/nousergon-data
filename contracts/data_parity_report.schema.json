@@ -611,6 +611,20 @@
                       "v1_bar_provisional",
                       "vendor_published_after_v1_fetch"
                     ]
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "rows"
+                    ],
+                    "description": "`v1_bar_provisional` only. Absent: the whole key is stamped provisional on v1's side and settled on the shadow's. `rows` (alpha-engine-config-I11563): the whole-key stamp is ambiguous because a run carried some rows from an earlier write, and EVERY row holding a numeric breach was proven provisional on v1's side and settled on the shadow's, row by row. `rows` lists up to 25 of them with the manifests each reading was followed through; `rows_explained` counts all."
+                  },
+                  "rows": {
+                    "type": "object"
+                  },
+                  "rows_explained": {
+                    "type": "integer",
+                    "minimum": 1
                   }
                 }
               }
@@ -625,7 +639,7 @@
           "items": {
             "type": "string"
           },
-          "description": "On a `mismatch` row where some v1-side evidence WAS found but did not cover every breach: why not (up to ten). An almost-proof is published, never silently discarded."
+          "description": "On every `mismatch` row graded for v1_cause: why it is not `v1_cause` (up to ten), whether or not any v1-side evidence was found (alpha-engine-config-I11563; before it, a row with no evidence at all carried no reason). An almost-proof is published, never silently discarded."
         }
       }
     },
