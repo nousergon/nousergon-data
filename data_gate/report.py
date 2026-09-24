@@ -76,6 +76,10 @@ from nousergon_lib.gates.report import (
     wire_budget,
 )
 from nousergon_lib.gates.tracker import Tracker, TrackerConfig
+from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeAccessIssue]
+    TradingCalendarRangeError,
+    previous_trading_day,
+)
 
 from data_gate.read import BOARD_KEY
 
@@ -88,6 +92,7 @@ __all__ = [
     "REPORT_JOB",
     "ROLLING_ISSUE_TITLE",
     "STALE_AFTER",
+    "TradingCalendarRangeError",
     "UndeliveredError",
     "UnresolvedLog",
     "deliver",
@@ -205,19 +210,19 @@ def _fraction(met: Any, total: Any) -> str:
 # ── the trading-day axis ─────────────────────────────────────────────────────
 
 
-def previous_trading_day(calendar_date: dt.date) -> dt.date:
-    """The last weekday STRICTLY BEFORE ``calendar_date``.
-
-    Saturday, Sunday and Monday all resolve to the preceding Friday — three
-    calendar days collapsing onto one trading day. That collapse is exactly why
-    :func:`manifest_key` carries the calendar date as well: without it, three
-    genuinely different deliveries would overwrite each other at one key and
-    the weekend's reports would vanish leaving the Monday one looking complete.
-    """
-    day = calendar_date - dt.timedelta(days=1)
-    while day.weekday() >= 5:  # 5 = Saturday, 6 = Sunday
-        day -= dt.timedelta(days=1)
-    return day
+# `previous_trading_day` is the shared, holiday-aware NYSE calendar's
+# (imported above), STRICTLY BEFORE the calendar date: the report is about a
+# completed prior session. A market holiday resolves past itself to the last
+# day that actually traded — the weekday rule this module used to carry
+# reported on the holiday itself the morning after one
+# (alpha-engine-config-I11193). Out-of-coverage dates RAISE
+# `TradingCalendarRangeError`; there is deliberately no weekday fallback.
+#
+# Saturday, Sunday and Monday all resolve to the preceding Friday — several
+# calendar days collapsing onto one trading day. That collapse is exactly why
+# :func:`manifest_key` carries the calendar date as well: without it, genuinely
+# different deliveries would overwrite each other at one key and the weekend's
+# reports would vanish leaving the Monday one looking complete.
 
 
 def manifest_key(basename: str, trading_day: str, calendar_date: str) -> str:
