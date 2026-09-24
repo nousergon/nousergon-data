@@ -48,8 +48,9 @@ from __future__ import annotations
 import datetime as dt
 import json
 import logging
+import time
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 from shadow.parity import (
     DEFAULT_ABSOLUTE_TOLERANCE,
@@ -63,8 +64,11 @@ __all__ = [
     "ARCTIC_PARITY_LIBRARIES",
     "ARCTIC_PARITY_UNIT_ID",
     "LibraryPair",
+    "LiveUnitNotReady",
+    "await_live_units",
     "compare_all",
     "compare_library",
+    "latest_live_manifest",
     "open_library_pairs",
     "rewrite_report",
     "run_arctic_parity",
@@ -89,6 +93,14 @@ ARCTIC_PARITY_UNIT_ID = "arctic-parity"
 
 #: `{prefix}/{unit_id}/{trading_day}/{run_id}.json` — issue's own closes-when.
 _MANIFEST_PREFIX = "data_collection/runs"
+
+#: The same prefix, relative to the `data_collection` store the report is
+#: published to — where `await_live_units` reads v1's manifests from.
+_LIVE_RUNS_PREFIX = "runs"
+
+#: Not a verdict: a breakdown of `match` (`shadow.parity.ParityReport.summary`,
+#: `data_gate.evidence.SUMMARY_NON_VERDICT_FIELDS`).
+_SETTLING_BAR_KEYS = "settling_bar_keys"
 
 _TERMINAL_VERDICTS = frozenset(
     {"match", "mismatch", "shadow_missing_day", "both_missing", "unmeasurable"}
@@ -281,18 +293,34 @@ def rewrite_report(report: dict[str, Any], results: dict[str, dict[str, Any]]) -
         rows.append(new_row)
     out["keys"] = rows
 
+    # Every count the published summary already DECLARED stays declared — at
+    # zero when no row carries it any more — and the verdict counts are then
+    # re-derived from the rows. `settling_bar_keys` is the exception: it is a
+    # breakdown OF `match` computed from S3 rows' settling bars (never an
+    # ArcticDB row's), so it is carried over as published rather than zeroed.
+    # Rebuilding the summary from a fixed list dropped `live_superseded`,
+    # `not_applicable` and `settling_bar_keys` on every rewrite, which stopped
+    # mattering only while nothing ran this on a scheduled report
+    # (alpha-engine-config-I11546).
+    previous = report.get("summary") or {}
     summary: dict[str, int] = {
-        "total": len(rows),
-        "match": 0,
-        "mismatch": 0,
-        "live_missing": 0,
-        "shadow_missing": 0,
-        "both_missing": 0,
-        "unmeasurable": 0,
-        "in_region_only": 0,
+        name: 0
+        for name in (
+            "match",
+            "mismatch",
+            "live_missing",
+            "shadow_missing",
+            "both_missing",
+            "unmeasurable",
+            "in_region_only",
+            *previous,
+        )
     }
+    summary["total"] = len(rows)
     for row in rows:
         summary[row["verdict"]] = summary.get(row["verdict"], 0) + 1
+    if _SETTLING_BAR_KEYS in previous:
+        summary[_SETTLING_BAR_KEYS] = int(previous[_SETTLING_BAR_KEYS] or 0)
     out["summary"] = summary
     out["met"] = bool(rows) and all(row["verdict"] == "match" for row in rows)
     return out
@@ -354,6 +382,100 @@ def write_run_manifest(
     resolved_sink.write(key, json.dumps(manifest, sort_keys=True, indent=2).encode("utf-8"))
     log.info("arctic_parity: run manifest written to %s (status=%s)", key, status)
     return key
+
+
+# ---------------------------------------------------------------------------
+# Waiting for v1's own write of the trading day (alpha-engine-config-I11546)
+# ---------------------------------------------------------------------------
+
+
+class LiveUnitNotReady(RuntimeError):
+    """v1's run of a unit this comparison depends on has not landed ``ok``."""
+
+
+def latest_live_manifest(store: Any, unit_id: str, trading_day: dt.date) -> "dict[str, Any] | None":
+    """v1's LATEST run manifest for ``unit_id`` on ``trading_day``, or ``None``.
+
+    Read from ``runs/{unit_id}/{trading_day}/`` in ``store`` — the store the
+    parity report is published to (``s3://alpha-engine-research/
+    data_collection``), which is where every live unit's
+    `data_run_manifest.v1` lands. The shadow's own manifests live under
+    ``staging/shadow/{day}/`` and can never be picked up here. Latest means
+    max ``finished``: a retried unit leaves one manifest per attempt, and the
+    last attempt is the one whose writes the live library now holds.
+    """
+    prefix = f"{_LIVE_RUNS_PREFIX}/{unit_id}/{trading_day.isoformat()}/"
+    latest: "dict[str, Any] | None" = None
+    for key in sorted(k for k in store.list_keys(prefix) if k.endswith(".json")):
+        manifest = json.loads(store.get_bytes(key).decode("utf-8"))
+        if not isinstance(manifest, dict) or manifest.get("unit_id") != unit_id:
+            continue
+        if latest is None or str(manifest.get("finished") or "") >= str(latest.get("finished") or ""):
+            latest = manifest
+    return latest
+
+
+def await_live_units(
+    store: Any,
+    trading_day: dt.date,
+    unit_ids: Iterable[str],
+    *,
+    timeout_seconds: float,
+    poll_seconds: float = 60.0,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> dict[str, dict[str, Any]]:
+    """Block until v1's run of every ``unit_ids`` member for ``trading_day``
+    has a manifest with ``status: ok``; return those manifests by unit.
+
+    **Why this exists.** Every read here is day-bounded, but it is not bounded
+    in TIME: unlike the S3 side, which grades each key against the object
+    v1's manifest recorded (`alpha-engine-config-I10892`), ArcticDB has no
+    manifest-pinned version to read. So a comparison run while v1 is still
+    appending the trading day grades a live library that is half-rewritten.
+    MEASURED 2026-09-22..24: `shadow-morning` published its report at
+    12:29-12:31Z, while v1's `morning-arctic-append` (D18, which rewrites the
+    `arcticdb/universe` trading-day row the morning after) ran 12:22-12:55Z under the
+    `alpha-engine-weekday` schedule (05:15 PT). A comparator started at the
+    end of `shadow-morning` without this wait would grade the universe mid-way
+    through v1's own append.
+
+    A latest manifest that is not ``ok`` keeps the wait going rather than
+    ending it: v1's recovery path re-runs a failed append, and the re-run's
+    manifest is the one the live library ends up reflecting. Raises
+    `LiveUnitNotReady` naming what was last seen once ``timeout_seconds``
+    passes — never a comparison against a day v1 has not finished writing.
+    """
+    pending = list(dict.fromkeys(unit_ids))
+    found: dict[str, dict[str, Any]] = {}
+    last_seen: dict[str, str] = {unit: "no manifest" for unit in pending}
+    deadline = clock() + max(0.0, float(timeout_seconds))
+    while True:
+        for unit in list(pending):
+            manifest = latest_live_manifest(store, unit, trading_day)
+            if manifest is None:
+                continue
+            status = str(manifest.get("status") or "")
+            last_seen[unit] = f"status={status!r} run_id={manifest.get('run_id')!r}"
+            if status == "ok":
+                found[unit] = manifest
+                pending.remove(unit)
+                log.info(
+                    "arctic_parity: v1 %s for %s landed ok (run %s, finished %s)",
+                    unit, trading_day.isoformat(), manifest.get("run_id"), manifest.get("finished"),
+                )
+        if not pending:
+            return found
+        remaining = deadline - clock()
+        if remaining <= 0:
+            detail = "; ".join(f"{unit}: {last_seen[unit]}" for unit in pending)
+            raise LiveUnitNotReady(
+                f"v1's run for {trading_day.isoformat()} has not landed ok after "
+                f"{float(timeout_seconds):.0f}s ({detail}) under {_LIVE_RUNS_PREFIX}/<unit>/"
+                f"{trading_day.isoformat()}/ — refusing to grade a live ArcticDB library "
+                "v1 may still be writing (alpha-engine-config-I11546)"
+            )
+        sleep(min(float(poll_seconds), remaining))
 
 
 # ---------------------------------------------------------------------------

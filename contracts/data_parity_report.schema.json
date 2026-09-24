@@ -436,7 +436,7 @@
         },
         "settling_bar": {
           "type": "object",
-          "description": "The cells of this key that fall on the report's OWN trading day, whose bar the vendor was still settling when the two sides fetched it (alpha-engine-config-I11351). Recorded here and NEVER counted in `values.breaches`, so a key breaching only on that bar grades `match`. This is not a wider tolerance: `x-vendor-live.band` is untouched, and membership, schema, row count and coverage stay strict for every row including the trading day -- a missing or extra trading-day row is still a mismatch. A key with a settling_bar block AND a strict breach on an earlier row is still `mismatch`. Present only when the key's own contract declares an `x-settling-bar` basis AND that basis applies to this report.",
+          "description": "The cells of this key that fall on the report's OWN trading day, whose bar the vendor was still settling when the two sides fetched it (alpha-engine-config-I11351). Recorded here and NEVER counted in `values.breaches`, so a key breaching only on that bar grades `match`. This is not a wider tolerance: `x-vendor-live.band` is untouched, and membership, schema, row count and coverage stay strict for every row including the trading day -- a missing or extra trading-day row is still a mismatch. A key with a settling_bar block AND a strict breach on an earlier row is still `mismatch`. Present only when the key's own contract declares an `x-settling-bar` basis AND that basis applies to this report. Under `row_date` and `key_date` only a NUMERIC move settles (a price, a volume, a derived indicator); an identity field that differs (`bar_date`, a currency, a label) is a strict breach on the trading day too (alpha-engine-config-I11551).",
           "required": [
             "basis",
             "date",
@@ -450,7 +450,7 @@
                 "key_date",
                 "same_day_snapshot"
               ],
-              "description": "row_date: the artifact is indexed by bar date and only the row equal to trading_day is settling (reference/price_cache/*.parquet). key_date: the artifact is indexed by ticker and its KEY names one trading day, so the whole file is that day's bar (staging/daily_closes/{date}.parquet, features/{date}/*.parquet, market_data/eod_closes/{date}.json). same_day_snapshot: an undated, overwritten-in-place artifact whose whole content is a same-day derivation of the session's bar (market_data/technicals/latest.json)."
+              "description": "row_date: the artifact is indexed by bar date and only the row equal to trading_day is settling (reference/price_cache/*.parquet); a JSON series document declares where each row's date is in its contract's `x-settling-bar.row_dates` and a row settles only when both sides date it trading_day (market_data/close_history/consolidated.json, `$.series.*[*][0]`, alpha-engine-config-I11551). key_date: the artifact is indexed by ticker and its KEY names one trading day, so the whole file is that day's bar (staging/daily_closes/{date}.parquet, features/{date}/*.parquet, market_data/eod_closes/{date}.json). same_day_snapshot: an undated, overwritten-in-place artifact whose whole content is a same-day derivation of the session's bar (market_data/technicals/latest.json)."
             },
             "date": {
               "type": [
@@ -493,11 +493,11 @@
         },
         "settling_bar_declaration_problem": {
           "type": "string",
-          "description": "A contract declared `x-settling-bar.basis: row_date` on a JSON key, which has no row index. Recorded rather than silently applied or silently dropped: it means the contract and the artifact disagree."
+          "description": "A contract declared `x-settling-bar.basis: row_date` on a JSON key without an `x-settling-bar.row_dates` entry naming where that key's row dates are. Recorded rather than silently applied or silently dropped: it means the contract and the artifact disagree. The contract loader never produces this state (a JSON template a row_date contract does not name carries no settling bar at all), so its appearance means a hand-built contract."
         },
         "prior_day": {
           "type": "object",
-          "description": "This report's STRICT grading of the previous trading day's row -- the bar the previous report could only record as settling. Present only on a `row_date` key, the only shape carrying that history. `prior_day_settled` rolls these up.",
+          "description": "This report's STRICT grading of the previous trading day's row -- the bar the previous report could only record as settling. Present only on a `row_date` key, the only shape carrying that history -- a parquet frame's dated index, or a JSON series document's declared `row_dates` (alpha-engine-config-I11551). `prior_day_settled` rolls these up.",
           "properties": {
             "date": {
               "type": "string"
@@ -570,6 +570,19 @@
             ]
           },
           "description": "For a key with no shadow object: what each owning unit's shadow run manifest for the trading day recorded. Present so a reader can tell a declared no-op from a failed leg from an unexplained gap without going to find the manifest (alpha-engine-config-I11231)."
+        },
+        "failure_attribution": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "enum": [
+              "refused_this_key",
+              "not_this_key",
+              "truncated",
+              "unrecorded"
+            ]
+          },
+          "description": "For a key with no shadow object whose owning unit's shadow run FAILED: whether that failure is this key's cause, read from the manifest's per-key `write_refused` record. `refused_this_key`: the run named this key. `not_this_key`: the run's COMPLETE refusal list does not name it, so the failure does not explain the absence. `truncated` / `unrecorded`: the run's list cannot rule the key in or out (alpha-engine-config-I11547)."
         }
       }
     },
