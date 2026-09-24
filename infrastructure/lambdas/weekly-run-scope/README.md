@@ -51,10 +51,15 @@ that is neither *disabled* nor *failed*.
 
 | Disposition | Meaning | Graded? |
 |---|---|---|
-| `DISABLED` | Its gate was entered and took the skip branch. `disabled_by` names the flag. | No — a decision |
+| `DISABLED` | Its gate was entered and took the skip branch, or a parent gate whose enabled branch is the only way in did (`source: parent_gate`). `disabled_by` names the flag. | No — a decision |
 | `ENABLED_COMPLETED` | Dispatched, entered, exited cleanly | Yes |
-| `ENABLED_FAILED` | Dispatched and entered, never exited cleanly | **Yes, as a failure** |
+| `ENABLED_FAILED` | Dispatched and entered, never exited cleanly — including a raise that a `Catch` routed on (`caught_error`) | **Yes, as a failure** |
 | `NOT_REACHED` | The gate was never entered — the run ended upstream | No — an absence of evidence |
+
+Gated stages that run after `RunScope` itself (`ReportCard`, `Director`,
+`ScannerLeaderboard`, `AggregateCosts`) are not rows: the history cannot hold
+them yet. They are listed under `after_scope` and named in the statement
+(alpha-engine-config-I11502).
 
 `ENABLED_FAILED` is why the whole module is written against **dispatch** rather
 than **success**. If grading followed what succeeded, a stage could silently

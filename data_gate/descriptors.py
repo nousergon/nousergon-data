@@ -27,12 +27,32 @@ __all__ = [
     "EXTERNALLY_OWNED_OBSERVABILITY_ROWS",
     "GUARD_CLASSES",
     "NA_TAXONOMY",
+    "OWN_REPO",
+    "PIN_KINDS",
     "UNITS_DIR",
     "Unit",
     "load_units",
 ]
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+
+#: This repository, as a `consumer_pins[].repo` value.
+OWN_REPO = "nousergon-data"
+
+#: What a `contract.consumer_pins` entry pins — a CLOSED taxonomy
+#: (`alpha-engine-config-I11282`). A free-text pin cannot be graded, so it can
+#: only ever be believed, and a believed pin reads MET on filler:
+#:
+#: * ``body_schema`` — a copy of a producer schema in the consumer repo;
+#:   `producer` names which of this unit's `contract.schema` files it copies.
+#: * ``key_template`` — a fixture carrying the S3 `object_key_template` the
+#:   consumer derives keys from; it must equal one of this unit's `writes`.
+#: * ``in_repo_reader`` — the consumer is in THIS repo (no cross-repo boundary
+#:   to copy across); `path` is the test here that drives `read_site`.
+PIN_KINDS = ("body_schema", "key_template", "in_repo_reader")
+
+_PIN_REQUIRED_FIELDS = ("repo", "path", "pins", "read_site")
+_PIN_ALLOWED_FIELDS = frozenset(_PIN_REQUIRED_FIELDS + ("producer", "note"))
 UNITS_DIR = REPO_ROOT / "registry.d" / "units"
 
 #: The nine scored columns of the audit's §3 unit register, in its own order.
@@ -394,6 +414,56 @@ def _check_retention(unit_id: str, document: dict[str, Any], path: pathlib.Path)
         )
 
 
+def _schema_files(contract: dict[str, Any]) -> list[str]:
+    raw = contract.get("schema")
+    values = raw if isinstance(raw, list) else [raw] if raw else []
+    return [str(v).strip() for v in values]
+
+
+def _validate_consumer_pins(document: dict[str, Any], path: pathlib.Path) -> None:
+    """Every `contract.consumer_pins` entry is a gradeable declaration (I11282)."""
+    contract = document.get("contract") or {}
+    pins = contract.get("consumer_pins") or []
+    if not isinstance(pins, list):
+        raise DescriptorError(f"{path.name}: contract.consumer_pins must be a list")
+    schemas = _schema_files(contract)
+    for index, pin in enumerate(pins):
+        where = f"{path.name}: contract.consumer_pins[{index}]"
+        if not isinstance(pin, dict):
+            raise DescriptorError(
+                f"{where} is {pin!r}, not a mapping with {list(_PIN_REQUIRED_FIELDS)}. A free-text "
+                "pin cannot be graded; a consumer with no pinned contract file belongs under "
+                "`contract.unpinned_consumers`, where it renders as a finding."
+            )
+        missing = [f for f in _PIN_REQUIRED_FIELDS if not str(pin.get(f) or "").strip()]
+        if missing:
+            raise DescriptorError(f"{where} is missing {missing}")
+        unknown = sorted(set(pin) - _PIN_ALLOWED_FIELDS)
+        if unknown:
+            raise DescriptorError(f"{where} declares unknown field(s) {unknown}")
+        kind = pin["pins"]
+        if kind not in PIN_KINDS:
+            raise DescriptorError(f"{where}: pins {kind!r} is not one of {list(PIN_KINDS)}")
+        if kind == "in_repo_reader":
+            if pin["repo"] != OWN_REPO:
+                raise DescriptorError(f"{where}: an in_repo_reader pin names repo {OWN_REPO!r}")
+        elif pin["repo"] == OWN_REPO:
+            raise DescriptorError(
+                f"{where}: a {kind} pin copies a contract ACROSS a repository boundary; a "
+                "consumer in this repository is an in_repo_reader pin"
+            )
+        if kind == "body_schema" and str(pin.get("producer") or "").strip() not in schemas:
+            raise DescriptorError(
+                f"{where}: a body_schema pin needs `producer` naming one of this unit's "
+                f"contract.schema files {schemas}; got {pin.get('producer')!r}"
+            )
+    unpinned = contract.get("unpinned_consumers")
+    if unpinned is not None and (
+        not isinstance(unpinned, list) or not all(isinstance(c, str) and c.strip() for c in unpinned)
+    ):
+        raise DescriptorError(f"{path.name}: contract.unpinned_consumers must be a list of non-empty strings")
+
+
 def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> None:
     missing = [key for key in _REQUIRED_TOP_LEVEL if key not in document]
     if missing:
@@ -427,6 +497,8 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
             f"{path.name}: clause_phase must name every scored column; a column with no "
             "phase is a clause that can never hold a gate."
         )
+
+    _validate_consumer_pins(document, path)
 
     guards = document["guards"]
     if not isinstance(guards, dict):

@@ -46,6 +46,7 @@ from builders._price_cache_writeboth import (
 from collectors import CaretTickerError
 from dates import (
     FutureBarError,
+    as_trading_day,
     assert_no_bar_after,
     bar_settlement_guard_entry,
     clip_to_trading_day,
@@ -485,13 +486,15 @@ def _is_missing_object(s3, exc: Exception) -> bool:
     return type(exc).__name__.lstrip("_") in {"NoSuchKey", "NoSuchBucketError"}
 
 
-def _existing_parquet_rows(s3, bucket: str, s3_prefix: str, ticker: str) -> int | None:
-    """Row count of the ticker's current price-cache parquet, or None if absent.
+def _read_existing_parquet(
+    s3, bucket: str, s3_prefix: str, ticker: str, *, purpose: str,
+) -> "pd.DataFrame | None":
+    """The ticker's current price-cache parquet, or None if absent.
 
     Any read failure other than "the object does not exist" RAISES — treating an
-    unreadable parquet as absent would let a short fetch overwrite a full history
-    on a transient S3 error, which is the same silent-degrade this guard exists
-    to stop.
+    unreadable parquet as absent would let a bad fetch overwrite a good history
+    on a transient S3 error, which is the same silent-degrade the write guards
+    below exist to stop. ``purpose`` names the guard in that error.
     """
     import io as _io
 
@@ -504,13 +507,72 @@ def _existing_parquet_rows(s3, bucket: str, s3_prefix: str, ticker: str) -> int 
                 continue
             last_exc = exc
             continue
-        return len(pd.read_parquet(_io.BytesIO(obj["Body"].read())))
+        return pd.read_parquet(_io.BytesIO(obj["Body"].read()))
     if last_exc is not None:
         raise RuntimeError(
-            f"Short-fetch guard: could not read the existing price-cache parquet "
-            f"for {ticker} to check for truncation: {last_exc}"
+            f"{purpose}: could not read the existing price-cache parquet "
+            f"for {ticker}: {last_exc}"
         ) from last_exc
     return None
+
+
+def _existing_parquet_rows(s3, bucket: str, s3_prefix: str, ticker: str) -> int | None:
+    """Row count of the ticker's current price-cache parquet, or None if absent.
+
+    Raises on any read failure other than "the object does not exist" (see
+    :func:`_read_existing_parquet`).
+    """
+    df = _read_existing_parquet(
+        s3, bucket, s3_prefix, ticker,
+        purpose="Short-fetch guard (checking for truncation)",
+    )
+    return None if df is None else len(df)
+
+
+def _last_bar_date(index) -> "date | None":
+    """The calendar date of the newest bar in ``index`` (UTC-normalized), or
+    None for an empty index."""
+    if len(index) == 0:
+        return None
+    idx = pd.to_datetime(pd.Index(index))
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    last = idx.max()
+    return None if pd.isna(last) else last.date()
+
+
+def _existing_parquet_last_bar(s3, bucket: str, s3_prefix: str, ticker: str) -> "date | None":
+    """Date of the newest bar in the ticker's current price-cache parquet, or
+    None if there is no parquet. Raises on any read failure other than "the
+    object does not exist" (see :func:`_read_existing_parquet`)."""
+    df = _read_existing_parquet(
+        s3, bucket, s3_prefix, ticker,
+        purpose="Behind-fetch guard (checking the cached last bar)",
+    )
+    return None if df is None else _last_bar_date(df.index)
+
+
+def _expected_last_bar(trading_day: "str | date") -> date:
+    """The newest bar a history fetch serving ``trading_day`` should end on.
+
+    ``nousergon_lib.dates.expected_last_close`` on the NYSE calendar: D itself
+    when D is a session, else the session before it (a Saturday run expects
+    Friday). Anchored on the run's trading day, never on the box's UTC clock.
+    Falls back to D's own calendar date if the lib lookup raises — that is the
+    conservative direction (it can only make the behind-fetch guard look at the
+    cache MORE often, never less).
+    """
+    d = as_trading_day(trading_day)
+    try:
+        from nousergon_lib.dates import expected_last_close
+
+        return expected_last_close(d)
+    except Exception:  # noqa: BLE001 - a calendar miss must not block the refresh
+        logger.warning(
+            "_expected_last_bar: expected_last_close(%s) failed; using the "
+            "calendar date as the expected last bar", d.isoformat(), exc_info=True,
+        )
+        return d
 
 
 def _longest_of(candidates: list[tuple[str, pd.DataFrame]]) -> tuple[str, pd.DataFrame]:
@@ -613,9 +675,12 @@ def _refresh_stale(
     import time
 
     window_start, window_end_excl = history_window(trading_day, fetch_period)
+    expected_last = _expected_last_bar(trading_day)
     logger.info(
-        "Refreshing %d stale tickers (window=%s: start=%s, end=%s exclusive) ...",
+        "Refreshing %d stale tickers (window=%s: start=%s, end=%s exclusive, "
+        "expected last bar %s) ...",
         len(stale), fetch_period, window_start.isoformat(), window_end_excl.isoformat(),
+        expected_last.isoformat(),
     )
 
     refreshed = 0
@@ -773,6 +838,48 @@ def _refresh_stale(
                                 )
                                 failed_tickers.append(ticker)
                                 continue
+
+                    # ── Behind-fetch guard (alpha-engine-config-I11467) ─────
+                    # A full-length answer can still be missing the run's last
+                    # session. Measured on the 2026-09-23 rehearsal: launched
+                    # 00:00 UTC (20:00 ET on 2026-09-22) for trading_day
+                    # 2026-09-22, yfinance answered ``end=2026-09-23`` with
+                    # series ending 2026-09-21 for every ticker, and the
+                    # refresh overwrote a cache that already held the
+                    # 2026-09-22 bar (AAPL: version written 2026-09-22T20:09Z
+                    # ends 09-22; the 00:10Z and 01:44Z rewrites end 09-21).
+                    # The short-fetch guard above cannot see this — 2,512 rows
+                    # is not short. A refresh that moves the cache's last bar
+                    # BACKWARDS is a failed refresh, not a new truth: keep the
+                    # existing parquet and count the ticker as failed, exactly
+                    # like a shrinking refresh. The existing parquet is only
+                    # read when the fetch ends before the run's expected
+                    # session, so a current answer pays no extra S3 GET.
+                    fetched_last = _last_bar_date(new_df.index)
+                    if fetched_last is not None and fetched_last < expected_last:
+                        cached_last = _existing_parquet_last_bar(
+                            s3, bucket, s3_prefix, ticker,
+                        )
+                        if cached_last is not None and fetched_last < cached_last:
+                            logger.error(
+                                "Behind-fetch REFUSED for %s: the fetched series ends "
+                                "%s but the existing price-cache parquet already ends "
+                                "%s (expected last bar for trading_day %s is %s) — not "
+                                "uploading (existing history preserved). See "
+                                "alpha-engine-config-I11467.",
+                                ticker, fetched_last.isoformat(), cached_last.isoformat(),
+                                str(trading_day), expected_last.isoformat(),
+                            )
+                            failed_tickers.append(ticker)
+                            continue
+                        logger.warning(
+                            "%s: fetched series ends %s, before the expected last bar "
+                            "%s for trading_day %s (cached parquet ends %s) — "
+                            "uploading, since it does not move the cache backwards.",
+                            ticker, fetched_last.isoformat(), expected_last.isoformat(),
+                            str(trading_day),
+                            cached_last.isoformat() if cached_last else "absent",
+                        )
 
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;

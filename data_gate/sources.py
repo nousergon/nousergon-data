@@ -28,6 +28,7 @@ opposite owners.
 
 from __future__ import annotations
 
+import base64
 import json
 import pathlib
 import urllib.error
@@ -216,6 +217,7 @@ class GitHubContents:
         self._opener = opener or _urllib_opener
         self._repos: dict[str, bool] = {}
         self._paths: dict[tuple[str, str], str | None] = {}
+        self._contents: dict[tuple[str, str], tuple[str | None, bytes | None]] = {}
 
     def _get(self, url: str) -> tuple[int, Any]:
         status, body = self._opener(
@@ -265,3 +267,41 @@ class GitHubContents:
             else:
                 raise SourceUnavailable(f"GitHub answered HTTP {status} for {self.owner}/{repo}:{path}")
         return self._paths[cache_key]
+
+    def read_file(self, repo: str, path: str) -> tuple[str | None, bytes | None]:
+        """``(kind, content)`` of a path on the default branch, one request per path.
+
+        `alpha-engine-config-I11282`: a consumer pin is graded on the pinned
+        file's CONTENT, not its existence, so the contents API's ``content``
+        field is decoded here. ``(None, None)`` is absent; a directory or other
+        non-file answers its kind with no content. A file the API will not
+        inline (over its 1 MB inline limit) raises :class:`SourceUnavailable`
+        — we could not look — rather than reading as an empty file.
+        """
+        self._require_repo(repo)
+        cache_key = (repo, path)
+        if cache_key not in self._contents:
+            url = (
+                f"{self.API}/repos/{self.owner}/{urllib.parse.quote(repo)}/contents/"
+                f"{urllib.parse.quote(path)}"
+            )
+            status, payload = self._get(url)
+            if status == 404:
+                self._contents[cache_key] = (None, None)
+            elif status != 200:
+                raise SourceUnavailable(f"GitHub answered HTTP {status} for {self.owner}/{repo}:{path}")
+            elif isinstance(payload, list):
+                self._contents[cache_key] = ("dir", None)
+            else:
+                kind = str((payload or {}).get("type") or "file")
+                if kind != "file":
+                    self._contents[cache_key] = (kind, None)
+                elif (payload or {}).get("encoding") != "base64":
+                    raise SourceUnavailable(
+                        f"GitHub did not inline {self.owner}/{repo}:{path} (encoding "
+                        f"{(payload or {}).get('encoding')!r}); its content cannot be compared"
+                    )
+                else:
+                    self._contents[cache_key] = ("file", base64.b64decode(payload.get("content") or ""))
+            self._paths.setdefault(cache_key, self._contents[cache_key][0])
+        return self._contents[cache_key]

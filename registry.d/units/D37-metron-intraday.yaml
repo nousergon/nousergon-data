@@ -47,8 +47,16 @@ contract:
     - tests/test_technical_rating_contracts.py
     - tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/technical_ratings.schema.json"
-    - "metron:tests/contracts/metron_intraday_latest.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/technical_ratings.schema.json"
+      pins: "body_schema"
+      producer: "contracts/technical_ratings.schema.json"
+      read_site: "api/services/technical_rating.py::load_technical_rating"
+    - repo: "metron"
+      path: "tests/contracts/metron_intraday_latest.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_intraday_latest.schema.json"
+      read_site: "api/services/intraday.py::load_quotes"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D37
 # D37 is the ONE unit whose run records need a retention decision stated in the

@@ -49,7 +49,11 @@ contract:
   schema: "contracts/inst_ownership.schema.json"
   producer_test: tests/test_inst_ownership_contract.py
   consumer_pins:
-    - "crucible:tests/contracts/inst_ownership.schema.json"
+    - repo: "crucible"
+      path: "tests/contracts/inst_ownership.schema.json"
+      pins: "body_schema"
+      producer: "contracts/inst_ownership.schema.json"
+      read_site: "crucible/data/point_in_time.py::SnapshotPointInTimeSource"
   # P-07 (alpha-engine-config#10870): crucible v2's
   # crucible/data/point_in_time.py::SnapshotPointInTimeSource._load_institutional
   # reads `data/inst_ownership/{YYYYQn}/latest.parquet` via

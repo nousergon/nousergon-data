@@ -188,7 +188,8 @@ class TestWiringPinsGateScopedReads:
         # And whose earlier operand guards the exact same path. This is the
         # guard-blessed idiom for a Choice reading an opaque Lambda output.
         rule = states["CheckSubstrateHealthGate"]["Choices"][0]
-        assert rule["Next"] == "MorningEnrich"
+        # alpha-engine-config-I11268: HEALTHY now proceeds to CheckShellRun.
+        assert rule["Next"] == "CheckShellRun"
         operands = rule["And"]
         var = "$.substrate_gate_result.gate.verdict"
         assert operands[0] == {"Variable": var, "IsPresent": True}, (

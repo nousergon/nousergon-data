@@ -39,7 +39,10 @@ then repeat every week:
 ``DISABLED``
     The stage's own ``CheckSkipX`` Choice was entered and took the skip branch,
     or an ancestor gate did — ``disabled_by`` names the flag responsible. NOT
-    graded. This is the state an operator creates on purpose.
+    graded. This is the state an operator creates on purpose. An ancestor is a
+    gate that was OBSERVED taking its skip branch and whose enabled branch is
+    the only way into this stage's gate (``governed_states``); the row's
+    ``source`` is then ``parent_gate``.
 
 ``ENABLED_COMPLETED``
     Dispatched, entered, exited cleanly. Graded.
@@ -49,11 +52,20 @@ then repeat every week:
     failure.** This row is the reason the whole module is written against
     dispatch rather than against success: if grading followed what succeeded, a
     stage could silently disable itself by crashing, which is precisely the
-    class of defect this fleet keeps paying for.
+    class of defect this fleet keeps paying for. An exit that a ``Catch``
+    routed on after the state raised is NOT a clean exit
+    (alpha-engine-config-I11502): the row carries ``caught_error``.
 
 ``NOT_REACHED``
     The gate was never entered — the execution ended, or failed, upstream of it.
     Never read as disabled, never read as passing.
+
+Stages that run AFTER this Lambda's own state (``SCOPE_STATE``) are not rows
+at all. The scope is taken mid-run, before ``ReportCard``, ``Director``,
+``ScannerLeaderboard`` and ``AggregateCosts`` have happened, so the history
+cannot say anything about them yet, and ``NOT_REACHED`` ("the run ended
+upstream") would be false. They are listed under ``after_scope`` instead, and
+the statement says how many there are (alpha-engine-config-I11502).
 
 One further rule, in section 4 below: the artifact is ONE key per cycle and
 several executions write it, so a row is only ever replaced by a row making a
@@ -257,6 +269,113 @@ def work_entry(definition: dict, entry: str | None) -> tuple[str | None, list[st
             nxt = choices[0].get("Next") if choices else None
         name = nxt
     return None, passed
+
+
+#: The state this Lambda runs as. Gates downstream of it cannot be in the
+#: history it reads (alpha-engine-config-I11502).
+SCOPE_STATE = "RunScope"
+
+
+def _all_edges(state: dict) -> Iterable[str]:
+    """Forward edges AND ``Catch`` edges.
+
+    Used only to find a state's predecessors for :func:`governed_states`,
+    where MORE edges is the conservative direction: every extra predecessor
+    is one more way into a state that does not pass through the governing
+    gate, so it can only shrink the governed set.
+    """
+    yield from _successors(state)
+    for catch in state.get("Catch", []) or []:
+        nxt = catch.get("Next")
+        if isinstance(nxt, str):
+            yield nxt
+
+
+def _predecessors(states: dict[str, dict]) -> dict[str, set[str]]:
+    preds: dict[str, set[str]] = {}
+    for name, body in states.items():
+        for target in _all_edges(body):
+            preds.setdefault(target, set()).add(name)
+    return preds
+
+
+def _nested_states(body: dict) -> set[str]:
+    out: set[str] = set()
+    for branch in body.get("Branches", []) or []:
+        out |= set(flatten_states(branch.get("States", {})))
+    iterator = body.get("Iterator") or body.get("ItemProcessor")
+    if isinstance(iterator, dict):
+        out |= set(flatten_states(iterator.get("States", {})))
+    return out
+
+
+def governed_states(
+    states: dict[str, dict],
+    preds: dict[str, set[str]],
+    gate: str,
+    on_enabled: str | None,
+) -> frozenset:
+    """The states that can ONLY be reached through ``gate``'s enabled branch.
+
+    alpha-engine-config-I11502. When a gate takes its skip branch, the gates
+    inside its enabled branch are never entered. Without this they read
+    ``NOT_REACHED`` ("the run ended upstream"), which is false: the run
+    carried on, and the stage was switched off by the parent's flag.
+
+    This is dominance, NOT reachability. Reachability was tried here and was
+    wrong (see :func:`work_entry`): the shared relaunch hub reaches into the
+    middle of many branches. Dominance fails the safe way on that hub. A state
+    with ANY predecessor outside the governed set (a hub edge, a ``Catch``
+    from elsewhere) is not governed, so the worst case is the old
+    ``NOT_REACHED``, never a wrong parent flag. The enabled entry itself must
+    have no predecessor but the gate, or the set is empty.
+
+    Parallel and Map bodies inside a governed state are governed as well:
+    Step Functions forbids transitions into a branch from outside it.
+    """
+    if not on_enabled or on_enabled not in states:
+        return frozenset()
+    if preds.get(on_enabled, set()) - {gate}:
+        return frozenset()
+    governed = {on_enabled}
+    queue = [on_enabled]
+    while queue:
+        name = queue.pop()
+        body = states.get(name, {})
+        candidates = set(_all_edges(body))
+        for nested in _nested_states(body):
+            if nested not in governed:
+                governed.add(nested)
+                queue.append(nested)
+                candidates |= set(_all_edges(states.get(nested, {})))
+        for target in candidates:
+            if target in governed or target not in states or target == gate:
+                continue
+            if preds.get(target, set()) <= governed:
+                governed.add(target)
+                queue.append(target)
+    return frozenset(governed)
+
+
+def states_after(states: dict[str, dict], start: str) -> frozenset:
+    """Every state forward-reachable from ``start``'s own successors.
+
+    Used for ONE question: which gates are still ahead of the Lambda that is
+    reading the history (:data:`SCOPE_STATE`)? It is only applied to gates the
+    history has not entered, so an over-wide walk cannot relabel a stage that
+    actually ran.
+    """
+    if start not in states:
+        return frozenset()
+    seen: set[str] = set()
+    queue = list(_successors(states[start]))
+    while queue:
+        name = queue.pop()
+        if name in seen or name not in states:
+            continue
+        seen.add(name)
+        queue.extend(_successors(states[name]))
+    return frozenset(seen)
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +690,52 @@ def exited_names(history: list[dict]) -> set[str]:
     return out
 
 
+#: Event-type suffixes that mean the state's work raised: ``TaskFailed``,
+#: ``LambdaFunctionFailed``, ``TaskTimedOut``, ``ParallelStateFailed`` and the
+#: rest of that family.
+_FAILURE_SUFFIXES = ("Failed", "TimedOut")
+
+
+def _error_name(event: dict) -> str | None:
+    for key, value in event.items():
+        if key.endswith("EventDetails") and isinstance(value, dict):
+            error = value.get("error")
+            if isinstance(error, str) and error:
+                return error
+    return None
+
+
+def caught_failures(history: list[dict]) -> dict[str, str]:
+    """States whose LAST exit came straight after a failure event.
+
+    alpha-engine-config-I11502. When a Task raises and its ``Catch`` routes the
+    run on, the history still records a ``TaskStateExited`` for it, whose
+    ``previousEventId`` is the ``TaskFailed``. Measured on
+    ``rehearsal-2026-09-23-2``: ChallengerShadow ``TaskFailed``
+    (``ChallengerShadowGapError``) -> ``TaskStateExited`` ->
+    ``MarkChallengerShadowDegraded``, which ``exited_names`` alone read as a
+    clean exit.
+
+    Only the last exit counts, so a failure that a ``Retry`` or a relaunch
+    later recovered from is not reported. The value is the error name, or
+    ``"unknown error"`` when the event carries none.
+    """
+    by_id = {event.get("id"): event for event in history}
+    caught: dict[str, str] = {}
+    for event in history:
+        if not event.get("type", "").endswith(_EXITED_SUFFIX):
+            continue
+        name = (event.get("stateExitedEventDetails") or {}).get("name")
+        if not name:
+            continue
+        previous = by_id.get(event.get("previousEventId")) or {}
+        if previous.get("type", "").endswith(_FAILURE_SUFFIXES):
+            caught[name] = _error_name(previous) or "unknown error"
+        else:
+            caught.pop(name, None)
+    return caught
+
+
 def gate_decisions(gates: dict[str, dict], history: list[dict]) -> dict[str, str]:
     """For each gate the run entered, whether it enabled or disabled its stage.
 
@@ -632,6 +797,7 @@ def build_run_scope(
     execution_arn: str = "",
     state_machine_arn: str = "",
     input_flags: dict | None = None,
+    scope_state: str = SCOPE_STATE,
 ) -> dict:
     """The run's own scope, derived. Never raises on a degenerate input.
 
@@ -645,12 +811,42 @@ def build_run_scope(
     exited = exited_names(history)
     entered = set(entered_sequence(history))
     decisions = gate_decisions(gates, history)
+    caught = caught_failures(history)
 
     states = flatten_states(definition.get("States", {}))
     flags = input_flags if isinstance(input_flags, dict) else {}
+    # Gates still ahead of this Lambda. Only meaningful while the history is
+    # the one this Lambda is running inside, i.e. it has entered scope_state;
+    # a replay of an older, complete history leaves this empty.
+    ahead = states_after(states, scope_state) if scope_state in entered else frozenset()
+    preds = _predecessors(states)
+    # Governed sets of the gates this run OBSERVED skipping, innermost first,
+    # so a stage inside two skipped gates names the flag nearest to it.
+    skipped_parents = sorted(
+        (
+            (governed_states(states, preds, g, gates[g].get("on_enabled")), g)
+            for g, d in decisions.items() if d == DISABLED
+        ),
+        key=lambda pair: (len(pair[0]), pair[1]),
+    )
 
     stages: dict[str, dict] = {}
+    after_scope: dict[str, dict] = {}
     for name, gate in sorted(gates.items()):
+        decision = decisions.get(name)
+        if decision is None and name in ahead:
+            flag_value = flags.get(gate["flag"])
+            after_scope[gate["stage"]] = {
+                "gate": name,
+                "flag": gate["flag"],
+                "input_flag": flag_value,
+                "reason": (
+                    f"{name} runs after {scope_state}, which is where this "
+                    "scope was taken, so the history could not contain it yet. "
+                    "Not recorded here — neither graded nor read as absent."
+                ),
+            }
+            continue
         entry, nested = work_entry(definition, gate.get("on_enabled"))
         row: dict[str, Any] = {
             "gate": name,
@@ -658,7 +854,6 @@ def build_run_scope(
             "entry_state": entry,
             "entry_state_type": states.get(entry, {}).get("Type") if entry else None,
         }
-        decision = decisions.get(name)
         if decision == DISABLED:
             row.update(
                 disposition=DISABLED,
@@ -677,6 +872,17 @@ def build_run_scope(
                     reason=(
                         f"dispatched: {entry} was entered and never exited — the "
                         "stage did not complete."
+                    ),
+                )
+            elif entry and entry in entered and entry in caught:
+                row.update(
+                    disposition=ENABLED_FAILED,
+                    source="execution_history",
+                    caught_error=caught[entry],
+                    reason=(
+                        f"dispatched: {entry} raised {caught[entry]} and its "
+                        "Catch routed the run on — entered, but it did not "
+                        "exit cleanly."
                     ),
                 )
             elif entry and entry in entered:
@@ -715,14 +921,36 @@ def build_run_scope(
                             "execution ended between the gate and the stage."
                         ),
                     )
+        elif parent := next(
+            (g for governed, g in skipped_parents if name in governed), None
+        ):
+            # The gate was never entered because a gate whose enabled branch is
+            # the ONLY way to it was observed taking its skip branch
+            # (alpha-engine-config-I11502: skip_parity bypassing ParityReplay
+            # and the three PitParity stages). Both halves are facts: the
+            # parent's decision is off the history, and the containment is
+            # dominance, which fails toward NOT_REACHED on the relaunch hub.
+            row.update(
+                disposition=DISABLED,
+                disabled_by=gates[parent]["flag"],
+                source="parent_gate",
+                reason=(
+                    f"{name} was never entered because {parent} took its skip "
+                    f"branch ({gates[parent]['flag']} was true on this run), and "
+                    f"{name} can only be reached through {parent}'s enabled "
+                    "branch."
+                ),
+            )
         else:
             # The gate was never entered. The run ended or branched away
             # upstream. Where the run's own input carried this stage's flag, say
             # so -- that is a FACT off the execution input, not an inference
-            # over the state graph. Blame walked through the graph was tried and
-            # got it wrong: the shared relaunch hub made containment
-            # unresolvable, and the wrong parent flag is worse than none,
-            # because the flag it names is not the flag to flip.
+            # over the state graph. Blame walked through the graph by
+            # REACHABILITY was tried and got it wrong: the shared relaunch hub
+            # made containment unresolvable, and the wrong parent flag is worse
+            # than none, because the flag it names is not the flag to flip. The
+            # parent_gate branch above uses dominance instead, which fails into
+            # this branch rather than naming a wrong flag.
             flag_value = flags.get(gate["flag"])
             row.update(
                 disposition=NOT_REACHED,
@@ -755,11 +983,14 @@ def build_run_scope(
         "stages": stages,
         "graded_stages": graded,
         "counts": counts,
-        "statement": _statement(counts, len(stages)),
+        "after_scope": after_scope,
+        "statement": _statement(counts, len(stages), after_scope),
     }
 
 
-def _statement(counts: dict[str, int], total: int) -> str:
+def _statement(
+    counts: dict[str, int], total: int, after_scope: dict | None = None
+) -> str:
     """The one sentence a reader needs to size any verdict computed over this.
 
     Rendered beside the grade, never instead of it: "GREEN" over an unstated
@@ -774,6 +1005,11 @@ def _statement(counts: dict[str, int], total: int) -> str:
         parts.append(f"{counts[NOT_REACHED]} never reached")
     if counts[ENABLED_FAILED]:
         parts.append(f"{counts[ENABLED_FAILED]} dispatched and did NOT complete")
+    if after_scope:
+        parts.append(
+            f"{len(after_scope)} run after this scope was taken and are not "
+            f"recorded ({', '.join(sorted(after_scope))})"
+        )
     return "; ".join(parts) + "."
 
 
@@ -909,7 +1145,14 @@ def _recompute(scope: dict) -> dict:
         # merge onto; where there was one, the flag is dropped first and the
         # surviving rows get a real statement.
         return scope
-    scope["statement"] = _statement(counts, len(stages))
+    # A stage the incumbent recorded as a row is no longer "after scope".
+    after_scope = {
+        name: entry for name, entry in (scope.get("after_scope") or {}).items()
+        if name not in stages
+    }
+    if "after_scope" in scope:
+        scope["after_scope"] = after_scope
+    scope["statement"] = _statement(counts, len(stages), after_scope)
     if unrecognised:
         scope["statement"] += (
             f" {unrecognised} row(s) carry a disposition outside the closed "
