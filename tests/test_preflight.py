@@ -91,11 +91,24 @@ class TestPolygonReachable:
             pf._check_polygon_reachable()  # must not raise
 
     def test_500_outage(self):
+        # alpha-engine-config-I11466: a sustained 5xx is retried on the default
+        # window (backoff sleep patched out), then still fails loud.
         pf = self._setup()
-        with patch("requests.get") as mock_get:
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
             mock_get.return_value = MagicMock(status_code=503, text="unavailable")
             with pytest.raises(RuntimeError, match="upstream outage"):
                 pf._check_polygon_reachable()
+        assert mock_get.call_count == 3
+
+    def test_transient_5xx_then_success_recovers(self):
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
+            mock_get.side_effect = [
+                MagicMock(status_code=503, text="unavailable"),
+                MagicMock(status_code=200, text='{"results": []}'),
+            ]
+            pf._check_polygon_reachable()
+        assert mock_get.call_count == 2
 
     def test_network_error(self):
         # L4494: a sustained ConnectionError now retries _REACHABILITY_MAX_ATTEMPTS
@@ -187,20 +200,79 @@ class TestFredReachable:
             pf._check_fred_reachable()  # must not raise
 
     def test_500_outage(self):
+        # alpha-engine-config-I11466: a SUSTAINED 5xx still fails loud — only
+        # after the full FRED retry window, not on the first response.
         pf = self._setup()
-        with patch("requests.get") as mock_get:
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
             mock_get.return_value = MagicMock(status_code=502, text="bad gateway")
-            with pytest.raises(RuntimeError, match="upstream outage"):
+            with pytest.raises(RuntimeError, match="after 9 attempts.*upstream outage"):
                 pf._check_fred_reachable()
+        assert mock_get.call_count == 9
 
     def test_network_error(self):
         # L4494: sustained Timeout retries then fails loud as "unreachable".
+        # alpha-engine-config-I11466: over the longer FRED window (9 attempts).
         pf = self._setup()
         with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
             mock_get.side_effect = requests.Timeout("timed out")
-            with pytest.raises(RuntimeError, match="unreachable after 3 attempts"):
+            with pytest.raises(RuntimeError, match="unreachable after 9 attempts"):
                 pf._check_fred_reachable()
-        assert mock_get.call_count == 3
+        assert mock_get.call_count == 9
+
+    def test_502_then_200_passes(self):
+        # alpha-engine-config-I11466 regression: a transient 502 must NOT abort
+        # the weekly run — it is retried and the next 200 passes the probe.
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep") as slp:
+            mock_get.side_effect = [
+                MagicMock(status_code=502, text="bad gateway"),
+                MagicMock(status_code=200, text='{"observations": []}'),
+            ]
+            pf._check_fred_reachable()
+        assert mock_get.call_count == 2
+        assert slp.call_count == 1
+
+    def test_rehearsal_2026_09_23_sequence_passes(self):
+        # The exact blip that failed rehearsal-2026-09-23-1: three ReadTimeouts
+        # (the old window's whole budget), then a 502, then FRED recovers.
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep"):
+            mock_get.side_effect = [
+                requests.ReadTimeout("read timeout=10.0"),
+                requests.ReadTimeout("read timeout=10.0"),
+                requests.ReadTimeout("read timeout=10.0"),
+                MagicMock(status_code=502, text="bad gateway"),
+                MagicMock(status_code=200, text='{"observations": []}'),
+            ]
+            pf._check_fred_reachable()
+        assert mock_get.call_count == 5
+
+    def test_400_auth_is_not_retried(self):
+        # 4xx auth failure stays fatal on the FIRST response — retrying cannot
+        # fix a bad key, and a drifted key must still fail in <1s.
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep") as slp:
+            mock_get.return_value = MagicMock(
+                status_code=400, text="Bad Request: api_key is invalid"
+            )
+            with pytest.raises(RuntimeError, match="auth failed"):
+                pf._check_fred_reachable()
+        assert mock_get.call_count == 1
+        assert slp.call_count == 0
+
+    def test_retry_window_is_bounded(self):
+        # The window is bounded: every backoff wait is capped, so a sustained
+        # outage fails loud in minutes rather than hanging the stage.
+        pf = self._setup()
+        with patch("requests.get") as mock_get, patch("preflight.time.sleep") as slp:
+            mock_get.return_value = MagicMock(status_code=503, text="unavailable")
+            with pytest.raises(RuntimeError, match="upstream outage"):
+                pf._check_fred_reachable()
+        waits = [c.args[0] for c in slp.call_args_list]
+        assert len(waits) == 8
+        assert max(waits) <= 60.0
+        # Sleeps alone stay under ~4 min; plus 9 x 10s timeouts, < 5 min total.
+        assert sum(waits) < 240.0
 
 
 # ── S3 writeable sentinel ────────────────────────────────────────────────────

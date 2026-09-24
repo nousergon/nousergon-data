@@ -126,7 +126,11 @@ class TestChainOrdering:
         HEALTHY proceeds to MorningEnrich as before; SUBSTRATE_UNHEALTHY
         short-circuits to a named failure WITHOUT ever entering
         MorningEnrich's own retry ladder."""
-        assert states["CheckSkipMorningEnrich"]["Default"] == "SubstrateHealthGate"
+        # alpha-engine-config-I11268: the gate moved AHEAD of this skip-gate
+        # (box acquisition -> SubstrateHealthGate -> CheckShellRun ->
+        # CheckSkipMorningEnrich), so skip_morning_enrich can no longer route
+        # around it; the Default now goes straight into MorningEnrich.
+        assert states["CheckSkipMorningEnrich"]["Default"] == "MorningEnrich"
         assert states["SubstrateHealthGate"]["Next"] == "CheckSubstrateHealthGate"
         # config#2275: the HEALTHY rule now IsPresent-guards the verdict path
         # (a 3-segment Lambda-payload path is never floorable), so the
@@ -141,9 +145,9 @@ class TestChainOrdering:
             for c in states["CheckSubstrateHealthGate"]["Choices"]
             if _rule_healthy(c)
         ]
-        assert healthy == ["MorningEnrich"], (
-            "SubstrateHealthGate verdict=HEALTHY must proceed into "
-            "MorningEnrich unchanged"
+        assert healthy == ["CheckShellRun"], (
+            "SubstrateHealthGate verdict=HEALTHY must proceed to CheckShellRun "
+            "(and from there through the skip chain into MorningEnrich)"
         )
         assert (
             states["CheckSubstrateHealthGate"]["Default"]

@@ -19,6 +19,25 @@ are ~90% of its bytes and nothing here reads them):
     ``watch-rerun-2026-08-15-1`` — the last execution that did real work, with
     ``skip_parity`` set by the 2026-08-13 ruling.
 
+``history_rehearsal_2026-09-23_at_run_scope.json.gz``
+    ``rehearsal-2026-09-23-2`` (alpha-engine-config-I11502), cut at the
+    ``RunScope`` ``TaskStateEntered`` event: exactly the history the Lambda
+    read when it ran. Unlike the two above it keeps the ``*Failed`` events
+    (error name only), because the caught ChallengerShadow failure is only
+    visible through them. Gzipped because the DataPhase poll loops make it
+    ~850 KB of JSON. Paired with ``definition_2026-09-23_rehearsal.json.gz``,
+    the definition it actually ran against (``step_function.json`` at
+    e4d87f3, the last change before the run; Comments stripped). It used to be
+    paired with this repo's own ``step_function.json`` so the test tracked the
+    definition that deploys, but a history is only readable against the graph
+    that produced it: alpha-engine-config-I11268 moved SubstrateHealthGate
+    off ``CheckSkipMorningEnrich``'s Default edge, and against the new graph
+    this history's recorded CheckSkipMorningEnrich -> SubstrateHealthGate
+    transition matches neither declared target, so MorningEnrich correctly
+    reads NOT_REACHED ("a definition edited mid-flight"). The synthetic-history
+    tests below still run against ``step_function.json``, so the deploying
+    definition stays covered.
+
 Synthetic payloads are used only for the degenerate cases. Every structural rule
 in ``run_scope.py`` was established by running it against these two files and
 finding it wrong — reachability, dominance, sequence adjacency and
@@ -27,6 +46,7 @@ them. A synthetic fixture would have agreed with all four.
 """
 from __future__ import annotations
 
+import gzip
 import io
 import json
 import logging
@@ -36,6 +56,7 @@ import pytest
 
 from run_scope import (
     AUTHORITY,
+    SCOPE_STATE,
     DISABLED,
     DISPOSITIONS,
     ENABLED_COMPLETED,
@@ -43,9 +64,11 @@ from run_scope import (
     GRADED_DISPOSITIONS,
     NOT_REACHED,
     build_run_scope,
+    caught_failures,
     derive_gates,
     entered_sequence,
     gate_decisions,
+    governed_states,
     graded_stage_names,
     merge_run_scopes,
     work_entry,
@@ -55,7 +78,10 @@ _FIXTURES = pathlib.Path(__file__).resolve().parent / "fixtures"
 
 
 def _load(name: str):
-    return json.loads((_FIXTURES / name).read_text())
+    path = _FIXTURES / name
+    if path.suffix == ".gz":
+        return json.loads(gzip.decompress(path.read_bytes()))
+    return json.loads(path.read_text())
 
 
 @pytest.fixture(scope="module")
@@ -243,7 +269,7 @@ def test_every_gate_gets_exactly_one_row_from_the_closed_vocabulary(
     for row in scope["stages"].values():
         assert row["disposition"] in DISPOSITIONS
         assert row["reason"]
-        assert row["source"] in {"execution_history", "nested_gate"}
+        assert row["source"] in {"execution_history", "nested_gate", "parent_gate"}
 
 
 @pytest.mark.parametrize("history_name", [
@@ -290,6 +316,213 @@ def test_graded_stage_names_withholds_an_unknown_disposition():
     assert graded_stage_names(block) == []
     assert graded_stage_names(None) == []
     assert graded_stage_names({"stages": "not a mapping"}) == []
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11502 — the rehearsal's three misreports
+# ---------------------------------------------------------------------------
+
+_REPO_DEFINITION = _FIXTURES.parents[2] / "step_function.json"
+
+
+@pytest.fixture(scope="module")
+def repo_definition():
+    return json.loads(_REPO_DEFINITION.read_text())
+
+
+@pytest.fixture(scope="module")
+def rehearsal_definition():
+    """The definition ``rehearsal-2026-09-23-2`` executed against."""
+    return _load("definition_2026-09-23_rehearsal.json.gz")
+
+
+@pytest.fixture(scope="module")
+def rehearsal_scope(rehearsal_definition):
+    return build_run_scope(
+        rehearsal_definition,
+        _load("history_rehearsal_2026-09-23_at_run_scope.json.gz"),
+        run_date="2026-09-23",
+        input_flags={"skip_parity": True},
+    )
+
+
+_AFTER_RUN_SCOPE = ["AggregateCosts", "Director", "ReportCard", "ScannerLeaderboard"]
+
+
+def test_stages_after_run_scope_are_listed_not_called_not_reached(rehearsal_scope):
+    """Misreport 1. ReportCard, Director, ScannerLeaderboard and AggregateCosts
+    all ran after RunScope on the rehearsal and were reported NOT_REACHED
+    ("the run ended upstream"). The history could not contain them yet."""
+    assert sorted(rehearsal_scope["after_scope"]) == _AFTER_RUN_SCOPE
+    for stage in _AFTER_RUN_SCOPE:
+        assert stage not in rehearsal_scope["stages"]
+        assert stage not in rehearsal_scope["graded_stages"]
+        assert SCOPE_STATE in rehearsal_scope["after_scope"][stage]["reason"]
+    assert "4 run after this scope was taken" in rehearsal_scope["statement"]
+
+
+def test_parity_sub_stages_inherit_the_parent_skip(rehearsal_scope):
+    """Misreport 2. skip_parity bypassed ParityReplay and the three PitParity
+    stages; they read NOT_REACHED, as if the run had died."""
+    assert rehearsal_scope["stages"]["Parity"]["disposition"] == DISABLED
+    for stage in (
+        "ParityReplay", "PitParityCompare", "PitParityLookahead",
+        "PitParityWalkforward",
+    ):
+        row = rehearsal_scope["stages"][stage]
+        assert row["disposition"] == DISABLED, stage
+        assert row["disabled_by"] == "skip_parity"
+        assert row["source"] == "parent_gate"
+
+
+def test_a_caught_failure_is_not_a_clean_exit(rehearsal_scope):
+    """Misreport 3. ChallengerShadow raised ChallengerShadowGapError and its
+    Catch routed to MarkChallengerShadowDegraded; it read 'exited cleanly'."""
+    row = rehearsal_scope["stages"]["ChallengerShadow"]
+    assert row["disposition"] == ENABLED_FAILED
+    assert row["caught_error"] == "ChallengerShadowGapError"
+    assert "ChallengerShadow" in rehearsal_scope["graded_stages"]
+
+
+def test_the_rehearsal_scope_as_a_whole(rehearsal_scope):
+    """The issue's close condition on the one run we have: every executed
+    stage completed, every skipped sub-stage disabled, the caught failure
+    failed, nothing NOT_REACHED."""
+    assert rehearsal_scope["counts"] == {
+        DISABLED: 5, ENABLED_COMPLETED: 21, ENABLED_FAILED: 1, NOT_REACHED: 0,
+    }
+
+
+@pytest.mark.parametrize("history_name", [
+    "history_all_skip_shell.json", "history_real_run_failed.json",
+    "history_rehearsal_2026-09-23_at_run_scope.json.gz",
+])
+def test_a_parent_gate_row_is_only_ever_backed_by_an_observed_skip(
+    definition, rehearsal_definition, history_name
+):
+    """The safety property of the parent_gate inference: it only names a flag
+    whose gate this run was SEEN skipping, over a child gate the run never
+    entered. A wrong parent flag is worse than NOT_REACHED."""
+    defn = rehearsal_definition if history_name.endswith(".gz") else definition
+    history = _load(history_name)
+    scope = build_run_scope(defn, history, run_date="2026-08-14")
+    gates = derive_gates(defn)
+    decisions = gate_decisions(gates, history)
+    entered = set(entered_sequence(history))
+    by_flag = {g["flag"]: name for name, g in gates.items()}
+    for row in scope["stages"].values():
+        if row["source"] != "parent_gate":
+            continue
+        assert decisions[by_flag[row["disabled_by"]]] == DISABLED
+        assert row["gate"] not in entered
+
+
+def test_the_real_run_fixture_no_longer_calls_parity_children_not_reached(
+    definition, real_run_history
+):
+    """The same defect was already in the 2026-08-15 capture."""
+    scope = build_run_scope(definition, real_run_history, run_date="2026-08-14")
+    assert scope["counts"][NOT_REACHED] == 0
+    assert scope["stages"]["PitParityWalkforward"]["disabled_by"] == "skip_parity"
+
+
+def _state(type_, **kw):
+    return {"Type": type_, **kw}
+
+
+def test_governed_states_is_empty_when_the_branch_has_another_way_in():
+    """Dominance fails toward NOT_REACHED: an entry reachable without passing
+    through the gate governs nothing."""
+    states = {
+        "CheckSkipA": _state("Choice", Default="A", Choices=[
+            {"Variable": "$.skip_a", "BooleanEquals": True, "Next": "Done"}]),
+        "Hub": _state("Pass", Next="A"),
+        "A": _state("Task", Next="CheckSkipB"),
+        "CheckSkipB": _state("Choice", Default="B", Choices=[
+            {"Variable": "$.skip_b", "BooleanEquals": True, "Next": "Done"}]),
+        "B": _state("Task", Next="Done"),
+        "Done": _state("Succeed"),
+    }
+    from run_scope import _predecessors
+
+    preds = _predecessors(states)
+    assert governed_states(states, preds, "CheckSkipA", "A") == frozenset()
+    del states["Hub"]
+    preds = _predecessors(states)
+    governed = governed_states(states, preds, "CheckSkipA", "A")
+    assert "CheckSkipB" in governed
+    # Done is also reached from the skip branch, so it is not governed.
+    assert "Done" not in governed
+
+
+def _ev(id_, prev, type_, name=None, **extra):
+    event = {"id": id_, "previousEventId": prev, "type": type_}
+    if type_.endswith("StateEntered"):
+        event["stateEnteredEventDetails"] = {"name": name}
+    if type_.endswith("StateExited"):
+        event["stateExitedEventDetails"] = {"name": name}
+    event.update(extra)
+    return event
+
+
+def test_caught_failures_counts_only_the_last_exit():
+    """A failure that a later visit recovered from is not reported."""
+    history = [
+        _ev(1, 0, "TaskStateEntered", "X"),
+        _ev(2, 1, "TaskFailed", taskFailedEventDetails={"error": "Boom"}),
+        _ev(3, 2, "TaskStateExited", "X"),
+        _ev(4, 3, "TaskStateEntered", "Y"),
+        _ev(5, 4, "LambdaFunctionFailed",
+            lambdaFunctionFailedEventDetails={"error": "Lambda.Unknown"}),
+        _ev(6, 5, "TaskStateExited", "Y"),
+        _ev(7, 6, "TaskStateEntered", "X"),
+        _ev(8, 7, "TaskSucceeded"),
+        _ev(9, 8, "TaskStateExited", "X"),
+    ]
+    assert caught_failures(history) == {"Y": "Lambda.Unknown"}
+
+
+def test_a_gate_after_run_scope_that_was_entered_is_recorded_normally(
+    repo_definition,
+):
+    """after_scope only applies to gates the history has not entered — a
+    history that already holds ReportCard (a replay after the run) records it
+    from the history, as before."""
+    history = [
+        _ev(1, 0, "TaskStateEntered", SCOPE_STATE),
+        _ev(2, 1, "TaskStateExited", SCOPE_STATE),
+        _ev(3, 2, "ChoiceStateEntered", "CheckSkipReportCard"),
+        _ev(4, 3, "ChoiceStateExited", "CheckSkipReportCard"),
+        _ev(5, 4, "TaskStateEntered", "ReportCard"),
+        _ev(6, 5, "TaskStateExited", "ReportCard"),
+    ]
+    scope = build_run_scope(repo_definition, history, run_date="2026-09-23")
+    assert scope["stages"]["ReportCard"]["disposition"] == ENABLED_COMPLETED
+    assert "ReportCard" not in scope["after_scope"]
+    assert "Director" in scope["after_scope"]
+
+
+def test_a_history_without_run_scope_has_nothing_after_scope(definition, real_run_history):
+    """A replay of an execution that never entered RunScope (these fixtures
+    predate it) must not invent an after_scope set."""
+    scope = build_run_scope(definition, real_run_history, run_date="2026-08-14")
+    assert scope["after_scope"] == {}
+
+
+def test_the_merge_drops_an_after_scope_stage_the_incumbent_recorded():
+    incumbent = {
+        "run_date": "2026-09-23", "execution_arn": "arn:scheduled",
+        "stages": {"ReportCard": {"disposition": ENABLED_COMPLETED}},
+    }
+    incoming = {
+        "run_date": "2026-09-23", "execution_arn": "arn:rerun",
+        "stages": {"Parity": {"disposition": DISABLED}},
+        "after_scope": {"ReportCard": {"gate": "CheckSkipReportCard"},
+                        "Director": {"gate": "CheckSkipDirector"}},
+    }
+    merged, _ = merge_run_scopes(incumbent, incoming)
+    assert set(merged["after_scope"]) == {"Director"}
+    assert "1 run after this scope was taken" in merged["statement"]
 
 
 

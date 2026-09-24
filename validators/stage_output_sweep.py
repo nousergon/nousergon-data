@@ -235,11 +235,22 @@ UNMEASURED_VERDICTS = frozenset({UNMEASURED})
 #: outcome it produces.
 RUN_MODE_DRY = "dry"
 
-#: The one run_mode that is a genuine, artifact-producing run. Any other
-#: resolved run_mode (``"exercise"``, ``RUN_MODE_DRY``) — or an unresolved one
-#: — suppresses the OBSERVE-mode alert per I7392 item B; verdict publish and
-#: the CloudWatch metric still happen regardless.
+#: The one run_mode that is a genuine, artifact-producing run. On any other
+#: resolved run_mode (``"exercise"``, ``"watch-rerun"``, ``RUN_MODE_DRY``) an
+#: OBSERVE-mode finding is published TRACKED-ONLY rather than at its own
+#: severity — see :func:`_alert_at_full_severity`. An unresolved run_mode is
+#: treated as weekly. Verdict publish and the CloudWatch metric happen
+#: regardless.
 RUN_MODE_WEEKLY = "weekly"
+
+#: alpha-engine-config-I11508 part 4: the severity a non-weekly OBSERVE-mode
+#: finding is published at. ``data_stage_output_sweep`` is a ``dynamic`` row
+#: in ``infrastructure/overseer/playbooks.yaml``, and krepis's dynamic ladder
+#: resolves ``warn`` to ``tracked-only``: the muted SNS sibling plus the
+#: Overseer bus, no Telegram. That is the non-paging path the fleet already
+#: has, so a rehearsal's missing outputs are recorded where the alert drain
+#: reads them, and nobody is paged for a run that was not the real one.
+TRACKED_ONLY_SEVERITY = "warn"
 
 _PLACEHOLDER_RE = re.compile(r"\{([a-z_]+)\}")
 
@@ -296,13 +307,14 @@ def _parse_run_mode(raw_input: Any, *, notes: list[str]) -> str | None:
     caller renders ``None`` as "degrade to today's behaviour", which for
     finding classification means no ``missing``/``stale`` verdict is ever
     downgraded to ``dry``, and for alerting means the OBSERVE-mode
-    non-weekly suppression in ``_should_alert`` never fires on a guess.
+    non-weekly tracked-only downgrade in ``_alert_at_full_severity`` never
+    fires on a guess.
     """
     if not isinstance(raw_input, str):
         notes.append(
             "describe_execution returned no usable 'input' — run_mode is "
             "UNKNOWN, degrading to today's behaviour (no dry-verdict "
-            "downgrade, no alert suppression)"
+            "downgrade, no tracked-only alert downgrade)"
         )
         return None
     try:
@@ -1200,29 +1212,39 @@ def sweep(
                 exc_info=True,
             )
 
-    if alert and summary["status"] != "ok" and _should_alert(document):
-        _alert(document)
-    elif alert and summary["status"] != "ok":
-        logger.info(
-            "Stage-output alert SUPPRESSED: OBSERVE mode, run_mode=%s is not "
-            "%r — findings are still in the published verdict artifact "
-            "(alpha-engine-config-I7392)",
-            run_mode, RUN_MODE_WEEKLY,
-        )
+    if alert and summary["status"] != "ok":
+        if _alert_at_full_severity(document):
+            _alert(document)
+        else:
+            logger.warning(
+                "Stage-output findings on a non-weekly run (OBSERVE mode, "
+                "run_mode=%s is not %r) — published TRACKED-ONLY (muted topic "
+                "+ Overseer bus, no page), not suppressed "
+                "(alpha-engine-config-I11508)",
+                run_mode, RUN_MODE_WEEKLY,
+            )
+            _alert(document, tracked_only=True)
 
     return document
 
 
-def _should_alert(document: dict) -> bool:
-    """I7392 item B: OBSERVE mode on a non-weekly run_mode publishes the
-    verdict artifact and the metric, but nothing to the alert bus.
+def _alert_at_full_severity(document: dict) -> bool:
+    """Whether a finding is published at its own severity, or tracked-only.
 
-    ENFORCE mode always alerts on a finding — enforcement failing a run
-    silently, with no alert explaining why, would be worse than the noise
-    this suppresses. An UNKNOWN run_mode (``None``) never suppresses either:
-    failing toward alerting matches every other honest-degradation rule in
-    this module (entered_stages, cycle_date) — "I don't know the run_mode"
-    must not become "assume it's safe to stay quiet".
+    I7392 item B stopped a non-weekly OBSERVE run from paging: a rehearsal or
+    an exercise run asserts against the full artifact set, and its findings
+    are not an incident. Until alpha-engine-config-I11508 part 4 that was done
+    by SUPPRESSING the alert, which left the findings only in the verdict
+    artifact. The 2026-09-23 rehearsal found 5 missing artifacts that way and
+    nothing surfaced them. A non-weekly run is now published tracked-only
+    (:data:`TRACKED_ONLY_SEVERITY`) instead, so it is recorded but not paged.
+
+    ENFORCE mode always goes at full severity. Enforcement failing a run with
+    no alert explaining why would be worse than the noise. An UNKNOWN
+    run_mode (``None``) goes at full severity too: failing toward alerting
+    matches every other honest-degradation rule in this module
+    (entered_stages, cycle_date). "I don't know the run_mode" must not become
+    "assume it's safe to stay quiet".
     """
     if document.get("enforce"):
         return True
@@ -1245,7 +1267,14 @@ def _emit_metrics(cloudwatch_client: Any, document: dict) -> None:
     if cloudwatch_client is None:
         import boto3  # noqa: PLC0415
 
-        cloudwatch_client = boto3.client("cloudwatch")
+        from krepis.aws_region import resolve_region  # noqa: PLC0415
+
+        # alpha-engine-config-I11508 part 3: the same NoRegionError class
+        # I7428 fixed for the stepfunctions client above. SSM
+        # AWS-RunShellScript carries no AWS_REGION, so a bare
+        # boto3.client("cloudwatch") raised "You must specify a region." on
+        # every box run and the metric never emitted (rehearsal-2026-09-23-2).
+        cloudwatch_client = boto3.client("cloudwatch", region_name=resolve_region())
 
     run_mode = document.get("run_mode") or "unknown"
     cloudwatch_client.put_metric_data(
@@ -1306,8 +1335,15 @@ def _describe(findings: Sequence[dict]) -> str:
     return preview
 
 
-def _alert(document: dict) -> None:
-    """Publish the finding. Loud in observe mode — that is the whole design."""
+def _alert(document: dict, *, tracked_only: bool = False) -> None:
+    """Publish the finding. Loud in observe mode — that is the whole design.
+
+    ``tracked_only`` (alpha-engine-config-I11508 part 4) is set for a
+    non-weekly run. It publishes at :data:`TRACKED_ONLY_SEVERITY` whatever the
+    findings' own severity, says so in the body, and keys dedup on the
+    run_mode too, so a rehearsal's record can never dedup away the real run's
+    page for the same run_date.
+    """
     try:
         from nousergon_lib import alerts  # noqa: PLC0415
     except ImportError as exc:
@@ -1324,7 +1360,13 @@ def _alert(document: dict) -> None:
     # 2026-08-21 run. Report both numbers explicitly.
     defect_stage_count = len({f["stage"] for f in defects})
 
-    parts = [
+    parts = []
+    if tracked_only:
+        parts.append(
+            f"[TRACKED-ONLY: run_mode={document.get('run_mode')} is not a "
+            f"weekly run, so this is recorded, not paged]"
+        )
+    parts += [
         f"Stage-output sweep [{mode}] {document['pipeline']} "
         f"run_date={document['run_date']}: "
         f"{len(defects)} artifact(s) across {defect_stage_count} stage(s) "
@@ -1356,12 +1398,16 @@ def _alert(document: dict) -> None:
         if any(f.get("severity") == "critical" for f in defects)
         else "warn"
     )
+    dedup_key = f"stage_output_sweep_{document['pipeline']}_{document['run_date']}"
+    if tracked_only:
+        severity = TRACKED_ONLY_SEVERITY
+        dedup_key += f"_{document.get('run_mode')}"
     try:
         result = alerts.publish(
             " ".join(parts),
             severity=severity,
             source="alpha-engine-data/validators/stage_output_sweep.py",
-            dedup_key=f"stage_output_sweep_{document['pipeline']}_{document['run_date']}",
+            dedup_key=dedup_key,
             dedup_window_min=720,
         )
         logger.info("Stage-output alert publish: any_ok=%s", result.any_ok)

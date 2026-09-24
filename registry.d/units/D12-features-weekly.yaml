@@ -64,7 +64,11 @@ contract:
     - tests/test_schema_contract.py
     - tests/test_feature_registry_contract.py
   consumer_pins:
-    - "crucible-dashboard:tests/contracts/feature_registry.schema.json"
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/feature_registry.schema.json"
+      pins: "body_schema"
+      producer: "contracts/feature_registry.schema.json"
+      read_site: "views/13_Feature_Store.py::_load_registry"
   # P-07 (alpha-engine-config#10870): schema/producer_test for the per-column parquet
   # contract already existed pre-PR. The coupling artifact
   # crucible-dashboard views/13_Feature_Store.py actually reads via S3 GET is
