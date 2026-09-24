@@ -4,9 +4,9 @@ search window are CONTENT (they decide what lands in the artifact), and must
 anchor on ``run_date`` for a DECLARED REPLAY (``shadow.root.active_root()``)
 and on the real wall clock for a LIVE run — ``run_date`` is populated on
 BOTH paths (``weekly_collector.py``'s ``args.date or default_run_date()``),
-so its mere presence cannot tell the two apart. Mirrors ``_fetch_insider``'s
-pre-existing (and separately tracked) unconditional
-``today = datetime.strptime(run_date, "%Y-%m-%d")`` shape in this same file.
+so its mere presence cannot tell the two apart. ``_fetch_insider`` now takes
+the same anchor (alpha-engine-config-I11308,
+``tests/test_alternative_insider_wallclock_anchor.py``).
 """
 
 from __future__ import annotations
@@ -64,6 +64,7 @@ def _fake_feedparser_module(entries):
 
 def _fake_edgar_response():
     resp = MagicMock()
+    resp.status_code = 200
     resp.raise_for_status.return_value = None
     resp.json.return_value = {"hits": {"hits": []}}
     return resp
@@ -101,7 +102,7 @@ def test_fetch_news_uses_run_date_not_wall_clock_under_a_declared_replay(monkeyp
     monkeypatch.setattr(alternative, "datetime", _FixedNow)
 
     with patch.dict("sys.modules", {"feedparser": _fake_feedparser_module(entries)}), \
-         patch.object(alternative.requests, "get", return_value=_fake_edgar_response()):
+         patch.object(alternative.requests.Session, "request", return_value=_fake_edgar_response()):
         _FixedNow._fixed = anchor
         out_a = alternative._fetch_news("AAPL", run_date)
 
@@ -118,7 +119,9 @@ def test_fetch_news_edgar_window_anchored_on_run_date_under_a_declared_replay(mo
     run_date = "2026-09-18"
     captured_urls = []
 
-    def _get(url, **kwargs):
+    def _get(method, url, **kwargs):
+        # EDGAR 8-K goes through request_with_retry on a requests.Session
+        # (alpha-engine-config-I11473), which calls session.request(method, url).
         captured_urls.append(url)
         return _fake_edgar_response()
 
@@ -126,7 +129,7 @@ def test_fetch_news_edgar_window_anchored_on_run_date_under_a_declared_replay(mo
     _FixedNow._fixed = datetime(2026, 9, 25, 12, 0, tzinfo=timezone.utc)  # replay a week later
 
     with patch.dict("sys.modules", {"feedparser": _fake_feedparser_module([])}), \
-         patch.object(alternative.requests, "get", side_effect=_get):
+         patch.object(alternative.requests.Session, "request", side_effect=_get):
         alternative._fetch_news("AAPL", run_date)
 
     assert captured_urls, "EDGAR 8-K search was never called"
@@ -158,7 +161,7 @@ def test_fetch_news_uses_wall_clock_on_a_live_run_no_declared_replay(monkeypatch
     _FixedNow._fixed = wall_clock
 
     with patch.dict("sys.modules", {"feedparser": _fake_feedparser_module(entries)}), \
-         patch.object(alternative.requests, "get", return_value=_fake_edgar_response()):
+         patch.object(alternative.requests.Session, "request", return_value=_fake_edgar_response()):
         out = alternative._fetch_news("AAPL", run_date)
 
     assert [a["headline"] for a in out["articles"]] == ["headline"], (
