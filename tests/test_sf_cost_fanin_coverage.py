@@ -33,7 +33,8 @@ aggregator.**
   guess that would be wrong today: ``dry_run_llm`` is threaded into
   ``Scanner``, ``RationaleClustering``, ``Counterfactual`` and
   ``AggregateCosts``, none of which make an LLM call, and is absent from
-  ``ChallengerShadow`` and ``Director``, which do.
+  ``Director``, which does (and from ``ChallengerShadow``, which did until
+  its single-agent arm was retired on 2026-09-22).
 """
 
 from __future__ import annotations
@@ -270,10 +271,18 @@ class TestKnownProducersStayDeclared:
         assert "ReplayConcordance" not in coverage["conditional_producers"]
         assert "replay-concordance" not in coverage["allowed_producers"]
 
-    def test_challenger_shadow_is_required(self, coverage):
-        assert coverage["required_producers"]["ChallengerShadow"] == [
-            "single-agent-quant"
-        ]
+    def test_retired_single_agent_quant_is_not_declared(self, coverage):
+        """alpha-engine-config-I11501: the single_agent_quant arm was retired
+        on 2026-09-22 (alpha-engine-config-I11393) and producers/single_agent.py,
+        ChallengerShadow's only paid-model call site, was deleted with it. The
+        stage still runs, so requiring its record failed the next rehearsal
+        (rehearsal-2026-09-23-2) with a CostCoverageError naming spend that can
+        no longer happen. Same shape as the ReplayConcordance retirement above,
+        and for the same reason it is not moved to allowed: a single-agent-quant
+        record in this prefix would mean something revived the call site."""
+        assert "ChallengerShadow" not in coverage["required_producers"]
+        assert "ChallengerShadow" not in coverage["conditional_producers"]
+        assert "single-agent-quant" not in coverage["allowed_producers"]
 
     def test_eval_judge_sync_is_required(self, coverage):
         """alpha-engine-config-I9329 — a LIVE defect this cutover had to fix,
