@@ -129,7 +129,7 @@ jobs:
       # shape, every call site). Same pin as requirements.txt, for the reason
       # deploy-infrastructure.yml states.
       - name: Install nousergon-lib (envelope builder for the console row)
-        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.150"
+        run: pip install "nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.154"
 
       - name: Mask the account id in this public log
         run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"

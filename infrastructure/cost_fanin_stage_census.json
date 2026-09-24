@@ -248,6 +248,11 @@
       "substrate": "crucible-dashboard (dashboard box)",
       "reason": "Numerical workload \u2014 the weekly substrate health sweep. no paid-model call site in the substrate."
     },
+    "WeeklyPreflightOnSpot": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data sf_preflight_on_spot.py (weekly launcher box, alpha-engine-data venv)",
+      "reason": "Read-only preflight checks (ArcticDB reads, a Wikipedia constituents fetch, one Polygon grouped-daily call) in observe mode (alpha-engine-config-I11312). no paid-model call site in the substrate."
+    },
     "PitParityLookaheadResourceKillCheck": {
       "disposition": "exempt",
       "substrate": "krepis.resource_kill probe over the parity spot instance",

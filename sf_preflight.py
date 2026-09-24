@@ -2241,7 +2241,11 @@ CAP_POLYGON = "polygon"            # POLYGON_API_KEY resolvable
 
 # Every environment has the AWS control plane; the Lambda has nothing else.
 LAMBDA_CAPABILITIES = frozenset({CAP_AWS})
-# The laptop and the weekly spot box carry the full set.
+# The laptop carries the full set. The weekly spot box carries everything
+# but CAP_CHECKOUT: it clones only the repos its stages run, not every
+# sibling alpha-engine-* checkout (alpha-engine-config-I11313 owns that
+# group at merge time). sf_preflight_on_spot.py DETECTS the rest per run
+# rather than assuming it, so a box that has lost one reports a skip.
 FULL_CAPABILITIES = frozenset({
     CAP_AWS, CAP_ARCTIC, CAP_REPO_MODULES, CAP_CHECKOUT, CAP_POLYGON,
 })
@@ -2396,6 +2400,7 @@ def run_preflight(
     capabilities: "frozenset[str] | set[str] | None" = None,
     run_date: "str | None" = None,
     skip_flags: "dict | None" = None,
+    checks: "list | None" = None,
 ) -> tuple[int, list[CheckResult]]:
     """Execute the checks this environment can run. Returns (n_failures, results).
 
@@ -2410,6 +2415,13 @@ def run_preflight(
     existing caller — the CLI, the spot box — is unchanged and
     ``check_skip_flag_artifact_coherence`` reports "nothing claimed".
 
+    ``checks`` narrows the run to a subset of ``CHECKS`` (order preserved
+    as given). Default None runs every check, so every existing caller is
+    unchanged. The on-spot observe pass (``sf_preflight_on_spot.py``,
+    alpha-engine-config-I11312) uses it to run only the checks the
+    WeeklyPreflight Lambda's profile cannot reach, leaving the AWS-only
+    checks to the Lambda that holds the IAM grants they read under.
+
     Each check runs in its own try/except — a single check raising must
     not abort the others (we want the full picture, not first-fail-bail).
     """
@@ -2422,7 +2434,7 @@ def run_preflight(
     )
 
     results: list[CheckResult] = []
-    for check_fn in CHECKS:
+    for check_fn in (CHECKS if checks is None else checks):
         # An undeclared check defaults to the FULL set: it can never silently
         # gain Lambda eligibility, and an undeclared check can never abort the
         # run (raising here would re-create the prologue-abort failure mode

@@ -953,6 +953,13 @@ _KNOWN_OPS_PLANE_WRITE_SITES = {
         "(alpha-engine-config-I7167) — an ops artifact about other stages' "
         "output, not a data key any unit descriptor would claim."
     ),
+    "sf_preflight_on_spot.py": (
+        "_write_artifact() PUTs the on-spot preflight pass's OWN verdict record "
+        "at health/weekly_preflight_on_spot/{run_date}/{execution}.json "
+        "(alpha-engine-config-I11312) — an observe-mode ops artifact about the "
+        "pipeline's preconditions, read by no unit and claimed by no unit "
+        "descriptor, not a published data key."
+    ),
     "validators/expectations.py": (
         "publish_completeness_metric() PUTs a unit's completeness MetricRecord "
         "at data_collection/metrics/eod_completeness/{trading_day}.json "

@@ -145,10 +145,15 @@ class TestChainOrdering:
             for c in states["CheckSubstrateHealthGate"]["Choices"]
             if _rule_healthy(c)
         ]
-        assert healthy == ["CheckShellRun"], (
-            "SubstrateHealthGate verdict=HEALTHY must proceed to CheckShellRun "
-            "(and from there through the skip chain into MorningEnrich)"
+        # alpha-engine-config-I11312: HEALTHY enters the observe-mode on-spot
+        # preflight pass, every exit of which is CheckShellRun (pinned by
+        # tests/test_sf_preflight_on_spot_wiring.py).
+        assert healthy == ["WeeklyPreflightOnSpot"], (
+            "SubstrateHealthGate verdict=HEALTHY must proceed through the "
+            "on-spot preflight pass to CheckShellRun (and from there through "
+            "the skip chain into MorningEnrich)"
         )
+        assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
         assert (
             states["CheckSubstrateHealthGate"]["Default"]
             == "ExtractSubstrateHealthGateError"

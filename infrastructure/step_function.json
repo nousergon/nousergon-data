@@ -8201,7 +8201,7 @@
     },
     "CheckSubstrateHealthGate": {
       "Type": "Choice",
-      "Comment": "config#2249: branches on SubstrateHealthGate's verdict. HEALTHY -> proceed into MorningEnrich as normal. SUBSTRATE_UNHEALTHY (any reason) -> short-circuit straight to the named-failure path WITHOUT ever entering MorningEnrich's own retry ladder \u2014 the whole point is failing fast (<2 min) instead of burning ~15 min discovering the same dead box via 4 retries. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
+      "Comment": "config#2249: branches on SubstrateHealthGate's verdict. HEALTHY -> proceed into MorningEnrich as normal. SUBSTRATE_UNHEALTHY (any reason) -> short-circuit straight to the named-failure path WITHOUT ever entering MorningEnrich's own retry ladder \u2014 the whole point is failing fast (<2 min) instead of burning ~15 min discovering the same dead box via 4 retries. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py. | alpha-engine-config-I11312: HEALTHY now enters WeeklyPreflightOnSpot (the observe-mode on-spot sf_preflight pass), which always exits to CheckShellRun \u2014 the gate's routing is otherwise unchanged.",
       "Choices": [
         {
           "And": [
@@ -8214,7 +8214,7 @@
               "StringEquals": "HEALTHY"
             }
           ],
-          "Next": "CheckShellRun"
+          "Next": "WeeklyPreflightOnSpot"
         }
       ],
       "Default": "ExtractSubstrateHealthGateError"
@@ -8231,6 +8231,232 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "WeeklyPreflightOnSpot": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11312: the SECOND sf_preflight pass, on the weekly box, in OBSERVE mode (sf-pipeline-policy.md \u00a77a). WeeklyPreflight (the Lambda) runs under LAMBDA_CAPABILITIES={aws}, so the seven checks needing ArcticDB, the repo's collector modules or a Polygon key (arctic_connectivity, constituents_fetch, universe_drift, universe_sample_freshness, polygon_grouped_coverage, predicted_missing_from_closes, backfill_source_freshness) have always skipped there (required_skip_count 8 on rehearsal-2026-09-23-2). This box already carries them: /home/ec2-user/alpha-engine-data/.venv is built from this repo's requirements.txt by the weekly-freshness-spot bootstrap (config-I7427). sf_preflight_on_spot.py runs exactly the checks the Lambda profile cannot reach, with capabilities DETECTED on the box (CAP_CHECKOUT never claimed \u2014 that group is I11313's; its skips are expected and never escalate), writes its record to s3://alpha-engine-research/health/weekly_preflight_on_spot/<run_date>/<execution name>.json, emits the AlphaEngine/WeeklyPreflight series under Profile=weekly-spot-full, and prints one compact verdict line that RecordWeeklyPreflightOnSpot stores as a STRING (never parsed in ASL, so no stdout shape can throw States.Runtime in a Pass). PLACEMENT: entered only from CheckSubstrateHealthGate's HEALTHY edge and exiting only to CheckShellRun, so it is after the box is bootstrapped AND proven SSM-responsive, on every box-acquiring path (first dispatch and the ec2_instance_id escape hatch; not the replacement-box resume, which is mid-run by definition), and before any stage is dispatched \u2014 MorningEnrich is the first data-mutating command. A DEDICATED state rather than a prefix of MorningEnrich's command: the box is already bootstrapped here, so this costs one SendCommand on a warm box (~1-2 min including the checks), not a bootstrap round trip; folding it into MorningEnrich would skip it whenever skip_morning_enrich=true, re-run it on every rung of MorningEnrich's 4+2 retry ladder, and bury its verdict in that stage's stdout. OBSERVE MODE, fails OPEN: no Retry (config#2279 declared class: health-observe, same as WeeklySubstrateHealthCheck \u2014 a retry would only delay the run); every Catch and every non-verdict terminal status lands on WeeklyPreflightOnSpotUnobserved -> notice -> CheckShellRun, and an observed FAIL verdict (exit OBSERVED_FAIL_EXIT_CODE=10) lands on RecordWeeklyPreflightOnSpotFail -> notice -> CheckShellRun. Nothing here can halt the run until the promotion criterion in sf_preflight_on_spot.py's docstring is met and a separate PR routes the FAIL arm to NormalizeFailureContext. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main >&2 || echo WARN alpha-engine-data pull failed, running the checkout as bootstrapped >&2','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('/home/ec2-user/alpha-engine-data/.venv/bin/python sf_preflight_on_spot.py --run-date {} --execution-name {}',$.run_date,$$.Execution.Name))",
+          "executionTimeout": [
+            "600"
+          ]
+        },
+        "TimeoutSeconds": 60
+      },
+      "TimeoutSeconds": 660,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "alpha-engine-config-I11312: observe mode fails OPEN \u2014 a SendCommand failure records the pass as unobserved and proceeds.",
+          "ResultPath": "$.weekly_preflight_on_spot_error",
+          "Next": "WeeklyPreflightOnSpotUnobserved"
+        }
+      ],
+      "ResultPath": "$.weekly_preflight_on_spot_cmd",
+      "Next": "InitWeeklyPreflightOnSpotPollCount"
+    },
+    "InitWeeklyPreflightOnSpotPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687 convention, alpha-engine-config-I11312). Cap=48 = ceil(600s executionTimeout / 15s wait * 1.2 slack).",
+      "Result": 0,
+      "ResultPath": "$.weekly_preflight_on_spot_polls",
+      "Next": "WaitForWeeklyPreflightOnSpot"
+    },
+    "WaitForWeeklyPreflightOnSpot": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11312: poll the on-spot preflight command to a terminal status. ResultSelector pins Status/ResponseCode/StandardOutputContent so every consumer below reads guaranteed fields.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.weekly_preflight_on_spot_cmd.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 5,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "alpha-engine-config-I11312: observe mode fails OPEN \u2014 a poll failure records the pass as unobserved and proceeds.",
+          "ResultPath": "$.weekly_preflight_on_spot_error",
+          "Next": "WeeklyPreflightOnSpotUnobserved"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StandardOutputContent.$": "$.StandardOutputContent"
+      },
+      "ResultPath": "$.weekly_preflight_on_spot_poll",
+      "Next": "CheckWeeklyPreflightOnSpotStatus"
+    },
+    "CheckWeeklyPreflightOnSpotStatus": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I11312: Success = the pass ran and found no fail (verdict OK or BLIND_SPOT \u2014 which one is in the recorded line). Failed with ResponseCode 10 = an OBSERVED FAIL verdict (sf_preflight_on_spot.OBSERVED_FAIL_EXIT_CODE, pinned by tests/test_sf_preflight_on_spot_wiring.py) \u2014 recorded and announced, never halting while in observe mode. InProgress/Pending/Delayed under the poll cap = keep polling. Anything else (a crash before the module could run, TimedOut, Cancelled, an exhausted budget) = unobserved, proceed.",
+      "Choices": [
+        {
+          "Variable": "$.weekly_preflight_on_spot_poll.Status",
+          "StringEquals": "Success",
+          "Next": "RecordWeeklyPreflightOnSpot"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_preflight_on_spot_poll.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.weekly_preflight_on_spot_poll.ResponseCode",
+              "NumericEquals": 10
+            }
+          ],
+          "Next": "RecordWeeklyPreflightOnSpotFail"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.weekly_preflight_on_spot_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.weekly_preflight_on_spot_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.weekly_preflight_on_spot_poll.Status",
+                  "StringEquals": "Pending"
+                },
+                {
+                  "Variable": "$.weekly_preflight_on_spot_poll.Status",
+                  "StringEquals": "Delayed"
+                }
+              ]
+            },
+            {
+              "Variable": "$.weekly_preflight_on_spot_polls",
+              "NumericLessThan": 48
+            }
+          ],
+          "Next": "WeeklyPreflightOnSpotWait"
+        }
+      ],
+      "Default": "WeeklyPreflightOnSpotUnobserved"
+    },
+    "WeeklyPreflightOnSpotWait": {
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait (same Pass+Wait pair as SubstrateHealthCheckWait, so the budget actually advances).",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.weekly_preflight_on_spot_polls, 1)"
+      },
+      "ResultPath": "$.weekly_preflight_on_spot_poll_count",
+      "Next": "WeeklyPreflightOnSpotPollWait"
+    },
+    "WeeklyPreflightOnSpotPollWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "MergeWeeklyPreflightOnSpotPollCount"
+    },
+    "MergeWeeklyPreflightOnSpotPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.weekly_preflight_on_spot_poll_count.polls",
+      "ResultPath": "$.weekly_preflight_on_spot_polls",
+      "Next": "WaitForWeeklyPreflightOnSpot"
+    },
+    "RecordWeeklyPreflightOnSpot": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11312: the pass RAN and found no fail. Recorded on its own result path, on BOTH polarities (sf-pipeline-policy.md \u00a72.3a rule 3 \u2014 observed:true here, observed:false on the unobserved arm), so the execution output answers 'did the on-spot preflight run, and what did it see' without reading S3. verdict_line is the module's stdout stored as a string: verdict (OK/BLIND_SPOT/ERROR), required_skip_count, group_required_skip_count (the I11312 closes-when metric) and fail/expected-skip names. Proceeds to CheckShellRun. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
+      "Parameters": {
+        "mode": "observe",
+        "observed": true,
+        "outcome": "NO_FAIL",
+        "command_status.$": "$.weekly_preflight_on_spot_poll.Status",
+        "response_code.$": "$.weekly_preflight_on_spot_poll.ResponseCode",
+        "verdict_line.$": "$.weekly_preflight_on_spot_poll.StandardOutputContent",
+        "artifact.$": "States.Format('s3://alpha-engine-research/health/weekly_preflight_on_spot/{}/{}.json', $.run_date, $$.Execution.Name)"
+      },
+      "ResultPath": "$.weekly_preflight_on_spot",
+      "Next": "CheckShellRun"
+    },
+    "RecordWeeklyPreflightOnSpotFail": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11312: an OBSERVED FAIL verdict. In observe mode this is recorded and announced (PublishWeeklyPreflightOnSpotNotice) and the run PROCEEDS \u2014 it is the verdict the promotion criterion counts. Promotion re-points this state's Next at an Extract*Error Pass into NormalizeFailureContext; until then it must not touch $.error or any degraded flag. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
+      "Parameters": {
+        "mode": "observe",
+        "observed": true,
+        "outcome": "FAIL",
+        "command_status.$": "$.weekly_preflight_on_spot_poll.Status",
+        "response_code.$": "$.weekly_preflight_on_spot_poll.ResponseCode",
+        "verdict_line.$": "$.weekly_preflight_on_spot_poll.StandardOutputContent",
+        "artifact.$": "States.Format('s3://alpha-engine-research/health/weekly_preflight_on_spot/{}/{}.json', $.run_date, $$.Execution.Name)",
+        "headline": "The on-spot preflight (observe mode) found a FAILING check. The run was NOT halted.",
+        "detail.$": "$.weekly_preflight_on_spot_poll.StandardOutputContent"
+      },
+      "ResultPath": "$.weekly_preflight_on_spot",
+      "Next": "PublishWeeklyPreflightOnSpotNotice"
+    },
+    "WeeklyPreflightOnSpotUnobserved": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11312: the on-spot preflight did not produce a verdict (SendCommand/poll failure, a crash before the module ran, TimedOut, or an exhausted poll budget). Observe mode fails OPEN: recorded as observed:false and announced, then the run proceeds. Reached from two Catches and one Choice Default, so it dereferences nothing a path might lack \u2014 the underlying error or poll result stays on the execution record under weekly_preflight_on_spot_error / weekly_preflight_on_spot_poll. An unobserved cycle does not count toward the promotion criterion. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
+      "Parameters": {
+        "mode": "observe",
+        "observed": false,
+        "outcome": "UNOBSERVED",
+        "artifact.$": "States.Format('s3://alpha-engine-research/health/weekly_preflight_on_spot/{}/{}.json', $.run_date, $$.Execution.Name)",
+        "headline": "The on-spot preflight (observe mode) did not produce a verdict. The run was NOT halted.",
+        "detail": "The SendCommand or poll error, or the last poll result, is on the execution record under weekly_preflight_on_spot_error / weekly_preflight_on_spot_poll; the SSM command output is on the weekly box."
+      },
+      "ResultPath": "$.weekly_preflight_on_spot",
+      "Next": "PublishWeeklyPreflightOnSpotNotice"
+    },
+    "PublishWeeklyPreflightOnSpotNotice": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11312: sf-pipeline-policy.md \u00a77a obligation 3 \u2014 an observe-mode verdict is not silent. Subject is a hardcoded constant (config#1819 discipline); Message formats only $.weekly_preflight_on_spot.headline/.detail, two fields BOTH upstream Pass states write, so nothing possibly-absent is dereferenced. Best-effort Catch: a publish failure must not keep the run from proceeding to CheckShellRun \u2014 this is a notice, not a gate.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn.$": "$.sns_topic_arn",
+        "Subject": "Alpha Engine Weekly Pipeline \u2014 On-Spot Preflight (Observe Mode, Not Halted)",
+        "Message.$": "States.Format('{}\n\nDetail: {}\n\nThis is the OBSERVE-MODE on-spot preflight (alpha-engine-config-I11312, sf-pipeline-policy.md \u00a77a). It never halts the run until promoted; this run PROCEEDS. The full record is at s3://alpha-engine-research/health/weekly_preflight_on_spot/.\n\nView pipeline status: https://dashboard.nousergon.ai/pipeline-status', $.weekly_preflight_on_spot.headline, $.weekly_preflight_on_spot.detail)"
+      },
+      "TimeoutSeconds": 30,
+      "ResultPath": "$.weekly_preflight_on_spot_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort notice \u2014 a publish failure must not block the run from proceeding.",
+          "ResultPath": "$.weekly_preflight_on_spot_notify_error",
+          "Next": "CheckShellRun"
+        }
+      ],
+      "Next": "CheckShellRun"
     },
     "CheckSpotDispatchNeeded": {
       "Type": "Choice",
