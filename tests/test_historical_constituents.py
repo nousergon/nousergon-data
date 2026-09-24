@@ -340,6 +340,15 @@ def test_the_prefix_is_used_when_the_counts_account_for_the_whole_list():
 def test_a_snapshot_whose_counts_do_not_add_up_is_refused():
     """Slicing anyway would drop names off the roster, which the diff would
     then emit as a burst of index removals that never happened — worse than
-    a gap, because it looks like real churn."""
-    snap = {"tickers": ["A", "B", "C"], "sp500_count": 2, "sp400_count": 5}
-    assert hc._sp500_roster(snap) is None
+    a gap, because it looks like real churn. A list LONGER than the counts,
+    or an overlap far larger than any rebalance, is that case.
+
+    (A SMALL shortfall is a rebalance-day overlap and is recoverable —
+    alpha-engine-config-I11470; see test_historical_constituents_quality_i11470.)"""
+    longer = {"tickers": ["A", "B", "C", "D"], "sp500_count": 2, "sp400_count": 1}
+    assert hc._sp500_roster(longer) is None
+    too_much_overlap = {
+        "tickers": ["A", "B", "C"], "sp500_count": 2,
+        "sp400_count": 2 + hc.MAX_RECOVERABLE_INDEX_OVERLAP,
+    }
+    assert hc._sp500_roster(too_much_overlap) is None

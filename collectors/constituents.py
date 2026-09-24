@@ -132,6 +132,13 @@ class SsgaWeights:
     index_of: dict[str, str] = field(default_factory=dict)
     raw_sum_by_index: dict[str, float] = field(default_factory=dict)
     method: str = "cache_no_weights"
+    #: Each fund's own member list, in file order and deduped WITHIN the fund
+    #: only (alpha-engine-config-I11470). The combined ``tickers`` list is
+    #: deduped ACROSS funds, so on a rebalance day a name both funds hold
+    #: appears once and the two counts stop describing it — which used to
+    #: make ``collect`` omit ``sp500_tickers`` in exactly the weeks the
+    #: membership moves. Empty on a cache-served run.
+    members_by_index: dict[str, list[str]] = field(default_factory=dict)
 
 
 # GICS sector name → sector ETF symbol
@@ -332,8 +339,30 @@ def collect(
     # rather than written wrong: a reader that finds them absent falls back to
     # the same guarded prefix, where a reader that finds them WRONG has no way
     # to tell.
+    #
+    # alpha-engine-config-I11470: the counts stop describing the list on every
+    # REBALANCE day, when both funds hold the names moving between indices
+    # (2026-09-18: ILMN and P, joining the S&P 500 at the 2026-09-21 open) —
+    # so the keys were omitted in precisely the weeks membership changes, and
+    # the 2026-09-18 snapshot was skipped by historical_constituents. Each
+    # fund's own list is now carried from the fetch, so the per-index rosters
+    # are written from what each fund actually holds, and the names both hold
+    # are recorded as `index_overlap` rather than inferred from arithmetic.
     per_index: dict[str, list[str]] = {}
-    if sp500_count + sp400_count == len(tickers):
+    members = weights.members_by_index
+    if members.get("S&P 500") and members.get("S&P 400"):
+        per_index = {
+            "sp500_tickers": list(members["S&P 500"]),
+            "sp400_tickers": list(members["S&P 400"]),
+        }
+        overlap = sorted(set(members["S&P 500"]) & set(members["S&P 400"]))
+        if overlap:
+            per_index["index_overlap"] = overlap
+            logger.info(
+                "constituents: %d name(s) held by both SPY and MDY (a rebalance "
+                "in flight): %s", len(overlap), overlap,
+            )
+    elif sp500_count + sp400_count == len(tickers):
         per_index = {
             "sp500_tickers": tickers[:sp500_count],
             "sp400_tickers": tickers[sp500_count:],
@@ -664,6 +693,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
     weight_map: dict[str, float] = {}
     index_of: dict[str, str] = {}
     raw_sum_by_index: dict[str, float] = {}
+    members_by_index: dict[str, list[str]] = {}
     for index_name, url in _SSGA_HOLDINGS_URLS.items():
         resp = requests.get(url, headers=_HEADERS, timeout=30)
         resp.raise_for_status()
@@ -728,6 +758,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
         # 'weight in the S&P 500' means.
         normalised = {t: w / raw_sum for t, w in batch_weights.items()}
         tickers.extend(batch)
+        members_by_index[index_name] = list(dict.fromkeys(batch))
         weight_map.update(normalised)
         index_of.update({t: index_name for t in batch})
         raw_sum_by_index[index_name] = raw_sum
@@ -746,6 +777,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
         index_of=index_of,
         raw_sum_by_index=raw_sum_by_index,
         method="ssga_holdings_file",
+        members_by_index=members_by_index,
     )
     # dedupe, preserve order
     return list(dict.fromkeys(tickers)), sp500_count, sp400_count, weights
