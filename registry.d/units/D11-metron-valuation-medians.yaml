@@ -41,7 +41,11 @@ contract:
   schema: contracts/metron_valuation_medians.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_valuation_medians.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_valuation_medians.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_valuation_medians.schema.json"
+      read_site: "api/services/valuation_medians.py::load_valuation_medians"
 registry_rows:
   - metron_valuation_medians
 run_manifest_prefix: data_collection/runs/D11

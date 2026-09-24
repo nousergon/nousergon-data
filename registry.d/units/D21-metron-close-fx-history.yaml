@@ -46,8 +46,16 @@ contract:
     - contracts/metron_fx_history.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_close_history.schema.json"
-    - "metron:tests/contracts/metron_fx_history.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_close_history.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_close_history.schema.json"
+      read_site: "portfolio_analytics/prices/spine_source.py::spine_close_history"
+    - repo: "metron"
+      path: "tests/contracts/metron_fx_history.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_fx_history.schema.json"
+      read_site: "api/services/prices.py"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D21
 detectors: []
