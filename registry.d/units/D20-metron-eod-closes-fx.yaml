@@ -46,8 +46,16 @@ contract:
     - contracts/metron_fx.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_closes.schema.json"
-    - "metron:tests/contracts/metron_fx.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_closes.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_closes.schema.json"
+      read_site: "portfolio_analytics/prices/spine_source.py::spine_latest_closes"
+    - repo: "metron"
+      path: "tests/contracts/metron_fx.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_fx.schema.json"
+      read_site: "api/services/fx.py"
 registry_rows:
   - eod_closes
   - fx

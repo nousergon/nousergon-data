@@ -61,7 +61,11 @@ contract:
     - tests/test_schema_contract.py
     - tests/test_feature_registry_contract.py
   consumer_pins:
-    - "crucible-dashboard:tests/contracts/feature_registry.schema.json"
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/feature_registry.schema.json"
+      pins: "body_schema"
+      producer: "contracts/feature_registry.schema.json"
+      read_site: "views/13_Feature_Store.py::_load_registry"
   # P-07 (alpha-engine-config-I10873): reuses the ALREADY-MERGED crucible-dashboard
   # pin from D12 (crucible-dashboard-PR862, merged 2026-09-15T17:04:36Z) — verified
   # live on crucible-dashboard origin/main this session. It is the same artifact
