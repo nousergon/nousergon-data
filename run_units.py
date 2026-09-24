@@ -143,6 +143,21 @@ _APPEND_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
 )
 
 
+#: Every class of ticker ``collectors.prices.collect`` did NOT write, by the
+#: result key it reports the count under — one per ``prices.FAIL_*`` cause, and
+#: they sum to its ``failed`` total (`alpha-engine-config-I11547`). Literals,
+#: not an import of ``collectors.prices`` (this module loads at process start
+#: and must not pull in yfinance); ``tests/test_prices_shadow_recent_listings_
+#: i11547.py`` pins them against ``prices.FAILURE_RESULT_KEYS``.
+_D03_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
+    ("failed_short_fetch_refused", "short_fetch_guard_refused"),
+    ("failed_behind_fetch_refused", "behind_fetch_guard_refused"),
+    ("failed_vendor_no_data", "vendor_no_data"),
+    ("failed_batch_fetch_error", "batch_fetch_error"),
+    ("failed_refresh_error", "refresh_error"),
+)
+
+
 #: (mode, phase name) -> the unit it is. Modes match ``run_weekly``'s dispatch:
 #: ``phase1``/``phase2`` are the Saturday weekly machine, ``daily`` is the
 #: weekday EOD machine, and the four self-contained modes each ARE one unit and
@@ -152,15 +167,15 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("phase1", "constituents"): PhaseUnit("D01", "count", "phase1"),
     ("phase1", "historical_constituents"): PhaseUnit("D02", "n_changes", "phase1"),
     # alpha-engine-config-I11230 deliverable 2: `collectors/prices.py::collect`
-    # already reports its own not-published count under `failed` (tickers the
-    # short-fetch guard refused to overwrite, or a batch download that raised)
-    # — declared here so the manifest's `rows_rejected` names them, the same
-    # way D12/D13 already do for their own collectors, instead of leaving the
-    # loss visible only in the `reason` string on a `partial` (now `failed`)
-    # manifest.
+    # reports its own not-published count — declared here so the manifest's
+    # `rows_rejected` names them, the same way D12/D13 already do for their own
+    # collectors. alpha-engine-config-I11547: declared BY CAUSE
+    # (`_D03_REJECTED_KEYS`), never as the undifferentiated `failed` total —
+    # which labelled every miss `short_fetch_guard_refused`, including the four
+    # 2026-09-21..23 shadow tickers the short-fetch guard had accepted.
     ("phase1", "prices"): PhaseUnit(
         "D03", "refreshed", "phase1",
-        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+        rejected_keys=_D03_REJECTED_KEYS,
     ),
     ("phase1", "fred_macro_history"): PhaseUnit("D04", "rows", "phase1"),
     ("phase1", "macro"): PhaseUnit("D05", "rows", "phase1"),
@@ -198,7 +213,7 @@ PHASE_UNITS: dict[tuple[str, str], PhaseUnit] = {
     ("daily", "daily_closes"): PhaseUnit("D19", "tickers_captured", "daily"),
     ("daily", "prices"): PhaseUnit(
         "D03", "refreshed", "daily",
-        rejected_keys=(("failed", "short_fetch_guard_refused"),),
+        rejected_keys=_D03_REJECTED_KEYS,
     ),
     ("daily", "metron_market_data"): PhaseUnit("D20", "closes", "daily"),
     ("daily", "metron_market_data_history"): PhaseUnit("D21", "close_series", "daily"),

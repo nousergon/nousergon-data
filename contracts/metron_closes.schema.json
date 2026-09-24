@@ -53,7 +53,7 @@
   },
   "x-settling-bar": {
     "basis": "key_date",
-    "rationale": "market_data/eod_closes/{date}.json is one trading day's closes keyed by ticker ($.closes.<ticker>.close / .bar_date); when the key names the report's trading_day the whole document is the unsettled bar. Only VALUE diffs are absorbed — a ticker present on one side only stays a membership breach and still counts against the coverage floor (alpha-engine-config-I11351)."
+    "rationale": "market_data/eod_closes/{date}.json is one trading day's closes keyed by ticker ($.closes.<ticker>.close / .bar_date); when the key names the report's trading_day the whole document is the unsettled bar. Only NUMERIC value diffs (the close) are absorbed: a differing bar_date or currency is an identity fact graded strictly on the trading day too (alpha-engine-config-I11551 — this declaration hid a D-1 EU bar_date for three days while it absorbed every value diff), and a ticker present on one side only stays a membership breach and still counts against the coverage floor (alpha-engine-config-I11351)."
   },
   "x-key-pattern": [
     "market_data/eod_closes/{date}.json",
