@@ -143,6 +143,34 @@ def _parser() -> argparse.ArgumentParser:
     )
     arctic.add_argument("--relative-tolerance", type=float, default=parity_module.DEFAULT_RELATIVE_TOLERANCE)
     arctic.add_argument("--absolute-tolerance", type=float, default=parity_module.DEFAULT_ABSOLUTE_TOLERANCE)
+    arctic.add_argument(
+        "--await-live-unit",
+        action="append",
+        default=[],
+        metavar="UNIT",
+        help=(
+            "Before comparing, wait until v1's run manifest for this unit on the trading day "
+            "reads status ok (repeatable). ArcticDB has no manifest-pinned version to grade "
+            "against, so comparing while v1 is still appending the day grades a half-written "
+            "library (alpha-engine-config-I11546). Refuses with exit 2, report untouched, when "
+            "--await-timeout-seconds passes first."
+        ),
+    )
+    arctic.add_argument("--await-timeout-seconds", type=float, default=0.0)
+    arctic.add_argument("--await-poll-seconds", type=float, default=60.0)
+    arctic.add_argument(
+        "--dispatch-gate",
+        action="store_true",
+        help=(
+            "After this run, workflow_dispatch data-gate.yml for the trading day with "
+            "trigger=parity-published, exactly as `parity --dispatch-gate` does "
+            "(alpha-engine-config-I11361). Set only by the scheduled morning dispatch, which "
+            "runs this AFTER `parity`, so the gate reads a report that already carries the "
+            "ArcticDB rows (alpha-engine-config-I11546). Dispatches on a failed or refused "
+            "comparison too, whenever a published report exists: the report parity wrote is "
+            "still the newest evidence, and the gate read following it is what the flag is for."
+        ),
+    )
 
     prune = sub.add_parser(
         "prune",
@@ -289,7 +317,9 @@ def _parity(args) -> int:
     return EXIT_MET if report.met else EXIT_NOT_MET
 
 
-def _dispatch_gate(store, key: str, document: dict, trading_day: dt.date) -> None:
+def _dispatch_gate(
+    store, key: str, document: dict, trading_day: dt.date, *, label: str = "shadow parity"
+) -> None:
     """`alpha-engine-config-I11361`: trigger the gate read off the publish.
 
     Runs only AFTER the report is published, so the read it triggers can never
@@ -301,10 +331,10 @@ def _dispatch_gate(store, key: str, document: dict, trading_day: dt.date) -> Non
 
     outcome = dispatch_gate_read(trading_day)
     if outcome["ok"]:
-        print(f"shadow parity: dispatched data-gate.yml for {trading_day} (trigger parity-published)")
+        print(f"{label}: dispatched data-gate.yml for {trading_day} (trigger parity-published)")
     else:
         print(
-            f"shadow parity: gate dispatch FAILED for {trading_day}: {outcome['error']} "
+            f"{label}: gate dispatch FAILED for {trading_day}: {outcome['error']} "
             "(recorded in the report; the post-publish crons remain the backstop)",
             file=sys.stderr,
         )
@@ -332,7 +362,18 @@ def _arctic_parity(args) -> int:
 
     trading_day = dt.date.fromisoformat(args.trading_day)
     store = open_store(args.store, dry_run=False)
+    key = parity_module.parity_key(trading_day)
+    updated = None
     try:
+        awaited = getattr(args, "await_live_unit", None) or []
+        if awaited:
+            arctic_parity.await_live_units(
+                store,
+                trading_day,
+                awaited,
+                timeout_seconds=args.await_timeout_seconds,
+                poll_seconds=args.await_poll_seconds,
+            )
         updated = arctic_parity.run_arctic_parity(
             trading_day=trading_day,
             bucket=args.bucket,
@@ -340,11 +381,40 @@ def _arctic_parity(args) -> int:
             rel_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
         )
+    except arctic_parity.LiveUnitNotReady as exc:
+        print(f"shadow arctic-parity: not compared: {exc}", file=sys.stderr)
+        rc = EXIT_UNMEASURED
     except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
         print(f"shadow arctic-parity: the comparison failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_UNMEASURED
-    print(json.dumps(updated["summary"], indent=2, sort_keys=True))
-    return EXIT_MET if updated["met"] else EXIT_NOT_MET
+        rc = EXIT_UNMEASURED
+    else:
+        print(json.dumps(updated["summary"], indent=2, sort_keys=True))
+        rc = EXIT_MET if updated["met"] else EXIT_NOT_MET
+    if getattr(args, "dispatch_gate", False):
+        document = updated if updated is not None else _published_report(store, key)
+        if document is not None:
+            _dispatch_gate(store, key, document, trading_day, label="shadow arctic-parity")
+    return rc
+
+
+def _published_report(store, key: str) -> "dict | None":
+    """The report as `parity` published it, for the gate dispatch after a
+    comparison that did not rewrite it; `None` when there is none to read."""
+    try:
+        document = json.loads(store.get_bytes(key).decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 - reported on stderr; the run already exits 2
+        # Deliberate: (a) the failure mode is "no readable report at `key`",
+        # i.e. there is nothing for a gate read to follow; (b) the run's exit
+        # code is already EXIT_UNMEASURED from the comparison, and the two
+        # post-publish crons in data-gate.yml read the store on their own; (c)
+        # it is printed to stderr, which the run log ships off the box.
+        print(
+            f"shadow arctic-parity: no gate dispatch — could not read {key}: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return None
+    return document if isinstance(document, dict) else None
 
 
 def main(argv: "list[str] | None" = None) -> int:
