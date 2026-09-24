@@ -153,7 +153,14 @@ def test_the_comparator_still_always_runs_on_both(workloads):
         assert "set +e" in cmd
         assert cmd.count(">> $LEGS") == legs
         assert cmd.count("RC_ALL=$RC") == legs
-        assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC" in cmd
+        assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL; " in cmd
+    assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC" in workloads["shadow-sameday"]
+    # `shadow-morning` ends on the ArcticDB comparator's code, which grades the
+    # whole rewritten report (alpha-engine-config-I11546); the executed shell
+    # is pinned by `test_shadow_morning_arctic_parity_i11546.py`.
+    assert workloads["shadow-morning"].endswith(
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PARITY_RC -eq 2 ] && exit $PARITY_RC; exit $ARCTIC_RC )"
+    )
 
 
 def test_the_shadow_morning_guard_asks_the_calendar_not_the_weekday(workloads):
