@@ -27,12 +27,12 @@ import re
 import time
 from datetime import date, timedelta
 
-import warnings
-
 import requests
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
 
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+# alpha-engine-config-I11476: the parser is chosen per document instead of
+# silencing XMLParsedAsHTMLWarning process-wide (a filter here also hid the
+# warning for every other module imported into the same process).
+from rag.pipelines._markup import parse_filing_markup
 
 logger = logging.getLogger(__name__)
 
@@ -141,7 +141,7 @@ def _download_and_extract(url: str) -> str | None:
         resp = requests.get(url, headers=_SEC_HEADERS, timeout=60)
         if resp.status_code != 200 or len(resp.text) < 200:
             return None
-        soup = BeautifulSoup(resp.text, "lxml")
+        soup = parse_filing_markup(resp.text)
         text = soup.get_text(separator="\n", strip=True)
         # 8-Ks are typically short; cap at 15K chars
         return text[:15000] if len(text) > 15000 else text

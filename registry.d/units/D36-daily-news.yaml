@@ -70,8 +70,17 @@ contract:
   # fixing _declared_schema_files in the data_gate track should extend it to lists.
   producer_test: tests/test_news_daily_contract.py
   consumer_pins:
-    - "morning-signal:tests/contracts/news_digest_daily.schema.json (HARD requirement, load_news_context raises when absent/stale/empty)"
-    - "crucible-dashboard:tests/contracts/news_article_row.schema.json"
+    - repo: "morning-signal"
+      path: "tests/contracts/news_digest_daily.schema.json"
+      pins: "body_schema"
+      producer: "contracts/news_digest_daily.schema.json"
+      read_site: "src/morning_signal/news_context.py::load_news_context"
+      note: "HARD requirement, load_news_context raises when absent/stale/empty"
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/news_article_row.schema.json"
+      pins: "body_schema"
+      producer: "contracts/news_article_row.schema.json"
+      read_site: "loaders/s3_loader.py"
   # P-07 (alpha-engine-config#10870): news_aggregate_row has no consumer pin here —
   # its live consumer (crucible-research thinktank/context.py) is v1, retiring under
   # phase 4, and out of scope for this PR; the producer schema is still built per

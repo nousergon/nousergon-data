@@ -56,7 +56,7 @@ _CANARY_THRESHOLD = _ACTION_JUMP_SCREEN_THRESHOLD
 def _max_abs_daily_move(df: pd.DataFrame) -> float:
     if df is None or df.empty or "Close" not in df.columns:
         return float("nan")
-    moves = df["Close"].pct_change().abs().dropna()
+    moves = df["Close"].ffill().pct_change(fill_method=None).abs().dropna()
     return float(moves.max()) if not moves.empty else float("nan")
 
 

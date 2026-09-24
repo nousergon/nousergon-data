@@ -46,7 +46,11 @@ contract:
   schema: "contracts/alternative_ticker.schema.json"
   producer_test: tests/test_alternative_ticker_contract.py
   consumer_pins:
-    - "nousergon-data:features/compute.py:939 (_alt_entry_from_payload, in-producer derivation)"
+    - repo: "nousergon-data"
+      path: "tests/test_alternative_ticker_contract.py"
+      pins: "in_repo_reader"
+      read_site: "features/compute.py::_alt_entry_from_payload"
+      note: "in-producer derivation; no cross-repo boundary"
   # P-07 (alpha-engine-config#10870): the only declared consumer is
   # features/compute.py::_load_cached_alternative -> _alt_entry_from_payload in THIS
   # repo (D26 pattern, PR1747) — no cross-repo boundary to pin a copy across.

@@ -139,15 +139,27 @@ PREFLIGHT
 fi
 
 # ── Morning-enrich run ───────────────────────────────────────────────────────
+# alpha-engine-config-I11474: the workload's own stale-overwrite guard may
+# deliberately skip the enrich. weekly_collector writes the guard's reason to
+# a local record iff that happened, and the workload copies it to this run's
+# S3 staging prefix — the one channel both this launcher and the spot share —
+# so the stage-coverage assertion below can say "not applicable this run"
+# instead of grading a declared skip WHOLLY STALE. The copy is guarded LOUDLY
+# rather than fatally: losing the record leaves coverage grading the run as a
+# normal one (the finding direction), and must never fail a stage that ran.
+_GUARD_SKIP_KEY="${_S3_STAGING}/stage_guard/MorningEnrich.txt"
 print_banner "MORNING ENRICH (polygon T+1 fill)"
 run_ssm "morning-enrich" "$(cat <<WORKLOAD
 set -eo pipefail
 ${_ENV_SOURCE}
 cd /home/ec2-user/data
 echo "==> Starting weekly_collector.py --morning-enrich at \$(date)"
-if ! \$PYTHON_BIN weekly_collector.py --morning-enrich 2>&1; then
+if ! \$PYTHON_BIN weekly_collector.py --morning-enrich --guard-skip-record /tmp/morning_enrich_guard_skip.txt 2>&1; then
     echo "ERROR: morning-enrich failed" >&2
     exit 1
+fi
+if [ -s /tmp/morning_enrich_guard_skip.txt ]; then
+    aws s3 cp /tmp/morning_enrich_guard_skip.txt "${_GUARD_SKIP_KEY}" --region "${AWS_REGION}" --quiet || echo "WARNING: could not stage the guard-skip record — stage coverage will grade this skipped run as a normal one (alpha-engine-config-I11474)" >&2
 fi
 echo "MorningEnrich complete at \$(date)"
 WORKLOAD
@@ -175,6 +187,21 @@ emit_heartbeat
 # infrastructure/_spot_common.sh — a carrier other code rewrites is exactly the
 # defect alpha-engine-config-I8155 fixes. EXECUTION_RUN_DATE is exported by
 # step_function.json from $.run_date and is never normalized by anything.
-"$LIB_PYTHON" -m krepis.stage_coverage assert --stage MorningEnrich --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" || echo "WARNING: stage-coverage assertion did not run for MorningEnrich (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
+#
+# alpha-engine-config-I11474: when the workload staged a guard-skip record,
+# its reason rides as --not-applicable-reason, and a verdict that would be
+# STALE is recorded COVERED_NO_OUTPUT carrying it (MISSING stays MISSING).
+# No record (the normal case, or a record that could not be read) passes no
+# flag, so the assertion grades the run exactly as before.
+_GUARD_SKIP_ARGS=()
+if aws s3 ls "$_GUARD_SKIP_KEY" --region "$AWS_REGION" >/dev/null 2>&1; then
+  if _GUARD_SKIP_REASON="$(aws s3 cp "$_GUARD_SKIP_KEY" - --region "$AWS_REGION")" && [ -n "$_GUARD_SKIP_REASON" ]; then
+    echo "==> MorningEnrich guard skipped this run: $_GUARD_SKIP_REASON"
+    _GUARD_SKIP_ARGS=(--not-applicable-reason "$_GUARD_SKIP_REASON")
+  else
+    echo "WARNING: a MorningEnrich guard-skip record exists but could not be read — stage coverage grades this run as a normal one (alpha-engine-config-I11474)" >&2
+  fi
+fi
+"$LIB_PYTHON" -m krepis.stage_coverage assert --stage MorningEnrich --window-start "$_STAGE_WINDOW_START" --run-date "$EXECUTION_RUN_DATE" ${_GUARD_SKIP_ARGS[@]+"${_GUARD_SKIP_ARGS[@]}"} || echo "WARNING: stage-coverage assertion did not run for MorningEnrich (rc=$?) — observe mode, stage NOT failed (config-I7214)" >&2
 
 echo "==> Morning-enrich complete."

@@ -219,11 +219,24 @@ def _report_command(args) -> int:
         if args.calendar_date
         else dt.datetime.now(dt.timezone.utc).date()
     )
-    trading_day = (
-        dt.date.fromisoformat(args.trading_day)
-        if args.trading_day
-        else report_module.previous_trading_day(calendar_date)
-    )
+    try:
+        trading_day = (
+            dt.date.fromisoformat(args.trading_day)
+            if args.trading_day
+            else report_module.previous_trading_day(calendar_date)
+        )
+    except report_module.TradingCalendarRangeError as exc:
+        # The shared NYSE calendar refuses a date outside its declared coverage
+        # rather than guessing (alpha-engine-config-I11193). No weekday
+        # fallback here: that guess is the defect this call site used to carry.
+        # Nothing was read or filed, so this is the same exit as an undelivered
+        # report, with the calendar's own reason on stderr.
+        print(
+            f"data_gate: the report's trading day could not be resolved: "
+            f"{type(exc).__name__}: {exc}",
+            file=sys.stderr,
+        )
+        return EXIT_UNMEASURED
     store = open_store(args.store, dry_run=args.dry_run)
     try:
         manifest = report_module.run_report(

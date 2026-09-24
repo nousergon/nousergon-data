@@ -79,7 +79,10 @@ consumers_reason: >-
 contract:
   schema: contracts/ndx_constituents.schema.json
   producer_test: tests/test_nasdaq100.py
-  consumer_pins:
+  consumer_pins: []
+  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
+  # contract file the gate can resolve and compare — graded as a finding.
+  unpinned_consumers:
     - "nousergon-data:collectors/index_contributions.py::_default_weights_source (D48)"
 registry_rows: []
 # alpha-engine-config-I11307: the ARTIFACT_REGISTRY row for these two key

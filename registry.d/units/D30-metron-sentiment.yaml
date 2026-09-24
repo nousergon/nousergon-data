@@ -40,7 +40,11 @@ contract:
   schema: contracts/metron_sentiment.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_sentiment.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_sentiment.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_sentiment.schema.json"
+      read_site: "api/services/sentiment.py::load_sentiment"
 registry_rows: []
 registry_rows_broken:
   - "metron_sentiment — PARKED while written daily. P-09 unparks it."
