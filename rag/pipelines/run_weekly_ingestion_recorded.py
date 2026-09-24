@@ -38,18 +38,21 @@ step already writes (``emit_manifest.py``, ``filing_change_detection.py``,
 carries* — the same "declare the key, never guess it" discipline
 ``run_units.PhaseUnit.rows_key`` enforces one level down.
 
-**Why ``trading_day`` is the UTC calendar date, not `dates.default_run_date()`.**
-Every artifact this pipeline writes is keyed by ``date.today()`` in UTC
-(``emit_manifest.py``, ``filing_change_detection.py``, and the bash script's
-own ``RUN_DATE="$(date -u '+%Y-%m-%d')"`` for ``emit_progress.py``) —
-never the trading-day axis. ``default_run_date()`` resolves to the *last
-closed session* (Saturday -> Friday), which would desync the manifest's
-``trading_day`` from the actual date embedded in every key this run
-discovers, and the dispatcher's completion check (`index.py::_key_pattern`)
-substitutes ``{date}``/``{trading_day}`` in ``writes:`` templates from the
-MANIFEST's own ``trading_day`` field — a Friday-keyed manifest describing a
-Saturday-keyed object would silently fail every ``rag/manifest/{date}.json``
-match.
+**The manifest's ``trading_day`` and the script's dated keys are ONE value.**
+The dispatcher's completion check (`index.py::_key_pattern`) substitutes
+``{date}``/``{trading_day}`` in ``writes:`` templates from the MANIFEST's own
+``trading_day`` field, so a manifest whose ``trading_day`` differs from the
+date embedded in the keys the run wrote silently fails every
+``rag/manifest/{date}.json`` match. Since alpha-engine-config-I11514 this
+wrapper passes its ``trading_day`` to ``run_weekly_ingestion.sh --run-date``,
+which keys ``rag/manifest/{date}.json``, ``rag/filing_changes/{date}.json`` and
+``health/rag_ingestion_progress/{date}.json`` by it — they can no longer drift
+apart, even across midnight UTC. (Before I11514 each step read the wall clock
+itself and this wrapper had to guess the same value.)
+
+``--date`` defaults to today UTC, not `dates.default_run_date()`: the
+dispatcher's EventBridge Scheduler input is static and cannot carry a cycle
+date, and this default preserves the keys this workload has always written.
 
 Replaces ``bash rag/pipelines/run_weekly_ingestion.sh`` as the
 ``rag-weekly-ingestion`` workload command in
@@ -66,12 +69,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import run_units
+from rag.pipelines import source_yield
 from validators import expectations
 
 logger = logging.getLogger(__name__)
@@ -99,17 +104,67 @@ OUTPUT_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _run_ingestion_script(dry_run: bool) -> int:
+def _ingestion_argv(dry_run: bool, run_date: str) -> list[str]:
+    """The exact argv the bash pipeline is run with.
+
+    ``--run-date`` is always passed (alpha-engine-config-I11514) so every dated
+    key the script writes carries this manifest's ``trading_day``.
+    """
+    argv = ["bash", str(SCRIPT_PATH), "--run-date", run_date]
+    if dry_run:
+        argv.append("--dry-run")
+    return argv
+
+
+def _run_ingestion_script(dry_run: bool, run_date: str, yield_dir: str | None = None) -> int:
     """Run the existing bash pipeline unchanged. Returns its exit code.
 
     A subprocess call, not a reimplementation: everything about HOW the nine
-    steps run stays exactly what `run_weekly_ingestion.sh` already does.
+    steps run stays exactly what `run_weekly_ingestion.sh` already does. The
+    one thing passed IN is where the script's per-source yields go
+    (``$RAG_SOURCE_YIELD_DIR``), so this process can read the verdict back.
     """
-    argv = ["bash", str(SCRIPT_PATH)]
-    if dry_run:
-        argv.append("--dry-run")
-    proc = subprocess.run(argv, cwd=str(REPO_ROOT))  # noqa: S603 -- fixed argv, no shell
+    argv = _ingestion_argv(dry_run, run_date)
+    env = None
+    if yield_dir is not None:
+        env = {**os.environ, source_yield.YIELD_DIR_ENV: yield_dir}
+    proc = subprocess.run(argv, cwd=str(REPO_ROOT), env=env)  # noqa: S603 -- fixed argv, no shell
     return proc.returncode
+
+
+#: The guard name the source-yield verdict is recorded under
+#: (alpha-engine-config-I11472).
+SOURCE_YIELD_GUARD = "rag_source_yield"
+
+
+def _record_source_yield(ctx: run_units.run_manifest.UnitRun, yield_dir: str) -> None:
+    """Record the script's source-yield verdict as a guard on the manifest.
+
+    Recorded on every run, clean or not — a guard that records only when it
+    fires is indistinguishable from one that stopped running. OBSERVE mode:
+    a degraded source is reported, never a failed run (``source_yield``
+    module docstring).
+    """
+    verdict = source_yield.load_verdict(yield_dir)
+    if verdict is None:
+        ctx.record_guard(
+            SOURCE_YIELD_GUARD,
+            mode="observe",
+            verdict="unmeasurable",
+            detail=f"no source-yield verdict under {yield_dir}",
+        )
+        return
+    degraded = verdict.get("degraded_sources") or []
+    ctx.record_guard(
+        SOURCE_YIELD_GUARD,
+        mode="observe",
+        verdict=verdict.get("status", "unmeasurable"),
+        detail=(
+            "; ".join(f"{d['source']}: {d['reason']}" for d in degraded)
+            or "every source returned documents or declared why not"
+        ),
+        value=float(len(degraded)),
+    )
 
 
 def _utcnow() -> datetime:
@@ -198,10 +253,12 @@ def _record_outputs(ctx: run_units.run_manifest.UnitRun, s3: Any, since: datetim
     return published
 
 
-def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool) -> dict[str, Any]:
+def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool, run_date: str) -> dict[str, Any]:
     since = _utcnow()
-    exit_code = _run_ingestion_script(dry_run)
+    yield_dir = str(source_yield.yield_dir(None) / f"d16-{since.strftime('%Y%m%dT%H%M%SZ')}")
+    exit_code = _run_ingestion_script(dry_run, run_date, yield_dir=yield_dir)
     published = 0 if dry_run else _record_outputs(ctx, _s3_client(), since)
+    _record_source_yield(ctx, yield_dir)
 
     if published:
         ctx.record_guard(
@@ -249,15 +306,16 @@ def main(argv: list[str] | None = None) -> int:
         "--date",
         type=str,
         default=None,
-        help="Override the manifest's trading_day (UTC calendar date). Default: today UTC — "
-        "matching what run_weekly_ingestion.sh's own steps key their writes by.",
+        help="The manifest's trading_day, also passed to run_weekly_ingestion.sh as "
+        "--run-date so every dated key it writes carries the same value "
+        "(alpha-engine-config-I11514). Default: today UTC.",
     )
     args = parser.parse_args(argv)
 
     trading_day = args.date or datetime.now(timezone.utc).date().isoformat()
 
     def _entry(ctx: run_units.run_manifest.UnitRun) -> dict[str, Any]:
-        return _body(ctx, dry_run=args.dry_run)
+        return _body(ctx, dry_run=args.dry_run, run_date=trading_day)
 
     result = run_units.recorded_entry(
         "D16",

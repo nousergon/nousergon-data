@@ -16,12 +16,22 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from unittest.mock import MagicMock
 
+import pytest
+
 from collectors import prices
+
+
+@pytest.fixture(autouse=True)
+def _no_recent_splits(monkeypatch):
+    """No network: the split guard (alpha-engine-config-I11518) sees no splits."""
+    monkeypatch.setattr(prices, "_polygon_split_scan", lambda start, end: [])
 
 
 def _make_s3(last_modified_by_ticker: dict[str, datetime]) -> MagicMock:
     contents = [
-        {"Key": f"predictor/price_cache/{ticker}.parquet", "LastModified": last_mod}
+        # The LIVE tree the scan reads (alpha-engine-config-I11518), not the
+        # retired ``predictor/price_cache/`` sentinel the callers pass.
+        {"Key": f"reference/price_cache/{ticker}.parquet", "LastModified": last_mod}
         for ticker, last_mod in last_modified_by_ticker.items()
     ]
 
@@ -87,7 +97,7 @@ def test_collect_threads_reference_date_into_staleness_check(monkeypatch):
     deterministic re-runs against a fixed ``--date``."""
     captured = {}
 
-    def _fake_find_stale(s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date=None):
+    def _fake_find_stale(s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date=None, **_kw):
         captured["reference_date"] = reference_date
         return []
 

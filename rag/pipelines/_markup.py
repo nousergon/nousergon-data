@@ -54,6 +54,22 @@ def is_non_xhtml_xml(markup: str) -> bool:
     return local_name.lower() != "html"
 
 
+_LEADING_XML_DECL = re.compile(r"\A(?:\s|\ufeff)*<\?xml\s.*?\?>", re.IGNORECASE | re.DOTALL)
+
+
 def parse_filing_markup(markup: str) -> BeautifulSoup:
-    """Parse an EDGAR document with the parser that matches what it is."""
-    return BeautifulSoup(markup, "xml" if is_non_xhtml_xml(markup) else "lxml")
+    """Parse an EDGAR document with the parser that matches what it is.
+
+    XHTML (inline XBRL) goes to the HTML parser WITHOUT its leading XML
+    declaration (alpha-engine-config-I11472). bs4's own raw-markup check
+    decides "XML, not HTML" from a document that starts with ``<?xml`` and has
+    no match for ``<[^ +]html`` in its first 500 characters — a pattern that
+    ``<html`` itself does not match, so every real iXBRL filing (whose first
+    500 characters are the declaration, generator comments and the opening
+    ``<html ...>`` tag) still raised ``XMLParsedAsHTMLWarning``: measured on
+    60 of 60 XML-declared 10-K / 10-Q / 20-F primary documents. The HTML
+    parser discards the declaration anyway, so removing it changes no text.
+    """
+    if is_non_xhtml_xml(markup):
+        return BeautifulSoup(markup, "xml")
+    return BeautifulSoup(_LEADING_XML_DECL.sub("", markup, count=1), "lxml")

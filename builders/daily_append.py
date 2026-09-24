@@ -264,6 +264,156 @@ def _write_row_backfill_safe(
     return "backfill"
 
 
+#: Trailing calendar-day window the daily append asks FRED for. FRED publishes
+#: DGS2 / BAA10Y / BAMLH0A0HYM2 one business day late, and a skipped evening
+#: (holiday run, failed state) must still be caught up by the next one, so the
+#: window is a couple of weeks, not one day. Everything older is the weekly
+#: backfill's (``builders/backfill.py::_RAW_MACRO_SERIES``).
+_FRED_MACRO_LOOKBACK_DAYS = 14
+
+
+def _fetch_fred_only_series(series_id: str, date_str: str) -> pd.Series:
+    """FRED observations for ``series_id`` over the trailing lookback window
+    ending ``date_str`` (inclusive), as a float ``Series`` on a DatetimeIndex.
+
+    FRED only — the one fetch seam :func:`_append_fred_only_macro_series`
+    uses, and deliberately not ``daily_closes``' polygon → FRED → yfinance
+    chain (alpha-engine-config-I11523). Raises on any FRED failure; the caller
+    turns that into a named miss.
+    """
+    from datetime import date as _date, timedelta as _timedelta
+
+    from collectors.fred_history import fetch_fred_history
+
+    end = _date.fromisoformat(date_str)
+    df = fetch_fred_history(
+        series_id,
+        end_date=end,
+        start_date=end - _timedelta(days=_FRED_MACRO_LOOKBACK_DAYS),
+    )
+    return df["value"].astype(float)
+
+
+def _append_fred_only_macro_series(
+    macro_lib,
+    date_str: str,
+    *,
+    fetch=None,
+) -> dict:
+    """Append new FRED observations for every FRED-only macro symbol
+    (``collectors/fred_history.py::FRED_ONLY_MACRO_SERIES`` — TWO, HYOAS,
+    BAA10Y) to the ArcticDB ``macro`` library.
+
+    alpha-engine-config-I11523: ``weekly_collector._MACRO_DAILY_TICKERS``
+    carried only the four caret indices, so between Saturday backfills nothing
+    added a ``macro/TWO``, ``macro/BAA10Y`` or ``macro/HYOAS`` bar. They cannot
+    simply join that list: ``staging/daily_closes`` is keyed by bare ticker,
+    ``TWO`` is also an equity, and a FRED miss there falls through to yfinance
+    — which answers ``TWO`` with Two Harbors. So these are fetched here, by
+    FRED series id, through FRED alone, and written straight to ``macro``.
+
+    Rows are stamped with FRED's own observation dates — the same dates the
+    weekly backfill writes from ``collectors/fred_history.py``'s parquets — and
+    only observations dated after the stored series' last row are appended.
+    History (and any restatement inside it) stays the weekly backfill's.
+
+    Every outcome per symbol is recorded; nothing is swallowed:
+
+    * ``appended``: ``{symbol: [iso dates written]}``
+    * ``current``: symbols FRED had nothing newer for (not a miss)
+    * ``missing``: ``{symbol: reason}`` — a FRED fetch failure, a symbol the
+      weekly backfill has not seeded yet, or a write/readback failure. Never
+      filled from another source.
+
+    Non-fatal to the run, like the sub-sector ETFs: all three feed
+    crucible-predictor's optional regime-substrate block, whose own
+    completeness gate grades them on staleness. A miss is logged at ERROR and
+    returned named so the run record carries it.
+    """
+    from collectors.fred_history import FRED_ONLY_MACRO_SERIES
+
+    fetch = fetch or _fetch_fred_only_series
+    cutoff = pd.Timestamp(date_str)
+    appended: dict[str, list[str]] = {}
+    current: list[str] = []
+    missing: dict[str, str] = {}
+
+    for symbol, series_id in FRED_ONLY_MACRO_SERIES.items():
+        try:
+            existing = macro_lib.read(symbol).data
+        except Exception as exc:
+            # Not seeded: seeding a ten-year series from a two-week window
+            # would leave a stub the consumer reads as "present". The weekly
+            # backfill writes the full history; the daily append only extends.
+            missing[symbol] = f"unseeded in ArcticDB macro ({type(exc).__name__})"
+            log.error(
+                "FRED-only macro %s: not readable from ArcticDB macro (%s) — "
+                "the weekly backfill seeds it; no daily bar appended for %s.",
+                symbol, exc, date_str,
+            )
+            continue
+        if existing.empty or "Close" not in existing.columns:
+            missing[symbol] = "stored series empty or has no Close column"
+            log.error(
+                "FRED-only macro %s: stored series is empty or has no Close "
+                "column — no daily bar appended for %s.", symbol, date_str,
+            )
+            continue
+
+        try:
+            obs = fetch(series_id, date_str)
+        except Exception as exc:
+            missing[symbol] = f"FRED {series_id} fetch failed: {exc}"
+            log.error(
+                "FRED-only macro %s: FRED %s fetch failed for %s — named miss, "
+                "no fallback source: %s",
+                symbol, series_id, date_str, exc,
+            )
+            continue
+
+        last = pd.Timestamp(existing.index.max())
+        obs = obs.dropna()
+        obs = obs[(obs.index > last) & (obs.index <= cutoff)]
+        if obs.empty:
+            current.append(symbol)
+            log.info(
+                "FRED-only macro %s: no FRED %s observation after %s through %s "
+                "(stored series current).",
+                symbol, series_id, last.date(), date_str,
+            )
+            continue
+
+        new_rows = pd.DataFrame({"Close": obs.astype(float)}, index=obs.index)
+        new_rows.index.name = "date"
+        try:
+            macro_lib.update(symbol, _align_schema_for_update(new_rows, existing))
+            readback_last = pd.Timestamp(macro_lib.read(symbol).data.index.max())
+        except Exception as exc:
+            missing[symbol] = f"ArcticDB write failed: {exc}"
+            log.error(
+                "FRED-only macro %s: ArcticDB append of %d row(s) failed for %s: %s",
+                symbol, len(new_rows), date_str, exc,
+            )
+            continue
+        if readback_last.normalize() != pd.Timestamp(obs.index.max()).normalize():
+            missing[symbol] = (
+                f"readback last date {readback_last.date()} != written "
+                f"{pd.Timestamp(obs.index.max()).date()}"
+            )
+            log.error(
+                "FRED-only macro %s: readback shows last date %s, expected %s.",
+                symbol, readback_last.date(), pd.Timestamp(obs.index.max()).date(),
+            )
+            continue
+        appended[symbol] = [pd.Timestamp(d).date().isoformat() for d in obs.index]
+        log.info(
+            "FRED-only macro %s: appended %d FRED %s row(s) %s",
+            symbol, len(obs), series_id, appended[symbol],
+        )
+
+    return {"appended": appended, "current": current, "missing": missing}
+
+
 def _emit_missing_from_closes_metric(count: int) -> None:
     """Emit ``AlphaEngine/Data/missing_from_closes_count`` gauge.
 
@@ -1814,6 +1964,9 @@ def _daily_append_impl(
 
     macro_missing_from_closes: list[str] = []
     macro_updated: list[str] = []
+    # alpha-engine-config-I11523: outcome of the FRED-only macro append
+    # (TWO / HYOAS / BAA10Y), surfaced on the result so a miss is named.
+    fred_macro_result: dict = {"skipped": "dry_run"}
     sector_updated: list[str] = []
 
     # Track per-symbol write mode (append vs backfill) so the verification
@@ -1905,42 +2058,16 @@ def _daily_append_impl(
                     sym, date_str, exc,
                 )
 
-        # HYOAS (config#939, credit spreads) — best-effort, NOT added to
-        # `macro_keys` above. Unlike SPY/VIX/TNX/etc. (battle-tested,
-        # load-bearing for every downstream feature), HYOAS is a newer,
-        # optional macro input: FRED-license-gated to 2023+ and not yet
-        # guaranteed present in every daily_closes parquet. Gating the
-        # WHOLE daily pipeline on its freshness (via macro_missing_from_closes
-        # -> the hard-fail below) would be a disproportionate blast radius
-        # for one optional feature — feature_engineer.compute_features
-        # already neutral-defaults hy_oas_credit_spread_pct to 0.0 when
-        # hyoas_series is None, so a missing HYOAS bar degrades one column
-        # to its neutral default rather than failing the run.
-        bar = closes.get("HYOAS")
-        if bar is not None and not np.isnan(bar.get("Close", np.nan)):
-            try:
-                new_row = pd.DataFrame(
-                    [{"Close": bar["Close"]}],
-                    index=pd.DatetimeIndex([today_ts]),
-                )
-                new_row.index.name = "date"
-                with _count_schema_drift(n_schema_drift, on_drift=_emit_schema_drift):
-                    mode = _write_row_backfill_safe(macro_lib, "HYOAS", new_row)
-                macro_updated.append("HYOAS")
-                macro_write_modes["HYOAS"] = mode
-            except Exception as exc:
-                log.warning(
-                    "HYOAS macro bar write failed for %s (non-fatal — "
-                    "hy_oas_credit_spread_pct will neutral-default): %s",
-                    date_str, exc,
-                )
-        else:
-            log.info(
-                "HYOAS bar missing/NaN from today's daily_closes for %s — "
-                "hy_oas_credit_spread_pct will neutral-default this run "
-                "(non-fatal, unlike the mandatory macro_keys set below).",
-                date_str,
-            )
+        # FRED-only macro series (TWO / HYOAS / BAA10Y) — fetched by FRED
+        # series id through FRED alone and appended to ArcticDB macro with
+        # their own observation dates (alpha-engine-config-I11523). This
+        # replaces the old "write HYOAS if today's daily_closes happens to
+        # carry it" block, which never fired: nothing requested HYOAS there,
+        # and TWO/BAA10Y cannot be requested there safely (``TWO`` is also an
+        # equity in that bare-ticker namespace). Best-effort, NOT added to
+        # macro_missing_from_closes: all three are optional regime inputs, so
+        # a FRED miss is a named miss in the result, not a failed run.
+        fred_macro_result = _append_fred_only_macro_series(macro_lib, date_str)
 
         # Hard-fail on any missing key — macro inputs are not optional.
         # downstream feature compute + predictor preflight both depend on
@@ -2954,6 +3081,9 @@ def _daily_append_impl(
         # caller-side distinction this field exists to support.
         "target_date_write_ok": True,
         "date": date_str,
+        # alpha-engine-config-I11523: {appended, current, missing} for the
+        # FRED-only macro series; ``missing`` names every symbol not advanced.
+        "fred_macro": fred_macro_result,
         "tickers_appended": n_ok,
         "tickers_partial": n_partial,
         # alpha-engine-config-I10810 (measured 2026-09-16, D18/D32): the run

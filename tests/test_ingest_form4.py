@@ -657,3 +657,85 @@ def test_no_orchestrator_fixture_is_dated_by_a_literal():
         "orchestrator fixtures run through the lookback filter, so they must "
         f"be anchored to `_FILED`, not written as a calendar date: {literals}"
     )
+
+
+# ── alpha-engine-config-I11472: the XSL-rendered primary document ─────
+#
+# The submissions API's `primaryDocument` for a Form 4 is usually the
+# XSL-RENDERED view (`xslF345X05/<name>.xml`) — an HTML page with an `.xml`
+# name. Fetching it and handing it to ElementTree failed every such filing
+# with `mismatched tag: line 29, column 16` in the 2026-09-23 rehearsal. The
+# page below is the head of EDGAR's real rendering: unclosed <meta> is what
+# the XML parser trips on.
+_FORM4_XSL_RENDERED = """<!DOCTYPE html PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+<title>SEC FORM 4</title>
+</head>
+<body><table><tr><td class="FormData">Nadella Satya</td></tr></table></body>
+</html>
+"""
+
+
+@pytest.mark.parametrize(
+    "primary, raw",
+    [
+        ("xslF345X05/wk-form4_1727.xml", "wk-form4_1727.xml"),
+        ("xslF345X03/form4.xml", "form4.xml"),
+        ("XSLF345X02/doc4.xml", "doc4.xml"),
+        ("form4.xml", "form4.xml"),
+        ("", ""),
+    ],
+)
+def test_raw_ownership_doc_strips_the_stylesheet_directory(primary, raw):
+    from rag.pipelines.ingest_form4 import raw_ownership_doc
+
+    assert raw_ownership_doc(primary) == raw
+
+
+class TestXslRenderedPrimaryDocument:
+    def _run(self, monkeypatch, *, served):
+        from rag.pipelines import ingest_form4
+
+        monkeypatch.setattr(ingest_form4, "_CIK_CACHE", {})
+        monkeypatch.setattr(ingest_form4, "_INTER_REQUEST_SLEEP_SECONDS", 0)
+        form4_list = [{
+            "form_type": "4",
+            "accession_number": "0001140361-26-037020",
+            "filed_date": _FILED,
+            "primary": "xslF345X05/form4.xml",
+        }]
+        http = TestIngestForTickers._make_http_mock(
+            None, form4_list=form4_list, xml_by_url=served,
+        )
+        stats = ingest_for_tickers(
+            ["AAPL"], lookback_days=_DISCOVERY_LOOKBACK_DAYS, s3_client=_InMemoryS3(), http=http,
+        )
+        fetched = [c.args[0] for c in http.get.call_args_list if "Archives" in c.args[0]]
+        return stats, fetched
+
+    def test_the_raw_xml_is_fetched_not_the_rendered_page(self, monkeypatch):
+        stats, fetched = self._run(monkeypatch, served={
+            "xslF345X05/form4.xml": _FORM4_XSL_RENDERED,
+            "/form4.xml": _FORM4_SINGLE_SALE,
+        })
+        assert fetched and all("xslF345X05" not in u for u in fetched)
+        assert stats["n_transactions_parsed"] == 1
+        assert stats["n_failures"] == 0
+
+    def test_an_html_page_is_counted_as_a_failure_not_parsed(self, monkeypatch):
+        stats, _ = self._run(monkeypatch, served={"/form4.xml": _FORM4_XSL_RENDERED})
+        assert stats["n_transactions_parsed"] == 0
+        assert stats["n_failures"] == 1
+
+    def test_the_rendered_page_is_what_mismatched_tag_was(self):
+        import xml.etree.ElementTree as ET
+
+        with pytest.raises(ET.ParseError, match="mismatched tag"):
+            ET.fromstring(_FORM4_XSL_RENDERED)
+
+    def test_an_unparseable_document_is_counted(self, monkeypatch):
+        stats, _ = self._run(monkeypatch, served={"/form4.xml": "<ownershipDocument><issuer>"})
+        assert stats["n_transactions_parsed"] == 0
+        assert stats["n_failures"] == 1

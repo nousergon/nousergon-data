@@ -3,7 +3,7 @@
 #
 # Runs all ingestion pipelines in sequence:
 #   0.  Preflight — env vars + S3 reachability (hard-fails on miss)
-#   1.  SEC filings (10-K/10-Q) — from signals universe, 2y lookback
+#   1.  SEC filings (10-K/10-Q, foreign 20-F/40-F) — from signals universe, 2y lookback
 #   2.  8-K material events — from signals universe, 1y lookback
 #   3.  Earnings transcripts (Finnhub) — from signals universe, latest 8
 #   4.  Thesis history — from research.db (incremental)
@@ -18,6 +18,9 @@
 #       → self-derived 7d/30d revisions
 #   9.  Filing change detection — analyze consecutive filings
 #   10. Manifest emit — corpus snapshot for presentation layer
+#   then: source-yield verdict (alpha-engine-config-I11472) — every source
+#       that returned 0 documents is named and the run reports DEGRADED
+#       (log + completion email); never changes the exit code.
 #
 # Intended to run on the Saturday Step Function via SSM on the always-on
 # EC2 instance. `set -euo pipefail` plus no `|| echo "non-fatal"`
@@ -29,6 +32,18 @@
 #   bash rag/pipelines/run_weekly_ingestion.sh                 # full run
 #   bash rag/pipelines/run_weekly_ingestion.sh --dry-run       # preview only
 #   bash rag/pipelines/run_weekly_ingestion.sh --preflight-only # step 0 only, exit 0
+#   bash rag/pipelines/run_weekly_ingestion.sh --run-date 2026-09-18  # cycle date from the SF
+#
+# --run-date YYYY-MM-DD (alpha-engine-config-I11514): the CYCLE date every
+# dated key this run writes is filed under — rag/manifest/{date}.json,
+# rag/filing_changes/{date}.json and health/rag_ingestion_progress/{date}.json.
+# The Saturday SF passes its $.run_date (the cycle's trading day, via
+# EXECUTION_RUN_DATE in infrastructure/spot_rag_ingestion.sh), which is the
+# same value the registry resolves `{date}` to. Keying by the box's wall clock
+# instead filed every run that crossed midnight UTC under the NEXT day, so the
+# stage-output sweep reported rag_manifest_dated missing on every weekly run.
+# Omitted (manual/local runs only), it falls back to `date -u` with a loud
+# WARNING line, never silently.
 #
 # --preflight-only (Friday shell-run dry path, ROADMAP "Friday shell-run —
 # per-module dry-path activation" #1): runs ONLY Step 0 (python -m
@@ -50,11 +65,20 @@ cd "$REPO_ROOT"
 # Parse flags
 DRY_RUN=""
 PREFLIGHT_ONLY=0
-for arg in "$@"; do
-    case "$arg" in
+RUN_DATE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --dry-run) DRY_RUN="--dry-run" ;;
         --preflight-only) PREFLIGHT_ONLY=1 ;;
+        --run-date)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --run-date requires a YYYY-MM-DD value" >&2
+                exit 2
+            fi
+            RUN_DATE="$2"; shift ;;
+        --run-date=*) RUN_DATE="${1#--run-date=}" ;;
     esac
+    shift
 done
 
 # Activate venv
@@ -85,7 +109,28 @@ fi
 echo "Using PYTHON_BIN=$PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 
 START_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-RUN_DATE="$(date -u '+%Y-%m-%d')"
+
+# Cycle date (alpha-engine-config-I11514) — see --run-date in the header. A
+# malformed value is a hard error: it would become an S3 key.
+if [ -n "$RUN_DATE" ]; then
+    if ! [[ "$RUN_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "ERROR: --run-date must be YYYY-MM-DD, got '$RUN_DATE'" >&2
+        exit 2
+    fi
+    echo "RUN_DATE=$RUN_DATE (cycle date passed by caller)"
+else
+    RUN_DATE="$(date -u '+%Y-%m-%d')"
+    echo "WARNING: no --run-date given — falling back to the box's UTC wall-clock date RUN_DATE=$RUN_DATE." >&2
+    echo "WARNING: dated keys (rag/manifest/{date}.json, rag/filing_changes/{date}.json, health/rag_ingestion_progress/{date}.json) may not match the SF cycle date if this run crosses midnight UTC (alpha-engine-config-I11514)." >&2
+fi
+
+# Per-source yield records for this run (rag/pipelines/source_yield.py,
+# alpha-engine-config-I11472). Each ingest step writes one file here; the
+# verdict after the last step reads them. Cleared at the start so a record
+# left by an earlier run on the same host can never stand in for this one.
+export RAG_SOURCE_YIELD_DIR="${RAG_SOURCE_YIELD_DIR:-${TMPDIR:-/tmp}/rag_source_yield/$RUN_DATE}"
+mkdir -p "$RAG_SOURCE_YIELD_DIR"
+rm -f "$RAG_SOURCE_YIELD_DIR"/*.json
 
 echo "========================================"
 echo "RAG Weekly Ingestion — $(date -u '+%Y-%m-%d %H:%M UTC')"
@@ -144,7 +189,7 @@ fi
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/10: SEC filings (10-K/10-Q)..."
+echo "==> Step 1/10: SEC filings (10-K/10-Q/20-F/40-F)..."
 emit_progress 1 10 "sec_filings"
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
@@ -242,7 +287,7 @@ echo ""
 echo "==> Step 9/10: Filing change detection..."
 emit_progress 9 10 "filing_changes"
 if [ -z "$DRY_RUN" ]; then
-    $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
+    $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3 --run-date "$RUN_DATE"
 else
     echo "  SKIPPED in dry-run mode"
 fi
@@ -252,10 +297,20 @@ echo ""
 echo "==> Step 10/10: Emit corpus manifest..."
 emit_progress 10 10 "manifest_emit"
 if [ -z "$DRY_RUN" ]; then
-    $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
+    $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3 --run-date "$RUN_DATE"
 else
     echo "  SKIPPED in dry-run mode"
 fi
+
+# ── Source-yield verdict (alpha-engine-config-I11472) ────────────────────────
+# Names every source that returned 0 documents this run (or whose step never
+# reported) and marks the run DEGRADED — in this log, in verdict.json beside
+# the yields, and in the completion email below. ALWAYS exits 0, exactly like
+# step 5's freshness assertion: a degraded source degrades the report, it does
+# not fail the weekly pipeline.
+echo ""
+echo "==> Source-yield verdict..."
+$PYTHON_BIN -m rag.pipelines.source_yield --report
 
 echo ""
 echo "========================================"
@@ -273,29 +328,36 @@ aws cloudwatch put-metric-data \
 echo "Heartbeat emitted: rag-ingestion"
 
 # Send completion email. With `set -euo pipefail` active, reaching this
-# point means all 9 pipelines succeeded — the hardcoded 'ok' statuses
-# are truthful rather than aspirational. PYTHON_BIN resolved at top of script.
+# point means all 9 pipelines EXITED 0 — which is not the same as every source
+# returning documents (alpha-engine-config-I11472: this email said 'ok' for
+# earnings_transcripts on a run that ingested 0 transcripts for 118 tickers).
+# So 'ok' is the base, and the source-yield verdict overlays it: a degraded
+# source shows as 'degraded' with its reason, and the run's status becomes
+# 'degraded'. A missing verdict reads as degraded too. PYTHON_BIN resolved at
+# top of script.
 $PYTHON_BIN -c "
 from emailer import send_step_email
 from datetime import datetime, timezone
-date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+from rag.pipelines.source_yield import email_collectors, load_verdict
+date_str = '$RUN_DATE'
+status, collectors = email_collectors({
+    'sec_filings': {'status': 'ok'},
+    '8k_events': {'status': 'ok'},
+    'earnings_transcripts': {'status': 'ok'},
+    'thesis_history': {'status': 'ok'},
+    'news_pipeline': {'status': 'ok'},
+    'form4_insider': {'status': 'ok'},
+    'inst_ownership_13f': {'status': 'ok'},
+    'analyst_pipeline': {'status': 'ok'},
+    'filing_changes': {'status': 'ok'},
+}, load_verdict())
 results = {
     'phase': 'RAG',
     'date': date_str,
     'started_at': '$START_TIME',
     'completed_at': datetime.now(timezone.utc).isoformat(),
-    'status': 'ok',
-    'collectors': {
-        'sec_filings': {'status': 'ok'},
-        '8k_events': {'status': 'ok'},
-        'earnings_transcripts': {'status': 'ok'},
-        'thesis_history': {'status': 'ok'},
-        'news_pipeline': {'status': 'ok'},
-        'form4_insider': {'status': 'ok'},
-        'inst_ownership_13f': {'status': 'ok'},
-        'analyst_pipeline': {'status': 'ok'},
-        'filing_changes': {'status': 'ok'},
-    },
+    'status': status,
+    'collectors': collectors,
 }
 send_step_email('RAG Ingestion', results, date_str)
 "
