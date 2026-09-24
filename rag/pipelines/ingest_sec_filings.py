@@ -26,7 +26,8 @@ import time
 from datetime import date, timedelta
 
 import requests
-from bs4 import BeautifulSoup
+
+from rag.pipelines._markup import parse_filing_markup
 
 logger = logging.getLogger(__name__)
 
@@ -161,7 +162,7 @@ def _download_filing_html(url: str) -> str | None:
 
 def _extract_sections(html: str) -> dict[str, str]:
     """Extract target sections from filing HTML."""
-    soup = BeautifulSoup(html, "lxml")
+    soup = parse_filing_markup(html)
     text = soup.get_text(separator="\n", strip=True)
 
     sections = {}

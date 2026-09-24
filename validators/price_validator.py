@@ -340,43 +340,71 @@ def validate_feature_record(
     return {"ticker": ticker, "anomalies": anomalies}
 
 
+# ── Full-history anomaly types (validate_parquet / validate_refreshed) ─────
+# alpha-engine-config-I11470: the post-refresh summary used to log only
+# "32/100 tickers have anomalies", and the reader had to open validation.json
+# to learn that 31 were one volume spike each and the 32nd was a read error.
+# Every anomaly now carries one of these types, and the summary counts and
+# names tickers per type.
+HISTORY_ANOMALY_EMPTY = "empty"
+HISTORY_ANOMALY_TRADING_GAP = "trading_day_gap"
+HISTORY_ANOMALY_MISSING_OBJECT = "missing_object"
+HISTORY_ANOMALY_READ_ERROR = "read_error"
+
+# How many tickers per type the log line names before summarising the rest.
+_SUMMARY_TICKERS_PER_TYPE = 10
+
+
 def validate_parquet(df: pd.DataFrame, ticker: str) -> dict:
     """
     Validate a single ticker's OHLCV DataFrame.
 
     Returns dict with anomaly counts and details. Empty anomalies = clean.
+    ``anomaly_types`` runs parallel to ``anomalies``: one type per message.
     """
     anomalies: list[str] = []
+    types: list[str] = []
+
+    def flag(kind: str, message: str) -> None:
+        types.append(kind)
+        anomalies.append(message)
 
     if df.empty:
-        return {"ticker": ticker, "status": "empty", "anomalies": ["empty dataframe"]}
+        return {
+            "ticker": ticker, "status": "empty",
+            "anomalies": ["empty dataframe"],
+            "anomaly_types": [HISTORY_ANOMALY_EMPTY],
+        }
 
     # ── 1. OHLC relationship ────────────────────────────────────────────────
     if all(c in df.columns for c in ("Open", "High", "Low", "Close")):
         bad_hl = (df["High"] < df["Low"]).sum()
         if bad_hl > 0:
-            anomalies.append(f"High<Low on {bad_hl} days")
+            flag(ANOMALY_BAD_OHLC, f"High<Low on {bad_hl} days")
 
     # ── 2. Zero or negative prices ──────────────────────────────────────────
     if "Close" in df.columns:
         bad_prices = (df["Close"] <= 0).sum()
         if bad_prices > 0:
-            anomalies.append(f"Close<=0 on {bad_prices} days")
+            flag(ANOMALY_NEGATIVE_OR_ZERO_CLOSE, f"Close<=0 on {bad_prices} days")
 
     # ── 3. Extreme daily returns ────────────────────────────────────────────
     if "Close" in df.columns and len(df) >= 2:
-        returns = df["Close"].pct_change().dropna()
+        returns = df["Close"].ffill().pct_change(fill_method=None).dropna()
         extreme = returns.abs() > MAX_DAILY_RETURN
         n_extreme = extreme.sum()
         if n_extreme > 0:
             dates = returns[extreme].index.strftime("%Y-%m-%d").tolist()
-            anomalies.append(f">{MAX_DAILY_RETURN:.0%} daily move on {n_extreme} days: {dates[:5]}")
+            flag(
+                ANOMALY_EXTREME_DAILY_MOVE,
+                f">{MAX_DAILY_RETURN:.0%} daily move on {n_extreme} days: {dates[:5]}",
+            )
 
     # ── 4. Zero volume on trading days ──────────────────────────────────────
     if "Volume" in df.columns:
         zero_vol = (df["Volume"] == 0).sum()
         if zero_vol > 0:
-            anomalies.append(f"zero volume on {zero_vol} days")
+            flag(ANOMALY_ZERO_VOLUME, f"zero volume on {zero_vol} days")
 
     # ── 5. Volume spikes ────────────────────────────────────────────────────
     if "Volume" in df.columns and len(df) >= 25:
@@ -387,7 +415,10 @@ def validate_parquet(df: pd.DataFrame, ticker: str) -> dict:
             ratio = with_baseline / baseline
             spikes = (ratio > MAX_VOLUME_SPIKE).sum()
             if spikes > 0:
-                anomalies.append(f"volume >{MAX_VOLUME_SPIKE:.0f}x median on {spikes} days")
+                flag(
+                    ANOMALY_VOLUME_SPIKE,
+                    f"volume >{MAX_VOLUME_SPIKE:.0f}x median on {spikes} days",
+                )
 
     # ── 6. Trading day gaps ─────────────────────────────────────────────────
     if len(df) >= 2:
@@ -401,13 +432,66 @@ def validate_parquet(df: pd.DataFrame, ticker: str) -> dict:
                 f"{idx[i-1].strftime('%Y-%m-%d')}→{idx[i].strftime('%Y-%m-%d')} ({int(g)}d)"
                 for i, g in big_gaps.items()
             ]
-            anomalies.append(f"{len(big_gaps)} gaps >{MAX_GAP_TRADING_DAYS} trading days: {gap_details[:3]}")
+            flag(
+                HISTORY_ANOMALY_TRADING_GAP,
+                f"{len(big_gaps)} gaps >{MAX_GAP_TRADING_DAYS} trading days: {gap_details[:3]}",
+            )
 
     return {
         "ticker": ticker,
         "status": "anomaly" if anomalies else "clean",
         "anomalies": anomalies,
+        "anomaly_types": types,
     }
+
+
+def _summarize(results: list[dict], label: str) -> dict:
+    """Roll per-ticker results up into the manifest summary, BY TYPE.
+
+    ``anomaly_counts_by_type`` counts tickers carrying each type and
+    ``anomaly_tickers_by_type`` names every one of them (uncapped — at most
+    ~100 names per call). ``anomaly_details`` keeps its historic 20-entry cap
+    for manifest size. The log line names the types and their tickers, so the
+    run log alone says what the anomalies were.
+    """
+    flagged = [r for r in results if r["status"] != "clean"]
+    by_type: dict[str, list[str]] = {}
+    for r in flagged:
+        for kind in dict.fromkeys(r.get("anomaly_types") or [r["status"]]):
+            by_type.setdefault(kind, []).append(r["ticker"])
+    by_type = dict(sorted(by_type.items(), key=lambda kv: (-len(kv[1]), kv[0])))
+
+    summary = {
+        "total_validated": len(results),
+        "clean": len(results) - len(flagged),
+        "anomalies": len(flagged),
+        "anomaly_counts_by_type": {k: len(v) for k, v in by_type.items()},
+        "anomaly_tickers_by_type": by_type,
+        "anomaly_details": flagged[:20],  # Cap for manifest size
+    }
+
+    if flagged:
+        named = "; ".join(
+            f"{kind}={len(tickers)} {tickers[:_SUMMARY_TICKERS_PER_TYPE]}"
+            + (f" +{len(tickers) - _SUMMARY_TICKERS_PER_TYPE} more"
+               if len(tickers) > _SUMMARY_TICKERS_PER_TYPE else "")
+            for kind, tickers in by_type.items()
+        )
+        logger.warning(
+            "%s: %d/%d tickers have anomalies — %s",
+            label, len(flagged), len(results), named,
+        )
+        # Per-ticker detail for everything but the routine single-type volume
+        # spike, which the by-type line above already names in full.
+        detailed = [
+            r for r in flagged
+            if not set(r.get("anomaly_types") or []) <= {ANOMALY_VOLUME_SPIKE}
+        ]
+        for r in detailed[:20]:
+            logger.warning("  %s: %s", r["ticker"], "; ".join(r["anomalies"]))
+    else:
+        logger.info("%s: all %d tickers clean", label, len(results))
+    return summary
 
 
 def validate_batch(parquet_dir: Path, tickers: list[str] | None = None) -> dict:
@@ -429,29 +513,18 @@ def validate_batch(parquet_dir: Path, tickers: list[str] | None = None) -> dict:
             result = validate_parquet(df, ticker)
             results.append(result)
         except Exception as e:
-            results.append({"ticker": ticker, "status": "error", "anomalies": [str(e)]})
+            results.append({
+                "ticker": ticker, "status": "error", "anomalies": [str(e)],
+                "anomaly_types": [HISTORY_ANOMALY_READ_ERROR],
+            })
 
-    anomaly_tickers = [r for r in results if r["status"] != "clean"]
-    total = len(results)
+    return _summarize(results, "Price validation")
 
-    summary = {
-        "total_validated": total,
-        "clean": total - len(anomaly_tickers),
-        "anomalies": len(anomaly_tickers),
-        "anomaly_details": anomaly_tickers[:20],  # Cap for manifest size
-    }
 
-    if anomaly_tickers:
-        logger.warning(
-            "Price validation: %d/%d tickers have anomalies",
-            len(anomaly_tickers), total,
-        )
-        for r in anomaly_tickers[:10]:
-            logger.warning("  %s: %s", r["ticker"], "; ".join(r["anomalies"]))
-    else:
-        logger.info("Price validation: all %d tickers clean", total)
-
-    return summary
+def _is_not_found(exc: Exception) -> bool:
+    """True for an S3 404 / NoSuchKey, however boto3 surfaced it."""
+    code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+    return code in ("404", "NoSuchKey", "NotFound")
 
 
 def validate_refreshed(
@@ -464,37 +537,67 @@ def validate_refreshed(
     Validate freshly refreshed tickers by downloading from S3.
 
     Only validates the tickers that were just refreshed (not the full cache).
+
+    Reads through ``price_cache_read_prefixes(s3_prefix)`` — the SAME
+    chokepoint the refresh writes through (alpha-engine-config-I11470). This
+    used to download ``{s3_prefix}{ticker}.parquet`` verbatim, and every
+    production caller passes the retired ``predictor/price_cache/`` sentinel,
+    which the write side translates to ``reference/price_cache/``. So since
+    the Wave-3 cutover this validated the legacy tree — 939 objects frozen on
+    2026-06-19 — rather than what the refresh had just written, and MRVL
+    (an S&P 500 addition of 2026-06-22, so never in the legacy tree) 404'd on
+    HeadObject even though ``reference/price_cache/MRVL.parquet`` was written
+    minutes earlier. Not a race: the wrong key. A key that is genuinely
+    missing is now its own anomaly type, naming the key.
     """
     import tempfile
 
+    from botocore.exceptions import ClientError
+
+    from builders._price_cache_writeboth import price_cache_read_prefixes
+
+    prefixes = price_cache_read_prefixes(s3_prefix)
     results = []
     for ticker in tickers[:100]:  # Cap at 100 to limit S3 calls
-        key = f"{s3_prefix}{ticker}.parquet"
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
-                s3_client.download_file(bucket, key, tmp.name)
-                df = pd.read_parquet(tmp.name)
-                df.index = pd.to_datetime(df.index)
-                result = validate_parquet(df, ticker)
-                results.append(result)
-        except Exception as e:
-            results.append({"ticker": ticker, "status": "error", "anomalies": [str(e)]})
+        tried: list[str] = []
+        result = None
+        for prefix in prefixes:
+            key = f"{prefix}{ticker}.parquet"
+            tried.append(key)
+            try:
+                with tempfile.NamedTemporaryFile(suffix=".parquet") as tmp:
+                    s3_client.download_file(bucket, key, tmp.name)
+                    df = pd.read_parquet(tmp.name)
+            except ClientError as e:
+                if _is_not_found(e):
+                    continue
+                result = {
+                    "ticker": ticker, "status": "error", "key": key,
+                    "anomalies": [f"s3://{bucket}/{key}: {e}"],
+                    "anomaly_types": [HISTORY_ANOMALY_READ_ERROR],
+                }
+                break
+            except Exception as e:
+                result = {
+                    "ticker": ticker, "status": "error", "key": key,
+                    "anomalies": [f"s3://{bucket}/{key}: {type(e).__name__}: {e}"],
+                    "anomaly_types": [HISTORY_ANOMALY_READ_ERROR],
+                }
+                break
+            df.index = pd.to_datetime(df.index)
+            result = {**validate_parquet(df, ticker), "key": key}
+            break
+        if result is None:
+            result = {
+                "ticker": ticker, "status": "error", "keys_tried": tried,
+                "anomalies": [
+                    "no price-cache object at "
+                    + ", ".join(f"s3://{bucket}/{k}" for k in tried)
+                ],
+                "anomaly_types": [HISTORY_ANOMALY_MISSING_OBJECT],
+            }
+        results.append(result)
 
-    anomaly_tickers = [r for r in results if r["status"] != "clean"]
-
-    summary = {
-        "total_validated": len(results),
-        "clean": len(results) - len(anomaly_tickers),
-        "anomalies": len(anomaly_tickers),
-        "anomaly_details": anomaly_tickers[:20],
-    }
-
-    if anomaly_tickers:
-        logger.warning(
-            "Post-refresh validation: %d/%d tickers have anomalies",
-            len(anomaly_tickers), len(results),
-        )
-    else:
-        logger.info("Post-refresh validation: all %d tickers clean", len(results))
-
+    summary = _summarize(results, "Post-refresh validation")
+    summary["validated_prefixes"] = prefixes
     return summary
