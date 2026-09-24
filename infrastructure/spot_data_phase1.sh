@@ -115,7 +115,7 @@ export PYTHON_BIN
 ENV_EOF
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  DataPhase1 — $(date +%Y-%m-%d)"
+echo "  DataPhase1 — run_date $(stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Instance types: $INSTANCE_TYPES | Branch: $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY | Attempt: $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS"
