@@ -1736,7 +1736,18 @@ _SEC_RATE_DELAY = 0.25
 
 
 def _fetch_insider(ticker: str, run_date: str) -> dict:
-    """Fetch insider trading data from SEC EDGAR Form 4."""
+    """Fetch insider trading data from SEC EDGAR Form 4.
+
+    The 90-day Form 4 lookback is CONTENT, so it takes the same anchor as
+    ``_fetch_news`` (alpha-engine-config-I11308, the follow-up to I11216
+    deliverable 5): ``run_date`` only under a DECLARED replay
+    (``active_root()``), and the real UTC calendar date on a live run.
+    ``run_date`` is populated on both paths (``weekly_collector.py``'s
+    ``args.date or default_run_date()``), so it cannot tell them apart; a
+    live Saturday run used to anchor on Friday's session instead of the day
+    it actually ran. The anchor is midnight of that date either way, so the
+    window's inclusive edge and ``days_ago`` keep their date-granular meaning.
+    """
     result = {
         "cluster_buying": False,
         "net_shares_30d": 0,
@@ -1748,7 +1759,13 @@ def _fetch_insider(ticker: str, run_date: str) -> dict:
         return result
 
     headers = {"User-Agent": identity, "Accept": "application/json"}
-    today = datetime.strptime(run_date, "%Y-%m-%d")
+    today = (
+        datetime.strptime(run_date, "%Y-%m-%d")
+        if active_root() is not None
+        else datetime.now(timezone.utc).replace(
+            tzinfo=None, hour=0, minute=0, second=0, microsecond=0,
+        )
+    )
 
     # Look up CIK
     try:
@@ -1839,11 +1856,8 @@ def _fetch_news(ticker: str, run_date: str) -> dict:
     cannot tell the two apart. A live run wants the actual wall clock here —
     it is collecting whatever is fresh at the moment it runs, not
     reproducing a specific past day — so the anchor only moves off the wall
-    clock when a replay is actually active. This mirrors ``_fetch_insider``'s
-    existing unconditional ``today = datetime.strptime(run_date, ...)``
-    anchor in this same file, which predates this fix and carries the same
-    live-run risk in miniature (90-day lookback, weekend-only exposure) —
-    tracked separately, not changed here (out of this PR's scope).
+    clock when a replay is actually active. ``_fetch_insider`` takes the
+    same anchor for its 90-day Form 4 lookback (alpha-engine-config-I11308).
     """
     result = {"articles": [], "sec_filings_8k": []}
     today = (
