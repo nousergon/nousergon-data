@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 import pytest
 
@@ -598,28 +599,33 @@ class TestExecutionContextRunMode:
         assert ctx.run_mode == "weekly"
 
 
-class TestShouldAlert:
+class TestAlertAtFullSeverity:
     def _doc(self, **kw):
         base = {"enforce": False, "run_mode": None}
         base.update(kw)
         return base
 
-    def test_observe_weekly_alerts(self):
-        assert sos._should_alert(self._doc(run_mode="weekly")) is True
+    def test_observe_weekly_is_full_severity(self):
+        assert sos._alert_at_full_severity(self._doc(run_mode="weekly")) is True
 
-    def test_observe_dry_run_suppresses(self):
-        assert sos._should_alert(self._doc(run_mode=sos.RUN_MODE_DRY)) is False
+    def test_observe_dry_run_is_tracked_only(self):
+        assert sos._alert_at_full_severity(self._doc(run_mode=sos.RUN_MODE_DRY)) is False
 
-    def test_observe_exercise_suppresses(self):
-        assert sos._should_alert(self._doc(run_mode="exercise")) is False
+    def test_observe_exercise_is_tracked_only(self):
+        assert sos._alert_at_full_severity(self._doc(run_mode="exercise")) is False
 
-    def test_observe_unknown_run_mode_alerts(self):
+    def test_observe_watch_rerun_is_tracked_only(self):
+        assert sos._alert_at_full_severity(self._doc(run_mode="watch-rerun")) is False
+
+    def test_observe_unknown_run_mode_is_full_severity(self):
         """Fail toward alerting on an unresolved run_mode — same posture as
         entered_stages=None and cycle_date=None elsewhere in this module."""
-        assert sos._should_alert(self._doc(run_mode=None)) is True
+        assert sos._alert_at_full_severity(self._doc(run_mode=None)) is True
 
-    def test_enforce_mode_always_alerts_even_on_dry(self):
-        assert sos._should_alert(self._doc(enforce=True, run_mode=sos.RUN_MODE_DRY)) is True
+    def test_enforce_mode_is_always_full_severity_even_on_dry(self):
+        assert sos._alert_at_full_severity(
+            self._doc(enforce=True, run_mode=sos.RUN_MODE_DRY)
+        ) is True
 
 
 class TestEmitMetrics:
@@ -668,6 +674,79 @@ class TestEmitMetrics:
         )
         assert doc["status"] == "stage_output_missing"
 
+    def test_no_injected_client_builds_cloudwatch_with_a_resolved_region(
+        self, monkeypatch
+    ):
+        """alpha-engine-config-I11508 part 3. The box runs this under SSM
+        AWS-RunShellScript with neither AWS_REGION nor AWS_DEFAULT_REGION set,
+        and a bare boto3.client("cloudwatch") raised "You must specify a
+        region." on rehearsal-2026-09-23-2, so the metric never emitted. The
+        client must be built with krepis's resolved region (DEFAULT_REGION
+        floor here, with the session/IMDS fallbacks forced to miss)."""
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        from krepis import aws_region
+
+        monkeypatch.setattr(aws_region, "_from_botocore_session", lambda: None)
+        monkeypatch.setattr(aws_region, "_from_imds", lambda: None)
+
+        built = []
+        cw = self._FakeCloudWatch()
+
+        def _client(service, **kw):
+            built.append((service, kw))
+            return cw
+
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", _client)
+        sos._emit_metrics(None, {"pipeline": PIPELINE, "run_mode": "weekly", "defects": [{}]})
+
+        assert built == [("cloudwatch", {"region_name": aws_region.DEFAULT_REGION})]
+        assert len(cw.calls) == 1
+
+    def test_no_injected_client_honours_aws_region(self, monkeypatch):
+        monkeypatch.setenv("AWS_REGION", "us-west-2")
+        built = []
+
+        def _client(service, **kw):
+            built.append((service, kw))
+            return self._FakeCloudWatch()
+
+        import boto3
+
+        monkeypatch.setattr(boto3, "client", _client)
+        sos._emit_metrics(None, {"pipeline": PIPELINE, "run_mode": "weekly", "defects": []})
+
+        assert built == [("cloudwatch", {"region_name": "us-west-2"})]
+
+    def test_real_boto3_client_does_not_raise_no_region_error(self, monkeypatch):
+        """End-to-end on the real botocore client constructor, which is where
+        NoRegionError is raised. Construction makes no network call; the
+        put_metric_data call is stubbed on the built client."""
+        monkeypatch.delenv("AWS_REGION", raising=False)
+        monkeypatch.delenv("AWS_DEFAULT_REGION", raising=False)
+        from krepis import aws_region
+
+        monkeypatch.setattr(aws_region, "_from_botocore_session", lambda: None)
+        monkeypatch.setattr(aws_region, "_from_imds", lambda: None)
+
+        import boto3
+
+        real_client = boto3.client
+        built = []
+
+        def _client(service, **kw):
+            client = real_client(service, **kw)
+            built.append(client)
+            client.put_metric_data = lambda **_: None
+            return client
+
+        monkeypatch.setattr(boto3, "client", _client)
+        sos._emit_metrics(None, {"pipeline": PIPELINE, "run_mode": "weekly", "defects": []})
+
+        assert built[0].meta.region_name == aws_region.DEFAULT_REGION
+
     def test_emit_metrics_default_off_does_not_touch_boto3(self, registry_file, monkeypatch):
         """sweep()'s default must not construct a real boto3 CloudWatch
         client — every other test in this file relies on that, and a
@@ -688,13 +767,15 @@ class TestEmitMetrics:
 
 class TestSweepRunModeIntegration:
     """End-to-end: run_mode threaded from sweep()'s explicit argument through
-    to the published document and the alert-suppression decision."""
+    to the published document and the alert-routing decision."""
 
-    def test_dry_run_mode_downgrades_defects_and_suppresses_the_alert(
+    def test_dry_run_mode_downgrades_defects_and_sends_no_alert(
         self, registry_file, monkeypatch
     ):
         alerted = []
-        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        monkeypatch.setattr(
+            sos, "_alert", lambda doc, **kw: alerted.append((doc, kw))
+        )
         s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
         doc = sos.sweep(
             run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
@@ -707,7 +788,9 @@ class TestSweepRunModeIntegration:
 
     def test_weekly_run_mode_still_alerts_on_a_real_defect(self, registry_file, monkeypatch):
         alerted = []
-        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        monkeypatch.setattr(
+            sos, "_alert", lambda doc, **kw: alerted.append((doc, kw))
+        )
         s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
         doc = sos.sweep(
             run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
@@ -715,17 +798,28 @@ class TestSweepRunModeIntegration:
         )
         assert doc["status"] == "stage_output_missing"
         assert len(alerted) == 1
+        assert alerted[0][1] == {}
 
-    def test_exercise_run_mode_publishes_but_does_not_alert(self, registry_file, monkeypatch):
+    @pytest.mark.parametrize("run_mode", ["exercise", "watch-rerun"])
+    def test_non_weekly_run_mode_is_published_tracked_only_not_suppressed(
+        self, registry_file, monkeypatch, run_mode
+    ):
+        """alpha-engine-config-I11508 part 4: rehearsal-2026-09-23-2
+        (pipeline_role watch-rerun) found 5 missing artifacts and the alert
+        was suppressed, so nothing surfaced them. A non-weekly run must still
+        publish, on the tracked-only path."""
         alerted = []
-        monkeypatch.setattr(sos, "_alert", lambda doc: alerted.append(doc))
+        monkeypatch.setattr(
+            sos, "_alert", lambda doc, **kw: alerted.append((doc, kw))
+        )
         s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
         doc = sos.sweep(
             run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
-            registry_path=registry_file, s3_client=s3, run_mode="exercise",
+            registry_path=registry_file, s3_client=s3, run_mode=run_mode,
         )
         assert doc["status"] == "stage_output_missing"
-        assert alerted == []
+        assert len(alerted) == 1
+        assert alerted[0][1] == {"tracked_only": True}
 
 
 class TestEnteredStages:
@@ -1067,7 +1161,7 @@ class TestSweep:
 
 class TestMain:
     def _run(self, monkeypatch, argv, s3):
-        monkeypatch.setattr(sos, "_alert", lambda doc: None)
+        monkeypatch.setattr(sos, "_alert", lambda doc, **kw: None)
         import boto3
 
         monkeypatch.setattr(boto3, "client", lambda *a, **k: s3)
@@ -1423,6 +1517,77 @@ class TestAlertBody:
             "unmeasured": [{"stage": "S", "artifact_id": "a", "verdict": sos.UNMEASURED}],
         })
         assert published["kw"]["severity"] == "warn"
+
+    def _capture(self, monkeypatch):
+        published = {}
+
+        class _Result:
+            any_ok = True
+
+        class _Alerts:
+            @staticmethod
+            def publish(message, **kw):
+                published["message"] = message
+                published["kw"] = kw
+                return _Result()
+
+        import sys as _sys
+
+        monkeypatch.setitem(_sys.modules, "nousergon_lib", type("M", (), {"alerts": _Alerts}))
+        monkeypatch.setitem(_sys.modules, "nousergon_lib.alerts", _Alerts)
+        return published
+
+    def _critical_doc(self, run_mode):
+        return {
+            "pipeline": PIPELINE, "run_date": RUN_DATE, "enforce": False,
+            "run_mode": run_mode, "entered_stages_known": True,
+            "defects": [{"stage": "RAGIngestion", "artifact_id": "rag_manifest_dated",
+                         "verdict": sos.MISSING, "severity": "critical"}],
+            "unmeasured": [],
+        }
+
+    def test_tracked_only_publishes_at_the_tracked_severity_even_when_critical(
+        self, monkeypatch
+    ):
+        """alpha-engine-config-I11508 part 4: a rehearsal's critical finding
+        is recorded, not paged — and says so in its body."""
+        published = self._capture(monkeypatch)
+        sos._alert(self._critical_doc("watch-rerun"), tracked_only=True)
+        assert published["kw"]["severity"] == sos.TRACKED_ONLY_SEVERITY
+        assert "TRACKED-ONLY" in published["message"]
+        assert "run_mode=watch-rerun" in published["message"]
+        assert "rag_manifest_dated" in published["message"]
+
+    def test_tracked_only_dedup_key_cannot_swallow_the_real_runs_page(
+        self, monkeypatch
+    ):
+        published = self._capture(monkeypatch)
+        sos._alert(self._critical_doc("weekly"))
+        weekly = dict(published["kw"])
+        sos._alert(self._critical_doc("watch-rerun"), tracked_only=True)
+        rehearsal = published["kw"]
+
+        assert weekly["severity"] == "error"
+        # The weekly key is unchanged from before I11508.
+        assert weekly["dedup_key"] == f"stage_output_sweep_{PIPELINE}_{RUN_DATE}"
+        assert rehearsal["dedup_key"] == f"stage_output_sweep_{PIPELINE}_{RUN_DATE}_watch-rerun"
+
+    def test_tracked_only_severity_resolves_to_the_tracked_only_tier(self):
+        """Pins the coupling the tracked-only path relies on: the source's
+        registry row is `dynamic`, and krepis resolves our severity on a
+        dynamic row to `tracked-only` (muted topic + bus, no Telegram). If
+        either half moves, a rehearsal would page again, or go silent."""
+        import yaml
+        from krepis import alert_tiers
+
+        playbooks = Path(__file__).resolve().parents[1] / "infrastructure" / "overseer" / "playbooks.yaml"
+        rows = yaml.safe_load(playbooks.read_text())["alert_classes"]
+        row = next(r for r in rows if r["source"] == "alpha-engine-data/validators/stage_output_sweep.py")
+        assert row["tier"] == alert_tiers.TIER_DYNAMIC
+        assert (
+            alert_tiers._DYNAMIC_LADDER[sos.TRACKED_ONLY_SEVERITY]
+            == alert_tiers.TIER_TRACKED_ONLY
+        )
 
 
 # ---------------------------------------------------------------------------
