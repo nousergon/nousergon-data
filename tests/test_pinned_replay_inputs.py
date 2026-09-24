@@ -22,6 +22,7 @@ import json
 
 import pytest
 
+import collectors.metron_market_data as mmd
 from shadow.pinned_inputs import Pin, pin_for
 
 KEY = "metron/holdings_universe.json"
@@ -166,23 +167,10 @@ def test_the_input_record_never_reads_an_inferred_pin_as_declared():
 
 # ---------------------------------------------------------------------------
 # The reader that consumes the pin
-#
-# `collectors.metron_market_data` is imported INSIDE each test rather than at
-# module scope. `infrastructure/lambdas/data-spot-dispatcher/test_handler.py`
-# stubs `nousergon_lib` into `sys.modules` to keep boto3 and arcticdb out of
-# the Lambda's test process and never restores it, so a collector imported
-# after it in the SAME process raises `ImportError: cannot import name
-# 'run_manifest'`. CI runs the two in separate jobs (`tests/` and the
-# glob-derived per-lambda run) so the combination does not arise there, and a
-# function-scope import keeps the blast radius to these three tests rather than
-# the whole file if it ever does. The stub-without-restore is a defect in that
-# file, not in these tests — filed as alpha-engine-config-I11222.
 # ---------------------------------------------------------------------------
 
 
 def test_the_universe_reader_requests_the_pinned_version(monkeypatch):
-    import collectors.metron_market_data as mmd
-
     monkeypatch.setattr(
         "shadow.pinned_inputs.pin_for",
         lambda *a, **kw: Pin(KEY, "v-0917-late", "inferred", "because"),
@@ -195,8 +183,6 @@ def test_the_universe_reader_requests_the_pinned_version(monkeypatch):
 
 def test_the_universe_reader_omits_versionid_when_unpinned(monkeypatch):
     """Production must issue an ordinary current-object GET."""
-    import collectors.metron_market_data as mmd
-
     monkeypatch.setattr(
         "shadow.pinned_inputs.pin_for", lambda *a, **kw: Pin(KEY, None, "unpinned", "no replay")
     )
@@ -208,8 +194,6 @@ def test_the_universe_reader_omits_versionid_when_unpinned(monkeypatch):
 
 def test_a_pinning_failure_never_breaks_the_production_read(monkeypatch):
     """The pin is an enhancement; losing it must not lose the universe."""
-    import collectors.metron_market_data as mmd
-
     def _boom(*a, **kw):
         raise RuntimeError("no shadow package here")
 
