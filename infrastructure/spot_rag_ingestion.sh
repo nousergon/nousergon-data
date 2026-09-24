@@ -84,7 +84,7 @@ export PYTHON_BIN
 ENV_EOF
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  RAGIngestion — $(date +%Y-%m-%d)"
+echo "  RAGIngestion — run_date $(stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 echo "  Instance types: $INSTANCE_TYPES | Branch: $BRANCH"
 echo "  Preflight-only: $PREFLIGHT_ONLY | Attempt: $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS"

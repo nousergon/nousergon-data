@@ -108,6 +108,12 @@ def test_resume_targets_exist_and_reset_their_poll_counter(states):
         st = states[target]
         if st["Type"] != "Task":
             continue  # bootstrap-phase resume lands on a Choice by design
+        if target == "SubstrateHealthGate":
+            # alpha-engine-config-I11268: the bootstrap-phase resume re-enters
+            # through the substrate gate (a one-shot Lambda probe, not a polled
+            # stage) so the replacement box is gated before CheckShellRun.
+            assert st["Next"] == "CheckSubstrateHealthGate"
+            continue
         assert st["Next"].startswith("Init") and st["Next"].endswith("PollCount"), (
             f"{target} no longer leads with its Init*PollCount state; resuming "
             f"there would inherit an exhausted poll counter"
@@ -214,7 +220,9 @@ def test_bootstrap_success_after_a_relaunch_resumes_instead_of_restarting(states
     assert len(success) == 1, "exactly one Success edge, or the walkers ambiguate"
     router = states[success[0]["Next"]]
     assert router["Type"] == "Choice"
-    assert router["Default"] == "CheckShellRun", "first boot still runs stage 1"
+    # alpha-engine-config-I11268: via the substrate gate, whose HEALTHY edge
+    # lands on CheckShellRun.
+    assert router["Default"] == "SubstrateHealthGate", "first boot still runs stage 1"
     (relaunched,) = router["Choices"]
     assert relaunched["Variable"] == "$.substrate_relaunch_attempts"
     assert relaunched["NumericGreaterThan"] == 0

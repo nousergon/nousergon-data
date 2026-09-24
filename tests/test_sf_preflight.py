@@ -694,66 +694,77 @@ def patched_sibling(monkeypatch, tmp_path):
 # ── check_price_cards_cover_all_models ─────────────────────────────────────────
 
 
-def test_price_cards_check_passes_when_all_models_have_cards(patched_sibling):
-    """Happy path: every runtime model (after snapshot normalization) has
-    a card. PR #77's normalization is honored."""
-    patched_sibling(
-        pricing_yaml="cards:\n"
-                     "  - {model_name: claude-haiku-4-5, effective_from: 2026-01-01,"
-                     " input_per_1m: 1.0, output_per_1m: 5.0,"
-                     " cache_read_per_1m: 0.1, cache_create_per_1m: 1.25}\n"
-                     "  - {model_name: claude-sonnet-4-6, effective_from: 2026-01-01,"
-                     " input_per_1m: 3.0, output_per_1m: 15.0,"
-                     " cache_read_per_1m: 0.3, cache_create_per_1m: 3.75}\n",
-        universe_yaml="sector_teams:\n"
-                      "  per_stock_model: claude-haiku-4-5-20251001\n"  # snapshot suffix
-                      "  strategic_model: claude-sonnet-4-6\n",
-        research_graph_src='_FALLBACK_AGENT_MODEL_NAMES = {"sector_team": "claude-haiku-4-5"}\n',
-    )
+class _FakeRegistry:
+    """Just the surface ``krepis.cost.live_group_primaries`` reads."""
+
+    def __init__(self, groups, models):
+        self.groups = groups
+        self.models = models
+
+    def live_group_ids(self, group):
+        return list(self.groups.get(group, []))
+
+
+@pytest.fixture
+def price_rule_registry(monkeypatch, tmp_path):
+    """Lay out an alpha-engine-config sibling carrying a registry file, and
+    make krepis' loader return the given fake for it."""
+    def _build(registry):
+        config = tmp_path / "alpha-engine-config"
+        (config / "private-docs").mkdir(parents=True)
+        (config / "private-docs" / "LLM_MODEL_REGISTRY.yaml").write_text("{}\n")
+        monkeypatch.setattr(
+            sfp, "_sibling_repo",
+            lambda name: config if name == "alpha-engine-config" else None,
+        )
+        import krepis.model_registry as _mr
+        monkeypatch.setattr(_mr, "load_registry", lambda path=None: registry)
+    return _build
+
+
+def test_price_cards_check_passes_when_every_live_primary_is_priced(price_rule_registry):
+    """Reads krepis' own packaged table: ``claude-haiku-4-5`` has a card."""
+    price_rule_registry(_FakeRegistry(
+        groups={"low": ["haiku"]}, models={"haiku": {"model": "claude-haiku-4-5"}},
+    ))
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "ok", result.message
+
+
+def test_price_cards_check_fails_on_an_unpriced_live_primary(price_rule_registry):
+    """The alpha-engine-config-I11100 shape: a live primary with no card."""
+    price_rule_registry(_FakeRegistry(
+        groups={"ultra": ["new-model"]},
+        models={"new-model": {"model": "deliberately-unpriced-model-xyz"}},
+    ))
+    result = sfp.check_price_cards_cover_all_models(_ctx())
+    assert result.status == "fail"
+    assert "deliberately-unpriced-model-xyz" in str(result.details)
+
+
+def test_price_cards_check_skips_chaos_probe_primaries(price_rule_registry):
+    """A chaos-probe group never bills, so it is never graded (the shared
+    rule's own exclusion, not a copy of it)."""
+    price_rule_registry(_FakeRegistry(
+        groups={"chaos": ["broken"]},
+        models={"broken": {"model": "unpriced-on-purpose", "chaos_probe": True}},
+    ))
     result = sfp.check_price_cards_cover_all_models(_ctx())
     assert result.status == "ok"
 
 
-def test_price_cards_check_fails_when_runtime_model_missing(patched_sibling):
-    """The 2026-05-02 PR #77 scenario exactly: per_stock_model is
-    'claude-haiku-4-5-20251001' (snapshot ID) but no card for the
-    family 'claude-haiku-4-5' exists. SHOULD be caught here."""
-    patched_sibling(
-        pricing_yaml="cards:\n"
-                     "  - {model_name: claude-sonnet-4-6, effective_from: 2026-01-01,"
-                     " input_per_1m: 3.0, output_per_1m: 15.0,"
-                     " cache_read_per_1m: 0.3, cache_create_per_1m: 3.75}\n",
-        universe_yaml="sector_teams:\n"
-                      "  per_stock_model: claude-haiku-4-5-20251001\n",
-        research_graph_src="",  # no fallbacks
-    )
+def test_price_cards_check_fails_when_the_registry_file_is_missing(monkeypatch, tmp_path):
+    (tmp_path / "alpha-engine-config").mkdir()
+    monkeypatch.setattr(sfp, "_sibling_repo", lambda name: tmp_path / name)
     result = sfp.check_price_cards_cover_all_models(_ctx())
     assert result.status == "fail"
-    assert "haiku" in result.message.lower() or "no matching price card" in result.message.lower()
+    assert "LLM_MODEL_REGISTRY.yaml" in result.message
 
 
 def test_price_cards_check_warns_when_sibling_repo_absent(monkeypatch):
     monkeypatch.setattr(sfp, "_sibling_repo", lambda name: None)
     result = sfp.check_price_cards_cover_all_models(_ctx())
     assert result.status == "warn"
-
-
-def test_price_cards_check_handles_fallback_models_in_research_graph(patched_sibling):
-    """Models in _FALLBACK_AGENT_MODEL_NAMES must also be checked — the
-    fallback path runs when track_llm_cost wiring is incomplete and would
-    crash if its model isn't in the price table."""
-    patched_sibling(
-        pricing_yaml="cards: []\n",  # empty cards
-        universe_yaml="",
-        research_graph_src='_FALLBACK_AGENT_MODEL_NAMES = {\n'
-                          '    "sector_team": "claude-haiku-4-5",\n'
-                          '    "ic_cio": "claude-sonnet-4-6",\n'
-                          '}\n',
-    )
-    result = sfp.check_price_cards_cover_all_models(_ctx())
-    assert result.status == "fail"
-    # Both fallback models should be flagged as missing.
-    assert "sector_team" in str(result.details) and "ic_cio" in str(result.details)
 
 
 # ── check_recursion_budget_for_response_format ────────────────────────────────

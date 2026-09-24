@@ -78,4 +78,10 @@ NOT_DISPATCHABLE_MODULES: dict[str, str] = {
         "for a report nobody just wrote"
     ),
     "dispatch": "this declaration itself",
+    "retention": (
+        "the date rule and guarded delete behind `python -m shadow prune` "
+        "(alpha-engine-config-I11447); deleting libraries is destructive, so it "
+        "runs by hand on the data-spot box, dry run by default, and no dispatcher "
+        "workload may reach `--apply`"
+    ),
 }
