@@ -104,6 +104,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # (alpha-engine-config-I11272) — re-evaluate for a REGISTERED row once
     # that lands and a scheduled run first writes the key.
     "data_gate/producers/cost_monthly.py": 1,
+    # alpha-engine-config-I11312 — the on-spot FULL-profile preflight pass's
+    # observe-mode verdict, one object per execution under
+    # health/weekly_preflight_on_spot/<run_date>/<execution>.json. GRANDFATHERED
+    # in alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml (variable
+    # cardinality); re-evaluate for a REGISTERED row at promotion to halting.
+    "sf_preflight_on_spot.py": 1,
     # alpha-engine-config-I10780 (data-collector plan P-13) — the EOD-spine
     # cardinality guard's single daily reading,
     # s3://alpha-engine-research/data_collection/metrics/eod_completeness/{trading_day}.json
