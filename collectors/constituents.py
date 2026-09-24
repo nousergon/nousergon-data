@@ -759,8 +759,18 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
         normalised = {t: w / raw_sum for t, w in batch_weights.items()}
         tickers.extend(batch)
         members_by_index[index_name] = list(dict.fromkeys(batch))
-        weight_map.update(normalised)
-        index_of.update({t: index_name for t in batch})
+        # A name both funds hold keeps the attribution of the FIRST fund that
+        # lists it, and SPY is fetched first (alpha-engine-config-I11525).
+        # Before this, MDY's `update` overwrote SPY's weight and index for
+        # every dual-held name, so on the 2026-09-18 rebalance ILMN and P
+        # (joining the S&P 500 at the 2026-09-21 open) were published with
+        # their S&P 400 weight under `index_of = "S&P 400"`. First-wins is the
+        # same rule the combined `tickers` dedupe already follows, so a name's
+        # position in the list, its index and its weight agree.
+        for t, w in normalised.items():
+            if t not in index_of:
+                weight_map[t] = w
+                index_of[t] = index_name
         raw_sum_by_index[index_name] = raw_sum
         logger.info(
             "Fetched %d tickers from %s (SSGA %s holdings), weights raw sum "

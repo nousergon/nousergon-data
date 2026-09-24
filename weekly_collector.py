@@ -188,17 +188,17 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
             "or is removed from features/registry.py::CATALOG + SCHEMA.md §3"
         ),
     },
-    # alpha-engine-config-I11470: the PIT membership map was published, and
-    # either the reference disagrees with it on a change nothing explains or a
-    # recent roster snapshot could not be read. The collector's own `detail`
-    # names each one.
+    # alpha-engine-config-I11470: the PIT membership map was published, and the
+    # reference disagrees with it on a change nothing explains, a recent roster
+    # snapshot could not be read, or (I11525) the map does not reproduce a
+    # roster snapshot. The collector's own `detail` names each one.
     "historical_constituents": {
         "tracked_issue": "alpha-engine-config-I11470",
         "clears_when": (
             "market_data/historical_constituents.json :: quality reports "
-            "n_reference_disagreements == 0 and n_recent_skipped_snapshots == 0 "
-            "(explain a disagreement in collectors/data/sp500_known_retickers.json "
-            "only with evidence; a skipped snapshot needs a readable S&P 500 slice)"
+            "n_reference_disagreements == 0, n_recent_skipped_snapshots == 0 and "
+            "n_replay_mismatches == 0 (explain a disagreement in collectors/data/sp500_known_retickers.json "
+            "only with evidence; a skipped snapshot needs a readable roster)"
         ),
     },
 }
@@ -1654,8 +1654,8 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             logger.warning("S3 constituents load failed — will fall back to Wikipedia: %s", exc)
 
     # ── 1b. Historical (point-in-time) constituents ──────────────────────────
-    # Replays the S&P 500 "Selected changes" table backward from today's roster
-    # to a {date: [tickers]} PIT membership map at
+    # Replays S&P 500+400 index changes backward from today's roster
+    # (alpha-engine-config-I11525) to a {date: [tickers]} PIT membership map at
     # market_data/historical_constituents.json — the survivorship-free universe
     # substrate the backtester consumes (config#657, G12). Reuses `tickers` (the
     # roster already collected/loaded above) so the two collectors' rosters stay
