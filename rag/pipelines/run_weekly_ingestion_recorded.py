@@ -66,12 +66,14 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import run_units
+from rag.pipelines import source_yield
 from validators import expectations
 
 logger = logging.getLogger(__name__)
@@ -99,17 +101,57 @@ OUTPUT_PREFIXES: tuple[str, ...] = (
 )
 
 
-def _run_ingestion_script(dry_run: bool) -> int:
+def _run_ingestion_script(dry_run: bool, yield_dir: str | None = None) -> int:
     """Run the existing bash pipeline unchanged. Returns its exit code.
 
     A subprocess call, not a reimplementation: everything about HOW the nine
-    steps run stays exactly what `run_weekly_ingestion.sh` already does.
+    steps run stays exactly what `run_weekly_ingestion.sh` already does. The
+    one thing passed IN is where the script's per-source yields go
+    (``$RAG_SOURCE_YIELD_DIR``), so this process can read the verdict back.
     """
     argv = ["bash", str(SCRIPT_PATH)]
     if dry_run:
         argv.append("--dry-run")
-    proc = subprocess.run(argv, cwd=str(REPO_ROOT))  # noqa: S603 -- fixed argv, no shell
+    env = None
+    if yield_dir is not None:
+        env = {**os.environ, source_yield.YIELD_DIR_ENV: yield_dir}
+    proc = subprocess.run(argv, cwd=str(REPO_ROOT), env=env)  # noqa: S603 -- fixed argv, no shell
     return proc.returncode
+
+
+#: The guard name the source-yield verdict is recorded under
+#: (alpha-engine-config-I11472).
+SOURCE_YIELD_GUARD = "rag_source_yield"
+
+
+def _record_source_yield(ctx: run_units.run_manifest.UnitRun, yield_dir: str) -> None:
+    """Record the script's source-yield verdict as a guard on the manifest.
+
+    Recorded on every run, clean or not — a guard that records only when it
+    fires is indistinguishable from one that stopped running. OBSERVE mode:
+    a degraded source is reported, never a failed run (``source_yield``
+    module docstring).
+    """
+    verdict = source_yield.load_verdict(yield_dir)
+    if verdict is None:
+        ctx.record_guard(
+            SOURCE_YIELD_GUARD,
+            mode="observe",
+            verdict="unmeasurable",
+            detail=f"no source-yield verdict under {yield_dir}",
+        )
+        return
+    degraded = verdict.get("degraded_sources") or []
+    ctx.record_guard(
+        SOURCE_YIELD_GUARD,
+        mode="observe",
+        verdict=verdict.get("status", "unmeasurable"),
+        detail=(
+            "; ".join(f"{d['source']}: {d['reason']}" for d in degraded)
+            or "every source returned documents or declared why not"
+        ),
+        value=float(len(degraded)),
+    )
 
 
 def _utcnow() -> datetime:
@@ -200,8 +242,10 @@ def _record_outputs(ctx: run_units.run_manifest.UnitRun, s3: Any, since: datetim
 
 def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool) -> dict[str, Any]:
     since = _utcnow()
-    exit_code = _run_ingestion_script(dry_run)
+    yield_dir = str(source_yield.yield_dir(None) / f"d16-{since.strftime('%Y%m%dT%H%M%SZ')}")
+    exit_code = _run_ingestion_script(dry_run, yield_dir)
     published = 0 if dry_run else _record_outputs(ctx, _s3_client(), since)
+    _record_source_yield(ctx, yield_dir)
 
     if published:
         ctx.record_guard(

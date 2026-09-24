@@ -67,6 +67,7 @@ _CHUNK_OVERLAP = 50
 # already fetched it this run/day.
 
 from rag.pipelines._cik_lookup import load_cik_map  # noqa: E402
+from rag.pipelines.source_yield import SourceYield, write_yield  # noqa: E402
 
 _CIK_CACHE: dict[str, str] = {}
 
@@ -186,12 +187,16 @@ def ingest_ticker(
     sector: str | None = None,
     lookback_days: int = 365,
     dry_run: bool = False,
+    stats: SourceYield | None = None,
 ) -> int:
     """Ingest 8-K filings for a single ticker. Returns count ingested."""
     from nousergon_lib.rag.embeddings import embed_texts
     from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
+    if stats is None:
+        stats = SourceYield(source="8k_events")
     filings = _search_8k_filings(ticker, lookback_days)
+    stats.discovered += len(filings)
     ingested = 0
 
     for filing in filings:
@@ -202,6 +207,7 @@ def ingest_ticker(
             continue
 
         if document_exists(ticker, "8-K", filed_date, "sec_edgar"):
+            stats.already_held += 1
             continue
 
         if dry_run:
@@ -211,6 +217,7 @@ def ingest_ticker(
 
         text = _download_and_extract(filing["url"])
         if not text or len(text) < 200:
+            stats.fail("no_text")
             continue
 
         # Detect material items for section labeling
@@ -245,6 +252,7 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
+            stats.ingested += 1
 
     return ingested
 
@@ -271,12 +279,14 @@ def main():
         parser.error("Provide --tickers or --from-signals")
         return
 
+    stats = SourceYield(source="8k_events", scope=len(tickers))
     total = 0
     for ticker in tickers:
-        n = ingest_ticker(ticker, lookback_days=args.lookback_days, dry_run=args.dry_run)
+        n = ingest_ticker(ticker, lookback_days=args.lookback_days, dry_run=args.dry_run, stats=stats)
         total += n
 
     logger.info("Total: %d 8-K filings ingested for %d tickers", total, len(tickers))
+    write_yield(stats)
 
 
 if __name__ == "__main__":

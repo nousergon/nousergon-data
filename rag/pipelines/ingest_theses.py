@@ -24,7 +24,13 @@ import logging
 import sqlite3
 from datetime import date
 
+from rag.pipelines.source_yield import SourceYield, write_yield
+
 logger = logging.getLogger(__name__)
+
+#: ``stance_source`` of the quant-only signals producer. Its entries carry
+#: ``thesis_summary = null`` by design (config#2938 follow-on).
+QUANT_ENVELOPE_STANCE_SOURCE = "quant_envelope_producer"
 
 _CHUNK_SIZE = 400
 _CHUNK_OVERLAP = 50
@@ -263,6 +269,17 @@ def ingest_signals_theses(
 
     s3 = boto3.client("s3")
     results = {"signals_theses": 0, "skipped_dedup": 0, "chunks_total": 0}
+    # Source-yield accounting (alpha-engine-config-I11472): how many entries
+    # were read, how many carried a narrative, and how many carried none BY
+    # DESIGN because a quant-only producer wrote them.
+    census = {
+        "signals_files": 0,
+        "signals_unreadable": 0,
+        "entries": 0,
+        "with_thesis": 0,
+        "quant_envelope_no_thesis": 0,
+        "other_no_thesis": 0,
+    }
 
     # List signal dates. PAGINATED (config-I5703): this walk needs a RANGE of
     # dates, not just the newest, so a `latest.json` pointer does not serve it
@@ -293,8 +310,11 @@ def ingest_signals_theses(
         try:
             obj = s3.get_object(Bucket=bucket, Key=f"{prefix}signals.json")
             data = json.loads(obj["Body"].read())
-        except Exception:
+        except Exception as e:
+            logger.warning("Signals thesis ingestion: could not read %ssignals.json: %s", prefix, e)
+            census["signals_unreadable"] += 1
             continue
+        census["signals_files"] += 1
 
         universe = data.get("universe", [])
         market_regime = data.get("market_regime", "")
@@ -306,8 +326,14 @@ def ingest_signals_theses(
             # thesis normalises to "" and the <50-char guard skips them cleanly
             # instead of raising `len(None)` (config#2938 follow-on, 2026-07-18).
             thesis = _field(entry, "thesis_summary", "")
+            census["entries"] += 1
             if not ticker or len(thesis) < 50:
+                if _field(entry, "stance_source", "") == QUANT_ENVELOPE_STANCE_SOURCE:
+                    census["quant_envelope_no_thesis"] += 1
+                else:
+                    census["other_no_thesis"] += 1
                 continue
+            census["with_thesis"] += 1
 
             doc_type = "thesis_signal"
             if document_exists(ticker, doc_type, filed_date, "alpha_engine"):
@@ -358,7 +384,46 @@ def ingest_signals_theses(
         "Signals thesis ingestion: %d theses, %d chunks, %d dedup skipped",
         results["signals_theses"], results["chunks_total"], results["skipped_dedup"],
     )
+    logger.info("Signals thesis census: %s", census)
+    results["census"] = census
     return results
+
+
+def signals_theses_yield(results: dict) -> SourceYield:
+    """The source-yield record for one ``ingest_signals_theses`` run.
+
+    Zero theses is DECLARED expected — not a gap — only when every entry read
+    was written by the quant-envelope producer, which carries
+    ``thesis_summary = null`` by design: there is no LLM narrative in the
+    decision set to embed. Any entry from another producer that arrives with
+    no narrative, or a window with no readable ``signals.json`` at all, is
+    NOT covered by that declaration and reads as the gap it is.
+    """
+    census = results.get("census") or {}
+    y = SourceYield(
+        source="thesis_history",
+        scope=int(census.get("entries", 0)),
+        discovered=int(census.get("with_thesis", 0)),
+        ingested=int(results.get("signals_theses", 0)),
+        already_held=int(results.get("skipped_dedup", 0)),
+        failures={
+            "signals_unreadable": int(census.get("signals_unreadable", 0)),
+            "no_thesis_non_quant": int(census.get("other_no_thesis", 0)),
+        },
+        detail=f"{census.get('signals_files', 0)} signals.json file(s) in window",
+    )
+    quant_only = int(census.get("quant_envelope_no_thesis", 0))
+    if (
+        y.discovered == 0
+        and y.scope > 0
+        and quant_only == y.scope
+        and not census.get("signals_unreadable")
+    ):
+        y.expected_empty = (
+            f"all {quant_only} signal entries in window are {QUANT_ENVELOPE_STANCE_SOURCE} "
+            "output, which carries no thesis_summary by design"
+        )
+    return y
 
 
 def main():
@@ -374,6 +439,7 @@ def main():
     if args.signals:
         results = ingest_signals_theses(since=args.since, dry_run=args.dry_run)
         print(json.dumps(results, indent=2))
+        write_yield(signals_theses_yield(results))
     elif args.db_path:
         results = ingest_theses(args.db_path, since=args.since, dry_run=args.dry_run)
         print(json.dumps(results, indent=2))

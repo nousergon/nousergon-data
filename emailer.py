@@ -51,7 +51,9 @@ def _build_email(step_name: str, results: dict, date_str: str) -> tuple[str, str
         # `.debug-swallow-allowlist.yaml`.
         pass
 
-    status_icon = "OK" if status == "OK" else "PARTIAL" if status == "PARTIAL" else "FAILED"
+    # DEGRADED (alpha-engine-config-I11472): the run completed but a source
+    # returned nothing — distinct from both OK and FAILED.
+    status_icon = status if status in ("OK", "PARTIAL", "DEGRADED") else "FAILED"
     subject = f"Alpha Engine {step_name} | {date_str} | {status_icon}"
 
     # Build collector rows
@@ -59,7 +61,7 @@ def _build_email(step_name: str, results: dict, date_str: str) -> tuple[str, str
     collector_rows_plain = ""
     for name, info in collectors.items():
         c_status = info.get("status", "unknown")
-        c_color = "#2e7d32" if c_status in ("ok", "ok_dry_run") else "#c62828"
+        c_color = "#2e7d32" if c_status in ("ok", "ok_dry_run", "expected_empty") else "#c62828"
         error = info.get("error", "")
 
         # Extract useful metrics from collector results
