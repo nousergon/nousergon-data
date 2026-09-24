@@ -56,12 +56,14 @@ def _context(key: str, v1_verdict: str | None = "provisional", shadow_verdict: s
     )
 
 
-def _closes_frame(rows: list[tuple[str, float, str]]) -> bytes:
+def _closes_frame(rows: list[tuple]) -> bytes:
+    """``(ticker, Close, xsource_provenance[, source])`` rows; ``source`` defaults to polygon."""
     frame = pd.DataFrame(
         {
             "ticker": [r[0] for r in rows],
             "Close": [r[1] for r in rows],
             "xsource_provenance": [r[2] for r in rows],
+            "source": [r[3] if len(r) > 3 else "polygon" for r in rows],
         }
     )
     buffer = io.BytesIO()
@@ -116,12 +118,55 @@ def test_a_shadow_that_was_also_provisional_proves_nothing():
 
 
 def test_an_identity_breach_beside_the_numeric_ones_keeps_the_row_strict():
-    """The measured 2026-09-22 shape: `xsource_provenance` text differs too."""
-    shadow = [("CPRI", 15.190, "CPRI@2026-09-22: yfinance=15.1900"), ("SAM", 168.25, "y")]
+    """The measured 2026-09-22 shape: the winning vendor (`source`) differs too."""
+    shadow = [("CPRI", 15.190, "x", "yfinance"), ("SAM", 168.25, "y")]
     body = _compare_daily(_LIVE, shadow, _context(DAILY_D1))
     assert body["verdict"] == "mismatch"
     assert body["values"]["identity_breaches"] == 1
     assert any("identity" in reason for reason in body["v1_cause_refused"])
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11559: `xsource_provenance` is provenance, not data
+# ---------------------------------------------------------------------------
+
+
+def test_the_contract_declares_xsource_provenance_as_provenance():
+    contract = parity.resolve_contract(DAILY_D1)
+    assert contract is not None
+    assert "xsource_provenance" in contract.provenance_fields
+    # The price it embeds is graded in its own column, never excused with it.
+    assert "Close" not in contract.provenance_fields
+    assert "source" not in contract.provenance_fields
+
+
+def test_xsource_provenance_text_is_reported_as_provenance_not_breaches():
+    """The audit string embeds the provisional price (`A@2026-09-22:
+    yfinance=167.2700 single-source PROVISIONAL`), so it differs whenever the
+    price does. It is recorded under `provenance_diffs`; the price itself is
+    still a breach in `Close`, and a proven provisional v1 bar still explains
+    only that numeric breach."""
+    live = [("CPRI", 15.195, "CPRI@2026-09-22: polygon=15.1950 single-source PROVISIONAL (no cross-check)")]
+    shadow = [("CPRI", 15.190, "CPRI@2026-09-22: polygon=15.1900 single-source PROVISIONAL (no cross-check)")]
+    strict = _compare_daily(live, shadow, _context(DAILY_D1, v1_verdict=None))
+    assert strict["verdict"] == "mismatch"
+    assert strict["values"]["breaches"] == 1
+    assert strict["values"]["identity_breaches"] == 0
+    assert [e["column"] for e in strict["values"]["examples"]] == ["Close"]
+    assert strict["provenance_diffs"]["count"] == 1
+    assert strict["provenance_diffs"]["examples"][0]["column"] == "xsource_provenance"
+
+    proven = _compare_daily(live, shadow, _context(DAILY_D1))
+    assert proven["verdict"] == "v1_cause"
+    assert proven["v1_cause"]["evidence"][0]["kind"] == "v1_bar_provisional"
+
+
+def test_an_equal_price_with_different_audit_text_is_a_match():
+    live = [("CPRI", 15.19, "CPRI@2026-09-22: polygon=15.1900 single-source PROVISIONAL (no cross-check)")]
+    shadow = [("CPRI", 15.19, "CPRI@2026-09-22: polygon=15.1900 yfinance=15.1900 agree@0.00bps")]
+    body = _compare_daily(live, shadow, _context(DAILY_D1, v1_verdict=None))
+    assert body["verdict"] == "match"
+    assert body["provenance_diffs"]["count"] == 1
 
 
 def test_a_symbol_on_one_side_only_is_never_explained():
