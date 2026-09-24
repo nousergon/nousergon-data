@@ -48,6 +48,7 @@ from builders._price_cache_writeboth import (
     price_cache_write_prefixes,
 )
 from collectors import CaretTickerError
+from collectors.price_cache_holes import SessionHoleFiller
 from dates import (
     FutureBarError,
     as_trading_day,
@@ -937,6 +938,14 @@ def _refresh_stale(
 
     window_start, window_end_excl = history_window(trading_day, fetch_period)
     expected_last = _expected_last_bar(trading_day)
+    # alpha-engine-config-I11553: an answer can be current at both ends and
+    # still miss a session in the middle — see collectors/price_cache_holes.py.
+    hole_filler = SessionHoleFiller(
+        s3, bucket,
+        window_start=window_start, expected_last=expected_last,
+        cache_keys=lambda t: [f"{p}{t}.parquet" for p in price_cache_read_prefixes(s3_prefix)],
+        skip=_CARET_SYMBOLS,
+    )
     logger.info(
         "Refreshing %d stale tickers (window=%s: start=%s, end=%s exclusive, "
         "expected last bar %s) ...",
@@ -1142,6 +1151,12 @@ def _refresh_stale(
                             cached_last.isoformat() if cached_last else "absent",
                         )
 
+                    # ── Interior-session hole fill (alpha-engine-config-I11553) ──
+                    # Neither guard above reads the middle of the series; a
+                    # 2026-09-22 bar dropped by the vendor for 837 tickers
+                    # reached D21's close_history this way.
+                    new_df = hole_filler.fill(ticker, new_df)
+
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
                     # see builders/_price_cache_writeboth.py for soak contract)
@@ -1198,4 +1213,5 @@ def _refresh_stale(
              "misses retry next refresh; persistent misses are delisting/rename "
              "candidates for universe pruning",
     )
+    hole_filler.report(logger)
     return refreshed, failed_tickers, written
