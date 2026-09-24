@@ -28,9 +28,10 @@ import json
 import logging
 import os
 from collections import defaultdict
-from datetime import date
 
 import numpy as np
+
+from rag.pipelines._run_date import resolve_run_date
 
 logger = logging.getLogger(__name__)
 
@@ -419,6 +420,17 @@ def main():
         ),
     )
     parser.add_argument(
+        "--run-date",
+        type=str,
+        default=None,
+        help=(
+            "Cycle date (YYYY-MM-DD) the dated key rag/filing_changes/{date}.json "
+            "and the output's 'date' field carry. run_weekly_ingestion.sh passes the "
+            "Step Function's $.run_date. Default: today UTC, with a WARNING "
+            "(alpha-engine-config-I11514)."
+        ),
+    )
+    parser.add_argument(
         "--from-parquet",
         action="store_true",
         help=(
@@ -432,13 +444,15 @@ def main():
     )
     args = parser.parse_args()
 
+    run_date = resolve_run_date(args.run_date, producer="filing_change_detection")
+
     results = compute_filing_changes(
         sample_tickers=args.sample_tickers,
         from_parquet=args.from_parquet,
     )
 
     output = {
-        "date": date.today().isoformat(),
+        "date": run_date,
         "n_analyzed": len(results),
         "n_lazy": sum(1 for r in results if r.get("lazy_flag")),
         "n_risk_factor_changes": sum(1 for r in results if r.get("risk_factor_change_flag")),
@@ -453,7 +467,7 @@ def main():
     if args.output_s3:
         import boto3
         s3 = boto3.client("s3")
-        key = f"rag/filing_changes/{args.key_prefix}{date.today().isoformat()}.json"
+        key = f"rag/filing_changes/{args.key_prefix}{run_date}.json"
         s3.put_object(
             Bucket=args.bucket, Key=key,
             Body=json.dumps(output, indent=2).encode(),
@@ -473,7 +487,7 @@ def main():
 
     # Print summary
     print(f"\n{'='*60}")
-    print(f"Filing Change Detection — {date.today()}")
+    print(f"Filing Change Detection — {run_date}")
     print(f"{'='*60}")
     print(f"Tickers analyzed: {len(set(r['ticker'] for r in results))}")
     print(f"Filing pairs: {len(results)}")

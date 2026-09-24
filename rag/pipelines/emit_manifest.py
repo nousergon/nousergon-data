@@ -27,8 +27,13 @@ Access during interview screenshare.
 
 Usage::
 
-    python -m rag.pipelines.emit_manifest --output-s3
+    python -m rag.pipelines.emit_manifest --output-s3 --run-date 2026-09-18
     python -m rag.pipelines.emit_manifest --output-local /tmp/manifest.json
+
+``--run-date`` is the cycle date the dated key ``rag/manifest/{date}.json`` is
+filed under (alpha-engine-config-I11514) — ``run_weekly_ingestion.sh`` passes
+the Step Function's ``$.run_date``. Omitted, it falls back to the UTC
+wall-clock date with a WARNING. ``latest.json`` is unaffected.
 """
 
 from __future__ import annotations
@@ -36,10 +41,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from typing import Any
 
 from nousergon_lib.rag.db import execute_query
+
+from rag.pipelines._run_date import resolve_run_date
 
 logger = logging.getLogger(__name__)
 
@@ -199,7 +206,16 @@ def main():
     parser.add_argument("--output-s3", action="store_true", help="Write manifest to S3 (date + latest pointer)")
     parser.add_argument("--output-local", type=str, help="Write manifest to local file")
     parser.add_argument("--bucket", type=str, default="alpha-engine-research")
+    parser.add_argument(
+        "--run-date",
+        type=str,
+        default=None,
+        help="Cycle date (YYYY-MM-DD) the dated key rag/manifest/{date}.json is filed under. "
+        "Default: today UTC, with a WARNING (alpha-engine-config-I11514).",
+    )
     args = parser.parse_args()
+
+    run_date = resolve_run_date(args.run_date, producer="emit_manifest") if args.output_s3 else None
 
     manifest = build_manifest()
 
@@ -212,7 +228,7 @@ def main():
         import boto3
         s3 = boto3.client("s3")
         body = json.dumps(manifest, indent=2, default=str).encode()
-        dated_key = f"rag/manifest/{date.today().isoformat()}.json"
+        dated_key = f"rag/manifest/{run_date}.json"
         s3.put_object(
             Bucket=args.bucket, Key=dated_key,
             Body=body, ContentType="application/json",

@@ -381,7 +381,7 @@ if [ "$RUN_MODE" = "launch-only" ] && [ -z "$ID_ARTIFACT_KEY" ]; then
 fi
 
 echo "═══════════════════════════════════════════════════════════════"
-echo "  Weekly Data Spot Run (Phase1 + RAG) — $(date +%Y-%m-%d)"
+echo "  Weekly Data Spot Run (mode: $RUN_MODE) — run_date $(stage_run_date)"
 echo "═══════════════════════════════════════════════════════════════"
 # --instance-type collapses the rotation list to a single value (legacy
 # behavior). Otherwise the lib CLI rotates across INSTANCE_TYPES on

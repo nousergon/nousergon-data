@@ -32,6 +32,18 @@
 #   bash rag/pipelines/run_weekly_ingestion.sh                 # full run
 #   bash rag/pipelines/run_weekly_ingestion.sh --dry-run       # preview only
 #   bash rag/pipelines/run_weekly_ingestion.sh --preflight-only # step 0 only, exit 0
+#   bash rag/pipelines/run_weekly_ingestion.sh --run-date 2026-09-18  # cycle date from the SF
+#
+# --run-date YYYY-MM-DD (alpha-engine-config-I11514): the CYCLE date every
+# dated key this run writes is filed under — rag/manifest/{date}.json,
+# rag/filing_changes/{date}.json and health/rag_ingestion_progress/{date}.json.
+# The Saturday SF passes its $.run_date (the cycle's trading day, via
+# EXECUTION_RUN_DATE in infrastructure/spot_rag_ingestion.sh), which is the
+# same value the registry resolves `{date}` to. Keying by the box's wall clock
+# instead filed every run that crossed midnight UTC under the NEXT day, so the
+# stage-output sweep reported rag_manifest_dated missing on every weekly run.
+# Omitted (manual/local runs only), it falls back to `date -u` with a loud
+# WARNING line, never silently.
 #
 # --preflight-only (Friday shell-run dry path, ROADMAP "Friday shell-run —
 # per-module dry-path activation" #1): runs ONLY Step 0 (python -m
@@ -53,11 +65,20 @@ cd "$REPO_ROOT"
 # Parse flags
 DRY_RUN=""
 PREFLIGHT_ONLY=0
-for arg in "$@"; do
-    case "$arg" in
+RUN_DATE=""
+while [ $# -gt 0 ]; do
+    case "$1" in
         --dry-run) DRY_RUN="--dry-run" ;;
         --preflight-only) PREFLIGHT_ONLY=1 ;;
+        --run-date)
+            if [ $# -lt 2 ]; then
+                echo "ERROR: --run-date requires a YYYY-MM-DD value" >&2
+                exit 2
+            fi
+            RUN_DATE="$2"; shift ;;
+        --run-date=*) RUN_DATE="${1#--run-date=}" ;;
     esac
+    shift
 done
 
 # Activate venv
@@ -88,7 +109,20 @@ fi
 echo "Using PYTHON_BIN=$PYTHON_BIN ($($PYTHON_BIN --version 2>&1))"
 
 START_TIME="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-RUN_DATE="$(date -u '+%Y-%m-%d')"
+
+# Cycle date (alpha-engine-config-I11514) — see --run-date in the header. A
+# malformed value is a hard error: it would become an S3 key.
+if [ -n "$RUN_DATE" ]; then
+    if ! [[ "$RUN_DATE" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+        echo "ERROR: --run-date must be YYYY-MM-DD, got '$RUN_DATE'" >&2
+        exit 2
+    fi
+    echo "RUN_DATE=$RUN_DATE (cycle date passed by caller)"
+else
+    RUN_DATE="$(date -u '+%Y-%m-%d')"
+    echo "WARNING: no --run-date given — falling back to the box's UTC wall-clock date RUN_DATE=$RUN_DATE." >&2
+    echo "WARNING: dated keys (rag/manifest/{date}.json, rag/filing_changes/{date}.json, health/rag_ingestion_progress/{date}.json) may not match the SF cycle date if this run crosses midnight UTC (alpha-engine-config-I11514)." >&2
+fi
 
 # Per-source yield records for this run (rag/pipelines/source_yield.py,
 # alpha-engine-config-I11472). Each ingest step writes one file here; the
@@ -253,7 +287,7 @@ echo ""
 echo "==> Step 9/10: Filing change detection..."
 emit_progress 9 10 "filing_changes"
 if [ -z "$DRY_RUN" ]; then
-    $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3
+    $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3 --run-date "$RUN_DATE"
 else
     echo "  SKIPPED in dry-run mode"
 fi
@@ -263,7 +297,7 @@ echo ""
 echo "==> Step 10/10: Emit corpus manifest..."
 emit_progress 10 10 "manifest_emit"
 if [ -z "$DRY_RUN" ]; then
-    $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3
+    $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3 --run-date "$RUN_DATE"
 else
     echo "  SKIPPED in dry-run mode"
 fi
@@ -305,7 +339,7 @@ $PYTHON_BIN -c "
 from emailer import send_step_email
 from datetime import datetime, timezone
 from rag.pipelines.source_yield import email_collectors, load_verdict
-date_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+date_str = '$RUN_DATE'
 status, collectors = email_collectors({
     'sec_filings': {'status': 'ok'},
     '8k_events': {'status': 'ok'},
