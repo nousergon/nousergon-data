@@ -44,7 +44,12 @@ contract:
   schema: "contracts/arctic_universe.schema.json"
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "crucible:tests/test_arctic_universe_contract.py"
+    - repo: "crucible"
+      path: "tests/contracts/arctic_universe.schema.json"
+      pins: "body_schema"
+      producer: "contracts/arctic_universe.schema.json"
+      read_site: "crucible/data/sources.py::ArcticPriceSource.load_panel"
+      note: "driven by crucible tests/test_arctic_universe_contract.py"
   # P-07 (alpha-engine-config-I10873): the plan §8.1 exclusion's single input-contract
   # clause. Previous value was PROSE ("crucible: coverage floor +
   # UndeclaredUniverseError") — data_gate/evidence.py::_declared_schema_files skips
