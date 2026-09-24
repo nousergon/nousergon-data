@@ -203,12 +203,82 @@ def history_window(
     return start.date(), (d + pd.Timedelta(days=1)).date()
 
 
-def clip_to_trading_day(frame, trading_day: "date | datetime | str", *, label: str):
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11548 — ``end = D + 1`` does not reliably include D's
+# bar for a listing whose exchange sits EAST of New York.
+#
+# yfinance reads a date-only ``end`` as 00:00 in the LISTING's exchange
+# timezone (``yfinance.utils._parse_user_dt``), so for NOVN.SW / RMS.PA /
+# SU.PA ``end = D + 1`` becomes D 22:00 UTC (CEST), while for a US listing it
+# is D+1 04:00 UTC. Once that instant has passed, the request covers only the
+# past and the vendor answers from its finalized daily store, which does not
+# yet hold an EU session's bar that evening — so D's bar is silently absent
+# and the latest-bar-on-or-before-D fetch returns D-1.
+#
+# Measured on the same code, differing only in wall-clock fetch time
+# (`s3://alpha-engine-research/data_collection/parity/2026-09-2{1,2,3}.json`
+# and the objects they compare):
+#   * v1 wrote D20/D21 at 20:09-20:13 UTC (before EU local midnight): day D
+#     present for NOVN.SW, RMS.PA, SU.PA on all three days.
+#   * the standalone shadow wrote them at 22:45-22:50 UTC (after it): day D
+#     absent for exactly those three on all three days; D05.SI (SGX, whose bar
+#     was hours older) and every US listing present.
+#   * the 2026-09-18 shadow, replayed on 2026-09-20: day D present.
+#   * every v1 run carried D-1 for the three EU listings at 20:09-20:13 UTC,
+#     ~29 hours after that session's close, so the finalized store holds an
+#     EU bar by then.
+#
+# So the REQUEST reaches one calendar day further (``D + 2``), which keeps the
+# requested range covering the fetch moment for any same-evening or next-day
+# run, and the D bound is enforced on the RESPONSE by
+# :func:`clip_to_trading_day` (and at the write site by
+# :func:`assert_no_bar_after`) exactly as before. D + 2 at 00:00 CEST is ~30.5
+# hours after a Paris/Zurich close, so a run after it reads D from the
+# finalized store, which by then holds it.
+# ---------------------------------------------------------------------------
+
+#: Calendar days the vendor REQUEST reaches past D's ``end_exclusive``.
+VENDOR_END_PAD_DAYS = 1
+
+
+def vendor_request_window(
+    trading_day: "date | datetime | str", period: str = "10y",
+) -> "tuple[date, date]":
+    """``(start, end_exclusive)`` to REQUEST from a vendor whose date-only
+    ``end`` is read in the listing's exchange timezone (yfinance), for a run
+    serving trading day D.
+
+    ``start`` is :func:`history_window`'s. ``end_exclusive`` is D + 2 calendar
+    days — one past :func:`history_window`'s — because D + 1 at 00:00 in a
+    European or Asian exchange's timezone is already in the past on a
+    same-evening US run, and the vendor then omits D's still-unfinalized bar
+    (alpha-engine-config-I11548; evidence in the block comment above).
+
+    The response WILL carry rows after D whenever the run is late enough for
+    them to exist, so every caller must pass it through
+    :func:`clip_to_trading_day` with ``expect_rows_after=True`` before use —
+    this widens what is ASKED for, never what is published.
+    """
+    import pandas as pd
+
+    start, end_excl = history_window(trading_day, period)
+    return start, (pd.Timestamp(end_excl) + pd.Timedelta(days=VENDOR_END_PAD_DAYS)).date()
+
+
+def clip_to_trading_day(
+    frame, trading_day: "date | datetime | str", *, label: str, expect_rows_after: bool = False,
+):
     """Drop rows dated after D from a FETCHED frame at the fetch boundary.
 
-    The fetch already asks for ``end = D + 1`` (exclusive); a vendor that
-    answers beyond the requested end is out of contract, so rows past D are
-    removed here and the count is logged at WARNING (the recording surface).
+    A fetch built on :func:`history_window` asks for ``end = D + 1``
+    (exclusive); a vendor that answers beyond the requested end is out of
+    contract, so rows past D are removed here and the count is logged at
+    WARNING (the recording surface). A fetch built on
+    :func:`vendor_request_window` deliberately asks past D
+    (alpha-engine-config-I11548) and passes ``expect_rows_after=True``: the
+    rows are dropped the same way and logged at INFO, because they are the
+    request working as designed, not the vendor misbehaving.
+
     This is the request bound, applied to the response — it is NOT the write
     guard: writers still call :func:`assert_no_bar_after`, which raises.
     """
@@ -222,7 +292,13 @@ def clip_to_trading_day(frame, trading_day: "date | datetime | str", *, label: s
         idx = idx.tz_convert("UTC").tz_localize(None)
     keep = idx.normalize() <= cutoff
     dropped = int((~keep).sum())
-    if dropped:
+    if dropped and expect_rows_after:
+        log.info(
+            "%s: dropped %d row(s) dated after trading_day %s from a request that "
+            "deliberately reaches past D (alpha-engine-config-I11548)",
+            label, dropped, cutoff.date().isoformat(),
+        )
+    elif dropped:
         log.warning(
             "%s: vendor returned %d row(s) dated after trading_day %s despite "
             "end-bound — dropped at the fetch boundary (alpha-engine-config-I10893)",
