@@ -179,6 +179,24 @@ print_banner "RAG INGESTION RUN"
 # RAG workload timeout is the full execution budget (not MAX_RUNTIME_SECONDS
 # which includes boot + overhead). Use the configured workload timeout.
 _RAG_WORKLOAD_TIMEOUT="${RAG_WORKLOAD_TIMEOUT:-21600}"
+
+# Cycle date for every dated key the ingestion writes (alpha-engine-config-
+# I11514): rag/manifest/{date}.json, rag/filing_changes/{date}.json and
+# health/rag_ingestion_progress/{date}.json. EXECUTION_RUN_DATE is exported by
+# step_function.json's RAGIngestion command from $.run_date (the cycle's trading
+# day after NormalizeRunDates) — the same value the registry resolves `{date}`
+# to and the stage-coverage assertion below is given. It is expanded HERE, on
+# the launching box, because the workload runs on another host over SSM where
+# the variable does not exist. Without it, run_weekly_ingestion.sh keys by the
+# box's UTC wall clock (with a WARNING), which files a run that crosses midnight
+# UTC under the next day.
+_RAG_RUN_DATE_ARGS=""
+if [ -n "${EXECUTION_RUN_DATE:-}" ]; then
+  _RAG_RUN_DATE_ARGS="--run-date ${EXECUTION_RUN_DATE}"
+else
+  echo "WARNING: EXECUTION_RUN_DATE unset — run_weekly_ingestion.sh will key dated S3 objects by the UTC wall-clock date, not the SF cycle date (alpha-engine-config-I11514)" >&2
+fi
+
 run_ssm "rag-ingestion" "$(cat <<WORKLOAD
 set -eo pipefail
 ${_ENV_SOURCE}
@@ -195,8 +213,8 @@ for name in VOYAGE_API_KEY FINNHUB_API_KEY EDGAR_IDENTITY RAG_DATABASE_URL; do
     unset val
 done
 
-echo "==> Starting run_weekly_ingestion.sh at \$(date)"
-if ! bash rag/pipelines/run_weekly_ingestion.sh 2>&1; then
+echo "==> Starting run_weekly_ingestion.sh ${_RAG_RUN_DATE_ARGS} at \$(date)"
+if ! bash rag/pipelines/run_weekly_ingestion.sh ${_RAG_RUN_DATE_ARGS} 2>&1; then
     echo "ERROR: RAG ingestion failed" >&2
     exit 1
 fi

@@ -737,7 +737,7 @@ def _d16_fixture_objects(after):
 def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
     module, since = d16
     fake_s3 = _FakeS3(_d16_fixture_objects(since))
-    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run, run_date: 0)  # noqa: ARG005
     monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
 
     assert module.main() == 0
@@ -767,7 +767,7 @@ def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
 def test_d16_script_failure_writes_a_failed_manifest_and_keeps_the_exit_code(sink, d16, monkeypatch):
     module, since = d16
     fake_s3 = _FakeS3({})  # nothing published — the script died before step 10
-    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 1)  # noqa: ARG005
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run, run_date: 1)  # noqa: ARG005
     monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
 
     assert module.main() == 1
@@ -786,7 +786,7 @@ def test_d16_exit_zero_with_no_published_output_is_a_failed_manifest(sink, d16, 
     reader unless it is graded the same way."""
     module, since = d16
     fake_s3 = _FakeS3({})
-    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run, run_date: 0)  # noqa: ARG005
     monkeypatch.setattr(module, "_s3_client", lambda: fake_s3)
 
     assert module.main() == 1
@@ -799,13 +799,29 @@ def test_d16_exit_zero_with_no_published_output_is_a_failed_manifest(sink, d16, 
 
 def test_d16_dry_run_writes_no_manifest(d16, monkeypatch):
     module, since = d16
-    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run: 0)  # noqa: ARG005
+    monkeypatch.setattr(module, "_run_ingestion_script", lambda dry_run, run_date: 0)  # noqa: ARG005
     monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--date", "2026-09-19", "--dry-run"])
     monkeypatch.setenv("NE_DATA_CODE_SHA", FAKE_SHA)
 
     # sink=None on a dry run (write=False) — run_manifest.run_unit logs one
     # line in its place and calls no sink at all, so no S3 client is needed.
     assert module.main() == 0
+
+
+def test_d16_passes_its_trading_day_to_the_script_as_run_date(d16, monkeypatch):
+    """alpha-engine-config-I11514: the manifest's trading_day and the dated
+    keys the script writes are the same value, passed once — never two reads
+    of the wall clock that can straddle midnight UTC."""
+    module, since = d16
+    seen: list[tuple[bool, str]] = []
+    monkeypatch.setattr(
+        module, "_run_ingestion_script", lambda dry_run, run_date: seen.append((dry_run, run_date)) or 0
+    )
+    monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--date", "2026-09-19", "--dry-run"])
+    monkeypatch.setenv("NE_DATA_CODE_SHA", FAKE_SHA)
+
+    assert module.main() == 0
+    assert seen == [(True, "2026-09-19")]
 
 
 def test_d16_dispatcher_workload_calls_the_recorded_entrypoint():
