@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -309,3 +310,109 @@ def test_groom_dispatcher_is_not_exempted_from_the_root_pin():
         "the groom dispatcher must track the root pin — its historical exemption "
         "reasons were all floors, and equality-pinning them froze the lib"
     )
+
+
+# --------------------------------------------------------------------------- #
+# cost-gate.yml: a DELIBERATELY isolated pin (alpha-engine-config-I11410).
+#
+# `.github/workflows/cost-gate.yml` installs nousergon-lib (for the
+# `nousergon-cost-gate` entry point) with --no-deps at its own tag, isolated
+# from requirements.txt on purpose: the gate went blocking only after it was
+# measured at 0 findings over 300 main commits AT THAT VERSION, so bumping it
+# is a re-measurement, not a lockstep chore. That makes lockstep EQUALITY the
+# wrong contract — but "no contract" is the -I7623 blind spot that let
+# pause-reconcile.yml drift 67 versions. The contract is instead:
+#
+#   * a FLOOR: never below the release the 0-findings measurement was taken at
+#     (an earlier release raised false positives on component ids containing a
+#     colon);
+#   * a LAG BOUND: never more than _COST_GATE_MAX_LAG patch releases behind the
+#     root pin, so a root bump that leaves it far behind fails in that PR;
+#   * a RE-EXAM DATE: past it, the isolation must be re-justified (re-measure
+#     and move the date) or dissolved (pin == root).
+# --------------------------------------------------------------------------- #
+
+_COST_GATE_WORKFLOW = ".github/workflows/cost-gate.yml"
+#: The release the blocking gate's 0-findings exit condition was measured at.
+_COST_GATE_FLOOR = (0, 124, 142)
+#: How many patch releases the gate may trail the root pin before it must be
+#: re-measured. Root was v0.124.150 (8 ahead) when this was set.
+_COST_GATE_MAX_LAG = 25
+#: Past this date the isolation must be re-examined, even if the lag is small.
+_COST_GATE_RE_EXAM = "2026-12-14"
+
+
+def _cost_gate_pins() -> list[str]:
+    text = (_REPO_ROOT / _COST_GATE_WORKFLOW).read_text()
+    return re.findall(
+        r"git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)",
+        text,
+    )
+
+
+def test_cost_gate_has_exactly_one_lib_install_pin():
+    """The checks below read ONE pin; a second install line would escape them."""
+    pins = _cost_gate_pins()
+    assert len(pins) == 1, (
+        f"{_COST_GATE_WORKFLOW} carries {len(pins)} nousergon-lib install pins "
+        f"({pins}); the floor/lag/re-exam contract below covers exactly one"
+    )
+
+
+def test_cost_gate_pin_is_not_below_its_measured_floor():
+    (pin,) = _cost_gate_pins()
+    assert _version_tuple(pin) >= _COST_GATE_FLOOR, (
+        f"{_COST_GATE_WORKFLOW} pins nousergon-lib {pin}, below the release the "
+        f"blocking gate's 0-findings measurement was taken at "
+        f"(v{'.'.join(map(str, _COST_GATE_FLOOR))}); earlier releases raise "
+        f"false positives on component ids containing a colon"
+    )
+
+
+def test_cost_gate_pin_does_not_drift_far_behind_root():
+    (pin,) = _cost_gate_pins()
+    root = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
+    gate_v, root_v = _version_tuple(pin), _version_tuple(root)
+    assert gate_v[:2] == root_v[:2], (
+        f"{_COST_GATE_WORKFLOW} pins nousergon-lib {pin} but requirements.txt is "
+        f"on {root} — a different minor line. Re-measure the gate at the root "
+        f"pin (0 findings over recent main commits) and bump it "
+        f"(alpha-engine-config-I11410)."
+    )
+    lag = root_v[2] - gate_v[2]
+    assert lag <= _COST_GATE_MAX_LAG, (
+        f"{_COST_GATE_WORKFLOW} pins nousergon-lib {pin}, {lag} patch releases "
+        f"behind requirements.txt's {root} (bound: {_COST_GATE_MAX_LAG}). The "
+        f"isolation is deliberate but not unbounded: re-measure the gate at the "
+        f"root pin and bump it (alpha-engine-config-I11410)."
+    )
+
+
+def test_cost_gate_isolation_is_re_examined_by_its_date():
+    (pin,) = _cost_gate_pins()
+    root = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
+    if pin == root:
+        return  # isolation dissolved; nothing to re-examine
+    today = datetime.now(timezone.utc).date()
+    assert today <= date.fromisoformat(_COST_GATE_RE_EXAM), (
+        f"{_COST_GATE_WORKFLOW}'s isolated nousergon-lib pin {pin} (root: {root}) "
+        f"passed its re-exam date {_COST_GATE_RE_EXAM}. Re-measure the gate at "
+        f"the root pin and bump it, or record why it stays and move "
+        f"_COST_GATE_RE_EXAM (alpha-engine-config-I11410)."
+    )
+
+
+def test_cost_gate_contract_rejects_a_drifted_pin(monkeypatch):
+    """The lag bound actually bites: a pin far behind root fails."""
+    import sys
+
+    module = sys.modules[__name__]
+    monkeypatch.setattr(module, "_cost_gate_pins", lambda: ["v0.124.100"])
+    monkeypatch.setattr(module, "_COST_GATE_FLOOR", (0, 124, 0))
+    monkeypatch.setattr(module, "_read_pin", lambda *_a: "v0.124.150")
+    try:
+        test_cost_gate_pin_does_not_drift_far_behind_root()
+    except AssertionError as exc:
+        assert "50 patch releases" in str(exc)
+    else:
+        raise AssertionError("a 50-release lag passed the cost-gate lag bound")

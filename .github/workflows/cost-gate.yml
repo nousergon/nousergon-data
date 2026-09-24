@@ -26,6 +26,9 @@ name: cost-gate
 # requirements.txt pin (v0.124.150, held in cross-repo lockstep by
 # tests/test_lib_pin_lockstep.py and per-Lambda CI guards) — bumping that
 # pin is a separate, guarded change and not part of this PR.
+# The isolation is not unbounded: test_lib_pin_lockstep.py holds this pin to a
+# floor (v0.124.142), a max lag behind requirements.txt, and a re-exam date
+# (alpha-engine-config-I11410). Bumping it means re-measuring 0 findings.
 #
 # Base-SHA resolution is event-aware: `merge_group.base_sha` on merge-queue
 # graduation, `pull_request.base.sha` on a PR, `github.event.before` on a
