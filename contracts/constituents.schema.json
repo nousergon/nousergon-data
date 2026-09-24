@@ -44,6 +44,14 @@
         "minLength": 1
       }
     },
+    "index_overlap": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Names held by BOTH SPY and MDY on this date (a rebalance in flight), so present in both sp500_tickers and sp400_tickers and once in tickers. Omitted when empty. alpha-engine-config-I11470."
+    },
     "sector_map": {
       "type": "object",
       "additionalProperties": {

@@ -188,6 +188,19 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
             "or is removed from features/registry.py::CATALOG + SCHEMA.md §3"
         ),
     },
+    # alpha-engine-config-I11470: the PIT membership map was published, and
+    # either the reference disagrees with it on a change nothing explains or a
+    # recent roster snapshot could not be read. The collector's own `detail`
+    # names each one.
+    "historical_constituents": {
+        "tracked_issue": "alpha-engine-config-I11470",
+        "clears_when": (
+            "market_data/historical_constituents.json :: quality reports "
+            "n_reference_disagreements == 0 and n_recent_skipped_snapshots == 0 "
+            "(explain a disagreement in collectors/data/sp500_known_retickers.json "
+            "only with evidence; a skipped snapshot needs a readable S&P 500 slice)"
+        ),
+    },
 }
 
 
@@ -242,15 +255,22 @@ def _describe_degraded_defects(results: dict) -> str:
             *(info.get("all_null_columns") or []),
         })
         reg = _DEGRADED_DEFECT_REGISTRY.get(name)
+        # A collector whose defect is not a column set says what it is in its
+        # own `detail` (alpha-engine-config-I11470: historical_constituents
+        # names each disagreement and skipped snapshot). `columns=?` alone
+        # told the reader nothing.
+        what = f"columns={cols}" if cols else (
+            f"detail={info['detail']}" if info.get("detail") else "columns=?"
+        )
         if reg:
             lines.append(
-                f"{name}: columns={cols or '?'} "
+                f"{name}: {what} "
                 f"tracked={reg['tracked_issue']} "
                 f"clears_when={reg['clears_when']}"
             )
         else:
             lines.append(
-                f"{name}: columns={cols or '?'} tracked=UNTRACKED — file an "
+                f"{name}: {what} tracked=UNTRACKED — file an "
                 "alpha-engine-config issue and add a "
                 "_DEGRADED_DEFECT_REGISTRY entry for this collector"
             )
