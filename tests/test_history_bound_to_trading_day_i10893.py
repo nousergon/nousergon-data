@@ -218,7 +218,9 @@ def test_yf_history_fx_is_bounded_and_ends_at_d(monkeypatch):
     out = mmd._yfinance_fx_history(["CHF"], "10y", trading_day=D)
 
     assert "period" not in calls[0]
-    assert (calls[0]["start"], calls[0]["end"]) == ("2016-09-14", "2026-09-15")
+    # The REQUEST reaches D + 2 (alpha-engine-config-I11548); the published series
+    # still ends at D because the response is clipped.
+    assert (calls[0]["start"], calls[0]["end"]) == ("2016-09-14", "2026-09-16")
     assert out["CHF"][-1][0] == D
 
 
@@ -239,7 +241,8 @@ def test_latest_closes_and_fx_are_bounded(monkeypatch):
     monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D_PLUS_1), calls))
     closes = mmd._yfinance_closes(["A"], trading_day=D)
     fx = mmd._yfinance_fx(["CHF"], trading_day=D)
-    assert all("period" not in c and c["end"] == "2026-09-15" for c in calls)
+    # Request reaches D + 2 (alpha-engine-config-I11548); the answer is still D's bar.
+    assert all("period" not in c and c["end"] == "2026-09-16" for c in calls)
     assert closes["A"][1] == D
     assert fx["CHF"] == round(float(_yf_frame(D_PLUS_1)["Close"].loc[D]), 6)
 

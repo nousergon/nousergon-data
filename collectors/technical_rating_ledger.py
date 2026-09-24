@@ -44,6 +44,7 @@ No lookahead: every rating (live or backfill) is computed from closes truncated 
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import random
 from datetime import datetime, timezone
@@ -142,6 +143,79 @@ def _as_series(values: list[float]):
     return pd.Series(values, dtype="float64")
 
 
+#: The unit whose v1 run manifest says when the ledger manifest was last read before
+#: v1 rewrote it for a trading day — D26 itself (``collect_rating_ledger``). A replay
+#: pins its read of ``RATING_LEDGER_MANIFEST_KEY`` to the version current at that
+#: run's START, which is the ledger as it stood BEFORE v1's own write for the day
+#: (alpha-engine-config-I11231).
+LEDGER_PIN_UNIT_ID = "D26"
+
+
+def _read_ledger_manifest(s3_client: Any, bucket: str) -> dict | None:
+    """The ledger manifest this run should build on — the CURRENT object in
+    production; under a shadow replay, the version v1 itself built on.
+
+    alpha-engine-config-I11231. The manifest is a read-modify-write key: D26 reads it,
+    adds the trading day, and writes it back. A shadow run of day D executes after v1's
+    D26 has already recorded D as ``basis: "live"``, so reading the CURRENT object made
+    the shadow's D26 correctly decline to rewrite an immutable date every single time —
+    ``not_applicable`` on 09-21, 09-22 and 09-23 — and ``rating_history/_manifest.json``
+    could never be compared at all. Reading the pre-v1 version (pinned by
+    ``shadow.pinned_inputs.pin_for`` to the version current at v1's D26 start: on
+    2026-09-23 that is the 2026-09-22T20:18:09Z version, v1 having started 20:15:06Z and
+    written 20:15:15Z) gives the shadow the SAME base v1 had, so it writes a manifest and
+    a live ledger date that parity can grade against v1's.
+
+    Outside a replay ``pin_for`` answers ``unpinned`` without touching S3, and this reads
+    the current object — which is what production means. When a replay cannot be pinned
+    (no v1 D26 manifest for the day, or the version aged out) it also reads the current
+    object, and the immutable-date no-op below still records ``not_applicable``, never
+    ``failed``.
+    """
+    pin = None
+    try:
+        from shadow.pinned_inputs import pin_for
+
+        pin = pin_for(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY, unit_id=LEDGER_PIN_UNIT_ID)
+    except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
+        # DELIBERATE degrade, at WARNING. (a) Failure mode swallowed: the pin could not be
+        # resolved at all (`shadow.pinned_inputs` would not import, or its manifest/version
+        # lookup raised) — NOT the ordinary production case, which `pin_for` answers as an
+        # `unpinned` Pin without raising. (b) The primary deliverable survives: the manifest
+        # is still read, from the CURRENT object, exactly as production reads it. (c)
+        # Recording surface: this WARNING line in the collector's log; inside a replay it
+        # means the shadow reads a ledger v1 may already have written, which the D26
+        # manifest then shows as `not_applicable` (no_new_data_declared) rather than a diff.
+        logger.warning(
+            "[technical_rating_ledger] input pinning unavailable for %s (%s) — reading the "
+            "CURRENT object (alpha-engine-config-I11231)",
+            RATING_LEDGER_MANIFEST_KEY, exc,
+        )
+    if pin is None or not pin.is_pinned:
+        return mmd._read_json(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY)
+    logger.info(
+        "[technical_rating_ledger] %s pinned to version %s (%s: %s)",
+        RATING_LEDGER_MANIFEST_KEY, pin.version_id, pin.basis, pin.detail,
+    )
+    try:
+        obj = s3_client.get_object(
+            Bucket=bucket, Key=RATING_LEDGER_MANIFEST_KEY, VersionId=pin.version_id,
+        )
+        return json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
+        # DELIBERATE degrade, at WARNING. (a) Failure mode swallowed: the pinned VERSION
+        # could not be read or parsed. (b) The primary deliverable survives: the current
+        # object is read instead, the production behaviour. (c) Recording surface: this
+        # WARNING line; the D26 manifest then shows whatever the current-object read
+        # produces (typically `not_applicable` on a same-day replay), never a silent diff.
+        logger.warning(
+            "[technical_rating_ledger] pinned version %s of %s unreadable (%s) — reading the "
+            "CURRENT object (alpha-engine-config-I11231)",
+            pin.version_id, RATING_LEDGER_MANIFEST_KEY, exc,
+        )
+        return mmd._read_json(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY)
+
+
 def collect_rating_ledger(
     *, bucket: str = mmd.DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None,
@@ -176,7 +250,7 @@ def collect_rating_ledger(
     if not ref_calendar:
         return {"status": "skipped", "reason": "empty reference calendar"}
 
-    manifest = mmd._read_json(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY) or {
+    manifest = _read_ledger_manifest(s3_client, bucket) or {
         "schema_version": LEDGER_MANIFEST_SCHEMA_VERSION, "dates": [],
     }
     existing_by_date: dict[str, dict] = {e["date"]: e for e in manifest.get("dates", [])}
@@ -336,40 +410,66 @@ def _extract_realized_rows(
     ledger_entries: dict[str, dict], series: dict[str, list], horizons: tuple[int, ...],
 ) -> dict[int, list[dict]]:
     """Per horizon, every ``{date, symbol, score, label, fwd_return, basis}`` row with a
-    REALIZED forward return — i.e. the symbol's own close_history has a bar exactly
-    ``horizon`` trading sessions after the rating date. Both the base and forward close
-    are read from the CURRENT close_history (not the ledger's frozen ``close``), so a
-    return is computed on one internally-consistent (possibly dividend-revised) basis
-    rather than mixing a frozen rated value with a since-revised one — the ledger's own
-    ``close`` stays the as-rated record (Gotcha per metron-ops#297)."""
-    # Per-symbol ascending (date -> index) over non-null closes, built once.
-    sym_points: dict[str, list[tuple[str, float]]] = {}
-    sym_date_idx: dict[str, dict[str, int]] = {}
-    for sym, rows in series.items():
-        pts = sorted(
-            {r[0]: float(r[1]) for r in rows if isinstance(r, (list, tuple)) and len(r) == 2 and r[1] is not None}.items()
-        )
-        sym_points[sym] = pts
-        sym_date_idx[sym] = {d: i for i, (d, _) in enumerate(pts)}
+    REALIZED forward return. Both the base and forward close are read from the CURRENT
+    close_history (not the ledger's frozen ``close``), so a return is computed on one
+    internally-consistent (possibly dividend-revised) basis rather than mixing a frozen
+    rated value with a since-revised one — the ledger's own ``close`` stays the as-rated
+    record (Gotcha per metron-ops#297).
+
+    **A horizon is counted in REFERENCE-CALENDAR sessions, never in a symbol's own bars**
+    (alpha-engine-config-I11549). The target of rating date ``d`` at horizon ``h`` is the
+    session ``h`` places after ``d`` on ``_reference_calendar(series)`` — the same US
+    calendar the ledger's dates are drawn from — and a symbol contributes a row only if it
+    has a close on BOTH ``d`` and that target date. Counting ``idx + h`` over each symbol's
+    own bars made the answer depend on which exchange the symbol lists on and on which of
+    its bars happened to be published yet:
+
+    * a non-US listing that trades on a US holiday (D05.SI, NOVN.SW, RMS.PA, SU.PA all
+      carry a 2026-09-07 Labor Day bar) reached its "20th session" one US session early,
+      so on 2026-09-23 the rating date 2026-08-26 — 19 US sessions back, horizon 20 NOT
+      yet realized for the rest of the universe — got an IC over those four names alone
+      (0.4). v1 published it; the shadow run, whose close_history lacked three of those
+      four listings' day-D bars, did not, which is the extra ``ic_series`` entry on every
+      same-day parity report;
+    * a symbol with a missing bar had its next available bar used as the forward close,
+      so a 2-session return was reported under horizon 1.
+
+    Neither is a realized ``h``-session return, so both are now left out: a rating date
+    whose horizon has not elapsed on the reference calendar yields no row for any symbol,
+    and a symbol with no close on the exact target date yields no row for that date.
+    """
+    calendar = _reference_calendar(series)
+    cal_pos = {d: i for i, d in enumerate(calendar)}
+    # Per-symbol {date: close} over non-null closes, built once.
+    sym_closes: dict[str, dict[str, float]] = {
+        sym: {
+            r[0]: float(r[1]) for r in rows
+            if isinstance(r, (list, tuple)) and len(r) == 2 and r[1] is not None
+        }
+        for sym, rows in series.items()
+    }
 
     rows_by_horizon: dict[int, list[dict]] = {h: [] for h in horizons}
     for date, entry in ledger_entries.items():
+        pos = cal_pos.get(date)
+        if pos is None:
+            continue
+        targets = {h: calendar[pos + h] for h in horizons if pos + h < len(calendar)}
+        if not targets:
+            continue
         basis = entry.get("basis")
         ratings = entry.get("ratings") or {}
         for sym, r in ratings.items():
-            pts = sym_points.get(sym)
-            idx_map = sym_date_idx.get(sym)
-            if not pts or not idx_map or date not in idx_map:
+            closes = sym_closes.get(sym)
+            if not closes:
                 continue
-            idx = idx_map[date]
-            base_close = pts[idx][1]
-            if base_close <= 0:
+            base_close = closes.get(date)
+            if base_close is None or base_close <= 0:
                 continue
-            for h in horizons:
-                j = idx + h
-                if j >= len(pts):
+            for h, target in targets.items():
+                fwd_close = closes.get(target)
+                if fwd_close is None:
                     continue
-                fwd_close = pts[j][1]
                 fwd_return = fwd_close / base_close - 1.0
                 rows_by_horizon[h].append({
                     "date": date, "symbol": sym, "score": float(r["score"]),
