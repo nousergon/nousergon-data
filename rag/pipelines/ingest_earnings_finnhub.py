@@ -1,9 +1,20 @@
 """Ingest earnings call transcripts from Finnhub into the RAG vector store.
 
-Finnhub free tier provides speaker-labeled transcripts at 60 req/min.
-Higher quality than FMP (pre-split by speaker with roles).
+Finnhub's transcript endpoints return speaker-labeled transcripts at 60
+req/min. Higher quality than FMP (pre-split by speaker with roles).
 
-Requires: FINNHUB_API_KEY environment variable (free at finnhub.io).
+Requires: FINNHUB_API_KEY environment variable.
+
+LICENCE STATUS (alpha-engine-config-I11472): Finnhub documents
+``/stock/transcripts`` and ``/stock/transcripts/list`` as PREMIUM endpoints,
+and not one ``earnings_transcript`` document has ever reached the corpus
+(``rag/manifest/latest.json :: by_source`` as of 2026-09-24 has no such key)
+while the weekly run printed ``Total: 0 transcripts`` every week. The list
+call's non-200 used to be logged at DEBUG, so the reason was never visible.
+It is now logged and counted, and a run in which the source lists nothing
+reports this source DEGRADED (``rag.pipelines.source_yield``). Whether to
+license the endpoint, switch source, or retire the step is an operator
+decision, not a code one.
 
 Usage:
     # Ingest recent transcripts for specific tickers
@@ -28,6 +39,8 @@ import requests
 
 from nousergon_lib.secrets import get_secret
 
+from rag.pipelines.source_yield import SourceYield, write_yield
+
 logger = logging.getLogger(__name__)
 
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -42,10 +55,16 @@ def _get_api_key() -> str:
     return key
 
 
-def _list_transcripts(ticker: str) -> list[dict]:
+def _list_transcripts(ticker: str, stats: SourceYield | None = None) -> list[dict]:
     """List available earnings call transcripts for a ticker.
 
     Returns list of {id, title, time, year, quarter} dicts.
+
+    A non-200 is counted on ``stats`` as ``http_<code>`` and logged at WARNING
+    the first time each code is seen, with Finnhub's own error body. It used
+    to be logged at DEBUG — below the INFO root logger — which is how every
+    one of 118 list calls could fail each week with nothing in the log but
+    ``Total: 0 transcripts`` (alpha-engine-config-I11472).
     """
     key = _get_api_key()
     url = f"{_FINNHUB_BASE}/stock/transcripts/list"
@@ -53,12 +72,28 @@ def _list_transcripts(ticker: str) -> list[dict]:
         time.sleep(1.1)  # 60 req/min = 1 req/sec
         resp = requests.get(url, params={"symbol": ticker, "token": key}, timeout=15)
         if resp.status_code != 200:
-            logger.debug("Finnhub transcript list %d for %s", resp.status_code, ticker)
+            name = f"http_{resp.status_code}"
+            body = (resp.text or "")[:200]
+            first = stats is None or name not in stats.failures
+            if stats is not None:
+                stats.fail(name)
+                if first:
+                    stats.detail = f"Finnhub /stock/transcripts/list HTTP {resp.status_code}: {body}"
+            if first:
+                logger.warning(
+                    "Finnhub transcript list HTTP %d for %s: %s (further HTTP %d responses "
+                    "are counted, not logged)", resp.status_code, ticker, body, resp.status_code,
+                )
             return []
         data = resp.json()
-        return data.get("transcripts", [])
+        listed = data.get("transcripts") or []
+        if not listed and stats is not None:
+            stats.fail("empty_list")
+        return listed
     except Exception as e:
         logger.warning("Finnhub list failed for %s: %s", ticker, e)
+        if stats is not None:
+            stats.fail("request_error")
         return []
 
 
@@ -163,6 +198,7 @@ def ingest_ticker(
     sector: str | None = None,
     max_transcripts: int = 8,
     dry_run: bool = False,
+    stats: SourceYield | None = None,
 ) -> int:
     """Ingest earnings transcripts for a single ticker via Finnhub.
 
@@ -171,12 +207,15 @@ def ingest_ticker(
     from nousergon_lib.rag.embeddings import embed_texts
     from nousergon_lib.rag.retrieval import ingest_document, document_exists
 
-    available = _list_transcripts(ticker)
+    if stats is None:
+        stats = SourceYield(source="earnings_transcripts")
+    available = _list_transcripts(ticker, stats)
     if not available:
         return 0
 
     # Take most recent N transcripts
     available = available[:max_transcripts]
+    stats.discovered += len(available)
     ingested = 0
 
     for t_meta in available:
@@ -193,6 +232,7 @@ def ingest_ticker(
             filed_date = date(year, min(q_month, 12), 28) if year else date.today()
 
         if document_exists(ticker, "earnings_transcript", filed_date, "finnhub"):
+            stats.already_held += 1
             continue
 
         if dry_run:
@@ -202,6 +242,7 @@ def ingest_ticker(
 
         transcript_data = _fetch_transcript(transcript_id)
         if not transcript_data:
+            stats.fail("fetch_failed")
             continue
 
         sections = _transcript_to_sections(transcript_data)
@@ -232,6 +273,7 @@ def ingest_ticker(
         )
         if doc_id:
             ingested += 1
+            stats.ingested += 1
 
     return ingested
 
@@ -258,12 +300,17 @@ def main():
         parser.error("Provide --tickers or --from-signals")
         return
 
+    stats = SourceYield(source="earnings_transcripts", scope=len(tickers))
     total = 0
     for ticker in tickers:
-        n = ingest_ticker(ticker, max_transcripts=args.max_per_ticker, dry_run=args.dry_run)
+        n = ingest_ticker(ticker, max_transcripts=args.max_per_ticker, dry_run=args.dry_run, stats=stats)
         total += n
 
-    logger.info("Total: %d transcripts ingested for %d tickers", total, len(tickers))
+    logger.info(
+        "Total: %d transcripts ingested for %d tickers (%d listed, %d already held, failures=%s)",
+        total, len(tickers), stats.discovered, stats.already_held, stats.failures or "{}",
+    )
+    write_yield(stats)
 
 
 if __name__ == "__main__":

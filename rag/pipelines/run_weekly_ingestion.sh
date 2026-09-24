@@ -3,7 +3,7 @@
 #
 # Runs all ingestion pipelines in sequence:
 #   0.  Preflight — env vars + S3 reachability (hard-fails on miss)
-#   1.  SEC filings (10-K/10-Q) — from signals universe, 2y lookback
+#   1.  SEC filings (10-K/10-Q, foreign 20-F/40-F) — from signals universe, 2y lookback
 #   2.  8-K material events — from signals universe, 1y lookback
 #   3.  Earnings transcripts (Finnhub) — from signals universe, latest 8
 #   4.  Thesis history — from research.db (incremental)
@@ -18,6 +18,9 @@
 #       → self-derived 7d/30d revisions
 #   9.  Filing change detection — analyze consecutive filings
 #   10. Manifest emit — corpus snapshot for presentation layer
+#   then: source-yield verdict (alpha-engine-config-I11472) — every source
+#       that returned 0 documents is named and the run reports DEGRADED
+#       (log + completion email); never changes the exit code.
 #
 # Intended to run on the Saturday Step Function via SSM on the always-on
 # EC2 instance. `set -euo pipefail` plus no `|| echo "non-fatal"`
@@ -121,6 +124,14 @@ else
     echo "WARNING: dated keys (rag/manifest/{date}.json, rag/filing_changes/{date}.json, health/rag_ingestion_progress/{date}.json) may not match the SF cycle date if this run crosses midnight UTC (alpha-engine-config-I11514)." >&2
 fi
 
+# Per-source yield records for this run (rag/pipelines/source_yield.py,
+# alpha-engine-config-I11472). Each ingest step writes one file here; the
+# verdict after the last step reads them. Cleared at the start so a record
+# left by an earlier run on the same host can never stand in for this one.
+export RAG_SOURCE_YIELD_DIR="${RAG_SOURCE_YIELD_DIR:-${TMPDIR:-/tmp}/rag_source_yield/$RUN_DATE}"
+mkdir -p "$RAG_SOURCE_YIELD_DIR"
+rm -f "$RAG_SOURCE_YIELD_DIR"/*.json
+
 echo "========================================"
 echo "RAG Weekly Ingestion — $(date -u '+%Y-%m-%d %H:%M UTC')"
 echo "========================================"
@@ -178,7 +189,7 @@ fi
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/10: SEC filings (10-K/10-Q)..."
+echo "==> Step 1/10: SEC filings (10-K/10-Q/20-F/40-F)..."
 emit_progress 1 10 "sec_filings"
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
@@ -291,6 +302,16 @@ else
     echo "  SKIPPED in dry-run mode"
 fi
 
+# ── Source-yield verdict (alpha-engine-config-I11472) ────────────────────────
+# Names every source that returned 0 documents this run (or whose step never
+# reported) and marks the run DEGRADED — in this log, in verdict.json beside
+# the yields, and in the completion email below. ALWAYS exits 0, exactly like
+# step 5's freshness assertion: a degraded source degrades the report, it does
+# not fail the weekly pipeline.
+echo ""
+echo "==> Source-yield verdict..."
+$PYTHON_BIN -m rag.pipelines.source_yield --report
+
 echo ""
 echo "========================================"
 echo "RAG Weekly Ingestion Complete — $(date -u '+%Y-%m-%d %H:%M UTC')"
@@ -307,29 +328,36 @@ aws cloudwatch put-metric-data \
 echo "Heartbeat emitted: rag-ingestion"
 
 # Send completion email. With `set -euo pipefail` active, reaching this
-# point means all 9 pipelines succeeded — the hardcoded 'ok' statuses
-# are truthful rather than aspirational. PYTHON_BIN resolved at top of script.
+# point means all 9 pipelines EXITED 0 — which is not the same as every source
+# returning documents (alpha-engine-config-I11472: this email said 'ok' for
+# earnings_transcripts on a run that ingested 0 transcripts for 118 tickers).
+# So 'ok' is the base, and the source-yield verdict overlays it: a degraded
+# source shows as 'degraded' with its reason, and the run's status becomes
+# 'degraded'. A missing verdict reads as degraded too. PYTHON_BIN resolved at
+# top of script.
 $PYTHON_BIN -c "
 from emailer import send_step_email
 from datetime import datetime, timezone
+from rag.pipelines.source_yield import email_collectors, load_verdict
 date_str = '$RUN_DATE'
+status, collectors = email_collectors({
+    'sec_filings': {'status': 'ok'},
+    '8k_events': {'status': 'ok'},
+    'earnings_transcripts': {'status': 'ok'},
+    'thesis_history': {'status': 'ok'},
+    'news_pipeline': {'status': 'ok'},
+    'form4_insider': {'status': 'ok'},
+    'inst_ownership_13f': {'status': 'ok'},
+    'analyst_pipeline': {'status': 'ok'},
+    'filing_changes': {'status': 'ok'},
+}, load_verdict())
 results = {
     'phase': 'RAG',
     'date': date_str,
     'started_at': '$START_TIME',
     'completed_at': datetime.now(timezone.utc).isoformat(),
-    'status': 'ok',
-    'collectors': {
-        'sec_filings': {'status': 'ok'},
-        '8k_events': {'status': 'ok'},
-        'earnings_transcripts': {'status': 'ok'},
-        'thesis_history': {'status': 'ok'},
-        'news_pipeline': {'status': 'ok'},
-        'form4_insider': {'status': 'ok'},
-        'inst_ownership_13f': {'status': 'ok'},
-        'analyst_pipeline': {'status': 'ok'},
-        'filing_changes': {'status': 'ok'},
-    },
+    'status': status,
+    'collectors': collectors,
 }
 send_step_email('RAG Ingestion', results, date_str)
 "

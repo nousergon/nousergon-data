@@ -28,7 +28,12 @@ Discovery: EDGAR ``data.sec.gov/submissions/CIK{padded}.json`` —
 shared with the 8-K + 10-K/Q pipelines.
 
 Download: ``www.sec.gov/Archives/edgar/data/{cik}/{accession_no_dashes}/
-{primary_doc}`` — Form 4 ``primaryDocument`` is the XML file directly.
+{raw_xml_doc}``. The submissions API's ``primaryDocument`` for a Form 4 is
+usually the XSL-RENDERED view — ``xslF345X05/<name>.xml``, an HTML page
+served under an ``.xml`` name — not the ownership XML itself. Fetching that
+path and handing it to an XML parser is what failed every such filing with
+``mismatched tag`` (alpha-engine-config-I11472); :func:`raw_ownership_doc`
+strips the stylesheet directory to reach the raw document beside it.
 """
 
 from __future__ import annotations
@@ -326,6 +331,34 @@ def _build_row(
 # ── EDGAR discovery + download ────────────────────────────────────────
 
 
+# The XSL stylesheet directory EDGAR prefixes a rendered ownership document
+# with: xslF345X02/, xslF345X03/, xslF345X05/, ... (F345 = Forms 3, 4 and 5).
+_XSL_RENDER_DIR = re.compile(r"^xsl[^/]*/", re.IGNORECASE)
+
+
+def raw_ownership_doc(primary_doc: str) -> str:
+    """The raw ownership-XML filename for a submissions-API ``primaryDocument``.
+
+    ``xslF345X05/wk-form4_1727.xml`` -> ``wk-form4_1727.xml``. A name with no
+    stylesheet directory is returned unchanged.
+    """
+    return _XSL_RENDER_DIR.sub("", primary_doc or "")
+
+
+def _is_well_formed(xml: str) -> bool:
+    try:
+        ET.fromstring(xml)
+    except ET.ParseError:
+        return False
+    return True
+
+
+def _looks_like_rendered_html(body: str) -> bool:
+    """True when a fetched "XML" document is actually an HTML page."""
+    head = body.lstrip()[:512].lower()
+    return head.startswith("<!doctype html") or head.startswith("<html")
+
+
 def _search_form4_filings(
     ticker: str,
     *,
@@ -382,7 +415,7 @@ def _search_form4_filings(
             "filed_date": filed,
             "primary_doc": primary,
             "url": f"https://www.sec.gov/Archives/edgar/data/{cik}/"
-                   f"{acc_nodash}/{primary}",
+                   f"{acc_nodash}/{raw_ownership_doc(primary)}",
         })
     return results
 
@@ -515,11 +548,25 @@ def ingest_for_tickers(
                 stats["n_failures"] += 1
                 continue
             stats["n_filings_downloaded"] += 1
+            if _looks_like_rendered_html(xml):
+                # Loud and counted, never parsed: an HTML page is not an
+                # ownership document, and the XML parser's "mismatched tag"
+                # hid which document had been fetched.
+                logger.warning(
+                    "[form4] %s: fetched an HTML page, not ownership XML (%s)",
+                    filing["accession_number"], filing["url"],
+                )
+                stats["n_failures"] += 1
+                continue
             transactions = parse_form4_xml(
                 xml,
                 accession_number=filing["accession_number"],
                 filed_date=filing["filed_date"],
             )
+            if not transactions and not _is_well_formed(xml):
+                # parse_form4_xml already logged the parse error; count it so
+                # a source whose every document fails is not a quiet 0.
+                stats["n_failures"] += 1
             stats["n_transactions_parsed"] += len(transactions)
             all_transactions.extend(transactions)
 
@@ -604,6 +651,17 @@ def main():
         dry_run=args.dry_run,
     )
     print(stats)
+
+    from rag.pipelines.source_yield import SourceYield, write_yield
+
+    write_yield(SourceYield(
+        source="form4_insider",
+        scope=stats["n_tickers"],
+        discovered=stats["n_filings_discovered"],
+        ingested=stats["n_transactions_parsed"],
+        failures={"failed_filings": stats["n_failures"]},
+        detail=f"{stats['n_filings_downloaded']} filing(s) downloaded",
+    ))
 
 
 if __name__ == "__main__":
