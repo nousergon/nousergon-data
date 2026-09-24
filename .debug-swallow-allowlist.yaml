@@ -10,7 +10,7 @@ schema_version: 1
 # RECORD-LOUD), never allowlisted — see alpha-engine-config-I10226.
 entries:
   - path: collectors/alternative.py
-    line: 1585
+    line: 1634
     reason: >-
       (a) failure mode swallowed: s3.get_object against
       archive/revisions/{date}.json fails/404s for every checked date.
