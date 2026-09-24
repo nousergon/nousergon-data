@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import types
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlparse
 
 import pytest
 import requests
@@ -73,7 +74,7 @@ def test_single_500_is_retried_and_8k_lands(no_backoff):
     assert alternative._EDGAR_8K_FAILED_KEY not in out
     # SEC fair-access requires the User-Agent on every attempt.
     assert all(c["headers"]["User-Agent"] == "alpha-engine-data/1.0" for c in calls)
-    assert "efts.sec.gov" in calls[0]["url"]
+    assert urlparse(calls[0]["url"]).hostname == "efts.sec.gov"
 
 
 def test_429_is_retried(no_backoff):
