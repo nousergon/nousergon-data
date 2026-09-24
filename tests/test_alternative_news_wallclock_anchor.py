@@ -4,9 +4,9 @@ search window are CONTENT (they decide what lands in the artifact), and must
 anchor on ``run_date`` for a DECLARED REPLAY (``shadow.root.active_root()``)
 and on the real wall clock for a LIVE run — ``run_date`` is populated on
 BOTH paths (``weekly_collector.py``'s ``args.date or default_run_date()``),
-so its mere presence cannot tell the two apart. Mirrors ``_fetch_insider``'s
-pre-existing (and separately tracked) unconditional
-``today = datetime.strptime(run_date, "%Y-%m-%d")`` shape in this same file.
+so its mere presence cannot tell the two apart. ``_fetch_insider`` now takes
+the same anchor (alpha-engine-config-I11308,
+``tests/test_alternative_insider_wallclock_anchor.py``).
 """
 
 from __future__ import annotations
