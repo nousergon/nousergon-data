@@ -78,7 +78,14 @@ def compute_daily_factor_returns(
     df = panel[["ticker", "date", "close", *loading_cols]].copy()
     df = df.sort_values(["ticker", "date"])
     # Realized daily return ON `date` (close_d / close_{d-1} - 1), per ticker.
-    df["daily_return"] = df.groupby("ticker", sort=False)["close"].pct_change()
+    # Gap handling is explicit (alpha-engine-config-I11476): forward-fill the
+    # close within each ticker, then take the return with ``fill_method=None``.
+    # That is exactly the pandas<3 default (``fill_method="pad"``), which pandas
+    # deprecated and will drop, so the result no longer depends on the version.
+    _close_ff = df.groupby("ticker", sort=False)["close"].ffill()
+    df["daily_return"] = _close_ff.groupby(df["ticker"], sort=False).pct_change(
+        fill_method=None
+    )
     # Lag the loadings by one row within each ticker so the rank that drives
     # day-d's factor return is known at d-1 (no contemporaneous use).
     for f in loading_cols:
