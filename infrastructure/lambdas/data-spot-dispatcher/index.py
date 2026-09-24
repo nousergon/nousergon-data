@@ -733,6 +733,10 @@ _WORKLOADS: dict[str, str] = {
     # against today (UTC) on the box. Not scheduled; running it after each
     # parity grade is a separate decision on I11447.
     "shadow-prune": "python -m shadow prune",
+    # The operator-invoked delete behind the report above (Brian, 2026-09-24).
+    # A separate key, so `--apply` is reachable only by naming it in the
+    # invoke payload and no event field can turn a report into a delete.
+    "shadow-prune-apply": "python -m shadow prune --apply",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a

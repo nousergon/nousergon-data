@@ -1202,8 +1202,14 @@ def test_shadow_prune_is_report_only(monkeypatch):
         {"workload": "shadow-prune", "apply": True, "trading_day": "2026-09-14"}
     )
     assert cmd2 == cmd
-    for workload, command in index._WORKLOADS.items():
-        assert not ("shadow prune" in command and "--apply" in command), workload
+    # The delete is reachable through exactly one key, named for it.
+    deleting = {
+        workload for workload, command in index._WORKLOADS.items()
+        if "shadow prune" in command and "--apply" in command
+    }
+    assert deleting == {"shadow-prune-apply"}
+    _resolved, apply_cmd = index._resolve_workload({"workload": "shadow-prune-apply"})
+    assert apply_cmd == "python -m shadow prune --apply"
 
 
 @pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
