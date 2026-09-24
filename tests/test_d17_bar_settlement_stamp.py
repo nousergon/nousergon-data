@@ -12,9 +12,14 @@ the whole-mode wrapper never folded it, so every D17 manifest measured on
 
 Same rule as D19/D20: graded on the moment the vendor fetch began against
 `dates.SETTLED_AFTER_ET`. D17 fetches polygon's grouped-daily the morning
-AFTER the session, so its verdict is `settled`. That is a fact about v1, and it
-makes a D-1 difference on this key stay strict: the stamp is evidence either
-way, and here it is evidence against a v1 cause.
+AFTER the session, so its fetch verdict is `settled`.
+
+Rows D17 did not fetch are different. Polygon does not serve every ticker, and
+the coalesce CARRIES those rows over from the existing object, which is D19's
+evening write. For those rows D17 records a second reading, graded on that
+object's write time (`daily_closes._settlement_guards`). When the two readings
+disagree, the key's evidence is ambiguous and the row stays strict. A
+whole-key stamp that is true for only some of its rows proves nothing.
 """
 
 from __future__ import annotations
@@ -163,3 +168,72 @@ def test_parity_reads_d17s_stamp_and_keeps_a_settled_v1_difference_strict(monkey
     assert body["verdict"] == "mismatch"
     assert "v1_cause" not in body
     assert body["values"]["breaches"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Rows D17 carries over from the existing object keep THAT object's settlement
+# ---------------------------------------------------------------------------
+
+#: v1 D19's write of `staging/daily_closes/2026-09-22.parquet`
+#: (version YRiUMLnywr0qFRHw..., 20:06:48Z = 16:06 ET): provisional.
+D19_WROTE = dt.datetime(2026, 9, 22, 20, 6, 48, tzinfo=dt.timezone.utc)
+
+
+def _existing(rows: dict[str, float], last_modified: dt.datetime):
+    from unittest.mock import MagicMock
+
+    s3 = MagicMock()
+    s3.head_object.return_value = {"LastModified": last_modified}
+    frame = pd.DataFrame(
+        [{"Open": c, "High": c, "Low": c, "Close": c, "Adj_Close": c, "Volume": 1, "VWAP": None,
+          "source": "yfinance"} for c in rows.values()],
+        index=pd.Index(list(rows), name="ticker"),
+    )
+    buffer = io.BytesIO()
+    frame.to_parquet(buffer, engine="pyarrow", index=True)
+    body = buffer.getvalue()
+    s3.get_object.side_effect = lambda *a, **k: {"Body": io.BytesIO(body)}
+    s3.put_object.return_value = {"ETag": '"abc"'}
+    return s3
+
+
+def _d17_collect(existing_rows: dict[str, float], polygon_serves: list[str]) -> dict:
+    from unittest.mock import patch
+
+    from collectors import daily_closes
+
+    def _polygon(tickers, run_date, records, source):
+        for t in polygon_serves:
+            records.append({"ticker": t, "date": run_date, "Open": 1.0, "High": 1.0, "Low": 1.0,
+                            "Close": 1.0, "Adj_Close": 1.0, "Volume": 1, "VWAP": 1.0,
+                            "source": "polygon"})
+        return len(polygon_serves)
+
+    s3 = _existing(existing_rows, D19_WROTE)
+    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
+            patch.object(daily_closes, "_fetch_polygon_closes", side_effect=_polygon), \
+            patch.object(daily_closes, "_fetch_yfinance_closes", return_value=0), \
+            patch.object(daily_closes, "_fetch_fred_closes", return_value=0):
+        return daily_closes.collect(
+            bucket="b", tickers=polygon_serves, run_date=TRADING_DAY, source="polygon_only",
+        )
+
+
+def test_a_d17_file_carrying_a_provisional_row_records_both_readings():
+    """The measured 2026-09-22 shape: polygon did not serve CPRI, so D17's
+    file carried v1 D19's 16:06 ET yfinance cell for it. The fetch reading is
+    `settled`, the carried reading is `provisional`, and parity reads the key's
+    evidence as ambiguous. The row stays strict."""
+    result = _d17_collect({"AAPL": 100.0, "CPRI": 15.195}, polygon_serves=["AAPL"])
+    assert result["status"] == "ok"
+    verdicts = [g["verdict"] for g in result["guards"]]
+    assert verdicts == ["settled", "provisional"]
+    assert {g["key"] for g in result["guards"]} == {KEY}
+    assert "1 row(s)" in result["guards"][1]["detail"]
+    assert parity._bar_settlement_stamp({"guards": result["guards"]}, KEY) is None
+
+
+def test_a_d17_file_it_fully_refreshed_records_only_its_fetch():
+    result = _d17_collect({"AAPL": 100.0}, polygon_serves=["AAPL"])
+    assert [g["verdict"] for g in result["guards"]] == ["settled"]
+    assert parity._bar_settlement_stamp({"guards": result["guards"]}, KEY)["verdict"] == "settled"
