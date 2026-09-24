@@ -5,22 +5,31 @@
 #   0.  Preflight — env vars + S3 reachability (hard-fails on miss)
 #   1.  SEC filings (10-K/10-Q, foreign 20-F/40-F) — from signals universe, 2y lookback
 #   2.  8-K material events — from signals universe, 1y lookback
-#   3.  Earnings transcripts (Finnhub) — from signals universe, latest 8
-#   4.  Thesis history — from research.db (incremental)
-#   5.  News corpus freshness ASSERTION (config-I5702) — verifies the
+#   3.  Thesis history — from research.db (incremental)
+#   4.  News corpus freshness ASSERTION (config-I5702) — verifies the
 #       corpus is warm; NEVER fetches. The daily job ingests news at fetch
 #       time now, so Saturday reads instead of fetching.
-#   6.  Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
-#   7.  13F institutional ownership (config#2428) — reads the
+#   5.  Form 4 insider transactions (Wave 1 Gate A) — EDGAR → parquet
+#   6.  13F institutional ownership (config#2428) — reads the
 #       inst_ownership derived table (produced separately by
 #       data.derived.inst_ownership) → RAG corpus ingest, doc_type="13F"
-#   8.  Analyst pipeline (Wave 1 Gate A) — yfinance + Finnhub snapshot
+#   7.  Analyst pipeline (Wave 1 Gate A) — yfinance + Finnhub snapshot
 #       → self-derived 7d/30d revisions
-#   9.  Filing change detection — analyze consecutive filings
-#   10. Manifest emit — corpus snapshot for presentation layer
+#   8.  Filing change detection — analyze consecutive filings
+#   9.  Manifest emit — corpus snapshot for presentation layer
 #   then: source-yield verdict (alpha-engine-config-I11472) — every source
 #       that returned 0 documents is named and the run reports DEGRADED
 #       (log + completion email); never changes the exit code.
+#
+# RETIRED 2026-09-24 — earnings transcripts (Finnhub), formerly step 3
+# (alpha-engine-config-I11472, Brian's ruling). Finnhub's /stock/transcripts
+# endpoints are a paid tier, and the step ingested 0 transcripts on every run
+# since the corpus began: no `earnings_transcript` document has ever been
+# stored. The ruling was to retire it rather than license the tier or switch
+# vendor, so the step, its module (rag/pipelines/ingest_earnings_finnhub.py)
+# and its expected source-yield entry are gone. The steps after it moved up by
+# one, so the run is now steps 0-9 of 9. The retirement is recorded in
+# rag/pipelines/source_yield.py::RETIRED_SOURCES, and every verdict carries it.
 #
 # Intended to run on the Saturday Step Function via SSM on the always-on
 # EC2 instance. `set -euo pipefail` plus no `|| echo "non-fatal"`
@@ -53,7 +62,8 @@
 # no Postgres/pgvector write, no manifest emit is reachable under it.
 #
 # Prerequisites (verified by step 0):
-#   - .env with RAG_DATABASE_URL, VOYAGE_API_KEY, FINNHUB_API_KEY, EDGAR_IDENTITY
+#   - .env with RAG_DATABASE_URL, VOYAGE_API_KEY, FINNHUB_API_KEY (analyst
+#     pipeline, step 7), EDGAR_IDENTITY
 #   - research.db available locally or fetchable from S3
 
 set -euo pipefail
@@ -140,7 +150,7 @@ echo "========================================"
 # ─────────────────────────────────────────────────────────────────────────
 # Writes s3://alpha-engine-research/health/rag_ingestion_progress/{RUN_DATE}.json
 # between each step below so the Fleet Status console strip can render
-# "step N/10: <label>" for this off-box, multi-hour SSM stage instead of a
+# "step N/9: <label>" for this off-box, multi-hour SSM stage instead of a
 # single opaque RUNNING dot.
 #
 # NOT registered in alpha-engine-config ARTIFACT_REGISTRY.yaml, deliberately
@@ -169,14 +179,14 @@ emit_progress() {
 
 # ── Step 0: Preflight — fail fast on env / connectivity drift ────────────────
 echo ""
-echo "==> Step 0/10: Preflight checks..."
-emit_progress 0 10 "preflight"
+echo "==> Step 0/9: Preflight checks..."
+emit_progress 0 9 "preflight"
 $PYTHON_BIN -m rag.preflight
 
 # Friday shell-run dry path: stop HERE, immediately after the existing
 # rag.preflight passed and strictly BEFORE Step 1 (the first ingest
 # pipeline). Every fetch (SEC/Finnhub/yfinance), every Voyage embedding
-# call, and every Postgres/pgvector + parquet write lives in Steps 1-10
+# call, and every Postgres/pgvector + parquet write lives in Steps 1-9
 # below — all statically unreachable once we exit here. rag.preflight
 # itself only does check_env_vars + check_s3_bucket (S3 HEAD): read-only,
 # zero external API fetch, zero mutation.
@@ -189,27 +199,23 @@ fi
 
 # ── Step 1: SEC filings (10-K/10-Q) ─────────────────────────────────────────
 echo ""
-echo "==> Step 1/10: SEC filings (10-K/10-Q/20-F/40-F)..."
-emit_progress 1 10 "sec_filings"
+echo "==> Step 1/9: SEC filings (10-K/10-Q/20-F/40-F)..."
+emit_progress 1 9 "sec_filings"
 $PYTHON_BIN -m rag.pipelines.ingest_sec_filings --from-signals --lookback-years 2 $DRY_RUN
 
 # ── Step 2: 8-K material events ─────────────────────────────────────────────
 echo ""
-echo "==> Step 2/10: 8-K material events..."
-emit_progress 2 10 "8k_events"
+echo "==> Step 2/9: 8-K material events..."
+emit_progress 2 9 "8k_events"
 $PYTHON_BIN -m rag.pipelines.ingest_8k_filings --from-signals --lookback-days 365 $DRY_RUN
 
-# ── Step 3: Earnings transcripts (Finnhub) ──────────────────────────────────
-# FINNHUB_API_KEY is verified by preflight; no runtime skip branch.
-echo ""
-echo "==> Step 3/10: Earnings transcripts (Finnhub)..."
-emit_progress 3 10 "earnings_transcripts"
-$PYTHON_BIN -m rag.pipelines.ingest_earnings_finnhub --from-signals --max-per-ticker 8 $DRY_RUN
+# (Earnings transcripts via Finnhub, formerly step 3, were RETIRED 2026-09-24,
+# alpha-engine-config-I11472. See the header.)
 
-# ── Step 4: Thesis history (v2 quant/qual from signals.json) ─────────────────
+# ── Step 3: Thesis history (v2 quant/qual from signals.json) ─────────────────
 echo ""
-echo "==> Step 4/10: Thesis history..."
-emit_progress 4 10 "thesis_history"
+echo "==> Step 3/9: Thesis history..."
+emit_progress 3 9 "thesis_history"
 SINCE=$(date -u -d '14 days ago' '+%Y-%m-%d' 2>/dev/null || date -u -v-14d '+%Y-%m-%d')
 $PYTHON_BIN -m rag.pipelines.ingest_theses --signals --since "$SINCE" $DRY_RUN
 
@@ -228,7 +234,7 @@ else
     echo "==> LM dict bootstrap: $LM_DICT_PATH already present, skipping download"
 fi
 
-# ── Step 5: News corpus freshness ASSERTION (config-I5702) ───────────────────
+# ── Step 4: News corpus freshness ASSERTION (config-I5702) ───────────────────
 # This step used to run the full news fetch inline — the ~3.1h Polygon sweep
 # that dominated RAGIngestion's 6h budget and was the stage in flight when the
 # 2026-07-29 weekly pipeline died (alpha-engine-config-I5695).
@@ -248,19 +254,19 @@ fi
 # actually landed — not from an artifact's mtime, which a run that ingested
 # nothing can still refresh.
 echo ""
-echo "==> Step 5/10: News corpus freshness assertion (no fetch)..."
-emit_progress 5 10 "news"
+echo "==> Step 4/9: News corpus freshness assertion (no fetch)..."
+emit_progress 4 9 "news"
 $PYTHON_BIN -m rag.pipelines.assert_corpus_freshness ${DRY_RUN:+--no-write}
 
-# ── Step 6: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
+# ── Step 5: Form 4 insider transactions (Wave 1 Gate A) ──────────────────────
 # EDGAR Form 4 → structured per-(filed_date) parquet at
 # s3://alpha-engine-research/data/insider_transactions/{date}.parquet
 echo ""
-echo "==> Step 6/10: Form 4 insider transactions..."
-emit_progress 6 10 "form4_insider"
+echo "==> Step 5/9: Form 4 insider transactions..."
+emit_progress 5 9 "form4_insider"
 $PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY_RUN
 
-# ── Step 7: 13F institutional ownership (config#2428) ───────────────────────
+# ── Step 6: 13F institutional ownership (config#2428) ───────────────────────
 # Reads the inst_ownership derived table (data.derived.inst_ownership —
 # built separately from SEC quarterly bulk Form 13F data, NOT re-fetched
 # here) and ingests one RAG document per (ticker, quarter) QoQ summary,
@@ -269,33 +275,33 @@ $PYTHON_BIN -m rag.pipelines.ingest_form4 --from-signals --lookback-days 90 $DRY
 # than a pipeline failure — the SEC bulk data itself is ~45-day delayed
 # by regulation, so an empty quarter is expected, not an error.
 echo ""
-echo "==> Step 7/10: 13F institutional ownership..."
-emit_progress 7 10 "inst_ownership_13f"
+echo "==> Step 6/9: 13F institutional ownership..."
+emit_progress 6 9 "inst_ownership_13f"
 $PYTHON_BIN -m rag.pipelines.ingest_13f --from-signals $DRY_RUN
 
-# ── Step 8: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
+# ── Step 7: Analyst pipeline (Wave 1 Gate A) ─────────────────────────────────
 # Snapshot per-(ticker, date) consensus + price targets via yfinance + Finnhub,
 # then compute 7d/30d revisions deltas from the accumulated time series.
 # Revisions become meaningful after ~4 weekly snapshots (Gate B in ROADMAP).
 echo ""
-echo "==> Step 8/10: Analyst snapshot + revisions..."
-emit_progress 8 10 "analyst_pipeline"
+echo "==> Step 7/9: Analyst snapshot + revisions..."
+emit_progress 7 9 "analyst_pipeline"
 $PYTHON_BIN -m rag.pipelines.run_analyst_pipeline --from-signals $DRY_RUN
 
-# ── Step 9: Filing change detection ──────────────────────────────────────────
+# ── Step 8: Filing change detection ──────────────────────────────────────────
 echo ""
-echo "==> Step 9/10: Filing change detection..."
-emit_progress 9 10 "filing_changes"
+echo "==> Step 8/9: Filing change detection..."
+emit_progress 8 9 "filing_changes"
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.filing_change_detection --output-s3 --run-date "$RUN_DATE"
 else
     echo "  SKIPPED in dry-run mode"
 fi
 
-# ── Step 10: Manifest emit (presentation-layer source of truth) ─────────────
+# ── Step 9: Manifest emit (presentation-layer source of truth) ──────────────
 echo ""
-echo "==> Step 10/10: Emit corpus manifest..."
-emit_progress 10 10 "manifest_emit"
+echo "==> Step 9/9: Emit corpus manifest..."
+emit_progress 9 9 "manifest_emit"
 if [ -z "$DRY_RUN" ]; then
     $PYTHON_BIN -m rag.pipelines.emit_manifest --output-s3 --run-date "$RUN_DATE"
 else
@@ -306,7 +312,7 @@ fi
 # Names every source that returned 0 documents this run (or whose step never
 # reported) and marks the run DEGRADED — in this log, in verdict.json beside
 # the yields, and in the completion email below. ALWAYS exits 0, exactly like
-# step 5's freshness assertion: a degraded source degrades the report, it does
+# step 4's freshness assertion: a degraded source degrades the report, it does
 # not fail the weekly pipeline.
 echo ""
 echo "==> Source-yield verdict..."
@@ -328,9 +334,10 @@ aws cloudwatch put-metric-data \
 echo "Heartbeat emitted: rag-ingestion"
 
 # Send completion email. With `set -euo pipefail` active, reaching this
-# point means all 9 pipelines EXITED 0 — which is not the same as every source
+# point means all 8 pipelines EXITED 0 — which is not the same as every source
 # returning documents (alpha-engine-config-I11472: this email said 'ok' for
-# earnings_transcripts on a run that ingested 0 transcripts for 118 tickers).
+# earnings_transcripts on a run that ingested 0 transcripts for 118 tickers;
+# that source was retired on 2026-09-24).
 # So 'ok' is the base, and the source-yield verdict overlays it: a degraded
 # source shows as 'degraded' with its reason, and the run's status becomes
 # 'degraded'. A missing verdict reads as degraded too. PYTHON_BIN resolved at
@@ -343,7 +350,6 @@ date_str = '$RUN_DATE'
 status, collectors = email_collectors({
     'sec_filings': {'status': 'ok'},
     '8k_events': {'status': 'ok'},
-    'earnings_transcripts': {'status': 'ok'},
     'thesis_history': {'status': 'ok'},
     'news_pipeline': {'status': 'ok'},
     'form4_insider': {'status': 'ok'},

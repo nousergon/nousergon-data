@@ -7,7 +7,8 @@ tickers`` and ``Signals thesis ingestion: 0 theses``. Nothing distinguished "a
 source that has nothing new this week" from "a source that returned nothing at
 all" — both print a 0 and exit 0, and the earnings-transcript source had been
 the second kind for as long as the corpus has existed (no
-``earnings_transcript`` document has ever been stored).
+``earnings_transcript`` document has ever been stored). That source was
+RETIRED on 2026-09-24 (see :data:`RETIRED_SOURCES`).
 
 HOW IT WORKS
 ------------
@@ -42,6 +43,11 @@ the completion email's per-collector status (and a ``DEGRADED`` subject), and
 — under the recorded entry point — a ``rag_source_yield`` guard on the D16 run
 manifest.
 
+A RETIRED source is not an expected source, so its absence is not a gap. It
+is not dropped silently either: :data:`RETIRED_SOURCES` names it with its date
+and reason, ``--report`` logs one line per retired source, and every verdict
+carries the map under ``retired_sources``.
+
 Usage (called by ``run_weekly_ingestion.sh`` after the last step)::
 
     python -m rag.pipelines.source_yield --report
@@ -69,10 +75,24 @@ VERDICT_FILE = "verdict.json"
 EXPECTED_SOURCES: tuple[str, ...] = (
     "sec_filings",
     "8k_events",
-    "earnings_transcripts",
     "thesis_history",
     "form4_insider",
 )
+
+#: Sources the weekly run USED to run and deliberately no longer does, each
+#: with the date and reason it was retired. Never also in
+#: :data:`EXPECTED_SOURCES`. Recorded here rather than deleted, so that the
+#: verdict says why a source is missing instead of leaving it unexplained.
+RETIRED_SOURCES: dict[str, str] = {
+    "earnings_transcripts": (
+        "retired 2026-09-24 (alpha-engine-config-I11472, Brian's ruling): "
+        "Finnhub's /stock/transcripts endpoints are a paid tier, and the step "
+        "ingested 0 transcripts on every run since the corpus began. The ruling "
+        "was not to license the tier and not to switch vendor. The step "
+        "(formerly step 3 of run_weekly_ingestion.sh) and its module "
+        "rag/pipelines/ingest_earnings_finnhub.py were removed."
+    ),
+}
 
 STATUS_OK = "ok"
 STATUS_DEGRADED = "degraded"
@@ -228,6 +248,7 @@ def assess(
         "status": STATUS_DEGRADED if degraded else STATUS_OK,
         "degraded_sources": degraded,
         "sources": sources,
+        "retired_sources": dict(RETIRED_SOURCES),
     }
 
 
@@ -285,6 +306,8 @@ def main(argv: list[str] | None = None) -> int:
     for name, info in verdict["sources"].items():
         if info["status"] == STATUS_EXPECTED_EMPTY:
             logger.info("[rag_source_yield] %s: %s", name, info["reason"])
+    for name, reason in verdict["retired_sources"].items():
+        logger.info("[rag_source_yield] %s: RETIRED, not expected: %s", name, reason)
 
     out = yield_dir(args.dir) / VERDICT_FILE
     try:

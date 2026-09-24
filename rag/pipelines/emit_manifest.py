@@ -9,8 +9,10 @@ outputs, not new measurement layers.
 
 What lands in the manifest:
 
-- ``by_source``: per ``doc_type`` rollup (10-K, 10-Q, 8-K,
-  earnings_transcript, thesis) — document count, ticker count, chunk count
+- ``by_source``: per ``doc_type`` rollup (10-K, 10-Q, 8-K, 13F, thesis,
+  ...) — document count, ticker count, chunk count. (``earnings_transcript``
+  was never populated, and its source was retired on 2026-09-24,
+  alpha-engine-config-I11472.)
 - ``by_ticker_coverage``: how many tickers are covered + per-ticker depth
   percentiles (p25 / p50 / p75)
 - ``totals``: documents, chunks, tickers
