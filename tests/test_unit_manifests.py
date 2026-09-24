@@ -777,7 +777,7 @@ def test_d16_records_the_source_yield_verdict_as_a_guard(sink, d16, monkeypatch,
         seen["yield_dir"] = yield_dir
         for name in source_yield.EXPECTED_SOURCES:
             source_yield.write_yield(
-                source_yield.SourceYield(source=name, scope=118, discovered=0 if name == "earnings_transcripts" else 5),
+                source_yield.SourceYield(source=name, scope=118, discovered=0 if name == "8k_events" else 5),
                 yield_dir,
             )
         source_yield.main(["--report", "--dir", yield_dir])
@@ -794,7 +794,7 @@ def test_d16_records_the_source_yield_verdict_as_a_guard(sink, d16, monkeypatch,
     guard = next(g for g in manifest["guards"] if g["guard"] == module.SOURCE_YIELD_GUARD)
     assert guard["verdict"] == "degraded"
     assert guard["mode"] == "observe"
-    assert "earnings_transcripts" in guard["detail"]
+    assert "8k_events" in guard["detail"]
     assert guard["value"] == 1.0
 
 
@@ -870,6 +870,55 @@ def test_d16_passes_its_trading_day_to_the_script_as_run_date(d16, monkeypatch):
 
     assert module.main() == 0
     assert seen == [(True, "2026-09-19")]
+
+
+@pytest.mark.parametrize(
+    "instant",
+    [
+        # The 2026-09-23 rehearsal shape: Friday evening ET, already Saturday UTC.
+        datetime(2026, 9, 26, 0, 30, tzinfo=timezone.utc),
+        # The production weekly schedule: Saturday 05:00 America/New_York.
+        datetime(2026, 9, 26, 9, 0, tzinfo=timezone.utc),
+    ],
+)
+def test_d16_with_no_date_keys_by_the_cycle_date_not_the_utc_day(d16, monkeypatch, instant):
+    """alpha-engine-config-I11475: the v2 path (the dispatcher's static weekly
+    schedule passes no --date) keys D16 by the cycle date — the last closed
+    session, Friday 2026-09-25 — never the UTC calendar day, Saturday."""
+    import dates
+
+    module, since = d16
+    real_default_run_date = dates.default_run_date
+    monkeypatch.setattr(dates, "default_run_date", lambda: real_default_run_date(now=instant))
+    seen: list[str] = []
+    monkeypatch.setattr(
+        module, "_run_ingestion_script", lambda dry_run, run_date, yield_dir=None: seen.append(run_date) or 0
+    )
+    monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--dry-run"])
+    monkeypatch.setenv("NE_DATA_CODE_SHA", FAKE_SHA)
+
+    assert module.main() == 0
+    assert instant.date().isoformat() == "2026-09-26"
+    assert seen == ["2026-09-25"]
+
+
+def test_d16_default_date_is_the_dates_chokepoint(d16, monkeypatch):
+    """The no---date default is `dates.default_run_date()` — the one function
+    `run_units.run_phase` keys every other weekly unit by — so D16's manifest
+    and dated keys share a partition with the rest of the weekly execution."""
+    import dates
+
+    module, since = d16
+    monkeypatch.setattr(dates, "default_run_date", lambda: "2026-09-18")
+    seen: list[str] = []
+    monkeypatch.setattr(
+        module, "_run_ingestion_script", lambda dry_run, run_date, yield_dir=None: seen.append(run_date) or 0
+    )
+    monkeypatch.setattr(sys, "argv", ["run_weekly_ingestion_recorded", "--dry-run"])
+    monkeypatch.setenv("NE_DATA_CODE_SHA", FAKE_SHA)
+
+    assert module.main() == 0
+    assert seen == ["2026-09-18"]
 
 
 def test_d16_dispatcher_workload_calls_the_recorded_entrypoint():

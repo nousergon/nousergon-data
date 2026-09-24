@@ -124,6 +124,6 @@ clause_phase:
   survives_phase4: 1
 notes: >-
     alpha-engine-config-I10753 + R7 retire, RECORDED (see retirement: block above).
-    Same residual note as D40: step 8 continues inside the unchanged
+    Same residual note as D40: step 7 continues inside the unchanged
     run_weekly_ingestion.sh script; this row is RETIRED for
     tracking/monitoring purposes, not asserting the write stopped.

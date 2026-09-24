@@ -19,7 +19,7 @@ Centralized data collection, storage, and distribution. Owns the price universe 
 - Ingests macro indicators from FRED (rates, VIX, commodities) and computes derived signals (yield-curve slope, VIX term slope, market breadth)
 - Pulls per-ticker alternative data (analyst consensus, EPS revisions, options chains, insider filings, 13F holdings, news sentiment) only for tickers promoted by Research — keeps API spend bounded
 - Computes the engineered feature store used by the Predictor for both training and inference
-- Runs the RAG ingestion step: SEC 10-K/10-Q/8-K, earnings transcripts, and thesis history embedded into the pgvector knowledge base that Research's qual-analyst agents query
+- Runs the RAG ingestion step: SEC 10-K/10-Q/8-K/20-F/40-F, Form 4, 13F, and thesis history embedded into the pgvector knowledge base that Research's qual-analyst agents query
 
 ## Phase 2 measurement contribution
 
@@ -35,7 +35,7 @@ flowchart LR
     APIs --> EOD
 
     P1[Phase 1 · weekly<br/>prices · macro · constituents · features]
-    RAG[RAG ingestion · weekly<br/>filings · transcripts · theses]
+    RAG[RAG ingestion · weekly<br/>filings · Form 4 · 13F · theses]
     P2[Phase 2 · weekly<br/>alt data — promoted tickers only]
     EOD[EOD · weekday<br/>daily closes · macro refresh]
 

@@ -11,7 +11,7 @@ machine's ``verify_units`` completion check on every execution that names it
 that never ran.
 
 **Also covers D46 (`alpha-engine-config-I10753`).** D46 (insider_transactions,
-Form 4) is step 6 of this SAME script and gets no dispatcher key of its own —
+Form 4) is step 5 of this SAME script and gets no dispatcher key of its own —
 a second entry point would re-run the identical EDGAR fetch a second time per
 week (see `index.py::_WORKLOADS["rag-weekly-ingestion"]`'s comment). Rather
 than leave D46 with no run record at all, its descriptor's
@@ -26,7 +26,7 @@ D46's own `writes:` floor — no second manifest, no second script run.
 
 This module is a THIN wrapper (`data_collection_plan_260914.md` §4.4;
 ``nousergon-data`` AGENTS.md's "wrap, don't reimplement" precedent): it runs
-the existing bash script completely unchanged — same nine ingestion steps,
+the existing bash script completely unchanged — same ingestion steps,
 same venv/PYTHON_BIN resolution, same LM-dict bootstrap, same
 ``--dry-run``/``--preflight-only`` flags — and adds exactly one thing around
 it, a ``run_units.recorded_entry("D16", ...)`` call. It never reimplements the
@@ -50,9 +50,17 @@ which keys ``rag/manifest/{date}.json``, ``rag/filing_changes/{date}.json`` and
 apart, even across midnight UTC. (Before I11514 each step read the wall clock
 itself and this wrapper had to guess the same value.)
 
-``--date`` defaults to today UTC, not `dates.default_run_date()`: the
-dispatcher's EventBridge Scheduler input is static and cannot carry a cycle
-date, and this default preserves the keys this workload has always written.
+**``--date`` defaults to the cycle date, never the UTC calendar day**
+(alpha-engine-config-I11475, Brian's ruling of 2026-09-24: the whole D16 key
+family is keyed by the SF cycle date, the same value v1's RAGIngestion passes
+from ``$.run_date`` since I11514). The data-collection weekly schedule's input
+is static and cannot carry a date, so the default is `dates.default_run_date()`
+— the last closed NYSE session, which is what the v1 SF's ``$.run_date``
+resolves to for the Saturday run (Friday), what `run_units.run_phase` keys
+every other unit in the same weekly execution by, and what the dispatcher's own
+run-log partition (`index.py::_run_log_trading_day`) resolves to. Before this,
+the default was today's UTC date, so the v2 path filed Saturday's run under
+Saturday while v1 filed the same cycle under Friday.
 
 Replaces ``bash rag/pipelines/run_weekly_ingestion.sh`` as the
 ``rag-weekly-ingestion`` workload command in
@@ -90,7 +98,7 @@ BUCKET = "alpha-engine-research"
 #: their shared parent prefix; `rag/watermarks/` and `rag/corpus_freshness/`
 #: are already prefixes; `health/rag_ingestion_progress/{date}.json` gets its
 #: own), PLUS D46's declared write prefix (`data/insider_transactions/`,
-#: alpha-engine-config-I10753 — step 6 of this same script, no separate
+#: alpha-engine-config-I10753 — step 5 of this same script, no separate
 #: manifest). Declared here, not derived from either descriptor at runtime,
 #: for the same reason `run_units.PHASE_UNITS` is a literal table: a renamed
 #: prefix on either side is a loud test failure, never a silent miss.
@@ -119,7 +127,7 @@ def _ingestion_argv(dry_run: bool, run_date: str) -> list[str]:
 def _run_ingestion_script(dry_run: bool, run_date: str, yield_dir: str | None = None) -> int:
     """Run the existing bash pipeline unchanged. Returns its exit code.
 
-    A subprocess call, not a reimplementation: everything about HOW the nine
+    A subprocess call, not a reimplementation: everything about HOW the
     steps run stays exactly what `run_weekly_ingestion.sh` already does. The
     one thing passed IN is where the script's per-source yields go
     (``$RAG_SOURCE_YIELD_DIR``), so this process can read the verdict back.
@@ -298,6 +306,20 @@ def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool, run_date: str) 
     return result
 
 
+def _default_cycle_date() -> str:
+    """The cycle date a scheduled run with no ``--date`` keys D16 by.
+
+    ``dates.default_run_date()`` (alpha-engine-config-I11475): the last closed
+    NYSE session, so a Saturday run is filed under Friday's cycle exactly as
+    v1's ``$.run_date`` files it. Imported here, not at module top, for the same
+    reason `run_units.run_phase` does: it keeps ``dates`` off the import path of
+    callers that always pass an explicit date.
+    """
+    from dates import default_run_date
+
+    return default_run_date()
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description=__doc__)
@@ -308,11 +330,13 @@ def main(argv: list[str] | None = None) -> int:
         default=None,
         help="The manifest's trading_day, also passed to run_weekly_ingestion.sh as "
         "--run-date so every dated key it writes carries the same value "
-        "(alpha-engine-config-I11514). Default: today UTC.",
+        "(alpha-engine-config-I11514). Default: the cycle date, "
+        "dates.default_run_date() — the last closed NYSE session, never the UTC "
+        "calendar day (alpha-engine-config-I11475).",
     )
     args = parser.parse_args(argv)
 
-    trading_day = args.date or datetime.now(timezone.utc).date().isoformat()
+    trading_day = args.date or _default_cycle_date()
 
     def _entry(ctx: run_units.run_manifest.UnitRun) -> dict[str, Any]:
         return _body(ctx, dry_run=args.dry_run, run_date=trading_day)

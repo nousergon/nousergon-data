@@ -982,7 +982,7 @@ fi
 #   1. IAM: spot can fetch the 4 RAG secrets from SSM
 #   2. PYTHON_BIN resolution under python3.12 on AL2023
 #   3. All 5 env vars pass rag/preflight.py::RAGPreflight.check_env_vars
-#   4. All 5 RAG submodules import under python3.12
+#   4. All 4 RAG submodules import under python3.12
 #   5. run_weekly_ingestion.sh --dry-run executes each pipeline's CLI path
 # Does NOT validate: Postgres reachability (dry-run doesn't connect),
 # external API quotas (dry-run doesn't hit them), runtime bugs that only
@@ -1014,14 +1014,13 @@ echo "==> RAG smoke: preflight env-var check"
 \$PYTHON_BIN -m rag.preflight
 
 echo ""
-echo "==> RAG smoke: import all 5 RAG submodules"
+echo "==> RAG smoke: import all 4 RAG submodules"
 \$PYTHON_BIN -c "
 import rag.pipelines.ingest_sec_filings
 import rag.pipelines.ingest_8k_filings
-import rag.pipelines.ingest_earnings_finnhub
 import rag.pipelines.ingest_theses
 import rag.pipelines.filing_change_detection
-print('all 5 rag submodules imported OK')
+print('all 4 rag submodules imported OK')
 "
 
 echo ""

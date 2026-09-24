@@ -124,9 +124,9 @@ clause_phase:
   survives_phase4: 1
 notes: >-
     alpha-engine-config-I10753 + R7 retire, RECORDED (see retirement: block above).
-    run_weekly_ingestion.sh step 8 (analyst pipeline) continues to execute as
+    run_weekly_ingestion.sh step 7 (analyst pipeline) continues to execute as
     part of the unchanged script the `rag-weekly-ingestion` workload runs
     (this unit's own trigger surface is out of scope for I10753/I10779 —
-    trimming step 8 out of the script is a separate follow-up); this row is
+    trimming step 7 out of the script is a separate follow-up); this row is
     RETIRED for tracking/monitoring purposes, not asserting the script no
     longer writes the archive.
