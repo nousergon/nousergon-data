@@ -248,33 +248,35 @@ def test_cache_persists_sub_industry_map() -> None:
             }
 
 
-def test_collect_raises_when_sector_coverage_gap_exceeds_tolerance(tmp_path) -> None:
-    """If more than the addition-lag tolerance of tickers land in `tickers`
-    without a sector entry, collect() must raise (systemic parse failure,
-    not a couple of recent-addition stragglers)."""
-    unmapped = [f"NEW{i}" for i in range(constituents._UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD + 1)]
-
+def test_collect_raises_when_a_member_stays_unclassified(tmp_path) -> None:
+    """alpha-engine-config-I11468: there is no addition-lag tolerance any
+    more. A member with no Wikipedia GICS row that the yfinance fallback
+    cannot classify either fails collect() — it is never published with an
+    'Unknown' sector."""
     def fake_fetch():
         return (
-            ["AAPL", "MSFT", *unmapped],
+            ["AAPL", "MSFT", "NEW0"],
             {"AAPL": "Information Technology", "MSFT": "Information Technology"},
             {"AAPL": "XLK", "MSFT": "XLK"},
             {},
             2,
-            len(unmapped),
+            1,
             constituents.SsgaWeights(),
         )
 
-    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch):
-        with pytest.raises(RuntimeError, match="Sector mapping incomplete"):
+    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch), \
+         patch(
+             "collectors.constituents._yfinance_classification",
+             return_value={"NEW0": {"error": "HTTPError: 404"}},
+         ):
+        with pytest.raises(constituents.SectorCoverageIncomplete, match="Sector mapping incomplete"):
             constituents.collect(bucket="any", dry_run=True)
 
 
-def test_collect_warns_but_proceeds_within_sector_gap_tolerance(tmp_path) -> None:
-    """config#2812: a small number of SSGA-confirmed-current members
-    missing a Wikipedia sector classification (addition-lag, verified live
-    for TOST/IESC on the first real run of this fix) must NOT block
-    collect() — only exceeding the tolerance does."""
+def test_collect_fills_a_wikipedia_lagging_add_from_yfinance(tmp_path) -> None:
+    """config#2812's TOST/IESC case (a recent addition Wikipedia has not
+    classified yet) no longer proceeds WITHOUT a sector: the yfinance
+    fallback supplies one and collect() proceeds (alpha-engine-config-I11468)."""
     def fake_fetch():
         return (
             ["AAPL", "MSFT", "TOST"],
@@ -286,7 +288,11 @@ def test_collect_warns_but_proceeds_within_sector_gap_tolerance(tmp_path) -> Non
             constituents.SsgaWeights(),
         )
 
-    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch):
+    with patch("collectors.constituents._fetch_constituents", side_effect=fake_fetch), \
+         patch(
+             "collectors.constituents._yfinance_classification",
+             return_value={"TOST": {"sector": "Technology", "industry": "Software - Infrastructure"}},
+         ):
         result = constituents.collect(bucket="any", dry_run=True)
     assert result["status"] == "ok_dry_run"
     assert "TOST" in result["tickers"]
