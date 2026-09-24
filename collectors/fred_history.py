@@ -334,6 +334,28 @@ def backfill_to_s3(
     }
 
 
+def written_keys(result: dict, s3_prefix: str = "predictor/price_cache/") -> dict[str, int]:
+    """``{s3_key: row_count}`` for every series parquet :func:`backfill_to_s3`
+    actually uploaded this run (alpha-engine-config-I11469).
+
+    Addressed under the SAME write prefix(es) the upload itself used
+    (``price_cache_write_prefixes``). Reads only ``per_ticker`` entries whose
+    status is ``ok`` — a series whose fetch or upload raised is recorded as
+    ``error`` there and never appears — and nothing at all for a dry run,
+    which fetched and wrote no object. Mirrors
+    ``collectors/prices.py::written_keys`` (alpha-engine-config-I11026).
+    """
+    if result.get("dry_run"):
+        return {}
+    out: dict[str, int] = {}
+    for ticker, entry in (result.get("per_ticker") or {}).items():
+        if not isinstance(entry, dict) or entry.get("status") != "ok":
+            continue
+        for prefix in price_cache_write_prefixes(s3_prefix):
+            out[f"{prefix}{ticker}.parquet"] = int(entry.get("rows") or 0)
+    return out
+
+
 def main():
     """CLI entry point — one-shot backfill of all FRED_HISTORY_MAP tickers.
 
