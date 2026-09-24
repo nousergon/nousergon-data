@@ -571,6 +571,12 @@ def _process_one_ticker(
     try:
         with _ticker_hard_timeout(_PER_TICKER_TIMEOUT_S, ticker):
             data = _fetch_all_alternative(ticker, run_date, bucket)
+        # alpha-engine-config-I11473: strip the private 8-K failure marker
+        # before validation / the S3 write; it is reported via the result.
+        news = data.get("news")
+        edgar_8k_failed = bool(
+            news.pop(_EDGAR_8K_FAILED_KEY, False) if isinstance(news, dict) else False
+        )
         blocking, warning = _validate_alt_payload(
             data, ticker, block_anomaly_types
         )
@@ -587,6 +593,7 @@ def _process_one_ticker(
                 "ticker": ticker,
                 "blocking": blocking,
                 "warning": warning,
+                "edgar_8k_failed": edgar_8k_failed,
             }
 
         key = f"{s3_prefix}weekly/{run_date}/alternative/{ticker}.json"
@@ -613,6 +620,7 @@ def _process_one_ticker(
             "data": data,
             "source_oks": source_oks,
             "warning": warning,
+            "edgar_8k_failed": edgar_8k_failed,
         }
     except _TickerHardTimeout:
         logger.warning(
@@ -732,6 +740,9 @@ def collect(
     # _build_predictor_options_mirror commentary). Canonical per-ticker
     # files above are the source of truth and are left untouched.
     per_ticker_alt: dict[str, dict] = {}
+    # alpha-engine-config-I11473: tickers whose EDGAR 8-K search still failed
+    # after retries (their JSON landed without 8-K data).
+    edgar_8k_failed_tickers: list[str] = []
 
     # ── Concurrent ticker processing ─────────────────────────────────────
     # Process all promoted tickers concurrently via ThreadPoolExecutor.
@@ -775,6 +786,8 @@ def collect(
         for future in as_completed(futures):
             result = future.result()
             with _agg_lock:
+                if result.get("edgar_8k_failed"):
+                    edgar_8k_failed_tickers.append(result["ticker"])
                 if result["status"] == "ok":
                     succeeded += 1
                     per_ticker_alt[result["ticker"]] = result["data"]
@@ -841,6 +854,21 @@ def collect(
         "quality_block_anomaly_types": sorted(block_anomaly_types),
     }
 
+    # alpha-engine-config-I11473: one aggregated line + a count in the phase
+    # result and manifest, so a widespread efts outage is visible rather than
+    # a scatter of per-ticker WARNINGs under a green stage.
+    edgar_8k_failed_tickers.sort()
+    if edgar_8k_failed_tickers:
+        logger.warning(
+            "EDGAR 8-K search failed after %d attempts for %d/%d ticker(s): %s",
+            _EDGAR_8K_MAX_ATTEMPTS, len(edgar_8k_failed_tickers), len(tickers),
+            ", ".join(edgar_8k_failed_tickers[:20]),
+        )
+    _edgar_8k_fields = {
+        "tickers_edgar_8k_failed": len(edgar_8k_failed_tickers),
+        "edgar_8k_failed_tickers": edgar_8k_failed_tickers[:20],
+    }
+
     # ── Per-source ok_ratio gate ────────────────────────────────────────────
     # Mirrors `fundamentals.py::_MIN_OK_RATIO` and
     # `short_interest.py::_MIN_OK_RATIO` patterns — every alt-data source
@@ -898,6 +926,7 @@ def collect(
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
         **_quality_fields,
+        **_edgar_8k_fields,
     }
     manifest_key = f"{s3_prefix}weekly/{run_date}/alternative/manifest.json"
     s3.put_object(
@@ -938,6 +967,7 @@ def collect(
             "breached_sources": [src for src, _, _ in breached],
             "errors": errors[:20],
             **_quality_fields,
+            **_edgar_8k_fields,
         }
 
     status = "ok" if failed == 0 else "partial"
@@ -956,6 +986,7 @@ def collect(
         "source_min_ok_ratios": min_ok_ratios,
         "errors": errors[:20],
         **_quality_fields,
+        **_edgar_8k_fields,
     }
 
 
@@ -1332,7 +1363,7 @@ from .finnhub_client import finnhub_get as _finnhub_get  # noqa: E402
 # (collectors/finnhub_client.py, #397 / #399) — a one-off Yahoo throttle or
 # 5xx must not silently null the ``target_price`` half of analyst_consensus —
 # without inventing a second retry mechanism.
-from nousergon_lib.http_retry import backoff_delay  # noqa: E402
+from nousergon_lib.http_retry import backoff_delay, request_with_retry  # noqa: E402
 
 # Tight attempt cap (issue L4611): yfinance ``.info`` is slow and heavily
 # Yahoo-throttled, and target_price is NOT the gating field for the
@@ -1342,6 +1373,24 @@ from nousergon_lib.http_retry import backoff_delay  # noqa: E402
 # budget. (The Finnhub sibling uses 3 attempts because it IS the gating source.)
 _YF_INFO_MAX_ATTEMPTS = 2
 _YF_INFO_BACKOFF_CAP = 4.0  # seconds — low cap; runtime-bounded, not gating
+
+# EDGAR 8-K full-text search (efts.sec.gov) retry — alpha-engine-config-I11473.
+# efts returns intermittent HTTP 500s (MSFT, AVGO, TSLA, JPM and SNDK in one
+# rehearsal run) that one backoff clears; with no retry each one silently
+# dropped that ticker's 8-K block. The GET goes through the L4499
+# ``request_with_retry`` chokepoint, retrying 429 + 5xx only
+# (``retry_network=False``): a TIMEOUT stays single-shot as before, because
+# 3 x 10s per ticker across ~900 tickers would triple this sub-fetch's worst
+# case under an efts blackhole, and the issue is the fast 500, not the hang.
+_EDGAR_8K_MAX_ATTEMPTS = 3
+_EDGAR_8K_BACKOFF_CAP = 8.0  # seconds
+_EDGAR_8K_HEADERS = {"User-Agent": "alpha-engine-data/1.0", "Accept-Encoding": "gzip"}
+# Private marker ``_fetch_news`` sets on its result when the 8-K search still
+# failed after retries. ``_process_one_ticker`` pops it before the payload is
+# validated or written (it never reaches S3) and ``collect`` counts it, so a
+# widespread efts outage is visible in the phase result instead of reading
+# as "no 8-Ks filed".
+_EDGAR_8K_FAILED_KEY = "_edgar_8k_failed"
 
 
 # ---- 1. Analyst consensus ----
@@ -1906,8 +1955,24 @@ def _fetch_news(ticker: str, run_date: str) -> dict:
             f"https://efts.sec.gov/LATEST/search-index?q=%22{ticker}%22"
             f"&dateRange=custom&startdt={start_date}&enddt={end_date}&forms=8-K"
         )
-        headers = {"User-Agent": "alpha-engine-data/1.0", "Accept-Encoding": "gzip"}
-        resp = requests.get(url, headers=headers, timeout=10)
+        # request_with_retry takes no ``headers`` argument; a per-call Session
+        # carries SEC's required User-Agent (a Session is not shared across
+        # the collector's worker threads).
+        with requests.Session() as session:
+            session.headers.update(_EDGAR_8K_HEADERS)
+            resp = request_with_retry(
+                url,
+                session=session,
+                timeout=10,
+                max_attempts=_EDGAR_8K_MAX_ATTEMPTS,
+                backoff_cap=_EDGAR_8K_BACKOFF_CAP,
+                retry_network=False,
+                scrub=_scrub_url_creds,
+                logger=logger,
+                label=f"EDGAR 8-K {ticker}",
+            )
+        # A 429/5xx that survived every attempt is returned, not raised —
+        # raise_for_status turns it into the failure path below.
         resp.raise_for_status()
         data = resp.json()
         for hit in data.get("hits", {}).get("hits", [])[:5]:
@@ -1919,5 +1984,6 @@ def _fetch_news(ticker: str, run_date: str) -> dict:
             })
     except Exception as e:
         logger.warning("EDGAR 8-K failed for %s: %s", ticker, _scrub_url_creds(e))
+        result[_EDGAR_8K_FAILED_KEY] = True
 
     return result
