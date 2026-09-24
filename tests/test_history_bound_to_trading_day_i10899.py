@@ -219,7 +219,9 @@ def test_metron_supplemental_ohlcv_requests_d_bounded_window(monkeypatch):
 
     assert len(calls) == 1
     assert "period" not in calls[0]
-    assert calls[0]["end"] == D_PLUS_1
+    # The REQUEST reaches D + 2 so a held EU/Asian listing's exchange-local end
+    # cannot drop D's bar (alpha-engine-config-I11548); the frame is still clipped to D.
+    assert calls[0]["end"] == "2026-09-16"
     assert df is not None
     assert df.index.max() == pd.Timestamp(D)  # clipped at the fetch boundary
 
