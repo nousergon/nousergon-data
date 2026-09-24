@@ -43,6 +43,12 @@ from builders._price_cache_writeboth import assert_valid_price_cache_ticker
 from collectors import CaretTickerError, prices
 
 
+@pytest.fixture(autouse=True)
+def _no_recent_splits(monkeypatch):
+    """No network: the split guard (alpha-engine-config-I11518) sees no splits."""
+    monkeypatch.setattr(prices, "_polygon_split_scan", lambda start, end: [])
+
+
 def _make_s3(contents: list[dict]) -> MagicMock:
     class _Paginator:
         def paginate(self, *, Bucket: str, Prefix: str):
@@ -202,15 +208,15 @@ def test_collect_does_not_mark_partial_from_stray_caret_key(monkeypatch):
     refusal, and flipped the whole ``prices`` result to ``status=partial``.
     After the fix, ``^VIX3M`` never reaches ``_refresh_stale`` at all."""
 
-    def _fake_find_stale(s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date=None):
+    def _fake_find_stale(s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date=None, **_kw):
         # Delegate to the real implementation so the population filter is
         # exercised, but keep the S3 double local to this test.
         return prices._find_stale_fast(
-            s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date,
+            s3, bucket, prefix, all_tickers, staleness_threshold_days, reference_date, **_kw,
         )
 
     s3 = _make_s3([
-        {"Key": "predictor/price_cache/^VIX3M.parquet",
+        {"Key": "reference/price_cache/^VIX3M.parquet",
          "LastModified": datetime(2026, 9, 14, 20, 8, 43, tzinfo=timezone.utc)},
     ])
     monkeypatch.setattr(prices, "boto3", MagicMock(client=lambda *_a, **_kw: s3))
