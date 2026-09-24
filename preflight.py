@@ -39,6 +39,23 @@ _REACHABILITY_MAX_ATTEMPTS = 3
 _REACHABILITY_BACKOFF_BASE = 1.0   # seconds; wait ≈ base * 2**attempt + U(0, base)
 _REACHABILITY_BACKOFF_CAP = 8.0    # seconds; never wait longer than this between tries
 
+# alpha-engine-config-I11466: the probe also retries HTTP 5xx, not only the
+# network class. rehearsal-2026-09-23-1 died at MorningEnrich on a FRED blip —
+# three ReadTimeouts in ~35s on SSM attempt 1, then an immediate HTTP 502 on
+# attempt 2 — and the re-run 50 min later passed the same probe. A 5xx is the
+# upstream saying "not now", the same transient class as a timeout. 4xx stays
+# terminal (400/401/403 are auth, retrying cannot fix a bad key) and 429 stays
+# a pass (config#2662), so neither is in this set.
+_REACHABILITY_TRANSIENT_STATUS = frozenset({500, 502, 503, 504})
+
+# FRED gets a longer window than polygon/FMP: its observed blips last minutes,
+# not seconds, and the default ~35s window is exactly what the 2026-09-23
+# rehearsal outlasted. 9 attempts with waits 1,2,4,8,16,32,60,60s (+jitter)
+# plus a 10s timeout per attempt bounds a sustained outage at ~4.5 min before
+# the probe fails loud — negligible against MorningEnrich's 5400s budget.
+_FRED_REACHABILITY_MAX_ATTEMPTS = 9
+_FRED_REACHABILITY_BACKOFF_CAP = 60.0
+
 # Mask the api key querystring (FRED ``api_key=`` / polygon ``apiKey=``) before
 # a probe error string reaches a log or RuntimeError. Defensive — Timeout/
 # ConnectionError strings carry host:port not the full URL, but a broader
@@ -242,7 +259,15 @@ class DataPreflight(BasePreflight):
 
     # ── Mode-specific primitives ─────────────────────────────────────────
 
-    def _reachability_get(self, label: str, url: str, params: dict) -> Any:
+    def _reachability_get(
+        self,
+        label: str,
+        url: str,
+        params: dict,
+        *,
+        max_attempts: int = _REACHABILITY_MAX_ATTEMPTS,
+        backoff_cap: float = _REACHABILITY_BACKOFF_CAP,
+    ) -> Any:
         """GET a reachability probe with bounded backoff + jitter retry.
 
         L4494: retries the transient network class (Timeout / ConnectionError)
@@ -253,31 +278,38 @@ class DataPreflight(BasePreflight):
         exhausted a transient failure raises ``RuntimeError(... unreachable
         ...)`` (the message all callers/tests match on). All error strings are
         api-key-scrubbed.
+
+        alpha-engine-config-I11466: an HTTP 5xx response
+        (``_REACHABILITY_TRANSIENT_STATUS``) is retried on the same schedule.
+        A 5xx that survives every attempt is RETURNED, so the caller's own
+        ``>= 500`` branch still raises "upstream outage" — a sustained outage
+        fails loud exactly as before, only later. Every other status (200,
+        4xx, 429) is returned on the first attempt for the caller to judge.
         """
         import requests
 
         last_exc: Exception | None = None
-        for attempt in range(_REACHABILITY_MAX_ATTEMPTS):
+        for attempt in range(max_attempts):
+            is_last = attempt == max_attempts - 1
             try:
-                return requests.get(url, params=params, timeout=_HTTP_TIMEOUT_SECS)
+                resp = requests.get(url, params=params, timeout=_HTTP_TIMEOUT_SECS)
             except (requests.Timeout, requests.ConnectionError) as exc:
                 last_exc = exc
-                if attempt < _REACHABILITY_MAX_ATTEMPTS - 1:
+                if not is_last:
                     wait = min(
                         _REACHABILITY_BACKOFF_BASE * (2 ** attempt)
                         + random.uniform(0, _REACHABILITY_BACKOFF_BASE),
-                        _REACHABILITY_BACKOFF_CAP,
+                        backoff_cap,
                     )
                     log.warning(
                         "preflight: %s transient %s — backing off %.1fs (attempt %d/%d)",
-                        label, type(exc).__name__, wait, attempt + 1,
-                        _REACHABILITY_MAX_ATTEMPTS,
+                        label, type(exc).__name__, wait, attempt + 1, max_attempts,
                     )
                     time.sleep(wait)
                     continue
                 raise RuntimeError(
                     f"Pre-flight: {label} unreachable after "
-                    f"{_REACHABILITY_MAX_ATTEMPTS} attempts: {_scrub_api_key(exc)} — "
+                    f"{max_attempts} attempts: {_scrub_api_key(exc)} — "
                     f"sustained network outage or egress blocked."
                 ) from exc
             except requests.RequestException as exc:
@@ -286,6 +318,19 @@ class DataPreflight(BasePreflight):
                     f"Pre-flight: {label} unreachable: {_scrub_api_key(exc)} — "
                     f"network outage or egress blocked."
                 ) from exc
+            if resp.status_code in _REACHABILITY_TRANSIENT_STATUS and not is_last:
+                wait = min(
+                    _REACHABILITY_BACKOFF_BASE * (2 ** attempt)
+                    + random.uniform(0, _REACHABILITY_BACKOFF_BASE),
+                    backoff_cap,
+                )
+                log.warning(
+                    "preflight: %s HTTP %d — backing off %.1fs (attempt %d/%d)",
+                    label, resp.status_code, wait, attempt + 1, max_attempts,
+                )
+                time.sleep(wait)
+                continue
+            return resp
         # Unreachable in practice (the loop returns or raises), but keeps the
         # type-checker happy and surfaces the last exception defensively.
         raise RuntimeError(
@@ -392,7 +437,23 @@ class DataPreflight(BasePreflight):
         log.info("preflight: polygon.io reachable + auth valid (HTTP 200)")
 
     def _check_fred_reachable(self) -> None:
-        """Validate FRED network + auth via single-observation DFF call."""
+        """Validate FRED network + auth via single-observation DFF call.
+
+        Retry window (alpha-engine-config-I11466): timeouts, connection errors
+        and HTTP 5xx are retried for up to ``_FRED_REACHABILITY_MAX_ATTEMPTS``
+        attempts (~4.5 min worst case), so a FRED blip shorter than that no
+        longer fails MorningEnrich / DataPhase1. A 400 naming the api key is
+        still fatal on the first response.
+
+        HALT, not DEGRADED, once the window is exhausted — deliberately. The
+        fail-open carve-outs in ``sf-pipeline-policy.md`` §5 are exhaustive and
+        cover a pre-spend probe whose OWN machinery broke (lib-pin drift,
+        pipeline contract), not a probe that worked and measured the upstream
+        as down. A FRED outage that outlasts ~4.5 min of retries is a real
+        condition the macro collectors would hit next; failing here, before the
+        spot spend, is what this probe exists for. Downgrading it would need a
+        carve-out added to that policy by PR first.
+        """
         api_key = (get_secret("FRED_API_KEY", required=False, default="") or "").strip()
         resp = self._reachability_get(
             "FRED",
@@ -404,6 +465,8 @@ class DataPreflight(BasePreflight):
                 "sort_order": "desc",
                 "limit": 1,
             },
+            max_attempts=_FRED_REACHABILITY_MAX_ATTEMPTS,
+            backoff_cap=_FRED_REACHABILITY_BACKOFF_CAP,
         )
 
         if resp.status_code == 400:
@@ -428,7 +491,8 @@ class DataPreflight(BasePreflight):
         if resp.status_code >= 500:
             raise RuntimeError(
                 f"Pre-flight: FRED returned HTTP {resp.status_code} on DFF call "
-                f"— upstream outage."
+                f"after {_FRED_REACHABILITY_MAX_ATTEMPTS} attempts — sustained "
+                f"upstream outage."
             )
         if resp.status_code != 200:
             raise RuntimeError(

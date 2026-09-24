@@ -23,10 +23,14 @@ one flag flip in the CFN preset changes the pipeline, this artifact, and the
 Director's purview together, because all three read the same two sources.
 
 **Where it runs.** As the SF state ``RunScope``, immediately before
-``ReportCard``, so every work stage is already in the history it reads. Its own
-row, ``ReportCard``'s and ``Director``'s are the three the history cannot yet
-contain; they resolve from the run's input flags, and each row records which of
-the two sources decided it (``source``).
+``ReportCard``, so every work stage upstream of it is already in the history it
+reads. ``ReportCard`` carries this scope in-band, which is why it cannot move
+later. The four gated stages after it (``ReportCard``, ``Director``,
+``ScannerLeaderboard``, ``AggregateCosts``) cannot be in the history yet. They
+used to be reported ``NOT_REACHED``, which is false on every run that reaches
+them (alpha-engine-config-I11502); they are now listed under ``after_scope``
+and left out of the graded denominator, and the statement says so. Each row
+records which source decided it (``source``).
 
 **One key per cycle, and more than one execution writes it.**
 ``backtest/{run_date}/run_scope.json`` is written by the scheduled Saturday run
