@@ -45,6 +45,7 @@ import hashlib
 import io
 import json
 import math
+import numbers
 import pathlib
 import re
 import string
@@ -164,10 +165,52 @@ class ContractSchema:
     #: hand-listed here — the same rule every other per-key fact in this module
     #: follows (`alpha-engine-config-I11351`).
     settling_basis: str = ""
+    #: For a JSON key with a ``row_date`` basis only: where each row's date is
+    #: read from, declared per key template in ``x-settling-bar.row_dates``
+    #: (`alpha-engine-config-I11551`). ``None`` everywhere else — a parquet
+    #: row_date key reads its row date from the frame's own index.
+    settling_row_dates: "JsonRowDates | None" = None
 
     @property
     def is_vendor_live(self) -> bool:
         return self.comparison_class == "vendor_live"
+
+
+@dataclass(frozen=True)
+class JsonRowDates:
+    """Where a JSON document keeps dated rows, e.g. ``$.series.*[*][0]``.
+
+    `alpha-engine-config-I11551`. A JSON document has no row index, so a
+    ``row_date`` settling bar over one has to be TOLD where its rows are.
+    ``container`` is the path to each list of rows (``("series", "*")`` —
+    every value of ``$.series``); each element of that list is one row, and
+    ``date_index`` is the position inside the row holding its date
+    (``market_data/close_history/consolidated.json`` rows are
+    ``[date, close]``, so ``0``).
+    """
+
+    declared: str
+    container: tuple[str, ...]
+    date_index: int
+
+
+#: The only row-date path shape a contract may declare: ``$`` followed by one
+#: or more ``.name`` / ``.*`` segments naming the row lists, then ``[*]`` (each
+#: row) and ``[N]`` (the date's position inside the row). Deliberately narrow:
+#: a richer JSONPath is a richer set of ways for a declaration to match
+#: nothing and silently forgive nothing — or the wrong thing.
+_ROW_DATES_PATH_RE = re.compile(r"^\$((?:\.(?:\*|[A-Za-z0-9_]+))+)\[\*\]\[(\d+)\]$")
+
+
+def _parse_row_dates(declared: str) -> JsonRowDates | None:
+    match = _ROW_DATES_PATH_RE.fullmatch(declared)
+    if match is None:
+        return None
+    return JsonRowDates(
+        declared=declared,
+        container=tuple(match.group(1).lstrip(".").split(".")),
+        date_index=int(match.group(2)),
+    )
 
 
 def _key_pattern_regex(template: str) -> "re.Pattern[str]":
@@ -250,11 +293,20 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
                 "defect. A forgiveness with no written reason is a widened band wearing a "
                 "different name (alpha-engine-config-I11351)."
             )
+        row_dates = _declared_row_dates(path, settling, settling_basis, templates)
         for template in templates:
             if not isinstance(template, str) or not template:
                 raise ValueError(
                     f"{path.name}: x-key-pattern entries must be non-empty strings, got {template!r}"
                 )
+            # A `row_date` basis reaches a JSON key only through that key's own
+            # `row_dates` entry. A JSON template the declaration does not name
+            # carries NO settling bar and is graded strictly — the red default
+            # (`metron_close_history` covers `close_history/{sym}.json` too, and
+            # only `consolidated.json` is declared; alpha-engine-config-I11551).
+            template_basis = settling_basis
+            if settling_basis == "row_date" and template.endswith(".json") and template not in row_dates:
+                template_basis = ""
             schemas.append(
                 ContractSchema(
                     path,
@@ -264,10 +316,56 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
                     value_band_relative=float(band.get("relative", 0.0)),
                     value_band_absolute=float(band.get("absolute", 0.0)),
                     coverage_floor=float(vendor_live.get("coverage_floor", 1.0)),
-                    settling_basis=settling_basis,
+                    settling_basis=template_basis,
+                    settling_row_dates=row_dates.get(template) if template_basis else None,
                 )
             )
     return tuple(schemas)
+
+
+def _declared_row_dates(
+    path: pathlib.Path, settling: dict[str, Any], basis: str, templates: list[Any]
+) -> dict[str, JsonRowDates]:
+    """``x-settling-bar.row_dates``, validated: key template -> where its rows' dates are.
+
+    Every way this could be wrong is refused at load, never at grading time,
+    because a declaration that quietly matched nothing would forgive nothing
+    and look exactly like one that works.
+    """
+    declared = settling.get("row_dates")
+    if declared is None:
+        return {}
+    if basis != "row_date":
+        raise ValueError(
+            f"{path.name}: x-settling-bar.row_dates is only meaningful with basis 'row_date', "
+            f"got basis {basis!r} (alpha-engine-config-I11551)."
+        )
+    if not isinstance(declared, dict) or not declared:
+        raise ValueError(
+            f"{path.name}: x-settling-bar.row_dates must map a key template to a row-date "
+            "path such as '$.series.*[*][0]'."
+        )
+    out: dict[str, JsonRowDates] = {}
+    for template, row_path in declared.items():
+        if template not in templates:
+            raise ValueError(
+                f"{path.name}: x-settling-bar.row_dates names {template!r}, which is not one of "
+                f"this contract's x-key-pattern entries {templates!r}."
+            )
+        if not str(template).endswith(".json"):
+            raise ValueError(
+                f"{path.name}: x-settling-bar.row_dates names {template!r}, which is not a JSON "
+                "key. A parquet row_date key reads its row date from the frame's own index."
+            )
+        parsed = _parse_row_dates(str(row_path))
+        if parsed is None:
+            raise ValueError(
+                f"{path.name}: x-settling-bar.row_dates[{template!r}] = {row_path!r} is not of "
+                "the form '$.<name|*>[.<name|*>...][*][<N>]' (each row list, each row, the "
+                "date's position in the row)."
+            )
+        out[str(template)] = parsed
+    return out
 
 
 #: How a contract may declare WHICH cells of its key are the trading day's own,
@@ -276,7 +374,11 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
 #:
 #: * ``row_date`` — the artifact is INDEXED BY DATE and holds history. Only the
 #:   row whose index is the report's `trading_day` is settling
-#:   (`reference/price_cache/{sym}.parquet`).
+#:   (`reference/price_cache/{sym}.parquet`). A JSON document has no index, so
+#:   it names where each row's date lives, per key, in
+#:   `x-settling-bar.row_dates` (`market_data/close_history/consolidated.json`:
+#:   `$.series.*[*][0]`, alpha-engine-config-I11551); a row is settling only
+#:   when BOTH sides date it the trading day.
 #: * ``key_date`` — the artifact is indexed by something else (ticker) and the
 #:   KEY names one trading day, so the whole artifact IS that day's bar. It is
 #:   settling only when the key names the report's own trading day
@@ -285,6 +387,15 @@ def _load_contract_schemas() -> tuple[ContractSchema, ...]:
 #: * ``same_day_snapshot`` — an undated, overwritten-in-place `latest`-style
 #:   artifact whose whole content is a same-day derivation of the session's bar
 #:   (`market_data/technicals/latest.json`).
+#:
+#: Under `row_date` and `key_date` a settling cell is only ever a NUMERIC move
+#: (a price, a volume, an indicator derived from them) — the thing the vendor is
+#: still revising. An identity field that differs (`bar_date`, a currency, a
+#: label) is not a moving number: it is graded strictly, on the trading day
+#: too. `alpha-engine-config-I11551`: `market_data/eod_closes/{date}.json`
+#: graded `match` for three days while the shadow's EU rows carried
+#: `bar_date` D-1 against v1's D, because every value diff of a `key_date`
+#: document was absorbed, the identity fields included.
 #:
 #: This is NOT a wider tolerance and it never touches `x-vendor-live.band`: the
 #: trading-day cells are a different measurement (two fetches of a number the
@@ -379,6 +490,20 @@ def _relative_difference(live: Any, shadow: Any) -> float | None:
     return abs(a - b) / abs(a)
 
 
+def _is_moving_numeric(value: Any) -> bool:
+    """Whether one cell is a number the vendor could still be revising.
+
+    A real number (Python or numpy, NaN included — a provisional bar can carry
+    one) — never a bool, a date, a timestamp, a duration or a string. Those
+    are what a row IS, not what it measured, and differing on them is an
+    identity fact graded strictly (`alpha-engine-config-I11551`). Checked by
+    type name for the numpy/pandas cases so pandas is never imported for it.
+    """
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        return False
+    return type(value).__name__ not in {"bool_", "bool", "timedelta64", "datetime64"}
+
+
 class _SettlingCollector:
     """The trading-day cells of one key, and how far they moved.
 
@@ -399,6 +524,22 @@ class _SettlingCollector:
         self.max_rel: float | None = None
         self.max_rel_close: float | None = None
         self.max_rel_volume: float | None = None
+
+    @property
+    def numeric_only(self) -> bool:
+        """Whether only a numeric move may settle (`alpha-engine-config-I11551`).
+
+        True for `row_date` and `key_date`: the settling cells are the bar's
+        own prices and volumes, and an identity field (`bar_date`) differing
+        between the two sides is a producer fact, not a vendor state.
+        `same_day_snapshot` keeps absorbing every VALUE diff, as declared in
+        I11351 — its whole surface is a same-day derivation of the bar.
+        """
+        return self.basis in {"row_date", "key_date"}
+
+    def forgives(self, live: Any, shadow: Any) -> bool:
+        """Whether a differing cell of a settling row may be recorded as settling."""
+        return not self.numeric_only or (_is_moving_numeric(live) and _is_moving_numeric(shadow))
 
     def _note_move(self, column: Any, rel: float | None) -> None:
         if rel is None:
@@ -457,6 +598,10 @@ class _SettlingCollector:
         }
 
 
+#: How `_key_pattern_regex` spells a `{placeholder}` segment.
+_PLACEHOLDER_REGEX = "[^/]+"
+
+
 def resolve_contract(live_key: str) -> ContractSchema | None:
     """The contract documenting `live_key`, or ``None``.
 
@@ -464,10 +609,16 @@ def resolve_contract(live_key: str) -> ContractSchema | None:
     field of it compares as data — "a key with no contract resolves every
     field as data. That is the red default" (I10894 deliverable 2).
     """
-    for contract in _load_contract_schemas():
-        if contract.pattern.fullmatch(live_key):
-            return contract
-    return None
+    matches = [c for c in _load_contract_schemas() if c.pattern.fullmatch(live_key)]
+    if not matches:
+        return None
+    # The MOST SPECIFIC template wins — the one with the fewest placeholders —
+    # and among equals, the first declared. A literal key and a `{sym}`
+    # template of the same contract can now carry different settling facts
+    # (`close_history/consolidated.json` vs `close_history/{sym}.json`,
+    # alpha-engine-config-I11551), and "consolidated" is also a valid `{sym}`.
+    return min(matches, key=lambda c: c.pattern.pattern.count(_PLACEHOLDER_REGEX))
+
 
 
 # ---------------------------------------------------------------------------
@@ -708,9 +859,12 @@ def _compare_frames(
             compared += 1
             if _numeric_close(live_row[col], shadow_row[col], rel, absolute):
                 continue
-            if row_settling:
+            if row_settling and settling.forgives(live_row[col], shadow_row[col]):
                 # Recorded, NOT a breach. The membership/schema/row-count
-                # checks above already ran over this same row unchanged.
+                # checks above already ran over this same row unchanged. A
+                # non-numeric cell (a date, a label) falls through to the
+                # strict breach path below, on the trading day too
+                # (alpha-engine-config-I11551).
                 settling.record(
                     row=row_key, column=col, live=live_row[col], shadow=shadow_row[col]
                 )
@@ -821,6 +975,11 @@ class JsonDiff:
     side: str = ""  # membership only: "live" (missing from shadow) | "shadow" (extra)
     parent_path: str = ""  # membership only
     parent_size_live: int = 0  # membership only
+    #: value only: both sides are numbers (never bools) — the only kind of
+    #: value diff a `row_date`/`key_date` settling bar may absorb
+    #: (`alpha-engine-config-I11551`). A string, a date, a null or a type
+    #: change is an identity diff and stays strict.
+    numeric: bool = False
 
 
 def _json_diffs(
@@ -872,7 +1031,14 @@ def _json_diffs(
     if isinstance(live, (int, float)) and isinstance(shadow, (int, float)):
         if _numeric_close(live, shadow, rel, absolute):
             return []
-        return [JsonDiff(path, "value", f"{path}: {live!r} live vs {shadow!r} shadow")]
+        return [
+            JsonDiff(
+                path,
+                "value",
+                f"{path}: {live!r} live vs {shadow!r} shadow",
+                numeric=_is_moving_numeric(live) and _is_moving_numeric(shadow),
+            )
+        ]
     if live == shadow:
         return []
     return [JsonDiff(path, "value", f"{path}: {live!r} live vs {shadow!r} shadow")]
@@ -881,6 +1047,62 @@ def _json_diffs(
 def _json_breaches(live: Any, shadow: Any, rel: float, absolute: float, path: str = "$") -> list[str]:
     """The rendered form of :func:`_json_diffs`, for callers wanting strings."""
     return [diff.rendered for diff in _json_diffs(live, shadow, rel, absolute, path)]
+
+
+def _json_dated_rows(live: Any, shadow: Any, spec: JsonRowDates) -> list[tuple[str, Any, Any]]:
+    """Every row both documents hold at the same position: ``(path, live date, shadow date)``.
+
+    `alpha-engine-config-I11551`. The path is spelled exactly as
+    :func:`_json_diffs` spells it (``$.series.SIZE[2511]``), so a diff can be
+    attributed to its row by prefix. Only rows the walker itself compares
+    positionally are returned: a row list whose LENGTH differs is one
+    cardinality diff to the walker, graded strictly, and none of its rows can
+    be settling — membership is never relaxed.
+    """
+    frontier: list[tuple[str, Any, Any]] = [("$", live, shadow)]
+    for segment in spec.container:
+        advanced: list[tuple[str, Any, Any]] = []
+        for path, live_node, shadow_node in frontier:
+            if not (isinstance(live_node, dict) and isinstance(shadow_node, dict)):
+                continue
+            if segment == "*":
+                names = sorted(set(live_node) & set(shadow_node))
+            else:
+                names = [segment] if segment in live_node and segment in shadow_node else []
+            advanced.extend((f"{path}.{name}", live_node[name], shadow_node[name]) for name in names)
+        frontier = advanced
+    rows: list[tuple[str, Any, Any]] = []
+    index = spec.date_index
+    for path, live_rows, shadow_rows in frontier:
+        if not (isinstance(live_rows, list) and isinstance(shadow_rows, list)):
+            continue
+        if len(live_rows) != len(shadow_rows):
+            continue
+        for position, (live_row, shadow_row) in enumerate(zip(live_rows, shadow_rows, strict=True)):
+            if (
+                isinstance(live_row, list)
+                and isinstance(shadow_row, list)
+                and len(live_row) > index
+                and len(shadow_row) > index
+            ):
+                rows.append((f"{path}[{position}]", live_row[index], shadow_row[index]))
+    return rows
+
+
+#: The last step of a `_json_diffs` path: ``[12]`` or ``.name``.
+_JSON_PATH_TAIL_RE = re.compile(r"(\[\d+\]|\.[^.\[\]]*)$")
+
+
+def _json_row_of(path: str, rows: "set[str] | frozenset[str]") -> str | None:
+    """The member of ``rows`` that ``path`` sits at or under, else ``None``."""
+    while path:
+        if path in rows:
+            return path
+        tail = _JSON_PATH_TAIL_RE.search(path)
+        if tail is None:
+            return None
+        path = path[: tail.start()]
+    return None
 
 
 
@@ -1115,28 +1337,57 @@ def compare_bytes(
         all_diffs = _json_diffs(live_doc, shadow_doc, compare_rel, compare_abs)
         breaches, provenance_diffs = _split_json_diffs(all_diffs, provenance_fields)
 
-        # A JSON document has no row index, so `row_date` cannot be evaluated
-        # over one — the two bases that CAN are the two that say "this whole
-        # document is the trading day's bar". A `row_date` declaration landing
-        # on a JSON key is recorded rather than silently applied or silently
-        # dropped: it means the contract and the artifact disagree.
+        # A JSON document has no row index, so a `row_date` basis reaches it
+        # only through the key's own `x-settling-bar.row_dates` declaration
+        # (alpha-engine-config-I11551), which says where each row's date is.
+        # Without one — reachable only through a hand-built ContractSchema;
+        # the loader never produces it — the declaration problem is recorded
+        # rather than silently applied or silently dropped.
+        row_spec = contract.settling_row_dates if contract is not None else None
+        dated_rows = _json_dated_rows(live_doc, shadow_doc, row_spec) if row_spec else []
+        body_note = ""
+        settling_rows: frozenset[str] = frozenset()
         if settling is not None and basis == "row_date":
-            body_note = (
-                "x-settling-bar.basis is 'row_date' but this key is a JSON document with no "
-                "row index; no cell was graded as settling. Declare 'key_date' or "
-                "'same_day_snapshot' instead (alpha-engine-config-I11351)."
-            )
-            settling = None
-        else:
-            body_note = ""
+            if row_spec is None:
+                body_note = (
+                    "x-settling-bar.basis is 'row_date' but this JSON key declares no "
+                    "x-settling-bar.row_dates entry naming where its row dates are; no cell was "
+                    "graded as settling (alpha-engine-config-I11351/-I11551)."
+                )
+                settling = None
+            else:
+                # Settling only where BOTH sides date the row the trading day:
+                # a row one side dates D and the other D-1 is an identity
+                # diff, graded strictly on its date cell.
+                settling_rows = frozenset(
+                    path
+                    for path, live_date, shadow_date in dated_rows
+                    if _row_is_day(live_date, settling.date) and _row_is_day(shadow_date, settling.date)
+                )
         if settling is not None:
             # VALUE diffs only. A key present on one side alone (membership) or
             # a list whose length differs (cardinality) is SHAPE, graded
             # exactly, whatever the bar was doing — the binding constraint on
             # I11351 and the same rule the vendor_live class already follows.
-            for diff in [d for d in breaches if d.kind == "value"]:
-                settling.record_json(diff)
-            breaches = [d for d in breaches if d.kind != "value"]
+            # Under `row_date`, only the value diffs INSIDE a trading-day row;
+            # under `row_date`/`key_date`, only NUMERIC ones — `bar_date` and
+            # every other identity field stay strict (I11551).
+            def _absorbed(diff: JsonDiff) -> bool:
+                if diff.kind != "value":
+                    return False
+                if settling.numeric_only and not diff.numeric:
+                    return False
+                if basis == "row_date":
+                    return _json_row_of(diff.path, settling_rows) is not None
+                return True
+
+            kept: list[JsonDiff] = []
+            for diff in breaches:
+                if _absorbed(diff):
+                    settling.record_json(diff)
+                else:
+                    kept.append(diff)
+            breaches = kept
 
         doc_size = len(live_doc) if isinstance(live_doc, (list, dict)) else 1
         body: dict[str, Any] = {
@@ -1158,6 +1409,24 @@ def compare_bytes(
             body["settling_bar"] = settling.as_block()
         if body_note:
             body["settling_bar_declaration_problem"] = body_note
+        if prior is not None and row_spec is not None:
+            # The JSON twin of `_compare_frames`' `prior_day` block
+            # (alpha-engine-config-I11551): the rows the PREVIOUS report could
+            # only record as settling are, on this one, ordinary history graded
+            # strictly — every remaining breach inside them counts.
+            prior_iso = prior.isoformat()
+            prior_rows = frozenset(
+                path
+                for path, live_date, shadow_date in dated_rows
+                if _row_is_day(live_date, prior_iso) and _row_is_day(shadow_date, prior_iso)
+            )
+            prior_breaches = sum(1 for d in breaches if _json_row_of(d.path, prior_rows) is not None)
+            body["prior_day"] = {
+                "date": prior_iso,
+                "rows_compared": len(prior_rows),
+                "breaches": prior_breaches,
+                "settled": bool(prior_rows) and prior_breaches == 0,
+            }
 
         if not vendor_live:
             body["verdict"] = "match" if not breaches else "mismatch"
@@ -2364,7 +2633,9 @@ def grade_prior_day_settled(
     Two different SHAPES carry that re-grade, because a `row_date` key and a
     `key_date` key disagree on WHERE yesterday's row lives:
 
-    * `row_date` (`reference/price_cache/*.parquet`) carries its own history,
+    * `row_date` (`reference/price_cache/*.parquet`, and since
+      `alpha-engine-config-I11551` the JSON series document
+      `market_data/close_history/consolidated.json`) carries its own history,
       so the re-grade sits in `prior_day` on the SAME key's row — looked up
       here by that exact key string.
     * `key_date` (`staging/daily_closes/{date}.parquet`,
