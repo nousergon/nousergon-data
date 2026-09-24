@@ -455,11 +455,14 @@ def _yfinance_closes(
     natively. Unpriceable symbols omitted. The fetch is bounded by
     ``[trading_day − 10d, trading_day]`` (alpha-engine-config-I10893) so a rerun for D
     executed on D+1 never reports D+1's partial session as D's close; ``None`` resolves
-    to the last closed session (``dates.default_run_date``), never wall-clock now."""
-    from dates import clip_to_trading_day, default_run_date, history_window
+    to the last closed session (``dates.default_run_date``), never wall-clock now.
+    The REQUEST reaches D + 2 (``dates.vendor_request_window``) and the response is
+    clipped to D: ``end = D + 1`` is 22:00 UTC for a Paris/Zurich listing, and a
+    same-evening fetch after it came back without D's bar (alpha-engine-config-I11548)."""
+    from dates import clip_to_trading_day, default_run_date, vendor_request_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
-    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
+    start, end_excl = vendor_request_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -483,7 +486,10 @@ def _yfinance_closes(
                 try:
                     df = (raw[sym] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"closes[{sym}]")
+                    df = clip_to_trading_day(
+                        df.dropna(subset=["Close"]), trading_day,
+                        label=f"closes[{sym}]", expect_rows_after=True,
+                    )
                     if df.empty:
                         continue
                     last = df.iloc[-1]
@@ -505,13 +511,13 @@ def _yfinance_fx(
     """Latest FX rate on or before ``trading_day`` per currency via yfinance
     ``{CCY}{BASE}=X`` → ``{CCY: rate}`` (``base`` per 1 unit of ``CCY``). Unresolvable
     pairs omitted — no fabrication. Bounded like :func:`_yfinance_closes`
-    (alpha-engine-config-I10893)."""
+    (alpha-engine-config-I10893, -I11548)."""
     if not currencies:
         return {}
-    from dates import clip_to_trading_day, default_run_date, history_window
+    from dates import clip_to_trading_day, default_run_date, vendor_request_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
-    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
+    start, end_excl = vendor_request_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -533,7 +539,10 @@ def _yfinance_fx(
         for pair, ccy in pairs.items():
             try:
                 df = (raw[pair] if is_multi else raw).copy()
-                df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"fx[{pair}]")
+                df = clip_to_trading_day(
+                    df.dropna(subset=["Close"]), trading_day,
+                    label=f"fx[{pair}]", expect_rows_after=True,
+                )
                 if df.empty:
                     continue
                 out[ccy] = round(float(df.iloc[-1]["Close"]), 6)
@@ -556,7 +565,9 @@ def _yf_history(
     explicit ``start``/``end`` derived from ``trading_day`` (required,
     alpha-engine-config-I10893) — never ``period=``, which ends at vendor "now" and
     published a pre-close D+1 bar into ``fx_history`` on a ``--date D`` rerun, with a
-    start that drifted with wall-clock time. ``is_fx`` maps a currency to the
+    start that drifted with wall-clock time. The request reaches D + 2 and the response
+    is clipped to D, so a non-US listing's day-D bar is not lost to an exchange-local
+    ``end`` that has already passed (alpha-engine-config-I11548). ``is_fx`` maps a currency to the
     ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted.
     ``auto_adjust`` selects the basis (config#1865): ``False`` (default) is split-adjusted-
     only; ``True`` is dividend-adjusted, matching the price_cache basis (see
@@ -569,12 +580,12 @@ def _yf_history(
         logger.warning("[metron_market_data] yfinance/pandas unavailable for history")
         return {}
 
-    from dates import clip_to_trading_day, history_window
+    from dates import clip_to_trading_day, vendor_request_window
 
     targets = {f"{c}{base}=X": c for c in symbols if c and c != base} if is_fx else {s: s for s in symbols if s}
     if not targets:
         return {}
-    start, end_excl = history_window(trading_day, period)
+    start, end_excl = vendor_request_window(trading_day, period)
     out: dict[str, list[tuple[str, float]]] = {}
     keys = list(targets)
     batches = [keys[i:i + _YFINANCE_BATCH_SIZE] for i in range(0, len(keys), _YFINANCE_BATCH_SIZE)]
@@ -590,7 +601,10 @@ def _yf_history(
                 try:
                     df = (raw[key] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"history[{key}]")
+                    df = clip_to_trading_day(
+                        df.dropna(subset=["Close"]), trading_day,
+                        label=f"history[{key}]", expect_rows_after=True,
+                    )
                     if df.empty:
                         continue
                     out[targets[key]] = [(d.date().isoformat(), round(float(c), 6)) for d, c in df["Close"].items()]
