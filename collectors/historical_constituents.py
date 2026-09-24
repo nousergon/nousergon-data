@@ -1,5 +1,5 @@
 """
-historical_constituents.py — Point-in-time S&P 500 index membership (G12).
+historical_constituents.py — Point-in-time S&P 500+400 index membership (G12).
 
 Survivorship-bias mitigation, Phase 1 (research memo
 ``nousergon-docs/survivorship-bias-research.md``): the backtester/predictor
@@ -48,9 +48,30 @@ network:
   * ``divergences(observed, reference, since=...)`` — the attestation (pure).
   * ``collect(...)`` — read + build + write to S3 (the I/O shell).
 
-S&P 500 only (the changes table on the S&P 400 page is sparser); the memo
-flags S&P 400 mid-cap as a follow-on. Delisted-ticker *prices* are memo
-Phase 2 — out of scope here; this ships the membership list.
+SCOPE: S&P 500+400 (alpha-engine-config-I11525, Brian's ruling 2026-09-24),
+the same universe as the live 903-name roster the map is replayed from. It used
+to replay S&P 500 changes only against that combined roster, so a name that
+moved from the S&P 400 into the S&P 500 dropped out of the universe before its
+move, and a name that left the S&P 400 was never restored. The two windows
+reach that scope differently, and the artifact's ``scope`` block says which:
+
+  * **On and after the cutover** the membership changes are the diff of each
+    snapshot's COMBINED roster (``sp500_tickers`` + ``sp400_tickers``, or the
+    combined ``tickers`` list on older snapshots). A 400->500 move is not a
+    universe change at all; a name joining or leaving the S&P 400 is. Every
+    run replays the finished map against every roster snapshot and reports
+    any date where they disagree (:func:`replay_mismatches`). The S&P 500
+    slice is still diffed separately, because the Wikipedia reference it is
+    attested against is an S&P 500 table.
+  * **Before the cutover** only S&P 500 changes exist: the frozen artifact
+    is S&P 500 history, and no S&P 400 change history is fetched or
+    committed anywhere in this repo. There, a name that joined the S&P 500
+    from the S&P 400 is still taken out at its S&P 500 add date, and S&P 400
+    departures are not restored. That gap is declared in the artifact, not
+    papered over.
+
+Delisted-ticker *prices* are memo Phase 2 — out of scope here; this ships the
+membership list.
 """
 
 from __future__ import annotations
@@ -306,7 +327,8 @@ def changes_from_snapshots(
 ) -> tuple[list[ConstituentChange], list[str]]:
     """Dated rosters -> membership changes, by diffing consecutive snapshots.
 
-    ``snapshots`` maps ``YYYY-MM-DD`` to that date's S&P 500 roster. A ticker
+    ``snapshots`` maps ``YYYY-MM-DD`` to that date's roster (S&P 500+400 for
+    membership, the S&P 500 slice for the attestation). A ticker
     present on date D+1 and absent on the preceding snapshot D is ADDED on
     D+1; present on D and absent on D+1 is REMOVED on D+1. Pure — the caller
     does the S3 reads.
@@ -487,6 +509,69 @@ def build_pit_membership(
     return pit
 
 
+def membership_as_of(
+    pit: dict[str, list[str]], current_tickers: list[str], date: str
+) -> set[str]:
+    """Membership in effect ON ``date``, read the way consumers read the map.
+
+    Same semantics as ``nousergon_lib.arcticdb.pit_membership_as_of``: each
+    key holds the roster immediately BEFORE that change date, so the roster
+    on ``date`` is the entry for the earliest change date strictly after it.
+    On or after the newest change date it is the current roster."""
+    later = [d for d in pit if d > date]
+    return set(pit[min(later)]) if later else set(current_tickers)
+
+
+def _round_trip_windows(dropped: list[ConstituentChange]) -> dict[str, list[tuple[str, str]]]:
+    """``{ticker: [(from, to)]}`` for each round trip :func:`suppress_flickers`
+    dropped. On a date inside ``[from, to)`` the snapshot and the map are
+    MEANT to disagree about that ticker: the map says the index never moved."""
+    by_ticker: dict[str, list[ConstituentChange]] = {}
+    for c in sorted(dropped, key=lambda c: (c.ticker, c.date, c.action)):
+        by_ticker.setdefault(c.ticker, []).append(c)
+    return {
+        t: [(a.date, b.date) for a, b in zip(evs[::2], evs[1::2])]
+        for t, evs in by_ticker.items()
+    }
+
+
+def replay_mismatches(
+    pit: dict[str, list[str]],
+    current_tickers: list[str],
+    universe: dict[str, list[str]],
+    *,
+    renames: dict[str, str] | None = None,
+    dropped: list[ConstituentChange] | None = None,
+) -> list[str]:
+    """Replay the finished map against every observed S&P 500+400 roster.
+
+    For each dated roster snapshot, the membership the map gives for that
+    date must be the roster the snapshot recorded (alpha-engine-config-I11525:
+    this is the check the map is closed against, run on every build rather
+    than once). Two differences are expected and are not reported:
+
+      * a reticker (``renames``, old -> new): the map carries the NEW symbol
+        through the old one's dates, because the company never left;
+      * a holdings-file round trip :func:`suppress_flickers` dropped: the map
+        keeps the name, because the index never moved.
+
+    Anything else is named, per date, as the names the map is missing and the
+    names it has that the snapshot did not.
+    """
+    renames = renames or {}
+    windows = _round_trip_windows(list(dropped or []))
+    out: list[str] = []
+    for date in sorted(universe):
+        expected = {renames.get(t, t) for t in universe[date]}
+        actual = membership_as_of(pit, current_tickers, date)
+        exempt = {t for t, ws in windows.items() if any(a <= date < b for a, b in ws)}
+        missing = sorted(expected - actual - exempt)
+        extra = sorted(actual - expected - exempt)
+        if missing or extra:
+            out.append(f"{date}: missing={missing} extra={extra}")
+    return out
+
+
 def _fetch_changes_table(
     urls: tuple[str, ...] = _SP500_CHANGES_URLS,
 ) -> tuple[pd.DataFrame, str]:
@@ -584,29 +669,81 @@ def _sp500_roster(snapshot: dict) -> list[str] | None:
     return sp500_roster_with_provenance(snapshot)[0]
 
 
+def universe_roster_with_provenance(snapshot: dict) -> tuple[list[str] | None, str]:
+    """The S&P 500+400 roster of one dated ``constituents.json``.
+
+    This is the scope the point-in-time map is built in
+    (alpha-engine-config-I11525). Unlike the S&P 500 slice it needs no
+    ordering contract: newer snapshots carry both explicit per-index lists
+    (``"explicit"``), and on older ones the combined ``tickers`` list IS the
+    union of the two funds' holdings (``"tickers"``). A rebalance-day overlap
+    shortens that list without making it wrong, since a name both funds hold
+    is one member of the universe.
+
+    A snapshot with no per-index counts at all is a cache-served roster: a
+    copy of an older day's list, not an observation of this one. Diffing it
+    would date whatever changed since the cache was written to the wrong day,
+    so it returns ``(None, <reason>)`` and the caller names it as skipped.
+    """
+    s500 = snapshot.get("sp500_tickers")
+    s400 = snapshot.get("sp400_tickers")
+    if s500 and s400:
+        return list(dict.fromkeys([*s500, *s400])), "explicit"
+    tickers = snapshot.get("tickers") or []
+    if not tickers:
+        return None, "no tickers"
+    if not (s500 or s400 or snapshot.get("sp500_count") or snapshot.get("sp400_count")):
+        return None, (
+            "no sp500_count/sp400_count (a cache-served roster is a copy of an "
+            "earlier day's list, not an observation of this one)"
+        )
+    return list(dict.fromkeys(tickers)), "tickers"
+
+
 @dataclass
 class RosterSnapshots:
     """Every dated roster on S3, and what happened to each one that did not
-    go in as-is. ``skipped`` and ``recovered`` are ``{date: reason}``."""
+    go in as-is. ``skipped`` and ``recovered`` are ``{date: reason}``.
+
+    Two views of the same files (alpha-engine-config-I11525): ``universe``
+    (S&P 500+400) is what membership is built from, and ``snapshots`` (the
+    S&P 500 slice) is what the S&P 500 reference is attested against.
+    ``skipped`` names snapshots whose S&P 500 slice could not be read;
+    ``universe_skipped`` names those whose combined roster could not be.
+    """
 
     snapshots: dict[str, list[str]] = field(default_factory=dict)
     skipped: dict[str, str] = field(default_factory=dict)
     recovered: dict[str, str] = field(default_factory=dict)
+    universe: dict[str, list[str]] = field(default_factory=dict)
+    universe_skipped: dict[str, str] = field(default_factory=dict)
 
     def newest_date(self) -> str | None:
-        dates = [*self.snapshots, *self.skipped]
+        dates = [*self.snapshots, *self.skipped, *self.universe, *self.universe_skipped]
         return max(dates) if dates else None
 
     def recent_skips(self, window_days: int = RECENT_SKIP_WINDOW_DAYS) -> list[str]:
-        """Skipped dates within ``window_days`` of the newest snapshot."""
+        """Skipped dates (either view) within ``window_days`` of the newest snapshot."""
         newest = self.newest_date()
         if newest is None:
             return []
         anchor = datetime.strptime(newest, "%Y-%m-%d")
         return sorted(
-            d for d in self.skipped
+            d for d in {*self.skipped, *self.universe_skipped}
             if (anchor - datetime.strptime(d, "%Y-%m-%d")).days <= window_days
         )
+
+    def skip_reason(self, date: str) -> str:
+        """Why ``date`` was skipped, naming which view(s) could not be read."""
+        parts = []
+        if date in self.universe_skipped:
+            parts.append(f"S&P 500+400 roster: {self.universe_skipped[date]}")
+        if date in self.skipped:
+            parts.append(
+                self.skipped[date] if not parts
+                else f"S&P 500 slice: {self.skipped[date]}"
+            )
+        return "; ".join(parts)
 
 
 def load_roster_snapshots(
@@ -634,6 +771,11 @@ def load_roster_snapshots(
             body = json.loads(
                 s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             )
+            universe, why = universe_roster_with_provenance(body)
+            if universe is None:
+                out.universe_skipped[date] = why
+            else:
+                out.universe[date] = universe
             roster, how = sp500_roster_with_provenance(body)
             if roster is None:
                 out.skipped[date] = how
@@ -651,6 +793,11 @@ def load_roster_snapshots(
         logger.warning(
             "historical_constituents: %d roster snapshot(s) skipped (recent: %s): %s",
             len(out.skipped), out.recent_skips(), out.skipped,
+        )
+    if out.universe_skipped:
+        logger.warning(
+            "historical_constituents: %d S&P 500+400 roster snapshot(s) skipped: %s",
+            len(out.universe_skipped), out.universe_skipped,
         )
     return out
 
@@ -671,12 +818,31 @@ class RenameResolution:
     renames: dict[str, str] = field(default_factory=dict)
     deferred: list[str] = field(default_factory=list)
     confirmed_by_reference: list[str] = field(default_factory=list)
+    #: Candidates Polygon ANSWERED with no ticker change. Published, with the
+    #: renames Polygon found, as the settled verdicts the next run reuses.
+    not_renamed: list[str] = field(default_factory=list)
+    #: Candidates not asked about because an earlier run's Polygon answer
+    #: for them is carried in ``prior`` (alpha-engine-config-I11525).
+    settled_by_prior_run: list[str] = field(default_factory=list)
+
+    def settled(self) -> dict:
+        """The verdicts Polygon gave, in the shape :func:`resolve_renames`
+        accepts back as ``prior``. Committed retickers are not repeated here:
+        they live in the committed file and are read from it every run."""
+        known = {
+            r["old"] for r in json.loads(_KNOWN_RETICKERS_PATH.read_text())["retickers"]
+        }
+        return {
+            "renamed": {o: n for o, n in sorted(self.renames.items()) if o not in known},
+            "not_renamed": sorted(self.not_renamed),
+        }
 
 
 def resolve_renames(
     swaps: dict[str, list[str]],
     *,
     reference_removed: set[str] | None = None,
+    prior: dict | None = None,
 ) -> RenameResolution:
     """Ask Polygon which of the disappearing tickers were retickers.
 
@@ -693,6 +859,15 @@ def resolve_renames(
     candidates on 2026-09-23, a number that only grows, and POOL ran out of
     429 retries. Only the swaps the reference does NOT explain need Polygon.
     ``None`` (reference unavailable) queries every candidate, as before.
+
+    ``prior`` is the previous run's published ``rename_checks`` block
+    (``{"renamed": {old: new}, "not_renamed": [...]}``): a candidate Polygon
+    has already ANSWERED for is not asked again (alpha-engine-config-I11525).
+    The S&P 500+400 diff meets every S&P 400 add/remove pair as a same-date
+    swap, and the S&P 500 reference explains none of them, so without this
+    each weekly run would re-query every S&P 400 departure since the cutover,
+    a list that only grows, against the shared rate-limited key. A deferred
+    candidate is never carried: it has no answer, and it is asked again.
 
     A detection failure returns no rename for that candidate, which lands
     the pair in ``unresolved`` and emits it as index churn, and the candidate
@@ -719,6 +894,15 @@ def resolve_renames(
         if r["old"] in candidates
     }
     candidates = [t for t in candidates if t not in out.renames]
+    if prior:
+        prior_renamed = dict(prior.get("renamed") or {})
+        prior_not = set(prior.get("not_renamed") or [])
+        out.settled_by_prior_run = [
+            t for t in candidates if t in prior_renamed or t in prior_not
+        ]
+        out.renames.update({t: prior_renamed[t] for t in candidates if t in prior_renamed})
+        out.not_renamed = [t for t in candidates if t in prior_not and t not in prior_renamed]
+        candidates = [t for t in candidates if t not in out.settled_by_prior_run]
     if reference_removed is not None:
         out.confirmed_by_reference = [t for t in candidates if t in reference_removed]
         candidates = [t for t in candidates if t not in reference_removed]
@@ -740,8 +924,13 @@ def resolve_renames(
             )
             out.deferred = list(candidates)
             return out
-        out.renames.update({a.ticker: a.new_ticker for a in detection.renames})
+        found = {a.ticker: a.new_ticker for a in detection.renames}
+        out.renames.update(found)
         out.deferred = sorted(detection.failed_candidates)
+        out.not_renamed = sorted({
+            *out.not_renamed,
+            *(t for t in candidates if t not in found and t not in out.deferred),
+        })
     if out.renames:
         logger.info(
             "historical_constituents: %d reticker(s) resolved and excluded "
@@ -762,6 +951,7 @@ def _verdict(
     recent_skips: dict[str, str],
     unresolved: list[str],
     deferred: list[str],
+    replay: list[str] | tuple = (),
 ) -> tuple[str, str | None]:
     """The stage's own status and, when DEGRADED, the defect named in full.
 
@@ -771,9 +961,15 @@ def _verdict(
     explains, and a recent roster snapshot that could not be read. An
     unexplained disagreement on a swap whose rename check was deferred names
     the deferral too, since the check that could have explained it did not
-    run.
+    run. A third (alpha-engine-config-I11525): a roster snapshot the finished
+    map does not reproduce (:func:`replay_mismatches`).
     """
     parts = []
+    if replay:
+        parts.append(
+            f"{len(replay)} roster snapshot(s) the S&P 500+400 map does not "
+            f"reproduce: {list(replay)[:10]}"
+        )
     if unexplained:
         parts.append(
             f"{len(unexplained)} unexplained reference disagreement(s): {unexplained}"
@@ -789,13 +985,36 @@ def _verdict(
     return "degraded", "historical_constituents: " + "; ".join(parts)
 
 
+def load_prior_rename_checks(
+    bucket: str, s3_prefix: str = "market_data/", s3=None,
+) -> tuple[dict | None, str | None]:
+    """The ``rename_checks`` block the previous build published, or ``None``.
+
+    Returns ``(prior, error)``. A missing or unreadable previous artifact is
+    not a failure of this build: it only means every candidate is asked
+    about again, which is what every run did before
+    alpha-engine-config-I11525. The error is returned so the artifact records
+    that the carry-forward did not happen.
+    """
+    s3 = s3 or boto3.client("s3")
+    key = f"{s3_prefix}historical_constituents.json"
+    try:
+        body = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        prior = body.get("rename_checks")
+        if prior is not None and not isinstance(prior, dict):
+            raise TypeError(f"rename_checks is {type(prior).__name__}, not an object")
+    except Exception as exc:  # noqa: BLE001 — returned, logged and recorded by the caller
+        return None, f"{type(exc).__name__}: {exc}"
+    return prior, None
+
+
 def collect(
     bucket: str,
     current_tickers: list[str],
     s3_prefix: str = "market_data/",
     dry_run: bool = False,
 ) -> dict:
-    """Build the point-in-time S&P 500 membership map and write to S3.
+    """Build the point-in-time S&P 500+400 membership map and write to S3.
 
     ``current_tickers`` is today's roster (the caller already has it from
     ``constituents.collect``); this avoids a second live fetch of the live
@@ -812,13 +1031,19 @@ def collect(
 
     Returns ``status="degraded"`` with a ``detail`` naming every defect when
     the attestation finds a disagreement nothing explains or a recent roster
-    snapshot was skipped (alpha-engine-config-I11470). The counts and names
-    ride the returned dict as well as the artifact, so the run manifest and
-    the DEGRADED alert carry them.
+    snapshot was skipped (alpha-engine-config-I11470), or when the finished
+    map does not reproduce a roster snapshot (alpha-engine-config-I11525).
+    The counts and names ride the returned dict as well as the artifact, so
+    the run manifest and the DEGRADED alert carry them.
+
+    Membership is built in S&P 500+400 scope from the COMBINED roster
+    snapshots; the S&P 500 slice is diffed separately, only to attest it
+    against the S&P 500 reference (see the module docstring's SCOPE).
     """
     frozen = load_frozen_changes()
     rosters = load_roster_snapshots(bucket)
     snapshots = rosters.snapshots
+    universe = rosters.universe
     newest = max(snapshots) if snapshots else None
 
     # The reference is fetched FIRST so it can narrow which swaps need a
@@ -847,12 +1072,31 @@ def collect(
         {c.ticker for c in reference if c.action == REMOVED and c.date >= SNAPSHOT_CUTOVER}
         if reference is not None else None
     )
+    # Rename candidates come from the S&P 500+400 diff. Every reticker of an
+    # S&P 500 member is a swap there too, and a name that merely moved
+    # between the two indices is not a swap at all, so it is never asked
+    # about. Verdicts Polygon already gave are carried from the previous
+    # build (alpha-engine-config-I11525; see resolve_renames).
+    prior, prior_error = load_prior_rename_checks(bucket, s3_prefix)
+    if prior_error:
+        logger.warning(
+            "historical_constituents: previous rename verdicts unreadable (%s) — "
+            "every rename candidate is asked about this run", prior_error,
+        )
     resolution = resolve_renames(
-        same_date_swaps(snapshots), reference_removed=reference_removed,
+        same_date_swaps(universe), reference_removed=reference_removed, prior=prior,
     )
     renames = resolution.renames
-    observed, unresolved = changes_from_snapshots(snapshots, renames)
-    observed, flickers = suppress_flickers(observed)
+
+    # Membership: the S&P 500+400 diff.
+    raw_observed, unresolved = changes_from_snapshots(universe, renames)
+    observed, flickers = suppress_flickers(raw_observed)
+    kept = set(observed)
+    dropped = [c for c in raw_observed if c not in kept]
+    # Attestation only: the S&P 500 slice, diffed the same way.
+    observed_sp500, unresolved_sp500 = changes_from_snapshots(snapshots, renames)
+    observed_sp500, flickers_sp500 = suppress_flickers(observed_sp500)
+    flickers = sorted({*flickers, *flickers_sp500})
     if flickers:
         logger.info(
             "historical_constituents: %d holdings-file round trip(s) shorter than "
@@ -863,11 +1107,19 @@ def collect(
         frozen + observed, key=lambda c: (c.date, c.ticker, c.action)
     )
     pit = build_pit_membership(current_tickers, changes)
+    replay = replay_mismatches(
+        pit, current_tickers, universe, renames=renames, dropped=dropped,
+    )
+    if replay:
+        logger.warning(
+            "historical_constituents: the S&P 500+400 map does NOT reproduce %d "
+            "roster snapshot(s): %s", len(replay), replay[:10],
+        )
 
     found: list[str] = []
     if reference is not None:
         found = divergences(
-            observed, reference, since=SNAPSHOT_CUTOVER, until=newest,
+            observed_sp500, reference, since=SNAPSHOT_CUTOVER, until=newest,
         )
         attestation = {
             "status": "diverged" if found else "agreed",
@@ -892,13 +1144,14 @@ def collect(
                 "a gap in our snapshots, or a reticker missing from %s: %s "
                 "(unresolved same-date swaps this run: %s)",
                 len(found), SNAPSHOT_CUTOVER, _KNOWN_RETICKERS_PATH.name,
-                found[:20], unresolved[:20],
+                found[:20], unresolved_sp500[:20],
             )
 
-    recent_skips = {d: rosters.skipped[d] for d in rosters.recent_skips()}
+    recent_skips = {d: rosters.skip_reason(d) for d in rosters.recent_skips()}
     status, detail = _verdict(
         unexplained=found, recent_skips=recent_skips,
-        unresolved=unresolved, deferred=resolution.deferred,
+        unresolved=unresolved_sp500, deferred=resolution.deferred,
+        replay=replay,
     )
     # One block, written into the artifact AND returned, so the published
     # file, the run manifest and the DEGRADED alert read the same numbers.
@@ -907,12 +1160,19 @@ def collect(
         "reference_disagreements": found,
         "n_skipped_snapshots": len(rosters.skipped),
         "skipped_snapshots": dict(sorted(rosters.skipped.items())),
+        "n_skipped_universe_snapshots": len(rosters.universe_skipped),
+        "skipped_universe_snapshots": dict(sorted(rosters.universe_skipped.items())),
+        "n_replayed_snapshots": len(universe),
+        "n_replay_mismatches": len(replay),
+        "replay_mismatches": replay,
         "n_recent_skipped_snapshots": len(recent_skips),
         "recent_skipped_snapshots": recent_skips,
         "recovered_snapshots": dict(sorted(rosters.recovered.items())),
         "snapshot_flickers": flickers,
         "rename_checks_deferred": resolution.deferred,
         "rename_checks_confirmed_by_reference": resolution.confirmed_by_reference,
+        "rename_checks_settled_by_prior_run": resolution.settled_by_prior_run,
+        "rename_checks_prior_error": prior_error,
         "attestation_status": attestation["status"],
     }
 
@@ -923,14 +1183,37 @@ def collect(
             "observed": f"s3://{bucket}/market_data/weekly/*/constituents.json",
             "cutover": SNAPSHOT_CUTOVER,
         },
-        "index": "S&P 500",
+        "index": "S&P 500+400",
+        # Which index changes each window is built from. Read this before
+        # trusting a pre-cutover date as S&P 500+400 membership: it is not.
+        "scope": {
+            "universe": "S&P 500+400",
+            "observed": {
+                "from": SNAPSHOT_CUTOVER,
+                "changes": "S&P 500+400 (diff of the combined roster snapshots)",
+            },
+            "frozen": {
+                "before": SNAPSHOT_CUTOVER,
+                "changes": "S&P 500 only",
+                "gap": (
+                    "no S&P 400 change history is fetched or committed: a name "
+                    "that joined the S&P 500 from the S&P 400 is absent before "
+                    "its S&P 500 add date, and S&P 400 departures are not "
+                    "restored (alpha-engine-config-I11525)"
+                ),
+            },
+        },
         "current_count": len(current_tickers),
         "n_changes": len(changes),
         "n_changes_frozen": len(frozen),
         "n_changes_observed": len(observed),
-        "n_roster_snapshots": len(snapshots),
+        "n_changes_observed_sp500": len(observed_sp500),
+        "n_roster_snapshots": len(universe),
         "renames_excluded": renames,
+        # Polygon's answers, reused by the next build (see resolve_renames).
+        "rename_checks": resolution.settled(),
         "unresolved_swaps": unresolved,
+        "unresolved_swaps_sp500": unresolved_sp500,
         "n_snapshots": len(pit),
         "attestation": attestation,
         "quality": {"status": status, "detail": detail, **quality},
@@ -943,7 +1226,7 @@ def collect(
             "[dry-run] historical_constituents: %d changes (%d frozen + %d "
             "observed from %d roster snapshots) -> %d PIT snapshots "
             "(current roster %d); attestation=%s; verdict=%s %s",
-            len(changes), len(frozen), len(observed), len(snapshots),
+            len(changes), len(frozen), len(observed), len(universe),
             len(pit), len(current_tickers), attestation["status"], status,
             detail or "",
         )
