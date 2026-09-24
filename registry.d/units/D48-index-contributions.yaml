@@ -85,7 +85,10 @@ consumers_reason: >-
 contract:
   schema: contracts/index_contributions.schema.json
   producer_test: tests/test_index_contributions.py
-  consumer_pins:
+  consumer_pins: []
+  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
+  # contract file the gate can resolve and compare — graded as a finding.
+  unpinned_consumers:
     - "metron:tests (benchmark-gap fixture pinned to schema_version 1, metron-ops-I346)"
 registry_rows: []
 # alpha-engine-config-I11297 / I11306: the ARTIFACT_REGISTRY freshness row is
