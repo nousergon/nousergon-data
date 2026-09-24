@@ -828,7 +828,9 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
     # that threads $.preflight_args, so the denominator GREW. This tripwire
     # firing on a stage addition is the tripwire working: a new stage must be
     # picked up automatically or fail, never counted silently.
-    assert len(report.results) == report.stages_declared == 22
+    # alpha-engine-config-I11312: +1 (WeeklyPreflightOnSpot), an acknowledged
+    # no-dry-path stage — the stage IS a preflight.
+    assert len(report.results) == report.stages_declared == 23
     # It does not page and it does not claim a clean run.
     assert report.outcome == ps.OUTCOME_DEGRADED
     ps.emit(report, aws, "arn:sns")

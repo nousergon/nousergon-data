@@ -324,6 +324,41 @@ def test_drill_live_instance_workload_failure_still_gets_its_one_reissue(gate_na
 # A stage with NO gate is the defect this file could not see
 # ---------------------------------------------------------------------------
 
+#: Poll stages whose non-Success arm is a NON-terminal, fail-open record —
+#: the same class the ``*Degraded`` skip below covers by name, listed here
+#: because the arm is deliberately NOT named Degraded (it sets no degraded
+#: flag and does not change how the run ends). Each entry's default target
+#: must proceed, which ``_fail_open_default_proceeds`` verifies rather than
+#: trusting the entry. Add-by-PR-only.
+_FAIL_OPEN_OBSERVE_STAGES = {
+    # alpha-engine-config-I11312: the observe-mode on-spot preflight. Its
+    # non-Success arm records observed:false and proceeds to CheckShellRun,
+    # so a lost box costs this probe's verdict, never the run — the loss is
+    # then met by MorningEnrich's own liveness branch, the first stage that
+    # addresses the box after it (tests/test_sf_preflight_on_spot_wiring.py).
+    "CheckWeeklyPreflightOnSpotStatus": "WeeklyPreflightOnSpotUnobserved",
+}
+
+
+def _fail_open_default_proceeds(scope: dict, target: str) -> bool:
+    """The target is a Pass chain that never sets $.error and reaches
+    CheckShellRun without passing a Fail state or the failure normalizer."""
+    seen = set()
+    while target not in seen and target in scope:
+        seen.add(target)
+        st = scope[target]
+        if st.get("Type") == "Fail" or target in ("NormalizeFailureContext", "HandleFailure"):
+            return False
+        if st.get("ResultPath") == "$.error":
+            return False
+        if target == "CheckShellRun":
+            return True
+        target = st.get("Next")
+        if target is None:
+            return False
+    return False
+
+
 def _branch_terminal_ssm_stages():
     """(stage, check_state, scope) for every SSM poll whose non-Success arm is
     terminal for its branch.
@@ -374,6 +409,12 @@ def _branch_terminal_ssm_stages():
             # test_sf_parity_resource_kill_halt_i7267.py, which pins all
             # three of those routes to *Degraded by name.
             if default.endswith("ResourceKillCheck"):
+                continue
+            if _FAIL_OPEN_OBSERVE_STAGES.get(name) == default:
+                assert _fail_open_default_proceeds(scope, default), (
+                    f"{name} is listed as fail-open but its Default {default!r} "
+                    "no longer proceeds to CheckShellRun"
+                )
                 continue
             yield name[len("Check"):-len("Status")], name, scope
 

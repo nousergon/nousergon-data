@@ -86,6 +86,8 @@ ALL_CHECK_STATUS_STATES = [
     "CheckSubstrateHealthCheckStatus",
     "CheckTrainSpecStatus",
     "CheckWeeklyFreshnessSpotBootstrapStatus",
+    # alpha-engine-config-I11312: the observe-mode on-spot preflight pass.
+    "CheckWeeklyPreflightOnSpotStatus",
 ]
 
 

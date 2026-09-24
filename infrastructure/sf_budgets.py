@@ -405,6 +405,19 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=480,
         pipeline_segment="sequential",
     ),
+    # alpha-engine-config-I11312: the observe-mode on-spot preflight pass.
+    # Constant, not per-ticker: its universe-touching checks SAMPLE
+    # (universe_sample_freshness reads 20 symbols) or make ONE grouped call
+    # (polygon_grouped_coverage). sf_preflight_on_spot.BUDGET_SECONDS (420)
+    # sits inside this so a hang is a recorded ERROR, not an SSM TimedOut.
+    "WeeklyPreflightOnSpot": StageBudget(
+        name="WeeklyPreflightOnSpot",
+        current_timeout_seconds=600,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=600,
+        max_budget_seconds=900,
+        pipeline_segment="sequential",
+    ),
 }
 
 

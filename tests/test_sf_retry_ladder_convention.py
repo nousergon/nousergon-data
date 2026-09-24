@@ -79,6 +79,11 @@ SPOT_STAGE_SEND_STATES = {
 HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",
     "WeeklySubstrateHealthCheck",
+    # alpha-engine-config-I11312: the observe-mode on-spot preflight pass —
+    # best-effort observation ahead of MorningEnrich; its Catch and every
+    # non-verdict status fail OPEN to CheckShellRun, so a retry ladder would
+    # only delay the run it cannot protect.
+    "WeeklyPreflightOnSpot",
 }
 
 GOLD_LADDER = [

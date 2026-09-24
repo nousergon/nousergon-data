@@ -165,10 +165,23 @@ def test_every_box_acquisition_exits_through_the_substrate_gate():
     definition = json.loads((INFRA / "step_function.json").read_text())
     states = definition["States"]
     healthy = [
-        f"Choices[{i}]" for i, rule in enumerate(states["CheckSubstrateHealthGate"]["Choices"])
-        if rule["Next"] == "CheckShellRun"
+        rule["Next"] for rule in states["CheckSubstrateHealthGate"]["Choices"]
+        if "CheckShellRun" in _reachable(states, rule["Next"], recovery=False)
     ]
-    assert healthy, "CheckSubstrateHealthGate's HEALTHY edge no longer leads to CheckShellRun"
+    assert len(healthy) == 1, "CheckSubstrateHealthGate's HEALTHY edge no longer leads to CheckShellRun"
+    # alpha-engine-config-I11312: the HEALTHY edge now enters the observe-mode
+    # on-spot preflight pass before CheckShellRun. Everything between the two
+    # is "behind the gate": entered from nowhere but the HEALTHY edge.
+    behind = _reachable(states, healthy[0], banned=frozenset({"CheckShellRun"}))
+    for name, state in states.items():
+        if name in behind or name == "CheckSubstrateHealthGate":
+            continue
+        leaked = set(_successors(state)) & behind
+        assert not leaked, f"{name} enters {sorted(leaked)} without passing SubstrateHealthGate"
+    gated_exits = {
+        (src, how) for src, how in _edges_into(states, "CheckShellRun") if src in behind
+    }
+    assert gated_exits, "nothing behind the gate reaches CheckShellRun"
 
     wsr = _rerun_module()
     bypass = wsr.spot_dispatch_bypass_rule(definition)
@@ -179,9 +192,7 @@ def test_every_box_acquisition_exits_through_the_substrate_gate():
         if rule == bypass
     }
     assert bypass_edges, "CheckSpotDispatchNeeded no longer carries the derived no-box bypass"
-    assert _edges_into(states, "CheckShellRun") == {
-        ("CheckSubstrateHealthGate", h) for h in healthy
-    } | bypass_edges
+    assert _edges_into(states, "CheckShellRun") == gated_exits | bypass_edges
 
     # Every acquisition route reaches CheckShellRun only THROUGH the gate.
     for start in ("DispatchWeeklyFreshnessSpot", "NormalizeEc2InstanceId", "ResumeAfterSubstrateRelaunch"):
