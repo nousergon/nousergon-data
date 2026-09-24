@@ -40,7 +40,11 @@ contract:
   schema: contracts/metron_analyst.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_analyst.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_analyst.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_analyst.schema.json"
+      read_site: "api/services/analyst.py::load_analyst"
 registry_rows: []
 registry_rows_broken:
   - >-

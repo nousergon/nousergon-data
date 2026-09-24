@@ -95,7 +95,30 @@ PROVENANCE_COL = _CANONICAL_PROVENANCE_COL
 #: also a hazard: ``_apply_daily_delta`` restates and marks-applied every
 #: registered split across whatever it was handed, while only the filtered
 #: ticker is written (alpha-engine-config-I11444).
-_PER_TICKER_CACHE_CONTEXT = frozenset({*_ALWAYS_DOWNLOAD, "HYOAS"})
+#: Every non-sector macro series ``_extract_macro_series`` pulls out of the
+#: price cache AND ``backfill()`` writes to the ArcticDB macro library as a raw
+#: ``Close`` series. ONE list for both sides, because two literals is how
+#: ``TWO`` and ``BAA10Y`` went missing: ``collectors/fred_history.py`` has
+#: written their 10y parquets every Saturday since alpha-engine-config-I9287,
+#: ``CUMULATIVE_MACRO_SYMBOLS`` declares both, and yet neither symbol existed in
+#: ArcticDB ``macro`` (measured 2026-09-24), so crucible-predictor's Stage-1b
+#: macro block read them as absent and graded ``finite_pct=0.00``
+#: (alpha-engine-config-I11471 / I10068). ``tests/test_macro_fred_series_reach_arctic.py``
+#: asserts every ``FRED_HISTORY_MAP`` key is here.
+_RAW_MACRO_SERIES: tuple[str, ...] = (
+    "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
+    # config#939 — credit spreads. FRED-only (BAMLH0A0HYM2), licence-gated to
+    # 2023+ on FRED; absent from price_data (e.g. pre-Stage-2.5 cache) →
+    # macro.get("HYOAS") returns None downstream, which compute_features
+    # already neutral-defaults rather than crashing.
+    "HYOAS",
+    # FRED-only (DGS2 / BAA10Y). Regime-substrate inputs for crucible-predictor
+    # (yield_curve_10y_2y, baa10y_level, baa10y_change_21d); BAA10Y is the
+    # full-history credit-regime series HYOAS cannot be.
+    "TWO", "BAA10Y",
+)
+
+_PER_TICKER_CACHE_CONTEXT = frozenset({*_ALWAYS_DOWNLOAD, *_RAW_MACRO_SERIES})
 
 
 def _load_current_constituents(s3, bucket: str, run_date: str | None = None) -> set[str]:
@@ -182,20 +205,9 @@ def _load_full_cache(
 
 def _extract_macro_series(price_data: dict[str, pd.DataFrame]) -> dict[str, pd.Series]:
     """Extract macro/ETF Close series from price data."""
-    macro_keys = {
-        "SPY": "SPY", "VIX": "VIX", "VIX3M": "VIX3M",
-        "TNX": "TNX", "IRX": "IRX", "GLD": "GLD", "USO": "USO",
-        # config#939 — credit spreads. HYOAS is the FRED-only ICE BofA US
-        # HY Index OAS index ticker (see collectors/daily_closes.py
-        # _FRED_INDEX_MAP), collected the same way as VIX/TNX/IRX. Absent
-        # from price_data (e.g. pre-Stage-2.5 cache) → macro.get("HYOAS")
-        # returns None downstream, which compute_features already
-        # neutral-defaults rather than crashing.
-        "HYOAS": "HYOAS",
-    }
     macro: dict[str, pd.Series] = {}
-    for key, stem in macro_keys.items():
-        df = price_data.get(stem)
+    for key in _RAW_MACRO_SERIES:
+        df = price_data.get(key)
         if df is not None and "Close" in df.columns:
             macro[key] = df["Close"].dropna()
 
@@ -1445,10 +1457,7 @@ def backfill(
             # ArcticDB on the next Saturday run, rather than staying frozen
             # at whatever ``daily_append`` alone could accumulate one row
             # at a time.
-            for key in [
-                "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO", "HYOAS",
-                *_SUB_SECTOR_ETFS,
-            ]:
+            for key in [*_RAW_MACRO_SERIES, *_SUB_SECTOR_ETFS]:
                 series = macro.get(key)
                 if series is not None:
                     macro_series_df = pd.DataFrame({"Close": series}, index=series.index)

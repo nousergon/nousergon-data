@@ -191,6 +191,36 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
 }
 
 
+def _write_guard_skip_record(path: str, results: dict) -> None:
+    """Record, for the stage launcher, that this run's own guard skipped it.
+
+    alpha-engine-config-I11474: MorningEnrich's stale-overwrite guard returns
+    ``status="skipped"`` with a ``skip_reason`` (the run manifest already
+    records that as ``not_applicable``), but the launcher's stage-coverage
+    assertion could not see it and graded the deliberate skip ``WHOLLY
+    STALE``. This file is the hand-off: present, non-empty, and holding the
+    guard's reason verbatim iff the guard fired; ABSENT on every other
+    outcome — including a leftover from an earlier run, which is removed
+    first so a stale record can never excuse a run that did execute.
+    """
+    target = Path(path)
+    target.unlink(missing_ok=True)
+    if (results or {}).get("status") != "skipped":
+        return
+    reason = " ".join(str(results.get("skip_reason") or "").split())
+    if not reason:
+        # A skip with no stated reason is not a declaration anything may act
+        # on: leave the record absent, so coverage grades the run as it would
+        # any other, and say so.
+        logger.warning(
+            "mode reported status=skipped with no skip_reason — no guard-skip record "
+            "written; stage coverage will grade this run as a normal one"
+        )
+        return
+    target.write_text(reason + "\n")
+    logger.info("guard-skip record written to %s: %s", target, reason)
+
+
 def _describe_degraded_defects(results: dict) -> str:
     """Build the `Defect detail: ...` clause of the DEGRADED alert.
 
@@ -567,6 +597,96 @@ def _prices_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, object]
     )
 
 
+def _fred_history_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, object], ...]:
+    """The per-series price-cache parquet keys ``fred_history.backfill_to_s3``
+    actually uploaded THIS run, each with its own row count
+    (alpha-engine-config-I11469 — D04 recorded ``outputs: []`` on the
+    2026-09-23 rehearsal while ``reference/price_cache/{TWO,HYOAS,BAA10Y}.parquet``
+    all landed at 23:05, so I11011 filed it ``failed``). Same shape as
+    :func:`_prices_extra_outputs`: the key SET comes from what the run wrote
+    (``fred_history.written_keys``), never from the requested series list."""
+    def _keys(r: dict) -> list[str]:
+        return list(fred_history.written_keys(r, s3_prefix))
+
+    def _rows(r: dict) -> dict[str, int]:
+        return fred_history.written_keys(r, s3_prefix)
+
+    return (
+        (_keys, lambda r: bool(fred_history.written_keys(r, s3_prefix)), _rows),
+    )
+
+
+def _signal_returns_extra_outputs() -> tuple[tuple[object, object, object], ...]:
+    """The two research.db keys ``signal_returns.collect`` uploaded THIS run
+    (alpha-engine-config-I11469). Read from the writer's own ``db_upload``
+    return — the pointer and the dated backup it actually PUT — which is empty
+    when the run wrote no rows and so uploaded nothing. Each is recorded with
+    ``total_written``, the rows this run changed in the database (the same
+    convention D08's ``research.db`` outputs use with ``rows_inserted``)."""
+    def _present(field: str):
+        return lambda r: bool((r.get("db_upload") or {}).get(field))
+
+    def _key(field: str):
+        return lambda r: [(r.get("db_upload") or {})[field]]
+
+    return tuple(
+        (_key(field), _present(field), lambda r: r.get("total_written") or 0)
+        for field in ("pointer_key", "backup_key")
+    )
+
+
+#: The spelling a manifest output uses for an ArcticDB LIBRARY write — the
+#: reference ``_record_mode_lineage`` already records for D32/D33/D34
+#: (``arcticdb/universe``), matching every descriptor's
+#: ``arcticdb/<lib> (library)`` ``writes:`` entry. Not an S3 key: nothing can
+#: HEAD it, so the empty-but-fresh guard grades it on its measured row count.
+_ARCTIC_LIBRARY_REF_PREFIX = "arcticdb/"
+
+
+def _arcticdb_backfill_extra_outputs() -> tuple[tuple[object, object, object], ...]:
+    """The two ArcticDB libraries ``builders.backfill.backfill`` wrote THIS run
+    (alpha-engine-config-I11469 — D13 spent 38 minutes appending on the
+    2026-09-23 rehearsal and recorded ``outputs: []``). ``tickers_written`` is
+    the universe symbols written (n_ok); ``macro_dates`` is the row count of
+    the ``macro/features`` frame, which is 0 exactly when that write was
+    skipped (empty frame, dry run, or a per-ticker patch)."""
+    return (
+        (
+            f"{_ARCTIC_LIBRARY_REF_PREFIX}universe",
+            lambda r: int(r.get("tickers_written") or 0) > 0,
+            lambda r: int(r.get("tickers_written") or 0),
+        ),
+        (
+            f"{_ARCTIC_LIBRARY_REF_PREFIX}macro",
+            lambda r: int(r.get("macro_dates") or 0) > 0,
+            lambda r: int(r.get("macro_dates") or 0),
+        ),
+    )
+
+
+def _check_arctic_library_output(unit_id: str, key: str, rows: int) -> "expectations.GuardReading":
+    """Empty-but-fresh verdict for an ArcticDB library output.
+
+    ``check_empty_fresh`` HEADs the key on S3, which an ArcticDB library
+    reference can never pass — it would read a real write as "a success claim
+    with no artifact behind it". The count is REAL and measured by the
+    builder, which is what the guard needs; the ArcticDB probe
+    (``data_collection/probes/arctic/{trading_day}.json``) is the independent
+    read-back of the same write. Same grading ``_record_mode_lineage`` applies
+    to D32/D33/D34.
+    """
+    if rows > 0:
+        return expectations.GuardReading(
+            "ok", f"{unit_id} published {rows} row(s) to {key}", key=key, value=float(rows),
+        )
+    return expectations.GuardReading(
+        "empty_fresh",
+        f"{unit_id} recorded {key} with ZERO rows — a fresh, empty write",
+        key=key,
+        value=0.0,
+    )
+
+
 def _run_manifest_context(reg: "PhaseRegistry", unit: run_units.PhaseUnit) -> dict:
     """The per-run manifest arguments shared by every wrapped call site here."""
     return {
@@ -865,6 +985,11 @@ def _record_phase_lineage(
         # `run_ctx.record_output` above was just given), never the primary
         # key's count standing in for a key it did not measure.
         for extra_key_name, extra_rows in extra_written:
+            if extra_key_name.startswith(_ARCTIC_LIBRARY_REF_PREFIX):
+                readings.append(
+                    _check_arctic_library_output(unit.unit_id, extra_key_name, extra_rows)
+                )
+                continue
             readings.append(
                 expectations.check_empty_fresh(
                     unit_id=unit.unit_id,
@@ -1608,6 +1733,11 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                 dry_run=dry_run,
             ),
             supports_auto_skip=False,
+            # alpha-engine-config-I11469: every per-series parquet this run
+            # actually wrote, with its own row count.
+            extra_outputs=_fred_history_extra_outputs(
+                price_cfg.get("s3_prefix", "predictor/price_cache/")
+            ),
         )
 
     # ── 3. Slim cache — REMOVED (Wave-4) ─────────────────────────────────────
@@ -1820,6 +1950,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
                     run_date=run_date,
                 ),
                 supports_auto_skip=False,
+                # alpha-engine-config-I11469: the research.db pointer + dated
+                # backup, only when this run actually uploaded them.
+                extra_outputs=_signal_returns_extra_outputs(),
             )
         else:
             results["collectors"]["signal_returns"] = _phase_not_run(
@@ -1889,6 +2022,9 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             reg, "arcticdb",
             lambda: backfill(bucket=bucket, dry_run=dry_run, run_date=run_date),
             supports_auto_skip=False,
+            # alpha-engine-config-I11469: the universe + macro library writes,
+            # each with the count the builder measured.
+            extra_outputs=_arcticdb_backfill_extra_outputs(),
         )
 
     # ── Finalize ─────────────────────────────────────────────────────────────
@@ -5059,6 +5195,13 @@ def _parse_args() -> argparse.Namespace:
              "fallback). --date overrides which trading day to enrich (default: previous trading day).",
     )
     parser.add_argument(
+        "--guard-skip-record", dest="guard_skip_record", default=None, metavar="PATH",
+        help="Write the mode's own guard skip_reason to PATH when its guard deliberately "
+             "skipped the run (status=skipped), and remove PATH otherwise. The stage "
+             "launcher hands it to the stage-coverage assertion as --not-applicable-reason "
+             "so a declared skip is not graded STALE (alpha-engine-config-I11474).",
+    )
+    parser.add_argument(
         "--chronic-gap-heal", dest="chronic_gap_heal", action="store_true",
         help="Best-effort: yfinance-backfill ArcticDB row gaps for the chronic-polygon-gap "
              "tickers (polygon doesn't reliably serve them) + emit the polygon-recovery / "
@@ -5198,6 +5341,9 @@ def main() -> None:
         raise SystemExit(0)
 
     results = run_weekly(config, args)
+
+    if getattr(args, "guard_skip_record", None):
+        _write_guard_skip_record(args.guard_skip_record, results)
 
     # config#646 (Option A): write the flow's end-of-run status() snapshot to
     # s3://alpha-engine-research/_flow_doctor/heartbeat/data-collector/{date}.json

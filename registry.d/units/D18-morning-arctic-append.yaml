@@ -41,7 +41,11 @@ contract:
   schema: contracts/arctic_universe.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "crucible:crucible/data/sources.py::ArcticPriceSource"
+    - repo: "crucible"
+      path: "tests/contracts/arctic_universe.schema.json"
+      pins: "body_schema"
+      producer: "contracts/arctic_universe.schema.json"
+      read_site: "crucible/data/sources.py::ArcticPriceSource.load_panel"
   target: "contracts/arctic_universe.schema.json, pinned in crucible (P-07)"
 registry_rows:
   - "feature_store_freshness_sentinel (indirect, depends_on)"

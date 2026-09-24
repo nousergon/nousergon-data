@@ -43,7 +43,11 @@ contract:
   schema: "contracts/staging_daily_closes.schema.json"
   producer_test: tests/test_staging_daily_closes_contract.py
   consumer_pins:
-    - "crucible-executor:contracts/staging_daily_closes.schema.json"
+    - repo: "crucible-executor"
+      path: "contracts/staging_daily_closes.schema.json"
+      pins: "body_schema"
+      producer: "contracts/staging_daily_closes.schema.json"
+      read_site: "executor/upstream_artifact_gate.py"
   # P-07 (alpha-engine-config#10870): same artifact as D17 (writes_shared_with:
   # D17, same S3 key template) — see D17's descriptor for the full note. The
   # consumer pin is crucible-executor's `contracts/staging_daily_closes.schema.json`

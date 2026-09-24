@@ -198,8 +198,9 @@ def _as_list(value: object) -> list:
     return list(value) if isinstance(value, (list, tuple)) else [value]
 
 
-def _read_schema_contract(unit: Unit) -> Reading:
-    """A REAL read: does the declared schema and producer test exist in this tree?
+def _read_schema_contract(store: GateStore, unit: Unit) -> Reading:
+    """A REAL read: the declared schema and producer test exist in this tree, and
+    every declared consumer pin resolves and still matches the producer.
 
     The one base column whose evidence is a committed file in this repository,
     so it is measurable on the day the board is built. It is expected to
@@ -231,23 +232,13 @@ def _read_schema_contract(unit: Unit) -> Reading:
             evidence=tuple(files),
             source="nousergon-data tree",
         )
-    if not (unit.raw.get("contract") or {}).get("consumer_pins"):
-        return Reading(
-            met=False,
-            detail=(
-                f"producer side present ({files}) and NO consumer pin is declared. A schema "
-                "the producer validates against and no consumer pins is half a contract: it "
-                "cannot fail a consumer that drifts (plan §4.3)."
-            ),
-            evidence=tuple(files),
-            source="nousergon-data tree",
-        )
-    return Reading(
-        met=True,
-        detail=f"schema and producer test present, with a declared consumer pin: {files}",
-        evidence=tuple(files),
-        source="nousergon-data tree",
-    )
+    # The consumer half (`alpha-engine-config-I11282`): every declared pin is
+    # resolved on its repository and compared with the producer, never
+    # believed from a non-empty list. Imported here: `consumer_pins` imports
+    # `Reading` from this module.
+    from data_gate import consumer_pins
+
+    return consumer_pins.read_consumer_pins(store, unit, files)
 
 
 #: The store is opened at `s3://alpha-engine-research/data_collection`, but a
@@ -770,7 +761,7 @@ def read_run_record(
 def read_base(store: GateStore, unit: Unit, column: str, *, trading_day: dt.date) -> Reading:
     """The evidence behind one base clause."""
     if column == "schema_contract":
-        return _read_schema_contract(unit)
+        return _read_schema_contract(store, unit)
     if column == "run_record":
         return read_run_record(store, unit, trading_day=trading_day)
     if column == "survives_phase4":

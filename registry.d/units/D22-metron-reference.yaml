@@ -45,8 +45,16 @@ contract:
     - contracts/metron_earnings.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_sectors.schema.json"
-    - "metron:tests/contracts/metron_earnings.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_sectors.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_sectors.schema.json"
+      read_site: "portfolio_analytics/sectors/spine_source.py::spine_sectors"
+    - repo: "metron"
+      path: "tests/contracts/metron_earnings.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_earnings.schema.json"
+      read_site: "portfolio_analytics/calendar/spine_source.py::spine_earnings_dates"
 registry_rows:
   - metron_earnings
   - metron_sectors
