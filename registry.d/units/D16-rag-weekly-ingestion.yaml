@@ -50,7 +50,11 @@ contract:
   schema: "contracts/rag_manifest.schema.json"
   producer_test: tests/test_rag_manifest_contract.py
   consumer_pins:
-    - "crucible-dashboard:tests/contracts/rag_manifest.schema.json"
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/rag_manifest.schema.json"
+      pins: "body_schema"
+      producer: "contracts/rag_manifest.schema.json"
+      read_site: "loaders/s3_loader.py"
   # P-07 (alpha-engine-config-I10873, I10934): disambiguates R7's split of
   # this unit's writes — `rag/watermarks/*` and `rag/corpus_freshness/latest.json`
   # are dropped (zero external readers, see `notes` below); the SURVIVING
