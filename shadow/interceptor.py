@@ -45,6 +45,13 @@ a key this process previously read as a live *input* means the run consumed
 v1's copy of its own output as the base of what it publishes. That is refused
 at the write — before anything is sent — naming the key, so the fix is a row in
 :data:`OWN_STATE_KEY_PATTERNS` (or a scope), never a silent live base.
+
+**A version-addressed read is none of the four** (`alpha-engine-config-I11231`).
+A keyed read carrying ``VersionId`` names one immutable live object on purpose
+— ``shadow.pinned_inputs`` pins a replay's read-modify-write base to the
+version current when v1's run for that day STARTED — so it passes through
+unmodified and is not recorded as an input: it is the base v1 itself used, not
+v1's copy of this run's output.
 """
 
 from __future__ import annotations
@@ -312,6 +319,20 @@ def rewrite_params(
         return api_params
 
     bucket = api_params.get("Bucket")
+    if operation_name in KEYED_READ_OPERATIONS and api_params.get("VersionId"):
+        # A VERSION-ADDRESSED read (`alpha-engine-config-I11231`) names one
+        # immutable historical object in the LIVE key space, chosen on purpose —
+        # `shadow.pinned_inputs.pin_for` selects the version current when v1's
+        # run for the replayed day STARTED, i.e. the base v1 itself built on,
+        # before v1 wrote anything for that day. It passes through unmodified
+        # (a live VersionId means nothing under the shadow key) and is NOT
+        # recorded as an input read: the guard in `RunLedger.record_write`
+        # exists for the CURRENT-object read, which can silently be v1's copy of
+        # this run's own output. A pinned pre-v1 version cannot be, and it is
+        # exactly the read-modify-write base a replay of D26's ledger manifest
+        # needs — refusing its write-back is what left that key uncomparable.
+        _live_key(api_params.get("Key", ""), root)  # still refuse a non-string key
+        return api_params
     if operation_name in KEYED_READ_OPERATIONS:
         live_key = _live_key(api_params.get("Key", ""), root)
         if classify_read(live_key, bucket=bucket, ledger=ledger) == "input":
