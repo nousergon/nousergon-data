@@ -11,7 +11,7 @@ machine's ``verify_units`` completion check on every execution that names it
 that never ran.
 
 **Also covers D46 (`alpha-engine-config-I10753`).** D46 (insider_transactions,
-Form 4) is step 6 of this SAME script and gets no dispatcher key of its own —
+Form 4) is step 5 of this SAME script and gets no dispatcher key of its own —
 a second entry point would re-run the identical EDGAR fetch a second time per
 week (see `index.py::_WORKLOADS["rag-weekly-ingestion"]`'s comment). Rather
 than leave D46 with no run record at all, its descriptor's
@@ -26,7 +26,7 @@ D46's own `writes:` floor — no second manifest, no second script run.
 
 This module is a THIN wrapper (`data_collection_plan_260914.md` §4.4;
 ``nousergon-data`` AGENTS.md's "wrap, don't reimplement" precedent): it runs
-the existing bash script completely unchanged — same nine ingestion steps,
+the existing bash script completely unchanged — same ingestion steps,
 same venv/PYTHON_BIN resolution, same LM-dict bootstrap, same
 ``--dry-run``/``--preflight-only`` flags — and adds exactly one thing around
 it, a ``run_units.recorded_entry("D16", ...)`` call. It never reimplements the
@@ -98,7 +98,7 @@ BUCKET = "alpha-engine-research"
 #: their shared parent prefix; `rag/watermarks/` and `rag/corpus_freshness/`
 #: are already prefixes; `health/rag_ingestion_progress/{date}.json` gets its
 #: own), PLUS D46's declared write prefix (`data/insider_transactions/`,
-#: alpha-engine-config-I10753 — step 6 of this same script, no separate
+#: alpha-engine-config-I10753 — step 5 of this same script, no separate
 #: manifest). Declared here, not derived from either descriptor at runtime,
 #: for the same reason `run_units.PHASE_UNITS` is a literal table: a renamed
 #: prefix on either side is a loud test failure, never a silent miss.
@@ -127,7 +127,7 @@ def _ingestion_argv(dry_run: bool, run_date: str) -> list[str]:
 def _run_ingestion_script(dry_run: bool, run_date: str, yield_dir: str | None = None) -> int:
     """Run the existing bash pipeline unchanged. Returns its exit code.
 
-    A subprocess call, not a reimplementation: everything about HOW the nine
+    A subprocess call, not a reimplementation: everything about HOW the
     steps run stays exactly what `run_weekly_ingestion.sh` already does. The
     one thing passed IN is where the script's per-source yields go
     (``$RAG_SOURCE_YIELD_DIR``), so this process can read the verdict back.

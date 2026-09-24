@@ -32,7 +32,7 @@ trigger:
   successor: >-
     nousergon-data-collection/data-collection-weekly, dispatcher workload
     `rag-weekly-ingestion` (alpha-engine-config-I10753) — SAME shared key as
-    D16, step 6 (`rag.pipelines.ingest_form4`) of the unchanged
+    D16, step 5 (`rag.pipelines.ingest_form4`) of the unchanged
     run_weekly_ingestion.sh. No separate dispatcher key: it is a substep of
     that one script, not a standalone entry point, and a second key would
     double-fetch the same EDGAR Form 4 filings each week.

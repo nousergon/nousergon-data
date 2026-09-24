@@ -4,9 +4,9 @@
 The weekly RAG ingestion pipeline (``rag/pipelines/run_weekly_ingestion.sh``)
 runs on the always-on EC2 instance via SSM as a single Step Functions Task —
 off-box, the dashboard's Fleet Status page sees only "RAGIngestion RUNNING"
-for up to several hours with no indication of which of its 10 inner steps is
+for up to several hours with no indication of which of its inner steps is
 executing. This module writes a small JSON progress marker to S3 between
-each step so the console can render "step 5/10: news" plus a staleness
+each step so the console can render "step 4/9: news" plus a staleness
 telltale (config-I2966 deliverable #2).
 
 Artifact: ``s3://alpha-engine-research/health/rag_ingestion_progress/{run_date}.json``
@@ -19,7 +19,7 @@ per explicit issue instruction — this artifact is progress TELEMETRY, not
 pipeline output. A failed write must never abort or degrade the actual
 ingestion run (SEC filings / news / Form 4 / etc. all still need
 ``set -euo pipefail`` to hard-fail on THEIR errors); losing one progress
-tick just means the console shows a slightly stale "step N/10" until the
+tick just means the console shows a slightly stale "step N/9" until the
 next tick lands. This is the one deliberate swallow in the weekly ingestion
 path — every other error in ``run_weekly_ingestion.sh`` remains a hard
 abort by design (see that script's own docstring).
@@ -27,7 +27,7 @@ abort by design (see that script's own docstring).
 Usage (called between steps by run_weekly_ingestion.sh)::
 
     python -m rag.pipelines.emit_progress \\
-        --run-date 2026-07-25 --step 5 --of 10 --label news \\
+        --run-date 2026-07-25 --step 4 --of 9 --label news \\
         --started-at 2026-07-25T09:00:12Z
 """
 

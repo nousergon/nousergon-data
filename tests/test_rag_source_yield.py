@@ -7,8 +7,9 @@ tickers`` and ``Signals thesis ingestion: 0 theses`` and still reported
 * the verdict (``rag.pipelines.source_yield``): a source offering 0 documents
   is ``degraded`` and NAMED; a declared-expected 0 is not a gap; a source that
   never reported is degraded; every offered document failing is degraded;
-* the Finnhub transcript source records WHY it returned nothing (the non-200
-  used to be logged at DEBUG, under the INFO root logger);
+* the earnings-transcript source (Finnhub), whose 0 started this, is RETIRED
+  (2026-09-24): it is not expected, its absence is not a gap, and the verdict
+  says it was retired rather than dropping it silently;
 * the thesis source declares its 0 expected only when every entry is
   quant-envelope output (no ``thesis_summary`` by design);
 * the wiring: the weekly script runs the verdict and the email carries it, and
@@ -29,6 +30,7 @@ import pytest
 from rag.pipelines import source_yield
 from rag.pipelines.source_yield import (
     EXPECTED_SOURCES,
+    RETIRED_SOURCES,
     SourceYield,
     assess,
     email_collectors,
@@ -55,13 +57,13 @@ def test_every_source_yielding_is_ok(tmp_path):
 
 
 def test_a_whole_source_returning_zero_is_degraded_and_named(tmp_path):
-    _write_all_ok(tmp_path, earnings_transcripts=SourceYield(
-        source="earnings_transcripts", scope=118, failures={"http_403": 118},
-        detail="Finnhub /stock/transcripts/list HTTP 403: You don't have access",
-    ))
+    _write_all_ok(tmp_path, **{"8k_events": SourceYield(
+        source="8k_events", scope=118, failures={"http_403": 118},
+        detail="EDGAR HTTP 403",
+    )})
     v = assess(tmp_path)
     assert v["status"] == "degraded"
-    assert [d["source"] for d in v["degraded_sources"]] == ["earnings_transcripts"]
+    assert [d["source"] for d in v["degraded_sources"]] == ["8k_events"]
     reason = v["degraded_sources"][0]["reason"]
     assert "0 documents for 118" in reason and "http_403=118" in reason
 
@@ -106,26 +108,26 @@ def test_an_empty_scope_is_degraded(tmp_path):
 
 
 def test_report_always_exits_zero_and_writes_the_verdict(tmp_path, caplog):
-    _write_all_ok(tmp_path, earnings_transcripts=SourceYield(source="earnings_transcripts", scope=118))
+    _write_all_ok(tmp_path, **{"8k_events": SourceYield(source="8k_events", scope=118)})
     with caplog.at_level("WARNING"):
         assert source_yield.main(["--report", "--dir", str(tmp_path)]) == 0
-    assert "DEGRADED" in caplog.text and "earnings_transcripts" in caplog.text
+    assert "DEGRADED" in caplog.text and "8k_events" in caplog.text
     assert source_yield.load_verdict(tmp_path)["status"] == "degraded"
 
 
 def test_email_overlays_the_verdict():
-    base = {"sec_filings": {"status": "ok"}, "earnings_transcripts": {"status": "ok"}}
+    base = {"sec_filings": {"status": "ok"}, "8k_events": {"status": "ok"}}
     verdict = {
         "status": "degraded",
         "sources": {
             "sec_filings": {"status": "ok", "reason": ""},
-            "earnings_transcripts": {"status": "degraded", "reason": "source returned 0 documents"},
+            "8k_events": {"status": "degraded", "reason": "source returned 0 documents"},
             "thesis_history": {"status": "expected_empty", "reason": "declared expected"},
         },
     }
     status, collectors = email_collectors(base, verdict)
     assert status == "degraded"
-    assert collectors["earnings_transcripts"] == {"status": "degraded", "error": "source returned 0 documents"}
+    assert collectors["8k_events"] == {"status": "degraded", "error": "source returned 0 documents"}
     assert collectors["thesis_history"] == {"status": "expected_empty"}
 
 
@@ -142,61 +144,36 @@ def test_the_email_subject_says_degraded():
     assert subject.endswith("| DEGRADED")
 
 
-# ── Finnhub transcripts: the reason for a zero is recorded ─────────────
+# ── Earnings transcripts: retired, not silently dropped ────────────────
 
 
-@pytest.fixture
-def _finnhub(monkeypatch):
-    from rag.pipelines import ingest_earnings_finnhub as mod
-
-    monkeypatch.setattr(mod, "_get_api_key", lambda: "k")
-    monkeypatch.setattr(mod.time, "sleep", lambda s: None)
-    retrieval = ModuleType("nousergon_lib.rag.retrieval")
-    retrieval.document_exists = MagicMock(return_value=False)
-    retrieval.ingest_document = MagicMock(return_value="doc-id")
-    embeddings = ModuleType("nousergon_lib.rag.embeddings")
-    embeddings.embed_texts = MagicMock(side_effect=lambda t: [[0.0] for _ in t])
-    monkeypatch.setitem(sys.modules, "nousergon_lib.rag.retrieval", retrieval)
-    monkeypatch.setitem(sys.modules, "nousergon_lib.rag.embeddings", embeddings)
-    return mod
+def test_retired_sources_are_never_expected():
+    assert "earnings_transcripts" in RETIRED_SOURCES
+    assert not set(RETIRED_SOURCES) & set(EXPECTED_SOURCES)
 
 
-def _resp(status, body):
-    r = MagicMock(status_code=status, text=json.dumps(body))
-    r.json.return_value = body
-    return r
+def test_retired_sources_say_when_and_why():
+    for name, reason in RETIRED_SOURCES.items():
+        assert re.search(r"retired \d{4}-\d{2}-\d{2}", reason), name
+        assert "alpha-engine-config-I" in reason, name
 
 
-def test_a_premium_gated_list_is_counted_and_logged_once(_finnhub, monkeypatch, caplog):
-    body = {"error": "You don't have access to this resource."}
-    monkeypatch.setattr(_finnhub.requests, "get", MagicMock(return_value=_resp(403, body)))
-    stats = SourceYield(source="earnings_transcripts", scope=3)
-
-    with caplog.at_level("WARNING"):
-        for t in ("AAPL", "MSFT", "NVDA"):
-            assert _finnhub.ingest_ticker(t, stats=stats) == 0
-
-    assert stats.failures == {"http_403": 3}
-    assert "access to this resource" in stats.detail
-    assert len([r for r in caplog.records if "transcript list HTTP 403" in r.getMessage()]) == 1
-    status, reason = source_yield._source_status(json.loads(json.dumps(stats.__dict__)))
-    assert status == "degraded" and "http_403=3" in reason
+def test_a_run_without_a_transcript_yield_is_not_degraded(tmp_path):
+    """The retired step writes no yield. Its absence is not a gap."""
+    _write_all_ok(tmp_path)
+    assert not (tmp_path / "earnings_transcripts.json").exists()
+    v = assess(tmp_path)
+    assert v["status"] == "ok"
+    assert "earnings_transcripts" not in v["sources"]
 
 
-def test_listed_transcripts_are_counted_as_discovered(_finnhub, monkeypatch):
-    listing = {"transcripts": [{"id": "t1", "time": "2026-07-30 16:00:00", "year": 2026, "quarter": 2}]}
-    transcript = {"transcript": [
-        {"name": "CEO", "role": "executive", "speech": "Prepared remarks " * 20},
-        {"name": "Analyst", "role": "analyst", "speech": "What about margins? " * 10},
-    ]}
-
-    def get(url, params=None, timeout=None):
-        return _resp(200, listing if url.endswith("/list") else transcript)
-
-    monkeypatch.setattr(_finnhub.requests, "get", get)
-    stats = SourceYield(source="earnings_transcripts", scope=1)
-    assert _finnhub.ingest_ticker("AAPL", stats=stats) == 1
-    assert (stats.discovered, stats.ingested, stats.failures) == (1, 1, {})
+def test_the_verdict_and_the_report_name_the_retired_source(tmp_path, caplog):
+    _write_all_ok(tmp_path)
+    with caplog.at_level("INFO"):
+        assert source_yield.main(["--report", "--dir", str(tmp_path)]) == 0
+    verdict = source_yield.load_verdict(tmp_path)
+    assert verdict["retired_sources"] == RETIRED_SOURCES
+    assert "earnings_transcripts: RETIRED" in caplog.text
 
 
 # ── Theses: zero is declared expected only for an all-quant window ─────
@@ -284,7 +261,7 @@ def test_the_verdict_step_cannot_abort_the_run():
 
 
 @pytest.mark.parametrize("module", [
-    "ingest_sec_filings", "ingest_8k_filings", "ingest_earnings_finnhub", "ingest_theses", "ingest_form4",
+    "ingest_sec_filings", "ingest_8k_filings", "ingest_theses", "ingest_form4",
 ])
 def test_every_expected_source_writes_a_yield(module):
     src = (REPO_ROOT / "rag" / "pipelines" / f"{module}.py").read_text()
@@ -295,3 +272,5 @@ def test_expected_sources_match_the_email_collectors():
     src = (REPO_ROOT / "rag" / "pipelines" / "run_weekly_ingestion.sh").read_text()
     for name in EXPECTED_SOURCES:
         assert f"'{name}': {{'status': 'ok'}}" in src
+    for name in RETIRED_SOURCES:
+        assert f"'{name}'" not in src, f"retired source {name} is still in the completion email"

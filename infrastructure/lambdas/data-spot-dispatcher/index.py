@@ -401,10 +401,10 @@ _WORKLOADS: dict[str, str] = {
     # writes `data_collection/runs/D16/{trading_day}/{run_id}.json` around it
     # — the ingestion steps themselves, their order, their env/venv resolution
     # are untouched. Covers D16 (its own writes) AND D46 (Form 4 insider
-    # transactions, step 6 of the script) — D46 does NOT get its own
+    # transactions, step 5 of the script) — D46 does NOT get its own
     # dispatcher key: it is a substep of this same script, not a standalone
     # entry point, so a second key would re-run the identical EDGAR fetch a
-    # second time per week. D40/D41 (steps 7/8) still execute as part of this
+    # second time per week. D40/D41 (step 7, analyst pipeline) still execute as part of this
     # unchanged script (this dispatcher does not own
     # rag/pipelines/run_weekly_ingestion.sh — that is `nousergon-data`'s RAG
     # pipeline code, a sibling surface); their retirement is at the

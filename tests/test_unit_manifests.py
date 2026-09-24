@@ -777,7 +777,7 @@ def test_d16_records_the_source_yield_verdict_as_a_guard(sink, d16, monkeypatch,
         seen["yield_dir"] = yield_dir
         for name in source_yield.EXPECTED_SOURCES:
             source_yield.write_yield(
-                source_yield.SourceYield(source=name, scope=118, discovered=0 if name == "earnings_transcripts" else 5),
+                source_yield.SourceYield(source=name, scope=118, discovered=0 if name == "8k_events" else 5),
                 yield_dir,
             )
         source_yield.main(["--report", "--dir", yield_dir])
@@ -794,7 +794,7 @@ def test_d16_records_the_source_yield_verdict_as_a_guard(sink, d16, monkeypatch,
     guard = next(g for g in manifest["guards"] if g["guard"] == module.SOURCE_YIELD_GUARD)
     assert guard["verdict"] == "degraded"
     assert guard["mode"] == "observe"
-    assert "earnings_transcripts" in guard["detail"]
+    assert "8k_events" in guard["detail"]
     assert guard["value"] == 1.0
 
 
