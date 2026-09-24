@@ -90,10 +90,13 @@ def test_the_launcher_stage_set_is_discovered_from_the_live_definition() -> None
     passes vacuously — a detector that cannot fail."""
     stages = _launcher_stages_in_this_repo()
     assert stages, "no launcher-backed weekly stages discovered — the parser broke"
-    # The four this repo is known to own. A NEW one appearing here is expected
+    # The two this repo is known to own. A NEW one appearing here is expected
     # to fail this assertion, which is the point: a stage added without an
-    # assertion must break a build, not go quiet.
-    assert set(stages) == {"MorningEnrich", "DataPhase1", "DataPhase2", "RAGIngestion"}
+    # assertion must break a build, not go quiet. MorningEnrich and DataPhase1
+    # were the other two until the decoupled data cutover
+    # (alpha-engine-config-I11269) moved that work to ne-data-collection-weekly,
+    # whose completion claim is its units' run manifests.
+    assert set(stages) == {"DataPhase2", "RAGIngestion"}
 
 
 # ── Every launcher asserts, and asserts its OWN stage ────────────────────────
@@ -440,7 +443,8 @@ def test_the_end_of_run_module_is_gone() -> None:
 #: (PitParityLookaheadKillCheck-shaped): those run no launcher, declare no
 #: stage row, and gaining the export would buy nothing.
 _COVERAGE_ASSERTING_SSM_STATES = frozenset({
-    "MorningEnrich", "DataPhase1", "RAGIngestion", "DataPhase2",
+    # MorningEnrich / DataPhase1 left with alpha-engine-config-I11269.
+    "RAGIngestion", "DataPhase2",
     "PredictorTraining", "TrainSpecDispatch", "ModelZooSelect",
     "SaturdayHealthCheck", "WeeklySubstrateHealthCheck",
     "Backtester", "PredictorBacktest", "PortfolioOptimizerBacktest",

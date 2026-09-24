@@ -51,16 +51,21 @@ _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 # CheckSkipPostMarketArcticAppend gate was removed with the on-trading append state).
 # The spot data-phase wiring is pinned separately in
 # test_sf_data_spot_relocation_wiring.py.
+#
+# alpha-engine-config-I11269: the spot data phase is REMOVED — the standalone
+# ne-data-collection-eod schedule runs it — and CheckSkipPostMarketData now
+# gates the bounded readiness wait on that collection's run manifests
+# (WaitForCollectionManifests, I11264) instead.
 _CHAIN = [
     # config#1549 — the hoisted top-of-pipeline executor-deploy refresh gate runs
     # FIRST (right after the SSM-readiness gate), so the entire EOD run executes
     # latest origin/main by construction. Skipping it resumes at the first work gate.
     ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
-    # 2026-07-14: CheckSkipPostMarketData's Default now runs through
-    # InitDataSpotRetryCounter (the new spot-interruption retry-budget init)
-    # before LaunchPostMarketDataSpot — pinned separately in
-    # TestEODDataSpotRetryBudget (test_sf_data_spot_relocation_wiring.py).
-    ("CheckSkipPostMarketData", "InitDataSpotRetryCounter", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
+    # alpha-engine-config-I11269: CheckSkipPostMarketData's Default enters the
+    # readiness wait (InitCollectionReadinessPoll -> ... ->
+    # WaitForCollectionManifests) — pinned in test_sf_data_spot_relocation_wiring.py
+    # and tests/test_v1_collection_readiness_wait.py.
+    ("CheckSkipPostMarketData", "InitCollectionReadinessPoll", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
     # config-I2702 (2026-07-15): the skip edge now lands on
     # ProbeEODReconcilePrecondition (the new verify-by-artifact precondition
     # probe), not directly on CheckSkipEODReconcile — every path into the
@@ -157,32 +162,15 @@ class TestEntryEdgesRouteThroughGates:
                 if c.get("StringEquals") == "Success"]
         assert succ == ["CheckSkipPostMarketData"]
 
-    def test_post_market_spot_success_enters_arctic_append_spot(self, states):
-        # config#1767: the post-market fetch now runs on spot; its poll Success
-        # enters the Arctic-append retry-counter init (2026-07-14), which then
-        # launches the Arctic-append spot workload (both run on spot).
-        succ = [c["Next"] for c in states["CheckPostMarketDataSpotStatus"]["Choices"]
-                if c.get("StringEquals") == "Success"]
-        assert succ == ["InitDataSpotArcticRetryCounter"]
-        assert states["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
-
-    def test_arctic_append_spot_success_enters_edgar_pit_retry_counter(self, states):
-        # alpha-engine-config-I10750: the EOD Arctic append's Success now
-        # enters the edgar-pit-fundamentals-daily retry-counter init, which
-        # then rejoins the reconcile/snapshot path at CheckSkipCaptureSnapshot
-        # once ITS poll succeeds (or fail-opens).
-        succ = [c["Next"] for c in states["CheckPostMarketArcticAppendSpotStatus"]["Choices"]
-                if c.get("StringEquals") == "Success"]
-        assert succ == ["InitDataSpotEdgarRetryCounter"]
-        assert states["InitDataSpotEdgarRetryCounter"]["Next"] == "LaunchEdgarPitFundamentalsDailySpot"
-
-    def test_edgar_pit_spot_success_enters_snapshot_gate(self, states):
-        # alpha-engine-config-I10750: edgar-pit-fundamentals-daily's poll
-        # Success rejoins the reconcile/snapshot path at
-        # CheckSkipCaptureSnapshot, mirroring the other two data-spot legs.
-        succ = [c["Next"] for c in states["CheckEdgarPitFundamentalsDailySpotStatus"]["Choices"]
-                if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipCaptureSnapshot"]
+    def test_collection_ready_enters_snapshot_gate(self, states):
+        # alpha-engine-config-I11269: the three spot legs (post-market-data,
+        # post-market-arctic-append, edgar-pit-fundamentals-daily) whose Success
+        # edges used to chain into CheckSkipCaptureSnapshot are gone; the
+        # readiness wait's "ready" edge is the one entry now. The not-ready
+        # edges reach it too, through the fail-open normalizer.
+        ready = states["CheckCollectionReadiness"]["Choices"][0]
+        assert ready["Next"] == "CheckSkipCaptureSnapshot"
+        assert states["PublishDataSpotFailureImmediate"]["Next"] == "CheckSkipCaptureSnapshot"
 
     def test_data_phase_no_longer_on_trading_box(self, states):
         # config#1767 deliverable #2: the EOD path retains NO data-phase SSM
@@ -238,9 +226,11 @@ class TestPaths:
                     for op in rule.get("And", [rule]):
                         merged.update(op)
                     return merged
+                # alpha-engine-config-I11269: CheckCollectionReadiness's
+                # happy edge is ready == true (its first rule), the same shape.
                 launched = (
                     [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
-                    if cur.endswith("SpotLaunched") else []
+                    if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
                 )
                 # alpha-engine-config-I6689: CheckExerciseCadence branches on
                 # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
@@ -282,15 +272,16 @@ class TestPaths:
             "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
         ]
 
-    def test_skip_refresh_resumes_at_data_spot(self, states):
+    def test_skip_refresh_resumes_at_the_collection_wait(self, states):
         # config#1549: skipping only the deploy refresh (e.g. an operator rerun
-        # on a box already known fresh) resumes at the first work task, which is
-        # now the spot data-phase retry-counter init (config#1767; counter init
-        # added 2026-07-14) then the spot launch itself.
+        # on a box already known fresh) resumes at the first work task, which
+        # is the collection readiness wait (alpha-engine-config-I11269; it was
+        # the spot data phase from config#1767 until then).
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
-        assert order[0] == "InitDataSpotRetryCounter"
-        assert order[1] == "LaunchPostMarketDataSpot"
+        assert order[:3] == [
+            "InitCollectionReadinessPoll", "SeedCollectionReadiness", "WaitForCollectionManifests",
+        ]
         assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
     def test_skip_data_phase_resumes_at_snapshot(self, states):
@@ -300,20 +291,17 @@ class TestPaths:
         # alpha-engine-config#5569: resumes at the new retry-counter init, then
         # CaptureSnapshot itself (mirrors InitDataSpotRetryCounter above).
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
-        assert "LaunchPostMarketDataSpot" not in order
-        assert "LaunchPostMarketArcticAppendSpot" not in order
+        assert "WaitForCollectionManifests" not in order
         assert order[0] == "InitCaptureSnapshotRetryCounter"
         assert order[1] == "CaptureSnapshot"
         assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 
-    def test_happy_path_runs_data_phase_on_spot(self, states):
-        # config#1767: the EOD data phase runs as spot-launch states, in order,
-        # before the snapshot.
+    def test_happy_path_waits_for_the_collection_before_the_snapshot(self, states):
+        # alpha-engine-config-I11269: the snapshot and reconcile read what the
+        # EOD collection wrote, so the wait precedes them; no spot launch runs.
         order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
-        assert "LaunchPostMarketDataSpot" in order
-        assert "LaunchPostMarketArcticAppendSpot" in order
-        assert order.index("LaunchPostMarketDataSpot") < order.index("LaunchPostMarketArcticAppendSpot")
-        assert order.index("LaunchPostMarketArcticAppendSpot") < order.index("CaptureSnapshot")
+        assert order.index("WaitForCollectionManifests") < order.index("CaptureSnapshot")
+        assert not [n for n in order if n.startswith("Launch") and n.endswith("Spot")], order
 
 
 class TestSkipFlagsInertOutsideOperatorReplay:

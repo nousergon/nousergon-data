@@ -1010,7 +1010,11 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
         "STRICTLY one report later, against the D-1 live/shadow pair; an unsettled re-grade "
         "reads UNMET here even when every other count is clean, because it is a producer "
         "defect the previous day's report could only record as settling, not a fact about "
-        "today's own snapshot (alpha-engine-config-I11360)"
+        "today's own snapshot (alpha-engine-config-I11360). After the decoupled data cutover "
+        "(data_gate/cutover.py) the clause is FROZEN at the last report dated on or before the "
+        "cutover's trading day and is not refreshed: v1 no longer writes the compared keys, so "
+        "a post-cutover report would compare the collector with itself "
+        "(alpha-engine-config-I11269)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:

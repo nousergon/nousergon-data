@@ -1280,7 +1280,30 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     exceptions while still naming a producer defect in the previous trading
     day's data that only this D-1 re-grade could catch. Rolled into `met` and
     named in `detail` here, never into `summary.mismatch` itself.
+
+    **After the cutover the clause is FROZEN at the last pre-cutover report**
+    (`alpha-engine-config-I11269`). Parity compares the standalone shadow's
+    output with v1's; once the cutover removes the v1 data stages, v1 no longer
+    writes the compared keys, so a post-cutover report would compare the
+    collector with itself and read a 100% match that measures nothing. For a
+    gate trading day AFTER `data_gate.cutover.cutover_trading_day()`, this
+    reader ignores every report dated after that day, grades the most recent
+    one on or before it on its own content, and skips both the same-day and
+    the freshness rules — those exist to keep a LIVE comparison current, and
+    there is no live comparison left to keep current. The detail says FROZEN
+    and names the cutover, so the row never reads as a fresh measurement.
     """
+    from data_gate.cutover import CUTOVER_UTC, cutover_trading_day
+
+    cutover_day = cutover_trading_day()
+    frozen = trading_day > cutover_day
+    select_through = cutover_day if frozen else trading_day
+    frozen_note = (
+        f" — FROZEN at the last pre-cutover report: the decoupled data cutover at {CUTOVER_UTC} "
+        f"(trading day {cutover_day.isoformat()}) removed the v1 data stages, so a later "
+        "report would compare the collector with itself; post-cutover reports are ignored "
+        "and this reading is not refreshed (alpha-engine-config-I11269)"
+    )
     try:
         keys = list(store.list_keys(PARITY_KEY_PREFIX))
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
@@ -1298,8 +1321,19 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     candidates = sorted(
         (day, key)
         for key in keys
-        if (day := _parity_report_day(key)) is not None and day <= trading_day
+        if (day := _parity_report_day(key)) is not None and day <= select_through
     )
+    if not candidates and frozen:
+        return Reading(
+            met=False,
+            detail=(
+                f"no parity report at or before the cutover's trading day "
+                f"{cutover_day.isoformat()} under {PARITY_KEY_PREFIX}, so the cutover has no "
+                f"pre-cutover parity evidence to freeze{frozen_note}"
+            ),
+            evidence=(f"{PARITY_KEY_PREFIX}*.json",),
+            source="data_collection store",
+        )
     if not candidates:
         return Reading(
             met=False,
@@ -1335,7 +1369,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     # below, and deliberately keeps grading UNMET rather than UNMEASURABLE: a
     # report days old means no shadow run is happening at all, which IS a
     # finding about cutover readiness rather than a gap in this read.
-    if report_day != trading_day:
+    if report_day != trading_day and not frozen:
         age_trading_days = _trading_days_between(report_day, trading_day)
         if age_trading_days <= PARITY_FRESHNESS_TRADING_DAYS:
             return Reading(
@@ -1357,7 +1391,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             )
 
     floor = subtract_trading_days(trading_day, PARITY_FRESHNESS_TRADING_DAYS)
-    if report_day < floor:
+    if report_day < floor and not frozen:
         age_trading_days = _trading_days_between(report_day, trading_day)
         return Reading(
             met=False,
@@ -1466,6 +1500,8 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             " — the report claims met:true while carrying the exceptions above, so it is "
             "read UNMET"
         )
+    if frozen:
+        detail += frozen_note
     return Reading(
         met=met,
         detail=detail,

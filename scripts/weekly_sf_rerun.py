@@ -134,44 +134,51 @@ sys.path.insert(
 from run_scope import (  # noqa: E402 — see sys.path insertion above
     disabling_flags_for_input,
     enabled_spine_stages,
+    flatten_states,
 )
 from nousergon_lib.pipeline_status.registry import (  # noqa: E402
     pending_definition_stages_for,
+    retiring_definition_stages_for,
     stage_order_for,
 )
 
 
-def _landed_spine(sm_arn: str) -> tuple[str, ...]:
-    """The declared spine, MINUS stages the pinned library has declared ahead
-    of this repo's own definitions (PENDING_DEFINITION_STAGES).
+def _landed_spine(sm_arn: str, sm_def: dict) -> tuple[str, ...]:
+    """The declared spine as it has LANDED in ``sm_def``: minus the stages the
+    pinned library marks as in transition that this definition does not carry.
 
-    alpha-engine-config-I11267 added ``PENDING_DEFINITION_STAGES`` precisely
-    so a consumer repo is not forced into merge-order lockstep with the
-    library — a pending stage the pinned lib names is one this repo has not
-    landed a state for YET, and a stage that cannot exist cannot be entered.
-    Feeding the RAW ``stage_order_for()`` tuple into the vacuity guard would
-    count that stage as part of "what a substantive run must enter" and
-    understate every real execution's coverage by exactly the number of
-    not-yet-landed stages — a false vacuity/coverage refusal, the identical
-    failure mode this guard exists to prevent, just introduced from the other
-    direction. The library's OWN ``undefined_spine_stages`` already applies
-    this same tolerance (`tests/test_pipeline_stage_order_contract.py` pins
-    it); this mirrors it for the two vacuity-guard call sites in this script.
+    alpha-engine-config-I11267 added the two transition markers precisely so a
+    consumer repo is not forced into merge-order lockstep with the library:
 
-    Deliberately does NOT also exclude ``RETIRING_DEFINITION_STAGES``: a
-    retiring stage is the OPPOSITE direction — its definition "may be either
-    still present or already dropped" (registry.py's own docstring), i.e. it
-    is real and enterable TODAY and only tolerated as ABSENT once the repo
-    actually removes it. Excluding it here would understate today's
-    substantive spine by a stage the live definition still has, which a
-    first cut of this fix did (MorningEnrich/DataPhase1 are the two live
-    RETIRING_DEFINITION_STAGES entries for this pipeline right now) —
-    measured via test_every_declared_spine_stage_is_switchable_off's
-    hardcoded count regressing from 17 to 15.
+    * ``PENDING_DEFINITION_STAGES`` — a stage the library names AHEAD of this
+      repo. Absent from the definition, it cannot be entered, and counting it
+      as part of "what a substantive run must enter" would understate every
+      real execution's coverage (a false vacuity refusal, the failure mode this
+      guard exists to prevent). Once the definition carries it, it is a real
+      stage and counts.
+    * ``RETIRING_DEFINITION_STAGES`` — the opposite direction: "may be either
+      still present or already dropped" (registry.py's own docstring). While
+      the definition still carries it, it is real and enterable and counts —
+      excluding it then understated the spine, which a first cut of this
+      helper did (measured via test_every_declared_spine_stage_is_switchable_off's
+      hardcoded count regressing from 17 to 15). Once the repo removes it, it
+      cannot be entered and must not count.
+
+    Both rules read the DEFINITION rather than the marker alone, which is what
+    lets the decoupled data cutover (alpha-engine-config-I11269) land in either
+    order with the library release that drops the markers: MorningEnrich /
+    DataPhase1 (retiring) leave, WaitForCollectionManifests (pending) arrives,
+    and the landed spine is the same under the old pin and the new one. A spine
+    stage that is absent and carries NEITHER marker stays in — it is a defect,
+    and the vacuity guard and the library contract test must both see it.
     """
-    spine = stage_order_for(sm_arn)
-    pending = pending_definition_stages_for(sm_arn)
-    return tuple(s for s in spine if s not in pending)
+    present = set(flatten_states(sm_def.get("States", {})))
+    in_transition = set(pending_definition_stages_for(sm_arn)) | set(
+        retiring_definition_stages_for(sm_arn)
+    )
+    return tuple(
+        s for s in stage_order_for(sm_arn) if s in present or s not in in_transition
+    )
 
 
 DEFAULT_STATE_MACHINE_ARN = (
@@ -332,14 +339,21 @@ STAGES: tuple[Stage, ...] = (
         ),
     ),
     Stage(
-        "morning_enrich", "skip_morning_enrich",
-        "CheckSkipMorningEnrich", "MorningEnrich",
-        frozenset({"CheckSkipDataPhase1"}),
-    ),
-    Stage(
-        "data_phase1", "skip_data_phase1",
-        "CheckSkipDataPhase1", "DataPhase1",
+        # alpha-engine-config-I11269 (the decoupled data cutover): the weekly SF
+        # no longer runs MorningEnrich or DataPhase1 — the standalone
+        # ne-data-collection-weekly does, and this SF waits on its run
+        # manifests (WaitForCollectionManifests, a read-only Lambda poll, no
+        # box). The gate and its flag keep their names so recovery inputs and
+        # the Saturday trigger's skip set stay valid; skipping it routes
+        # straight to ResearchPredictorParallel, which is what a rerun of an
+        # execution that already got past the wait must do.
+        "collection_readiness", "skip_morning_enrich",
+        "CheckSkipMorningEnrich", "WaitForCollectionManifests",
         frozenset({"ResearchPredictorParallel"}),
+        # Pre-cutover histories: a failure inside either removed data stage
+        # still reads as THIS stage failing, so a rerun of such a history
+        # waits on the collector rather than skipping past missing data.
+        historical_work=frozenset({"MorningEnrich", "DataPhase1"}),
     ),
     # --- ResearchPredictorParallel branch A -------------------------------
     # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
@@ -1214,8 +1228,9 @@ def _simulate_reachable_works(flags: dict, original_input: dict) -> set:
             if not effective[n]:
                 ran.add(n)
 
-    # main chain (lib-pin gate first, then the enrich/phase1 pair)
-    run_linear(["lib_pin_drift_check", "morning_enrich", "data_phase1"])
+    # main chain (lib-pin gate first, then the collection-readiness wait that
+    # replaced the enrich/phase1 pair at the decoupled cutover, I11269)
+    run_linear(["lib_pin_drift_check", "collection_readiness"])
     # parallel branches (always entered)
     run_linear(sorted(BRANCH_A_STAGES, key=lambda n: [s.name for s in STAGES].index(n)))
     run_linear(["predictor_training"])
@@ -1843,7 +1858,7 @@ def refuse_vacuous_rerun(
     Accepting does NOT make the run substantive — the SF still terminates
     ``VacuousRun`` — it records who decided to spend the dispatch and why.
     """
-    spine = _landed_spine(sm_arn)
+    spine = _landed_spine(sm_arn, sm_def)
     if not spine:
         raise VacuousRerunError(
             f"no declared spine for {sm_arn.rsplit(':', 1)[-1]!r} in "
@@ -2180,7 +2195,7 @@ def main(argv: list | None = None) -> int:
     # Reported here so --dry-run shows it; ENFORCED below, after the plan is
     # printed, because a refusal an operator cannot read the plan behind is a
     # refusal they will work around.
-    spine = _landed_spine(args.state_machine_arn)
+    spine = _landed_spine(args.state_machine_arn, sm_def)
     if not spine:
         raise VacuousRerunError(
             f"no declared spine for {args.state_machine_arn.rsplit(':', 1)[-1]!r} "

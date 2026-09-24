@@ -99,18 +99,19 @@ class TestScannerIsGoneFromTheWeekdayPipeline:
         assert not dangling, f"routes into removed scanner states: {dangling}"
 
     def test_the_data_phase_now_reaches_the_predictor_gate_directly(self, daily):
-        """The three edges that used to converge on `CheckSkipScanner` must now
+        """The edges that used to converge on `CheckSkipScanner` must now
         converge on `CheckSkipPredictorInference` — not on nothing, and not on
         some other stage that happens to parse."""
         states = dict(_walk(daily["States"]))
-        for name in (
-            "CheckMorningEnrichSpotLaunched",
-            "CheckMorningArcticAppendSpotLaunched",
-        ):
-            assert states[name]["Default"] == "CheckSkipPredictorInference", (
-                f"{name} must fall through to the predictor gate now that the "
-                f"scanner gate is gone"
-            )
+        # alpha-engine-config-I11269: the two spot *Launched gates left with the
+        # spot data phase; the readiness wait's ready edge and the skip edge are
+        # the data phase's forward exits now.
+        assert states["CheckCollectionReadiness"]["Choices"][0]["Next"] == (
+            "CheckSkipPredictorInference"
+        ), "the ready edge must fall through to the predictor gate"
+        assert states["CheckSkipMorningEnrich"]["Choices"][0]["Next"] == (
+            "CheckSkipPredictorInference"
+        )
         assert (
             states["PublishDataSpotFailureImmediate"]["Next"]
             == "CheckSkipPredictorInference"

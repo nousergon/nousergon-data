@@ -158,15 +158,10 @@
       "substrate": "nousergon-data infrastructure/lambdas/eval-judge-spot-dispatcher",
       "reason": "Boots the judge spot instance and returns. The judge's spend is declared under EvalJudgeProcess, the stage that runs on it."
     },
-    "MorningEnrich": {
+    "WaitForCollectionManifests": {
       "disposition": "exempt",
-      "substrate": "nousergon-data collectors (data spot)",
-      "reason": "Numerical workload \u2014 OHLCV/intraday collection. no paid-model call site in the substrate."
-    },
-    "DataPhase1": {
-      "disposition": "exempt",
-      "substrate": "nousergon-data collectors (data spot)",
-      "reason": "Numerical workload \u2014 the weekly price-cache refresh. no paid-model call site in the substrate."
+      "substrate": "nousergon-data Lambda alpha-engine-collection-readiness-probe",
+      "reason": "Read-only poll of the standalone collection's run manifests (alpha-engine-config-I11264); replaced MorningEnrich and DataPhase1 at the decoupled data cutover (alpha-engine-config-I11269). S3 List/Get only \u2014 no paid-model call site in the substrate."
     },
     "DataPhase2": {
       "disposition": "exempt",

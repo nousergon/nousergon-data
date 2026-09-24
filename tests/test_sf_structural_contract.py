@@ -157,8 +157,6 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         # command; the actual long-running work is bounded by the
         # invoking state's own executionTimeout / the box-side script,
         # not this poll call.
-        "WaitForMorningEnrich": "ssm:getCommandInvocation single poll — bounded by MorningEnrich's own executionTimeout",
-        "WaitForDataPhase1": "ssm:getCommandInvocation single poll — bounded by DataPhase1's own executionTimeout",
         "ResearchPredictorParallel.WaitForRAGIngestion": "ssm:getCommandInvocation single poll — bounded by RAGIngestion's own executionTimeout",
         "ResearchPredictorParallel.WaitForDataPhase2": "ssm:getCommandInvocation single poll — bounded by DataPhase2's own executionTimeout",
         "ResearchPredictorParallel.WaitForPredictorTraining": "ssm:getCommandInvocation single poll — bounded by PredictorTraining's own executionTimeout",
@@ -414,6 +412,17 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # ── alpha-engine-config-I11264 ─────────────────────────────────
+        "WaitForCollectionManifests": (
+            "a raising probe is not a verdict either way: the Catch records "
+            "$.collection_readiness_error and spends one poll of the bounded "
+            "budget (CheckCollectionReadinessBudget). The weekly wait is "
+            "FAIL-CLOSED, not fail-open: exhaustion (or a raise under "
+            "shell_run) reaches ExtractCollectionNotReadyError -> "
+            "NormalizeFailureContext -> HandleFailure, like the MorningEnrich "
+            "and DataPhase1 error paths it replaced, so there is no degraded "
+            "continuation to flag."
+        ),
         # ── alpha-engine-config-I11312 ─────────────────────────────────
         "WeeklyPreflightOnSpot": (
             "OBSERVE-MODE probe (sf-pipeline-policy.md \u00a77a): its verdict "
@@ -761,6 +770,15 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
     },
     "step_function_daily.json": {
+        "WaitForCollectionManifests": (
+            "a raising probe is not a verdict either way: the Catch "
+            "records $.collection_readiness_error and spends one poll of the "
+            "bounded budget (CheckCollectionReadinessBudget), leaving the "
+            "seeded not-ready verdict in place. The flag is set where the "
+            "outcome is decided, on exhaustion: ExtractCollectionNotReadyError "
+            "-> ExtractDataSpotError -> SetDataSpotDegradedFlag writes "
+            "$.degraded_summary (alpha-engine-config-I11264)."
+        ),
         "TradingDayGate": (
             "Same design intent as the NAMED weekly run-day-gate §5 "
             "carve-out (missing a trading day is worse than a duplicate; "
@@ -775,6 +793,15 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
     },
     "step_function_eod.json": {
+        "WaitForCollectionManifests": (
+            "a raising probe is not a verdict either way: the Catch "
+            "records $.collection_readiness_error and spends one poll of the "
+            "bounded budget (CheckCollectionReadinessBudget), leaving the "
+            "seeded not-ready verdict in place. The flag is set where the "
+            "outcome is decided, on exhaustion: ExtractCollectionNotReadyError "
+            "-> ExtractDataSpotError -> SetDataSpotDegradedFlag writes "
+            "$.degraded_summary (alpha-engine-config-I11264)."
+        ),
         "CaptureSnapshot": (
             "NOT fail-open (alpha-engine-config#5569): the Catch routes to "
             "CheckCaptureSnapshotRetryBudget — a bounded single retry that "
@@ -799,32 +826,22 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "failure-family route if the real reconcile then cannot "
             "complete."
         ),
-        "HealLaunchPostMarketDataSpot": (
+        "HealStartCollection": (
             "Heal-loop state, only reachable after SkipEODReconcileDataGap "
             "-> SetDegradedFlag has ALREADY set $.degraded_summary "
             "unconditionally (both SkipEODReconcileDataGap's normal Next "
             "and its own Catch converge on SetDegradedFlag) — the flag is "
-            "already true before this state ever runs."
-        ),
-        "HealPollPostMarketDataSpot": (
-            "Same ancestor-already-flagged reasoning as "
-            "HealLaunchPostMarketDataSpot."
-        ),
-        "HealLaunchArcticAppendSpot": (
-            "Same ancestor-already-flagged reasoning as "
-            "HealLaunchPostMarketDataSpot."
-        ),
-        "HealPollArcticAppendSpot": (
-            "Same ancestor-already-flagged reasoning as "
-            "HealLaunchPostMarketDataSpot."
+            "already true before this state ever runs. Its Catch reaches "
+            "HealReProbe: the precondition artifact, not the started "
+            "collection's status, is the verdict (alpha-engine-config-I11266)."
         ),
         "HealReProbe": (
             "Same ancestor-already-flagged reasoning as "
-            "HealLaunchPostMarketDataSpot."
+            "HealStartCollection."
         ),
         "HealDispatchReplay": (
             "Same ancestor-already-flagged reasoning as "
-            "HealLaunchPostMarketDataSpot (heal-loop state)."
+            "HealStartCollection (heal-loop state)."
         ),
         "ReadExerciseCadence": (
             "Deliberate fail-toward-running default: SetCadenceReadDegraded "
@@ -1372,17 +1389,25 @@ def test_sf_file_set_matches_exemption_registry():
 #                  recovery a standing rule, and an 11h ceiling let one hung
 #                  execution hold the mutex past the close and take the
 #                  recovery with it.
-#   eod     14400  sf-pipeline-policy.md §4 gives the eod pipeline a ≤75-min
+#   eod     28800  sf-pipeline-policy.md §4 gives the eod pipeline a ≤75-min
 #                  wall-clock target and no numeric ceiling (it must "include
-#                  the bounded heal loop"). Derived: 4h is 2.1× the longest
-#                  execution observed over 2026-07-31→09-04 (115 min, a failed
-#                  run on 08-17) and still clears the 22:00 PT
-#                  alpha-engine-stop-trading cost guard by six hours.
+#                  the bounded heal loop"). It was 14400 (4h, 2.1× the longest
+#                  execution observed over 2026-07-31→09-04). The decoupled
+#                  data cutover (alpha-engine-config-I11269) makes the run WAIT
+#                  on ne-data-collection-eod, which fires at 18:15 ET, 2h15m
+#                  after this SF's ~16:00 ET start: the bounded readiness wait
+#                  alone is 59 × 300 s = 17700 s (derived in
+#                  tests/test_v1_collection_readiness_wait.py), and one heal
+#                  attempt (HealStartCollection) is bounded at 10800 s. 28800
+#                  (8h) covers the wait plus one full heal and ends by 00:00 ET,
+#                  still an hour inside the 22:00 PT (01:00 ET)
+#                  alpha-engine-stop-trading cost guard. A second heal attempt
+#                  is truncated by this ceiling, as heals were under 14400.
 #   groom   15000  unchanged; not a pipeline sf-pipeline-policy.md governs.
 _TOP_LEVEL_TIMEOUT_CEILING = {
     "step_function.json": 43200,
     "step_function_daily.json": 7200,
-    "step_function_eod.json": 14400,
+    "step_function_eod.json": 28800,
     "step_function_groom.json": 15000,
 }
 

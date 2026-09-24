@@ -75,6 +75,8 @@ jobs:
               - 'infrastructure/lambdas/weekly-preflight/**'
               - 'infrastructure/lambdas/substrate-health-gate/**'
               - 'infrastructure/lambdas/weekly-run-scope/**'
+              - 'infrastructure/lambdas/collection-readiness-probe/**'
+              - 'data_gate/run_manifest_predicate.py'
 
   rehearsal-path-guard:
     needs: label

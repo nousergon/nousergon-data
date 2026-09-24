@@ -196,6 +196,12 @@ def all_lambda_invoke_states() -> Iterator[LambdaInvokeState]:
 # Live function timeouts, measured 2026-08-11 via
 # `aws lambda get-function-configuration --query Timeout`.
 CODIFIED_FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
+    # alpha-engine-config-I11264. The v1 SFs' WaitForCollectionManifests poll:
+    # lists at most 18 unit prefixes under data_collection/runs/ and reads one
+    # manifest each. Matches the --bootstrap timeout in
+    # infrastructure/lambdas/collection-readiness-probe/deploy.sh; the three
+    # states carry TimeoutSeconds 60, below it, so the state binds.
+    "alpha-engine-collection-readiness-probe": 90,
     "alpha-engine-data-spot-dispatcher": 600,
     "alpha-engine-eod-precondition-probe": 30,
     "alpha-engine-evaluator": 660,

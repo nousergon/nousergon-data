@@ -1,7 +1,7 @@
 {
-  "Comment": "Alpha Engine EOD Pipeline \u2014 post-market data capture, snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
+  "Comment": "Alpha Engine EOD Pipeline \u2014 waits for the standalone EOD data collection (ne-data-collection-eod) to publish, then snapshot capture, reconciliation, daily substrate health check, instance shutdown. Triggered by daemon shutdown on trading EC2.",
   "StartAt": "MarketHoursGate",
-  "TimeoutSeconds": 14400,
+  "TimeoutSeconds": 28800,
   "States": {
     "MarketHoursGate": {
       "Type": "Task",
@@ -953,7 +953,7 @@
     },
     "CheckSkipPostMarketData": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate. Input {\"skip_post_market_data\": true} routes past the entire EOD data phase (post-market fetch + Arctic append, now on the ephemeral spot box per config#1767) straight to CheckSkipCaptureSnapshot; missing flag = run as normal. The old on-trading PostMarketData/PostMarketArcticAppend SSM states were relocated to the data spot so ae-trading no longer does EOD data work (config#1767); reconcile/snapshot/stop stays on the trading box.",
+      "Comment": "Per-task rerun gate. Input {\"skip_post_market_data\": true} (operator-replay only) routes past the EOD collection readiness wait straight to CheckSkipCaptureSnapshot; missing flag = run as normal. alpha-engine-config-I11269: the post-market data phase no longer runs here \u2014 the standalone ne-data-collection-eod machine runs it at dates.SETTLED_AFTER_ET \u2014 so the flag now skips WaitForCollectionManifests. The flag name is kept because HealDispatchReplay's reconcile-only replay input and scripts/weekday_sf_rerun.py both emit it.",
       "Choices": [
         {
           "And": [
@@ -977,368 +977,16 @@
           "Next": "CheckSkipCaptureSnapshot"
         }
       ],
-      "Default": "InitDataSpotRetryCounter"
-    },
-    "InitDataSpotRetryCounter": {
-      "Type": "Pass",
-      "Comment": "Retry budget for a genuinely-interrupted (not merely slow) post-market-data spot workload \u2014 e.g. an AWS spot reclaim mid-job (root cause of the 2026-07-14 EOD FAILED incident: Server.SpotInstanceTermination ~22min into the run, well before the fetch completed). One relaunch-on-a-fresh-box retry before falling through to the existing fail-open path. Mirrors the InitSSMPollCounter counter idiom already used above for SSM-readiness polling. force_on_demand starts false; IncrementDataSpotRetry flips it true so the one retry never gambles on spot a second time.",
-      "Result": {
-        "attempts": 0,
-        "force_on_demand": false
-      },
-      "ResultPath": "$.data_spot_retry",
-      "Next": "LaunchPostMarketDataSpot"
-    },
-    "LaunchPostMarketDataSpot": {
-      "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run PostMarketData (post-close fetch) on an ephemeral spot box, NOT on ae-trading. Arctic write follows in PostMarketArcticAppend, also on spot. force_on_demand.$ is false on the first attempt and true on the post-interruption retry (2026-07-14 incident) \u2014 the dispatcher then skips spot entirely for that attempt.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-data-spot-dispatcher",
-        "Payload": {
-          "execution_id.$": "$$.Execution.Id",
-          "workload": "post-market-data",
-          "force_on_demand.$": "$.data_spot_retry.force_on_demand"
-        }
-      },
-      "TimeoutSeconds": 420,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "FAIL-OPEN (config#1767 #4): an EOD data-spot launch failure must NOT block reconcile + instance-stop. Record it as data and continue; mirrors Saturday ResearchPredictorParallel.",
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.postmarket_launch",
-      "Next": "CheckPostMarketDataSpotLaunched"
-    },
-    "CheckPostMarketDataSpotLaunched": {
-      "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.postmarket_launch.Payload.data_spot.launched",
-              "BooleanEquals": true
-            }
-          ],
-          "Comment": "config-I2767: IsPresent-guarded \u2014 a dispatcher payload without data_spot.launched previously threw States.Runtime here, ending the execution FAILED before StopTradingInstance (cost guard bypassed).",
-          "Next": "PollPostMarketDataSpot"
-        },
-        {
-          "Not": {
-            "Variable": "$.postmarket_launch.Payload.data_spot.launched",
-            "IsPresent": true
-          },
-          "Comment": "config-I2767: a payload WITHOUT data_spot.launched means the dispatcher could not verifiably launch (partial/malformed result) \u2014 route into the existing data-spot failure notifier instead of silently treating it as an intentional not-launched skip (Default).",
-          "Next": "ExtractDataSpotError"
-        }
-      ],
-      "Default": "CheckSkipCaptureSnapshot"
-    },
-    "PollPostMarketDataSpot": {
-      "Type": "Task",
-      "Comment": "Poll the post-market data-spot SSM command; bounded by the on-box watchdog + reaper. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) \u2014 a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.postmarket_launch.Payload.data_spot.command_id",
-        "InstanceId.$": "$.postmarket_launch.Payload.data_spot.instance_id"
-      },
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 6,
-          "IntervalSeconds": 15,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.postmarket_poll",
-      "Next": "CheckPostMarketDataSpotStatus"
-    },
-    "CheckPostMarketDataSpotStatus": {
-      "Type": "Choice",
-      "Comment": "Success -> the Arctic append spot workload retry-counter init; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotRetryBudget (one relaunch retry before the existing fail-open path). Inverse of the OLD on-trading CheckPostMarketStatus which HandleFailure'd.",
-      "Choices": [
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Success",
-          "Next": "InitDataSpotArcticRetryCounter"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PostMarketDataSpotWait"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "PostMarketDataSpotWait"
-        },
-        {
-          "Variable": "$.postmarket_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "PostMarketDataSpotWait"
-        }
-      ],
-      "Default": "CheckDataSpotRetryBudget"
-    },
-    "CheckDataSpotRetryBudget": {
-      "Type": "Choice",
-      "Comment": "A terminal non-Success status on the post-market-data spot poll (Failed/Cancelled/TimedOut/the SSM Undeliverable class an already-reclaimed spot instance produces) is presumed transient AWS spot interruption until proven otherwise \u2014 retry once on a freshly-launched box before accepting failure. Bounded at 1 retry: a second consecutive interruption is no longer 'transient blip' territory and falls through to the existing fail-open path rather than looping indefinitely. $.data_spot_retry is always initialized by InitDataSpotRetryCounter before this state is reachable.",
-      "Choices": [
-        {
-          "Variable": "$.data_spot_retry.attempts",
-          "NumericLessThan": 1,
-          "Next": "IncrementDataSpotRetry"
-        }
-      ],
-      "Default": "ExtractDataSpotError"
-    },
-    "IncrementDataSpotRetry": {
-      "Type": "Pass",
-      "Comment": "force_on_demand flips to true for the retry \u2014 a box already lost to spot interruption once must not gamble on spot again.",
-      "Parameters": {
-        "attempts.$": "States.MathAdd($.data_spot_retry.attempts, 1)",
-        "force_on_demand": true
-      },
-      "ResultPath": "$.data_spot_retry",
-      "Next": "LaunchPostMarketDataSpot"
-    },
-    "PostMarketDataSpotWait": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "PollPostMarketDataSpot"
-    },
-    "InitDataSpotArcticRetryCounter": {
-      "Type": "Pass",
-      "Comment": "Retry budget for the Arctic-append sub-phase \u2014 the actual SPY-close WRITE that eod_reconcile.py's _spy_close hard-depends on. Mirrors InitDataSpotRetryCounter, including force_on_demand.",
-      "Result": {
-        "attempts": 0,
-        "force_on_demand": false
-      },
-      "ResultPath": "$.data_spot_arctic_retry",
-      "Next": "LaunchPostMarketArcticAppendSpot"
-    },
-    "LaunchPostMarketArcticAppendSpot": {
-      "Type": "Task",
-      "Comment": "config#1767: invoke alpha-engine-data-spot-dispatcher to run the EOD ArcticDB append on the spot box. Arctic/S3 write runs ON THE SPOT via its executor profile, not the trading box. force_on_demand.$ mirrors LaunchPostMarketDataSpot's post-interruption-retry behavior.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-data-spot-dispatcher",
-        "Payload": {
-          "execution_id.$": "$$.Execution.Id",
-          "workload": "post-market-arctic-append",
-          "force_on_demand.$": "$.data_spot_arctic_retry.force_on_demand"
-        }
-      },
-      "TimeoutSeconds": 420,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "FAIL-OPEN (config#1767 #4): an EOD data-spot launch failure must NOT block reconcile + instance-stop. Record it as data and continue; mirrors Saturday ResearchPredictorParallel.",
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.postmarket_arctic_launch",
-      "Next": "CheckPostMarketArcticAppendSpotLaunched"
-    },
-    "CheckPostMarketArcticAppendSpotLaunched": {
-      "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false kill-switch -> continue.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
-              "BooleanEquals": true
-            }
-          ],
-          "Comment": "config-I2767: IsPresent-guarded \u2014 same States.Runtime-before-cost-guard class as CheckPostMarketDataSpotLaunched.",
-          "Next": "PollPostMarketArcticAppendSpot"
-        },
-        {
-          "Not": {
-            "Variable": "$.postmarket_arctic_launch.Payload.data_spot.launched",
-            "IsPresent": true
-          },
-          "Comment": "config-I2767: malformed dispatcher payload \u2014 route into the existing data-spot failure notifier, never a silent skip.",
-          "Next": "ExtractDataSpotError"
-        }
-      ],
-      "Default": "CheckSkipCaptureSnapshot"
-    },
-    "PollPostMarketArcticAppendSpot": {
-      "Type": "Task",
-      "Comment": "Poll the EOD Arctic-append data-spot SSM command. EXTENDED config-I2702 deliverable #5: the Ssm.SdkClientException/States.Timeout retry budget was widened from 2 attempts (~13s) to 6 attempts / 15s base / 2.0x backoff (~16 min) \u2014 a transient poll-side AWS SDK hiccup must never be misclassified as 'the workload failed' while the collector is still genuinely running (root cause of the 2026-07-15 CheckSkipEODReconcile stale-flag incident).",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.postmarket_arctic_launch.Payload.data_spot.command_id",
-        "InstanceId.$": "$.postmarket_arctic_launch.Payload.data_spot.instance_id"
-      },
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 6,
-          "IntervalSeconds": 15,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.postmarket_arctic_poll",
-      "Next": "CheckPostMarketArcticAppendSpotStatus"
-    },
-    "CheckPostMarketArcticAppendSpotStatus": {
-      "Type": "Choice",
-      "Comment": "Success -> the EDGAR pit-fundamentals spot workload retry-counter init (alpha-engine-config-I10750); InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotArcticRetryBudget (one relaunch retry before the existing fail-open path).",
-      "Choices": [
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Success",
-          "Next": "InitDataSpotEdgarRetryCounter"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "PostMarketArcticAppendSpotWait"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "PostMarketArcticAppendSpotWait"
-        },
-        {
-          "Variable": "$.postmarket_arctic_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "PostMarketArcticAppendSpotWait"
-        }
-      ],
-      "Default": "CheckDataSpotArcticRetryBudget"
-    },
-    "CheckDataSpotArcticRetryBudget": {
-      "Type": "Choice",
-      "Comment": "Same one-retry-then-give-up policy as CheckDataSpotRetryBudget, applied to the Arctic-append sub-phase. $.data_spot_arctic_retry is always initialized by InitDataSpotArcticRetryCounter before this state is reachable.",
-      "Choices": [
-        {
-          "Variable": "$.data_spot_arctic_retry.attempts",
-          "NumericLessThan": 1,
-          "Next": "IncrementDataSpotArcticRetry"
-        }
-      ],
-      "Default": "ExtractDataSpotError"
-    },
-    "IncrementDataSpotArcticRetry": {
-      "Type": "Pass",
-      "Comment": "force_on_demand flips to true for the retry \u2014 mirrors IncrementDataSpotRetry.",
-      "Parameters": {
-        "attempts.$": "States.MathAdd($.data_spot_arctic_retry.attempts, 1)",
-        "force_on_demand": true
-      },
-      "ResultPath": "$.data_spot_arctic_retry",
-      "Next": "LaunchPostMarketArcticAppendSpot"
-    },
-    "PostMarketArcticAppendSpotWait": {
-      "Type": "Wait",
-      "Seconds": 20,
-      "Next": "PollPostMarketArcticAppendSpot"
+      "Default": "InitCollectionReadinessPoll"
     },
     "ExtractDataSpotError": {
       "Type": "Pass",
-      "Comment": "FAIL-OPEN normalizer (config#1767 #4). An EOD data-spot launch/poll failure or non-Success terminal status lands here. Record as DATA, best-effort alert, then CONTINUE to snapshot/reconcile/instance-stop \u2014 a data-phase failure must NOT block the EOD close-out. Mirrors Saturday ResearchPredictorParallel branch-error pattern.",
+      "Comment": "FAIL-OPEN normalizer (config#1767 #4), repointed by alpha-engine-config-I11269: the standalone EOD collection did not publish every unit this pipeline reads within the bounded wait (or published a failed one). Record as DATA, best-effort alert, then CONTINUE to snapshot/reconcile/instance-stop \u2014 a data-phase miss must NOT block the EOD close-out. $.collection_readiness is always present here (SeedCollectionReadiness).",
       "Parameters": {
-        "phase": "DataSpot",
-        "source": "CheckPostMarket*SpotStatus or launch Catch"
+        "phase": "CollectionReadiness",
+        "source": "WaitForCollectionManifests (budget exhausted or producer settled not-ok)",
+        "readiness.$": "$.collection_readiness",
+        "poll.$": "$.collection_readiness_poll"
       },
       "ResultPath": "$.data_spot_error",
       "Next": "SetDataSpotDegradedFlag"
@@ -1348,7 +996,7 @@
       "Comment": "alpha-engine-config#6715: EOD parity with step_function_daily.json's SetDataSpotDegradedFlag (config#6692 Option-A) and this file's own SetDegradedFlag (config-I2702) \u2014 the EOD post-market data-spot fail-open path (ExtractDataSpotError) recorded the failure as DATA ($.data_spot_error) and fired a best-effort SNS alert (PublishDataSpotFailureImmediate) but never threaded a $.degraded_summary flag, so a data-spot failure completed with a plain SUCCEEDED marker despite failing open \u2014 the exact asymmetry with the daily SF's already-fixed equivalent that tests/test_sf_structural_contract.py::test_every_fail_open_catch_route_sets_the_degraded_flag_or_is_exempt (alpha-engine-config#6715) exists to catch. Mirrors step_function_daily.json's SetDataSpotDegradedFlag exactly: threads $.degraded_summary onto the data-spot fail-open path WITHOUT changing its fail-open continuation \u2014 Next still leads to PublishDataSpotFailureImmediate and on to CheckSkipCaptureSnapshot exactly as before, so the run still proceeds to snapshot/reconcile/instance-stop. The flag is only read later by CheckDegradedOutcome (reached via StopTradingInstance's Next at the tail of every path), which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution. Does not clobber $.data_spot_error (set by the preceding ExtractDataSpotError ResultPath) or any earlier $.degraded_summary from SetDegradedFlag (the EOD-reconcile-skip path, config-I2702) \u2014 if both stages degraded, this state's write simply wins as the most-recent cause; degraded=true is preserved either way.",
       "Parameters": {
         "degraded": true,
-        "reason": "eod_data_spot_fail_open",
+        "reason": "eod_collection_not_ready_fail_open",
         "run_date.$": "$.run_date",
         "stage_error.$": "$.data_spot_error"
       },
@@ -1357,12 +1005,12 @@
     },
     "PublishDataSpotFailureImmediate": {
       "Type": "Task",
-      "Comment": "Best-effort SNS alert that the EOD data spot failed \u2014 surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
+      "Comment": "Best-effort SNS alert that the standalone EOD collection was not ready \u2014 surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
-        "Subject": "Alpha Engine EOD Data Spot \u2014 FAILED (fail-open, reconcile continues)",
-        "Message.$": "States.Format('EOD data-spot phase failed but the pipeline continued to reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
+        "Subject": "Alpha Engine EOD collection NOT READY (fail-open, reconcile continues)",
+        "Message.$": "States.Format('The standalone EOD collection (ne-data-collection-eod) did not publish every unit the postclose SF reads within its bounded readiness wait; the pipeline continued to snapshot + reconcile + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
       },
       "ResultPath": "$.data_spot_failure_notify",
       "TimeoutSeconds": 60,
@@ -1581,284 +1229,11 @@
           "Next": "HealNonConvergent"
         }
       ],
-      "Default": "HealLaunchPostMarketDataSpot"
-    },
-    "HealLaunchPostMarketDataSpot": {
-      "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-data workload. force_on_demand=true unconditionally \u2014 we are already in a degraded-recovery context (the upstream CheckDataSpotRetryBudget single-retry-on-spot already ran and this loop is a step beyond that), so gambling on spot capacity again is not worth the risk of a second interruption burning a heal-loop attempt.",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-data-spot-dispatcher",
-        "Payload": {
-          "execution_id.$": "$$.Execution.Id",
-          "workload": "post-market-data",
-          "force_on_demand": true
-        }
-      },
-      "TimeoutSeconds": 420,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "A launch failure this heal attempt is not fatal to the loop \u2014 HealLoopIncrement retries (bounded by HealLoopGate).",
-          "ResultPath": "$.heal_error",
-          "Next": "HealLoopIncrement"
-        }
-      ],
-      "ResultPath": "$.heal_postmarket_launch",
-      "Next": "HealCheckPostMarketDataSpotLaunched"
-    },
-    "HealCheckPostMarketDataSpotLaunched": {
-      "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false (kill-switch) -> this heal attempt accomplished nothing, try again next iteration.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.heal_postmarket_launch.Payload.data_spot.launched",
-              "BooleanEquals": true
-            }
-          ],
-          "Comment": "config-I2767: IsPresent-guarded \u2014 absent launched (malformed dispatcher payload) falls to Default HealLoopIncrement: the bounded heal loop (2 attempts) retries or pages via HealNonConvergent, never States.Runtime.",
-          "Next": "HealPollPostMarketDataSpot"
-        }
-      ],
-      "Default": "HealLoopIncrement"
-    },
-    "HealPollPostMarketDataSpot": {
-      "Type": "Task",
-      "Comment": "config-I2702 deliverable #5: poll the SSM command's OWN authoritative state to a terminal status \u2014 no arbitrary attempt cap on the InProgress/Pending/Delayed branch (bounded only by the data-spot box's own MAX_RUNTIME_SECONDS=7200 watchdog). The transient-SDK-error Retry budget below mirrors the widened PollPostMarketDataSpot budget.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.heal_postmarket_launch.Payload.data_spot.command_id",
-        "InstanceId.$": "$.heal_postmarket_launch.Payload.data_spot.instance_id"
-      },
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 6,
-          "IntervalSeconds": 15,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.heal_error",
-          "Next": "HealLoopIncrement"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.heal_postmarket_poll",
-      "Next": "HealCheckPostMarketDataSpotStatus"
-    },
-    "HealCheckPostMarketDataSpotStatus": {
-      "Type": "Choice",
-      "Comment": "Success -> dispatch the Arctic-append workload; InProgress/Pending/Delayed -> wait+re-poll (unbounded, deliverable #5); ANY terminal non-Success -> this heal attempt failed, try again next iteration.",
-      "Choices": [
-        {
-          "Variable": "$.heal_postmarket_poll.Status",
-          "StringEquals": "Success",
-          "Next": "HealLaunchArcticAppendSpot"
-        },
-        {
-          "Variable": "$.heal_postmarket_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "HealPostMarketDataSpotWait"
-        },
-        {
-          "Variable": "$.heal_postmarket_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "HealPostMarketDataSpotWait"
-        },
-        {
-          "Variable": "$.heal_postmarket_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "HealPostMarketDataSpotWait"
-        }
-      ],
-      "Default": "HealLoopIncrement"
-    },
-    "HealPostMarketDataSpotWait": {
-      "Type": "Wait",
-      "Seconds": 15,
-      "Next": "HealPollPostMarketDataSpot"
-    },
-    "HealLaunchArcticAppendSpot": {
-      "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(a): dispatch the missing post-market-arctic-append workload (the actual SPY-close WRITE the probe checks for).",
-      "Resource": "arn:aws:states:::lambda:invoke",
-      "Parameters": {
-        "FunctionName": "alpha-engine-data-spot-dispatcher",
-        "Payload": {
-          "execution_id.$": "$$.Execution.Id",
-          "workload": "post-market-arctic-append",
-          "force_on_demand": true
-        }
-      },
-      "TimeoutSeconds": 420,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
-          ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.heal_error",
-          "Next": "HealLoopIncrement"
-        }
-      ],
-      "ResultPath": "$.heal_arctic_launch",
-      "Next": "HealCheckArcticAppendSpotLaunched"
-    },
-    "HealCheckArcticAppendSpotLaunched": {
-      "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false (kill-switch) -> try again next iteration.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.heal_arctic_launch.Payload.data_spot.launched",
-              "BooleanEquals": true
-            }
-          ],
-          "Comment": "config-I2767: IsPresent-guarded \u2014 absent launched falls to Default HealLoopIncrement (bounded heal loop), never States.Runtime.",
-          "Next": "HealPollArcticAppendSpot"
-        }
-      ],
-      "Default": "HealLoopIncrement"
-    },
-    "HealPollArcticAppendSpot": {
-      "Type": "Task",
-      "Comment": "config-I2702 deliverable #5: poll the SSM command's own authoritative state to a terminal status \u2014 unbounded on InProgress, bounded only by the box's own watchdog.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.heal_arctic_launch.Payload.data_spot.command_id",
-        "InstanceId.$": "$.heal_arctic_launch.Payload.data_spot.instance_id"
-      },
-      "TimeoutSeconds": 60,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 6,
-          "IntervalSeconds": 15,
-          "BackoffRate": 2.0
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "ResultPath": "$.heal_error",
-          "Next": "HealLoopIncrement"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.heal_arctic_poll",
-      "Next": "HealCheckArcticAppendSpotStatus"
-    },
-    "HealCheckArcticAppendSpotStatus": {
-      "Type": "Choice",
-      "Comment": "Success -> re-probe the precondition; InProgress/Pending/Delayed -> wait+re-poll (unbounded, deliverable #5); ANY terminal non-Success -> try again next iteration.",
-      "Choices": [
-        {
-          "Variable": "$.heal_arctic_poll.Status",
-          "StringEquals": "Success",
-          "Next": "HealReProbe"
-        },
-        {
-          "Variable": "$.heal_arctic_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "HealArcticAppendSpotWait"
-        },
-        {
-          "Variable": "$.heal_arctic_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "HealArcticAppendSpotWait"
-        },
-        {
-          "Variable": "$.heal_arctic_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "HealArcticAppendSpotWait"
-        }
-      ],
-      "Default": "HealLoopIncrement"
-    },
-    "HealArcticAppendSpotWait": {
-      "Type": "Wait",
-      "Seconds": 20,
-      "Next": "HealPollArcticAppendSpot"
+      "Default": "HealStartCollection"
     },
     "HealReProbe": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(b): re-probe after the dispatched workloads complete. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) \u2014 HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
+      "Comment": "config-I2702 deliverable #3(b): re-probe after the heal actuator (HealStartCollection, alpha-engine-config-I11266) returns. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) \u2014 HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-eod-precondition-probe",
@@ -1914,7 +1289,7 @@
     },
     "HealLoopIncrement": {
       "Type": "Pass",
-      "Comment": "Advances the heal-loop attempt counter and returns to HealLoopGate for the bound check. Mirrors IncrementDataSpotRetry/IncrementSSMPoll.",
+      "Comment": "Advances the heal-loop attempt counter and returns to HealLoopGate for the bound check. Mirrors IncrementCollectionReadinessPoll/IncrementSSMPoll.",
       "Parameters": {
         "attempts.$": "States.MathAdd($.heal_loop.attempts, 1)"
       },
@@ -2526,108 +1901,70 @@
       "OutputPath": "$.merged",
       "Next": "HandleFailure"
     },
-    "InitDataSpotEdgarRetryCounter": {
+    "InitCollectionReadinessPoll": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I10750: schedule edgar-pit-fundamentals-daily (nousergon-data-PR1700/alpha-engine-config-I10733) on the SAME weekday-after-close mechanism as the other EOD data-spot legs, so it inherits the postclose SF's cadence rather than a new standalone EventBridge rule (which would land DISABLED under the 2026-08-07 automation-pause ruling, config-I6617 \u2014 only the weekly SF, the daily preopen/postclose SFs, and the 24/7 box stay live). Retry-budget counter mirrors InitDataSpotRetryCounter / InitDataSpotArcticRetryCounter exactly.",
+      "Comment": "alpha-engine-config-I11264: poll counter for the bounded readiness wait on the standalone nousergon-data-collection run manifests. Mirrors the InitSSMPollCounter idiom. The budget is in CheckCollectionReadinessBudget.",
       "Result": {
-        "attempts": 0,
-        "force_on_demand": false
+        "attempts": 0
       },
-      "ResultPath": "$.data_spot_edgar_retry",
-      "Next": "LaunchEdgarPitFundamentalsDailySpot"
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "SeedCollectionReadiness"
     },
-    "LaunchEdgarPitFundamentalsDailySpot": {
+    "SeedCollectionReadiness": {
+      "Type": "Pass",
+      "Comment": "Seeds $.collection_readiness so every later reader (the not-ready normalizer, the alert body) finds the path even when every poll raised into the Catch and no verdict was ever returned. A seed, not a verdict: ready=false.",
+      "Result": {
+        "ready": false,
+        "settled": false,
+        "missing": [],
+        "failed": [],
+        "failure_mode": "",
+        "baseline": "",
+        "summary": "no readiness verdict returned yet (every poll so far raised or none ran)"
+      },
+      "ResultPath": "$.collection_readiness",
+      "Next": "WaitForCollectionManifests"
+    },
+    "WaitForCollectionManifests": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I10733/-I10750: invoke alpha-engine-data-spot-dispatcher to run edgar-pit-fundamentals-daily (collectors/edgar_pit_fundamentals.py incremental, trailing 15 sessions) in-region on the same ephemeral spot box, after the arctic append leg. Independent of that leg's own data (no shared ResultPath), so a failure here cannot corrupt it.",
+      "Comment": "alpha-engine-config-I11264 / -I11269: the postclose SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-eod). It starts at ~16:00 ET on the trading box's daemon shutdown, BEFORE data-collection-eod fires at dates.SETTLED_AFTER_ET (18:15 ET), so without this wait ProbeEODReconcilePrecondition would read yesterday's macro sentinel every trading day (plan \u00a76.2b). lookback_seconds is 0 because this SF starts before its producer: any manifest that finished after this execution started is this cycle's. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
-        "FunctionName": "alpha-engine-data-spot-dispatcher",
+        "FunctionName": "alpha-engine-collection-readiness-probe",
         "Payload": {
-          "execution_id.$": "$$.Execution.Id",
-          "workload": "edgar-pit-fundamentals-daily",
-          "force_on_demand.$": "$.data_spot_edgar_retry.force_on_demand"
-        }
-      },
-      "TimeoutSeconds": 420,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
+          "collection": "eod",
+          "units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
           ],
-          "MaxAttempts": 1,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.0
+          "not_before.$": "$$.Execution.StartTime",
+          "lookback_seconds": 0
         }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Comment": "FAIL-OPEN (mirrors config#1767 #4 for the post-market-data/arctic-append legs): an edgar-pit-fundamentals-daily launch failure must NOT block reconcile + instance-stop.",
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.edgar_pit_launch",
-      "Next": "CheckEdgarPitFundamentalsDailySpotLaunched"
-    },
-    "CheckEdgarPitFundamentalsDailySpotLaunched": {
-      "Type": "Choice",
-      "Comment": "launched:true -> poll; launched:false kill-switch -> continue to snapshot/reconcile.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
-              "BooleanEquals": true
-            }
-          ],
-          "Comment": "IsPresent-guarded, mirrors CheckPostMarketDataSpotLaunched (config-I2767).",
-          "Next": "PollEdgarPitFundamentalsDailySpot"
-        },
-        {
-          "Not": {
-            "Variable": "$.edgar_pit_launch.Payload.data_spot.launched",
-            "IsPresent": true
-          },
-          "Comment": "Malformed dispatcher payload -> the existing data-spot failure notifier, never a silent skip.",
-          "Next": "ExtractDataSpotError"
-        }
-      ],
-      "Default": "CheckSkipCaptureSnapshot"
-    },
-    "PollEdgarPitFundamentalsDailySpot": {
-      "Type": "Task",
-      "Comment": "Poll the edgar-pit-fundamentals-daily spot SSM command. Retry budget mirrors PollPostMarketArcticAppendSpot.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.edgar_pit_launch.Payload.data_spot.command_id",
-        "InstanceId.$": "$.edgar_pit_launch.Payload.data_spot.instance_id"
       },
       "TimeoutSeconds": 60,
       "Retry": [
         {
           "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
           ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 10,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 6,
-          "IntervalSeconds": 15,
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
           "BackoffRate": 2.0
         }
       ],
@@ -2636,72 +1973,146 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "ExtractDataSpotError",
-          "ResultPath": "$.error"
+          "Comment": "Not a verdict either way: record the raise and spend one poll of the bounded budget (CheckCollectionReadinessBudget).",
+          "ResultPath": "$.collection_readiness_error",
+          "Next": "CheckCollectionReadinessBudget"
         }
       ],
       "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
+        "ready.$": "$.Payload.readiness.ready",
+        "settled.$": "$.Payload.readiness.settled",
+        "missing.$": "$.Payload.readiness.missing",
+        "failed.$": "$.Payload.readiness.failed",
+        "failure_mode.$": "$.Payload.readiness.failure_mode",
+        "baseline.$": "$.Payload.readiness.baseline",
+        "summary.$": "$.Payload.readiness.summary"
       },
-      "ResultPath": "$.edgar_pit_poll",
-      "Next": "CheckEdgarPitFundamentalsDailySpotStatus"
+      "ResultPath": "$.collection_readiness",
+      "Next": "CheckCollectionReadiness"
     },
-    "CheckEdgarPitFundamentalsDailySpotStatus": {
+    "CheckCollectionReadiness": {
       "Type": "Choice",
-      "Comment": "Success -> continue to snapshot/reconcile/stop; InProgress/Pending/Delayed -> wait; ANY other terminal status -> CheckDataSpotEdgarRetryBudget.",
+      "Comment": "ready -> the first data consumer. settled-but-not-ready (every unit has a manifest for this cycle and at least one failed the predicate) -> degrade NOW: no amount of waiting changes a published failure, so burning the rest of the budget would only delay the same outcome. Otherwise poll again inside the budget.",
       "Choices": [
         {
-          "Variable": "$.edgar_pit_poll.Status",
-          "StringEquals": "Success",
+          "And": [
+            {
+              "Variable": "$.collection_readiness.ready",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.ready",
+              "BooleanEquals": true
+            }
+          ],
           "Next": "CheckSkipCaptureSnapshot"
         },
         {
-          "Variable": "$.edgar_pit_poll.Status",
-          "StringEquals": "InProgress",
-          "Next": "EdgarPitFundamentalsDailySpotWait"
-        },
-        {
-          "Variable": "$.edgar_pit_poll.Status",
-          "StringEquals": "Pending",
-          "Next": "EdgarPitFundamentalsDailySpotWait"
-        },
-        {
-          "Variable": "$.edgar_pit_poll.Status",
-          "StringEquals": "Delayed",
-          "Next": "EdgarPitFundamentalsDailySpotWait"
+          "And": [
+            {
+              "Variable": "$.collection_readiness.settled",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.settled",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ExtractCollectionNotReadyError"
         }
       ],
-      "Default": "CheckDataSpotEdgarRetryBudget"
+      "Default": "CheckCollectionReadinessBudget"
     },
-    "CheckDataSpotEdgarRetryBudget": {
+    "CheckCollectionReadinessBudget": {
       "Type": "Choice",
-      "Comment": "Same one-retry-then-give-up policy as CheckDataSpotArcticRetryBudget. $.data_spot_edgar_retry is always initialized by InitDataSpotEdgarRetryCounter before this state is reachable.",
+      "Comment": "The wait is BOUNDED: 59 polls of 300 s. 59 x 300 s = 17700 s from a ~16:00 ET start is ~20:55 ET = the eod schedule's cron (18:15 ET) + the declared caps of the two workloads that write its verify_units (post-market-data 5400 s + post-market-arctic-append 3600 s, _WORKLOAD_MAX_RUNTIME_SECONDS) + one SSM-online budget (300 s) per workload. Past that instant both workloads have been hard-stopped by their own caps, so a not-ready answer can no longer turn ready by itself \u2014 and the heal loop that follows a failed precondition cannot start a second writer alongside a first. Derived, not remembered: tests/test_v1_collection_readiness_wait.py recomputes it from the template and the dispatcher.",
       "Choices": [
         {
-          "Variable": "$.data_spot_edgar_retry.attempts",
-          "NumericLessThan": 1,
-          "Next": "IncrementDataSpotEdgarRetry"
+          "And": [
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "NumericGreaterThanEquals": 59
+            }
+          ],
+          "Comment": "IsPresent-guarded (config#2275) although InitCollectionReadinessPoll seeds the counter on every path into this block: a Choice cannot Catch, so a guard costs nothing and an unguarded dereference is one refactor away from States.Runtime.",
+          "Next": "ExtractCollectionNotReadyError"
         }
       ],
-      "Default": "ExtractDataSpotError"
+      "Default": "CollectionReadinessPollWait"
     },
-    "IncrementDataSpotEdgarRetry": {
-      "Type": "Pass",
-      "Comment": "force_on_demand flips to true for the retry \u2014 mirrors IncrementDataSpotArcticRetry.",
-      "Parameters": {
-        "attempts.$": "States.MathAdd($.data_spot_edgar_retry.attempts, 1)",
-        "force_on_demand": true
-      },
-      "ResultPath": "$.data_spot_edgar_retry",
-      "Next": "LaunchEdgarPitFundamentalsDailySpot"
-    },
-    "EdgarPitFundamentalsDailySpotWait": {
+    "CollectionReadinessPollWait": {
       "Type": "Wait",
-      "Seconds": 20,
-      "Next": "PollEdgarPitFundamentalsDailySpot"
+      "Seconds": 300,
+      "Next": "IncrementCollectionReadinessPoll"
+    },
+    "IncrementCollectionReadinessPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.collection_readiness_poll.attempts, 1)"
+      },
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "WaitForCollectionManifests"
+    },
+    "ExtractCollectionNotReadyError": {
+      "Type": "Pass",
+      "Comment": "Budget exhausted, or the producer settled with a failed unit. Route into the EXISTING fail-open normalizer (ExtractDataSpotError -> SetDataSpotDegradedFlag -> PublishDataSpotFailureImmediate -> CheckSkipCaptureSnapshot): today's posture is preserved \u2014 CaptureSnapshot, the precondition probe, reconcile or the heal loop, and StopTradingInstance all still run, and the terminal is DegradedRun.",
+      "Next": "ExtractDataSpotError"
+    },
+    "HealStartCollection": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11266 (Brian ruling 2026-09-21 on alpha-engine-config-I11270, option (a)): the heal loop's ACTUATOR, repointed. It used to relaunch the post-market-data and post-market-arctic-append spots itself (HealLaunchPostMarketDataSpot / HealLaunchArcticAppendSpot) \u2014 a second writer of market_data/* and the ArcticDB universe/macro libraries inside the failure path. It now starts the standalone ne-data-collection-eod machine and waits for it (.sync:2), so the normal path and the heal path run ONE writer implementation. detect -> act -> verify -> close is unchanged: HealReProbe re-reads the precondition whatever this execution's outcome (a collection that FAILED on one unit may still have landed the SPY close the probe checks), HealCheckConverged and HealDispatchReplay follow exactly as before, and HealLoopGate's bound (attempts >= 2 or past_deadline) still ends the loop at HealNonConvergent. NOT a v1 data stage: it runs no collector, so it is deliberately absent from data_gate/producers/v1_data_stage.py::V1_DATA_STAGE_STATES \u2014 adding it there would red data.phase1.v1_data_stage_quiet on every healed day for the one writer the cutover wants. Input mirrors data-collection-eod's schedule Input minus the two workloads that write no verify_unit (pinned by tests/test_v1_collection_readiness_wait.py); require_trading_day is false because this pipeline only reaches here on a trading day it already ran for.",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-data-collection-eod",
+        "Name.$": "States.Format('v1-eod-heal-{}-{}', $.run_date, States.UUID())",
+        "Input": {
+          "collection": "eod",
+          "workloads": [
+            "post-market-data",
+            "post-market-arctic-append"
+          ],
+          "require_trading_day": false,
+          "verify_units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
+          ],
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "TimeoutSeconds": 10800,
+      "ResultSelector": {
+        "status.$": "$.Status",
+        "execution_arn.$": "$.ExecutionArn"
+      },
+      "ResultPath": "$.heal_collection",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A FAILED/TIMED_OUT collection is not a convergence verdict \u2014 the collection fails loud on ANY unit, while the precondition is the SPY close + macro sentinel. HealReProbe decides, exactly as it did after a failed spot.",
+          "ResultPath": "$.heal_error",
+          "Next": "HealReProbe"
+        }
+      ],
+      "Next": "HealReProbe"
     }
   }
 }

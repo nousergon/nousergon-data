@@ -180,6 +180,129 @@ def dispatcher_workloads(path: Path = DISPATCHER) -> set[str]:
     raise ValueError(f"{path}: no _WORKLOADS literal found")
 
 
+def _env_int_default(node: ast.AST) -> int | None:
+    """``int(os.environ.get("X", "7200"))`` -> 7200, anything else -> None."""
+    if (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "int"
+        and node.args
+        and isinstance(node.args[0], ast.Call)
+        and len(node.args[0].args) == 2
+        and isinstance(node.args[0].args[1], ast.Constant)
+    ):
+        return int(node.args[0].args[1].value)
+    return None
+
+
+def dispatcher_runtime_caps(path: Path = DISPATCHER) -> tuple[int, dict[str, int], int]:
+    """``(default cap, per-workload caps, SSM-online budget)``, all in seconds.
+
+    Read from the dispatcher's SOURCE, never imported (its module imports its
+    launch stack). These are the numbers every "worst case" ordering claim about
+    the collection schedules has to be derived from (alpha-engine-config-I11363):
+    a workload is hard-stopped at its cap, and each launch first spends up to the
+    SSM-online budget before the workload clock starts.
+    """
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    default = overrides = ssm = None
+    for node in ast.walk(tree):
+        target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
+        if not isinstance(target, ast.Name) or getattr(node, "value", None) is None:
+            continue
+        if target.id == "MAX_RUNTIME_SECONDS":
+            default = _env_int_default(node.value)
+        elif target.id == "SSM_ONLINE_BUDGET_SEC":
+            ssm = _env_int_default(node.value)
+        elif target.id == "_WORKLOAD_MAX_RUNTIME_SECONDS":
+            overrides = {k.value: int(v.value) for k, v in zip(node.value.keys, node.value.values)}  # type: ignore[union-attr]
+    if default is None or overrides is None or ssm is None:
+        raise ValueError(f"{path}: could not read the runtime caps")
+    return default, overrides, ssm
+
+
+def worst_case_seconds(workloads: list[str], *, through: str, path: Path = DISPATCHER) -> int:
+    """Worst-case seconds from a schedule's fire until ``through`` is hard-stopped.
+
+    The collection state machine runs its workloads strictly in order
+    (``RunWorkloads``, MaxConcurrency 1), so the bound for any one workload is
+    the sum over it and every workload before it of (SSM-online budget + cap).
+    """
+    default, overrides, ssm = dispatcher_runtime_caps(path)
+    upto = workloads[: workloads.index(through) + 1]
+    return sum(ssm + overrides.get(w, default) for w in upto)
+
+
+#: Which workload of each state-machine schedule writes each unit a consumer
+#: waits on (alpha-engine-config-I11264 / -I11363). Declared once, here: the v1
+#: readiness waits size their budgets from it, and the sameday-shadow ordering
+#: check below bounds the EOD run with it. Completeness against the v1 waits is
+#: asserted by tests/test_v1_collection_readiness_wait.py.
+UNIT_WRITERS: dict[str, dict[str, str]] = {
+    "data-collection-eod": {
+        **{u: "post-market-data" for u in (
+            "D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27",
+            "D28", "D29", "D30", "D31",
+        )},
+        "D32": "post-market-arctic-append",
+    },
+    "data-collection-morning": {"D17": "morning-enrich", "D18": "morning-arctic-append"},
+    "data-collection-weekly": {
+        "D17": "morning-enrich",
+        **{u: "weekly-phase-one" for u in (
+            "D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11",
+            "D12", "D13", "D14",
+        )},
+        "D34": "chronic-gap-heal",
+    },
+}
+
+
+def worst_case_through_units(schedule: dict, units: list[str], *, path: Path = DISPATCHER) -> int:
+    """Worst-case seconds from ``schedule``'s fire until every workload that
+    writes one of ``units`` is hard-stopped (see :func:`worst_case_seconds`)."""
+    workloads = schedule["input"]["workloads"]
+    writers = UNIT_WRITERS[schedule["name"]]
+    last = max((writers[u] for u in units), key=workloads.index)
+    return worst_case_seconds(workloads, through=last, path=path)
+
+
+def _cron_minutes(expression: str) -> int | None:
+    """``cron(M H ? * MON-FRI *)`` -> minutes after local midnight."""
+    m = re.fullmatch(r"cron\((\d+) (\d+) \?.*\)", expression)
+    return int(m.group(2)) * 60 + int(m.group(1)) if m else None
+
+
+def sameday_ordering_problems(sched: list[dict], *, path: Path = DISPATCHER) -> list[str]:
+    """alpha-engine-config-I11363: the sameday shadow may not run beside a live
+    EOD collection that could still be writing what it compares.
+
+    Refused when BOTH are ENABLED and the shadow's cron does not clear the EOD
+    cron plus the declared caps of every workload up to the last one writing an
+    EOD verify_unit. Both crons are same-day America/New_York weekday times
+    (checked by lint), so the comparison is in local minutes.
+    """
+    by_name = {s["name"]: s for s in sched}
+    eod = by_name.get("data-collection-eod")
+    shadow = by_name.get("data-collection-shadow-sameday")
+    if not eod or not shadow:
+        return ["sameday ordering: data-collection-eod or data-collection-shadow-sameday is missing"]
+    if eod["declared_state"] != "ENABLED" or shadow["declared_state"] != "ENABLED":
+        return []
+    eod_start, shadow_start = _cron_minutes(eod["expression"]), _cron_minutes(shadow["expression"])
+    if eod_start is None or shadow_start is None:
+        return ["sameday ordering: unparseable cron on data-collection-eod or -shadow-sameday"]
+    bound = eod_start + -(-worst_case_through_units(eod, eod["input"]["verify_units"], path=path) // 60)
+    if shadow_start < bound:
+        return [
+            f"sameday ordering: data-collection-shadow-sameday fires at minute {shadow_start} "
+            f"while data-collection-eod (ENABLED) may still be writing its verify_units until "
+            f"minute {bound} ET — move the shadow past it or keep it DISABLED "
+            "(alpha-engine-config-I11363)"
+        ]
+    return []
+
+
 def declared_units(directory: Path = UNITS_DIR) -> set[str]:
     """Every unit id with a descriptor, from the filenames alone.
 
@@ -322,6 +445,7 @@ def lint() -> list[str]:
     problems += pause_manifest_problems(
         schedules(tpl), json.loads(PAUSE_MANIFEST.read_text(encoding="utf-8"))
     )
+    problems += sameday_ordering_problems(schedules(tpl))
     return problems
 
 

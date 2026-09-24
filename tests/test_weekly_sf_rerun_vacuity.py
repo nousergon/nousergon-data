@@ -64,14 +64,15 @@ def sf_def() -> dict:
 
 
 @pytest.fixture(scope="module")
-def spine(mod) -> tuple:
+def spine(mod, sf_def) -> tuple:
     """The LANDED spine — excludes stages the pinned nousergon-lib has
     declared ahead of (PENDING_DEFINITION_STAGES) or behind (RETIRING_
-    DEFINITION_STAGES) this repo's own step_function.json
-    (alpha-engine-config-I11267). The raw `stage_order_for()` is what
-    production code must never feed directly into a vacuity/coverage
-    judgment — see `weekly_sf_rerun._landed_spine`'s docstring for why."""
-    return mod._landed_spine(WEEKLY_ARN)
+    DEFINITION_STAGES) this repo's own step_function.json, when the
+    definition does not carry them (alpha-engine-config-I11267 / -I11269).
+    The raw `stage_order_for()` is what production code must never feed
+    directly into a vacuity/coverage judgment — see
+    `weekly_sf_rerun._landed_spine`'s docstring for why."""
+    return mod._landed_spine(WEEKLY_ARN, sf_def)
 
 
 def _input(name: str) -> dict:
@@ -178,10 +179,13 @@ def test_re_enabling_a_box_stage_also_reopens_the_substrate_resume_targets(
 ):
     """The over-approximation is deliberate and must stay visible.
 
-    `ResumeAfterSubstrateRelaunch` re-enters five work states directly, past
+    `ResumeAfterSubstrateRelaunch` re-enters its work states directly, past
     their gates, whenever `$.error.phase` can be set — which becomes possible
     the moment ANY stage on the box can run and lose its substrate. So clearing
-    `skip_rag_ingestion` legitimately puts six stages back, not one. A future
+    `skip_rag_ingestion` legitimately puts four stages back, not one (it was
+    six until alpha-engine-config-I11269 removed the MorningEnrich and
+    DataPhase1 resume targets with their stages; the readiness wait that
+    replaced them runs on no box, so it has no substrate to lose). A future
     change that narrows this to `RAGIngestion` alone has started asserting a
     path cannot be taken when it can, and the refusal becomes a false
     accusation on the next substrate-loss recovery.
@@ -189,8 +193,6 @@ def test_re_enabling_a_box_stage_also_reopens_the_substrate_resume_targets(
     payload = _input(REAL_VACUOUS_INPUTS[0])
     relaxed = {k: v for k, v in payload.items() if k != "skip_rag_ingestion"}
     assert mod.enabled_spine_stages(sf_def, relaxed, spine) == (
-        "MorningEnrich",
-        "DataPhase1",
         "RAGIngestion",
         "Backtester",
         "EvaluatorDiagnostics",
@@ -214,10 +216,17 @@ def test_every_declared_spine_stage_is_switchable_off(mod, sf_def, spine):
     import run_scope
 
     assert run_scope.ungated_spine_stages(sf_def, spine) == ()
-    assert len(spine) == 17, (
+    # 17 -> 16 at alpha-engine-config-I11269: MorningEnrich and DataPhase1
+    # left, WaitForCollectionManifests arrived (gated by CheckSkipMorningEnrich).
+    # Re-measured against the real recovery inputs: every REAL_VACUOUS_INPUTS
+    # fixture still reads vacuous (test_the_real_inputs_can_enter_no_spine_stage) and
+    # the relaxed one above reopens exactly its substrate-resume targets.
+    assert len(spine) == 16, (
         "the weekly spine changed — re-measure the guard against the real "
         "recovery inputs before adjusting this number"
     )
+    assert "WaitForCollectionManifests" in spine
+    assert not {"MorningEnrich", "DataPhase1"} & set(spine)
 
 
 def test_the_gating_is_read_from_the_definition_not_listed(mod, sf_def, spine):

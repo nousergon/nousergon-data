@@ -54,6 +54,7 @@ from nousergon_lib.pipeline_status import registry
 from nousergon_lib.pipeline_status.registry import (
     PIPELINE_STAGE_ORDER,
     stale_pending_stages,
+    stale_retiring_stages,
     undefined_spine_stages,
 )
 
@@ -142,12 +143,62 @@ def test_no_spine_stage_is_still_marked_pending_once_this_repo_defines_it(pipeli
     )
 
 
+@pytest.mark.parametrize("pipeline", sorted(PIPELINE_STAGE_ORDER))
+def test_no_spine_stage_is_still_marked_retiring_once_this_repo_removes_it(pipeline):
+    """The REMOVE-direction mirror of the pending check (alpha-engine-config-I11267
+    deliverable 3), and just as strict here, because this repo OWNS the definitions.
+
+    ``RETIRING_DEFINITION_STAGES`` lets a consumer tolerate a spine stage that is
+    still live today but whose removal is coming, in either merge order. The PR
+    that DROPS the state (the decoupled data cutover, alpha-engine-config-I11269)
+    is the change that makes the marker stale, so it is the PR that must take a
+    library release that drops the stage from the spine and its marker with it.
+    A marker that outlives its state is a tolerance nobody needs any more — it
+    would hide a later accidental removal of a stage of the same name.
+    Consumers reading this repo's ``main`` must NOT fail on this.
+    """
+    stale = stale_retiring_stages(pipeline, _names_for(pipeline))
+    assert not stale, (
+        f"{pipeline}: {list(stale)} are gone from {DEFINITIONS[pipeline]} but the "
+        f"pinned nousergon-lib still marks them RETIRING_DEFINITION_STAGES. Drop them "
+        f"from PIPELINE_STAGE_ORDER and the marker in nousergon-lib and bump the pin "
+        f"in this PR."
+    )
+
+
+def _mark_retiring(monkeypatch, stage: str) -> None:
+    order = dict(registry.PIPELINE_STAGE_ORDER)
+    order[_EOD] = (*order[_EOD], stage)
+    monkeypatch.setattr(registry, "PIPELINE_STAGE_ORDER", order)
+    marks = {k: dict(v) for k, v in registry.RETIRING_DEFINITION_STAGES.items()}
+    marks.setdefault(_EOD, {})[stage] = "alpha-engine-config-I11267 (test fixture)"
+    monkeypatch.setattr(registry, "RETIRING_DEFINITION_STAGES", marks)
+
+
+def test_a_retiring_stage_still_defined_is_not_stale(monkeypatch):
+    """Library first: the marker lands while the state is still live — green."""
+    _mark_retiring(monkeypatch, _OLD)
+    names = set(_BASE_DEFINITION) | {_OLD}
+    assert stale_retiring_stages(_EOD, names) == ()
+    assert undefined_spine_stages(_EOD, names) == ()
+
+
+def test_removing_the_state_with_the_marker_still_set_is_red_here(monkeypatch):
+    """Mutation: the definition drops the state, the pin still marks it — the
+    exact condition the test above must fail on."""
+    _mark_retiring(monkeypatch, _OLD)
+    names = set(_BASE_DEFINITION)
+    assert undefined_spine_stages(_EOD, names) == ()  # the consumer tolerance
+    assert stale_retiring_stages(_EOD, names) == (_OLD,)  # the owner's strictness
+
+
 # ── Both merge orders (alpha-engine-config-I10762) ───────────────────────────
 # Mutation tests: each simulates the mirror PR's view by patching the library
 # registry, and asserts the verdict this repo's guard must return for it.
 
 _EOD = "ne-postclose-trading-pipeline"
 _NEW = "LaunchSomeNewDailySpot"
+_OLD = "LaunchSomeRetiringDailySpot"
 
 
 #: A synthetic definition built from the spine as imported, so these tests

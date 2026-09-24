@@ -69,7 +69,17 @@ def _flatten_states(sf_doc: dict) -> dict:
 # carries"; PRs that drift the JSON without updating it fail loud here.
 #
 # Saturday SF — alpha-engine-research + alpha-engine-data Lambdas
+# alpha-engine-config-I11264: the collection-readiness probe's payload, shared
+# by the three v1 SFs' WaitForCollectionManifests. No `action`/`workload`: the
+# probe refuses both, so it can never be mistaken for a dispatcher call.
+_READINESS_PROBE_KEYS = frozenset(
+    {"collection", "units", "not_before.$", "lookback_seconds"}
+)
+
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
+    # alpha-engine-config-I11264: the weekly SF's bounded wait on
+    # ne-data-collection-weekly's run manifests.
+    "WaitForCollectionManifests": _READINESS_PROBE_KEYS,
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     # alpha-engine-config-I10172: run_date.$ added — this stage had never
@@ -327,16 +337,11 @@ _WEEKDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # aws-sdk:s3:getObject read would need an IAM change in another repo), and so
     # it polls through the same ssm-liveness-poller contract as the two above.
     "WaitForCorrectnessVerdict": _LIVENESS_POLLER_KEYS,
-    # config#1767 (Phase 2): the data phase (enrich + Arctic append) was relocated
-    # onto two independent ephemeral spot boxes via the alpha-engine-data-spot-
-    # dispatcher Lambda. Each launch state passes {"workload": <key>,
-    # "force_on_demand.$"} selecting the collector invocation + threading the
-    # config#2542 retry-budget's on-demand override; the dispatcher returns
-    # {data_spot:{launched,instance_id,...}}.
-    # config#5504: execution_id.$ threads $$.Execution.Id into the dispatcher
-    # payload so the spot box carries per-run identity tags for cost attribution.
-    "LaunchMorningEnrichSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
-    "LaunchMorningArcticAppendSpot": frozenset({"workload", "force_on_demand.$", "execution_id.$"}),
+    # alpha-engine-config-I11269: the two data-spot launch states
+    # (LaunchMorningEnrichSpot / LaunchMorningArcticAppendSpot, config#1767)
+    # left with the phase; ne-data-collection-morning runs that work. The
+    # bounded readiness wait polls the read-only probe instead (I11264).
+    "WaitForCollectionManifests": _READINESS_PROBE_KEYS,
     # alpha-engine-config-I7811 (Brian ruling 2026-08-20): the weekday Scanner
     # entry was REMOVED with the state. The scanner forms its two cuts WEEKLY,
     # on the Saturday pipeline, whose own "Scanner" payload registry entry above
@@ -655,34 +660,20 @@ class TestEODSFTopLevelFieldsClosed:
             "failure_notify",
             "failure_notify_error",
             "force_stop_result",
-            "postmarket_poll",
-            # PostMarketArcticAppend (2026-06-16) — slow daily_append split out
-            # of PostMarketData into its own state (mirrors MorningArcticAppend
-            # L4608); emits its own poll ResultPath.
-            "postmarket_arctic_poll",
-            # config#1767 (Phase 2): the EOD data phase (PostMarketData +
-            # PostMarketArcticAppend) was relocated OFF the on-trading SSM path
-            # onto an ephemeral spot box. The old on-trading send ResultPaths
-            # ($.postmarket_result, $.postmarket_arctic_result) are gone; each
-            # spot launch emits its dispatcher-Lambda ResultPath and a fail-open
-            # error path. The poll ResultPaths above are reused by the spot poll.
-            "postmarket_launch",
-            "postmarket_arctic_launch",
+            # alpha-engine-config-I11269: the spot data phase's launch / poll /
+            # retry ResultPaths (postmarket_*, postmarket_arctic_*,
+            # data_spot_retry, data_spot_arctic_retry, and the I10750 edgar_pit_*
+            # / data_spot_edgar_retry) left with the phase. The bounded
+            # readiness wait on ne-data-collection-eod (I11264) emits the probe
+            # verdict, its Catch's error, and the poll counter.
+            "collection_readiness",
+            "collection_readiness_error",
+            "collection_readiness_poll",
+            # Kept: the fail-open normalizer's contract. $.data_spot_error is
+            # what CheckSkipEODReconcile's data-gap branch keys on and the
+            # failure notice renders; its name predates the cutover.
             "data_spot_error",
             "data_spot_failure_notify",
-            # 2026-07-14 incident fix: bounded (1x) relaunch-on-a-fresh-box
-            # retry for a spot-reclaimed data-spot workload, plus a distinct
-            # loud skip of EODReconcile when the retry is exhausted (today's
-            # SPY close genuinely never landed in ArcticDB, so eod_reconcile.py's
-            # _spy_close hard-fail would otherwise be guaranteed).
-            "data_spot_retry",
-            "data_spot_arctic_retry",
-            # alpha-engine-config-I10750: the edgar-pit-fundamentals-daily leg
-            # added after post-market-arctic-append — same launch/poll/retry
-            # ResultPath shape as the two legs above.
-            "edgar_pit_launch",
-            "edgar_pit_poll",
-            "data_spot_edgar_retry",
             "eod_skip_notify",
             "snapshot_poll",
             "snapshot_result",
@@ -762,10 +753,10 @@ class TestEODSFTopLevelFieldsClosed:
             # three outcome notifications (converged / replay-dispatch-failed /
             # non-convergent) each emit their own SNS ResultPath.
             "heal_loop",
-            "heal_postmarket_launch",
-            "heal_postmarket_poll",
-            "heal_arctic_launch",
-            "heal_arctic_poll",
+            # alpha-engine-config-I11266: the heal_postmarket_* / heal_arctic_*
+            # launch/poll paths left with the heal loop's own spot relaunch;
+            # HealStartCollection's .sync:2 result is the one actuator path now.
+            "heal_collection",
             "heal_error",
             "heal_replay_dispatch",
             "heal_replay_dispatch_error",
@@ -890,7 +881,12 @@ class TestEODSFTopLevelFieldsClosed:
 # pipeline (the 2026-08-08 succeeded run put the whole merged Evaluator stage
 # at 482s, of which evaluate.py was 282s). Reusing one box would mean weakening
 # a termination trap every stage depends on, to save ~200s.
-_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 15
+# 15 → 13 on alpha-engine-config-I11269 (the decoupled data cutover):
+# MorningEnrich and DataPhase1 left this definition — the standalone
+# ne-data-collection-weekly state machine runs morning-enrich and
+# weekly-phase-one, and this SF waits on their run manifests with a Lambda
+# poll (WaitForCollectionManifests) that launches nothing.
+_EXPECTED_SATURDAY_SPOT_STATE_COUNT = 13
 
 
 def _spot_states(sf_path: Path) -> list[str]:

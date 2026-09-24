@@ -1,42 +1,40 @@
-name: Deploy data-spot-dispatcher
+name: Deploy collection-readiness-probe
 
-# Auto-deploy the alpha-engine-data-spot-dispatcher Lambda CODE on merge to
-# main. Mirrors deploy-scheduled-groom-dispatcher.yml — same gap, same fix: a
-# merged code change to the dispatcher must not sit inert until someone
-# remembers to run deploy.sh by hand (the exact failure mode that broke the
-# 2026-07-08 EOD run, where the invoking SF def auto-deployed but the Lambda
-# did not exist).
+# Auto-deploy the alpha-engine-collection-readiness-probe Lambda CODE on
+# merge to main (alpha-engine-config-I11264 deliverable 1).
 #
-# Separation of concerns: this deploys CODE only (deploy.sh with NO flag —
-# the flagless run is code-only; --bootstrap is what ADDS the IAM-role
-# creation, and stays operator-only: the github-actions-lambda-deploy OIDC
-# role deliberately has no iam:CreateRole / iam:PutRolePolicy, a fleet-wide
-# policy after 4 IAM-clobber incidents in 2 months — see
-# nous-ergon-ops/infrastructure/iam/README.md).
+# Mirrors deploy-preopen-deploy-readiness-probe.yml: code only. deploy.sh with
+# no flags is its update-code path — the BOOTSTRAP block (IAM role/policy,
+# Lambda create) is gated behind --bootstrap/--apply-iam and is NEVER invoked
+# here, so this workflow cannot create or rewire infrastructure, only ship code
+# to a function that already exists.
 #
-# IAM: no new grant needed — LambdaUpdate already covers
-# arn:...:function:alpha-engine-* (nous-ergon-ops/infrastructure/iam/github-actions-lambda-
-# deploy.json), which already includes this function.
+# The zip PACKAGES the shared run-manifest predicate and the unit descriptors
+# it grades, so those paths are on the filter too: a descriptor edit must reach
+# this function on the merge button alone, or it goes on grading the previous
+# descriptor set with nothing red (same reasoning as
+# deploy-data-spot-dispatcher.yml, alpha-engine-config-I10787).
+#
+# IAM: no change needed. github-actions-lambda-deploy's LambdaUpdate
+# statement already grants GetFunction / GetFunctionConfiguration /
+# UpdateFunctionCode / UpdateFunctionConfiguration on
+# arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-*, which
+# covers alpha-engine-collection-readiness-probe.
 
 on:
   push:
     branches: [main]
     paths:
-      - 'infrastructure/lambdas/data-spot-dispatcher/**'
-      - '.github/workflows/deploy-data-spot-dispatcher.yml'
-      # alpha-engine-config-I10787: these two are PACKAGED into the function zip
-      # (deploy.sh), so a descriptor edit changes what the completion check
-      # grades. Without them on this filter the merge button would leave the
-      # deployed Lambda grading the previous descriptor set, silently.
+      - 'infrastructure/lambdas/collection-readiness-probe/**'
+      - '.github/workflows/deploy-collection-readiness-probe.yml'
       - 'registry.d/units/**'
       - 'data_gate/descriptors.py'
       - 'data_gate/__init__.py'
-      # alpha-engine-config-I11264: the completion predicate the check runs.
       - 'data_gate/run_manifest_predicate.py'
   workflow_dispatch:
 
 concurrency:
-  group: deploy-data-spot-dispatcher-main
+  group: deploy-collection-readiness-probe-main
   cancel-in-progress: false
 
 permissions:
@@ -45,7 +43,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy data-spot-dispatcher Lambda (code-only)
+    name: Deploy collection-readiness-probe Lambda (code-only)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -70,16 +68,16 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy data-spot-dispatcher (code-only — no --bootstrap)
+      - name: Deploy collection-readiness-probe (code-only)
         working-directory: alpha-engine-data
-        run: bash infrastructure/lambdas/data-spot-dispatcher/deploy.sh
+        run: bash infrastructure/lambdas/collection-readiness-probe/deploy.sh
 
       - name: Report deployed version
         working-directory: alpha-engine-data
         run: |
           echo "Deployed commit: ${{ github.sha }}"
           aws lambda get-function \
-            --function-name alpha-engine-data-spot-dispatcher \
+            --function-name alpha-engine-collection-readiness-probe \
             --query "Configuration.[LastModified,CodeSha256]" \
             --output text
 
@@ -88,8 +86,10 @@ jobs:
         uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
         with:
           deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
-          deploy_workflow: deploy-data-spot-dispatcher.yml
+          deploy_workflow: deploy-collection-readiness-probe.yml
 
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
   notify-main-failure:
     needs: [deploy]
     if: ${{ failure() && github.ref == 'refs/heads/main' }}
