@@ -720,6 +720,19 @@ _WORKLOADS: dict[str, str] = {
         "python -m shadow arctic-parity --trading-day {trading_day} "
         "--store s3://alpha-engine-research/data_collection"
     ),
+    # alpha-engine-config-I11447: shadow ArcticDB retention, REPORT ONLY. Every
+    # shadow run seeds a full copy of each live library as
+    # `shadow_{YYYYMMDD}_<name>` and nothing removed them (3.3 GB and growing
+    # ~0.65 GB per run on 2026-09-23). `python -m shadow prune` opens ArcticDB,
+    # which is reachable only from an in-region box (alpha-engine-config-I9771),
+    # so it runs here or nowhere. Without `--apply` it lists what it WOULD
+    # delete and changes nothing. There is deliberately no event field that
+    # adds `--apply`: the rendered command stays a fixed string.
+    #
+    # No trading day: the window is measured from each library's own stamp
+    # against today (UTC) on the box. Not scheduled; running it after each
+    # parity grade is a separate decision on I11447.
+    "shadow-prune": "python -m shadow prune",
 }
 # Defense-in-depth: the workload key is SF-config-controlled, not raw user input,
 # but the value is embedded verbatim into the SSM shell command, so pin it to a

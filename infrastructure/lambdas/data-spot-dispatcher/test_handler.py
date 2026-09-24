@@ -1161,15 +1161,49 @@ def test_every_dispatchable_shadow_module_resolves_to_a_real_workload(monkeypatc
     decl = _shadow_dispatch_declaration()
     for module, (workload, subcommand) in decl.DISPATCHABLE_MODULES.items():
         assert workload in index._WORKLOADS, f"{module}: no _WORKLOADS[{workload!r}]"
-        assert workload in index._WORKLOADS_REQUIRING_TRADING_DAY, (
-            f"{module}: {workload!r} must refuse a dispatch with no trading day"
-        )
-        _resolved, cmd = index._resolve_workload(
-            {"workload": workload, "trading_day": "2026-09-14"}
-        )
+        if workload in decl.DATE_FREE_WORKLOADS:
+            assert workload not in index._WORKLOADS_REQUIRING_TRADING_DAY, (
+                f"{module}: {workload!r} is declared date-free but still requires a trading day"
+            )
+            _resolved, cmd = index._resolve_workload({"workload": workload})
+        else:
+            assert workload in index._WORKLOADS_REQUIRING_TRADING_DAY, (
+                f"{module}: {workload!r} must refuse a dispatch with no trading day"
+            )
+            _resolved, cmd = index._resolve_workload(
+                {"workload": workload, "trading_day": "2026-09-14"}
+            )
         assert subcommand in cmd, (
             f"{module}: {workload!r} does not invoke `python -m {subcommand}`"
         )
+
+
+def test_date_free_workloads_are_dispatchable_and_carry_a_reason():
+    """A date-free key is an exception to the trading-day rule above, so it
+    must be one of the declared dispatchable workloads and say why."""
+    decl = _shadow_dispatch_declaration()
+    dispatchable = {workload for workload, _sub in decl.DISPATCHABLE_MODULES.values()}
+    for workload, reason in decl.DATE_FREE_WORKLOADS.items():
+        assert workload in dispatchable, workload
+        assert reason.strip(), workload
+
+
+def test_shadow_prune_is_report_only(monkeypatch):
+    """alpha-engine-config-I11447. Deleting a shadow ArcticDB library cannot be
+    undone, so the dispatcher's prune workload only reports: no `--apply`, no
+    event field that could add one, and nothing else in the allowlist reaches
+    `shadow prune --apply` either."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    resolved, cmd = index._resolve_workload({"workload": "shadow-prune"})
+    assert resolved == "shadow-prune"
+    assert cmd == "python -m shadow prune"
+    # Extra event fields are ignored, never rendered into the command.
+    _resolved, cmd2 = index._resolve_workload(
+        {"workload": "shadow-prune", "apply": True, "trading_day": "2026-09-14"}
+    )
+    assert cmd2 == cmd
+    for workload, command in index._WORKLOADS.items():
+        assert not ("shadow prune" in command and "--apply" in command), workload
 
 
 @pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])
