@@ -46,6 +46,13 @@
       }
     }
   },
+  "x-settling-bar": {
+    "basis": "row_date",
+    "row_dates": {
+      "market_data/close_history/consolidated.json": "$.series.*[*][0]"
+    },
+    "rationale": "market_data/close_history/consolidated.json holds each symbol's full close history as [date, close] rows under $.series.<sym>; the row dated the report's trading_day is that session's bar, which v1 fetches while the vendor is still settling it (alpha-engine-config-I11551, measured 2026-09-21..23: day-D rows differed on 57-60% of series at a median 2.3-2.8 bps while every earlier row matched exactly; v1's own next run re-fetched SIZE@2026-09-23 as the shadow's value). Only a NUMERIC move inside a row both sides date trading_day settles; the row's date, a series whose length differs (a missing or extra day-D row) and every earlier row stay strict, and the day-D rows are re-graded strictly on the next report's prior_day block. The per-symbol close_history/{sym}.json key is NOT named in row_dates and carries no settling bar."
+  },
   "x-key-pattern": [
     "market_data/close_history/{sym}.json",
     "market_data/close_history/consolidated.json"
