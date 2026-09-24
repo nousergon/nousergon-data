@@ -40,7 +40,11 @@ contract:
   schema: contracts/metron_security_performance.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins:
-    - "metron:tests/contracts/metron_security_performance.schema.json"
+    - repo: "metron"
+      path: "tests/contracts/metron_security_performance.schema.json"
+      pins: "body_schema"
+      producer: "contracts/metron_security_performance.schema.json"
+      read_site: "api/services/security_performance.py::load_security_performance"
 registry_rows:
   - metron_security_performance
 run_manifest_prefix: data_collection/runs/D28
