@@ -191,6 +191,36 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
 }
 
 
+def _write_guard_skip_record(path: str, results: dict) -> None:
+    """Record, for the stage launcher, that this run's own guard skipped it.
+
+    alpha-engine-config-I11474: MorningEnrich's stale-overwrite guard returns
+    ``status="skipped"`` with a ``skip_reason`` (the run manifest already
+    records that as ``not_applicable``), but the launcher's stage-coverage
+    assertion could not see it and graded the deliberate skip ``WHOLLY
+    STALE``. This file is the hand-off: present, non-empty, and holding the
+    guard's reason verbatim iff the guard fired; ABSENT on every other
+    outcome — including a leftover from an earlier run, which is removed
+    first so a stale record can never excuse a run that did execute.
+    """
+    target = Path(path)
+    target.unlink(missing_ok=True)
+    if (results or {}).get("status") != "skipped":
+        return
+    reason = " ".join(str(results.get("skip_reason") or "").split())
+    if not reason:
+        # A skip with no stated reason is not a declaration anything may act
+        # on: leave the record absent, so coverage grades the run as it would
+        # any other, and say so.
+        logger.warning(
+            "mode reported status=skipped with no skip_reason — no guard-skip record "
+            "written; stage coverage will grade this run as a normal one"
+        )
+        return
+    target.write_text(reason + "\n")
+    logger.info("guard-skip record written to %s: %s", target, reason)
+
+
 def _describe_degraded_defects(results: dict) -> str:
     """Build the `Defect detail: ...` clause of the DEGRADED alert.
 
@@ -5059,6 +5089,13 @@ def _parse_args() -> argparse.Namespace:
              "fallback). --date overrides which trading day to enrich (default: previous trading day).",
     )
     parser.add_argument(
+        "--guard-skip-record", dest="guard_skip_record", default=None, metavar="PATH",
+        help="Write the mode's own guard skip_reason to PATH when its guard deliberately "
+             "skipped the run (status=skipped), and remove PATH otherwise. The stage "
+             "launcher hands it to the stage-coverage assertion as --not-applicable-reason "
+             "so a declared skip is not graded STALE (alpha-engine-config-I11474).",
+    )
+    parser.add_argument(
         "--chronic-gap-heal", dest="chronic_gap_heal", action="store_true",
         help="Best-effort: yfinance-backfill ArcticDB row gaps for the chronic-polygon-gap "
              "tickers (polygon doesn't reliably serve them) + emit the polygon-recovery / "
@@ -5198,6 +5235,9 @@ def main() -> None:
         raise SystemExit(0)
 
     results = run_weekly(config, args)
+
+    if getattr(args, "guard_skip_record", None):
+        _write_guard_skip_record(args.guard_skip_record, results)
 
     # config#646 (Option A): write the flow's end-of-run status() snapshot to
     # s3://alpha-engine-research/_flow_doctor/heartbeat/data-collector/{date}.json
