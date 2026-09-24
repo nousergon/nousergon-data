@@ -44,6 +44,14 @@
         "minLength": 1
       }
     },
+    "index_overlap": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      },
+      "description": "Names held by BOTH SPY and MDY on this date (a rebalance in flight), so present in both sp500_tickers and sp400_tickers and once in tickers. Omitted when empty. alpha-engine-config-I11470."
+    },
     "sector_map": {
       "type": "object",
       "additionalProperties": {
@@ -71,6 +79,38 @@
         "type": "string",
         "minLength": 1
       }
+    },
+    "sector_fallback": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "source",
+          "sector",
+          "yf_sector",
+          "yf_industry"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "enum": [
+              "yfinance"
+            ]
+          },
+          "sector": {
+            "type": "string",
+            "minLength": 1
+          },
+          "yf_sector": {
+            "type": "string"
+          },
+          "yf_industry": {
+            "type": "string"
+          }
+        }
+      },
+      "description": "Constituents whose sector_map/sector_etf_map entry came from the yfinance fallback rather than Wikipedia's GICS table (alpha-engine-config-I11468): `sector` is the GICS sector written to sector_map, `yf_sector`/`yf_industry` the raw yfinance evidence it was mapped from. Wikipedia lags brand-new index additions, so this is usually empty or a handful of names. Every ticker in `tickers` has a sector_map entry; the producer raises rather than publish one without. Absent on snapshots written before I11468."
     },
     "sp500_count": {
       "type": "integer",

@@ -57,7 +57,10 @@ consumers:
 contract:
   schema: contracts/constituents.schema.json
   producer_test: tests/test_p07_contracts.py
-  consumer_pins:
+  consumer_pins: []
+  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
+  # contract file the gate can resolve and compare — graded as a finding.
+  unpinned_consumers:
     - "crucible:crucible/data/universe.py"
 registry_rows:
   - constituents_dated

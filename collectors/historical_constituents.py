@@ -59,7 +59,7 @@ import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
@@ -77,6 +77,31 @@ logger = logging.getLogger(__name__)
 SNAPSHOT_CUTOVER = "2026-04-04"
 
 _ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+#: A ticker that leaves the observed roster and comes back within this many
+#: calendar days was never out of the index (alpha-engine-config-I11470).
+#: Measured: SPY's 2026-09-10 holdings file listed 502 names with OKE missing,
+#: and OKE was back on 2026-09-11. Diffed as-is, that is a REMOVED and an ADDED
+#: the reference has never heard of, and a PIT universe that drops OKE for one
+#: day. S&P does not remove a constituent and re-add it inside a week, so a
+#: round trip this short is a gap in the holdings file, not index churn. A
+#: genuine change of that shape would still surface, because the reference
+#: would list it and the attestation would then report it as not observed.
+FLICKER_MAX_DAYS = 7
+
+#: A skipped roster snapshot is DEGRADED, not just logged, when it falls
+#: within this many days of the newest snapshot on S3 (alpha-engine-config-
+#: I11470). A skipped recent snapshot moves the date this week's changes are
+#: attributed to and, when it is the newest one, diffs the week against an
+#: older roster. An old skip is still named in the artifact every run.
+RECENT_SKIP_WINDOW_DAYS = 14
+
+#: The most SPY/MDY overlap a legacy snapshot may carry and still have its
+#: S&P 500 slice recovered from the prefix. See :func:`_sp500_roster`. The
+#: overlap is the names moving between the two indices on a rebalance, which
+#: both funds hold for a day: measured 1 (2026-04-11, 2026-04-12) and 2
+#: (2026-09-18: ILMN and P, joining the S&P 500 at the 2026-09-21 open).
+MAX_RECOVERABLE_INDEX_OVERLAP = 10
 
 #: Index changes from 1976 to the cutover are settled history — they do not
 #: change, so re-deriving them from an editable wiki on every weekly run buys
@@ -286,9 +311,9 @@ def changes_from_snapshots(
     D+1; present on D and absent on D+1 is REMOVED on D+1. Pure — the caller
     does the S3 reads.
 
-    This is the whole point of the collector'"'"'s rewrite: after the cutover,
+    This is the whole point of the collector's rewrite: after the cutover,
     membership is something we OBSERVED rather than something we replayed
-    from a third party'"'"'s prose. The earliest snapshot yields no changes —
+    from a third party's prose. The earliest snapshot yields no changes —
     it is the baseline the rest are diffed against, not an event.
 
     The change is dated to the LATER snapshot because that is the first date
@@ -329,11 +354,53 @@ def changes_from_snapshots(
     return changes, unresolved
 
 
+def suppress_flickers(
+    changes: list[ConstituentChange],
+    *,
+    max_days: int = FLICKER_MAX_DAYS,
+) -> tuple[list[ConstituentChange], list[str]]:
+    """Drop round trips shorter than ``max_days``; name each one dropped.
+
+    A REMOVED followed by an ADDED of the same ticker (a name missing from a
+    holdings file for a day) or an ADDED followed by a REMOVED (a name that
+    appeared in one file and was gone the next) cancels out: neither event
+    happened to the index. Returns ``(kept, flickers)``, where each flicker
+    reads ``"OKE absent 2026-09-10 -> 2026-09-11 (1d)"`` so the artifact says
+    which names were affected and when, rather than making them disappear.
+    """
+    by_ticker: dict[str, list[ConstituentChange]] = {}
+    for c in sorted(changes, key=lambda c: (c.date, c.action)):
+        by_ticker.setdefault(c.ticker, []).append(c)
+
+    dropped: set[ConstituentChange] = set()
+    flickers: list[str] = []
+    for ticker, events in sorted(by_ticker.items()):
+        i = 0
+        while i < len(events) - 1:
+            first, second = events[i], events[i + 1]
+            gap = (
+                datetime.strptime(second.date, "%Y-%m-%d")
+                - datetime.strptime(first.date, "%Y-%m-%d")
+            ).days
+            if first.action != second.action and gap <= max_days:
+                dropped.update((first, second))
+                shape = "absent" if first.action == REMOVED else "present"
+                flickers.append(
+                    f"{ticker} {shape} {first.date} -> {second.date} ({gap}d)"
+                )
+                i += 2
+                continue
+            i += 1
+    kept = [c for c in changes if c not in dropped]
+    return kept, flickers
+
+
 def divergences(
     observed: list[ConstituentChange],
     reference: list[ConstituentChange],
     *,
     since: str,
+    until: str | None = None,
 ) -> list[str]:
     """Human-readable disagreements between two derivations, on/after ``since``.
 
@@ -346,18 +413,45 @@ def divergences(
 
     Dates are NOT compared — the snapshot derivation dates a change to the
     first snapshot that shows it, which is up to a cadence-interval later
-    than the wiki'"'"'s effective date. Comparing them would report a
+    than the wiki's effective date. Comparing them would report a
     disagreement on every single change. Membership of the (ticker, action)
     set is the claim being tested.
+
+    ``until`` (the newest roster snapshot) bounds the REFERENCE side: the
+    changes table lists a change when it is announced, usually a week or more
+    before it takes effect, and no snapshot can have observed a change dated
+    after the newest one (alpha-engine-config-I11470). Those are pending, not
+    disagreements; see :func:`pending_reference_changes`.
     """
     obs = {(c.ticker, c.action) for c in observed if c.date >= since}
-    ref = {(c.ticker, c.action) for c in reference if c.date >= since}
+    ref_all = {(c.ticker, c.action) for c in reference if c.date >= since}
+    # Only the observable window is owed an observation. An observed change
+    # is still matched against the whole table: index funds buy an addition
+    # at the close BEFORE its effective date (the 2026-09-18 holdings already
+    # carried ILMN and P, effective 2026-09-21), so the snapshot can lead.
+    ref = {
+        (c.ticker, c.action) for c in reference
+        if c.date >= since and (until is None or c.date <= until)
+    }
     out = []
-    for ticker, action in sorted(obs - ref):
+    for ticker, action in sorted(obs - ref_all):
         out.append(f"observed {action} {ticker} not in reference")
     for ticker, action in sorted(ref - obs):
         out.append(f"reference {action} {ticker} not observed")
     return out
+
+
+def pending_reference_changes(
+    reference: list[ConstituentChange], *, until: str
+) -> list[str]:
+    """Reference changes dated after ``until``: announced, not yet owed an
+    observation. Named in the artifact so a pending change is visible, and so
+    the week it becomes observable is the week it starts being checked."""
+    return [
+        f"{c.date} {c.action} {c.ticker}"
+        for c in sorted(reference, key=lambda c: (c.date, c.ticker, c.action))
+        if c.date > until
+    ]
 
 
 def build_pit_membership(
@@ -424,46 +518,110 @@ def _fetch_changes_table(
     )
 
 
-def _sp500_roster(snapshot: dict) -> list[str] | None:
-    """The S&P 500 slice of one dated ``constituents.json``, or None.
+def sp500_roster_with_provenance(snapshot: dict) -> tuple[list[str] | None, str]:
+    """The S&P 500 slice of one dated ``constituents.json``, and how it was read.
 
-    ``constituents.collect`` writes a single combined ``tickers`` list —
-    the SPY holdings followed by the MDY holdings, deduped preserving order
-    — plus ``sp500_count`` / ``sp400_count``. Explicit per-index lists were
-    added later, so newer snapshots carry ``sp500_tickers`` and are read
-    directly; the 84 already on S3 are not, and for those the prefix is the
-    only way in.
+    ``constituents.collect`` writes a single combined ``tickers`` list: the SPY
+    holdings followed by the MDY holdings, deduped keeping the FIRST
+    occurrence, plus ``sp500_count`` / ``sp400_count``. Newer snapshots carry
+    explicit ``sp500_tickers`` and are read directly (provenance
+    ``"explicit"``). Older ones are read from the prefix, and only when the
+    counts say the prefix is the SPY batch:
 
-    That prefix is only sound when nothing was lost to the dedupe, so the
-    counts must account for the whole list. When they do not, this returns
-    None rather than slicing anyway: a roster silently short by the overlap
-    would surface as a burst of fabricated ADDED/REMOVED events on that
-    date, which is worse than a gap because it looks like real index churn.
+    * ``sp500_count + sp400_count == len(tickers)``: nothing was deduped, the
+      prefix is exactly the SPY batch (``"prefix"``).
+    * The list is SHORTER than the counts by a small overlap (at most
+      :data:`MAX_RECOVERABLE_INDEX_OVERLAP`): a name held by both funds on a
+      rebalance day. The dedupe keeps the first occurrence and SPY comes
+      first, so the overlap is removed from the MDY tail and the first
+      ``sp500_count`` entries are still the SPY batch
+      (``"prefix_recovered_overlap_<n>"``). alpha-engine-config-I11470: this
+      shape was refused before, which skipped 2026-04-11, 2026-04-12 and
+      2026-09-18 (the last snapshot before that week's run, with ILMN and P
+      held by both funds ahead of their 2026-09-21 move into the S&P 500).
+
+    Anything else returns ``(None, <reason>)`` and the caller names the
+    snapshot as skipped: a list LONGER than the counts, one shorter than the
+    S&P 500 slice itself, a prefix with repeated names, or an overlap too
+    large to be a rebalance. Slicing those would put names on the roster or
+    take them off it, which the diff would emit as index churn that did not
+    happen.
     """
     explicit = snapshot.get("sp500_tickers")
     if explicit:
-        return list(explicit)
+        return list(explicit), "explicit"
     tickers = snapshot.get("tickers") or []
     n500 = snapshot.get("sp500_count") or 0
     n400 = snapshot.get("sp400_count") or 0
-    if not tickers or not n500 or n500 + n400 != len(tickers):
-        return None
-    return list(tickers[:n500])
+    if not tickers or not n500:
+        return None, (
+            "no sp500_tickers and no sp500_count (a cache-served roster "
+            "carries no per-index split)"
+        )
+    overlap = n500 + n400 - len(tickers)
+    if overlap == 0:
+        return list(tickers[:n500]), "prefix"
+    if overlap < 0:
+        return None, (
+            f"tickers ({len(tickers)}) exceeds sp500_count + sp400_count "
+            f"({n500 + n400})"
+        )
+    prefix = tickers[:n500]
+    if len(prefix) < n500 or len(set(prefix)) != n500:
+        return None, f"prefix of {n500} is not {n500} distinct names"
+    if overlap > MAX_RECOVERABLE_INDEX_OVERLAP:
+        return None, (
+            f"overlap of {overlap} between the two funds exceeds "
+            f"{MAX_RECOVERABLE_INDEX_OVERLAP}, larger than any rebalance"
+        )
+    return list(prefix), f"prefix_recovered_overlap_{overlap}"
+
+
+def _sp500_roster(snapshot: dict) -> list[str] | None:
+    """The S&P 500 slice of one snapshot, or None when it cannot be read.
+
+    See :func:`sp500_roster_with_provenance`."""
+    return sp500_roster_with_provenance(snapshot)[0]
+
+
+@dataclass
+class RosterSnapshots:
+    """Every dated roster on S3, and what happened to each one that did not
+    go in as-is. ``skipped`` and ``recovered`` are ``{date: reason}``."""
+
+    snapshots: dict[str, list[str]] = field(default_factory=dict)
+    skipped: dict[str, str] = field(default_factory=dict)
+    recovered: dict[str, str] = field(default_factory=dict)
+
+    def newest_date(self) -> str | None:
+        dates = [*self.snapshots, *self.skipped]
+        return max(dates) if dates else None
+
+    def recent_skips(self, window_days: int = RECENT_SKIP_WINDOW_DAYS) -> list[str]:
+        """Skipped dates within ``window_days`` of the newest snapshot."""
+        newest = self.newest_date()
+        if newest is None:
+            return []
+        anchor = datetime.strptime(newest, "%Y-%m-%d")
+        return sorted(
+            d for d in self.skipped
+            if (anchor - datetime.strptime(d, "%Y-%m-%d")).days <= window_days
+        )
 
 
 def load_roster_snapshots(
     bucket: str,
     s3=None,
     prefix: str = "market_data/weekly/",
-) -> dict[str, list[str]]:
+) -> RosterSnapshots:
     """Read every dated ``constituents.json`` under ``prefix`` from S3.
 
-    Returns ``{YYYY-MM-DD: sp500_roster}``. Snapshots whose S&P 500 slice
-    cannot be established are logged and skipped — see :func:`_sp500_roster`.
+    A snapshot whose S&P 500 slice cannot be established is skipped, and
+    NAMED with its reason in the result — never only in a log line. See
+    :func:`sp500_roster_with_provenance`.
     """
     s3 = s3 or boto3.client("s3")
-    snapshots: dict[str, list[str]] = {}
-    unusable: list[str] = []
+    out = RosterSnapshots()
     paginator = s3.get_paginator("list_objects_v2")
     for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
         for obj in page.get("Contents", []):
@@ -476,21 +634,50 @@ def load_roster_snapshots(
             body = json.loads(
                 s3.get_object(Bucket=bucket, Key=key)["Body"].read()
             )
-            roster = _sp500_roster(body)
+            roster, how = sp500_roster_with_provenance(body)
             if roster is None:
-                unusable.append(date)
+                out.skipped[date] = how
                 continue
-            snapshots[date] = roster
-    if unusable:
-        logger.warning(
-            "historical_constituents: %d roster snapshot(s) skipped — no "
-            "usable S&P 500 slice (sp500_count + sp400_count != len(tickers)): %s",
-            len(unusable), sorted(unusable)[:20],
+            out.snapshots[date] = roster
+            if how.startswith("prefix_recovered"):
+                out.recovered[date] = how
+    if out.recovered:
+        logger.info(
+            "historical_constituents: %d legacy roster snapshot(s) read from the "
+            "SPY prefix despite a SPY/MDY overlap: %s",
+            len(out.recovered), out.recovered,
         )
-    return snapshots
+    if out.skipped:
+        logger.warning(
+            "historical_constituents: %d roster snapshot(s) skipped (recent: %s): %s",
+            len(out.skipped), out.recent_skips(), out.skipped,
+        )
+    return out
 
 
-def resolve_renames(swaps: dict[str, list[str]]) -> dict[str, str]:
+@dataclass
+class RenameResolution:
+    """What the rename pass decided, and what it could not.
+
+    ``deferred`` names every candidate whose Polygon query failed (e.g. still
+    rate-limited after the client's backoff). It is carried into the artifact
+    and the stage result by name rather than only logged
+    (alpha-engine-config-I11470): a check that did not run is a fact about
+    this run, and the next run asks again. ``confirmed_by_reference`` names
+    candidates not asked about because the reference already lists them as
+    index removals.
+    """
+
+    renames: dict[str, str] = field(default_factory=dict)
+    deferred: list[str] = field(default_factory=list)
+    confirmed_by_reference: list[str] = field(default_factory=list)
+
+
+def resolve_renames(
+    swaps: dict[str, list[str]],
+    *,
+    reference_removed: set[str] | None = None,
+) -> RenameResolution:
     """Ask Polygon which of the disappearing tickers were retickers.
 
     Reuses ``corporate_actions.detect_renames`` — the same detection the
@@ -498,14 +685,25 @@ def resolve_renames(swaps: dict[str, list[str]]) -> dict[str, str]:
     than twice with two answers. Imported lazily: this module's pure layer
     is unit-tested without the polygon client or its config.
 
+    ``reference_removed`` is the set of tickers the reference changes table
+    lists as REMOVED since the cutover. A candidate in it is a confirmed index
+    removal and is not queried (alpha-engine-config-I11470). Before this, every
+    same-date swap since the cutover was re-queried every week, one call per
+    ticker against a 5-calls-a-minute key the rest of the fleet shares: 12
+    candidates on 2026-09-23, a number that only grows, and POOL ran out of
+    429 retries. Only the swaps the reference does NOT explain need Polygon.
+    ``None`` (reference unavailable) queries every candidate, as before.
+
     A detection failure returns no rename for that candidate, which lands
-    the pair in ``unresolved`` and emits it as index churn with a WARNING.
-    That is the opposite of the prune path's history-safety default, and
-    deliberately so: prune DELETES history on a wrong answer, where this
-    only mis-dates one membership event that the attestation then flags.
+    the pair in ``unresolved`` and emits it as index churn, and the candidate
+    is named in ``deferred``. That is the opposite of the prune path's
+    history-safety default, and deliberately so: prune DELETES history on a
+    wrong answer, where this only mis-dates one membership event that the
+    attestation then flags.
     """
+    out = RenameResolution()
     if not swaps:
-        return {}
+        return out
     candidates = sorted({t for tickers in swaps.values() for t in tickers})
 
     # Committed retickers first. Polygon does NOT report these as
@@ -515,38 +713,80 @@ def resolve_renames(swaps: dict[str, list[str]]) -> dict[str, str]:
     # index change, so it gets the same treatment: written down once, reviewed
     # in a diff, and not re-derived weekly from a source that does not have it.
     known = json.loads(_KNOWN_RETICKERS_PATH.read_text())
-    renames = {
+    out.renames = {
         r["old"]: r["new"]
         for r in known["retickers"]
         if r["old"] in candidates
     }
-    candidates = [t for t in candidates if t not in renames]
-    if not candidates:
-        return renames
+    candidates = [t for t in candidates if t not in out.renames]
+    if reference_removed is not None:
+        out.confirmed_by_reference = [t for t in candidates if t in reference_removed]
+        candidates = [t for t in candidates if t not in reference_removed]
+    if candidates:
+        try:
+            from builders.prune_delisted_tickers import _build_rename_client
 
-    try:
-        from builders.prune_delisted_tickers import _build_rename_client
+            import corporate_actions as ca
 
-        import corporate_actions as ca
-
-        client = _build_rename_client()
-        if client is None:
-            raise RuntimeError("no polygon client for rename detection")
-        detection = ca.detect_renames(candidates, client=client)
-    except Exception as exc:  # noqa: BLE001 — recorded, and callers warn
-        logger.warning(
-            "historical_constituents: rename detection unavailable (%s) — %d "
-            "same-date swap(s) will be emitted as index changes unclassified",
-            exc, len(candidates),
-        )
-        return renames
-    renames.update({a.ticker: a.new_ticker for a in detection.renames})
-    if renames:
+            client = _build_rename_client()
+            if client is None:
+                raise RuntimeError("no polygon client for rename detection")
+            detection = ca.detect_renames(candidates, client=client)
+        except Exception as exc:  # noqa: BLE001 — recorded as `deferred`, and callers warn
+            logger.warning(
+                "historical_constituents: rename detection unavailable (%s) — %d "
+                "same-date swap(s) will be emitted as index changes unclassified: %s",
+                exc, len(candidates), candidates,
+            )
+            out.deferred = list(candidates)
+            return out
+        out.renames.update({a.ticker: a.new_ticker for a in detection.renames})
+        out.deferred = sorted(detection.failed_candidates)
+    if out.renames:
         logger.info(
             "historical_constituents: %d reticker(s) resolved and excluded "
-            "from membership changes: %s", len(renames), renames,
+            "from membership changes: %s", len(out.renames), out.renames,
         )
-    return renames
+    if out.deferred:
+        logger.warning(
+            "historical_constituents: rename check DEFERRED for %s (query failed "
+            "after the client's backoff); asked again next run",
+            out.deferred,
+        )
+    return out
+
+
+def _verdict(
+    *,
+    unexplained: list[str],
+    recent_skips: dict[str, str],
+    unresolved: list[str],
+    deferred: list[str],
+) -> tuple[str, str | None]:
+    """The stage's own status and, when DEGRADED, the defect named in full.
+
+    DEGRADED means the artifact was published and is known to be wrong
+    somewhere (`_DegradedRun`, alpha-engine-config-I10784). Two conditions
+    earn it (alpha-engine-config-I11470): a reference disagreement nothing
+    explains, and a recent roster snapshot that could not be read. An
+    unexplained disagreement on a swap whose rename check was deferred names
+    the deferral too, since the check that could have explained it did not
+    run.
+    """
+    parts = []
+    if unexplained:
+        parts.append(
+            f"{len(unexplained)} unexplained reference disagreement(s): {unexplained}"
+            + (f" (unresolved swaps: {unresolved})" if unresolved else "")
+            + (f" (rename check deferred for: {deferred})" if deferred else "")
+        )
+    if recent_skips:
+        parts.append(
+            f"{len(recent_skips)} recent roster snapshot(s) skipped: {recent_skips}"
+        )
+    if not parts:
+        return "ok", None
+    return "degraded", "historical_constituents: " + "; ".join(parts)
 
 
 def collect(
@@ -569,23 +809,27 @@ def collect(
     ATTEST the post-cutover window and never to produce it, so a page that
     moves or 404s costs an attestation, not the pipeline
     (alpha-engine-config-I6946).
+
+    Returns ``status="degraded"`` with a ``detail`` naming every defect when
+    the attestation finds a disagreement nothing explains or a recent roster
+    snapshot was skipped (alpha-engine-config-I11470). The counts and names
+    ride the returned dict as well as the artifact, so the run manifest and
+    the DEGRADED alert carry them.
     """
     frozen = load_frozen_changes()
-    snapshots = load_roster_snapshots(bucket)
-    renames = resolve_renames(same_date_swaps(snapshots))
-    observed, unresolved = changes_from_snapshots(snapshots, renames)
-    changes = sorted(
-        frozen + observed, key=lambda c: (c.date, c.ticker, c.action)
-    )
-    pit = build_pit_membership(current_tickers, changes)
+    rosters = load_roster_snapshots(bucket)
+    snapshots = rosters.snapshots
+    newest = max(snapshots) if snapshots else None
 
-    # Attestation. Non-fatal by deliberate carve-out from fail-loud:
-    # (a) the failure swallowed is an unreachable or restructured wiki page,
-    # which says nothing about the membership map already built from two
-    # sources that do not involve it; (b) it is recorded as a WARNING on this
-    # phase's log and as `attestation` in the written artifact, so a run that
-    # could not attest is distinguishable from one that attested cleanly —
-    # `divergences` null is not the same value as `[]`.
+    # The reference is fetched FIRST so it can narrow which swaps need a
+    # Polygon rename query (see resolve_renames). Non-fatal by deliberate
+    # carve-out from fail-loud: (a) the failure swallowed is an unreachable
+    # or restructured wiki page, which says nothing about the membership map
+    # built from two sources that do not involve it; (b) it is recorded as a
+    # WARNING on this phase's log and as `attestation` in the written
+    # artifact, so a run that could not attest is distinguishable from one
+    # that attested cleanly — `divergences` null is not the same value as `[]`.
+    reference: list[ConstituentChange] | None = None
     attestation: dict = {"status": "skipped", "divergences": None}
     try:
         reference = parse_changes_table(_fetch_changes_table()[0])
@@ -598,12 +842,41 @@ def collect(
             "observed snapshots; nothing cross-checked it this run",
             exc, len(snapshots),
         )
-    else:
-        found = divergences(observed, reference, since=SNAPSHOT_CUTOVER)
+
+    reference_removed = (
+        {c.ticker for c in reference if c.action == REMOVED and c.date >= SNAPSHOT_CUTOVER}
+        if reference is not None else None
+    )
+    resolution = resolve_renames(
+        same_date_swaps(snapshots), reference_removed=reference_removed,
+    )
+    renames = resolution.renames
+    observed, unresolved = changes_from_snapshots(snapshots, renames)
+    observed, flickers = suppress_flickers(observed)
+    if flickers:
+        logger.info(
+            "historical_constituents: %d holdings-file round trip(s) shorter than "
+            "%dd dropped (not index changes): %s",
+            len(flickers), FLICKER_MAX_DAYS, flickers,
+        )
+    changes = sorted(
+        frozen + observed, key=lambda c: (c.date, c.ticker, c.action)
+    )
+    pit = build_pit_membership(current_tickers, changes)
+
+    found: list[str] = []
+    if reference is not None:
+        found = divergences(
+            observed, reference, since=SNAPSHOT_CUTOVER, until=newest,
+        )
         attestation = {
             "status": "diverged" if found else "agreed",
             "divergences": found,
             "since": SNAPSHOT_CUTOVER,
+            "until": newest,
+            "pending_reference_changes": (
+                pending_reference_changes(reference, until=newest) if newest else []
+            ),
         }
         if found:
             # An unresolved same-date swap is NOT reported on its own: a real
@@ -622,6 +895,27 @@ def collect(
                 found[:20], unresolved[:20],
             )
 
+    recent_skips = {d: rosters.skipped[d] for d in rosters.recent_skips()}
+    status, detail = _verdict(
+        unexplained=found, recent_skips=recent_skips,
+        unresolved=unresolved, deferred=resolution.deferred,
+    )
+    # One block, written into the artifact AND returned, so the published
+    # file, the run manifest and the DEGRADED alert read the same numbers.
+    quality = {
+        "n_reference_disagreements": len(found),
+        "reference_disagreements": found,
+        "n_skipped_snapshots": len(rosters.skipped),
+        "skipped_snapshots": dict(sorted(rosters.skipped.items())),
+        "n_recent_skipped_snapshots": len(recent_skips),
+        "recent_skipped_snapshots": recent_skips,
+        "recovered_snapshots": dict(sorted(rosters.recovered.items())),
+        "snapshot_flickers": flickers,
+        "rename_checks_deferred": resolution.deferred,
+        "rename_checks_confirmed_by_reference": resolution.confirmed_by_reference,
+        "attestation_status": attestation["status"],
+    }
+
     result = {
         "schema_version": 2,
         "source": {
@@ -639,6 +933,7 @@ def collect(
         "unresolved_swaps": unresolved,
         "n_snapshots": len(pit),
         "attestation": attestation,
+        "quality": {"status": status, "detail": detail, **quality},
         "membership": pit,  # {date: [tickers as-of just before that date]}
         "built_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -647,11 +942,15 @@ def collect(
         logger.info(
             "[dry-run] historical_constituents: %d changes (%d frozen + %d "
             "observed from %d roster snapshots) -> %d PIT snapshots "
-            "(current roster %d); attestation=%s",
+            "(current roster %d); attestation=%s; verdict=%s %s",
             len(changes), len(frozen), len(observed), len(snapshots),
-            len(pit), len(current_tickers), attestation["status"],
+            len(pit), len(current_tickers), attestation["status"], status,
+            detail or "",
         )
-        return {"status": "ok_dry_run", "n_changes": len(changes), "n_snapshots": len(pit)}
+        return {
+            "status": "ok_dry_run", "n_changes": len(changes),
+            "n_snapshots": len(pit), "verdict": status, **quality,
+        }
 
     s3 = boto3.client("s3")
     key = f"{s3_prefix}historical_constituents.json"
@@ -665,4 +964,12 @@ def collect(
         "Wrote historical_constituents.json to s3://%s/%s (%d changes, %d snapshots)",
         bucket, key, len(changes), len(pit),
     )
-    return {"status": "ok", "n_changes": len(changes), "n_snapshots": len(pit)}
+    if detail:
+        logger.warning("%s", detail)
+    out = {
+        "status": status, "n_changes": len(changes), "n_snapshots": len(pit),
+        **quality,
+    }
+    if detail:
+        out["detail"] = detail
+    return out

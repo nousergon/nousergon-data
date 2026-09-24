@@ -195,15 +195,25 @@ def collect(
     # collectors/research_db_upload.py for why they may not be written apart.
     #
     # No try/except: a producer write that fails must fail the run.
+    #
+    # `db_upload` names the two keys ACTUALLY written this run (empty when
+    # nothing was written — a run that changed nothing uploads nothing), the
+    # same contract `collectors/universe_returns.py` returns: the run manifest
+    # records what a run wrote, read from the writer's own return, never
+    # copied from the descriptor (alpha-engine-config-I11469 — D09 recorded
+    # `outputs: []` on a run that uploaded both keys, so its manifest filed
+    # `failed` under I11011).
     total_written = sum(r.get("rows_written", 0) for r in results.values())
+    db_upload: dict = {}
     if not dry_run and total_written > 0:
-        upload_research_db(s3, db_path, bucket, run_date or default_run_date())
+        db_upload = upload_research_db(s3, db_path, bucket, run_date or default_run_date())
 
     has_errors = any(r.get("status") == "error" for r in results.values())
     return {
         "status": "partial" if has_errors else ("ok_dry_run" if dry_run else "ok"),
         "total_written": total_written,
         **results,
+        "db_upload": db_upload,
     }
 
 

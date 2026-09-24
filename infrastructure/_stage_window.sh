@@ -135,3 +135,29 @@ print(value if isinstance(value, str) and value.strip() else "")' 2>/dev/null)" 
   printf '%s' "$prior"
   return 0
 }
+
+# The date a stage LABELS itself with (alpha-engine-config-I11475).
+#
+# Every launcher used to print `$(date +%Y-%m-%d)` in its banner — the box's
+# UTC calendar day. A run that crosses 00:00 UTC then labels itself a day
+# ahead of its own cycle: measured on the 2026-09-23 weekly rehearsal, whose
+# run_date was 2026-09-23 and whose DataPhase2 banner (launched ~00:44 UTC)
+# read 2026-09-24. The stage-coverage assertion a few lines further down the
+# same launchers already files its verdict under `$EXECUTION_RUN_DATE`, so the
+# banner and the verdict named two different days for one stage.
+#
+# Resolution order, one definition for every launcher that sources this file:
+#   1. `$EXECUTION_RUN_DATE` — exported by step_function.json from $.run_date
+#      (the cycle's trading day after NormalizeRunDates); the SF's own answer.
+#   2. The exchange's calendar day (America/New_York) — for a manual launch
+#      with no SF around it. Never the UTC day: between 00:00 UTC and midnight
+#      ET the UTC day is already tomorrow on the exchange's calendar, the same
+#      class `collectors/universe_returns.py::_market_today` fixed in
+#      alpha-engine-config-I11445.
+stage_run_date() {
+  if [ -n "${EXECUTION_RUN_DATE:-}" ]; then
+    printf '%s' "$EXECUTION_RUN_DATE"
+    return 0
+  fi
+  TZ=America/New_York date +%Y-%m-%d
+}

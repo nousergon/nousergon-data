@@ -31,11 +31,21 @@ SECTOR SOURCE (unchanged): SPY/MDY's own "Sector" holdings column is NOT
 usable GICS classification (verified live: >98% of SPY rows carry a literal
 "-" placeholder, not a sector name) — Wikipedia's constituents tables remain
 the sector/sub-industry source, keyed by ticker and looked up against the
-SSGA-sourced membership list. A membership ticker absent from Wikipedia's
-sector map still hard-fails in ``collect()`` (unchanged behavior) — this is
-now a *useful* freshness signal in the opposite direction (Wikipedia lagging
-on a brand-new ADDITION, which is much rarer and lower-impact than the
-removal-lag this fix addresses, and surfaces loudly rather than silently).
+SSGA-sourced membership list.
+
+SECTOR FALLBACK + COMPLETENESS GATE (alpha-engine-config-I11468): Wikipedia
+lags brand-new index ADDITIONS the same way it lagged JHG/BLD's removal. Until
+I11468 ``collect()`` tolerated up to 10 such members with a log warning and
+published them WITHOUT a ``sector_map`` entry, so the 2026-09-23 S&P 400 adds
+(AGNC, CORT, EAT, HUBS) reached signals as sector "Unknown" and
+ChallengerShadow refused the write. Now a member with no Wikipedia GICS row is
+classified from yfinance ``Ticker.info`` (sector + industry, mapped onto GICS
+by ``_YF_SECTOR_TO_GICS`` / ``_YF_INDUSTRY_TO_GICS``), with each fallback
+recorded in the published ``sector_fallback`` field. Any member that is STILL
+unclassified after that raises ``SectorCoverageIncomplete`` before anything is
+written, so every published constituent has a sector. More than
+``_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD`` members missing from Wikipedia is a
+parse/layout break, not addition-lag, and raises before the fallback runs.
 
 ``sub_industry_map`` (config#934 narrow slice, 2026-07-09): the Wikipedia
 constituents tables already scraped here carry a "GICS Sub-Industry" column
@@ -53,6 +63,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from io import BytesIO, StringIO
@@ -121,6 +132,13 @@ class SsgaWeights:
     index_of: dict[str, str] = field(default_factory=dict)
     raw_sum_by_index: dict[str, float] = field(default_factory=dict)
     method: str = "cache_no_weights"
+    #: Each fund's own member list, in file order and deduped WITHIN the fund
+    #: only (alpha-engine-config-I11470). The combined ``tickers`` list is
+    #: deduped ACROSS funds, so on a rebalance day a name both funds hold
+    #: appears once and the two counts stop describing it — which used to
+    #: make ``collect`` omit ``sp500_tickers`` in exactly the weeks the
+    #: membership moves. Empty on a cache-served run.
+    members_by_index: dict[str, list[str]] = field(default_factory=dict)
 
 
 # GICS sector name → sector ETF symbol
@@ -192,17 +210,61 @@ _HEADERS = {"User-Agent": "alpha-engine-data/1.0 (weekly-collector)"}
 # trailing legal-disclaimer text block (NaN ticker).
 _SSGA_TICKER_RE = re.compile(r"^[A-Z]{1,6}(\.[A-Z])?$")
 
-# Sector-classification is now sourced independently of membership
-# (config#2812), so a small number of SSGA-confirmed-current members can
-# legitimately have no Wikipedia sector row yet — Wikipedia lags brand-new
-# index ADDITIONS the same way it lagged JHG/BLD's REMOVAL, just verified
-# live to be a much smaller/quieter gap (2 tickers, TOST + IESC, both
-# recent legitimate additions, on the first live run of this fix). Warn
-# loudly and proceed for a small gap; a gap this large signals a genuine
-# parse/layout failure and still hard-fails, mirroring daily_append's
-# missing-from-closes convention (small-N tolerated + alerted, not silently
-# dropped, per feedback_no_silent_fails).
+class SectorCoverageIncomplete(RuntimeError):
+    """A constituent has no GICS sector after every classification source.
+
+    alpha-engine-config-I11468. Raised BEFORE any S3 write. A constituent
+    published without a sector is not a smaller correct answer: it reaches
+    signals as sector "Unknown", which the executor's sector caps cannot size
+    against, and ChallengerShadow refuses the whole write over it.
+    """
+
+
+# Wikipedia lags brand-new index ADDITIONS (config#2812: TOST + IESC on the
+# first live run; alpha-engine-config-I11468: AGNC, CORT, EAT, HUBS on
+# 2026-09-23). Up to this many members missing from the Wikipedia pass is
+# addition-lag and goes to the yfinance fallback below. More than this is a
+# parse/layout failure and raises BEFORE the fallback runs, so a Wikipedia
+# break can never move the whole universe onto yfinance's taxonomy.
 _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD = 10
+
+
+# yfinance ``info['sector']`` → GICS sector name (alpha-engine-config-I11468).
+# yfinance's sector taxonomy is Morningstar-derived, not GICS: the names
+# differ for six of the eleven sectors, so the mapping is spelled out and a
+# yfinance sector NOT listed here is treated as unclassified (raise), never
+# passed through or guessed. Measured 2026-09-24 against the 898 constituents
+# that carry both a Wikipedia GICS sector and a yfinance sector: this table
+# plus the industry overrides below agree with GICS for ~96% of names.
+_YF_SECTOR_TO_GICS: dict[str, str] = {
+    "Technology": "Information Technology",
+    "Healthcare": "Health Care",
+    "Financial Services": "Financials",
+    "Consumer Cyclical": "Consumer Discretionary",
+    "Consumer Defensive": "Consumer Staples",
+    "Communication Services": "Communication Services",
+    "Industrials": "Industrials",
+    "Energy": "Energy",
+    "Utilities": "Utilities",
+    "Real Estate": "Real Estate",
+    "Basic Materials": "Materials",
+}
+
+# yfinance ``info['industry']`` values whose GICS sector differs from the
+# sector-level mapping above. Each was UNANIMOUS in the 2026-09-24 measurement:
+# "REIT - Mortgage" (yfinance: Real Estate) is Financials under GICS since the
+# 2023 reclassification (2 of 2, and AGNC's case), and "Packaging &
+# Containers" (yfinance: Consumer Cyclical) is GICS Materials (11 of 11).
+_YF_INDUSTRY_TO_GICS: dict[str, str] = {
+    "REIT - Mortgage": "Financials",
+    "Packaging & Containers": "Materials",
+}
+
+# Pause between the fallback's per-ticker yfinance calls. Same value and
+# rationale as collectors/universe_classification.py (avoids HTTP 429). The
+# fallback only runs for members Wikipedia has not classified yet — a
+# handful in a week with index adds, zero otherwise.
+_YF_FALLBACK_DELAY_SECS = 0.4
 
 
 def collect(
@@ -228,21 +290,26 @@ def collect(
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
 
+    # A gap this large is a Wikipedia parse/layout break, not addition-lag.
+    # Raise BEFORE the fallback: otherwise the whole universe (~900 names,
+    # ~6 min of yfinance calls) would quietly move onto yfinance's taxonomy.
     unmapped = [t for t in tickers if t not in sector_map]
     if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
-        raise RuntimeError(
+        raise SectorCoverageIncomplete(
             f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
-            f"missing GICS sector (exceeds the {_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker "
-            f"tolerance for Wikipedia addition-lag). Sample: {unmapped[:10]}. EOD reconcile "
-            f"sector attribution depends on full coverage; aborting before write."
+            f"missing from the Wikipedia GICS pass (exceeds the "
+            f"{_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker addition-lag tolerance) — "
+            f"Wikipedia parse/layout break suspected; not falling back to yfinance "
+            f"for the universe. Sample: {unmapped[:10]}. Aborting before write."
         )
-    if unmapped:
-        logger.warning(
-            "Sector mapping: %d of %d tickers missing GICS sector (within the "
-            "%d-ticker Wikipedia addition-lag tolerance) — likely recent index "
-            "additions Wikipedia hasn't classified yet: %s",
-            len(unmapped), len(tickers), _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD, unmapped,
-        )
+
+    # alpha-engine-config-I11468: members Wikipedia has not classified yet
+    # (addition-lag, at most the threshold above) get a sector from yfinance;
+    # then EVERY member must have both a GICS sector and a sector ETF, or
+    # nothing is written.
+    sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
+    _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
+
     # Sub-industry is additive/best-effort — NOT a hard gate like sector
     # above. Nothing downstream consumes it yet (config#934 narrow slice),
     # so a partial or empty sub_industry_map must not block the weekly
@@ -272,8 +339,30 @@ def collect(
     # rather than written wrong: a reader that finds them absent falls back to
     # the same guarded prefix, where a reader that finds them WRONG has no way
     # to tell.
+    #
+    # alpha-engine-config-I11470: the counts stop describing the list on every
+    # REBALANCE day, when both funds hold the names moving between indices
+    # (2026-09-18: ILMN and P, joining the S&P 500 at the 2026-09-21 open) —
+    # so the keys were omitted in precisely the weeks membership changes, and
+    # the 2026-09-18 snapshot was skipped by historical_constituents. Each
+    # fund's own list is now carried from the fetch, so the per-index rosters
+    # are written from what each fund actually holds, and the names both hold
+    # are recorded as `index_overlap` rather than inferred from arithmetic.
     per_index: dict[str, list[str]] = {}
-    if sp500_count + sp400_count == len(tickers):
+    members = weights.members_by_index
+    if members.get("S&P 500") and members.get("S&P 400"):
+        per_index = {
+            "sp500_tickers": list(members["S&P 500"]),
+            "sp400_tickers": list(members["S&P 400"]),
+        }
+        overlap = sorted(set(members["S&P 500"]) & set(members["S&P 400"]))
+        if overlap:
+            per_index["index_overlap"] = overlap
+            logger.info(
+                "constituents: %d name(s) held by both SPY and MDY (a rebalance "
+                "in flight): %s", len(overlap), overlap,
+            )
+    elif sp500_count + sp400_count == len(tickers):
         per_index = {
             "sp500_tickers": tickers[:sp500_count],
             "sp400_tickers": tickers[sp500_count:],
@@ -294,6 +383,10 @@ def collect(
         "sector_etf_map": sector_etf_map,
         "sub_industry_map": sub_industry_map,
         "sub_sector_etf_map": sub_sector_etf_map,
+        # Members whose sector came from the yfinance fallback rather than
+        # Wikipedia's GICS table, with the raw yfinance evidence
+        # (alpha-engine-config-I11468). Empty in a week with no index adds.
+        "sector_fallback": sector_fallback,
         "sp500_count": sp500_count,
         "sp400_count": sp400_count,
         "total_count": len(tickers),
@@ -412,11 +505,138 @@ def collect(
         "count": len(tickers),
         "tickers": tickers,
         "sector_map_count": len(sector_etf_map),
+        "sector_fallback_count": len(sector_fallback),
         "sub_industry_map_count": len(sub_industry_map),
         "sub_sector_etf_map_count": len(sub_sector_etf_map),
         "weight_map_count": len(weights.weight_map),
         "weight_method": weights.method,
     }
+
+
+def _yfinance_classification(tickers: list[str]) -> dict[str, dict[str, str]]:
+    """Fetch ``{ticker: {"sector", "industry"} | {"error"}}`` from yfinance.
+
+    One ``Ticker.info`` call per ticker. A failure is RECORDED per ticker as
+    ``{"error": ...}`` — never dropped — so ``_assert_full_sector_coverage``
+    can name why a member stayed unclassified. SSGA spells share classes with
+    a dot (``BRK.B``); yfinance wants a dash (``BRK-B``).
+    """
+    from nousergon_lib.yfinance_quiet import quiet_yfinance
+
+    try:
+        import yfinance as yf
+    except ImportError as exc:
+        return {t: {"error": f"yfinance not importable: {exc}"} for t in tickers}
+
+    out: dict[str, dict[str, str]] = {}
+    with quiet_yfinance():
+        for i, ticker in enumerate(tickers):
+            if i > 0 and _YF_FALLBACK_DELAY_SECS > 0:
+                time.sleep(_YF_FALLBACK_DELAY_SECS)
+            try:
+                info = yf.Ticker(ticker.replace(".", "-")).info or {}
+            except Exception as exc:
+                out[ticker] = {"error": f"{type(exc).__name__}: {exc}"}
+                continue
+            out[ticker] = {
+                "sector": str(info.get("sector") or "").strip(),
+                "industry": str(info.get("industry") or "").strip(),
+            }
+    return out
+
+
+def _yf_to_gics(sector: str, industry: str) -> str | None:
+    """Map a yfinance sector/industry pair onto a GICS sector, or None.
+
+    Industry overrides win; an unknown or empty sector is None (unclassified),
+    never passed through — a non-GICS name would have no sector ETF and would
+    be a new bucket the executor's sector caps do not know.
+    """
+    if industry in _YF_INDUSTRY_TO_GICS:
+        return _YF_INDUSTRY_TO_GICS[industry]
+    return _YF_SECTOR_TO_GICS.get(sector)
+
+
+def _fill_missing_sectors(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_etf_map: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    """Classify members missing from the Wikipedia pass via yfinance, in place.
+
+    alpha-engine-config-I11468. Mutates ``sector_map`` / ``sector_etf_map``
+    for every member yfinance can classify onto a GICS sector, and returns
+    ``{ticker: evidence}`` for every member it TRIED: on success
+    ``{"source": "yfinance", "sector", "yf_sector", "yf_industry"}``, on
+    failure ``{"source": "yfinance", "error"}``. Only members lacking a
+    sector are looked up, so a normal week makes no yfinance call at all.
+    """
+    missing = [t for t in tickers if t not in sector_map]
+    if not missing:
+        return {}
+    logger.warning(
+        "Sector mapping: %d of %d members have no Wikipedia GICS row (likely "
+        "recent index additions) — classifying via yfinance fallback: %s",
+        len(missing), len(tickers), missing,
+    )
+    evidence: dict[str, dict[str, str]] = {}
+    for ticker, row in _yfinance_classification(missing).items():
+        if "error" in row:
+            evidence[ticker] = {"source": "yfinance", "error": row["error"]}
+            continue
+        gics = _yf_to_gics(row.get("sector", ""), row.get("industry", ""))
+        if gics is None:
+            evidence[ticker] = {
+                "source": "yfinance",
+                "error": (
+                    f"no GICS mapping for yfinance sector={row.get('sector')!r} "
+                    f"industry={row.get('industry')!r}"
+                ),
+            }
+            continue
+        sector_map[ticker] = gics
+        sector_etf_map[ticker] = GICS_TO_ETF[gics]
+        evidence[ticker] = {
+            "source": "yfinance",
+            "sector": gics,
+            "yf_sector": row.get("sector", ""),
+            "yf_industry": row.get("industry", ""),
+        }
+    logger.warning(
+        "Sector fallback: classified %d of %d via yfinance: %s",
+        sum("sector" in e for e in evidence.values()), len(missing),
+        {t: e.get("sector") or e.get("error") for t, e in evidence.items()},
+    )
+    return evidence
+
+
+def _assert_full_sector_coverage(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_etf_map: dict[str, str],
+    sector_fallback: dict[str, dict[str, str]],
+) -> None:
+    """Raise unless every member has a GICS sector AND a sector ETF.
+
+    alpha-engine-config-I11468: ``len(sector_map) == len(tickers)`` is the
+    producer's invariant, with no tolerance. Both maps are checked because
+    they are published separately — ``sector_map`` inside constituents.json,
+    ``sector_etf_map`` as ``data/sector_map.json`` for the feature store — and
+    a member missing from either is the same "Unknown" sector downstream.
+    """
+    unmapped = [t for t in tickers if t not in sector_map or t not in sector_etf_map]
+    if unmapped:
+        reasons = {
+            t: (sector_fallback.get(t) or {}).get("error", "no sector ETF for its GICS sector")
+            for t in unmapped
+        }
+        raise SectorCoverageIncomplete(
+            f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} "
+            f"constituents have no GICS sector after the Wikipedia pass and the "
+            f"yfinance fallback — refusing to publish constituents with an "
+            f"'Unknown' sector (alpha-engine-config-I11468). Reasons (first 10): "
+            f"{dict(list(reasons.items())[:10])}"
+        )
 
 
 def _select_constituents_table(tables: list[pd.DataFrame], index_name: str) -> pd.DataFrame:
@@ -473,6 +693,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
     weight_map: dict[str, float] = {}
     index_of: dict[str, str] = {}
     raw_sum_by_index: dict[str, float] = {}
+    members_by_index: dict[str, list[str]] = {}
     for index_name, url in _SSGA_HOLDINGS_URLS.items():
         resp = requests.get(url, headers=_HEADERS, timeout=30)
         resp.raise_for_status()
@@ -537,6 +758,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
         # 'weight in the S&P 500' means.
         normalised = {t: w / raw_sum for t, w in batch_weights.items()}
         tickers.extend(batch)
+        members_by_index[index_name] = list(dict.fromkeys(batch))
         weight_map.update(normalised)
         index_of.update({t: index_name for t in batch})
         raw_sum_by_index[index_name] = raw_sum
@@ -555,6 +777,7 @@ def _fetch_ssga_membership() -> tuple[list[str], int, int, SsgaWeights]:
         index_of=index_of,
         raw_sum_by_index=raw_sum_by_index,
         method="ssga_holdings_file",
+        members_by_index=members_by_index,
     )
     # dedupe, preserve order
     return list(dict.fromkeys(tickers)), sp500_count, sp400_count, weights
