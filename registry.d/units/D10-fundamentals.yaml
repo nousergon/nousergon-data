@@ -41,7 +41,11 @@ contract:
   schema: "contracts/fundamentals_snapshot.schema.json"
   producer_test: tests/test_fundamentals_snapshot_contract.py
   consumer_pins:
-    - "crucible-dashboard:tests/contracts/fundamentals_snapshot_s3_key_template.json (KEY-TEMPLATE pin, not the body schema — health_checker.py's `fundamentals` freshness check reads only the object key's embedded date, never the body)"
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/fundamentals_snapshot_s3_key_template.json"
+      pins: "key_template"
+      read_site: "health_checker.py::_find_latest_prefix"
+      note: "KEY-TEMPLATE pin, not the body schema: health_checker.py's `fundamentals` freshness check reads only the object key's embedded date, never the body"
   # P-07 (alpha-engine-config-I10873, I10934): D10 is CONNECTED
   # (crucible-dashboard health_checker.py's `fundamentals` freshness check
   # genuinely reads `archive/fundamentals/` — verified 2026-09-16, NOT the
