@@ -390,7 +390,7 @@ def validate_parquet(df: pd.DataFrame, ticker: str) -> dict:
 
     # ── 3. Extreme daily returns ────────────────────────────────────────────
     if "Close" in df.columns and len(df) >= 2:
-        returns = df["Close"].pct_change().dropna()
+        returns = df["Close"].ffill().pct_change(fill_method=None).dropna()
         extreme = returns.abs() > MAX_DAILY_RETURN
         n_extreme = extreme.sum()
         if n_extreme > 0:
