@@ -44,6 +44,7 @@ import argparse
 import json
 import logging
 import time
+from bisect import bisect_left
 from datetime import date, datetime, timezone
 from typing import Any, Callable
 
@@ -1091,14 +1092,20 @@ def _fred_series_history(series_ids: list[str], as_of: date, api_key: str, *, lo
 # ── S3 write (the single put-object site for this file) ──────────────────────
 
 
-def _write_json(s3_client: Any, bucket: str, key: str, obj: dict) -> None:
+def _write_json(
+    s3_client: Any, bucket: str, key: str, obj: dict, *, if_match: str | None = None,
+) -> None:
     """Write ``obj`` as compact JSON to ``s3://bucket/key``. The ONE put_object site in
     this module — every artifact (dated + latest) routes through here, so the
-    artifact-registry coverage guard pins a single count."""
+    artifact-registry coverage guard pins a single count. ``if_match`` makes the write
+    conditional on the object's current ETag (``scripts/restore_close_history_bars.py``
+    refuses to overwrite a publish that landed after it read)."""
+    extra = {"IfMatch": if_match} if if_match else {}
     s3_client.put_object(
         Bucket=bucket, Key=key,
         Body=json.dumps(obj, separators=(",", ":"), sort_keys=True).encode("utf-8"),
         ContentType="application/json",
+        **extra,
     )
 
 
@@ -1311,6 +1318,201 @@ def _grade_cardinality(
     }
 
 
+# ── Interior-bar carry-forward (alpha-engine-config-I11556) ──────────────────
+#
+# ``collect_history`` rebuilds every series from its sources on each run. A bar the
+# previous run published is therefore dropped the day a source stops answering it.
+# On 2026-09-22 yfinance's store lost that session for ~860 names; price_cache
+# heals its own interior holes (alpha-engine-config-I11553), but the 24 symbols
+# that reach this artifact only through the yfinance gap-fill (VOO, ASML, MELI, …)
+# had no source that still carried the bar, so the live consolidated.json lost it.
+# The fix: a session the previous publish carried STRICTLY INSIDE the fresh
+# series, and the fresh series omits, is carried forward from that publish.
+
+#: Max relative disagreement between the basis factor measured on the fresh bar
+#: before a carried session and the one measured on the fresh bar after it. The
+#: same tolerance, for the same reason, as the price-cache hole fill
+#: (``collectors/price_cache_holes.py``, alpha-engine-config-I11553): wider than
+#: rounding noise, narrower than any dividend worth correcting.
+CARRY_FACTOR_AGREEMENT = 1e-3
+
+
+def _coerce_series(raw: Any) -> dict[str, float] | None:
+    """``[[date, close], …]`` → ``{date: close}``; ``None`` when any row is malformed."""
+    try:
+        out = {str(d)[:10]: float(c) for d, c in raw}
+    except (TypeError, ValueError):
+        return None
+    return out
+
+
+def _is_session(day: str) -> bool:
+    from nousergon_lib.dates import is_trading_day
+
+    try:
+        return is_trading_day(date.fromisoformat(day))
+    except ValueError:
+        return False
+
+
+def carry_forward_interior_bars(
+    fresh: dict[str, list[tuple[str, float]]],
+    previous: dict[str, Any],
+    *,
+    tolerance: float = CARRY_FACTOR_AGREEMENT,
+) -> tuple[dict[str, list[tuple[str, float]]], list[dict], list[dict]]:
+    """Carry each previously published bar the fresh series omits from its interior.
+
+    Returns ``(series, carried, refused)``. ``series`` is ``fresh`` with the carried
+    bars merged in, ascending; a symbol with nothing to carry keeps its fresh list
+    object unchanged. ``carried`` / ``refused`` are one record per session.
+
+    The rules, each deliberate:
+
+    * **Interior only.** A session is a candidate only when it lies strictly
+      between the fresh series' first and last bar. The ends move for legitimate
+      reasons (the lookback window rolls forward; a symbol's newest session is not
+      yet printed), and extending a series is not this function's business.
+    * **The fresh bar wins.** A session the fresh series carries is never
+      touched, whatever the previous publish said about it.
+    * **NYSE sessions only.** A dropped non-session date is not a lost bar.
+    * **Onto the fresh basis.** The artifact is dividend-adjusted, so the
+      previous publish can sit on an older basis. The carried close is rescaled
+      by ``fresh / previous`` on the nearest fresh bar BEFORE it (always
+      required: an adjustment that became known after the previous publish has an
+      ex-date after it, so it rescaled that bar and the carried one alike). When
+      the nearest fresh bar AFTER it is also in the previous publish, the two
+      factors must agree within ``tolerance``; otherwise the carry is refused,
+      because a corporate action sits between them and one factor would be wrong
+      on one side. The upper anchor is optional because the day after a session
+      is lost, the previous publish ends ON that session (2026-09-23 was exactly
+      this case).
+    """
+    series: dict[str, list[tuple[str, float]]] = {}
+    carried: list[dict] = []
+    refused: list[dict] = []
+    for sym, fresh_series in fresh.items():
+        series[sym] = fresh_series
+        prev_raw = previous.get(sym)
+        if len(fresh_series) < 2 or not prev_raw:
+            continue
+        prev = _coerce_series(prev_raw)
+        if prev is None:
+            refused.append({"symbol": sym, "date": None, "reason": "previous_series_malformed"})
+            continue
+        fresh_map = {d: c for d, c in fresh_series}
+        fresh_dates = sorted(fresh_map)
+        first, last = fresh_dates[0], fresh_dates[-1]
+        candidates = sorted(d for d in prev if first < d < last and d not in fresh_map)
+        if not candidates:
+            continue
+        additions: list[tuple[str, float]] = []
+        for day in candidates:
+            if not _is_session(day):
+                refused.append({"symbol": sym, "date": day, "reason": "not_a_session"})
+                continue
+            i = bisect_left(fresh_dates, day)
+            lo, hi = fresh_dates[i - 1], fresh_dates[i]
+            if not (prev.get(lo) and fresh_map[lo] and prev[day] > 0):
+                refused.append({"symbol": sym, "date": day, "reason": "no_lower_anchor"})
+                continue
+            factor = fresh_map[lo] / prev[lo]
+            if prev.get(hi):
+                factor_hi = fresh_map[hi] / prev[hi]
+                if abs(factor / factor_hi - 1.0) > tolerance:
+                    refused.append({
+                        "symbol": sym, "date": day, "reason": "basis_factor_disagreement",
+                        "factor_before": factor, "factor_after": factor_hi,
+                    })
+                    continue
+            close = round(prev[day] * factor, 6)
+            additions.append((day, close))
+            carried.append({
+                "symbol": sym, "date": day, "close": close,
+                "previous_close": prev[day], "factor": factor,
+            })
+        if additions:
+            series[sym] = sorted([*fresh_series, *additions])
+    return series, carried, refused
+
+
+def _is_missing_object(exc: Exception) -> bool:
+    """True when ``exc`` means "no such S3 object" and nothing else."""
+    response = getattr(exc, "response", None)
+    code = response.get("Error", {}).get("Code") if isinstance(response, dict) else None
+    return code in {"NoSuchKey", "404"} or type(exc).__name__.lstrip("_") == "NoSuchKey"
+
+
+def read_published_close_history(s3_client: Any, bucket: str) -> tuple[dict[str, Any] | None, str]:
+    """The previously published consolidated ``series`` map → ``(series, basis)``.
+
+    ``basis`` is ``"read"``, ``"absent"`` or ``"unreadable"``.
+
+    **This read is RUN STATE, not an input** (`alpha-engine-config-I10891`): the run
+    publishes this same key, so what it reads here is the base of what it writes.
+    Under a shadow root it must resolve to the shadow's own copy, which
+    :func:`shadow.interceptor.own_state_reads` does. Read as a live input, the
+    publish of the same key a moment later raises ``ShadowGuardViolation``; read
+    live without being recorded, a shadow run would carry v1's bars into its own
+    output and grade v1 against itself. Outside a shadow root the scope is inert.
+    """
+    from shadow.interceptor import own_state_reads
+
+    try:
+        with own_state_reads():
+            obj = s3_client.get_object(Bucket=bucket, Key=CONSOLIDATED_CLOSE_HISTORY_KEY)
+        doc = json.loads(obj["Body"].read())
+        series = doc["series"]
+        if not isinstance(series, dict):
+            raise TypeError(f"'series' is {type(series).__name__}, not an object")
+    except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
+        if _is_missing_object(exc):
+            logger.info(
+                "[metron_market_data] no previously published %s — nothing to carry forward "
+                "(first publish, or a fresh shadow root)", CONSOLIDATED_CLOSE_HISTORY_KEY,
+            )
+            return None, "absent"
+        # DELIBERATE degrade, recorded at ERROR.
+        # (a) Failure mode: the previous publish exists but could not be read or
+        #     parsed (throttle, permissions, truncated body, schema change).
+        # (b) The primary deliverable survives: this run publishes exactly what the
+        #     pre-I11556 code published — the fresh series, with no carry. Failing
+        #     the run instead would withhold every fresh bar to protect a few old ones.
+        # (c) Recording surface: this ERROR line, and `carry_base: "unreadable"` in the
+        #     unit's result, which rides on the D21 run manifest.
+        logger.error(
+            "[metron_market_data] previously published %s unreadable (%s: %s) — publishing "
+            "WITHOUT the interior-bar carry-forward; any session a source omitted this run is "
+            "dropped from the artifact (alpha-engine-config-I11556)",
+            CONSOLIDATED_CLOSE_HISTORY_KEY, type(exc).__name__, exc,
+        )
+        return None, "unreadable"
+    return series, "read"
+
+
+def _log_carry(carried: list[dict], refused: list[dict]) -> None:
+    """One aggregated line for the carried bars, one for the refused ones."""
+    if carried:
+        logger.warning(
+            "[metron_market_data] close_history carried %d interior bar(s) across %d symbol(s) "
+            "forward from the previously published %s, because this run's source omitted them "
+            "(alpha-engine-config-I11556): %s",
+            len(carried), len({c["symbol"] for c in carried}), CONSOLIDATED_CLOSE_HISTORY_KEY,
+            ", ".join(
+                f"{c['symbol']}@{c['date']}={c['close']:g}"
+                + ("" if abs(c["factor"] - 1.0) < 1e-12 else f" (x{c['factor']:.6f})")
+                for c in carried
+            ),
+        )
+    if refused:
+        logger.warning(
+            "[metron_market_data] close_history REFUSED to carry %d interior bar(s) the source "
+            "omitted — those sessions are missing from this publish (alpha-engine-config-I11556): %s",
+            len(refused),
+            ", ".join(f"{r['symbol']}@{r['date']}:{r['reason']}" for r in refused),
+        )
+
+
 def collect_history(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None,
@@ -1346,6 +1548,13 @@ def collect_history(
     ``dates.assert_no_bar_after`` before anything is written. A bar after run_date
     RAISES; it is never trimmed at the write site.
 
+    Interior-bar carry-forward (alpha-engine-config-I11556): every series is rebuilt
+    from its sources, so a session a source stops answering would vanish from the
+    artifact. A session the previously published consolidated artifact carried strictly
+    inside a series, and this run's source omitted, is carried forward onto the fresh
+    basis (:func:`carry_forward_interior_bars`); a fresh bar always wins. That read is
+    run state under a shadow root (:func:`read_published_close_history`).
+
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     from datetime import date as _date
 
@@ -1377,6 +1586,17 @@ def collect_history(
         fx_history_source
         or (lambda ccys: _yfinance_fx_history(ccys, period, trading_day=trading_day))
     )(currencies)
+    # alpha-engine-config-I11556: a session the previous publish carried inside a
+    # series, and this run's source omitted, is carried forward rather than dropped.
+    previous, carry_base = read_published_close_history(s3_client, bucket)
+    carried: list[dict] = []
+    refused: list[dict] = []
+    if previous:
+        closes, carried, refused = carry_forward_interior_bars(closes, previous)
+        _log_carry(carried, refused)
+    carry_result = {
+        "carry_base": carry_base, "carried_bars": len(carried), "carry_refused": len(refused),
+    }
     for yf_sym, series in closes.items():
         assert_no_bar_after([d for d, _c in series], trading_day,
                             artifact=f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
@@ -1385,7 +1605,9 @@ def collect_history(
                             artifact=f"{FX_HISTORY_PREFIX}{ccy}.json")
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
-        return {"status": "ok_dry_run", "close_series": len(closes), "fx_series": len(fx)}
+        return {
+            "status": "ok_dry_run", "close_series": len(closes), "fx_series": len(fx), **carry_result,
+        }
     try:
         for yf_sym, series in sorted(closes.items()):
             _write_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json", {
@@ -1416,7 +1638,7 @@ def collect_history(
     # guessed/static list.
     return {
         "status": "ok", "close_series": len(closes), "fx_series": len(fx),
-        "fx_currencies": sorted(fx.keys()),
+        "fx_currencies": sorted(fx.keys()), **carry_result,
     }
 
 
