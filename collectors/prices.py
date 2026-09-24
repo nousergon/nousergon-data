@@ -454,13 +454,14 @@ def _polygon_split_scan(start: str, end: str) -> list:
 
 
 def _scrubbed(exc: Exception) -> str:
-    """``exc`` as text with any polygon apiKey removed (the scan's URL carries it)."""
-    try:
-        from polygon_client import _scrub_api_key
+    """``exc`` named by its type only.
 
-        return str(_scrub_api_key(exc))
-    except Exception:  # noqa: BLE001 - never let the scrubber mask the original failure
-        return type(exc).__name__
+    The split scan's request URL carries the polygon apiKey, and an HTTP
+    exception's text echoes that URL. A regex scrub is not a sanitiser CodeQL
+    (or a reviewer) can verify, so the message is never logged at all — the
+    type is enough to tell a 429 from a timeout from a parse error here.
+    """
+    return type(exc).__name__
 
 
 def _cache_ticker(polygon_ticker: str) -> str:
