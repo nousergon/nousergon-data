@@ -722,13 +722,16 @@ class TestStrictSuperset:
         assert guard["And"][0] == {"Variable": "$.ec2_instance_id", "IsPresent": True}
         assert guard["And"][1] == {"Variable": "$.ec2_instance_id", "IsString": True}
         assert guard["Next"] == "WrapEc2InstanceIdInArray"
-        assert norm["Default"] == "CheckShellRun"
+        # alpha-engine-config-I11268: every box-acquisition exit now passes
+        # SubstrateHealthGate before CheckShellRun (HEALTHY -> CheckShellRun),
+        # so a skip_* flag downstream can no longer route around the gate.
+        assert norm["Default"] == "SubstrateHealthGate"
         wrap = states["WrapEc2InstanceIdInArray"]
         assert wrap["Type"] == "Pass"
         assert "States.JsonMerge" in wrap["Parameters"]["merged.$"]
         assert "ec2_instance_id" in wrap["Parameters"]["merged.$"]
         assert wrap["OutputPath"] == "$.merged"
-        assert wrap["Next"] == "CheckShellRun"
+        assert wrap["Next"] == "SubstrateHealthGate"
 
     def test_initialize_input_merge_expr_unchanged(self, states):
         # The run_date / sns_topic_arn defaults-under-input merge must be
@@ -1482,7 +1485,7 @@ class TestHappyPathTraversal:
         # five extra states in the visited order before CheckShellRun (now six
         # per alpha-engine-config-I5687's InitWeeklyFreshnessSpotBootstrapPollCount
         # poll-budget seed).
-        assert order[: order.index("CheckSkipMorningEnrich") + 4] == [
+        assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
             "CheckWeeklyRunDayGate",
             # alpha-engine-config-I8809: the graph's ONE date normalization.
@@ -1521,10 +1524,13 @@ class TestHappyPathTraversal:
             # interrupted stage instead of re-running from stage 1. One extra
             # Choice in the visited order.
             "RouteAfterBootstrapSuccess",
-            "CheckShellRun",
-            "CheckSkipMorningEnrich",
+            # alpha-engine-config-I11268: the substrate gate moved from behind
+            # CheckSkipMorningEnrich's Default to right after box acquisition,
+            # ahead of CheckShellRun — same states, gate first.
             "SubstrateHealthGate",
             "CheckSubstrateHealthGate",
+            "CheckShellRun",
+            "CheckSkipMorningEnrich",
             "MorningEnrich",
         ]
 

@@ -720,7 +720,7 @@
     },
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_morning_enrich\": true} routes past the MorningEnrich state directly to the next skip-gate (CheckSkipDataPhase1). Missing flag = run as normal. MorningEnrich was split out of DataPhase1 by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run a completed morning-enrich. Useful for adhoc reruns where Friday's polygon-corrected daily_closes are already in ArcticDB but phase1 needs a re-run.",
+      "Comment": "Skip-gate. Input like {\"skip_morning_enrich\": true} routes past the MorningEnrich state directly to the next skip-gate (CheckSkipDataPhase1). Missing flag = run as normal. MorningEnrich was split out of DataPhase1 by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run a completed morning-enrich. Useful for adhoc reruns where Friday's polygon-corrected daily_closes are already in ArcticDB but phase1 needs a re-run. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Choices": [
         {
           "And": [
@@ -736,7 +736,7 @@
           "Next": "CheckSkipDataPhase1"
         }
       ],
-      "Default": "SubstrateHealthGate"
+      "Default": "MorningEnrich"
     },
     "MorningEnrich": {
       "Type": "Task",
@@ -8161,7 +8161,7 @@
     },
     "SubstrateHealthGate": {
       "Type": "Task",
-      "Comment": "config#2249: fast pre-dispatch substrate health gate, immediately before MorningEnrich (the first state to actually dispatch work to the Saturday box). A dead/unhealthy dispatch box (disk full, or the SSM agent wedged/unresponsive so a command silently never registers) used to be discovered only after MorningEnrich burned its full 'gold 4+2' retry ladder (config#2279, up to ~15 min) before falling into the generic PipelineFailure path. This ONE Lambda invocation issues its own tiny SSM `df` probe command and polls it to a terminal status internally (bounded well under this Task's own TimeoutSeconds), returning verdict=HEALTHY or verdict=SUBSTRATE_UNHEALTHY with a distinct reason (disk_full / ssm_unresponsive / ssm_command_never_registered) \u2014 see infrastructure/lambdas/substrate-health-gate/index.py. Deliberately a SEPARATE fast pre-check, not a replacement for MorningEnrich's own resilience: MorningEnrich keeps its full retry ladder for real transient issues once dispatch is confirmed healthy. Adds ~10-20s to every Saturday run (accepted \u2014 the Saturday run has slack, unlike the tight weekday pre-open buffer; NOT wired into the weekday SF). ResultSelector captures the WHOLE Lambda payload under .gate (verdict/message/reason/disk_used_percent/...) rather than cherry-picking $.Payload.<key>: the Lambda's documented contract emits `reason` ONLY on the SUBSTRATE_UNHEALTHY verdicts, so a prior per-key select of `reason.$: $.Payload.reason` crashed EVERY healthy run with States.Runtime '$.Payload.reason could not be found' (the gate could never pass on a healthy box \u2014 surfaced by the 2026-07-17 Friday preflight shell run). Passthrough lets each consumer read only fields the producer guarantees for its branch (Choice reads .gate.verdict; the non-HEALTHY Extract reads .gate.reason). Contract regression-guarded by tests/test_sf_substrate_gate_contract_wiring.py. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates. It keys no artifact here (this gate declares output: none) \u2014 its only use is the stage-coverage assertion's grouping key (alpha-engine-config-I10172), and it must be the trading day because that is what every other Lambda-backed coverage-asserting state in this graph keys its verdict by.",
+      "Comment": "config#2249: fast pre-dispatch substrate health gate, immediately before MorningEnrich (the first state to actually dispatch work to the Saturday box). A dead/unhealthy dispatch box (disk full, or the SSM agent wedged/unresponsive so a command silently never registers) used to be discovered only after MorningEnrich burned its full 'gold 4+2' retry ladder (config#2279, up to ~15 min) before falling into the generic PipelineFailure path. This ONE Lambda invocation issues its own tiny SSM `df` probe command and polls it to a terminal status internally (bounded well under this Task's own TimeoutSeconds), returning verdict=HEALTHY or verdict=SUBSTRATE_UNHEALTHY with a distinct reason (disk_full / ssm_unresponsive / ssm_command_never_registered) \u2014 see infrastructure/lambdas/substrate-health-gate/index.py. Deliberately a SEPARATE fast pre-check, not a replacement for MorningEnrich's own resilience: MorningEnrich keeps its full retry ladder for real transient issues once dispatch is confirmed healthy. Adds ~10-20s to every Saturday run (accepted \u2014 the Saturday run has slack, unlike the tight weekday pre-open buffer; NOT wired into the weekday SF). ResultSelector captures the WHOLE Lambda payload under .gate (verdict/message/reason/disk_used_percent/...) rather than cherry-picking $.Payload.<key>: the Lambda's documented contract emits `reason` ONLY on the SUBSTRATE_UNHEALTHY verdicts, so a prior per-key select of `reason.$: $.Payload.reason` crashed EVERY healthy run with States.Runtime '$.Payload.reason could not be found' (the gate could never pass on a healthy box \u2014 surfaced by the 2026-07-17 Friday preflight shell run). Passthrough lets each consumer read only fields the producer guarantees for its branch (Choice reads .gate.verdict; the non-HEALTHY Extract reads .gate.reason). Contract regression-guarded by tests/test_sf_substrate_gate_contract_wiring.py. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates. It keys no artifact here (this gate declares output: none) \u2014 its only use is the stage-coverage assertion's grouping key (alpha-engine-config-I10172), and it must be the trading day because that is what every other Lambda-backed coverage-asserting state in this graph keys its verdict by. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "arn:aws:lambda:us-east-1:711398986525:function:alpha-engine-substrate-health-gate",
@@ -8201,7 +8201,7 @@
     },
     "CheckSubstrateHealthGate": {
       "Type": "Choice",
-      "Comment": "config#2249: branches on SubstrateHealthGate's verdict. HEALTHY -> proceed into MorningEnrich as normal. SUBSTRATE_UNHEALTHY (any reason) -> short-circuit straight to the named-failure path WITHOUT ever entering MorningEnrich's own retry ladder \u2014 the whole point is failing fast (<2 min) instead of burning ~15 min discovering the same dead box via 4 retries.",
+      "Comment": "config#2249: branches on SubstrateHealthGate's verdict. HEALTHY -> proceed into MorningEnrich as normal. SUBSTRATE_UNHEALTHY (any reason) -> short-circuit straight to the named-failure path WITHOUT ever entering MorningEnrich's own retry ladder \u2014 the whole point is failing fast (<2 min) instead of burning ~15 min discovering the same dead box via 4 retries. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Choices": [
         {
           "And": [
@@ -8214,7 +8214,7 @@
               "StringEquals": "HEALTHY"
             }
           ],
-          "Next": "MorningEnrich"
+          "Next": "CheckShellRun"
         }
       ],
       "Default": "ExtractSubstrateHealthGateError"
@@ -8347,7 +8347,7 @@
     },
     "NormalizeEc2InstanceId": {
       "Type": "Choice",
-      "Comment": "config#2248 normalization guard: the CheckSpotDispatchNeeded escape hatch (ec2_instance_id already present on the execution input) passes the value through verbatim \u2014 but some callers (e.g. certain director-verify input shapes) supply it as a plain string instead of the [\"i-...\"] array every downstream sendCommand InstanceIds.$ expects. This gate inspects the shape: a string gets wrapped into a one-element array by WrapEc2InstanceIdInArray; an array passes straight through to CheckShellRun. The dispatch path (Default \u2192 DispatchWeeklyFreshnessSpot \u2192 MergeWeeklyFreshnessSpotInstanceId) already guarantees array shape, so this gate is only reached via the escape hatch. IsPresent-guarded (per config#2275 Choice guard convention) \u2014 though the upstream CheckSpotDispatchNeeded.IsPresent already guarantees the field exists by the time we reach this gate, the guard is defensive against future topology changes.",
+      "Comment": "config#2248 normalization guard: the CheckSpotDispatchNeeded escape hatch (ec2_instance_id already present on the execution input) passes the value through verbatim \u2014 but some callers (e.g. certain director-verify input shapes) supply it as a plain string instead of the [\"i-...\"] array every downstream sendCommand InstanceIds.$ expects. This gate inspects the shape: a string gets wrapped into a one-element array by WrapEc2InstanceIdInArray; an array passes straight through to CheckShellRun. The dispatch path (Default \u2192 DispatchWeeklyFreshnessSpot \u2192 MergeWeeklyFreshnessSpotInstanceId) already guarantees array shape, so this gate is only reached via the escape hatch. IsPresent-guarded (per config#2275 Choice guard convention) \u2014 though the upstream CheckSpotDispatchNeeded.IsPresent already guarantees the field exists by the time we reach this gate, the guard is defensive against future topology changes. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Choices": [
         {
           "And": [
@@ -8363,16 +8363,16 @@
           "Next": "WrapEc2InstanceIdInArray"
         }
       ],
-      "Default": "CheckShellRun"
+      "Default": "SubstrateHealthGate"
     },
     "WrapEc2InstanceIdInArray": {
       "Type": "Pass",
-      "Comment": "config#2248: wrap a bare-string $.ec2_instance_id (from the CheckSpotDispatchNeeded escape hatch) into the one-element array [\"i-...\"] that every downstream sendCommand InstanceIds.$ expects. Mirrors MergeWeeklyFreshnessSpotInstanceId's JsonMerge pattern exactly \u2014 the only difference is the source field ($.ec2_instance_id instead of $.weekly_freshness_spot_result.instance_id).",
+      "Comment": "config#2248: wrap a bare-string $.ec2_instance_id (from the CheckSpotDispatchNeeded escape hatch) into the one-element array [\"i-...\"] that every downstream sendCommand InstanceIds.$ expects. Mirrors MergeWeeklyFreshnessSpotInstanceId's JsonMerge pattern exactly \u2014 the only difference is the source field ($.ec2_instance_id instead of $.weekly_freshness_spot_result.instance_id). | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Parameters": {
         "merged.$": "States.JsonMerge($, States.StringToJson(States.Format('\\{\"ec2_instance_id\":[\"{}\"]\\}', $.ec2_instance_id)), false)"
       },
       "OutputPath": "$.merged",
-      "Next": "CheckShellRun"
+      "Next": "SubstrateHealthGate"
     },
     "DispatchWeeklyFreshnessSpot": {
       "Type": "Task",
@@ -9621,7 +9621,7 @@
     },
     "RouteAfterBootstrapSuccess": {
       "Type": "Choice",
-      "Comment": "A bootstrapped launcher box means one of two things. First boot: fall through to CheckShellRun and run the pipeline from stage 1. REPLACEMENT box after a substrate loss: resume at the interrupted stage instead -- falling through would re-run every stage the lost box already completed, which for the weekly pipeline means duplicate side effects (config#2252: duplicate model-zoo promotion emails) on top of hours of wasted compute.",
+      "Comment": "A bootstrapped launcher box means one of two things. First boot: fall through to CheckShellRun and run the pipeline from stage 1. REPLACEMENT box after a substrate loss: resume at the interrupted stage instead -- falling through would re-run every stage the lost box already completed, which for the weekly pipeline means duplicate side effects (config#2252: duplicate model-zoo promotion emails) on top of hours of wasted compute. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Choices": [
         {
           "Variable": "$.substrate_relaunch_attempts",
@@ -9629,7 +9629,7 @@
           "Next": "ResumeAfterSubstrateRelaunch"
         }
       ],
-      "Default": "CheckShellRun"
+      "Default": "SubstrateHealthGate"
     },
     "SubstrateRelaunchGate": {
       "Type": "Choice",
@@ -9727,7 +9727,7 @@
     },
     "ResumeAfterSubstrateRelaunch": {
       "Type": "Choice",
-      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work.",
+      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
       "Choices": [
         {
           "And": [
@@ -9831,7 +9831,7 @@
               "StringEquals": "WeeklyFreshnessSpotBootstrap/SubstrateLost"
             }
           ],
-          "Next": "CheckShellRun"
+          "Next": "SubstrateHealthGate"
         }
       ],
       "Default": "NormalizeSubstrateResumeContext"
