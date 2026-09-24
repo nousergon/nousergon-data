@@ -2,8 +2,12 @@
 prices.py — Refresh stale price cache parquets and upload to S3.
 
 Two-phase staleness check:
-  1. Fast: polygon grouped-daily (1 API call) gets latest close for all US stocks.
-     Compare against S3 parquet last-modified dates to find stale tickers.
+  1. Fast: list the LIVE ``reference/price_cache/`` tree (via
+     ``price_cache_read_prefixes`` — never the legacy ``predictor/price_cache/``
+     tree frozen 2026-06-19, alpha-engine-config-I11518) and compare each
+     parquet's last-modified time, on the trading-day axis, with the run's
+     trading day. A split guard adds any fresh ticker whose history does not
+     reflect a split executed in the last 30 days (polygon split scan).
   2. Refresh: yfinance batch download for stale tickers only (10y full rewrite).
 
 Why yfinance for refresh (not polygon): polygon free tier only has ~2 years
@@ -31,7 +35,7 @@ from __future__ import annotations
 
 import logging
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 import boto3
@@ -120,9 +124,12 @@ def collect(
     all_tickers = list(dict.fromkeys(tickers + _ALWAYS_DOWNLOAD))
 
     # ── Fast staleness check via S3 metadata ─────────────────────────────────
-    # Instead of downloading all parquets, just list them and check last-modified
+    # Instead of downloading all parquets, list the LIVE prefix and check
+    # last-modified (alpha-engine-config-I11518), plus the split guard.
+    split_forced: dict[str, str] = {}
     stale = _find_stale_fast(
         s3, bucket, s3_prefix, all_tickers, staleness_threshold_days, reference_date,
+        forced_refresh=split_forced,
     )
 
     if not stale:
@@ -189,6 +196,12 @@ def collect(
             )
         ],
     }
+    if split_forced:
+        # alpha-engine-config-I11518: every ticker the split guard pulled into
+        # the refresh although it was fresh by age, with the reason (bounded:
+        # a split scan failure names the whole fresh set, so cap the sample).
+        result["split_forced_refresh"] = len(split_forced)
+        result["split_forced_sample"] = dict(list(split_forced.items())[:20])
     if short_fetch_retries:
         # alpha-engine-config-I11287: never silent — every ticker that
         # entered the short-fetch guard's bounded retry is named here with
@@ -267,6 +280,66 @@ def _reject_caret_tickers(tickers: list[str], context: str) -> list[str]:
     return clean
 
 
+def _implied_last_bar(last_modified: datetime) -> date:
+    """The newest NYSE session whose close had settled when an object was
+    written — the most a parquet written at ``last_modified`` can hold.
+
+    ``LastModified``'s UTC calendar date overstates that: the daily EOD refresh
+    writes at ~23:xx UTC, and a run that crosses midnight (the 2026-09-23
+    rehearsal launched at 00:00 UTC — alpha-engine-config-I11467) stamps D+1 on
+    a parquet whose last bar is D, which let a ``max_stale=1`` gate tolerate a
+    TWO-session lag. A write during a session likewise cannot hold that
+    session. Mapping the write instant onto the trading-day axis is never less
+    conservative than the calendar date: it can only make a parquet read older.
+    """
+    from nousergon_lib.dates import last_closed_trading_day
+
+    ts = last_modified
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    return last_closed_trading_day(ts)
+
+
+def _list_live_cache(s3, bucket: str, prefix: str) -> dict[str, tuple[str, datetime]]:
+    """``{ticker: (key, LastModified)}`` for every per-ticker parquet under the
+    LIVE read prefixes (``price_cache_read_prefixes(prefix)``), first prefix
+    wins per ticker.
+
+    alpha-engine-config-I11518: this used to list ``prefix`` verbatim, and every
+    production caller passes the retired ``predictor/price_cache/`` sentinel,
+    whose tree froze on 2026-06-19 (939 objects). Every ticker therefore read
+    stale on every run and was re-fetched for 10 years. The sentinel now
+    resolves through the same chokepoint the refresh WRITES through, so the scan
+    sees what the writer produced. Only direct children of a prefix count — a
+    nested key cannot stand in for a missing ticker.
+    """
+    existing: dict[str, tuple[str, datetime]] = {}
+    paginator = s3.get_paginator("list_objects_v2")
+    for read_prefix in price_cache_read_prefixes(prefix):
+        n = 0
+        for page in paginator.paginate(Bucket=bucket, Prefix=read_prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith(".parquet") or not key.startswith(read_prefix):
+                    continue
+                rest = key[len(read_prefix):]
+                if "/" in rest:
+                    continue
+                ticker = rest[: -len(".parquet")]
+                if ticker.startswith("^"):
+                    logger.warning(
+                        "_find_stale_fast: stray caret-prefixed price-cache key %s "
+                        "excluded from the staleness map — bare names are the "
+                        "contract for this listing. See alpha-engine-config-I9288.",
+                        key,
+                    )
+                    continue
+                n += 1
+                existing.setdefault(ticker, (key, obj["LastModified"]))
+        logger.info("S3 cache: %d parquets under s3://%s/%s", n, bucket, read_prefix)
+    return existing
+
+
 def _find_stale_fast(
     s3,
     bucket: str,
@@ -274,16 +347,29 @@ def _find_stale_fast(
     all_tickers: list[str],
     staleness_threshold_days: int,
     reference_date: str | date | None = None,
+    *,
+    split_scan=None,
+    forced_refresh: "dict[str, str] | None" = None,
 ) -> list[str]:
     """
     Fast staleness check using S3 object metadata (no downloads).
 
-    Lists all parquets in the cache, checks LastModified timestamp against
-    ``reference_date`` on the NYSE trading-day axis (nousergon_lib.dates.
-    is_fresh_in_trading_days) — holiday/weekend-aware, so the same
-    ``staleness_threshold_days`` value means "N trading sessions behind"
-    whether this runs weekly or daily. Any ticker with no parquet, or a
-    parquet more than ``staleness_threshold_days`` sessions stale, is stale.
+    Lists the per-ticker parquets under the LIVE read prefixes
+    (:func:`_list_live_cache` — never the retired ``predictor/price_cache/``
+    tree, alpha-engine-config-I11518) and maps each object's ``LastModified``
+    onto the NYSE trading-day axis (:func:`_implied_last_bar`), then checks it
+    against ``reference_date`` with nousergon_lib.dates.is_fresh_in_trading_days
+    — holiday/weekend-aware, so the same ``staleness_threshold_days`` value
+    means "N trading sessions behind" whether this runs weekly or daily.
+
+    A ticker is stale when it has NO object under the live prefixes (a full
+    fetch, never a silent skip), when its parquet is more than
+    ``staleness_threshold_days`` sessions behind, or when the split guard
+    (:func:`_split_guard`) finds a recent split the parquet's history does not
+    reflect. ``split_scan(start, end) -> list[CorporateAction]`` defaults to the
+    polygon whole-market split scan; tests inject one. ``forced_refresh``, if
+    given, is filled in place with ``{ticker: reason}`` for every ticker the
+    split guard added.
 
     A ``^``-prefixed basename must never become a ticker here (alpha-engine-
     config-I9288): neither a stray S3 key discovered by listing nor a
@@ -293,42 +379,217 @@ def _find_stale_fast(
     """
     from nousergon_lib.dates import is_fresh_in_trading_days
 
-    reference = reference_date if reference_date is not None else datetime.now(timezone.utc).date()
+    reference = as_trading_day(
+        reference_date if reference_date is not None else datetime.now(timezone.utc).date()
+    )
 
     all_tickers = _reject_caret_tickers(all_tickers, "_find_stale_fast: requested tickers")
 
-    # Build map of ticker -> last modified from S3 listing
-    existing: dict[str, datetime] = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=bucket, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith(".parquet"):
-                continue
-            ticker = key.split("/")[-1].replace(".parquet", "")
-            if ticker.startswith("^"):
-                logger.warning(
-                    "_find_stale_fast: stray caret-prefixed price-cache key %s "
-                    "excluded from the staleness map — bare names are the "
-                    "contract for this listing. See alpha-engine-config-I9288.",
-                    key,
-                )
-                continue
-            existing[ticker] = obj["LastModified"]
-
-    logger.info("S3 cache: %d parquets found", len(existing))
+    existing = _list_live_cache(s3, bucket, prefix)
 
     stale: list[str] = []
+    fresh: dict[str, tuple[str, datetime]] = {}
+    n_missing = 0
     for ticker in all_tickers:
-        last_mod = existing.get(ticker)
-        if last_mod is None:
+        found = existing.get(ticker)
+        if found is None:
+            n_missing += 1
             stale.append(ticker)
         elif not is_fresh_in_trading_days(
-            last_mod.date(), reference, max_stale=staleness_threshold_days,
+            _implied_last_bar(found[1]), reference, max_stale=staleness_threshold_days,
         ):
             stale.append(ticker)
+        else:
+            fresh[ticker] = found
 
+    forced = _split_guard(s3, bucket, fresh, reference, split_scan=split_scan)
+    if forced_refresh is not None:
+        forced_refresh.update(forced)
+    if forced:
+        already = set(stale)
+        stale = [t for t in all_tickers if t in already or t in forced]
+
+    logger.info(
+        "Staleness (threshold=%d sessions, reference=%s): %d requested, %d missing "
+        "under the live prefix, %d aged out, %d forced by the split guard, %d fresh",
+        staleness_threshold_days, reference.isoformat(), len(all_tickers), n_missing,
+        len(stale) - n_missing - len(forced), len(forced), len(fresh) - len(forced),
+    )
     return stale
+
+
+# ── Split guard (alpha-engine-config-I11518) ────────────────────────────────
+# Before I11518 the scan read the frozen legacy tree, so every ticker was
+# re-fetched (10y, ``auto_adjust=True``) on every run and any split was folded
+# into the whole history within a day, whatever else had touched the parquet.
+# Once the scan reads the live tree a fresh parquet is SKIPPED, and two things
+# can then leave its history on the wrong scale:
+#   1. it was written before a split's ex_date — the whole history sits on the
+#      pre-split basis until the ticker next ages out;
+#   2. the chronic-gap self-heal (``weekly_collector._self_heal_chronic_polygon_gaps``)
+#      APPENDED post-split adjusted rows onto pre-split history. That write
+#      bumps LastModified, so the append itself makes the seam look fresh.
+# Either way the fix is the full re-fetch this module already does, so the
+# guard only decides WHICH fresh tickers get one. Splits come from polygon's
+# whole-market split scan (one call per run); a ticker's parquet is read only
+# when a split executed after it was written could still be un-flattened in it.
+# Window over which executed splits are considered. Covers any fresh parquet's
+# age (a few sessions at every configured threshold) with room for a self-heal
+# seam written weeks after the ticker's last full rewrite.
+_SPLIT_GUARD_LOOKBACK_DAYS = 30
+
+
+def _polygon_split_scan(start: str, end: str) -> list:
+    """Whole-market splits executed in ``[start, end]`` as CorporateActions.
+
+    RAISES on any client or fetch failure (unlike ``corporate_actions.
+    detect_splits``, which degrades to ``[]``): the guard must be able to tell
+    "no splits" from "could not look", because the second one has to fall back
+    to a full refresh rather than skip tickers blind.
+    """
+    from corporate_actions import splits_from_events
+    from polygon_client import polygon_client
+
+    return splits_from_events(polygon_client().get_recent_splits(start, end))
+
+
+def _scrubbed(exc: Exception) -> str:
+    """``exc`` named by its type only.
+
+    The split scan's request URL carries the polygon apiKey, and an HTTP
+    exception's text echoes that URL. A regex scrub is not a sanitiser CodeQL
+    (or a reviewer) can verify, so the message is never logged at all — the
+    type is enough to tell a 429 from a timeout from a parse error here.
+    """
+    return type(exc).__name__
+
+
+def _cache_ticker(polygon_ticker: str) -> str:
+    """Polygon class-share tickers use ``.`` (``BRK.B``); the cache uses ``-``."""
+    return str(polygon_ticker).replace(".", "-")
+
+
+def _split_seam_reason(df: pd.DataFrame, action, implied_last: date) -> "str | None":
+    """Why ``df`` (a fresh parquet) does not reflect ``action``, or None if it does."""
+    from corporate_actions import _ORIENTATION_MIN_SEPARATION, expected_factor, price_evidence_orientation
+
+    ex = as_trading_day(action.ex_date)
+    label = f"split {action.split_from}:{action.split_to} ex {ex.isoformat()}"
+    last_bar = _last_bar_date(df.index) if not df.empty else None
+    if last_bar is None or last_bar < ex:
+        return (
+            f"{label}: parquet ends {last_bar.isoformat() if last_bar else 'empty'}, "
+            "before the ex_date, so its whole history is on the pre-split basis"
+        )
+    try:
+        factor = expected_factor(action)
+    except Exception:  # noqa: BLE001 - malformed ratio: nothing to test the seam against
+        return None
+    if 1.0 / _ORIENTATION_MIN_SEPARATION < factor < _ORIENTATION_MIN_SEPARATION:
+        # A near-1 record (polygon's 1000:1061 spinoff-style ratios) cannot be
+        # told apart from an ordinary daily move, so only the ex_date/last-bar
+        # checks above apply to it.
+        return None
+    if "Close" not in df.columns:
+        return f"{label}: parquet has no Close column to check the boundary"
+    close = df["Close"].copy()
+    idx = pd.to_datetime(close.index)
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    close.index = idx
+    verdict = price_evidence_orientation(close.dropna(), action)
+    if verdict in ("direct", "inverse", "ambiguous"):
+        return (
+            f"{label}: the adjusted Close still jumps by the split factor at the "
+            f"boundary ({verdict}) — pre-split rows were never re-adjusted"
+        )
+    return None
+
+
+def _split_guard(
+    s3,
+    bucket: str,
+    fresh: dict[str, tuple[str, datetime]],
+    reference: date,
+    *,
+    split_scan=None,
+) -> dict[str, str]:
+    """``{ticker: reason}`` for every FRESH ticker whose parquet does not
+    reflect a split executed in the last ``_SPLIT_GUARD_LOOKBACK_DAYS``.
+
+    * Written before the ex_date (by :func:`_implied_last_bar`) → re-fetch,
+      no read needed.
+    * Written on/after it → read the parquet: a last bar before the ex_date, or
+      a boundary move matching the split factor (the self-heal append seam),
+      → re-fetch. A read failure → re-fetch (the refresh has its own guards;
+      skipping blind is the failure this exists to stop).
+
+    If the split scan itself fails, EVERY fresh ticker is returned: that is the
+    pre-I11518 full refresh, never a skip made without looking.
+    """
+    if not fresh:
+        return {}
+    scan = split_scan if split_scan is not None else _polygon_split_scan
+    start = reference - timedelta(days=_SPLIT_GUARD_LOOKBACK_DAYS)
+    try:
+        actions = scan(start.isoformat(), reference.isoformat())
+    except Exception as exc:  # noqa: BLE001 - degrade to a full refresh, never a blind skip
+        logger.warning(
+            "Split guard: the polygon split scan failed (%s) — refreshing all %d "
+            "fresh tickers this run rather than skipping them without knowing "
+            "whether a split restated their history (alpha-engine-config-I11518).",
+            _scrubbed(exc), len(fresh),
+        )
+        return {t: "split scan unavailable this run" for t in fresh}
+
+    by_ticker: dict[str, list] = {}
+    for action in actions or []:
+        if getattr(action, "type", "split") != "split":
+            continue
+        try:
+            ex = as_trading_day(action.ex_date)
+        except Exception:  # noqa: BLE001 - unparseable ex_date is not a candidate
+            continue
+        if ex > reference:
+            continue
+        ticker = _cache_ticker(action.ticker)
+        if ticker in fresh:
+            by_ticker.setdefault(ticker, []).append(action)
+
+    import io as _io
+
+    forced: dict[str, str] = {}
+    for ticker, ticker_actions in by_ticker.items():
+        key, last_modified = fresh[ticker]
+        implied_last = _implied_last_bar(last_modified)
+        reason = None
+        df = None
+        for action in sorted(ticker_actions, key=lambda a: a.ex_date):
+            ex = as_trading_day(action.ex_date)
+            if implied_last < ex:
+                reason = (
+                    f"split {action.split_from}:{action.split_to} ex {ex.isoformat()}: "
+                    f"parquet written {last_modified.isoformat()} (holds at most "
+                    f"{implied_last.isoformat()}), before the ex_date"
+                )
+                break
+            if df is None:
+                try:
+                    obj = s3.get_object(Bucket=bucket, Key=key)
+                    df = pd.read_parquet(_io.BytesIO(obj["Body"].read()))
+                except Exception as exc:  # noqa: BLE001 - unverifiable → re-fetch, logged below
+                    reason = f"could not read s3://{bucket}/{key} to check the split: {exc}"
+                    break
+            reason = _split_seam_reason(df, action, implied_last)
+            if reason:
+                break
+        if reason:
+            forced[ticker] = reason
+            logger.warning(
+                "Split guard: %s is fresh by age but will be re-fetched — %s "
+                "(alpha-engine-config-I11518).", ticker, reason,
+            )
+    return forced
 
 
 # Row count below which a "full period" yfinance refresh is treated as

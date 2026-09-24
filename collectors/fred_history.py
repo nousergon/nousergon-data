@@ -87,12 +87,35 @@ FRED_HISTORY_MAP: dict[str, str] = {
     "BAA10Y": "BAA10Y",
 }
 
+# The FRED-ONLY macro symbols: series with no market-data twin, so FRED is
+# their only legitimate source. Kept apart from the four caret indices above
+# because the two sets are fetched through different namespaces:
+#
+# * the caret indices ride ``collectors/daily_closes.collect``'s ticker list
+#   as ``^VIX`` etc., where a FRED miss falls through to yfinance on the same
+#   ``^`` symbol — the correct instrument;
+# * these symbols must NEVER enter that ticker list. ``staging/daily_closes``
+#   is keyed by bare ticker and shares its namespace with equities, and
+#   ``TWO`` is also the Two Harbors equity: polygon's grouped-daily would
+#   hand back the equity bar under the ``TWO`` key, and a FRED miss would fall
+#   through to yfinance, which answers ``TWO`` with the equity too.
+#
+# So ``builders/daily_append.py`` fetches these by FRED series id, through
+# :func:`fetch_fred_history` only, and writes them straight to the ArcticDB
+# ``macro`` library. A FRED miss is a named miss there, never a fallthrough
+# (alpha-engine-config-I11523). Derived from ``FRED_HISTORY_MAP`` so the
+# series ids stay declared once.
+FRED_ONLY_MACRO_SERIES: dict[str, str] = {
+    sym: FRED_HISTORY_MAP[sym] for sym in ("TWO", "HYOAS", "BAA10Y")
+}
+
 
 def fetch_fred_history(
     series_id: str,
     period_years: int = 10,
     api_key: str | None = None,
     end_date: "date | datetime | str | None" = None,
+    start_date: "date | datetime | str | None" = None,
 ) -> pd.DataFrame:
     """Fetch a multi-year date-range time series from FRED.
 
@@ -105,6 +128,9 @@ def fetch_fred_history(
         end_date: last observation date to request (inclusive) — the run's
             trading day on every publishing path (alpha-engine-config-I10893).
             ``None`` means today (UTC) and is only for ad-hoc/operator reads.
+        start_date: first observation date to request (inclusive). Overrides
+            ``period_years`` when given — the daily append asks for a short
+            trailing window, not ten years (alpha-engine-config-I11523).
 
     Returns:
         DataFrame indexed by date (DatetimeIndex, ascending) with a
@@ -124,7 +150,10 @@ def fetch_fred_history(
         as_trading_day(end_date) if end_date is not None
         else datetime.now(timezone.utc).date()
     )
-    start_date = end_date - timedelta(days=int(period_years * 365.25) + 7)
+    if start_date is not None:
+        start_date = as_trading_day(start_date)
+    else:
+        start_date = end_date - timedelta(days=int(period_years * 365.25) + 7)
 
     params = {
         "series_id": series_id,
