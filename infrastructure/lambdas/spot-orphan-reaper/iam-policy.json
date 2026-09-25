@@ -19,6 +19,12 @@
       }
     },
     {
+      "Sid": "ReadWeeklyRehearsalExecutionStatus",
+      "Effect": "Allow",
+      "Action": "states:DescribeExecution",
+      "Resource": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:rehearsal-*"
+    },
+    {
       "Sid": "EmitOrphanMetric",
       "Effect": "Allow",
       "Action": "cloudwatch:PutMetricData",
