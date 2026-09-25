@@ -41,6 +41,7 @@ from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exc
 from data_gate import evidence as ev
 from data_gate import exit_criteria as xc
 from data_gate import standalone
+from data_gate import trigger_reconcile as tr
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
 from data_gate.inventory import scan
 
@@ -107,6 +108,7 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
     "data.phase1.consecutive_morning_cycles",
     "data.phase1.consecutive_weekly_cycles",
     "data.phase1.v1_data_stage_quiet",
+    "data.phase1.triggers_reconciled",
     "data.phase1.cost_baseline_measured",
     "data.phase2.eod_universe_covered",
     "data.phase2.empty_fresh_free",
@@ -1211,6 +1213,35 @@ def _clause_phase1_v1_data_stage_quiet(store: ev.GateStore) -> Clause:
     )
 
 
+def _clause_phase1_triggers_reconciled(
+    store: ev.GateStore, units: list[Unit], *, trading_day: dt.date
+) -> Clause:
+    """Declared ``trigger.schedule`` vs the LIVE trigger (`alpha-engine-config-
+    I11189` deliverable 2, with `-I11194`'s DISABLED-annotation check).
+
+    Phase 1, beside the ``run_record`` criterion it underwrites: every
+    ``run_record`` clause grades a scheduled unit from its DECLARED fire, so a
+    declaration that has drifted from the live trigger turns healthy units red
+    (I11189: thirteen of them, for a week) or, with a stale DISABLED
+    annotation, hides a live trigger from grading altogether. See
+    `data_gate/trigger_reconcile.py`.
+    """
+    from data_gate.cadence import gate_moment
+
+    return _exit_clause(
+        "data.phase1.triggers_reconciled",
+        (
+            "every non-retired unit's declared trigger.schedule reconciles with its LIVE trigger — "
+            f"declared fires matched by live fires within {int(tr.FIRE_TOLERANCE.total_seconds() // 60)} "
+            "min (EventBridge rule / Scheduler entry expression, the owning state machine's execution "
+            "starts, or the workflow file's cron), and a DISABLED annotation agreeing with the live "
+            "state in both directions. A declaration that cannot be reconciled is UNMEASURABLE, never MET"
+        ),
+        tr.read_triggers_reconciled(store, units, as_of=gate_moment(trading_day)),
+        phase="data-phase1",
+    )
+
+
 #: Brian's ruling, 2026-09-21 (verbatim), on why this clause is STANDING and
 #: not a phase-1/2/3 exit gate — see :class:`StandingClause`:
 #:
@@ -1455,6 +1486,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_reliability_weekly_streak(weekly))
     clauses.append(_clause_board_collector_code_identity(weekly))
     clauses.append(_clause_phase1_v1_data_stage_quiet(store))
+    clauses.append(_clause_phase1_triggers_reconciled(store, units, trading_day=trading_day))
     clauses.append(_clause_phase1_cost_baseline_measured(store))
     clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
     clauses.append(_clause_phase2_empty_fresh_free(eod))

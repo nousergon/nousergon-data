@@ -104,6 +104,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # (alpha-engine-config-I11272) — re-evaluate for a REGISTERED row once
     # that lands and a scheduled run first writes the key.
     "data_gate/producers/cost_monthly.py": 1,
+    # alpha-engine-config-I11189 deliverable 2 — the fourth phase-exit-metrics.yml
+    # producer, scheduled as its `trigger_observation` job: one metric-document
+    # PUT, data_collection/metrics/trigger_observation/latest.json (plus the
+    # shared _run_record.py PUT above), read by data.phase1.triggers_reconciled.
+    # GRANDFATHERED in alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml
+    # (`data_collection/metrics/trigger_observation/`) until its IAM grant is
+    # applied and a scheduled run first writes the key — the same posture
+    # cost_monthly.py took — then re-evaluated for a REGISTERED row.
+    "data_gate/producers/trigger_observation.py": 1,
     # alpha-engine-config-I11312 — the on-spot FULL-profile preflight pass's
     # observe-mode verdict, one object per execution under
     # health/weekly_preflight_on_spot/<run_date>/<execution>.json. GRANDFATHERED
