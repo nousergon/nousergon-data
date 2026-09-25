@@ -51,9 +51,13 @@ class YfinanceAnalystAdapter:
         return self._yf
 
     def fetch(self, ticker: str) -> AnalystSnapshot | None:
+        from collectors.yahoo_session import YahooAuthError, yahoo_info
+
         try:
             with quiet_yfinance():
-                info = self._get_yf().Ticker(ticker).info
+                info = yahoo_info(ticker, yf_module=self._get_yf())
+        except YahooAuthError:
+            raise  # a rejected session is not a per-ticker miss (alpha-engine-config-I11578)
         except Exception as e:
             logger.warning(
                 "[yfinance_analyst] fetch failed for %s: %s", ticker, e,
