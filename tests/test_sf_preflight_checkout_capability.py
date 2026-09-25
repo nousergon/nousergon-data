@@ -59,6 +59,30 @@ def _definition_checkouts() -> set:
     return found
 
 
+def _definition_checkout_command_count() -> int:
+    """How many ``commands.$`` values name a checkout: what tool_contracts
+    must report as ``checked``. Derived from the definition, so the floor
+    moves with it (a stage retired by a cutover is not a vacuous check)."""
+    count = 0
+
+    def walk(node):
+        nonlocal count
+        if isinstance(node, dict):
+            for k, v in node.items():
+                if k == "commands.$" and isinstance(v, str):
+                    if (sp.scan_command_checkouts(v)
+                            or sp._parse_checkout_repo(v.split()) is not None):
+                        count += 1
+                else:
+                    walk(v)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item)
+
+    walk(json.loads(_DEFINITION.read_text(encoding="utf-8")))
+    return count
+
+
 # ── 1. what CAP_CHECKOUT means ───────────────────────────────────────────────
 
 
@@ -199,7 +223,9 @@ def test_tool_contracts_passes_the_committed_definition_on_real_pin_shapes(
     }))
     result = sp.check_tool_contracts(None)
     assert result.status == "ok", result.details
-    assert result.details["checked"] >= 20
+    expected = _definition_checkout_command_count()
+    assert expected > 0, "the committed definition names no checkout at all"
+    assert result.details["checked"] == expected
 
 
 def test_tool_contracts_still_fails_a_pin_that_is_too_old(monkeypatch, tmp_path):
