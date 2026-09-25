@@ -36,7 +36,7 @@ import pandas as pd
 from collectors.constituents import GICS_TO_ETF
 from collectors.fundamentals import _fetch_single_ticker
 from collectors.metron_market_data import load_metron_universe
-from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, vendor_request_window
+from dates import FutureBarError, assert_no_bar_after, clip_to_trading_day, history_window
 from features.feature_engineer import FEATURES, MIN_ROWS_FOR_FEATURES, compute_features
 from features.writer import write_feature_snapshot
 from nousergon_lib.yfinance_quiet import yf_quiet
@@ -88,14 +88,11 @@ def _fetch_ticker_ohlcv(
     reads a pre-populated cache. Bounded to ``[trading_day − period, trading_day]``
     via explicit ``start``/``end`` (never ``period=``, which ends at vendor "now"
     and could publish a partial post-close bar into these display-only
-    factor-scoring features on a rerun). The request reaches D + 2
-    (``dates.vendor_request_window``) and the response is clipped to D, because a
-    held EU/Asian listing's exchange-local ``end = D + 1`` has already passed on a
-    same-evening run and D's bar came back missing (alpha-engine-config-I11548).
-    Returns None on fetch failure or insufficient history (never fabricates)."""
+    factor-scoring features on a rerun). Returns None on fetch failure or
+    insufficient history (never fabricates)."""
     import yfinance as yf
 
-    window_start, window_end_excl = vendor_request_window(trading_day, period)
+    window_start, window_end_excl = history_window(trading_day, period)
     try:
         df = yf.download(
             ticker,
@@ -112,9 +109,7 @@ def _fetch_ticker_ohlcv(
         return None
     if isinstance(df.columns, pd.MultiIndex):  # yf.download can nest columns even for one ticker
         df.columns = df.columns.get_level_values(0)
-    df = clip_to_trading_day(
-        df, trading_day, label=f"metron_supplemental_ohlcv[{ticker}]", expect_rows_after=True,
-    )
+    df = clip_to_trading_day(df, trading_day, label=f"metron_supplemental_ohlcv[{ticker}]")
     assert_no_bar_after(
         df.index, trading_day,
         artifact=f"{SUPPLEMENTAL_PREFIX}{trading_day}/technical.parquet#{ticker}",
