@@ -60,8 +60,10 @@ Promotion criterion (§7a obligation 2): promote ``fail`` to HALTING when two
 consecutive observed cycles (a Friday rehearsal and the following Saturday)
 each show, in the S3 record above:
   1. ``verdict`` != ``ERROR`` and the SF recorded ``observed: true``;
-  2. ``group_required_skip_count == 0`` — all seven ARCTIC/REPO_MODULES/
-     POLYGON checks actually RAN (the issue's closes-when);
+  2. ``group_required_skip_count == 0`` and ``blocked_count == 0`` — all
+     seven ARCTIC/REPO_MODULES/POLYGON checks actually RAN (the issue's
+     closes-when). A ``blocked`` check did not run: its upstream failed
+     (alpha-engine-config-I11566);
   3. no ``fail`` that was not a true positive — every fail in the window is
      either absent or was confirmed against the system it describes (a fail
      that was the probe's own environment is a false positive and resets the
@@ -100,6 +102,14 @@ log = logging.getLogger("sf_preflight_on_spot")
 MODE = "observe"
 PROFILE = "weekly-spot-full"
 DEFAULT_BUCKET = "alpha-engine-research"
+# Explicit, never ambient (alpha-engine-config-I11567): the SSM shell this runs
+# in exports no AWS_DEFAULT_REGION, so a region-less ``boto3.client
+# ("cloudwatch")`` raised NoRegionError and the I11312 observe window recorded
+# no metric at all (rehearsal-2026-09-24-1: ``metric_error: "NoRegionError"``).
+# Same value as ``sf_preflight._REGION``, pinned equal by
+# tests/test_sf_preflight_on_spot.py; restated rather than imported so an
+# ERROR verdict whose cause is sf_preflight's own import still emits.
+REGION = "us-east-1"
 ARTIFACT_PREFIX = "health/weekly_preflight_on_spot"
 METRIC_NAMESPACE = "AlphaEngine/WeeklyPreflight"
 
@@ -195,7 +205,9 @@ def classify(results: list) -> dict:
             expected_skips.append(r["name"])
     if summary["fail_count"]:
         verdict = "FAIL"
-    elif group_skips:
+    elif group_skips or summary["blocked_count"]:
+        # A blocked check did not run. With no fail beside it (its upstream
+        # was never run at all) that is an unobserved check, never an OK.
         verdict = "BLIND_SPOT"
     else:
         verdict = "OK"
@@ -210,6 +222,8 @@ def classify(results: list) -> dict:
         "group_required_skip_count": len(group_skips),
         "group_required_skip_names": group_skips,
         "expected_skip_names": expected_skips,
+        "blocked_count": summary["blocked_count"],
+        "blocked_names": summary["blocked_names"],
         "fail_names": [r["name"] for r in summary["fail_results"]],
         "warn_names": [r["name"] for r in summary["warn_results"]],
         "results": summary["result_dicts"],
@@ -251,7 +265,7 @@ def _write_artifact(bucket: str, key: str, record: dict) -> "str | None":
     try:
         import boto3
 
-        boto3.client("s3").put_object(
+        boto3.client("s3", region_name=REGION).put_object(
             Bucket=bucket, Key=key,
             Body=json.dumps(record, indent=2, default=str).encode(),
             ContentType="application/json",
@@ -270,7 +284,7 @@ def _emit_metrics(record: dict) -> "str | None":
         import boto3
 
         dims = [{"Name": "Profile", "Value": PROFILE}]
-        boto3.client("cloudwatch").put_metric_data(
+        boto3.client("cloudwatch", region_name=REGION).put_metric_data(
             Namespace=METRIC_NAMESPACE,
             MetricData=[
                 {"MetricName": name, "Dimensions": dims, "Value": float(value), "Unit": "Count"}
@@ -296,6 +310,7 @@ def verdict_line(record: dict, artifact_uri: str) -> str:
     keys = (
         "mode", "verdict", "ran_count", "fail_count", "required_skip_count",
         "group_required_skip_count", "group_required_skip_names", "fail_names",
+        "blocked_names",
         "expected_skip_names", "error", "timed_out", "artifact_error",
         "metric_error", "elapsed_seconds",
     )
@@ -341,7 +356,8 @@ def main(argv: "list[str] | None" = None) -> int:
         )
     elif record["verdict"] in ("ERROR", "BLIND_SPOT"):
         log.error("on-spot preflight %s: %s", record["verdict"],
-                  record.get("error") or record.get("group_required_skip_names"))
+                  record.get("error") or record.get("group_required_skip_names")
+                  or record.get("blocked_names"))
 
     print(verdict_line(record, f"s3://{args.bucket}/{key}"))
     return OBSERVED_FAIL_EXIT_CODE if record["verdict"] == "FAIL" else 0

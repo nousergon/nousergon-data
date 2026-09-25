@@ -107,7 +107,13 @@ _UNIVERSE_SAMPLE_SIZE = 20
 @dataclass
 class CheckResult:
     name: str
-    status: str  # "ok" | "warn" | "fail" | "skip" (capability absent — see CHECK_CAPABILITIES)
+    # "ok" | "warn" | "fail"
+    # | "skip"    — capability absent in this ENVIRONMENT (see CHECK_CAPABILITIES)
+    # | "blocked" — not run because an UPSTREAM check that produces this one's
+    #               input did not (see _blocked); the upstream's own result
+    #               carries the cause, so a blocked check is never a second
+    #               failure of the same cause (alpha-engine-config-I11566)
+    status: str
     message: str
     details: dict = field(default_factory=dict)
     elapsed_seconds: float = 0.0
@@ -146,6 +152,49 @@ class PreflightContext:
     # arctic must read these from ctx instead of re-initializing.
     universe_lib: "Any | None" = None
     macro_lib: "Any | None" = None
+    # {check name: status} of every check run_preflight has already run in
+    # this pass, so a dependent can tell an upstream that FAILED (blocked)
+    # from one that deliberately degraded (e.g. polygon's no-key warn).
+    check_statuses: dict = field(default_factory=dict)
+
+
+# Which check populates each context field a dependent check reads. A
+# dependent that finds its input unpopulated reports status="blocked" naming
+# these producers, instead of a second "fail" for the producer's one cause
+# (alpha-engine-config-I11566: rehearsal-2026-09-24-1 read fail_count 5 for
+# one constituents_fetch false positive).
+_CONTEXT_PRODUCERS: "dict[str, str]" = {
+    "fresh_constituents": "constituents_fetch",
+    "arctic_universe_symbols": "arctic_connectivity",
+    "universe_lib": "arctic_connectivity",
+    "polygon_returned_tickers": "polygon_grouped_coverage",
+}
+
+
+def _blocked(ctx: "PreflightContext", name: str, fields: "tuple[str, ...]", t0: float) -> "CheckResult | None":
+    """``status="blocked"`` if any of ``fields`` is unpopulated, else None.
+
+    A blocked check did not RUN — it is not a pass — and it is not a
+    failure either: the check that should have produced its input has
+    already reported the cause. Counting it as ``fail`` made one cause read
+    as N failures and hid which check actually broke.
+    """
+    import time
+
+    missing = [f for f in fields if getattr(ctx, f) is None]
+    if not missing:
+        return None
+    blocked_by = sorted({_CONTEXT_PRODUCERS[f] for f in missing})
+    return CheckResult(
+        name=name,
+        status="blocked",
+        message=(
+            f"Blocked: not run — {', '.join(blocked_by)} did not produce its input "
+            f"(that check's own result carries the cause)"
+        ),
+        details={"blocked_by": blocked_by, "missing_context": missing},
+        elapsed_seconds=time.time() - t0,
+    )
 
 
 # ── Individual checks ─────────────────────────────────────────────────────────
@@ -155,13 +204,29 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
     """Catches PR #135 class: ``constituents.collect()`` return-shape regressions.
 
     Calls the real ``_fetch_constituents()`` (Wikipedia, no rate limit) and
-    asserts the contract: non-empty tickers, complete sector map. The S&P
-    500/400 split must each contribute their expected ~500/~400 counts.
+    asserts the contract: non-empty tickers, and the sector coverage
+    ``collect()`` will actually enforce. The S&P 500/400 split must each
+    contribute their expected ~500/~400 counts.
+
+    Sector coverage goes through ``collectors.constituents.
+    resolve_sector_coverage`` — the SAME function ``collect()`` calls — so
+    this predicts ``collect()`` instead of a stricter copy of its pre-I11468
+    rule. Until alpha-engine-config-I11566 this check failed whenever ANY
+    member lacked a Wikipedia sector, while ``collect()`` had since I11468
+    filled up to 10 of them from yfinance and succeeded (rehearsal-2026-09-24-1:
+    AGNC, HUBS, CORT, EAT — 903/903 published). It now fails exactly when
+    ``collect()`` would raise: more than the addition-lag threshold missing,
+    or any member still unclassified after the fallback. A normal week has
+    nothing missing and makes no yfinance call.
     """
     import time
     t0 = time.time()
     try:
-        from collectors.constituents import _fetch_constituents
+        from collectors.constituents import (
+            SectorCoverageIncomplete,
+            _fetch_constituents,
+            resolve_sector_coverage,
+        )
         (
             tickers, sector_map, sector_etf_map, sub_industry_map,
             sp500, sp400, _weights,
@@ -196,21 +261,37 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
             elapsed_seconds=time.time() - t0,
         )
     unmapped = [t for t in tickers if t not in sector_map]
-    if unmapped:
+    try:
+        sector_fallback = resolve_sector_coverage(tickers, sector_map, sector_etf_map)
+    except SectorCoverageIncomplete as exc:
         return CheckResult(
             name="constituents_fetch",
             status="fail",
-            message=f"sector_map missing for {len(unmapped)} tickers (collect would raise)",
+            message=(
+                f"sector_map missing for {len(unmapped)} tickers after collect()'s "
+                f"threshold + yfinance fallback (collect would raise): {exc}"
+            ),
             details={"unmapped_sample": unmapped[:10]},
             elapsed_seconds=time.time() - t0,
         )
 
     ctx.fresh_constituents = set(tickers)
+    fallback_note = (
+        f"; {len(sector_fallback)} sector(s) via collect()'s yfinance fallback "
+        f"({', '.join(sorted(sector_fallback))})"
+        if sector_fallback else ""
+    )
     return CheckResult(
         name="constituents_fetch",
         status="ok",
-        message=f"Wikipedia OK: {len(tickers)} tickers ({sp500} S&P 500 + {sp400} S&P 400)",
-        details={"total": len(tickers), "sp500": sp500, "sp400": sp400},
+        message=(
+            f"Wikipedia OK: {len(tickers)} tickers ({sp500} S&P 500 + {sp400} S&P 400)"
+            f"{fallback_note}"
+        ),
+        details={
+            "total": len(tickers), "sp500": sp500, "sp400": sp400,
+            "sector_fallback": sector_fallback,
+        },
         elapsed_seconds=time.time() - t0,
     )
 
@@ -265,13 +346,9 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
     """
     import time
     t0 = time.time()
-    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
-        return CheckResult(
-            name="universe_drift",
-            status="fail",
-            message="Skipped: prior checks failed to populate context",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(ctx, "universe_drift", ("fresh_constituents", "arctic_universe_symbols"), t0)
+    if blocked is not None:
+        return blocked
 
     from features.compute import _SKIP_TICKERS, _is_sector_etf
 
@@ -292,13 +369,9 @@ def check_universe_drift(ctx: PreflightContext) -> CheckResult:
 
     # Reuse the universe lib from check_arctic_connectivity to avoid the
     # macOS arcticdb re-init crash (see PreflightContext docstring).
-    if ctx.universe_lib is None:
-        return CheckResult(
-            name="universe_drift",
-            status="fail",
-            message="Skipped: arctic_connectivity did not populate universe_lib",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(ctx, "universe_drift", ("universe_lib",), t0)
+    if blocked is not None:
+        return blocked
     universe_lib = ctx.universe_lib
     import pandas as pd
     today_ts = pd.Timestamp(ctx.today)
@@ -374,13 +447,11 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
     """
     import time
     t0 = time.time()
-    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
-        return CheckResult(
-            name="universe_sample_freshness",
-            status="fail",
-            message="Skipped: prior checks failed to populate context",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(
+        ctx, "universe_sample_freshness", ("fresh_constituents", "arctic_universe_symbols"), t0,
+    )
+    if blocked is not None:
+        return blocked
 
     import arcticdb as adb
     import pandas as pd
@@ -398,13 +469,9 @@ def check_universe_sample_freshness(ctx: PreflightContext) -> CheckResult:
     rng = random.Random(ctx.today)
     sample = rng.sample(relevant, min(_UNIVERSE_SAMPLE_SIZE, len(relevant)))
 
-    if ctx.universe_lib is None:
-        return CheckResult(
-            name="universe_sample_freshness",
-            status="fail",
-            message="Skipped: arctic_connectivity did not populate universe_lib",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(ctx, "universe_sample_freshness", ("universe_lib",), t0)
+    if blocked is not None:
+        return blocked
     universe_lib = ctx.universe_lib
     today = pd.Timestamp(ctx.today).normalize()
 
@@ -457,13 +524,9 @@ def check_polygon_grouped_coverage(ctx: PreflightContext) -> CheckResult:
     """
     import time
     t0 = time.time()
-    if ctx.fresh_constituents is None:
-        return CheckResult(
-            name="polygon_grouped_coverage",
-            status="fail",
-            message="Skipped: constituents fetch failed",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(ctx, "polygon_grouped_coverage", ("fresh_constituents",), t0)
+    if blocked is not None:
+        return blocked
 
     from nousergon_lib.secrets import get_secret
     if not get_secret("POLYGON_API_KEY", required=False):
@@ -547,20 +610,23 @@ def check_predicted_missing_from_closes(ctx: PreflightContext) -> CheckResult:
     """
     import time
     t0 = time.time()
-    if ctx.fresh_constituents is None or ctx.arctic_universe_symbols is None:
-        return CheckResult(
-            name="predicted_missing_from_closes",
-            status="fail",
-            message="Skipped: prior checks failed to populate context",
-            elapsed_seconds=time.time() - t0,
-        )
+    blocked = _blocked(
+        ctx, "predicted_missing_from_closes", ("fresh_constituents", "arctic_universe_symbols"), t0,
+    )
+    if blocked is not None:
+        return blocked
     if ctx.polygon_returned_tickers is None:
-        return CheckResult(
-            name="predicted_missing_from_closes",
-            status="warn",
-            message="Skipped: polygon check skipped (no API key locally)",
-            elapsed_seconds=time.time() - t0,
-        )
+        # polygon's own no-key path is a deliberate WARN (laptop preflight);
+        # anything else that left the ticker set unpopulated — a polygon
+        # fail, or polygon itself blocked — is this check being blocked.
+        if ctx.check_statuses.get("polygon_grouped_coverage") == "warn":
+            return CheckResult(
+                name="predicted_missing_from_closes",
+                status="warn",
+                message="Skipped: polygon check skipped (no API key locally)",
+                elapsed_seconds=time.time() - t0,
+            )
+        return _blocked(ctx, "predicted_missing_from_closes", ("polygon_returned_tickers",), t0)
 
     # Simulate post-prune state: arctic ∩ constituents (stragglers gone).
     post_prune_arctic = ctx.arctic_universe_symbols & ctx.fresh_constituents
@@ -2359,7 +2425,11 @@ def summarize_results(results: "list[CheckResult]") -> dict:
     fail_results = [r for r in result_dicts if r.get("status") == "fail"]
     warn_results = [r for r in result_dicts if r.get("status") == "warn"]
     skip_results = [r for r in result_dicts if r.get("status") == "skip"]
-    ran_count = len(result_dicts) - len(skip_results)
+    # alpha-engine-config-I11566: a BLOCKED check did not run either — its
+    # upstream's result carries the cause — so it is neither a fail (that
+    # would count one cause N times) nor a ran check.
+    blocked_results = [r for r in result_dicts if r.get("status") == "blocked"]
+    ran_count = len(result_dicts) - len(skip_results) - len(blocked_results)
     required_skips = [
         r for r in skip_results
         if CHECK_REQUIRED.get(f"check_{r['name']}", True)
@@ -2375,6 +2445,9 @@ def summarize_results(results: "list[CheckResult]") -> dict:
         "skip_count": len(skip_results),
         "required_skip_count": len(required_skips),
         "required_skip_names": [r["name"] for r in required_skips],
+        "blocked_results": blocked_results,
+        "blocked_count": len(blocked_results),
+        "blocked_names": [r["name"] for r in blocked_results],
     }
 
 
@@ -2452,6 +2525,7 @@ def run_preflight(
                 ),
                 details={"required": sorted(required), "missing": sorted(missing)},
             ))
+            ctx.check_statuses[results[-1].name] = results[-1].status
             continue
         try:
             results.append(check_fn(ctx))
@@ -2461,6 +2535,7 @@ def run_preflight(
                 status="fail",
                 message=f"Check raised: {type(exc).__name__}: {exc}",
             ))
+        ctx.check_statuses[results[-1].name] = results[-1].status
     n_fail = sum(1 for r in results if r.status == "fail")
     return n_fail, results
 
@@ -2470,7 +2545,7 @@ def run_preflight(
 
 def _format_human(results: list[CheckResult]) -> str:
     lines = ["", "=" * 70, " Saturday SF Preflight ", "=" * 70, ""]
-    icons = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[SKIP]"}
+    icons = {"ok": "[OK]  ", "warn": "[WARN]", "fail": "[FAIL]", "skip": "[SKIP]", "blocked": "[BLKD]"}
     for r in results:
         lines.append(f"{icons.get(r.status, '[?]   ')} {r.name:<32} {r.message}")
         if r.status == "fail" and r.details:
@@ -2478,14 +2553,19 @@ def _format_human(results: list[CheckResult]) -> str:
                 lines.append(f"        {k}: {v}")
     n_fail = sum(1 for r in results if r.status == "fail")
     n_warn = sum(1 for r in results if r.status == "warn")
+    n_blocked = sum(1 for r in results if r.status == "blocked")
     lines.append("")
     lines.append("-" * 70)
-    if n_fail == 0 and n_warn == 0:
+    if n_fail == 0 and n_blocked:
+        lines.append(f" Predicted SF outcome: INCOMPLETE ({n_blocked} check(s) blocked, {n_warn} warning(s))")
+    elif n_fail == 0 and n_warn == 0:
         lines.append(" Predicted SF outcome: PASS")
     elif n_fail == 0:
         lines.append(f" Predicted SF outcome: PASS with {n_warn} warning(s)")
     else:
         lines.append(f" Predicted SF outcome: FAIL ({n_fail} failure(s), {n_warn} warning(s))")
+    if n_fail and n_blocked:
+        lines.append(f" {n_blocked} check(s) BLOCKED by an upstream failure — not run, not counted as failures")
     lines.append("=" * 70)
     return "\n".join(lines)
 
@@ -2509,7 +2589,10 @@ def main() -> int:
     else:
         print(_format_human(results))
 
-    return 1 if n_fail > 0 else 0
+    # A blocked check did not run, so a run with one is not a PASS even when
+    # nothing failed (only reachable when its upstream was not run at all).
+    n_blocked = sum(1 for r in results if r.status == "blocked")
+    return 1 if n_fail > 0 or n_blocked > 0 else 0
 
 
 if __name__ == "__main__":

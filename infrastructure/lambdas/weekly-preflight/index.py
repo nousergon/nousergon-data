@@ -302,6 +302,13 @@ def handler(event: dict, context) -> dict:
     ran_count = summary["ran_count"]
     required_skip_count = summary["required_skip_count"]
     required_skip_names = summary["required_skip_names"]
+    # alpha-engine-config-I11566: a check BLOCKED by an upstream that did not
+    # produce its input did not run. Beside a fail it is already explained by
+    # that fail (and never counted as a second one); on its own it is an
+    # unobserved required check, so it degrades exactly like a required skip.
+    # `.get` so a sf_preflight predating the field still packages cleanly.
+    blocked_count = summary.get("blocked_count", 0)
+    blocked_names = summary.get("blocked_names", [])
     declared_count = len(getattr(sfp, "CHECKS", ()) or ()) or len(result_dicts)
 
     def _metrics(status: str) -> dict:
@@ -329,6 +336,8 @@ def handler(event: dict, context) -> dict:
             "ran_count": ran_count,
             "required_skip_count": required_skip_count,
             "required_skip_names": required_skip_names,
+            "blocked_count": blocked_count,
+            "blocked_names": blocked_names,
             "failures": [r["name"] for r in fail_results],
             "results": result_dicts,
         }
@@ -365,7 +374,7 @@ def handler(event: dict, context) -> dict:
     # shape. A required check that RAN and found a real violation still
     # hard-fails above via has_violation — this branch is reached only when
     # every check that ran passed.
-    if required_skip_count > 0:
+    if required_skip_count > 0 or blocked_count > 0:
         metrics = _metrics("DEGRADED")
         return {
             "status": "DEGRADED",
@@ -373,6 +382,8 @@ def handler(event: dict, context) -> dict:
             "has_violation": False,
             "degraded": True,
             "degraded_reason": "required_checks_unreachable",
+            "blocked_count": blocked_count,
+            "blocked_names": blocked_names,
             "warn_count": len(warn_results),
             "skip_count": len(skip_results),
             "ran_count": ran_count,

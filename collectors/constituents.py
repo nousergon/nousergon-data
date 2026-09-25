@@ -290,25 +290,9 @@ def collect(
     if not tickers:
         return {"status": "error", "error": "No tickers fetched"}
 
-    # A gap this large is a Wikipedia parse/layout break, not addition-lag.
-    # Raise BEFORE the fallback: otherwise the whole universe (~900 names,
-    # ~6 min of yfinance calls) would quietly move onto yfinance's taxonomy.
-    unmapped = [t for t in tickers if t not in sector_map]
-    if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
-        raise SectorCoverageIncomplete(
-            f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
-            f"missing from the Wikipedia GICS pass (exceeds the "
-            f"{_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker addition-lag tolerance) — "
-            f"Wikipedia parse/layout break suspected; not falling back to yfinance "
-            f"for the universe. Sample: {unmapped[:10]}. Aborting before write."
-        )
-
-    # alpha-engine-config-I11468: members Wikipedia has not classified yet
-    # (addition-lag, at most the threshold above) get a sector from yfinance;
-    # then EVERY member must have both a GICS sector and a sector ETF, or
-    # nothing is written.
-    sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
-    _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
+    # alpha-engine-config-I11468: threshold, yfinance fallback, full-coverage
+    # gate — one function, shared with sf_preflight.check_constituents_fetch.
+    sector_fallback = resolve_sector_coverage(tickers, sector_map, sector_etf_map)
 
     # Sub-industry is additive/best-effort — NOT a hard gate like sector
     # above. Nothing downstream consumes it yet (config#934 narrow slice),
@@ -556,6 +540,46 @@ def _yf_to_gics(sector: str, industry: str) -> str | None:
     if industry in _YF_INDUSTRY_TO_GICS:
         return _YF_INDUSTRY_TO_GICS[industry]
     return _YF_SECTOR_TO_GICS.get(sector)
+
+
+def resolve_sector_coverage(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_etf_map: dict[str, str],
+) -> dict[str, dict[str, str]]:
+    """Complete ``sector_map`` / ``sector_etf_map`` for every member, or raise.
+
+    alpha-engine-config-I11468, lifted out of ``collect()`` so the weekly
+    preflight (``sf_preflight.check_constituents_fetch``,
+    alpha-engine-config-I11566) predicts ``collect()`` by running the SAME
+    rule rather than a stricter copy of the pre-I11468 one. Three steps, in
+    this order:
+
+    1. More than ``_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD`` members missing from
+       the Wikipedia pass is a parse/layout break, not addition-lag: raise
+       ``SectorCoverageIncomplete`` BEFORE any yfinance call, so a Wikipedia
+       break can never move the whole universe (~900 names, ~6 min of
+       yfinance calls) onto yfinance's taxonomy.
+    2. The members Wikipedia has not classified yet get a sector from
+       yfinance (``_fill_missing_sectors``; mutates both maps in place).
+    3. EVERY member must then have a GICS sector AND a sector ETF, or
+       ``SectorCoverageIncomplete``.
+
+    Returns the ``sector_fallback`` evidence ``collect()`` publishes
+    (``{}`` on a normal week, which makes no yfinance call at all).
+    """
+    unmapped = [t for t in tickers if t not in sector_map]
+    if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
+        raise SectorCoverageIncomplete(
+            f"Sector mapping incomplete: {len(unmapped)} of {len(tickers)} tickers "
+            f"missing from the Wikipedia GICS pass (exceeds the "
+            f"{_UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD}-ticker addition-lag tolerance) — "
+            f"Wikipedia parse/layout break suspected; not falling back to yfinance "
+            f"for the universe. Sample: {unmapped[:10]}. Aborting before write."
+        )
+    sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
+    _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
+    return sector_fallback
 
 
 def _fill_missing_sectors(

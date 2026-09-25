@@ -198,3 +198,81 @@ def test_a_raising_probe_withholds_its_capability(monkeypatch):
     caps = spot.detect_capabilities()
     assert sp.CAP_POLYGON not in caps
     assert sp.CAP_AWS in caps
+
+
+# ── alpha-engine-config-I11566: one cause is one failure ─────────────────────
+
+
+def _classify(statuses):
+    return spot.classify([sp.CheckResult(name=n, status=s, message="") for n, s in statuses])
+
+
+def test_a_blocked_dependent_is_not_a_second_fail():
+    """rehearsal-2026-09-24-1 shape: constituents_fetch failed and its four
+    dependents are BLOCKED — fail_count 1, not 5."""
+    rec = _classify([
+        ("arctic_connectivity", "ok"),
+        ("constituents_fetch", "fail"),
+        ("universe_drift", "blocked"),
+        ("universe_sample_freshness", "blocked"),
+        ("polygon_grouped_coverage", "blocked"),
+        ("predicted_missing_from_closes", "blocked"),
+        ("backfill_source_freshness", "ok"),
+    ])
+    assert rec["verdict"] == "FAIL"
+    assert rec["fail_count"] == 1
+    assert rec["fail_names"] == ["constituents_fetch"]
+    assert rec["blocked_count"] == 4
+    assert rec["ran_count"] == 3
+
+
+def test_blocked_without_a_fail_is_a_blind_spot_never_ok():
+    rec = _classify([("arctic_connectivity", "ok"), ("universe_drift", "blocked")])
+    assert rec["verdict"] == "BLIND_SPOT"
+    assert rec["blocked_names"] == ["universe_drift"]
+
+
+# ── alpha-engine-config-I11567: explicit region ──────────────────────────────
+
+
+def test_region_matches_sf_preflight():
+    assert spot.REGION == sp._REGION
+
+
+def test_aws_clients_work_with_no_region_in_the_environment(monkeypatch, tmp_path, capsys):
+    """The SSM shell exports no AWS_DEFAULT_REGION. Real boto3 client
+    construction (which raises NoRegionError for cloudwatch without a region)
+    must succeed; only the network call is stubbed."""
+    for var in ("AWS_DEFAULT_REGION", "AWS_REGION", "AWS_PROFILE"):
+        monkeypatch.delenv(var, raising=False)
+    empty = tmp_path / "aws-config"
+    empty.write_text("")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(empty))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(empty))
+
+    import boto3
+
+    real_client = boto3.client
+    built = []
+
+    class _Sink:
+        def put_metric_data(self, **_k):
+            return {}
+
+        def put_object(self, **_k):
+            return {}
+
+    def _client(service, *a, **k):
+        real = real_client(service, *a, **k)  # raises NoRegionError if unset
+        built.append((service, real.meta.region_name))
+        return _Sink()
+
+    # A fresh session so the default one cannot carry a cached region.
+    monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
+    monkeypatch.setattr(boto3, "client", _client)
+    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "observe", "verdict": "OK"})
+    assert spot.main(["--run-date", "2026-09-25", "--execution-name", "exec-1"]) == 0
+    line = json.loads(capsys.readouterr().out.strip())
+    assert "metric_error" not in line, line
+    assert "artifact_error" not in line, line
+    assert sorted(built) == [("cloudwatch", "us-east-1"), ("s3", "us-east-1")]

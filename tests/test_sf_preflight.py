@@ -44,8 +44,11 @@ def test_constituents_fetch_ok_populates_context():
     # Actually use realistic-shape data: deduped tickers + complete sector_map.
     real_tickers = [f"T{i}" for i in range(900)]
     real_sectors = {t: "Industrials" for t in real_tickers}
+    # A sector ETF per member too: collect()'s coverage gate checks BOTH maps
+    # (I11468), and this check now runs that same gate (I11566).
+    real_etfs = {t: "XLI" for t in real_tickers}
     fake_return = (
-        real_tickers, real_sectors, {}, {}, 500, 400, constituents.SsgaWeights()
+        real_tickers, real_sectors, real_etfs, {}, 500, 400, constituents.SsgaWeights()
     )
 
     with patch("collectors.constituents._fetch_constituents", return_value=fake_return):
@@ -159,13 +162,15 @@ def test_universe_drift_no_stragglers_passes_quietly():
     assert "No straggler candidates" in result.message
 
 
-def test_universe_drift_skipped_if_context_unpopulated():
-    """If constituents fetch failed upstream, this check fails loudly
-    instead of misleadingly passing on partial data."""
+def test_universe_drift_blocked_if_context_unpopulated():
+    """If constituents fetch failed upstream, this check never passes on
+    partial data — and never re-counts the upstream's failure as its own
+    (alpha-engine-config-I11566): it is BLOCKED, naming the producers."""
     ctx = _ctx()
     # ctx.fresh_constituents and ctx.arctic_universe_symbols left None
     result = sfp.check_universe_drift(ctx)
-    assert result.status == "fail"
+    assert result.status == "blocked"
+    assert result.details["blocked_by"] == ["arctic_connectivity", "constituents_fetch"]
 
 
 # ── check_polygon_grouped_coverage (PR #131 class) ────────────────────────────
@@ -1401,3 +1406,180 @@ def test_weekly_preflight_receives_the_execution_input():
         f"lambda:invoke states with no Payload receive an empty event: {missing}. "
         f"Every handler's event contract is dead code until one is passed."
     )
+
+
+# ── alpha-engine-config-I11566: constituents_fetch predicts collect() ────────
+
+
+def _addition_lag_fetch(n_missing: int = 4):
+    """903 members, ``n_missing`` of them (the newest index adds) absent from
+    the Wikipedia GICS pass — the rehearsal-2026-09-24-1 shape (AGNC, HUBS,
+    CORT, EAT)."""
+    new_adds = ["AGNC", "HUBS", "CORT", "EAT", "N5", "N6", "N7", "N8", "N9", "N10", "N11"][:n_missing]
+    tickers = [f"T{i}" for i in range(903 - n_missing)] + new_adds
+    sectors = {t: "Industrials" for t in tickers if t not in new_adds}
+    etfs = {t: "XLI" for t in sectors}
+    return new_adds, (tickers, sectors, etfs, {}, 503, 400, constituents.SsgaWeights())
+
+
+def _yf(rows):
+    return patch("collectors.constituents._yfinance_classification", return_value=rows)
+
+
+def test_constituents_fetch_ok_when_collect_fallback_fills_the_addition_lag():
+    """The false FAIL this issue is about: 4 members with no Wikipedia sector,
+    all classifiable by collect()'s yfinance fallback -> collect() succeeds, so
+    the preflight must say ok and populate the context for its dependents."""
+    new_adds, fetched = _addition_lag_fetch(4)
+    yf_rows = {
+        "AGNC": {"sector": "Real Estate", "industry": "REIT - Mortgage"},
+        "HUBS": {"sector": "Technology", "industry": "Software - Application"},
+        "CORT": {"sector": "Healthcare", "industry": "Biotechnology"},
+        "EAT": {"sector": "Consumer Cyclical", "industry": "Restaurants"},
+    }
+    ctx = _ctx()
+    with patch("collectors.constituents._fetch_constituents", return_value=fetched), _yf(yf_rows):
+        result = sfp.check_constituents_fetch(ctx)
+    assert result.status == "ok", result.message
+    assert ctx.fresh_constituents == set(fetched[0])
+    assert set(result.details["sector_fallback"]) == set(new_adds)
+    assert result.details["sector_fallback"]["AGNC"]["sector"] == "Financials"
+    assert "yfinance fallback" in result.message
+
+
+def test_constituents_fetch_fails_when_the_fallback_cannot_classify():
+    """collect() still raises when a member stays unclassified — so must this."""
+    _, fetched = _addition_lag_fetch(4)
+    yf_rows = {
+        "AGNC": {"sector": "Real Estate", "industry": "REIT - Mortgage"},
+        "HUBS": {"error": "HTTP 404"},
+        "CORT": {"sector": "Healthcare", "industry": "Biotechnology"},
+        "EAT": {"sector": "Consumer Cyclical", "industry": "Restaurants"},
+    }
+    ctx = _ctx()
+    with patch("collectors.constituents._fetch_constituents", return_value=fetched), _yf(yf_rows):
+        result = sfp.check_constituents_fetch(ctx)
+    assert result.status == "fail"
+    assert "HUBS" in result.message
+    assert ctx.fresh_constituents is None
+
+
+def test_constituents_fetch_over_threshold_fails_without_calling_yfinance():
+    """> the addition-lag threshold is a Wikipedia break: collect() raises
+    BEFORE the fallback, and so does the preflight (no yfinance call)."""
+    _, fetched = _addition_lag_fetch(constituents._UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD + 1)
+    ctx = _ctx()
+    with patch("collectors.constituents._fetch_constituents", return_value=fetched), \
+            patch("collectors.constituents._yfinance_classification") as yf:
+        result = sfp.check_constituents_fetch(ctx)
+    assert result.status == "fail"
+    assert "sector_map missing" in result.message
+    yf.assert_not_called()
+
+
+def test_constituents_fetch_and_collect_share_one_coverage_rule():
+    """Not a copy: both the check and collect() go through
+    resolve_sector_coverage, so they cannot drift apart again."""
+
+    class _Sentinel(Exception):
+        pass
+
+    def _boom(*_a, **_k):
+        raise _Sentinel("shared rule reached")
+
+    _, fetched = _addition_lag_fetch(0)
+    with patch("collectors.constituents._fetch_constituents", return_value=fetched), \
+            patch("collectors.constituents.resolve_sector_coverage", side_effect=_boom):
+        with pytest.raises(_Sentinel):
+            constituents.collect(bucket="test-bucket", dry_run=True)
+        with pytest.raises(_Sentinel):
+            sfp.check_constituents_fetch(_ctx())
+
+
+# ── alpha-engine-config-I11566: one cause is one failure ─────────────────────
+
+
+_DEPENDENTS = (
+    "check_universe_drift",
+    "check_universe_sample_freshness",
+    "check_polygon_grouped_coverage",
+    "check_predicted_missing_from_closes",
+)
+
+
+@pytest.mark.parametrize("fn_name", _DEPENDENTS)
+def test_dependents_of_a_failed_constituents_fetch_are_blocked_not_failed(fn_name, monkeypatch):
+    monkeypatch.setenv("POLYGON_API_KEY", "stub")
+    ctx = _ctx()
+    ctx.arctic_universe_symbols = {"AAPL"}
+    ctx.universe_lib = MagicMock()
+    # fresh_constituents left None: constituents_fetch failed.
+    result = getattr(sfp, fn_name)(ctx)
+    assert result.status == "blocked", result
+    assert result.details["blocked_by"] == ["constituents_fetch"]
+
+
+def test_rehearsal_2026_09_24_shape_counts_one_cause_once(monkeypatch):
+    """rehearsal-2026-09-24-1 read fail_count 5 for ONE constituents cause.
+    Run the real checks, in CHECKS order, behind a failing constituents fetch."""
+    monkeypatch.setenv("POLYGON_API_KEY", "stub")
+    monkeypatch.setattr(sfp, "_previous_trading_day_str", lambda: "2026-09-23")
+
+    def _arctic_ok(ctx):
+        ctx.arctic_universe_symbols = {"AAPL"}
+        ctx.universe_lib = MagicMock()
+        return sfp.CheckResult(name="arctic_connectivity", status="ok", message="stub")
+
+    _arctic_ok.__name__ = "check_arctic_connectivity"
+    checks = [
+        _arctic_ok,
+        sfp.check_constituents_fetch,
+        sfp.check_universe_drift,
+        sfp.check_universe_sample_freshness,
+        sfp.check_polygon_grouped_coverage,
+        sfp.check_predicted_missing_from_closes,
+    ]
+    with patch("collectors.constituents._fetch_constituents",
+               side_effect=ConnectionError("Wikipedia 503")):
+        n_fail, results = sfp.run_preflight(
+            bucket="test-bucket", capabilities=sfp.FULL_CAPABILITIES, checks=checks,
+        )
+    summary = sfp.summarize_results(results)
+    assert n_fail == 1
+    assert summary["fail_count"] == 1
+    assert [r["name"] for r in summary["fail_results"]] == ["constituents_fetch"]
+    assert summary["blocked_count"] == 4
+    assert summary["blocked_names"] == [
+        "universe_drift", "universe_sample_freshness",
+        "polygon_grouped_coverage", "predicted_missing_from_closes",
+    ]
+    # A blocked check did not run.
+    assert summary["ran_count"] == 2
+    assert summary["required_skip_count"] == 0
+
+
+def test_predicted_missing_blocked_by_a_failed_polygon_check():
+    ctx = _ctx()
+    ctx.fresh_constituents = {"AAPL"}
+    ctx.arctic_universe_symbols = {"AAPL"}
+    ctx.check_statuses["polygon_grouped_coverage"] = "fail"
+    result = sfp.check_predicted_missing_from_closes(ctx)
+    assert result.status == "blocked"
+    assert result.details["blocked_by"] == ["polygon_grouped_coverage"]
+
+
+def test_predicted_missing_keeps_the_no_key_warn():
+    """polygon's deliberate no-key WARN (laptop) still reads as a warn."""
+    ctx = _ctx()
+    ctx.fresh_constituents = {"AAPL"}
+    ctx.arctic_universe_symbols = {"AAPL"}
+    ctx.check_statuses["polygon_grouped_coverage"] = "warn"
+    result = sfp.check_predicted_missing_from_closes(ctx)
+    assert result.status == "warn"
+
+
+def test_cli_never_renders_a_blocked_only_run_as_pass():
+    results = [sfp.CheckResult(name="universe_drift", status="blocked", message="Blocked")]
+    text = sfp._format_human(results)
+    assert "PASS" not in text
+    assert "INCOMPLETE" in text
