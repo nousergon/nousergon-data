@@ -29,6 +29,19 @@ name: Data-collection phase-exit metrics
 # `executor_profile` job already hit its 15-minute cap once; a slow
 # neighbour must not gate or be gated by this one).
 #
+# ── `trigger_observation` is a FOURTH job, for the same reason ─────────
+#
+# `alpha-engine-config-I11189` deliverable 2 added
+# `data_gate.producers.trigger_observation`: it reads each unit descriptor's
+# LIVE trigger (states:ListExecutions / events:DescribeRule /
+# scheduler:GetSchedule — read-only) and publishes what it saw for
+# `data.phase1.triggers_reconciled` to reconcile against the declared
+# `trigger.schedule`. A job here, not a new workflow, so the role's trust
+# policy (`job_workflow_ref` pins THIS file) needs no operator-gated edit; its
+# additive inline grants auto-apply on merge in `nous-ergon-ops`. Until they
+# do, this job fails loud on AccessDenied at its first read — the clause it
+# feeds reads UNMEASURABLE meanwhile, never MET.
+#
 # ── Cadence: mirrors the collector's own daily cadence ─────────────────────
 #
 # `data-gate.yml` (this repo) evaluates the whole ladder at `30 23 * * *`
@@ -241,11 +254,52 @@ jobs:
           --cur-bucket "${{ vars.CUR_EXPORT_BUCKET }}"
           --cur-export-name "${{ vars.CUR_EXPORT_NAME }}"
 
+  trigger_observation:
+    name: trigger_observation metric (declared vs live triggers)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}."; exit 1 ;; esac
+
+      - name: Run trigger_observation producer
+        run: python -m data_gate.producers.trigger_observation
+
   # Required of every scheduled workflow in this repo by
   # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
   # naming every other job and an `if` gated to the default branch.
   notify-main-failure:
-    needs: [v1_data_stage, executor_profile, cost_monthly]
+    needs: [v1_data_stage, executor_profile, cost_monthly, trigger_observation]
     if: failure() && github.ref == 'refs/heads/main'
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit

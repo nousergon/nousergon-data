@@ -53,9 +53,11 @@ from __future__ import annotations
 
 import datetime
 import logging
+import math
 import os
 import uuid
 
+import boto3
 from nousergon_lib import spot_dispatch
 from nousergon_lib.spot_dispatch import SpotLaunchError, SpotProbeError
 
@@ -135,6 +137,54 @@ RUN_TIMEOUT_SECONDS = int(os.environ.get("THINKTANK_SPOT_RUN_TIMEOUT_SECONDS", "
 # CAP, not a health check, so it is not a substitute for this.
 WATCHDOG_SECONDS = int(os.environ.get("THINKTANK_SPOT_WATCHDOG_SECONDS", "9000"))  # 2.5h
 SSM_ONLINE_BUDGET_SEC = int(os.environ.get("THINKTANK_SPOT_SSM_ONLINE_BUDGET_SEC", "300"))
+
+# ── Lambda-timeout headroom (alpha-engine-config-I11532) ───────────────────
+# On 2026-09-23 the function's timeout was 300s and SSM_ONLINE_BUDGET_SEC was
+# ALSO 300s, so `wait_ssm_online` was permitted to consume the whole invocation.
+# SSM registered slowly, Lambda killed the handler before `send_async_command`,
+# and the day's Think Tank run was lost. The two numbers lived in different
+# files (here and deploy.sh), which is why nobody saw the equality.
+#
+# The function's timeout is DECLARED in deploy.sh as FN_TIMEOUT and converged
+# onto the live function by every deploy; this constant mirrors it and
+# test_handler.py fails if the two ever differ. What has to fit inside it:
+#
+#   launch (spot rotation + on-demand fallback, seconds in practice)
+#   + INSTANCE_RUNNING_WAIT_MAX_SEC  (the lib's instance_running waiter, which
+#                                     runs BEFORE the SSM budget starts)
+#   + SSM_ONLINE_BUDGET_SEC
+#   + DISPATCH_RESERVE_SEC            (send_command + tag + return)
+#
+# test_handler.py asserts that sum stays strictly below the timeout, and
+# `_ssm_online_budget` clamps the wait at RUNTIME to what the invocation has
+# left, so even a drifted configuration makes the wait RAISE (which terminates
+# the box and lets the async retry launch a fresh one) instead of being killed
+# silently mid-wait.
+LAMBDA_TIMEOUT_SECONDS = 900
+# `nousergon_lib.spot_dispatch.wait_ssm_online` waits for `instance_running`
+# with WaiterConfig Delay=5 x MaxAttempts=40 before its SSM loop begins.
+# test_handler.py reads the real lib source and fails if that grows past this.
+INSTANCE_RUNNING_WAIT_MAX_SEC = 200
+DISPATCH_RESERVE_SEC = 60
+
+# ── Interrupted-dispatch recovery (alpha-engine-config-I11532) ─────────────
+# A box is marked as DISPATCHED by this tag, written the moment
+# `send_async_command` returns. A running Think Tank box WITHOUT it is a box
+# whose dispatching invocation died between launch and send — the 2026-09-23
+# orphan. The async retry used to read that orphan as a healthy concurrent run
+# and skip, which is what turned a slow SSM registration into a lost day.
+COMMAND_ID_TAG = "thinktank-command-id"
+# The invocation that launched the box, stamped atomically with RunInstances.
+# Lambda's async retries of one event carry that event's request id, so a
+# retry finding its own id on an undispatched box knows that box's dispatcher
+# was its own earlier attempt — dead. Should that ever not hold, the age rule
+# in `_adoptable_orphan` still adopts once no invocation can be alive.
+DISPATCH_REQUEST_ID_TAG = "thinktank-dispatch-request-id"
+# How old an undispatched box may be and still be adopted. It must cover the
+# whole async-retry schedule (initial invoke + ~1 min + retry + ~2 min + retry,
+# each up to LAMBDA_TIMEOUT_SECONDS) — test_handler.py asserts that — and no
+# more: an older undispatched box is not one this day's retries created.
+ADOPT_WINDOW_SEC = int(os.environ.get("THINKTANK_SPOT_ADOPT_WINDOW_SEC", "2700"))  # 45 min
 CW_LOG_GROUP = os.environ.get("THINKTANK_SPOT_CW_LOG_GROUP", "/alpha-engine/thinktank-spot")
 
 # ── Router addressing (alpha-engine-config-I6367 / I6373) ──────────────────
@@ -284,30 +334,166 @@ def _launch_instance(
     )
 
 
-def _already_running() -> list[str]:
-    """Duplicate-launch guard.
+def _running_boxes() -> list[dict]:
+    """Duplicate-launch guard: every live Think Tank box, with its tags.
 
-    A degraded EC2 API must never read as "no duplicate running" — that is the
-    config#2267 fail-open class. ``running_instance_ids`` raises SpotProbeError
-    rather than returning a clean empty list, and the caller below chooses
-    coverage over dedupe explicitly and records the choice.
+    Returns ``[{"instance_id", "launch_time", "tags"}]``. A degraded EC2 API
+    must never read as "no duplicate running" — that is the config#2267
+    fail-open class. ``running_instance_ids`` raises SpotProbeError rather than
+    returning a clean empty list, the tag read below does the same, and the
+    caller chooses coverage over dedupe explicitly and records the choice.
     """
     # discriminator_tags is REQUIRED positional. Empty is correct here: this
     # dispatcher has exactly one lane (one daily run), so the Name tag alone
     # identifies a duplicate — same shape as alert-drain-dispatcher. Lanes
     # that DO partition (groom tiers, arctic migrations) pass a discriminator.
-    return spot_dispatch.running_instance_ids(INSTANCE_TAG_NAME, {}, region=REGION)
+    ids = spot_dispatch.running_instance_ids(INSTANCE_TAG_NAME, {}, region=REGION)
+    if not ids:
+        return []
+    # The lib returns ids only; whether a box was DISPATCHED is in its tags.
+    try:
+        resp = boto3.client("ec2", region_name=REGION).describe_instances(
+            InstanceIds=list(ids)
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised as SpotProbeError; never swallowed
+        raise SpotProbeError(
+            f"tag read for running thinktank boxes {ids} failed: "
+            f"{type(exc).__name__}: {exc}"
+        ) from exc
+    return [
+        {
+            "instance_id": inst["InstanceId"],
+            "launch_time": inst.get("LaunchTime"),
+            "tags": {t["Key"]: t["Value"] for t in inst.get("Tags", [])},
+        }
+        for r in resp.get("Reservations", [])
+        for inst in r.get("Instances", [])
+    ]
+
+
+def _adoptable_orphan(
+    boxes: list[dict], *, request_id: str | None, timeout_bound_sec: float
+) -> dict | None:
+    """The running box whose dispatch provably died before the send, or None.
+
+    None means "skip, as before": either a dispatched run is live, or nothing
+    here is provably ours to finish. A box qualifies only if ALL of:
+
+    * no box carries COMMAND_ID_TAG — a dispatched run is in flight, so a
+      second one would be a duplicate, not a recovery;
+    * it carries this dispatcher's run-token, TODAY's trading-day tag and a
+      DISPATCH_REQUEST_ID_TAG (so a box launched before this recovery path
+      existed is never adopted), and no termination-reason tag
+      (terminate_on_failure is already tearing it down);
+    * its dispatcher is provably dead — either this invocation is the async
+      retry of the one that launched it (same request id), or the box is older
+      than any invocation can live (``timeout_bound_sec``), so no dispatcher
+      can still be mid-wait on it. A younger box launched by a DIFFERENT
+      request id may belong to a live invocation (a duplicate EventBridge
+      delivery, a manual invoke), and sending to it would double-run the box;
+    * it is no older than ADOPT_WINDOW_SEC.
+
+    Of several, the most recently launched wins.
+    """
+    if any(COMMAND_ID_TAG in b["tags"] for b in boxes):
+        return None
+    now = datetime.datetime.now(datetime.timezone.utc)
+    today = _trading_day()
+    candidates = []
+    for b in boxes:
+        tags = b["tags"]
+        if not tags.get("thinktank-run-token") or not tags.get(DISPATCH_REQUEST_ID_TAG):
+            continue
+        if tags.get("thinktank-trading-day") != today:
+            continue
+        if spot_dispatch.TERMINATION_REASON_TAG in tags:
+            continue
+        launched = b.get("launch_time")
+        if launched is None:
+            continue
+        age = (now - launched).total_seconds()
+        if age > ADOPT_WINDOW_SEC:
+            continue
+        own_retry = bool(request_id) and tags.get(DISPATCH_REQUEST_ID_TAG) == request_id
+        if own_retry or age > timeout_bound_sec:
+            candidates.append(b)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda b: b["launch_time"])
+
+
+def _remaining_sec(context) -> float | None:
+    getter = getattr(context, "get_remaining_time_in_millis", None)
+    if getter is None:
+        return None
+    return getter() / 1000.0
+
+
+def _ssm_online_budget(context) -> int:
+    """SSM_ONLINE_BUDGET_SEC, clamped to what this invocation can still afford.
+
+    The clamp is what makes the I11532 class impossible rather than merely
+    unlikely: whatever the configured timeout, the wait gives up with enough
+    left to terminate the box and RAISE — so the async retry launches a fresh
+    one — instead of Lambda killing the handler mid-wait with the box orphaned.
+    """
+    remaining = _remaining_sec(context)
+    if remaining is None:
+        return SSM_ONLINE_BUDGET_SEC
+    affordable = int(remaining - INSTANCE_RUNNING_WAIT_MAX_SEC - DISPATCH_RESERVE_SEC)
+    if affordable < SSM_ONLINE_BUDGET_SEC:
+        logger.warning(
+            "thinktank-spot: only %.0fs left in this invocation — clamping the SSM "
+            "Online wait from %ss to %ss so it fails loud before Lambda's timeout "
+            "(alpha-engine-config-I11532)",
+            remaining, SSM_ONLINE_BUDGET_SEC, max(affordable, 0),
+        )
+    return max(min(SSM_ONLINE_BUDGET_SEC, affordable), 0)
+
+
+def _record_dispatch(instance_id: str, command_id: str) -> bool:
+    """Mark the box DISPATCHED (COMMAND_ID_TAG). Never raises.
+
+    The command is already running when this is called, so a tagging failure
+    must not RAISE: that would trigger an async retry which, finding the box
+    untagged, would send the command a second time. Retried once, then logged.
+    Needs no new IAM: the role's `CreateDiscriminatorTagsOnOwnBoxesOnly`
+    statement already grants ec2:CreateTags on instances Name-tagged
+    alpha-engine-thinktank-spot.
+    """
+    ec2 = boto3.client("ec2", region_name=REGION)
+    for attempt in (1, 2):
+        try:
+            ec2.create_tags(
+                Resources=[instance_id],
+                Tags=[{"Key": COMMAND_ID_TAG, "Value": command_id}],
+            )
+            return True
+        except Exception as exc:  # noqa: BLE001 - see docstring
+            logger.error(
+                "thinktank-spot: could not tag %s with %s=%s (attempt %d): %s: %s",
+                instance_id, COMMAND_ID_TAG, command_id, attempt,
+                type(exc).__name__, exc,
+            )
+    return False
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     """EventBridge handler — launch the daily Think Tank box.
 
     ``event`` may carry ``{"force_on_demand": bool}``. Returns
-    ``{"launched", "instance_id", "command_id", "market", "run_token",
-    "dedupe_degraded"}``.
+    ``{"launched", "adopted", "instance_id", "command_id", "command_tagged",
+    "market", "run_token", "dedupe_degraded"}``, or
+    ``{"launched": False, "reason": "already_running", "instance_ids"}``.
 
     Fail-loud: a launch/SSM error RAISES so EventBridge's two async retries
     engage and the Lambda Errors metric drives the alarm.
+
+    Retry-safe (alpha-engine-config-I11532): EventBridge's async retry re-enters
+    here after an invocation that may have died ANYWHERE — including after the
+    launch and before the send. A running box with no COMMAND_ID_TAG whose
+    dispatcher provably died is therefore finished (``adopted``), not skipped;
+    see ``_adoptable_orphan`` for exactly when.
     """
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
@@ -344,9 +530,20 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             "(alpha-engine-config-I5208)"
         )
 
+    request_id = getattr(context, "aws_request_id", None)
+    # No invocation outlives the function's timeout, so a box older than this
+    # cannot still have a live dispatcher waiting on it. The live timeout is
+    # read from the context as well as the constant, so a hand-raised timeout
+    # can only make adoption MORE conservative, never less.
+    remaining_at_start = _remaining_sec(context)
+    timeout_bound_sec = max(
+        LAMBDA_TIMEOUT_SECONDS,
+        math.ceil(remaining_at_start) if remaining_at_start is not None else 0,
+    )
+
     dedupe_degraded = False
     try:
-        running = _already_running()
+        running = _running_boxes()
     except SpotProbeError:
         # Coverage beats dedupe for a once-daily arm: a duplicate box costs
         # cents and both runs converge on the same checkpointed ledger, while
@@ -358,25 +555,49 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         )
         dedupe_degraded = True
         running = []
-    if running:
-        logger.warning(
-            "thinktank-spot box already running (%s) — skipping this launch", running
-        )
-        return {"launched": False, "reason": "already_running", "instance_ids": running}
 
-    run_token = uuid.uuid4().hex
-    try:
-        instance_id, market = _launch_instance(run_token, force_on_demand=force_on_demand, extra_tags=extra_tags or None)
-    except SpotLaunchError:
-        logger.error("thinktank-spot launch failed (spot + on-demand exhausted)")
-        raise
-    logger.info("launched thinktank-spot box %s (%s)", instance_id, market)
+    adopted = False
+    if running:
+        orphan = _adoptable_orphan(
+            running, request_id=request_id, timeout_bound_sec=timeout_bound_sec
+        )
+        if orphan is None:
+            ids = [b["instance_id"] for b in running]
+            logger.warning(
+                "thinktank-spot box already running (%s) — skipping this launch", ids
+            )
+            return {"launched": False, "reason": "already_running", "instance_ids": ids}
+        # alpha-engine-config-I11532: the box exists but its dispatcher died
+        # before sending the command (2026-09-23: Lambda timeout mid-SSM-wait).
+        # Finish THAT dispatch — same box, same run token, so the completion
+        # marker the reaper looks for is the one the box will write.
+        instance_id = orphan["instance_id"]
+        run_token = orphan["tags"]["thinktank-run-token"]
+        market = "adopted"
+        adopted = True
+        logger.warning(
+            "thinktank-spot box %s is running but was never dispatched (no %s tag; "
+            "launched %s by request %s) — its dispatcher died before the send. "
+            "Sending the command to it instead of skipping (alpha-engine-config-I11532)",
+            instance_id, COMMAND_ID_TAG, orphan["launch_time"],
+            orphan["tags"].get(DISPATCH_REQUEST_ID_TAG, "<untagged>"),
+        )
+    else:
+        run_token = uuid.uuid4().hex
+        if request_id:
+            extra_tags[DISPATCH_REQUEST_ID_TAG] = request_id
+        try:
+            instance_id, market = _launch_instance(run_token, force_on_demand=force_on_demand, extra_tags=extra_tags or None)
+        except SpotLaunchError:
+            logger.error("thinktank-spot launch failed (spot + on-demand exhausted)")
+            raise
+        logger.info("launched thinktank-spot box %s (%s)", instance_id, market)
 
     # Between launch and the bootstrap command landing there is no watchdog or
     # trap on the box yet — anything failing in here would orphan it.
     try:
         spot_dispatch.wait_ssm_online(
-            instance_id, region=REGION, ssm_online_budget_sec=SSM_ONLINE_BUDGET_SEC
+            instance_id, region=REGION, ssm_online_budget_sec=_ssm_online_budget(context)
         )
         command_id = spot_dispatch.send_async_command(
             instance_id,
@@ -392,10 +613,16 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         )
         raise
 
+    # AFTER the send and outside the try: the command is running, so nothing
+    # from here on may terminate the box or raise.
+    command_tagged = _record_dispatch(instance_id, command_id)
+
     return {
         "launched": True,
+        "adopted": adopted,
         "instance_id": instance_id,
         "command_id": command_id,
+        "command_tagged": command_tagged,
         "market": market,
         "run_token": run_token,
         "dedupe_degraded": dedupe_degraded,
