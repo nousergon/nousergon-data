@@ -228,8 +228,9 @@ def test_a_d17_file_carrying_a_provisional_row_records_both_readings():
     assert result["status"] == "ok"
     verdicts = [g["verdict"] for g in result["guards"]]
     assert verdicts == ["settled", "provisional"]
-    assert {g["key"] for g in result["guards"]} == {KEY}
-    assert "1 row(s)" in result["guards"][1]["detail"]
+    # alpha-engine-config-I11563: the carried reading names its row.
+    assert [g["key"] for g in result["guards"]] == [KEY, f"{KEY}#CPRI"]
+    assert "row CPRI" in result["guards"][1]["detail"]
     assert parity._bar_settlement_stamp({"guards": result["guards"]}, KEY) is None
 
 
