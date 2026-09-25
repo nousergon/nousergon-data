@@ -202,6 +202,12 @@ shared_writers:
       The compute units' input-lineage recorder (alpha-engine-config-I11203).
       Its matches are hashlib/list verbs; it writes nothing itself — the refs it
       renders ride the unit's own run manifest.
+  - path: features/numeric_pin.py
+    parent_units: [D12, D31]
+    reason: >-
+      The compute units' numeric-environment pin (alpha-engine-config-I11203).
+      Its matches are os.environ/hashlib verbs; it writes no artifact — the
+      environment it records rides the unit's own run manifest as an input ref.
   - path: features/gen_schema_md.py
     parent_units: [D12]
     reason: Regenerates SCHEMA.md from CATALOG; a build tool for the contract, not a unit.

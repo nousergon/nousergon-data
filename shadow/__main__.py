@@ -36,6 +36,15 @@ and "we could not compare them" are different facts.
 
 from __future__ import annotations
 
+# alpha-engine-config-I11203: `run` hosts D31 (the shadow's feature build) and
+# `recompute-lineage` re-runs it; both must compute under the numeric pin, and
+# numpy reads it once, on first import — so it is applied before anything below
+# can import numpy (features/numeric_pin.py).
+if __name__ == "__main__":
+    from features import numeric_pin as _numeric_pin
+
+    _numeric_pin.apply()
+
 import argparse
 import datetime as dt
 import json

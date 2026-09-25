@@ -42,7 +42,7 @@ import pytest
 
 import weekly_collector
 from collectors import daily_closes
-from features import compute
+from features import compute, numeric_pin
 from features.input_record import (
     AGGREGATE_MIN_MEMBERS,
     InputRecorder,
@@ -68,6 +68,41 @@ TICKERS = [f"T{i:02d}" for i in range(24)]
 #: provisional bar, the shadow's at 18:45 ET on the settled one.
 V1_D19_FETCH = dt.datetime(2026, 9, 23, 20, 4, 38, tzinfo=dt.timezone.utc)
 SH_D19_FETCH = dt.datetime(2026, 9, 23, 22, 45, 22, tzinfo=dt.timezone.utc)
+
+
+def _pinned_environment(**overrides):
+    """A numeric environment as a pinned box measures it (`features.numeric_pin.effective`)."""
+    return {
+        "policy": numeric_pin.POLICY,
+        "pinned": True,
+        "problems": [],
+        "env": {**numeric_pin.THREAD_ENV, numeric_pin.NUMPY_ENV: "SSE SSE2 SSE3", numeric_pin.BLAS_CORETYPE_ENV: "Haswell"},
+        "numpy": "1.26.4",
+        "numpy_baseline": ["SSE", "SSE2", "SSE3"],
+        "numpy_dispatch": [],
+        "blas": {"core": "Haswell", "threads": 1, "config": "OpenBLAS 0.3.23.dev DYNAMIC_ARCH"},
+        "libc": "glibc 2.34",
+        "libm_path": "fma",
+        "cpu_model": "Intel(R) Xeon(R) Platinum 8275CL CPU @ 3.00GHz",
+        "cpu_vendor": "GenuineIntel",
+        "machine": "x86_64",
+        "python": "3.12.11",
+        "instance_type": "c5.large",
+        **overrides,
+    }
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _pinned_process():
+    """Every D31 run and recompute in this module computes on a pinned box.
+
+    The test process itself cannot be pinned (numpy is loaded long before);
+    what these tests exercise is the record and the refusal, so the measured
+    environment is stood in for — the same one for both, as on the box.
+    """
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(numeric_pin, "effective", lambda: _pinned_environment())
+        yield
 
 
 # ---------------------------------------------------------------------------
@@ -438,6 +473,10 @@ def test_the_recorder_round_trips_every_input_kind():
     assert universe.digest == frames_digest(frames)
     assert pins.restated == ()
     assert pins.unreadable == ()
+    # The frozen record ends with the numeric environment, read back field for field.
+    assert refs[-1]["key"].startswith(numeric_pin.INPUT_SCHEME)
+    assert refs[-1]["version"].startswith(f"{numeric_pin.INPUT_VERSION_PREFIX}{numeric_pin.POLICY}:pinned:")
+    assert pins.numeric == numeric_pin.flat(_pinned_environment())
 
 
 def test_parse_refs_reads_both_version_spellings_and_names_what_it_cannot():
@@ -831,6 +870,77 @@ def test_a_refused_record_grants_nothing(day, record):
     body, _ = _grade(day, refused)
     assert body["verdict"] == "mismatch"
     assert any("not complete" in why and "arcticdb/universe" in why for why in body["v1_cause_refused"])
+
+
+# ---------------------------------------------------------------------------
+# D2. The numeric environment (alpha-engine-config-I11203, the pin)
+# ---------------------------------------------------------------------------
+
+
+def _with_numeric(manifest, environment):
+    inputs = [r for r in manifest["inputs"] if not r["key"].startswith(numeric_pin.INPUT_SCHEME)]
+    if environment is not None:
+        inputs.append(numeric_pin.as_input_ref(environment))
+    return {**manifest, "inputs": inputs}
+
+
+def _recompute_v1(day, manifest, **kwargs):
+    return rl.recompute_side(
+        "v1", manifest, trading_day=DAY, bucket=BUCKET, client=day.s3,
+        arctic_loader=day.arctic_loader(day.v1_library), **kwargs,
+    )
+
+
+def test_each_side_records_the_numeric_environment_it_computed_under(day, record):
+    for side in ("v1", "shadow"):
+        assert record["sides"][side]["numeric_env"] == numeric_pin.flat(_pinned_environment())
+    assert record["recompute_host"]["numeric_env"] == numeric_pin.flat(_pinned_environment())
+    # It is how the run computed, not what it read: never a differing input.
+    assert all(d["kind"] != "numeric" for d in record["differing_inputs"])
+
+
+def test_a_run_that_computed_outside_the_pin_is_refused_by_name(day):
+    unpinned = _pinned_environment(
+        pinned=False,
+        problems=["numpy dispatches ['AVX512F', 'AVX512_SKX'] above its baseline"],
+        numpy_dispatch=["AVX512F", "AVX512_SKX"],
+    )
+    side = _recompute_v1(day, _with_numeric(day.v1_manifest, unpinned))
+    assert "computed UNPINNED on c5.large" in side.refusal
+    assert "AVX512_SKX" in side.refusal
+    assert side.groups == {}  # refused before any compute
+
+
+def test_a_run_that_predates_the_pin_is_refused_by_name(day):
+    side = _recompute_v1(day, _with_numeric(day.v1_manifest, None))
+    assert "recorded no numeric environment" in side.refusal
+    assert "depend on the CPU it ran on" in side.refusal
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [("numpy", "2.4.6"), ("libm_path", "no-fma"), ("libc", "glibc 2.39"), ("blas_core", "SkylakeX")],
+)
+def test_a_run_under_a_different_pinned_environment_is_refused_naming_the_field(day, field, value):
+    own = numeric_pin.flat(_pinned_environment())
+    side = _recompute_v1(day, day.v1_manifest, numeric_env={**own, field: value})
+    assert "differs from the recompute's" in side.refusal
+    assert field in side.refusal and value in side.refusal
+
+
+def test_a_different_cpu_under_the_same_pin_is_not_a_difference(day):
+    """The point of the pin: an AMD box recomputing an Intel box's run is fine."""
+    own = numeric_pin.flat(_pinned_environment(cpu_model="AMD EPYC 7R13 Processor", cpu_vendor="AuthenticAMD",
+                                               instance_type="c6a.large"))
+    side = _recompute_v1(day, day.v1_manifest, numeric_env=own)
+    assert side.refusal is None
+    assert side.groups
+
+
+def test_a_recompute_outside_the_pin_refuses(day):
+    own = numeric_pin.flat(_pinned_environment(pinned=False, problems=["OPENBLAS_NUM_THREADS is None"]))
+    side = _recompute_v1(day, day.v1_manifest, numeric_env=own)
+    assert "this recompute is not pinned" in side.refusal
 
 
 def test_only_feature_keys_carry_lineage(day, record):

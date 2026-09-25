@@ -23,6 +23,13 @@ Data sources:
 
 from __future__ import annotations
 
+# alpha-engine-config-I11203: `python -m features.compute` is D31 run by hand;
+# pin the numeric environment before numpy loads (features/numeric_pin.py).
+if __name__ == "__main__":
+    from features import numeric_pin as _numeric_pin
+
+    _numeric_pin.apply()
+
 import argparse
 import io
 import json
@@ -53,6 +60,7 @@ from features.postflight import (
 )
 from features.private_pack import apply_private_features
 from features.registry import GROUPS, upload_registry
+from features import numeric_pin
 from features.input_record import InputRecorder
 from features.writer import write_feature_snapshot
 
@@ -1641,6 +1649,16 @@ def compute_and_write(
     # happened. The metron supplemental step below reads through the same
     # client but publishes no key the lineage covers.
     input_refs = recorder.freeze()
+    # The frozen record ends with the numeric environment (`features.numeric_pin`).
+    # A run outside the pin still publishes — D31's consumers are waiting — but
+    # its bytes depend on the CPU, the recompute will refuse it by name, and it
+    # says so here too.
+    _numeric = next((f for f in map(numeric_pin.from_input_ref, (r["key"] for r in input_refs)) if f), None)
+    if _numeric is not None and _numeric.get("pinned") != "1":
+        log.warning(
+            "D31 computed OUTSIDE the numeric pin (%s): %s — these feature bytes depend on this CPU (%s)",
+            numeric_pin.POLICY, _numeric.get("problems"), _numeric.get("cpu_model"),
+        )
     features_df = build.features_df
     macro = build.macro
     n_ok, n_skip, n_err = build.n_ok, build.n_skip, build.n_err

@@ -24,6 +24,16 @@ Usage:
 
 from __future__ import annotations
 
+# alpha-engine-config-I11203: pin the numeric environment BEFORE anything below
+# imports numpy, so D31's feature bytes do not depend on which CPU the box got
+# (features/numeric_pin.py has the measurements). Only when run as a program —
+# an importer (a test) keeps its own environment. `python -m shadow run
+# --module weekly_collector` has already applied it; this re-check is a no-op.
+if __name__ == "__main__":
+    from features import numeric_pin as _numeric_pin
+
+    _numeric_pin.apply()
+
 import argparse
 import json
 import logging

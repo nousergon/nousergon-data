@@ -1474,6 +1474,11 @@ python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks b
 # requirements.txt` above); this gate catches future drift the same way the
 # DLP gate above does: fail closed at boot, not at the first LLM call.
 python -c "import openai" || fail "openai package (flow-doctor diagnosis router wire) not installed"
+# alpha-engine-config-I11203: declare the run manifests' compute row (measured
+# from instance metadata — until now every manifest this box wrote said
+# `local`) and the numeric pin D31 computes under (derived from
+# features/numeric_pin.py, never restated). One file, sourced from the checkout.
+source infrastructure/data_box_env.sh || fail "data box env (compute row / numeric pin) failed"
 # No `| tee` here: the renderer's run-log block already `exec`'d this shell's
 # stdout+stderr through tee, so every line of the collector is captured with
 # the provisioning that preceded it. Piping again would double every line AND

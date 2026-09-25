@@ -36,6 +36,13 @@ Three kinds of input, each recorded in the manifest's closed `InputRef` shape
   was restated). Split restatement is the one step whose inputs are an external
   feed plus registry state, so what is recorded is its OUTCOME for this run.
 
+One more entry is not a data input but decides the bytes all the same: the
+**numeric environment** the run computed under, ``numeric-env://process?..``
+with ``version = "numeric-pin:<policy>:<pinned|unpinned>:<digest>"``
+(`features.numeric_pin`) — the CPU, numpy's SIMD dispatch actually in effect,
+the BLAS kernel and threads, and the pin. It is added when the record is
+frozen, measured then rather than asserted.
+
 Reads the recorder does not see — the corporate-action registry's own reads,
 and anything after the recording is frozen (`features.metron_supplemental`,
 which writes no key the lineage covers) — are deliberately outside it. A
@@ -51,6 +58,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping
 from urllib.parse import parse_qsl, urlencode, urlsplit
+
+from features import numeric_pin
 
 #: A directory contributing more objects than this is recorded as one set
 #: entry rather than one entry per object.
@@ -171,9 +180,14 @@ class InputRecorder:
 
     # -- rendering --------------------------------------------------------
     def freeze(self) -> list[dict[str, Any]]:
-        """Render the refs and stop recording: later reads are not this run's feature inputs."""
+        """Render the refs and stop recording: later reads are not this run's feature inputs.
+
+        The frozen record also carries the numeric environment the features
+        were computed under (`features.numeric_pin`), measured now — after the
+        compute, in the process that ran it.
+        """
         if self._frozen is None:
-            self._frozen = self._render()
+            self._frozen = self._render() + [numeric_pin.as_input_ref(numeric_pin.effective())]
         return list(self._frozen)
 
     def refs(self) -> list[dict[str, Any]]:
@@ -277,6 +291,9 @@ class RecordedInputs:
     restated: tuple[str, ...] | None = None
     restated_window: tuple[str, str] | None = None
     unreadable: tuple[str, ...] = ()
+    #: The numeric environment the run recorded (`features.numeric_pin.flat`
+    #: fields), or None when it recorded none (a run before the pin).
+    numeric: dict[str, str] | None = None
 
     @property
     def empty(self) -> bool:
@@ -295,6 +312,7 @@ def parse_refs(refs: Iterable[Mapping[str, Any]]) -> RecordedInputs:
     arctic: dict[str, ArcticPin] = {}
     restated: tuple[str, ...] | None = None
     window: tuple[str, str] | None = None
+    numeric: dict[str, str] | None = None
     unreadable: list[str] = []
     for ref in refs:
         key = str(ref.get("key") or "")
@@ -346,6 +364,11 @@ def parse_refs(refs: Iterable[Mapping[str, Any]]) -> RecordedInputs:
             body = version[len(RESTATED_VERSION_PREFIX):]
             restated = tuple(t for t in body.split(",") if t)
             window = (query.get("from", ""), query.get("to", ""))
+        elif key.startswith(numeric_pin.INPUT_SCHEME):
+            if not (version and version.startswith(numeric_pin.INPUT_VERSION_PREFIX)):
+                unreadable.append(key)
+                continue
+            numeric = numeric_pin.from_input_ref(key)
         else:
             unreadable.append(key)
-    return RecordedInputs(objects, sets, arctic, restated, window, tuple(unreadable))
+    return RecordedInputs(objects, sets, arctic, restated, window, tuple(unreadable), numeric)

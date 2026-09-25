@@ -45,17 +45,21 @@ ArcticDB ``as_of`` reads plus the compute. Measured 2026-09-25 from OUTSIDE the
 region: 239 s of reads per side (a current read of the same window: ~97 s),
 ~45 s of compute. Two sides: under 10 minutes, less in region.
 
-WHAT BYTE EQUALITY NEEDS, measured on 2026-09-23 (read-only replay). With v1's
-ArcticDB read recovered exactly (``as_of``; its digest equals the shadow seed
-library's copy of the same rows), four of v1's five groups reproduced byte for
-byte and `technical` did not: 3,446 cells in exactly four columns
-(`beta_60d`, `idio_vol_60d`, `vol_ratio_10_60`, `residual_momentum_ratio`),
-relative difference <= 7e-13. All four are built on log returns, and changing
-numpy's CPU dispatch on the replaying host changed WHICH cells differed — so
-those bytes depend on the SIMD path of the machine that computed them. The
-record therefore names the recompute host (:func:`host_fingerprint`); a
-`technical` refusal on a host whose dispatch differs from the original run's
-is that, and is still a refusal. No tolerance is introduced to absorb it.
+WHAT BYTE EQUALITY NEEDS, measured on 2026-09-23/25 (read-only replay). With
+v1's ArcticDB read recovered exactly (``as_of``), every group but `technical`
+reproduced byte for byte on any host. `technical` depends on the numeric
+environment: its four log-return columns (`beta_60d`, `idio_vol_60d`,
+`vol_ratio_10_60`, `residual_momentum_ratio`) move by up to ~7e-13 relative
+with numpy's SIMD dispatch (AVX-512 vs AVX2 ``log``) and with numpy's version.
+Replayed with v1's own stack — numpy 1.26.4, AVX-512 on, as on the c5.large v1
+ran on — v1's published file came back byte for byte; with AVX-512 masked,
+3,433 cells differed. No tolerance absorbs that (Brian, 2026-09-25): D31 and
+this recompute both compute under `features.numeric_pin`, which fixes the
+dispatch, and each run records the environment it actually computed under. A
+side whose recorded environment is unpinned, or differs from the recompute's
+own, is refused by name (:func:`features.numeric_pin.mismatch`) before any
+compute — a byte mismatch that is really a CPU difference is never left to be
+read as a code or input difference.
 
 READ-ONLY. Every S3 read goes through :class:`PinnedS3`, which raises on any
 mutating call. The only write is the record itself, by the CLI.
@@ -70,8 +74,9 @@ import json
 import re
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterable
+from typing import Any, Callable, Iterable, Mapping
 
+from features import numeric_pin
 from features.input_record import RecordedInputs, frames_digest, parse_refs, set_digest
 
 SCHEMA_VERSION = "d31_recompute_lineage.v1"
@@ -118,6 +123,7 @@ def host_fingerprint() -> dict[str, Any]:
         "pandas": pandas.__version__,
         "pyarrow": pyarrow.__version__,
         "cpu_features": sorted(name for name, on in cpu_features.items() if on),
+        "numeric_env": numeric_pin.flat(numeric_pin.effective()),
     }
 
 
@@ -452,6 +458,8 @@ class SideRecompute:
     arctic: dict[str, dict[str, Any]] = field(default_factory=dict)
     unrecorded: list[str] = field(default_factory=list)
     seconds: float = 0.0
+    #: The numeric environment the run recorded (`features.numeric_pin`).
+    numeric: dict[str, str] | None = None
 
     @property
     def ok(self) -> bool:
@@ -464,6 +472,7 @@ class SideRecompute:
             "recomputed_sha256": dict(sorted(self.groups.items())),
             "arcticdb": self.arctic,
             "unrecorded_requests": sorted(set(self.unrecorded))[:25],
+            "numeric_env": self.numeric,
             "seconds": round(self.seconds, 1),
         }
 
@@ -523,6 +532,7 @@ def recompute_side(
     client: Any,
     physical_prefixes: Iterable[str] = ("",),
     arctic_loader: "Callable[..., Any] | None" = None,
+    numeric_env: "Mapping[str, str] | None" = None,
 ) -> SideRecompute:
     """Re-run D31's feature code over one run's recorded inputs.
 
@@ -531,6 +541,10 @@ def recompute_side(
     exactly as `features.compute._load_price_source` does. By default the
     load is D31's own, reading each library AS OF the moment the run
     recorded (:func:`as_of_library_reader`).
+
+    ``numeric_env`` is this process's numeric environment
+    (`features.numeric_pin.flat`), measured when omitted. A run that recorded
+    a different one is refused before anything is read.
     """
     import pandas as pd
 
@@ -544,7 +558,11 @@ def recompute_side(
         return result
     pins = parse_refs(manifest.get("inputs") or [])
     result.pins = pins
+    result.numeric = pins.numeric
     why = _pin_problems(pins, trading_day, compute._ARCTICDB_LOOKBACK_DAYS)
+    if why is None:
+        own = numeric_env if numeric_env is not None else numeric_pin.flat(numeric_pin.effective())
+        why = numeric_pin.mismatch(pins.numeric, own)
     if why is not None:
         result.refusal = why
         return result
@@ -745,13 +763,20 @@ def evaluate_day(
 
     reader = reader or S3Reader(bucket, client)
     root = ShadowRoot(trading_day)
+    own_numeric = numeric_pin.flat(numeric_pin.effective())
     anchor = f"features/{trading_day.isoformat()}/technical.parquet"
     v1_manifest = _recording(_manifests(reader, f"{D31_MANIFEST_PREFIX}/{trading_day.isoformat()}/"), anchor)
     shadow_manifest = _recording(
         _manifests(reader, root.key(f"{D31_MANIFEST_PREFIX}/{trading_day.isoformat()}/")), anchor
     )
     v1 = recompute_side(
-        "v1", v1_manifest, trading_day=trading_day, bucket=bucket, client=client, arctic_loader=arctic_loader
+        "v1",
+        v1_manifest,
+        trading_day=trading_day,
+        bucket=bucket,
+        client=client,
+        arctic_loader=arctic_loader,
+        numeric_env=own_numeric,
     )
     shadow = recompute_side(
         "shadow",
@@ -761,6 +786,7 @@ def evaluate_day(
         client=client,
         physical_prefixes=(root.prefix, ""),
         arctic_loader=arctic_loader,
+        numeric_env=own_numeric,
     )
 
     def _published(side: str, key: str, out: dict[str, Any] | None) -> bytes | None:
