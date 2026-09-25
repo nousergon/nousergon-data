@@ -49,6 +49,39 @@ def write_feature_snapshot(
         import boto3
         s3_client = boto3.client("s3")
 
+    written = {}
+
+    for group, (group_df, body) in snapshot_group_frames(date_str, features_df).items():
+        key = f"{prefix}{date_str}/{group}.parquet"
+        s3_client.put_object(Bucket=bucket, Key=key, Body=body)
+
+        written[group] = len(group_df)
+        logger.debug("Wrote %s: %d rows, %d features", key, len(group_df), group_df.shape[1])
+
+    total_groups = len(written)
+    total_rows = sum(written.values())
+    logger.info(
+        "Feature snapshot written for %s: %d groups, %d total rows",
+        date_str, total_groups, total_rows,
+    )
+    return written
+
+
+def snapshot_group_frames(
+    date_str: str, features_df: pd.DataFrame,
+) -> dict[str, tuple[pd.DataFrame, bytes]]:
+    """Each feature group's frame and the exact Parquet bytes the snapshot publishes for it.
+
+    The ONE place a group's published bytes are produced. `write_feature_snapshot`
+    PUTs exactly these bytes, and the D31 recompute lineage
+    (`shadow.recompute_lineage`, alpha-engine-config-I11203) compares them with
+    a published file — so the two can never serialise a group differently.
+
+    Resolves which registered columns are present per group and enforces the
+    write-time units-suffix contract across ALL groups before returning
+    anything, so a mis-suffixed column fails the whole snapshot rather than
+    some groups.
+    """
     # Resolve which registered columns are actually present, per group,
     # BEFORE any S3 write.
     group_available: dict[str, list[str]] = {}
@@ -73,8 +106,7 @@ def write_feature_snapshot(
         for name in available:
             validate_units_suffix(name)
 
-    written = {}
-
+    out: dict[str, tuple[pd.DataFrame, bytes]] = {}
     for group, available in group_available.items():
         # Build the group DataFrame
         if group == "macro":
@@ -90,21 +122,7 @@ def write_feature_snapshot(
             group_df = features_df[id_cols + available].copy()
             group_df.insert(len(id_cols), "date", date_str)
 
-        # Write to S3 as Parquet
         buf = io.BytesIO()
         group_df.to_parquet(buf, index=False, engine="pyarrow")
-        buf.seek(0)
-
-        key = f"{prefix}{date_str}/{group}.parquet"
-        s3_client.put_object(Bucket=bucket, Key=key, Body=buf.getvalue())
-
-        written[group] = len(group_df)
-        logger.debug("Wrote %s: %d rows, %d features", key, len(group_df), len(available))
-
-    total_groups = len(written)
-    total_rows = sum(written.values())
-    logger.info(
-        "Feature snapshot written for %s: %d groups, %d total rows",
-        date_str, total_groups, total_rows,
-    )
-    return written
+        out[group] = (group_df, buf.getvalue())
+    return out

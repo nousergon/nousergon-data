@@ -44,12 +44,20 @@ DISPATCHABLE_MODULES: dict[str, tuple[str, str]] = {
     "parity": ("shadow-parity", "shadow parity"),
     "arctic_parity": ("arctic-parity", "shadow arctic-parity"),
     "retention": ("shadow-prune", "shadow prune"),
+    # alpha-engine-config-I11203: the tail of the same-day run, after `parity`.
+    "recompute_lineage": ("shadow-sameday", "shadow recompute-lineage"),
 }
 
 #: dispatchable workload key -> why it takes no trading day. Every comparator
 #: above is meaningless without one, so a missing day is refused at dispatch;
 #: a key listed here is the declared exception, with its reason.
 DATE_FREE_WORKLOADS: dict[str, str] = {
+    "shadow-sameday": (
+        "it resolves its trading day ON THE BOX (`dates.default_run_date()` == "
+        "today in ET) because its Scheduler rule carries a static input, and it "
+        "refuses a non-session or a pre-close fire there "
+        "(`test_shadow_sameday_guard_refuses_non_sessions_and_pre_close`)"
+    ),
     "shadow-prune": (
         "retention measures each shadow library's own stamp against today on "
         "the box (alpha-engine-config-I11447); there is no day to compare"

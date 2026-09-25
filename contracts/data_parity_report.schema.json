@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pre-cutover shadow parity report",
-  "description": "data_collection/parity/{trading_day}.json (data-collector plan \u00a76.2 step 4, alpha-engine-config-I10778). Written by `python -m shadow parity`, which diffs one standalone shadow run's output under staging/shadow/{trading_day}/ against the same trading day's v1 output, per key: row count, symbol set, schema, value tolerance. Read by nousergon-data/data_gate/evidence.py::read_parity as the `data.cutover_ready.parity` clause's evidence (alpha-engine-config-I10777). PRODUCER TEST: tests/test_shadow_parity.py. v2 (alpha-engine-config-I11351 / -I11352): adds the per-key `settling_bar` block, the report-level `prior_day_settled` block, `summary.settling_bar_keys`, a `dispatch` field on every `legs` entry, and turns `legs_known` from a bare boolean into one boolean PER DISPATCH GROUP. v1 documents stay valid and stay readable by the gate (evidence.PARITY_SCHEMA_VERSIONS). v3 (alpha-engine-config-I11203, Brian's ruling 2026-09-24): adds the `v1_cause` row verdict -- a difference PROVEN, by machine-checked evidence recorded inline on the row, to be caused on the v1 side -- with its `v1_cause` / `v1_cause_refused` blocks, `summary.v1_cause`, `prior_day_settled.v1_cause`, and `values.identity_breaches` on frame rows. v1 and v2 documents stay valid.",
+  "description": "data_collection/parity/{trading_day}.json (data-collector plan \u00a76.2 step 4, alpha-engine-config-I10778). Written by `python -m shadow parity`, which diffs one standalone shadow run's output under staging/shadow/{trading_day}/ against the same trading day's v1 output, per key: row count, symbol set, schema, value tolerance. Read by nousergon-data/data_gate/evidence.py::read_parity as the `data.cutover_ready.parity` clause's evidence (alpha-engine-config-I10777). PRODUCER TEST: tests/test_shadow_parity.py. v2 (alpha-engine-config-I11351 / -I11352): adds the per-key `settling_bar` block, the report-level `prior_day_settled` block, `summary.settling_bar_keys`, a `dispatch` field on every `legs` entry, and turns `legs_known` from a bare boolean into one boolean PER DISPATCH GROUP. v1 documents stay valid and stay readable by the gate (evidence.PARITY_SCHEMA_VERSIONS). v3 (alpha-engine-config-I11203, Brian's ruling 2026-09-24): adds the `v1_cause` row verdict -- a difference PROVEN, by machine-checked evidence recorded inline on the row, to be caused on the v1 side -- with its `v1_cause` / `v1_cause_refused` blocks, `summary.v1_cause`, `prior_day_settled.v1_cause`, and `values.identity_breaches` on frame rows. Evidence kind `recompute_lineage` (a derived key proven through the inputs it was computed from, `lineage/D31/{trading_day}.json`) was added within v3: the kind enum widened, no field changed shape. v1 and v2 documents stay valid.",
   "type": "object",
   "required": [
     "schema_version",
@@ -609,8 +609,24 @@
                     "type": "string",
                     "enum": [
                       "v1_bar_provisional",
-                      "vendor_published_after_v1_fetch"
-                    ]
+                      "vendor_published_after_v1_fetch",
+                      "recompute_lineage"
+                    ],
+                    "description": "`recompute_lineage` (alpha-engine-config-I11203): a DERIVED key (D31's `features/{D}/*.parquet`), which stamps no settlement of its own. `shadow recompute-lineage` re-ran one feature code over the inputs v1's and the shadow's D31 each RECORDED and got each side's published bytes back exactly (sha256 on both sides, bound to the objects this report graded); every recorded input whose content differs between the runs (`differing_inputs`) was itself graded `v1_cause` under its own key's comparison at report time. The evidence chains; it is never assumed."
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "rows"
+                    ],
+                    "description": "`v1_bar_provisional` only. Absent: the whole key is stamped provisional on v1's side and settled on the shadow's. `rows` (alpha-engine-config-I11563): the whole-key stamp is ambiguous because a run carried some rows from an earlier write, and EVERY row holding a numeric breach was proven provisional on v1's side and settled on the shadow's, row by row. `rows` lists up to 25 of them with the manifests each reading was followed through; `rows_explained` counts all."
+                  },
+                  "rows": {
+                    "type": "object"
+                  },
+                  "rows_explained": {
+                    "type": "integer",
+                    "minimum": 1
                   }
                 }
               }
@@ -625,7 +641,7 @@
           "items": {
             "type": "string"
           },
-          "description": "On a `mismatch` row where some v1-side evidence WAS found but did not cover every breach: why not (up to ten). An almost-proof is published, never silently discarded."
+          "description": "On every `mismatch` row graded for v1_cause: why it is not `v1_cause` (up to ten), whether or not any v1-side evidence was found (alpha-engine-config-I11563; before it, a row with no evidence at all carried no reason). An almost-proof is published, never silently discarded."
         },
         "failure_attribution": {
           "type": "object",

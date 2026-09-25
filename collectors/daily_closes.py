@@ -44,6 +44,7 @@ import logging
 import random
 import re
 import time
+from collections import Counter
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -163,6 +164,8 @@ def _coalesce_by_source_priority(
     new_records: list[dict],
     existing_rows: list[dict],
     run_date: str,
+    *,
+    carried: "list[str] | None" = None,
 ) -> tuple[list[dict], dict]:
     """Merge this-run records with the prior parquet by source priority.
 
@@ -188,6 +191,11 @@ def _coalesce_by_source_priority(
 
     Returns ``(merged_records, stats)`` — stats counts retained / overwritten /
     new_only / downgrade_blocked tickers for loud observability.
+
+    ``carried``, when given, is extended with the TICKERS whose merged row is
+    the existing object's row rather than this run's (retained or
+    downgrade-blocked). Their settlement is that object's,
+    not this fetch's (`_settlement_guards`, alpha-engine-config-I11563).
     """
     def _prio(row: dict | None) -> int:
         if row is None:
@@ -219,6 +227,8 @@ def _coalesce_by_source_priority(
         elif new_p < 0:  # ticker absent from this run → retain prior
             merged[ticker] = old_row
             stats["retained"] += 1
+            if carried is not None:
+                carried.append(str(ticker))
         elif new_p >= old_p:  # equal-or-higher source wins (tie → restatement)
             # I10783: this cell is genuinely being (re)written — bump its
             # revision counter off the prior row's, rather than trusting
@@ -230,6 +240,8 @@ def _coalesce_by_source_priority(
         else:  # fresh value is strictly lower-quality — keep the better existing
             merged[ticker] = old_row
             stats["downgrade_blocked"] += 1
+            if carried is not None:
+                carried.append(str(ticker))
 
     return list(merged.values()), stats
 
@@ -689,6 +701,69 @@ def _send_corporate_action_email(actions: list, run_date: str) -> None:
         )
 
 
+def _read_earlier_root_file(s3, bucket: str, key: str) -> pd.DataFrame | None:
+    """One earlier shadow root's copy of a D19 file, or ``None`` (logged)."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        frame = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+    except Exception as exc:  # noqa: BLE001 - one missing root is ordinary; the others still count
+        from collectors.price_cache_holes import _is_missing
+
+        (logger.info if _is_missing(exc) else logger.warning)(
+            "[merge base] s3://%s/%s unavailable (%s: %s) — not part of this merge base",
+            bucket, key, type(exc).__name__, exc,
+        )
+        return None
+    if "ticker" in frame.columns:
+        frame = frame.set_index("ticker")
+    return frame[~frame.index.duplicated(keep="last")]
+
+
+def _with_earlier_root_merge_base(
+    s3, bucket: str, key: str, run_date: str, current: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """``current`` coalesced with the shadow's own earlier roots' copies of ``key``.
+
+    alpha-engine-config-I11582 — the same source, and the same
+    ``VENDOR_PRECEDENCE``-then-newest ranking, as the hole filler's
+    (``collectors.shadow_earlier_roots.with_earlier_shadow_roots``,
+    alpha-engine-config-I11577). Earlier-root keys are outside the active
+    root, so the interceptor reads them live as inputs this run never writes;
+    v1's live file is never read. The identity outside a shadow root.
+    """
+    from collectors.shadow_earlier_roots import with_earlier_shadow_roots
+
+    merged = with_earlier_shadow_roots(
+        current, key, datetime.strptime(run_date, "%Y-%m-%d").date(),
+        lambda earlier: _read_earlier_root_file(s3, bucket, earlier),
+    )
+    if merged is not None and merged is not current:
+        logger.info(
+            "[merge base] %s: coalesced this root's copy (%s) with the shadow's earlier "
+            "roots — %d ticker(s) (alpha-engine-config-I11582)",
+            run_date, "absent" if current is None else f"{len(current)} tickers", len(merged),
+        )
+    return merged
+
+
+def _read_merge_base(
+    s3, bucket: str, key: str, run_date: str, earlier_root_base: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """The existing parquet ``collect`` merges into.
+
+    ``earlier_root_base`` is already the whole base when the current root had
+    no copy. Otherwise the current copy is read (raising, as before, so the
+    caller's legacy-overwrite fallback still applies to a read fault) and,
+    under a shadow root only, coalesced with the earlier roots.
+    """
+    if earlier_root_base is not None:
+        return earlier_root_base
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    current = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+    merged = _with_earlier_root_merge_base(s3, bucket, key, run_date, current)
+    return current if merged is None else merged
+
+
 def collect(
     bucket: str,
     tickers: list[str],
@@ -934,8 +1009,21 @@ def collect(
             raise
         # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
 
-    if head is not None:
-        last_modified = head["LastModified"]
+    # alpha-engine-config-I11582: under a shadow root the key above is run
+    # state, so it resolves to the CURRENT root's copy — which, on a fresh
+    # daily root, does not exist for a window date. v1 builds this merge base
+    # on the file its earlier runs left in place; the shadow's equivalent is
+    # its own earlier roots. When this call reads a merge base at all
+    # (``polygon_only``, or ``skip_if_canonical``) and the current root has
+    # none, look there before concluding there is nothing to keep. ``None``
+    # outside a shadow root, so production is unchanged.
+    earlier_root_base: pd.DataFrame | None = None
+    reads_merge_base = source == "polygon_only" or skip_if_canonical
+    if head is None and reads_merge_base:
+        earlier_root_base = _with_earlier_root_merge_base(s3, bucket, key, run_date, None)
+
+    if head is not None or earlier_root_base is not None:
+        last_modified = head["LastModified"] if head is not None else None
         if source == "polygon_only":
             # Read existing rows for (a) Close-discrepancy logging and (b) the
             # source-priority coalesce merge before write — so a cell the live
@@ -953,8 +1041,7 @@ def collect(
             # adjusted close stays on the current scale. Mirrors the yfinance
             # side's canonical-skip structure for consistency.
             try:
-                obj = s3.get_object(Bucket=bucket, Key=key)
-                existing_df = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+                existing_df = _read_merge_base(s3, bucket, key, run_date, earlier_root_base)
                 existing_close_for_discrepancy = {
                     str(t): float(existing_df.loc[t, "Close"])
                     for t in existing_df.index
@@ -967,7 +1054,9 @@ def collect(
                 logger.info(
                     "polygon_only: found existing parquet (last_modified=%s, %d tickers) — "
                     "will coalesce (retain-on-empty, priority-ranked) and log Close discrepancies",
-                    last_modified.isoformat(), len(existing_close_for_discrepancy),
+                    last_modified.isoformat() if last_modified is not None
+                    else "none in this shadow root; earlier shadow roots",
+                    len(existing_close_for_discrepancy),
                 )
                 if skip_if_canonical and not dry_run:
                     touched = split_touched_dates or set()
@@ -1010,10 +1099,7 @@ def collect(
             # windowed reconciliation is to fill NaN cells in older dates
             # that legacy logic would skip.
             try:
-                obj = s3.get_object(Bucket=bucket, Key=key)
-                existing_df = pd.read_parquet(
-                    io.BytesIO(obj["Body"].read()), engine="pyarrow",
-                )
+                existing_df = _read_merge_base(s3, bucket, key, run_date, earlier_root_base)
                 if "source" in existing_df.columns:
                     for t in existing_df.index:
                         row = existing_df.loc[t]
@@ -1218,9 +1304,13 @@ def collect(
     # the merged-output denominator"). polygon_only has
     # ``existing_rows_for_merge`` empty at this point (only populated in its
     # own branch above), so this is a no-op for that mode.
+    # alpha-engine-config-I11563: the tickers whose written row is the existing
+    # object's rather than this run's fetch, from EITHER coalesce below. Each is
+    # stamped with that object's settlement, row by row (`_settlement_guards`).
+    carried_tickers: list[str] = []
     if source != "polygon_only" and existing_rows_for_merge:
         records, canon_merge_stats = _coalesce_by_source_priority(
-            records, existing_rows_for_merge, run_date,
+            records, existing_rows_for_merge, run_date, carried=carried_tickers,
         )
         logger.info(
             "[skip_if_canonical] %s: coalesce retained %d preserved canonical "
@@ -1268,15 +1358,14 @@ def collect(
     # ``_coalesce_by_source_priority`` primitive above, before the coverage
     # gate — config#720 unified both modes onto this one function; only the
     # gate-ordering and the existing-rows population differ per mode.)
-    # alpha-engine-config-I11559: how many rows of what this run writes were
+    # alpha-engine-config-I11559: the rows of what this run writes that were
     # carried over from the existing object rather than fetched now. Their
-    # settlement is that object's, not this fetch's (`_settlement_guards`).
-    carried_rows = 0
+    # settlement is that object's, not this fetch's (`_settlement_guards`);
+    # I11563 records WHICH rows, not only how many.
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
-            records, existing_rows_for_merge, run_date,
+            records, existing_rows_for_merge, run_date, carried=carried_tickers,
         )
-        carried_rows = merge_stats["retained"] + merge_stats["downgrade_blocked"]
         if merge_stats["retained"] or merge_stats["downgrade_blocked"]:
             logger.warning(
                 "polygon_only coalesce for %s: retained %d prior cell(s) the live pass "
@@ -1396,7 +1485,7 @@ def collect(
             "vendor_divergence": vendor_divergence_record,
             "guards": _settlement_guards(
                 fetch_started_at, run_date, key,
-                carried_rows=carried_rows,
+                carried_rows=carried_tickers,
                 carried_from=last_modified if head is not None else None,
             ),
         }
@@ -1433,7 +1522,7 @@ def collect(
             # reading for rows carried over from the existing object.
             "guards": _settlement_guards(
                 fetch_started_at, run_date, key,
-                carried_rows=carried_rows,
+                carried_rows=carried_tickers,
                 carried_from=last_modified if head is not None else None,
             ),
         }
@@ -1447,48 +1536,74 @@ def collect(
         }
 
 
+def row_settlement_key(key: str, row: str) -> str:
+    """The guard `key` of one row's `bar_settlement` reading: ``<key>#<ticker>``.
+
+    The same ``<live key>#<address>`` spelling the vendor-publication guards use
+    (`dates.VENDOR_PUBLISHED_AT_GUARD`), so the manifest's closed guard shape
+    carries it unchanged. `shadow.parity._row_bar_settlement` reads it back.
+    """
+    return f"{key}#{row}"
+
+
 def _settlement_guards(
     fetch_started_at: datetime,
     run_date: str,
     key: str,
     *,
-    carried_rows: int = 0,
+    carried_rows: "list[str] | tuple[str, ...]" = (),
     carried_from: "datetime | None" = None,
 ) -> list[dict]:
     """The `bar_settlement` readings for one written ``key``.
 
     The first reading is always this run's fetch, graded on when it began
-    (`alpha-engine-config-I11354`, the D19/D20 rule). `alpha-engine-config-I11559`
-    adds a second when the written file also carries ``carried_rows`` rows
-    taken from the existing object instead of this fetch. The polygon_only
+    (`alpha-engine-config-I11354`, the D19/D20 rule). It is the settlement of
+    every row this run FETCHED.
+
+    `alpha-engine-config-I11559` / `-I11563`: the written file can also carry
+    rows taken from the existing object instead of this fetch. The polygon_only
     coalesce (D17) keeps a ticker polygon did not serve (retain-on-empty) or
-    would have downgraded. Those cells hold the existing object's bar, so they
-    are graded on ITS write time. D19's post-close skip path already uses that
-    rule for the object it leaves in place.
+    would have downgraded; the yfinance/auto coalesce keeps a canonical row it
+    did not refetch. Those cells hold the existing object's bar, so each one
+    gets its OWN reading, keyed ``<key>#<ticker>`` (:func:`row_settlement_key`)
+    and graded on that object's write time. D19's post-close skip path already
+    uses that rule for the object it leaves in place.
+
+    `shadow.parity` reads them row by row (`_row_bar_settlement`): a breach
+    on a row v1 stamped `provisional` and the shadow stamped `settled` is
+    explainable, and every other breach on the key stays strict. Read as a
+    whole-key stamp (`_bar_settlement_stamp`), readings that disagree stay
+    ambiguous, exactly as under I11559.
 
     Measured on 2026-09-22. D17's 12:19Z morning fetch was `settled`, but CPRI
     and SAM in the file it wrote were D19's 16:06 ET yfinance cells
     (`provisional`), and they were the only rows that differed from the
-    shadow's. With one `settled` reading the key would have claimed the whole
-    file was settled. When the two readings disagree, `shadow.parity` reads the
-    key's evidence as ambiguous (`_bar_settlement_stamp`) and the row stays
-    strict. It is never explained by a whole-key stamp that is true for only
-    some of its rows.
+    shadow's.
 
     Bound: the existing object's write time is the LATEST moment its carried
-    cells can have been fetched. If that object itself carried cells from an
-    earlier write, the reading can be `settled` for a cell that was fetched
-    provisionally. That error only leans toward `settled`.
+    cells can have been fetched. A `provisional` reading graded on it is
+    therefore always true. A `settled` one can be false, if that object itself
+    carried the cell from an earlier write. `shadow.parity` never takes a
+    carried `settled` reading on trust: it follows the row back to the run
+    that fetched it.
     """
     guards = [bar_settlement_guard_entry(fetch_started_at, run_date, key=key)]
-    if carried_rows and carried_from is not None:
-        carried = bar_settlement_guard_entry(carried_from, run_date, key=key)
-        carried["detail"] = (
-            f"{carried_rows} row(s) of {key} were carried over from the existing object, "
-            f"not fetched by this run; graded on that object's write time. "
-            + carried["detail"]
+    rows = sorted({str(t) for t in carried_rows})
+    if not rows or carried_from is None:
+        return guards
+    # Every carried row is named, however many there are: an unnamed carried
+    # row would read as fetched. The detail is kept short because a
+    # skip_if_canonical re-run can carry most of the file.
+    written = carried_from.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for row in rows:
+        reading = bar_settlement_guard_entry(
+            carried_from, run_date, key=row_settlement_key(key, row)
         )
-        guards.append(carried)
+        reading["detail"] = (
+            f"carried, not fetched: row {row} is the existing object's (written {written}); "
+            f"graded on that write against {SETTLED_AFTER_ET} ET. Verdict {reading['verdict']}."
+        )
+        guards.append(reading)
     return guards
 
 
@@ -2395,6 +2510,23 @@ def _fetch_yfinance_closes(
     config#1277) — got today's yfinance close mislabeled with the requested
     historical date, producing a false QUARANTINE on nearly every date in the
     56-business-day window (alpha-engine-config#2475).
+
+    **Only a ``^`` index ticker may resolve on-or-before** (alpha-engine-config-I11577).
+    For an equity the record is stamped ``date_str``, so the bar must BE
+    ``date_str``'s session; a bar from an earlier session is refused, never
+    relabelled. Measured 2026-09-24: yfinance had no 2026-09-22 bar for 835
+    tickers, the shadow D19 window pass wrote their 2026-09-21 closes as
+    ``staging/daily_closes/2026-09-22.parquet``, and the shadow's price-cache
+    hole filler published them as 2026-09-22. Every caller passes an NYSE
+    session (``collect`` refuses a non-trading single date and
+    ``_previous_business_days`` is holiday-aware), so on-or-before only ever
+    changed the answer when the vendor LACKED the session — the case that must
+    read "not covered", which the coverage gate and ``log_yf_coverage`` then
+    count. The ``^`` indices keep it: they fall back from FRED, whose
+    ``observation_end`` resolution is on-or-before by design. A bar's session
+    is its exchange-local date (a tz-aware index is read in its own zone, not
+    converted to UTC first, which would move a European midnight bar to the
+    previous day).
     """
     try:
         import yfinance as yf
@@ -2410,6 +2542,8 @@ def _fetch_yfinance_closes(
 
     count = 0
     covered: set[str] = set()
+    # I11577: equities whose latest bar predates ``date_str`` -> that bar's date.
+    refused_stale: dict[str, str] = {}
     batches = [tickers[i:i + _YFINANCE_BATCH_SIZE]
                for i in range(0, len(tickers), _YFINANCE_BATCH_SIZE)]
 
@@ -2433,13 +2567,16 @@ def _fetch_yfinance_closes(
             for ticker in batch:
                 try:
                     df = (raw[ticker] if is_multi else raw).copy()
-                    df.index = pd.to_datetime(df.index)
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_convert("UTC").tz_localize(None)
+                    df.index = _bar_session_dates(df.index)
                     df = df.dropna(subset=["Close"])
-                    # On-or-before ``date_str`` — a batched/backfilled fetch
-                    # must never resolve to a bar AFTER the requested date.
+                    # Never a bar AFTER the requested date; for an equity,
+                    # never one BEFORE it either (I11577 — see docstring).
                     df = df[df.index <= pd.Timestamp(requested)]
+                    if not ticker.startswith("^"):
+                        on_day = df[df.index == pd.Timestamp(requested)]
+                        if on_day.empty and not df.empty:
+                            refused_stale[ticker] = df.index.max().date().isoformat()
+                        df = on_day
                     if df.empty:
                         continue
 
@@ -2476,6 +2613,29 @@ def _fetch_yfinance_closes(
         except Exception as e:
             logger.warning("yfinance batch failed: %s", e)
 
+    if refused_stale:
+        logger.warning(
+            "yfinance fallback for %s: %d equity ticker(s) had no bar for that session "
+            "and are left uncovered rather than stamped %s with an earlier close "
+            "(latest bar by date: %s; sample: %s) — alpha-engine-config-I11577",
+            date_str, len(refused_stale), date_str,
+            dict(sorted(Counter(refused_stale.values()).items())),
+            sorted(refused_stale)[:20],
+        )
     logger.info("yfinance fallback: %d/%d tickers captured", count, len(tickers))
     log_yf_coverage(logger, "daily_closes", tickers, covered)
     return count
+
+
+def _bar_session_dates(index) -> pd.DatetimeIndex:
+    """Each bar's session date, tz-naive and normalised.
+
+    A tz-aware index is read in its OWN zone (the exchange's): converting to
+    UTC first would move a bar stamped at a European exchange's local midnight
+    to the previous calendar day. yfinance's daily ``download`` is tz-naive by
+    default (``ignore_tz``), where this is just ``normalize()``.
+    """
+    idx = pd.to_datetime(pd.Index(index))
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return pd.DatetimeIndex(idx).normalize()

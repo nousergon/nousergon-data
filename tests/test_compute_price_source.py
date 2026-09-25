@@ -77,6 +77,6 @@ def test_returns_none_when_arcticdb_empty(monkeypatch):
 
 
 def test_load_prices_and_macro_empty_when_no_source(monkeypatch):
-    monkeypatch.setattr(compute, "_load_price_source", lambda s3, b: None)
+    monkeypatch.setattr(compute, "_load_price_source", lambda s3, b, **_kw: None)
     prices, macro = compute._load_prices_and_macro(None, "b", "2026-04-10")
     assert prices == {} and macro == {}

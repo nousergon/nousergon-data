@@ -1350,7 +1350,19 @@ def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
     Each event is ``{"ticker", "execution_date", "split_from", "split_to"}``.
     Pure transform (no I/O) so callers that already fetched the events (the
     daily-closes window scan) can reuse them WITHOUT a second polygon call.
-    Malformed rows are skipped.
+    Rows missing a field are skipped.
+
+    Ratio fields are passed through UNCAST: :meth:`CorporateAction.from_split`
+    normalizes them (integral → ``int``, so integer-ratio ids are unchanged;
+    fractional kept). An ``int()`` cast here survived the 2026-07-02 fix to
+    ``polygon_client._split_ratio_num`` / ``from_split``, and it (a) silently
+    truncated a fractional ratio ``>= 1`` (``1:1.2`` → ``1:1``) and (b) turned
+    one ``< 1`` into ``0``, which ``from_split`` rightly refuses with
+    ``ValueError`` — so ONE such polygon row raised out of the whole-market
+    scan, and every run from 2026-09-24 fell back to the price-cache split
+    guard's refresh-everything path (alpha-engine-config-I11518 follow-up).
+    A non-positive or non-numeric ratio still raises: a caller that must tell
+    "no splits" from "could not read the splits" (the split guard) needs that.
     """
     actions: list[CorporateAction] = []
     for ev in events or []:
@@ -1364,8 +1376,8 @@ def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
             CorporateAction.from_split(
                 ticker=str(ticker),
                 ex_date=str(ex_date),
-                split_from=int(sf),
-                split_to=int(st),
+                split_from=sf,
+                split_to=st,
                 source="polygon",
                 raw=dict(ev),
             )
