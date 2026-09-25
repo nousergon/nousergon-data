@@ -44,6 +44,7 @@ import logging
 import random
 import re
 import time
+from collections import Counter
 from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -2340,6 +2341,23 @@ def _fetch_yfinance_closes(
     config#1277) — got today's yfinance close mislabeled with the requested
     historical date, producing a false QUARANTINE on nearly every date in the
     56-business-day window (alpha-engine-config#2475).
+
+    **Only a ``^`` index ticker may resolve on-or-before** (alpha-engine-config-I11577).
+    For an equity the record is stamped ``date_str``, so the bar must BE
+    ``date_str``'s session; a bar from an earlier session is refused, never
+    relabelled. Measured 2026-09-24: yfinance had no 2026-09-22 bar for 835
+    tickers, the shadow D19 window pass wrote their 2026-09-21 closes as
+    ``staging/daily_closes/2026-09-22.parquet``, and the shadow's price-cache
+    hole filler published them as 2026-09-22. Every caller passes an NYSE
+    session (``collect`` refuses a non-trading single date and
+    ``_previous_business_days`` is holiday-aware), so on-or-before only ever
+    changed the answer when the vendor LACKED the session — the case that must
+    read "not covered", which the coverage gate and ``log_yf_coverage`` then
+    count. The ``^`` indices keep it: they fall back from FRED, whose
+    ``observation_end`` resolution is on-or-before by design. A bar's session
+    is its exchange-local date (a tz-aware index is read in its own zone, not
+    converted to UTC first, which would move a European midnight bar to the
+    previous day).
     """
     try:
         import yfinance as yf
@@ -2355,6 +2373,8 @@ def _fetch_yfinance_closes(
 
     count = 0
     covered: set[str] = set()
+    # I11577: equities whose latest bar predates ``date_str`` -> that bar's date.
+    refused_stale: dict[str, str] = {}
     batches = [tickers[i:i + _YFINANCE_BATCH_SIZE]
                for i in range(0, len(tickers), _YFINANCE_BATCH_SIZE)]
 
@@ -2378,13 +2398,16 @@ def _fetch_yfinance_closes(
             for ticker in batch:
                 try:
                     df = (raw[ticker] if is_multi else raw).copy()
-                    df.index = pd.to_datetime(df.index)
-                    if df.index.tz is not None:
-                        df.index = df.index.tz_convert("UTC").tz_localize(None)
+                    df.index = _bar_session_dates(df.index)
                     df = df.dropna(subset=["Close"])
-                    # On-or-before ``date_str`` — a batched/backfilled fetch
-                    # must never resolve to a bar AFTER the requested date.
+                    # Never a bar AFTER the requested date; for an equity,
+                    # never one BEFORE it either (I11577 — see docstring).
                     df = df[df.index <= pd.Timestamp(requested)]
+                    if not ticker.startswith("^"):
+                        on_day = df[df.index == pd.Timestamp(requested)]
+                        if on_day.empty and not df.empty:
+                            refused_stale[ticker] = df.index.max().date().isoformat()
+                        df = on_day
                     if df.empty:
                         continue
 
@@ -2421,6 +2444,29 @@ def _fetch_yfinance_closes(
         except Exception as e:
             logger.warning("yfinance batch failed: %s", e)
 
+    if refused_stale:
+        logger.warning(
+            "yfinance fallback for %s: %d equity ticker(s) had no bar for that session "
+            "and are left uncovered rather than stamped %s with an earlier close "
+            "(latest bar by date: %s; sample: %s) — alpha-engine-config-I11577",
+            date_str, len(refused_stale), date_str,
+            dict(sorted(Counter(refused_stale.values()).items())),
+            sorted(refused_stale)[:20],
+        )
     logger.info("yfinance fallback: %d/%d tickers captured", count, len(tickers))
     log_yf_coverage(logger, "daily_closes", tickers, covered)
     return count
+
+
+def _bar_session_dates(index) -> pd.DatetimeIndex:
+    """Each bar's session date, tz-naive and normalised.
+
+    A tz-aware index is read in its OWN zone (the exchange's): converting to
+    UTC first would move a bar stamped at a European exchange's local midnight
+    to the previous calendar day. yfinance's daily ``download`` is tz-naive by
+    default (``ignore_tz``), where this is just ``normalize()``.
+    """
+    idx = pd.to_datetime(pd.Index(index))
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_localize(None)
+    return pd.DatetimeIndex(idx).normalize()

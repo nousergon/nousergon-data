@@ -77,6 +77,13 @@ _SPLIT_SCALE_THRESHOLD = 0.2
 #: calendar days), so a miss is a defect, not a known historical gap.
 HOLE_ALERT_TRADING_DAYS = 5
 
+#: Under a shadow root, how many of the shadow's own earlier daily roots (the
+#: NYSE sessions before its trading day, newest first) are searched for a
+#: session's canonical ``staging/daily_closes`` file (alpha-engine-config-I11577).
+#: Matches :data:`HOLE_ALERT_TRADING_DAYS`: an older hole is past the window a
+#: staging source is expected to exist for, and falls to the cached parquet.
+SHADOW_ROOT_LOOKBACK_SESSIONS = HOLE_ALERT_TRADING_DAYS
+
 _PRICE_COLS = ("Open", "High", "Low", "Close")
 _SAMPLE = 20
 
@@ -161,28 +168,98 @@ class SessionHoleFiller:
         return [s for s in self._sessions if first < s < last and s not in present]
 
     # ── sources ──────────────────────────────────────────────────────────
-    def _staging_frame(self, session: date) -> "pd.DataFrame | None":
-        if session in self._daily_closes:
-            return self._daily_closes[session]
-        key = f"{DAILY_CLOSES_PREFIX}{session.isoformat()}.parquet"
-        frame = None
+    def _read_daily_closes(self, key: str, session: date) -> "pd.DataFrame | None":
         try:
             obj = self._s3.get_object(Bucket=self._bucket, Key=key)
             frame = pd.read_parquet(io.BytesIO(obj["Body"].read()))
             if "ticker" in frame.columns:
                 frame = frame.set_index("ticker")
-            frame = frame[~frame.index.duplicated(keep="last")]
+            return frame[~frame.index.duplicated(keep="last")]
         except Exception as exc:  # noqa: BLE001 - an absent source is an unfilled hole, recorded
             # Expired staging (7-day lifecycle) is the ordinary case for an old
             # hole and is summarised by report(); anything else is a read fault.
             (logger.info if _is_missing(exc) else logger.warning)(
                 "price_cache hole fill: s3://%s/%s unavailable (%s: %s) — holes on "
-                "%s need the cached parquet instead",
+                "%s need another source",
                 self._bucket, key, type(exc).__name__, exc, session,
             )
-            frame = None
+            return None
+
+    def _staging_frame(self, session: date) -> "pd.DataFrame | None":
+        if session in self._daily_closes:
+            return self._daily_closes[session]
+        key = f"{DAILY_CLOSES_PREFIX}{session.isoformat()}.parquet"
+        frame = self._read_daily_closes(key, session)
+        from shadow.root import active_root
+
+        root = active_root()
+        if root is not None:
+            frame = self._with_earlier_shadow_roots(frame, key, session, root)
         self._daily_closes[session] = frame
         return frame
+
+    def _with_earlier_shadow_roots(
+        self, frame: "pd.DataFrame | None", key: str, session: date, root: Any,
+    ) -> "pd.DataFrame | None":
+        """``frame`` coalesced with the shadow's OWN earlier roots' copies of ``key``.
+
+        alpha-engine-config-I11577. Under a shadow root, ``staging/daily_closes/``
+        is run state (``shadow.interceptor.OWN_STATE_KEY_PATTERNS``), so the
+        plain read above resolves to the CURRENT root's copy — on a fresh
+        same-day root, the D19 window pass's own yfinance-only rewrite, with
+        none of the polygon rows v1's live file keeps (``skip_if_canonical``).
+        On 2026-09-24 that file carried 835 tickers' 2026-09-21 closes stamped
+        2026-09-22, and this filler published them into the shadow price cache.
+
+        The session's canonical record in the shadow's world is the one its
+        own earlier runs wrote: ``staging/shadow/{T}/staging/daily_closes/{S}``
+        for the sessions ``T`` between ``S`` and the root's trading day (the
+        2026-09-23 root's 2026-09-22 file is the shadow morning pass's polygon
+        overwrite). Those keys are outside this root, so the interceptor reads
+        them LIVE as ordinary inputs, and this run never writes one — the
+        I10891 read-then-write rule cannot trip. v1's live file is NOT read:
+        a guard-baseline read may decide whether to publish, never supply what
+        is published (``shadow.interceptor.guard_baseline_reads``).
+
+        Rows are coalesced per ticker the way D19 coalesces a merge base
+        (``collectors.daily_closes.VENDOR_PRECEDENCE``, a null Close ranking
+        below everything): the highest-precedence source wins, and among
+        equals the newest root (the current one first).
+        """
+        from collectors.daily_closes import VENDOR_PRECEDENCE
+        from shadow.root import SHADOW_ROOT_TEMPLATE
+
+        try:
+            roots = _session_dates(session, root.trading_day - timedelta(days=1))
+        except Exception as exc:  # noqa: BLE001 - a calendar miss leaves the current root only
+            logger.warning(
+                "price_cache hole fill: could not enumerate earlier shadow roots for %s "
+                "(%s) — using the current root's copy only", session, exc,
+            )
+            roots = []
+        candidates = [frame] if frame is not None else []
+        for t in reversed(roots[-SHADOW_ROOT_LOOKBACK_SESSIONS:]):
+            earlier = SHADOW_ROOT_TEMPLATE.format(trading_day=t.isoformat()) + key
+            got = self._read_daily_closes(earlier, session)
+            if got is not None:
+                candidates += [got]
+        if len(candidates) <= 1:
+            return candidates[0] if candidates else None
+
+        def _rank(part: pd.DataFrame) -> pd.Series:
+            src = part["source"] if "source" in part.columns else pd.Series(None, index=part.index)
+            rank = src.map(lambda v: VENDOR_PRECEDENCE.get(v, 1)).astype(float)
+            if "Close" in part.columns:
+                rank[part["Close"].isna()] = 0.0
+            return rank
+
+        merged = pd.concat([
+            part.assign(_hole_rank=_rank(part), _hole_recency=recency)
+            for recency, part in enumerate(candidates)
+        ])
+        merged = merged.sort_values(["_hole_rank", "_hole_recency"], ascending=[False, True], kind="stable")
+        merged = merged[~merged.index.duplicated(keep="first")]
+        return merged.drop(columns=["_hole_rank", "_hole_recency"])
 
     def _staging_bars(self, ticker: str, sessions: "list[date]") -> "pd.DataFrame | None":
         rows = {}
