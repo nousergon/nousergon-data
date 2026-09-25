@@ -134,6 +134,17 @@ def _run(index_module, spots, s3_marker_exists: bool = False):
     return out, ec2, cw, s3
 
 
+def _metric_calls(cw, metric_name: str) -> list:
+    """put_metric_data calls carrying ``metric_name``. The handler also emits
+    per-market scan metrics on every run (alpha-engine-config-I11108), so a
+    test about the per-name reap series must select it rather than count all
+    put_metric_data calls."""
+    return [
+        c for c in cw.put_metric_data.call_args_list
+        if any(d["MetricName"] == metric_name for d in c.kwargs["MetricData"])
+    ]
+
+
 class TestThresholdConfig:
     def test_threshold_is_budget_plus_grace(self, index_module):
         assert index_module.REAP_AFTER_SECONDS == THRESHOLD
@@ -258,7 +269,7 @@ class TestHandler:
         assert out["orphans_detected"] == 1
         assert out["terminated"] == ["i-groom"]
         ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-groom"])
-        cw.put_metric_data.assert_called_once()
+        assert len(_metric_calls(cw, "spot_orphans_terminated")) == 1
         # NOT a ci-watch box — the incomplete-reap alert must never fire.
         assert out["ci_watch_incomplete_reaps"] == []
         assert index_module._test_send_message.calls == []
@@ -273,7 +284,7 @@ class TestHandler:
         assert out["orphans_detected"] == 0
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
-        cw.put_metric_data.assert_not_called()
+        assert _metric_calls(cw, "spot_orphans_terminated") == []
 
     def test_boundary_just_under_threshold_is_safe(self, index_module):
         spots = [_spot("i-0001", "alpha-engine-backtest-20260511", age_seconds=THRESHOLD - 60)]
@@ -598,3 +609,141 @@ class TestThinkTankIncompleteReapAlert:
         assert out["alert_drain_incomplete_reaps"] == ["i-drain"]
         assert out["thinktank_incomplete_reaps"] == ["i-tt"]
         assert len(index_module._test_send_message.calls) == 4
+
+
+# ── alpha-engine-config-I11108 / I7185 / I11575: on-demand run boxes ─────────
+
+
+def _box(instance_id: str, name: str, age_seconds: int, *, lifecycle: str | None,
+         launch_market: str | None, watchdog_deadline: str | None = None) -> dict:
+    """A describe-instances entry carrying the fields the two scans filter on."""
+    inst = _spot(instance_id, name, age_seconds, watchdog_deadline=watchdog_deadline)
+    if lifecycle is not None:
+        inst["InstanceLifecycle"] = lifecycle
+    if launch_market is not None:
+        inst["Tags"].append({"Key": "LaunchMarket", "Value": launch_market})
+    return inst
+
+
+def _matches(inst: dict, flt: dict) -> bool:
+    tags = {t["Key"]: t["Value"] for t in inst["Tags"]}
+    name, values = flt["Name"], flt["Values"]
+    if name == "instance-state-name":
+        return True  # every fixture box is running
+    if name == "instance-lifecycle":
+        return inst.get("InstanceLifecycle") in values
+    if name.startswith("tag:"):
+        value = tags.get(name[len("tag:"):])
+        if value is None:
+            return False
+        return any(value.startswith(v[:-1]) if v.endswith("*") else value == v for v in values)
+    raise AssertionError(f"unexpected filter {flt}")
+
+
+def _run_filtered(index_module, fleet: list[dict]):
+    """Like _run, but the fake EC2 applies the Filters it is given, the way
+    EC2 does (all filters AND together), so the scan's scope is under test."""
+    paginator = MagicMock()
+    paginator.paginate.side_effect = lambda Filters: [{
+        "Reservations": [{"Instances": [
+            i for i in fleet if all(_matches(i, f) for f in Filters)
+        ]}],
+    }]
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value = paginator
+    cw = MagicMock()
+    s3 = MagicMock()
+    s3.head_object.side_effect = _NotFound("404 Not Found")
+    clients = {"ec2": ec2, "cloudwatch": cw, "s3": s3}
+    with patch.object(index_module.boto3, "client",
+                      side_effect=lambda svc, **kw: clients[svc]):
+        out = index_module.handler({}, None)
+    return out, ec2, cw
+
+
+class TestOnDemandRunBoxes:
+    def test_on_demand_launcher_box_past_its_deadline_is_reaped(self, index_module):
+        # The 2026-09-19 weekly box: on-demand fallback, never seen by the
+        # spot-only scan, leaked ~8h. Fails against the pre-fix filter.
+        past = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+        fleet = [_box("i-weekly", "alpha-engine-weekly-freshness-spot", 50000,
+                      lifecycle=None, launch_market="on-demand", watchdog_deadline=past)]
+        out, ec2, _cw = _run_filtered(index_module, fleet)
+        assert out["terminated"] == ["i-weekly"]
+        assert out["orphan_detail"][0]["market"] == "on-demand"
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-weekly"])
+
+    def test_on_demand_launcher_box_within_its_deadline_is_kept(self, index_module):
+        future = (datetime.now(timezone.utc) + timedelta(hours=3)).isoformat()
+        fleet = [_box("i-weekly", "alpha-engine-weekly-freshness-spot", 30000,
+                      lifecycle=None, launch_market="on-demand", watchdog_deadline=future)]
+        out, ec2, _cw = _run_filtered(index_module, fleet)
+        assert out["scanned"] == 1
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_long_lived_boxes_without_the_launcher_tag_are_never_scanned(self, index_module):
+        # alpha-engine-dashboard has run on-demand since 2026-07-27 with no
+        # watchdog-deadline tag. A Name-only scan would reap it at the 6.5h
+        # fallback cap; the launcher's LaunchMarket tag is what keeps it out.
+        fleet = [
+            _box("i-dash", "alpha-engine-dashboard", 60 * 86400, lifecycle=None, launch_market=None),
+            _box("i-exec", "alpha-engine-executor", THRESHOLD * 3, lifecycle=None, launch_market=None),
+        ]
+        out, ec2, _cw = _run_filtered(index_module, fleet)
+        assert out["scanned"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+    def test_spot_box_is_still_reaped_and_counted_once(self, index_module):
+        # launch_with_fallback also tags a spot win LaunchMarket=spot; a box
+        # matching both scans must be considered once.
+        fleet = [_box("i-groom", "alpha-engine-groom-spot", THRESHOLD + 600,
+                      lifecycle="spot", launch_market="spot")]
+        out, ec2, _cw = _run_filtered(index_module, fleet)
+        assert out["scanned"] == 1
+        assert out["terminated"] == ["i-groom"]
+        assert out["terminated_by_market"] == {"spot": 1}
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-groom"])
+
+    def test_other_name_prefixes_stay_out_of_scope(self, index_module):
+        fleet = [_box("i-v2", "crucible-v2-experiment.backfill", THRESHOLD * 2,
+                      lifecycle=None, launch_market="on-demand")]
+        out, ec2, _cw = _run_filtered(index_module, fleet)
+        assert out["scanned"] == 0
+        ec2.terminate_instances.assert_not_called()
+
+
+class TestScanMetrics:
+    def _points(self, cw) -> dict[tuple[str, str], float]:
+        calls = _metric_calls(cw, "orphan_reaper_candidates")
+        assert len(calls) == 1
+        return {
+            (d["MetricName"], d["Dimensions"][0]["Value"]): d["Value"]
+            for d in calls[0].kwargs["MetricData"]
+        }
+
+    def test_an_empty_scan_still_emits_zero_candidates(self, index_module):
+        # I11108 deliverable 2: "found nothing to look at" must be a data
+        # point, not an absence that reads the same as a healthy fleet.
+        _out, _ec2, cw = _run_filtered(index_module, [])
+        assert self._points(cw) == {
+            ("orphan_reaper_candidates", "spot"): 0.0,
+            ("orphan_reaper_terminated", "spot"): 0.0,
+            ("orphan_reaper_candidates", "on-demand"): 0.0,
+            ("orphan_reaper_terminated", "on-demand"): 0.0,
+        }
+
+    def test_candidates_and_reaps_are_split_by_market(self, index_module):
+        past = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+        fleet = [
+            _box("i-spot", "alpha-engine-backtest-20260925", 600, lifecycle="spot", launch_market="spot"),
+            _box("i-od", "alpha-engine-weekly-freshness-spot", 50000,
+                 lifecycle=None, launch_market="on-demand", watchdog_deadline=past),
+        ]
+        out, _ec2, cw = _run_filtered(index_module, fleet)
+        assert out["scanned_by_market"] == {"spot": 1, "on-demand": 1}
+        points = self._points(cw)
+        assert points[("orphan_reaper_candidates", "spot")] == 1.0
+        assert points[("orphan_reaper_terminated", "spot")] == 0.0
+        assert points[("orphan_reaper_candidates", "on-demand")] == 1.0
+        assert points[("orphan_reaper_terminated", "on-demand")] == 1.0
