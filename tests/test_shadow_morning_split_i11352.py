@@ -155,10 +155,14 @@ def test_the_comparator_still_always_runs_on_both(workloads):
         assert cmd.count("RC_ALL=$RC") == legs
         assert "[ $RC_ALL -ne 0 ] && exit $RC_ALL; " in cmd
     # `shadow-sameday` ends on the parity code unless its post-grade prune
-    # failed (alpha-engine-config-I11447); pinned by the dispatcher's
-    # `test_shadow_sameday_prunes_only_after_the_day_is_graded`.
+    # failed (alpha-engine-config-I11447; pinned by the dispatcher's
+    # `test_shadow_sameday_prunes_only_after_the_day_is_graded`) or its
+    # recompute lineage crashed (alpha-engine-config-I11203; the executed
+    # shell is pinned by `test_recompute_lineage.py`).
     assert workloads["shadow-sameday"].endswith(
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; exit $PARITY_RC )"
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; "
+        "[ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
+        '[ "${LINEAGE_RC:-0}" -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )'
     )
     # `shadow-morning` ends on the ArcticDB comparator's code, which grades the
     # whole rewritten report (alpha-engine-config-I11546); the executed shell

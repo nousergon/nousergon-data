@@ -49,6 +49,7 @@ from datetime import datetime, timezone
 
 import boto3
 
+from collectors.yahoo_session import YahooAuthError, yahoo_info
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance
 
 logger = logging.getLogger(__name__)
@@ -149,7 +150,7 @@ def collect(
                 "shares_short": None,
             }
             try:
-                info = yf.Ticker(ticker).info
+                info = yahoo_info(ticker, yf_module=yf)
                 short_pct = info.get("shortPercentOfFloat")
                 short_ratio = info.get("shortRatio")
                 shares_short = info.get("sharesShort")
@@ -166,6 +167,8 @@ def collect(
                 if any(v is not None for v in row.values()):
                     ok_count += 1
                     covered.add(ticker)
+            except YahooAuthError:
+                raise  # the session is gone for every ticker (alpha-engine-config-I11578)
             except Exception as exc:
                 err_count += 1
                 logger.debug("short interest fetch failed for %s: %s", ticker, exc)

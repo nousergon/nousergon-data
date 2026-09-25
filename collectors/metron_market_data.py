@@ -52,6 +52,7 @@ import run_units
 from dates import default_run_date, default_session_date
 from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
+from collectors.yahoo_session import YahooAuthError, call_yahoo, yahoo_info
 from validators import expectations
 
 logger = logging.getLogger(__name__)
@@ -433,18 +434,212 @@ _METRON_COVERAGE_NOTE = (
 )
 
 
+#: Coverage below which a per-symbol yfinance pass is a vendor COLLAPSE, not a
+#: thin day: the fetcher raises :class:`YfCoverageCollapse` and the unit publishes
+#: nothing, so the previous artifact stands (alpha-engine-config-I11578).
+#: Healthy shadow runs 2026-09-18..23 over the 75-symbol held universe: sectors
+#: 61 (0.81), fundamentals 65-66 (0.87-0.88), earnings 60 (0.80), analyst 60
+#: (0.80). Collapses: sectors 19 (0.25) on 09-22; sectors 0 and fundamentals 43
+#: (0.57) on 09-24 under HTTP 401. The ~8 CUSIPs and 401(k) CITs that never price
+#: are inside the healthy figures.
+METRON_YF_COVERAGE_FLOOR = 0.70
+#: A ratio over fewer requested symbols than this is not evidence of a collapse.
+METRON_YF_COVERAGE_MIN_REQUESTED = 20
+
+
+class YfCoverageCollapse(RuntimeError):
+    """A per-symbol yfinance pass covered less than its declared floor."""
+
+
 def _log_yf_coverage(
     kind: str,
     requested: list[str],
     covered: dict | set,
     *,
     error_on_empty: bool = False,
+    floor: float | None = None,
 ) -> None:
-    """Metron wrapper over :func:`nousergon_lib.yfinance_quiet.log_yf_coverage` (config#1029)."""
+    """Metron wrapper over :func:`nousergon_lib.yfinance_quiet.log_yf_coverage` (config#1029).
+
+    With ``floor``, a pass over at least ``METRON_YF_COVERAGE_MIN_REQUESTED``
+    symbols that covers less than ``floor`` of them logs ERROR and raises
+    :class:`YfCoverageCollapse`, so the unit fails instead of overwriting its
+    artifact with a near-empty one (alpha-engine-config-I11578)."""
     log_yf_coverage(
         logger, kind, requested, covered,
         error_on_empty=error_on_empty, note=_METRON_COVERAGE_NOTE,
     )
+    wanted = set(requested)
+    if floor is None or len(wanted) < METRON_YF_COVERAGE_MIN_REQUESTED:
+        return
+    ratio = len(wanted & set(covered)) / len(wanted)
+    if ratio < floor:
+        msg = (
+            f"{kind}: yfinance covered {len(wanted & set(covered))}/{len(wanted)} symbols "
+            f"({ratio:.2f}), below the {floor:.2f} collapse floor; refusing to publish a "
+            "near-empty artifact (alpha-engine-config-I11578)"
+        )
+        logger.error("[metron_market_data] %s", msg)
+        raise YfCoverageCollapse(msg)
+
+
+# ── Day-D session close from intraday bars (alpha-engine-config-I11548) ─────
+#
+# yfinance's DAILY series stops carrying a European listing's day-D bar once
+# that exchange's local date has rolled to D+1, and does not carry it again
+# until its finalized daily store catches up, the next US afternoon.
+# Measured on the D20/D21 parity reports and shadow objects for 2026-09-21..24:
+#   * v1 fetched at 20:09-20:15 UTC and carried day D for NOVN.SW, RMS.PA, SU.PA
+#     on all four days;
+#   * the standalone shadow fetched at 22:45-22:52 UTC and carried D-1 for
+#     exactly those three on all four days, while D05.SI and every US listing
+#     carried D;
+#   * 2026-09-24 ran with the request end pushed to D+2 (nousergon-data PR1925)
+#     and still carried D-1, and no fetch-boundary clip fired, so the vendor
+#     answered with nothing dated D rather than something dated after D. The
+#     request window was not the cause, and it is back to ``history_window``.
+#
+# An intraday bar carries its own exchange-local timestamp and is served as the
+# session trades, not from the lagging daily store. (That was not measurable
+# where this was written, which had no route to the vendor; the next shadow
+# run is the measurement, and a miss degrades to the truthful D-1 path below.)
+# So a symbol whose daily fetch ends one session before D
+# (``_lagging_by_one_session``) gets D's close from D's own intraday session,
+# only after that
+# session has ended by the vendor's declared regular-session end. The bar_date
+# stays truthful: a symbol with no complete day-D intraday session keeps its
+# earlier bar_date and is reported as stale (``_log_stale_bars``); it is never
+# relabelled.
+
+#: Intraday interval for the day-D session close. Hourly bars are served for
+#: ~730 days, so a ``--date D`` rerun weeks later can still take this path.
+SESSION_CLOSE_INTERVAL = "1h"
+#: Only a daily series that ends within this many calendar days before D is
+#: "lagging by the rollover" (D-1, or the Friday before a Monday D plus one
+#: holiday). A series that ends earlier has stopped for another reason, and
+#: one intraday close after that gap would not be the missing bar.
+SESSION_CLOSE_MAX_LAG_DAYS = 5
+
+
+def _lagging_by_one_session(last_bar: str, trading_day: str) -> bool:
+    """True when a daily series ending at ``last_bar`` lacks only D's bar."""
+    gap = (date.fromisoformat(trading_day[:10]) - date.fromisoformat(last_bar[:10])).days
+    return 0 < gap <= SESSION_CLOSE_MAX_LAG_DAYS
+
+
+def _session_close_from_intraday(
+    bars: Any, meta: Any, trading_day: date, now_utc: Any, *, label: str,
+) -> float | None:
+    """Day ``trading_day``'s regular-session close from one symbol's intraday
+    ``bars`` (tz-aware, exchange time, regular session only) and the chart
+    ``meta`` returned with them, or ``None`` when the bars do not prove a
+    complete session on that exchange-local date.
+
+    A session counts as complete only when the vendor's own ``tradingPeriods``
+    declares its regular end for that date and ``now_utc`` is past it. The value
+    is ``regularMarketPrice`` when ``regularMarketTime`` falls on that date at or
+    after the last bar, because that is the session's final print including any
+    closing auction, and the same number the vendor's live daily row carries.
+    Otherwise it is the last regular-session bar's close."""
+    import pandas as pd
+
+    if bars is None or len(bars) == 0 or "Close" not in getattr(bars, "columns", ()):
+        return None
+    idx = pd.DatetimeIndex(bars.index)
+    if idx.tz is None:
+        logger.warning("[metron_market_data] session close %s: intraday index has no timezone", label)
+        return None
+    bars = bars.loc[idx.date == trading_day].dropna(subset=["Close"])
+    if bars.empty:
+        return None
+    try:
+        periods = meta.get("tradingPeriods") if meta is not None else None
+        ends = [] if periods is None else [
+            pd.Timestamp(e) for d, e in zip(periods.index, periods["end"]) if d.date() == trading_day
+        ]
+    except Exception as e:  # noqa: BLE001 -- recorded below: unknown end means no fill, never a guess
+        logger.warning("[metron_market_data] session close %s: tradingPeriods unreadable: %s", label, e)
+        ends = []
+    if not ends:
+        logger.warning(
+            "[metron_market_data] session close %s: no declared regular-session end for %s; "
+            "not taking an intraday close", label, trading_day,
+        )
+        return None
+    if pd.Timestamp(now_utc) < ends[-1]:
+        logger.info(
+            "[metron_market_data] session close %s: %s session ends %s, still open at %s",
+            label, trading_day, ends[-1], now_utc,
+        )
+        return None
+    close = float(bars["Close"].iloc[-1])
+    rmt = meta.get("regularMarketTime") if meta is not None else None
+    rmp = meta.get("regularMarketPrice") if meta is not None else None
+    if isinstance(rmt, pd.Timestamp) and rmt.tzinfo is not None and rmp is not None:
+        rmt_local = rmt.tz_convert(idx.tz)
+        if rmt_local.date() == trading_day and rmt_local >= bars.index[-1] and float(rmp) > 0:
+            close = float(rmp)
+    return round(close, 6)
+
+
+@_yf_quiet
+def _yfinance_session_closes(
+    yf_symbols: list[str], *, trading_day: "str | date", now_utc: Any = None,
+) -> dict[str, float]:
+    """``{yf_symbol: close}`` for each symbol whose day-D regular session is
+    complete in its intraday bars (see :func:`_session_close_from_intraday`).
+    Per-symbol requests, because the exchange timezone is per listing and the
+    caller only asks for the few symbols whose daily series ends before D.
+    Symbols with no provable session are omitted, never filled."""
+    if not yf_symbols:
+        return {}
+    try:
+        import pandas as pd
+        import yfinance as yf
+    except ImportError:  # pragma: no cover
+        return {}
+    day = date.fromisoformat(str(trading_day)[:10])
+    now = pd.Timestamp.now(tz="UTC") if now_utc is None else pd.Timestamp(now_utc)
+    # Date-only bounds are read in the listing's own timezone: [D, D+1) local.
+    start, end = day.isoformat(), (pd.Timestamp(day) + pd.Timedelta(days=1)).date().isoformat()
+    out: dict[str, float] = {}
+    for sym in yf_symbols:
+        try:
+            ticker = yf.Ticker(sym)
+            bars = ticker.history(
+                start=start, end=end, interval=SESSION_CLOSE_INTERVAL,
+                prepost=False, auto_adjust=False,
+            )
+            close = _session_close_from_intraday(
+                bars, ticker.history_metadata, day, now, label=sym,
+            )
+        except Exception as e:  # noqa: BLE001 -- one symbol's miss keeps its truthful earlier bar
+            logger.warning("[metron_market_data] session close fetch failed for %s: %s", sym, e)
+            continue
+        if close is not None:
+            out[sym] = close
+    if out:
+        logger.warning(
+            "[metron_market_data] daily series ended before %s for %d symbol(s); took the "
+            "day-%s close from each one's completed intraday session (alpha-engine-config-I11548): %s",
+            day, len(out), day, ", ".join(f"{s}={c}" for s, c in sorted(out.items())),
+        )
+    return out
+
+
+def _log_stale_bars(kind: str, bar_dates: dict[str, str], trading_day: "str | date") -> dict[str, str]:
+    """Report every symbol whose published latest bar is older than D, and return
+    them as ``{yf_symbol: bar_date}``. The bar_date on the artifact is already
+    truthful; this puts it on the run's log and result so a stale close is not
+    only discoverable by diffing (alpha-engine-config-I11548)."""
+    day = str(trading_day)[:10]
+    stale = {s: d for s, d in sorted(bar_dates.items()) if d < day}
+    if stale:
+        logger.warning(
+            "[metron_market_data] %s: %d symbol(s) published with a latest bar before %s: %s",
+            kind, len(stale), day, ", ".join(f"{s}@{d}" for s, d in stale.items()),
+        )
+    return stale
 
 
 @_yf_quiet
@@ -457,13 +652,13 @@ def _yfinance_closes(
     ``[trading_day − 10d, trading_day]`` (alpha-engine-config-I10893) so a rerun for D
     executed on D+1 never reports D+1's partial session as D's close; ``None`` resolves
     to the last closed session (``dates.default_run_date``), never wall-clock now.
-    The REQUEST reaches D + 2 (``dates.vendor_request_window``) and the response is
-    clipped to D: ``end = D + 1`` is 22:00 UTC for a Paris/Zurich listing, and a
-    same-evening fetch after it came back without D's bar (alpha-engine-config-I11548)."""
-    from dates import clip_to_trading_day, default_run_date, vendor_request_window
+    A symbol whose daily series ends before D takes D's close from its completed
+    intraday session when the vendor has one (:func:`_yfinance_session_closes`,
+    alpha-engine-config-I11548); otherwise it keeps its truthful earlier bar_date."""
+    from dates import clip_to_trading_day, default_run_date, history_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
-    start, end_excl = vendor_request_window(trading_day, LATEST_BAR_LOOKBACK)
+    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -487,10 +682,7 @@ def _yfinance_closes(
                 try:
                     df = (raw[sym] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = clip_to_trading_day(
-                        df.dropna(subset=["Close"]), trading_day,
-                        label=f"closes[{sym}]", expect_rows_after=True,
-                    )
+                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"closes[{sym}]")
                     if df.empty:
                         continue
                     last = df.iloc[-1]
@@ -500,6 +692,9 @@ def _yfinance_closes(
                     logger.warning("[metron_market_data] close extract failed for %s: %s", sym, e)
         except Exception as e:
             logger.warning("[metron_market_data] yfinance close batch failed: %s", e)
+    behind = sorted(s for s, (_c, d) in out.items() if _lagging_by_one_session(d, trading_day))
+    for sym, close in _yfinance_session_closes(behind, trading_day=trading_day).items():
+        out[sym] = (round(close, 4), trading_day[:10])
     logger.info("[metron_market_data] closes: %d/%d symbols priced", len(out), len(yf_symbols))
     _log_yf_coverage("closes", yf_symbols, out, error_on_empty=True)
     return out
@@ -512,13 +707,13 @@ def _yfinance_fx(
     """Latest FX rate on or before ``trading_day`` per currency via yfinance
     ``{CCY}{BASE}=X`` → ``{CCY: rate}`` (``base`` per 1 unit of ``CCY``). Unresolvable
     pairs omitted — no fabrication. Bounded like :func:`_yfinance_closes`
-    (alpha-engine-config-I10893, -I11548)."""
+    (alpha-engine-config-I10893)."""
     if not currencies:
         return {}
-    from dates import clip_to_trading_day, default_run_date, vendor_request_window
+    from dates import clip_to_trading_day, default_run_date, history_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
-    start, end_excl = vendor_request_window(trading_day, LATEST_BAR_LOOKBACK)
+    start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
     try:
         import pandas as pd
         import yfinance as yf
@@ -540,10 +735,7 @@ def _yfinance_fx(
         for pair, ccy in pairs.items():
             try:
                 df = (raw[pair] if is_multi else raw).copy()
-                df = clip_to_trading_day(
-                    df.dropna(subset=["Close"]), trading_day,
-                    label=f"fx[{pair}]", expect_rows_after=True,
-                )
+                df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"fx[{pair}]")
                 if df.empty:
                     continue
                 out[ccy] = round(float(df.iloc[-1]["Close"]), 6)
@@ -566,9 +758,7 @@ def _yf_history(
     explicit ``start``/``end`` derived from ``trading_day`` (required,
     alpha-engine-config-I10893) — never ``period=``, which ends at vendor "now" and
     published a pre-close D+1 bar into ``fx_history`` on a ``--date D`` rerun, with a
-    start that drifted with wall-clock time. The request reaches D + 2 and the response
-    is clipped to D, so a non-US listing's day-D bar is not lost to an exchange-local
-    ``end`` that has already passed (alpha-engine-config-I11548). ``is_fx`` maps a currency to the
+    start that drifted with wall-clock time. ``is_fx`` maps a currency to the
     ``{CCY}{BASE}=X`` pair and keys the result by the bare currency. Empty series omitted.
     ``auto_adjust`` selects the basis (config#1865): ``False`` (default) is split-adjusted-
     only; ``True`` is dividend-adjusted, matching the price_cache basis (see
@@ -581,12 +771,12 @@ def _yf_history(
         logger.warning("[metron_market_data] yfinance/pandas unavailable for history")
         return {}
 
-    from dates import clip_to_trading_day, vendor_request_window
+    from dates import clip_to_trading_day, history_window
 
     targets = {f"{c}{base}=X": c for c in symbols if c and c != base} if is_fx else {s: s for s in symbols if s}
     if not targets:
         return {}
-    start, end_excl = vendor_request_window(trading_day, period)
+    start, end_excl = history_window(trading_day, period)
     out: dict[str, list[tuple[str, float]]] = {}
     keys = list(targets)
     batches = [keys[i:i + _YFINANCE_BATCH_SIZE] for i in range(0, len(keys), _YFINANCE_BATCH_SIZE)]
@@ -602,10 +792,7 @@ def _yf_history(
                 try:
                     df = (raw[key] if is_multi else raw).copy()
                     df.index = pd.to_datetime(df.index)
-                    df = clip_to_trading_day(
-                        df.dropna(subset=["Close"]), trading_day,
-                        label=f"history[{key}]", expect_rows_after=True,
-                    )
+                    df = clip_to_trading_day(df.dropna(subset=["Close"]), trading_day, label=f"history[{key}]")
                     if df.empty:
                         continue
                     out[targets[key]] = [(d.date().isoformat(), round(float(c), 6)) for d, c in df["Close"].items()]
@@ -613,6 +800,14 @@ def _yf_history(
                     logger.warning("[metron_market_data] history extract failed for %s: %s", key, e)
         except Exception as e:
             logger.warning("[metron_market_data] yfinance history batch failed: %s", e)
+    if not is_fx:
+        # alpha-engine-config-I11548: the day-D bar a listing's daily series lacks,
+        # from its completed intraday session. The session's last price is the
+        # adjusted close too: an adjustment only rescales bars BEFORE an event.
+        day = str(trading_day)[:10]
+        behind = sorted(s for s, series in out.items() if _lagging_by_one_session(series[-1][0], day))
+        for sym, close in _yfinance_session_closes(behind, trading_day=day).items():
+            out[sym] = [*out[sym], (day, close)]
     logger.info("[metron_market_data] history: %d/%d series captured", len(out), len(targets))
     _log_yf_coverage("fx_history" if is_fx else "close_history", list(targets.values()), out)
     return out
@@ -821,18 +1016,20 @@ def _yfinance_classification(yf_symbols: list[str]) -> tuple[dict[str, str], dic
     countries: dict[str, str] = {}
     for sym in yf_symbols:
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
             sector = info.get("sector")
             if sector:
                 sectors[sym] = str(sector)
             country = info.get("country")
             if country:
                 countries[sym] = str(country)
+        except YahooAuthError:
+            raise  # the session is gone for every symbol: fail the unit (I11578)
         except Exception as e:
             logger.warning("[metron_market_data] classification fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] sectors: %d/%d classified, countries: %d/%d domiciled",
                 len(sectors), len(yf_symbols), len(countries), len(yf_symbols))
-    _log_yf_coverage("sectors", yf_symbols, sectors)
+    _log_yf_coverage("sectors", yf_symbols, sectors, floor=METRON_YF_COVERAGE_FLOOR)
     _log_yf_coverage("countries", yf_symbols, countries)
     return sectors, countries
 
@@ -846,7 +1043,12 @@ def _yfinance_spy_weights() -> dict[str, float]:
     except ImportError:  # pragma: no cover
         return {}
     try:
-        raw = yf.Ticker(BENCHMARK).funds_data.sector_weightings or {}
+        raw = call_yahoo(
+            lambda: yf.Ticker(BENCHMARK).funds_data.sector_weightings or {},
+            label=f"funds_data[{BENCHMARK}]",
+        )
+    except YahooAuthError:
+        raise
     except Exception as e:
         logger.warning("[metron_market_data] SPY sector weights fetch failed: %s", e)
         return {}
@@ -887,17 +1089,22 @@ def _yfinance_earnings(yf_symbols: list[str], as_of: date) -> dict[str, str]:
     out: dict[str, str] = {}
     for sym in yf_symbols:
         try:
-            df = yf.Ticker(sym).get_earnings_dates(limit=8)
+            df = call_yahoo(
+                lambda: yf.Ticker(sym).get_earnings_dates(limit=8),
+                label=f"earnings[{sym}]", is_empty=lambda d: d is None or d.empty,
+            )
             if df is None or df.empty:
                 continue
             idx = pd.to_datetime(df.index)
             future = sorted(d for d in idx.tz_localize(None) if d >= anchor)
             if future:
                 out[sym] = future[0].date().isoformat()
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] earnings fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] earnings: %d/%d dated", len(out), len(yf_symbols))
-    _log_yf_coverage("earnings", yf_symbols, out)
+    _log_yf_coverage("earnings", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -917,7 +1124,9 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for sym in yf_symbols:
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] fundamentals fetch failed for %s: %s", sym, e)
             continue
@@ -925,7 +1134,7 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
         if fields:
             out[sym] = fields
     logger.info("[metron_market_data] fundamentals: %d/%d symbols covered", len(out), len(yf_symbols))
-    _log_yf_coverage("fundamentals", yf_symbols, out)
+    _log_yf_coverage("fundamentals", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -987,7 +1196,7 @@ def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
         if any(v is not None for v in fields.values()):
             out[sym] = {k: v for k, v in fields.items() if v is not None}
     logger.info("[metron_market_data] analyst: %d/%d symbols covered", len(out), len(yf_symbols))
-    _log_yf_coverage("analyst", yf_symbols, out)
+    _log_yf_coverage("analyst", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -1163,6 +1372,7 @@ def collect(
         artifact=f"{CLOSES_PREFIX}{run_date}.json",
     )
 
+    stale = _log_stale_bars("closes", {yf: bd for yf, (_c, bd) in priced.items()}, run_date)
     closes = {
         yf: {"close": close, "currency": ccy_by_yf.get(yf, "USD"), "bar_date": bar_date}
         for yf, (close, bar_date) in sorted(priced.items())
@@ -1181,7 +1391,7 @@ def collect(
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN: %d closes, %d fx (not written)", len(closes), len(rates))
         return {"status": "ok_dry_run", "universe": len(holdings),
-                "closes": len(closes), "fx": len(rates)}
+                "closes": len(closes), "fx": len(rates), "stale_bars": stale}
 
     try:
         _write_json(s3_client, bucket, closes_key, closes_artifact)
@@ -1207,7 +1417,7 @@ def collect(
                 len(closes), len(rates), bucket, CLOSES_PREFIX)
     return {
         "status": "ok", "universe": len(holdings),
-        "closes": len(closes), "fx": len(rates),
+        "closes": len(closes), "fx": len(rates), "stale_bars": stale,
         "closes_key": closes_key, "fx_key": fx_key,
         **_grade_cardinality(
             s3_client, bucket, run_date,
@@ -1596,6 +1806,9 @@ def collect_history(
         _log_carry(carried, refused)
     carry_result = {
         "carry_base": carry_base, "carried_bars": len(carried), "carry_refused": len(refused),
+        "stale_series": _log_stale_bars(
+            "close_history", {s: series[-1][0] for s, series in closes.items() if series}, trading_day,
+        ),
     }
     for yf_sym, series in closes.items():
         assert_no_bar_after([d for d, _c in series], trading_day,
@@ -2483,8 +2696,10 @@ def _eafe_tickers() -> set[str]:
     n_success = 0
     for etf, country in sorted(_EAFE_COUNTRY_ETFS.items()):
         try:
-            t = yf.Ticker(etf)
-            th = t.funds_data.top_holdings
+            th = call_yahoo(
+                lambda etf=etf: yf.Ticker(etf).funds_data.top_holdings,
+                label=f"funds_data[{etf}]", is_empty=lambda h: h is None or len(h) == 0,
+            )
             if th is not None and len(th) > 0:
                 symbols = {str(s).strip() for s in th.index if s and str(s).strip()}
                 result.update(symbols)
@@ -2545,7 +2760,9 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
         if i > 0 and i % _YFINANCE_BATCH_SIZE == 0:
             time.sleep(_YFINANCE_BATCH_DELAY)  # rate-limit courtesy on the ~900-name pass
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] valuation fetch failed for %s: %s", sym, e)
             continue

@@ -112,6 +112,7 @@ def _install_stub(results, n_fail=None, raises=None, required=None):
         fail_r = [d for d in dicts if d["status"] == "fail"]
         warn_r = [d for d in dicts if d["status"] == "warn"]
         skip_r = [d for d in dicts if d["status"] == "skip"]
+        blocked_r = [d for d in dicts if d["status"] == "blocked"]
         required_skip = [
             d for d in skip_r if stub.CHECK_REQUIRED.get(f"check_{d['name']}", True)
         ]
@@ -120,12 +121,16 @@ def _install_stub(results, n_fail=None, raises=None, required=None):
             "fail_results": fail_r,
             "warn_results": warn_r,
             "skip_results": skip_r,
-            "ran_count": len(dicts) - len(skip_r),
+            "ran_count": len(dicts) - len(skip_r) - len(blocked_r),
             "fail_count": len(fail_r),
             "warn_count": len(warn_r),
             "skip_count": len(skip_r),
             "required_skip_count": len(required_skip),
             "required_skip_names": [d["name"] for d in required_skip],
+            # alpha-engine-config-I11566.
+            "blocked_results": blocked_r,
+            "blocked_count": len(blocked_r),
+            "blocked_names": [d["name"] for d in blocked_r],
         }
 
     stub.run_preflight = run_preflight
@@ -234,6 +239,34 @@ class WeeklyPreflightHandlerTests(unittest.TestCase):
         self.assertEqual(out["status"], "FAIL")
         self.assertTrue(out["has_violation"])
         self.assertEqual(out["required_skip_count"], 1)
+
+    def test_blocked_dependents_do_not_multiply_one_failure(self):
+        """alpha-engine-config-I11566: one upstream fail + its BLOCKED
+        dependents is one failure, with the dependents named apart."""
+        _install_stub([
+            _Result("sf_iam_reachability", "ok"),
+            _Result("constituents_fetch", "fail", "sector_map missing"),
+            _Result("universe_drift", "blocked", "Blocked"),
+            _Result("polygon_grouped_coverage", "blocked", "Blocked"),
+        ])
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "FAIL")
+        self.assertEqual(out["fail_count"], 1)
+        self.assertEqual(out["failures"], ["constituents_fetch"])
+        self.assertEqual(out["blocked_names"], ["universe_drift", "polygon_grouped_coverage"])
+        self.assertEqual(out["ran_count"], 2)
+
+    def test_blocked_without_a_fail_degrades_never_ok(self):
+        """A blocked check did not run: on its own it is an unobserved
+        check, which degrades exactly like a required skip."""
+        _install_stub([
+            _Result("sf_iam_reachability", "ok"),
+            _Result("universe_drift", "blocked", "Blocked"),
+        ])
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "DEGRADED")
+        self.assertFalse(out["has_violation"])
+        self.assertEqual(out["blocked_count"], 1)
 
     def test_all_skipped_is_an_error_not_a_pass(self):
         """Zero checks run is an unobserved gate, never a green one."""
