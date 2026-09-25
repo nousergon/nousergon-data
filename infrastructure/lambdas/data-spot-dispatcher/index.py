@@ -621,7 +621,14 @@ _WORKLOADS: dict[str, str] = {
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
         "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
+        # alpha-engine-config-I11447 (Brian, 2026-09-24): once the day is
+        # graded, drop shadow libraries past the 7-day window. "Graded" is
+        # parity exit 0 (MET) or 1 (ran, NOT MET); exit 2 means the comparison
+        # itself failed, and then nothing is deleted. A prune failure outranks
+        # the NOT-MET exit, which is expected daily and would hide it.
+        "PRUNE_RC=0; if [ $PARITY_RC -le 1 ]; then python -m shadow prune --apply; PRUNE_RC=$?; "
+        '[ $PRUNE_RC -ne 0 ] && echo "shadow-sameday: shadow prune --apply FAILED (rc=$PRUNE_RC)"; fi; '
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; exit $PARITY_RC )"
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
     # `shadow-sameday` above, split out because v1 runs these two legs TWELVE

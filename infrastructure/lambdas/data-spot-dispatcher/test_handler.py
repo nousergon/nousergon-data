@@ -1211,14 +1211,41 @@ def test_shadow_prune_is_report_only(monkeypatch):
         {"workload": "shadow-prune", "apply": True, "trading_day": "2026-09-14"}
     )
     assert cmd2 == cmd
-    # The delete is reachable through exactly one key, named for it.
+    # The delete is reachable through exactly two keys: the operator one, named
+    # for it, and the daily post-grade prune Brian approved on 2026-09-24.
     deleting = {
         workload for workload, command in index._WORKLOADS.items()
         if "shadow prune" in command and "--apply" in command
     }
-    assert deleting == {"shadow-prune-apply"}
+    assert deleting == {"shadow-prune-apply", "shadow-sameday"}
     _resolved, apply_cmd = index._resolve_workload({"workload": "shadow-prune-apply"})
     assert apply_cmd == "python -m shadow prune --apply"
+
+
+def test_shadow_sameday_prunes_only_after_the_day_is_graded(monkeypatch):
+    """alpha-engine-config-I11447. The daily prune runs after `shadow parity`
+    and only when it graded the day: exit 0 (MET) or 1 (NOT MET). Exit 2 (the
+    comparison failed) and a parity step that never ran delete nothing, and a
+    prune failure is not hidden behind the daily NOT-MET exit."""
+    import subprocess
+
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    cmd = index._WORKLOADS["shadow-sameday"]
+    assert cmd.index("python -m shadow prune --apply") > cmd.index("python -m shadow parity")
+    start = cmd.index("PRUNE_RC=0;")
+    tail = cmd[start:]
+    script = tail.replace("python -m shadow prune --apply", 'echo PRUNED; (exit "$FAKE_PRUNE_RC")')
+
+    def run(rc_all, parity_rc, prune_rc=0):
+        body = f"RC_ALL={rc_all}; PARITY_RC={parity_rc}; FAKE_PRUNE_RC={prune_rc}; ( {script}"
+        out = subprocess.run(["bash", "-c", body], capture_output=True, text=True)
+        return out.returncode, "PRUNED" in out.stdout
+
+    assert run(0, 0) == (0, True)
+    assert run(0, 1) == (1, True)       # NOT MET is still a graded day
+    assert run(0, 2) == (2, False)      # comparison failed: delete nothing
+    assert run(0, 1, prune_rc=3) == (3, True)   # prune failure outranks NOT MET
+    assert run(4, 0) == (4, True)       # a failed leg still exits as the leg did
 
 
 @pytest.mark.parametrize("workload", ["shadow-parity", "arctic-parity"])

@@ -1177,6 +1177,24 @@ def _refresh_stale(
                                 ticker, len(new_df),
                             )
 
+                    # ── Interior-session hole fill (alpha-engine-config-I11553) ──
+                    # Neither guard below reads the middle of the series; a
+                    # 2026-09-22 bar dropped by the vendor for 837 tickers
+                    # reached D21's close_history this way.
+                    #
+                    # It runs BEFORE the guards (alpha-engine-config-I11576) so
+                    # they judge the frame that would actually be published.
+                    # The filler carries a filled bar forward from the cache,
+                    # so once it had written 2026-09-22 into HONA's 71-row
+                    # parquet, every later same-session fetch (70 rows, still
+                    # missing 09-22) read as one row SHORTER than the cache and
+                    # was refused — HONA, Q, FDXF and SOLS, the only cached
+                    # tickers under the 400-row threshold, on 2026-09-24.
+                    # A fill only adds bars strictly INSIDE the fetched span,
+                    # so a fetch truncated at either end is still exactly as
+                    # short after it and is still refused.
+                    new_df = hole_filler.fill(ticker, new_df)
+
                     # ── Short-fetch guard (alpha-engine-config-I9256) ───────
                     # yfinance intermittently answers a full-period request with
                     # a handful of rows (measured 2026-08-29: a 1-row
@@ -1208,6 +1226,12 @@ def _refresh_stale(
                                     ticker, yf_sym, window_start, window_end_excl, trading_day,
                                 )
                                 _retry_counts[ticker] = attempts_made
+                                if retried_df is not None:
+                                    # Judged post-fill, like the batch answer
+                                    # (I11576); the batch answer's fill record
+                                    # is replaced by the retried frame's.
+                                    hole_filler.discard(ticker)
+                                    retried_df = hole_filler.fill(ticker, retried_df)
                                 if retried_df is not None and len(retried_df) >= existing_rows:
                                     logger.info(
                                         "Short-fetch guard: %s recovered after %d retr%s "
@@ -1231,6 +1255,7 @@ def _refresh_stale(
                                         recovered_len, attempts_made, _SHORT_FETCH_RETRY_ATTEMPTS,
                                         fetch_period, existing_rows,
                                     )
+                                    hole_filler.discard(ticker)
                                     _fail(ticker, FAIL_SHORT_FETCH)
                                     continue
                             else:
@@ -1245,6 +1270,7 @@ def _refresh_stale(
                                     ticker, original_len, fetch_period, existing_rows,
                                     _SHORT_FETCH_RETRY_MAX_TICKERS_PER_RUN,
                                 )
+                                hole_filler.discard(ticker)
                                 _fail(ticker, FAIL_SHORT_FETCH)
                                 continue
 
@@ -1279,6 +1305,7 @@ def _refresh_stale(
                                 ticker, fetched_last.isoformat(), cached_last.isoformat(),
                                 str(trading_day), expected_last.isoformat(),
                             )
+                            hole_filler.discard(ticker)
                             _fail(ticker, FAIL_BEHIND_FETCH)
                             continue
                         logger.warning(
@@ -1289,12 +1316,6 @@ def _refresh_stale(
                             str(trading_day),
                             cached_last.isoformat() if cached_last else "absent",
                         )
-
-                    # ── Interior-session hole fill (alpha-engine-config-I11553) ──
-                    # Neither guard above reads the middle of the series; a
-                    # 2026-09-22 bar dropped by the vendor for 837 tickers
-                    # reached D21's close_history this way.
-                    new_df = hole_filler.fill(ticker, new_df)
 
                     # Write locally and upload (Wave 3 PR1: write-both to legacy
                     # ``predictor/price_cache/`` + new ``reference/price_cache/``;
@@ -1329,6 +1350,7 @@ def _refresh_stale(
                     raise  # always fatal by its own contract, never a per-ticker miss (I11547)
                 except Exception as e:
                     logger.warning("Refresh failed for %s: %s", ticker, e)
+                    hole_filler.discard(ticker)
                     _fail(ticker, FAIL_REFRESH_ERROR)
 
             pct = 100 * min(batch_start + batch_size, len(stale)) / len(stale)
