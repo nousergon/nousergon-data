@@ -1374,9 +1374,11 @@ def test_every_workload_ships_its_log_on_exit_failure_and_sigterm(monkeypatch):
         assert "trap '_stop_run_log_shipper; _ship_run_log' TERM INT" in rendered, workload
         # And periodically, so a SIGKILL still leaves at most one interval.
         assert "_run_log_shipper_loop &" in rendered, workload
-        # `fail` itself ships too, for the `|| fail` call sites that clear the
-        # EXIT trap before shutting the box down.
-        assert 'fail() { trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; _ship_if_available;' in rendered, workload
+        # `fail` itself ships too when it runs before the renderer's `finish`
+        # trap exists (after that, `finish` ships). alpha-engine-config-I11200:
+        # it no longer powers the box off inline — see the outcome tests below.
+        assert 'fail() { _DATA_SPOT_REASON="$1"; echo "[data-spot-prelude] FATAL: $1";' in rendered, workload
+        assert "trap - EXIT; _ship_if_available;" in rendered, workload
         assert "set -uo pipefail" in rendered, workload
 
 
@@ -1419,6 +1421,170 @@ def test_the_trading_day_partition_prefers_the_declared_day(monkeypatch):
     under the day the box happened to boot."""
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     assert index._run_log_trading_day("2026-09-14") == "2026-09-14"
+
+
+# ── alpha-engine-config-I11200 deliverable 4: the outcome is the box's record ──
+#
+# Every data-spot command SSM still retained on 2026-09-25 whose workload
+# FAILED read `Failed / Undeliverable`, ResponseCode -1, no output (e114f53e,
+# 9c9cb8c1, 3a812b85, c76d243b) — because `fail()` ran `shutdown -h now`
+# inline and the box powered off before the SSM agent reported. These tests
+# EXECUTE the exit paths of the script the Lambda actually sends (its prelude
+# and the renderer's `finish` trap, cut from `_bootstrap_command`'s output)
+# against PATH shims, rather than asserting on its text alone.
+
+_DEFAULT_RECORDER = "/usr/local/sbin/data-spot-record-outcome"
+
+
+def _exit_path(index, tmp_path, scenario, *, with_finish=True):
+    """Run the prelude (+ the `finish` trap) followed by ``scenario``.
+
+    Returns (exit code, calls made to shutdown/systemd-run/aws, the outcome
+    record the box uploaded or None)."""
+    import json
+    import re
+    import subprocess
+
+    rendered = index._bootstrap_command(
+        "shadow-weekday", "true", "tok",
+        instance_id="i-022fabadd97ccc71d", trading_day="2026-09-14",
+    )
+    recorder = tmp_path / "data-spot-record-outcome"
+    rendered = rendered.replace(
+        getattr(index, "OUTCOME_RECORDER", _DEFAULT_RECORDER), str(recorder)
+    )
+    prelude = rendered[: rendered.index("\nset -eo pipefail\n")]
+    finish = re.search(r"^finish\(\) \{.*?^trap finish EXIT$", rendered, re.M | re.S)
+
+    shims = tmp_path / "bin"
+    shims.mkdir()
+    calls, record = tmp_path / "calls", tmp_path / "record.json"
+    for name, body in (
+        ("shutdown", 'echo "shutdown $*" >> "$CALLS"'),
+        ("systemd-run", 'echo "systemd-run $*" >> "$CALLS"'),
+        ("aws", 'echo "aws $*" >> "$CALLS"; case "$*" in *"s3 cp - "*) cat > "$RECORD";; esac'),
+    ):
+        shim = shims / name
+        shim.write_text(f"#!/bin/sh\n{body}\nexit 0\n")
+        shim.chmod(0o755)
+
+    # The renderer's run-log block defines these; the exit paths call them.
+    ship = '_stop_run_log_shipper() { :; }\n_ship_run_log() { echo "ship" >> "$CALLS"; }\n'
+    script = "\n".join(
+        [prelude, ship, finish.group(0) if (with_finish and finish) else "", scenario]
+    )
+    env = {**os.environ, "PATH": f"{shims}:{os.environ['PATH']}",
+           "CALLS": str(calls), "RECORD": str(record)}
+    proc = subprocess.run(["bash", "-c", script], env=env, capture_output=True,
+                          text=True, timeout=60)
+    made = calls.read_text().splitlines() if calls.exists() else []
+    doc = json.loads(record.read_text()) if record.exists() else None
+    return proc.returncode, made, doc
+
+
+def _powered_off_inline(calls):
+    return [c for c in calls if c.startswith("shutdown ")]
+
+
+def test_a_failed_workload_exits_with_its_code_before_the_box_powers_off(monkeypatch, tmp_path):
+    """The c76d243b shape: the workload exits 1 and `fail` is called. The
+    shell must exit 1 with the power-off DEFERRED, so the SSM agent reports
+    `Failed` with the real exit code instead of `Undeliverable` / -1."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    rc, calls, doc = _exit_path(
+        index, tmp_path, 'false || fail "workload shadow-weekday exited 1"'
+    )
+    assert rc == 1
+    assert _powered_off_inline(calls) == [], calls
+    assert any(c.startswith("systemd-run --on-active=60 ") for c in calls), calls
+    assert doc is not None, "no outcome record was published"
+    assert doc["status"] == "failed" and doc["rc"] == 1
+    assert doc["reason"] == "workload shadow-weekday exited 1"
+    assert doc["schema"] == "data_spot_outcome.v1"
+    assert doc["trading_day"] == "2026-09-14"
+    assert doc["instance_id"] == "i-022fabadd97ccc71d"
+    assert doc["log_location"].endswith("/shadow-weekday/2026-09-14/i-022fabadd97ccc71d.log")
+
+
+def test_a_successful_workload_records_ok_and_still_powers_off(monkeypatch, tmp_path):
+    """Before I11200 the success path never shut down at all: a 5-minute
+    morning-enrich box (i-0cc74e7235d4ff72d, 2026-09-24) was still refreshing
+    its instance-role credentials 1h41m later, idling to the hard cap."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    rc, calls, doc = _exit_path(index, tmp_path, 'echo "[data-spot] workload shadow-weekday complete"')
+    assert rc == 0
+    assert _powered_off_inline(calls) == [], calls
+    assert any(c.startswith("systemd-run --on-active=60 ") for c in calls), calls
+    assert doc is not None and doc["status"] == "ok" and doc["rc"] == 0
+    assert doc["reason"] is None
+
+
+def test_a_failure_before_the_finish_trap_exists_is_recorded_and_deferred_too(monkeypatch, tmp_path):
+    """A failure inside the renderer's own timer/run-log blocks reaches the
+    prelude's `fail` with no `finish` defined yet. Same outcome, no race."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    rc, calls, doc = _exit_path(
+        index, tmp_path, 'false || fail "hard-timeout arm failed"', with_finish=False
+    )
+    assert rc == 1
+    assert _powered_off_inline(calls) == [], calls
+    assert any(c.startswith("systemd-run --on-active=60 ") for c in calls), calls
+    assert doc is not None and doc["status"] == "failed"
+    assert doc["reason"] == "hard-timeout arm failed"
+
+
+def test_a_reason_with_quotes_cannot_corrupt_the_record(monkeypatch, tmp_path):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    reason = """it said "no" and 'maybe' \\ then {"x": 1}"""
+    _rc, _calls, doc = _exit_path(index, tmp_path, f"false || fail {__import__('shlex').quote(reason)}")
+    assert doc is not None and doc["reason"] == reason
+
+
+def test_the_hard_timeout_kill_records_killed(monkeypatch, tmp_path):
+    """A timer kill never reaches `finish`; the renderer's kill recorder runs
+    the same writer, so the record says `killed`, not nothing."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    rendered = index._bootstrap_command(
+        "shadow-weekday", "true", "tok", instance_id="i-x", trading_day="2026-09-14"
+    )
+    kill_block = rendered[rendered.index("<<'RECORDKILL'"): rendered.index("\nRECORDKILL\n")]
+    assert f'{index.OUTCOME_RECORDER} killed -1 "timer: ${{KILL_REASON:-unknown}}"' in kill_block
+    _rc, _calls, doc = _exit_path(
+        index, tmp_path,
+        f'KILL_REASON=budget_exhausted sh {tmp_path}/data-spot-record-outcome killed -1 '
+        '"timer: budget_exhausted"',
+    )
+    assert doc is not None and doc["status"] == "killed" and doc["rc"] == -1
+
+
+def test_the_dispatch_result_names_the_outcome_record_beside_the_log(monkeypatch):
+    """Where to read the verdict, handed to every caller at launch."""
+    index, ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-0abc")
+    monkeypatch.setattr(index, "_wait_ssm_online", lambda iid: None)
+    monkeypatch.setattr(index, "_run_log_trading_day", lambda declared=None: "2026-09-21")
+    out = index.handler({"workload": "morning-enrich"}, None)["data_spot"]
+    assert out["outcome_location"] == (
+        "s3://alpha-engine-research/data_collection/logs/"
+        "morning-enrich/2026-09-21/i-0abc.outcome.json"
+    )
+    assert out["outcome_location"] in ssm.sent[-1]["Parameters"]["commands"][0]
+
+
+def test_every_workload_renders_the_deferred_shutdown_and_the_recorder(monkeypatch):
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    for workload, cmd in _every_resolved_workload(index):
+        rendered = index._bootstrap_command(
+            workload, cmd, "tok", instance_id="i-x", trading_day="2026-09-21"
+        )
+        assert "trap finish EXIT" in rendered, workload
+        assert f"--on-active={index.SHUTDOWN_DELAY_SECONDS} " in rendered, workload
+        assert f"cat > {index.OUTCOME_RECORDER} <<'OUTCOME'" in rendered, workload
+        # The recorder is installed before anything that can call it.
+        assert rendered.index(f"cat > {index.OUTCOME_RECORDER}") < rendered.index("fail() {"), workload
+        # No inline power-off anywhere this Lambda writes (the renderer keeps
+        # one only as the fallback when the delayed timer cannot be armed).
+        prelude = rendered[: rendered.index("\nset -eo pipefail\n")]
+        assert "; shutdown -h now; exit 1" not in prelude, workload
 
 
 # ── Isolation: the stubs above must not outlive the test that installed them ──
