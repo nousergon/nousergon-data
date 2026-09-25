@@ -49,6 +49,25 @@ convert it to the **fail-open continue branch** (`ExtractDataSpotError`). The
 fail-open decision lives in the SF (config#1767 deliverable #4): a data-spot
 failure must NOT block daemon start (weekday) or reconcile + instance-stop (EOD).
 
+A launched result also carries `log_location` (the run log in S3) and
+`outcome_location` (see below).
+
+## Reading a run's outcome (alpha-engine-config-I11200)
+
+**Read `outcome_location`, not the SSM invocation status.** On exit the box
+publishes `data_collection/logs/{workload}/{trading_day}/{instance_id}.outcome.json`
+(`data_spot_outcome.v1`: `status` ∈ `ok` / `failed` / `killed`, `rc`, the
+`fail` `reason`, `log_location`, `finished_at`). No record for a box that is
+gone means it was taken away (spot reclaim) before it could write one.
+
+Until 2026-09-25 every FAILED run read `Failed / Undeliverable`, ResponseCode
+-1, no output in SSM, because `fail()` powered the box off inline, before the
+SSM agent reported. Every exit now goes through the renderer's `finish` trap,
+which records the outcome and schedules the power-off 60 s out of band, so SSM
+now reports the real status and exit code as well. The Step Functions still
+poll SSM, because it is also the liveness channel. The record is still the
+place to read what happened.
+
 ## IAM & security group (deliverable #3)
 
 - **Spot box role:** reuses `alpha-engine-executor-profile` /
