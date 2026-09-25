@@ -146,10 +146,13 @@ def test_yfinance_fetch_returns_requested_date_not_latest_bar():
     assert call_kwargs.get("end") == "2026-07-01"
 
 
-def test_yfinance_fetch_falls_back_to_prior_trading_day():
-    """A requested date with no exact yfinance bar (weekend/holiday) resolves
-    to the nearest prior trading day, mirroring FRED's on-or-before semantics
-    — not skipped, and not a later bar."""
+def test_yfinance_fetch_refuses_an_earlier_bar_for_an_equity():
+    """A requested date with no exact yfinance bar is NOT covered for an
+    equity: the record is stamped with the requested date, so an earlier
+    session's close would be written as that date's
+    (alpha-engine-config-I11577). This test used to pin the opposite —
+    on-or-before for SPY — and that relabel is what published 835 tickers'
+    2026-09-21 closes as 2026-09-22 in the shadow's D19 file."""
     records = []
     fake_frame = _make_yf_frame([
         ("2026-07-02", 300.0, 301.0, 299.0, 300.5, 1_000_000),  # Thursday
@@ -160,8 +163,28 @@ def test_yfinance_fetch_falls_back_to_prior_trading_day():
     mock_yf.download.return_value = fake_frame
 
     with patch.dict("sys.modules", {"yfinance": mock_yf}):
-        # 2026-07-04 (Saturday) has no bar — should resolve to 07-02, not 07-06.
         count = daily_closes._fetch_yfinance_closes(["SPY"], "2026-07-04", records)
 
+    assert count == 0
+    assert records == []
+
+
+def test_yfinance_fetch_falls_back_to_prior_trading_day_for_an_index():
+    """A ``^`` index keeps FRED's on-or-before resolution (it is the FRED
+    fallback) — resolved to the nearest prior bar, and never a later one."""
+    records = []
+    fake_frame = _make_yf_frame([
+        ("2026-07-02", 30.0, 30.1, 29.9, 30.05, 0),  # Thursday
+        ("2026-07-06", 30.5, 30.6, 30.4, 30.55, 0),  # next Monday
+    ])
+
+    mock_yf = MagicMock()
+    mock_yf.download.return_value = fake_frame
+
+    with patch.dict("sys.modules", {"yfinance": mock_yf}):
+        count = daily_closes._fetch_yfinance_closes(["^TNX"], "2026-07-04", records)
+
     assert count == 1
-    assert records[0]["Close"] == 300.5
+    assert records[0]["ticker"] == "TNX"
+    assert records[0]["date"] == "2026-07-04"
+    assert records[0]["Close"] == 30.05

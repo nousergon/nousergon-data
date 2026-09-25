@@ -51,6 +51,7 @@ new states.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import re
@@ -605,6 +606,21 @@ _WORKLOADS: dict[str, str] = {
     # the `shadow-morning` key below, on v1's own cadence; this one's parity
     # call now declares `--legs-group sameday` so a report carrying only this
     # group renders the morning group as unknown rather than as silence.
+    #
+    # THEN `recompute-lineage` (alpha-engine-config-I11203): re-runs D31's
+    # feature code over the inputs v1's and this run's D31 each RECORDED and
+    # writes `lineage/D31/$TD.json`, which the NEXT trading day's report reads
+    # when it re-grades `features/$TD/*` (`prior_day_settled`). It runs here
+    # because both D31 outputs for $TD exist by now, and after `parity` so it
+    # can never delay the report or its gate dispatch. Cost: two ArcticDB
+    # `as_of` reads (~4 min each measured from outside the region, 2026-09-25)
+    # plus ~45 s of compute per side, against this workload's 18000 s cap.
+    # It runs whatever the legs did — a missing D31 manifest is a named
+    # refusal in the record, not a skipped step. Exit code: a failed leg,
+    # then a failed prune, then `parity`'s 2, then a crashed recompute (2),
+    # then `parity`'s own MET/NOT MET; a record that REFUSES exits 0 —
+    # refusing is its job. It runs BEFORE the prune: the prune never touches
+    # what it reads (live ArcticDB `as_of`, and S3 by VersionId).
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -621,6 +637,8 @@ _WORKLOADS: dict[str, str] = {
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
         "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
+        "python -m shadow recompute-lineage --trading-day $TD "
+        "--store s3://alpha-engine-research/data_collection; LINEAGE_RC=$?; "
         # alpha-engine-config-I11447 (Brian, 2026-09-24): once the day is
         # graded, drop shadow libraries past the 7-day window. "Graded" is
         # parity exit 0 (MET) or 1 (ran, NOT MET); exit 2 means the comparison
@@ -628,7 +646,9 @@ _WORKLOADS: dict[str, str] = {
         # the NOT-MET exit, which is expected daily and would hide it.
         "PRUNE_RC=0; if [ $PARITY_RC -le 1 ]; then python -m shadow prune --apply; PRUNE_RC=$?; "
         '[ $PRUNE_RC -ne 0 ] && echo "shadow-sameday: shadow prune --apply FAILED (rc=$PRUNE_RC)"; fi; '
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; exit $PARITY_RC )"
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; "
+        "[ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
+        '[ "${LINEAGE_RC:-0}" -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )'
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
     # `shadow-sameday` above, split out because v1 runs these two legs TWELVE
@@ -960,6 +980,16 @@ def _bootstrap_spec(
     run_log_exports = {RUN_LOG_ENV: run_log.s3_uri} if run_log is not None else {}
     return SpotBootstrapSpec(
         run_log=run_log,
+        # alpha-engine-config-I11200 deliverable 4: every exit goes through
+        # the renderer's `finish` trap, which ships the log, records the
+        # outcome, and schedules the power-off OUT OF BAND so the SSM agent
+        # reports the command's real status first. See `_bootstrap_command`.
+        shutdown_delay_seconds=SHUTDOWN_DELAY_SECONDS,
+        # The recorder is written by `_bootstrap_command`'s prelude, which is
+        # only ever rendered together with a run log — a spec with no run log
+        # names no recorder rather than one that may not exist.
+        finish_hook=_outcome_finish_hook() if run_log is not None else None,
+        record_before_kill=_outcome_kill_hook() if run_log is not None else None,
         repo_url=f"https://github.com/{DATA_REPO}.git",
         checkout="/home/ec2-user/alpha-engine-data",
         branch=DATA_BRANCH,
@@ -1059,6 +1089,168 @@ def _run_log_uri(workload: str, trading_day: str, instance_id: str) -> str:
     )
 
 
+# ── The run's outcome is published by the box, not inferred from SSM ─────────
+#
+# alpha-engine-config-I11200 deliverable 4. Measured 2026-09-25 over every
+# data-spot command SSM still retained: each one whose workload FAILED read
+# `Failed / Undeliverable` (e114f53e shadow-sameday, 9c9cb8c1 post-market-data,
+# 3a812b85 shadow-morning, c76d243b shadow-weekday), and each that succeeded
+# read `Success`. The cause was the prelude's `fail()`, which ran
+# `shutdown -h now` inline: the box powered off before the SSM agent's final
+# status callback, so SSM recorded the command as never delivered, with
+# ResponseCode -1 and no output — a workload that ran 27 minutes and exited 1
+# read as a box that never came online. (The success path had the opposite
+# defect: it never shut down at all, so a 5-minute morning-enrich box idled to
+# its 2-hour hard cap — i-0cc74e7235d4ff72d, 2026-09-24.)
+#
+# Two changes, one mechanism:
+#   1. Every exit — success, `fail`, or an abort under `set -e` — runs the
+#      renderer's `finish` trap, which schedules the power-off
+#      SHUTDOWN_DELAY_SECONDS out of band and exits immediately, so the agent
+#      reports the real status and exit code first (krepis's
+#      `shutdown_delay_seconds`, alpha-engine-config#1472 — the fleet primitive
+#      for exactly this race).
+#   2. The trap PUBLISHES the outcome — status, exit code, the `fail` reason —
+#      to `_outcome_uri`, beside the run log. A timer kill (hard cap) records
+#      `killed`. A spot reclaim records nothing, and an absent record for a
+#      box that is gone IS that verdict. SSM stays the liveness channel the
+#      Step Functions poll; it is no longer the only place an outcome exists.
+
+#: Seconds between the bootstrap exiting and the box powering off. The SSM
+#: agent starts its status callback only after the monitored process exits,
+#: so this is the window the callback gets. 60 s matches the Overseer
+#: bootstraps that adopted the same primitive (krepis `ci-watch`).
+SHUTDOWN_DELAY_SECONDS = 60
+
+#: Where the prelude installs the outcome recorder on the box. A standalone
+#: `/bin/sh` script rather than a bash function because the hard-timeout
+#: timer's kill recorder (`record_before_kill`) runs in its own `/bin/sh`,
+#: outside this shell, and must reach the same writer.
+OUTCOME_RECORDER = "/usr/local/sbin/data-spot-record-outcome"
+
+#: Schema tag on every outcome record, so a reader can refuse a shape it does
+#: not know rather than guess at it.
+OUTCOME_SCHEMA = "data_spot_outcome.v1"
+
+
+def _outcome_uri(workload: str, trading_day: str, instance_id: str) -> str:
+    """``…/{instance_id}.outcome.json`` — beside the run log, same partition.
+
+    Under ``data_collection/logs/`` because both box roles already write there
+    (``alpha-engine-executor-role``'s research-bucket write and
+    ``nousergon-data-collection-box-role``'s ``data_collection/logs/*``), so
+    publishing it needs no IAM change.
+    """
+    log = _run_log_uri(workload, trading_day, instance_id)
+    return log[: -len(".log")] + ".outcome.json"
+
+
+def _outcome_finish_hook() -> str:
+    """The `finish` trap's record step; `rc` is in scope there."""
+    return (
+        f'{OUTCOME_RECORDER} "$([ "$rc" -eq 0 ] && echo ok || echo failed)" '
+        '"$rc" "${_DATA_SPOT_REASON:-}"'
+    )
+
+
+def _outcome_kill_hook() -> str:
+    """The hard-timeout recorder's step; `KILL_REASON` is exported there."""
+    return f'{OUTCOME_RECORDER} killed -1 "timer: ${{KILL_REASON:-unknown}}"'
+
+
+def _outcome_recorder_block(
+    *,
+    workload: str,
+    trading_day: str,
+    instance_id: str,
+    run_token: str,
+    log_location: str,
+    outcome_location: str,
+) -> str:
+    """Install the recorder: ``data-spot-record-outcome STATUS RC [REASON]``.
+
+    It never fails its caller — a record it cannot write is reported on stdout
+    (the CloudWatch tail) and the box still winds down. Everything the launcher
+    knows is baked in as a literal, the way the run-log URI is; only what the
+    box learns at exit arrives as arguments. The system ``python3`` builds the
+    JSON (it is on the AMI before anything is installed, which a record of an
+    early failure depends on), so a reason carrying quotes cannot corrupt it.
+    """
+    base = {
+        "schema": OUTCOME_SCHEMA,
+        "workload": workload,
+        "trading_day": trading_day,
+        "instance_id": instance_id,
+        "run_token": run_token,
+        "log_location": log_location,
+    }
+    return f"""cat > {OUTCOME_RECORDER} <<'OUTCOME'
+#!/bin/sh
+# data-spot run outcome recorder (alpha-engine-config-I11200). Never fails.
+set +e
+# A timer kill is recorded first and is final: the SIGTERM the power-off sends
+# then fails the collector, and the `finish` trap that follows must not
+# overwrite `killed` with the exit code the kill itself caused.
+if [ "$1" = killed ]; then
+  : > '{OUTCOME_RECORDER}.killed'
+elif [ -e '{OUTCOME_RECORDER}.killed' ]; then
+  echo "run outcome already recorded as killed — not overwritten by status=$1 rc=$2"
+  exit 0
+fi
+_doc="$(python3 - "$@" <<'PY'
+import datetime, json, sys
+doc = json.loads({json.dumps(base)!r})
+status, rc, reason = (sys.argv[1:] + ["", "", ""])[:3]
+doc["status"] = status or "unknown"
+try:
+    doc["rc"] = int(rc)
+except ValueError:
+    doc["rc"] = None
+doc["reason"] = reason[-2000:] or None
+doc["finished_at"] = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+print(json.dumps(doc, sort_keys=True))
+PY
+)"
+if [ -z "$_doc" ]; then
+  echo "WARN: run outcome not recorded — could not build the record (status=$1 rc=$2)"
+  exit 0
+fi
+if printf '%s\\n' "$_doc" | aws s3 cp - '{outcome_location}' --region {REGION} --content-type application/json >/dev/null 2>&1; then
+  echo "run outcome recorded -> {outcome_location} (status=$1 rc=$2)"
+else
+  echo "WARN: run outcome record FAILED -> {outcome_location} (status=$1 rc=$2)"
+fi
+exit 0
+OUTCOME
+chmod +x {OUTCOME_RECORDER}"""
+
+
+def _prelude(
+    *,
+    log: str,
+    recorder: str,
+) -> str:
+    """The part of the script this Lambda owns that runs BEFORE the renderer.
+
+    ``fail()`` has two cases. Once the renderer's ``finish`` trap is installed
+    (everything from the interpreter install on), it records the reason and
+    exits 1 — ``finish`` ships the log, records the outcome and schedules the
+    delayed power-off. Before that (a failure inside the renderer's own timer
+    and run-log blocks) there is no ``finish``, so it does the same three
+    steps itself. Neither case powers the box off inline: that is the race that
+    made SSM read every failed run as ``Undeliverable``.
+    """
+    return f"""set -uo pipefail
+mkdir -p "$(dirname {log})"
+{recorder}
+_DATA_SPOT_REASON=""
+_ship_if_available() {{ if declare -F _ship_run_log >/dev/null 2>&1; then _stop_run_log_shipper 2>/dev/null || true; _ship_run_log || true; fi; }}
+_deferred_shutdown() {{ systemd-run --on-active={SHUTDOWN_DELAY_SECONDS} --unit=data-spot-prelude-delayed-shutdown /sbin/shutdown -h now >/dev/null 2>&1 || shutdown -h now; }}
+fail() {{ _DATA_SPOT_REASON="$1"; echo "[data-spot-prelude] FATAL: $1"; if declare -F finish >/dev/null 2>&1; then exit 1; fi; trap - EXIT; _ship_if_available; {OUTCOME_RECORDER} failed 1 "$1"; _deferred_shutdown; exit 1; }}
+trap 'rc=$?; _ship_if_available; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
+"""
+
+
 def _bootstrap_command(
     workload: str,
     collector_cmd: str,
@@ -1083,8 +1275,12 @@ def _bootstrap_command(
 
     The EXIT trap is load-bearing: the rendered block runs under ``set -e``, so
     an abort inside it never reaches a ``|| fail`` and would otherwise skip the
-    log upload and the shutdown. The box self-terminates on completion
-    (InstanceInitiatedShutdownBehavior=terminate).
+    log upload and the shutdown. From the interpreter install on, the
+    renderer's ``finish`` trap replaces it and owns every exit: it ships the
+    log, publishes the outcome record (:func:`_outcome_uri`), and schedules the
+    power-off ``SHUTDOWN_DELAY_SECONDS`` out of band, so the box
+    self-terminates on completion (InstanceInitiatedShutdownBehavior=terminate)
+    AFTER the SSM agent has reported the real status (alpha-engine-config-I11200).
 
     **CloudWatch is the live tail, not the record** (alpha-engine-config-I11353).
     ``CloudWatchOutputConfig`` on the SSM command caps the ``…/stdout`` stream
@@ -1104,12 +1300,17 @@ def _bootstrap_command(
     # prelude itself (or in the watchdog block above the run-log block) reaches
     # a trap whose shipper does not exist yet. Probe rather than assume: a
     # `command not found` inside an EXIT trap would skip the shutdown.
-    prelude = f"""set -uo pipefail
-mkdir -p "$(dirname {log})"
-_ship_if_available() {{ if declare -F _ship_run_log >/dev/null 2>&1; then _stop_run_log_shipper 2>/dev/null || true; _ship_run_log || true; fi; }}
-fail() {{ trap - EXIT; echo "[data-spot-prelude] FATAL: $1"; _ship_if_available; shutdown -h now; exit 1; }}
-trap 'rc=$?; _ship_if_available; [ "$rc" -eq 0 ] || fail "bootstrap aborted (rc=$rc)"' EXIT
-"""
+    prelude = _prelude(
+        log=log,
+        recorder=_outcome_recorder_block(
+            workload=workload,
+            trading_day=resolved_day,
+            instance_id=instance_id,
+            run_token=run_token,
+            log_location=s3_log,
+            outcome_location=_outcome_uri(workload, resolved_day, instance_id),
+        ),
+    )
     tail = f"""set +e
 set -uo pipefail
 git config --global --add safe.directory '*' || true
@@ -1159,6 +1360,11 @@ python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks b
 # requirements.txt` above); this gate catches future drift the same way the
 # DLP gate above does: fail closed at boot, not at the first LLM call.
 python -c "import openai" || fail "openai package (flow-doctor diagnosis router wire) not installed"
+# alpha-engine-config-I11203: declare the run manifests' compute row (measured
+# from instance metadata — until now every manifest this box wrote said
+# `local`) and the numeric pin D31 computes under (derived from
+# features/numeric_pin.py, never restated). One file, sourced from the checkout.
+source infrastructure/data_box_env.sh || fail "data box env (compute row / numeric pin) failed"
 # No `| tee` here: the renderer's run-log block already `exec`'d this shell's
 # stdout+stderr through tee, so every line of the collector is captured with
 # the provisioning that preceded it. Piping again would double every line AND
@@ -1436,5 +1642,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             # Returned so a failed execution's history NAMES the log, rather
             # than a reader having to reconstruct the key from the instance id.
             "log_location": log_location,
+            # The run's outcome as the box itself published it — the verdict
+            # to read, not the SSM invocation status (alpha-engine-config-I11200).
+            "outcome_location": _outcome_uri(workload, run_log_day, instance_id),
         }
     }

@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 from nousergon_lib.gates import LADDER_KEY, GateStore, read_store_document
 from nousergon_lib.run_manifest import SCHEMA_VERSION as _MANIFEST_SCHEMA
 from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeAccessIssue]
+    add_trading_days,
     previous_trading_day,
     subtract_trading_days,
 )
@@ -1246,6 +1247,28 @@ def _trading_days_between(earlier: dt.date, later: dt.date) -> int:
     return age
 
 
+def _parity_window_phrase(report_day: dt.date, trading_day: dt.date) -> str:
+    """How much of the freshness window a report has left, as the clause
+    prints it (`alpha-engine-config-I11185` deliverable 3).
+
+    Without this a reader cannot tell a report one trading day old from one
+    about to age out, and the clause flips to UNMET on freshness with a detail
+    string that looks like the previous day's — a control reporting the wrong
+    thing. `counts through` is the last gate trading day on which this report
+    is still inside `PARITY_FRESHNESS_TRADING_DAYS`; past it the phrase says
+    `expired after` instead, with 0 remaining.
+    """
+    age = _trading_days_between(report_day, trading_day)
+    remaining = max(PARITY_FRESHNESS_TRADING_DAYS - age, 0)
+    last_counting_day = add_trading_days(report_day, PARITY_FRESHNESS_TRADING_DAYS)
+    verb = "counts through" if age <= PARITY_FRESHNESS_TRADING_DAYS else "expired after"
+    return (
+        f"freshness window: {remaining} of {PARITY_FRESHNESS_TRADING_DAYS} trading days "
+        f"remaining (report trading_day {report_day.isoformat()} {verb} "
+        f"{last_counting_day.isoformat()})"
+    )
+
+
 def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     """Pre-cutover parity: the most recent report within the freshness window.
 
@@ -1299,6 +1322,16 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     the freshness rules — those exist to keep a LIVE comparison current, and
     there is no live comparison left to keep current. The detail says FROZEN
     and names the cutover, so the row never reads as a fresh measurement.
+
+    **Every reading that selects a report names its remaining window**
+    (`alpha-engine-config-I11185` deliverable 3): the report's trading day,
+    how many trading days of `PARITY_FRESHNESS_TRADING_DAYS` are left, and the
+    last day it counts on. An UNMET reading also says WHICH half failed — an
+    aged-out report is "failing on FRESHNESS, not content", a fresh report
+    that does not match is "failing on CONTENT" — so the two causes of the
+    same red bit never render as the same string. A FROZEN reading carries no
+    window phrase: the freshness rule is not applied to it, so a countdown
+    would describe a rule that does not govern the verdict.
     """
     from data_gate.cutover import CUTOVER_UTC, cutover_trading_day
 
@@ -1390,7 +1423,9 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
                     "UNMET would put a verdict on a day nothing was measured on "
                     "(alpha-engine-config-I11355). The gate read is triggered again after "
                     "the same-day parity publishes; a reading still showing this means the "
-                    "later trigger did not fire or the shadow run did not publish."
+                    "later trigger did not fire or the shadow run did not publish. "
+                    + _parity_window_phrase(report_day, trading_day)
+                    + "."
                 ),
                 evidence=(key,),
                 unmeasurable=True,
@@ -1406,7 +1441,11 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
                 f"most recent parity report is {key} (trading_day {report_day.isoformat()}), "
                 f"{age_trading_days} trading day(s) before the gate's {trading_day.isoformat()} "
                 f"— older than the {PARITY_FRESHNESS_TRADING_DAYS}-trading-day freshness window "
-                "(evidence.PARITY_FRESHNESS_TRADING_DAYS). Stale."
+                "(evidence.PARITY_FRESHNESS_TRADING_DAYS). Stale: the clause is failing on "
+                "FRESHNESS, not content — this report's own verdict was not read, and a new "
+                "shadow parity run inside the window is the fix; "
+                + _parity_window_phrase(report_day, trading_day)
+                + "."
             ),
             evidence=(key,),
             source="data_collection store",
@@ -1528,7 +1567,17 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             "read UNMET"
         )
     if frozen:
+        # No window phrase: freshness is not applied to a frozen reading
+        # (alpha-engine-config-I11269), so a countdown would misdescribe it.
+        if not met:
+            detail += " — failing on CONTENT"
         detail += frozen_note
+    else:
+        # alpha-engine-config-I11185 deliverable 3: the window is printed on every
+        # verdict, MET included, so its expiry is visible before it bites.
+        detail += "; " + _parity_window_phrase(report_day, trading_day)
+        if not met:
+            detail += " — failing on CONTENT; the report is inside its freshness window"
     return Reading(
         met=met,
         detail=detail,
