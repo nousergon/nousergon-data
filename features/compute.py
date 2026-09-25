@@ -53,6 +53,7 @@ from features.postflight import (
 )
 from features.private_pack import apply_private_features
 from features.registry import GROUPS, upload_registry
+from features.input_record import InputRecorder
 from features.writer import write_feature_snapshot
 
 log = logging.getLogger(__name__)
@@ -830,7 +831,42 @@ def _extract_macro(
     return macro
 
 
-def _load_price_source(s3, bucket: str) -> dict | None:
+class _SameClient:
+    """Sentinel: build the corporate-action registry from the loader's own client."""
+
+
+_SAME_CLIENT = _SameClient()
+
+
+def _rows_before(frames: dict[str, pd.DataFrame], before: pd.Timestamp) -> dict[str, pd.DataFrame]:
+    """Each frame's rows dated strictly before ``before``; a frame left empty is dropped.
+
+    A frame with no rows before the cutoff is dropped exactly as the loader
+    drops an empty read (`nousergon_lib.arcticdb._load_arctic_frames`).
+    """
+    cutoff = pd.Timestamp(before).normalize()
+    out: dict[str, pd.DataFrame] = {}
+    for symbol, frame in frames.items():
+        kept = frame[frame.index < cutoff]
+        if not kept.empty:
+            out[symbol] = kept
+    return out
+
+
+def _utc_moment() -> str:
+    """Now, UTC, to the microsecond — the ``as_of`` an ArcticDB read is recorded at."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+
+
+def _load_price_source(
+    s3,
+    bucket: str,
+    *,
+    end: "pd.Timestamp | None" = None,
+    before: "pd.Timestamp | None" = None,
+    recorder: "InputRecorder | None" = None,
+    library_reader=None,
+) -> dict | None:
     """The ~full-universe price+macro symbol set from ArcticDB.
 
     Wave-4 terminal state (predictor/price_cache_slim deleted). This feeds
@@ -851,16 +887,41 @@ def _load_price_source(s3, bucket: str) -> dict | None:
     the existing no-data contract; matches the pre-Wave-4 behaviour when
     the single price source was unavailable). ``s3`` is retained in the
     signature for caller compatibility but is no longer used.
+
+    ``end`` is the window end both libraries are read to. ``None`` is today
+    (UTC), exactly the library default; it is resolved HERE, once, so the
+    two reads share one window and a recorder can name it
+    (alpha-engine-config-I11203). ``before`` drops every row dated on or
+    after it — the trading day, on the D31 path (`compute_and_write`'s
+    ``exclude_trading_day_arctic_rows``). ``recorder`` receives a content
+    digest of each library's frames as loaded, and the UTC moment just before
+    each library was read: ArcticDB keeps prior symbol versions, so a later
+    reader can ask for the library ``as_of`` that moment.
+
+    ``library_reader(library, symbols, *, lookback_days, end)`` replaces the
+    two `nousergon_lib.arcticdb` loaders (``symbols=None`` = every universe
+    symbol). Only `shadow.recompute_lineage` passes one, to read AS OF a
+    recorded moment; the symbol selection and filtering here stay the code
+    under test.
     """
+    if end is None:
+        end = pd.Timestamp.now(tz="UTC").normalize().tz_localize(None)
+    end = pd.Timestamp(end).normalize()
     try:
         # lookback_days=_ARCTICDB_LOOKBACK_DAYS (alpha-engine-config-I7572):
         # the library default (730 calendar days, ~504 trading days) reads
         # fewer rows than _FEATURE_WARMUP_ROWS needs, starving the
         # factor-momentum second pass of warmup on every daily run — see
         # that constant's definition for the measured evidence.
-        prices = load_universe_ohlcv(
-            bucket, lookback_days=_ARCTICDB_LOOKBACK_DAYS,
-        )  # equities + SPY
+        universe_read_at = _utc_moment()
+        if library_reader is not None:
+            prices = library_reader(
+                "universe", None, lookback_days=_ARCTICDB_LOOKBACK_DAYS, end=end,
+            )
+        else:
+            prices = load_universe_ohlcv(
+                bucket, lookback_days=_ARCTICDB_LOOKBACK_DAYS, end=end,
+            )  # equities + SPY
         macro_syms = set(_MACRO_SLIM_KEYS.values())
         try:
             mlib = open_macro_lib(bucket)
@@ -869,9 +930,26 @@ def _load_price_source(s3, bucket: str) -> dict | None:
             }
         except Exception as exc:  # noqa: BLE001 - XL* discovery best-effort
             log.warning("macro-lib symbol listing failed: %s", exc)
-        macro_frames = load_macro_series(
-            bucket, macro_syms, lookback_days=_ARCTICDB_LOOKBACK_DAYS,
-        )
+        macro_read_at = _utc_moment()
+        if library_reader is not None:
+            macro_frames = library_reader(
+                "macro", macro_syms, lookback_days=_ARCTICDB_LOOKBACK_DAYS, end=end,
+            )
+        else:
+            macro_frames = load_macro_series(
+                bucket, macro_syms, lookback_days=_ARCTICDB_LOOKBACK_DAYS, end=end,
+            )
+        if before is not None:
+            prices = _rows_before(prices, before)
+            macro_frames = _rows_before(macro_frames, before)
+        if recorder is not None:
+            window = {
+                "end": end.date().isoformat(),
+                "lookback_days": _ARCTICDB_LOOKBACK_DAYS,
+                "before": before.date().isoformat() if before is not None else None,
+            }
+            recorder.arctic_loaded("universe", prices, as_of=universe_read_at, **window)
+            recorder.arctic_loaded("macro", macro_frames, as_of=macro_read_at, **window)
         return {**prices, **macro_frames} or None
     except Exception as exc:  # noqa: BLE001 - return empty, don't run blind
         log.warning("ArcticDB universe/macro read failed: %s", exc)
@@ -879,7 +957,14 @@ def _load_price_source(s3, bucket: str) -> dict | None:
 
 
 def _load_prices_and_macro(
-    s3, bucket: str, date_str: str,
+    s3,
+    bucket: str,
+    date_str: str,
+    *,
+    registry_client=_SAME_CLIENT,
+    recorder: "InputRecorder | None" = None,
+    exclude_trading_day_arctic_rows: bool = False,
+    price_source_loader=None,
 ) -> tuple[dict[str, pd.DataFrame], dict[str, pd.Series]]:
     """
     Load price data and macro series — ArcticDB primary, slim fallback
@@ -888,16 +973,40 @@ def _load_prices_and_macro(
     Trusts upstream data quality — DailyData collects fresh prices,
     Saturday DataPhase1 handles splits during full price refresh.
     No yfinance calls; no external API dependencies.
+
+    Keyword arguments: see :func:`build_feature_frame`. The restatement
+    outcome (which tickers a registered split restated on THIS run) is
+    recorded on ``recorder`` (alpha-engine-config-I11203).
     """
-    source = _load_price_source(s3, bucket)
+    if price_source_loader is not None:
+        source = price_source_loader(s3, bucket)
+    else:
+        source = _load_price_source(
+            s3,
+            bucket,
+            before=pd.Timestamp(date_str) if exclude_trading_day_arctic_rows else None,
+            recorder=recorder,
+        )
     if not source:
         return {}, {}
 
     price_data = dict(source)
-    registry = _build_registry(s3, bucket)
+    if registry_client is _SAME_CLIENT:
+        registry_client = s3
+    registry = _build_registry(registry_client, bucket) if registry_client is not None else None
+    window_start = min(
+        (d for d in (_safe_last_date(df.index) for df in price_data.values()) if d is not None),
+        default=None,
+    )
     price_data, _split_tickers = _apply_daily_delta(
         s3, bucket, date_str, price_data, registry=registry,
     )
+    if recorder is not None:
+        recorder.restatement(
+            start=window_start.date().isoformat() if window_start is not None else "",
+            end=date_str,
+            restated_tickers=_split_tickers,
+        )
 
     # Inference-side post-condition: LOUD-BUT-LOGGED, never raises here. The
     # snapshot must not silently halt inference on a residual, and the BLOCKING
@@ -1147,54 +1256,63 @@ def _expected_alternative_count(s3, bucket: str, prefix: str) -> int | None:
 
 # ── Main computation ─────────────────────────────────────────────────────────
 
-def compute_and_write(
+@dataclass
+class FeatureBuild:
+    """The feature frame exactly as the snapshot publishes it, and how it was reached.
+
+    ``features_df`` is ``None`` when no price data loaded (the caller's
+    ``no_price_data`` outcome).
+    """
+
+    features_df: "pd.DataFrame | None"
+    macro: dict
+    n_ok: int = 0
+    n_skip: int = 0
+    n_err: int = 0
+    t_load: float = 0.0
+    t_compute: float = 0.0
+
+
+def build_feature_frame(
     date_str: str,
-    bucket: str = DEFAULT_BUCKET,
-    dry_run: bool = False,
-    zero_variance_fatal: bool = True,
-) -> dict:
+    bucket: str,
+    *,
+    s3,
+    registry_client=_SAME_CLIENT,
+    recorder: "InputRecorder | None" = None,
+    exclude_trading_day_arctic_rows: bool = False,
+    price_source_loader=None,
+) -> FeatureBuild:
+    """Load every input and compute the full feature frame — everything but the write.
+
+    Split out of :func:`compute_and_write` (alpha-engine-config-I11203) so the
+    D31 recompute lineage (`shadow.recompute_lineage`) runs THIS code over a
+    pinned, read-only client and compares the result's published bytes
+    (`features.writer.snapshot_group_frames`) with a published snapshot. One
+    function, so a recompute can never exercise different feature code from
+    the run it is checking.
+
+    ``registry_client`` is the client the corporate-action registry is built
+    from; ``None`` builds none, which skips split detection and restatement
+    (the recompute passes ``None`` only when the run it replays recorded that
+    nothing was restated). ``price_source_loader`` replaces
+    :func:`_load_price_source` (the recompute's verified ArcticDB replay).
     """
-    Compute all 53 features for the full universe and write to S3.
-
-    Returns summary dict with counts and timing. When the zero-variance
-    postflight finds offending columns, the returned dict carries them under
-    ``zero_variance_columns`` regardless of which mode ran — the caller decides
-    what that means for ITS pipeline.
-
-    ``zero_variance_fatal`` (alpha-engine-config-I7572) selects between the two
-    correct answers to "a feature column is a cross-sectional constant":
-
-    * ``True`` (default — backfill, weekly, any offline recompute): raise
-      BEFORE the snapshot is written. Nothing downstream is waiting on the
-      artifact, so refusing to produce a known-defective one is right.
-
-    * ``False`` (the EOD daily path): write the snapshot, THEN report. On
-      2026-08-17 the fatal form cost far more than the defect it caught. Eight
-      columns were constants; the raise sits before ``write_feature_snapshot``,
-      so the OTHER ~200 columns of that day's snapshot were destroyed too, the
-      collector exited 1, the SF's data-spot workload failed, and
-      ``LaunchPostMarketArcticAppendSpot`` was therefore never reached — so the
-      day's SPY close never landed in ArcticDB, the freshness sentinel stayed
-      on the prior trading day, ``EODReconcile`` was skipped, and the self-heal
-      loop re-ran the same deterministic failure twice before paging
-      ``HealNonConvergent``. A defect in eight analytics columns took the
-      price-append and reconcile path down with it.
-
-      The guard is NOT weakened here and no column is exempted: it runs over
-      exactly the same columns and its verdict is reported at ERROR, carried in
-      the summary, and surfaced by the caller. What changes is only what the
-      verdict is allowed to destroy.
-    """
-    import boto3
-
-    s3 = boto3.client("s3")
     t0 = time.time()
 
     # ── 1. Load data ─────────────────────────────────────────────────────────
-    price_data, macro = _load_prices_and_macro(s3, bucket, date_str)
+    price_data, macro = _load_prices_and_macro(
+        s3,
+        bucket,
+        date_str,
+        registry_client=registry_client,
+        recorder=recorder,
+        exclude_trading_day_arctic_rows=exclude_trading_day_arctic_rows,
+        price_source_loader=price_source_loader,
+    )
     if not price_data:
         log.error("No price data loaded — cannot compute features")
-        return {"status": "error", "error": "no_price_data"}
+        return FeatureBuild(None, macro)
 
     sector_map = _load_sector_map(s3, bucket)
     sub_sector_map = _load_sub_sector_etf_map(s3, bucket)
@@ -1351,7 +1469,8 @@ def compute_and_write(
             f"(n_ok={n_ok} n_err={n_err} n_skip={n_skip} of {len(universe_tickers)})"
         )
 
-    # ── 3. Write to S3 ───────────────────────────────────────────────────────
+
+    # ── 3. Assemble the snapshot frame ─────────────────────────────────────────
     features_df = pd.DataFrame(store_rows)
 
     # alpha-engine-config-I7539: factor_momentum_ratio second pass. Rebuild the
@@ -1431,6 +1550,103 @@ def compute_and_write(
     # (features_df unchanged) unless NOUSERGON_PRIVATE_FEATURE_PACK is set;
     # every public/CI run takes this no-op path. See features/private_pack.py.
     features_df = apply_private_features(features_df)
+
+    return FeatureBuild(
+        features_df,
+        macro,
+        n_ok=n_ok,
+        n_skip=n_skip,
+        n_err=n_err,
+        t_load=t_load,
+        t_compute=t_compute,
+    )
+
+
+
+def compute_and_write(
+    date_str: str,
+    bucket: str = DEFAULT_BUCKET,
+    dry_run: bool = False,
+    zero_variance_fatal: bool = True,
+    exclude_trading_day_arctic_rows: bool = False,
+) -> dict:
+    """
+    Compute all 53 features for the full universe and write to S3.
+
+    ``exclude_trading_day_arctic_rows`` (the D31 EOD call site,
+    alpha-engine-config-I11203): read ArcticDB rows strictly BEFORE
+    ``date_str`` only, so the trading day's own bar always comes from its
+    ``staging/daily_closes/`` delta. On v1's schedule this changes nothing —
+    D31 runs before the day's ArcticDB append (D32), so the library holds no
+    row for the day yet. A run AFTER that append (the shadow's 18:55 ET D31,
+    or a v1 re-run) otherwise reads v1's own appended bar for every ticker
+    its delta does not override: v1's output as its input.
+
+    The returned dict carries ``input_refs`` — the run's recorded inputs, in
+    the run manifest's ``InputRef`` shape (`features.input_record`).
+
+    Returns summary dict with counts and timing. When the zero-variance
+    postflight finds offending columns, the returned dict carries them under
+    ``zero_variance_columns`` regardless of which mode ran — the caller decides
+    what that means for ITS pipeline.
+
+    ``zero_variance_fatal`` (alpha-engine-config-I7572) selects between the two
+    correct answers to "a feature column is a cross-sectional constant":
+
+    * ``True`` (default — backfill, weekly, any offline recompute): raise
+      BEFORE the snapshot is written. Nothing downstream is waiting on the
+      artifact, so refusing to produce a known-defective one is right.
+
+    * ``False`` (the EOD daily path): write the snapshot, THEN report. On
+      2026-08-17 the fatal form cost far more than the defect it caught. Eight
+      columns were constants; the raise sits before ``write_feature_snapshot``,
+      so the OTHER ~200 columns of that day's snapshot were destroyed too, the
+      collector exited 1, the SF's data-spot workload failed, and
+      ``LaunchPostMarketArcticAppendSpot`` was therefore never reached — so the
+      day's SPY close never landed in ArcticDB, the freshness sentinel stayed
+      on the prior trading day, ``EODReconcile`` was skipped, and the self-heal
+      loop re-ran the same deterministic failure twice before paging
+      ``HealNonConvergent``. A defect in eight analytics columns took the
+      price-append and reconcile path down with it.
+
+      The guard is NOT weakened here and no column is exempted: it runs over
+      exactly the same columns and its verdict is reported at ERROR, carried in
+      the summary, and surfaced by the caller. What changes is only what the
+      verdict is allowed to destroy.
+    """
+    import boto3
+
+    raw_s3 = boto3.client("s3")
+    # alpha-engine-config-I11203: every object the feature compute reads is
+    # recorded (key, ETag, VersionId), with a content digest of each ArcticDB
+    # library read, so `shadow.recompute_lineage` can re-run this exact
+    # computation later and prove it reproduces the published bytes.
+    recorder = InputRecorder(bucket)
+    s3 = recorder.wrap(raw_s3)
+    t0 = time.time()
+
+    build = build_feature_frame(
+        date_str,
+        bucket,
+        s3=s3,
+        # The corporate-action registry reads and writes its own state; its
+        # effect on THIS run is recorded as the restatement outcome instead.
+        registry_client=raw_s3,
+        recorder=recorder,
+        exclude_trading_day_arctic_rows=exclude_trading_day_arctic_rows,
+    )
+    if build.features_df is None:
+        return {"status": "error", "error": "no_price_data"}
+    # Frozen HERE: every read that can reach a published feature group has
+    # happened. The metron supplemental step below reads through the same
+    # client but publishes no key the lineage covers.
+    input_refs = recorder.freeze()
+    features_df = build.features_df
+    macro = build.macro
+    n_ok, n_skip, n_err = build.n_ok, build.n_skip, build.n_err
+    t_load, t_compute = build.t_load, build.t_compute
+
+    # ── 3. Write to S3 ───────────────────────────────────────────────────────
 
     # alpha-engine-config-I7539: postflight zero-variance guard, run AFTER
     # every producer above (per-ticker compute, factor-momentum second pass,
@@ -1580,6 +1796,9 @@ def compute_and_write(
         "metron_supplemental_written": supplemental_written,
         "load_seconds": round(t_load, 1),
         "compute_seconds": round(t_compute, 1),
+        # alpha-engine-config-I11203: folded onto the run manifest's `inputs`
+        # by `weekly_collector._record_phase_lineage`.
+        "input_refs": input_refs,
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
     }

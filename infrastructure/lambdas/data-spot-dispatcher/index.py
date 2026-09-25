@@ -589,6 +589,19 @@ _WORKLOADS: dict[str, str] = {
     # the `shadow-morning` key below, on v1's own cadence; this one's parity
     # call now declares `--legs-group sameday` so a report carrying only this
     # group renders the morning group as unknown rather than as silence.
+    #
+    # THEN `recompute-lineage` (alpha-engine-config-I11203): re-runs D31's
+    # feature code over the inputs v1's and this run's D31 each RECORDED and
+    # writes `lineage/D31/$TD.json`, which the NEXT trading day's report reads
+    # when it re-grades `features/$TD/*` (`prior_day_settled`). It runs here
+    # because both D31 outputs for $TD exist by now, and after `parity` so it
+    # can never delay the report or its gate dispatch. Cost: two ArcticDB
+    # `as_of` reads (~4 min each measured from outside the region, 2026-09-25)
+    # plus ~45 s of compute per side, against this workload's 18000 s cap.
+    # It runs whatever the legs did — a missing D31 manifest is a named
+    # refusal in the record, not a skipped step. Exit code: a failed leg,
+    # then `parity`'s 2, then a crashed recompute (2), then `parity`'s own
+    # MET/NOT MET; a record that REFUSES exits 0 — refusing is its job.
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -605,7 +618,10 @@ _WORKLOADS: dict[str, str] = {
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
         "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; exit $PARITY_RC )"
+        "python -m shadow recompute-lineage --trading-day $TD "
+        "--store s3://alpha-engine-research/data_collection; LINEAGE_RC=$?; "
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
+        "[ $LINEAGE_RC -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )"
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
     # `shadow-sameday` above, split out because v1 runs these two legs TWELVE

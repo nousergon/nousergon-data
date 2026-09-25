@@ -976,6 +976,16 @@ def _record_phase_lineage(
                     extra_written.append((k, rows_out))
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
+        # alpha-engine-config-I11203: a collector that recorded what it READ
+        # (`features.input_record`, D31/D12) hands the refs back under
+        # `input_refs`, already in the manifest's closed `InputRef` shape.
+        for ref in result.get("input_refs") or ():
+            run_ctx.record_input(
+                str(ref["key"]),
+                etag=ref.get("etag"),
+                version=ref.get("version"),
+                schema_version=ref.get("schema_version"),
+            )
     _record_collector_guards(run_ctx, result)
 
     if auto_skipped or dry:
@@ -4661,6 +4671,12 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: compute_and_write(
             date_str=run_date, bucket=bucket, dry_run=dry_run,
             zero_variance_fatal=False,
+            # alpha-engine-config-I11203: the day's own bar comes from its
+            # daily_closes delta, never from ArcticDB. A no-op on v1's
+            # schedule (D31 runs before D32 appends the day); it stops a run
+            # AFTER that append — the shadow's, or a re-run — reading v1's
+            # appended bar as its input.
+            exclude_trading_day_arctic_rows=True,
         ),
         artifact_key=f"features/{run_date}/schema_version.json",
         # alpha-engine-config-I10855: D31 declares the same 5 parquet keys as

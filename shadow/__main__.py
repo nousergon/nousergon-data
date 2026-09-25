@@ -1,7 +1,11 @@
 """`python -m shadow run …`, `python -m shadow parity …`,
-`python -m shadow arctic-parity …` and `python -m shadow prune …`.
+`python -m shadow arctic-parity …`, `python -m shadow recompute-lineage …` and
+`python -m shadow prune …`.
 
-Four commands. `run` and `parity` are the two halves of plan §6.2 step 4;
+Five commands. `recompute-lineage` (`alpha-engine-config-I11203`) re-runs D31
+over each side's recorded inputs and publishes the record `parity`'s v1_cause
+grading of a derived feature key reads; it opens ArcticDB, so it runs on the
+box too. `run` and `parity` are the two halves of plan §6.2 step 4;
 `arctic-parity` (`alpha-engine-config-I10819`) is the in-region follow-up that
 fills the `in_region_only` rows `parity` cannot measure from the laptop.
 **Run it on the data-spot box, never the laptop** — it opens ArcticDB
@@ -172,6 +176,22 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
 
+    lineage = sub.add_parser(
+        "recompute-lineage",
+        help=(
+            "in-region only: re-run D31 over each side's recorded inputs for a trading day and "
+            "publish the recompute lineage record parity's v1_cause grading reads"
+        ),
+    )
+    lineage.add_argument("--trading-day", required=True)
+    lineage.add_argument("--bucket", default=DEFAULT_BUCKET)
+    lineage.add_argument(
+        "--store",
+        required=True,
+        help="the parity store: s3://alpha-engine-research/data_collection, or a directory",
+    )
+    lineage.add_argument("--dry-run", action="store_true", help="compute and print; publish nothing")
+
     prune = sub.add_parser(
         "prune",
         help="delete shadow ArcticDB libraries older than the retention window (dry run unless --apply)",
@@ -194,6 +214,38 @@ def _prune(args) -> int:
     today = dt.date.fromisoformat(args.today) if args.today else dt.datetime.now(dt.timezone.utc).date()
     report = prune(_get_arctic(args.bucket), today=today, keep_days=args.keep_days, apply=args.apply)
     print(json.dumps(report, indent=2, sort_keys=True))
+    return 0
+
+
+def _recompute_lineage(args) -> int:
+    """`alpha-engine-config-I11203`: exit 0 when a record was published (complete OR
+    refused — a refusal is a finding the record carries), 2 when none could be."""
+    import boto3
+
+    from shadow import recompute_lineage
+
+    trading_day = dt.date.fromisoformat(args.trading_day)
+    try:
+        record = recompute_lineage.evaluate_day(
+            trading_day, bucket=args.bucket, client=boto3.client("s3"), code_sha=_code_sha()
+        )
+    except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
+        print(f"shadow recompute-lineage: failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_UNMEASURED
+    payload = json.dumps(record, indent=2, sort_keys=True).encode("utf-8")
+    key = recompute_lineage.lineage_record_key(trading_day)
+    if not args.dry_run:
+        open_store(args.store, dry_run=False).put_bytes(key, payload)
+    summary = {
+        "status": record["status"],
+        "published": None if args.dry_run else key,
+        "sides": {side: facts.get("refusal") for side, facts in record["sides"].items()},
+        "reproduced": {
+            k: {side: v[side]["reproduced"] for side in ("v1", "shadow")} for k, v in record["keys"].items()
+        },
+        "differing_inputs": [item.get("key") for item in record["differing_inputs"]],
+    }
+    print(json.dumps(summary, indent=2, sort_keys=True))
     return 0
 
 
@@ -425,6 +477,8 @@ def main(argv: "list[str] | None" = None) -> int:
         return _arctic_parity(args)
     if args.command == "prune":
         return _prune(args)
+    if args.command == "recompute-lineage":
+        return _recompute_lineage(args)
     return _parity(args)
 
 
