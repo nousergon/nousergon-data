@@ -43,6 +43,31 @@ never the budget alone. Re-derive from `thinktank/runs/{date}/manifest_*.json`
 rather than guessing; `deadline_skipped_sweep` / `deadline_skipped_new` /
 `deadline_skipped_refresh` tell you exactly what did not fit.
 
+## The retry must finish a dispatch it finds half-done (alpha-engine-config-I11532)
+
+On 2026-09-23 the function timeout (300s, in `deploy.sh`) was **equal** to
+`SSM_ONLINE_BUDGET_SEC` (300s, in `index.py`). SSM registered slowly, Lambda
+killed the handler after the launch and before `send_async_command`, and
+EventBridge's async retry found the box running and skipped it as a healthy
+concurrent run. The box ran nothing; the day was lost. Two fixes:
+
+- **Headroom.** `FN_TIMEOUT=900` in `deploy.sh` is the one declaration, and
+  every deploy converges it onto the live function (it used to be set only by
+  `--bootstrap`). `index.py` mirrors it as `LAMBDA_TIMEOUT_SECONDS`;
+  `test_handler.py` parses `deploy.sh` and fails if they differ or if
+  `instance_running waiter (200s) + SSM_ONLINE_BUDGET_SEC + 60s` stops fitting
+  strictly inside it. At runtime the SSM wait is also clamped to what the
+  invocation has left, so it raises (terminate + retry) rather than being killed.
+- **A dispatch record.** The box is tagged `thinktank-command-id` the moment the
+  send succeeds, and `thinktank-dispatch-request-id` atomically at launch. A
+  running box **without** a command id, with today's trading-day tag, whose
+  dispatcher is provably dead (the retry carries the same request id, or the
+  box is older than any invocation can live) and younger than
+  `ADOPT_WINDOW_SEC` (45 min) is **adopted**: the retry sends the command to it,
+  reusing its run token. A box that has a command id still means "skip".
+  No new IAM: `CreateDiscriminatorTagsOnOwnBoxesOnly` already grants
+  `ec2:CreateTags` on this dispatcher's own boxes.
+
 ## Rollout order (staged — §47 sub-rule (b))
 
 Merging this PR has **zero live effect**. The Think Tank keeps running on

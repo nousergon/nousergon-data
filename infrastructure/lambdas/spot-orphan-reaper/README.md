@@ -70,6 +70,17 @@ share the Name prefix (`alpha-engine-dashboard`, `alpha-engine-executor`). **Nev
 widen the scan to `tag:Name` alone:** those hosts carry no `watchdog-deadline`, so
 they would be terminated at the 6.5h fallback cap.
 
+## A finished rehearsal's box ends early (alpha-engine-config-I11569)
+
+A failed weekly run keeps its launcher box until the 13h watchdog, on purpose:
+the watch-rerun reuses it through `$.ec2_instance_id`. A **rehearsal**
+(`rehearsal-*`, launched by nous-ergon-ops `weekly-sf-rehearsal.yml`) is never
+rerun onto its box. When a box's `execution-id` tag names a rehearsal that stopped
+more than `REHEARSAL_REAP_GRACE_SECONDS` (default 3600) ago, the reaper terminates
+it with `reap_reason=rehearsal-finished`. Any `DescribeExecution` error, including
+AccessDenied before the role carries `ReadWeeklyRehearsalExecutionStatus`, keeps
+the box on its own deadline. Production executions are never looked up.
+
 ## CloudWatch metric
 
 `AlphaEngine/Infra/spot_orphans_terminated` (Count, sum) with a `name` dimension
