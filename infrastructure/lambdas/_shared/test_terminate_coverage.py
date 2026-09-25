@@ -36,10 +36,10 @@ _EXPECTED_LAUNCHERS = frozenset(
         # watchdog sized past the SF's own 12h TimeoutSeconds.
         "weekly-freshness-spot-dispatcher",
         # alpha-engine-config-I5208 / ARCHITECTURE §47 — daily Think Tank off
-        # the 900s Lambda ceiling onto spot. Terminates on failure in the
-        # launch→bootstrap window (the box has no watchdog or trap until the
-        # bootstrap command lands), plus a 2.5h watchdog sized above the SSM
-        # execution timeout.
+        # the 900s Lambda ceiling onto spot. Since alpha-engine-config-I11597
+        # a SELF-STARTING launch: the job and its power-off ride the launch as
+        # user-data, so there is no launch→bootstrap window to terminate in;
+        # plus a 2.5h watchdog sized above the job unit's timeout.
         "thinktank-spot-dispatcher",
         # alpha-engine-config-I9329 — dedicated spot box for EvalJudgeProcess
         # (bootstrap-only launcher; SF polls bootstrap then sends the run).
@@ -131,6 +131,45 @@ class TerminateCoverageUnitTest(unittest.TestCase):
             "    spot_dispatch.terminate_on_failure(iid, region=R, label='x')\n",
         )
         assert_every_launcher_terminates_on_failure(self.root)  # no raise
+
+
+class SelfStartingLaunchCoverageTest(unittest.TestCase):
+    """alpha-engine-config-I11597: krepis.ec2_spot.launch_self_starting."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write(self, dispatcher: str, body: str) -> None:
+        d = self.root / dispatcher
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "index.py").write_text(body)
+
+    def test_self_starting_launch_is_a_launcher_covered_by_construction(self):
+        self._write(
+            "self-starting-dispatcher",
+            "from krepis import ec2_spot\n"
+            "def handler(e, c):\n"
+            "    return ec2_spot.launch_self_starting(x, y, user_data=u)\n",
+        )
+        self.assertEqual(
+            find_box_launchers(self.root), {"self-starting-dispatcher": True}
+        )
+        assert_every_launcher_terminates_on_failure(self.root)  # no raise
+
+    def test_mixing_in_a_classic_launch_still_needs_a_terminate(self):
+        self._write(
+            "mixed-dispatcher",
+            "from krepis import ec2_spot\n"
+            "def handler(e, c):\n"
+            "    ec2_spot.launch_self_starting(x, y, user_data=u)\n"
+            "    return spot_dispatch.launch_with_fallback(x, y)\n",
+        )
+        with self.assertRaises(AssertionError):
+            assert_every_launcher_terminates_on_failure(self.root)
 
 
 class TerminateCoverageLiveTest(unittest.TestCase):

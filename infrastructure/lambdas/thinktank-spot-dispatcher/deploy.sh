@@ -70,14 +70,14 @@ ROLE_NAME="alpha-engine-thinktank-spot-dispatcher-role"
 POLICY_NAME="alpha-engine-thinktank-spot-dispatcher-role-policy"
 RULE_NAME="alpha-research-thinktank-daily"
 # The function timeout — the ONE place it is declared (alpha-engine-config-I11532).
-# It was 300s, EQUAL to index.py's SSM_ONLINE_BUDGET_SEC, and on 2026-09-23 a
-# slow SSM registration let the wait eat the whole invocation: Lambda killed
-# the handler after the launch and before the send, and the day's run was lost.
-# It must exceed launch + the lib's 200s instance_running waiter +
-# SSM_ONLINE_BUDGET_SEC + send. index.py mirrors it as LAMBDA_TIMEOUT_SECONDS;
-# test_handler.py parses THIS line, fails if the two differ, and fails if the
-# sum above stops fitting. Converged onto the live function on every deploy
-# (step below), so raising it here is the whole change.
+# It was 300s, EQUAL to index.py's old SSM-online wait, and on 2026-09-23 a slow
+# SSM registration let the wait eat the whole invocation: Lambda killed the
+# handler after the launch and before the send, and the day's run was lost.
+# Since alpha-engine-config-I11597 the handler no longer waits for anything: it
+# makes one self-starting launch (a dedupe probe, a client-token probe, then
+# RunInstances across at most 9 types x 6 subnets x 2 markets) and returns, so
+# 900s is headroom for a worst-case capacity rotation, not a budget any step is
+# sized against. Converged onto the live function on every deploy (step below).
 FN_TIMEOUT=900
 # Same topic the alarms this cutover replaces already publish to, so the
 # rotation does not silently change where a Think Tank page lands.
@@ -218,7 +218,9 @@ if $SMOKE; then
     echo "    dispatcher returned:"
     cat /tmp/thinktank-smoke-out.json; echo
     assert_no_function_error "${INVOKE_STDOUT}" /tmp/thinktank-smoke-out.json
-    echo "    Watch: aws logs tail /alpha-engine/thinktank-spot --follow"
+    echo "    Watch: aws ec2 get-console-output --instance-id <instance_id above> --latest"
+    echo "           (the job unit logs to the console; the bootstrap log ships to"
+    echo "           s3://alpha-engine-research/_ssm_logs/thinktank-spot/<date>/ on exit)"
     echo "    Gate:  thinktank/challenger_selection/, thinktank/ratings/ AND"
     echo "           thinktank/events/ written for the trading day, box self-terminated."
 fi
