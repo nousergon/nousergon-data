@@ -151,7 +151,8 @@ exit 0
 """
 
 # A per-stage launcher shaped exactly like spot_data_phase1.sh's control flow:
-# source, declare identity, launch, arm the trap, run a workload that dies.
+# source, declare identity, launch (spot_launch arms the EXIT trap itself,
+# alpha-engine-config-I11574), run a workload that dies.
 _STAGE = """#!/usr/bin/env bash
 set -euo pipefail
 source "{infra}/_spot_common.sh"
@@ -161,7 +162,6 @@ _PROCESS_NAME="${{_PROCESS_NAME:-data-phase1}}"
 MAX_RUNTIME_SECONDS="${{MAX_RUNTIME_SECONDS:-6600}}"
 ORIG_ARGS=("$@")
 spot_launch
-trap on_exit EXIT
 echo "ATTEMPT $SPOT_ATTEMPT ran on $_INSTANCE_ID"
 exit "${{FAKE_WORKLOAD_RC:-7}}"
 """
@@ -369,6 +369,114 @@ def test_single_type_override_still_launches_its_type(rig: _Rig) -> None:
     first, second = rig.launches()
     assert first["types"] == second["types"] == ["c6i.xlarge"]
     assert second["on_demand"] is True
+
+
+# ── launch-time refusals: exit 64 / 65 before the workload (I11574) ───────────
+
+
+def _refuse_first_launch(rig: _Rig, rc: int) -> None:
+    """The FIRST ``krepis.ec2_spot launch`` of the run exits ``rc`` without an
+    instance id (64 = every pool refused capacity, 65 = spot quota hit)."""
+    fake = rig.python.read_text().replace(
+        'if [ "$1" = "-m" ] && [ "$2" = "krepis.ec2_spot" ] && [ "$3" = "launch" ]; then\n  shift 3\n',
+        'if [ "$1" = "-m" ] && [ "$2" = "krepis.ec2_spot" ] && [ "$3" = "launch" ]; then\n  shift 3\n'
+        f'  if [ ! -s "$FAKE_DIR/launch.log" ]; then printf \'%s\\n\' "$*" >> "$FAKE_DIR/launch.log"; exit {rc}; fi\n',
+    )
+    rig.python.write_text(fake)
+
+
+def test_stage_capacity_exhausted_at_launch_relaunches_on_demand(rig: _Rig) -> None:
+    """ec2_spot exit 64 inside ``spot_launch`` used to exit the per-stage
+    launcher BEFORE its ``trap on_exit EXIT`` line ran: no classification, no
+    relaunch, no on-demand rung. ``spot_launch`` now arms the trap itself."""
+    _refuse_first_launch(rig, 64)
+    proc = rig.run(rig.stage, RUN_TOKEN="exec-stage-cap", FAKE_WORKLOAD_RC="0")
+    launches = rig.launches()
+    assert len(launches) == 2, _why(proc)
+    first, second = launches
+    assert first["on_demand"] is False
+    assert second["on_demand"] is True, _why(proc)
+    assert second["tags"] == [
+        "LaunchMarket=on-demand",
+        "LaunchReason=capacity_exhausted",
+    ]
+    # Nothing was reclaimed, so nothing is demoted.
+    assert second["types"] == _TYPES.split(",")
+    assert proc.returncode == 0, _why(proc)
+    assert "ATTEMPT 2 ran on i-fake2" in proc.stdout, _why(proc)
+
+
+def test_stage_spot_quota_at_launch_relaunches_on_demand(rig: _Rig) -> None:
+    """ec2_spot exit 65 (account-wide spot quota) is a launch-time refusal too;
+    on-demand capacity is a separate quota, so the relaunch goes on-demand
+    tagged with lib spot_dispatch's ``quota_exceeded`` reason."""
+    _refuse_first_launch(rig, 65)
+    proc = rig.run(rig.stage, RUN_TOKEN="exec-stage-quota", FAKE_WORKLOAD_RC="0")
+    launches = rig.launches()
+    assert len(launches) == 2, _why(proc)
+    assert launches[1]["on_demand"] is True, _why(proc)
+    assert launches[1]["tags"] == [
+        "LaunchMarket=on-demand",
+        "LaunchReason=quota_exceeded",
+    ]
+    assert proc.returncode == 0, _why(proc)
+
+
+def test_stage_spot_quota_goes_on_demand_before_the_final_attempt(rig: _Rig) -> None:
+    """A spot quota is account-wide: another spot attempt cannot succeed, so
+    the very next attempt is on-demand even with budget left."""
+    _refuse_first_launch(rig, 65)
+    proc = rig.run(
+        rig.stage, RUN_TOKEN="exec-quota-3", MAX_SPOT_ATTEMPTS="3", FAKE_WORKLOAD_RC="0"
+    )
+    launches = rig.launches()
+    assert len(launches) == 2, _why(proc)
+    assert launches[1]["on_demand"] is True, _why(proc)
+
+
+def test_stage_launch_refusal_on_the_final_attempt_gives_up(rig: _Rig) -> None:
+    _refuse_first_launch(rig, 64)
+    proc = rig.run(rig.stage, RUN_TOKEN="exec-cap-1", MAX_SPOT_ATTEMPTS="1")
+    assert len(rig.launches()) == 1
+    assert proc.returncode == 64, _why(proc)
+    assert "persisted across all 1 attempt(s)" in proc.stderr, _why(proc)
+
+
+def test_spot_launch_arms_the_exit_trap_before_launching() -> None:
+    """Structural: the trap is armed INSIDE ``spot_launch``, ahead of the
+    krepis launch call, so no per-stage launcher can place it too late."""
+    text = (_INFRA / "_spot_common.sh").read_text()
+    body = text[text.index("spot_launch() {") :]
+    body = body[: body.index("\n# ── Staging teardown")]
+    assert "trap on_exit EXIT" in body
+    assert body.index("trap on_exit EXIT") < body.index("-m krepis.ec2_spot launch")
+    for stage in (
+        "spot_morning_enrich.sh",
+        "spot_data_phase1.sh",
+        "spot_rag_ingestion.sh",
+    ):
+        stage_text = (_INFRA / stage).read_text()
+        launch_at = stage_text.index("\nspot_launch ")
+        assert "trap on_exit EXIT" not in stage_text[launch_at:], (
+            f"{stage}: re-arming the trap after spot_launch is where I11574 hid"
+        )
+
+
+def test_monolith_spot_quota_at_launch_relaunches_on_demand(rig: _Rig) -> None:
+    _refuse_first_launch(rig, 65)
+    proc = rig.run(
+        _INFRA / "spot_data_weekly.sh",
+        "--phase2-only",
+        RUN_TOKEN="exec-mono-quota",
+        FAKE_WAIT_RC="255",
+    )
+    launches = rig.launches()
+    assert len(launches) == 2, _why(proc)
+    assert launches[1]["on_demand"] is True, _why(proc)
+    assert launches[1]["tags"] == [
+        "LaunchMarket=on-demand",
+        "LaunchReason=quota_exceeded",
+    ]
 
 
 # ── spot_data_weekly.sh monolith (DataPhase2) ────────────────────────────────

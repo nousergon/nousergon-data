@@ -193,6 +193,16 @@ spot_assert_instance_types_allowed() {
 }
 
   spot_assert_instance_types_allowed "$INSTANCE_TYPES" || exit 2
+  # Arm the EXIT handler BEFORE the first billable call (alpha-engine-config-
+  # I11574). The per-stage launchers used to arm it on the line AFTER
+  # `spot_launch`, so an ec2_spot refusal here (exit 64 = every pool refused
+  # capacity, 65 = spot quota) exited under `set -e` with no handler: no
+  # classification, no relaunch, no on-demand rung — and anything that failed
+  # between RunInstances and that line left the box running. Armed here, the
+  # launch-time refusal takes the same on_exit -> relaunch -> on-demand path
+  # the monolith's does (_spot_relaunch.sh), and cleanup() is a no-op while
+  # _INSTANCE_ID is still empty.
+  trap on_exit EXIT
   # Demote pools this run already saw reclaimed; the final attempt of a
   # relaunch chain goes on-demand (alpha-engine-config-I11565, _spot_relaunch.sh).
   spot_launch_plan
@@ -304,6 +314,10 @@ cleanup() {
 _spot_failure_reason() {
   local rc="$1"
   if [ "$rc" -eq 64 ]; then echo "launch-capacity-exhausted"; return 0; fi
+  # ec2_spot exit 65: the account-wide SPOT quota refused the launch. No
+  # instance exists; on-demand is a separate quota, so it is relaunchable
+  # (straight to on-demand — _spot_relaunch.sh) (alpha-engine-config-I11574).
+  if [ "$rc" -eq 65 ]; then echo "launch-quota-exceeded"; return 0; fi
   [ -z "$_INSTANCE_ID" ] && return 1
   # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
   local _decide_json="" _decide_rc=0
