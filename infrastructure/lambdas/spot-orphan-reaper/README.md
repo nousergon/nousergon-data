@@ -51,12 +51,35 @@ box whose watchdog failed) lingers up to 6.5h before the backstop fires instead 
 2. **This Lambda**: hourly scan + termination for the case where the watchdog itself never installed (dispatcher SSM cancelled before the `systemd-run` step, package-manager-interrupted bootstrap, AMI issue, etc.).
 3. **CloudWatch billing alarm** (`AlphaEngine-Monthly` budget, $50/month): catches anything the other two missed, signals via SNS.
 
+## Scope: spot boxes AND launcher-tagged on-demand boxes (alpha-engine-config-I11108)
+
+Until 2026-09-25 the scan filtered on `instance-lifecycle=spot`, so a box the
+launcher fell back to on-demand for was invisible. The 2026-09-19 weekly run's
+c5.large leaked ~8h while the reaper logged `Scanned 0`. The scan now runs twice
+and merges the results by instance id:
+
+| Scope | Filter (plus `running` and `tag:Name=alpha-engine-*`) |
+|---|---|
+| spot | `instance-lifecycle=spot` |
+| on-demand | `tag:LaunchMarket=on-demand` |
+
+`LaunchMarket` is stamped only by `nousergon_lib.spot_dispatch.launch_with_fallback`
+and `_spot_relaunch.sh` (`launch --no-spot`), atomically with RunInstances. That tag
+is what separates an ephemeral run box from the long-lived on-demand hosts that
+share the Name prefix (`alpha-engine-dashboard`, `alpha-engine-executor`). **Never
+widen the scan to `tag:Name` alone:** those hosts carry no `watchdog-deadline`, so
+they would be terminated at the 6.5h fallback cap.
+
 ## CloudWatch metric
 
 `AlphaEngine/Infra/spot_orphans_terminated` (Count, sum) with a `name` dimension
 (the terminated box's `Name` tag). Zero is the expected steady-state; any non-zero
 value is a process-quality signal worth investigating — the most likely cause is a
 launcher that shipped without arming its watchdog.
+
+`AlphaEngine/Infra/orphan_reaper_candidates` and `orphan_reaper_terminated` (Count)
+with a `market` dimension (`spot` / `on-demand`) are emitted on **every** run,
+zeros included, so "nothing matched the filter" is a data point, not an absence.
 
 ## Watch-kind incomplete-reap alert (additive, generalized config#2106)
 

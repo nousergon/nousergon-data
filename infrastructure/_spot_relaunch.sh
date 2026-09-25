@@ -49,8 +49,11 @@
 #     escalation is countable by spot-interruption-recorder's fallback sweep
 #     rather than only visible on the bill. `LaunchReason` is
 #     `force_on_demand` after a reclaim (the bounded-relaunch escalation that
-#     reason was defined for, config#1645) and `capacity_exhausted` after an
-#     all-pools launch refusal. An on-demand box cannot be reclaimed, so the
+#     reason was defined for, config#1645), `capacity_exhausted` after an
+#     all-pools launch refusal (ec2_spot exit 64), and `quota_exceeded` after
+#     a spot-quota refusal (exit 65) — which escalates on the NEXT attempt,
+#     not only the final one, because the quota is account-wide
+#     (alpha-engine-config-I11574). An on-demand box cannot be reclaimed, so the
 #     last attempt stops depending on the market that failed the first ones.
 #     `SPOT_FINAL_ATTEMPT_ON_DEMAND=0` turns rule 2 off for one invocation.
 #
@@ -201,8 +204,18 @@ spot_launch_plan() {
     _SPOT_PLAN_MARKET="on-demand"
     case "$SPOT_RELAUNCH_CAUSE" in
       launch-capacity-exhausted) _SPOT_PLAN_REASON="capacity_exhausted" ;;
+      launch-quota-exceeded) _SPOT_PLAN_REASON="quota_exceeded" ;;
       *) _SPOT_PLAN_REASON="force_on_demand" ;;
     esac
+  fi
+  # A spot QUOTA refusal is account-wide: no spot attempt in this chain can
+  # succeed, so the very next one is on-demand whatever budget is left
+  # (alpha-engine-config-I11574; lib spot_dispatch REASON_QUOTA).
+  if [ "$SPOT_FINAL_ATTEMPT_ON_DEMAND" = "1" ] \
+      && [ "$SPOT_RELAUNCH_CAUSE" = "launch-quota-exceeded" ] \
+      && [ "$SPOT_ATTEMPT" -gt 1 ]; then
+    _SPOT_PLAN_MARKET="on-demand"
+    _SPOT_PLAN_REASON="quota_exceeded"
   fi
   _SPOT_PLAN_MARKET_ARGS=(--extra-tag "LaunchMarket=${_SPOT_PLAN_MARKET}" --extra-tag "LaunchReason=${_SPOT_PLAN_REASON}")
   if [ "$_SPOT_PLAN_MARKET" = "on-demand" ]; then
@@ -222,6 +235,7 @@ spot_launch_plan() {
 spot_relaunch_cause() {
   case "${1:-}" in
     launch-capacity-exhausted*) echo "launch-capacity-exhausted" ;;
+    launch-quota-exceeded*) echo "launch-quota-exceeded" ;;
     *) echo "reclaim" ;;
   esac
 }

@@ -247,8 +247,43 @@ UNIVERSE_BENCHMARK_PROXIES = frozenset({
 # and `is`-identity holds; new code should use UNIVERSE_BENCHMARK_PROXIES.
 _UNIVERSE_EXTRA = UNIVERSE_BENCHMARK_PROXIES
 
-# Tickers that are macro/index series, not stocks
+# The non-XL* symbols `_load_price_source` reads from the ArcticDB `macro`
+# library and merges into the SAME dict as the equity universe. Declared here,
+# above `_SKIP_TICKERS`, because every one of them must be skip-protected BY
+# CONSTRUCTION (alpha-engine-config-I11190): a macro stem missing from the skip
+# set is computed as if it were a stock.
+_MACRO_SLIM_KEYS = {
+    "SPY": "SPY",
+    "VIX": "VIX",     # stored as VIX, yfinance ticker is ^VIX
+    "VIX3M": "VIX3M", # stored as VIX3M, yfinance ticker is ^VIX3M
+    "TNX": "TNX",     # stored as TNX, yfinance ticker is ^TNX
+    "IRX": "IRX",
+    "GLD": "GLD",
+    "USO": "USO",
+    "HYOAS": "HYOAS", # config#939 — credit spreads; FRED-only index ticker
+}
+
+
+# Tickers that are macro/index series, not stocks.
+#
+# `*_MACRO_SLIM_KEYS.values()` (alpha-engine-config-I11190): #688 (2026-07-08,
+# config#939) added HYOAS to `_MACRO_SLIM_KEYS`, so `_load_price_source` read
+# it into `price_data` — but not into this hand-kept set. So HYOAS (a FRED
+# credit-spread index, NOT a stock) went through the per-ticker compute, got a
+# row in every published snapshot, and entered the factor-momentum second
+# pass's cross-sectional panel. FRED publishes it on days the equity market is
+# shut (holidays, some month-end weekends: 26 such dates in the 2026-09-24
+# 585-row window). Each is a one-name date, fails
+# `compute_daily_factor_returns`' min_names gate, and is a NaN factor return;
+# `compute_factor_momentum_series`' `rolling(231, min_periods=231)` then never
+# saw 231 consecutive dates (the longest run was 68). That, not the warmup
+# window I7539/I7572 widened, is why factor_momentum_ratio has been 0/901 on
+# the daily path every run since 2026-08-19 and D31 has recorded `failed`
+# (degraded) every day. Deriving the macro half of this set from the loader's
+# own declaration makes the next macro series skip-protected with no second
+# edit.
 _SKIP_TICKERS = {
+    *_MACRO_SLIM_KEYS.values(),
     "SPY", "VIX", "VIX3M", "TNX", "IRX", "GLD", "USO",
     "^VIX", "^VIX3M", "^TNX", "^IRX",
     *_SUB_SECTOR_ETFS,
@@ -794,18 +829,6 @@ def audit_action_jumps(
             else:
                 suspected.setdefault(ticker, []).append((date_str, float(val)))
     return ActionJumpAudit(missed=missed, suspected=suspected)
-
-
-_MACRO_SLIM_KEYS = {
-    "SPY": "SPY",
-    "VIX": "VIX",     # stored as VIX, yfinance ticker is ^VIX
-    "VIX3M": "VIX3M", # stored as VIX3M, yfinance ticker is ^VIX3M
-    "TNX": "TNX",     # stored as TNX, yfinance ticker is ^TNX
-    "IRX": "IRX",
-    "GLD": "GLD",
-    "USO": "USO",
-    "HYOAS": "HYOAS", # config#939 — credit spreads; FRED-only index ticker
-}
 
 
 def _extract_macro(
@@ -1820,6 +1843,27 @@ def compute_and_write(
         "total_seconds": round(t_total, 1),
         "dry_run": dry_run,
     }
+
+    # alpha-engine-config-I11190: `weekly_collector._DegradedRun` records a
+    # degraded run's manifest reason from `error`/`detail`/`reason`, and this
+    # result carried none of them — so D31's only failure record read "no
+    # detail reported" every day while the defect sat, fully named, in the two
+    # keys above. Say it in the field the manifest reads (the
+    # `collectors/prices.py` I11230 precedent).
+    if result["status"] == "degraded":
+        _parts = []
+        if _all_null:
+            _parts.append(f"all-null feature column(s) {sorted(_all_null)}")
+        if _zero_variance:
+            _parts.append(
+                "zero-variance feature column(s) "
+                f"{dict(sorted(_zero_variance.items()))} (column: non_null_count)"
+            )
+        result["reason"] = (
+            "; ".join(_parts)
+            + f" over {n_ok} tickers on the daily path — snapshot written, "
+            "column(s) carry no signal"
+        )
 
     log.info("Feature store compute complete: %s", json.dumps(result, default=str))
     return result
