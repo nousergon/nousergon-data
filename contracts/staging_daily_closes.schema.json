@@ -40,6 +40,11 @@
       "minimum": 1,
       "x-provenance": true,
       "description": "Per-cell write counter, default 1. Incremented only when an existing cell is actually overwritten by an equal-or-higher-priority source (collectors.daily_closes._coalesce_by_source_priority) — an explicit, queryable trail of vendor overwrites instead of a silent one (alpha-engine-config-I10783). x-provenance (alpha-engine-config-I10894): a run-identity counter, not a data value — shadow/parity.py excludes it from `values.breaches` and reports it under `provenance_diffs` instead, because it is DEFINED to differ between the live and shadow read-modify-write chains (I10891)."
+    },
+    "xsource_provenance": {
+      "type": ["string", "null"],
+      "x-provenance": true,
+      "description": "Cross-source observer audit string (collectors/cross_source_observer.py XSOURCE_PROVENANCE, built by sources/cross_source_gate.py as GateDecision.provenance), e.g. `A@2026-09-22: yfinance=167.2700 single-source PROVISIONAL (no cross-check)`. Optional: only the L1 observer writes it. x-provenance (alpha-engine-config-I11559): the text EMBEDS the vendor and price the row was built from, so grading it as data re-grades the same `Close` a second time, as a string, with no tolerance. shadow/parity.py reports it under `provenance_diffs` instead of `values.breaches`. The price it embeds is still graded, strictly, in its own `Close` column, and the vendor in `source`."
     }
   }
 }

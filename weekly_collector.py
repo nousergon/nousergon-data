@@ -1328,6 +1328,11 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         finally:
             _CURRENT_RUN_CTX.reset(token)
         captured["result"] = result
+        # alpha-engine-config-I11559: fold on the readings the mode's nested
+        # collectors graded themselves (D17's `bar_settlement` stamp) BEFORE
+        # the status checks, so a failure manifest carries them too — the same
+        # rule `_phase_collect` follows (`alpha-engine-config-I10827`).
+        _record_collector_guards(run_ctx, {"guards": _mode_collector_guards(mode, result)})
         # A mode function returning a non-ok status has FAILED — the manifest
         # says so rather than recording a successful run whose body reported a
         # failure it swallowed (`observability-policy` §3.1). The raise is
@@ -1446,6 +1451,35 @@ def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
 #: arctic write in the same run, and gating this recording behind the arctic
 #: count (as the prior single-key implementation did) left it permanently
 #: unrecorded on every weekday run.
+#: mode -> the nested ``result["collectors"][<name>]`` entries whose
+#: self-graded ``guards`` a whole-mode unit folds onto its own run manifest
+#: (`alpha-engine-config-I11559`). `_phase_collect` folds a collector's guards
+#: because the collector's result IS the phase's result; a whole-mode unit
+#: returns a mode result with its collectors one level down, so their readings
+#: were computed and then dropped. D17 is the case that mattered: its
+#: `daily_closes.collect(source="polygon_only")` call already returns the same
+#: `bar_settlement` stamp D19 records (`dates.bar_settlement_guard_entry`, the
+#: TARGET date's in window mode), and `shadow.parity`'s `v1_bar_provisional`
+#: evidence reads it off the manifest that recorded
+#: `staging/daily_closes/{D}.parquet` — which, after the morning rewrite, is
+#: D17's. Named per mode rather than folded from every nested collector, so a
+#: mode starts carrying a collector's readings by a deliberate edit here.
+_MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
+    "morning_enrich": ("daily_closes",),
+}
+
+
+def _mode_collector_guards(mode: str, result: dict | None) -> list[dict]:
+    """The guard entries :data:`_MODE_GUARD_COLLECTORS` names for ``mode``."""
+    collectors = (result or {}).get("collectors") or {}
+    guards: list[dict] = []
+    for name in _MODE_GUARD_COLLECTORS.get(mode, ()):
+        entry = collectors.get(name)
+        if isinstance(entry, dict):
+            guards.extend(entry.get("guards") or ())
+    return guards
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
     "morning_enrich": (
         (
