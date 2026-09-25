@@ -254,6 +254,11 @@ _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
 # spot_data_weekly.sh monolith (alpha-engine-config-I10194 §3).
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_stage_window.sh"
 
+# What the attempt after a spot interruption does differently (demote the
+# reclaimed pool; final attempt on-demand) — the same ONE file _spot_common.sh
+# sources (alpha-engine-config-I11565).
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_spot_relaunch.sh"
+
 # ── Parse flags ──────────────────────────────────────────────────────────────
 # RUN_MODE values:
 #   full                — phase1 + rag (legacy bundled, manual/adhoc)
@@ -541,9 +546,15 @@ _spot_failure_reason() {
         --json \
         2>/dev/null)" || _decide_rc=$?
     [ "$_decide_rc" -eq 0 ] || return 1   # CLI failed to answer -> treat as hold (do not relaunch)
-    local _relaunch=""
-    _relaunch="$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; print("1" if json.load(sys.stdin).get("relaunch") else "0")')"
+    local _relaunch="" _class=""
+    read -r _relaunch _class <<<"$(printf '%s' "$_decide_json" | "$LIB_PYTHON" -c 'import json,sys; d=json.load(sys.stdin); print("1" if d.get("relaunch") else "0", d.get("classification") or "none")')" || true
     echo "  spot relaunch-decision (attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS): $_decide_json" >&2
+    # Record EVERY confirmed reclaim, hold verdicts included, so the next
+    # launch in this run — this script's own relaunch or the SF's re-issue —
+    # demotes the reclaimed pool (alpha-engine-config-I11565). stderr/file only.
+    if [ "$_class" = "reclaim" ]; then
+        spot_record_reclaim "$INSTANCE_ID" "data-weekly-${RUN_MODE:-}" || true
+    fi
     [ "$_relaunch" = "1" ] || return 1
     echo "confirmed-reclaim${_decide_json:+ ($_decide_json)}"
 }
@@ -570,6 +581,10 @@ on_exit() {
         echo "==> Spot interruption (reason=$reason) on attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS — relaunching a fresh spot in ${SPOT_RETRY_BACKOFF_SECONDS}s..." >&2
         sleep "$SPOT_RETRY_BACKOFF_SECONDS"
         trap - EXIT
+        # SPOT_RELAUNCH_CAUSE tells the next attempt it is a relaunch, so the
+        # final one launches on-demand (_spot_relaunch.sh, rule 2).
+        SPOT_RELAUNCH_CAUSE="$(spot_relaunch_cause "$reason")"
+        export SPOT_RELAUNCH_CAUSE
         SPOT_ATTEMPT=$((SPOT_ATTEMPT + 1)) exec bash "$0" ${ORIG_ARGS[@]+"${ORIG_ARGS[@]}"}
     fi
     if [ "$rc" -ne 0 ] && [ -n "$reason" ]; then
@@ -618,11 +633,15 @@ spot_assert_instance_types_allowed() {
 }
 
 spot_assert_instance_types_allowed "$INSTANCE_TYPES" || exit 2
-echo "==> Requesting spot instance (lib CLI rotation: types=[$INSTANCE_TYPES], subnets=[$SUBNETS])..."
+# Demote pools this run already saw reclaimed; the final attempt of a
+# relaunch chain goes on-demand (alpha-engine-config-I11565, _spot_relaunch.sh).
+spot_launch_plan
+echo "==> Requesting ${_SPOT_PLAN_MARKET} instance (lib CLI rotation: types=[$_SPOT_PLAN_TYPES], subnets=[$_SPOT_PLAN_SUBNETS], attempt $SPOT_ATTEMPT/$MAX_SPOT_ATTEMPTS)..."
 
 INSTANCE_ID=$("$LIB_PYTHON" -m krepis.ec2_spot launch \
-    --types "$INSTANCE_TYPES" \
-    --subnets "$SUBNETS" \
+    --types "$_SPOT_PLAN_TYPES" \
+    --subnets "$_SPOT_PLAN_SUBNETS" \
+    "${_SPOT_PLAN_MARKET_ARGS[@]}" \
     --image-id "$AMI_ID" \
     --key-name "$KEY_NAME" \
     --security-group "$SECURITY_GROUP" \
@@ -648,6 +667,7 @@ if [ "$ec2_spot_rc" -ne 0 ] || [ -z "$INSTANCE_ID" ]; then
 fi
 
 echo "  Instance ID: $INSTANCE_ID"
+spot_capture_launched_pool "$INSTANCE_ID"
 
 RUN_ID="$(date +%Y%m%dT%H%M%SZ)-${INSTANCE_ID}"
 S3_STAGING_PREFIX="tmp/spot_data_weekly/${RUN_ID}"
