@@ -199,6 +199,27 @@ def test_code_only_path_makes_no_iam_call_at_all(tmp_path: Path) -> None:
     )
 
 
+def test_code_only_path_converges_the_timeout_and_nothing_else(tmp_path: Path) -> None:
+    """alpha-engine-config-I11532. The timeout used to be set ONCE, by
+    --bootstrap's create-function, so FN_TIMEOUT could be edited in deploy.sh
+    and never reach the live function — the flagless path is the only one CI
+    runs on merge. It must converge the timeout, and ONLY the timeout: the live
+    function carries no environment, and an `--environment` here would silently
+    wipe any override an operator set."""
+    proc = _deploy(tmp_path, get_role=(255, _DENIED))
+    assert proc.returncode == 0, f"{proc.stdout}\n{proc.stderr}"
+    config_calls = [
+        line
+        for line in _aws_calls(tmp_path).splitlines()
+        if line.startswith("lambda update-function-configuration")
+    ]
+    assert len(config_calls) == 1, config_calls
+    call = config_calls[0]
+    assert "--timeout 900" in call, call
+    for forbidden in ("--environment", "--role", "--handler", "--runtime"):
+        assert forbidden not in call, f"{forbidden} rode the timeout convergence: {call}"
+
+
 def test_code_only_path_runs_the_shared_handler_test_gate(tmp_path: Path) -> None:
     """25 handler tests sat beside index.py that this deploy.sh never ran. The
     gate must be the SHARED one, so it cannot re-drift into the no-install form

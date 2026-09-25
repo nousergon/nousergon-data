@@ -13,8 +13,11 @@ name: Deploy thinktank-spot-dispatcher
 # anti-pattern (an issue closed as fixed on a PR whose command was never run).
 # So: form 1.
 #
-# Separation of concerns: CODE ONLY. deploy.sh's flagless run is already
-# code-only; --bootstrap is what ADDS IAM-role and Lambda-function creation on
+# Separation of concerns: CODE plus the function TIMEOUT, nothing else.
+# deploy.sh's flagless run converges FN_TIMEOUT onto the live function
+# (alpha-engine-config-I11532: the timeout used to be set once, at --bootstrap,
+# so it sat at 300s -- equal to the SSM-online wait -- and a slow SSM
+# registration lost the 2026-09-23 run); --bootstrap is what ADDS IAM-role and Lambda-function creation on
 # top, and --apply-iam re-applies the policy. The github-actions-lambda-deploy
 # OIDC role deliberately holds no iam:CreateRole / iam:PutRolePolicy (fleet-wide
 # after 4 IAM-clobber incidents in 2 months; see
@@ -43,7 +46,7 @@ permissions:
 
 jobs:
   deploy:
-    name: Deploy thinktank-spot-dispatcher Lambda (code-only)
+    name: Deploy thinktank-spot-dispatcher Lambda (code + timeout)
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -68,7 +71,7 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Deploy thinktank-spot-dispatcher (code-only -- no --bootstrap)
+      - name: Deploy thinktank-spot-dispatcher (code + timeout -- no --bootstrap)
         working-directory: alpha-engine-data
         run: bash infrastructure/lambdas/thinktank-spot-dispatcher/deploy.sh
 
@@ -78,7 +81,7 @@ jobs:
           echo "Deployed commit: ${{ github.sha }}"
           aws lambda get-function \
             --function-name alpha-engine-thinktank-spot-dispatcher \
-            --query "Configuration.[LastModified,CodeSha256]" \
+            --query "Configuration.[LastModified,CodeSha256,Timeout]" \
             --output text
 
       - name: Append to system-wide deploy changelog
