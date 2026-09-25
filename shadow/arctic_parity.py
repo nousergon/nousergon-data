@@ -55,6 +55,7 @@ from typing import Any, Callable, Iterable, Mapping
 from shadow.parity import (
     DEFAULT_ABSOLUTE_TOLERANCE,
     DEFAULT_RELATIVE_TOLERANCE,
+    PASSING_VERDICTS as PARITY_PASSING_VERDICTS,
     _compare_frames,
     parity_key,
 )
@@ -322,7 +323,7 @@ def rewrite_report(report: dict[str, Any], results: dict[str, dict[str, Any]]) -
     if _SETTLING_BAR_KEYS in previous:
         summary[_SETTLING_BAR_KEYS] = int(previous[_SETTLING_BAR_KEYS] or 0)
     out["summary"] = summary
-    out["met"] = bool(rows) and all(row["verdict"] == "match" for row in rows)
+    out["met"] = bool(rows) and all(row["verdict"] in PARITY_PASSING_VERDICTS for row in rows)
     return out
 
 

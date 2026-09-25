@@ -376,6 +376,23 @@ def bar_settlement(
 #: collection rather than report on it. Moving that schedule is a pipeline-
 #: timing decision reserved to Brian; this guard is the measurement he rules
 #: from.
+#: The guard name a collector records a VENDOR's own publish time under
+#: (`alpha-engine-config-I11203`). Its `key` is ``"<live key>#<json path>"``
+#: (``market_data/macro/latest.json#$.series.DGS10``) and its `value` is the
+#: vendor's last-updated moment for that series, read AFTER the run's own
+#: observations (so an upper bound on the version it read), as POSIX seconds,
+#: UTC. With :data:`VENDOR_FIRST_RELEASED_GUARD` it is the evidence
+#: `shadow.parity`'s `vendor_published_after_v1_fetch` reads: an observation
+#: first released on a later day than v1's version was last updated could not
+#: have been in what v1 read — a v1-side timing fact, proven rather than
+#: asserted.
+VENDOR_PUBLISHED_AT_GUARD = "vendor_published_at"
+
+#: Its companion: the date one OBSERVATION was first released by the vendor.
+#: `key` is ``"<live key>#<json path>@<observation date>"`` and `value` that
+#: release date at 00:00 UTC, as POSIX seconds (`alpha-engine-config-I11203`).
+VENDOR_FIRST_RELEASED_GUARD = "vendor_first_released"
+
 BAR_SETTLEMENT_GUARD = GuardStaging(
     name="bar_settlement",
     mode=GuardMode.OBSERVE,

@@ -737,7 +737,9 @@ def test_the_shadow_prefix_accumulating_across_attempts_keeps_only_the_latest_ma
 def test_resolve_contract_reads_the_declared_key_pattern_and_provenance_fields():
     contract = parity.resolve_contract("staging/daily_closes/2026-09-12.parquet")
     assert contract is not None
-    assert contract.provenance_fields == frozenset({"revision"})
+    # `xsource_provenance` since alpha-engine-config-I11559: the observer's
+    # audit string embeds the price, which stays graded in `Close`.
+    assert contract.provenance_fields == frozenset({"revision", "xsource_provenance"})
 
     contract = parity.resolve_contract("market_data/weekly/2026-09-12/constituents.json")
     assert contract is not None
