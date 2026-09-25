@@ -258,6 +258,36 @@ def test_a_collector_self_reported_auto_skip_routes_the_same_as_a_registry_one()
     assert m["rows_out"] == 0
 
 
+def test_a_self_reported_auto_skip_still_records_what_it_read():
+    """`alpha-engine-config-I11231`. A no-op read something -- D26's no-op is the
+    ledger manifest at a version that already carried the day -- and on a shadow
+    run that version is the evidence of whether it built on v1's base or on v1's
+    own write. An auto-skip publishes nothing, so it records no output; it still
+    records its inputs."""
+    s3 = FakeS3()
+    reg = FakeRegistry(s3)
+    ref = {
+        "key": "s3://alpha-engine-research/market_data/technicals/rating_history/_manifest.json",
+        "etag": None, "version": "9Mf1cVm0zUZ4mmkQU_y91k0gTk2dm65L", "schema_version": None,
+    }
+    weekly_collector._phase_collect(
+        reg, "metron_rating_ledger",
+        lambda: {
+            "status": "ok",
+            "auto_skipped": True,
+            "skip_reason": "target date already live-published, immutable",
+            "backfill_written": 0,
+            "live_written": False,
+            "input_refs": [ref],
+        },
+        supports_auto_skip=False,
+    )
+    m = _manifests(s3)[0]
+    assert m["status"] == "not_applicable"
+    assert m["outputs"] == []
+    assert m["inputs"] == [ref]
+
+
 def test_the_collector_self_reported_skip_reason_reaches_the_log(caplog):
     """The detail behind `no_new_data_declared` — WHY this cycle had nothing new
     — must still be discoverable, even though it does not live in `reason`."""

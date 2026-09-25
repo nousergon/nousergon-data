@@ -2,8 +2,9 @@
 (alpha-engine-config-I11312).
 
 Pins the three properties the state machine relies on: it runs exactly the
-checks the Lambda profile cannot reach, it classifies CAP_CHECKOUT skips as
-expected rather than as the gap it exists to close, and it fails OPEN — no
+checks the Lambda profile cannot reach, it escalates a REQUIRED check's skip
+(tool_contracts included, alpha-engine-config-I11568) as the gap it exists to
+close while listing optional skips apart, and it fails OPEN — no
 crash, timeout or AWS write failure can turn into a non-zero exit other than
 the one deliberate observed-FAIL code.
 """
@@ -53,7 +54,21 @@ def test_in_scope_group_is_derived_from_the_capability_table():
         fn.__name__.replace("check_", "") for fn in sp.CHECKS
         if sp.CHECK_CAPABILITIES[fn.__name__] & spot.IN_SCOPE_CAPABILITIES
     }
-    assert derived == _GROUP
+    assert derived == _GROUP | _CHECKOUT
+
+
+def test_checkout_is_in_scope_so_required_tool_contracts_runs_somewhere():
+    """alpha-engine-config-I11568: tool_contracts is REQUIRED and needs
+    CAP_CHECKOUT; with checkout out of scope here as well as absent from the
+    Lambda, a required check ran in NO environment."""
+    assert sp.CAP_CHECKOUT in spot.IN_SCOPE_CAPABILITIES
+    for fn in sp.CHECKS:
+        if sp.CHECK_REQUIRED.get(fn.__name__, True) and not (
+            sp.CHECK_CAPABILITIES[fn.__name__] <= sp.LAMBDA_CAPABILITIES
+        ):
+            assert sp.CHECK_CAPABILITIES[fn.__name__] - {sp.CAP_AWS} <= (
+                spot.IN_SCOPE_CAPABILITIES
+            ), f"{fn.__name__} is required and reachable in neither profile"
 
 
 def _run_with(monkeypatch, caps, outcome="ok"):
@@ -73,18 +88,27 @@ def _run_with(monkeypatch, caps, outcome="ok"):
     return spot.observe("test-bucket", "2026-09-25")
 
 
-_BOX = {sp.CAP_AWS, sp.CAP_ARCTIC, sp.CAP_REPO_MODULES, sp.CAP_POLYGON}
+_BOX = {sp.CAP_AWS, sp.CAP_ARCTIC, sp.CAP_REPO_MODULES, sp.CAP_POLYGON, sp.CAP_CHECKOUT}
 
 
-def test_full_box_closes_the_group_and_only_checkout_skips(monkeypatch):
+def test_full_box_runs_every_spot_check_including_the_checkout_group(monkeypatch):
     rec = _run_with(monkeypatch, _BOX)
     assert rec["verdict"] == "OK"
     assert rec["group_required_skip_count"] == 0
-    assert set(rec["expected_skip_names"]) == _CHECKOUT
-    # tool_contracts is REQUIRED in CHECK_REQUIRED, so the Lambda-comparable
-    # count still names it — expected here, never escalated to the verdict.
-    assert rec["required_skip_names"] == ["tool_contracts"]
-    assert rec["ran_count"] == len(_GROUP)
+    assert rec["required_skip_names"] == []
+    assert rec["expected_skip_names"] == []
+    assert rec["ran_count"] == len(_GROUP | _CHECKOUT)
+
+
+def test_a_box_without_its_checkouts_is_a_blind_spot_on_tool_contracts(monkeypatch):
+    """alpha-engine-config-I11568: a lost sibling checkout must not read as
+    an expected skip — tool_contracts is REQUIRED, so it escalates. The two
+    OPTIONAL checkout checks are listed apart and never escalate."""
+    rec = _run_with(monkeypatch, _BOX - {sp.CAP_CHECKOUT})
+    assert rec["verdict"] == "BLIND_SPOT"
+    assert rec["group_required_skip_names"] == ["tool_contracts"]
+    assert set(rec["expected_skip_names"]) == _CHECKOUT - {"tool_contracts"}
+    assert rec["fail_count"] == 0
 
 
 def test_a_lost_capability_is_a_named_blind_spot_not_a_fail(monkeypatch):
@@ -99,7 +123,7 @@ def test_a_lost_capability_is_a_named_blind_spot_not_a_fail(monkeypatch):
 def test_a_failing_check_is_a_fail_verdict(monkeypatch):
     rec = _run_with(monkeypatch, _BOX, outcome="fail")
     assert rec["verdict"] == "FAIL"
-    assert set(rec["fail_names"]) == _GROUP
+    assert set(rec["fail_names"]) == _GROUP | _CHECKOUT
 
 
 def test_a_crash_is_recorded_not_raised(monkeypatch):
@@ -177,15 +201,46 @@ def test_stdout_is_exactly_one_json_line(monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("key", ["pk-test", None])
-def test_detect_capabilities_measures_polygon_and_never_claims_checkout(monkeypatch, key):
+def test_detect_capabilities_measures_polygon(monkeypatch, key):
     import nousergon_lib.secrets as secrets
 
     monkeypatch.setattr(secrets, "get_secret", lambda name, required=False: key)
     caps = spot.detect_capabilities()
-    assert sp.CAP_CHECKOUT not in caps
     assert (sp.CAP_POLYGON in caps) is bool(key)
     # This repo's own modules are importable from its checkout.
     assert sp.CAP_REPO_MODULES in caps
+
+
+def _siblings_present(monkeypatch, present):
+    from pathlib import Path
+
+    monkeypatch.setattr(
+        sp, "_sibling_repo",
+        lambda name: Path("/home/ec2-user") / name if name in present else None,
+    )
+
+
+def test_detect_claims_checkout_when_every_sibling_resolves(monkeypatch):
+    _siblings_present(monkeypatch, set(sp.CHECKOUT_SIBLINGS))
+    assert sp.CAP_CHECKOUT in spot.detect_capabilities()
+
+
+@pytest.mark.parametrize("lost", sp.CHECKOUT_SIBLINGS)
+def test_detect_withholds_checkout_when_any_sibling_is_absent(monkeypatch, lost):
+    """All or nothing: a partial set is what turns tool_contracts' "not
+    checked out as sibling" into a false fail on the box's own layout."""
+    _siblings_present(monkeypatch, set(sp.CHECKOUT_SIBLINGS) - {lost})
+    assert sp.CAP_CHECKOUT not in spot.detect_capabilities()
+
+
+def test_a_raising_checkout_probe_withholds_checkout(monkeypatch):
+    def _raise(name):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(sp, "_sibling_repo", _raise)
+    caps = spot.detect_capabilities()
+    assert sp.CAP_CHECKOUT not in caps
+    assert sp.CAP_AWS in caps
 
 
 def test_a_raising_probe_withholds_its_capability(monkeypatch):

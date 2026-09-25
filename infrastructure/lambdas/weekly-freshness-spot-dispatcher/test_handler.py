@@ -158,6 +158,17 @@ class TestBootstrapCommand:
         assert "nousergon/crucible-backtester" in cmd
         assert "nousergon/crucible-dashboard" in cmd
 
+    def test_clones_research_for_the_on_spot_preflight(self, index_mod):
+        """alpha-engine-config-I11568: sf_preflight's CAP_CHECKOUT checks read
+        crucible-research on this box; it is public, so no credential."""
+        index, sd = index_mod
+        index.handler({}, None)
+        cmd = sd.send_async_command.call_args.args[1]
+        assert "/home/ec2-user/crucible-research" in cmd
+        assert "https://github.com/nousergon/crucible-research.git" in cmd
+        authed = [ln for ln in cmd.splitlines() if "x-access-token" in ln]
+        assert not any("crucible-research" in ln for ln in authed)
+
     def test_builds_dashboard_venv(self, index_mod):
         index, sd = index_mod
         index.handler({}, None)

@@ -986,9 +986,9 @@ def _record_phase_lineage(
                     extra_written.append((k, rows_out))
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
-        # alpha-engine-config-I11203: a collector that recorded what it READ
-        # (`features.input_record`, D31/D12) hands the refs back under
-        # `input_refs`, already in the manifest's closed `InputRef` shape.
+    if not dry:  # I11231: an auto-skip claims no output but still READ (D26's ledger version).
+        # I11203: a collector that recorded what it READ (D31/D12, D26) hands the refs
+        # back under `input_refs`, already in the manifest's closed `InputRef` shape.
         for ref in result.get("input_refs") or ():
             run_ctx.record_input(
                 str(ref["key"]),

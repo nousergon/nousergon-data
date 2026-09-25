@@ -62,7 +62,7 @@ it firing. `InstanceInitiatedShutdownBehavior=terminate` (set by
 spot_dispatch.launch_with_fallback's `shutdown_behavior="terminate"`) so the
 watchdog's `shutdown -h now` actually TERMINATES the box, not just stops it.
 
-That timer, the interpreter install and the four PUBLIC repo clones are all
+That timer, the interpreter install and the five PUBLIC repo clones are all
 rendered by `krepis.spot_bootstrap` since alpha-engine-config-I7372 — see
 `_bootstrap_spec()` / `_bootstrap_command()`. The cutover also adds the
 `ec2-spot-watchdog` unit this box never had: it answers "the SSM agent died
@@ -214,7 +214,7 @@ SECURITY_GROUP = os.environ.get("WEEKLY_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e61
 # read-write the two on-box health checks need.
 IAM_PROFILE = os.environ.get("WEEKLY_SPOT_IAM_PROFILE", "alpha-engine-executor-profile")
 # Modest disk: this box does not itself hold price data (its nested spots do
-# their own large-disk launches) — it only holds 4 shallow repo clones + one
+# their own large-disk launches) — it only holds 5 shallow repo clones + one
 # venv. Headroom above the groom box's 40GB since the dashboard venv pulls in
 # the full nousergon_lib/krepis/pandas/numpy/pyarrow stack.
 VOLUME_SIZE_GB = int(os.environ.get("WEEKLY_SPOT_VOLUME_SIZE_GB", "40"))
@@ -229,6 +229,16 @@ DASHBOARD_REPO = os.environ.get("WEEKLY_SPOT_DASHBOARD_REPO", "nousergon/crucibl
 DASHBOARD_BRANCH = os.environ.get("WEEKLY_SPOT_DASHBOARD_BRANCH", "main")
 PREDICTOR_REPO = os.environ.get("WEEKLY_SPOT_PREDICTOR_REPO", "nousergon/crucible-predictor")
 PREDICTOR_BRANCH = os.environ.get("WEEKLY_SPOT_PREDICTOR_BRANCH", "main")
+# alpha-engine-config-I11568: no stage on THIS box runs research code — the
+# checkout is read by sf_preflight's CAP_CHECKOUT checks, which the on-spot
+# preflight pass (sf_preflight_on_spot.py) runs here. tool_contracts reads the
+# requirements pin of every checkout the weekly definition shells out to, and
+# EvalJudgeProcess shells out to crucible-research; recursion_budget reads its
+# agents/sector_teams/*.py. Cloned under its CURRENT name: the definition
+# already spells it crucible-research, and sf_preflight's alias table resolves
+# the legacy alpha-engine-research spelling to it.
+RESEARCH_REPO = os.environ.get("WEEKLY_SPOT_RESEARCH_REPO", "nousergon/crucible-research")
+RESEARCH_BRANCH = os.environ.get("WEEKLY_SPOT_RESEARCH_BRANCH", "main")
 
 # alpha-engine-config is private; the box reads the fleet PAT from SSM via its
 # instance profile — same pattern data-spot-dispatcher/scheduled-groom-
@@ -237,8 +247,8 @@ GH_PAT_SSM = os.environ.get(
     "WEEKLY_SPOT_GH_PAT_SSM", "/alpha-engine/saturday_sf_watch/github_pat"
 )
 
-# Bootstrap (clone x5 + TWO venv builds) execution timeout — the SSM command's
-# own ceiling, independent of the SF's poll loop. Generous: 5 shallow clones +
+# Bootstrap (clone x6 + TWO venv builds) execution timeout — the SSM command's
+# own ceiling, independent of the SF's poll loop. Generous: 6 shallow clones +
 # a full nousergon_lib/krepis/pandas/numpy/pyarrow venv build realistically
 # takes low-single-digit minutes, but a cold pip index / dnf mirror can be
 # slow; bounding at 30 min leaves large headroom without risking a false
@@ -302,6 +312,13 @@ def _bootstrap_spec() -> SpotBootstrapSpec:
                 checkout="/home/ec2-user/alpha-engine-dashboard",
                 branch=DASHBOARD_BRANCH,
             ),
+            # PUBLIC (measured 2026-09-25, repository visibility "public"),
+            # so it rides the renderer with no credential, like the three above.
+            Clone(
+                repo_url=f"https://github.com/{RESEARCH_REPO}.git",
+                checkout="/home/ec2-user/crucible-research",
+                branch=RESEARCH_BRANCH,
+            ),
         ),
         # Orphan-prevention backstop, unchanged in value and meaning — the
         # renderer emits the same transient `systemd-run --on-active` timer
@@ -336,7 +353,7 @@ def _bootstrap_command(run_token: str) -> str:
 
     1. a PRELUDE this Lambda owns — the tee'd log, ``fail()``, an EXIT trap;
     2. ``krepis.spot_bootstrap.render_bootstrap()`` — the watchdog unit, the
-       hard-timeout timer, the interpreter, the four public clones;
+       hard-timeout timer, the interpreter, the five public clones;
     3. a TAIL this Lambda owns — the private config clone, the ownership
        fixes and the dashboard venv, none of which the renderer can express.
 
@@ -384,7 +401,7 @@ git clone --depth 1 --branch {CONFIG_BRANCH} \\
   /home/ec2-user/alpha-engine-config || fail "alpha-engine-config clone failed"
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data /home/ec2-user/alpha-engine-config \\
   /home/ec2-user/alpha-engine-backtester /home/ec2-user/alpha-engine-dashboard \\
-  /home/ec2-user/alpha-engine-predictor || fail "chown failed"
+  /home/ec2-user/alpha-engine-predictor /home/ec2-user/crucible-research || fail "chown failed"
 # crucible-backtester's config.yaml is gitignored (the .example pattern), and
 # spot_backtest.sh hard-exits without it: "ERROR: config.yaml not found".
 # The canonical provisioning is a symlink into alpha-engine-config's TRACKED
@@ -443,10 +460,14 @@ python3.12 -m venv .venv || fail "data venv create failed"
 .venv/bin/pip install --upgrade pip -q || fail "data pip upgrade failed"
 [ -f requirements.txt ] || fail "alpha-engine-data requirements.txt missing"
 .venv/bin/pip install -q -r requirements.txt || fail "data requirements install failed"
-# Keep the dispatch box on the same released contract as its packaged Lambda.
-# A floor here would let a later bootstrap resolve a pre-I8155 stage-coverage
-# implementation even though the repository pin has already moved.
-.venv/bin/pip install -q 'krepis==0.59.41' || fail "data krepis install failed"
+# krepis comes from requirements.txt's own EXACT pin, and nothing here
+# overrides it (alpha-engine-config-I11568). A second hard-coded
+# `pip install krepis==0.59.41` used to follow this line: it downgraded the
+# venv below both that pin and nousergon-lib's own krepis>=0.59.52 floor
+# (pip logged the conflict on every bootstrap and carried on), and left
+# sf_preflight's price_cards check without krepis.cost.unpriced_live_primaries
+# (first shipped 0.59.67). tests/test_weekly_spot_data_venv_provisioning.py
+# pins the exact pin and the absence of any override.
 chown -R ec2-user:ec2-user /home/ec2-user/alpha-engine-data/.venv || fail "data venv chown failed"
 trap - EXIT
 aws s3 cp {log} "{s3_log}" --region {REGION} --quiet || true
