@@ -122,8 +122,7 @@ echo "  Preflight-only: $PREFLIGHT_ONLY | Attempt: $SPOT_ATTEMPT/$MAX_SPOT_ATTEM
 echo ""
 
 # ── Launch + wait + config + SSM ─────────────────────────────────────────────
-spot_launch
-trap on_exit EXIT
+spot_launch   # arms the on_exit EXIT handler before it launches (alpha-engine-config-I11574)
 
 aws ec2 wait instance-running --instance-ids "$_INSTANCE_ID" --region "$AWS_REGION"
 stage_config "$_CONFIG_SRC" "config.yaml"

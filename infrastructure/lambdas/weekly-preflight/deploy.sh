@@ -203,6 +203,13 @@ fi
 # import defect). status=FAIL is a genuine preflight violation about system
 # state, not about this code: report it loudly and let the deploy succeed,
 # since blocking the deploy would block the fix for the very violation.
+# status=DEGRADED (alpha-engine-config-I11112) means the handler RAN and a
+# REQUIRED check could not — and from a Lambda invoke it always will: the
+# Lambda runtime provides no arctic/repo_modules/polygon/checkout capability,
+# so those checks skip here by design and run on the weekly box instead.
+# It is a successful execution with a disclosed gap, so report the gap and
+# let the deploy succeed (alpha-engine-config-I11408: treating it as
+# "could not execute" turned every push red from 2026-09-21 on).
 # The handler is strictly read-only (Describe/Get/Simulate), so invoking it
 # on every deploy has no side effects and costs a sub-second Lambda run.
 if ! $DRY_RUN; then
@@ -216,6 +223,9 @@ if ! $DRY_RUN; then
   case "${SMOKE_STATUS}" in
     OK)
       python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(f\"  ran {d.get('ran_count')} check(s), {d.get('skip_count')} skipped, {d.get('warn_count')} warning(s)\")" "${RESP}"
+      ;;
+    DEGRADED)
+      python3 -c "import json,sys; d=json.load(open(sys.argv[1])); print(f\"  ran {d.get('ran_count')} check(s); {d.get('required_skip_count')} required check(s) unreachable from Lambda (expected here): {d.get('required_skip_names')}\")" "${RESP}"
       ;;
     FAIL)
       echo "  ⚠ preflight reports a genuine violation (system state, not this deploy):"
