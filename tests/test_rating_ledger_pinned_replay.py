@@ -242,3 +242,112 @@ def test_production_reads_the_current_manifest_and_never_lists_versions(bucket):
     assert "ListObjectVersions" not in bucket.operations
     assert "ListObjectsV2" not in bucket.operations
     assert bucket.puts == []
+
+
+# ---------------------------------------------------------------------------
+# The same-day shadow of 2026-09-24 (alpha-engine-config-I11231, again)
+# ---------------------------------------------------------------------------
+#
+# PR1926's pin reached `_current_at` on the same-day shadow of 2026-09-24 (it is
+# keyed off the active shadow root, not off a replay-only flag) and died there:
+# `alpha-engine-executor-role` holds no `s3:ListBucketVersions`, so the listing
+# read AccessDenied, the pin fell back to the CURRENT object -- v1's own
+# 20:20:15Z write -- and D26 recorded `not_applicable` again. v1's D26 manifest
+# carried `inputs: []`, so the DECLARED pin that needs no listing at all was
+# never available either. These pin both halves of that.
+
+
+class _NoVersionListing(VersionedS3):
+    """The live executor role: GetObject yes, ListObjectVersions AccessDenied."""
+
+    def __call__(self, client, operation: str, params: dict):
+        if operation == "ListObjectVersions":
+            raise ClientError(
+                {"Error": {"Code": "AccessDenied", "Message": "not authorized to perform: s3:ListBucketVersions"}},
+                operation,
+            )
+        return super().__call__(client, operation, params)
+
+
+def _production(bucket_model, **kw):
+    real = botocore.client.BaseClient._make_api_call
+    botocore.client.BaseClient._make_api_call = lambda client, op, params: bucket_model(client, op, params)
+    try:
+        return trl.collect_rating_ledger(bucket=BUCKET, s3_client=boto3.client("s3"), **kw)
+    finally:
+        botocore.client.BaseClient._make_api_call = real
+
+
+def test_production_declares_the_ledger_version_it_built_on(bucket):
+    """v1's D26 hands back the manifest version it read, in the closed `InputRef`
+    shape, so a later shadow of the day has a DECLARED pin."""
+    # Roll the bucket back to the moment v1's D26 starts: DAY not yet recorded.
+    bucket.versions[MANIFEST] = bucket.versions[MANIFEST][:1]
+    result = _production(bucket, run_date=DAY)
+    assert result["live_written"] is True
+    assert result["input_refs"] == [
+        {"key": f"s3://{BUCKET}/{MANIFEST}", "etag": None, "version": bucket.pre_v1, "schema_version": None},
+    ]
+
+
+def test_the_immutable_no_op_still_names_the_version_it_read(bucket):
+    """The no-op is recorded as what it is: the ledger read at a version that
+    already carried the day. A shadow that read v1's own write says so."""
+    result = _production(bucket, run_date=DAY)
+    assert result["auto_skipped"] is True
+    (ref,) = result["input_refs"]
+    assert ref["key"] == f"s3://{BUCKET}/{MANIFEST}"
+    assert ref["version"] == bucket.versions[MANIFEST][-1][1]
+
+
+@pytest.fixture
+def unlistable():
+    """The 2026-09-24 same-day shadow's bucket, as the live executor role sees it."""
+    s3 = _NoVersionListing()
+    days = _business_days(40, DAY)
+    series = {
+        "SPY": [[d, 500.0 + i] for i, d in enumerate(days)],
+        "AAPL": [[d, 200.0 + (i % 7)] for i, d in enumerate(days)],
+    }
+    s3.seed(
+        mmd.CONSOLIDATED_CLOSE_HISTORY_KEY,
+        {"schema_version": 5, "adjustment_basis": "dividend_adjusted", "series": series,
+         "currency": {s: "USD" for s in series}},
+        "2026-09-23T20:14:00",
+    )
+    prior_dates = [d for d in days if d < DAY][-5:]
+    entries = [{"date": d, "basis": "live" if d == PRIOR else "backfill", "rating_version": RATING_VERSION}
+               for d in prior_dates]
+    s3.pre_v1 = s3.seed(MANIFEST, {"schema_version": 1, "dates": entries}, "2026-09-22T20:18:09")
+    return s3
+
+
+def _v1_manifest_then_shadow(s3):
+    """Run v1's D26 in production, write its run manifest as the lib would, then
+    run the same-day shadow of the day."""
+    v1 = _production(s3, run_date=DAY)
+    assert v1["live_written"] is True
+    s3.seed(
+        f"data_collection/runs/D26/{DAY}/01M3AH6KJ591P3WBR8H08T6MJV.json",
+        {"unit_id": "D26", "trading_day": DAY, "started": "2026-09-23T20:15:06Z",
+         "finished": "2026-09-23T20:15:15Z", "status": "ok", "inputs": v1["input_refs"]},
+        "2026-09-23T20:15:16",
+    )
+    real = botocore.client.BaseClient._make_api_call
+    activate(ROOT)
+    interceptor._ORIGINAL = s3
+    try:
+        return trl.collect_rating_ledger(bucket=BUCKET, run_date=DAY, s3_client=boto3.client("s3"))
+    finally:
+        interceptor._ORIGINAL = real
+        deactivate()
+
+
+def test_a_same_day_shadow_pins_from_the_declared_version_without_listing_versions(unlistable):
+    result = _v1_manifest_then_shadow(unlistable)
+
+    assert "ListObjectVersions" not in unlistable.operations, "a declared pin needs no listing"
+    assert result["live_written"] is True, "the shadow builds on the pre-v1 ledger, as v1 did"
+    assert "auto_skipped" not in result
+    assert ("GetObject", MANIFEST, unlistable.pre_v1) in unlistable.reads
+    assert unlistable.current(ROOT.key(MANIFEST)) == unlistable.current(MANIFEST)

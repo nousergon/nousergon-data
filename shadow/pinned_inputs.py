@@ -127,13 +127,26 @@ def _manifests_for(s3_client, bucket: str, unit_id: str, trading_day: dt.date) -
     return out
 
 
-def _declared(manifests: list[dict], key: str) -> str | None:
-    """The VersionId a manifest DECLARES it read for ``key``, newest wins."""
+def _declared(manifests: list[dict], key: str, bucket: str) -> str | None:
+    """The VersionId a manifest DECLARES it read for ``key``, newest wins.
+
+    `alpha-engine-config-I11231`. A manifest's `inputs` are the lib's closed
+    `InputRef` (`key`/`etag`/`version`/`schema_version`, no other field), and
+    producers key an S3 read as ``s3://<bucket>/<key>`` (`features.input_record`,
+    `collectors/metron_market_data.py`). Matching only a bare key under a
+    `version_id` field -- the shape `Pin.as_input_record` writes, which the
+    schema rejects -- meant no schema-valid manifest could ever declare a pin,
+    so every replay fell through to the version LISTING. Both spellings are
+    read; `version` and `version_id` both mean the S3 VersionId, as
+    `features.input_record.parse_refs` already reads them.
+    """
+    names = {key, f"s3://{bucket}/{key}"}
     found: str | None = None
     for manifest in manifests:
         for record in manifest.get("inputs") or []:
-            if record.get("key") == key and record.get("version_id"):
-                found = str(record["version_id"])
+            version = record.get("version") or record.get("version_id")
+            if record.get("key") in names and version:
+                found = str(version)
     return found
 
 
@@ -159,14 +172,22 @@ def _run_started(manifests: list[dict]) -> dt.datetime | None:
     return min(starts) if starts else None
 
 
-def _current_at(s3_client, bucket: str, key: str, moment: dt.datetime) -> str | None:
-    """The VersionId that was the current object at ``moment``.
+def _current_at(
+    s3_client, bucket: str, key: str, moment: dt.datetime,
+) -> tuple[str | None, str | None]:
+    """``(version_id, listing_error)``: the VersionId that was the current object
+    at ``moment``, or why there is none.
 
     That is the newest version whose LastModified is at or before it. A key
-    whose every retained version is NEWER than the moment answers ``None``:
-    the version v1 read has aged out of the 30-day noncurrent window, and
-    saying so is the honest answer. Substituting the oldest surviving version
-    would be a guess wearing a pin's clothes.
+    whose every retained version is NEWER than the moment answers
+    ``(None, None)``: the version v1 read has aged out of the 30-day noncurrent
+    window, and saying so is the honest answer. Substituting the oldest
+    surviving version would be a guess wearing a pin's clothes.
+
+    A key whose versions cannot be LISTED answers ``(None, <the error>)`` --
+    a different cause, and the caller must not report it as the first one
+    (`alpha-engine-config-I11231`: on 2026-09-24 the listing was AccessDenied
+    and the pin's detail said the version had aged out).
     """
     try:
         paginator = s3_client.get_paginator("list_object_versions")
@@ -178,11 +199,11 @@ def _current_at(s3_client, bucket: str, key: str, moment: dt.datetime) -> str | 
                 candidates.append((version["LastModified"], str(version["VersionId"])))
     except Exception as exc:  # noqa: BLE001 - an unlistable key is "no pin", named
         logger.warning("[pinned_inputs] cannot list versions of %s (%s)", key, exc)
-        return None
+        return None, str(exc)
     eligible = [(when, vid) for when, vid in candidates if when <= moment]
     if not eligible:
-        return None
-    return max(eligible, key=lambda pair: pair[0])[1]
+        return None, None
+    return max(eligible, key=lambda pair: pair[0])[1], None
 
 
 def pin_for(
@@ -206,7 +227,7 @@ def pin_for(
         trading_day = root.trading_day
 
     manifests = _manifests_for(s3_client, bucket, unit_id, trading_day)
-    declared = _declared(manifests, key)
+    declared = _declared(manifests, key, bucket)
     if declared:
         return Pin(key, declared, "declared", f"{unit_id} run manifest for {trading_day} recorded this version")
 
@@ -218,7 +239,18 @@ def pin_for(
             "unpinned",
             f"no {unit_id} run manifest for {trading_day} declares an input or a start time",
         )
-    inferred = _current_at(s3_client, bucket, key, started)
+    inferred, listing_error = _current_at(s3_client, bucket, key, started)
+    if listing_error is not None:
+        return Pin(
+            key,
+            None,
+            "unpinned",
+            (
+                f"cannot list versions of {key} to infer the one current at {unit_id}'s "
+                f"{started.isoformat()} start ({listing_error}), and no {unit_id} run manifest "
+                f"for {trading_day} declares it"
+            ),
+        )
     if inferred is None:
         return Pin(
             key,
