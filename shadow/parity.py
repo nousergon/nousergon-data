@@ -40,6 +40,7 @@ then those rows are honestly unmeasurable rather than quietly green.
 from __future__ import annotations
 
 import datetime as dt
+import fnmatch
 import functools
 import hashlib
 import io
@@ -53,6 +54,8 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 from data_gate import evidence
+from dates import VENDOR_FIRST_RELEASED_GUARD as _VENDOR_FIRST_RELEASED_GUARD
+from dates import VENDOR_PUBLISHED_AT_GUARD as _VENDOR_PUBLISHED_AT_GUARD
 from data_gate.descriptors import Unit, load_units
 from shadow.root import LIVE_ARCTIC_LIBRARIES, ShadowRoot
 
@@ -91,7 +94,15 @@ PARITY_KEY_TEMPLATE = evidence.PARITY_KEY_TEMPLATE
 #: from a bare boolean into one boolean PER DISPATCH GROUP. `data_gate.evidence
 #: .read_parity` accepts both versions — the reports the cutover gate reads
 #: today were published under v1 and are not invalidated by the bump.
-PARITY_SCHEMA_VERSION = "data_parity_report.v2"
+#: v3 (`alpha-engine-config-I11203`) adds the `v1_cause` verdict with its
+#: inline evidence block, `summary.v1_cause`, `prior_day_settled.v1_cause`,
+#: and `values.identity_breaches` on frame rows. v1 and v2 stay readable.
+PARITY_SCHEMA_VERSION = "data_parity_report.v3"
+
+#: The row verdicts a report may be MET on. `v1_cause` is explained, not
+#: matched (alpha-engine-config-I11203); every other verdict fails the report.
+#: Defined by the consumer, like `PARITY_KEY_TEMPLATE`.
+PASSING_VERDICTS: frozenset[str] = evidence.PARITY_PASSING_VERDICTS
 
 #: The dispatch groups a `legs` entry may belong to. `sameday` is the 18:30 ET
 #: post-market dispatch on day D; `morning` is the 07:45 ET D+1 dispatch that
@@ -809,6 +820,12 @@ def _compare_frames(
     # "50 breaches" over a key where every row drifted, and a parity number that
     # saturates is a parity number nobody can act on.
     breach_count = 0
+    #: The breaches that are NOT a numeric move: a date, a label, a duplicate
+    #: row key. Counted apart so a reader of the row (`v1_cause`,
+    #: alpha-engine-config-I11203) can tell "every breach is a price or a
+    #: volume" from "something about what the row IS differs" without
+    #: re-deriving it from the capped examples.
+    identity_breach_count = 0
     breaches: list[dict[str, Any]] = []
     provenance_diff_count = 0
     provenance_diffs: list[dict[str, Any]] = []
@@ -819,6 +836,7 @@ def _compare_frames(
         out["values"] = {
             "compared_cells": 0,
             "breaches": 1,
+            "identity_breaches": 1,
             "examples": [{"reason": f"the shadow side has no {column!r} column to align on"}],
         }
         out["provenance_diffs"] = {"count": 0, "examples": []}
@@ -840,6 +858,7 @@ def _compare_frames(
             # A duplicated row key. Not comparable cell-by-cell, and a silent
             # `.iloc[0]` would compare arbitrary rows — record it as a breach.
             breach_count += 1
+            identity_breach_count += 1
             if len(breaches) < 50:
                 breaches.append(
                     {"row": str(row_key), "column": None, "reason": "duplicate row key"}
@@ -872,6 +891,8 @@ def _compare_frames(
             if row_is_prior:
                 prior_breaches += 1
             breach_count += 1
+            if not (_is_moving_numeric(live_row[col]) and _is_moving_numeric(shadow_row[col])):
+                identity_breach_count += 1
             if len(breaches) < 50:
                 breaches.append(
                     {
@@ -896,6 +917,7 @@ def _compare_frames(
     out["values"] = {
         "compared_cells": compared,
         "breaches": breach_count,
+        "identity_breaches": identity_breach_count,
         "examples": breaches[:10],
     }
     out["provenance_diffs"] = {"count": provenance_diff_count, "examples": provenance_diffs[:10]}
@@ -1210,6 +1232,344 @@ def _grade_coverage(
     }
 
 
+# ---------------------------------------------------------------------------
+# `v1_cause` — a difference PROVEN to be caused on the v1 side
+# (alpha-engine-config-I11203, Brian's ruling 2026-09-24 21:08Z)
+# ---------------------------------------------------------------------------
+#
+# A `mismatch` row is re-graded `v1_cause` ONLY when every one of its breaches
+# is explained by machine-checked evidence, recorded inline on the row. Two
+# kinds of evidence are admissible, and nothing else:
+#
+# 1. `v1_bar_provisional` — v1's OWN run manifest stamps the key's bar
+#    `bar_settlement: provisional` (`dates.bar_settlement_guard_entry`), AND
+#    the shadow's manifest stamps the same key `settled`. Explains NUMERIC
+#    value breaches only, and only on a `key_date` key — an artifact whose
+#    whole content IS that one bar. A history artifact (`row_date`) carries
+#    earlier rows the stamp says nothing about.
+# 2. `vendor_published_after_v1_fetch` — the shadow has more trailing
+#    observations in a dated series than v1 (FRED `DGS10`: 498 live vs 499
+#    shadow), the shared prefix agrees, every extra observation is dated
+#    after v1's last one, AND each extra observation was first released by
+#    the vendor (a `vendor_first_released` guard on the shadow's manifest) on
+#    a later day than the version v1 read was last updated (a
+#    `vendor_published_at` guard on v1's manifest, read after v1's own
+#    observations). Such an observation could not have been in what v1 read.
+#
+# Never explained, whatever the evidence: a schema difference, a membership
+# difference (a key or symbol on one side only), a coverage shortfall, a row
+# count difference on a frame, an identity field (a date, a label, a
+# currency), a missing shadow key. Those are standalone-side facts and stay
+# `mismatch` (or their own verdicts). No band is widened and no key excluded.
+
+#: The guard name a producer records a vendor's own publish time under. Its
+#: `key` is ``"<live key>#<json path>"`` and its `value` is the publish time as
+#: POSIX seconds (UTC), so it compares without re-parsing the detail text.
+#: Declared once, beside the settlement guard it complements.
+VENDOR_PUBLISHED_AT_GUARD = _VENDOR_PUBLISHED_AT_GUARD
+VENDOR_FIRST_RELEASED_GUARD = _VENDOR_FIRST_RELEASED_GUARD
+
+#: The calendar a vendor's first-release DATES are stated in. The one vendor
+#: recording them today is FRED (the St. Louis Fed), whose real-time dates and
+#: `last_updated` stamps are US Central; v1's version time is converted to
+#: this calendar before the two days are compared.
+VENDOR_RELEASE_CALENDAR_TZ = "America/Chicago"
+
+#: The two admissible evidence kinds, and only these.
+V1_CAUSE_KINDS: frozenset[str] = frozenset({"v1_bar_provisional", "vendor_published_after_v1_fetch"})
+
+
+@dataclass(frozen=True)
+class V1CauseContext:
+    """The two run manifests that recorded one key for one trading day.
+
+    ``v1`` is v1's manifest whose `outputs` include the key (the latest such
+    attempt); ``shadow`` the shadow run's. Either may be ``None`` — then no
+    evidence drawn from it exists, and nothing is explained by its absence.
+    """
+
+    v1: "dict[str, Any] | None"
+    shadow: "dict[str, Any] | None"
+
+
+def manifest_recording(manifests: Iterable[dict[str, Any]], live_key: str) -> dict[str, Any] | None:
+    """The latest (by `finished`) manifest whose `outputs` include ``live_key``."""
+    best: dict[str, Any] | None = None
+    for manifest in manifests:
+        if not any(str(out.get("key") or "") == live_key for out in manifest.get("outputs") or []):
+            continue
+        if best is None or str(manifest.get("finished") or "") >= str(best.get("finished") or ""):
+            best = manifest
+    return best
+
+
+def _manifest_ref(manifest: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "unit_id": manifest.get("unit_id"),
+        "run_id": manifest.get("run_id"),
+        "started": manifest.get("started"),
+    }
+
+
+def _bar_settlement_stamp(manifest: "dict[str, Any] | None", live_key: str) -> dict[str, Any] | None:
+    """The `bar_settlement` guard entry a manifest recorded for ``live_key``, if any.
+
+    Matched exactly or as a glob (`predictor/price_cache/*.parquet`). Two
+    entries disagreeing for one key is not evidence of anything and returns
+    ``None``.
+    """
+    if manifest is None:
+        return None
+    found = [
+        guard
+        for guard in manifest.get("guards") or []
+        if str(guard.get("guard") or "") == "bar_settlement"
+        and guard.get("key")
+        and (str(guard["key"]) == live_key or fnmatch.fnmatchcase(live_key, str(guard["key"])))
+    ]
+    verdicts = {str(guard.get("verdict") or "") for guard in found}
+    return found[-1] if len(verdicts) == 1 else None
+
+
+def _vendor_guard_value(manifest: "dict[str, Any] | None", guard_name: str, key: str) -> float | None:
+    """The numeric `value` of one vendor-publication guard a manifest recorded, if any."""
+    if manifest is None:
+        return None
+    for guard in manifest.get("guards") or []:
+        if str(guard.get("guard") or "") != guard_name or guard.get("key") != key:
+            continue
+        value = guard.get("value")
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            return float(value)
+    return None
+
+
+def _iso_utc(seconds: float) -> str:
+    return dt.datetime.fromtimestamp(seconds, dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _provisional_bar_evidence(
+    live_key: str, contract: "ContractSchema | None", context: V1CauseContext
+) -> tuple[dict[str, Any] | None, str]:
+    """Kind 1, or ``(None, why not)``."""
+    if contract is None or contract.settling_basis != "key_date":
+        return None, (
+            "numeric breaches are explained by a provisional v1 bar only on a key_date key, whose "
+            "whole content is that one bar"
+        )
+    v1_stamp = _bar_settlement_stamp(context.v1, live_key)
+    if v1_stamp is None or v1_stamp.get("verdict") != "provisional":
+        return None, "v1's manifest does not stamp this key bar_settlement: provisional"
+    shadow_stamp = _bar_settlement_stamp(context.shadow, live_key)
+    if shadow_stamp is None or shadow_stamp.get("verdict") != "settled":
+        return None, (
+            "the shadow's manifest does not stamp this key bar_settlement: settled, so both sides "
+            "may have read an unsettled bar and the cause is not proven to be v1's"
+        )
+    return (
+        {
+            "kind": "v1_bar_provisional",
+            "v1_manifest": _manifest_ref(context.v1 or {}),
+            "v1_stamp": {k: v1_stamp.get(k) for k in ("key", "verdict", "detail")},
+            "shadow_manifest": _manifest_ref(context.shadow or {}),
+            "shadow_stamp": {k: shadow_stamp.get(k) for k in ("key", "verdict", "detail")},
+        },
+        "",
+    )
+
+
+def _json_resolve(document: Any, path: str) -> tuple[bool, Any]:
+    """The node a `_json_diffs` path names, tolerating dict keys that contain dots."""
+    if not path.startswith("$"):
+        return False, None
+    node, rest = document, path[1:]
+    while rest:
+        if rest.startswith("["):
+            close = rest.find("]")
+            if close < 0 or not isinstance(node, list):
+                return False, None
+            try:
+                node = node[int(rest[1:close])]
+            except (ValueError, IndexError):
+                return False, None
+            rest = rest[close + 1 :]
+            continue
+        if not rest.startswith(".") or not isinstance(node, dict):
+            return False, None
+        tail = rest[1:]
+        # Longest key first: `NOVN.SW` must win over `NOVN`.
+        for name in sorted((str(k) for k in node), key=len, reverse=True):
+            if tail.startswith(name) and (len(tail) == len(name) or tail[len(name)] in ".["):
+                node, rest = node[name], tail[len(name) :]
+                break
+        else:
+            return False, None
+    return True, node
+
+
+def _row_date_of(row: Any) -> dt.date | None:
+    if not isinstance(row, list) or not row:
+        return None
+    try:
+        return dt.date.fromisoformat(str(row[0])[:10])
+    except ValueError:
+        return None
+
+
+def _vendor_publish_evidence(
+    live_key: str,
+    diff: JsonDiff,
+    live_doc: Any,
+    shadow_doc: Any,
+    rel: float,
+    absolute: float,
+    context: V1CauseContext,
+) -> tuple[dict[str, Any] | None, str]:
+    """Kind 2 for one cardinality diff, or ``(None, why not)``.
+
+    The proof: v1 recorded the vendor's ``last_updated`` for this series
+    AFTER reading its observations — an upper bound on when the version v1
+    read was published. The shadow recorded, for each observation it holds
+    and v1 does not, the date the vendor FIRST released it. An observation
+    first released on a later calendar day (the vendor's own calendar) than
+    the version v1 read could not have been in it.
+    """
+    found_live, live_rows = _json_resolve(live_doc, diff.path)
+    found_shadow, shadow_rows = _json_resolve(shadow_doc, diff.path)
+    if not (found_live and found_shadow and isinstance(live_rows, list) and isinstance(shadow_rows, list)):
+        return None, f"{diff.path}: not a list on both sides"
+    if not live_rows or len(shadow_rows) <= len(live_rows):
+        return None, (
+            f"{diff.path}: the shadow does not carry EXTRA observations ({len(live_rows)} live vs "
+            f"{len(shadow_rows)} shadow) — a shorter shadow series is a standalone-side loss"
+        )
+    if _json_diffs(live_rows, shadow_rows[: len(live_rows)], rel, absolute, diff.path):
+        return None, f"{diff.path}: the observations both sides hold do not agree"
+    last_live = _row_date_of(live_rows[-1])
+    extra_dates = [_row_date_of(row) for row in shadow_rows[len(live_rows) :]]
+    if last_live is None or any(d is None or d <= last_live for d in extra_dates):
+        return None, f"{diff.path}: the extra observations are not all dated after v1's last one"
+    v1_version = _vendor_guard_value(context.v1, VENDOR_PUBLISHED_AT_GUARD, f"{live_key}#{diff.path}")
+    if v1_version is None:
+        return None, f"{diff.path}: v1's manifest records no vendor last-updated time for this series"
+    from zoneinfo import ZoneInfo
+
+    v1_version_day = dt.datetime.fromtimestamp(v1_version, ZoneInfo(VENDOR_RELEASE_CALENDAR_TZ)).date()
+    released: dict[str, str] = {}
+    for obs_day in (d for d in extra_dates if d is not None):  # all non-None, checked above
+        first = _vendor_guard_value(
+            context.shadow, VENDOR_FIRST_RELEASED_GUARD, f"{live_key}#{diff.path}@{obs_day.isoformat()}"
+        )
+        if first is None:
+            return None, (
+                f"{diff.path}: the shadow's manifest records no first-release date for observation "
+                f"{obs_day.isoformat()}"
+            )
+        first_day = dt.datetime.fromtimestamp(first, dt.timezone.utc).date()
+        if first_day <= v1_version_day:
+            return None, (
+                f"{diff.path}: observation {obs_day.isoformat()} was first released "
+                f"{first_day.isoformat()}, not after the {v1_version_day.isoformat()} version v1 read"
+            )
+        released[obs_day.isoformat()] = first_day.isoformat()
+    return (
+        {
+            "kind": "vendor_published_after_v1_fetch",
+            "path": diff.path,
+            "extra_observations_first_released": released,
+            "v1_read_version_last_updated": _iso_utc(v1_version),
+            "v1_read_version_day": v1_version_day.isoformat(),
+            "vendor_calendar": VENDOR_RELEASE_CALENDAR_TZ,
+            "v1_manifest": _manifest_ref(context.v1 or {}),
+            "shadow_manifest": _manifest_ref(context.shadow or {}),
+        },
+        "",
+    )
+
+
+def _grade_v1_cause(
+    body: dict[str, Any],
+    *,
+    live_key: str,
+    contract: "ContractSchema | None",
+    context: "V1CauseContext | None",
+    json_breaches: "list[JsonDiff] | None" = None,
+    live_doc: Any = None,
+    shadow_doc: Any = None,
+    rel: float = 0.0,
+    absolute: float = 0.0,
+) -> None:
+    """Re-grade a `mismatch` body as `v1_cause` in place, when — and only when — proven.
+
+    Otherwise the body keeps `mismatch`; if any evidence was on hand but did
+    not cover every breach, `v1_cause_refused` says why, so an almost-proof is
+    visible rather than silently discarded.
+    """
+    if context is None or body.get("verdict") != "mismatch":
+        return
+    refusals: list[str] = []
+    schema = body.get("schema") or {}
+    if schema and not schema.get("match", True):
+        refusals.append("the schema differs")
+    coverage = body.get("coverage") or {}
+    if coverage and not coverage.get("met", True):
+        refusals.append("coverage is below its floor")
+    symbols = body.get("symbol_set") or {}
+    if symbols.get("only_live") or symbols.get("only_shadow"):
+        refusals.append("the symbol set differs")
+    rows = body.get("row_count") or {}
+    if body.get("comparator") == "parquet" and rows.get("live") != rows.get("shadow"):
+        refusals.append("the row count differs")
+    evidence: list[dict[str, Any]] = []
+    if body.get("comparator") == "parquet":
+        values = body.get("values") or {}
+        identity = int(values.get("identity_breaches") or 0)
+        numeric = int(values.get("breaches") or 0) - identity
+        if identity:
+            refusals.append(f"{identity} identity breach(es) (a non-numeric cell)")
+        if numeric:
+            proof, why = _provisional_bar_evidence(live_key, contract, context)
+            if proof is None:
+                refusals.append(why)
+            else:
+                evidence.append({**proof, "explains": f"{numeric} numeric breach(es)"})
+    elif json_breaches is not None:
+        numeric_values = [d for d in json_breaches if d.kind == "value" and d.numeric]
+        for diff in json_breaches:
+            if diff.kind == "membership":
+                refusals.append(f"{diff.path}: membership (a key on one side only)")
+            elif diff.kind == "value" and not diff.numeric:
+                refusals.append(f"{diff.path}: identity field")
+            elif diff.kind == "cardinality":
+                proof, why = _vendor_publish_evidence(
+                    live_key, diff, live_doc, shadow_doc, rel, absolute, context
+                )
+                if proof is None:
+                    refusals.append(why)
+                else:
+                    evidence.append(proof)
+        if numeric_values:
+            proof, why = _provisional_bar_evidence(live_key, contract, context)
+            if proof is None:
+                refusals.append(why)
+            else:
+                evidence.append({**proof, "explains": f"{len(numeric_values)} numeric breach(es)"})
+    else:
+        refusals.append(f"no v1_cause evidence applies to a {body.get('comparator')!r} comparison")
+    if not refusals and evidence:
+        body["verdict"] = "v1_cause"
+        body["v1_cause"] = {
+            "evidence": evidence,
+            "note": (
+                "every breach on this key is explained by machine-checked evidence that its cause is "
+                "on the v1 side (alpha-engine-config-I11203 ruling). Explained, not matched: the gate "
+                "counts it apart from match."
+            ),
+        }
+    elif evidence:
+        body["v1_cause_refused"] = sorted(set(refusals))[:10]
+
+
 def compare_bytes(
     key: str,
     live: bytes,
@@ -1220,8 +1580,13 @@ def compare_bytes(
     contract: "ContractSchema | None" = None,
     trading_day: "dt.date | None" = None,
     prior_day: "dt.date | None" = None,
+    v1_cause: "V1CauseContext | None" = None,
 ) -> dict[str, Any]:
     """Compare one key's two payloads. Returns the row body; never raises for data.
+
+    ``v1_cause`` carries the two run manifests that recorded the key; with it,
+    a `mismatch` whose every breach is PROVEN to be v1-caused is re-graded
+    `v1_cause` (:func:`_grade_v1_cause`, alpha-engine-config-I11203).
 
     ``contract``, when resolved (:func:`resolve_contract`), separates
     provenance fields from data fields (I10894): a provenance diff is
@@ -1288,6 +1653,7 @@ def compare_bytes(
                 and body["values"]["breaches"] == 0
             )
             body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
+            _grade_v1_cause(body, live_key=key, contract=contract, context=v1_cause)
             return body
 
         # The vendor_live grading, in the frame's own terms: SHAPE exactly
@@ -1322,6 +1688,7 @@ def compare_bytes(
         }
         matched = schema_ok and body["coverage"]["met"] and body["values"]["breaches"] == 0
         body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
+        _grade_v1_cause(body, live_key=key, contract=contract, context=v1_cause)
         return body
 
     if key.endswith(".json"):
@@ -1428,8 +1795,19 @@ def compare_bytes(
                 "settled": bool(prior_rows) and prior_breaches == 0,
             }
 
+        v1_cause_inputs = {
+            "live_key": key,
+            "contract": contract,
+            "context": v1_cause,
+            "json_breaches": breaches,
+            "live_doc": live_doc,
+            "shadow_doc": shadow_doc,
+            "rel": compare_rel,
+            "absolute": compare_abs,
+        }
         if not vendor_live:
             body["verdict"] = "match" if not breaches else "mismatch"
+            _grade_v1_cause(body, **v1_cause_inputs)
             return body
 
         # The ruling grades a vendor_live key on SCHEMA CONFORMANCE, KEY-SET
@@ -1465,6 +1843,7 @@ def compare_bytes(
         body["verdict"] = (
             "match" if (not non_membership and body["coverage"]["met"]) else "mismatch"
         )
+        _grade_v1_cause(body, **v1_cause_inputs)
         return body
 
     live_digest = hashlib.sha256(live).hexdigest()
@@ -1563,6 +1942,9 @@ class ParityReport:
             # appears when non-zero cannot be told apart from health when it is
             # absent (alpha-engine-config-I11231).
             "not_applicable": 0,
+            # alpha-engine-config-I11203: a difference PROVEN to be caused on
+            # the v1 side. Explained, never folded into `match`.
+            "v1_cause": 0,
         }
         for row in self.rows:
             counts[row.verdict] = counts.get(row.verdict, 0) + 1
@@ -1575,13 +1957,16 @@ class ParityReport:
 
     @property
     def met(self) -> bool:
-        """MET only when every row matched.
+        """MET only when every row matched or is PROVEN v1-caused.
 
         Deliberately strict: an unmeasurable or missing key is not parity
         evidence, and the gate this feeds exists to stop a cutover that has
         not been measured. Plan §4.1 rule 2 — UNMEASURABLE is never met.
+        `v1_cause` passes only because its evidence is machine-checked and
+        recorded on the row (alpha-engine-config-I11203); the gate prints its
+        count apart from `match`.
         """
-        return bool(self.rows) and all(row.verdict == "match" for row in self.rows)
+        return bool(self.rows) and all(row.verdict in PASSING_VERDICTS for row in self.rows)
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -1789,6 +2174,7 @@ def _compare_one_key(
     trading_day: "dt.date | None" = None,
     prior_day: "dt.date | None" = None,
     shadow_manifests: dict[str, dict[str, Any]] | None = None,
+    v1_cause: "V1CauseContext | None" = None,
 ) -> KeyResult:
     """Grade one key. ``expected`` is v1's manifest output record for this
     trading day (:func:`recorded_live_version`); with it, the live side is the
@@ -1843,6 +2229,7 @@ def _compare_one_key(
         contract=resolve_contract(live_key),
         trading_day=trading_day if trading_day is not None else root.trading_day,
         prior_day=prior_day,
+        v1_cause=v1_cause,
     )
     body["shadow_key"] = shadow_key
     body["live_version"] = live_version
@@ -2064,6 +2451,14 @@ def _verdict_detail(body: dict[str, Any]) -> str:
             f"{prior.get('breaches')} breach(es) over {prior.get('rows_compared')} row(s)"
         )
 
+    proven = (body.get("v1_cause") or {}).get("evidence") or []
+    if proven:
+        kinds = sorted({str(item.get("kind")) for item in proven})
+        parts.append(f"every breach proven v1-caused ({', '.join(kinds)}) — explained, not matched")
+    refused = body.get("v1_cause_refused") or []
+    if refused:
+        parts.append(f"v1_cause NOT proven: {refused[0]}")
+
     if not parts:
         return ""
     if drift.get("class"):
@@ -2117,6 +2512,59 @@ def _latest_manifests_by_unit(reader: "S3Reader", prefix: str, limit: int = 5000
         if current is None or str(manifest.get("finished") or "") >= str(current.get("finished") or ""):
             latest[unit_id] = manifest
     return latest
+
+
+def _all_manifests_by_unit(reader: "S3Reader", prefix: str, limit: int = 5000) -> dict[str, list[dict[str, Any]]]:
+    """Every manifest under `prefix`, grouped by `unit_id` — EVERY attempt.
+
+    `v1_cause` evidence (alpha-engine-config-I11203) is read off the attempt
+    that RECORDED the key, which is not always the latest one: v1's D19 on
+    2026-09-22 wrote `staging/daily_closes/2026-09-22.parquet` (stamped
+    `bar_settlement: provisional`) and then re-ran as `not_applicable` with no
+    outputs and no stamp. Latest-only would read the stamp as absent.
+    """
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for key in sorted(k for k in reader.list(prefix, limit) if k.endswith(".json")):
+        manifest = _read_manifest(reader, key)
+        if manifest is None or not manifest.get("unit_id"):
+            continue
+        grouped.setdefault(str(manifest["unit_id"]), []).append(manifest)
+    return grouped
+
+
+class _V1CauseManifests:
+    """Reads, once each, every v1 and shadow manifest `v1_cause` evidence needs."""
+
+    def __init__(self, reader: "S3Reader", unit_by_id: dict[str, Unit], day: dt.date, shadow_root: ShadowRoot) -> None:
+        self.reader = reader
+        self.unit_by_id = unit_by_id
+        self.day = day
+        self._v1: dict[str, list[dict[str, Any]]] = {}
+        self._shadow: dict[str, list[dict[str, Any]]] | None = None
+        self._shadow_prefix = shadow_root.key("data_collection/runs/")
+
+    def _v1_for(self, unit_id: str) -> list[dict[str, Any]]:
+        if unit_id not in self._v1:
+            unit = self.unit_by_id.get(unit_id)
+            self._v1[unit_id] = (
+                []
+                if unit is None
+                else [
+                    m
+                    for group in _all_manifests_by_unit(
+                        self.reader, f"{unit.run_manifest_prefix}/{self.day.isoformat()}/"
+                    ).values()
+                    for m in group
+                ]
+            )
+        return self._v1[unit_id]
+
+    def context(self, live_key: str, owners: list[str]) -> V1CauseContext:
+        if self._shadow is None:
+            self._shadow = _all_manifests_by_unit(self.reader, self._shadow_prefix)
+        v1 = [m for unit_id in owners for m in self._v1_for(unit_id)]
+        shadow = [m for unit_id in owners for m in self._shadow.get(unit_id, [])]
+        return V1CauseContext(v1=manifest_recording(v1, live_key), shadow=manifest_recording(shadow, live_key))
 
 
 def _manifest_output_keys(manifest: dict[str, Any], prefix_value: str) -> set[str]:
@@ -2177,7 +2625,10 @@ def _prior_day_settled_field(
     measured breach.
     """
     verdict = prior_result.verdict
-    available = verdict in {"match", "mismatch"}
+    # `v1_cause` (alpha-engine-config-I11203) is a strict outcome too: the D-1
+    # pair was compared and every breach was PROVEN to be v1's frozen,
+    # provisional bar. Not settled — explained, and counted apart.
+    available = verdict in {"match", "mismatch", "v1_cause"}
     field: dict[str, Any] = {
         "date": prior_day.isoformat(),
         "key": prior_live_key,
@@ -2192,6 +2643,10 @@ def _prior_day_settled_field(
         if not coverage.get("met", True):
             breaches += int(coverage.get("missing") or 0)
         field["breaches"] = breaches
+        if verdict == "v1_cause":
+            field["v1_cause"] = prior_result.body.get("v1_cause")
+        elif prior_result.body.get("v1_cause_refused"):
+            field["v1_cause_refused"] = prior_result.body["v1_cause_refused"]
     else:
         field["unmeasurable_reason"] = (
             prior_result.body.get("unmeasurable_reason")
@@ -2237,6 +2692,7 @@ def _attach_key_date_prior_day_settled(
     """
     prior_root = ShadowRoot(prior_day)
     prior_shadow_manifests = _latest_manifests_by_unit(reader, prior_root.key("data_collection/runs/"))
+    prior_v1_cause = _V1CauseManifests(reader, unit_by_id, prior_day, prior_root)
     prior_manifest_cache: dict[str, list[dict[str, Any]]] = {}
 
     def _expected_prior(live_key: str, owners: list[str]) -> dict[str, Any] | None:
@@ -2286,6 +2742,7 @@ def _attach_key_date_prior_day_settled(
             trading_day=trading_day,
             prior_day=None,
             shadow_manifests=prior_shadow_manifests,
+            v1_cause=prior_v1_cause.context(prior_live_key, row.unit_ids),
         )
         row.body["prior_day_settled"] = _prior_day_settled_field(
             prior_result,
@@ -2358,6 +2815,8 @@ def run_parity(
     # behaviour, rather than silently excluding everything.
     shadow_manifest_prefix = root.key("data_collection/runs/")
     shadow_manifests = _latest_manifests_by_unit(reader, shadow_manifest_prefix)
+    # alpha-engine-config-I11203: the manifests `v1_cause` evidence is read from.
+    v1_cause_manifests = _V1CauseManifests(reader, unit_by_id, trading_day, root)
     executed_units = set(shadow_manifests)
     scoped = bool(executed_units)
 
@@ -2462,6 +2921,7 @@ def run_parity(
                             trading_day=trading_day,
                             prior_day=prior_day,
                             shadow_manifests=shadow_manifests,
+                            v1_cause=v1_cause_manifests.context(member, unit_ids),
                         )
                     )
                 continue
@@ -2498,6 +2958,7 @@ def run_parity(
                         trading_day=trading_day,
                         prior_day=prior_day,
                         shadow_manifests=shadow_manifests,
+                        v1_cause=v1_cause_manifests.context(member, unit_ids),
                     )
                 )
             if max(len(live_keys), len(shadow_keys)) >= max_keys_per_prefix:
@@ -2521,6 +2982,7 @@ def run_parity(
                 trading_day=trading_day,
                 prior_day=prior_day,
                 shadow_manifests=shadow_manifests,
+                v1_cause=v1_cause_manifests.context(target.value, unit_ids),
             )
         )
 
@@ -2689,6 +3151,10 @@ def grade_prior_day_settled(
     by_key = {row.key: row for row in rows}
     settled: list[str] = []
     unsettled: list[dict[str, Any]] = []
+    #: Re-graded pairs whose every breach is PROVEN to be v1's frozen,
+    #: provisional D-1 file (alpha-engine-config-I11203). Neither settled nor
+    #: unsettled: explained, and published as its own count.
+    v1_caused: list[str] = []
     unmeasurable: dict[str, list[str]] = {}
     for key in settling_yesterday:
         basis = basis_by_key.get(key, "")
@@ -2730,6 +3196,8 @@ def grade_prior_day_settled(
                 continue
         if prior.get("settled"):
             settled.append(key)
+        elif prior.get("verdict") == "v1_cause" and prior.get("v1_cause"):
+            v1_caused.append(key)
         else:
             unsettled.append({"key": key, "breaches": prior.get("breaches")})
     return {
@@ -2739,6 +3207,8 @@ def grade_prior_day_settled(
         "keys_with_settling_bar": len(settling_yesterday),
         "settled": len(settled),
         "unsettled": len(unsettled),
+        "v1_cause": len(v1_caused),
+        "v1_cause_examples": sorted(v1_caused)[:10],
         "unmeasurable": sum(len(keys) for keys in unmeasurable.values()),
         "unmeasurable_reasons": {
             reason: {
