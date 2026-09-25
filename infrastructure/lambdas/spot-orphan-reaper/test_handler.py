@@ -640,7 +640,7 @@ def _matches(inst: dict, flt: dict) -> bool:
     raise AssertionError(f"unexpected filter {flt}")
 
 
-def _run_filtered(index_module, fleet: list[dict]):
+def _run_filtered(index_module, fleet: list[dict], sfn=None):
     """Like _run, but the fake EC2 applies the Filters it is given, the way
     EC2 does (all filters AND together), so the scan's scope is under test."""
     paginator = MagicMock()
@@ -655,6 +655,8 @@ def _run_filtered(index_module, fleet: list[dict]):
     s3 = MagicMock()
     s3.head_object.side_effect = _NotFound("404 Not Found")
     clients = {"ec2": ec2, "cloudwatch": cw, "s3": s3}
+    if sfn is not None:
+        clients["stepfunctions"] = sfn
     with patch.object(index_module.boto3, "client",
                       side_effect=lambda svc, **kw: clients[svc]):
         out = index_module.handler({}, None)
@@ -747,3 +749,86 @@ class TestScanMetrics:
         assert points[("orphan_reaper_terminated", "spot")] == 0.0
         assert points[("orphan_reaper_candidates", "on-demand")] == 1.0
         assert points[("orphan_reaper_terminated", "on-demand")] == 1.0
+
+
+# ── alpha-engine-config-I11569: a finished rehearsal's box ends early ────────
+
+_EXEC_PREFIX = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:"
+
+
+def _weekly_box(instance_id: str, execution_name: str, age_seconds: int = 7200) -> dict:
+    """An on-demand weekly launcher box, still inside its 13h watchdog-deadline."""
+    deadline = (datetime.now(timezone.utc) + timedelta(hours=10)).isoformat()
+    inst = _box(instance_id, "alpha-engine-weekly-freshness-spot", age_seconds,
+                lifecycle=None, launch_market="on-demand", watchdog_deadline=deadline)
+    inst["Tags"].append({"Key": "execution-id", "Value": _EXEC_PREFIX + execution_name})
+    return inst
+
+
+def _sfn(status: str, stopped_seconds_ago: int | None = None, raises: Exception | None = None):
+    sfn = MagicMock()
+    if raises is not None:
+        sfn.describe_execution.side_effect = raises
+    else:
+        desc = {"status": status}
+        if stopped_seconds_ago is not None:
+            desc["stopDate"] = datetime.now(timezone.utc) - timedelta(seconds=stopped_seconds_ago)
+        sfn.describe_execution.return_value = desc
+    return sfn
+
+
+class TestRehearsalBoxes:
+    def test_failed_rehearsal_box_is_reaped_after_the_grace(self, index_module):
+        # rehearsal-2026-09-24-1: FailExecution at 22:51Z, box kept to 11:00Z.
+        sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-1")], sfn)
+        assert out["terminated"] == ["i-reh"]
+        assert out["orphan_detail"][0]["reap_reason"] == "rehearsal-finished"
+        sfn.describe_execution.assert_called_once_with(
+            executionArn=_EXEC_PREFIX + "rehearsal-2026-09-24-1")
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-reh"])
+
+    def test_rehearsal_inside_the_grace_is_kept(self, index_module):
+        sfn = _sfn("FAILED", stopped_seconds_ago=600)
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-2")], sfn)
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_running_rehearsal_is_kept(self, index_module):
+        sfn = _sfn("RUNNING")
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-25-1")], sfn)
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_describe_failure_keeps_the_box(self, index_module):
+        # Before the role carries states:DescribeExecution, every call is
+        # AccessDenied; the box must fall back to its own deadline.
+        sfn = _sfn("", raises=RuntimeError("AccessDeniedException"))
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-1")], sfn)
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_failed_production_run_keeps_its_box_for_the_watch_rerun(self, index_module):
+        # A non-rehearsal execution's box is reused by weekly_sf_rerun via
+        # $.ec2_instance_id, so it is never looked up, let alone reaped early.
+        sfn = _sfn("FAILED", stopped_seconds_ago=7200)
+        out, ec2, _cw = _run_filtered(
+            index_module, [_weekly_box("i-prod", "2b6ab316-8060-4011-8140-cccf0f2194bd")], sfn)
+        assert out["terminated"] == []
+        sfn.describe_execution.assert_not_called()
+        ec2.terminate_instances.assert_not_called()
+
+    def test_dry_run_reports_but_does_not_terminate(self, monkeypatch, index_module):
+        monkeypatch.setattr(index_module, "DRY_RUN", True)
+        sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+        out, ec2, _cw = _run_filtered(index_module, [_weekly_box("i-reh", "rehearsal-2026-09-24-1")], sfn)
+        assert out["orphans_detected"] == 1
+        assert out["terminated"] == []
+        ec2.terminate_instances.assert_not_called()
+
+    def test_iam_grants_describe_on_rehearsal_executions_only(self):
+        import json
+        policy = json.loads((SCRIPT_DIR / "iam-policy.json").read_text())
+        grants = [s for s in policy["Statement"] if "states:DescribeExecution" in str(s["Action"])]
+        assert len(grants) == 1
+        assert grants[0]["Resource"].endswith(":execution:ne-weekly-freshness-pipeline:rehearsal-*")

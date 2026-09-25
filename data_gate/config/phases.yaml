@@ -102,6 +102,11 @@ phases:
         clause: data.phase1.consecutive_weekly_cycles
       - criterion: v1 Step Functions data-stage executions since the cutover = 0
         clause: data.phase1.v1_data_stage_quiet
+      - criterion: >-
+          every unit's declared trigger.schedule reconciles with its live trigger
+          (alpha-engine-config-I11189) — the precondition for run_record meaning
+          anything, since run_record grades each unit from its DECLARED fire
+        clause: data.phase1.triggers_reconciled
     notes: >-
       The EOD/morning/weekly exit criteria above ask for ONE complete cycle, not a streak —
       Brian's ruling, 2026-09-21 (verbatim): "it sounds like the only time gate we should have

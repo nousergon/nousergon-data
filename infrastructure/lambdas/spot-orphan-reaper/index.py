@@ -233,8 +233,49 @@ def _scan_spot_instances(ec2) -> list[dict]:
                         # When present and parseable, the reap decision uses this
                         # deadline + GRACE_SECONDS instead of the global cap.
                         "watchdog_deadline": tags.get("watchdog-deadline", ""),
+                        # The launching SF execution's ARN, stamped by the
+                        # weekly dispatcher (config#5504). Read only to end a
+                        # finished REHEARSAL's box early; see
+                        # _rehearsal_finished().
+                        "execution_id": tags.get("execution-id", ""),
                     })
     return out
+
+
+# alpha-engine-config-I11569: a failed weekly run keeps its on-demand launcher
+# box up until the 13h watchdog. That is deliberate for a production run,
+# because the watch-rerun reuses the box through $.ec2_instance_id. A
+# rehearsal (execution name ``rehearsal-*``, nous-ergon-ops
+# weekly-sf-rehearsal.yml) is never rerun onto its box: each rehearsal
+# launches its own. So once a rehearsal execution has stopped, its box is idle
+# spend until the watchdog. The grace leaves room for an operator redrive.
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+REHEARSAL_REAP_GRACE_SECONDS = int(os.environ.get("REHEARSAL_REAP_GRACE_SECONDS", "3600"))
+_EXECUTION_LIVE_STATUSES = frozenset({"RUNNING", "PENDING_REDRIVE"})
+
+
+def _rehearsal_finished(sfn, execution_arn: str, now: datetime) -> bool:
+    """True iff ``execution_arn`` names a rehearsal execution that stopped
+    more than REHEARSAL_REAP_GRACE_SECONDS ago.
+
+    Fails SAFE, the opposite direction from _completion_marker_exists: any
+    error (AccessDenied before the role carries states:DescribeExecution, a
+    throttle, a deleted execution) returns False, so the box keeps its own
+    watchdog-deadline. Reaping early on a guess could end a live rehearsal."""
+    name = execution_arn.rsplit(":", 1)[-1]
+    if not execution_arn.startswith("arn:") or not name.startswith(REHEARSAL_EXECUTION_PREFIX):
+        return False
+    try:
+        desc = sfn.describe_execution(executionArn=execution_arn)
+    except Exception as exc:  # noqa: BLE001 — fail-safe, see docstring
+        logger.warning("describe_execution failed for %s (keeping deadline): %s", execution_arn, exc)
+        return False
+    if desc.get("status") in _EXECUTION_LIVE_STATUSES:
+        return False
+    stopped = desc.get("stopDate")
+    if stopped is None:
+        return False
+    return (now - stopped).total_seconds() >= REHEARSAL_REAP_GRACE_SECONDS
 
 
 def _completion_key(kind: WatchKind, watch_tags: dict[str, str]) -> str:
@@ -362,6 +403,7 @@ def handler(event: dict, context) -> dict:
     ec2 = boto3.client("ec2", region_name=REGION)
     cw = boto3.client("cloudwatch", region_name=REGION)
     s3 = boto3.client("s3", region_name=REGION)
+    sfn = None  # created on first rehearsal box, so a fleet without one makes no call
     now = datetime.now(timezone.utc)
     threshold = timedelta(seconds=REAP_AFTER_SECONDS)
 
@@ -404,8 +446,16 @@ def handler(event: dict, context) -> dict:
         else:
             effective_threshold = threshold
 
+        reap_reason = "deadline"
         if age <= effective_threshold:
-            continue
+            execution_id = inst.get("execution_id", "")
+            if not execution_id.rsplit(":", 1)[-1].startswith(REHEARSAL_EXECUTION_PREFIX):
+                continue
+            if sfn is None:
+                sfn = boto3.client("stepfunctions", region_name=REGION)
+            if not _rehearsal_finished(sfn, execution_id, now):
+                continue
+            reap_reason = "rehearsal-finished"
         orphans.append({
             "instance_id": inst["instance_id"],
             "name": inst["name"],
@@ -414,11 +464,12 @@ def handler(event: dict, context) -> dict:
             "instance_type": inst["instance_type"],
             "market": inst["market"],
             "watchdog_deadline": watchdog_deadline_str or None,
+            "reap_reason": reap_reason,
         })
         if DRY_RUN:
             logger.warning(
-                "DRY_RUN orphan %s (%s, age=%ds, reap_after=%ds): would terminate",
-                inst["instance_id"], inst["name"], int(age.total_seconds()),
+                "DRY_RUN orphan %s (%s, reason=%s, age=%ds, reap_after=%ds): would terminate",
+                inst["instance_id"], inst["name"], reap_reason, int(age.total_seconds()),
                 int(effective_threshold.total_seconds()),
             )
             continue
@@ -428,8 +479,8 @@ def handler(event: dict, context) -> dict:
             per_name_terminated[inst["name"]] = per_name_terminated.get(inst["name"], 0) + 1
             terminated_by_market[inst["market"]] = terminated_by_market.get(inst["market"], 0) + 1
             logger.warning(
-                "Terminated orphan %s (%s, market=%s, age=%ds, reap_after=%ds, type=%s)",
-                inst["instance_id"], inst["name"], inst["market"], int(age.total_seconds()),
+                "Terminated orphan %s (%s, market=%s, reason=%s, age=%ds, reap_after=%ds, type=%s)",
+                inst["instance_id"], inst["name"], inst["market"], reap_reason, int(age.total_seconds()),
                 int(effective_threshold.total_seconds()), inst["instance_type"],
             )
             # WATCH_KINDS migration (additive — every other tag's reap path
