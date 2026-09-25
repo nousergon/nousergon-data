@@ -521,6 +521,7 @@ def _yfinance_classification(tickers: list[str]) -> dict[str, dict[str, str]]:
     can name why a member stayed unclassified. SSGA spells share classes with
     a dot (``BRK.B``); yfinance wants a dash (``BRK-B``).
     """
+    from collectors.yahoo_session import yahoo_info
     from nousergon_lib.yfinance_quiet import quiet_yfinance
 
     try:
@@ -534,7 +535,7 @@ def _yfinance_classification(tickers: list[str]) -> dict[str, dict[str, str]]:
             if i > 0 and _YF_FALLBACK_DELAY_SECS > 0:
                 time.sleep(_YF_FALLBACK_DELAY_SECS)
             try:
-                info = yf.Ticker(ticker.replace(".", "-")).info or {}
+                info = yahoo_info(ticker.replace(".", "-"), yf_module=yf)
             except Exception as exc:
                 out[ticker] = {"error": f"{type(exc).__name__}: {exc}"}
                 continue

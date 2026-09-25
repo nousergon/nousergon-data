@@ -63,6 +63,7 @@ from datetime import datetime, timezone
 
 import boto3
 
+from collectors.yahoo_session import YahooAuthError, yahoo_info
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance
 
 logger = logging.getLogger(__name__)
@@ -169,7 +170,7 @@ def collect(
                 time.sleep(inter_request_delay)
             row = {field: None for field in _INFO_FIELDS.values()}
             try:
-                info = yf.Ticker(ticker).info or {}
+                info = yahoo_info(ticker, yf_module=yf)
                 for info_key, field in _INFO_FIELDS.items():
                     v = info.get(info_key)
                     if v:
@@ -177,6 +178,8 @@ def collect(
                 if any(v is not None for v in row.values()):
                     ok_count += 1
                     covered.add(ticker)
+            except YahooAuthError:
+                raise  # the session is gone for every ticker (alpha-engine-config-I11578)
             except Exception as exc:
                 err_count += 1
                 logger.debug("classification fetch failed for %s: %s", ticker, exc)
