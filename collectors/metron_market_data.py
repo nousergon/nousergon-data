@@ -52,6 +52,7 @@ import run_units
 from dates import default_run_date, default_session_date
 from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
+from collectors.yahoo_session import YahooAuthError, call_yahoo, yahoo_info
 from validators import expectations
 
 logger = logging.getLogger(__name__)
@@ -433,18 +434,53 @@ _METRON_COVERAGE_NOTE = (
 )
 
 
+#: Coverage below which a per-symbol yfinance pass is a vendor COLLAPSE, not a
+#: thin day: the fetcher raises :class:`YfCoverageCollapse` and the unit publishes
+#: nothing, so the previous artifact stands (alpha-engine-config-I11578).
+#: Healthy shadow runs 2026-09-18..23 over the 75-symbol held universe: sectors
+#: 61 (0.81), fundamentals 65-66 (0.87-0.88), earnings 60 (0.80), analyst 60
+#: (0.80). Collapses: sectors 19 (0.25) on 09-22; sectors 0 and fundamentals 43
+#: (0.57) on 09-24 under HTTP 401. The ~8 CUSIPs and 401(k) CITs that never price
+#: are inside the healthy figures.
+METRON_YF_COVERAGE_FLOOR = 0.70
+#: A ratio over fewer requested symbols than this is not evidence of a collapse.
+METRON_YF_COVERAGE_MIN_REQUESTED = 20
+
+
+class YfCoverageCollapse(RuntimeError):
+    """A per-symbol yfinance pass covered less than its declared floor."""
+
+
 def _log_yf_coverage(
     kind: str,
     requested: list[str],
     covered: dict | set,
     *,
     error_on_empty: bool = False,
+    floor: float | None = None,
 ) -> None:
-    """Metron wrapper over :func:`nousergon_lib.yfinance_quiet.log_yf_coverage` (config#1029)."""
+    """Metron wrapper over :func:`nousergon_lib.yfinance_quiet.log_yf_coverage` (config#1029).
+
+    With ``floor``, a pass over at least ``METRON_YF_COVERAGE_MIN_REQUESTED``
+    symbols that covers less than ``floor`` of them logs ERROR and raises
+    :class:`YfCoverageCollapse`, so the unit fails instead of overwriting its
+    artifact with a near-empty one (alpha-engine-config-I11578)."""
     log_yf_coverage(
         logger, kind, requested, covered,
         error_on_empty=error_on_empty, note=_METRON_COVERAGE_NOTE,
     )
+    wanted = set(requested)
+    if floor is None or len(wanted) < METRON_YF_COVERAGE_MIN_REQUESTED:
+        return
+    ratio = len(wanted & set(covered)) / len(wanted)
+    if ratio < floor:
+        msg = (
+            f"{kind}: yfinance covered {len(wanted & set(covered))}/{len(wanted)} symbols "
+            f"({ratio:.2f}), below the {floor:.2f} collapse floor; refusing to publish a "
+            "near-empty artifact (alpha-engine-config-I11578)"
+        )
+        logger.error("[metron_market_data] %s", msg)
+        raise YfCoverageCollapse(msg)
 
 
 @_yf_quiet
@@ -821,18 +857,20 @@ def _yfinance_classification(yf_symbols: list[str]) -> tuple[dict[str, str], dic
     countries: dict[str, str] = {}
     for sym in yf_symbols:
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
             sector = info.get("sector")
             if sector:
                 sectors[sym] = str(sector)
             country = info.get("country")
             if country:
                 countries[sym] = str(country)
+        except YahooAuthError:
+            raise  # the session is gone for every symbol: fail the unit (I11578)
         except Exception as e:
             logger.warning("[metron_market_data] classification fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] sectors: %d/%d classified, countries: %d/%d domiciled",
                 len(sectors), len(yf_symbols), len(countries), len(yf_symbols))
-    _log_yf_coverage("sectors", yf_symbols, sectors)
+    _log_yf_coverage("sectors", yf_symbols, sectors, floor=METRON_YF_COVERAGE_FLOOR)
     _log_yf_coverage("countries", yf_symbols, countries)
     return sectors, countries
 
@@ -846,7 +884,12 @@ def _yfinance_spy_weights() -> dict[str, float]:
     except ImportError:  # pragma: no cover
         return {}
     try:
-        raw = yf.Ticker(BENCHMARK).funds_data.sector_weightings or {}
+        raw = call_yahoo(
+            lambda: yf.Ticker(BENCHMARK).funds_data.sector_weightings or {},
+            label=f"funds_data[{BENCHMARK}]",
+        )
+    except YahooAuthError:
+        raise
     except Exception as e:
         logger.warning("[metron_market_data] SPY sector weights fetch failed: %s", e)
         return {}
@@ -887,17 +930,22 @@ def _yfinance_earnings(yf_symbols: list[str], as_of: date) -> dict[str, str]:
     out: dict[str, str] = {}
     for sym in yf_symbols:
         try:
-            df = yf.Ticker(sym).get_earnings_dates(limit=8)
+            df = call_yahoo(
+                lambda: yf.Ticker(sym).get_earnings_dates(limit=8),
+                label=f"earnings[{sym}]", is_empty=lambda d: d is None or d.empty,
+            )
             if df is None or df.empty:
                 continue
             idx = pd.to_datetime(df.index)
             future = sorted(d for d in idx.tz_localize(None) if d >= anchor)
             if future:
                 out[sym] = future[0].date().isoformat()
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] earnings fetch failed for %s: %s", sym, e)
     logger.info("[metron_market_data] earnings: %d/%d dated", len(out), len(yf_symbols))
-    _log_yf_coverage("earnings", yf_symbols, out)
+    _log_yf_coverage("earnings", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -917,7 +965,9 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
     out: dict[str, dict] = {}
     for sym in yf_symbols:
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] fundamentals fetch failed for %s: %s", sym, e)
             continue
@@ -925,7 +975,7 @@ def _yfinance_fundamentals(yf_symbols: list[str]) -> dict[str, dict]:
         if fields:
             out[sym] = fields
     logger.info("[metron_market_data] fundamentals: %d/%d symbols covered", len(out), len(yf_symbols))
-    _log_yf_coverage("fundamentals", yf_symbols, out)
+    _log_yf_coverage("fundamentals", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -987,7 +1037,7 @@ def _yfinance_analyst(yf_symbols: list[str]) -> dict[str, dict]:
         if any(v is not None for v in fields.values()):
             out[sym] = {k: v for k, v in fields.items() if v is not None}
     logger.info("[metron_market_data] analyst: %d/%d symbols covered", len(out), len(yf_symbols))
-    _log_yf_coverage("analyst", yf_symbols, out)
+    _log_yf_coverage("analyst", yf_symbols, out, floor=METRON_YF_COVERAGE_FLOOR)
     return out
 
 
@@ -2368,8 +2418,10 @@ def _eafe_tickers() -> set[str]:
     n_success = 0
     for etf, country in sorted(_EAFE_COUNTRY_ETFS.items()):
         try:
-            t = yf.Ticker(etf)
-            th = t.funds_data.top_holdings
+            th = call_yahoo(
+                lambda etf=etf: yf.Ticker(etf).funds_data.top_holdings,
+                label=f"funds_data[{etf}]", is_empty=lambda h: h is None or len(h) == 0,
+            )
             if th is not None and len(th) > 0:
                 symbols = {str(s).strip() for s in th.index if s and str(s).strip()}
                 result.update(symbols)
@@ -2430,7 +2482,9 @@ def _yfinance_valuation(yf_symbols: list[str]) -> dict[str, dict]:
         if i > 0 and i % _YFINANCE_BATCH_SIZE == 0:
             time.sleep(_YFINANCE_BATCH_DELAY)  # rate-limit courtesy on the ~900-name pass
         try:
-            info = yf.Ticker(sym).info or {}
+            info = yahoo_info(sym, yf_module=yf)
+        except YahooAuthError:
+            raise
         except Exception as e:
             logger.warning("[metron_market_data] valuation fetch failed for %s: %s", sym, e)
             continue
