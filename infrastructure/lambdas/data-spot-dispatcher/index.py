@@ -600,8 +600,10 @@ _WORKLOADS: dict[str, str] = {
     # plus ~45 s of compute per side, against this workload's 18000 s cap.
     # It runs whatever the legs did — a missing D31 manifest is a named
     # refusal in the record, not a skipped step. Exit code: a failed leg,
-    # then `parity`'s 2, then a crashed recompute (2), then `parity`'s own
-    # MET/NOT MET; a record that REFUSES exits 0 — refusing is its job.
+    # then a failed prune, then `parity`'s 2, then a crashed recompute (2),
+    # then `parity`'s own MET/NOT MET; a record that REFUSES exits 0 —
+    # refusing is its job. It runs BEFORE the prune: the prune never touches
+    # what it reads (live ArcticDB `as_of`, and S3 by VersionId).
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -620,8 +622,16 @@ _WORKLOADS: dict[str, str] = {
         "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
         "python -m shadow recompute-lineage --trading-day $TD "
         "--store s3://alpha-engine-research/data_collection; LINEAGE_RC=$?; "
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
-        "[ $LINEAGE_RC -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )"
+        # alpha-engine-config-I11447 (Brian, 2026-09-24): once the day is
+        # graded, drop shadow libraries past the 7-day window. "Graded" is
+        # parity exit 0 (MET) or 1 (ran, NOT MET); exit 2 means the comparison
+        # itself failed, and then nothing is deleted. A prune failure outranks
+        # the NOT-MET exit, which is expected daily and would hide it.
+        "PRUNE_RC=0; if [ $PARITY_RC -le 1 ]; then python -m shadow prune --apply; PRUNE_RC=$?; "
+        '[ $PRUNE_RC -ne 0 ] && echo "shadow-sameday: shadow prune --apply FAILED (rc=$PRUNE_RC)"; fi; '
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; "
+        "[ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
+        '[ "${LINEAGE_RC:-0}" -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )'
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
     # `shadow-sameday` above, split out because v1 runs these two legs TWELVE

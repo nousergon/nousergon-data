@@ -860,6 +860,7 @@ python() {{
     run) return {legs} ;;
     parity) return {parity_rc} ;;
     recompute-lineage) return {lineage} ;;
+    prune) return 0 ;;
   esac
   return 99
 }}
@@ -881,7 +882,8 @@ python() {{
 )
 def test_sameday_runs_the_recompute_after_parity(workloads, tmp_path, legs, parity_rc, lineage, expected):  # noqa: F811
     rc, calls = _run_sameday(workloads["shadow-sameday"], tmp_path, legs=legs, parity_rc=parity_rc, lineage=lineage)
-    assert calls == ["run", "run", "parity", "recompute-lineage"]
+    prune = ["prune"] if parity_rc <= 1 else []  # alpha-engine-config-I11447: only on a graded day
+    assert calls == ["run", "run", "parity", "recompute-lineage", *prune]
     assert rc == expected
 
 
