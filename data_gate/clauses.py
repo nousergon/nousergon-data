@@ -1010,7 +1010,13 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
         "STRICTLY one report later, against the D-1 live/shadow pair; an unsettled re-grade "
         "reads UNMET here even when every other count is clean, because it is a producer "
         "defect the previous day's report could only record as settling, not a fact about "
-        "today's own snapshot (alpha-engine-config-I11360)"
+        "today's own snapshot (alpha-engine-config-I11360). A `v1_cause` row — every breach "
+        "PROVEN, by machine-checked evidence recorded on the row, to be caused on the v1 side "
+        "(v1's own manifest stamps its bar provisional while the shadow's is settled, or the "
+        "vendor first released the shadow's extra observation after the version v1 read) — "
+        "is explained rather than failing, and its count is printed apart from `match`; "
+        "schema, membership, coverage and identity-field differences are never explained "
+        "(alpha-engine-config-I11203, Brian's ruling 2026-09-24)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:

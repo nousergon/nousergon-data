@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Pre-cutover shadow parity report",
-  "description": "data_collection/parity/{trading_day}.json (data-collector plan \u00a76.2 step 4, alpha-engine-config-I10778). Written by `python -m shadow parity`, which diffs one standalone shadow run's output under staging/shadow/{trading_day}/ against the same trading day's v1 output, per key: row count, symbol set, schema, value tolerance. Read by nousergon-data/data_gate/evidence.py::read_parity as the `data.cutover_ready.parity` clause's evidence (alpha-engine-config-I10777). PRODUCER TEST: tests/test_shadow_parity.py. v2 (alpha-engine-config-I11351 / -I11352): adds the per-key `settling_bar` block, the report-level `prior_day_settled` block, `summary.settling_bar_keys`, a `dispatch` field on every `legs` entry, and turns `legs_known` from a bare boolean into one boolean PER DISPATCH GROUP. v1 documents stay valid and stay readable by the gate (evidence.PARITY_SCHEMA_VERSIONS).",
+  "description": "data_collection/parity/{trading_day}.json (data-collector plan \u00a76.2 step 4, alpha-engine-config-I10778). Written by `python -m shadow parity`, which diffs one standalone shadow run's output under staging/shadow/{trading_day}/ against the same trading day's v1 output, per key: row count, symbol set, schema, value tolerance. Read by nousergon-data/data_gate/evidence.py::read_parity as the `data.cutover_ready.parity` clause's evidence (alpha-engine-config-I10777). PRODUCER TEST: tests/test_shadow_parity.py. v2 (alpha-engine-config-I11351 / -I11352): adds the per-key `settling_bar` block, the report-level `prior_day_settled` block, `summary.settling_bar_keys`, a `dispatch` field on every `legs` entry, and turns `legs_known` from a bare boolean into one boolean PER DISPATCH GROUP. v1 documents stay valid and stay readable by the gate (evidence.PARITY_SCHEMA_VERSIONS). v3 (alpha-engine-config-I11203, Brian's ruling 2026-09-24): adds the `v1_cause` row verdict -- a difference PROVEN, by machine-checked evidence recorded inline on the row, to be caused on the v1 side -- with its `v1_cause` / `v1_cause_refused` blocks, `summary.v1_cause`, `prior_day_settled.v1_cause`, and `values.identity_breaches` on frame rows. v1 and v2 documents stay valid.",
   "type": "object",
   "required": [
     "schema_version",
@@ -22,9 +22,10 @@
       "type": "string",
       "enum": [
         "data_parity_report.v1",
-        "data_parity_report.v2"
+        "data_parity_report.v2",
+        "data_parity_report.v3"
       ],
-      "description": "v2 is what the producer writes today. v1 is retained because reports published before 2026-09-22 carry it and the cutover gate still reads them; a bump that invalidated them would red the parity clause for a reason that is not a parity fact."
+      "description": "v3 is what the producer writes today. v1 and v2 are retained because reports published before them carry those versions and the cutover gate still reads them; a bump that invalidated them would red the parity clause for a reason that is not a parity fact."
     },
     "trading_day": {
       "type": "string",
@@ -68,11 +69,11 @@
     },
     "met": {
       "type": "boolean",
-      "description": "TRUE only when every row's verdict is `match`. An unmeasurable, missing or in-region-only row is not parity evidence (plan \u00a74.1 rule 2: UNMEASURABLE is never met), so it makes this false."
+      "description": "TRUE only when every row's verdict is `match` or `v1_cause` (alpha-engine-config-I11203: proven v1-side, explained and counted apart). An unmeasurable, missing or in-region-only row is not parity evidence (plan \u00a74.1 rule 2: UNMEASURABLE is never met), so it makes this false."
     },
     "summary": {
       "type": "object",
-      "description": "Counts by verdict, plus `total` and `settling_bar_keys`. Every verdict in the row enum appears as a key. `settling_bar_keys` is NOT a verdict: it is how many of the `match` keys matched only because their trading-day cells were graded as a settling bar, and a reader rolling `summary` up into exception counts must skip it (data_gate.evidence.SUMMARY_NON_VERDICT_FIELDS, alpha-engine-config-I11351).",
+      "description": "Counts by verdict, plus `total` and `settling_bar_keys`. Every verdict in the row enum appears as a key. `settling_bar_keys` is NOT a verdict: it is how many of the `match` keys matched only because their trading-day cells were graded as a settling bar, and a reader rolling `summary` up into exception counts must skip it (data_gate.evidence.SUMMARY_NON_VERDICT_FIELDS, alpha-engine-config-I11351). `v1_cause` IS a verdict (v3): rows explained by proven v1-side evidence. A reader must count it apart from `match`, never inside it (data_gate.evidence.PARITY_PASSING_VERDICTS).",
       "additionalProperties": {
         "type": "integer",
         "minimum": 0
@@ -216,6 +217,17 @@
         },
         "unsettled_examples": {
           "type": "array"
+        },
+        "v1_cause": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Re-graded D-1 pairs whose every breach is PROVEN to be v1's frozen, provisional D-1 file (v1's manifest stamps it bar_settlement: provisional, the shadow's settled). Neither settled nor unsettled: explained, and never counted in `unsettled` (alpha-engine-config-I11203)."
+        },
+        "v1_cause_examples": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
         }
       }
     },
@@ -301,9 +313,10 @@
             "unmeasurable",
             "in_region_only",
             "live_superseded",
-            "not_applicable"
+            "not_applicable",
+            "v1_cause"
           ],
-          "description": "`in_region_only` is its own verdict rather than a flavour of `unmeasurable` because it names a DIFFERENT next action: run the comparator in-region, not fix a read. `live_superseded` (alpha-engine-config-I10892): v1's run manifest for this trading day records an ETag the live key no longer carries, and no retained VersionId to fetch the recorded object by \u2014 the live object belongs to a later run, so it is not evidence either way. Never met. `not_applicable` (alpha-engine-config-I11231): the owning unit's OWN shadow run manifest for the trading day records `status: not_applicable` with a declared reason (e.g. `no_new_data_declared` on an immutable-date artifact) \u2014 v1 wrote the key and the shadow correctly did not, so there is nothing to diff. Its next action is 'read the declaration', not 'fix the producer', which is why it is not a flavour of `shadow_missing`. Never met: a declared no-op is not parity evidence either."
+          "description": "`in_region_only` is its own verdict rather than a flavour of `unmeasurable` because it names a DIFFERENT next action: run the comparator in-region, not fix a read. `live_superseded` (alpha-engine-config-I10892): v1's run manifest for this trading day records an ETag the live key no longer carries, and no retained VersionId to fetch the recorded object by \u2014 the live object belongs to a later run, so it is not evidence either way. Never met. `not_applicable` (alpha-engine-config-I11231): the owning unit's OWN shadow run manifest for the trading day records `status: not_applicable` with a declared reason (e.g. `no_new_data_declared` on an immutable-date artifact) \u2014 v1 wrote the key and the shadow correctly did not, so there is nothing to diff. Its next action is 'read the declaration', not 'fix the producer', which is why it is not a flavour of `shadow_missing`. Never met: a declared no-op is not parity evidence either. `v1_cause` (alpha-engine-config-I11203, Brian's ruling 2026-09-24): every breach on the key is explained by machine-checked evidence, recorded in the row's `v1_cause.evidence`, that its cause is on the v1 side -- v1's own manifest stamps the bar `bar_settlement: provisional` while the shadow's stamps it `settled` (numeric breaches of a key_date key only), or the vendor published the shadow's extra trailing observations after v1's recorded fetch start. Schema, membership, coverage, row count and identity-field differences are never explained. Met, but counted apart from `match`."
         },
         "live_version": {
           "type": "object",
@@ -415,6 +428,11 @@
             },
             "examples": {
               "type": "array"
+            },
+            "identity_breaches": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "Frame rows only: how many of `breaches` are NOT a numeric move (a date, a label, a duplicate row key). Never explainable as v1_cause (alpha-engine-config-I11203)."
             }
           }
         },
@@ -570,6 +588,58 @@
             ]
           },
           "description": "For a key with no shadow object: what each owning unit's shadow run manifest for the trading day recorded. Present so a reader can tell a declared no-op from a failed leg from an unexplained gap without going to find the manifest (alpha-engine-config-I11231)."
+        },
+        "v1_cause": {
+          "type": "object",
+          "description": "Present only on a `v1_cause` row: the evidence, one entry per explained breach group, each naming its kind and the manifest facts it was checked against.",
+          "required": [
+            "evidence"
+          ],
+          "properties": {
+            "evidence": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": [
+                  "kind"
+                ],
+                "properties": {
+                  "kind": {
+                    "type": "string",
+                    "enum": [
+                      "v1_bar_provisional",
+                      "vendor_published_after_v1_fetch"
+                    ]
+                  },
+                  "scope": {
+                    "type": "string",
+                    "enum": [
+                      "rows"
+                    ],
+                    "description": "`v1_bar_provisional` only. Absent: the whole key is stamped provisional on v1's side and settled on the shadow's. `rows` (alpha-engine-config-I11563): the whole-key stamp is ambiguous because a run carried some rows from an earlier write, and EVERY row holding a numeric breach was proven provisional on v1's side and settled on the shadow's, row by row. `rows` lists up to 25 of them with the manifests each reading was followed through; `rows_explained` counts all."
+                  },
+                  "rows": {
+                    "type": "object"
+                  },
+                  "rows_explained": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                }
+              }
+            },
+            "note": {
+              "type": "string"
+            }
+          }
+        },
+        "v1_cause_refused": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "On every `mismatch` row graded for v1_cause: why it is not `v1_cause` (up to ten), whether or not any v1-side evidence was found (alpha-engine-config-I11563; before it, a row with no evidence at all carried no reason). An almost-proof is published, never silently discarded."
         },
         "failure_attribution": {
           "type": "object",

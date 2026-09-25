@@ -1699,10 +1699,115 @@ def collect_reference(
             "spy_weights": len(spy_weights), "earnings": len(earnings)}
 
 
+#: How many of each series' most recent observations get their FIRST-release
+#: date recorded (`alpha-engine-config-I11203`). A parity difference of the
+#: form "the shadow has one more observation" is at most a day or two of
+#: publication lag; five covers a long weekend with room.
+FRED_FIRST_RELEASE_TAIL = 5
+
+
+def _fred_publication_evidence(
+    series: dict[str, list[tuple[str, float]]], api_key: str
+) -> dict[str, dict]:
+    """The vendor's own publication facts for each series this run read.
+
+    `alpha-engine-config-I11203` (Brian's "proven v1 cause" ruling). Per series:
+
+    * ``last_updated`` — FRED's ``last_updated`` for the series, read AFTER the
+      observations, so it is an UPPER bound on when the version this run read
+      was published;
+    * ``first_released`` — for the last :data:`FRED_FIRST_RELEASE_TAIL`
+      observations, the date each value was FIRST released
+      (``output_type=4``, "initial release only").
+
+    Together they let `shadow.parity` PROVE that an observation one side has
+    and the other lacks was first released on a later day than the other
+    side's version was last updated — which is what a v1-side timing cause
+    is — rather than assert it. Fail-soft per series and per fact: a missing
+    fact is missing evidence, which leaves the difference strict.
+    """
+    import urllib.parse
+    import urllib.request
+
+    def _get(endpoint: str, params: dict) -> dict:
+        query = urllib.parse.urlencode({**params, "api_key": api_key, "file_type": "json"})
+        with urllib.request.urlopen(f"https://api.stlouisfed.org/fred/{endpoint}?{query}", timeout=15) as resp:
+            return json.loads(resp.read().decode())
+
+    out: dict[str, dict] = {}
+    for sid, observations in series.items():
+        facts: dict = {}
+        tail = [obs_date for obs_date, _ in observations[-FRED_FIRST_RELEASE_TAIL:]]
+        try:
+            payload = _get("series/observations", {
+                "series_id": sid, "observation_start": tail[0], "output_type": 4,
+                "realtime_start": "1776-07-04", "realtime_end": "9999-12-31",
+            })
+            facts["first_released"] = {
+                str(row["date"]): str(row["realtime_start"])
+                for row in payload.get("observations", [])
+                if row.get("date") in tail and row.get("realtime_start")
+            }
+        except Exception as e:  # noqa: BLE001 - evidence only; its absence keeps parity strict
+            logger.warning("[metron_market_data] FRED first-release dates unavailable for %s: %s", sid, e)
+        try:
+            raw = str((_get("series", {"series_id": sid}).get("seriess") or [{}])[0].get("last_updated") or "")
+            moment = datetime.fromisoformat(raw)
+            if moment.tzinfo is None:
+                # FRED always carries an offset; a naive stamp is not a publish
+                # TIME anyone can compare, so it is not recorded, not guessed.
+                raise ValueError(f"no UTC offset in {raw!r}")
+            facts["last_updated"] = (moment.timestamp(), raw)
+        except Exception as e:  # noqa: BLE001 - evidence only; its absence keeps parity strict
+            logger.warning("[metron_market_data] FRED last_updated unavailable for %s: %s", sid, e)
+        if facts:
+            out[sid] = facts
+    return out
+
+
+def _vendor_publication_guards(key: str, evidence: dict[str, dict]) -> list[dict]:
+    """Manifest guard entries carrying :func:`_fred_publication_evidence`.
+
+    Machine-readable by construction: the fact is in ``value`` (POSIX seconds,
+    UTC) and the addressed series or observation is in ``key`` —
+    ``<key>#$.series.<sid>`` for the series' ``last_updated`` and
+    ``<key>#$.series.<sid>@<observation date>`` for one observation's first
+    release (its date at 00:00 UTC). `detail` repeats both for a human.
+    """
+    from dates import VENDOR_FIRST_RELEASED_GUARD, VENDOR_PUBLISHED_AT_GUARD
+
+    guards: list[dict] = []
+    for sid, facts in sorted(evidence.items()):
+        if "last_updated" in facts:
+            seconds, raw = facts["last_updated"]
+            guards.append({
+                "guard": VENDOR_PUBLISHED_AT_GUARD, "mode": "observe", "verdict": "recorded",
+                "detail": (
+                    f"FRED series {sid} last_updated {raw}, read after this run's observations: an "
+                    "upper bound on when the version it read was published (alpha-engine-config-I11203)"
+                ),
+                "key": f"{key}#$.series.{sid}", "value": seconds, "baseline": None,
+            })
+        for obs_date, released in sorted((facts.get("first_released") or {}).items()):
+            try:
+                day = date.fromisoformat(released)
+            except ValueError:
+                continue
+            guards.append({
+                "guard": VENDOR_FIRST_RELEASED_GUARD, "mode": "observe", "verdict": "recorded",
+                "detail": f"FRED series {sid} observation {obs_date} first released {released}",
+                "key": f"{key}#$.series.{sid}@{obs_date}",
+                "value": datetime(day.year, day.month, day.day, tzinfo=timezone.utc).timestamp(),
+                "baseline": None,
+            })
+    return guards
+
+
 def collect_macro(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None, api_key: str | None = None, macro_source: MacroSource | None = None,
     release_source: Callable[[list[str], str], tuple[dict, list]] | None = None,
+    publication_source: Callable[[dict[str, list[tuple[str, float]]]], dict[str, dict]] | None = None,
 ) -> dict:
     """Write the macro-indicator artifact for Metron's Macro page — Metron's LAST direct
     external fetch (FRED) moved to the spine:
@@ -1733,6 +1838,15 @@ def collect_macro(
         series = macro_source(METRON_MACRO_SERIES, _run_date_anchor(run_date))
     if not series:
         return {"status": "skipped", "reason": "no macro series (FRED key unset or fetch failed)"}
+    # alpha-engine-config-I11203: the vendor's own publication facts for each
+    # series this run read, recorded on the manifest as parity evidence (see
+    # `_fred_publication_evidence` for why each is read when it is).
+    if publication_source is not None:
+        publication = publication_source(series)
+    elif macro_source is None and api_key:
+        publication = _fred_publication_evidence(series, api_key)
+    else:
+        publication = {}
     # v2: next-release dates + the macro event calendar. Best-effort — a FRED hiccup leaves
     # them empty (the consumer degrades to "next-release not wired") and never costs the
     # series artifact, which is the primary deliverable.
@@ -1760,7 +1874,8 @@ def collect_macro(
     logger.info("[metron_market_data] wrote %d macro series, %d next-release, %d events",
                 len(series), len(next_release), len(release_events))
     return {"status": "ok", "series": len(series),
-            "next_release": len(next_release), "release_events": len(release_events)}
+            "next_release": len(next_release), "release_events": len(release_events),
+            "guards": _vendor_publication_guards(f"{MACRO_PREFIX}latest.json", publication)}
 
 
 def _fred_macro_releases(series_ids: list[str], api_key: str, run_date: str) -> tuple[dict, list]:

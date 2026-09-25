@@ -164,6 +164,8 @@ def _coalesce_by_source_priority(
     new_records: list[dict],
     existing_rows: list[dict],
     run_date: str,
+    *,
+    carried: "list[str] | None" = None,
 ) -> tuple[list[dict], dict]:
     """Merge this-run records with the prior parquet by source priority.
 
@@ -189,6 +191,11 @@ def _coalesce_by_source_priority(
 
     Returns ``(merged_records, stats)`` — stats counts retained / overwritten /
     new_only / downgrade_blocked tickers for loud observability.
+
+    ``carried``, when given, is extended with the TICKERS whose merged row is
+    the existing object's row rather than this run's (retained or
+    downgrade-blocked). Their settlement is that object's,
+    not this fetch's (`_settlement_guards`, alpha-engine-config-I11563).
     """
     def _prio(row: dict | None) -> int:
         if row is None:
@@ -220,6 +227,8 @@ def _coalesce_by_source_priority(
         elif new_p < 0:  # ticker absent from this run → retain prior
             merged[ticker] = old_row
             stats["retained"] += 1
+            if carried is not None:
+                carried.append(str(ticker))
         elif new_p >= old_p:  # equal-or-higher source wins (tie → restatement)
             # I10783: this cell is genuinely being (re)written — bump its
             # revision counter off the prior row's, rather than trusting
@@ -231,6 +240,8 @@ def _coalesce_by_source_priority(
         else:  # fresh value is strictly lower-quality — keep the better existing
             merged[ticker] = old_row
             stats["downgrade_blocked"] += 1
+            if carried is not None:
+                carried.append(str(ticker))
 
     return list(merged.values()), stats
 
@@ -1293,9 +1304,13 @@ def collect(
     # the merged-output denominator"). polygon_only has
     # ``existing_rows_for_merge`` empty at this point (only populated in its
     # own branch above), so this is a no-op for that mode.
+    # alpha-engine-config-I11563: the tickers whose written row is the existing
+    # object's rather than this run's fetch, from EITHER coalesce below. Each is
+    # stamped with that object's settlement, row by row (`_settlement_guards`).
+    carried_tickers: list[str] = []
     if source != "polygon_only" and existing_rows_for_merge:
         records, canon_merge_stats = _coalesce_by_source_priority(
-            records, existing_rows_for_merge, run_date,
+            records, existing_rows_for_merge, run_date, carried=carried_tickers,
         )
         logger.info(
             "[skip_if_canonical] %s: coalesce retained %d preserved canonical "
@@ -1343,9 +1358,13 @@ def collect(
     # ``_coalesce_by_source_priority`` primitive above, before the coverage
     # gate — config#720 unified both modes onto this one function; only the
     # gate-ordering and the existing-rows population differ per mode.)
+    # alpha-engine-config-I11559: the rows of what this run writes that were
+    # carried over from the existing object rather than fetched now. Their
+    # settlement is that object's, not this fetch's (`_settlement_guards`);
+    # I11563 records WHICH rows, not only how many.
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
-            records, existing_rows_for_merge, run_date,
+            records, existing_rows_for_merge, run_date, carried=carried_tickers,
         )
         if merge_stats["retained"] or merge_stats["downgrade_blocked"]:
             logger.warning(
@@ -1464,9 +1483,11 @@ def collect(
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
             "vendor_divergence": vendor_divergence_record,
-            "guards": [
-                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
-            ],
+            "guards": _settlement_guards(
+                fetch_started_at, run_date, key,
+                carried_rows=carried_tickers,
+                carried_from=last_modified if head is not None else None,
+            ),
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1497,10 +1518,13 @@ def collect(
             "vendor_divergence": vendor_divergence_record,
             # alpha-engine-config-I11354: D19's settlement verdict, folded onto
             # the run manifest by `weekly_collector._record_collector_guards`.
-            # Observe mode — never moves the exit code.
-            "guards": [
-                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
-            ],
+            # Observe mode — never moves the exit code. I11559: plus the
+            # reading for rows carried over from the existing object.
+            "guards": _settlement_guards(
+                fetch_started_at, run_date, key,
+                carried_rows=carried_tickers,
+                carried_from=last_modified if head is not None else None,
+            ),
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1510,6 +1534,77 @@ def collect(
             "tickers_captured": len(closes_df),
             "source": source,
         }
+
+
+def row_settlement_key(key: str, row: str) -> str:
+    """The guard `key` of one row's `bar_settlement` reading: ``<key>#<ticker>``.
+
+    The same ``<live key>#<address>`` spelling the vendor-publication guards use
+    (`dates.VENDOR_PUBLISHED_AT_GUARD`), so the manifest's closed guard shape
+    carries it unchanged. `shadow.parity._row_bar_settlement` reads it back.
+    """
+    return f"{key}#{row}"
+
+
+def _settlement_guards(
+    fetch_started_at: datetime,
+    run_date: str,
+    key: str,
+    *,
+    carried_rows: "list[str] | tuple[str, ...]" = (),
+    carried_from: "datetime | None" = None,
+) -> list[dict]:
+    """The `bar_settlement` readings for one written ``key``.
+
+    The first reading is always this run's fetch, graded on when it began
+    (`alpha-engine-config-I11354`, the D19/D20 rule). It is the settlement of
+    every row this run FETCHED.
+
+    `alpha-engine-config-I11559` / `-I11563`: the written file can also carry
+    rows taken from the existing object instead of this fetch. The polygon_only
+    coalesce (D17) keeps a ticker polygon did not serve (retain-on-empty) or
+    would have downgraded; the yfinance/auto coalesce keeps a canonical row it
+    did not refetch. Those cells hold the existing object's bar, so each one
+    gets its OWN reading, keyed ``<key>#<ticker>`` (:func:`row_settlement_key`)
+    and graded on that object's write time. D19's post-close skip path already
+    uses that rule for the object it leaves in place.
+
+    `shadow.parity` reads them row by row (`_row_bar_settlement`): a breach
+    on a row v1 stamped `provisional` and the shadow stamped `settled` is
+    explainable, and every other breach on the key stays strict. Read as a
+    whole-key stamp (`_bar_settlement_stamp`), readings that disagree stay
+    ambiguous, exactly as under I11559.
+
+    Measured on 2026-09-22. D17's 12:19Z morning fetch was `settled`, but CPRI
+    and SAM in the file it wrote were D19's 16:06 ET yfinance cells
+    (`provisional`), and they were the only rows that differed from the
+    shadow's.
+
+    Bound: the existing object's write time is the LATEST moment its carried
+    cells can have been fetched. A `provisional` reading graded on it is
+    therefore always true. A `settled` one can be false, if that object itself
+    carried the cell from an earlier write. `shadow.parity` never takes a
+    carried `settled` reading on trust: it follows the row back to the run
+    that fetched it.
+    """
+    guards = [bar_settlement_guard_entry(fetch_started_at, run_date, key=key)]
+    rows = sorted({str(t) for t in carried_rows})
+    if not rows or carried_from is None:
+        return guards
+    # Every carried row is named, however many there are: an unnamed carried
+    # row would read as fetched. The detail is kept short because a
+    # skip_if_canonical re-run can carry most of the file.
+    written = carried_from.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    for row in rows:
+        reading = bar_settlement_guard_entry(
+            carried_from, run_date, key=row_settlement_key(key, row)
+        )
+        reading["detail"] = (
+            f"carried, not fetched: row {row} is the existing object's (written {written}); "
+            f"graded on that write against {SETTLED_AFTER_ET} ET. Verdict {reading['verdict']}."
+        )
+        guards.append(reading)
+    return guards
 
 
 def _collect_window(
