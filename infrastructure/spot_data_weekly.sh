@@ -533,6 +533,9 @@ _spot_failure_reason() {
     # feature the backtester/predictor siblings don't have, not part of
     # the mid-run reclaim classifier #883 lifts to the lib.
     if [ "$rc" -eq 64 ]; then echo "launch-capacity-exhausted"; return 0; fi
+    # ec2_spot exit 65: account-wide SPOT quota; on-demand is a separate
+    # quota, so relaunch straight to on-demand (alpha-engine-config-I11574).
+    if [ "$rc" -eq 65 ]; then echo "launch-quota-exceeded"; return 0; fi
     # Nothing launched and not a clean exit → unclassifiable, treat hard.
     [ -z "$INSTANCE_ID" ] && return 1
     # See alpha-engine-config-I7009 — migrated off the exit-code contract to --json.
