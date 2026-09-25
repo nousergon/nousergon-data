@@ -1251,7 +1251,7 @@ def _grade_coverage(
 # ---------------------------------------------------------------------------
 #
 # A `mismatch` row is re-graded `v1_cause` ONLY when every one of its breaches
-# is explained by machine-checked evidence, recorded inline on the row. Two
+# is explained by machine-checked evidence, recorded inline on the row. Three
 # kinds of evidence are admissible, and nothing else:
 #
 # 1. `v1_bar_provisional` — v1's OWN run manifest stamps the key's bar
@@ -1273,6 +1273,13 @@ def _grade_coverage(
 #    a later day than the version v1 read was last updated (a
 #    `vendor_published_at` guard on v1's manifest, read after v1's own
 #    observations). Such an observation could not have been in what v1 read.
+# 3. `recompute_lineage` — a DERIVED key (D31's feature groups), which stamps
+#    no settlement of its own. `shadow.recompute_lineage` re-ran ONE feature
+#    code over each side's RECORDED inputs and got each side's published
+#    bytes back exactly, so the two files differ only through the recorded
+#    inputs that differ; each of those is graded here, under its own key's
+#    comparison, and must itself be `v1_cause` (kinds 1-2). Explains NUMERIC
+#    breaches only, like kind 1. It chains; it never stands alone.
 #
 # Never explained, whatever the evidence: a schema difference, a membership
 # difference (a key or symbol on one side only), a coverage shortfall, a row
@@ -1295,8 +1302,11 @@ VENDOR_FIRST_RELEASED_GUARD = _VENDOR_FIRST_RELEASED_GUARD
 #: this calendar before the two days are compared.
 VENDOR_RELEASE_CALENDAR_TZ = "America/Chicago"
 
-#: The two admissible evidence kinds, and only these.
-V1_CAUSE_KINDS: frozenset[str] = frozenset({"v1_bar_provisional", "vendor_published_after_v1_fetch"})
+#: The admissible evidence kinds, and only these. `recompute_lineage`
+#: (alpha-engine-config-I11203, derived keys): see `_recompute_lineage_evidence`.
+V1_CAUSE_KINDS: frozenset[str] = frozenset(
+    {"v1_bar_provisional", "vendor_published_after_v1_fetch", "recompute_lineage"}
+)
 
 
 @dataclass(frozen=True)
@@ -1316,6 +1326,27 @@ class V1CauseContext:
     #: through these to the run that fetched it (`_row_bar_settlement`).
     v1_history: "tuple[dict[str, Any], ...]" = ()
     shadow_history: "tuple[dict[str, Any], ...]" = ()
+    #: A DERIVED key's recompute lineage (alpha-engine-config-I11203), when
+    #: the key is one `shadow.recompute_lineage` covers. ``None`` otherwise.
+    recompute: "RecomputeLineage | None" = None
+
+
+@dataclass(frozen=True)
+class RecomputeLineage:
+    """One trading day's D31 recompute record, with its input chain graded.
+
+    ``record`` is the document `shadow.recompute_lineage` wrote (``None`` when
+    absent or unreadable, with ``why_absent`` saying which). ``chain`` holds
+    one graded entry per recorded input whose content differs between the v1
+    and shadow runs; ``chain_refusal`` is set when any of them is not itself
+    PROVEN v1-caused — then nothing on the day is explained by lineage.
+    """
+
+    record_key: str
+    record: "dict[str, Any] | None"
+    why_absent: str = ""
+    chain: "tuple[dict[str, Any], ...]" = ()
+    chain_refusal: "str | None" = None
 
 
 def manifest_recording(manifests: Iterable[dict[str, Any]], live_key: str) -> dict[str, Any] | None:
@@ -1711,6 +1742,82 @@ def _vendor_publish_evidence(
     )
 
 
+def _recompute_lineage_evidence(
+    live_key: str,
+    lineage: RecomputeLineage,
+    live_sha256: "str | None",
+    shadow_sha256: "str | None",
+    numeric: int,
+) -> tuple[dict[str, Any] | None, str]:
+    """Kind 3, `recompute_lineage`, for a DERIVED key — or ``(None, why not)``.
+
+    alpha-engine-config-I11203. The record (`shadow.recompute_lineage`) shows
+    that ONE feature code maps v1's recorded inputs to v1's published bytes
+    AND the shadow's recorded inputs to the shadow's published bytes. Then the
+    two files differ only through the inputs that differ, and each of those
+    was graded here, at report time, under ITS OWN key's comparison: every
+    one must be `v1_cause` (`_grade_input_chain`). Byte equality, not a
+    tolerance: no band is involved anywhere in the proof.
+
+    Bound to the bytes this report graded: the record's published sha256 on
+    each side must be the sha256 of the object compared here, or the record
+    is about some other object and proves nothing about this one.
+    """
+    record = lineage.record
+    if record is None:
+        return None, f"no recompute lineage for this derived key: {lineage.why_absent}"
+    if record.get("status") != "complete":
+        refusals = [
+            f"{side}: {(record.get('sides') or {}).get(side, {}).get('refusal')}"
+            for side in ("v1", "shadow")
+            if ((record.get("sides") or {}).get(side) or {}).get("refusal")
+        ]
+        return None, "the recompute lineage record is not complete — " + ("; ".join(refusals) or "no reason given")
+    entry = (record.get("keys") or {}).get(live_key)
+    if not entry:
+        return None, f"the recompute lineage record ({lineage.record_key}) does not cover this key"
+    for side, graded in (("v1", live_sha256), ("shadow", shadow_sha256)):
+        facts = entry.get(side) or {}
+        if not graded or facts.get("published_sha256") != graded:
+            return None, (
+                f"the recompute lineage record's {side} file is not the object this report graded "
+                f"(record {facts.get('published_sha256')}, graded {graded})"
+            )
+        if not facts.get("reproduced"):
+            return None, (
+                f"the recompute did not reproduce the {side} file from the {side} run's recorded inputs "
+                f"(recomputed {facts.get('recomputed_sha256')}, published {facts.get('published_sha256')}) — "
+                "a code or unrecorded-input difference, so the difference is not proven input-driven"
+            )
+    if lineage.chain_refusal is not None:
+        return None, lineage.chain_refusal
+    if not lineage.chain:
+        return None, (
+            "no recorded input differs between the two runs, yet the files do — the difference is "
+            "not attributable to a v1 input"
+        )
+    sides = record.get("sides") or {}
+    return (
+        {
+            "kind": "recompute_lineage",
+            "record": {
+                "key": lineage.record_key,
+                "generated_at": record.get("generated_at"),
+                "code_sha": record.get("code_sha"),
+            },
+            "v1_manifest": (sides.get("v1") or {}).get("manifest"),
+            "shadow_manifest": (sides.get("shadow") or {}).get("manifest"),
+            "reproduced": {
+                "v1_sha256": (entry.get("v1") or {}).get("published_sha256"),
+                "shadow_sha256": (entry.get("shadow") or {}).get("published_sha256"),
+            },
+            "differing_inputs": list(lineage.chain),
+            "explains": f"{numeric} numeric breach(es)",
+        },
+        "",
+    )
+
+
 def _grade_v1_cause(
     body: dict[str, Any],
     *,
@@ -1723,6 +1830,8 @@ def _grade_v1_cause(
     rel: float = 0.0,
     absolute: float = 0.0,
     numeric_breach_rows: "dict[str, int] | None" = None,
+    live_sha256: "str | None" = None,
+    shadow_sha256: "str | None" = None,
 ) -> None:
     """Re-grade a `mismatch` body as `v1_cause` in place, when — and only when — proven.
 
@@ -1760,20 +1869,28 @@ def _grade_v1_cause(
             refusals.append(f"{identity} identity breach(es) (a non-numeric cell)")
         if numeric:
             proof, why = _provisional_bar_evidence(live_key, contract, context)
-            if proof is not None:
-                evidence.append({**proof, "explains": f"{numeric} numeric breach(es)"})
-            elif numeric_breach_rows is not None and contract is not None and contract.settling_basis == "key_date":
+            whys = [why]
+            if proof is None and (
+                numeric_breach_rows is not None and contract is not None and contract.settling_basis == "key_date"
+            ):
                 # The whole key is not one provisional-vs-settled pair. It may
                 # still be one ROW BY ROW (alpha-engine-config-I11563).
-                row_proof, row_why = _provisional_row_evidence(
-                    live_key, context, numeric_breach_rows, numeric
+                proof, row_why = _provisional_row_evidence(live_key, context, numeric_breach_rows, numeric)
+                whys.append(row_why)
+            elif proof is not None:
+                proof = {**proof, "explains": f"{numeric} numeric breach(es)"}
+            if proof is None and context.recompute is not None:
+                # A DERIVED key stamps no settlement of its own. Its cause may
+                # still be proven through what it was computed FROM
+                # (alpha-engine-config-I11203, recompute lineage).
+                proof, lineage_why = _recompute_lineage_evidence(
+                    live_key, context.recompute, live_sha256, shadow_sha256, numeric
                 )
-                if row_proof is None:
-                    refusals.extend([why, row_why])
-                else:
-                    evidence.append(row_proof)
+                whys.append(lineage_why)
+            if proof is None:
+                refusals.extend(whys)
             else:
-                refusals.append(why)
+                evidence.append(proof)
     elif json_breaches is not None:
         numeric_values = [d for d in json_breaches if d.kind == "value" and d.numeric]
         for diff in json_breaches:
@@ -1898,7 +2015,13 @@ def compare_bytes(
             )
             body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
             _grade_v1_cause(
-                body, live_key=key, contract=contract, context=v1_cause, numeric_breach_rows=breach_rows
+                body,
+                live_key=key,
+                contract=contract,
+                context=v1_cause,
+                numeric_breach_rows=breach_rows,
+                live_sha256=hashlib.sha256(live).hexdigest(),
+                shadow_sha256=hashlib.sha256(shadow).hexdigest(),
             )
             return body
 
@@ -1935,7 +2058,13 @@ def compare_bytes(
         matched = schema_ok and body["coverage"]["met"] and body["values"]["breaches"] == 0
         body.update({"comparator": "parquet", "verdict": "match" if matched else "mismatch"})
         _grade_v1_cause(
-            body, live_key=key, contract=contract, context=v1_cause, numeric_breach_rows=breach_rows
+            body,
+            live_key=key,
+            contract=contract,
+            context=v1_cause,
+            numeric_breach_rows=breach_rows,
+            live_sha256=hashlib.sha256(live).hexdigest(),
+            shadow_sha256=hashlib.sha256(shadow).hexdigest(),
         )
         return body
 
@@ -2781,15 +2910,162 @@ def _all_manifests_by_unit(reader: "S3Reader", prefix: str, limit: int = 5000) -
 
 
 class _V1CauseManifests:
-    """Reads, once each, every v1 and shadow manifest `v1_cause` evidence needs."""
+    """Reads, once each, every v1 and shadow manifest `v1_cause` evidence needs.
 
-    def __init__(self, reader: "S3Reader", unit_by_id: dict[str, Unit], day: dt.date, shadow_root: ShadowRoot) -> None:
+    With a ``store`` (the parity store), a D31 feature key's context also
+    carries the day's recompute lineage, its input chain graded once per day
+    (alpha-engine-config-I11203, :meth:`_lineage`).
+    """
+
+    def __init__(
+        self,
+        reader: "S3Reader",
+        unit_by_id: dict[str, Unit],
+        day: dt.date,
+        shadow_root: ShadowRoot,
+        *,
+        store: Any | None = None,
+        rel: float = DEFAULT_RELATIVE_TOLERANCE,
+        absolute: float = DEFAULT_ABSOLUTE_TOLERANCE,
+    ) -> None:
         self.reader = reader
         self.unit_by_id = unit_by_id
         self.day = day
         self._v1: dict[str, list[dict[str, Any]]] = {}
         self._shadow: dict[str, list[dict[str, Any]]] | None = None
         self._shadow_prefix = shadow_root.key("data_collection/runs/")
+        self._store = store
+        self._rel = rel
+        self._absolute = absolute
+        self._lineage_cache: "RecomputeLineage | None" = None
+
+    def _shadow_for(self, unit_id: str) -> list[dict[str, Any]]:
+        if self._shadow is None:
+            self._shadow = _all_manifests_by_unit(self.reader, self._shadow_prefix)
+        return self._shadow.get(unit_id, [])
+
+    def _owners_of(self, key: str) -> list[str]:
+        """Units whose declared writes cover ``key`` on this day."""
+        owners = []
+        for unit_id, unit in sorted(self.unit_by_id.items()):
+            for declared in unit.raw.get("writes") or []:
+                target = classify_write(unit_id, str(declared), self.day)
+                if (target.kind == "key" and target.value == key) or (
+                    target.kind == "prefix" and target.value and key.startswith(target.value)
+                ):
+                    owners.append(unit_id)
+                    break
+        return owners
+
+    def _lineage(self) -> "RecomputeLineage":
+        if self._lineage_cache is None:
+            self._lineage_cache = self._load_lineage()
+        return self._lineage_cache
+
+    def _load_lineage(self) -> "RecomputeLineage":
+        from shadow.recompute_lineage import SCHEMA_VERSION, lineage_record_key
+
+        key = lineage_record_key(self.day)
+        try:
+            document = json.loads(self._store.get_bytes(key).decode("utf-8"))
+        except FileNotFoundError:
+            return RecomputeLineage(key, None, f"no record at {key} (the recompute has not run for {self.day})")
+        except Exception as exc:  # noqa: BLE001 - an unreadable record proves nothing; named on the row
+            return RecomputeLineage(key, None, f"the record at {key} is unreadable: {type(exc).__name__}: {exc}")
+        if not isinstance(document, dict) or document.get("schema_version") != SCHEMA_VERSION:
+            return RecomputeLineage(key, None, f"the record at {key} is not a {SCHEMA_VERSION} document")
+        if document.get("trading_day") != self.day.isoformat():
+            return RecomputeLineage(key, None, f"the record at {key} is for {document.get('trading_day')!r}")
+        chain, refusal = self._grade_input_chain(document)
+        return RecomputeLineage(key, document, "", tuple(chain), refusal)
+
+    def _grade_input_chain(self, record: dict[str, Any]) -> "tuple[list[dict[str, Any]], str | None]":
+        """Grade every input whose content differs between the runs, under its OWN key.
+
+        Each must come out `v1_cause` — v1's writer of the exact version v1's
+        D31 read stamped it provisional, the shadow's writer of the version the
+        shadow's D31 read stamped it settled (kind 1, whole key or row by row).
+        The evidence chains; it is never assumed. A differing input that is an
+        ArcticDB library, an aggregated set, or read by one side only carries no
+        such stamp and refuses the whole chain.
+        """
+        chain: list[dict[str, Any]] = []
+        for item in record.get("differing_inputs") or []:
+            key = str(item.get("key") or "")
+            if item.get("kind") != "object":
+                return chain, (
+                    f"differing input {key} ({item.get('kind')}) carries no settlement stamp, so the "
+                    "chain cannot prove it v1-caused"
+                )
+            if item.get("only"):
+                return chain, f"differing input {key} was read by the {item['only']} run only"
+            sides: dict[str, dict[str, Any]] = {}
+            for side in ("v1", "shadow"):
+                facts = item.get(side) or {}
+                physical, version = facts.get("physical_key"), facts.get("version_id")
+                meta = (
+                    self.reader.get_with_meta(str(physical), version_id=str(version))
+                    if physical and version
+                    else None
+                )
+                if meta is None:
+                    return chain, f"differing input {key}: the {side} version {version} is not readable"
+                if facts.get("sha256") and hashlib.sha256(meta["body"]).hexdigest() != facts["sha256"]:
+                    return chain, f"differing input {key}: the {side} bytes are not the ones the recompute read"
+                sides[side] = {"facts": facts, "body": meta["body"]}
+            owners = self._owners_of(key)
+            v1_all = [m for unit_id in owners for m in self._v1_for(unit_id)]
+            shadow_all = [m for unit_id in owners for m in self._shadow_for(unit_id)]
+            writers = {
+                "v1": _manifest_writing(v1_all, key, sides["v1"]["facts"]["version_id"]),
+                "shadow": _manifest_writing(shadow_all, key, sides["shadow"]["facts"]["version_id"]),
+            }
+            for side, writer in writers.items():
+                if writer is None:
+                    return chain, (
+                        f"differing input {key}: no {side} manifest of {owners or 'any owning unit'} for "
+                        f"{self.day} records writing version {sides[side]['facts']['version_id']}"
+                    )
+            body = compare_bytes(
+                key,
+                sides["v1"]["body"],
+                sides["shadow"]["body"],
+                rel=self._rel,
+                absolute=self._absolute,
+                contract=resolve_contract(key),
+                v1_cause=V1CauseContext(
+                    v1=writers["v1"],
+                    shadow=writers["shadow"],
+                    v1_history=manifests_recording(v1_all, key),
+                    shadow_history=manifests_recording(shadow_all, key),
+                ),
+            )
+            if body.get("verdict") != "v1_cause":
+                reason = (body.get("v1_cause_refused") or [body.get("unmeasurable_reason") or ""])[0]
+                return chain, (
+                    f"differing input {key} grades {body.get('verdict')!r}, not v1_cause"
+                    + (f": {reason}" if reason else "")
+                )
+            chain.append(
+                {
+                    "key": key,
+                    "verdict": "v1_cause",
+                    "evidence_kinds": sorted(
+                        {str(e.get("kind")) for e in (body.get("v1_cause") or {}).get("evidence") or []}
+                    ),
+                    "v1": {
+                        "physical_key": sides["v1"]["facts"].get("physical_key"),
+                        "version_id": sides["v1"]["facts"].get("version_id"),
+                        "writer": _manifest_ref(writers["v1"]),
+                    },
+                    "shadow": {
+                        "physical_key": sides["shadow"]["facts"].get("physical_key"),
+                        "version_id": sides["shadow"]["facts"].get("version_id"),
+                        "writer": _manifest_ref(writers["shadow"]),
+                    },
+                }
+            )
+        return chain, None
 
     def _v1_for(self, unit_id: str) -> list[dict[str, Any]]:
         if unit_id not in self._v1:
@@ -2808,16 +3084,28 @@ class _V1CauseManifests:
         return self._v1[unit_id]
 
     def context(self, live_key: str, owners: list[str]) -> V1CauseContext:
-        if self._shadow is None:
-            self._shadow = _all_manifests_by_unit(self.reader, self._shadow_prefix)
+        from shadow.recompute_lineage import is_lineage_key
+
         v1 = [m for unit_id in owners for m in self._v1_for(unit_id)]
-        shadow = [m for unit_id in owners for m in self._shadow.get(unit_id, [])]
+        shadow = [m for unit_id in owners for m in self._shadow_for(unit_id)]
         return V1CauseContext(
             v1=manifest_recording(v1, live_key),
             shadow=manifest_recording(shadow, live_key),
             v1_history=manifests_recording(v1, live_key),
             shadow_history=manifests_recording(shadow, live_key),
+            recompute=self._lineage() if self._store is not None and is_lineage_key(live_key) else None,
         )
+
+
+def _manifest_writing(manifests: Iterable[dict[str, Any]], key: str, version_id: Any) -> dict[str, Any] | None:
+    """The manifest whose `outputs` record writing ``key`` at exactly ``version_id``."""
+    if not version_id:
+        return None
+    for manifest in manifests:
+        for out in manifest.get("outputs") or []:
+            if str(out.get("key") or "") == key and out.get("version_id") == version_id:
+                return manifest
+    return None
 
 
 def _manifest_output_keys(manifest: dict[str, Any], prefix_value: str) -> set[str]:
@@ -2918,6 +3206,7 @@ def _attach_key_date_prior_day_settled(
     prior_day: dt.date,
     rel_tolerance: float,
     absolute_tolerance: float,
+    store: Any | None = None,
 ) -> None:
     """Deliverable 1 of `alpha-engine-config-I11360`.
 
@@ -2945,7 +3234,15 @@ def _attach_key_date_prior_day_settled(
     """
     prior_root = ShadowRoot(prior_day)
     prior_shadow_manifests = _latest_manifests_by_unit(reader, prior_root.key("data_collection/runs/"))
-    prior_v1_cause = _V1CauseManifests(reader, unit_by_id, prior_day, prior_root)
+    prior_v1_cause = _V1CauseManifests(
+        reader,
+        unit_by_id,
+        prior_day,
+        prior_root,
+        store=store,
+        rel=rel_tolerance,
+        absolute=absolute_tolerance,
+    )
     prior_manifest_cache: dict[str, list[dict[str, Any]]] = {}
 
     def _expected_prior(live_key: str, owners: list[str]) -> dict[str, Any] | None:
@@ -3023,10 +3320,13 @@ def run_parity(
     """Diff every declared key of every live-v1-producer unit and build the report.
 
     ``store`` is the same `GateStore` the report is published to. It is read —
-    never written — for exactly one thing: the PREVIOUS trading day's report,
-    which names the keys that day could only grade as settling. Absent, the
-    report says so under `prior_day_settled` rather than omitting the block,
-    because "we did not look" and "nothing was unsettled" are different facts.
+    never written — for exactly two things: the PREVIOUS trading day's report,
+    which names the keys that day could only grade as settling, and that day's
+    D31 recompute lineage record (`lineage/D31/{prior_day}.json`,
+    alpha-engine-config-I11203), which the re-grade of a derived feature key
+    reads. Absent, the report says so under `prior_day_settled` rather than
+    omitting the block, because "we did not look" and "nothing was unsettled"
+    are different facts.
     """
     from nousergon_lib.trading_calendar import previous_trading_day
 
@@ -3278,6 +3578,9 @@ def run_parity(
         prior_day=prior_day,
         rel_tolerance=rel_tolerance,
         absolute_tolerance=absolute_tolerance,
+        # alpha-engine-config-I11203: the D-1 recompute lineage record is read
+        # from the same store the report is published to.
+        store=store,
     )
     stamp = (now or dt.datetime.now(dt.timezone.utc)).replace(microsecond=0).isoformat()
     return ParityReport(

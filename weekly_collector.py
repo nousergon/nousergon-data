@@ -24,6 +24,16 @@ Usage:
 
 from __future__ import annotations
 
+# alpha-engine-config-I11203: pin the numeric environment BEFORE anything below
+# imports numpy, so D31's feature bytes do not depend on which CPU the box got
+# (features/numeric_pin.py has the measurements). Only when run as a program —
+# an importer (a test) keeps its own environment. `python -m shadow run
+# --module weekly_collector` has already applied it; this re-check is a no-op.
+if __name__ == "__main__":
+    from features import numeric_pin as _numeric_pin
+
+    _numeric_pin.apply()
+
 import argparse
 import json
 import logging
@@ -976,6 +986,16 @@ def _record_phase_lineage(
                     extra_written.append((k, rows_out))
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
+        # alpha-engine-config-I11203: a collector that recorded what it READ
+        # (`features.input_record`, D31/D12) hands the refs back under
+        # `input_refs`, already in the manifest's closed `InputRef` shape.
+        for ref in result.get("input_refs") or ():
+            run_ctx.record_input(
+                str(ref["key"]),
+                etag=ref.get("etag"),
+                version=ref.get("version"),
+                schema_version=ref.get("schema_version"),
+            )
     _record_collector_guards(run_ctx, result)
 
     if auto_skipped or dry:
@@ -4661,6 +4681,12 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         lambda: compute_and_write(
             date_str=run_date, bucket=bucket, dry_run=dry_run,
             zero_variance_fatal=False,
+            # alpha-engine-config-I11203: the day's own bar comes from its
+            # daily_closes delta, never from ArcticDB. A no-op on v1's
+            # schedule (D31 runs before D32 appends the day); it stops a run
+            # AFTER that append — the shadow's, or a re-run — reading v1's
+            # appended bar as its input.
+            exclude_trading_day_arctic_rows=True,
         ),
         artifact_key=f"features/{run_date}/schema_version.json",
         # alpha-engine-config-I10855: D31 declares the same 5 parquet keys as

@@ -589,6 +589,21 @@ _WORKLOADS: dict[str, str] = {
     # the `shadow-morning` key below, on v1's own cadence; this one's parity
     # call now declares `--legs-group sameday` so a report carrying only this
     # group renders the morning group as unknown rather than as silence.
+    #
+    # THEN `recompute-lineage` (alpha-engine-config-I11203): re-runs D31's
+    # feature code over the inputs v1's and this run's D31 each RECORDED and
+    # writes `lineage/D31/$TD.json`, which the NEXT trading day's report reads
+    # when it re-grades `features/$TD/*` (`prior_day_settled`). It runs here
+    # because both D31 outputs for $TD exist by now, and after `parity` so it
+    # can never delay the report or its gate dispatch. Cost: two ArcticDB
+    # `as_of` reads (~4 min each measured from outside the region, 2026-09-25)
+    # plus ~45 s of compute per side, against this workload's 18000 s cap.
+    # It runs whatever the legs did — a missing D31 manifest is a named
+    # refusal in the record, not a skipped step. Exit code: a failed leg,
+    # then a failed prune, then `parity`'s 2, then a crashed recompute (2),
+    # then `parity`'s own MET/NOT MET; a record that REFUSES exits 0 —
+    # refusing is its job. It runs BEFORE the prune: the prune never touches
+    # what it reads (live ArcticDB `as_of`, and S3 by VersionId).
     "shadow-sameday": (
         "( set -e; "
         "TD=$(python -c 'from dates import default_run_date; print(default_run_date())'); "
@@ -605,6 +620,8 @@ _WORKLOADS: dict[str, str] = {
         "RC=$?; printf 'post-market-arctic-append\\t%s\\n' $RC >> $LEGS; [ $RC -ne 0 ] && RC_ALL=$RC; "
         "python -m shadow parity --trading-day $TD --legs-file $LEGS --legs-group sameday "
         "--store s3://alpha-engine-research/data_collection --dispatch-gate; PARITY_RC=$?; "
+        "python -m shadow recompute-lineage --trading-day $TD "
+        "--store s3://alpha-engine-research/data_collection; LINEAGE_RC=$?; "
         # alpha-engine-config-I11447 (Brian, 2026-09-24): once the day is
         # graded, drop shadow libraries past the 7-day window. "Graded" is
         # parity exit 0 (MET) or 1 (ran, NOT MET); exit 2 means the comparison
@@ -612,7 +629,9 @@ _WORKLOADS: dict[str, str] = {
         # the NOT-MET exit, which is expected daily and would hide it.
         "PRUNE_RC=0; if [ $PARITY_RC -le 1 ]; then python -m shadow prune --apply; PRUNE_RC=$?; "
         '[ $PRUNE_RC -ne 0 ] && echo "shadow-sameday: shadow prune --apply FAILED (rc=$PRUNE_RC)"; fi; '
-        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; exit $PARITY_RC )"
+        "[ $RC_ALL -ne 0 ] && exit $RC_ALL; [ $PRUNE_RC -ne 0 ] && exit $PRUNE_RC; "
+        "[ $PARITY_RC -eq 2 ] && exit $PARITY_RC; "
+        '[ "${LINEAGE_RC:-0}" -ne 0 ] && exit $LINEAGE_RC; exit $PARITY_RC )'
     ),
     # D+1 MORNING shadow run (alpha-engine-config-I11352). The other half of
     # `shadow-sameday` above, split out because v1 runs these two legs TWELVE
@@ -1455,6 +1474,11 @@ python -m krepis.session_dlp preflight || fail "DLP preflight failed (gitleaks b
 # requirements.txt` above); this gate catches future drift the same way the
 # DLP gate above does: fail closed at boot, not at the first LLM call.
 python -c "import openai" || fail "openai package (flow-doctor diagnosis router wire) not installed"
+# alpha-engine-config-I11203: declare the run manifests' compute row (measured
+# from instance metadata — until now every manifest this box wrote said
+# `local`) and the numeric pin D31 computes under (derived from
+# features/numeric_pin.py, never restated). One file, sourced from the checkout.
+source infrastructure/data_box_env.sh || fail "data box env (compute row / numeric pin) failed"
 # No `| tee` here: the renderer's run-log block already `exec`'d this shell's
 # stdout+stderr through tee, so every line of the collector is captured with
 # the provisioning that preceded it. Piping again would double every line AND

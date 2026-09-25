@@ -92,7 +92,7 @@ def _synthetic_universe_with_sub_sectors(n_per_group: int = 15, n_rows: int = 40
 def _patch_loaders(monkeypatch, price_data, macro, sub_sector_map):
     monkeypatch.setattr(
         compute, "_load_prices_and_macro",
-        lambda s3, bucket, date_str: (dict(price_data), dict(macro)),
+        lambda s3, bucket, date_str, **_kw: (dict(price_data), dict(macro)),
     )
     monkeypatch.setattr(compute, "_load_sector_map", lambda s3, bucket: {})
     monkeypatch.setattr(

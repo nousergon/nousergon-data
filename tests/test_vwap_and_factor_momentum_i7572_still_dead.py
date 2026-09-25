@@ -66,7 +66,7 @@ def _universe_latest_vwap_nan(n_tickers: int = 25, n_rows: int = 400):
 def _patch_loaders(monkeypatch, price_data, macro):
     monkeypatch.setattr(
         compute, "_load_prices_and_macro",
-        lambda s3, bucket, date_str: (dict(price_data), dict(macro)),
+        lambda s3, bucket, date_str, **_kw: (dict(price_data), dict(macro)),
     )
     monkeypatch.setattr(compute, "_load_sector_map", lambda s3, bucket: {})
     monkeypatch.setattr(compute, "_load_sub_sector_etf_map", lambda s3, bucket: {})
