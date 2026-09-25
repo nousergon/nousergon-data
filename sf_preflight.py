@@ -934,12 +934,18 @@ def _read_pinned_version(requirements_path) -> str | None:
         text = requirements_path.read_text()
     except (OSError, IOError):
         return None
-    pat = re.compile(r"^krepis==(\S+)", re.MULTILINE)
+    # alpha-engine-config-I11568: a requirement may carry EXTRAS —
+    # crucible-dashboard pins ``krepis[flow-doctor, openai]==0.59.70`` — and a
+    # bare ``^krepis==`` does not match that line, so every dashboard command
+    # read as "pin not found": 18 false violations the first time this check
+    # ran against real checkouts.
+    extras = r"(?:\[[^\]\n]*\])?"
+    pat = re.compile(rf"^krepis{extras}\s*==\s*([^\s#;,]+)", re.MULTILINE)
     m = pat.search(text)
     if m:
         return m.group(1)
     # Also support ``krepis>=X.Y.Z`` or unpinned lines
-    pat2 = re.compile(r"^krepis\s*(>=|~=|==)\s*(\S+)", re.MULTILINE)
+    pat2 = re.compile(rf"^krepis{extras}\s*(>=|~=|==)\s*([^\s#;,]+)", re.MULTILINE)
     m2 = pat2.search(text)
     return m2.group(2) if m2 else None
 
@@ -987,7 +993,10 @@ def check_tool_contracts(ctx: PreflightContext) -> CheckResult:
 
     t0 = time.time()
 
-    sfn = _boto3.client("stepfunctions")
+    # Explicit region (alpha-engine-config-I11568): this check now runs on the
+    # weekly box, whose SSM shell exports no AWS_DEFAULT_REGION — the same
+    # NoRegionError alpha-engine-config-I11567 measured for CloudWatch there.
+    sfn = _boto3.client("stepfunctions", region_name=_REGION)
     try:
         live = _json.loads(
             sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
@@ -2307,14 +2316,31 @@ CAP_POLYGON = "polygon"            # POLYGON_API_KEY resolvable
 
 # Every environment has the AWS control plane; the Lambda has nothing else.
 LAMBDA_CAPABILITIES = frozenset({CAP_AWS})
-# The laptop carries the full set. The weekly spot box carries everything
-# but CAP_CHECKOUT: it clones only the repos its stages run, not every
-# sibling alpha-engine-* checkout (alpha-engine-config-I11313 owns that
-# group at merge time). sf_preflight_on_spot.py DETECTS the rest per run
-# rather than assuming it, so a box that has lost one reports a skip.
+# The laptop and the weekly spot box carry the full set.
+# sf_preflight_on_spot.py DETECTS each one on the box per run rather than
+# assuming it, so a box that has lost one reports a named skip.
 FULL_CAPABILITIES = frozenset({
     CAP_AWS, CAP_ARCTIC, CAP_REPO_MODULES, CAP_CHECKOUT, CAP_POLYGON,
 })
+
+# What CAP_CHECKOUT MEANS (alpha-engine-config-I11568): every sibling checkout
+# the CAP_CHECKOUT checks read, resolvable by ``_sibling_repo`` beside this
+# repo. price_cards reads alpha-engine-config's LLM_MODEL_REGISTRY.yaml,
+# recursion_budget reads research's agents/sector_teams/*.py, tool_contracts
+# reads the requirements file of every checkout the weekly definition's
+# ``commands.$`` shell out to (dashboard, research, this repo). A host claims
+# the capability only when ALL of them resolve — a partial set would turn the
+# optional checks' "sibling not checked out" warns into a false pass and
+# tool_contracts' "not checked out as sibling" into a false fail.
+# tests/test_sf_preflight_checkout_capability.py derives the tool_contracts
+# half from the committed definition and asserts the weekly box's bootstrap
+# clones every entry, so a new governing repo cannot drift past this list.
+CHECKOUT_SIBLINGS: "tuple[str, ...]" = (
+    "alpha-engine-config",
+    "alpha-engine-research",
+    "alpha-engine-dashboard",
+    "alpha-engine-data",
+)
 
 # Every entry in CHECKS MUST appear here — tests/test_sf_preflight.py pins
 # it, so a new check cannot silently inherit (or silently lose) Lambda

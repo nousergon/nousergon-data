@@ -56,13 +56,41 @@ def test_data_venv_installs_that_repos_own_requirements():
     )
 
 
+def _requirements_krepis_pin() -> str:
+    reqs = (_REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
+    m = re.search(r"^krepis(?:\[[^\]]*\])?==([0-9][^\s#]*)", reqs, re.M)
+    assert m, "requirements.txt no longer pins krepis EXACTLY (==)"
+    return m.group(1)
+
+
+def _version(v: str) -> tuple:
+    return tuple(int(p) for p in v.split("."))
+
+
 def test_data_venv_carries_the_released_krepis_stage_coverage_contract():
-    """The box must not resolve a pre-I8155 fallback implementation."""
+    """The box must not resolve a pre-I8155 fallback implementation.
+
+    The data venv installs requirements.txt, whose krepis pin is EXACT, so
+    that pin IS the contract the box runs. It must be at least I8155's
+    release (0.59.31) and at least the first release carrying
+    krepis.cost.unpriced_live_primaries (0.59.67), which sf_preflight's
+    price_cards check imports on this box (alpha-engine-config-I11568).
+    """
+    pinned = _version(_requirements_krepis_pin())
+    assert pinned >= (0, 59, 31), "pre-I8155 StageVerdict contract"
+    assert pinned >= (0, 59, 67), "pre-unpriced_live_primaries krepis"
+
+
+def test_nothing_overrides_the_data_venvs_own_krepis_pin():
+    """alpha-engine-config-I11568: a hard-coded `pip install krepis==0.59.41`
+    ran AFTER requirements.txt and downgraded the venv below both the repo's
+    own pin and nousergon-lib's krepis>=0.59.52 floor — pip logged the
+    conflict on every bootstrap (measured 2026-09-25) and carried on. A
+    second pin is a second copy that drifts; the repo's own is the only one.
+    """
     src = _src()
-    assert ".venv/bin/pip install -q 'krepis==0.59.41'" in src, (
-        "the data venv must install the released I8155 contract explicitly; "
-        "a floor can resolve a pre-I8155 verdict-key fallback and split a run"
-    )
+    overrides = re.findall(r"\.venv/bin/pip install[^\n]*krepis", src)
+    assert not overrides, f"the data venv's krepis is overridden: {overrides}"
 
 
 def test_data_venv_is_separate_from_the_dashboard_venv():
@@ -105,6 +133,5 @@ def test_data_venv_failures_are_fatal_not_swallowed():
     for expected in (
         'fail "data venv create failed"',
         'fail "data requirements install failed"',
-        'fail "data krepis install failed"',
     ):
         assert expected in src, f"missing hard failure for: {expected}"
