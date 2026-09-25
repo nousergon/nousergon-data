@@ -690,6 +690,69 @@ def _send_corporate_action_email(actions: list, run_date: str) -> None:
         )
 
 
+def _read_earlier_root_file(s3, bucket: str, key: str) -> pd.DataFrame | None:
+    """One earlier shadow root's copy of a D19 file, or ``None`` (logged)."""
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+        frame = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+    except Exception as exc:  # noqa: BLE001 - one missing root is ordinary; the others still count
+        from collectors.price_cache_holes import _is_missing
+
+        (logger.info if _is_missing(exc) else logger.warning)(
+            "[merge base] s3://%s/%s unavailable (%s: %s) — not part of this merge base",
+            bucket, key, type(exc).__name__, exc,
+        )
+        return None
+    if "ticker" in frame.columns:
+        frame = frame.set_index("ticker")
+    return frame[~frame.index.duplicated(keep="last")]
+
+
+def _with_earlier_root_merge_base(
+    s3, bucket: str, key: str, run_date: str, current: pd.DataFrame | None,
+) -> pd.DataFrame | None:
+    """``current`` coalesced with the shadow's own earlier roots' copies of ``key``.
+
+    alpha-engine-config-I11582 — the same source, and the same
+    ``VENDOR_PRECEDENCE``-then-newest ranking, as the hole filler's
+    (``collectors.shadow_earlier_roots.with_earlier_shadow_roots``,
+    alpha-engine-config-I11577). Earlier-root keys are outside the active
+    root, so the interceptor reads them live as inputs this run never writes;
+    v1's live file is never read. The identity outside a shadow root.
+    """
+    from collectors.shadow_earlier_roots import with_earlier_shadow_roots
+
+    merged = with_earlier_shadow_roots(
+        current, key, datetime.strptime(run_date, "%Y-%m-%d").date(),
+        lambda earlier: _read_earlier_root_file(s3, bucket, earlier),
+    )
+    if merged is not None and merged is not current:
+        logger.info(
+            "[merge base] %s: coalesced this root's copy (%s) with the shadow's earlier "
+            "roots — %d ticker(s) (alpha-engine-config-I11582)",
+            run_date, "absent" if current is None else f"{len(current)} tickers", len(merged),
+        )
+    return merged
+
+
+def _read_merge_base(
+    s3, bucket: str, key: str, run_date: str, earlier_root_base: pd.DataFrame | None,
+) -> pd.DataFrame:
+    """The existing parquet ``collect`` merges into.
+
+    ``earlier_root_base`` is already the whole base when the current root had
+    no copy. Otherwise the current copy is read (raising, as before, so the
+    caller's legacy-overwrite fallback still applies to a read fault) and,
+    under a shadow root only, coalesced with the earlier roots.
+    """
+    if earlier_root_base is not None:
+        return earlier_root_base
+    obj = s3.get_object(Bucket=bucket, Key=key)
+    current = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+    merged = _with_earlier_root_merge_base(s3, bucket, key, run_date, current)
+    return current if merged is None else merged
+
+
 def collect(
     bucket: str,
     tickers: list[str],
@@ -935,8 +998,21 @@ def collect(
             raise
         # 404/NoSuchKey: expected case — file doesn't exist, proceed to write.
 
-    if head is not None:
-        last_modified = head["LastModified"]
+    # alpha-engine-config-I11582: under a shadow root the key above is run
+    # state, so it resolves to the CURRENT root's copy — which, on a fresh
+    # daily root, does not exist for a window date. v1 builds this merge base
+    # on the file its earlier runs left in place; the shadow's equivalent is
+    # its own earlier roots. When this call reads a merge base at all
+    # (``polygon_only``, or ``skip_if_canonical``) and the current root has
+    # none, look there before concluding there is nothing to keep. ``None``
+    # outside a shadow root, so production is unchanged.
+    earlier_root_base: pd.DataFrame | None = None
+    reads_merge_base = source == "polygon_only" or skip_if_canonical
+    if head is None and reads_merge_base:
+        earlier_root_base = _with_earlier_root_merge_base(s3, bucket, key, run_date, None)
+
+    if head is not None or earlier_root_base is not None:
+        last_modified = head["LastModified"] if head is not None else None
         if source == "polygon_only":
             # Read existing rows for (a) Close-discrepancy logging and (b) the
             # source-priority coalesce merge before write — so a cell the live
@@ -954,8 +1030,7 @@ def collect(
             # adjusted close stays on the current scale. Mirrors the yfinance
             # side's canonical-skip structure for consistency.
             try:
-                obj = s3.get_object(Bucket=bucket, Key=key)
-                existing_df = pd.read_parquet(io.BytesIO(obj["Body"].read()), engine="pyarrow")
+                existing_df = _read_merge_base(s3, bucket, key, run_date, earlier_root_base)
                 existing_close_for_discrepancy = {
                     str(t): float(existing_df.loc[t, "Close"])
                     for t in existing_df.index
@@ -968,7 +1043,9 @@ def collect(
                 logger.info(
                     "polygon_only: found existing parquet (last_modified=%s, %d tickers) — "
                     "will coalesce (retain-on-empty, priority-ranked) and log Close discrepancies",
-                    last_modified.isoformat(), len(existing_close_for_discrepancy),
+                    last_modified.isoformat() if last_modified is not None
+                    else "none in this shadow root; earlier shadow roots",
+                    len(existing_close_for_discrepancy),
                 )
                 if skip_if_canonical and not dry_run:
                     touched = split_touched_dates or set()
@@ -1011,10 +1088,7 @@ def collect(
             # windowed reconciliation is to fill NaN cells in older dates
             # that legacy logic would skip.
             try:
-                obj = s3.get_object(Bucket=bucket, Key=key)
-                existing_df = pd.read_parquet(
-                    io.BytesIO(obj["Body"].read()), engine="pyarrow",
-                )
+                existing_df = _read_merge_base(s3, bucket, key, run_date, earlier_root_base)
                 if "source" in existing_df.columns:
                     for t in existing_df.index:
                         row = existing_df.loc[t]
