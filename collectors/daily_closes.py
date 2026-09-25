@@ -1268,10 +1268,15 @@ def collect(
     # ``_coalesce_by_source_priority`` primitive above, before the coverage
     # gate — config#720 unified both modes onto this one function; only the
     # gate-ordering and the existing-rows population differ per mode.)
+    # alpha-engine-config-I11559: how many rows of what this run writes were
+    # carried over from the existing object rather than fetched now. Their
+    # settlement is that object's, not this fetch's (`_settlement_guards`).
+    carried_rows = 0
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
             records, existing_rows_for_merge, run_date,
         )
+        carried_rows = merge_stats["retained"] + merge_stats["downgrade_blocked"]
         if merge_stats["retained"] or merge_stats["downgrade_blocked"]:
             logger.warning(
                 "polygon_only coalesce for %s: retained %d prior cell(s) the live pass "
@@ -1389,9 +1394,11 @@ def collect(
             "unexplained_discrepancies": unexplained_discrepancies,
             "xsource_observer": xsource_summary,
             "vendor_divergence": vendor_divergence_record,
-            "guards": [
-                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
-            ],
+            "guards": _settlement_guards(
+                fetch_started_at, run_date, key,
+                carried_rows=carried_rows,
+                carried_from=last_modified if head is not None else None,
+            ),
         }
 
     # ── Step 4: Write to S3 ──────────────────────────────────────────────────
@@ -1422,10 +1429,13 @@ def collect(
             "vendor_divergence": vendor_divergence_record,
             # alpha-engine-config-I11354: D19's settlement verdict, folded onto
             # the run manifest by `weekly_collector._record_collector_guards`.
-            # Observe mode — never moves the exit code.
-            "guards": [
-                bar_settlement_guard_entry(fetch_started_at, run_date, key=key)
-            ],
+            # Observe mode — never moves the exit code. I11559: plus the
+            # reading for rows carried over from the existing object.
+            "guards": _settlement_guards(
+                fetch_started_at, run_date, key,
+                carried_rows=carried_rows,
+                carried_from=last_modified if head is not None else None,
+            ),
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1435,6 +1445,51 @@ def collect(
             "tickers_captured": len(closes_df),
             "source": source,
         }
+
+
+def _settlement_guards(
+    fetch_started_at: datetime,
+    run_date: str,
+    key: str,
+    *,
+    carried_rows: int = 0,
+    carried_from: "datetime | None" = None,
+) -> list[dict]:
+    """The `bar_settlement` readings for one written ``key``.
+
+    The first reading is always this run's fetch, graded on when it began
+    (`alpha-engine-config-I11354`, the D19/D20 rule). `alpha-engine-config-I11559`
+    adds a second when the written file also carries ``carried_rows`` rows
+    taken from the existing object instead of this fetch. The polygon_only
+    coalesce (D17) keeps a ticker polygon did not serve (retain-on-empty) or
+    would have downgraded. Those cells hold the existing object's bar, so they
+    are graded on ITS write time. D19's post-close skip path already uses that
+    rule for the object it leaves in place.
+
+    Measured on 2026-09-22. D17's 12:19Z morning fetch was `settled`, but CPRI
+    and SAM in the file it wrote were D19's 16:06 ET yfinance cells
+    (`provisional`), and they were the only rows that differed from the
+    shadow's. With one `settled` reading the key would have claimed the whole
+    file was settled. When the two readings disagree, `shadow.parity` reads the
+    key's evidence as ambiguous (`_bar_settlement_stamp`) and the row stays
+    strict. It is never explained by a whole-key stamp that is true for only
+    some of its rows.
+
+    Bound: the existing object's write time is the LATEST moment its carried
+    cells can have been fetched. If that object itself carried cells from an
+    earlier write, the reading can be `settled` for a cell that was fetched
+    provisionally. That error only leans toward `settled`.
+    """
+    guards = [bar_settlement_guard_entry(fetch_started_at, run_date, key=key)]
+    if carried_rows and carried_from is not None:
+        carried = bar_settlement_guard_entry(carried_from, run_date, key=key)
+        carried["detail"] = (
+            f"{carried_rows} row(s) of {key} were carried over from the existing object, "
+            f"not fetched by this run; graded on that object's write time. "
+            + carried["detail"]
+        )
+        guards.append(carried)
+    return guards
 
 
 def _collect_window(

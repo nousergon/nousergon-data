@@ -118,6 +118,7 @@ from builders._price_cache_writeboth import (
 from dates import (  # config#1014 trading-day axis; I10893 write guard
     FutureBarError as _FutureBarError,
     assert_no_bar_after as _assert_no_bar_after,
+    bar_settlement_guard_entry as _bar_settlement_guard_entry,
     default_run_date,
 )
 # alpha-engine-config-I10773 (P-06) / I10785 (P-18): one run manifest per unit
@@ -1139,6 +1140,27 @@ def _record_collector_guards(run_ctx, result: dict) -> None:
         run_ctx.record_metric(metric)
 
 
+def _with_bar_settlement(result: dict, *, fetched_at, run_date: str, keys: tuple[str, ...]) -> dict:
+    """``result`` with one `bar_settlement` guard entry per written key.
+
+    `alpha-engine-config-I11203`. The same observe-mode reading D03/D19 already
+    stamp (`dates.bar_settlement_guard_entry`), for a collector that fetches
+    the session's bar itself but does not grade it. Stamped only on a result
+    that WROTE (`status == "ok"`): a key nothing wrote has no bar to describe.
+    ``fetched_at`` is taken immediately before the collector's call — the same
+    "fetch began" convention D19 stamps with (`daily_closes`'s
+    ``fetch_started_at``) — so the two units' verdicts are comparable. A fetch
+    straddling the 18:15 ET threshold by seconds reads `provisional`.
+    """
+    if not isinstance(result, dict) or result.get("status") != "ok":
+        return result
+    stamped = dict(result)
+    stamped["guards"] = list(result.get("guards") or []) + [
+        _bar_settlement_guard_entry(fetched_at, run_date, key=key) for key in keys
+    ]
+    return stamped
+
+
 def _record_rejections(run_ctx, result: dict, pairs: tuple[tuple[str, str], ...]) -> None:
     """Fold a collector's own not-published counts onto its manifest, by reason.
 
@@ -1306,6 +1328,11 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
         finally:
             _CURRENT_RUN_CTX.reset(token)
         captured["result"] = result
+        # alpha-engine-config-I11559: fold on the readings the mode's nested
+        # collectors graded themselves (D17's `bar_settlement` stamp) BEFORE
+        # the status checks, so a failure manifest carries them too — the same
+        # rule `_phase_collect` follows (`alpha-engine-config-I10827`).
+        _record_collector_guards(run_ctx, {"guards": _mode_collector_guards(mode, result)})
         # A mode function returning a non-ok status has FAILED — the manifest
         # says so rather than recording a successful run whose body reported a
         # failure it swallowed (`observability-policy` §3.1). The raise is
@@ -1424,6 +1451,35 @@ def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
 #: arctic write in the same run, and gating this recording behind the arctic
 #: count (as the prior single-key implementation did) left it permanently
 #: unrecorded on every weekday run.
+#: mode -> the nested ``result["collectors"][<name>]`` entries whose
+#: self-graded ``guards`` a whole-mode unit folds onto its own run manifest
+#: (`alpha-engine-config-I11559`). `_phase_collect` folds a collector's guards
+#: because the collector's result IS the phase's result; a whole-mode unit
+#: returns a mode result with its collectors one level down, so their readings
+#: were computed and then dropped. D17 is the case that mattered: its
+#: `daily_closes.collect(source="polygon_only")` call already returns the same
+#: `bar_settlement` stamp D19 records (`dates.bar_settlement_guard_entry`, the
+#: TARGET date's in window mode), and `shadow.parity`'s `v1_bar_provisional`
+#: evidence reads it off the manifest that recorded
+#: `staging/daily_closes/{D}.parquet` — which, after the morning rewrite, is
+#: D17's. Named per mode rather than folded from every nested collector, so a
+#: mode starts carrying a collector's readings by a deliberate edit here.
+_MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
+    "morning_enrich": ("daily_closes",),
+}
+
+
+def _mode_collector_guards(mode: str, result: dict | None) -> list[dict]:
+    """The guard entries :data:`_MODE_GUARD_COLLECTORS` names for ``mode``."""
+    collectors = (result or {}).get("collectors") or {}
+    guards: list[dict] = []
+    for name in _MODE_GUARD_COLLECTORS.get(mode, ()):
+        entry = collectors.get(name)
+        if isinstance(entry, dict):
+            guards.extend(entry.get("guards") or ())
+    return guards
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
     "morning_enrich": (
         (
@@ -4398,9 +4454,21 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     # Metron reads these artifacts (it makes no direct market-data API calls). Reads its
     # own universe from s3://<bucket>/metron/holdings_universe.json (fail-soft → skipped
     # when absent), independent of the constituent `tickers` above.
+    # alpha-engine-config-I11203: D20 fetches the session's closes itself, so its
+    # manifest stamps each closes key with the settlement verdict of THAT fetch
+    # — the evidence `shadow.parity` reads to grade a difference `v1_cause`.
+    d20_fetch_started = datetime.now(timezone.utc)
     results["collectors"]["metron_market_data"] = _phase_collect(
         reg, "metron_market_data",
-        lambda: metron_market_data.collect(bucket=bucket, run_date=run_date, dry_run=dry_run),
+        lambda: _with_bar_settlement(
+            metron_market_data.collect(bucket=bucket, run_date=run_date, dry_run=dry_run),
+            fetched_at=d20_fetch_started,
+            run_date=run_date,
+            keys=(
+                f"{metron_market_data.CLOSES_PREFIX}{run_date}.json",
+                f"{metron_market_data.CLOSES_PREFIX}latest.json",
+            ),
+        ),
         artifact_key=f"{metron_market_data.CLOSES_PREFIX}{run_date}.json",
         # alpha-engine-config-I10855: D20 writes 4 keys unconditionally on
         # status="ok" — dated + latest closes, dated + latest fx
