@@ -1196,8 +1196,15 @@ PARITY_FRESHNESS_TRADING_DAYS = 5
 #: cutover gate reads today — were written under it, and a bump that made them
 #: unreadable would red the clause for a reason that is not a parity fact.
 PARITY_SCHEMA_VERSIONS: frozenset[str] = frozenset(
-    {"data_parity_report.v1", "data_parity_report.v2"}
+    {"data_parity_report.v1", "data_parity_report.v2", "data_parity_report.v3"}
 )
+
+#: Row verdicts a parity report may be MET on (`alpha-engine-config-I11203`,
+#: Brian's ruling 2026-09-24): `match`, and `v1_cause` — a difference whose
+#: cause is PROVEN, by machine-checked evidence recorded inline on the row, to
+#: be on the v1 side. Explained, never folded into `match`: `read_parity`
+#: prints its count separately. Every other verdict stays an exception.
+PARITY_PASSING_VERDICTS: frozenset[str] = frozenset({"match", "v1_cause"})
 
 #: `summary` keys that are NOT verdict counts, so an `exceptions` roll-up must
 #: skip them. `settling_bar_keys` is a BREAKDOWN of `match`, not a class of
@@ -1423,12 +1430,20 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     total = int(summary.get("total") or 0)
     matched = int(summary.get("match") or 0)
     settling = int(summary.get("settling_bar_keys") or 0)
+    v1_caused = int(summary.get("v1_cause") or 0)
     exceptions = {
         name: int(count)
         for name, count in summary.items()
-        if name not in SUMMARY_NON_VERDICT_FIELDS and int(count or 0)
+        if name not in SUMMARY_NON_VERDICT_FIELDS
+        and name not in PARITY_PASSING_VERDICTS
+        and int(count or 0)
     }
-    met = bool(document.get("met")) and total > 0 and matched == total and not exceptions
+    met = (
+        bool(document.get("met"))
+        and total > 0
+        and matched + v1_caused == total
+        and not exceptions
+    )
     mismatch = int(summary.get("mismatch") or 0)
     # A `key_date` key's D-1 pair re-grade (`alpha-engine-config-I11360`,
     # deliverable 3) is NOT a row on this report and never touches `summary`
@@ -1441,6 +1456,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     # report's own per-key verdict tally and stays that.
     prior_day_settled = document.get("prior_day_settled") or {}
     prior_unsettled = int(prior_day_settled.get("unsettled") or 0)
+    prior_v1_caused = int(prior_day_settled.get("v1_cause") or 0)
     met = met and prior_unsettled == 0
     # The THREE-WAY split (`alpha-engine-config-I11351` deliverable 3). A
     # settling-only key already grades `match` — its trading-day cells were
@@ -1452,6 +1468,12 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
         f"{matched}/{total} published keys match ({settling} settling-only, "
         f"{mismatch} mismatch) (report {key}, trading_day {report_day.isoformat()})"
     )
+    # alpha-engine-config-I11203: explained, printed apart — never hidden
+    # inside `match`, and never silent.
+    # Printed whenever the report can carry the verdict (v3+), zero included,
+    # so "none proven" is a reading rather than an absence.
+    if "v1_cause" in summary:
+        detail += f"; v1_cause={v1_caused} (proven v1-side, explained, not matched)"
     if exceptions:
         detail += "; " + ", ".join(f"{name}={count}" for name, count in sorted(exceptions.items()))
     if prior_unsettled:
@@ -1460,6 +1482,11 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             f"forgiven as settling on {prior_day_settled.get('trading_day')}'s report, "
             "re-graded strictly on this report and still mismatches (alpha-engine-config-I11360); "
             "read as a mismatch for this gate"
+        )
+    if prior_v1_caused:
+        detail += (
+            f"; prior_day_settled.v1_cause={prior_v1_caused} — D-1 pairs whose every breach is "
+            "proven to be v1's frozen provisional bar (explained, not settled)"
         )
     if document.get("met") and not met:
         detail += (

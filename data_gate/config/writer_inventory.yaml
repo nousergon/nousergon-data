@@ -264,6 +264,14 @@ shared_writers:
       data_run_manifest.v1 — this IS D16's dispatcher-invoked entry point
       (infrastructure/lambdas/data-spot-dispatcher/index.py::_WORKLOADS
       "rag-weekly-ingestion"), not a substep of the script it wraps.
+  - path: scripts/restore_close_history_bars.py
+    parent_units: [D21]
+    reason: >-
+      alpha-engine-config-I11556: the operator-run restore of close_history bars D21
+      dropped before it carried interior bars forward. It writes D21's own keys
+      (consolidated.json and the per-symbol files) through D21's own put site,
+      collectors/metron_market_data.py::_write_json, and merges with D21's own
+      carry_forward_interior_bars, so its writes are D21's.
 
 # Paths excluded from the scan entirely, each with the reason it is not a
 # producer of a published data key.
