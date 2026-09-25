@@ -9,7 +9,7 @@
 # Flags are STAGED on purpose. A flagless run is code-only, so merging and
 # auto-deploy can never repoint the live schedule:
 #
-#   (no flags)    update the Lambda's code only
+#   (no flags)    update the Lambda's code + converge its timeout (FN_TIMEOUT)
 #   --bootstrap   create the IAM role + Lambda (idempotent)
 #   --apply-iam   re-apply iam-policy.json only, no code/bootstrap side effects (config#2825)
 #   --smoke       fire ONE real run on a REAL spot box (the §47 validation gate)
@@ -69,6 +69,16 @@ ROLE_NAME="alpha-engine-thinktank-spot-dispatcher-role"
 # (alpha-engine-config#6061, config#2340 surface 3).
 POLICY_NAME="alpha-engine-thinktank-spot-dispatcher-role-policy"
 RULE_NAME="alpha-research-thinktank-daily"
+# The function timeout — the ONE place it is declared (alpha-engine-config-I11532).
+# It was 300s, EQUAL to index.py's SSM_ONLINE_BUDGET_SEC, and on 2026-09-23 a
+# slow SSM registration let the wait eat the whole invocation: Lambda killed
+# the handler after the launch and before the send, and the day's run was lost.
+# It must exceed launch + the lib's 200s instance_running waiter +
+# SSM_ONLINE_BUDGET_SEC + send. index.py mirrors it as LAMBDA_TIMEOUT_SECONDS;
+# test_handler.py parses THIS line, fails if the two differ, and fails if the
+# sum above stops fitting. Converged onto the live function on every deploy
+# (step below), so raising it here is the whole change.
+FN_TIMEOUT=900
 # Same topic the alarms this cutover replaces already publish to, so the
 # rotation does not silently change where a Think Tank page lands.
 SNS_TOPIC_ARN="${SNS_TOPIC_ARN:-arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts}"
@@ -165,7 +175,7 @@ if $BOOTSTRAP; then
         --runtime python3.12 --handler index.handler \
         --role "arn:aws:iam::${ACCOUNT_ID}:role/${ROLE_NAME}" \
         --zip-file "fileb://${ZIP}" \
-        --timeout 300 --memory-size 512 \
+        --timeout "$FN_TIMEOUT" --memory-size 512 \
         --region "$REGION" --query 'FunctionArn' --output text
 fi
 
@@ -178,6 +188,22 @@ if ! $DRY_RUN; then
 fi
 
 verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
+
+# ----- Converge the timeout (alpha-engine-config-I11532) --------------------
+# update-function-code never touches configuration, so before this step the
+# timeout was set ONCE, by --bootstrap's create-function, and a change to it in
+# this file was inert on the live function. Timeout ONLY, deliberately: the live
+# function carries no environment (measured 2026-09-25) and `--environment`
+# here would make this file the owner of every env override an operator sets.
+# github-actions-lambda-deploy's LambdaUpdate grant already holds
+# lambda:UpdateFunctionConfiguration on function:alpha-engine-*.
+echo "==> converging function timeout to ${FN_TIMEOUT}s"
+run aws lambda update-function-configuration --function-name "$FUNCTION_NAME" \
+    --timeout "$FN_TIMEOUT" \
+    --region "$REGION" --query 'LastUpdateStatus' --output text
+if ! $DRY_RUN; then
+    aws lambda wait function-updated --function-name "$FUNCTION_NAME" --region "$REGION"
+fi
 
 if $SMOKE; then
     echo "==> SMOKE: firing ONE real Think Tank run on a REAL spot box"
