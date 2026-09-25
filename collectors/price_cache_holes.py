@@ -28,6 +28,9 @@ matched the vendor's own 09-21 / 09-23 closes to a median 2e-8.
   parquet (so a bar filled once is CARRIED FORWARD by every later refresh —
   ``staging/`` expires after 7 days, and a vendor that never restores the
   session would otherwise re-open the hole the day the staging file went).
+  Under a shadow root both sources also look in the shadow's own earlier
+  daily roots (``collectors.shadow_earlier_roots``, alpha-engine-config-I11577
+  / I11582), since a fresh root holds neither; v1's live keys are never read.
 * **Basis.** The cache is dividend-adjusted (``auto_adjust=True``); neither
   source need be on the fetch's current basis. Each filled bar is rescaled by
   ``fetched.Close / source.Close`` measured on the hole's two neighbouring
@@ -76,6 +79,14 @@ _SPLIT_SCALE_THRESHOLD = 0.2
 #: D19 staging file for it should still exist (``staging/`` expires after 7
 #: calendar days), so a miss is a defect, not a known historical gap.
 HOLE_ALERT_TRADING_DAYS = 5
+
+#: Under a shadow root, how many of the shadow's own earlier daily roots (the
+#: NYSE sessions before its trading day, newest first) are searched for a
+#: session's canonical ``staging/daily_closes`` file (alpha-engine-config-I11577)
+#: and for a ticker's cache parquet to carry a filled bar forward from
+#: (alpha-engine-config-I11582). Matches :data:`HOLE_ALERT_TRADING_DAYS`: an
+#: older root has expired with the rest of ``staging/``.
+SHADOW_ROOT_LOOKBACK_SESSIONS = HOLE_ALERT_TRADING_DAYS
 
 _PRICE_COLS = ("Open", "High", "Low", "Close")
 _SAMPLE = 20
@@ -161,26 +172,49 @@ class SessionHoleFiller:
         return [s for s in self._sessions if first < s < last and s not in present]
 
     # ── sources ──────────────────────────────────────────────────────────
-    def _staging_frame(self, session: date) -> "pd.DataFrame | None":
-        if session in self._daily_closes:
-            return self._daily_closes[session]
-        key = f"{DAILY_CLOSES_PREFIX}{session.isoformat()}.parquet"
-        frame = None
+    def _read_daily_closes(self, key: str, session: date) -> "pd.DataFrame | None":
         try:
             obj = self._s3.get_object(Bucket=self._bucket, Key=key)
             frame = pd.read_parquet(io.BytesIO(obj["Body"].read()))
             if "ticker" in frame.columns:
                 frame = frame.set_index("ticker")
-            frame = frame[~frame.index.duplicated(keep="last")]
+            return frame[~frame.index.duplicated(keep="last")]
         except Exception as exc:  # noqa: BLE001 - an absent source is an unfilled hole, recorded
             # Expired staging (7-day lifecycle) is the ordinary case for an old
             # hole and is summarised by report(); anything else is a read fault.
             (logger.info if _is_missing(exc) else logger.warning)(
                 "price_cache hole fill: s3://%s/%s unavailable (%s: %s) — holes on "
-                "%s need the cached parquet instead",
+                "%s need another source",
                 self._bucket, key, type(exc).__name__, exc, session,
             )
-            frame = None
+            return None
+
+    def _staging_frame(self, session: date) -> "pd.DataFrame | None":
+        """D19's canonical closes for ``session``, memoised across tickers.
+
+        Under a shadow root, ``staging/daily_closes/`` is run state
+        (``shadow.interceptor.OWN_STATE_KEY_PATTERNS``), so the plain read
+        resolves to the CURRENT root's copy — on a fresh same-day root, the D19
+        window pass's own yfinance-only rewrite, with none of the polygon rows
+        v1's live file keeps. On 2026-09-24 that file carried 835 tickers'
+        2026-09-21 closes stamped 2026-09-22, and this filler published them
+        (alpha-engine-config-I11577). The copy is therefore coalesced with the
+        shadow's OWN earlier roots' copies
+        (``collectors.shadow_earlier_roots.with_earlier_shadow_roots``, shared
+        with D19's merge base, alpha-engine-config-I11582). v1's live file is
+        never read: a guard-baseline read may decide whether to publish, never
+        supply what is published.
+        """
+        if session in self._daily_closes:
+            return self._daily_closes[session]
+        from collectors.shadow_earlier_roots import with_earlier_shadow_roots
+
+        key = f"{DAILY_CLOSES_PREFIX}{session.isoformat()}.parquet"
+        frame = with_earlier_shadow_roots(
+            self._read_daily_closes(key, session), key, session,
+            lambda earlier: self._read_daily_closes(earlier, session),
+            lookback=SHADOW_ROOT_LOOKBACK_SESSIONS,
+        )
         self._daily_closes[session] = frame
         return frame
 
@@ -195,6 +229,25 @@ class SessionHoleFiller:
             return None
         return pd.DataFrame.from_dict(rows, orient="index")
 
+    def _read_cached(self, key: str, ticker: str, *, own_state: bool) -> "pd.DataFrame | None":
+        from shadow.interceptor import own_state_reads
+
+        try:
+            if own_state:
+                with own_state_reads():
+                    obj = self._s3.get_object(Bucket=self._bucket, Key=key)
+            else:
+                obj = self._s3.get_object(Bucket=self._bucket, Key=key)
+            df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
+        except Exception as exc:  # noqa: BLE001 - missing/unreadable -> next source, recorded below
+            logger.info(
+                "price_cache hole fill: cached parquet %s not usable for %s (%s)",
+                key, ticker, type(exc).__name__,
+            )
+            return None
+        df.index = pd.DatetimeIndex([pd.Timestamp(d) for d in _index_dates(df.index)])
+        return df[~df.index.duplicated(keep="last")]
+
     def _cached_bars(self, ticker: str) -> "pd.DataFrame | None":
         """The ticker's current cache parquet, read as run state.
 
@@ -203,22 +256,54 @@ class SessionHoleFiller:
         (``shadow.interceptor.own_state_reads``) — never a live input the
         same run then overwrites. Outside a shadow root this is a plain read.
         """
-        from shadow.interceptor import own_state_reads
-
         for key in (self._cache_keys(ticker) if self._cache_keys else []):
-            try:
-                with own_state_reads():
-                    obj = self._s3.get_object(Bucket=self._bucket, Key=key)
-                df = pd.read_parquet(io.BytesIO(obj["Body"].read()))
-            except Exception as exc:  # noqa: BLE001 - missing/unreadable -> next source, recorded below
-                logger.info(
-                    "price_cache hole fill: cached parquet %s not usable for %s (%s)",
-                    key, ticker, type(exc).__name__,
-                )
-                continue
-            df.index = pd.DatetimeIndex([pd.Timestamp(d) for d in _index_dates(df.index)])
-            return df[~df.index.duplicated(keep="last")]
+            df = self._read_cached(key, ticker, own_state=True)
+            if df is not None:
+                return df
         return None
+
+    def _cached_frames(self, ticker: str):
+        """Every cache parquet a filled bar may be carried forward from, in order.
+
+        First :meth:`_cached_bars` (the current root's copy under a shadow
+        root, the live cache otherwise). Under a shadow root, then the
+        ticker's cache parquet in each of the shadow's OWN earlier roots,
+        newest first (alpha-engine-config-I11582): on a fresh same-day root the
+        current copy does not exist yet, so without them the shadow could
+        carry nothing forward once ``staging/daily_closes`` expired, where v1
+        carries the bar its earlier run filled. Each frame is tried as a
+        separate source, never merged with another, because each root's
+        series is on its own adjustment basis (``_rescaled_bar`` measures the
+        factor inside one frame). Earlier-root keys are read outside
+        ``own_state_reads()`` — they are outside this root, so the
+        interceptor reads them live as inputs no shadow run ever writes. v1's
+        live cache is never read here. Outside a shadow root this yields the
+        live cache alone, exactly as before.
+        """
+        from collectors.shadow_earlier_roots import earlier_root_days, earlier_root_key
+        from shadow.root import active_root
+
+        current = self._cached_bars(ticker)
+        if current is not None:
+            yield current
+        root = active_root()
+        if root is None or not self._cache_keys:
+            return
+        try:
+            days = earlier_root_days(root, lookback=SHADOW_ROOT_LOOKBACK_SESSIONS)
+        except Exception as exc:  # noqa: BLE001 - a calendar miss leaves the current root only, logged
+            logger.warning(
+                "price_cache hole fill: could not enumerate earlier shadow roots before %s "
+                "(%s) — carry-forward uses the current root's cache only",
+                root.trading_day, exc,
+            )
+            return
+        for day in days:
+            for key in self._cache_keys(ticker):
+                df = self._read_cached(earlier_root_key(key, day), ticker, own_state=False)
+                if df is not None:
+                    yield df
+                    break
 
     # ── fill ─────────────────────────────────────────────────────────────
     def _rescaled_bar(
@@ -285,14 +370,26 @@ class SessionHoleFiller:
             before = fetched.index[fetched.index < ts]
             after = fetched.index[fetched.index > ts]
             sessions_needed |= {before.max().date(), after.min().date()}
-        loaders = (
-            ("daily_closes", lambda: self._staging_bars(ticker, sorted(sessions_needed))),
-            ("cache", lambda: self._cached_bars(ticker)),
-        )
-        for name, load in loaders:
+
+        # Lazily, and stopping as soon as nothing is pending: a hole the D19
+        # file filled costs no cache read, and a hole the current cache filled
+        # costs no earlier-root read (``pending`` is read at each resume).
+        def _sources():
+            yield "daily_closes", self._staging_bars(ticker, sorted(sessions_needed))
+            if not pending:
+                return
+            found = False
+            for frame in self._cached_frames(ticker):
+                found = True
+                yield "cache", frame
+                if not pending:
+                    return
+            if not found:
+                yield "cache", None
+
+        for name, source in _sources():
             if not pending:
                 break
-            source = load()
             if source is None:
                 for h in pending:
                     reasons.setdefault(h, f"{name}: unavailable")
