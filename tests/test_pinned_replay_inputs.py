@@ -202,3 +202,42 @@ def test_a_pinning_failure_never_breaks_the_production_read(monkeypatch):
 
     assert mmd._read_metron_universe_holdings("b", s3, KEY) == []
     assert "VersionId" not in s3.get_calls[-1]
+
+
+def test_a_declared_pin_is_read_from_the_manifest_s_own_inputref_shape():
+    """`alpha-engine-config-I11231`. The lib's `InputRef` is closed
+    (`key`/`etag`/`version`/`schema_version`) and producers key an S3 read as
+    ``s3://<bucket>/<key>``. A declared pin that only matched a bare key under a
+    `version_id` field could never be found on a schema-valid manifest."""
+    s3 = FakeS3(
+        {MANIFEST_KEY: _manifest(
+            "2026-09-18T20:12:15+00:00",
+            [{"key": f"s3://b/{KEY}", "etag": None, "version": "v-declared", "schema_version": None}],
+        )},
+        VERSIONS,
+    )
+
+    pin = pin_for(s3, "b", KEY, unit_id="D22", trading_day=DAY)
+
+    assert pin.basis == "declared"
+    assert pin.version_id == "v-declared"
+
+
+def test_an_unlistable_key_is_named_as_unlistable_not_as_aged_out():
+    """2026-09-24: the version listing was DENIED, and the pin said the version
+    had aged out of retention -- a false cause on the one line that records why a
+    replay read the current object."""
+    s3 = FakeS3({MANIFEST_KEY: _manifest("2026-09-18T20:12:15+00:00")}, VERSIONS)
+
+    def _denied(name):  # noqa: ARG001
+        raise RuntimeError("AccessDenied: s3:ListBucketVersions")
+
+    s3.get_paginator = _denied
+
+    pin = pin_for(s3, "b", KEY, unit_id="D22", trading_day=DAY)
+
+    assert pin.basis == "unpinned"
+    assert pin.version_id is None
+    assert "aged out" not in pin.detail
+    assert "cannot list versions" in pin.detail
+    assert "AccessDenied" in pin.detail
