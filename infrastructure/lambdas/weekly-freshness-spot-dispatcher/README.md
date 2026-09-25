@@ -18,7 +18,9 @@ This **mirrors the fleet dispatcher pattern** (`nousergon_lib.spot_dispatch`
 launches a spot (on-demand fallback on capacity/quota exhaustion), waits for
 SSM Online, fires an **async detached** `ssm send-command` that clones all
 four repos the 14 downstream states' `git -C ... pull --ff-only` commands
-expect at their dashboard-box paths and builds
+expect at their dashboard-box paths (plus `/home/ec2-user/crucible-research`,
+which the on-spot preflight's CAP_CHECKOUT checks read,
+alpha-engine-config-I11568) and builds
 `/home/ec2-user/alpha-engine-dashboard/.venv`, and returns immediately with
 the new instance id. The Step Function's own poll loop
 (`WaitForWeeklyFreshnessSpotBootstrap` / `CheckWeeklyFreshnessSpotBootstrapStatus`

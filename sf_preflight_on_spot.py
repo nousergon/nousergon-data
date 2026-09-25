@@ -25,12 +25,19 @@ holds none of ``iam:SimulatePrincipalPolicy`` / ``lambda:GetAlias`` — running
 them here would report the BOX's IAM, as fails, not the pipeline's.
 
 Capabilities are DETECTED per run, not assumed (``detect_capabilities``). A
-box that has lost arcticdb, the repo modules or the Polygon key reports those
-checks as REQUIRED skips — a named gap — never as a fail and never as silence.
-``CAP_CHECKOUT`` is never claimed: the box does not carry every sibling
-checkout, and that group (price_cards / recursion_budget / tool_contracts) is
-alpha-engine-config-I11313's, owned at merge time. Its skips are EXPECTED and
-are reported apart (``expected_skip_names``) so they cannot escalate.
+box that has lost arcticdb, the repo modules, the Polygon key or a sibling
+checkout reports those checks as REQUIRED skips — a named gap — never as a
+fail and never as silence.
+
+``CAP_CHECKOUT`` (alpha-engine-config-I11568) is claimed only when every
+``sf_preflight.CHECKOUT_SIBLINGS`` entry resolves beside this checkout. Until
+then it was never claimed, so ``tool_contracts`` — REQUIRED — ran nowhere: not
+in the Lambda, not here. The weekly box's bootstrap now clones the one sibling
+it lacked (crucible-research), and a box missing any of them skips
+``tool_contracts`` as a group gap (verdict BLIND_SPOT), not as an expected
+skip. Only the two OPTIONAL checkout checks (price_cards / recursion_budget,
+owned at merge time by alpha-engine-config-I11313) are listed apart as
+``expected_skip_names`` when that happens.
 
 OBSERVE MODE (sf-pipeline-policy.md §7a)
 ----------------------------------------
@@ -61,9 +68,10 @@ consecutive observed cycles (a Friday rehearsal and the following Saturday)
 each show, in the S3 record above:
   1. ``verdict`` != ``ERROR`` and the SF recorded ``observed: true``;
   2. ``group_required_skip_count == 0`` and ``blocked_count == 0`` — all
-     seven ARCTIC/REPO_MODULES/POLYGON checks actually RAN (the issue's
-     closes-when). A ``blocked`` check did not run: its upstream failed
-     (alpha-engine-config-I11566);
+     eight required ARCTIC/REPO_MODULES/POLYGON/CHECKOUT checks actually RAN
+     (the issue's closes-when; tool_contracts joined the group with
+     alpha-engine-config-I11568). A ``blocked`` check did not run: its
+     upstream failed (alpha-engine-config-I11566);
   3. no ``fail`` that was not a true positive — every fail in the window is
      either absent or was confirmed against the system it describes (a fail
      that was the probe's own environment is a false positive and resets the
@@ -125,8 +133,9 @@ OBSERVED_FAIL_EXIT_CODE = 10
 # written artifact instead of an SSM TimedOut with nothing on S3.
 BUDGET_SECONDS = 420
 
-# The capability group this pass exists to reach (alpha-engine-config-I11312).
-IN_SCOPE_CAPABILITIES = frozenset({"arctic", "repo_modules", "polygon"})
+# The capability group this pass exists to reach (alpha-engine-config-I11312;
+# "checkout" joined with alpha-engine-config-I11568).
+IN_SCOPE_CAPABILITIES = frozenset({"arctic", "repo_modules", "polygon", "checkout"})
 
 # Modules the REPO_MODULES capability names (sf_preflight.CAP_REPO_MODULES).
 _REPO_MODULES = ("collectors", "features", "builders", "polygon_client")
@@ -143,9 +152,9 @@ def _on_alarm(signum, frame):  # pragma: no cover - signal plumbing
 
 
 def detect_capabilities() -> frozenset:
-    """What THIS host provides, measured — never CAP_CHECKOUT (see module
-    docstring). Each probe is independently guarded: a probe that raises
-    withholds its capability, which surfaces as a required skip."""
+    """What THIS host provides, measured. Each probe is independently
+    guarded: a probe that raises withholds its capability, which surfaces as
+    a required skip."""
     import sf_preflight as sp
 
     caps = {sp.CAP_AWS}
@@ -166,6 +175,17 @@ def detect_capabilities() -> frozenset:
             caps.add(sp.CAP_POLYGON)
     except Exception as exc:  # noqa: BLE001 - a failed probe withholds the capability
         log.warning("POLYGON_API_KEY probe raised: %s", exc)
+    try:
+        # All or nothing (alpha-engine-config-I11568): a partial set would let
+        # the optional checks warn their way past a missing sibling and make
+        # tool_contracts fail on the box's layout rather than on the system.
+        absent = [n for n in sp.CHECKOUT_SIBLINGS if sp._sibling_repo(n) is None]
+        if absent:
+            log.error("sibling checkout(s) absent, CAP_CHECKOUT withheld: %s", absent)
+        else:
+            caps.add(sp.CAP_CHECKOUT)
+    except Exception as exc:  # noqa: BLE001 - a failed probe withholds the capability
+        log.warning("sibling-checkout probe raised: %s", exc)
     return frozenset(caps)
 
 
@@ -185,10 +205,11 @@ def classify(results: list) -> dict:
 
     ``required_skip_count`` is ``sf_preflight.summarize_results``'s — the
     same number the Lambda reports, so the two are comparable.
-    ``group_required_skip_count`` narrows it to the ARCTIC/REPO_MODULES/
-    POLYGON group this pass exists for; it is the closes-when metric and the
-    one the promotion criterion reads. A skip whose ONLY missing capability
-    is CAP_CHECKOUT is expected here and is listed, not escalated.
+    ``group_required_skip_count`` narrows it to the REQUIRED checks of the
+    ARCTIC/REPO_MODULES/POLYGON/CHECKOUT group this pass exists for; it is
+    the closes-when metric and the one the promotion criterion reads. A skip
+    of an OPTIONAL check (CHECK_REQUIRED False) is listed as expected, never
+    escalated.
     """
     import sf_preflight as sp
 
@@ -197,11 +218,9 @@ def classify(results: list) -> dict:
     for r in summary["skip_results"]:
         fn_name = f"check_{r['name']}"
         needs = sp.CHECK_CAPABILITIES.get(fn_name, sp.FULL_CAPABILITIES)
-        missing = set((r.get("details") or {}).get("missing") or ())
-        if needs & IN_SCOPE_CAPABILITIES:
-            if sp.CHECK_REQUIRED.get(fn_name, True):
-                group_skips.append(r["name"])
-        elif missing and missing <= {sp.CAP_CHECKOUT}:
+        if needs & IN_SCOPE_CAPABILITIES and sp.CHECK_REQUIRED.get(fn_name, True):
+            group_skips.append(r["name"])
+        else:
             expected_skips.append(r["name"])
     if summary["fail_count"]:
         verdict = "FAIL"
