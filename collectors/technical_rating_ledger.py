@@ -151,9 +151,58 @@ def _as_series(values: list[float]):
 LEDGER_PIN_UNIT_ID = "D26"
 
 
-def _read_ledger_manifest(s3_client: Any, bucket: str) -> dict | None:
+def _get_ledger_manifest(
+    s3_client: Any, bucket: str, *, version_id: str | None = None,
+) -> tuple[dict | None, dict]:
+    """``(manifest, input_ref)`` for one read of the ledger manifest.
+
+    ``input_ref`` is the lib's closed ``InputRef`` for the run manifest
+    (alpha-engine-config-I11231): the version this run actually built on. v1
+    recording it is what gives a later shadow of the day a DECLARED pin
+    (``shadow.pinned_inputs._declared``) — one exact ``GetObject`` by VersionId,
+    with no ``s3:ListBucketVersions`` listing to infer it. On the 2026-09-24
+    same-day shadow that listing was AccessDenied and v1's D26 manifest carried
+    ``inputs: []``, so neither pin could resolve and D26 read v1's own write.
+
+    Raises on a failed read; a missing object is ``(None, <ref with no version>)``
+    through the caller's fallback, exactly as ``mmd._read_json`` treats it.
+    """
+    params: dict[str, Any] = {"Bucket": bucket, "Key": RATING_LEDGER_MANIFEST_KEY}
+    if version_id is not None:
+        params["VersionId"] = version_id
+    obj = s3_client.get_object(**params)
+    manifest = json.loads(obj["Body"].read())
+    read_version = obj.get("VersionId") or version_id
+    etag = obj.get("ETag")
+    return manifest, {
+        "key": f"s3://{bucket}/{RATING_LEDGER_MANIFEST_KEY}",
+        "etag": str(etag).strip('"') if etag else None,
+        "version": str(read_version) if read_version else None,
+        "schema_version": None,
+    }
+
+
+def _read_current_ledger_manifest(s3_client: Any, bucket: str) -> tuple[dict | None, dict]:
+    """The CURRENT object, fail-soft to ``None`` on any miss like ``mmd._read_json``."""
+    try:
+        return _get_ledger_manifest(s3_client, bucket)
+    except Exception:  # noqa: BLE001 - see the three-part rationale below
+        # DELIBERATE degrade — the contract `mmd._read_json` gave this read before it
+        # needed the VersionId. (a) Failure mode swallowed: the manifest is absent (the
+        # ledger's first run) or unreadable/unparseable. (b) The primary deliverable
+        # survives: the ledger self-seeds from an empty manifest, as it always has. (c)
+        # Recording surface: the returned InputRef carries no `version`, so the run
+        # manifest shows the ledger was read at no recorded version.
+        return None, {
+            "key": f"s3://{bucket}/{RATING_LEDGER_MANIFEST_KEY}",
+            "etag": None, "version": None, "schema_version": None,
+        }
+
+
+def _read_ledger_manifest(s3_client: Any, bucket: str) -> tuple[dict | None, dict]:
     """The ledger manifest this run should build on — the CURRENT object in
-    production; under a shadow replay, the version v1 itself built on.
+    production; under a shadow replay, the version v1 itself built on — and the
+    ``InputRef`` naming the version actually read.
 
     alpha-engine-config-I11231. The manifest is a read-modify-write key: D26 reads it,
     adds the trading day, and writes it back. A shadow run of day D executes after v1's
@@ -192,16 +241,20 @@ def _read_ledger_manifest(s3_client: Any, bucket: str) -> dict | None:
             RATING_LEDGER_MANIFEST_KEY, exc,
         )
     if pin is None or not pin.is_pinned:
-        return mmd._read_json(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY)
+        if pin is not None:
+            # The pin's own reason, always: in production it says no replay is active; in a
+            # shadow run it is the only line that says WHY the current object was read.
+            logger.info(
+                "[technical_rating_ledger] %s unpinned (%s) — reading the CURRENT object",
+                RATING_LEDGER_MANIFEST_KEY, pin.detail,
+            )
+        return _read_current_ledger_manifest(s3_client, bucket)
     logger.info(
         "[technical_rating_ledger] %s pinned to version %s (%s: %s)",
         RATING_LEDGER_MANIFEST_KEY, pin.version_id, pin.basis, pin.detail,
     )
     try:
-        obj = s3_client.get_object(
-            Bucket=bucket, Key=RATING_LEDGER_MANIFEST_KEY, VersionId=pin.version_id,
-        )
-        return json.loads(obj["Body"].read())
+        return _get_ledger_manifest(s3_client, bucket, version_id=pin.version_id)
     except Exception as exc:  # noqa: BLE001 - see the three-part rationale below
         # DELIBERATE degrade, at WARNING. (a) Failure mode swallowed: the pinned VERSION
         # could not be read or parsed. (b) The primary deliverable survives: the current
@@ -213,7 +266,7 @@ def _read_ledger_manifest(s3_client: Any, bucket: str) -> dict | None:
             "CURRENT object (alpha-engine-config-I11231)",
             pin.version_id, RATING_LEDGER_MANIFEST_KEY, exc,
         )
-        return mmd._read_json(s3_client, bucket, RATING_LEDGER_MANIFEST_KEY)
+        return _read_current_ledger_manifest(s3_client, bucket)
 
 
 def collect_rating_ledger(
@@ -250,9 +303,8 @@ def collect_rating_ledger(
     if not ref_calendar:
         return {"status": "skipped", "reason": "empty reference calendar"}
 
-    manifest = _read_ledger_manifest(s3_client, bucket) or {
-        "schema_version": LEDGER_MANIFEST_SCHEMA_VERSION, "dates": [],
-    }
+    manifest, ledger_input_ref = _read_ledger_manifest(s3_client, bucket)
+    manifest = manifest or {"schema_version": LEDGER_MANIFEST_SCHEMA_VERSION, "dates": []}
     existing_by_date: dict[str, dict] = {e["date"]: e for e in manifest.get("dates", [])}
 
     # The trailing `LEDGER_BACKFILL_MIN_DATES` sessions STRICTLY BEFORE run_date — the
@@ -335,6 +387,11 @@ def collect_rating_ledger(
     result = {
         "status": "ok", "backfill_written": backfill_written, "live_written": live_written,
         "live_skipped_reason": live_skipped_reason, "total_dates": len(existing_by_date),
+        # alpha-engine-config-I11231: the ledger version this run built on, folded onto
+        # the run manifest's `inputs` by `weekly_collector._record_phase_lineage` —
+        # v1's record is a later shadow's DECLARED pin, and a shadow's own record
+        # shows whether it built on v1's base or on v1's write.
+        "input_refs": [ledger_input_ref],
     }
     # alpha-engine-config-I11231: nothing published this cycle, and the reason is
     # the immutability contract correctly declining a rewrite -- not an empty
