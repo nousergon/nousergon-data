@@ -467,8 +467,9 @@ def _log_yf_coverage(
 # session trades, not from the lagging daily store. (That was not measurable
 # where this was written, which had no route to the vendor; the next shadow
 # run is the measurement, and a miss degrades to the truthful D-1 path below.)
-# So a symbol whose daily fetch ends before D gets D's close from D's own
-# intraday session, only after that
+# So a symbol whose daily fetch ends one session before D
+# (``_lagging_by_one_session``) gets D's close from D's own intraday session,
+# only after that
 # session has ended by the vendor's declared regular-session end. The bar_date
 # stays truthful: a symbol with no complete day-D intraday session keeps its
 # earlier bar_date and is reported as stale (``_log_stale_bars``); it is never
@@ -477,6 +478,17 @@ def _log_yf_coverage(
 #: Intraday interval for the day-D session close. Hourly bars are served for
 #: ~730 days, so a ``--date D`` rerun weeks later can still take this path.
 SESSION_CLOSE_INTERVAL = "1h"
+#: Only a daily series that ends within this many calendar days before D is
+#: "lagging by the rollover" (D-1, or the Friday before a Monday D plus one
+#: holiday). A series that ends earlier has stopped for another reason, and
+#: one intraday close after that gap would not be the missing bar.
+SESSION_CLOSE_MAX_LAG_DAYS = 5
+
+
+def _lagging_by_one_session(last_bar: str, trading_day: str) -> bool:
+    """True when a daily series ending at ``last_bar`` lacks only D's bar."""
+    gap = (date.fromisoformat(trading_day[:10]) - date.fromisoformat(last_bar[:10])).days
+    return 0 < gap <= SESSION_CLOSE_MAX_LAG_DAYS
 
 
 def _session_close_from_intraday(
@@ -644,7 +656,7 @@ def _yfinance_closes(
                     logger.warning("[metron_market_data] close extract failed for %s: %s", sym, e)
         except Exception as e:
             logger.warning("[metron_market_data] yfinance close batch failed: %s", e)
-    behind = sorted(s for s, (_c, d) in out.items() if d < trading_day[:10])
+    behind = sorted(s for s, (_c, d) in out.items() if _lagging_by_one_session(d, trading_day))
     for sym, close in _yfinance_session_closes(behind, trading_day=trading_day).items():
         out[sym] = (round(close, 4), trading_day[:10])
     logger.info("[metron_market_data] closes: %d/%d symbols priced", len(out), len(yf_symbols))
@@ -757,7 +769,7 @@ def _yf_history(
         # from its completed intraday session. The session's last price is the
         # adjusted close too: an adjustment only rescales bars BEFORE an event.
         day = str(trading_day)[:10]
-        behind = sorted(s for s, series in out.items() if series[-1][0] < day)
+        behind = sorted(s for s, series in out.items() if _lagging_by_one_session(series[-1][0], day))
         for sym, close in _yfinance_session_closes(behind, trading_day=day).items():
             out[sym] = [*out[sym], (day, close)]
     logger.info("[metron_market_data] history: %d/%d series captured", len(out), len(targets))

@@ -262,3 +262,28 @@ def test_d20_reports_a_symbol_that_stays_behind_d(caplog):
 
 def test_log_stale_bars_is_empty_when_every_bar_is_d():
     assert mmd._log_stale_bars("closes", {"AAPL": D, "NOVN.SW": D}, D) == {}
+
+
+def test_a_series_that_stopped_long_before_d_is_not_filled(monkeypatch):
+    """Only a series lagging by the rollover is filled: one ending a week or more
+    before D has stopped for another reason, and an intraday close would open a gap."""
+    import yfinance
+
+    calls: list = []
+    _Ticker.requested = []
+    _Ticker.serve_intraday = True
+    monkeypatch.setattr(mmd.time, "sleep", lambda *_: None)
+    monkeypatch.setattr(yfinance, "download", _daily_download(calls, eu_through="2026-09-16"))
+    monkeypatch.setattr(yfinance, "Ticker", _Ticker)
+    closes = mmd._yfinance_closes(EU, trading_day=D)
+    series = mmd._yfinance_close_history_dividend_adjusted(EU, "1y", trading_day=D)
+    assert _Ticker.requested == []
+    assert {s: closes[s][1] for s in EU} == dict.fromkeys(EU, "2026-09-16")
+    assert all(series[s][-1][0] == "2026-09-16" for s in EU)
+
+
+@pytest.mark.parametrize("last, lagging", [
+    ("2026-09-23", True), ("2026-09-19", True), ("2026-09-18", False), ("2026-09-24", False),
+])
+def test_lagging_by_one_session(last, lagging):
+    assert mmd._lagging_by_one_session(last, D) is lagging
