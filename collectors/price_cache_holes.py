@@ -316,6 +316,17 @@ class SessionHoleFiller:
         add.index.name = fetched.index.name
         return pd.concat([fetched, add]).sort_index()
 
+    def discard(self, ticker: str) -> None:
+        """Forget what :meth:`fill` recorded for ``ticker``.
+
+        ``_refresh_stale`` fills BEFORE its write guards so they judge the
+        frame it would publish (alpha-engine-config-I11576); a ticker a guard
+        then refuses publishes nothing, so its fills must not be reported as
+        published — nor its unfilled holes as "published missing".
+        """
+        self.filled.pop(ticker, None)
+        self.unfilled.pop(ticker, None)
+
     # ── recording ────────────────────────────────────────────────────────
     def report(self, log: logging.Logger = logger) -> dict:
         """Emit the run's one aggregated record per outcome; return the summary."""
