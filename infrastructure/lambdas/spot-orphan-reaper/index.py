@@ -33,11 +33,15 @@ covers the gap between that watchdog firing and the reaper's hourly cadence.
 Every new workload should emit ``watchdog-deadline`` rather than fitting under
 the fallback cap.
 
-Hourly EventBridge cron scans running ``alpha-engine-*`` spot instances and
-terminates any older than its effective threshold. Emits CloudWatch custom
-metric ``AlphaEngine/Infra/spot_orphans_terminated`` (sum) with a ``name``
-dimension (the box's Name tag) — purely for observability, NOT feeding the reap
-decision.
+Hourly EventBridge cron scans running ``alpha-engine-*`` run boxes (every spot
+instance, plus every on-demand instance the launcher tagged
+``LaunchMarket=on-demand``; see ``_SCAN_SCOPES``) and terminates any older than
+its effective threshold. Emits CloudWatch custom metric
+``AlphaEngine/Infra/spot_orphans_terminated`` (sum) with a ``name`` dimension
+(the box's Name tag), and on every run ``orphan_reaper_candidates`` /
+``orphan_reaper_terminated`` with a ``market`` dimension, zeros included, so a
+scan that stops matching is visible. All purely for observability, NOT feeding
+the reap decision.
 
 WATCH-KIND INCOMPLETE-REAP ALERT (additive, generalized config#2106): for a
 small, explicit set of "watch" workloads (Fleet CI Watch, Fleet-SF Watch,
@@ -161,35 +165,75 @@ REAP_AFTER_SECONDS = MAX_SPOT_BUDGET_SECONDS + GRACE_SECONDS
 DRY_RUN = os.environ.get("DRY_RUN", "false").lower() == "true"
 
 
+# alpha-engine-config-I11108 / I7185 / I11575: the scan used to filter on
+# ``instance-lifecycle=spot`` alone, so a box the launcher fell back to
+# ON-DEMAND capacity for was invisible here. The 2026-09-19 weekly run leaked
+# a c5.large for ~8h while this Lambda logged "Scanned 0". Every weekly
+# launcher box is now on-demand (force_on_demand), and
+# ``spot_dispatch.launch_with_fallback`` falls back to on-demand on a capacity
+# dip for every dispatcher.
+#
+# The fix is NOT "drop the lifecycle filter". ``alpha-engine-dashboard`` and
+# ``alpha-engine-executor`` are long-lived on-demand boxes with the same Name
+# prefix and no watchdog-deadline tag, so a Name-only scan would terminate the
+# dashboard at the 6.5h fallback cap. An on-demand box is in scope only when
+# the launcher chokepoint marked it ephemeral: ``launch_with_fallback`` (and
+# ``_spot_relaunch.sh``'s ``launch --no-spot``) stamp ``LaunchMarket`` on the
+# same RunInstances call, and nothing else in the fleet sets that tag.
+LAUNCH_MARKET_TAG = "LaunchMarket"
+MARKET_SPOT = "spot"
+MARKET_ON_DEMAND = "on-demand"
+
+_SCAN_SCOPES: tuple[tuple[str, dict], ...] = (
+    (MARKET_SPOT, {"Name": "instance-lifecycle", "Values": ["spot"]}),
+    (MARKET_ON_DEMAND, {"Name": f"tag:{LAUNCH_MARKET_TAG}", "Values": [MARKET_ON_DEMAND]}),
+)
+
+
 def _scan_spot_instances(ec2) -> list[dict]:
-    """List running alpha-engine-tagged spot instances."""
+    """List running alpha-engine run boxes: every spot instance, plus every
+    on-demand instance the launcher chokepoint tagged ``LaunchMarket=on-demand``.
+
+    Two scans because EC2 filters AND together; an instance matched by both is
+    kept once, attributed to the spot scope. ``InstanceLifecycle`` decides the
+    reported market when present, since it is what EC2 billed."""
     paginator = ec2.get_paginator("describe_instances")
     out: list[dict] = []
-    for page in paginator.paginate(
-        Filters=[
-            {"Name": "instance-state-name", "Values": ["running"]},
-            {"Name": "instance-lifecycle", "Values": ["spot"]},
-            {"Name": "tag:Name", "Values": ["alpha-engine-*"]},
-        ],
-    ):
-        for reservation in page.get("Reservations", []):
-            for inst in reservation.get("Instances", []):
-                tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
-                out.append({
-                    "instance_id": inst["InstanceId"],
-                    "name": tags.get("Name", ""),
-                    "launch_time": inst["LaunchTime"],
-                    "instance_type": inst.get("InstanceType", ""),
-                    # Only meaningful for a WATCH_KINDS-tagged box; empty
-                    # (harmless no-op) for every other workload's instances.
-                    "watch_tags": {k: tags.get(k, "") for k in _ALL_DISCRIMINATOR_TAG_KEYS},
-                    # Optional per-box watchdog deadline (ISO8601 UTC, set
-                    # atomically with RunInstances by the launcher via
-                    # spot_dispatch.launch_with_fallback(extra_tags=...)).
-                    # When present and parseable, the reap decision uses this
-                    # deadline + GRACE_SECONDS instead of the global cap.
-                    "watchdog_deadline": tags.get("watchdog-deadline", ""),
-                })
+    seen: set[str] = set()
+    for scope_market, scope_filter in _SCAN_SCOPES:
+        for page in paginator.paginate(
+            Filters=[
+                {"Name": "instance-state-name", "Values": ["running"]},
+                scope_filter,
+                {"Name": "tag:Name", "Values": ["alpha-engine-*"]},
+            ],
+        ):
+            for reservation in page.get("Reservations", []):
+                for inst in reservation.get("Instances", []):
+                    if inst["InstanceId"] in seen:
+                        continue
+                    seen.add(inst["InstanceId"])
+                    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+                    market = (
+                        MARKET_SPOT if inst.get("InstanceLifecycle") == "spot"
+                        else tags.get(LAUNCH_MARKET_TAG) or scope_market
+                    )
+                    out.append({
+                        "instance_id": inst["InstanceId"],
+                        "name": tags.get("Name", ""),
+                        "launch_time": inst["LaunchTime"],
+                        "instance_type": inst.get("InstanceType", ""),
+                        "market": market,
+                        # Only meaningful for a WATCH_KINDS-tagged box; empty
+                        # (harmless no-op) for every other workload's instances.
+                        "watch_tags": {k: tags.get(k, "") for k in _ALL_DISCRIMINATOR_TAG_KEYS},
+                        # Optional per-box watchdog deadline (ISO8601 UTC, set
+                        # atomically with RunInstances by the launcher via
+                        # spot_dispatch.launch_with_fallback(extra_tags=...)).
+                        # When present and parseable, the reap decision uses this
+                        # deadline + GRACE_SECONDS instead of the global cap.
+                        "watchdog_deadline": tags.get("watchdog-deadline", ""),
+                    })
     return out
 
 
@@ -285,6 +329,31 @@ def _emit_metric(cw, name: str, count: int) -> None:
         logger.warning("CloudWatch put_metric_data failed for %s: %s", name, exc)
 
 
+def _emit_scan_metrics(cw, scanned: dict[str, int], terminated: dict[str, int]) -> None:
+    """Per-market candidates and reaps, emitted on EVERY run, zeros included
+    (alpha-engine-config-I11108 deliverable 2). ``spot_orphans_terminated``
+    above only emits on a reap, so a scan that stopped matching anything read
+    exactly like a healthy fleet. A candidates series is a line that drops to
+    zero when the filter goes blind. Separate metric names, so the existing
+    ``name``-dimensioned series and any alarm on it are unchanged."""
+    data = []
+    for market in (MARKET_SPOT, MARKET_ON_DEMAND):
+        for metric, counts in (
+            ("orphan_reaper_candidates", scanned),
+            ("orphan_reaper_terminated", terminated),
+        ):
+            data.append({
+                "MetricName": metric,
+                "Dimensions": [{"Name": "market", "Value": market}],
+                "Value": float(counts.get(market, 0)),
+                "Unit": "Count",
+            })
+    try:
+        cw.put_metric_data(Namespace="AlphaEngine/Infra", MetricData=data)
+    except Exception as exc:
+        logger.warning("CloudWatch put_metric_data failed for scan metrics: %s", exc)
+
+
 def handler(event: dict, context) -> dict:
     """Hourly orphan scan + termination.
 
@@ -297,14 +366,19 @@ def handler(event: dict, context) -> dict:
     threshold = timedelta(seconds=REAP_AFTER_SECONDS)
 
     instances = _scan_spot_instances(ec2)
+    scanned_by_market: dict[str, int] = {}
+    for inst in instances:
+        scanned_by_market[inst["market"]] = scanned_by_market.get(inst["market"], 0) + 1
     logger.info(
-        "Scanned %d running alpha-engine spot instances (reap threshold=%ds)",
-        len(instances), REAP_AFTER_SECONDS,
+        "Scanned %d running alpha-engine run boxes (spot=%d, on-demand=%d; reap threshold=%ds)",
+        len(instances), scanned_by_market.get(MARKET_SPOT, 0),
+        scanned_by_market.get(MARKET_ON_DEMAND, 0), REAP_AFTER_SECONDS,
     )
 
     orphans: list[dict] = []
     terminated: list[str] = []
     per_name_terminated: dict[str, int] = {}
+    terminated_by_market: dict[str, int] = {}
     incomplete_reaps: dict[str, list[str]] = {wk.result_key: [] for wk in WATCH_KINDS}
 
     for inst in instances:
@@ -338,6 +412,7 @@ def handler(event: dict, context) -> dict:
             "age_seconds": int(age.total_seconds()),
             "reap_after_seconds": int(effective_threshold.total_seconds()),
             "instance_type": inst["instance_type"],
+            "market": inst["market"],
             "watchdog_deadline": watchdog_deadline_str or None,
         })
         if DRY_RUN:
@@ -351,9 +426,10 @@ def handler(event: dict, context) -> dict:
             ec2.terminate_instances(InstanceIds=[inst["instance_id"]])
             terminated.append(inst["instance_id"])
             per_name_terminated[inst["name"]] = per_name_terminated.get(inst["name"], 0) + 1
+            terminated_by_market[inst["market"]] = terminated_by_market.get(inst["market"], 0) + 1
             logger.warning(
-                "Terminated orphan %s (%s, age=%ds, reap_after=%ds, type=%s)",
-                inst["instance_id"], inst["name"], int(age.total_seconds()),
+                "Terminated orphan %s (%s, market=%s, age=%ds, reap_after=%ds, type=%s)",
+                inst["instance_id"], inst["name"], inst["market"], int(age.total_seconds()),
                 int(effective_threshold.total_seconds()), inst["instance_type"],
             )
             # WATCH_KINDS migration (additive — every other tag's reap path
@@ -372,9 +448,12 @@ def handler(event: dict, context) -> dict:
 
     for name, count in per_name_terminated.items():
         _emit_metric(cw, name, count)
+    _emit_scan_metrics(cw, scanned_by_market, terminated_by_market)
 
     return {
         "scanned": len(instances),
+        "scanned_by_market": scanned_by_market,
+        "terminated_by_market": terminated_by_market,
         "orphans_detected": len(orphans),
         "terminated": terminated,
         "dry_run": DRY_RUN,
