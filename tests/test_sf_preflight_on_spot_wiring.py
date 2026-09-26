@@ -3,11 +3,9 @@
 
 Three properties, each the reason the state exists or the reason it is safe:
 
-1. PLACEMENT — entered only from CheckSubstrateHealthGate's HEALTHY edge,
-   exits only to CheckShellRun: after the box is bootstrapped and proven
-   SSM-responsive, before any stage is dispatched.
-2. OBSERVE MODE FAILS OPEN — no path out of the observe chain reaches a
-   failure state, sets $.error, or writes a degraded flag.
+1. PLACEMENT — entered only from CheckSubstrateHealthGate's HEALTHY edge.
+2. ENFORCE on observed FAIL; fail OPEN on unobserved — a measured FAIL of a
+   required check halts; a crash/timeout/SSM miss does not.
 3. The observed-FAIL exit code in the module and the ResponseCode the
    Choice matches are the same number.
 """
@@ -31,6 +29,7 @@ CHAIN = {
     "MergeWeeklyPreflightOnSpotPollCount",
     "RecordWeeklyPreflightOnSpot",
     "RecordWeeklyPreflightOnSpotFail",
+    "ExtractWeeklyPreflightOnSpotFail",
     "WeeklyPreflightOnSpotUnobserved",
     "PublishWeeklyPreflightOnSpotNotice",
 }
@@ -63,15 +62,19 @@ def test_only_entry_is_the_substrate_gate_healthy_edge():
     assert json.dumps(healthy[0]).count('"HEALTHY"') == 1
 
 
-def test_only_exit_is_check_shell_run():
+def test_clean_and_unobserved_exit_to_check_shell_run():
+    """OK and unobserved still converge on CheckShellRun; FAIL halts."""
     states = _states()
-    exits = {tgt for name in CHAIN for tgt in _succ(states[name]) if tgt not in CHAIN}
-    assert exits == {"CheckShellRun"}
+    assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
+    assert states["PublishWeeklyPreflightOnSpotNotice"]["Next"] == "CheckShellRun"
+    assert states["WeeklyPreflightOnSpotUnobserved"]["Next"] == "PublishWeeklyPreflightOnSpotNotice"
+    assert states["RecordWeeklyPreflightOnSpotFail"]["Next"] == "ExtractWeeklyPreflightOnSpotFail"
+    assert states["ExtractWeeklyPreflightOnSpotFail"]["Next"] == "NormalizeFailureContext"
+    assert states["ExtractWeeklyPreflightOnSpotFail"]["ResultPath"] == "$.error"
 
 
-def test_every_non_success_outcome_proceeds():
-    """Fail OPEN: both Catches land on the unobserved arm, the Choice Default
-    too, and the notice's own Catch goes on to CheckShellRun."""
+def test_unobserved_still_fails_open():
+    """Crash/timeout/SSM miss must not halt — only a measured FAIL does."""
     states = _states()
     for name in ("WeeklyPreflightOnSpot", "WaitForWeeklyPreflightOnSpot"):
         catches = states[name]["Catch"]
@@ -83,17 +86,18 @@ def test_every_non_success_outcome_proceeds():
     assert notice["Next"] == "CheckShellRun"
     assert [c["Next"] for c in notice["Catch"]] == ["CheckShellRun"]
     assert "Retry" not in states["WeeklyPreflightOnSpot"], (
-        "observe-mode probe: a retry ladder only delays the run it cannot protect"
+        "unobserved path: a retry ladder only delays the run it cannot protect"
     )
 
 
-def test_observe_chain_writes_no_error_or_degraded_flag():
-    """Observe mode may not change how the run terminates: no $.error (the
-    HandleFailure input), no $.gate_degraded / $.degraded_summary family."""
+def test_observed_fail_writes_error_via_extract():
+    """Enforce: the FAIL arm is the only chain member that may write $.error."""
     states = _states()
-    for name in CHAIN:
+    for name in CHAIN - {"ExtractWeeklyPreflightOnSpotFail"}:
         rp = states[name].get("ResultPath", "")
         assert rp == "" or rp.startswith("$.weekly_preflight_on_spot"), (name, rp)
+    assert states["ExtractWeeklyPreflightOnSpotFail"]["ResultPath"] == "$.error"
+    assert states["RecordWeeklyPreflightOnSpotFail"]["Parameters"]["mode"] == "enforce"
 
 
 def test_observed_fail_code_matches_the_choice():
@@ -108,12 +112,8 @@ def test_command_runs_the_module_from_the_data_venv():
     cmd = _states()["WeeklyPreflightOnSpot"]["Parameters"]["Parameters"]["commands.$"]
     assert "/home/ec2-user/alpha-engine-data/.venv/bin/python sf_preflight_on_spot.py" in cmd
     assert "cd /home/ec2-user/alpha-engine-data" in cmd
-    # The module is the LAST command, so its exit code is the script's —
-    # which is what CheckWeeklyPreflightOnSpotStatus matches on.
     assert cmd.rstrip(")").rstrip().endswith("$.run_date,$$.Execution.Name")
     assert cmd.index("sf_preflight_on_spot.py") > cmd.index("cd /home/ec2-user/alpha-engine-data")
-    # Nothing but the module's verdict line may reach stdout: the git pull is
-    # redirected so RecordWeeklyPreflightOnSpot's stored line stays clean.
     assert "pull --ff-only origin main >&2" in cmd
 
 
@@ -143,3 +143,7 @@ def test_recorded_on_both_polarities():
     for n in ("RecordWeeklyPreflightOnSpotFail", "WeeklyPreflightOnSpotUnobserved"):
         params = states[n]["Parameters"]
         assert "headline" in params and ("detail" in params or "detail.$" in params), n
+
+
+def test_module_mode_is_enforce():
+    assert spot.MODE == "enforce"

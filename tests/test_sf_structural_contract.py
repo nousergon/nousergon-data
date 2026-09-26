@@ -416,21 +416,23 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
         # ── alpha-engine-config-I11312 ─────────────────────────────────
         "WeeklyPreflightOnSpot": (
-            "OBSERVE-MODE probe (sf-pipeline-policy.md \u00a77a): its verdict "
-            "may not change how the run ends until promoted, and a degraded "
-            "flag here would do exactly that \u2014 $.degraded_summary ends "
-            "the run at DegradedRun (config-I6891) and $.gate_degraded "
-            "without it makes the completion email's own invariant lie (see "
+            "ENFORCE-MODE (sf-pipeline-policy.md §7a, promoted 2026-09-26): "
+            "an OBSERVED FAIL halts via NormalizeFailureContext; Catch still "
+            "fails OPEN for unobserved (crash/timeout/SSM miss). A degraded "
+            "flag on Catch would change how those unobserved runs end "
+            "— $.degraded_summary ends the run at DegradedRun "
+            "(config-I6891) and $.gate_degraded without it makes the "
+            "completion email's own invariant lie (see "
             "WeeklyPreflightBlindSpotDeclared's Comment). The fail-open is "
             "NOT silent: WeeklyPreflightOnSpotUnobserved records "
             "$.weekly_preflight_on_spot.observed=false (true on the other "
-            "arms \u2014 both polarities) and PublishWeeklyPreflightOnSpotNotice "
+            "arms — both polarities) and PublishWeeklyPreflightOnSpotNotice "
             "announces it; the error stays at $.weekly_preflight_on_spot_error."
         ),
         "WaitForWeeklyPreflightOnSpot": (
-            "same as WeeklyPreflightOnSpot: the poll of the same observe-mode "
+            "same as WeeklyPreflightOnSpot: the poll of the same on-spot "
             "command, failing open to the same recorded-and-announced "
-            "unobserved arm."
+            "unobserved arm (observed FAIL never reaches this Catch)."
         ),
         # ── alpha-engine-config-I11298, Brian ruling 2026-09-21 ────────
         "AggregateCosts": (
