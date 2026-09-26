@@ -331,11 +331,11 @@ def test_drill_live_instance_workload_failure_still_gets_its_one_reissue(gate_na
 #: must proceed, which ``_fail_open_default_proceeds`` verifies rather than
 #: trusting the entry. Add-by-PR-only.
 _FAIL_OPEN_OBSERVE_STAGES = {
-    # alpha-engine-config-I11312: the observe-mode on-spot preflight. Its
-    # non-Success arm records observed:false and proceeds to CheckShellRun,
-    # so a lost box costs this probe's verdict, never the run — the loss is
-    # then met by MorningEnrich's own liveness branch, the first stage that
-    # addresses the box after it (tests/test_sf_preflight_on_spot_wiring.py).
+    # alpha-engine-config-I11312: the on-spot preflight's UNOBSERVED arm.
+    # Default (non-Success / non-FAIL-exit) records observed:false and
+    # proceeds to CheckShellRun — a lost box costs this probe's verdict,
+    # never the run. Observed FAIL (exit code match) is NOT fail-open:
+    # it routes to NormalizeFailureContext (tests/test_sf_preflight_on_spot_wiring.py).
     "CheckWeeklyPreflightOnSpotStatus": "WeeklyPreflightOnSpotUnobserved",
 }
 
