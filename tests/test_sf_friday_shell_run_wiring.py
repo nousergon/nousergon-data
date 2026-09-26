@@ -616,6 +616,16 @@ def orig_spot_cmds() -> dict:
       `EXECUTION_RUN_DATE` is a NEW carrier for exactly that reason: it is
       never normalized by anything downstream.
 
+    - **Regenerated 2026-09-25** (alpha-engine-config-I11570): every
+      `git -C <checkout> pull --ff-only origin main` line became
+      `bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh
+      <execution name> <checkout>`, still under the same flock. The first call
+      per (execution, checkout) runs the same pull and records the SHA; later
+      calls in that execution check it out instead, so a re-issued stage can
+      no longer advance the code mid-execution (rehearsal-2026-09-24-1:
+      DataPhase1 re-issue moved dafacc5 -> 6d2460d). A deliberate, reviewed
+      absent-path change confined to those 18 lines; nothing else moved.
+
     Regenerate ONLY on a deliberate, reviewed change to a spot state's
     absent-path (`preflight_args=""`) command, by re-extracting the
     resolved spot commands from the new `origin/main` SF.

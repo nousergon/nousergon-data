@@ -60,10 +60,20 @@ _SF_DIR = _REPO_ROOT / "infrastructure"
 # `sudo -u ec2-user` open always succeeds (see module docstring clause 2).
 CANONICAL_LOCK = "/home/ec2-user/.ae-git-sync.lock"
 
-_PULL = re.compile(r"git (?:-C \S+ )?pull\b")
-# The guarded form: flock, any -w budget, the canonical inode, then `git`.
+# alpha-engine-config-I11570: the weekly SF's pulls go through
+# infrastructure/exec_code_pin.sh, which pulls on the first call of an
+# execution and checks out the pinned SHA after that. It writes the same
+# checkout, so it is held to the same lock clause as a bare `git pull`.
+_PIN_HELPER = r"bash \S*/infrastructure/exec_code_pin\.sh\b"
+_PULL = re.compile(r"git (?:-C \S+ )?pull\b|" + _PIN_HELPER)
+# The guarded form: flock, any -w budget, the canonical inode, then `git` or
+# the pin helper.
 _GUARDED = re.compile(
-    r"flock (?:-w \d+ )?" + re.escape(CANONICAL_LOCK) + r" git\b"
+    r"flock (?:-w \d+ )?"
+    + re.escape(CANONICAL_LOCK)
+    + r" (?:git\b|"
+    + _PIN_HELPER
+    + r")"
 )
 
 
@@ -127,7 +137,10 @@ def test_git_lock_is_the_single_ec2_user_writable_inode() -> None:
     """Clause 2: exactly one lock path, and it is under /home/ec2-user."""
     used: set[str] = set()
     for path in _sf_definitions():
-        for m in re.finditer(r"flock (?:-w \d+ )?(\S+) git\b", path.read_text()):
+        for m in re.finditer(
+            r"flock (?:-w \d+ )?(\S+) (?:git\b|" + _PIN_HELPER + r")",
+            path.read_text(),
+        ):
             used.add(m.group(1))
     assert used, "no flock-guarded git call found in any SF definition"
     assert used == {CANONICAL_LOCK}, (

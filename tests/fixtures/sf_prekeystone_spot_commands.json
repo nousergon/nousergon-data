@@ -1,7 +1,7 @@
 {
   "Backtester": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -11,8 +11,8 @@
   ],
   "DataPhase1": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-data",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-config",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "export EXECUTION_RUN_DATE='2026-05-18'",
@@ -20,7 +20,7 @@
   ],
   "DataPhase2": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-data",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "export EXECUTION_RUN_DATE='2026-05-18'",
@@ -28,7 +28,7 @@
   ],
   "DriftDetection": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-data",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "set -a && source /home/ec2-user/.alpha-engine.env && set +a",
@@ -36,7 +36,7 @@
   ],
   "EvaluatorDiagnostics": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -46,7 +46,7 @@
   ],
   "EvaluatorOptimize": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -56,8 +56,8 @@
   ],
   "MorningEnrich": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-data",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-config",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "export EXECUTION_RUN_DATE='2026-05-18'",
@@ -65,7 +65,7 @@
   ],
   "ParityReplay": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -75,7 +75,7 @@
   ],
   "PitParityCompare": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -85,7 +85,7 @@
   ],
   "PitParityLookahead": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -99,7 +99,7 @@
   ],
   "PitParityWalkforward": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -113,7 +113,7 @@
   ],
   "PortfolioOptimizerBacktest": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -123,7 +123,7 @@
   ],
   "PredictorBacktest": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-backtester pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-backtester",
     "cd /home/ec2-user/alpha-engine-backtester",
     "export HOME=/home/ec2-user",
     "export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1",
@@ -133,8 +133,8 @@
   ],
   "PredictorTraining": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-predictor pull --ff-only origin main",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-predictor",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-config",
     "sudo -u ec2-user cp --remove-destination /home/ec2-user/alpha-engine-config/experiments/reference/predictor/predictor.yaml /home/ec2-user/alpha-engine-predictor/config/predictor.yaml",
     "cd /home/ec2-user/alpha-engine-predictor",
     "export HOME=/home/ec2-user",
@@ -146,7 +146,7 @@
   ],
   "RAGIngestion": [
     "set -eo pipefail",
-    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main",
+    "sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh test-execution-name /home/ec2-user/alpha-engine-data",
     "cd /home/ec2-user/alpha-engine-data",
     "export HOME=/home/ec2-user",
     "export EXECUTION_RUN_DATE='2026-05-18'",

@@ -114,7 +114,8 @@ def test_command_runs_the_module_from_the_data_venv():
     assert cmd.index("sf_preflight_on_spot.py") > cmd.index("cd /home/ec2-user/alpha-engine-data")
     # Nothing but the module's verdict line may reach stdout: the git pull is
     # redirected so RecordWeeklyPreflightOnSpot's stored line stays clean.
-    assert "pull --ff-only origin main >&2" in cmd
+    assert "/home/ec2-user/alpha-engine-data >&2" in cmd
+    assert "exec_code_pin.sh {} /home/ec2-user/alpha-engine-data >&2" in cmd
 
 
 def test_internal_budget_is_inside_the_ssm_timeout_and_poll_cap():

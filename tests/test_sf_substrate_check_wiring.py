@@ -268,9 +268,13 @@ class TestCommandShape:
         # alpha-engine-data (validators.*) checked out fresh — the SF's own
         # command array pulls both before invoking the script, mirroring
         # MorningEnrich's convention.
+        # alpha-engine-config-I11570: both go through exec_code_pin.sh, which
+        # pulls main on the execution's first use and checks out that pinned
+        # SHA afterwards, so the check runs the execution's code.
         joined = " ".join(commands)
-        assert "git -C /home/ec2-user/alpha-engine-dashboard pull" in joined
-        assert "git -C /home/ec2-user/alpha-engine-data pull" in joined
+        pin = "bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh {} "
+        assert pin + "/home/ec2-user/alpha-engine-dashboard" in joined
+        assert pin + "/home/ec2-user/alpha-engine-data" in joined
 
     def test_no_runtime_pip_install(self, commands):
         # config#2276: deps are synced at deploy time (crucible-dashboard
