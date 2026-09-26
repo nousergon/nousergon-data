@@ -751,7 +751,7 @@ class TestScanMetrics:
         assert points[("orphan_reaper_terminated", "on-demand")] == 1.0
 
 
-# ── alpha-engine-config-I11569: a finished rehearsal's box ends early ────────
+# ── alpha-engine-config-I11569 / I11108: a finished weekly run's box ends early ─
 
 _EXEC_PREFIX = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:"
 
@@ -777,7 +777,7 @@ def _sfn(status: str, stopped_seconds_ago: int | None = None, raises: Exception 
     return sfn
 
 
-class TestRehearsalBoxes:
+class TestFinishedExecutionBoxes:
     def test_failed_rehearsal_box_is_reaped_after_the_grace(self, index_module):
         # rehearsal-2026-09-24-1: FailExecution at 22:51Z, box kept to 11:00Z.
         sfn = _sfn("FAILED", stopped_seconds_ago=3700)
@@ -808,15 +808,49 @@ class TestRehearsalBoxes:
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
 
-    def test_failed_production_run_keeps_its_box_for_the_watch_rerun(self, index_module):
-        # A non-rehearsal execution's box is reused by weekly_sf_rerun via
-        # $.ec2_instance_id, so it is never looked up, let alone reaped early.
-        sfn = _sfn("FAILED", stopped_seconds_ago=7200)
+    def test_failed_production_run_box_is_reaped_after_the_grace(self, index_module):
+        # 2026-09-19: FAILED at 14:25Z, box idle until a hand-terminate. No
+        # watch-rerun reuses the box (rerun inputs carry no ec2_instance_id).
+        sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+        out, ec2, _cw = _run_filtered(
+            index_module, [_weekly_box("i-prod", "2b6ab316-8060-4011-8140-cccf0f2194bd")], sfn)
+        assert out["terminated"] == ["i-prod"]
+        assert out["orphan_detail"][0]["reap_reason"] == "execution-finished"
+        ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-prod"])
+
+    def test_succeeded_run_box_is_reaped_after_the_grace(self, index_module):
+        sfn = _sfn("SUCCEEDED", stopped_seconds_ago=3700)
+        out, ec2, _cw = _run_filtered(
+            index_module, [_weekly_box("i-ok", "watch-rerun-2026-09-18-4")], sfn)
+        assert out["terminated"] == ["i-ok"]
+        assert out["orphan_detail"][0]["reap_reason"] == "execution-finished"
+
+    def test_production_run_inside_the_grace_is_kept(self, index_module):
+        sfn = _sfn("FAILED", stopped_seconds_ago=600)
         out, ec2, _cw = _run_filtered(
             index_module, [_weekly_box("i-prod", "2b6ab316-8060-4011-8140-cccf0f2194bd")], sfn)
         assert out["terminated"] == []
-        sfn.describe_execution.assert_not_called()
         ec2.terminate_instances.assert_not_called()
+
+    def test_other_state_machines_are_never_looked_up(self, index_module):
+        # Other definitions' launches may outlive their execution by design.
+        sfn = _sfn("SUCCEEDED", stopped_seconds_ago=7200)
+        inst = _weekly_box("i-eod", "x")
+        inst["Tags"] = [t for t in inst["Tags"] if t["Key"] != "execution-id"]
+        inst["Tags"].append({"Key": "execution-id", "Value":
+            "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-pipeline:abc"})
+        out, ec2, _cw = _run_filtered(index_module, [inst], sfn)
+        assert out["terminated"] == []
+        sfn.describe_execution.assert_not_called()
+
+    def test_malformed_execution_id_is_never_looked_up(self, index_module):
+        sfn = _sfn("SUCCEEDED", stopped_seconds_ago=7200)
+        inst = _weekly_box("i-x", "x")
+        inst["Tags"] = [t for t in inst["Tags"] if t["Key"] != "execution-id"]
+        inst["Tags"].append({"Key": "execution-id", "Value": "ne-weekly-freshness-pipeline:rehearsal-1"})
+        out, ec2, _cw = _run_filtered(index_module, [inst], sfn)
+        assert out["terminated"] == []
+        sfn.describe_execution.assert_not_called()
 
     def test_dry_run_reports_but_does_not_terminate(self, monkeypatch, index_module):
         monkeypatch.setattr(index_module, "DRY_RUN", True)
@@ -826,9 +860,11 @@ class TestRehearsalBoxes:
         assert out["terminated"] == []
         ec2.terminate_instances.assert_not_called()
 
-    def test_iam_grants_describe_on_rehearsal_executions_only(self):
+    def test_iam_grants_describe_on_weekly_executions_only(self, index_module):
         import json
         policy = json.loads((SCRIPT_DIR / "iam-policy.json").read_text())
         grants = [s for s in policy["Statement"] if "states:DescribeExecution" in str(s["Action"])]
         assert len(grants) == 1
-        assert grants[0]["Resource"].endswith(":execution:ne-weekly-freshness-pipeline:rehearsal-*")
+        # The grant must cover exactly the state machines the code may look up.
+        (sm,) = index_module.FINISHED_REAP_STATE_MACHINES
+        assert grants[0]["Resource"] == f"arn:aws:states:us-east-1:711398986525:execution:{sm}:*"

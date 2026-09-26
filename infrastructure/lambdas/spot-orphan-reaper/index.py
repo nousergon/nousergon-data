@@ -235,35 +235,55 @@ def _scan_spot_instances(ec2) -> list[dict]:
                         "watchdog_deadline": tags.get("watchdog-deadline", ""),
                         # The launching SF execution's ARN, stamped by the
                         # weekly dispatcher (config#5504). Read only to end a
-                        # finished REHEARSAL's box early; see
-                        # _rehearsal_finished().
+                        # finished weekly run's box early; see
+                        # _execution_finished().
                         "execution_id": tags.get("execution-id", ""),
                     })
     return out
 
 
-# alpha-engine-config-I11569: a failed weekly run keeps its on-demand launcher
-# box up until the 13h watchdog. That is deliberate for a production run,
-# because the watch-rerun reuses the box through $.ec2_instance_id. A
-# rehearsal (execution name ``rehearsal-*``, nous-ergon-ops
-# weekly-sf-rehearsal.yml) is never rerun onto its box: each rehearsal
-# launches its own. So once a rehearsal execution has stopped, its box is idle
-# spend until the watchdog. The grace leaves room for an operator redrive.
+# alpha-engine-config-I11569 / I11108 deliverable 4: once the weekly run that
+# launched a box has stopped, nothing uses the box again, but it stays up until
+# its 13h watchdog-deadline. Since config#2248 the box is dispatched INSIDE the
+# execution; `ec2_instance_id` is never in a cadence input, and
+# weekly_sf_rerun.rerun_input() passes through only the source execution's
+# input, so every watch-rerun boots a fresh box (measured 2026-09-26: the five
+# latest watch-reruns all carried ec2_instance_id=None). The three weekly
+# dispatches that stamp execution-id (the freshness box, its relaunch, the
+# eval-judge box) are all polled to completion by the SF itself.
+#
+# Scoped to the state machines named here, never to any execution-id tag:
+# other definitions' launches may outlive their execution by design. The grace
+# leaves room for an operator to look at a failed box before it goes.
+FINISHED_REAP_STATE_MACHINES = frozenset({"ne-weekly-freshness-pipeline"})
 REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
-REHEARSAL_REAP_GRACE_SECONDS = int(os.environ.get("REHEARSAL_REAP_GRACE_SECONDS", "3600"))
+FINISHED_EXECUTION_REAP_GRACE_SECONDS = int(os.environ.get(
+    "FINISHED_EXECUTION_REAP_GRACE_SECONDS",
+    os.environ.get("REHEARSAL_REAP_GRACE_SECONDS", "3600"),
+))
 _EXECUTION_LIVE_STATUSES = frozenset({"RUNNING", "PENDING_REDRIVE"})
 
 
-def _rehearsal_finished(sfn, execution_arn: str, now: datetime) -> bool:
-    """True iff ``execution_arn`` names a rehearsal execution that stopped
-    more than REHEARSAL_REAP_GRACE_SECONDS ago.
+def _early_reap_candidate(execution_arn: str) -> bool:
+    """True iff ``execution_arn`` is an execution of a state machine in
+    FINISHED_REAP_STATE_MACHINES (``arn:aws:states:<region>:<acct>:execution:<sm>:<name>``)."""
+    parts = execution_arn.split(":")
+    return (
+        len(parts) == 8 and parts[0] == "arn" and parts[2] == "states"
+        and parts[5] == "execution" and parts[6] in FINISHED_REAP_STATE_MACHINES
+        and bool(parts[7])
+    )
+
+
+def _execution_finished(sfn, execution_arn: str, now: datetime) -> bool:
+    """True iff ``execution_arn`` names an early-reap candidate execution that
+    stopped more than FINISHED_EXECUTION_REAP_GRACE_SECONDS ago.
 
     Fails SAFE, the opposite direction from _completion_marker_exists: any
     error (AccessDenied before the role carries states:DescribeExecution, a
     throttle, a deleted execution) returns False, so the box keeps its own
-    watchdog-deadline. Reaping early on a guess could end a live rehearsal."""
-    name = execution_arn.rsplit(":", 1)[-1]
-    if not execution_arn.startswith("arn:") or not name.startswith(REHEARSAL_EXECUTION_PREFIX):
+    watchdog-deadline. Reaping early on a guess could end a live run."""
+    if not _early_reap_candidate(execution_arn):
         return False
     try:
         desc = sfn.describe_execution(executionArn=execution_arn)
@@ -275,7 +295,7 @@ def _rehearsal_finished(sfn, execution_arn: str, now: datetime) -> bool:
     stopped = desc.get("stopDate")
     if stopped is None:
         return False
-    return (now - stopped).total_seconds() >= REHEARSAL_REAP_GRACE_SECONDS
+    return (now - stopped).total_seconds() >= FINISHED_EXECUTION_REAP_GRACE_SECONDS
 
 
 def _completion_key(kind: WatchKind, watch_tags: dict[str, str]) -> str:
@@ -403,7 +423,7 @@ def handler(event: dict, context) -> dict:
     ec2 = boto3.client("ec2", region_name=REGION)
     cw = boto3.client("cloudwatch", region_name=REGION)
     s3 = boto3.client("s3", region_name=REGION)
-    sfn = None  # created on first rehearsal box, so a fleet without one makes no call
+    sfn = None  # created on first early-reap candidate, so a fleet without one makes no call
     now = datetime.now(timezone.utc)
     threshold = timedelta(seconds=REAP_AFTER_SECONDS)
 
@@ -449,13 +469,19 @@ def handler(event: dict, context) -> dict:
         reap_reason = "deadline"
         if age <= effective_threshold:
             execution_id = inst.get("execution_id", "")
-            if not execution_id.rsplit(":", 1)[-1].startswith(REHEARSAL_EXECUTION_PREFIX):
+            if not _early_reap_candidate(execution_id):
                 continue
             if sfn is None:
                 sfn = boto3.client("stepfunctions", region_name=REGION)
-            if not _rehearsal_finished(sfn, execution_id, now):
+            if not _execution_finished(sfn, execution_id, now):
                 continue
-            reap_reason = "rehearsal-finished"
+            # Kept distinct so rehearsal reaps read the same in the log as
+            # they did under I11569.
+            reap_reason = (
+                "rehearsal-finished"
+                if execution_id.rsplit(":", 1)[-1].startswith(REHEARSAL_EXECUTION_PREFIX)
+                else "execution-finished"
+            )
         orphans.append({
             "instance_id": inst["instance_id"],
             "name": inst["name"],
