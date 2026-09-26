@@ -156,14 +156,62 @@ def _get_json(s3_client: Any, bucket: str, key: str) -> dict | None:
         return None
 
 
-def _load_holdings(s3_client: Any, bucket: str) -> list[str]:
-    """Held tickers from Metron's holdings artifact.
+# A yfinance exchange suffix on a held listing: ``NOVN.SW``, ``RMS.PA``,
+# ``SU.PA``, ``1299.HK``. Metron's symbology (``to_yf_symbol``) only ever emits
+# a one- or two-letter suffix, and only for a NON-US listing — a US share class
+# is spelled with a dash there (``BRK-B``). ``ATAI.CVR`` is not a listing
+# suffix and does not match.
+_FOREIGN_LISTING_RE = re.compile(r"^(?P<base>[A-Z0-9]+)\.(?P<suffix>[A-Z]{1,2})$")
+
+
+def foreign_only_held_tickers(holdings_payload: dict) -> list[str]:
+    """Held broker symbols whose ONLY held listing is on a non-US exchange.
+
+    Metron's ``holdings_universe.json`` publishes two views of one held set:
+    ``holdings[].yf_symbol`` (foreign listings exchange-suffixed, ``SU.PA``)
+    and ``tickers`` (the BARE broker symbol, ``SU``). Every source this package
+    ingests from is US-only — EDGAR by CIK, Polygon news by US ticker — so a
+    bare foreign symbol either resolves to nothing or, worse, to a DIFFERENT
+    US issuer that happens to share it. Measured on the 2026-09-25 weekly
+    rehearsal: a held Schneider Electric (``SU.PA``) put ``SU`` in the scope and
+    the corpus filed Suncor Energy's 40-Fs, 8-Ks and Form 4s as its evidence;
+    Novartis (``NOVN.SW``) and Hermès (``RMS.PA``) went to EDGAR as ``NOVN`` /
+    ``RMS``. Metron's own symbology module states the hazard: "a bare ``1299``
+    either fails to resolve or silently matches the wrong US line."
+
+    A symbol is foreign-only when it is NOT itself a held ``yf_symbol`` (a
+    held US line of the same name keeps it) and some held ``yf_symbol`` is that
+    symbol plus an exchange suffix. The payload carries no broker→yf join key,
+    so the base-plus-suffix match is the join; it is exact, never a prefix.
+    """
+    held_yf = {
+        str(h.get("yf_symbol") or "").strip().upper()
+        for h in (holdings_payload.get("holdings") or [])
+        if isinstance(h, dict)
+    }
+    foreign_bases = {
+        m.group("base") for m in map(_FOREIGN_LISTING_RE.match, held_yf) if m
+    }
+    tickers = {
+        str(t).strip().upper() for t in (holdings_payload.get("tickers") or []) if t
+    }
+    return sorted(t for t in tickers if t in foreign_bases and t not in held_yf)
+
+
+def _load_holdings(s3_client: Any, bucket: str) -> tuple[list[str], list[str]]:
+    """Held tickers from Metron's holdings artifact, and the foreign-only ones dropped.
 
     NON-FATAL on absence, matching collectors/daily_news.py's posture: a
     missing Metron artifact narrows coverage (held names lose fresh evidence)
     but cannot corrupt it, and blocking the entire corpus fill on a
     cross-product artifact is the worse failure. The degradation is logged at
     WARNING naming exactly what is not covered, never swallowed silently.
+
+    Foreign-only listings (:func:`foreign_only_held_tickers`) are dropped here,
+    BEFORE the union with the feed cut, and named in the log: the bare symbol
+    names a different company to every US source. Dropping them from the held
+    slice only means a symbol the scanner's own cut carries (where ``SU`` IS
+    Suncor) is still covered.
     """
     data = _get_json(s3_client, bucket, HOLDINGS_UNIVERSE_KEY)
     if not data:
@@ -173,11 +221,21 @@ def _load_holdings(s3_client: Any, bucket: str) -> list[str]:
             "positions go without fresh evidence until it returns.",
             bucket, HOLDINGS_UNIVERSE_KEY,
         )
-        return []
+        return [], []
     tickers = [str(t).strip().upper() for t in (data.get("tickers") or []) if t]
+    foreign = set(foreign_only_held_tickers(data))
+    if foreign:
+        logger.warning(
+            "[rag_scope] dropped %d held foreign-listing symbol(s) %s — held only "
+            "on a non-US exchange, and every ingestion source here is US-only, so "
+            "the bare symbol would resolve to nothing or to a different US issuer. "
+            "These positions carry NO corpus evidence",
+            len(foreign), sorted(foreign),
+        )
+        tickers = [t for t in tickers if t not in foreign]
     logger.info("[rag_scope] holdings: %d held ticker(s) (as_of=%s)",
                 len(tickers), data.get("as_of"))
-    return tickers
+    return tickers, sorted(foreign)
 
 
 def load_rag_scope(
@@ -247,7 +305,7 @@ def load_rag_scope(
             f"the cut the predictor scores (rag-corpus-policy.md §2.1)."
         ) from exc
 
-    held = _load_holdings(s3_client, bucket)
+    held, foreign_held = _load_holdings(s3_client, bucket)
     candidates = sorted(set(cut_tickers) | set(held))
 
     # Drop anything no equity source can resolve (see _TICKER_RE). Named in the
@@ -276,6 +334,7 @@ def load_rag_scope(
             SCOPE_CUT: len(set(cut_tickers)),
             "held": len(set(held)),
             "rejected_non_equity": len(rejected),
+            "rejected_foreign_listing": len(foreign_held),
         },
         "run_date": membership.get("run_date"),
         "source": cut.get("source") or key,
