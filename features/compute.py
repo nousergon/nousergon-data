@@ -434,6 +434,75 @@ def _safe_last_date(idx: pd.Index) -> pd.Timestamp | None:
     return pd.Timestamp(last).normalize()
 
 
+def _is_market_holiday(d: str) -> bool:
+    """True when weekday ``d`` is an NYSE holiday. Outside the calendar's
+    coverage the answer is unknown, and unknown is reported as NOT a holiday
+    so a missing file there is still surfaced rather than excused."""
+    from datetime import date as _date
+    from nousergon_lib.trading_calendar import is_trading_day
+
+    try:
+        return not is_trading_day(_date.fromisoformat(d))
+    except Exception:  # noqa: BLE001 - out of calendar coverage
+        return False
+
+
+def _report_missing_daily_closes(
+    missing_dates: list[str], loaded_dates: list[str],
+) -> None:
+    """Classify the delta window's missing ``staging/daily_closes`` dates.
+
+    The window opens at the OLDEST price-cache ticker's last date
+    (``_apply_daily_delta`` uses ``min``), so one delisted ticker whose cache
+    stopped months ago stretches it far past what ``staging/`` still holds —
+    ``staging/`` objects expire after 7 days (bucket lifecycle rule
+    ``expire-staging-after-7-days``). rehearsal-2026-09-25-1 DataPhase1: HOLX's
+    cache ends 2026-04-07, the window ran 2026-04-08 -> 2026-09-25, and
+    ~105 trading days each logged "daily_closes/<d>.parquet missing (market
+    holiday?)" — a guess that was wrong for every one of them, and a wall of
+    noise any real gap would have been lost in.
+
+    So a missing date is one of three things, and each is said once:
+
+    * an NYSE holiday — expected, logged at DEBUG;
+    * older than the oldest object this run could read — beyond staging
+      retention, not a gap: ONE warning with the count and span;
+    * a trading day at or after that oldest object (or any trading day, when
+      nothing loaded) — a real hole in the delta, warned per date.
+    """
+    if not missing_dates:
+        return
+    oldest_loaded = min(loaded_dates) if loaded_dates else None
+    holidays: list[str] = []
+    beyond_retention: list[str] = []
+    gaps: list[str] = []
+    for d in missing_dates:
+        if _is_market_holiday(d):
+            holidays.append(d)
+        elif oldest_loaded is not None and d < oldest_loaded:
+            beyond_retention.append(d)
+        else:
+            gaps.append(d)
+    if holidays:
+        log.debug("daily_closes delta: no object on NYSE holiday(s) %s", holidays)
+    if beyond_retention:
+        log.warning(
+            "daily_closes delta: %d trading day(s) %s -> %s predate the oldest "
+            "staging/daily_closes object this run could read (%s). staging/ "
+            "objects expire after 7 days, so these are beyond the delta's reach, "
+            "not a gap — the window reaches back that far because a price-cache "
+            "ticker's history ends there (see the 'delta window pinned by' line "
+            "above; usually a delisted ticker)",
+            len(beyond_retention), beyond_retention[0], beyond_retention[-1],
+            oldest_loaded,
+        )
+    for d in gaps:
+        log.warning(
+            "daily_closes/%s.parquet missing on an NYSE trading day inside the "
+            "readable staging window — a gap in the daily_closes delta", d,
+        )
+
+
 def _load_delta_from_daily_closes(
     s3, bucket: str, start_date: pd.Timestamp, end_date: pd.Timestamp,
 ) -> dict[str, list[dict]]:
@@ -461,19 +530,23 @@ def _load_delta_from_daily_closes(
     ticker_rows: dict[str, list[dict]] = {}
 
     n_missing_dates = 0
+    missing_dates: list[str] = []
+    loaded_dates: list[str] = []
     for d in delta_dates:
         key = f"staging/daily_closes/{d}.parquet"
         try:
             obj = s3.get_object(Bucket=bucket, Key=key)
         except s3.exceptions.NoSuchKey:
-            # Market holiday within the business-day range (e.g., Good Friday).
-            log.warning("daily_closes/%s.parquet missing (market holiday?)", d)
+            # Classified after the loop (_report_missing_daily_closes): a
+            # holiday, a date older than staging retention, or a real gap.
+            missing_dates.append(d)
             n_missing_dates += 1
             continue
         except Exception as exc:
             raise RuntimeError(
                 f"Unexpected S3 error reading daily_closes/{d}.parquet: {exc}"
             ) from exc
+        loaded_dates.append(d)
         buf = io.BytesIO(obj["Body"].read())
         day_df = pd.read_parquet(buf, engine="pyarrow")
         for ticker, row in day_df.iterrows():
@@ -509,6 +582,8 @@ def _load_delta_from_daily_closes(
                 "VWAP":   float(vwap_raw) if pd.notna(vwap_raw) else np.nan,
                 "source": str(src_raw) if pd.notna(src_raw) else "unknown",
             })
+
+    _report_missing_daily_closes(missing_dates, loaded_dates)
 
     n_tickers = len(ticker_rows)
     n_rows = sum(len(v) for v in ticker_rows.values())
@@ -629,6 +704,13 @@ def _apply_daily_delta(
 
     slim_last_date = min(valid_dates)
     today = pd.Timestamp(date_str).normalize()
+    pinned_by = sorted(
+        t for t, d in zip(price_data.keys(), candidate_dates) if d == slim_last_date
+    )
+    log.info(
+        "daily_closes delta window pinned by %d ticker(s) whose cache ends %s: %s",
+        len(pinned_by), slim_last_date.date(), pinned_by[:10],
+    )
 
     # Load all delta files between slim cache last date and target date
     ticker_rows = _load_delta_from_daily_closes(s3, bucket, slim_last_date, today)
