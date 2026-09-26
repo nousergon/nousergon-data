@@ -145,9 +145,9 @@ class TestChainOrdering:
             for c in states["CheckSubstrateHealthGate"]["Choices"]
             if _rule_healthy(c)
         ]
-        # alpha-engine-config-I11312: HEALTHY enters the observe-mode on-spot
-        # preflight pass, every exit of which is CheckShellRun (pinned by
-        # tests/test_sf_preflight_on_spot_wiring.py).
+        # alpha-engine-config-I11312: HEALTHY enters the enforce-mode on-spot
+        # preflight pass; OK/unobserved exit to CheckShellRun, observed FAIL
+        # halts (pinned by tests/test_sf_preflight_on_spot_wiring.py).
         assert healthy == ["WeeklyPreflightOnSpot"], (
             "SubstrateHealthGate verdict=HEALTHY must proceed through the "
             "on-spot preflight pass to CheckShellRun (and from there through "
