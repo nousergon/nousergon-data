@@ -169,10 +169,14 @@ def test_every_box_acquisition_exits_through_the_substrate_gate():
         if "CheckShellRun" in _reachable(states, rule["Next"], recovery=False)
     ]
     assert len(healthy) == 1, "CheckSubstrateHealthGate's HEALTHY edge no longer leads to CheckShellRun"
-    # alpha-engine-config-I11312: the HEALTHY edge now enters the observe-mode
-    # on-spot preflight pass before CheckShellRun. Everything between the two
-    # is "behind the gate": entered from nowhere but the HEALTHY edge.
-    behind = _reachable(states, healthy[0], banned=frozenset({"CheckShellRun"}))
+    # alpha-engine-config-I11312: the HEALTHY edge now enters the on-spot
+    # preflight pass before CheckShellRun. Everything between the two is
+    # "behind the gate": entered from nowhere but the HEALTHY edge. Its
+    # observed-FAIL arm halts into the shared failure tail, which every stage
+    # enters, so NormalizeFailureContext bounds the region like CheckShellRun.
+    behind = _reachable(
+        states, healthy[0], banned=frozenset({"CheckShellRun", "NormalizeFailureContext"})
+    )
     for name, state in states.items():
         if name in behind or name == "CheckSubstrateHealthGate":
             continue

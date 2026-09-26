@@ -1,4 +1,4 @@
-"""sf_preflight_on_spot.py — the observe-mode on-spot preflight pass
+"""sf_preflight_on_spot.py — the on-spot preflight pass (enforce)
 (alpha-engine-config-I11312).
 
 Pins the three properties the state machine relies on: it runs exactly the
@@ -159,7 +159,7 @@ def test_the_budget_escapes_the_per_check_except(monkeypatch):
     [("OK", 0), ("BLIND_SPOT", 0), ("ERROR", 0), ("FAIL", spot.OBSERVED_FAIL_EXIT_CODE)],
 )
 def test_exit_code_is_zero_unless_an_observed_fail(monkeypatch, capsys, verdict, expected_rc):
-    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "observe", "verdict": verdict, "fail_names": []})
+    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "enforce", "verdict": verdict, "fail_names": []})
     monkeypatch.setattr(spot, "_write_artifact", lambda b, k, r: None)
     monkeypatch.setattr(spot, "_emit_metrics", lambda r: None)
     rc = spot.main(["--run-date", "2026-09-25", "--execution-name", "exec-1"])
@@ -172,7 +172,7 @@ def test_exit_code_is_zero_unless_an_observed_fail(monkeypatch, capsys, verdict,
 
 
 def test_aws_write_failures_are_recorded_not_raised(monkeypatch, capsys):
-    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "observe", "verdict": "OK"})
+    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "enforce", "verdict": "OK"})
 
     class _Broken:
         def __getattr__(self, name):
@@ -189,7 +189,7 @@ def test_aws_write_failures_are_recorded_not_raised(monkeypatch, capsys):
 
 def test_stdout_is_exactly_one_json_line(monkeypatch, capsys):
     monkeypatch.setattr(spot, "observe", lambda b, d: {
-        "mode": "observe", "verdict": "OK", "results": [{"message": "x" * 50_000}],
+        "mode": "enforce", "verdict": "OK", "results": [{"message": "x" * 50_000}],
     })
     monkeypatch.setattr(spot, "_write_artifact", lambda b, k, r: None)
     monkeypatch.setattr(spot, "_emit_metrics", lambda r: None)
@@ -325,7 +325,7 @@ def test_aws_clients_work_with_no_region_in_the_environment(monkeypatch, tmp_pat
     # A fresh session so the default one cannot carry a cached region.
     monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
     monkeypatch.setattr(boto3, "client", _client)
-    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "observe", "verdict": "OK"})
+    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "enforce", "verdict": "OK"})
     assert spot.main(["--run-date", "2026-09-25", "--execution-name", "exec-1"]) == 0
     line = json.loads(capsys.readouterr().out.strip())
     assert "metric_error" not in line, line

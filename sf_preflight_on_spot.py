@@ -1,5 +1,5 @@
 """
-sf_preflight_on_spot.py — the weekly SF's SECOND preflight pass, on the box.
+sf_preflight_on_spot.py — the weekly SF's SECOND preflight pass, on the box (enforce).
 
 alpha-engine-config-I11312. ``WeeklyPreflight`` (the Lambda) runs
 ``sf_preflight`` under ``LAMBDA_CAPABILITIES`` = {CAP_AWS}, so every check
@@ -39,51 +39,35 @@ skip. Only the two OPTIONAL checkout checks (price_cards / recursion_budget,
 owned at merge time by alpha-engine-config-I11313) are listed apart as
 ``expected_skip_names`` when that happens.
 
-OBSERVE MODE (sf-pipeline-policy.md §7a)
-----------------------------------------
-This pass makes seven checks reachable that could previously never fail, so it
-is a change to an existing halting check's reachable inputs (§7a.4) and it
-observes before it enforces:
+ENFORCE MODE (sf-pipeline-policy.md §7a — PROMOTED 2026-09-26)
+-------------------------------------------------------------
+This pass made eight required checks reachable that could previously never
+fail (a change to an existing halting check's reachable inputs, §7a.4). It
+observed for two consecutive cycles, then this module and the ASL FAIL arm
+were promoted together:
 
-* It never halts the run. Exit code ``OBSERVED_FAIL_EXIT_CODE`` on a fail
-  verdict, ``0`` otherwise; the state machine records either and proceeds to
-  ``CheckShellRun``. Any crash or timeout inside this module is caught and
-  recorded as verdict ``ERROR`` (exit 0); a crash before this module can run
-  (missing venv, import error) or an SSM/poll failure lands on
-  ``WeeklyPreflightOnSpotUnobserved`` and proceeds too. It fails OPEN.
-* It is not silent (§7a obligation 3). A fail verdict is logged at ERROR, is
-  published by the state machine as its own notice
-  (``PublishWeeklyPreflightOnSpotNotice``), and every verdict is written to
+* An observed FAIL (exit ``OBSERVED_FAIL_EXIT_CODE``) HALTS the run —
+  ``RecordWeeklyPreflightOnSpotFail`` → ``ExtractWeeklyPreflightOnSpotFail``
+  → ``NormalizeFailureContext``. Exit ``0`` otherwise.
+* Unobserved still fails OPEN (§7a does not require a crash/timeout to
+  halt): any crash or timeout inside this module is caught and recorded as
+  verdict ``ERROR`` (exit 0); a crash before this module can run or an
+  SSM/poll failure lands on ``WeeklyPreflightOnSpotUnobserved`` and
+  proceeds.
+* It is not silent (§7a obligation 3). A fail verdict is logged at ERROR,
+  every verdict is written to
   ``s3://alpha-engine-research/health/weekly_preflight_on_spot/<run_date>/
-  <execution_name>.json`` and emitted as the ``AlphaEngine/WeeklyPreflight``
-  series with ``Profile=weekly-spot-full`` — the same metric names the Lambda
-  emits under its own profile, so the two passes read side by side.
+  <execution_name>.json``, and emitted as the ``AlphaEngine/WeeklyPreflight``
+  series with ``Profile=weekly-spot-full``.
 
-Observe window: TWO cycles — the Friday shell-run rehearsal
-(``shell_run=true``) and the Saturday scheduled run that follows it. Both
-reach this state (it sits before ``CheckShellRun``).
+Promotion evidence (criterion met):
+  * ``rehearsal-2026-09-25-1`` — verdict OK, group_required_skip_count=0,
+    blocked_count=0, SF ``observed: true``
+  * cadence ``f283a70c-…`` 2026-09-26 — same shape
+  * no false-positive fails in the window (9/24-2 FAIL was pre-I11566/I11568
+    and reset the count; the two cycles above are consecutive after that)
 
-Promotion criterion (§7a obligation 2): promote ``fail`` to HALTING when two
-consecutive observed cycles (a Friday rehearsal and the following Saturday)
-each show, in the S3 record above:
-  1. ``verdict`` != ``ERROR`` and the SF recorded ``observed: true``;
-  2. ``group_required_skip_count == 0`` and ``blocked_count == 0`` — all
-     eight required ARCTIC/REPO_MODULES/POLYGON/CHECKOUT checks actually RAN
-     (the issue's closes-when; tool_contracts joined the group with
-     alpha-engine-config-I11568). A ``blocked`` check did not run: its
-     upstream failed (alpha-engine-config-I11566);
-  3. no ``fail`` that was not a true positive — every fail in the window is
-     either absent or was confirmed against the system it describes (a fail
-     that was the probe's own environment is a false positive and resets the
-     count after its fix lands).
-Promotion is a separate PR: route ``RecordWeeklyPreflightOnSpotFail`` to
-``NormalizeFailureContext`` (via an Extract*Error Pass, the pre-spend-gate
-convention) instead of the notice, and delete this paragraph's "observe"
-language. Re-exam: 2026-10-05 — the Monday after the second Friday/Saturday
-pair following merge, so one slipped cycle (e.g. an unobserved run, or the
-companion nousergon-lib registry release landing late) still fits. The date
-belongs on alpha-engine-config-I11312 as a `Re-exam:` line; a pass still in
-observe mode after it is the §7a failure one direction over.
+Closes alpha-engine-config-I11312.
 
 Usage (on the box, from the data checkout):
     .venv/bin/python sf_preflight_on_spot.py --run-date 2026-09-25 \\
@@ -107,7 +91,7 @@ from datetime import datetime, timezone
 
 log = logging.getLogger("sf_preflight_on_spot")
 
-MODE = "observe"
+MODE = "enforce"
 PROFILE = "weekly-spot-full"
 DEFAULT_BUCKET = "alpha-engine-research"
 # Explicit, never ambient (alpha-engine-config-I11567): the SSM shell this runs
@@ -265,7 +249,7 @@ def observe(bucket: str, run_date: "str | None") -> dict:
             checks=_spot_checks(),
         )
         record.update(classify(results))
-    except BaseException as exc:  # noqa: BLE001 - observe mode fails OPEN, recorded
+    except BaseException as exc:  # noqa: BLE001 - unobserved still fails OPEN, recorded
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         record.update({
@@ -339,7 +323,7 @@ def verdict_line(record: dict, artifact_uri: str) -> str:
 
 
 def main(argv: "list[str] | None" = None) -> int:
-    parser = argparse.ArgumentParser(description="Weekly SF on-spot preflight pass (observe mode).")
+    parser = argparse.ArgumentParser(description="Weekly SF on-spot preflight pass (enforce mode).")
     parser.add_argument("--bucket", default=DEFAULT_BUCKET)
     parser.add_argument("--run-date", default=None)
     parser.add_argument("--execution-name", default=None)
@@ -370,7 +354,7 @@ def main(argv: "list[str] | None" = None) -> int:
         # distinguishable from an enforcing verdict only by the exit code's
         # consequence (the state machine records it and proceeds).
         log.error(
-            "OBSERVE-MODE preflight FAIL (would halt once promoted): %s",
+            "ENFORCE-MODE preflight FAIL (halting): %s",
             ", ".join(record.get("fail_names", [])),
         )
     elif record["verdict"] in ("ERROR", "BLIND_SPOT"):
