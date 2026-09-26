@@ -38,6 +38,7 @@ from features.feature_engineer import (
 )
 from features.factor_momentum import update_factor_momentum_latest
 from features.cross_sectional import FACTOR_LOADING_SOURCES
+from features.postflight import ALL_NULL_EXPECTED
 from features.compute import (
     DEFAULT_BUCKET,
     UNIVERSE_BENCHMARK_PROXIES,
@@ -129,6 +130,69 @@ log = logging.getLogger(__name__)
 _DEFERRED_SECOND_PASS_FEATURES: frozenset[str] = frozenset(
     {"factor_momentum_ratio", *FACTOR_LOADING_SOURCES.values()}
 )
+
+# `alpha-engine-config-I10939`, second cause (measured 2026-09-22..25, D32):
+# with the deferred columns above excluded, `n_ok` STILL read 0 on every EOD
+# append (`n_ok=0 n_partial=909`), and 899 of those 909 rows had exactly one
+# NaN feature: `vwap_divergence_pct`. Its input is missing on purpose. The
+# EOD `daily_closes` pass (`yfinance_only`) writes `VWAP=None` for every
+# ticker, because yfinance has no true VWAP and the typical-price proxy was
+# rejected (see `_load_daily_closes`). FRED index rows also carry no VWAP.
+# `features.postflight.ALL_NULL_EXPECTED` already DECLARES this column as
+# legitimately NaN on the latest row, but only the feature-store guards read
+# that declaration. The write-time coverage count did not, so the declared
+# NaN marked every row "partial".
+#
+# Each declared feature is mapped to the input column it is derived from.
+# It counts as expected NaN only when that input is NaN AND the row's source
+# is one that never carries that input by design. A POLYGON row (the morning
+# enrichment, which DOES carry VWAP) whose VWAP is missing is still a
+# degraded row. That is a real outage, not the declared shape, and it keeps
+# counting as `partial`. The keys are pinned to `ALL_NULL_EXPECTED` by
+# `tests/test_daily_append_expected_nan_i10939.py`, so a new declaration
+# cannot be added there without a structural reason being stated here.
+_EXPECTED_NAN_INPUT: dict[str, str] = {"vwap_divergence_pct": "VWAP"}
+
+#: `daily_closes` row sources (the per-row `source` provenance column) that
+#: carry no VWAP by design: yfinance EOD rows and FRED index rows. Polygon is
+#: deliberately absent.
+_VWAP_LESS_SOURCES: frozenset[str] = frozenset({"yfinance", "fred"})
+
+
+def _write_time_nan_features(today_row: pd.DataFrame) -> tuple[list[str], list[str]]:
+    """Split one row's NaN FEATURES into (degraded, declared-expected).
+
+    ``degraded`` drives ``n_ok`` / ``n_partial`` and the per-ticker
+    ``partial-features`` log line. ``expected`` holds the NaN features that
+    are the declared structural shape for this row (see
+    ``_EXPECTED_NAN_INPUT``). They are counted separately and reported under
+    ``result["expected_nan_features"]``, so they stay visible without marking
+    the row degraded. The ``_DEFERRED_SECOND_PASS_FEATURES`` columns are in
+    neither list, because their real value is written by a later pass in the
+    same run.
+    """
+    source = None
+    if PROVENANCE_COL in today_row.columns:
+        raw = today_row[PROVENANCE_COL].iloc[0]
+        source = str(raw) if pd.notna(raw) else None
+    nan_features = [
+        f for f in FEATURES
+        if f in today_row.columns and f not in _DEFERRED_SECOND_PASS_FEATURES
+        and today_row[f].isna().iloc[0]
+    ]
+    expected: list[str] = []
+    if source in _VWAP_LESS_SOURCES:
+        for f in nan_features:
+            input_col = _EXPECTED_NAN_INPUT.get(f)
+            if (
+                input_col is not None
+                and f in ALL_NULL_EXPECTED
+                and input_col in today_row.columns
+                and pd.isna(today_row[input_col].iloc[0])
+            ):
+                expected.append(f)
+    degraded = [f for f in nan_features if f not in expected]
+    return degraded, expected
 
 # OHLCV_COLS + PROVENANCE_COL are the canonical universe-library schema —
 # re-exported from store.arctic_store so the chokepoint
@@ -2388,6 +2452,10 @@ def _daily_append_impl(
     n_skip = 0            # legitimate skips (dry_run, NaN close from upstream)
     n_err = 0             # ArcticDB read failures
     n_partial = 0         # rows written with ≥1 NaN feature (short-history, etc.)
+    # alpha-engine-config-I10939: per-ticker declared-expected NaN features
+    # (see `_write_time_nan_features`), and how many WRITTEN rows carried each.
+    expected_nan_by_ticker: dict[str, list[str]] = {}
+    expected_nan_counts: dict[str, int] = {}
     n_parquet_warmup = 0  # rows whose feature compute used parquet-enriched context
     n_quality_blocked = 0  # rows refused by validate_today_row (block severity)
     n_quality_warned = 0   # rows written but flagged by validate_today_row (warn)
@@ -2744,11 +2812,12 @@ def _daily_append_impl(
                 # `_DEFERRED_SECOND_PASS_FEATURES` module docstring — and are
                 # excluded here so a legitimately-not-yet-computed value does
                 # not mark every ticker in the universe "partial".
-                nan_features = [
-                    f for f in FEATURES
-                    if f in today_row.columns and f not in _DEFERRED_SECOND_PASS_FEATURES
-                    and today_row[f].isna().iloc[0]
-                ]
+                # The declared-expected NaN (`_EXPECTED_NAN_INPUT`: a VWAP-derived
+                # feature on a row whose source carries no VWAP by design) is
+                # also split out, so it is counted apart from degraded coverage.
+                nan_features, expected_nan = _write_time_nan_features(today_row)
+                if expected_nan:
+                    expected_nan_by_ticker[ticker] = expected_nan
 
                 # Match stored schema dtype per-column. ArcticDB rejects
                 # updates whose column dtypes don't match the existing
@@ -2975,6 +3044,8 @@ def _daily_append_impl(
                         n_err += 1
                         continue
                     nan_features, hist_rows = payload_meta[ticker]
+                    for _f in expected_nan_by_ticker.get(ticker, ()):
+                        expected_nan_counts[_f] = expected_nan_counts.get(_f, 0) + 1
                     if nan_features:
                         log.warning(
                             "partial-features ticker=%s rows=%d nan=%d/%d features=%s",
@@ -3103,6 +3174,11 @@ def _daily_append_impl(
         # observability that already consumes them; this is an ADDITIVE key,
         # not a rename, so no existing reader's semantics change.
         "tickers_published": n_ok + n_partial,
+        # alpha-engine-config-I10939: {feature: rows written with that feature
+        # NaN as its declared structural shape}. These rows are counted in
+        # `tickers_appended` rather than `tickers_partial`, so this key keeps
+        # them visible.
+        "expected_nan_features": dict(expected_nan_counts),
         "tickers_skipped": n_skip,
         "tickers_errored": n_err,
         "tickers_parquet_warmup": n_parquet_warmup,
@@ -3122,12 +3198,12 @@ def _daily_append_impl(
     }
 
     log.info(
-        "ArcticDB daily_append: stocks n_ok=%d n_partial=%d n_skip=%d n_err=%d "
+        "ArcticDB daily_append: stocks n_ok=%d n_partial=%d expected_nan=%s n_skip=%d n_err=%d "
         "n_parquet_warmup=%d n_missing_from_closes=%d (of %d) "
         "quality_blocked=%d quality_warned=%d anomaly_counts=%s "
         "l2_quarantined=%d l2_alarmed=%d l2_gate_counts=%s | "
         "macro_updated=%d sector_updated=%d | %.1fs total",
-        n_ok, n_partial, n_skip, n_err, n_parquet_warmup,
+        n_ok, n_partial, dict(expected_nan_counts), n_skip, n_err, n_parquet_warmup,
         n_missing_from_closes, len(stock_tickers),
         n_quality_blocked, n_quality_warned, dict(quality_counts_by_type),
         n_l2_quarantined, n_l2_alarmed, dict(l2_counts_by_gate),
