@@ -249,6 +249,9 @@ LIB_PYTHON="${LIB_PYTHON:-/home/ec2-user/alpha-engine-dashboard/.venv/bin/python
 # Restated here rather than sourced: this script does NOT source
 # _spot_common.sh (it carries its own run_ssm/launch pair, see the header).
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+# Exported so the relaunch re-exec inherits the execution's start — see the
+# same line in _spot_common.sh (rehearsal-2026-09-25-1 DataPhase1).
+export _STAGE_WINDOW_START
 
 # The window rule lives in ONE file, sourced by both this file and the
 # spot_data_weekly.sh monolith (alpha-engine-config-I10194 §3).

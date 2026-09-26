@@ -115,6 +115,17 @@ MAX_RUNTIME_SECONDS="${MAX_RUNTIME_SECONDS:-}"
 # Captured here rather than at assertion time because the workload runs in
 # between: a window taken after the write would be trivially satisfied by it.
 _STAGE_WINDOW_START="${_STAGE_WINDOW_START:-$(date -u +%Y-%m-%dT%H:%M:%SZ)}"
+# EXPORTED so the spot-interruption relaunch inherits it: `on_exit` re-runs
+# this script with `exec bash "$0"`, and an unexported value is recomputed as
+# "now" by the `${_STAGE_WINDOW_START:-...}` default above — so the relaunch's
+# window started AFTER everything attempt 1 wrote, and the stage read STALE on
+# its own output. Measured on rehearsal-2026-09-25-1 DataPhase1: attempt 1
+# (21:50Z) wrote constituents/macro/short_interest/macro_history/
+# release_calendar/universe_classification before its reclaim, attempt 2
+# auto-skipped them, and the verdict's window was attempt 2's 22:19:59Z. A
+# relaunch is the SAME execution, so it keeps the execution's start; a fresh
+# run of the script (an SF reissue) still captures its own.
+export _STAGE_WINDOW_START
 
 # The window rule lives in ONE file, sourced by both this file and the
 # spot_data_weekly.sh monolith (alpha-engine-config-I10194 §3).
