@@ -13,7 +13,9 @@ history's event vocabulary):
   then fails terminally at Evaluator. Exercises the skip_backtester
   OVERSHOOT drop (its skip route jumps a degraded parity-family stage's
   gate) and per-branch skip emission;
-- ``early_failure``: DataPhase1 fails with only MorningEnrich completed;
+- ``early_failure``: DataPhase1 fails with only MorningEnrich completed (a
+  pre-cutover history; both fold into collection_readiness since
+  alpha-engine-config-I11269);
 - ``director_degraded``: the REAL watch-rerun-2026-08-01-4 history (the
   "permanent fixture" for alpha-engine-config-I6055 — see its test) — the
   Director hard-failed (ModuleNotFoundError: openai, event 858),
@@ -74,8 +76,11 @@ class TestDerivePlan:
         assert plan.run_date == "2026-07-11"
         assert "InitializeInput" in plan.run_date_provenance
         assert set(plan.skip_flags) == {
+            # alpha-engine-config-I11269: a pre-cutover history's completed
+            # MorningEnrich + DataPhase1 fold into the collection_readiness
+            # stage, whose flag is skip_morning_enrich; skip_data_phase1
+            # retired with its gate.
             "skip_morning_enrich",
-            "skip_data_phase1",
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
@@ -115,8 +120,11 @@ class TestDerivePlan:
         assert plan.skip_flags.get("skip_backtester_stage_only") is True
         assert any("skip_backtester_stage_only" in n for n in plan.notes)
         assert set(plan.skip_flags) == {
+            # alpha-engine-config-I11269: a pre-cutover history's completed
+            # MorningEnrich + DataPhase1 fold into the collection_readiness
+            # stage, whose flag is skip_morning_enrich; skip_data_phase1
+            # retired with its gate.
             "skip_morning_enrich",
-            "skip_data_phase1",
             "skip_scanner",
             "skip_regime_substrate",
             "skip_signals_envelope",
@@ -157,9 +165,15 @@ class TestDerivePlan:
         assert "skip_evaluator" not in plan.skip_flags
 
     def test_early_failure(self, mod):
+        """A pre-cutover history that failed in DataPhase1 after MorningEnrich
+        completed (alpha-engine-config-I11269): both are historical work of the
+        ONE collection_readiness stage, so the stage reads as failed and the
+        rerun does NOT skip it — it waits on the standalone collector rather
+        than skipping past data the failed run never produced. (Before the
+        cutover this emitted skip_morning_enrich and re-ran DataPhase1.)"""
         plan = mod.derive_plan(_events("early_failure"))
-        assert plan.failed == ["data_phase1"]
-        assert set(plan.skip_flags) == {"skip_morning_enrich"}
+        assert plan.failed == ["collection_readiness"]
+        assert set(plan.skip_flags) == set()
 
     @pytest.mark.parametrize(
         "fixture",
@@ -1700,7 +1714,8 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
         derive_plan() could produce — its sole health-check conjunct
         (skip_post_eval) carried emit_skip=False, so no derived input ever
         set it. Synthesized minimally: one stateEnteredEventDetails per
-        witness state for each of the 8 box-conjunct stages, plus Director's
+        witness state for each box-conjunct stage (8 until the I11269 cutover, 6
+        since), plus Director's
         own work state entered-but-not-completed (the recovery target)."""
         events = [
             {
@@ -1715,8 +1730,10 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
             *[
                 {"type": "TaskStateEntered", "stateEnteredEventDetails": {"name": n}}
                 for n in [
-                    "CheckSkipDataPhase1",               # morning_enrich witness
-                    "ResearchPredictorParallel",          # data_phase1 witness
+                    # alpha-engine-config-I11269: the morning_enrich and
+                    # data_phase1 witnesses folded into collection_readiness,
+                    # which is not a box conjunct (the wait runs on no box).
+                    "ResearchPredictorParallel",          # collection_readiness witness
                     "CheckSkipRegimeRetrospectiveEval",   # rag_ingestion witness
                     "CheckSkipEvalJudge",                 # data_phase2 witness
                     "ResolveZooSpecs",                    # predictor_training witness

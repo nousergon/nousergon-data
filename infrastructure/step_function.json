@@ -1,5 +1,5 @@
 {
-  "Comment": "Alpha Engine Saturday Pipeline \u2014 orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. MorningEnrich, DataPhase1 and RAGIngestion are independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich \u2014 plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md \u2014 for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 Counterfactual; ReplayConcordance retired under alpha-engine-config-I10539, 2026-09-16) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email \u2014 pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot \u2014 accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected. config#2274: top-level TimeoutSeconds=43200 (12h) \u2014 the global hang ceiling. Recorded max full run is 3.04h (24-execution history sampled 2026-07-11); the longest LEGITIMATE composition is well under 12h even in the worst case (EvalJudgePoll's 21600s max_wait batch cap + the 7200s spot stages + retry ladders + offcycle/shell presets). Before this ceiling, a hung SSM WaitFor* poll loop (SSM control-plane degradation, e.g. the 2026-07-11 disk-full incident) polled toward the SF 1-year default, invisible to BOTH the deadman alarm (ExecutionsStarted only) and sf-watch (terminal statuses only). A ceiling breach yields status TIMED_OUT, which the sf-watch EventBridge rule already matches (saturday-sf-watch-dispatcher/deploy.sh EVENT_PATTERN) \u2014 a hang now pages and dispatches repair automatically. Per-poll-loop iteration caps deliberately skipped: the global ceiling is the load-bearing fix. config#2279: DECLARED RETRY CONVENTION for SSM states \u2014 every aws-sdk:ssm:sendCommand spot-stage state carries the 4+2 jittered ladder ([States.TaskFailed,States.Timeout]x4 + [States.ALL]x2, 30s base, backoff 2.0, MaxDelay 300, Jitter FULL); re-issue is idempotent for ALL stages because the send-state Retry fires only on pre-execution API failures (the launcher never ran; the WaitFor* poll loop owns post-delivery outcomes). The two tail health-check sends are the declared health-observe class (no Retry, fail-soft Catch). getCommandInvocation poll states carry the InvocationDoesNotExist eventual-consistency ladder. Enforced by tests/test_sf_retry_ladder_convention.py \u2014 a new SSM state must be added to a declared class there or CI fails. Lambda-state States.TaskFailed hardening is the sibling half (config#2250, data-PR752).",
+  "Comment": "Alpha Engine Saturday Pipeline \u2014 orchestrates weekly data collection, RAG ingestion, research, eval-judge + agent-justification triple, predictor training, backtesting, and evaluation sequentially with fail-fast error handling. Weekly data collection (morning-enrich + weekly-phase-one) runs in the standalone ne-data-collection-weekly state machine since the decoupled cutover (alpha-engine-config-I11269); this pipeline waits, bounded, for its run manifests (WaitForCollectionManifests) and then runs the consumers. Before that, MorningEnrich, DataPhase1 and RAGIngestion were independent SF states (RAG split 2026-05-06 after a RAG-side import bug failed under the DataPhase1 label, masking that the data layer was healthy; MorningEnrich split out of DataPhase1 2026-05-16 by the preflight-task-split so a phase1 failure never re-runs the completed ~28-min morning-enrich \u2014 plan alpha-engine-docs/private/preflight-task-split-260516.md). Backtester and Evaluator are independent SF states (split 2026-05-07 \u2014 plan: alpha-engine-docs/private/evaluator-split-260507.md \u2014 for failure isolation, per-stage email, and independent CW heartbeats). The eval-judge chain (EvalJudge \u2192 EvalRollingMean \u2192 RationaleClustering \u2192 Counterfactual; ReplayConcordance retired under alpha-engine-config-I10539, 2026-09-16) runs after DataPhase2 and BEFORE PredictorTraining (reorder shipped 2026-05-07 evening) so its persisted S3 artifacts (decision_artifacts/_eval/, _clustering/, _concordance/, _counterfactual/) are available when Evaluator generates the weekly email \u2014 pre-reorder the judge chain ran AFTER Evaluator, so its results were never visible in the operator's primary review surface. Each spot-bearing state runs on its own spot \u2014 accepts +1 bootstrap cycle (~7 min) per split in exchange for failure isolation, redrive granularity, and per-step health markers. RAG still runs before Research so the knowledge base is fresh. Judge chain only reads decision_artifacts/ written by Research, so it has no dependency on Predictor or Backtester output. Backtester runs AFTER predictor training (depends on model weights); Evaluator runs after Backtester (reads same-cohort backtest artifacts). Supports partial execution via boolean skip_* flags on input (e.g. {\"skip_data_phase1\": true, \"skip_rag_ingestion\": true, \"skip_evaluator\": true}); a missing flag is treated as false, so scheduled runs are unaffected. config#2274: top-level TimeoutSeconds=43200 (12h) \u2014 the global hang ceiling. Recorded max full run is 3.04h (24-execution history sampled 2026-07-11); the longest LEGITIMATE composition is well under 12h even in the worst case (EvalJudgePoll's 21600s max_wait batch cap + the 7200s spot stages + retry ladders + offcycle/shell presets). Before this ceiling, a hung SSM WaitFor* poll loop (SSM control-plane degradation, e.g. the 2026-07-11 disk-full incident) polled toward the SF 1-year default, invisible to BOTH the deadman alarm (ExecutionsStarted only) and sf-watch (terminal statuses only). A ceiling breach yields status TIMED_OUT, which the sf-watch EventBridge rule already matches (saturday-sf-watch-dispatcher/deploy.sh EVENT_PATTERN) \u2014 a hang now pages and dispatches repair automatically. Per-poll-loop iteration caps deliberately skipped: the global ceiling is the load-bearing fix. config#2279: DECLARED RETRY CONVENTION for SSM states \u2014 every aws-sdk:ssm:sendCommand spot-stage state carries the 4+2 jittered ladder ([States.TaskFailed,States.Timeout]x4 + [States.ALL]x2, 30s base, backoff 2.0, MaxDelay 300, Jitter FULL); re-issue is idempotent for ALL stages because the send-state Retry fires only on pre-execution API failures (the launcher never ran; the WaitFor* poll loop owns post-delivery outcomes). The two tail health-check sends are the declared health-observe class (no Retry, fail-soft Catch). getCommandInvocation poll states carry the InvocationDoesNotExist eventual-consistency ladder. Enforced by tests/test_sf_retry_ladder_convention.py \u2014 a new SSM state must be added to a declared class there or CI fails. Lambda-state States.TaskFailed hardening is the sibling half (config#2250, data-PR752).",
   "StartAt": "InitializeInput",
   "TimeoutSeconds": 43200,
   "States": {
@@ -720,7 +720,7 @@
     },
     "CheckSkipMorningEnrich": {
       "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_morning_enrich\": true} routes past the MorningEnrich state directly to the next skip-gate (CheckSkipDataPhase1). Missing flag = run as normal. MorningEnrich was split out of DataPhase1 by the preflight-task-split (2026-05-16, plan alpha-engine-docs/private/preflight-task-split-260516.md): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run a completed morning-enrich. Useful for adhoc reruns where Friday's polygon-corrected daily_closes are already in ArcticDB but phase1 needs a re-run. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
+      "Comment": "Skip-gate. Input {\"skip_morning_enrich\": true} routes past the weekly collection readiness wait straight to ResearchPredictorParallel. Missing flag = run as normal. alpha-engine-config-I11269: MorningEnrich and DataPhase1 no longer run here \u2014 the standalone ne-data-collection-weekly machine runs them \u2014 so this gate now fronts WaitForCollectionManifests, and skip_data_phase1 (whose gate is gone) is subsumed by it. SubstrateHealthGate stays on every box-acquiring path ahead of CheckShellRun (alpha-engine-config-I11268), so this skip edge bypasses no gate.",
       "Choices": [
         {
           "And": [
@@ -733,412 +733,10 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipDataPhase1"
-        }
-      ],
-      "Default": "MorningEnrich"
-    },
-    "MorningEnrich": {
-      "Type": "Task",
-      "Comment": "Friday polygon-T+1 daily_closes fill (weekly_collector.py --morning-enrich) on a dedicated spot EC2. Split out of DataPhase1 by the preflight-task-split (2026-05-16): morning-enrich (~28 min) and phase1 are independent preflight-bearing actions, so a phase1 failure must never re-run this completed ~28-min step. Mirrors the RAGIngestion split precedent \u2014 its own spot, watchdog budget, per-state health marker, and a proper UNION entry preflight (preflight.py mode 'morning_enrich': polygon + FRED secrets + reachability + S3 writeable + ArcticDB libraries present; deliberately NO ArcticDB-freshness check \u2014 morning-enrich is part of what makes it fresh). ~7 min extra bootstrap vs the prior bundled design \u2014 accepted in exchange for never re-paying the 28-min morning-enrich on a downstream redrive. alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('export EXECUTION_RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug morning-enrich --log /var/log/morning-enrich.log -- bash infrastructure/spot_morning_enrich.sh{}',$$.Execution.Name,$.preflight_args))",
-          "executionTimeout": [
-            "5400"
-          ]
-        },
-        "TimeoutSeconds": 5400
-      },
-      "TimeoutSeconds": 5460,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.TaskFailed",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 4,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        },
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.morning_enrich_result",
-      "Next": "InitMorningEnrichPollCount"
-    },
-    "WaitForMorningEnrich": {
-      "Type": "Task",
-      "Comment": "Poll SSM command until complete",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.morning_enrich_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.morning_enrich_poll",
-      "Next": "CheckMorningEnrichStatus"
-    },
-    "CheckMorningEnrichStatus": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.morning_enrich_poll.Status",
-          "StringEquals": "Success",
-          "Next": "CheckSkipDataPhase1"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.morning_enrich_polls",
-              "IsPresent": true
-            },
-            {
-              "Or": [
-                {
-                  "Variable": "$.morning_enrich_poll.Status",
-                  "StringEquals": "InProgress"
-                },
-                {
-                  "Variable": "$.morning_enrich_poll.Status",
-                  "StringEquals": "Pending"
-                }
-              ]
-            },
-            {
-              "Variable": "$.morning_enrich_polls",
-              "NumericLessThan": 216
-            }
-          ],
-          "Next": "MorningEnrichWait"
-        }
-      ],
-      "Default": "MorningEnrichRetryGate",
-      "Comment": "[I5687: poll budget cap=216 via $.morning_enrich_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
-    },
-    "MorningEnrichWait": {
-      "Type": "Pass",
-      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckMorningEnrichStatus actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
-      "Parameters": {
-        "polls.$": "States.MathAdd($.morning_enrich_polls, 1)"
-      },
-      "ResultPath": "$.morning_enrich_poll_count",
-      "Next": "MorningEnrichPollWait"
-    },
-    "MorningEnrichRetryGate": {
-      "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). The launcher is an EPHEMERAL per-execution spot since config#2248 (DispatchWeeklyFreshnessSpot replaced the always-on dashboard box as the $.ec2_instance_id source), so the dominant reason a poll goes non-Success is that the instance is GONE \u2014 and a re-issue of ssm:sendCommand to a terminated instance id can only raise Ssm.InvalidInstanceIdException, burning the retry ladder (5 attempts / ~4m20s measured on execution 158e7fe8-a6ca-4278-b097-c02ca4e34752) on a deterministic no-op. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractMorningEnrichSubstrateLostError WITHOUT consuming the re-issue counter, so a later genuine transient workload failure still gets its retry; recovery is the mechanical scripts/weekly_sf_rerun.py, which derives the skip-set from the failed execution. WORKLOAD FAILED on a live instance => the original single idempotent re-issue is correct and unchanged: absent counter => re-issue; counter=1 => give up to ExtractMorningEnrichError.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.morning_enrich_poll.StatusDetails",
-              "IsPresent": true
-            },
-            {
-              "Or": [
-                {
-                  "Variable": "$.morning_enrich_poll.StatusDetails",
-                  "StringEquals": "Undeliverable"
-                },
-                {
-                  "Variable": "$.morning_enrich_poll.StatusDetails",
-                  "StringEquals": "Terminated"
-                }
-              ]
-            }
-          ],
-          "Next": "ExtractMorningEnrichSubstrateLostError"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.morning_enrich_attempts",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.morning_enrich_attempts",
-              "NumericGreaterThanEquals": 1
-            }
-          ],
-          "Next": "ExtractMorningEnrichError"
-        }
-      ],
-      "Default": "MorningEnrichReissue"
-    },
-    "MorningEnrichReissue": {
-      "Type": "Pass",
-      "Comment": "Mark one re-issue consumed (morning_enrich_attempts=1) and loop back to MorningEnrich.",
-      "Result": 1,
-      "ResultPath": "$.morning_enrich_attempts",
-      "Next": "MorningEnrich"
-    },
-    "CheckSkipDataPhase1": {
-      "Type": "Choice",
-      "Comment": "Skip-gate. Input like {\"skip_data_phase1\": true} routes past DataPhase1 directly to the next skip-gate (CheckSkipRAGIngestion). Missing flag = run as normal.",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.skip_data_phase1",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.skip_data_phase1",
-              "BooleanEquals": true
-            }
-          ],
           "Next": "ResearchPredictorParallel"
         }
       ],
-      "Default": "DataPhase1"
-    },
-    "DataPhase1": {
-      "Type": "Task",
-      "Comment": "Weekly Phase 1 data collection + universe-prune (weekly_collector.py --phase 1 then builders.prune_delisted_tickers) on a dedicated spot EC2. MorningEnrich was split into its own preceding SF state by the preflight-task-split (2026-05-16): a failure here no longer re-runs the completed ~28-min morning-enrich. RAG ingestion lives in the separate RAGIngestion state (split 2026-05-06). Entry preflight is preflight.py mode 'phase1' (a strict superset of morning_enrich's dependency set \u2014 phase1 additionally builds the universe). alpha-engine-config-I4442/I4497 (2026-08-09): repointed from the shared monolith launcher to a dedicated per-stage script \u2014 the monolith is retained unchanged as the rollback path. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
-      "Parameters": {
-        "DocumentName": "AWS-RunShellScript",
-        "InstanceIds.$": "$.ec2_instance_id",
-        "Parameters": {
-          "commands.$": "States.Array('set -eo pipefail','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-data pull --ff-only origin main','sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock git -C /home/ec2-user/alpha-engine-config pull --ff-only origin main','cd /home/ec2-user/alpha-engine-data','export HOME=/home/ec2-user',States.Format('export EXECUTION_RUN_DATE=\\'{}\\'',$.run_date),States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug data-weekly --log /var/log/data-weekly.log -- bash infrastructure/spot_data_phase1.sh{}',$$.Execution.Name,$.preflight_args))",
-          "executionTimeout": [
-            "6600"
-          ]
-        },
-        "TimeoutSeconds": 6600
-      },
-      "TimeoutSeconds": 6660,
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "States.TaskFailed",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 4,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        },
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 30,
-          "BackoffRate": 2.0,
-          "MaxDelaySeconds": 300,
-          "JitterStrategy": "FULL"
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultPath": "$.data_phase1_result",
-      "Next": "InitDataPhase1PollCount"
-    },
-    "WaitForDataPhase1": {
-      "Type": "Task",
-      "Comment": "Poll SSM command until complete",
-      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
-      "Parameters": {
-        "CommandId.$": "$.data_phase1_result.Command.CommandId",
-        "InstanceId.$": "$.ec2_instance_id[0]"
-      },
-      "Retry": [
-        {
-          "ErrorEquals": [
-            "Ssm.InvocationDoesNotExistException",
-            "Ssm.InvocationDoesNotExist"
-          ],
-          "MaxAttempts": 10,
-          "IntervalSeconds": 30,
-          "BackoffRate": 1.5
-        },
-        {
-          "ErrorEquals": [
-            "Ssm.SdkClientException",
-            "States.Timeout"
-          ],
-          "MaxAttempts": 2,
-          "IntervalSeconds": 5,
-          "BackoffRate": 1.5
-        }
-      ],
-      "Catch": [
-        {
-          "ErrorEquals": [
-            "States.ALL"
-          ],
-          "Next": "NormalizeFailureContext",
-          "ResultPath": "$.error"
-        }
-      ],
-      "ResultSelector": {
-        "Status.$": "$.Status",
-        "ResponseCode.$": "$.ResponseCode",
-        "StatusDetails.$": "$.StatusDetails",
-        "StandardErrorContent.$": "$.StandardErrorContent"
-      },
-      "ResultPath": "$.data_phase1_poll",
-      "Next": "CheckDataPhase1Status"
-    },
-    "CheckDataPhase1Status": {
-      "Type": "Choice",
-      "Choices": [
-        {
-          "Variable": "$.data_phase1_poll.Status",
-          "StringEquals": "Success",
-          "Next": "ResearchPredictorParallel"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.data_phase1_polls",
-              "IsPresent": true
-            },
-            {
-              "Or": [
-                {
-                  "Variable": "$.data_phase1_poll.Status",
-                  "StringEquals": "InProgress"
-                },
-                {
-                  "Variable": "$.data_phase1_poll.Status",
-                  "StringEquals": "Pending"
-                }
-              ]
-            },
-            {
-              "Variable": "$.data_phase1_polls",
-              "NumericLessThan": 240
-            }
-          ],
-          "Next": "DataPhase1Wait"
-        }
-      ],
-      "Default": "DataPhase1RetryGate",
-      "Comment": "[I5687: poll budget cap=216 via $.data_phase1_polls \u2014 mirrors DataPhase2/ThinkTank; budget exhaustion falls through to the existing Default]"
-    },
-    "DataPhase1Wait": {
-      "Type": "Pass",
-      "Comment": "Increment the poll counter, then wait. A Pass+Wait pair rather than a bare Wait so the budget in CheckDataPhase1Status actually advances \u2014 a counter that never increments is an unbounded loop wearing a bound.",
-      "Parameters": {
-        "polls.$": "States.MathAdd($.data_phase1_polls, 1)"
-      },
-      "ResultPath": "$.data_phase1_poll_count",
-      "Next": "DataPhase1PollWait"
-    },
-    "DataPhase1RetryGate": {
-      "Type": "Choice",
-      "Comment": "SOTA bounded auto-retry (config#1059), liveness-branched (config#5688). A polled non-Success SSM status on this idempotent batch step is retriable, not terminal \u2014 but ONLY while the instance is alive. The launcher is an EPHEMERAL per-execution spot since config#2248, so re-issuing to $.ec2_instance_id after substrate loss can only raise Ssm.InvalidInstanceIdException. SUBSTRATE LOST (StatusDetails Undeliverable/Terminated) => fail fast to ExtractDataPhase1SubstrateLostError WITHOUT consuming the re-issue counter; recovery is the mechanical scripts/weekly_sf_rerun.py. WORKLOAD FAILED on a live instance => re-issue DataPhase1 ONCE ($.ec2_instance_id) before giving up \u2014 re-running is safe (the data job overwrites the same run_date S3 keys). Absent counter => first failure => re-issue; counter present (=1) => second failure => give up to ExtractDataPhase1Error. Keeps the scheduled execution alive through a transient blip so it succeeds first-pass (moves unattended_first_pass_rate).",
-      "Choices": [
-        {
-          "And": [
-            {
-              "Variable": "$.data_phase1_poll.StatusDetails",
-              "IsPresent": true
-            },
-            {
-              "Or": [
-                {
-                  "Variable": "$.data_phase1_poll.StatusDetails",
-                  "StringEquals": "Undeliverable"
-                },
-                {
-                  "Variable": "$.data_phase1_poll.StatusDetails",
-                  "StringEquals": "Terminated"
-                }
-              ]
-            }
-          ],
-          "Next": "ExtractDataPhase1SubstrateLostError"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.data_phase1_attempts",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.data_phase1_attempts",
-              "NumericGreaterThanEquals": 1
-            }
-          ],
-          "Next": "ExtractDataPhase1Error"
-        }
-      ],
-      "Default": "DataPhase1Reissue"
-    },
-    "DataPhase1Reissue": {
-      "Type": "Pass",
-      "Comment": "Mark one re-issue consumed (data_phase1_attempts=1) and loop back to DataPhase1 for an idempotent re-run.",
-      "Result": 1,
-      "ResultPath": "$.data_phase1_attempts",
-      "Next": "DataPhase1"
+      "Default": "InitCollectionReadinessPoll"
     },
     "ResearchPredictorParallel": {
       "Type": "Parallel",
@@ -7764,50 +7362,6 @@
       "ResultPath": "$.degraded_summary",
       "Next": "CheckDegradedOutcome"
     },
-    "ExtractMorningEnrichError": {
-      "Type": "Pass",
-      "Comment": "Normalize MorningEnrich SSM non-Success poll into $.error. Mirrors ExtractDataPhase1Error \u2014 the soft-failure path from CheckMorningEnrichStatus.Default does not populate $.error, only Task Catch blocks do.",
-      "Parameters": {
-        "phase": "MorningEnrich",
-        "source": "CheckMorningEnrichStatus.Default",
-        "poll.$": "$.morning_enrich_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
-    },
-    "ExtractMorningEnrichSubstrateLostError": {
-      "Type": "Pass",
-      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractMorningEnrichError. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a MorningEnrich failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through MorningEnrichReissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.morning_enrich_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
-      "Parameters": {
-        "phase": "MorningEnrich/SubstrateLost",
-        "source": "MorningEnrichRetryGate.SubstrateLost",
-        "poll.$": "$.morning_enrich_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "SubstrateRelaunchGate"
-    },
-    "ExtractDataPhase1Error": {
-      "Type": "Pass",
-      "Comment": "Normalize DataPhase1 SSM non-Success poll into $.error so HandleFailure's States.Format template has something to serialize (the soft-failure path from CheckDataPhase1Status.Default does not populate $.error \u2014 only Task Catch blocks do).",
-      "Parameters": {
-        "phase": "DataPhase1",
-        "source": "CheckDataPhase1Status.Default",
-        "poll.$": "$.data_phase1_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "NormalizeFailureContext"
-    },
-    "ExtractDataPhase1SubstrateLostError": {
-      "Type": "Pass",
-      "Comment": "config#5688: the SUBSTRATE-LOST sibling of ExtractDataPhase1Error. Same normalization, distinguishable phase \u2014 the launcher spot was gone (StatusDetails Undeliverable/Terminated) before the workload could report, so this is an infrastructure event, not a DataPhase1 failure. The distinct phase reaches the SNS body through the same NormalizeFailureContext chain, which is what makes substrate loss separable from workload failure in failure telemetry. Deliberately does NOT route through DataPhase1Reissue: re-issuing ssm:sendCommand to a terminated instance id is a guaranteed Ssm.InvalidInstanceIdException, and consuming $.data_phase1_attempts here would spend the one bounded retry a genuine transient workload failure needs.",
-      "Parameters": {
-        "phase": "DataPhase1/SubstrateLost",
-        "source": "DataPhase1RetryGate.SubstrateLost",
-        "poll.$": "$.data_phase1_poll"
-      },
-      "ResultPath": "$.error",
-      "Next": "SubstrateRelaunchGate"
-    },
     "ExtractBacktesterError": {
       "Type": "Pass",
       "Comment": "Normalize Backtester SSM non-Success poll into $.error.",
@@ -7920,7 +7474,7 @@
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
         "Subject.$": "States.Format('Alpha Engine Saturday{} Pipeline \u2014 FAILED', $.pipeline_label)",
-        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_data_phase1 / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
+        "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
       "Next": "FailExecution"
@@ -7929,7 +7483,7 @@
       "Type": "Fail",
       "Comment": "config#5601 \u2014 the terminal Fail carries the UNDERLYING error, not a constant. Before this, EVERY failure of this pipeline terminated with the identical static Cause, so states:DescribeExecution reported 41 of the last 60 runs as the same opaque 'PipelineFailure' and no control-plane consumer \u2014 dashboard, console, or any failure histogram \u2014 could tell one failure mode from another. The information already existed and was already correct: NormalizeFailureContext (config#1819) guarantees $.error is present, and HandleFailure renders it into the SNS body with this exact expression. It simply never reached the EXECUTION RECORD, so 'is this one bug recurring or forty different bugs' could only be answered by opening CloudWatch per run, by hand. That is what kept the daily exercise cadence (config#5489) from converging: 5x the attempts, but every attempt still ended in a manual archaeology dig. | SAFETY: CausePath is evaluated at runtime and throws States.Runtime on a missing path, which would REPLACE the real failure with a runtime error \u2014 the worst regression available here. It is safe because this state has exactly ONE inbound edge (HandleFailure), and all 30 failure paths reach HandleFailure through NormalizeFailureContext, whose entire purpose is to guarantee $.error. States.JsonToString($.error) is the SAME expression HandleFailure's Message parameter already runs in production. | Error stays the static 'PipelineFailure' literal deliberately: consumers key on it, and per-run detail belongs in Cause.",
       "Error": "PipelineFailure",
-      "CausePath": "States.Format('Pipeline step failed: {}. Do NOT redrive-execution: every Task Catch in this pipeline routes to this shared FailExecution state, so redrive is a deterministic no-op (it re-enters FailExecution and re-fails immediately with the same stale input). To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed (e.g. skip_morning_enrich, skip_data_phase1, skip_backtester) -- see infrastructure/README.md for the full flag list and rationale.', States.JsonToString($.error))"
+      "CausePath": "States.Format('Pipeline step failed: {}. Do NOT redrive-execution: every Task Catch in this pipeline routes to this shared FailExecution state, so redrive is a deterministic no-op (it re-enters FailExecution and re-fails immediately with the same stale input). To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed (e.g. skip_morning_enrich, skip_backtester) -- see infrastructure/README.md for the full flag list and rationale.', States.JsonToString($.error))"
     },
     "EvaluatorDeployDriftCheck": {
       "Type": "Task",
@@ -8460,7 +8014,7 @@
     },
     "CheckSpotDispatchNeeded": {
       "Type": "Choice",
-      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) \u2014 it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here \u2014 the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes. alpha-engine-config-I8167 (operator decision (a), 2026-08-24): the deriver's 8th conjunct is now skip_saturday_health_check rather than skip_post_eval, because skip_post_eval could never be reached from a mechanical recovery's Director-only input without also silently disabling ReportCard/Director/ScannerLeaderboard \u2014 see CheckSkipSaturdayHealthCheck.",
+      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) \u2014 it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here \u2014 the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes. alpha-engine-config-I8167 (operator decision (a), 2026-08-24): the deriver's 8th conjunct is now skip_saturday_health_check rather than skip_post_eval, because skip_post_eval could never be reached from a mechanical recovery's Director-only input without also silently disabling ReportCard/Director/ScannerLeaderboard \u2014 see CheckSkipSaturdayHealthCheck. alpha-engine-config-I11269 (decoupled data cutover): MorningEnrich and DataPhase1 left this definition - the standalone ne-data-collection-weekly runs that work, and WaitForCollectionManifests is a Lambda poll that addresses no box - so the re-derived conjunction no longer carries skip_morning_enrich or skip_data_phase1 and is six conjuncts; the state counts quoted above are as of their own issues.",
       "Choices": [
         {
           "Variable": "$.ec2_instance_id",
@@ -8469,30 +8023,6 @@
         },
         {
           "And": [
-            {
-              "And": [
-                {
-                  "Variable": "$.skip_morning_enrich",
-                  "IsPresent": true
-                },
-                {
-                  "Variable": "$.skip_morning_enrich",
-                  "BooleanEquals": true
-                }
-              ]
-            },
-            {
-              "And": [
-                {
-                  "Variable": "$.skip_data_phase1",
-                  "IsPresent": true
-                },
-                {
-                  "Variable": "$.skip_data_phase1",
-                  "BooleanEquals": true
-                }
-              ]
-            },
             {
               "And": [
                 {
@@ -8776,42 +8306,6 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
-    },
-    "InitMorningEnrichPollCount": {
-      "Type": "Pass",
-      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=216 = ceil(5400s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
-      "Result": 0,
-      "ResultPath": "$.morning_enrich_polls",
-      "Next": "WaitForMorningEnrich"
-    },
-    "MorningEnrichPollWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "MergeMorningEnrichPollCount"
-    },
-    "MergeMorningEnrichPollCount": {
-      "Type": "Pass",
-      "InputPath": "$.morning_enrich_poll_count.polls",
-      "ResultPath": "$.morning_enrich_polls",
-      "Next": "WaitForMorningEnrich"
-    },
-    "InitDataPhase1PollCount": {
-      "Type": "Pass",
-      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=216 = ceil(5400s timeout / 30s wait * 1.2 slack), matching the DataPhase2 (#1186) / ThinkTank precedent.",
-      "Result": 0,
-      "ResultPath": "$.data_phase1_polls",
-      "Next": "WaitForDataPhase1"
-    },
-    "DataPhase1PollWait": {
-      "Type": "Wait",
-      "Seconds": 30,
-      "Next": "MergeDataPhase1PollCount"
-    },
-    "MergeDataPhase1PollCount": {
-      "Type": "Pass",
-      "InputPath": "$.data_phase1_poll_count.polls",
-      "ResultPath": "$.data_phase1_polls",
-      "Next": "WaitForDataPhase1"
     },
     "InitBacktesterPollCount": {
       "Type": "Pass",
@@ -9963,32 +9457,6 @@
             },
             {
               "Variable": "$.error.phase",
-              "StringEquals": "MorningEnrich/SubstrateLost"
-            }
-          ],
-          "Next": "MorningEnrich"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.error.phase",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.error.phase",
-              "StringEquals": "DataPhase1/SubstrateLost"
-            }
-          ],
-          "Next": "DataPhase1"
-        },
-        {
-          "And": [
-            {
-              "Variable": "$.error.phase",
-              "IsPresent": true
-            },
-            {
-              "Variable": "$.error.phase",
               "StringEquals": "Backtester/SubstrateLost"
             }
           ],
@@ -10387,6 +9855,202 @@
       },
       "ResultPath": "$.weekly_preflight_blind_spot",
       "Next": "CheckMutexRole"
+    },
+    "InitCollectionReadinessPoll": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11264: poll counter for the bounded readiness wait on the standalone nousergon-data-collection run manifests. Mirrors the InitSSMPollCounter idiom. The budget is in CheckCollectionReadinessBudget.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "SeedCollectionReadiness"
+    },
+    "SeedCollectionReadiness": {
+      "Type": "Pass",
+      "Comment": "Seeds $.collection_readiness so every later reader (the not-ready normalizer, the alert body) finds the path even when every poll raised into the Catch and no verdict was ever returned. A seed, not a verdict: ready=false.",
+      "Result": {
+        "ready": false,
+        "settled": false,
+        "missing": [],
+        "failed": [],
+        "failure_mode": "",
+        "baseline": "",
+        "summary": "no readiness verdict returned yet (every poll so far raised or none ran)"
+      },
+      "ResultPath": "$.collection_readiness",
+      "Next": "WaitForCollectionManifests"
+    },
+    "WaitForCollectionManifests": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11264 / -I11269: the weekly SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-weekly). It starts at 09:00 UTC Saturday (alpha-engine-saturday), which is the same instant as data-collection-weekly's 05:00 America/New_York under EDT and an hour BEFORE it under EST, so lookback_seconds is 0. The units are the weekly schedule's verify_units MINUS D15/D16/D46, whose v1 owners (DataPhase2, RAGIngestion) are still in this definition and still run inside ResearchPredictorParallel (alpha-engine-config-I10753 is their own cutover) \u2014 the derivation is pinned by tests/test_v1_collection_readiness_wait.py against each unit's trigger.owner. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-collection-readiness-probe",
+        "Payload": {
+          "collection": "weekly",
+          "units": [
+            "D01",
+            "D02",
+            "D03",
+            "D04",
+            "D05",
+            "D06",
+            "D07",
+            "D08",
+            "D10",
+            "D11",
+            "D12",
+            "D13",
+            "D14",
+            "D17",
+            "D34"
+          ],
+          "not_before.$": "$$.Execution.StartTime",
+          "lookback_seconds": 0
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Not a verdict either way: record the raise and spend one poll of the bounded budget (CheckCollectionReadinessBudget).",
+          "ResultPath": "$.collection_readiness_error",
+          "Next": "CheckCollectionReadinessBudget"
+        }
+      ],
+      "ResultSelector": {
+        "ready.$": "$.Payload.readiness.ready",
+        "settled.$": "$.Payload.readiness.settled",
+        "missing.$": "$.Payload.readiness.missing",
+        "failed.$": "$.Payload.readiness.failed",
+        "failure_mode.$": "$.Payload.readiness.failure_mode",
+        "baseline.$": "$.Payload.readiness.baseline",
+        "summary.$": "$.Payload.readiness.summary"
+      },
+      "ResultPath": "$.collection_readiness",
+      "Next": "CheckCollectionReadiness"
+    },
+    "CheckCollectionReadiness": {
+      "Type": "Choice",
+      "Comment": "ready -> the first data consumer. shell_run -> the first data consumer after one probe (dry). settled-but-not-ready (every unit has a manifest for this cycle and at least one failed the predicate) -> degrade NOW: no amount of waiting changes a published failure, so burning the rest of the budget would only delay the same outcome. Otherwise poll again inside the budget.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.ready",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.ready",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ResearchPredictorParallel"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "shell_run (the Friday preflight) runs this wait DRY, like every other stage it replaced ran --preflight-only: ONE probe exercises the Lambda, its IAM and the manifest read, its verdict stays on $.collection_readiness, and the run continues whatever it says. Saturday's collection has not run on a Friday, so waiting would only burn the budget and then fail the preflight on a condition that is expected.",
+          "Next": "ResearchPredictorParallel"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.settled",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.settled",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ExtractCollectionNotReadyError"
+        }
+      ],
+      "Default": "CheckCollectionReadinessBudget"
+    },
+    "CheckCollectionReadinessBudget": {
+      "Type": "Choice",
+      "Comment": "The wait is BOUNDED: 87 polls of 300 s = 26100 s. Derived, not remembered (tests/test_v1_collection_readiness_wait.py recomputes it): up to 3600 s for the EST hour by which data-collection-weekly's 05:00 America/New_York cron trails this SF's 09:00 UTC start, plus the worst case of every standalone weekly workload up to the last one writing a unit this wait reads (morning-enrich, weekly-phase-one, chronic-gap-heal: one SSM-online budget of 300 s + the dispatcher's 7200 s cap each). Past that instant each of them has been hard-stopped by its own cap, so a not-ready answer can no longer turn ready by itself. The typical case is far shorter: the poll exits as soon as every unit is settled (v1's own MorningEnrich + DataPhase1 finished ~2h12m after the 09:00 UTC start on 2026-09-19).",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.shell_run",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.shell_run",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "shell_run: reachable only when the one dry probe RAISED (WaitForCollectionManifests' Catch). A probe that cannot run on Friday will not run on Saturday either, so the preflight fails loud now instead of polling for 87 x 300 s.",
+          "Next": "ExtractCollectionNotReadyError"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "NumericGreaterThanEquals": 87
+            }
+          ],
+          "Comment": "IsPresent-guarded (config#2275) although InitCollectionReadinessPoll seeds the counter on every path into this block: a Choice cannot Catch, so a guard costs nothing and an unguarded dereference is one refactor away from States.Runtime.",
+          "Next": "ExtractCollectionNotReadyError"
+        }
+      ],
+      "Default": "CollectionReadinessPollWait"
+    },
+    "CollectionReadinessPollWait": {
+      "Type": "Wait",
+      "Seconds": 300,
+      "Next": "IncrementCollectionReadinessPoll"
+    },
+    "IncrementCollectionReadinessPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.collection_readiness_poll.attempts, 1)"
+      },
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "WaitForCollectionManifests"
+    },
+    "ExtractCollectionNotReadyError": {
+      "Type": "Pass",
+      "Comment": "FAIL-CLOSED, matching the stages this wait replaces: a MorningEnrich or DataPhase1 failure went to NormalizeFailureContext -> HandleFailure, because the weekly research, predictor-training and backtest legs must not run on a universe the collector did not finish. The same holds when the standalone collector is the producer.",
+      "Parameters": {
+        "phase": "CollectionReadiness",
+        "source": "WaitForCollectionManifests (budget exhausted or producer settled not-ok)",
+        "readiness.$": "$.collection_readiness",
+        "poll.$": "$.collection_readiness_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
     }
   }
 }

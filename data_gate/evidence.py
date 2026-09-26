@@ -1311,14 +1311,39 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     day's data that only this D-1 re-grade could catch. Rolled into `met` and
     named in `detail` here, never into `summary.mismatch` itself.
 
+    **After the cutover the clause is FROZEN at the last pre-cutover report**
+    (`alpha-engine-config-I11269`). Parity compares the standalone shadow's
+    output with v1's; once the cutover removes the v1 data stages, v1 no longer
+    writes the compared keys, so a post-cutover report would compare the
+    collector with itself and read a 100% match that measures nothing. For a
+    gate trading day AFTER `data_gate.cutover.cutover_trading_day()`, this
+    reader ignores every report dated after that day, grades the most recent
+    one on or before it on its own content, and skips both the same-day and
+    the freshness rules — those exist to keep a LIVE comparison current, and
+    there is no live comparison left to keep current. The detail says FROZEN
+    and names the cutover, so the row never reads as a fresh measurement.
+
     **Every reading that selects a report names its remaining window**
     (`alpha-engine-config-I11185` deliverable 3): the report's trading day,
     how many trading days of `PARITY_FRESHNESS_TRADING_DAYS` are left, and the
     last day it counts on. An UNMET reading also says WHICH half failed — an
     aged-out report is "failing on FRESHNESS, not content", a fresh report
     that does not match is "failing on CONTENT" — so the two causes of the
-    same red bit never render as the same string.
+    same red bit never render as the same string. A FROZEN reading carries no
+    window phrase: the freshness rule is not applied to it, so a countdown
+    would describe a rule that does not govern the verdict.
     """
+    from data_gate.cutover import CUTOVER_UTC, cutover_trading_day
+
+    cutover_day = cutover_trading_day()
+    frozen = trading_day > cutover_day
+    select_through = cutover_day if frozen else trading_day
+    frozen_note = (
+        f" — FROZEN at the last pre-cutover report: the decoupled data cutover at {CUTOVER_UTC} "
+        f"(trading day {cutover_day.isoformat()}) removed the v1 data stages, so a later "
+        "report would compare the collector with itself; post-cutover reports are ignored "
+        "and this reading is not refreshed (alpha-engine-config-I11269)"
+    )
     try:
         keys = list(store.list_keys(PARITY_KEY_PREFIX))
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
@@ -1336,8 +1361,19 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     candidates = sorted(
         (day, key)
         for key in keys
-        if (day := _parity_report_day(key)) is not None and day <= trading_day
+        if (day := _parity_report_day(key)) is not None and day <= select_through
     )
+    if not candidates and frozen:
+        return Reading(
+            met=False,
+            detail=(
+                f"no parity report at or before the cutover's trading day "
+                f"{cutover_day.isoformat()} under {PARITY_KEY_PREFIX}, so the cutover has no "
+                f"pre-cutover parity evidence to freeze{frozen_note}"
+            ),
+            evidence=(f"{PARITY_KEY_PREFIX}*.json",),
+            source="data_collection store",
+        )
     if not candidates:
         return Reading(
             met=False,
@@ -1373,7 +1409,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     # below, and deliberately keeps grading UNMET rather than UNMEASURABLE: a
     # report days old means no shadow run is happening at all, which IS a
     # finding about cutover readiness rather than a gap in this read.
-    if report_day != trading_day:
+    if report_day != trading_day and not frozen:
         age_trading_days = _trading_days_between(report_day, trading_day)
         if age_trading_days <= PARITY_FRESHNESS_TRADING_DAYS:
             return Reading(
@@ -1397,7 +1433,7 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             )
 
     floor = subtract_trading_days(trading_day, PARITY_FRESHNESS_TRADING_DAYS)
-    if report_day < floor:
+    if report_day < floor and not frozen:
         age_trading_days = _trading_days_between(report_day, trading_day)
         return Reading(
             met=False,
@@ -1530,11 +1566,18 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             " — the report claims met:true while carrying the exceptions above, so it is "
             "read UNMET"
         )
-    # alpha-engine-config-I11185 deliverable 3: the window is printed on every
-    # verdict, MET included, so its expiry is visible before it bites.
-    detail += "; " + _parity_window_phrase(report_day, trading_day)
-    if not met:
-        detail += " — failing on CONTENT; the report is inside its freshness window"
+    if frozen:
+        # No window phrase: freshness is not applied to a frozen reading
+        # (alpha-engine-config-I11269), so a countdown would misdescribe it.
+        if not met:
+            detail += " — failing on CONTENT"
+        detail += frozen_note
+    else:
+        # alpha-engine-config-I11185 deliverable 3: the window is printed on every
+        # verdict, MET included, so its expiry is visible before it bites.
+        detail += "; " + _parity_window_phrase(report_day, trading_day)
+        if not met:
+            detail += " — failing on CONTENT; the report is inside its freshness window"
     return Reading(
         met=met,
         detail=detail,

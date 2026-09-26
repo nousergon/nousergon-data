@@ -60,7 +60,10 @@ def _substrate_lost(states):
 def test_every_top_level_substrate_lost_site_routes_to_the_gate(states):
     """The CLASS, not the DataPhase1 instance that surfaced it."""
     sites = _substrate_lost(states)
-    assert len(sites) >= 8, f"expected the full sequential set, got {sorted(sites)}"
+    # 8 -> 6 at alpha-engine-config-I11269: MorningEnrich and DataPhase1 (and
+    # their Extract*SubstrateLostError sites) left with the decoupled data
+    # cutover; the wait that replaced them runs on no box.
+    assert len(sites) >= 6, f"expected the full sequential set, got {sorted(sites)}"
     wrong = {k: v.get("Next") for k, v in sites.items() if v.get("Next") != GATE}
     assert not wrong, f"substrate-lost sites bypassing {GATE}: {wrong}"
 

@@ -1,36 +1,65 @@
-"""Pins the MorningEnrich → DataPhase1 split in the Saturday SF.
+"""Pins the REMOVAL of MorningEnrich + DataPhase1 from the Saturday SF, and
+the bounded collection-readiness wait that replaces them.
 
-Origin: the preflight-task-split (2026-05-16, plan
-alpha-engine-docs/private/preflight-task-split-260516.md). The standing
-rule — every preflight-bearing action is its own SF task; a downstream
-failure must never re-run a completed upstream task — was violated by
-the old `DataPhase1` state, which ran `spot_data_weekly.sh --data-only`
-= morning-enrich (~28 min) THEN phase1 on one spot. Every phase1
-recovery re-paid the 28-min morning-enrich because its preflight was
-buried 28 minutes deep.
+History: the preflight-task-split (2026-05-16) split the old monolithic
+``DataPhase1`` (``spot_data_weekly.sh --data-only`` = morning-enrich THEN
+phase1 on one spot) into a MorningEnrich quartet followed by a DataPhase1
+quartet, so a phase1 failure never re-ran the 28-min morning-enrich. This file
+pinned that split (see git history for that version, superseded here).
+
+alpha-engine-config-I11269 (Brian's ruling (b), 2026-09-21): the standalone
+``ne-data-collection-weekly`` state machine now runs morning-enrich and
+weekly-phase-one (in that order, MaxConcurrency 1 — the split's ordering
+property now lives in that machine's workload list, pinned by
+tests/test_data_collection_stack.py). The v1 weekly SF no longer runs either
+stage: ``CheckSkipMorningEnrich.Default`` enters ``WaitForCollectionManifests``
+(I11264), a bounded poll of the collection-readiness probe over the run
+manifests of the units the weekly legs read.
 
 This test catches regressions like:
-- Someone reroutes InitializeInput back past CheckSkipMorningEnrich and
-  silently drops the MorningEnrich state.
-- Someone wires MorningEnrich AFTER DataPhase1 (re-introduces the
-  re-run-the-28-min-step-on-phase1-failure bug).
-- Someone reverts DataPhase1's SSM command back to `--data-only` (which
-  re-bundles morning-enrich into phase1).
-- Someone drops the HandleFailure Catch on the new states.
+- Someone re-adds MorningEnrich / DataPhase1 (or any state of their
+  quartets) — a v1 run would then double-write against the standalone
+  schedule.
+- A dangling reference to a removed state.
+- The wait being bypassed on the no-skip path (ResearchPredictorParallel
+  reachable from CheckSkipMorningEnrich.Default without passing the wait).
+- The weekly wait failing OPEN: unlike the weekday/EOD waits, a not-ready
+  weekly collection halts through NormalizeFailureContext exactly like the
+  removed stages' error paths did, because research/training/backtest must
+  not run on a universe the collector did not finish.
 """
 
 from __future__ import annotations
 
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
 
 from tests.sf_command_utils import extract_commands
 
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
+
+_REMOVED_STATES = [
+    "MorningEnrich", "InitMorningEnrichPollCount", "WaitForMorningEnrich",
+    "CheckMorningEnrichStatus", "MorningEnrichWait", "MorningEnrichPollWait",
+    "MergeMorningEnrichPollCount", "MorningEnrichRetryGate", "MorningEnrichReissue",
+    "ExtractMorningEnrichError", "ExtractMorningEnrichSubstrateLostError",
+    "CheckSkipDataPhase1", "DataPhase1", "InitDataPhase1PollCount",
+    "WaitForDataPhase1", "CheckDataPhase1Status", "DataPhase1Wait",
+    "DataPhase1PollWait", "MergeDataPhase1PollCount", "DataPhase1RetryGate",
+    "DataPhase1Reissue", "ExtractDataPhase1Error",
+    "ExtractDataPhase1SubstrateLostError",
+]
+
+_WAIT_BLOCK = {
+    "InitCollectionReadinessPoll", "SeedCollectionReadiness",
+    "WaitForCollectionManifests", "CheckCollectionReadiness",
+    "CheckCollectionReadinessBudget", "CollectionReadinessPollWait",
+    "IncrementCollectionReadinessPoll", "ExtractCollectionNotReadyError",
+}
 
 
 @pytest.fixture(scope="module")
@@ -43,360 +72,200 @@ def states(sf) -> dict:
     return sf["States"]
 
 
-class TestQuartetPresence:
-    """The MorningEnrich quartet (+ Wait/Extract helpers) must exist,
-    mirroring the RAGIngestion / DataPhase1 quartets."""
+def _targets(state: dict) -> list[str]:
+    out: list[str] = []
+    for k in ("Next", "Default"):
+        if k in state:
+            out.append(state[k])
+    for c in state.get("Choices", []):
+        if "Next" in c:
+            out.append(c["Next"])
+    for c in state.get("Catch", []):
+        if "Next" in c:
+            out.append(c["Next"])
+    return out
 
-    @pytest.mark.parametrize(
-        "name",
-        [
-            "CheckSkipMorningEnrich",
-            "MorningEnrich",
-            "WaitForMorningEnrich",
-            "CheckMorningEnrichStatus",
-            "MorningEnrichWait",
-            "ExtractMorningEnrichError",
-            "MorningEnrichRetryGate",
-            "MorningEnrichReissue",
-        ],
-    )
-    def test_state_exists(self, states, name):
-        assert name in states, f"{name} missing from Saturday SF States"
+
+class TestRemoval:
+    @pytest.mark.parametrize("name", _REMOVED_STATES)
+    def test_state_absent(self, states, name):
+        assert name not in states, (
+            f"{name} must not run from the v1 weekly SF — ne-data-collection-weekly owns it"
+        )
+
+    def test_the_removed_list_is_the_two_quartets_by_construction(self):
+        """Non-vacuity WITHOUT git (CI's PR checkout is shallow, so the
+        origin/main comparison below skips there): the removed names are
+        exactly the split's two quartets, spelled by the naming convention
+        every poll-loop quartet in this SF follows. A typo in the list above
+        would make its absence pin pass vacuously; it cannot survive this."""
+        suffixes = (
+            "", "InitPollCount", "WaitFor", "CheckStatus", "Wait", "PollWait",
+            "MergePollCount", "RetryGate", "Reissue", "ExtractError",
+            "ExtractSubstrateLostError",
+        )
+
+        def spell(stage: str, suffix: str) -> str:
+            if suffix in ("", "Wait", "PollWait", "RetryGate", "Reissue"):
+                return stage + suffix
+            if suffix == "WaitFor":
+                return f"WaitFor{stage}"
+            if suffix == "CheckStatus":
+                return f"Check{stage}Status"
+            if suffix.startswith("Extract"):
+                return f"Extract{stage}{suffix.removeprefix('Extract')}"
+            head = suffix.removesuffix("PollCount")  # Init / Merge
+            return f"{head}{stage}PollCount"
+
+        derived = [spell("MorningEnrich", s) for s in suffixes]
+        derived += ["CheckSkipDataPhase1"] + [spell("DataPhase1", s) for s in suffixes]
+        assert sorted(_REMOVED_STATES) == sorted(derived)
+        # And the convention is real: a surviving quartet (RAGIngestion, inside
+        # ResearchPredictorParallel) is spelled exactly this way in the
+        # committed definition, so `spell` is not a convention invented here.
+        def walk(sts: dict, out: set) -> set:
+            for n, b in sts.items():
+                out.add(n)
+                for br in b.get("Branches", []):
+                    walk(br["States"], out)
+            return out
+
+        committed = walk(json.loads(_SF_PATH.read_text())["States"], set())
+        missing = [spell("RAGIngestion", s) for s in suffixes
+                   if spell("RAGIngestion", s) not in committed]
+        assert not missing, missing
+
+    def test_the_removed_list_is_exactly_what_main_had(self):
+        """Non-vacuity: every name above existed on the pre-cutover
+        definition, so the absence pins test a real removal, not a typo."""
+        try:
+            old = subprocess.run(
+                ["git", "show", "origin/main:infrastructure/step_function.json"],
+                cwd=_REPO_ROOT, capture_output=True, text=True, check=True,
+            ).stdout
+        except (OSError, subprocess.CalledProcessError) as exc:
+            pytest.skip(f"no origin/main to compare against: {exc}")
+        old_states = json.loads(old)["States"]
+        if "MorningEnrich" not in old_states:
+            pytest.skip("origin/main already carries the removal")
+        assert set(_REMOVED_STATES) <= set(old_states)
+
+    def test_no_dangling_reference_to_removed_states(self, states):
+        for name, st in states.items():
+            for t in _targets(st):
+                assert t not in _REMOVED_STATES, f"{name} references removed state {t!r}"
+
+    @pytest.mark.parametrize("script", ["spot_morning_enrich.sh", "spot_data_phase1.sh"])
+    def test_no_state_runs_the_removed_stage_scripts(self, states, script):
+        for name, st in states.items():
+            if not st.get("Resource", "").endswith("ssm:sendCommand"):
+                continue
+            assert script not in " ".join(extract_commands(st)), (
+                f"{name} still runs {script} from the v1 weekly SF"
+            )
 
 
 class TestChainOrdering:
-    """InitializeInput → CheckSkipMorningEnrich → MorningEnrich →
-    WaitForMorningEnrich → CheckMorningEnrichStatus(success) →
-    CheckSkipDataPhase1 → DataPhase1 (existing downstream unchanged)."""
+    def test_shell_run_default_still_enters_the_skip_gate(self, states):
+        assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich"
 
-    def test_initialize_input_routes_to_morning_enrich_skipgate(self, states):
-        # 2026-05-27: L274 SF MutualExclusionGuard inserted CheckMutexRole
-        # between InitializeInput and CheckShellRun. The strict-superset
-        # property still holds: CheckMutexRole.Default eventually reaches
-        # CheckShellRun, whose Default is the pre-spine target
-        # CheckSkipMorningEnrich. The real Saturday run (no shell_run + with
-        # pipeline_role='weekly' that acquires the mutex; or any non-cadence
-        # role that bypasses) still reaches the MorningEnrich skip-gate
-        # first — MorningEnrich still precedes DataPhase1.
-        # 2026-06-08: L4517 inserted the lib-pin drift gate as the first
-        # workload gate; its skip/check/gate Defaults converge on CheckMutexRole, so the
-        # downstream mutex→CheckShellRun→CheckSkipMorningEnrich chain is unchanged.
-        # config#830: a cadence-preset gate (CheckRunMode) now precedes the lib-pin
-        # gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the chain holds.
-        # config#2248 (2026-07-21): CheckMutexRole.Default and AcquireMutex.Next
-        # now both land on CheckSpotDispatchNeeded, not CheckShellRun directly —
-        # the new gate that resolves $.ec2_instance_id before ANY execution can
-        # reach CheckShellRun (either immediately, if already present, or after
-        # dispatching+polling a fresh ephemeral spot). See
-        # tests/test_sf_mutex_wiring.py for the full mutex-chain contract and
-        # tests/test_sf_friday_shell_run_wiring.py for the dispatch-chain trace.
-        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate", (
-            "InitializeInput hands off to the config#1824 run-day gate, whose "
-            "bypass Default -> CheckRunMode (config#830 cadence preset); "
-            "CheckRunMode.Default → CheckSkipLibPinDriftCheck (the L4517 lib-pin "
-            "gate); see tests/test_sf_lib_pin_drift_wiring.py for the gate→mutex chain"
-        )
-        assert states["CheckRunMode"]["Default"] == "CheckSkipLibPinDriftCheck"
-        assert states["CheckMutexRole"]["Default"] == "CheckSpotDispatchNeeded", (
-            "Mutex bypass must route to CheckSpotDispatchNeeded so the "
-            "pre-mutex downstream chain is byte-identical for operator/"
-            "missing-role inputs"
-        )
-        assert states["AcquireMutex"]["Next"] == "CheckSpotDispatchNeeded", (
-            "Mutex acquire path must also land at CheckSpotDispatchNeeded so "
-            "cadence runs reach the same downstream chain after grabbing the "
-            "mutex"
-        )
-        # CheckSpotDispatchNeeded's IsPresent branch reaches
-        # NormalizeEc2InstanceId — the normalization gate inserted before
-        # CheckShellRun (config#2248 guard: wraps a bare-string
-        # ec2_instance_id into the ["i-..."] array). Its Default dispatches
-        # a fresh spot and reaches CheckShellRun after the bootstrap-poll
-        # chain resolves — either way CheckShellRun.Default is still the
-        # pre-spine target.
-        assert states["CheckSpotDispatchNeeded"]["Choices"][0]["Next"] == "NormalizeEc2InstanceId"
-        assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich", (
-            "CheckShellRun.Default must be CheckSkipMorningEnrich so the "
-            "real Saturday run is byte-identical pre-spine."
-        )
-
-    def test_skip_morning_enrich_default_runs_substrate_gate_then_morning_enrich(self, states):
-        """config#2249: CheckSkipMorningEnrich.Default now routes through the
-        new fast pre-dispatch SubstrateHealthGate before MorningEnrich —
-        HEALTHY proceeds to MorningEnrich as before; SUBSTRATE_UNHEALTHY
-        short-circuits to a named failure WITHOUT ever entering
-        MorningEnrich's own retry ladder."""
-        # alpha-engine-config-I11268: the gate moved AHEAD of this skip-gate
-        # (box acquisition -> SubstrateHealthGate -> CheckShellRun ->
-        # CheckSkipMorningEnrich), so skip_morning_enrich can no longer route
-        # around it; the Default now goes straight into MorningEnrich.
-        assert states["CheckSkipMorningEnrich"]["Default"] == "MorningEnrich"
+    def test_substrate_gate_still_precedes_check_shell_run(self, states):
+        # alpha-engine-config-I11268: SubstrateHealthGate sits on every
+        # box-acquiring path ahead of CheckShellRun, so the skip edge below
+        # bypasses no gate. HEALTHY -> on-spot preflight -> CheckShellRun.
         assert states["SubstrateHealthGate"]["Next"] == "CheckSubstrateHealthGate"
-        # config#2275: the HEALTHY rule now IsPresent-guards the verdict path
-        # (a 3-segment Lambda-payload path is never floorable), so the
-        # StringEquals lives inside the rule's And rather than at its top
-        # level. Match either shape so this stays robust to that detail.
-        def _rule_healthy(rule):
-            leaves = rule.get("And", [rule])
-            return any(leaf.get("StringEquals") == "HEALTHY" for leaf in leaves)
-
-        healthy = [
-            c["Next"]
-            for c in states["CheckSubstrateHealthGate"]["Choices"]
-            if _rule_healthy(c)
-        ]
-        # alpha-engine-config-I11312: HEALTHY enters the observe-mode on-spot
-        # preflight pass, every exit of which is CheckShellRun (pinned by
-        # tests/test_sf_preflight_on_spot_wiring.py).
-        assert healthy == ["WeeklyPreflightOnSpot"], (
-            "SubstrateHealthGate verdict=HEALTHY must proceed through the "
-            "on-spot preflight pass to CheckShellRun (and from there through "
-            "the skip chain into MorningEnrich)"
-        )
         assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
-        assert (
-            states["CheckSubstrateHealthGate"]["Default"]
-            == "ExtractSubstrateHealthGateError"
-        ), (
-            "any non-HEALTHY verdict must short-circuit to the named-error "
-            "path, not fall through into MorningEnrich's retry ladder"
-        )
-        assert states["ExtractSubstrateHealthGateError"]["Next"] == (
-            "NormalizeFailureContext"
-        )
+        assert states["CheckSubstrateHealthGate"]["Default"] == "ExtractSubstrateHealthGateError"
 
-    def test_skip_morning_enrich_honors_skip_flag(self, states):
-        """{"skip_morning_enrich": true} must route to CheckSkipDataPhase1
-        (mirrors the skip_data_phase1 / skip_rag_ingestion shape)."""
+    def test_skip_morning_enrich_default_enters_the_wait(self, states):
+        assert states["CheckSkipMorningEnrich"]["Default"] == "InitCollectionReadinessPoll"
+
+    def test_skip_flag_routes_past_the_wait(self, states):
         choices = states["CheckSkipMorningEnrich"]["Choices"]
         assert len(choices) == 1
-        c = choices[0]
-        # And[ IsPresent, BooleanEquals true ] on $.skip_morning_enrich
-        variables = {cond["Variable"] for cond in c["And"]}
-        assert variables == {"$.skip_morning_enrich"}
-        assert c["Next"] == "CheckSkipDataPhase1"
+        assert {c["Variable"] for c in choices[0]["And"]} == {"$.skip_morning_enrich"}
+        assert choices[0]["Next"] == "ResearchPredictorParallel"
 
-    def test_morning_enrich_routes_to_wait_state(self, states):
-        # alpha-engine-config-I5687: MorningEnrich dispatches through the
-        # poll-budget seed (InitMorningEnrichPollCount) before the first
-        # poll, mirroring the DataPhase2/ThinkTank precedent.
-        assert states["MorningEnrich"]["Next"] == "InitMorningEnrichPollCount"
-        assert states["InitMorningEnrichPollCount"]["Next"] == "WaitForMorningEnrich"
-        assert states["InitMorningEnrichPollCount"]["ResultPath"] == "$.morning_enrich_polls"
-
-    def test_wait_routes_to_status_check(self, states):
-        assert states["WaitForMorningEnrich"]["Next"] == "CheckMorningEnrichStatus"
-
-    def test_status_success_routes_to_data_phase1_skipgate(self, states):
-        success = [
-            c["Next"]
-            for c in states["CheckMorningEnrichStatus"]["Choices"]
-            if c.get("StringEquals") == "Success"
-        ]
-        assert success == ["CheckSkipDataPhase1"], (
-            "MorningEnrich success must hand off to CheckSkipDataPhase1 — "
-            "DataPhase1 runs AFTER a completed MorningEnrich."
-        )
-
-    def test_status_inprogress_and_pending_loop_via_wait(self, states):
-        # alpha-engine-config-I5687: bounded And[] loop-back branch, not a
-        # bare pair of StringEquals branches — mirrors DataPhase2/ThinkTank.
-        bounded = next(
-            c for c in states["CheckMorningEnrichStatus"]["Choices"] if "And" in c
-        )
-        variables = {cond.get("Variable") for cond in bounded["And"]}
-        assert "$.morning_enrich_polls" in variables
-        or_block = next(cond["Or"] for cond in bounded["And"] if "Or" in cond)
-        statuses = {c["StringEquals"] for c in or_block}
-        assert statuses == {"InProgress", "Pending"}
-        assert bounded["Next"] == "MorningEnrichWait"
-        assert states["MorningEnrichWait"]["Next"] == "MorningEnrichPollWait"
-        assert states["MorningEnrichPollWait"]["Next"] == "MergeMorningEnrichPollCount"
-        assert states["MergeMorningEnrichPollCount"]["Next"] == "WaitForMorningEnrich"
-
-    def test_status_default_routes_through_bounded_retry_to_error(self, states):
-        """A non-Success poll status now routes through the bounded
-        auto-retry gate (config#1059) before terminating at the error
-        path: one idempotent re-issue, then ExtractMorningEnrichError on
-        give-up. Keeps the scheduled run alive through a transient blip
-        so it succeeds first-pass (moves unattended_first_pass_rate)."""
-        assert (
-            states["CheckMorningEnrichStatus"]["Default"]
-            == "MorningEnrichRetryGate"
-        )
-        gate = states["MorningEnrichRetryGate"]
-        # Give-up path: counter already consumed -> terminate at error.
-        give_up = [
-            c["Next"] for c in gate["Choices"]
-            if c["Next"] == "ExtractMorningEnrichError"
-        ]
-        assert give_up == ["ExtractMorningEnrichError"], (
-            "bounded-retry gate must still terminate at "
-            "ExtractMorningEnrichError once the re-issue budget is spent"
-        )
-        # First-failure path: re-issue once, looping back to the step.
-        assert gate["Default"] == "MorningEnrichReissue"
-        reissue = states["MorningEnrichReissue"]
-        assert reissue["Next"] == "MorningEnrich", (
-            "re-issue must loop back to the MorningEnrich step for an "
-            "idempotent re-run"
-        )
-        assert reissue["ResultPath"] == "$.morning_enrich_attempts"
-
-    def test_morning_enrich_is_reachable_before_data_phase1(self, sf, states):
-        """Walk the HAPPY path from StartAt (skip-gates take Default = run
-        the action; status/verdict checks take the Success/HEALTHY choice)
-        and assert MorningEnrich is visited strictly before DataPhase1."""
-        order: list[str] = []
+    def test_the_no_skip_path_cannot_reach_research_without_the_wait(self, states):
+        """Walk everything reachable from the skip gate's Default, stopping at
+        ResearchPredictorParallel and at the failure chokepoint: the region is
+        exactly the wait block, so no edge reaches the research legs except
+        CheckCollectionReadiness's ready edge."""
         seen: set[str] = set()
-        cur = sf["StartAt"]
-        while cur and cur in states and cur not in seen:
-            seen.add(cur)
-            order.append(cur)
-            st = states[cur]
-            if st.get("Type") == "Choice":
-                # Status/verdict checks: follow the Success/HEALTHY edge
-                # (the real forward path). Skip-gates have no such edge →
-                # fall back to Default (= run the action, the no-skip path).
-                # A rule's forward-edge StringEquals may sit at the rule's top
-                # level OR inside an And that IsPresent-guards the same path
-                # (config#2275: 3-segment Lambda-payload verdict paths must be
-                # guarded, e.g. CheckSubstrateHealthGate's HEALTHY rule).
-                def _forward_edge(rule):
-                    leaves = rule.get("And", [rule])
-                    return any(
-                        leaf.get("StringEquals") in ("Success", "HEALTHY")
-                        for leaf in leaves
-                    )
-
-                success = [
-                    c["Next"] for c in st.get("Choices", []) if _forward_edge(c)
-                ]
-                cur = success[0] if success else st.get("Default")
-            else:
-                cur = st.get("Next")
-            if cur == "DataPhase1":
-                order.append(cur)
-                break
-        assert "MorningEnrich" in order, order
-        assert "DataPhase1" in order, order
-        assert order.index("MorningEnrich") < order.index("DataPhase1"), (
-            "MorningEnrich must precede DataPhase1 — the whole point of "
-            "the split is that a phase1 failure never re-runs morning-enrich."
+        todo = [states["CheckSkipMorningEnrich"]["Default"]]
+        while todo:
+            n = todo.pop()
+            if n in seen or n in ("ResearchPredictorParallel", "NormalizeFailureContext"):
+                continue
+            seen.add(n)
+            todo.extend(_targets(states[n]))
+        assert seen == _WAIT_BLOCK, sorted(seen ^ _WAIT_BLOCK)
+        into_research = sorted(
+            n for n in seen if "ResearchPredictorParallel" in _targets(states[n])
         )
+        assert into_research == ["CheckCollectionReadiness"]
 
 
-class TestSsmCommandShape:
-    """MorningEnrich invokes spot_morning_enrich.sh; DataPhase1 invokes
-    spot_data_phase1.sh (alpha-engine-config-I4442/I4497 SF cutover,
-    2026-08-09, nousergon-data#1122). Neither invokes the shared
-    spot_data_weekly.sh monolith any longer — it is retained, unchanged,
-    only as the rollback path."""
-
-    def _commands(self, states, name):
-        # commands.$ States.Array (keystone routed the final launch through
-        # a States.Format($.preflight_args) suffix) — resolve via the
-        # shared helper, which renders the Format element as its template.
-        return extract_commands(states[name])
-
-    def test_morning_enrich_invokes_morning_enrich_only(self, states):
-        # alpha-engine-config-I4442/I4497 SF cutover (2026-08-09, nousergon-data
-        # #1122): MorningEnrich now invokes its own dedicated script rather than
-        # the monolith + a mode flag. The monolith is retained unchanged as the
-        # rollback path (test_sf_structural_contract.py pins the new script's
-        # on-disk existence).
-        joined = " ".join(self._commands(states, "MorningEnrich"))
-        assert "spot_morning_enrich.sh" in joined
-        assert "spot_data_weekly.sh" not in joined
-        assert "--data-only" not in joined
-        assert "--phase1-only" not in joined
-        assert "--morning-enrich-only" not in joined
-
-    def test_data_phase1_invokes_phase1_only(self, states):
-        # alpha-engine-config-I4442/I4497 SF cutover: DataPhase1 now invokes
-        # its own dedicated script.
-        joined = " ".join(self._commands(states, "DataPhase1"))
-        assert "spot_data_phase1.sh" in joined, (
-            "DataPhase1 must run its dedicated per-stage script post-cutover."
-        )
-        assert "spot_data_weekly.sh" not in joined
-        assert "--data-only" not in joined
-        assert "--phase1-only" not in joined
-
-    def test_morning_enrich_command_starts_with_pipefail(self, states):
-        # Same invariant test_sf_ssm_pipefail_wiring.py pins globally;
-        # asserted here too so a MorningEnrich-specific regression is
-        # self-documenting.
-        cmds = self._commands(states, "MorningEnrich")
-        assert cmds[0].startswith("set ") and "pipefail" in cmds[0]
-
-    def test_morning_enrich_log_capture_via_lib_cli(self, states):
-        """The trap-and-log-ship invariant is now satisfied by the
-        krepis.ssm_log_capture Python CLI (lib v0.25.0), not
-        by an inline `trap 'aws s3 cp ...' EXIT` line. The 2026-05-22
-        Friday-PM dry-pass caught the prior inline-trap form failing
-        under ASL States.Array escape semantics (`\\'` not unescaped to
-        `'` inside arg strings) — so we lifted to a Python CLI invoked
-        as a single States.Format-rendered token list with no bash
-        quoting surface. See alpha-engine-lib PR #57 + this state's
-        sibling traps across the 7 other Saturday-SF spot states.
-        """
-        cmds = self._commands(states, "MorningEnrich")
-        work_idx = next(
-            i
-            for i, c in enumerate(cmds)
-            if "krepis.ssm_log_capture run" in c
-        )
-        work = cmds[work_idx]
-        # Right slug and log path
-        assert "--slug morning-enrich" in work
-        assert "--log /var/log/morning-enrich.log" in work
-        # Inner command is the dedicated morning-enrich launcher (post
-        # I4442/I4497 SF cutover, not the monolith + mode flag)
-        assert "-- bash infrastructure/spot_morning_enrich.sh" in work
-        # No inline trap survives anywhere in this state
-        assert not any(c.startswith("trap ") for c in cmds), (
-            "Inline `trap 'aws s3 cp ...' EXIT` line must not coexist "
-            "with the lib CLI — the CLI internalizes the trap. Two "
-            "competing log-ship paths can race on the same /var/log "
-            "file."
-        )
-
-
-class TestCatchSemantics:
-    """Both new Task states must Catch States.ALL → NormalizeFailureContext
-    (config#1819: the single chokepoint in front of HandleFailure, was
-    HandleFailure directly pre-fix) with ResultPath $.error, exactly like the
-    DataPhase1 / RAGIngestion quartets (the SF halts on infra failure of
-    these states)."""
-
-    @pytest.mark.parametrize("name", ["MorningEnrich", "WaitForMorningEnrich"])
-    def test_catch_routes_to_handle_failure(self, states, name):
-        catches = states[name]["Catch"]
-        assert len(catches) >= 1
-        for c in catches:
-            assert c["ErrorEquals"] == ["States.ALL"]
-            assert c["Next"] == "NormalizeFailureContext"
-            assert c["ResultPath"] == "$.error"
-
-    def test_extract_error_routes_to_handle_failure(self, states):
-        st = states["ExtractMorningEnrichError"]
+class TestWeeklyWaitFailsClosed:
+    def test_not_ready_halts_through_the_failure_chokepoint(self, states):
+        st = states["ExtractCollectionNotReadyError"]
         assert st["Type"] == "Pass"
         assert st["ResultPath"] == "$.error"
         assert st["Next"] == "NormalizeFailureContext"
-        assert st["Parameters"]["phase"] == "MorningEnrich"
+        assert st["Parameters"]["phase"] == "CollectionReadiness"
+
+    def test_both_not_ready_edges_reach_the_error_state(self, states):
+        settled = [
+            c for c in states["CheckCollectionReadiness"]["Choices"]
+            if c["And"][0]["Variable"] == "$.collection_readiness.settled"
+        ]
+        assert [c["Next"] for c in settled] == ["ExtractCollectionNotReadyError"]
+        budget = [
+            c for c in states["CheckCollectionReadinessBudget"]["Choices"]
+            if {leaf["Variable"] for leaf in c.get("And", [c])}
+            == {"$.collection_readiness_poll.attempts"}
+        ]
+        assert [c["Next"] for c in budget] == ["ExtractCollectionNotReadyError"]
+
+    def test_a_raising_probe_spends_a_poll_it_does_not_halt(self, states):
+        catch = states["WaitForCollectionManifests"]["Catch"]
+        assert [c["Next"] for c in catch] == ["CheckCollectionReadinessBudget"]
 
 
-class TestResultPathIsolation:
-    """MorningEnrich must not stomp on DataPhase1's SSM result path."""
+class TestShellRunRunsTheWaitDry:
+    """The Friday shell run (shell_run=true) ran MorningEnrich/DataPhase1 with
+    --preflight-only. Their replacement runs dry too: one probe, then on. A
+    Friday has no Saturday collection to wait for, so a real wait would burn
+    its whole budget and then fail the preflight on an expected condition."""
 
-    def test_distinct_result_paths(self, states):
-        assert (
-            states["MorningEnrich"]["ResultPath"]
-            != states["DataPhase1"]["ResultPath"]
-        )
-        assert states["MorningEnrich"]["ResultPath"] == "$.morning_enrich_result"
+    @staticmethod
+    def _is_shell_run(rule: dict) -> bool:
+        return {c["Variable"] for c in rule.get("And", [])} == {"$.shell_run"}
 
-    def test_wait_reads_morning_enrich_command_id(self, states):
-        cmd_id = states["WaitForMorningEnrich"]["Parameters"]["CommandId.$"]
-        assert "morning_enrich_result" in cmd_id
+    def test_one_dry_probe_then_continue(self, states):
+        choices = states["CheckCollectionReadiness"]["Choices"]
+        order = [
+            "ready" if c["And"][0]["Variable"] == "$.collection_readiness.ready"
+            else "shell_run" if self._is_shell_run(c)
+            else "settled"
+            for c in choices
+        ]
+        # ready first (a green probe is a green probe), then the dry exit
+        # BEFORE the settled-not-ok halt: a Friday verdict never halts.
+        assert order == ["ready", "shell_run", "settled"]
+        assert choices[1]["Next"] == "ResearchPredictorParallel"
+
+    def test_a_raising_dry_probe_fails_the_preflight_now(self, states):
+        choices = states["CheckCollectionReadinessBudget"]["Choices"]
+        dry = [c for c in choices if self._is_shell_run(c)]
+        assert [c["Next"] for c in dry] == ["ExtractCollectionNotReadyError"]
+        assert choices.index(dry[0]) == 0  # before the attempts bound
+
+    def test_the_real_run_is_unaffected(self, states):
+        """shell_run absent: neither dry rule can fire, so the pinned
+        budget/verdict edges above are the whole behaviour."""
+        for name in ("CheckCollectionReadiness", "CheckCollectionReadinessBudget"):
+            for c in states[name]["Choices"]:
+                if self._is_shell_run(c):
+                    assert c["And"][0] == {"Variable": "$.shell_run", "IsPresent": True}
+                    assert c["And"][1]["BooleanEquals"] is True

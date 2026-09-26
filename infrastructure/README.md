@@ -79,7 +79,7 @@ retry only re-runs the stage that actually failed (and everything after
 it). This is the operational equivalent of a targeted redrive:
 
 ```
-skip_weekly_run_day_gate, skip_morning_enrich, skip_data_phase1, skip_data_phase2,
+skip_weekly_run_day_gate, skip_morning_enrich, skip_data_phase2,
 skip_lib_pin_drift_check, skip_scanner, skip_signals_envelope, skip_challenger_shadow,
 skip_regime_substrate, skip_research, skip_rag_ingestion,
 skip_rationale_clustering, skip_eval_judge, skip_evaluator, skip_post_eval,
@@ -87,6 +87,12 @@ skip_regime_retrospective_eval, skip_predictor_training, skip_predictor_backtest
 skip_portfolio_optimizer_backtest, skip_backtester, skip_backtester_stage_only,
 skip_parity, skip_counterfactual, skip_aggregate_costs
 ```
+
+`skip_morning_enrich` skips the bounded wait on `ne-data-collection-weekly`'s
+run manifests (`WaitForCollectionManifests`). `skip_data_phase1` retired with
+its stage in the decoupled data cutover (alpha-engine-config-I11269): the
+standalone collection runs morning-enrich and weekly-phase-one, and a rerun
+never re-runs them from this pipeline.
 
 **`skip_backtester_stage_only` (config#2362 Option A, operator-ruled
 2026-07-21)**: additive, distinct from `skip_backtester`'s legacy whole-pair
@@ -124,9 +130,10 @@ executor) or when the failed execution's history proves SignalsEnvelope
 already ran this `run_date` — never hand-set it true on an operator rerun
 that is expected to produce a live Monday signal.
 
-e.g. an execution that failed at `MorningEnrich` retries with
+e.g. an execution that failed at `WaitForCollectionManifests` retries with
 `skip_weekly_run_day_gate=true` (already passed) and every other `skip_*`
-left `false`/absent so the pipeline re-runs from `MorningEnrich` forward.
+left `false`/absent so the pipeline re-checks the collection's manifests
+and runs forward from there.
 
 Caution: this is safe for the idempotent/additive `shell` (Friday
 rehearsal) path. For a `full` Saturday run, stages are **not** all

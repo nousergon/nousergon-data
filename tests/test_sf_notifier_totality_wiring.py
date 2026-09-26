@@ -164,11 +164,12 @@ class TestNormalizeFailureContextIsSoleChokepoint:
         NormalizeFailureContext. Spot-checks the known failure-path
         entrypoints across the weekly SF (top-level Task Catches, the
         Parallel-level backstop Catch, and every Extract*Error Pass)."""
+        # alpha-engine-config-I11269: MorningEnrich / DataPhase1 (and their
+        # WaitFor* polls) left with the decoupled data cutover. The wait that
+        # replaced them has no Catch to NormalizeFailureContext (a raising
+        # probe spends a poll); its not-ready outcome reaches the chokepoint
+        # through ExtractCollectionNotReadyError, pinned below.
         expected_normalize_entrypoints = [
-            "MorningEnrich",
-            "WaitForMorningEnrich",
-            "DataPhase1",
-            "WaitForDataPhase1",
             "ResearchPredictorParallel",
             "Backtester",
             "WaitForBacktester",
@@ -197,8 +198,7 @@ class TestNormalizeFailureContextIsSoleChokepoint:
         expected_extract_normalizers = [
             "ExtractLibPinDriftError",
             "ExtractParallelBranchError",
-            "ExtractMorningEnrichError",
-            "ExtractDataPhase1Error",
+            "ExtractCollectionNotReadyError",
             "ExtractBacktesterError",
             "ExtractPredictorBacktestError",
             "ExtractPortfolioOptimizerBacktestError",

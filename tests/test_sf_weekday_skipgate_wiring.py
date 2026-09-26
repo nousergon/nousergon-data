@@ -74,7 +74,9 @@ _CHAIN = [
     # I7811 (Brian ruling 2026-08-20): the scanner forms its cuts WEEKLY, so
     # CheckSkipScanner/Scanner are gone from this pipeline and the morning-enrich
     # skip lands on the predictor gate directly.
-    ("CheckSkipMorningEnrich", "LaunchMorningEnrichSpot", "skip_morning_enrich", "CheckSkipPredictorInference"),
+    # alpha-engine-config-I11269: the gate now fronts the bounded readiness
+    # wait on ne-data-collection-morning's manifests, not the spot data phase.
+    ("CheckSkipMorningEnrich", "WaitForCollectionManifests", "skip_morning_enrich", "CheckSkipPredictorInference"),
     ("CheckSkipPredictorInference", "PredictorInference", "skip_predictor_inference", "CheckSkipMorningPlanner"),
     ("CheckSkipMorningPlanner", "RunMorningPlanner", "skip_morning_planner", "CheckSkipRunDaemon"),
     # config#2857 + alpha-engine-config#6692: the skip edge now routes through
@@ -115,12 +117,13 @@ class TestGateShape:
     @pytest.mark.parametrize("gate,task,flag,nxt", _CHAIN)
     def test_default_runs_the_task(self, states, gate, task, flag, nxt):
         default = states[gate]["Default"]
-        # config#2542: CheckSkipMorningEnrich's Default now threads through the
-        # InitMorningEnrichRetryCounter Pass state (seeds the spot-retry budget)
-        # before LaunchMorningEnrichSpot — follow at most one Pass-state hop so
-        # the gate/skip invariant this test pins still holds.
-        if default != task and states[default]["Type"] == "Pass":
-            default = states[default]["Next"]
+        # alpha-engine-config-I11269: CheckSkipMorningEnrich's Default threads
+        # through two Pass seeds (InitCollectionReadinessPoll,
+        # SeedCollectionReadiness) before WaitForCollectionManifests — follow
+        # Pass-state hops so the gate/skip invariant this test pins still holds.
+        hops = 0
+        while default != task and states[default]["Type"] == "Pass" and hops < 2:
+            default, hops = states[default]["Next"], hops + 1
         assert default == task, (
             f"{gate} Default must (eventually) run {task} (missing flag = run as normal)"
         )
@@ -178,26 +181,14 @@ class TestEntryEdgesRouteThroughGates:
             "costs ~2 minutes rather than a full data phase"
         )
 
-    def test_morning_enrich_spot_success_enters_append_spot(self, states):
-        # config#1767: the enrich fetch now runs on its own ephemeral spot. Its
-        # poll-status Success enters the Arctic-append retry-budget init
-        # (config#2542), which immediately seeds $.morning_arctic_append_retry
-        # and hands off to the Arctic-append spot launch (both run on
-        # independent spots).
-        success = [c["Next"] for c in states["CheckMorningEnrichSpotStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
-        assert success == ["InitMorningArcticAppendRetryCounter"]
-        assert states["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
-
-    def test_arctic_append_spot_success_enters_scanner_gate(self, states):
-        # config#1767: the Arctic append also runs on its own spot; its Success
-        # rejoins the trading path at CheckSkipPredictorInference (I7811; was CheckSkipScanner under I6494:
-        # weekday Scanner runs before PredictorInference). I2717 removed the
-        # intermediate CheckSkipChronicGapHeal gate (heal moved standalone).
-        success = [c["Next"] for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
-                   if c.get("StringEquals") == "Success"]
-        # I7811: the scanner gate is gone; the data phase rejoins at the predictor gate.
-        assert success == ["CheckSkipPredictorInference"]
+    def test_collection_ready_enters_predictor_gate(self, states):
+        # alpha-engine-config-I11269: the enrich and Arctic-append spot legs
+        # (config#1767) whose Success edges rejoined the trading path at
+        # CheckSkipPredictorInference are gone; the readiness wait's "ready"
+        # edge is the one entry now, and the fail-open normalizer the other.
+        ready = states["CheckCollectionReadiness"]["Choices"][0]
+        assert ready["Next"] == "CheckSkipPredictorInference"
+        assert states["PublishDataSpotFailureImmediate"]["Next"] == "CheckSkipPredictorInference"
 
     def test_data_phase_no_longer_on_trading_box(self, states):
         # config#1767 deliverable #2: the trading path retains NO data-phase SSM
@@ -282,7 +273,7 @@ class TestPaths:
                     # config-I2767: unwrap the And[IsPresent, BooleanEquals] guard.
                     [c["Next"] for c in st.get("Choices", [])
                      if any(op.get("BooleanEquals") is True for op in c.get("And", [c]))]
-                    if cur.endswith("SpotLaunched") else []
+                    if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
                 )
                 cur = (succ or launched or [st.get("Default")])[0]
             else:
@@ -317,17 +308,14 @@ class TestPaths:
         the skip resumes at Scanner (still needed for weekday membership /
         factor-profile freshness on ArcticDB), then PredictorInference."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags={"skip_morning_enrich"})
-        assert "LaunchMorningEnrichSpot" not in order
-        assert "LaunchMorningArcticAppendSpot" not in order
+        assert "WaitForCollectionManifests" not in order
         assert order[0] == "PredictorInference"
         assert order[-1] == "PipelineComplete"
 
-    def test_happy_path_runs_data_phase_on_spot(self, states):
-        """The data phase runs as spot-launch states, not on-trading SSM."""
+    def test_happy_path_waits_for_the_collection_before_the_predictor(self, states):
+        """alpha-engine-config-I11269: no spot launch runs from this SF; the
+        predictor reads what ne-data-collection-morning wrote, so the wait
+        precedes it."""
         order = self._walk(states, "CheckSkipMorningEnrich", skip_flags=set())
-        assert "LaunchMorningEnrichSpot" in order
-        assert "LaunchMorningArcticAppendSpot" in order
-        # Enrich spot precedes append spot precedes Scanner precedes
-        # PredictorInference (I6494); I2717 removed chronic-gap-heal hop.
-        assert order.index("LaunchMorningEnrichSpot") < order.index("LaunchMorningArcticAppendSpot")
-        assert order.index("LaunchMorningArcticAppendSpot") < order.index("PredictorInference")
+        assert order.index("WaitForCollectionManifests") < order.index("PredictorInference")
+        assert not [n for n in order if n.startswith("Launch") and n.endswith("Spot")], order

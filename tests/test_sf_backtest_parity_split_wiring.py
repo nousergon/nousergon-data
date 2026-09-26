@@ -498,6 +498,9 @@ class TestChainOrdering:
                 or name.endswith("Reissue")
                 or name.endswith("Degraded")
                 or name in ("HandleFailure", "FailExecution")
+                # alpha-engine-config-I11269: the readiness wait's not-yet
+                # loop (the analogue of an InProgress/Pending poll edge).
+                or name == "CheckCollectionReadinessBudget"
             )
 
         order: list[str] = []

@@ -206,13 +206,16 @@ def test_every_box_acquisition_exits_through_the_substrate_gate():
     assert wsr.box_states_needing_dispatch(definition, flags) == set()
 
 
-def test_skip_morning_enrich_still_skips_only_morning_enrich():
-    """The flag keeps its meaning: CheckSkipMorningEnrich routes to MorningEnrich,
-    or past it to CheckSkipDataPhase1 — and the gate is already behind it."""
+def test_skip_morning_enrich_still_skips_only_the_collection_step():
+    """The flag keeps its meaning: CheckSkipMorningEnrich routes into the step
+    that stands where MorningEnrich stood — since the decoupled data cutover
+    (alpha-engine-config-I11269) the bounded wait on ne-data-collection-weekly's
+    manifests — or past it to ResearchPredictorParallel, and the gate is
+    already behind it."""
     states = _load("step_function.json")
     gate = states["CheckSkipMorningEnrich"]
-    assert gate["Default"] == "MorningEnrich"
-    assert [c["Next"] for c in gate["Choices"]] == ["CheckSkipDataPhase1"]
+    assert gate["Default"] == "InitCollectionReadinessPoll"
+    assert [c["Next"] for c in gate["Choices"]] == ["ResearchPredictorParallel"]
     assert states["CheckShellRun"]["Default"] == "CheckSkipMorningEnrich"
     assert states["ApplyShellRunDefaults"]["Next"] == "CheckSkipMorningEnrich"
 
@@ -225,7 +228,7 @@ def test_a_reintroduced_bypass_is_caught():
         for key in ("Next", "Default"):
             if state.get(key) == "SubstrateHealthGate":
                 state[key] = "CheckShellRun"
-    states["CheckSubstrateHealthGate"]["Choices"][0]["Next"] = "MorningEnrich"
+    states["CheckSubstrateHealthGate"]["Choices"][0]["Next"] = "InitCollectionReadinessPoll"
     states["CheckSkipMorningEnrich"]["Default"] = "SubstrateHealthGate"
     found = _bypasses("step_function.json", states)
     assert any("'SubstrateHealthGate'" in f and "CheckSkipMorningEnrich" in f for f in found), found

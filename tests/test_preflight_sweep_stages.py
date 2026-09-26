@@ -108,7 +108,9 @@ def test_the_derivation_finds_the_pipeline_s_send_command_stages(stages):
     names = {s.name for s in stages}
     # Spot-check the three nesting shapes the walker has to handle: a
     # top-level stage, a Parallel-branch stage, and a second Parallel.
-    assert "DataPhase1" in names
+    # (The top-level spot-check was DataPhase1 until the decoupled data
+    # cutover, alpha-engine-config-I11269, removed it.)
+    assert "Backtester" in names
     assert "ResearchPredictorParallel.PredictorTraining" in names
     assert "ParityParallel.ParityReplay" in names
 

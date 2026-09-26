@@ -92,8 +92,9 @@ _EXPECTED_SKIPS = {
     # Added 2026-06-08 (L4517 — preventive cross-repo lib-pin drift gate,
     # the first state after InitializeInput).
     "skip_lib_pin_drift_check",
+    # alpha-engine-config-I11269: skip_morning_enrich now gates the bounded
+    # collection readiness wait; skip_data_phase1 retired with DataPhase1.
     "skip_morning_enrich",
-    "skip_data_phase1",
     # config#3134: Scanner, SignalsEnvelope, ChallengerShadow and (until
     # 2026-08-10) ThinkTankCoverage each got their own CheckSkip* gate —
     # previously NONE of them had one, so every partial rerun unconditionally
@@ -189,15 +190,12 @@ _EXPECTED_SKIPS = {
 # per-stage script instead of a shared monolith + mode flag. The old
 # monolith launchers (spot_data_weekly.sh / spot_backtest.sh) are retained
 # on disk, unchanged, only as the rollback path.
+#
+# alpha-engine-config-I11269: MorningEnrich and DataPhase1 left this
+# definition (ne-data-collection-weekly runs that work); their replacement,
+# WaitForCollectionManifests, is a Lambda poll whose dry path is pinned by
+# tests/test_sf_morning_enrich_split_wiring.py::TestShellRunRunsTheWaitDry.
 _SPOT_STATES = {
-    "MorningEnrich": (
-        "bash infrastructure/spot_morning_enrich.sh",
-        "/var/log/morning-enrich.log",
-    ),
-    "DataPhase1": (
-        "bash infrastructure/spot_data_phase1.sh",
-        "/var/log/data-weekly.log",
-    ),
     "RAGIngestion": (
         "bash infrastructure/spot_rag_ingestion.sh",
         "/var/log/rag-ingestion.log",
@@ -1409,8 +1407,10 @@ class TestHappyPathTraversal:
         # DataPhase1), so they too are off this main-thread trace now —
         # their dry-routing is covered by the same in-branch dry assertions.
         for ran_dry in (
-            "MorningEnrich",
-            "DataPhase1",
+            # alpha-engine-config-I11269: the collection readiness wait that
+            # replaced MorningEnrich/DataPhase1 is VISITED and exits dry after
+            # one probe (shell_run rule in CheckCollectionReadiness).
+            "WaitForCollectionManifests",
             "Backtester",
             "PredictorBacktest",
             "PortfolioOptimizerBacktest",
@@ -1539,7 +1539,9 @@ class TestHappyPathTraversal:
             "RecordWeeklyPreflightOnSpot",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
-            "MorningEnrich",
+            # alpha-engine-config-I11269: the readiness wait's first seed, where
+            # MorningEnrich used to be.
+            "InitCollectionReadinessPoll",
         ]
 
 

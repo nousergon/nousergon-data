@@ -1194,21 +1194,21 @@ class TestPostJoinAggregationAndFailure:
 
 
 class TestInboundRewireAndDownstreamUnchanged:
-    def test_data_phase1_forks_into_parallel(self, states):
-        """config#885: DataPhase1 now routes DIRECTLY into the Parallel
-        (both the skip path and the poll-Success path), so PredictorTraining
-        (Branch B) forks parallel to the relocated Scanner chain (Branch A
-        head). This is the whole point of the change — Predictor's ~91 min
-        overlaps Scanner+RAG+Research instead of stacking after it."""
+    def test_collection_readiness_forks_into_parallel(self, states):
+        """config#885: the data phase routes DIRECTLY into the Parallel (both
+        the skip path and the success path), so PredictorTraining (Branch B)
+        forks parallel to the relocated Scanner chain (Branch A head). This is
+        the whole point of the change — Predictor's ~91 min overlaps
+        Scanner+RAG+Research instead of stacking after it. Since
+        alpha-engine-config-I11269 the data phase is the bounded wait on
+        ne-data-collection-weekly (DataPhase1 left this definition)."""
         assert any(
             c["Next"] == "ResearchPredictorParallel"
-            for c in states["CheckSkipDataPhase1"]["Choices"]
+            for c in states["CheckSkipMorningEnrich"]["Choices"]
         )
-        success = next(
-            c for c in states["CheckDataPhase1Status"]["Choices"]
-            if c.get("StringEquals") == "Success"
-        )
-        assert success["Next"] == "ResearchPredictorParallel"
+        ready = states["CheckCollectionReadiness"]["Choices"][0]
+        assert ready["And"][1]["Variable"] == "$.collection_readiness.ready"
+        assert ready["Next"] == "ResearchPredictorParallel"
 
     def test_relocated_chain_threads_through_branch_a(self, branch_a):
         """The relocated Scanner chain's terminal RegimeRetrospectiveEval
@@ -1323,6 +1323,9 @@ class TestInboundRewireAndDownstreamUnchanged:
                 or name.endswith("LivenessGate")  # config#6938: error-side branch
                 or name.endswith("Reissue")
                 or name in ("HandleFailure", "FailExecution")
+                # alpha-engine-config-I11269: the readiness wait's not-yet
+                # loop (the analogue of an InProgress/Pending poll edge).
+                or name == "CheckCollectionReadinessBudget"
             )
 
         order: list[str] = []

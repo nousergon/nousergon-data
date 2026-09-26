@@ -765,13 +765,25 @@ def _pending(key: str, what: str, reader: str) -> Reading:
 def read_v1_data_stage_quiet(store: GateStore) -> Reading:
     """Phase 1's "v1 SF data-stage executions since cutover = 0".
 
-    Two facts neither of which exists as an artifact today: the cutover instant,
-    and the v1 pipelines' executions after it. Both are readable — the cutover
-    instant from the moment the standalone schedules were enabled, the
-    executions from ``states:ListExecutions`` over the v1 data-stage machines —
-    but nothing publishes either, and a gate READS; it never runs a survey of
-    its own. So the row states what it will read.
+    Reads the document ``data_gate/producers/v1_data_stage.py`` publishes. Three
+    shapes are refused as UNMEASURABLE rather than graded, because each would
+    otherwise read as a quiet that nobody measured:
+
+    * a document that does not survey EVERY v1 state machine
+      (``data_gate.cutover.V1_STATE_MACHINE_NAMES``) — the pre-I11265 producer
+      surveyed only the weekly machine and would read 0 over the two daily
+      pipelines the decoupled cutover leaves running (alpha-engine-config-I11265);
+    * a document measured from a cutover instant other than the committed one
+      (``data_gate.cutover.CUTOVER_UTC``) — e.g. the pre-cutover placeholder
+      baseline still in S3 the morning after the merge;
+    * a document whose ``as_of`` precedes its own ``cutover_utc`` — a survey
+      taken before the window it describes began.
+
+    The detail renders the per-machine breakdown, so a non-zero reading names its
+    pipeline (I11265 deliverable 4).
     """
+    from data_gate.cutover import CUTOVER_UTC, V1_STATE_MACHINE_NAMES, cutover_instant
+
     read = read_store_document(store, V1_DATA_STAGE_KEY)
     if read.problem is not None:
         return Reading(
@@ -790,29 +802,73 @@ def read_v1_data_stage_quiet(store: GateStore) -> Reading:
             "the v1 data-stage machines since it",
         )
     document = read.document or {}
+    as_of = str(document.get("as_of") or "")
+
+    def _refuse(why: str) -> Reading:
+        return Reading(
+            met=False,
+            detail=f"{V1_DATA_STAGE_KEY}: {why}",
+            evidence=(V1_DATA_STAGE_KEY,),
+            unmeasurable=True,
+            source=_SOURCE_STORE,
+            as_of=as_of,
+        )
+
     count = document.get("executions_since_cutover")
     try:
         executions = int(count)
     except (TypeError, ValueError):
-        return Reading(
-            met=False,
-            detail=(
-                f"{V1_DATA_STAGE_KEY} carries executions_since_cutover={count!r}, which is not a "
-                "count. A field the exit counts on that does not parse is a finding, not a zero."
-            ),
-            evidence=(V1_DATA_STAGE_KEY,),
-            unmeasurable=True,
-            source=_SOURCE_STORE,
+        return _refuse(
+            f"carries executions_since_cutover={count!r}, which is not a count. A field the "
+            "exit counts on that does not parse is a finding, not a zero."
         )
+    per_machine = document.get("per_state_machine")
+    if not isinstance(per_machine, dict):
+        per_machine = {}
+    unsurveyed = [name for name in V1_STATE_MACHINE_NAMES if name not in per_machine]
+    if unsurveyed:
+        return _refuse(
+            f"does not survey {unsurveyed}. The decoupled cutover leaves all three v1 state "
+            "machines running, so a document blind to any of them would read 0 whether or not "
+            "that pipeline's data stages were removed (alpha-engine-config-I11265)."
+        )
+    declared = str(document.get("cutover_utc") or "")
+    if declared != CUTOVER_UTC:
+        return _refuse(
+            f"was measured from cutover_utc={declared!r}, not the committed cutover instant "
+            f"{CUTOVER_UTC} (data_gate/cutover.py). A count over a different window is not "
+            "a reading about this cutover."
+        )
+    try:
+        if cutover_instant(as_of) < cutover_instant(declared):
+            return _refuse(
+                f"was measured at {as_of}, before its own cutover {declared}; a survey of a "
+                "window that had not begun counts nothing."
+            )
+    except ValueError as exc:
+        return _refuse(f"carries an unparseable instant: {exc}")
+    counts: dict[str, int] = {}
+    for name in V1_STATE_MACHINE_NAMES:
+        row = per_machine[name]
+        try:
+            counts[name] = int(row.get("executions_since_cutover") if isinstance(row, dict) else row)
+        except (TypeError, ValueError):
+            return _refuse(f"per_state_machine[{name!r}]={row!r} is not a count.")
+    if sum(counts.values()) != executions:
+        return _refuse(
+            f"reports a total of {executions} but its per-machine counts {counts} sum to "
+            f"{sum(counts.values())}; a document that disagrees with itself is not a reading."
+        )
+    breakdown = ", ".join(f"{name}={n}" for name, n in counts.items())
     return Reading(
         met=executions == 0,
         detail=(
             f"{V1_DATA_STAGE_KEY}: {executions} v1 data-stage execution(s) since the cutover at "
-            f"{document.get('cutover_utc')}; the exit requires 0"
+            f"{declared} ({breakdown}); the exit requires 0"
         ),
         evidence=(V1_DATA_STAGE_KEY,),
         source=_SOURCE_STORE,
-        as_of=str(document.get("as_of") or ""),
+        as_of=as_of,
     )
 
 
