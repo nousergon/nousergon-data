@@ -8234,7 +8234,7 @@
     },
     "WeeklyPreflightOnSpot": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I11312: the SECOND sf_preflight pass, on the weekly box, in ENFORCE mode (sf-pipeline-policy.md \u00a77a \u2014 promoted 2026-09-26). WeeklyPreflight (the Lambda) runs under LAMBDA_CAPABILITIES={aws}, so seven of eight FULL-profile required checks cannot run there; this pass runs them on the box. An OBSERVED FAIL (exit OBSERVED_FAIL_EXIT_CODE) HALTS via RecordWeeklyPreflightOnSpotFail \u2192 Extract \u2192 NormalizeFailureContext. Unobserved (crash/timeout/SSM miss) still fails OPEN.",
+      "Comment": "alpha-engine-config-I11312: the SECOND sf_preflight pass, on the weekly box, in ENFORCE mode (sf-pipeline-policy.md \u00a77a; promoted 2026-09-26 after the rehearsal-2026-09-25-1 + 2026-09-26 cadence pair). WeeklyPreflight (the Lambda) runs under LAMBDA_CAPABILITIES={aws}, so the seven checks needing ArcticDB, the repo's collector modules or a Polygon key (arctic_connectivity, constituents_fetch, universe_drift, universe_sample_freshness, polygon_grouped_coverage, predicted_missing_from_closes, backfill_source_freshness) have always skipped there (required_skip_count 8 on rehearsal-2026-09-23-2). This box already carries them: /home/ec2-user/alpha-engine-data/.venv is built from this repo's requirements.txt by the weekly-freshness-spot bootstrap (config-I7427). sf_preflight_on_spot.py runs exactly the checks the Lambda profile cannot reach, with capabilities DETECTED on the box (CAP_CHECKOUT never claimed \u2014 that group is I11313's; its skips are expected and never escalate), writes its record to s3://alpha-engine-research/health/weekly_preflight_on_spot/<run_date>/<execution name>.json, emits the AlphaEngine/WeeklyPreflight series under Profile=weekly-spot-full, and prints one compact verdict line that RecordWeeklyPreflightOnSpot stores as a STRING (never parsed in ASL, so no stdout shape can throw States.Runtime in a Pass). PLACEMENT: entered only from CheckSubstrateHealthGate's HEALTHY edge and exiting only to CheckShellRun, so it is after the box is bootstrapped AND proven SSM-responsive, on every box-acquiring path (first dispatch and the ec2_instance_id escape hatch; not the replacement-box resume, which is mid-run by definition), and before any stage is dispatched \u2014 MorningEnrich is the first data-mutating command. A DEDICATED state rather than a prefix of MorningEnrich's command: the box is already bootstrapped here, so this costs one SendCommand on a warm box (~1-2 min including the checks), not a bootstrap round trip; folding it into MorningEnrich would skip it whenever skip_morning_enrich=true, re-run it on every rung of MorningEnrich's 4+2 retry ladder, and bury its verdict in that stage's stdout. ENFORCE MODE, unobserved fails OPEN: no Retry (config#2279 declared class: health-observe, same as WeeklySubstrateHealthCheck \u2014 a retry would only delay the run); every Catch and every non-verdict terminal status lands on WeeklyPreflightOnSpotUnobserved -> notice -> CheckShellRun, and an observed FAIL verdict (exit OBSERVED_FAIL_EXIT_CODE=10) lands on RecordWeeklyPreflightOnSpotFail -> ExtractWeeklyPreflightOnSpotFail -> NormalizeFailureContext and HALTS the run. Only a measured FAIL of a required check halts; a probe that could not run never does. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -8253,7 +8253,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "alpha-engine-config-I11312: unobserved still fails OPEN \u2014 a SendCommand failure records the pass as unobserved and proceeds.",
+          "Comment": "alpha-engine-config-I11312: unobserved fails OPEN \u2014 a SendCommand failure records the pass as unobserved and proceeds.",
           "ResultPath": "$.weekly_preflight_on_spot_error",
           "Next": "WeeklyPreflightOnSpotUnobserved"
         }
@@ -8302,7 +8302,7 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "alpha-engine-config-I11312: unobserved still fails OPEN \u2014 a poll failure records the pass as unobserved and proceeds.",
+          "Comment": "alpha-engine-config-I11312: unobserved fails OPEN \u2014 a poll failure records the pass as unobserved and proceeds.",
           "ResultPath": "$.weekly_preflight_on_spot_error",
           "Next": "WeeklyPreflightOnSpotUnobserved"
         }
@@ -8438,7 +8438,7 @@
     },
     "WeeklyPreflightOnSpotUnobserved": {
       "Type": "Pass",
-      "Comment": "alpha-engine-config-I11312: the on-spot preflight did not produce a verdict (SendCommand/poll failure, a crash before the module ran, TimedOut, or an exhausted poll budget). Unobserved still fails OPEN: record observed=false and proceed; only a measured FAIL halts.",
+      "Comment": "alpha-engine-config-I11312: the on-spot preflight did not produce a verdict (SendCommand/poll failure, a crash before the module ran, TimedOut, or an exhausted poll budget). Unobserved still fails OPEN after promotion: recorded as observed:false and announced, then the run proceeds. Reached from two Catches and one Choice Default, so it dereferences nothing a path might lack \u2014 the underlying error or poll result stays on the execution record under weekly_preflight_on_spot_error / weekly_preflight_on_spot_poll. Only an observed FAIL halts (RecordWeeklyPreflightOnSpotFail). | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates; it keys the on-spot preflight's verdict record (health/weekly_preflight_on_spot/<run_date>/) the same way every other artifact prefix of this cycle is keyed.",
       "Parameters": {
         "mode": "enforce",
         "observed": false,
@@ -8452,7 +8452,7 @@
     },
     "PublishWeeklyPreflightOnSpotNotice": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I11312: sf-pipeline-policy.md \u00a77a obligation 3 \u2014 an unobserved / notice-path outcome is not silent. Subject is a hardcoded constant (config#1819 discipline); Message formats only $.weekly_preflight_on_spot fields. Observed FAIL no longer reaches this notice \u2014 it halts via NormalizeFailureContext.",
+      "Comment": "alpha-engine-config-I11312: sf-pipeline-policy.md \u00a77a obligation 3 \u2014 an unobserved pass is not silent (an observed FAIL no longer reaches this notice; it halts via NormalizeFailureContext). Subject is a hardcoded constant (config#1819 discipline); Message formats only $.weekly_preflight_on_spot.headline/.detail, two fields BOTH upstream Pass states write, so nothing possibly-absent is dereferenced. Best-effort Catch: a publish failure must not keep the run from proceeding to CheckShellRun \u2014 this is a notice, not a gate.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
