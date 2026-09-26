@@ -28,6 +28,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import boto3
+from botocore.config import Config
 import numpy as np
 import pandas as pd
 
@@ -143,6 +144,14 @@ def _cache_key_stem(key: str) -> str:
     return key.split("/")[-1].replace(".parquet", "")
 
 
+#: Concurrent S3 GETs in ``_load_full_cache``. ``backfill`` sizes its client's
+#: connection pool from this same constant: botocore's default pool is 10, so
+#: 20 workers on a default client made the weekly rebuild log "Connection pool
+#: is full, discarding connection" ten times per run (rehearsal-2026-09-25-1
+#: DataPhase1) and paid a fresh TLS handshake for every discarded connection.
+_FULL_CACHE_WORKERS = 20
+
+
 def _load_full_cache(
     s3,
     bucket: str,
@@ -190,7 +199,7 @@ def _load_full_cache(
         except Exception:
             return ticker, None
 
-    with ThreadPoolExecutor(max_workers=20) as pool:
+    with ThreadPoolExecutor(max_workers=_FULL_CACHE_WORKERS) as pool:
         futures = {pool.submit(_download, k): k for k in keys}
         for fut in as_completed(futures):
             ticker, df = fut.result()
@@ -1033,7 +1042,11 @@ def backfill(
     Returns:
         Summary dict with counts and timing.
     """
-    s3 = boto3.client("s3")
+    # Pool sized to the widest thread fan-out this client serves
+    # (``_load_full_cache``) so no worker's connection is discarded.
+    s3 = boto3.client(
+        "s3", config=Config(max_pool_connections=_FULL_CACHE_WORKERS),
+    )
     t0 = time.time()
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
