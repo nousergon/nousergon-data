@@ -36,7 +36,7 @@ import pytest
 
 class TestLoadRagScope:
     def _s3(self, *, cuts=None, holdings=("HELD",), membership=True,
-            predictor_cut="attractiveness_top_20"):
+            predictor_cut="attractiveness_top_20", held_yf=None):
         s3 = MagicMock()
         payloads = {}
         if membership:
@@ -65,6 +65,12 @@ class TestLoadRagScope:
         if holdings is not None:
             payloads["metron/holdings_universe.json"] = {
                 "as_of": "2026-07-29", "tickers": list(holdings),
+                # Metron's yf-priced view of the same held set: foreign
+                # listings exchange-suffixed (SU.PA), US lines bare.
+                "holdings": [
+                    {"yf_symbol": y, "currency": "USD"}
+                    for y in (held_yf if held_yf is not None else holdings)
+                ],
             }
 
         def _get(Bucket, Key):
@@ -194,6 +200,56 @@ class TestLoadRagScope:
         assert "912828YK0" not in scope["tickers"]
         assert scope["counts"]["rejected_non_equity"] == 1
         assert any("912828YK0" in r.message for r in caplog.records)
+
+    def test_symbols_held_only_on_a_foreign_exchange_are_dropped_loudly(self, caplog):
+        # 2026-09-25 weekly rehearsal: Metron publishes a held Schneider
+        # Electric as yf ``SU.PA`` and bare broker ``SU``. Every source here is
+        # US-only, so ``SU`` filled the corpus with SUNCOR's 40-Fs/8-Ks/Form 4s
+        # as the position's evidence, and NOVN / RMS (Novartis, Hermès) went
+        # to EDGAR as ``No CIK found``. Dropped from the HELD slice, and named.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        s3 = self._s3(
+            holdings=("HELD", "SU", "NOVN", "RMS"),
+            held_yf=("HELD", "SU.PA", "NOVN.SW", "RMS.PA"),
+        )
+        with caplog.at_level("WARNING"):
+            scope = load_rag_scope(s3_client=s3)
+        assert scope["tickers"] == ["AAPL", "HELD", "MSFT"]
+        assert scope["counts"]["rejected_foreign_listing"] == 3
+        assert any(
+            "foreign-listing" in r.message and "SU" in r.message
+            for r in caplog.records
+        )
+
+    def test_a_foreign_held_symbol_the_feed_cut_carries_is_kept(self):
+        # Only the held slice's bare symbol is wrong. When the scanner's own
+        # cut carries ``SU`` it is Suncor, a US listing, and stays in scope.
+        from rag.pipelines._rag_scope import load_rag_scope
+
+        s3 = self._s3(
+            cuts={
+                "attractiveness_top_60": {"tickers": ["AAPL", "SU"]},
+                "attractiveness_top_20": {"tickers": ["AAPL"]},
+            },
+            holdings=("SU",), held_yf=("SU.PA",),
+        )
+        assert load_rag_scope(s3_client=s3)["tickers"] == ["AAPL", "SU"]
+
+    def test_a_symbol_held_on_both_a_us_and_a_foreign_line_is_kept(self):
+        # A held US line of the same name keeps the symbol; share classes
+        # (BRK-B, dash-spelled by yfinance) and a CVR are not exchange suffixes.
+        from rag.pipelines._rag_scope import foreign_only_held_tickers
+
+        payload = {
+            "tickers": ["SHEL", "BRK-B", "ATAI.CVR", "BN"],
+            "holdings": [
+                {"yf_symbol": "SHEL"}, {"yf_symbol": "SHEL.L"},
+                {"yf_symbol": "BRK-B"}, {"yf_symbol": "ATAI.CVR"},
+                {"yf_symbol": "BN"},
+            ],
+        }
+        assert foreign_only_held_tickers(payload) == []
 
     def test_share_class_tickers_survive_the_filter(self):
         # BRK.B / BF-B are real, resolvable tickers — the filter must not be
