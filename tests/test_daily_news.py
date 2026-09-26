@@ -16,13 +16,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from collectors import daily_news
 
 
-def _mock_s3(holdings=None, signals_universe=None):
+def _mock_s3(holdings=None, signals_universe=None, yf_symbols=None):
     """S3 mock serving the Metron holdings_universe.json key and a signals.json.
 
     The holdings object mirrors Metron's REAL published payload
     (``metron/holdings_universe.json`` — config#1506): the symbols-only ``tickers``
     slice the union consumes, alongside the ``holdings``/``currencies`` fields the
-    market-data producer reads. daily_news must read ONLY ``tickers`` and ignore the rest.
+    market-data producer reads. daily_news reads ``tickers``, and ``holdings`` only to
+    tell a foreign-only listing (``yf_symbols`` override, e.g. ``SU.PA``) from a US one.
     """
     s3 = MagicMock()
     s3.list_objects_v2.return_value = {
@@ -38,7 +39,10 @@ def _mock_s3(holdings=None, signals_universe=None):
                 "as_of": "2026-07-02",
                 "source": "metron",
                 # Full Metron shape — daily_news must pick out `tickers` and ignore these.
-                "holdings": [{"yf_symbol": t, "currency": "USD"} for t in holdings],
+                "holdings": [
+                    {"yf_symbol": t, "currency": "USD"}
+                    for t in (yf_symbols if yf_symbols is not None else holdings)
+                ],
                 "currencies": [],
                 "tickers": holdings,
             }
@@ -87,6 +91,25 @@ def test_load_holdings_reads_tickers_slice_of_metron_payload():
     # the `holdings`/`currencies` (yf-priced) fields are the market-data producer's view.
     s3 = _mock_s3(holdings=["AAPL", "nvda"], signals_universe=[])
     assert daily_news._load_holdings_universe("b", s3) == ["AAPL", "NVDA"]
+
+
+def test_load_holdings_drops_symbols_held_only_on_a_foreign_exchange():
+    # 2026-09-25 weekly rehearsal: a held Schneider Electric (yf SU.PA) is published
+    # bare as `SU`, and Polygon keys news by US ticker — so the daily fetch filed
+    # Suncor Energy's news as the position's. A held US line (AAPL) is untouched.
+    s3 = _mock_s3(
+        holdings=["AAPL", "SU", "NOVN"],
+        yf_symbols=["AAPL", "SU.PA", "NOVN.SW"],
+        signals_universe=[],
+    )
+    assert daily_news._load_holdings_universe("b", s3) == ["AAPL"]
+
+
+def test_assemble_universe_keeps_a_foreign_held_symbol_the_decision_set_carries():
+    # Held only as SU.PA, but the scanner's own cut carries SU (Suncor, a US
+    # listing): the AE slice keeps it — only the HELD slice's bare symbol is wrong.
+    s3 = _mock_s3(holdings=["SU"], yf_symbols=["SU.PA"], signals_universe=["SU"])
+    assert daily_news.assemble_universe("b", s3) == ["SU"]
 
 
 def test_assemble_universe_fail_soft_no_holdings():

@@ -86,6 +86,22 @@ def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
         tickers = [
             str(t).strip().upper() for t in data.get("tickers", []) if str(t).strip()
         ]
+        # A symbol held only on a non-US exchange (SU.PA, NOVN.SW) is published
+        # bare in ``tickers`` (SU, NOVN), and the news vendors here key by US
+        # ticker — so fetching it files a DIFFERENT company's news (Suncor for a
+        # held Schneider Electric) as the position's news. Same rule, same
+        # helper as the weekly corpus scope, so one fetch serves one corpus
+        # (rag-corpus-policy.md §2.3).
+        from rag.pipelines._rag_scope import foreign_only_held_tickers
+
+        foreign = set(foreign_only_held_tickers(data))
+        if foreign:
+            logger.warning(
+                "[daily_news] dropped %d held foreign-listing symbol(s) %s — "
+                "the bare symbol names a different US issuer to the news vendors",
+                len(foreign), sorted(foreign),
+            )
+            tickers = [t for t in tickers if t not in foreign]
         logger.info("[daily_news] loaded %d Metron holdings tickers", len(tickers))
         return tickers
     except Exception as e:  # missing object, no creds, parse error, etc.
