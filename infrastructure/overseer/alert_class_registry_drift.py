@@ -22,7 +22,11 @@ Two emission shapes are covered (alpha-engine-config-I6753 added the second):
 Pattern matching:
   - Direct literal equality: source=="foo" matches registry row where source=="foo"
   - Wildcard patterns: registry rows ending with ``:*`` (e.g. ``groom:*``,
-    ``cloudwatch-alarm:*``) match any source with the matching prefix.
+    ``cloudwatch-alarm:*``) match any source with the matching prefix. Rows
+    ending with ``/*`` (e.g. ``alert-transport-liveness/*``) are prefix claims
+    too, and keep their slash, so ``foo/*`` never claims ``foobar``. Both
+    shapes are a subset of what the runtime resolver accepts
+    (``krepis.alert_tiers._match`` treats any trailing ``*`` as a prefix).
   - ``raw-sns:*``, ``raw-telegram:*``, ``flow-doctor:*``, ``email:*`` rows match
     any source with that prefix (drain-blind non-bus sources).
 
@@ -185,16 +189,29 @@ def _load_alert_classes(playbooks_path: Path) -> list[dict]:
     return data.get("alert_classes", [])
 
 
+def is_wildcard_source(source: str) -> bool:
+    """True for a registry ``source`` that is a prefix claim (``:*`` or ``/*``)."""
+    return source.endswith((":*", "/*"))
+
+
+def _wildcard_prefix(pattern: str) -> str:
+    """The prefix a wildcard row claims.
+
+    ``groom:*`` claims ``groom`` (the historical behaviour, kept unchanged);
+    ``alert-transport-liveness/*`` claims ``alert-transport-liveness/``.
+    """
+    return pattern[:-2] if pattern.endswith(":*") else pattern[:-1]
+
+
 def _build_registry_patterns(alert_classes: list[dict]) -> list[tuple[str, str, bool]]:
     """Build a list of (class_name, source_pattern, is_wildcard) tuples.
 
-    Wildcard patterns (ending with ``:*``) are matched by prefix.
+    Wildcard patterns (ending with ``:*`` or ``/*``) are matched by prefix.
     """
     patterns = []
     for cls in alert_classes:
         source = cls["source"]
-        is_wildcard = source.endswith(":*")
-        patterns.append((cls["class"], source, is_wildcard))
+        patterns.append((cls["class"], source, is_wildcard_source(source)))
     return patterns
 
 
@@ -240,8 +257,7 @@ def _source_matches_registry(source: str, patterns: list[tuple[str, str, bool]])
     """Check if a source value matches any registered alert_class pattern."""
     for _class_name, pattern, is_wildcard in patterns:
         if is_wildcard:
-            prefix = pattern[:-2]  # strip trailing ":*"
-            if source.startswith(prefix):
+            if source.startswith(_wildcard_prefix(pattern)):
                 return True
         else:
             if source == pattern:

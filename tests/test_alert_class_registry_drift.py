@@ -159,6 +159,21 @@ class TestSourceMatchesRegistry:
     def test_empty_patterns(self):
         assert not d._source_matches_registry("anything", [])
 
+    def test_slash_wildcard_is_a_prefix_claim_that_keeps_its_slash(self):
+        """``foo/*`` claims ``foo/<anything>`` but never ``foobar`` — the same
+        semantics krepis.alert_tiers._match applies at emit time
+        (alpha-engine-config-I9409)."""
+        patterns = d._build_registry_patterns([
+            {"class": "alert_transport_liveness_probe",
+             "source": "alert-transport-liveness/*"},
+        ])
+        assert patterns[0][2] is True
+        assert d._source_matches_registry("alert-transport-liveness/ne-admin", patterns)
+        assert d._source_matches_registry(
+            "alert-transport-liveness/github-actions-alert-transport-liveness", patterns)
+        assert not d._source_matches_registry("alert-transport-livenessX", patterns)
+        assert not d._source_matches_registry("alert-transport-liveness", patterns)
+
     def test_research_prefix(self):
         patterns = d._build_registry_patterns(_BASIC_CLASSES)
         assert d._source_matches_registry("research:score_aggregator", patterns)

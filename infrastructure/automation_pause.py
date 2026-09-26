@@ -864,7 +864,17 @@ def alarm_coverage_findings() -> list[dict]:
     return out
 
 
-def alert_on_findings(findings: list[dict], source: str = __file__) -> None:
+#: The alert-class registry key this module pages under
+#: (``infrastructure/overseer/playbooks.yaml`` → ``automation_pause_check``).
+#: A literal, never ``__file__``: the default used to be ``__file__``, which in
+#: CI is the runner's absolute checkout path
+#: (``/home/runner/work/nousergon-data/nousergon-data/infrastructure/...``) — a
+#: string that moves with the runner layout and that no registry row can key
+#: on, so every page landed as registry drift (alpha-engine-config-I9409).
+ALERT_SOURCE = "nousergon-data/infrastructure/automation_pause.py"
+
+
+def alert_on_findings(findings: list[dict], source: str = ALERT_SOURCE) -> None:
     """Page independently of any groom or sweep consumer (alpha-engine-config-I8110).
 
     ``--check`` already runs inside ``sf-arn-drift-check.yml``'s daily cron —

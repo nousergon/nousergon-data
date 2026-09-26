@@ -63,6 +63,29 @@ def test_alert_publishes_at_error_severity(mod):
     assert kwargs["source"] == "test-source"
 
 
+def test_default_source_is_stable_and_registered(mod):
+    """The default source is a repo-relative literal with an alert_classes row.
+
+    It used to default to ``__file__``, which in CI is the runner's absolute
+    checkout path, so every page arrived as registry drift under a key that
+    moves with the runner layout (alpha-engine-config-I9409).
+    """
+    import yaml
+
+    with patch("krepis.alerts.publish") as mock_publish:
+        mod.alert_on_findings(SAMPLE_FINDINGS)
+    source = mock_publish.call_args.kwargs["source"]
+    assert source == mod.ALERT_SOURCE == "nousergon-data/infrastructure/automation_pause.py"
+    assert not source.startswith("/"), "an absolute path is not a stable registry key"
+
+    playbooks = yaml.safe_load(
+        (INFRA / "overseer" / "playbooks.yaml").read_text()
+    )
+    assert any(r["source"] == source for r in playbooks["alert_classes"]), (
+        f"source={source!r} has no alert_classes row in playbooks.yaml"
+    )
+
+
 def test_alert_message_names_every_finding(mod):
     with patch("krepis.alerts.publish") as mock_publish:
         mod.alert_on_findings(SAMPLE_FINDINGS)
