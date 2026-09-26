@@ -455,7 +455,7 @@ def main(argv: list[str] | None = None) -> int:
                 continue
             matched_pr = next(
                 (n for pat, n in sorted(pend_origin.items())
-                 if scan._source_matches_registry(src, [("", pat, pat.endswith(":*"))])),  # noqa: SLF001
+                 if scan._source_matches_registry(src, [("", pat, scan.is_wildcard_source(pat))])),  # noqa: SLF001
                 None,
             )
             if matched_pr is not None:
