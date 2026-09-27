@@ -1331,6 +1331,32 @@ alert_classes:
     # derived: error-capable, automated response declared
     tier: notify-silent
 
+  - class: research_cut_slot_below_arm_floor
+    # alpha-engine-config-I9409 / -I11240 (registry drift; first observed by
+    # drain-2026-09-23T1201Z). crucible-research/scoring/cut_arena.py
+    # ::assert_slot_floor (alpha-engine-config-I9317 deliverable 5) pages at
+    # severity="critical" through ops_alerts.publish_ops_alert and then raises
+    # SlotFloorBreached, when the universe-cut slot holds fewer active arms
+    # than ARENA_CONFIG.min_active_arms. The drift checker could not see it:
+    # the call site binds publish_ops_alert to a local name (`alert(...)`),
+    # a shape its publish-call pattern does not match.
+    source: "crucible-research/scoring/cut_arena.py"
+    severities: [critical]
+    intake: bus
+    response: drain-queue
+    # derived: critical/alarm-capable. A slot below its floor produces ZERO
+    # comparisons and writes a hold that reads like a decision — the
+    # 2026-08-21/2026-08-28 no_promotable_challenger defect.
+    tier: page
+    operator_reason: >-
+      Page by design (alpha-engine-config-I9317): the scanner run has already
+      raised, so the safe state (no decision recorded, the standing champion
+      pointer unchanged) is reached without a human. The page exists because
+      restoring the arm floor means registering or un-retiring arms, a
+      champion-challenger-policy decision no automation may take; drain-queue
+      still owns triage of why the register shrank. Weekly cadence, deduped on
+      a fixed key, so it cannot storm.
+
   # ── crucible v2 (crucible/alerts.py) ──
   # alpha-engine-config-I10593. `crucible.alerts` publishes the daily v2
   # heartbeat through krepis with source="crucible-v2/heartbeat"
@@ -1372,6 +1398,91 @@ alert_classes:
       cost ledger are each an actionable-now break in crucible v2's
       observability surface, not a lifecycle notice like the info case above.
 
+  # alpha-engine-config-I9409 / -I11240. The rest of the crucible-v2/*
+  # namespace, declared in one pass so no sibling is left behind again:
+  # #1686 declared crucible-v2/heartbeat alone, and the other four sources
+  # kept paging as registry drift. crucible/alerts.py::send() publishes
+  # source=f"crucible-v2/{condition}", or f"crucible-v2/synthetic/{condition}"
+  # for a deliberate exercise, where condition is one of PAGE_CONDITIONS =
+  # ("absence", "failure") — a closed set, so these are explicit rows rather
+  # than a crucible-v2/* wildcard that would also silently claim the next new
+  # emitter. PageGroup.severity is always "error" (plan §4.6: both conditions
+  # are incident-tier; there is no warning tier).
+  - class: crucible_v2_absence
+    source: "crucible-v2/absence"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page: one of the two page conditions plan §4.6 admits.
+    tier: page
+    operator_reason: >-
+      Page by design (crucible v2 plan §4.6): a member that did not produce
+      its artifact on a trading day is one of exactly two conditions v2
+      defines as worth a human's attention, and the pages topic is its
+      declared channel. Any lower tier would rewrite the SNS leg to the muted
+      sibling and silence crucible-v2-pages. drain-queue owns triage.
+  - class: crucible_v2_failure
+    source: "crucible-v2/failure"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page: the other page condition — a hard member failure with a
+    # run id and exception text (e.g. MissingSourceError).
+    tier: page
+    operator_reason: >-
+      Page by design (crucible v2 plan §4.6): a hard member failure is the
+      second of the two page conditions, carries its run id, and is deduped
+      per incident. Any lower tier would rewrite the SNS leg to the muted
+      sibling and silence crucible-v2-pages. drain-queue owns triage.
+  - class: crucible_v2_synthetic_absence
+    source: "crucible-v2/synthetic/absence"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, per Brian's option (b) ruling on
+    # alpha-engine-config-I10366: a deliberate exercise reaches a separate
+    # channel and is excluded from production alert accounting. crucible
+    # already routes the SNS leg of a synthetic group to the muted topic at
+    # the producer (crucible-PR189, active from 2026-09-20); this row does the
+    # same for the Telegram leg, which the undeclared source was still pushing
+    # to the operator chat as a registry-drift page.
+    tier: notify-silent
+    operator_reason: >-
+      A synthetic page is a fault-injection or replay exercise, not a
+      production failure (crucible/synthetic.py). It is recorded in full on
+      the bus and the muted topic and delivered silently; the exercise's own
+      "exactly one page" assertion reads the bus row, never the phone.
+  - class: crucible_v2_synthetic_failure
+    source: "crucible-v2/synthetic/failure"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # Same disposition as crucible_v2_synthetic_absence. Not yet observed on
+    # the intake, declared with its sibling because the condition set is
+    # closed and the source is derived from it.
+    tier: notify-silent
+    operator_reason: >-
+      A synthetic page is a fault-injection or replay exercise, not a
+      production failure (crucible/synthetic.py). It is recorded in full on
+      the bus and the muted topic and delivered silently; the exercise's own
+      "exactly one page" assertion reads the bus row, never the phone.
+  - class: crucible_v2_morning_report
+    # crucible/morning.py::deliver publishes the daily report with
+    # source=DELIVERY_SOURCE ("crucible-v2/report.morning"), severity info,
+    # sns=False, telegram=True, silent=False, and an explicit
+    # destination=operator chat.
+    source: "crucible-v2/report.morning"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, deliberately NOT tracked-only: tracked-only
+    # suppresses the Telegram leg entirely, and Brian ruled the report must
+    # arrive and buzz (alpha-engine-config-I9916). notify-silent keeps both,
+    # because krepis honours the caller's explicit destination and
+    # silent=False at that tier. A lifecycle notice under the 2026-08-03
+    # ruling, not an incident.
+    tier: notify-silent
+
   # ── data plane (nousergon-data) ──
   - class: weekly_cost_coverage_gap
     # alpha-engine-config-I11298, Brian ruling 2026-09-21 ("proceed with rec
@@ -1392,6 +1503,29 @@ alert_classes:
     # standing owner for a gap on the director-plan callsite is
     # alpha-engine-config-I11298.
     tier: tracked-only
+  - class: automation_pause_check
+    # alpha-engine-config-I9409. infrastructure/automation_pause.py
+    # ::alert_on_findings (--check --alert-on-fail, pause-check-alert.yml, every
+    # 4h) pages when live AWS disagrees with automation_pause.json. Its source
+    # used to default to __file__, which in CI is the runner's absolute
+    # checkout path (/home/runner/work/nousergon-data/nousergon-data/...), so
+    # every page arrived as registry drift under a key no row could hold. It
+    # now publishes this repo-relative literal (automation_pause.ALERT_SOURCE).
+    source: "nousergon-data/infrastructure/automation_pause.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page, matching the emitter's stated intent: with the groom
+    # paused, the phone push is the only delivery this check can rely on.
+    tier: page
+    operator_reason: >-
+      Page by design (alpha-engine-config-I8110): a trigger Brian ruled paused
+      is live, or an alarm is muted without a declared pause. Re-arming or
+      re-pausing is his ruling to make and automation_pause.py --enforce is
+      deliberately not run unattended for triggers. 4-hourly cadence, deduped
+      per finding set for 180 minutes, so an unresolved drift re-pages once
+      per cycle.
+
   - class: data_constituents_drift
     source: "alpha-engine-data/validators/constituents_drift_check.py"
     severities: [dynamic]
@@ -1587,6 +1721,47 @@ alert_classes:
     response: drain-queue
     # DECLARED: groom lifecycle, named in I6751's NOTIFY-SILENT row.
     tier: notify-silent
+
+  # ── fleet transport + credential probes (alpha-engine-config-I9409) ──
+  - class: alert_transport_liveness_probe
+    # The alpha-engine-config-I9209 synthetic transport-liveness probes
+    # (nousergon_lib.alert_transport_probe.synthetic_detail), emitted as
+    # source=f"alert-transport-liveness/{identity}" by the laptop checks
+    # (ne-laptop-agent, ne-laptop-daemon), ne-admin, and the
+    # github-actions-alert-transport-liveness workflow. They are put straight
+    # onto the bus (not through krepis.alerts.publish), carry
+    # disable_notification=true and the body marker
+    # "[SYNTHETIC LIVENESS PROBE - no action]". Measured 2026-09-21: 400 of
+    # 480 intake events. A prefix row, because the identity set grows with
+    # every probing principal.
+    source: "alert-transport-liveness/*"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED: heartbeat traffic whose arrival IS the proof. The drain folds
+    # it at T0; a missing probe is detected by the probe's own read-back
+    # (nonce/counter), never by this row.
+    tier: tracked-only
+  - class: credential_liveness
+    # alpha-engine-config-I7926: third-party credential liveness in
+    # alpha-engine-config/scripts/check_credential_health.py::_send_page,
+    # source="credential_liveness", sns=False. severity "error" for a
+    # credential EXPIRING inside its warning window, "critical" for one that
+    # is dead, revoked or unverifiable.
+    source: "credential_liveness"
+    severities: [error, critical]
+    intake: bus
+    response: drain-queue
+    # DECLARED dynamic: the two severities are two different facts. An
+    # expiring credential still works, so it is notify-silent (the drain files
+    # or updates the rotation issue); a dead one is broken now and pages.
+    tier: dynamic
+    operator_reason: >-
+      Rotating a third-party credential is human-only: it needs a login at
+      the vendor, and no automation holds or should hold that authority. The
+      drain closes the loop by filing or updating the rotation issue (e.g.
+      alpha-engine-config-I9249); a dead credential pages because the
+      services that depend on it are failing now.
 
   # ── CloudWatch alarms (blanket row — the tap covers every alarm) ──
   - class: cw_alarms_all
@@ -1848,7 +2023,13 @@ alert_classes:
   - class: sf_completion_telegram
     source: "flow-doctor:sf-telegram-notifier"
     severities: [dynamic]
-    intake: none
+    # intake: bus, not none (alpha-engine-config-I9409, comment 1). Every send
+    # goes through flow_doctor_telegram.notify_via_flow_doctor(source=...),
+    # which scopes KREPIS_EVENT_SOURCE; krepis.telegram.send_message's
+    # auto-emit hook then puts one event per notice on the Overseer bus under
+    # this source. drain-2026-08-30T1202Z ingested them, so `none` was a
+    # false declaration. The row stays in this section for history only.
+    intake: bus
     response: operator
     # DECLARED: lifecycle notice under Brian's 2026-08-03 ruling (buzz only for
     # started / stopped-early / finished); failures route via sf-watch, not this
