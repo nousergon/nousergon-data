@@ -4,11 +4,11 @@ boto3>=1.34.0
 # This dispatcher uses nousergon_lib.spot_dispatch only for its duplicate-box
 # guard (running_instance_ids + SpotProbeError, present since v0.106.0) and
 # SpotLaunchError — no feature floor above root. Bump in lockstep with root.
-nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.154
+nousergon-lib @ git+https://github.com/nousergon/nousergon-lib@v0.124.158
 # krepis.ec2_spot.launch_self_starting + krepis.spot_bootstrap.
 # render_self_starting_user_data (alpha-engine-config-I11597, krepis-PR236)
 # — the self-starting launch, first shipped in 0.59.71. Pinned here, not via
 # root, the same way eval-judge-spot-dispatcher pins its krepis: moving root
 # would move every weekly-path Lambda with it. 0.59.71 satisfies
-# nousergon-lib v0.124.154's krepis>=0.59.52 floor.
+# nousergon-lib v0.124.158's krepis>=0.59.52 floor.
 krepis==0.59.71

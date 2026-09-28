@@ -50,15 +50,20 @@ def test_map_covers_all_four_orchestrated_state_machines(cle):
     }
 
 
-def test_discovers_the_2026_07_08_incident_reference(cle):
-    """The exact bug class this guard exists for: step_function_eod.json's
-    LaunchPostMarketDataSpot / LaunchPostMarketArcticAppendSpot states invoke
-    alpha-engine-data-spot-dispatcher (config#1767 Phase 2, nousergon-data#643)."""
+def test_discovers_the_2026_07_08_incident_reference_class(cle):
+    """The exact bug class this guard exists for: an SF state invoking a Lambda
+    that a separate deploy has to create. On 2026-07-08 that was
+    step_function_eod.json's data-spot launch states naming
+    alpha-engine-data-spot-dispatcher (config#1767 Phase 2, nousergon-data#643).
+    Those states were removed by alpha-engine-config-I11269; the same class now
+    lives in the WaitForCollectionManifests poll naming
+    alpha-engine-collection-readiness-probe, a function the cutover introduces."""
     refs = cle._discover_referenced_functions("ne-postclose-trading-pipeline", "step_function_eod.json")
     errors = [r for r in refs if "error" in r]
     assert not errors, f"unexpected parse errors: {errors}"
     normalized = {r["normalized_name"] for r in refs}
-    assert "alpha-engine-data-spot-dispatcher" in normalized
+    assert "alpha-engine-collection-readiness-probe" in normalized
+    assert "alpha-engine-data-spot-dispatcher" not in normalized
 
 
 def test_every_codified_sf_definition_parses_cleanly(cle):

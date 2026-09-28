@@ -1,0 +1,5 @@
+# boto3 is provided by the Lambda python3.12 runtime; pinned for reproducible builds.
+boto3>=1.34.0
+# data_gate/descriptors.py (packaged by deploy.sh) parses the unit descriptors.
+# Not provided by the Lambda runtime.
+PyYAML>=6.0

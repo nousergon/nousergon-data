@@ -109,21 +109,16 @@ ACCOUNT_ID = "711398986525"
 #: names in one list with no machine-readable split, so this module names the
 #: split explicitly rather than re-deriving it from comment boundaries.
 STATE_TO_STATE_MACHINE: Mapping[str, str] = {
-    # alpha-engine-config-I10545: was "MorningEnrich" / "DataPhase1" (the
-    # always-~0s dispatch states) — renamed to match
-    # STATE_DURATION_FLOORS_SEC's move to the poll states that actually span
-    # the workload.
-    "WaitForMorningEnrich": "ne-weekly-freshness-pipeline",
-    "WaitForDataPhase1": "ne-weekly-freshness-pipeline",
+    # The weekly WaitForMorningEnrich / WaitForDataPhase1 and preopen
+    # PollMorningEnrichSpot / PollMorningArcticAppendSpot rows left with their
+    # states and floors in the data cutover (alpha-engine-config-I11269).
     # alpha-engine-config-I10574: was "RAGIngestion" / "PredictorTraining" /
-    # "Backtester" — same dispatch-vs-poll defect as the two above, caught a
-    # PR later. See the module docstring's "MEASURE THE SAME SPAN" section.
+    # "Backtester" — the dispatch-vs-poll defect I10545 fixed for the data
+    # stages. See the module docstring's "MEASURE THE SAME SPAN" section.
     "WaitForRAGIngestion": "ne-weekly-freshness-pipeline",
     "WaitForPredictorTraining": "ne-weekly-freshness-pipeline",
     "WaitForBacktester": "ne-weekly-freshness-pipeline",
     "ModelZooTrainMap": "ne-weekly-freshness-pipeline",
-    "PollMorningEnrichSpot": "ne-preopen-trading-pipeline",
-    "PollMorningArcticAppendSpot": "ne-preopen-trading-pipeline",
     "Scanner": "ne-preopen-trading-pipeline",
 }
 

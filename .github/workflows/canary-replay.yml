@@ -126,6 +126,8 @@ jobs:
               - 'infrastructure/lambdas/weekly-preflight/**'
               - 'infrastructure/lambdas/substrate-health-gate/**'
               - 'infrastructure/lambdas/weekly-run-scope/**'
+              - 'infrastructure/lambdas/collection-readiness-probe/**'
+              - 'data_gate/run_manifest_predicate.py'
       - name: Apply canary:replay label
         if: steps.filter.outputs.weekly_critical == 'true'
         env:

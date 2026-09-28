@@ -120,17 +120,30 @@ def test_every_checkout_sync_is_keyed_on_the_execution_name():
 
 
 def test_first_box_stages_resolve_the_data_pin_before_any_workload():
-    """MorningEnrich and DataPhase1 must sync alpha-engine-data (and config)
-    through the helper BEFORE they run their launcher, so the worker pin
-    (_spot_common.sh) finds the execution's pin file on the box."""
-    states = _definition()["States"]
-    for stage in ("MorningEnrich", "DataPhase1"):
+    """Every stage that launches a spot worker must sync alpha-engine-data
+    through the helper BEFORE it runs its launcher, so the worker pin
+    (_spot_common.sh) finds the execution's pin file on the box.
+
+    The data cutover (alpha-engine-config-I11269) removes MorningEnrich and
+    DataPhase1 from this definition, so the set is whichever of the
+    worker-launching stages the definition still carries."""
+    states = dict(_all_states(_definition()["States"]))
+    present = [
+        s for s in ("MorningEnrich", "DataPhase1", "RAGIngestion") if s in states
+    ]
+    assert present, "no worker-launching stage left to pin"
+    for stage in present:
         cmds = _rendered(states[stage])
         pin_idx = [i for i, c in enumerate(cmds) if _HELPER_CALL.search(c)]
         run_idx = [i for i, c in enumerate(cmds) if "ssm_log_capture" in c]
         assert pin_idx and run_idx and max(pin_idx) < min(run_idx), stage
         pinned = {m.group(2) for c in cmds for m in _HELPER_CALL.finditer(c)}
-        assert pinned == {"/home/ec2-user/alpha-engine-data", "/home/ec2-user/alpha-engine-config"}
+        assert "/home/ec2-user/alpha-engine-data" in pinned, stage
+        if stage in ("MorningEnrich", "DataPhase1"):
+            assert pinned == {
+                "/home/ec2-user/alpha-engine-data",
+                "/home/ec2-user/alpha-engine-config",
+            }, stage
 
 
 def test_every_reissue_reenters_a_pinned_stage():
@@ -139,7 +152,9 @@ def test_every_reissue_reenters_a_pinned_stage():
     re-issue checks out the SHA the failed attempt ran."""
     all_states = dict(_all_states(_definition()["States"]))
     reissues = {n: s for n, s in all_states.items() if n.endswith("Reissue")}
-    assert "DataPhase1Reissue" in reissues
+    # DataPhase1Reissue leaves with the data cutover (I11269); RAGIngestion
+    # stays, so its re-issue is the one this guard must always see.
+    assert "RAGIngestionReissue" in reissues
     for name, state in reissues.items():
         target = all_states[state["Next"]]
         cmds = _rendered(target)

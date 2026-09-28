@@ -136,20 +136,98 @@ def test_the_eod_schedule_fires_at_the_declared_settlement_hour(stack, tpl):
 def test_the_eod_schedule_leaves_the_morning_run_a_full_overnight(stack, tpl):
     """The later start must not push EOD collection into the next morning's run.
 
-    The EOD workload takes the dispatcher's 7200s default
-    (``_WORKLOAD_MAX_RUNTIME_SECONDS`` declares overrides only for the three
-    shadow workloads), so a worst-case finish is 18:15 + 2h = 20:15 ET.
-    MorningSchedule fires at 07:30 ET, 13h15m after the EOD start — 10h45m of
-    slack past the cap. Asserted from the two crons in this template against the
-    declared cap rather than from a remembered margin.
+    alpha-engine-config-I11363: derived from the declared caps, not from one
+    remembered default. The whole EOD workload list — including arctic-probe
+    and edgar-pit-fundamentals-daily on the 7200 s default — is hard-stopped
+    before MorningSchedule fires the next day.
     """
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
-    eod_h, eod_m = _cron_hour_minute(by_name["data-collection-eod"]["expression"])
+    eod = by_name["data-collection-eod"]
+    eod_h, eod_m = _cron_hour_minute(eod["expression"])
     morn_h, morn_m = _cron_hour_minute(by_name["data-collection-morning"]["expression"])
-    gap_minutes = (24 * 60) - (eod_h * 60 + eod_m) + (morn_h * 60 + morn_m)
-    assert gap_minutes == 13 * 60 + 15
-    # The dispatcher's default cap, in minutes. EOD declares no override.
-    assert gap_minutes > 7200 // 60
+    gap_seconds = ((24 * 60) - (eod_h * 60 + eod_m) + (morn_h * 60 + morn_m)) * 60
+    workloads = eod["input"]["workloads"]
+    whole_run = stack.worst_case_seconds(workloads, through=workloads[-1])
+    assert whole_run < gap_seconds, (whole_run, gap_seconds)
+
+
+def test_the_eod_unit_writers_carry_declared_caps(stack):
+    """alpha-engine-config-I11363: the two workloads that write the EOD
+    verify_units are capped explicitly (measured 30.4-45.7 and 24.7-28.1 min
+    over 2026-09-15..23) rather than riding the 7200 s default, so every
+    consumer bound derived from them is a declared number."""
+    default, overrides, ssm = stack.dispatcher_runtime_caps()
+    assert (default, ssm) == (7200, 300)
+    writers = set(stack.UNIT_WRITERS["data-collection-eod"].values())
+    assert writers == {"post-market-data", "post-market-arctic-append"}
+    assert {w: overrides[w] for w in writers} == {
+        "post-market-data": 5400, "post-market-arctic-append": 3600,
+    }
+
+
+def test_the_eod_ordering_chain_is_derived_from_the_template(stack, tpl):
+    """alpha-engine-config-I11363. From the EOD cron, the last minute any EOD
+    verify_unit can still be written is the cron plus (SSM-online budget + cap)
+    of each workload up to the last unit writer: 18:15 + 95 + 65 = 20:55 ET.
+    Every number comes from the template or the dispatcher source."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    eod = by_name["data-collection-eod"]
+    h, m = _cron_hour_minute(eod["expression"])
+    worst = stack.worst_case_through_units(eod, eod["input"]["verify_units"])
+    default, overrides, ssm = stack.dispatcher_runtime_caps()
+    assert worst == sum(
+        ssm + overrides.get(w, default) for w in ("post-market-data", "post-market-arctic-append")
+    )
+    assert h * 60 + m + -(-worst // 60) == 20 * 60 + 55
+
+
+def test_the_sameday_shadow_is_not_enabled_beside_a_live_eod_run(stack, tpl):
+    """alpha-engine-config-I11363's ordering assertion, decided for a DISABLED
+    shadow: the check stays ARMED rather than being deleted with the shadow.
+    Its 18:30 ET cron does not clear the 20:55 ET bound above, so the committed
+    template is lint-clean only because the shadow is DISABLED — and a
+    re-enable that does not also move the cron fails lint (below)."""
+    sched = stack.schedules(tpl)
+    assert stack.sameday_ordering_problems(sched) == []
+    by_name = {s["name"]: s for s in sched}
+    assert by_name["data-collection-shadow-sameday"]["declared_state"] == "DISABLED"
+    shadow_h, shadow_m = _cron_hour_minute(by_name["data-collection-shadow-sameday"]["expression"])
+    assert shadow_h * 60 + shadow_m < 20 * 60 + 55  # the premise the DISABLED state carries
+
+
+def _with_shadow(stack, tpl, *, state: str, expression: str | None = None) -> list[dict]:
+    import copy
+
+    sched = copy.deepcopy(stack.schedules(tpl))
+    for s in sched:
+        if s["name"] == "data-collection-shadow-sameday":
+            s["declared_state"] = state
+            if expression:
+                s["expression"] = expression
+    return sched
+
+
+def test_re_enabling_the_sameday_shadow_at_its_cron_is_refused(stack, tpl):
+    problems = stack.sameday_ordering_problems(_with_shadow(stack, tpl, state="ENABLED"))
+    assert len(problems) == 1 and "alpha-engine-config-I11363" in problems[0], problems
+
+
+@pytest.mark.parametrize(
+    "expression,refused",
+    [("cron(54 20 ? * MON-FRI *)", True), ("cron(55 20 ? * MON-FRI *)", False)],
+)
+def test_the_ordering_check_moves_exactly_at_the_derived_bound(stack, tpl, expression, refused):
+    sched = _with_shadow(stack, tpl, state="ENABLED", expression=expression)
+    assert bool(stack.sameday_ordering_problems(sched)) is refused
+
+
+def test_lint_carries_the_ordering_check(stack, tpl, monkeypatch):
+    """The lint (run by the deploy workflow) is the guard, so it is graded
+    rather than assumed: a template with the shadow re-enabled fails lint."""
+    assert not any("alpha-engine-config-I11363" in p for p in stack.lint())
+    mutated = _with_shadow(stack, tpl, state="ENABLED")
+    monkeypatch.setattr(stack, "schedules", lambda _tpl: mutated)
+    assert any("alpha-engine-config-I11363" in p for p in stack.lint())
 
 
 def _cron_hour_minute(expression: str) -> tuple[int, int]:
@@ -171,27 +249,33 @@ def test_schedule_names_are_unique_without_their_group(stack, tpl):
         assert s["name"].startswith("data-collection-"), s["name"]
 
 
-def test_ships_disabled(stack, tpl):
-    """alpha-engine-config-I10739 deliverable 2: nothing double-writes market_data/*
-    while the v1 SFs still run. The enable PR changes this test's expectation
-    for CollectionState in the same change that flips the Default.
+def test_declared_states_at_the_decoupled_cutover(stack, tpl):
+    """alpha-engine-config-I11269 (Brian's ruling (b), 2026-09-21). This was
+    `test_ships_disabled` (alpha-engine-config-I10739 deliverable 2: nothing
+    double-writes market_data/* while the v1 SFs still run), and the enable PR
+    was to change its expectation for CollectionState in the same change that
+    flips the Default. This is that change: the same PR removes the v1 SFs'
+    inline data stages, so collection is ENABLED and there is still one writer.
 
-    The two SHADOW schedules are deliberately EXCLUDED from this invariant
-    (alpha-engine-config-I11233, -I11352): each writes only to
-    staging/shadow/, never market_data/*, so they carry none of the
-    double-write risk this test guards and are born ENABLED instead. The
-    exclusion is a NAMED set, not a substring match — a future schedule called
-    `data-collection-shadow-anything` does not inherit the carve-out."""
-    shadow = {"data-collection-shadow-sameday", "data-collection-shadow-morning"}
+    The daily heal stays DISABLED (its v1 rule is paused by the 2026-08-07
+    ruling; enabling it is a separate decision). Both SHADOW schedules turn
+    DISABLED: once v1 stops writing the compared keys, a parity run would
+    compare the collector with itself. `data.cutover_ready.parity` is frozen at
+    the last pre-cutover report instead (tests/test_gate_read_follows_the_parity_publish.py)."""
     defaults = stack.parameter_defaults(tpl)
-    assert defaults["CollectionState"] == "DISABLED"
+    assert defaults["CollectionState"] == "ENABLED"
     assert defaults["DailyHealState"] == "DISABLED"
+    assert defaults["ShadowSamedayState"] == "DISABLED"
+    assert defaults["ShadowMorningState"] == "DISABLED"
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
-    assert shadow <= set(by_name), sorted(by_name)
-    assert {
-        s["declared_state"] for name, s in by_name.items() if name not in shadow
-    } == {"DISABLED"}
-    assert {by_name[name]["declared_state"] for name in shadow} == {"ENABLED"}
+    assert {n: s["declared_state"] for n, s in by_name.items()} == {
+        "data-collection-daily-heal": "DISABLED",
+        "data-collection-eod": "ENABLED",
+        "data-collection-morning": "ENABLED",
+        "data-collection-weekly": "ENABLED",
+        "data-collection-shadow-sameday": "DISABLED",
+        "data-collection-shadow-morning": "DISABLED",
+    }
 
 
 def test_daily_heal_has_its_own_state_switch(stack, tpl):
@@ -210,7 +294,13 @@ def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
     The set below is `run_units.PHASE_UNITS` for the "daily" mode (minus the arctic
     append `--skip-arctic-append` defers) plus MODE_UNITS["daily_arctic_append"]."""
     eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
-    assert eod["workloads"] == ["post-market-data", "post-market-arctic-append", "arctic-probe"]
+    # alpha-engine-config-I11269: edgar-pit-fundamentals-daily joins at the
+    # tail (it was the v1 postclose SF's LaunchEdgarPitFundamentalsDailySpot
+    # leg). It has no unit descriptor, so verify_units is unchanged.
+    assert eod["workloads"] == [
+        "post-market-data", "post-market-arctic-append", "arctic-probe",
+        "edgar-pit-fundamentals-daily",
+    ]
     assert eod["require_trading_day"] is True
     assert "verify_keys" not in eod
     assert set(eod["verify_units"]) == {
@@ -265,26 +355,41 @@ def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
     assert any("verify_units is empty" in p for p in stack.lint())
 
 
-def test_eod_and_morning_end_with_the_arctic_probe(stack, tpl):
-    """P-05 (alpha-engine-config-I10748): the in-region ArcticDB probe must be
-    the FINAL workload of both schedules so data_gate's ArcticDB-derived
-    clauses see the day's collection before the probe describes it."""
+#: Workloads allowed AFTER arctic-probe: each reads ArcticDB at most and writes
+#: none of it, so the probe still describes the day's final ArcticDB state.
+#: edgar-pit-fundamentals-daily reads the `universe` library for split-adjusted
+#: closes (collectors/edgar_pit_fundamentals.py::ArcticPriceReader) and writes
+#: S3 objects only.
+_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily"}
+
+
+def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
+    """P-05 (alpha-engine-config-I10748): the in-region ArcticDB probe must run
+    after every ArcticDB-writing workload of both schedules so data_gate's
+    ArcticDB-derived clauses see the day's collection before the probe
+    describes it. Until alpha-engine-config-I11269 that meant "last"; the EOD
+    schedule now carries edgar after it, which writes no ArcticDB."""
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
-    assert by_name["data-collection-eod"]["input"]["workloads"][-1] == "arctic-probe"
     assert by_name["data-collection-morning"]["input"]["workloads"][-1] == "arctic-probe"
+    eod = by_name["data-collection-eod"]["input"]["workloads"]
+    after = eod[eod.index("arctic-probe") + 1:]
+    assert after == ["edgar-pit-fundamentals-daily"]
+    assert set(after) <= _NON_ARCTIC_WRITERS
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):
     """alpha-engine-config-I10753: DataPhase2 (D15) and RAGIngestion (D16/D46)
     join morning-enrich/weekly-phase-one in v1 data order. D40/D41 are
     retired (R7) and get no workload; D46 is a substep of rag-weekly-ingestion,
-    not its own key. chronic-gap-heal (D34) joins them at the tail
-    (alpha-engine-config-I11002) — it has no data-order dependency on the
-    other four legs, so it is appended rather than interleaved."""
+    not its own key. chronic-gap-heal (D34, alpha-engine-config-I11002) has no
+    data-order dependency on the other legs; alpha-engine-config-I11269 moves
+    it from the tail to THIRD, because the v1 weekly SF now waits on D34 but
+    not on D15/D16/D46, and at the tail its bounded wait would have to cover
+    two workloads it does not read (tests/test_v1_collection_readiness_wait.py)."""
     weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
     assert weekly["workloads"] == [
-        "morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion",
-        "chronic-gap-heal",
+        "morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two",
+        "rag-weekly-ingestion",
     ]
     assert weekly["require_trading_day"] is False
 
@@ -459,19 +564,21 @@ def test_the_definition_fails_loud_rather_than_skipping(stack):
 
 
 def test_the_four_failure_modes_the_asl_switches_on_are_the_lambdas_own(stack):
-    """The ASL's Choice arms and the dispatcher's precedence tuple are one list.
-    Drift here is a mode that fails the execution as "unknown" rather than named."""
+    """The ASL's Choice arms and the shared predicate's precedence tuple are one
+    list. Drift here is a mode that fails the execution as "unknown" rather than
+    named. The tuple lives in data_gate/run_manifest_predicate.py since
+    alpha-engine-config-I11264 moved the predicate out of the dispatcher."""
     import ast
 
     asl = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))
     arms = [c["StringEquals"] for c in asl["States"]["CompletionFailureMode"]["Choices"]]
-    tree = ast.parse(stack.DISPATCHER.read_text(encoding="utf-8"))
+    tree = ast.parse((REPO / "data_gate" / "run_manifest_predicate.py").read_text(encoding="utf-8"))
     modes = None
     for node in ast.walk(tree):
         target = getattr(node, "target", None) or (getattr(node, "targets", None) or [None])[0]
         if isinstance(target, ast.Name) and target.id == "COMPLETION_FAILURE_MODES":
             modes = [e.value for e in node.value.elts]
-    assert modes is not None, "COMPLETION_FAILURE_MODES not found in the dispatcher"
+    assert modes is not None, "COMPLETION_FAILURE_MODES not found in the shared predicate"
     assert arms == modes
 
 
@@ -484,12 +591,14 @@ def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack):
         encoding="utf-8"
     )
     assert "data_gate/descriptors.py" in deploy
+    assert "data_gate/run_manifest_predicate.py" in deploy
     assert "registry.d/units" in deploy
     paths = yaml.safe_load(
         (WORKFLOWS / "deploy-data-spot-dispatcher.yml").read_text(encoding="utf-8")
     )[True]["push"]["paths"]
     assert "registry.d/units/**" in paths
     assert "data_gate/descriptors.py" in paths
+    assert "data_gate/run_manifest_predicate.py" in paths
 
 
 def test_yaml_aliases_are_refused(stack, tmp_path):
@@ -546,15 +655,22 @@ def test_check_live_reports_unapplied_template_and_console_flip(stack, tpl):
     # the console-flip (State) finding, and a hard-coded cron silently became a
     # second, unintended expression-drift finding the moment the schedule moved
     # (alpha-engine-config-I11354 moved it 16:45 ET -> 18:15 ET).
-    _eod_expr = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["expression"]
+    _eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]
+    _eod_expr = _eod["expression"]
+    _flipped = {"ENABLED": "DISABLED", "DISABLED": "ENABLED"}[_eod["declared_state"]]
     sched = _scheduler_matching(
         stack, tpl,
-        **{"data-collection-eod": {"State": "ENABLED", "ScheduleExpression": _eod_expr}},
+        # The flip is the OPPOSITE of the declared state, whatever that is
+        # (ENABLED since alpha-engine-config-I11269), so the finding is a
+        # console flip in either direction rather than one remembered value.
+        **{"data-collection-eod": {"State": _flipped, "ScheduleExpression": _eod_expr}},
     )
     findings = stack.live_findings(cfn, sched)
     assert any("UPDATE_ROLLBACK_COMPLETE" in x for x in findings)
     assert sum("stack tag" in x for x in findings) == 2
-    assert any("nousergon-data-collection/data-collection-eod is ENABLED live" in x for x in findings)
+    assert any(
+        f"nousergon-data-collection/data-collection-eod is {_flipped} live" in x for x in findings
+    )
 
 
 def test_check_live_key_is_the_one_the_gate_reads(stack):

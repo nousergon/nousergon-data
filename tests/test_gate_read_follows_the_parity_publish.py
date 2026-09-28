@@ -258,3 +258,61 @@ def test_the_job_timeout_covers_six_reads_at_the_measured_duration():
     measured_worst_read_minutes = 4.0
     install_minutes = 1.0
     assert job["timeout-minutes"] >= len(reads) * measured_worst_read_minutes + install_minutes
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11269 — after the cutover the clause is FROZEN
+# ---------------------------------------------------------------------------
+
+from data_gate import cutover as _cutover  # noqa: E402
+
+CUTOVER_DAY = _cutover.cutover_trading_day()
+_AFTER = dt.date(2026, 10, 2)  # a trading day well after the cutover
+
+
+def test_the_freeze_dates_are_the_committed_cutover():
+    assert CUTOVER_DAY == dt.date(2026, 9, 28)
+    assert _AFTER > CUTOVER_DAY
+
+
+def test_after_the_cutover_the_last_pre_cutover_report_is_graded_frozen():
+    """A post-cutover report compares the collector with itself (v1 no longer
+    writes the keys) — it is ignored, even though it is newer and reads 100%."""
+    post = dt.date(2026, 10, 1)
+    store = _Store({
+        evidence.parity_store_key(CUTOVER_DAY): _report(CUTOVER_DAY, match=9),
+        evidence.parity_store_key(post): _report(post),
+        evidence.parity_store_key(_AFTER): _report(_AFTER),
+    })
+    reading = evidence.read_parity(store, trading_day=_AFTER)
+    assert reading.unmeasurable is False
+    assert reading.met is False  # the pre-cutover report's own 9/10
+    assert reading.evidence == (evidence.parity_store_key(CUTOVER_DAY),)
+    assert "FROZEN" in reading.detail and _cutover.CUTOVER_UTC in reading.detail
+
+
+def test_the_frozen_reading_is_not_subject_to_same_day_or_freshness():
+    """Weeks after the cutover the frozen report is 'stale' by both live rules;
+    neither applies, because there is no live comparison left to keep current."""
+    last = dt.date(2026, 9, 25)
+    store = _Store({evidence.parity_store_key(last): _report(last)})
+    reading = evidence.read_parity(store, trading_day=dt.date(2026, 11, 20))
+    assert reading.unmeasurable is False and reading.met is True
+    assert "FROZEN" in reading.detail
+
+
+def test_no_pre_cutover_report_is_unmet_after_the_cutover():
+    store = _Store({evidence.parity_store_key(_AFTER): _report(_AFTER)})
+    reading = evidence.read_parity(store, trading_day=_AFTER)
+    assert reading.met is False and reading.unmeasurable is False
+    assert "no parity report at or before the cutover" in reading.detail
+
+
+def test_on_the_cutover_day_itself_the_live_rules_still_apply():
+    """The cutover day's own report compares against v1 output written by the
+    OLD definition that afternoon — still a live, same-day reading."""
+    prior = dt.date(2026, 9, 25)
+    store = _Store({evidence.parity_store_key(prior): _report(prior)})
+    reading = evidence.read_parity(store, trading_day=CUTOVER_DAY)
+    assert reading.unmeasurable is True  # one report behind: the I11355 rule
+    assert "FROZEN" not in reading.detail

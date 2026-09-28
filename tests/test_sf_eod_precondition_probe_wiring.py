@@ -310,7 +310,8 @@ class TestHealLoopBound:
                 variables.add(cond["Variable"])
         assert variables == {"$.heal_loop.attempts", "$.precondition_probe.Payload.past_deadline"}
         assert c["Next"] == "HealNonConvergent"
-        assert gate["Default"] == "HealLaunchPostMarketDataSpot"
+        # alpha-engine-config-I11266: the actuator is HealStartCollection now.
+        assert gate["Default"] == "HealStartCollection"
 
     def test_attempts_bound_is_two(self, states):
         gate = states["HealLoopGate"]
@@ -326,60 +327,67 @@ class TestHealLoopBound:
         assert inc["ResultPath"] == "$.heal_loop"
         assert inc["Next"] == "HealLoopGate"
 
-    @pytest.mark.parametrize("failure_state", [
-        "HealLaunchPostMarketDataSpot", "HealCheckPostMarketDataSpotLaunched",
-        "HealPollPostMarketDataSpot", "HealCheckPostMarketDataSpotStatus",
-        "HealLaunchArcticAppendSpot", "HealCheckArcticAppendSpotLaunched",
-        "HealPollArcticAppendSpot", "HealCheckArcticAppendSpotStatus",
-        "HealReProbe", "HealCheckConverged",
-    ])
+    @pytest.mark.parametrize("failure_state", ["HealReProbe", "HealCheckConverged"])
     def test_every_failure_mode_in_the_loop_reaches_the_increment(self, states, failure_state):
-        # No dead end anywhere in the dispatch-poll-reprobe chain — every
-        # non-success branch must funnel back to HealLoopIncrement so the
-        # attempts/deadline bound (not an unbounded retry) is what stops it.
+        # No dead end anywhere in the act-reprobe chain — every non-success
+        # branch must funnel back to HealLoopIncrement so the attempts/deadline
+        # bound (not an unbounded retry) is what stops it.
         assert "HealLoopIncrement" in _targets(states[failure_state]), (
             f"{failure_state} has a branch that does not reach HealLoopIncrement: "
             f"{_targets(states[failure_state])}"
         )
 
+    def test_every_actuator_outcome_is_reprobed(self, states):
+        # alpha-engine-config-I11266: success, FAILED, TIMED_OUT and ABORTED
+        # of the started collection all land on HealReProbe — the verdict is
+        # the precondition artifact, never the collection's own status (it
+        # fails loud on ANY unit; the precondition is the SPY close + macro
+        # sentinel). HealReProbe's own Catch then reaches HealLoopIncrement.
+        st = states["HealStartCollection"]
+        assert set(_targets(st)) == {"HealReProbe"}
+        assert [c["ErrorEquals"] for c in st["Catch"]] == [["States.ALL"]]
+
 
 class TestHealLoopDispatchChain:
-    def test_launch_postmarket_dispatches_with_force_on_demand(self, states):
-        st = states["HealLaunchPostMarketDataSpot"]
+    """alpha-engine-config-I11266: the heal actuator starts the standalone
+    ne-data-collection-eod machine (startExecution.sync:2) instead of
+    relaunching the two data spots itself — one writer implementation for the
+    normal and the heal path. HealReProbe / HealCheckConverged /
+    HealDispatchReplay and the HealLoopGate bound are unchanged."""
+
+    _COLLECTION_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-data-collection-eod"
+
+    def test_actuator_starts_the_standalone_eod_collection_and_waits(self, states):
+        st = states["HealStartCollection"]
         assert st["Type"] == "Task"
-        assert st["Resource"] == "arn:aws:states:::lambda:invoke"
-        assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        assert st["Parameters"]["Payload"] == {
-            "workload": "post-market-data", "force_on_demand": True,
-            "execution_id.$": "$$.Execution.Id",
-        }
-        assert st["Next"] == "HealCheckPostMarketDataSpotLaunched"
+        assert st["Resource"] == "arn:aws:states:::states:startExecution.sync:2"
+        assert st["Parameters"]["StateMachineArn"] == self._COLLECTION_ARN
+        inp = st["Parameters"]["Input"]
+        assert inp["collection"] == "eod"
+        assert inp["workloads"] == ["post-market-data", "post-market-arctic-append"]
+        assert inp["require_trading_day"] is False
+        # Bounded: .sync never waits past the task timeout.
+        assert 0 < st["TimeoutSeconds"] <= 3 * 3600
+        # Its result must not clobber the probe verdict the gate reads.
+        assert st["ResultPath"] == "$.heal_collection"
 
-    def test_postmarket_success_chains_to_arctic_append(self, states):
-        succ = [c["Next"] for c in states["HealCheckPostMarketDataSpotStatus"]["Choices"]
-                if c.get("StringEquals") == "Success"]
-        assert succ == ["HealLaunchArcticAppendSpot"]
+    def test_the_old_spot_relaunch_states_are_gone(self, states):
+        left = sorted(n for n in states if n.startswith("Heal") and "Spot" in n)
+        assert left == [], left
 
-    def test_postmarket_inprogress_loops_on_the_ssm_command_state(self, states):
-        # Deliverable #5: poll the SSM command's own state — unbounded wait
-        # loop (no attempt cap), bounded only by the box's own watchdog.
-        inprog = [c["Next"] for c in states["HealCheckPostMarketDataSpotStatus"]["Choices"]
-                  if c.get("StringEquals") == "InProgress"]
-        assert inprog == ["HealPostMarketDataSpotWait"]
-        assert states["HealPostMarketDataSpotWait"]["Next"] == "HealPollPostMarketDataSpot"
+    def test_no_eod_state_invokes_the_data_spot_dispatcher(self, states):
+        # alpha-engine-config-I11266: neither the heal loop nor the normal
+        # path may launch a collection box from this SF any more.
+        def invoking(fn):
+            return sorted(
+                n for n, st in states.items()
+                if st.get("Resource") == "arn:aws:states:::lambda:invoke"
+                and st.get("Parameters", {}).get("FunctionName") == fn
+            )
 
-    def test_launch_arctic_dispatches_with_force_on_demand(self, states):
-        st = states["HealLaunchArcticAppendSpot"]
-        assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        assert st["Parameters"]["Payload"] == {
-            "workload": "post-market-arctic-append", "force_on_demand": True,
-            "execution_id.$": "$$.Execution.Id",
-        }
-
-    def test_arctic_success_chains_to_reprobe(self, states):
-        succ = [c["Next"] for c in states["HealCheckArcticAppendSpotStatus"]["Choices"]
-                if c.get("StringEquals") == "Success"]
-        assert succ == ["HealReProbe"]
+        assert invoking(_DISPATCHER_FN) == []
+        # Non-vacuity: the same scan does see this SF's real Lambda invokes.
+        assert {"ProbeEODReconcilePrecondition", "HealReProbe"} <= set(invoking(_PROBE_FN))
 
     def test_reprobe_success_chains_to_convergence_check(self, states):
         assert states["HealReProbe"]["Next"] == "HealCheckConverged"
