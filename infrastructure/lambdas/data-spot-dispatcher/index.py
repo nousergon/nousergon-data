@@ -228,10 +228,27 @@ MAX_RUNTIME_SECONDS = int(os.environ.get("DATA_SPOT_MAX_RUNTIME_SECONDS", "7200"
 #: adds up to `_SHADOW_MORNING_AWAIT_V1_SECONDS` (45 min) of waiting and ~2 min
 #: of ArcticDB comparison (measured 2026-09-17): ~96 min worst case, ~72 min on
 #: the measured days — under 7200 with room, and still per workload.
+#:
+#: The two end-of-day collection workloads get DECLARED caps instead of the
+#: shared 7200 s default (alpha-engine-config-I11363). That default was never a
+#: considered bound for either, and two things now read these numbers as the
+#: EOD collection's worst case: the v1 postclose SF's bounded readiness wait
+#: (`step_function_eod.json::WaitForCollectionManifests`, whose poll budget a
+#: test derives from `data-collection-eod`'s cron plus these caps) and the
+#: shadow-sameday ordering check in `tests/test_data_collection_stack.py`.
+#: MEASURED from the run manifests under `data_collection/runs/{unit}/{day}/`
+#: over the seven trading days 2026-09-15 .. 2026-09-23 (v1's 16:03 ET runs,
+#: same commands): `post-market-data` (D03, D19-D31) spanned 30.4-45.7 min,
+#: `post-market-arctic-append` (D32) 24.7-28.1 min; the whole EOD chain
+#: 57.6-80.8 min. 5400 s is the figure I11363 derived from the chain's 80.8 min
+#: max and is kept for `post-market-data` alone, so it is roughly twice that
+#: workload's own max; 3600 s is about twice the append's.
 _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     "shadow-weekday": 18000,
     "shadow-sameday": 18000,
     "shadow-morning": 7200,
+    "post-market-data": 5400,
+    "post-market-arctic-append": 3600,
 }
 
 
@@ -893,356 +910,44 @@ def _trading_day_check(now=None) -> dict:
 
 # ── completion check (alpha-engine-config-I10787, data collector plan P-20) ───
 #
-# WHY THIS LIVES HERE AND NOT IN THE ASL. The completion claim is now the run
-# manifest (`data_run_manifest.v1`) of every unit the machine runs, graded on
-# three properties: the manifest EXISTS for this execution, its `status` is
-# `ok`, and every key the unit's descriptor says it publishes appears in
-# `outputs[]` at or above its declared `rows_out` floor.
+# The predicate — a unit's run manifest EXISTS for this execution, its `status`
+# is `ok`, and every key its descriptor says it publishes appears in
+# `outputs[]` at or above its `rows_out` floor — lives in
+# `data_gate/run_manifest_predicate.py`, with the reasoning for why it is a
+# Lambda computation rather than ASL. It moved there from this file, verbatim,
+# when the v1 state machines' `WaitForCollectionManifests` needed to ask the
+# same question from the consumer side (alpha-engine-config-I11264) through
+# `alpha-engine-collection-readiness-probe` — a separate function, so no v1 SF
+# can invoke THIS one, which launches collector boxes (alpha-engine-config-
+# I11266). deploy.sh packages the module beside `data_gate/descriptors.py`.
 #
-# Pure ASL could do the first two (`s3:listObjectsV2` + `s3:getObject` +
-# `States.StringToJson` + a Choice). It cannot do the third: `outputs` is an
-# ARRAY OF OBJECTS and ASL has no way to search an array by a field value, so
-# per-key floor compliance is not expressible declaratively — the best a Map
-# over `outputs` could assert is "some output exists", which is the claim we are
-# replacing. A `{"action": "completion-check"}` action on THIS Lambda puts the
-# logic where the descriptors it reads already live, mirrors the existing
-# `trading-day-check` precedent (a pure computation that launches nothing), and
-# is unit-testable. SOTA is the declarative integration; the delta is that the
-# declarative form cannot express the per-key claim at all, so it would have had
-# to be weakened to fit the mechanism.
-#
-# FAIL LOUD, NEVER FAIL OPEN. This function RAISES on anything it cannot
-# measure (an undeclared unit, an unparseable manifest, a missing `rows_out`),
-# and returns `ok: false` with a machine-readable finding list on anything it
-# measured and found wanting. The ASL routes BOTH to a Fail state — a dispatcher
-# error through the existing Catch, a finding through four distinct named Fail
-# states — so there is no path from this state to CollectionSucceeded except an
-# affirmative, measured pass.
-
-#: The bucket every collector already writes its manifests to
-#: (`run_units.MANIFEST_BUCKET`). Env-overridable for a rehearsal account.
-MANIFEST_BUCKET = os.environ.get("DATA_COLLECTION_MANIFEST_BUCKET", "alpha-engine-research")
-
-#: The floor a published key's ``rows_out`` must meet when its descriptor
-#: declares none. ONE, not zero: a key published with zero rows is the
-#: empty-but-fresh silent degradation this whole objective exists to end, and a
-#: default of zero would make the floor mechanism vacuous everywhere it was not
-#: hand-calibrated. A unit for which zero is legitimate declares that, with a
-#: reason, under ``completeness.rows_out_floor_na_code``. Calibrated per-unit
-#: cardinality floors are P-13 (alpha-engine-config-I5935); this ships the
-#: mechanism and the loud default.
-DEFAULT_ROWS_OUT_FLOOR = 1
-
-#: Failure modes in PRECEDENCE order. The ASL switches on the first one present
-#: across all units so the execution's named error is the most upstream cause —
-#: a missing manifest explains a missing output, never the other way round.
-COMPLETION_FAILURE_MODES = (
-    "manifest_missing",
-    "run_not_ok",
-    "output_missing",
-    "rows_below_floor",
-)
-
-#: How far back to list manifests. The prefix is partitioned by trading day, so
-#: `StartAfter` at (execution start - this many days) bounds a listing that
-#: would otherwise grow without limit, while staying partition-agnostic: the
-#: check never has to GUESS which trading day the unit filed its run under.
-MANIFEST_LOOKBACK_DAYS = int(os.environ.get("DATA_COLLECTION_MANIFEST_LOOKBACK_DAYS", "3"))
-
-#: The guard whose `not_applicable` verdict is a unit DECLARING that it
-#: published nothing this run (same-date auto-skip or a dry run —
-#: `weekly_collector.py::_record_phase_lineage`). It exempts key coverage and
-#: nothing else. Legitimate because the auto-skip predicate re-verifies the
-#: artifact's presence on S3 before returning the cache hit, so the published
-#: object IS there; the unit simply did not rewrite it. Without this exemption
-#: every idempotent re-drive of the weekly phase 1 would be a failure.
-EMPTY_FRESH_GUARD = "empty_fresh"
-
-#: A ``writes:`` entry that is a prose declaration rather than an S3 key
-#: template — `arcticdb/universe (library)`, `research.db::score_performance`,
-#: `predictor/price_cache/<macro series>`. These are COUNTED and returned under
-#: `unverifiable`, never silently dropped: the swallowed failure mode would be
-#: "this unit's publish claim grades nothing", and the recording surface is the
-#: `unverifiable` list on every completion-check response plus the WARNING log
-#: line below. Typing `writes:` entries (`kind: s3-key|arctic-library|table`) is
-#: the robust fix and is a tracked follow-up, not something to infer here.
-_NON_S3_WRITE = re.compile(r"(::|\s|<|>|\(|\))")
-_WRITE_TOKEN = re.compile(r"\{[a-z_]+\}|\*")
-_MAX_SUMMARY_CHARS = 4000
-
-_UNITS_CACHE: dict[str, dict] | None = None
+# FAIL LOUD, NEVER FAIL OPEN, unchanged: the check RAISES on anything it cannot
+# measure and returns `ok: false` with machine-readable findings on anything it
+# measured and found wanting; the collection ASL routes both to a Fail state.
 
 
-def _descriptors():
-    """The repo's ONE descriptor loader, imported lazily.
+def _predicate():
+    """The shared predicate module, imported lazily.
 
-    Lazy so the module-import graph the hermetic test gate derives stays free of
-    it, and because a launch invocation must not pay to parse 46 YAML files.
-    `data_gate/descriptors.py` and `registry.d/units/` are packaged into this
-    Lambda's zip at their repo-relative paths (see deploy.sh), so the loader's
-    own ``REPO_ROOT``-relative ``UNITS_DIR`` resolves to ``/var/task`` — one
-    implementation of "what a unit declares", not a second parser that drifts.
+    Lazy so the module-import graph the hermetic test gate derives stays free
+    of it, and because a launch invocation must not pay to parse 46 YAML files.
     """
-    from data_gate import descriptors
+    from data_gate import run_manifest_predicate
 
-    return descriptors
+    return run_manifest_predicate
 
 
 def _unit_descriptors() -> dict[str, dict]:
-    global _UNITS_CACHE
-    if _UNITS_CACHE is None:
-        _UNITS_CACHE = {u.unit_id: u.raw for u in _descriptors().load_units()}
-    return _UNITS_CACHE
+    return _predicate().unit_descriptors()
 
 
 def _parse_ts(value, *, where: str):
-    """RFC3339 -> aware datetime, or RAISE naming where the bad value came from.
-
-    Both timestamps this reads are contracts: `$$.Execution.StartTime` and the
-    manifest's `finished`. A value that will not parse is a contract violation,
-    and guessing one would silently move the freshness baseline.
-    """
-    from datetime import datetime, timezone
-
-    text = str(value or "").strip()
-    if not text:
-        raise ValueError(f"{where} is empty; the completion check has no freshness baseline")
-    try:
-        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
-    except ValueError as exc:
-        raise ValueError(f"{where}={value!r} is not an RFC3339 timestamp") from exc
-    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def _key_pattern(template: str, trading_day: str):
-    """One ``writes:`` template as a regex over concrete manifest output keys.
-
-    ``{date}``/``{trading_day}`` resolve to the day the MANIFEST ITSELF declares
-    it ran for — never a day this function computes, which is how a check like
-    this ends up disagreeing with the producer about what "today" was. Every
-    other placeholder and every ``*`` is a fan-out (per ticker, per symbol, per
-    currency) and matches one path segment. A trailing ``/`` is a declared
-    prefix and matches anything under it. Returns None for a prose declaration.
-    """
-    if _NON_S3_WRITE.search(template) or template.startswith("arcticdb/"):
-        return None
-    parts, pos = [], 0
-    for match in _WRITE_TOKEN.finditer(template):
-        parts.append(re.escape(template[pos : match.start()]))
-        token = match.group(0)
-        parts.append(re.escape(trading_day) if token in ("{date}", "{trading_day}") else r"[^/]+")
-        pos = match.end()
-    parts.append(re.escape(template[pos:]))
-    body = "".join(parts)
-    if template.endswith("/"):
-        body += r".+"
-    return re.compile(rf"^{body}$")
-
-
-def _rows_out_floor(unit_id: str, completeness: dict) -> tuple[int | None, str]:
-    """The per-key ``rows_out`` floor for a unit, and how it was arrived at.
-
-    ``completeness.floor`` is deliberately NOT used: it is a RATIO against a
-    denominator (`metron/holdings_universe.json`, "constituents - delisted"),
-    which this function cannot resolve and must not approximate. The absolute
-    floor is its own declaration.
-    """
-    declared = completeness.get("rows_out_floor")
-    if declared is not None:
-        return int(declared), "declared"
-    na_code = completeness.get("rows_out_floor_na_code")
-    if na_code:
-        if na_code not in _descriptors().NA_TAXONOMY:
-            raise ValueError(
-                f"{unit_id}: completeness.rows_out_floor_na_code={na_code!r} is not in "
-                f"observability-policy §3.5's closed taxonomy "
-                f"{sorted(_descriptors().NA_TAXONOMY)}"
-            )
-        return None, f"not_applicable ({na_code})"
-    if completeness.get("status") == "not_applicable":
-        return None, f"not_applicable ({completeness.get('na_code')})"
-    return DEFAULT_ROWS_OUT_FLOOR, "default"
-
-
-def _finding(mode: str, unit_id: str, key: str | None, detail: str) -> dict:
-    if mode not in COMPLETION_FAILURE_MODES:
-        raise ValueError(f"unknown completion failure mode {mode!r}")
-    return {"mode": mode, "unit": unit_id, "key": key, "detail": detail}
-
-
-def _newest_manifest(s3, prefix: str, started_at):
-    """The unit's newest run manifest, if it finished at or after ``started_at``.
-
-    ``run_id`` is a ULID and the day partition is an ISO date, so the prefix
-    lists in execution order and ``max()`` IS the newest run — if THAT one
-    predates this execution, every other one does too.
-    """
-    from datetime import timedelta
-
-    prefix = f"{prefix.rstrip('/')}/"
-    start_after = f"{prefix}{(started_at - timedelta(days=MANIFEST_LOOKBACK_DAYS)).date().isoformat()}"
-    keys: list[str] = []
-    token = None
-    while True:
-        kwargs = {"Bucket": MANIFEST_BUCKET, "Prefix": prefix, "StartAfter": start_after}
-        if token:
-            kwargs = {"Bucket": MANIFEST_BUCKET, "Prefix": prefix, "ContinuationToken": token}
-        page = s3.list_objects_v2(**kwargs)
-        keys.extend(o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(".json"))
-        if not page.get("IsTruncated"):
-            break
-        token = page.get("NextContinuationToken")
-    if not keys:
-        return None, None
-    key = max(keys)
-    doc = json.loads(s3.get_object(Bucket=MANIFEST_BUCKET, Key=key)["Body"].read())
-    if _parse_ts(doc.get("finished"), where=f"{key}:finished") < started_at:
-        return key, None
-    return key, doc
-
-
-def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], dict]:
-    """Grade one unit's run against its descriptor. Returns (findings, row)."""
-    prefix = str(raw["run_manifest_prefix"])
-    row = {"unit": unit_id, "manifest": None, "status": None, "keys_checked": 0,
-           "unverifiable": [], "auto_skipped": False, "floor": None}
-    key, doc = _newest_manifest(s3, prefix, started_at)
-    if doc is None:
-        stale = f" (newest is {key}, which finished before it)" if key else ""
-        return [
-            _finding(
-                "manifest_missing", unit_id, None,
-                f"no data_run_manifest.v1 under s3://{MANIFEST_BUCKET}/{prefix}/ finished at "
-                f"or after this execution started{stale}: the workloads exited 0 but the "
-                f"unit left no run record for this run",
-            )
-        ], row
-
-    row["manifest"] = key
-    status = str(doc.get("status") or "")
-    row["status"] = status
-    if status != "ok":
-        return [
-            _finding(
-                "run_not_ok", unit_id, None,
-                f"manifest {key} reports status={status!r} reason={str(doc.get('reason') or '')[:400]!r}. "
-                f"Naming a unit in verify_units IS the machine's declaration that this run must "
-                f"publish it, so `not_applicable` is not a pass here — a unit that may "
-                f"legitimately do nothing on this schedule is simply not named.",
-            )
-        ], row
-
-    outputs = list(doc.get("outputs") or [])
-    trading_day = str(doc.get("trading_day") or "")
-    auto_skipped = any(
-        g.get("guard") == EMPTY_FRESH_GUARD and g.get("verdict") == "not_applicable"
-        for g in (doc.get("guards") or [])
-    )
-    row["auto_skipped"] = auto_skipped
-    floor, floor_source = _rows_out_floor(unit_id, raw.get("completeness") or {})
-    row["floor"] = floor if floor is not None else floor_source
-
-    findings: list[dict] = []
-    for template in raw.get("writes") or []:
-        pattern = _key_pattern(str(template), trading_day)
-        if pattern is None:
-            row["unverifiable"].append(template)
-            continue
-        row["keys_checked"] += 1
-        matched = [o for o in outputs if pattern.match(str(o.get("key") or ""))]
-        if not matched:
-            if auto_skipped:
-                continue
-            findings.append(
-                _finding(
-                    "output_missing", unit_id, str(template),
-                    f"{unit_id} declares it publishes {template!r} but manifest {key} lists no "
-                    f"matching key in outputs[] (it lists {[o.get('key') for o in outputs]}). "
-                    f"A run that did not record the artifact did not publish it.",
-                )
-            )
-            continue
-        if floor is None:
-            continue
-        for out in matched:
-            if "rows_out" not in out:
-                raise ValueError(
-                    f"{key}: outputs entry {out.get('key')!r} has no rows_out; "
-                    "data_run_manifest.v1 requires it and 'we did not count' is not a value"
-                )
-            rows = int(out["rows_out"])
-            if rows < floor:
-                findings.append(
-                    _finding(
-                        "rows_below_floor", unit_id, str(out.get("key")),
-                        f"{unit_id} published {out.get('key')!r} with rows_out={rows}, below its "
-                        f"floor of {floor} ({floor_source}). Manifest {key}.",
-                    )
-                )
-    if row["unverifiable"]:
-        logger.warning(
-            "completion-check: %s declares %d writes entries that are not S3 key templates "
-            "and are therefore ungraded: %s",
-            unit_id, len(row["unverifiable"]), row["unverifiable"],
-        )
-    return findings, row
+    return _predicate().parse_ts(value, where=where)
 
 
 def _completion_check(event: dict, s3_client=None) -> dict:
-    """Grade every named unit's run manifest for this execution.
-
-    Returns ``{"completion": {...}}`` — `ok`, a `failure_mode` the ASL switches
-    on, the full machine-readable `findings` list, one `units` row per unit
-    (including the ones that passed, so a unit emitting nothing is visible), and
-    a `summary` the Fail state uses as its Cause.
-    """
-    units = [str(u).strip() for u in (event.get("units") or []) if str(u).strip()]
-    if not units:
-        raise ValueError(
-            "completion-check was invoked with no units. The ASL only reaches this state "
-            "when verify_units is non-empty, so an empty list here is a mis-wired input, "
-            "not a machine with nothing to verify."
-        )
-    started_at = _parse_ts(event.get("started_at"), where="started_at")
-    collection = str(event.get("collection") or "unknown")
-    descriptors = _unit_descriptors()
     s3 = s3_client if s3_client is not None else boto3.client("s3", region_name=REGION)
-
-    findings: list[dict] = []
-    rows: list[dict] = []
-    for unit_id in units:
-        raw = descriptors.get(unit_id)
-        if raw is None:
-            raise ValueError(
-                f"verify_units names {unit_id!r}, which has no descriptor under "
-                f"registry.d/units/. The descriptors are the only source of units "
-                f"(data_collection_plan §4.1); a machine verifying a unit nobody declared "
-                f"would grade nothing and read as a pass."
-            )
-        unit_findings, row = _check_unit(s3, unit_id, raw, started_at)
-        findings.extend(unit_findings)
-        rows.append(row)
-
-    mode = next(
-        (m for m in COMPLETION_FAILURE_MODES if any(f["mode"] == m for f in findings)), ""
-    )
-    summary = (
-        f"data collection {collection}: completion check PASSED over {len(units)} unit(s)"
-        if not findings
-        else f"data collection {collection}: {len(findings)} completion finding(s) over "
-        f"{len(units)} unit(s); first mode {mode}. "
-        + " | ".join(f"[{f['mode']}] {f['unit']} {f['key'] or ''}: {f['detail']}" for f in findings)
-    )[:_MAX_SUMMARY_CHARS]
-    logger.info("completion-check %s: ok=%s mode=%s", collection, not findings, mode or "-")
-    return {
-        "completion": {
-            "ok": not findings,
-            "failure_mode": mode,
-            "findings": findings,
-            "units": rows,
-            "summary": summary,
-        }
-    }
+    return _predicate().completion_check(event, s3_client=s3)
 
 
 def _bootstrap_spec(
@@ -1840,7 +1545,10 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     Two pure-computation actions launch nothing and return before any of the
     below: ``{"action": "trading-day-check"}`` and
     ``{"action": "completion-check", "units": [...], "started_at": ...,
-    "collection": ...}`` (alpha-engine-config-I10787).
+    "collection": ...}`` (alpha-engine-config-I10787). The consumer-side
+    readiness question is deliberately NOT an action here — it is
+    ``alpha-engine-collection-readiness-probe`` (alpha-engine-config-I11264 /
+    -I11266), so no v1 state machine invokes this function.
 
     `event` carries {"workload": "morning-enrich" | "morning-arctic-append" |
     "post-market-data" | "post-market-arctic-append" | "daily-heal" | ... |

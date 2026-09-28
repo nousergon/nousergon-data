@@ -17,13 +17,14 @@ liveness-poll quintet (``InitChronicGapPoll``/``WaitForChronicGap``/
 ``CheckChronicGapStatus``/``ChronicGapWait``/``StampChronicGapUnresponsive``),
 and its skip-gate (``CheckSkipChronicGapHeal``) are now DELETED from
 ``step_function_daily.json`` — 7 states removed in total. The 5 states that
-used to route into ``CheckSkipChronicGapHeal`` now route to
+used to route into ``CheckSkipChronicGapHeal`` were rerouted to
 ``CheckSkipPredictorInference`` (alpha-engine-config-I6494 — weekday Scanner before
 PredictorInference): ``CheckSkipMorningEnrich``,
 ``CheckMorningEnrichSpotLaunched``, ``CheckMorningArcticAppendSpotLaunched``,
 ``CheckMorningArcticAppendSpotStatus`` (its "Success" choice), and
 ``PublishDataSpotFailureImmediate`` (both its plain ``Next`` and its Catch's
-``Next``).
+``Next``). alpha-engine-config-I11269 later removed the three spot-block
+predecessors; the readiness wait's "ready" edge replaces them.
 
 This test catches regressions like:
 - Someone re-adds ChronicGapSelfHeal (or any state in its quintet/skip-gate)
@@ -119,23 +120,23 @@ class TestRewiredPredecessorsRouteToScannerGate:
         assert len(choices) == 1
         assert choices[0]["Next"] == "CheckSkipPredictorInference"
 
-    def test_morning_enrich_spot_launched_default(self, states):
-        assert states["CheckMorningEnrichSpotLaunched"]["Default"] == (
-            "CheckSkipPredictorInference"
-        )
+    # alpha-engine-config-I11269: the spot launch/poll block these three
+    # predecessors lived in is gone; its continue edge now leaves the bounded
+    # readiness wait (CheckCollectionReadiness "ready") instead.
+    def test_collection_ready_edge(self, states):
+        ready = states["CheckCollectionReadiness"]["Choices"][0]
+        assert ready["Next"] == "CheckSkipPredictorInference"
 
-    def test_arctic_append_spot_launched_default(self, states):
-        assert states["CheckMorningArcticAppendSpotLaunched"]["Default"] == (
-            "CheckSkipPredictorInference"
-        )
-
-    def test_arctic_append_spot_status_success_edge(self, states):
-        success = [
-            c["Next"]
-            for c in states["CheckMorningArcticAppendSpotStatus"]["Choices"]
-            if c.get("StringEquals") == "Success"
-        ]
-        assert success == ["CheckSkipPredictorInference"]
+    @pytest.mark.parametrize(
+        "gone",
+        [
+            "CheckMorningEnrichSpotLaunched",
+            "CheckMorningArcticAppendSpotLaunched",
+            "CheckMorningArcticAppendSpotStatus",
+        ],
+    )
+    def test_spot_predecessors_removed(self, states, gone):
+        assert gone not in states
 
     def test_publish_data_spot_failure_immediate_routes_forward(self, states):
         st = states["PublishDataSpotFailureImmediate"]

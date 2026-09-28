@@ -495,6 +495,13 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
             # case with it (alpha-engine-config-I11546) — still well under the
             # chained workloads' budget, not a copy of it.
             expected = 7200
+        elif workload == "post-market-data":
+            # alpha-engine-config-I11363: a DECLARED EOD cap, measured 30.4-45.7
+            # min over 2026-09-15..23, not the inherited default.
+            expected = 5400
+        elif workload == "post-market-arctic-append":
+            # Same arc: measured 24.7-28.1 min.
+            expected = 3600
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
@@ -824,7 +831,7 @@ def test_a_declared_floor_beats_the_default(monkeypatch):
         assert result["completion"]["failure_mode"] == "rows_below_floor"
         assert "floor of 80" in result["completion"]["findings"][0]["detail"]
     finally:
-        index._UNITS_CACHE = None
+        index._predicate().reset_unit_cache()
 
 
 def test_a_unit_whose_collector_reports_no_count_is_graded_on_presence(monkeypatch):
@@ -863,7 +870,7 @@ def test_the_named_mode_is_the_most_upstream_cause(monkeypatch):
     completion = result["completion"]
     assert {f["mode"] for f in completion["findings"]} == {"output_missing", "manifest_missing"}
     assert completion["failure_mode"] == "manifest_missing"
-    assert completion["failure_mode"] == index.COMPLETION_FAILURE_MODES[0]
+    assert completion["failure_mode"] == index._predicate().COMPLETION_FAILURE_MODES[0]
 
 
 def test_a_prose_writes_entry_is_counted_not_silently_dropped(monkeypatch):

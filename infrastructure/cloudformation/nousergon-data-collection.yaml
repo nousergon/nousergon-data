@@ -12,10 +12,14 @@ Description: >-
 # DECLARATION (sf-pipeline-policy §2.6): this file is the one place that says
 # when collection runs and whether it runs at all.
 #
-#   * CollectionState   — the eod, morning and weekly schedules. Ships DISABLED:
-#                         until phase 4's maintenance window the v1 SFs still
-#                         run the same workloads, and both enabled would
-#                         double-write the same keys.
+#   * CollectionState   — the eod, morning and weekly schedules. ENABLED by the
+#                         decoupled data cutover (alpha-engine-config-I11269,
+#                         Brian's 2026-09-21 ruling (b)): the SAME change
+#                         removes the v1 SFs' inline data stages and makes
+#                         each v1 SF wait on these schedules' run manifests
+#                         (WaitForCollectionManifests), so there is one writer.
+#                         Rollback is reverting that one change, which restores
+#                         the v1 stages and this DISABLED default together.
 #   * DailyHealState    — the daily-heal schedule, separately, because its v1
 #                         rule `alpha-engine-daily-heal` is paused by Brian's
 #                         2026-08-07 ruling (infrastructure/automation_pause.json).
@@ -37,7 +41,7 @@ Description: >-
 Parameters:
   CollectionState:
     Type: String
-    Default: DISABLED
+    Default: ENABLED
     AllowedValues: [DISABLED, ENABLED]
     Description: State of the eod, morning and weekly schedules. See the declaration block.
   DailyHealState:
@@ -47,22 +51,25 @@ Parameters:
     Description: State of the daily-heal schedule (paused by ruling 2026-08-07).
   ShadowSamedayState:
     Type: String
-    Default: ENABLED
+    Default: DISABLED
     AllowedValues: [DISABLED, ENABLED]
     Description: >-
-      State of the shadow-sameday schedule. Born ENABLED, unlike
-      CollectionState/DailyHealState above: the workload writes only under
-      staging/shadow/, never market_data/*, so it carries none of the
-      double-write risk the other schedules' DISABLED default guards against
-      (alpha-engine-config-I11233).
+      State of the shadow-sameday schedule. Born ENABLED (it writes only under
+      staging/shadow/, alpha-engine-config-I11233); DISABLED by the decoupled
+      cutover (alpha-engine-config-I11269): once v1 no longer writes the
+      compared keys, a parity run would compare the collector with itself and
+      publish a 100% match that measures nothing.
   ShadowMorningState:
     Type: String
-    Default: ENABLED
+    Default: DISABLED
     AllowedValues: [DISABLED, ENABLED]
     Description: >-
       State of the shadow-morning schedule. Born ENABLED for the same reason
-      ShadowSamedayState is: the workload writes only under staging/shadow/,
-      never market_data/* (alpha-engine-config-I11352).
+      ShadowSamedayState was (alpha-engine-config-I11352); DISABLED by the
+      decoupled cutover for the same reason too: v1's preopen no longer runs
+      morning-enrich/morning-arctic-append, so the D17/D18 keys it would compare
+      against are the collector's own, written fifteen minutes earlier by
+      data-collection-morning (alpha-engine-config-I11269).
   DefinitionS3Bucket:
     Type: String
     Default: alpha-engine-research
@@ -212,14 +219,25 @@ Resources:
   # at 16:45/17:30/18:15/18:45 ET measures it. If that sample says 17:30
   # suffices, this cron and the constant move together.
   #
-  # Runtime budget: the workload keeps the dispatcher's 7200s default
-  # (`DATA_SPOT_MAX_RUNTIME_SECONDS`; `_WORKLOAD_MAX_RUNTIME_SECONDS` declares
-  # overrides only for the three shadow workloads), so a worst-case finish is
-  # ~20:15 ET. MorningSchedule below fires at 07:30 ET the next day — 13h15m
-  # after this start, 10h45m of slack past the cap — so the later start cannot
-  # push EOD collection into the morning run. The readiness wait
-  # (`DATA_SPOT_SSM_ONLINE_BUDGET_SEC`, 300s) is spent before the workload
-  # clock and is unchanged by moving the start.
+  # Runtime budget (alpha-engine-config-I11363): `post-market-data` and
+  # `post-market-arctic-append` carry DECLARED caps in the dispatcher's
+  # `_WORKLOAD_MAX_RUNTIME_SECONDS` (5400 s and 3600 s, measured 30.4-45.7 and
+  # 24.7-28.1 min over 2026-09-15..23), so the two workloads that write this
+  # schedule's verify_units are hard-stopped by ~20:55 ET including one
+  # SSM-online budget (`DATA_SPOT_SSM_ONLINE_BUDGET_SEC`, 300 s) each. The v1
+  # postclose SF's bounded readiness wait (`step_function_eod.json::
+  # CheckCollectionReadinessBudget`) is derived from exactly that sum by
+  # tests/test_v1_collection_readiness_wait.py. `arctic-probe` and
+  # `edgar-pit-fundamentals-daily` follow on the 7200 s default and write no
+  # verify_unit, so they bound nothing a consumer waits on. MorningSchedule
+  # fires at 07:30 ET the next day, far past every cap.
+  #
+  # `edgar-pit-fundamentals-daily` (alpha-engine-config-I10750) joins at the
+  # tail with the cutover: it ran as the v1 postclose SF's
+  # LaunchEdgarPitFundamentalsDailySpot leg, which the cutover removes, and
+  # this schedule is its successor. It has no unit descriptor, so it is not in
+  # verify_units; its run summary and `runs/latest.json` sentinel are its own
+  # evidence, as they were under v1.
   #
   # `verify_units` is every manifest-emitting unit its two collector
   # workloads run (run_units.PHASE_UNITS ("daily", *) minus the arctic append the
@@ -247,7 +265,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe"], "require_trading_day": true, "verify_units": ["D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31", "D32"]}'
+        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe", "edgar-pit-fundamentals-daily"], "require_trading_day": true, "verify_units": ["D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31", "D32"]}'
 
   # Weekday pre-open ArcticDB enrich + append. Replaces ne-preopen-trading-
   # pipeline's LaunchMorningEnrichSpot + LaunchMorningArcticAppendSpot. 07:30 ET
@@ -330,6 +348,16 @@ Resources:
   # 05:00 America/New_York) and its v1 successor name
   # (`ne-data-collection-weekly`) — chronic-gap-heal was never a daily
   # operation, unlike D33's own heal.
+  #
+  # It runs THIRD, not last (alpha-engine-config-I11269). It has no data-order
+  # dependency on alternative-phase-two or rag-weekly-ingestion (I11002), but
+  # the v1 weekly SF, which keeps running after the cutover, now waits on D34
+  # before ResearchPredictorParallel (`step_function.json::
+  # WaitForCollectionManifests`) — and it does NOT wait on D15/D16/D46, whose v1
+  # owners (DataPhase2, RAGIngestion) are still in that definition. At the tail
+  # D34 would sit behind two workloads the consumer does not read, and the
+  # bounded wait's budget (derived from the caps of every workload up to the
+  # last one writing a waited unit) would have to cover them too.
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -346,7 +374,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion", "chronic-gap-heal"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D34", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D34", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
@@ -384,17 +412,16 @@ Resources:
   # (5h) cap means a worst-case finish ~23:30 ET, comfortably inside the weekday
   # window and with no other schedule in this stack running after it.
   #
-  # CUTOVER PREREQUISITE (alpha-engine-config-I11363), introduced by moving
-  # EodSchedule above from 16:45 ET to 18:15 ET: this sameday shadow now starts
-  # FIFTEEN MINUTES after EodSchedule instead of an hour and three quarters.
-  # Today that is inert — CollectionState ships DISABLED, so EodSchedule does
-  # not fire and this run compares only against v1's 16:00 ET postclose. It stops
-  # being inert on the phase-4 cutover PR that flips CollectionState to ENABLED:
-  # a live EOD collection still writing market_data/* at 18:30 ET would be read
-  # mid-write by this parity run, which is parity noise, not a producer defect.
-  # The cutover PR moves this schedule (or gates it on the EOD run's completion
-  # marker) in the same change. Stated here rather than fixed here so the
-  # schedule move stays one revertible line.
+  # DISABLED AT THE CUTOVER (alpha-engine-config-I11269, which also closes the
+  # I11363 prerequisite that stood here): with CollectionState ENABLED,
+  # EodSchedule's 18:15 ET run would still be writing market_data/* at 18:30 ET,
+  # and — the larger point — v1 no longer writes the compared keys, so this run
+  # would compare the collector with itself. `data.cutover_ready.parity` is
+  # FROZEN at the last pre-cutover report instead (`data_gate/evidence.py::
+  # read_parity`). tests/test_data_collection_stack.py keeps the ordering
+  # invariant armed for any future re-enable: it fails if this schedule and
+  # CollectionState are both ENABLED while this cron does not clear EodSchedule's
+  # cron plus the declared caps of the workloads that write its verify_units.
   #
   # Born ENABLED (ShadowSamedayState, default ENABLED) rather than sharing
   # CollectionState: it writes only to staging/shadow/ (7-day lifecycle

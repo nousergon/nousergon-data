@@ -1,30 +1,32 @@
-"""Pins the config#1767 (Phase 2) relocation of the data-heavy weekday/EOD work
-OFF the always-on ae-trading box onto an ephemeral EC2 spot box.
+"""Pins the v1 weekday/EOD data phase OFF the ae-trading box — and, since the
+decoupled cutover (alpha-engine-config-I11269), off the v1 SFs altogether.
 
-Background (alpha-engine-config#1767): the weekday pre-open pipeline
-(step_function_daily.json: MorningEnrich + MorningArcticAppend) and the EOD
-post-close pipeline (step_function_eod.json: PostMarketData + PostMarketArcticAppend)
-used to SSM-invoke ~30-50 min of daily_closes fetch + ArcticDB append ON the
-trading box (i-018eb3307a21329bf), filling /tmp and competing with IB Gateway +
-the daemon. Phase 2 moves that data phase onto a fresh spot box launched by the
-alpha-engine-data-spot-dispatcher Lambda — MIRRORING the Saturday spot pattern
-(the fleet's SF-expressible spot launcher is the scheduled-groom-dispatcher
-Lambda + step_function_groom.json's LaunchGroomSpot -> CheckLaunched -> poll,
-which itself mirrors spot_data_weekly.sh).
+History: config#1767 (Phase 2) moved the weekday pre-open data phase
+(MorningEnrich + MorningArcticAppend) and the EOD post-close data phase
+(PostMarketData + PostMarketArcticAppend) off the always-on trading box onto an
+ephemeral spot box launched by alpha-engine-data-spot-dispatcher. I11269
+(Brian's ruling (b), 2026-09-21) removes that spot launch/poll/retry block from
+both v1 SFs: the standalone nousergon-data-collection schedules own the
+collection, and each v1 SF only WAITS, bounded, for the run manifests of the
+units it reads (WaitForCollectionManifests, I11264).
 
 This test pins, structurally (no live infra needed):
-  1. The new spot launch/poll states exist with the correct Type/Resource and
-     select the data-spot dispatcher Lambda (deliverable #1).
-  2. The trading path no longer contains the relocated on-trading
-     MorningEnrich/PostMarketData SSM states (deliverable #2).
-  3. FAILURE ISOLATION (deliverable #4, LOAD-BEARING): a data-spot failure —
-     launch Catch, poll Catch, or a non-Success terminal SSM status — routes to
-     the CONTINUE path (the predictor/daemon path on weekday; the
-     reconcile/snapshot/stop path on EOD), NEVER to HandleFailure/FailExecution.
-     Mirrors the Saturday ResearchPredictorParallel branch-error pattern
-     (record-as-data, fail-open).
-  4. The dispatcher Lambda's workload map runs the SAME weekly_collector.py
-     entrypoints the on-trading states ran (M0 data contract preserved).
+  1. The spot launch/poll/retry states are GONE from both SFs, and no state in
+     either invokes the data-spot dispatcher — a v1 SF that still launched a
+     collection box would double-write against the standalone schedule.
+  2. The on-trading data-phase SSM states stay gone (config#1767 deliverable #2).
+  3. FAILURE ISOLATION (LOAD-BEARING, config#1767 deliverable #4, unchanged in
+     spirit): a not-ready collection — budget exhausted, the producer settled
+     not-ok, or every probe raising — routes through the SAME
+     ExtractDataSpotError -> SetDataSpotDegradedFlag ->
+     PublishDataSpotFailureImmediate normalizer to the CONTINUE path (the
+     predictor/daemon path on weekday; the reconcile/snapshot/stop path on
+     EOD), NEVER to HandleFailure/FailExecution. The normalizer's names and
+     $.data_spot_error / $.degraded_summary contracts are kept deliberately:
+     CheckSkipEODReconcile and CheckDegradedOutcome read them.
+  4. The dispatcher Lambda's workload map still runs the SAME
+     weekly_collector.py entrypoints (it is the standalone collection's
+     launcher now; M0 data contract preserved).
 """
 
 from __future__ import annotations
@@ -40,9 +42,9 @@ _EOD = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 _DISPATCHER = _REPO_ROOT / "infrastructure" / "lambdas" / "data-spot-dispatcher"
 
 _LAMBDA_INVOKE = "arn:aws:states:::lambda:invoke"
-_SSM_POLL = "arn:aws:states:::aws-sdk:ssm:getCommandInvocation"
 _SSM_SEND = "arn:aws:states:::aws-sdk:ssm:sendCommand"
 _DISPATCHER_FN = "alpha-engine-data-spot-dispatcher"
+_PROBE_FN = "alpha-engine-collection-readiness-probe"
 
 
 @pytest.fixture(scope="module")
@@ -55,8 +57,17 @@ def eod() -> dict:
     return json.loads(_EOD.read_text())["States"]
 
 
-# ── Terminal HALT states each SF must NEVER reach from a data-spot failure ────
+# ── Terminal HALT states each SF must NEVER reach from a data-phase failure ───
 _HALT = {"HandleFailure", "FailExecution", "ForceStopInstance"}
+
+# The bounded readiness-wait block, identical in shape in both SFs.
+_WAIT_BLOCK = [
+    "InitCollectionReadinessPoll", "SeedCollectionReadiness",
+    "WaitForCollectionManifests", "CheckCollectionReadiness",
+    "CheckCollectionReadinessBudget", "CollectionReadinessPollWait",
+    "IncrementCollectionReadinessPoll", "ExtractCollectionNotReadyError",
+    "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
+]
 
 
 def _all_targets(state: dict) -> list[str]:
@@ -74,62 +85,132 @@ def _all_targets(state: dict) -> list[str]:
     return t
 
 
+def _invokes(state: dict, fn: str) -> bool:
+    return (
+        state.get("Resource") == _LAMBDA_INVOKE
+        and state.get("Parameters", {}).get("FunctionName") == fn
+    )
+
+
+def _reachable_from(states: dict, start: str, stop: str) -> set[str]:
+    """Every state reachable from `start` without passing through `stop`."""
+    seen: set[str] = set()
+    todo = [start]
+    while todo:
+        name = todo.pop()
+        if name in seen or name == stop:
+            continue
+        seen.add(name)
+        todo.extend(_all_targets(states[name]))
+    return seen
+
+
+class _WaitBlockIsolation:
+    """Shared fail-open pins for the readiness wait; subclasses bind the SF."""
+
+    SF: str
+    CONTINUE: str
+    SKIP_GATE: str
+
+    @pytest.fixture
+    def sf(self, request):
+        return request.getfixturevalue(self.SF)
+
+    def test_the_wait_polls_the_readiness_probe_not_the_dispatcher(self, sf):
+        st = sf["WaitForCollectionManifests"]
+        assert _invokes(st, _PROBE_FN)
+        assert "action" not in st["Parameters"]["Payload"]
+        assert "workload" not in st["Parameters"]["Payload"]
+
+    def test_a_raising_probe_spends_a_poll_it_never_halts(self, sf):
+        catch = sf["WaitForCollectionManifests"]["Catch"]
+        assert [c["Next"] for c in catch] == ["CheckCollectionReadinessBudget"]
+        assert catch[0]["ErrorEquals"] == ["States.ALL"]
+        # The raise must not overwrite the seeded verdict the normalizer reads.
+        assert catch[0]["ResultPath"] != "$.collection_readiness"
+
+    def test_ready_continues_and_settled_not_ok_fails_open(self, sf):
+        ch = sf["CheckCollectionReadiness"]["Choices"]
+        assert ch[0]["Next"] == self.CONTINUE
+        assert ch[1]["Next"] == "ExtractCollectionNotReadyError"
+        assert sf["CheckCollectionReadiness"]["Default"] == "CheckCollectionReadinessBudget"
+
+    def test_budget_exhaustion_fails_open(self, sf):
+        st = sf["CheckCollectionReadinessBudget"]
+        assert st["Choices"][0]["Next"] == "ExtractCollectionNotReadyError"
+        assert sf["ExtractCollectionNotReadyError"]["Next"] == "ExtractDataSpotError"
+
+    def test_error_normalizer_continues_not_halts(self, sf):
+        # Names and ResultPaths kept on purpose: CheckSkipEODReconcile reads
+        # $.data_spot_error; CheckDegradedOutcome reads $.degraded_summary.
+        assert sf["ExtractDataSpotError"]["Type"] == "Pass"
+        assert sf["ExtractDataSpotError"]["ResultPath"] == "$.data_spot_error"
+        assert sf["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
+        flag = sf["SetDataSpotDegradedFlag"]
+        assert flag["Type"] == "Pass"
+        assert flag["Parameters"]["degraded"] is True
+        assert flag["ResultPath"] == "$.degraded_summary"
+        assert flag["Next"] == "PublishDataSpotFailureImmediate"
+        pub = sf["PublishDataSpotFailureImmediate"]
+        assert pub["Next"] == self.CONTINUE
+        for c in pub.get("Catch", []):
+            assert c["Next"] == self.CONTINUE
+
+    def test_no_wait_block_state_reaches_a_halt(self, sf):
+        for name in _WAIT_BLOCK:
+            for tgt in _all_targets(sf[name]):
+                assert tgt not in _HALT, (
+                    f"{name} routes to HALT state {tgt} — a not-ready collection "
+                    "would block the trading path (config#1767 #4 violation)"
+                )
+
+    def test_the_whole_wait_region_is_exactly_the_wait_block(self, sf):
+        """Exhaustive, not a list the test chose: walk everything reachable from
+        the skip gate's Default up to the continue state. Anything outside the
+        declared block (a stray HALT, a leftover spot state) fails here."""
+        region = _reachable_from(sf, sf[self.SKIP_GATE]["Default"], self.CONTINUE)
+        assert region == set(_WAIT_BLOCK), sorted(region ^ set(_WAIT_BLOCK))
+
+    def test_the_skip_flag_routes_to_continue(self, sf):
+        assert sf[self.SKIP_GATE]["Choices"][0]["Next"] == self.CONTINUE
+        assert sf[self.SKIP_GATE]["Default"] == "InitCollectionReadinessPoll"
+
+    def test_no_state_invokes_the_data_spot_dispatcher(self, sf):
+        offenders = sorted(n for n, st in sf.items() if _invokes(st, _DISPATCHER_FN))
+        assert offenders == [], (
+            f"{offenders} still launch a collection box from a v1 SF — the "
+            "standalone schedule owns collection since I11269"
+        )
+
+
 # ══════════════════════════════════════════════════════════════════════════
 # WEEKDAY (step_function_daily.json)
 # ══════════════════════════════════════════════════════════════════════════
-class TestWeekdaySpotStatesPresent:
-    _LAUNCH = ["LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"]
-    _POLL = ["PollMorningEnrichSpot", "PollMorningArcticAppendSpot"]
-    _LAUNCHED_GATE = ["CheckMorningEnrichSpotLaunched", "CheckMorningArcticAppendSpotLaunched"]
-    _STATUS = ["CheckMorningEnrichSpotStatus", "CheckMorningArcticAppendSpotStatus"]
-
-    @pytest.mark.parametrize("name", _LAUNCH)
-    def test_launch_state_invokes_dispatcher(self, daily, name):
-        st = daily[name]
-        assert st["Type"] == "Task"
-        assert st["Resource"] == _LAMBDA_INVOKE
-        assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        assert st["Parameters"]["Payload"]["workload"] in {
-            "morning-enrich", "morning-arctic-append"
-        }
-        # config#2542: force_on_demand.$ threads the retry-budget's on-demand
-        # override into the dispatcher (see TestWeekdayDataSpotRetryBudget),
-        # mirroring the EOD launch states.
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
-
-    @pytest.mark.parametrize("name", _POLL)
-    def test_poll_state_polls_ssm(self, daily, name):
-        st = daily[name]
-        assert st["Type"] == "Task"
-        assert st["Resource"] == _SSM_POLL
-        # Polls the command_id + instance_id the dispatcher returned.
-        p = st["Parameters"]
-        assert p["CommandId.$"].endswith(".Payload.data_spot.command_id")
-        assert p["InstanceId.$"].endswith(".Payload.data_spot.instance_id")
-
-    @pytest.mark.parametrize("name", _LAUNCHED_GATE)
-    def test_launched_gate_is_choice(self, daily, name):
-        assert daily[name]["Type"] == "Choice"
-
-    @pytest.mark.parametrize("name", _STATUS)
-    def test_status_check_is_choice(self, daily, name):
-        assert daily[name]["Type"] == "Choice"
-
-
 class TestWeekdayDataPhaseOffTrading:
-    """Deliverable #2: the on-trading data-phase SSM states are GONE."""
+    """The on-trading data-phase SSM states (config#1767) AND the spot
+    launch/poll/retry block that replaced them (removed by I11269) are GONE."""
 
     @pytest.mark.parametrize(
         "gone",
         [
+            # config#1767: on-trading SSM data phase.
             "MorningEnrich", "MorningArcticAppend",
             "WaitForMorningEnrich", "WaitForMorningArcticAppend",
             "CheckMorningEnrichStatus", "CheckMorningArcticAppendStatus",
             "CheckSkipMorningArcticAppend", "MorningEnrichPollTimeout",
+            # I11269: the data-spot launch/poll/retry block.
+            "InitMorningEnrichRetryCounter", "LaunchMorningEnrichSpot",
+            "CheckMorningEnrichSpotLaunched", "PollMorningEnrichSpot",
+            "CheckMorningEnrichSpotStatus", "MorningEnrichSpotWait",
+            "CheckMorningEnrichRetryBudget", "IncrementMorningEnrichRetry",
+            "InitMorningArcticAppendRetryCounter", "LaunchMorningArcticAppendSpot",
+            "CheckMorningArcticAppendSpotLaunched", "PollMorningArcticAppendSpot",
+            "CheckMorningArcticAppendSpotStatus", "MorningArcticAppendSpotWait",
+            "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
         ],
     )
     def test_relocated_state_absent(self, daily, gone):
-        assert gone not in daily, f"{gone} must move to the data-spot dispatcher"
+        assert gone not in daily, f"{gone} must not run from the v1 weekday SF"
 
     def test_no_ssm_send_targets_trading_instance_for_data(self, daily):
         # No remaining ssm:sendCommand state runs a weekly_collector data workload.
@@ -142,197 +223,54 @@ class TestWeekdayDataPhaseOffTrading:
             assert "--morning-arctic-append" not in joined, f"{name} still appends on-box"
 
 
-class TestWeekdayFailureIsolation:
-    """Deliverable #4 (LOAD-BEARING): a data-spot failure must NOT block daemon
-    start — it routes to the continue path, never HandleFailure."""
+class TestWeekdayFailureIsolation(_WaitBlockIsolation):
+    """A not-ready morning collection must NOT block daemon start.
 
-    # alpha-engine-config-I2717 (2026-07-16): the continue path used to be the
-    # CheckSkipChronicGapHeal gate; that gate (and the heal behind it) was
-    # removed entirely. alpha-engine-config-I6494: the continue path now
-    # rejoins at CheckSkipPredictorInference (I7811 removed the weekday Scanner).
-    _CONTINUE = "CheckSkipPredictorInference"
+    alpha-engine-config-I6494: the continue path rejoins at
+    CheckSkipPredictorInference (I7811 removed the weekday Scanner)."""
 
-    def test_launch_catch_is_fail_open(self, daily):
-        for name in ("LaunchMorningEnrichSpot", "LaunchMorningArcticAppendSpot"):
-            catch = daily[name]["Catch"]
-            targets = {c["Next"] for c in catch}
-            assert targets == {"ExtractDataSpotError"}, (
-                f"{name} launch Catch must fail-open to ExtractDataSpotError, "
-                f"got {targets}"
-            )
-            for c in catch:
-                assert c["Next"] not in _HALT
-
-    def test_poll_catch_is_fail_open(self, daily):
-        for name in ("PollMorningEnrichSpot", "PollMorningArcticAppendSpot"):
-            for c in daily[name]["Catch"]:
-                assert c["Next"] == "ExtractDataSpotError"
-                assert c["Next"] not in _HALT
-
-    def test_status_default_is_fail_open_not_handlefailure(self, daily):
-        # The OLD on-trading CheckMorningEnrichStatus Default was HandleFailure.
-        # The spot status check Default must route to the retry-budget check
-        # (config#2542) — itself always fail-open, never HandleFailure.
-        assert daily["CheckMorningEnrichSpotStatus"]["Default"] == "CheckMorningEnrichRetryBudget"
-        assert daily["CheckMorningArcticAppendSpotStatus"]["Default"] == "CheckMorningArcticAppendRetryBudget"
-        for name in ("CheckMorningEnrichRetryBudget", "CheckMorningArcticAppendRetryBudget"):
-            assert daily[name]["Default"] == "ExtractDataSpotError"
-            assert daily[name]["Default"] not in _HALT
-
-    def test_error_normalizer_continues_not_halts(self, daily):
-        # alpha-engine-config#6692: ExtractDataSpotError -> SetDataSpotDegradedFlag
-        # (threads $.degraded_summary, read much later by CheckDegradedOutcome)
-        # -> PublishDataSpotFailureImmediate -> CONTINUE. The fail-open
-        # continuation itself is unchanged by the degraded-flag insertion.
-        assert daily["ExtractDataSpotError"]["Type"] == "Pass"
-        assert daily["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
-        flag = daily["SetDataSpotDegradedFlag"]
-        assert flag["Type"] == "Pass"
-        assert flag["Parameters"]["degraded"] is True
-        assert flag["ResultPath"] == "$.degraded_summary"
-        assert flag["Next"] == "PublishDataSpotFailureImmediate"
-        assert flag["Next"] not in _HALT
-        pub = daily["PublishDataSpotFailureImmediate"]
-        assert pub["Next"] == self._CONTINUE
-        # Even the SNS publish's own Catch is fail-open.
-        for c in pub.get("Catch", []):
-            assert c["Next"] == self._CONTINUE
-            assert c["Next"] not in _HALT
-
-    def test_no_data_spot_state_reaches_a_halt(self, daily):
-        """Exhaustive: walking every data-spot state's targets, none escapes to a
-        HALT state (HandleFailure/FailExecution)."""
-        data_states = [
-            "InitMorningEnrichRetryCounter",
-            "LaunchMorningEnrichSpot", "CheckMorningEnrichSpotLaunched",
-            "PollMorningEnrichSpot", "CheckMorningEnrichSpotStatus", "MorningEnrichSpotWait",
-            "CheckMorningEnrichRetryBudget", "IncrementMorningEnrichRetry",
-            "InitMorningArcticAppendRetryCounter",
-            "LaunchMorningArcticAppendSpot", "CheckMorningArcticAppendSpotLaunched",
-            "PollMorningArcticAppendSpot", "CheckMorningArcticAppendSpotStatus",
-            "MorningArcticAppendSpotWait",
-            "CheckMorningArcticAppendRetryBudget", "IncrementMorningArcticAppendRetry",
-            "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
-        ]
-        for name in data_states:
-            for tgt in _all_targets(daily[name]):
-                assert tgt not in _HALT, (
-                    f"{name} routes to HALT state {tgt} — a data-spot failure would "
-                    "block daemon start (config#1767 #4 violation)"
-                )
-
-    def test_skip_and_launched_false_route_to_continue(self, daily):
-        # skip_morning_enrich skips the whole phase; launched:false kill-switch
-        # also lands on the continue path.
-        assert daily["CheckSkipMorningEnrich"]["Choices"][0]["Next"] == self._CONTINUE
-        for gate in ("CheckMorningEnrichSpotLaunched", "CheckMorningArcticAppendSpotLaunched"):
-            assert daily[gate]["Default"] == self._CONTINUE
-
-
-class TestWeekdayDataSpotRetryBudget:
-    """config#2542: audit of the SAME spot-reclaim/hard-fail bug class fixed for
-    EOD by PR813 (2026-07-14 incident) — a spot-reclaimed morning-enrich or
-    morning-arctic-append workload gets ONE relaunch-on-a-fresh-box retry
-    before the pipeline accepts the failure and falls through to the
-    pre-existing fail-open path. Mirrors TestEODDataSpotRetryBudget exactly."""
-
-    def test_retry_counters_initialized_before_first_launch(self, daily):
-        assert daily["CheckSkipMorningEnrich"]["Default"] == "InitMorningEnrichRetryCounter"
-        assert daily["InitMorningEnrichRetryCounter"]["Type"] == "Pass"
-        assert daily["InitMorningEnrichRetryCounter"]["ResultPath"] == "$.morning_enrich_retry"
-        assert daily["InitMorningEnrichRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
-        assert daily["InitMorningEnrichRetryCounter"]["Next"] == "LaunchMorningEnrichSpot"
-
-        assert daily["CheckMorningEnrichSpotStatus"]["Choices"][0]["Next"] == "InitMorningArcticAppendRetryCounter"
-        assert daily["InitMorningArcticAppendRetryCounter"]["Type"] == "Pass"
-        assert daily["InitMorningArcticAppendRetryCounter"]["ResultPath"] == "$.morning_arctic_append_retry"
-        assert daily["InitMorningArcticAppendRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
-        assert daily["InitMorningArcticAppendRetryCounter"]["Next"] == "LaunchMorningArcticAppendSpot"
-
-    @pytest.mark.parametrize(
-        "launch_state,counter_field",
-        [
-            ("LaunchMorningEnrichSpot", "morning_enrich_retry"),
-            ("LaunchMorningArcticAppendSpot", "morning_arctic_append_retry"),
-        ],
-    )
-    def test_launch_threads_force_on_demand_from_retry_counter(self, daily, launch_state, counter_field):
-        payload = daily[launch_state]["Parameters"]["Payload"]
-        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
-
-    @pytest.mark.parametrize(
-        "budget_state,counter_field,increment_state,relaunch_state",
-        [
-            ("CheckMorningEnrichRetryBudget", "$.morning_enrich_retry.attempts",
-             "IncrementMorningEnrichRetry", "LaunchMorningEnrichSpot"),
-            ("CheckMorningArcticAppendRetryBudget", "$.morning_arctic_append_retry.attempts",
-             "IncrementMorningArcticAppendRetry", "LaunchMorningArcticAppendSpot"),
-        ],
-    )
-    def test_one_retry_then_give_up(
-        self, daily, budget_state, counter_field, increment_state, relaunch_state
-    ):
-        st = daily[budget_state]
-        assert st["Type"] == "Choice"
-        assert len(st["Choices"]) == 1
-        cond = st["Choices"][0]
-        assert cond["Variable"] == counter_field
-        assert cond["NumericLessThan"] == 1
-        assert cond["Next"] == increment_state
-        # Retry budget exhausted -> the pre-existing fail-open path, never a HALT.
-        assert st["Default"] == "ExtractDataSpotError"
-
-        inc = daily[increment_state]
-        assert inc["Type"] == "Pass"
-        assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
-        assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
-        # The one retry must never gamble on spot a second time.
-        assert inc["Parameters"]["force_on_demand"] is True
-        # The retry relaunches on a FRESH box — same launch state, not a
-        # separate "retry launch" — a plain Lambda invoke each time.
-        assert inc["Next"] == relaunch_state
+    SF = "daily"
+    CONTINUE = "CheckSkipPredictorInference"
+    SKIP_GATE = "CheckSkipMorningEnrich"
 
 
 # ══════════════════════════════════════════════════════════════════════════
 # EOD (step_function_eod.json)
 # ══════════════════════════════════════════════════════════════════════════
-class TestEODSpotStatesPresent:
-    _LAUNCH = ["LaunchPostMarketDataSpot", "LaunchPostMarketArcticAppendSpot"]
-    _POLL = ["PollPostMarketDataSpot", "PollPostMarketArcticAppendSpot"]
-
-    @pytest.mark.parametrize("name", _LAUNCH)
-    def test_launch_state_invokes_dispatcher(self, eod, name):
-        st = eod[name]
-        assert st["Type"] == "Task"
-        assert st["Resource"] == _LAMBDA_INVOKE
-        assert st["Parameters"]["FunctionName"] == _DISPATCHER_FN
-        assert st["Parameters"]["Payload"]["workload"] in {
-            "post-market-data", "post-market-arctic-append"
-        }
-        # 2026-07-14: force_on_demand.$ threads the retry-budget's on-demand
-        # override into the dispatcher (see TestEODDataSpotRetryBudget).
-        assert set(st["Parameters"]["Payload"]) == {"workload", "force_on_demand.$", "execution_id.$"}
-
-    @pytest.mark.parametrize("name", _POLL)
-    def test_poll_state_polls_ssm(self, eod, name):
-        st = eod[name]
-        assert st["Type"] == "Task"
-        assert st["Resource"] == _SSM_POLL
-
-
 class TestEODDataPhaseOffTrading:
     @pytest.mark.parametrize(
         "gone",
         [
+            # config#1767: on-trading SSM data phase.
             "PostMarketData", "PostMarketArcticAppend",
             "WaitForPostMarketData", "WaitForPostMarketArcticAppend",
             "CheckPostMarketStatus", "CheckPostMarketArcticAppendStatus",
             "CheckSkipPostMarketArcticAppend",
             "PostMarketStatusError", "PostMarketArcticAppendStatusError",
+            # I11269: the data-spot launch/poll/retry block.
+            "InitDataSpotRetryCounter", "LaunchPostMarketDataSpot",
+            "CheckPostMarketDataSpotLaunched", "PollPostMarketDataSpot",
+            "CheckPostMarketDataSpotStatus", "PostMarketDataSpotWait",
+            "CheckDataSpotRetryBudget", "IncrementDataSpotRetry",
+            "InitDataSpotArcticRetryCounter", "LaunchPostMarketArcticAppendSpot",
+            "CheckPostMarketArcticAppendSpotLaunched", "PollPostMarketArcticAppendSpot",
+            "CheckPostMarketArcticAppendSpotStatus", "PostMarketArcticAppendSpotWait",
+            "CheckDataSpotArcticRetryBudget", "IncrementDataSpotArcticRetry",
+            "InitDataSpotEdgarRetryCounter", "LaunchEdgarPitFundamentalsDailySpot",
+            "CheckEdgarPitFundamentalsDailySpotLaunched", "PollEdgarPitFundamentalsDailySpot",
+            "CheckEdgarPitFundamentalsDailySpotStatus", "EdgarPitFundamentalsDailySpotWait",
+            "CheckDataSpotEdgarRetryBudget", "IncrementDataSpotEdgarRetry",
+            # I11266: the heal loop's own spot relaunch (HealStartCollection
+            # starts ne-data-collection-eod instead).
+            "HealLaunchPostMarketDataSpot", "HealCheckPostMarketDataSpotLaunched",
+            "HealPollPostMarketDataSpot", "HealCheckPostMarketDataSpotStatus",
+            "HealPostMarketDataSpotWait", "HealLaunchArcticAppendSpot",
+            "HealCheckArcticAppendSpotLaunched", "HealPollArcticAppendSpot",
+            "HealCheckArcticAppendSpotStatus", "HealArcticAppendSpotWait",
         ],
     )
     def test_relocated_state_absent(self, eod, gone):
-        assert gone not in eod, f"{gone} must move to the data-spot dispatcher"
+        assert gone not in eod, f"{gone} must not run from the v1 EOD SF"
 
     def test_reconcile_snapshot_stop_path_intact(self, eod):
         # Deliverable #2: the reconcile/snapshot/instance-stop path stays on the box.
@@ -349,141 +287,13 @@ class TestEODDataPhaseOffTrading:
             assert "--post-market-arctic-append" not in joined, f"{name} still appends on-box"
 
 
-class TestEODFailureIsolation:
-    """Deliverable #4: an EOD data-spot failure must NOT block reconcile +
-    instance-stop — it routes to CheckSkipCaptureSnapshot, never HandleFailure."""
+class TestEODFailureIsolation(_WaitBlockIsolation):
+    """A not-ready EOD collection must NOT block reconcile + instance-stop — it
+    routes to CheckSkipCaptureSnapshot, never HandleFailure."""
 
-    _CONTINUE = "CheckSkipCaptureSnapshot"
-
-    def test_launch_catch_is_fail_open(self, eod):
-        for name in ("LaunchPostMarketDataSpot", "LaunchPostMarketArcticAppendSpot"):
-            for c in eod[name]["Catch"]:
-                assert c["Next"] == "ExtractDataSpotError"
-                assert c["Next"] not in _HALT
-
-    def test_poll_catch_is_fail_open(self, eod):
-        for name in ("PollPostMarketDataSpot", "PollPostMarketArcticAppendSpot"):
-            for c in eod[name]["Catch"]:
-                assert c["Next"] == "ExtractDataSpotError"
-                assert c["Next"] not in _HALT
-
-    def test_status_default_is_fail_open_not_handlefailure(self, eod):
-        # 2026-07-14 (root cause: AWS spot reclaim mid-job, Server.SpotInstanceTermination):
-        # a terminal non-Success poll status now routes through a one-shot
-        # retry-budget Choice BEFORE falling through to the fail-open
-        # ExtractDataSpotError normalizer — see TestEODDataSpotRetryBudget.
-        assert eod["CheckPostMarketDataSpotStatus"]["Default"] == "CheckDataSpotRetryBudget"
-        assert eod["CheckPostMarketArcticAppendSpotStatus"]["Default"] == "CheckDataSpotArcticRetryBudget"
-        assert eod["CheckDataSpotRetryBudget"]["Default"] == "ExtractDataSpotError"
-        assert eod["CheckDataSpotArcticRetryBudget"]["Default"] == "ExtractDataSpotError"
-
-    def test_error_normalizer_continues_to_reconcile_path(self, eod):
-        # alpha-engine-config#6715: ExtractDataSpotError now threads through
-        # SetDataSpotDegradedFlag (mirrors step_function_daily.json's
-        # SetDataSpotDegradedFlag, config#6692 Option-A) before reaching the
-        # SAME PublishDataSpotFailureImmediate -> CheckSkipCaptureSnapshot
-        # fail-open continuation this test has always pinned — the
-        # continuation path itself is unchanged, only $.degraded_summary now
-        # gets set along the way.
-        assert eod["ExtractDataSpotError"]["Next"] == "SetDataSpotDegradedFlag"
-        flag = eod["SetDataSpotDegradedFlag"]
-        assert flag["Type"] == "Pass"
-        assert flag["ResultPath"] == "$.degraded_summary"
-        assert flag["Next"] == "PublishDataSpotFailureImmediate"
-        pub = eod["PublishDataSpotFailureImmediate"]
-        assert pub["Next"] == self._CONTINUE
-        for c in pub.get("Catch", []):
-            assert c["Next"] == self._CONTINUE
-            assert c["Next"] not in _HALT
-
-    def test_no_data_spot_state_reaches_a_halt(self, eod):
-        data_states = [
-            "LaunchPostMarketDataSpot", "CheckPostMarketDataSpotLaunched",
-            "PollPostMarketDataSpot", "CheckPostMarketDataSpotStatus", "PostMarketDataSpotWait",
-            "CheckDataSpotRetryBudget", "IncrementDataSpotRetry",
-            "InitDataSpotArcticRetryCounter",
-            "LaunchPostMarketArcticAppendSpot", "CheckPostMarketArcticAppendSpotLaunched",
-            "PollPostMarketArcticAppendSpot", "CheckPostMarketArcticAppendSpotStatus",
-            "PostMarketArcticAppendSpotWait",
-            "CheckDataSpotArcticRetryBudget", "IncrementDataSpotArcticRetry",
-            "ExtractDataSpotError", "SetDataSpotDegradedFlag", "PublishDataSpotFailureImmediate",
-        ]
-        for name in data_states:
-            for tgt in _all_targets(eod[name]):
-                assert tgt not in _HALT, (
-                    f"{name} routes to HALT state {tgt} — an EOD data-spot failure "
-                    "would block reconcile + instance-stop (config#1767 #4 violation)"
-                )
-
-    def test_skip_and_launched_false_route_to_continue(self, eod):
-        assert eod["CheckSkipPostMarketData"]["Choices"][0]["Next"] == self._CONTINUE
-        for gate in ("CheckPostMarketDataSpotLaunched", "CheckPostMarketArcticAppendSpotLaunched"):
-            assert eod[gate]["Default"] == self._CONTINUE
-
-
-class TestEODDataSpotRetryBudget:
-    """2026-07-14 incident fix: a spot-reclaimed data-spot workload (AWS
-    Server.SpotInstanceTermination — first observed 2026-07-14, ~22min into a
-    post-market-data run) gets ONE relaunch-on-a-fresh-box retry before the
-    pipeline accepts the failure and falls through to the pre-existing
-    fail-open path. Bounded, not unbounded — a second consecutive
-    interruption still falls through, so this can never loop indefinitely."""
-
-    def test_retry_counters_initialized_before_first_launch(self, eod):
-        assert eod["CheckSkipPostMarketData"]["Default"] == "InitDataSpotRetryCounter"
-        assert eod["InitDataSpotRetryCounter"]["Type"] == "Pass"
-        assert eod["InitDataSpotRetryCounter"]["ResultPath"] == "$.data_spot_retry"
-        assert eod["InitDataSpotRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
-        assert eod["InitDataSpotRetryCounter"]["Next"] == "LaunchPostMarketDataSpot"
-
-        assert eod["CheckPostMarketDataSpotStatus"]["Choices"][0]["Next"] == "InitDataSpotArcticRetryCounter"
-        assert eod["InitDataSpotArcticRetryCounter"]["Type"] == "Pass"
-        assert eod["InitDataSpotArcticRetryCounter"]["ResultPath"] == "$.data_spot_arctic_retry"
-        assert eod["InitDataSpotArcticRetryCounter"]["Result"] == {"attempts": 0, "force_on_demand": False}
-        assert eod["InitDataSpotArcticRetryCounter"]["Next"] == "LaunchPostMarketArcticAppendSpot"
-
-    @pytest.mark.parametrize(
-        "launch_state,counter_field",
-        [
-            ("LaunchPostMarketDataSpot", "data_spot_retry"),
-            ("LaunchPostMarketArcticAppendSpot", "data_spot_arctic_retry"),
-        ],
-    )
-    def test_launch_threads_force_on_demand_from_retry_counter(self, eod, launch_state, counter_field):
-        payload = eod[launch_state]["Parameters"]["Payload"]
-        assert payload["force_on_demand.$"] == f"$.{counter_field}.force_on_demand"
-
-    @pytest.mark.parametrize(
-        "budget_state,counter_field,increment_state,relaunch_state",
-        [
-            ("CheckDataSpotRetryBudget", "$.data_spot_retry.attempts",
-             "IncrementDataSpotRetry", "LaunchPostMarketDataSpot"),
-            ("CheckDataSpotArcticRetryBudget", "$.data_spot_arctic_retry.attempts",
-             "IncrementDataSpotArcticRetry", "LaunchPostMarketArcticAppendSpot"),
-        ],
-    )
-    def test_one_retry_then_give_up(
-        self, eod, budget_state, counter_field, increment_state, relaunch_state
-    ):
-        st = eod[budget_state]
-        assert st["Type"] == "Choice"
-        assert len(st["Choices"]) == 1
-        cond = st["Choices"][0]
-        assert cond["Variable"] == counter_field
-        assert cond["NumericLessThan"] == 1
-        assert cond["Next"] == increment_state
-        # Retry budget exhausted -> the pre-existing fail-open path, never a HALT.
-        assert st["Default"] == "ExtractDataSpotError"
-
-        inc = eod[increment_state]
-        assert inc["Type"] == "Pass"
-        assert inc["ResultPath"] == counter_field.rsplit(".", 1)[0]
-        assert inc["Parameters"]["attempts.$"] == f"States.MathAdd({counter_field}, 1)"
-        # The one retry must never gamble on spot a second time.
-        assert inc["Parameters"]["force_on_demand"] is True
-        # The retry relaunches on a FRESH box — same launch state, not a
-        # separate "retry launch" — a plain Lambda invoke each time.
-        assert inc["Next"] == relaunch_state
+    SF = "eod"
+    CONTINUE = "CheckSkipCaptureSnapshot"
+    SKIP_GATE = "CheckSkipPostMarketData"
 
 
 class TestEODReconcileSkippedOnDataGap:

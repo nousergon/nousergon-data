@@ -36,8 +36,8 @@ import pytest
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
 SPOT_STAGE_SEND_STATES = {
-    "MorningEnrich",
-    "DataPhase1",
+    # MorningEnrich / DataPhase1 left this definition with the decoupled data
+    # cutover (alpha-engine-config-I11269); ne-data-collection-weekly runs them.
     # alpha-engine-config-I5759: repointed from lambda:invoke to the spot
     # dispatch->poll quartet; it carries the same gold 4+2 ladder as its
     # siblings because re-issue is idempotent for the same reason (the send
@@ -80,7 +80,7 @@ HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",
     "WeeklySubstrateHealthCheck",
     # alpha-engine-config-I11312: the observe-mode on-spot preflight pass —
-    # best-effort observation ahead of MorningEnrich; its Catch and every
+    # best-effort observation ahead of CheckShellRun; its Catch and every
     # non-verdict status fail OPEN to CheckShellRun, so a retry ladder would
     # only delay the run it cannot protect.
     "WeeklyPreflightOnSpot",

@@ -1018,7 +1018,11 @@ def _clause_cutover_ready_parity(store: ev.GateStore, *, trading_day: dt.date) -
         "vendor first released the shadow's extra observation after the version v1 read) — "
         "is explained rather than failing, and its count is printed apart from `match`; "
         "schema, membership, coverage and identity-field differences are never explained "
-        "(alpha-engine-config-I11203, Brian's ruling 2026-09-24)"
+        "(alpha-engine-config-I11203, Brian's ruling 2026-09-24). After the decoupled data cutover "
+        "(data_gate/cutover.py) the clause is FROZEN at the last report dated on or before the "
+        "cutover's trading day and is not refreshed: v1 no longer writes the compared keys, so "
+        "a post-cutover report would compare the collector with itself "
+        "(alpha-engine-config-I11269)"
     )
     reading = ev.read_parity(store, trading_day=trading_day)
     if reading.unmeasurable:

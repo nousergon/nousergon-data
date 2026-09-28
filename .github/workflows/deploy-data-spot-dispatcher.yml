@@ -31,6 +31,8 @@ on:
       - 'registry.d/units/**'
       - 'data_gate/descriptors.py'
       - 'data_gate/__init__.py'
+      # alpha-engine-config-I11264: the completion predicate the check runs.
+      - 'data_gate/run_manifest_predicate.py'
   workflow_dispatch:
 
 concurrency:

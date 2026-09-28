@@ -830,7 +830,10 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
     # picked up automatically or fail, never counted silently.
     # alpha-engine-config-I11312: +1 (WeeklyPreflightOnSpot), an acknowledged
     # no-dry-path stage — the stage IS a preflight.
-    assert len(report.results) == report.stages_declared == 23
+    # alpha-engine-config-I11269: -2 (MorningEnrich, DataPhase1) — the
+    # decoupled data cutover moved that work to ne-data-collection-weekly; the
+    # wait that replaced them is a Lambda poll, not a sendCommand stage.
+    assert len(report.results) == report.stages_declared == 21
     # It does not page and it does not claim a clean run.
     assert report.outcome == ps.OUTCOME_DEGRADED
     ps.emit(report, aws, "arn:sns")

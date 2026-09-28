@@ -59,7 +59,11 @@ SF_PATH = Path(__file__).resolve().parents[1] / "infrastructure" / "step_functio
 # bounded-loop shape it established is still the pattern the others follow.
 ALL_CHECK_STATUS_STATES = [
     "CheckBacktesterStatus",
-    "CheckDataPhase1Status",
+    # alpha-engine-config-I11269: CheckDataPhase1Status and
+    # CheckMorningEnrichStatus left with their stages. The readiness wait that
+    # replaced them (CheckCollectionReadiness / CheckCollectionReadinessBudget)
+    # is bounded too; its budget is derived in
+    # tests/test_v1_collection_readiness_wait.py.
     "CheckDataPhase2Status",
     # alpha-engine-config-I9329: EvalJudgeProcess moved off Lambda onto a
     # dedicated spot box, so the eval-judge chain acquired the same two
@@ -70,7 +74,6 @@ ALL_CHECK_STATUS_STATES = [
     "CheckEvaluatorDiagnosticsStatus",
     "CheckEvaluatorOptimizeStatus",
     "CheckModelZooStatus",
-    "CheckMorningEnrichStatus",
     # alpha-engine-config#6030: CheckParityStatus was split into the three
     # ParityParallel branch loops + the compare-join loop, each bounded.
     "CheckPitParityLookaheadStatus",
@@ -246,12 +249,12 @@ def test_every_bounded_loop_seeds_and_increments_its_counter(sf, state_name: str
             )
 
 
-def test_three_retry_gates_check_liveness_before_reissue(sf):
-    """§2.2 / I5688: MorningEnrichRetryGate, DataPhase1RetryGate, and
-    RAGIngestionRetryGate must bound re-issue (liveness check or attempts
-    cap) rather than re-issuing to a dead instance unconditionally."""
-    retry_gates = ["MorningEnrichRetryGate", "DataPhase1RetryGate",
-                   "RAGIngestionRetryGate"]
+def test_the_retry_gates_check_liveness_before_reissue(sf):
+    """§2.2 / I5688: RAGIngestionRetryGate must bound re-issue (liveness
+    check or attempts cap) rather than re-issuing to a dead instance
+    unconditionally. MorningEnrichRetryGate and DataPhase1RetryGate were the
+    other two until alpha-engine-config-I11269 removed their stages."""
+    retry_gates = ["RAGIngestionRetryGate"]
 
     for gate_name in retry_gates:
         found = False

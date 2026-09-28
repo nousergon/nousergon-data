@@ -90,8 +90,9 @@ def _ssm_execution_timeout(state_name: str) -> int:
 # Saturday SF). This list is load-bearing — adding a new SSM stage without
 # adding it here will fail the coverage test below.
 SSM_STAGE_NAMES = [
-    "MorningEnrich",
-    "DataPhase1",
+    # MorningEnrich and DataPhase1 left the definition with the decoupled data
+    # cutover (alpha-engine-config-I11269); the coverage test below fails if
+    # either SSM state ever comes back without a budget row.
     "RAGIngestion",
     "PredictorTraining",
     "ModelZooSelect",
@@ -124,12 +125,6 @@ class TestSsmExecutionTimeoutPins:
             f"but sf_budgets.py declares current_timeout_seconds={expected}. "
             f"Edit sf_budgets.py to match, or vice versa."
         )
-
-    def test_morning_enrich(self):
-        self._check("MorningEnrich")
-
-    def test_data_phase1(self):
-        self._check("DataPhase1")
 
     def test_rag_ingestion(self):
         self._check("RAGIngestion")

@@ -152,9 +152,16 @@ DAILY_STAGES: tuple[Stage, ...] = (
     # CheckSkipPredictorInference. A stage table that still named `scanner`
     # would emit `skip_scanner` into a definition with no gate to read it, and
     # the helper's own coherence check would reject its own output.
+    # alpha-engine-config-I11269 (decoupled data cutover): the morning spot legs
+    # left this definition; the standalone ne-data-collection-morning runs them
+    # and CheckSkipMorningEnrich's Default now enters the bounded readiness
+    # wait on its manifests. Name and flag kept so recovery inputs stay valid.
+    # The not-ready route (budget exhausted, or the producer settled failed) is
+    # a DEGRADED bypass: a rerun must wait again, never skip it.
     Stage("morning_enrich", "skip_morning_enrich",
-          "CheckSkipMorningEnrich", "LaunchMorningEnrichSpot",
-          frozenset({"CheckSkipPredictorInference"})),
+          "CheckSkipMorningEnrich", "WaitForCollectionManifests",
+          frozenset({"CheckSkipPredictorInference"}),
+          degraded_witness=frozenset({"ExtractCollectionNotReadyError"})),
     Stage("predictor_inference", "skip_predictor_inference",
           "CheckSkipPredictorInference", "PredictorInference",
           frozenset({"CheckSkipMorningPlanner"})),
@@ -176,9 +183,12 @@ EOD_STAGES: tuple[Stage, ...] = (
     Stage("refresh_executor_deploy", "skip_refresh_executor_deploy",
           "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
           frozenset({"CheckSkipPostMarketData"})),
+    # alpha-engine-config-I11269: same repoint as morning_enrich above — the
+    # post-market spot legs left this definition for ne-data-collection-eod.
     Stage("post_market_data", "skip_post_market_data",
-          "CheckSkipPostMarketData", "LaunchPostMarketDataSpot",
-          frozenset({"CheckSkipCaptureSnapshot"})),
+          "CheckSkipPostMarketData", "WaitForCollectionManifests",
+          frozenset({"CheckSkipCaptureSnapshot"}),
+          degraded_witness=frozenset({"ExtractCollectionNotReadyError"})),
     Stage("capture_snapshot", "skip_capture_snapshot",
           "CheckSkipCaptureSnapshot", "CaptureSnapshot",
           frozenset({"ProbeEODReconcilePrecondition"})),

@@ -72,6 +72,12 @@ WEEKLY_CRITICAL_GLOBS: tuple[str, ...] = (
     "infrastructure/lambdas/weekly-preflight/**",
     "infrastructure/lambdas/substrate-health-gate/**",
     "infrastructure/lambdas/weekly-run-scope/**",
+    # alpha-engine-config-I11264 / -I11269: the weekly SF's bounded wait on
+    # ne-data-collection-weekly (WaitForCollectionManifests) is FAIL-CLOSED, so
+    # a probe regression fails the Saturday run. Its readiness predicate lives
+    # in data_gate/run_manifest_predicate.py, which the probe packages.
+    "infrastructure/lambdas/collection-readiness-probe/**",
+    "data_gate/run_manifest_predicate.py",
 )
 
 # In-repo Lambdas the weekly SF invokes that are deliberately NOT
