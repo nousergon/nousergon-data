@@ -1,0 +1,126 @@
+name: Deploy substrate-health-gate
+
+# Auto-deploy the alpha-engine-substrate-health-gate Lambda on merge to main.
+#
+# Why this exists (alpha-engine-config-I10172): this Lambda backs the weekly
+# SF's SubstrateHealthGate Task state and had no deploy-*.yml — it was
+# operator-deployed only. nousergon-data#1657 (merged 2026-09-08) wired its
+# stage-coverage verdict (COVERED_NO_OUTPUT on every exit path, via
+# krepis.stage_coverage) and added krepis to requirements.txt, but nothing
+# shipped it: measured 2026-09-28, the live function was last modified
+# 2026-08-14, its zip was 4,158 bytes carrying only index.py (no krepis), and
+# its index.py contained zero `stage_coverage` references. So the SF entered
+# SubstrateHealthGate every week, the Lambda returned HEALTHY, and no
+# `_stage_coverage/<run_date>/SubstrateHealthGate.json` was ever written — the
+# last of I10172's seven absences, while the six siblings instrumented in the
+# same PR (each with its own deploy-*.yml) all now write theirs. This is the
+# codified-but-not-live drift class deploy-infrastructure.yml (deploys the SF,
+# not the lambdas) was built to avoid; the fix is the same shape as
+# deploy-weekly-run-scope.yml.
+#
+# Separation of concerns: this deploys the function CODE (deploy.sh default
+# path = handler-test preflight + pip-install requirements.txt +
+# update-function-code + verify_code_deployed). substrate-health-gate/deploy.sh
+# has no `--code-only` flag, so the plain default path is used, same as
+# deploy-weekly-run-scope.yml. It does NOT pass --smoke: that issues a real
+# SSM df probe against the trading box.
+#
+# IAM: the github-actions-lambda-deploy role's LambdaUpdate grant covers
+# arn:aws:lambda:...:function:alpha-engine-* (including this function,
+# alpha-engine-substrate-health-gate) so this job needs no policy change. The
+# Lambda's OWN role already carries WriteStageCoverageVerdicts
+# (s3:PutObject on alpha-engine-research/_stage_coverage/*) and the registry
+# read live — verified against the live role 2026-09-28.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'infrastructure/lambdas/substrate-health-gate/**'
+      - '.github/workflows/deploy-substrate-health-gate.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-substrate-health-gate-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    name: Deploy substrate-health-gate Lambda
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          path: alpha-engine-data
+          # HEAD^ is read by the IAM-apply step below; the default depth of 1
+          # has no parent and would silently report "unchanged".
+          fetch-depth: 2
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # This repository is public and its run logs are public; GitHub masks
+        # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-lambda-deploy
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12 (match Lambda runtime)
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Deploy substrate-health-gate
+        working-directory: alpha-engine-data
+        run: bash infrastructure/lambdas/substrate-health-gate/deploy.sh
+
+      # The merge emits the exact operator command whenever it ships code whose
+      # IAM this workflow is NOT allowed to apply (config#6738,
+      # pull-request-policy §4.2 form 3). github-actions-lambda-deploy has no
+      # iam:PutRolePolicy by design — the single-writer rule adopted after 4
+      # IAM-clobber incidents — so a changed iam-policy.json ships as CODE ONLY
+      # and the grant lags. Deliberately does not fail the job: the code deploy
+      # really did succeed, and the standing detector is
+      # nous-ergon-ops/infrastructure/iam/check-drift.py (every PR + daily
+      # 09:35 UTC), which stays red until the command below is run.
+      - name: Emit operator IAM-apply command if iam-policy.json changed
+        if: always()
+        working-directory: alpha-engine-data
+        run: |
+          CHANGED=$(git diff --name-only HEAD^ HEAD -- infrastructure/lambdas/substrate-health-gate/iam-policy.json || true)
+          if [ -z "${CHANGED}" ]; then echo "iam-policy.json unchanged in this merge — no operator step."; exit 0; fi
+          CMD="AWS_PROFILE=ne-admin bash infrastructure/lambdas/substrate-health-gate/deploy.sh --apply-iam"
+          echo "::warning title=Operator IAM apply required::${CMD}"
+          { echo "### Operator step required"; echo ""; echo "\`infrastructure/lambdas/substrate-health-gate/iam-policy.json\` changed in this merge, and this workflow's OIDC role cannot apply IAM (single-writer rule). Run from a checkout of \`nousergon-data\`:"; echo ""; echo '```'; echo "${CMD}"; echo '```'; echo ""; echo "Until it runs: \`nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root ../nousergon-data/infrastructure/lambdas\` stays red (daily 09:35 UTC)."; } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Report deployed version
+        working-directory: alpha-engine-data
+        run: |
+          echo "Deployed commit: ${{ github.sha }}"
+          aws lambda get-function \
+            --function-name alpha-engine-substrate-health-gate \
+            --query "Configuration.[LastModified,CodeSha256,CodeSize]" \
+            --output text
+
+      - name: Append to system-wide deploy changelog
+        if: always()
+        uses: nousergon/nousergon-docs/.github/actions/append-changelog@8a904b7a817901f2520dd87131ff307ed97fee02 # main
+        with:
+          deploy_status: ${{ job.status == 'success' && 'success' || 'failure' }}
+          deploy_workflow: deploy-substrate-health-gate.yml
+
+  # Alert (Telegram) on genuine post-merge failure on the default branch.
+  # Reusable workflow + transport in nousergon-lib. config#1128.
+  notify-main-failure:
+    needs: [deploy]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit

@@ -15,8 +15,12 @@
 # script, mirrors ssm-liveness-poller's bootstrap note below).
 #
 # Managed outside CloudFormation — same rationale as ssm-liveness-poller /
-# pipeline-watchdog / eod-backstop (operator-deployed only, narrow OIDC
-# blast radius).
+# pipeline-watchdog / eod-backstop (narrow OIDC blast radius). The default
+# (code-update) path runs on every merge touching this directory via
+# .github/workflows/deploy-substrate-health-gate.yml (alpha-engine-config-
+# I10172: until then this Lambda was operator-deployed only, and the
+# stage-coverage wiring merged 2026-09-08 never reached the account).
+# --bootstrap / --apply-iam stay operator steps.
 #
 # Usage:
 #   bash infrastructure/lambdas/substrate-health-gate/deploy.sh             # update code only
