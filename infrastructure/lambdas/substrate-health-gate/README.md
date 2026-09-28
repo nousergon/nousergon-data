@@ -49,6 +49,13 @@ for the companion nousergon-lib dependency.
 
 ## Deploy
 
+Code deploys on merge: any push to `main` touching this directory runs
+`.github/workflows/deploy-substrate-health-gate.yml`, which runs `deploy.sh`'s
+default path (handler tests, package with `requirements.txt`,
+`update-function-code`). Until alpha-engine-config-I10172 this Lambda was
+operator-deployed only, and its stage-coverage verdict sat merged-but-not-live
+for three weekly cycles. First-time creation and IAM stay operator steps:
+
 ```bash
 bash infrastructure/lambdas/substrate-health-gate/deploy.sh --bootstrap  # first time
 bash infrastructure/lambdas/substrate-health-gate/deploy.sh              # code update

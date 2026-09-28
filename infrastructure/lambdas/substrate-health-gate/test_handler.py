@@ -8,8 +8,11 @@ retry-then-fail path — plus the healthy pass-through case.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
+import types
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -87,16 +90,139 @@ def test_stage_coverage_is_unmeasured_without_a_run_date():
     }
 
 
-def test_stage_coverage_is_asserted_on_every_verdict_path():
+def _fake_stage_coverage_module(calls: list):
+    """A stand-in ``krepis.stage_coverage`` that records each call and never
+    touches AWS — so these tests are hermetic whether or not krepis is
+    installed (CI installs requirements.txt; deploy.sh installs only boto3)."""
+    fake = types.ModuleType("krepis.stage_coverage")
+
+    def assert_stage_coverage(stage, *, run_date, window_start=None, **_):
+        calls.append({"stage": stage, "run_date": run_date, "window_start": window_start})
+        return {"stage": stage, "status": "COVERED_NO_OUTPUT", "run_date": run_date}
+
+    fake.assert_stage_coverage = assert_stage_coverage
+    return fake
+
+
+def _clock_that_never_expires():
+    """Monotonic clock stub for the poll-budget-exhaustion paths without
+    sleeping: each call advances 1s, so the 45s budget runs out in 45 polls."""
+    ticks = iter(range(0, 10_000))
+    return lambda: float(next(ticks))
+
+
+# Every exit path of handler(): (label, invocation_sequence, verdict, reason).
+_EXIT_PATHS = [
+    ("healthy", [_df_success(10)], "HEALTHY", None),
+    ("disk_full", [_df_success(95)], "SUBSTRATE_UNHEALTHY", "disk_full"),
+    (
+        "terminal_non_success",
+        [{"Status": "Failed", "ResponseCode": 1, "StatusDetails": "Failed"}],
+        "SUBSTRATE_UNHEALTHY",
+        "ssm_unresponsive",
+    ),
+    (
+        "unparseable_df",
+        [{"Status": "Success", "ResponseCode": 0, "StandardOutputContent": "garbage"}],
+        "SUBSTRATE_UNHEALTHY",
+        "ssm_unresponsive",
+    ),
+    (
+        "never_registered",
+        [_not_registered_error() for _ in range(100)],
+        "SUBSTRATE_UNHEALTHY",
+        "ssm_command_never_registered",
+    ),
+    (
+        "registered_never_terminal",
+        [{"Status": "InProgress"} for _ in range(100)],
+        "SUBSTRATE_UNHEALTHY",
+        "ssm_unresponsive",
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,sequence,verdict,reason", _EXIT_PATHS, ids=[p[0] for p in _EXIT_PATHS]
+)
+def test_stage_coverage_is_asserted_exactly_once_on_every_exit_path(
+    monkeypatch, label, sequence, verdict, reason
+):
     """The coverage question ('did this stage run and declare itself') is
-    orthogonal to the health question — asserted whether the gate finds
-    HEALTHY or SUBSTRATE_UNHEALTHY, so a real miss is never masked by a
-    non-terminal early return."""
-    ssm = _ssm_stub(invocation_sequence=[_df_success(100)])
-    with mock.patch.object(index, "_ssm", ssm), mock.patch.object(time, "sleep"):
-        out = index.handler(_event(run_date="2026-09-04"), None)
-    assert out["verdict"] == "SUBSTRATE_UNHEALTHY"
+    orthogonal to the health question — asserted once on EVERY return,
+    HEALTHY and each SUBSTRATE_UNHEALTHY reason alike, keyed by the SF's
+    trading-day run_date (alpha-engine-config-I10172)."""
+    calls: list = []
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", _fake_stage_coverage_module(calls))
+    ssm = _ssm_stub(invocation_sequence=sequence)
+    before = datetime.now(timezone.utc)
+    with (
+        mock.patch.object(index, "_ssm", ssm),
+        mock.patch.object(time, "sleep"),
+        mock.patch.object(time, "monotonic", _clock_that_never_expires()),
+    ):
+        out = index.handler(_event(run_date="2026-09-25"), None)
+
+    assert out["verdict"] == verdict
+    assert out.get("reason") == reason
+    assert len(calls) == 1, f"{label}: asserted {len(calls)} times"
+    assert calls[0]["stage"] == "SubstrateHealthGate"
+    assert calls[0]["run_date"] == "2026-09-25"
+    # Window opens at handler ENTRY (alpha-engine-config-I7214).
+    assert before <= calls[0]["window_start"] <= datetime.now(timezone.utc)
+    assert out["stage_coverage"] == {
+        "stage": "SubstrateHealthGate",
+        "status": "COVERED_NO_OUTPUT",
+        "run_date": "2026-09-25",
+    }
+
+
+@pytest.mark.parametrize("label", ["healthy", "disk_full", "never_registered"])
+def test_real_krepis_records_covered_no_output_to_the_trading_day_partition(
+    monkeypatch, tmp_path, label
+):
+    """End to end through the REAL krepis.stage_coverage (skipped where the
+    deploy.sh preflight installs only boto3): with the registry row
+    ARTIFACT_REGISTRY.yaml carries for this stage (`output: none`), the
+    handler writes COVERED_NO_OUTPUT to
+    `_stage_coverage/<run_date>/SubstrateHealthGate.json` on the healthy and
+    unhealthy paths alike. AWS is replaced with mocks — nothing is written."""
+    real = pytest.importorskip("krepis.stage_coverage")
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "pipeline_stages:\n"
+        "  - stage: SubstrateHealthGate\n"
+        "    stage_class: infrastructure\n"
+        "    output: none\n"
+        "    reason: constructs only an SSM client and sends one disk probe\n"
+    )
+    s3 = mock.Mock()
+    cloudwatch = mock.Mock()
+    wrapper = types.ModuleType("krepis.stage_coverage")
+    wrapper.assert_stage_coverage = lambda stage, **kw: real.assert_stage_coverage(
+        stage,
+        s3_client=s3,
+        cloudwatch_client=cloudwatch,
+        registry_local_path=str(registry),
+        **kw,
+    )
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", wrapper)
+    sequence = dict((p[0], p[1]) for p in _EXIT_PATHS)[label]
+    ssm = _ssm_stub(invocation_sequence=sequence)
+    with (
+        mock.patch.object(index, "_ssm", ssm),
+        mock.patch.object(time, "sleep"),
+        mock.patch.object(time, "monotonic", _clock_that_never_expires()),
+    ):
+        out = index.handler(_event(run_date="2026-09-25"), None)
+
+    assert out["stage_coverage"]["status"] == "COVERED_NO_OUTPUT"
     assert out["stage_coverage"]["stage"] == "SubstrateHealthGate"
+    s3.put_object.assert_called_once()
+    put = s3.put_object.call_args.kwargs
+    assert put["Bucket"] == "alpha-engine-research"
+    assert put["Key"] == "_stage_coverage/2026-09-25/SubstrateHealthGate.json"
+    assert json.loads(put["Body"])["status"] == "COVERED_NO_OUTPUT"
 
 
 def test_stage_coverage_assertion_is_import_guarded_and_loud():
