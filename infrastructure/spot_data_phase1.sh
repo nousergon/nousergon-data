@@ -170,6 +170,14 @@ PREFLIGHT
 fi
 
 # ── DataPhase1 run (phase1 + prune) ──────────────────────────────────────────
+# Record this cycle's FIRST entry before the workload writes anything
+# (alpha-engine-config-I10173 / -I10194 §3). Write-once: a spot relaunch or an
+# SF reissue of this stage for the same run_date finds the record and keeps the
+# first entry, so the phases they auto-skip are judged against the window of
+# the attempt that actually wrote them. Placed after the smoke/preflight exits
+# on purpose — those write nothing and must not open the window.
+record_stage_entry DataPhase1 "${EXECUTION_RUN_DATE:-}"
+
 print_banner "DATAPHASE1 (price refresh + prune)"
 run_ssm "phase1" "$(cat <<WORKLOAD
 set -eo pipefail
