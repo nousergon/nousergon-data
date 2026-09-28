@@ -1180,6 +1180,11 @@ class TestPredictorSkipFreshness:
             )
 
     def test_coerce_clamps_calendar_date_to_manifest(self, mod):
+        """I8809's case, still honoured after I11655: a weights consumer runs
+        (only skip_predictor_training is set), and the manifest is one day
+        behind -- a recovery launched across UTC midnight. Saturday 08-29 and
+        Friday 08-28 resolve to the same trading day, so the clamp moves no
+        cycle."""
         s3 = self._FakeS3(
             last_modified=datetime(2026, 8, 28, 17, 46, 15, tzinfo=timezone.utc)
         )
@@ -1188,9 +1193,262 @@ class TestPredictorSkipFreshness:
         )
         assert cal == "2026-08-28"
         assert note is not None
+        assert "2026-08-28 unchanged" in note
         mod.check_predictor_skip_freshness(
             s3, cal, {"skip_predictor_training": True}
         )  # does not raise
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I11655 -- the clamp regraded a Director-only rerun
+# ---------------------------------------------------------------------------
+
+#: The REAL input of watch-rerun-2026-09-25-1 (describe-execution, read
+#: 2026-09-28), minus calendar_date: every stage but ReportCard/Director
+#: skipped. The script clamped its calendar_date 2026-09-26 -> 2026-09-12, and
+#: NormalizeRunDates re-derived run_date 2026-09-11 from that, so the Director
+#: graded the wrong week.
+_DIRECTOR_ONLY_SKIPS = {
+    f"skip_{name}": True for name in (
+        "aggregate_costs", "backtester", "challenger_shadow", "counterfactual",
+        "data_phase1", "data_phase2", "eval_judge", "evaluator",
+        "morning_enrich", "parity", "portfolio_optimizer_backtest",
+        "predictor_backtest", "predictor_training", "rag_ingestion",
+        "rationale_clustering", "regime_retrospective_eval",
+        "regime_substrate", "research_self_test", "saturday_health_check",
+        "scanner", "scanner_leaderboard", "signals_envelope",
+    )
+}
+
+
+class TestPredictorSkipClampIsBounded:
+    """alpha-engine-config-I11655."""
+
+    class _FakeS3:
+        def __init__(self, *, last_modified=None, error=None):
+            self._last_modified = last_modified
+            self._error = error
+            self.calls = 0
+
+        def head_object(self, **kwargs):
+            self.calls += 1
+            if self._error is not None:
+                raise self._error
+            return {"LastModified": self._last_modified}
+
+    _STALE = datetime(2026, 9, 12, 15, 0, 0, tzinfo=timezone.utc)
+
+    def _plan(self, mod, skip_flags):
+        return mod.RerunPlan(
+            run_date="2026-09-25",
+            run_date_provenance="explicit run_date in the failed execution's input",
+            original_input={"pipeline_role": "weekly", "run_date": "2026-09-25"},
+            calendar_date="2026-09-26",
+            calendar_date_provenance="ApplyNormalizedRunDate merged output",
+            skip_flags=dict(skip_flags),
+        )
+
+    def test_director_only_input_needs_no_freshness_proof(self, mod):
+        assert mod.predictor_weights_consumers_all_skipped(_DIRECTOR_ONLY_SKIPS)
+        assert not mod.predictor_skip_needs_freshness(_DIRECTOR_ONLY_SKIPS)
+
+    def test_director_only_plan_is_neither_clamped_nor_checked(self, mod):
+        """The manifest is never read: a stale one cannot move the date, and
+        an unreadable one cannot refuse a run that reads no weights."""
+        s3 = self._FakeS3(error=RuntimeError("must not be called"))
+        cal, note = mod.coerce_calendar_date_for_predictor_skip(
+            s3, "2026-09-26", _DIRECTOR_ONLY_SKIPS
+        )
+        assert (cal, note) == ("2026-09-26", None)
+        mod.check_predictor_skip_freshness(s3, "2026-09-26", _DIRECTOR_ONLY_SKIPS)
+        assert s3.calls == 0
+
+    def test_director_only_plan_emits_the_derived_calendar_date(self, mod):
+        """End to end through the function main() runs: the EMITTED input keeps
+        calendar_date 2026-09-26, so NormalizeRunDates derives run_date
+        2026-09-25, the cycle being recovered, and not 2026-09-11."""
+        from krepis.dates import resolve_trading_day
+
+        plan = self._plan(mod, _DIRECTOR_ONLY_SKIPS)
+        s3 = self._FakeS3(last_modified=self._STALE)
+        mod.apply_predictor_skip_coherence(plan, s3)
+        emitted = plan.rerun_input()
+        assert emitted["calendar_date"] == "2026-09-26"
+        assert emitted["skip_predictor_training"] is True
+        assert resolve_trading_day(emitted["calendar_date"]) == emitted["run_date"]
+        assert s3.calls == 0
+        assert any("I11655" in n for n in plan.notes)
+
+    def test_the_cadence_declared_skip_parity_counts(self, mod):
+        """skip_parity reaches the emitted input from the cadence declaration,
+        not from the derived set. The check reads the emitted input, so a
+        derived set without it is still recognised as consumer-free."""
+        derived = {k: v for k, v in _DIRECTOR_ONLY_SKIPS.items() if k != "skip_parity"}
+        plan = self._plan(mod, derived)
+        s3 = self._FakeS3(error=RuntimeError("must not be called"))
+        mod.apply_predictor_skip_coherence(plan, s3)
+        assert plan.calendar_date == "2026-09-26"
+
+    @pytest.mark.parametrize("consumer", [
+        "skip_backtester", "skip_predictor_backtest",
+        "skip_portfolio_optimizer_backtest", "skip_evaluator",
+    ])
+    def test_one_running_consumer_brings_the_proof_back(self, mod, consumer):
+        flags = {k: v for k, v in _DIRECTOR_ONLY_SKIPS.items() if k != consumer}
+        assert mod.predictor_skip_needs_freshness(flags)
+
+    def test_a_consumer_flag_must_be_boolean_true(self, mod):
+        """The SF tests BooleanEquals: true. A truthy non-boolean does not
+        satisfy it there, so it must not satisfy it here."""
+        flags = dict(_DIRECTOR_ONLY_SKIPS, skip_evaluator="true")
+        assert mod.predictor_skip_needs_freshness(flags)
+
+    def test_consumer_plan_with_a_one_day_gap_clamps(self, mod):
+        """Saturday 2026-09-26 -> Friday 2026-09-25: one day, same trading day."""
+        flags = {k: v for k, v in _DIRECTOR_ONLY_SKIPS.items() if k != "skip_evaluator"}
+        plan = self._plan(mod, flags)
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 9, 25, 23, 10, 0, tzinfo=timezone.utc)
+        )
+        mod.apply_predictor_skip_coherence(plan, s3)
+        assert plan.calendar_date == "2026-09-25"
+        assert plan.rerun_input()["calendar_date"] == "2026-09-25"
+        assert any("clamped 2026-09-26 -> 2026-09-25" in n for n in plan.notes)
+
+    def test_consumer_plan_with_a_fourteen_day_gap_refuses(self, mod):
+        """The watch-rerun-2026-09-25-1 dates, with the evaluator running:
+        refuse, naming both dates and both trading days, and never move the
+        plan's calendar_date."""
+        flags = {k: v for k, v in _DIRECTOR_ONLY_SKIPS.items() if k != "skip_evaluator"}
+        plan = self._plan(mod, flags)
+        s3 = self._FakeS3(last_modified=self._STALE)
+        with pytest.raises(mod.SkipCoherenceError) as exc:
+            mod.apply_predictor_skip_coherence(plan, s3)
+        msg = str(exc.value)
+        for needle in ("2026-09-12", "2026-09-26", "2026-09-11", "2026-09-25",
+                       "14 day(s)", "evaluator", "NormalizeRunDates",
+                       "WITHOUT skip_predictor_training"):
+            assert needle in msg, needle
+        assert plan.calendar_date == "2026-09-26"
+
+    def test_a_short_gap_that_changes_the_trading_day_refuses(self, mod):
+        """The day bound alone is not the invariant. Monday 2026-09-28 is a
+        trading day; clamping it to Sunday 2026-09-27 is ONE day but re-dates
+        the run to Friday 2026-09-25."""
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 9, 27, 12, 0, 0, tzinfo=timezone.utc)
+        )
+        with pytest.raises(mod.SkipCoherenceError) as exc:
+            mod.coerce_calendar_date_for_predictor_skip(
+                s3, "2026-09-28", {"skip_predictor_training": True}
+            )
+        assert "1 day(s)" in str(exc.value)
+        assert "2026-09-25 instead of 2026-09-28" in str(exc.value)
+
+    def test_a_holiday_weekend_gap_within_the_bound_clamps(self, mod):
+        """Monday 2026-09-07 is Labor Day and resolves to Friday 2026-09-04.
+        A manifest written that Friday is three days back and the same
+        session: the widest move the clamp exists to absorb."""
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 9, 4, 22, 0, 0, tzinfo=timezone.utc)
+        )
+        cal, note = mod.coerce_calendar_date_for_predictor_skip(
+            s3, "2026-09-07", {"skip_predictor_training": True}
+        )
+        assert cal == "2026-09-04" and note is not None
+
+    def test_the_day_bound_holds_on_its_own(self, mod, monkeypatch):
+        """Pin the bound independently of the calendar: with every date
+        resolving to one trading day, a four-day move still refuses."""
+        monkeypatch.setattr(mod, "resolve_trading_day", lambda _d: "2026-09-04")
+        s3 = self._FakeS3(
+            last_modified=datetime(2026, 9, 4, 22, 0, 0, tzinfo=timezone.utc)
+        )
+        with pytest.raises(mod.SkipCoherenceError) as exc:
+            mod.coerce_calendar_date_for_predictor_skip(
+                s3, "2026-09-08", {"skip_predictor_training": True}
+            )
+        assert "4 day(s)" in str(exc.value)
+
+
+class TestPredictorSkipVacuousRuleMatchesTheSf:
+    """alpha-engine-config-I11655: CheckSkipPredictorTraining's vacuous-skip
+    rule and the script's PREDICTOR_WEIGHTS_CONSUMER_SKIPS are one declaration
+    in two places. If they drift, the script stops clamping for an input the SF
+    still validates (a failed run) or the SF skips validation for an input the
+    script thinks needs it."""
+
+    @pytest.fixture
+    def gate(self, sf_def):
+        for branch in sf_def["States"]["ResearchPredictorParallel"]["Branches"]:
+            if "CheckSkipPredictorTraining" in branch["States"]:
+                return branch["States"]["CheckSkipPredictorTraining"]
+        raise AssertionError("CheckSkipPredictorTraining not found")
+
+    @staticmethod
+    def _flags(rule):
+        return {c["Variable"].removeprefix("$.") for c in rule["And"]}
+
+    def test_rule_order_preset_then_vacuous_then_validate(self, gate):
+        preset, vacuous, validate = gate["Choices"]
+        assert "mode" in self._flags(preset)
+        assert preset["Next"] == "PredictorTrainingSkipped"
+        assert vacuous["Next"] == "PredictorTrainingSkipped"
+        assert validate["Next"] == "ValidatePredictorSkipWeightsFresh"
+        assert self._flags(validate) == {"skip_predictor_training"}
+
+    def test_vacuous_rule_names_exactly_the_declared_consumers(self, mod, gate):
+        vacuous = gate["Choices"][1]
+        assert self._flags(vacuous) == (
+            {"skip_predictor_training"} | set(mod.PREDICTOR_WEIGHTS_CONSUMER_SKIPS)
+        )
+        for flag in self._flags(vacuous):
+            conds = [c for c in vacuous["And"] if c["Variable"] == f"$.{flag}"]
+            assert {"IsPresent": True} in [{k: v for k, v in c.items() if k != "Variable"} for c in conds], flag
+            assert {"BooleanEquals": True} in [{k: v for k, v in c.items() if k != "Variable"} for c in conds], flag
+            assert len(conds) == 2, flag
+
+    def test_every_consumer_flag_is_a_real_skip_gate(self, mod):
+        for flag in mod.PREDICTOR_WEIGHTS_CONSUMER_SKIPS:
+            assert flag in mod.STAGES_BY_FLAG, flag
+
+    def _route(self, gate, execution_input):
+        from run_scope import evaluate_rule
+
+        for rule in gate["Choices"]:
+            verdict = evaluate_rule(rule, execution_input, set())
+            assert verdict in (True, False), rule
+            if verdict:
+                return rule["Next"]
+        return gate["Default"]
+
+    def test_all_consumers_skipped_routes_to_skipped(self, gate):
+        assert self._route(gate, _DIRECTOR_ONLY_SKIPS) == "PredictorTrainingSkipped"
+
+    @pytest.mark.parametrize("consumer", [
+        "skip_backtester", "skip_predictor_backtest",
+        "skip_portfolio_optimizer_backtest", "skip_parity", "skip_evaluator",
+    ])
+    def test_one_missing_consumer_skip_still_validates(self, mod, gate, consumer):
+        missing = {k: v for k, v in _DIRECTOR_ONLY_SKIPS.items() if k != consumer}
+        assert self._route(gate, missing) == "ValidatePredictorSkipWeightsFresh"
+        false = dict(_DIRECTOR_ONLY_SKIPS, **{consumer: False})
+        assert self._route(gate, false) == "ValidatePredictorSkipWeightsFresh"
+        # and the script agrees on both inputs
+        assert mod.predictor_skip_needs_freshness(missing)
+        assert mod.predictor_skip_needs_freshness(false)
+
+    def test_consumer_skips_alone_never_skip_training(self, gate):
+        no_training_skip = {
+            k: v for k, v in _DIRECTOR_ONLY_SKIPS.items()
+            if k != "skip_predictor_training"
+        }
+        assert self._route(gate, no_training_skip) == "PredictorTraining"
+
+    def test_backtest_eval_preset_still_wins_first(self, gate):
+        assert self._route(
+            gate, {"skip_predictor_training": True, "mode": "backtest-eval"}
+        ) == "PredictorTrainingSkipped"
 
 
 class TestCadenceDeclaredSkipsAreCarried:

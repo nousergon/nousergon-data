@@ -58,33 +58,126 @@
 # change with it.
 _STAGE_WINDOW_TRACKS_CYCLE="${_STAGE_WINDOW_TRACKS_CYCLE:-}"
 
+# Where a declared stage records its FIRST ENTRY for a cycle.
+#
+# NOT under `_stage_coverage/<run_date>/`: the coverage sweep
+# (`nousergon_lib.pipeline_status.coverage._load_verdicts_one`) reads every
+# `.json` directly under that prefix as a stage VERDICT, so a record there
+# would be counted as a stage. `_stage_coverage/_entry/` sits beside the
+# sweep's own `_stage_coverage/_sweep/`, where no date partition is listed.
+_STAGE_ENTRY_PREFIX="_stage_coverage/_entry"
+
+# Record the instant this stage was FIRST entered for `run_date`, before its
+# workload writes anything (alpha-engine-config-I10173 / -I10194 §3).
+#
+# WHY A RECORD, not only the prior verdict. `resolve_stage_window_start` below
+# used to recover the cycle's first attempt from the `window_start` of an
+# EXISTING verdict. A verdict is written at the END of an attempt, so it can
+# only carry what that attempt believed its window was — and twice that was
+# already late:
+#
+#   - Every cycle from 2026-09-11 to 2026-09-25: DataPhase1's spot was
+#     reclaimed, the launcher re-exec'd itself (`exec bash "$0"` in
+#     `_spot_common.sh::on_exit`), and the unexported start was recomputed as
+#     "now". Measured on rehearsal-2026-09-25-1: the command entered 21:50:25Z,
+#     attempt 1 wrote macro/short_interest/macro_history/release_calendar/
+#     universe_classification at 21:54-22:12Z, attempt 2 captured 22:19:59Z,
+#     auto-skipped them at 22:22Z, and recorded STALE. `nousergon-data#1972`
+#     exported the start so a relaunch keeps it — but the late window was
+#     already PERSISTED in that verdict, and the scheduled run the next morning
+#     reused it verbatim (verdict version recorded 2026-09-26T10:24:06Z,
+#     `window_start: 2026-09-25T22:19:59+00:00`, five artifacts STALE again).
+#     A window that is only as good as the last verdict's is poisoned for the
+#     rest of the cycle by one bad verdict.
+#   - An SF reissue (`DataPhase1Reissue` in step_function.json) is a NEW SSM
+#     command, so no exported value survives into it; and a first command that
+#     died mid-workload never reached its assertion, so there is no verdict to
+#     reuse either. The reissue then captured its own start, after the first
+#     command's writes — the same false STALE one level up.
+#
+# A record written at FIRST ENTRY closes both: it exists before any workload
+# write, it is written once per (run_date, stage) and never moved, and the
+# resolver takes the earliest start it can prove for this cycle.
+#
+# Write-once: an existing record is left alone (the first entry wins). An
+# unreadable record is NOT overwritten — a rewrite would move the first entry
+# LATER, which is the defect. Never fails the stage: always returns 0, and
+# every non-write is loud on stderr.
+#
+# Call it only on the path that runs the real workload — never from a
+# `--preflight-only` / `--smoke-only` run, which writes nothing and would
+# otherwise open the window before the cycle's first real write.
+record_stage_entry() {
+  local stage="$1" run_date="${2:-}"
+
+  if [ "${_STAGE_WINDOW_TRACKS_CYCLE:-}" != "1" ]; then
+    return 0
+  fi
+
+  if [ -z "$run_date" ]; then
+    echo "WARNING: stage-entry ${stage}: no run_date — not recording a first entry; a later attempt of this cycle cannot find it (alpha-engine-config-I10194)" >&2
+    return 0
+  fi
+
+  local key="${_STAGE_ENTRY_PREFIX}/${run_date}/${stage}.json"
+  local err_file rc=0
+  err_file="$(mktemp)"
+  aws s3api head-object --bucket "$S3_BUCKET" --key "$key" --region "$AWS_REGION" >/dev/null 2>"$err_file" || rc=$?
+
+  if [ "$rc" -eq 0 ]; then
+    echo "  stage-entry ${stage}: ${run_date} was already entered (s3://${S3_BUCKET}/${key}) — keeping the FIRST entry, not this attempt's ${_STAGE_WINDOW_START}" >&2
+    rm -f "$err_file"
+    return 0
+  fi
+
+  if ! grep -qiE '404|Not Found|NoSuchKey|does not exist' "$err_file"; then
+    echo "WARNING: stage-entry ${stage}: could not read s3://${S3_BUCKET}/${key} (rc=${rc}): $(tr '\n' ' ' < "$err_file")" >&2
+    echo "         NOT writing a first-entry record — overwriting one that exists would move this cycle's window LATER. A later attempt falls back to the prior verdict's window." >&2
+    rm -f "$err_file"
+    return 0
+  fi
+
+  local body
+  body="$(printf '{"stage": "%s", "run_date": "%s", "window_start": "%s", "recorded_at": "%s", "spot_attempt": "%s"}' \
+    "$stage" "$run_date" "$_STAGE_WINDOW_START" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "${SPOT_ATTEMPT:-}")"
+  rc=0
+  printf '%s' "$body" | aws s3 cp - "s3://${S3_BUCKET}/${key}" --region "$AWS_REGION" --content-type application/json >/dev/null 2>"$err_file" || rc=$?
+  if [ "$rc" -eq 0 ]; then
+    echo "  stage-entry ${stage}: recorded this cycle's first entry ${_STAGE_WINDOW_START} for ${run_date} at s3://${S3_BUCKET}/${key}" >&2
+  else
+    echo "WARNING: stage-entry ${stage}: could not write s3://${S3_BUCKET}/${key} (rc=${rc}): $(tr '\n' ' ' < "$err_file") — a later attempt of this cycle falls back to the prior verdict's window" >&2
+  fi
+  rm -f "$err_file"
+  return 0
+}
+
 # Resolve the window this stage should assert against.
 #
 # For a stage that has NOT declared `_STAGE_WINDOW_TRACKS_CYCLE=1` this is
 # `$_STAGE_WINDOW_START` verbatim — the semantics are unchanged fleet-wide.
 #
-# For a declared stage, an EXISTING `_stage_coverage/<run_date>/<stage>.json`
-# verdict means an earlier attempt of THIS cycle already asserted, and its
-# `window_start` is that first attempt's start. Reusing it makes the window
-# track the CYCLE rather than this particular execution. It never admits a
-# PREVIOUS cycle's leftovers: the first attempt for run_date X necessarily
-# started after cycle X began, so a genuine leftover still predates it and
-# still reads STALE. Successive attempts re-write the same value, so the
-# window is monotone and converges on the cycle's first attempt.
+# For a declared stage it is the EARLIEST start this cycle can prove for the
+# stage, read from two places under `run_date`:
 #
-# Every failure path DEGRADES TOWARD THE ALARMING SIDE — back to this
-# execution's start — and says so on stderr. That direction is deliberate:
-# a false STALE is a finding a human reads and can dismiss; a false COVERED
-# is silence, and silence is what this whole mechanism exists to remove
+#   1. the first-entry record `record_stage_entry` wrote before the cycle's
+#      first workload write (see above) — the authoritative source;
+#   2. the `window_start` of an EXISTING `_stage_coverage/<run_date>/<stage>.json`
+#      verdict — an earlier attempt's window, kept for cycles whose first
+#      attempt ran before the record existed or could not write it.
+#
+# Both are starts of attempts of THIS cycle, so the earliest is the stage's
+# first entry and it never admits a PREVIOUS cycle's leftovers: those were
+# written before any attempt for run_date X began. That is also CHECKED, not
+# assumed — a candidate earlier than `run_date`'s own 00:00Z cannot be an entry
+# for that cycle and is rejected loudly.
+#
+# Every failure path DEGRADES TOWARD THE ALARMING SIDE — a candidate that
+# cannot be read or parsed is dropped, and with none left the window is this
+# execution's own start — and says so on stderr. That direction is deliberate:
+# a false STALE is a finding a human reads and can dismiss; a false COVERED is
+# silence, and silence is what this whole mechanism exists to remove
 # (`principles.md` §2.7). Nothing here can fail the stage: the caller is in
 # observe mode and this function always returns 0.
-#
-# Residual, named rather than swallowed: if the cycle's FIRST attempt died
-# before it asserted, no verdict exists to reuse and the second attempt
-# captures its own window — the original false STALE is still possible for
-# that shape. It is a strictly smaller window of exposure than today's
-# (which mis-reads EVERY rerun), and an attempt that never reached its
-# assertion is also an attempt whose phases mostly did not complete.
 resolve_stage_window_start() {
   local stage="$1" run_date="${2:-}"
 
@@ -99,39 +192,78 @@ resolve_stage_window_start() {
     return 0
   fi
 
-  local key="_stage_coverage/${run_date}/${stage}.json"
-  local err_file body rc=0
-  err_file="$(mktemp)"
-  body="$(aws s3 cp "s3://${S3_BUCKET}/${key}" - --region "$AWS_REGION" 2>"$err_file")" || rc=$?
-
-  if [ "$rc" -ne 0 ]; then
-    if grep -qiE '404|Not Found|NoSuchKey|does not exist' "$err_file"; then
-      echo "  stage-window ${stage}: no prior verdict at s3://${S3_BUCKET}/${key} — this is the cycle's first attempt; window = ${_STAGE_WINDOW_START}" >&2
+  local candidates=() source key err_file body rc value
+  for source in first-entry-record prior-verdict; do
+    if [ "$source" = "first-entry-record" ]; then
+      key="${_STAGE_ENTRY_PREFIX}/${run_date}/${stage}.json"
     else
-      echo "WARNING: stage-window ${stage}: could not read s3://${S3_BUCKET}/${key} (rc=${rc}): $(tr '\n' ' ' < "$err_file")" >&2
-      echo "         Degrading to THIS execution's window start ${_STAGE_WINDOW_START} — the ALARMING side. A rerun may now report STALE on its own auto-skipped output (alpha-engine-config-I10194 §3); that is a visible finding, not silence." >&2
+      key="_stage_coverage/${run_date}/${stage}.json"
+    fi
+    rc=0
+    err_file="$(mktemp)"
+    body="$(aws s3 cp "s3://${S3_BUCKET}/${key}" - --region "$AWS_REGION" 2>"$err_file")" || rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+      if grep -qiE '404|Not Found|NoSuchKey|does not exist' "$err_file"; then
+        if [ "$source" = "prior-verdict" ]; then
+          echo "  stage-window ${stage}: no prior verdict at s3://${S3_BUCKET}/${key}" >&2
+        else
+          echo "  stage-window ${stage}: no first-entry record at s3://${S3_BUCKET}/${key}" >&2
+        fi
+      else
+        echo "WARNING: stage-window ${stage}: could not read s3://${S3_BUCKET}/${key} (rc=${rc}): $(tr '\n' ' ' < "$err_file")" >&2
+        echo "         Dropping the ${source} — the ALARMING side. A rerun may now report STALE on its own auto-skipped output (alpha-engine-config-I10194 §3); that is a visible finding, not silence." >&2
+      fi
+      rm -f "$err_file"
+      continue
     fi
     rm -f "$err_file"
-    printf '%s' "$_STAGE_WINDOW_START"
-    return 0
-  fi
-  rm -f "$err_file"
 
-  local prior=""
-  prior="$(printf '%s' "$body" | "$LIB_PYTHON" -c 'import json,sys
+    value="$(printf '%s' "$body" | "$LIB_PYTHON" -c 'import json,sys
 try:
     value = json.load(sys.stdin).get("window_start")
 except Exception:
     value = None
-print(value if isinstance(value, str) and value.strip() else "")' 2>/dev/null)" || prior=""
+print(value if isinstance(value, str) and value.strip() else "")' 2>/dev/null)" || value=""
+
+    if [ -z "$value" ]; then
+      echo "WARNING: stage-window ${stage}: the ${source} for ${run_date} carries no usable window_start — dropping it (the alarming side)" >&2
+      continue
+    fi
+    candidates+=("${source}=${value}")
+  done
+
+  local prior=""
+  if [ "${#candidates[@]}" -gt 0 ]; then
+    prior="$(printf '%s\n' "${candidates[@]}" | "$LIB_PYTHON" -c 'import sys
+from datetime import datetime, timezone
+run_date = sys.argv[1]
+floor = datetime.fromisoformat(run_date).replace(tzinfo=timezone.utc)
+best = None
+for line in sys.stdin.read().splitlines():
+    source, _, raw = line.partition("=")
+    try:
+        at = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+    except ValueError:
+        print(f"WARNING: stage-window: the {source} window_start {raw!r} does not parse - dropping it (the alarming side)", file=sys.stderr)
+        continue
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    if at < floor:
+        print(f"WARNING: stage-window: the {source} window_start {raw} predates run_date {run_date} itself - it cannot be an entry for this cycle; dropping it (the alarming side)", file=sys.stderr)
+        continue
+    if best is None or at < best[0]:
+        best = (at, raw.strip())
+print(best[1] if best else "")' "$run_date")" || prior=""
+  fi
 
   if [ -z "$prior" ]; then
-    echo "WARNING: stage-window ${stage}: the prior verdict for ${run_date} carries no usable window_start — degrading to this execution's start ${_STAGE_WINDOW_START} (the alarming side)" >&2
+    echo "  stage-window ${stage}: no usable first-entry record or prior verdict for ${run_date} — this is the cycle's first attempt; window = ${_STAGE_WINDOW_START}" >&2
     printf '%s' "$_STAGE_WINDOW_START"
     return 0
   fi
 
-  echo "  stage-window ${stage}: reusing this CYCLE's first-attempt window ${prior} from the existing ${run_date} verdict, not this execution's ${_STAGE_WINDOW_START} (alpha-engine-config-I10194 §3)" >&2
+  echo "  stage-window ${stage}: reusing this CYCLE's first-attempt window ${prior} (earliest of: ${candidates[*]}), not this execution's ${_STAGE_WINDOW_START} (alpha-engine-config-I10194 §3)" >&2
   printf '%s' "$prior"
   return 0
 }
