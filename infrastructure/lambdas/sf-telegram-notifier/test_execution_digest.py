@@ -70,114 +70,21 @@ def test_preflight_suppresses_floor_breach():
     assert rows[0].floor_breach is False
 
 
-def test_poll_morning_enrich_spot_floor_is_the_recalibrated_value():
-    # alpha-engine-config-I10164: the prior 8m floor was unmeasured and sat
-    # above the median of every healthy run (median 273.7s across n=34
-    # SUCCEEDED executions), firing a chronic false positive. Recalibrated to
-    # 90s, ~15% below the measured minimum genuine duration (106.8s).
-    assert STATE_DURATION_FLOORS_SEC["PollMorningEnrichSpot"] == 90
-
-
-def test_poll_morning_enrich_spot_floor_clears_the_measured_minimum_genuine_run():
-    # The slowest-to-clear genuine run measured (operator-recovery-2026-08-13,
-    # 106.8s) must NOT breach the new floor — a floor still firing on the
-    # fastest observed healthy run would be the same defect class recalibrated
-    # to a different wrong number.
-    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
-    rows = build_state_durations(
-        {"PollMorningEnrichSpot": 107},
-        is_preflight=False,
-        execution_start=start,
-        run_date="2026-07-04",
-        s3_client=None,
-    )
-    assert rows[0].floor_breach is False
-
-
-def test_poll_morning_enrich_spot_floor_still_catches_a_genuinely_hollow_run():
-    # A run that returns before the constituents fetch even starts (no
-    # measured genuine run, n=34, completes in under 90s) must still trip
-    # HOLLOW-SUSPECT.
-    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
-    rows = build_state_durations(
-        {"PollMorningEnrichSpot": 45},
-        is_preflight=False,
-        execution_start=start,
-        run_date="2026-07-04",
-        s3_client=None,
-    )
-    assert rows[0].floor_breach is True
-    assert rows[0].anomaly is True
-
-
-def test_poll_morning_arctic_append_spot_floor_is_the_recalibrated_value():
-    # alpha-engine-config-I10164 part 1: the prior 8m (480s) floor was also
-    # unmeasured (config-I6857) and sat BELOW every genuine run (min 1474.9s
-    # across n=29 Success-status executions), so it never false-positived —
-    # but it also missed a confirmed-broken 929.7s run, the mirror-image
-    # defect. Recalibrated to 1200s, ~19% below the measured genuine minimum.
-    assert STATE_DURATION_FLOORS_SEC["PollMorningArcticAppendSpot"] == 1200
-
-
-def test_poll_morning_arctic_append_spot_floor_clears_the_measured_minimum_genuine_run():
-    # The fastest genuine (arctic_append_poll.Status == "Success") run
-    # measured (500c7956-..., 1474.9s) must NOT breach the new floor.
-    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
-    rows = build_state_durations(
-        {"PollMorningArcticAppendSpot": 1475},
-        is_preflight=False,
-        execution_start=start,
-        run_date="2026-07-04",
-        s3_client=None,
-    )
-    assert rows[0].floor_breach is False
-
-
-def test_poll_morning_arctic_append_spot_floor_still_catches_a_confirmed_broken_run():
-    # 929.7s (b9d76d5c-..., 2026-07-14) is a CONFIRMED broken run — its
-    # arctic_append_poll.Status read "Failed" (SSM StandardErrorContent:
-    # a pip-cache-permission failure, "failed to run commands: exit status
-    # 1") even though the overall SF execution completed SUCCEEDED. The old
-    # 480s floor MISSED this one (929.7s > 480s); the recalibrated 1200s
-    # floor must catch it.
-    start = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
-    rows = build_state_durations(
-        {"PollMorningArcticAppendSpot": 930},
-        is_preflight=False,
-        execution_start=start,
-        run_date="2026-07-04",
-        s3_client=None,
-    )
-    assert rows[0].floor_breach is True
-    assert rows[0].anomaly is True
-
-
-def test_weekly_wait_floors_recalibrated_off_the_poll_states_not_dispatch():
-    # alpha-engine-config-I10545: the prior floors sat on "MorningEnrich" /
-    # "DataPhase1" (the SSM dispatch Task states), which enter+exit in well
-    # under a second every run (measured 0.22s / 0.24s on the 2026-09-12
-    # execution) — a floor there breaches unconditionally. Floors now sit on
-    # the poll states that actually span the workload, ~20% below the
-    # measured minimum across the last four canonical weekly runs (min
-    # WaitForMorningEnrich 31.7min=1902s, min WaitForDataPhase1 83.6min=5016s).
-    assert "MorningEnrich" not in STATE_DURATION_FLOORS_SEC
-    assert "DataPhase1" not in STATE_DURATION_FLOORS_SEC
-    assert STATE_DURATION_FLOORS_SEC["WaitForMorningEnrich"] == 25 * 60
-    assert STATE_DURATION_FLOORS_SEC["WaitForDataPhase1"] == 67 * 60
-
-
-def test_weekly_wait_floors_clear_the_measured_minimum_genuine_runs():
-    # The slowest-to-clear genuine minimums measured (31.7min / 83.6min) must
-    # not breach the new floors.
-    start = datetime(2026, 9, 12, 12, 0, 0, tzinfo=timezone.utc)
-    rows = build_state_durations(
-        {"WaitForMorningEnrich": int(31.7 * 60), "WaitForDataPhase1": int(83.6 * 60)},
-        is_preflight=False,
-        execution_start=start,
-        run_date="2026-09-12",
-        s3_client=None,
-    )
-    assert all(not r.floor_breach for r in rows)
+def test_retired_data_stage_floors_left_with_their_states():
+    # alpha-engine-config-I11269: the data cutover removed the weekly
+    # WaitForMorningEnrich / WaitForDataPhase1 and preopen
+    # PollMorningEnrichSpot / PollMorningArcticAppendSpot states, so their
+    # floors (I10545 / I10164 calibrations) and digest-order entries went
+    # with them. The readiness wait that replaced them leads the order.
+    for retired in (
+        "WaitForMorningEnrich",
+        "WaitForDataPhase1",
+        "PollMorningEnrichSpot",
+        "PollMorningArcticAppendSpot",
+    ):
+        assert retired not in STATE_DURATION_FLOORS_SEC
+        assert retired not in ed.DIGEST_STATE_ORDER
+    assert ed.DIGEST_STATE_ORDER[0] == "WaitForCollectionManifests"
 
 
 def test_dispatch_state_duration_still_renders_with_no_floor():

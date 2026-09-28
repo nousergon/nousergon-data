@@ -109,31 +109,12 @@ class StageBudget:
 
 STAGE_BUDGETS: dict[str, StageBudget] = {
     # ── Data-collection stages (universe-scaling) ──────────────────────────
-    "MorningEnrich": StageBudget(
-        name="MorningEnrich",
-        current_timeout_seconds=5_400,
-        per_ticker_cost_seconds=2.2,  # estimated from current=5400s, fixed=3300s
-        fixed_overhead_seconds=3_300,
-        max_budget_seconds=10_800,
-        pipeline_segment="sequential",
-    ),
-    # alpha-engine-config-I7176 / -I9201 (2026-08-28): 5_400 -> 6_600. Measured
-    # DataPhase1 wall clock on the four most recent real scheduled runs —
-    # 2026-08-01 2388s, 08-08 2418s, 08-15 4926s, 08-22 5018s. The step between
-    # 08-08 and 08-15 is the retirement of the daily exercise cadence
-    # (4159239d, Brian ruling 2026-08-13), whose Friday pass had been writing
-    # the .phases/ markers Saturday auto-skipped on; 4926/5018s is the true
-    # cold cost, not growth. 6_600 = 5018 x 1.31, well inside max_budget_seconds.
-    # Mirrored in infrastructure/spot_data_phase1.sh (MAX_RUNTIME_SECONDS) and
-    # step_function.json (executionTimeout / TimeoutSeconds / poll cap 240).
-    "DataPhase1": StageBudget(
-        name="DataPhase1",
-        current_timeout_seconds=6_600,
-        per_ticker_cost_seconds=2.2,  # estimated (same dispatch pattern)
-        fixed_overhead_seconds=3_300,
-        max_budget_seconds=10_800,
-        pipeline_segment="sequential",
-    ),
+    # MorningEnrich (5_400) and DataPhase1 (6_600, measured 2388-5018 s over
+    # 2026-08-01..22, alpha-engine-config-I9201) left this table with the
+    # decoupled data cutover (alpha-engine-config-I11269): the standalone
+    # ne-data-collection-weekly runs that work under the dispatcher's own
+    # per-workload caps, and the weekly SF now spends a bounded Lambda poll
+    # (WaitForCollectionManifests, no SSM executionTimeout) in their place.
     "RAGIngestion": StageBudget(
         name="RAGIngestion",
         current_timeout_seconds=21_600,

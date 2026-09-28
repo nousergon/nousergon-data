@@ -197,7 +197,7 @@ def test_declared_skip_excludes_the_disabled_stage(handler_module) -> None:
     s3 = _FakeS3RunScope(
         {
             "Parity": {"disposition": "DISABLED", "entry_state": "ParityParallel"},
-            "MorningEnrich": {"disposition": "ENABLED_COMPLETED"},
+            "RAGIngestion": {"disposition": "ENABLED_COMPLETED"},
         }
     )
     spine, excluded = handler_module._declared_skip_stage_spine(
@@ -210,11 +210,11 @@ def test_declared_skip_excludes_the_disabled_stage(handler_module) -> None:
     assert spine is not None
     assert "ParityParallel" in _default_spine()
     assert "ParityParallel" not in spine
-    assert "MorningEnrich" in spine  # every other declared stage survives
+    assert "RAGIngestion" in spine  # every other declared stage survives (a stage the cutover keeps: MorningEnrich leaves the spine with it, alpha-engine-config-I11269)
 
 
 def test_declared_skip_is_a_noop_when_nothing_is_disabled(handler_module) -> None:
-    s3 = _FakeS3RunScope({"MorningEnrich": {"disposition": "ENABLED_COMPLETED"}})
+    s3 = _FakeS3RunScope({"RAGIngestion": {"disposition": "ENABLED_COMPLETED"}})
     spine, excluded = handler_module._declared_skip_stage_spine(
         pipeline="ne-weekly-freshness-pipeline",
         run_date="2026-09-04",

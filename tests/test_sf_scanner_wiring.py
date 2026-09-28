@@ -158,7 +158,7 @@ class TestFailureIsolation:
 
 
 class TestEdges:
-    def test_data_phase1_skip_path_routes_to_parallel(self, sf):
+    def test_collection_skip_path_routes_to_parallel(self, sf):
         # config#885: the Scanner→RAG→Regime chain was relocated INTO
         # ResearchPredictorParallel Branch A (Scanner is now Branch A's
         # StartAt) so PredictorTraining (Branch B) forks parallel to it
@@ -167,12 +167,15 @@ class TestEdges:
         # Scanner unconditionally — observe-mode is NOT re-gated, just
         # relocated). Anyone re-introducing a gate at Branch A's head
         # would silently disable observation on phase1-skip reruns.
-        skip = sf["States"]["CheckSkipDataPhase1"]
+        # alpha-engine-config-I11269: DataPhase1 left this definition; the
+        # skip edge that now lands on the Parallel is CheckSkipMorningEnrich's
+        # (it fronts the bounded collection readiness wait).
+        skip = sf["States"]["CheckSkipMorningEnrich"]
         skip_choices = skip["Choices"]
         assert any(
             c["Next"] == "ResearchPredictorParallel" for c in skip_choices
         ), (
-            "CheckSkipDataPhase1 skip branch must route to "
+            "CheckSkipMorningEnrich skip branch must route to "
             "ResearchPredictorParallel (config#885: Scanner moved into "
             "Branch A as its StartAt)."
         )
@@ -188,14 +191,16 @@ class TestEdges:
             == "CheckSkipScanner"
         )
 
-    def test_data_phase1_success_path_routes_to_parallel(self, sf):
-        status = sf["States"]["CheckDataPhase1Status"]
-        success = next(
-            c for c in status["Choices"]
-            if c.get("StringEquals") == "Success"
-        )
+    def test_collection_ready_path_routes_to_parallel(self, sf):
+        # alpha-engine-config-I11269: the forward edge that used to be
+        # CheckDataPhase1Status's Success is the readiness wait's ready edge.
+        status = sf["States"]["CheckCollectionReadiness"]
+        success = status["Choices"][0]
+        assert success["And"][1] == {
+            "Variable": "$.collection_readiness.ready", "BooleanEquals": True,
+        }
         assert success["Next"] == "ResearchPredictorParallel", (
-            "CheckDataPhase1Status Success branch must route to "
+            "CheckCollectionReadiness ready branch must route to "
             "ResearchPredictorParallel — config#885 forked the Scanner "
             "chain into Branch A so it runs parallel to PredictorTraining."
         )
