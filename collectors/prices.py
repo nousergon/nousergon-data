@@ -60,7 +60,7 @@ from dates import (
 )
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 from shadow.interceptor import guard_baseline_reads
-from shadow.root import ShadowGuardViolation
+from shadow.root import ShadowGuardViolation, active_root
 
 logger = logging.getLogger(__name__)
 
@@ -497,13 +497,27 @@ def _find_stale_fast(
 
     existing = _list_live_cache(s3, bucket, prefix)
 
+    # Under a shadow root, S3 reads pass through to LIVE, so a live parquet that
+    # already holds the shadow's own trading day is v1's output for that day:
+    # the very thing the shadow exists to reproduce. Counting it fresh made the
+    # shadow's D03 publish nothing whenever v1's post-market refresh ran first
+    # (every day since the scan began reading the live tree), so parity had no
+    # shadow price_cache to compare (alpha-engine-config-I11614). The shadow
+    # must fetch those tickers itself.
+    shadow = active_root()
+    shadow_day = shadow.trading_day if shadow is not None else None
+
     stale: list[str] = []
     fresh: dict[str, tuple[str, datetime]] = {}
     n_missing = 0
+    n_shadow_v1 = 0
     for ticker in all_tickers:
         found = existing.get(ticker)
         if found is None:
             n_missing += 1
+            stale.append(ticker)
+        elif shadow_day is not None and _implied_last_bar(found[1]) >= shadow_day:
+            n_shadow_v1 += 1
             stale.append(ticker)
         elif not is_fresh_in_trading_days(
             _implied_last_bar(found[1]), reference, max_stale=staleness_threshold_days,
@@ -523,8 +537,16 @@ def _find_stale_fast(
         "Staleness (threshold=%d sessions, reference=%s): %d requested, %d missing "
         "under the live prefix, %d aged out, %d forced by the split guard, %d fresh",
         staleness_threshold_days, reference.isoformat(), len(all_tickers), n_missing,
-        len(stale) - n_missing - len(forced), len(forced), len(fresh) - len(forced),
+        len(stale) - n_missing - n_shadow_v1 - len(forced), len(forced),
+        len(fresh) - len(forced),
     )
+    if shadow_day is not None:
+        logger.info(
+            "Staleness (shadow %s): %d live parquet(s) already hold the shadow's "
+            "trading day, written by v1 for that day, and are re-fetched by the "
+            "shadow (alpha-engine-config-I11614)",
+            shadow_day.isoformat(), n_shadow_v1,
+        )
     return stale
 
 
