@@ -70,16 +70,27 @@ share the Name prefix (`alpha-engine-dashboard`, `alpha-engine-executor`). **Nev
 widen the scan to `tag:Name` alone:** those hosts carry no `watchdog-deadline`, so
 they would be terminated at the 6.5h fallback cap.
 
-## A finished rehearsal's box ends early (alpha-engine-config-I11569)
+## A finished weekly run's box ends early (alpha-engine-config-I11569, I11108)
 
-A failed weekly run keeps its launcher box until the 13h watchdog, on purpose:
-the watch-rerun reuses it through `$.ec2_instance_id`. A **rehearsal**
-(`rehearsal-*`, launched by nous-ergon-ops `weekly-sf-rehearsal.yml`) is never
-rerun onto its box. When a box's `execution-id` tag names a rehearsal that stopped
-more than `REHEARSAL_REAP_GRACE_SECONDS` (default 3600) ago, the reaper terminates
-it with `reap_reason=rehearsal-finished`. Any `DescribeExecution` error, including
-AccessDenied before the role carries `ReadWeeklyRehearsalExecutionStatus`, keeps
-the box on its own deadline. Production executions are never looked up.
+When a box's `execution-id` tag names an `ne-weekly-freshness-pipeline` execution
+that stopped more than `FINISHED_EXECUTION_REAP_GRACE_SECONDS` (default 3600; the
+old `REHEARSAL_REAP_GRACE_SECONDS` name is still read) ago, the reaper terminates
+it. The reason is `rehearsal-finished` for a `rehearsal-*` execution and
+`execution-finished` for any other.
+
+Nothing reuses a finished run's box. Since config#2248 the box is dispatched
+inside the execution, `ec2_instance_id` is never in a cadence input, and
+`weekly_sf_rerun.py` passes through only the source execution's input, so every
+watch-rerun boots a fresh box (the five latest watch-reruns, measured 2026-09-26,
+all carried `ec2_instance_id: None`). The weekly definition stamps
+`execution-id` on three dispatches, the freshness box, its relaunch and the
+eval-judge box, and polls each to completion.
+
+Only the state machines in `FINISHED_REAP_STATE_MACHINES` are looked up. Other
+definitions' launches can outlive their execution, so an `execution-id` naming
+any other state machine is ignored. Any `DescribeExecution` error, including
+AccessDenied before the role carries `ReadWeeklyExecutionStatus`, keeps the box
+on its own deadline.
 
 ## CloudWatch metric
 
