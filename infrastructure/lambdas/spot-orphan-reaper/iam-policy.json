@@ -19,10 +19,10 @@
       }
     },
     {
-      "Sid": "ReadWeeklyRehearsalExecutionStatus",
+      "Sid": "ReadWeeklyExecutionStatus",
       "Effect": "Allow",
       "Action": "states:DescribeExecution",
-      "Resource": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:rehearsal-*"
+      "Resource": "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*"
     },
     {
       "Sid": "EmitOrphanMetric",
