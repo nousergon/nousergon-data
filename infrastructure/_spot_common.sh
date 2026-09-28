@@ -475,6 +475,66 @@ bootstrap_spot() {
     --config-copy config.yaml:/home/ec2-user/alpha-engine-config/data/config.yaml:/home/ec2-user/alpha-engine-config)"
   run_ssm "bootstrap" "$_script" 300
   echo "  Bootstrap complete."
+  pin_worker_checkout
+}
+
+# ── Execution code pin (alpha-engine-config-I11570) ─────────────────────────
+#
+# The bootstrap above clones `--branch main`, i.e. whatever main is at the
+# moment THIS worker launches. A re-issued stage launches a new worker, so on
+# rehearsal-2026-09-24-1 the DataPhase1 re-issue ran newer code (6d2460d) than
+# the first attempt (dafacc5) inside one execution. The SF stage command now
+# resolves one SHA per execution on the launcher box
+# (infrastructure/exec_code_pin.sh) and records it under
+# $AE_EXEC_PIN_ROOT/<execution name>/alpha-engine-data; the execution name
+# reaches this script as $RUN_TOKEN (krepis.ssm_log_capture exports the
+# --correlation-id to its child). The worker then checks out exactly that SHA
+# before install_deps, so requirements.txt comes from the pinned tree too.
+#
+# No pin file (a laptop run, an older launcher) or an explicit non-main
+# --branch keeps the previous behaviour: run the cloned branch tip.
+AE_EXEC_PIN_ROOT="${AE_EXEC_PIN_ROOT:-/home/ec2-user/.ae-exec-pin}"
+
+_exec_code_pin_sha() {
+  [ "${BRANCH:-main}" = "main" ] || return 0
+  [ -n "${RUN_TOKEN:-}" ] || return 0
+  local pin_file="${AE_EXEC_PIN_ROOT}/${RUN_TOKEN}/alpha-engine-data"
+  [ -s "$pin_file" ] || return 0
+  local sha
+  sha="$(tr -d '[:space:]' < "$pin_file")"
+  if ! [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ERROR: execution code pin ${pin_file} holds '${sha}', not a 40-hex SHA" >&2
+    return 1
+  fi
+  printf '%s\n' "$sha"
+}
+
+pin_worker_checkout() {
+  local sha
+  sha="$(_exec_code_pin_sha)"
+  if [ -z "$sha" ]; then
+    echo "  No execution code pin for RUN_TOKEN='${RUN_TOKEN:-}' — worker runs ${BRANCH:-main} as cloned."
+    return 0
+  fi
+  echo "==> Pinning worker checkout to execution SHA ${sha}..."
+  run_ssm "code-pin" "$(cat <<PIN
+set -eo pipefail
+cd /home/ec2-user/data
+if [ "\$(git rev-parse HEAD)" != "${sha}" ]; then
+  if ! git cat-file -e "${sha}^{commit}" 2>/dev/null; then
+    git fetch -q --depth 1 origin "${sha}"
+  fi
+  git -c advice.detachedHead=false checkout -q --detach "${sha}"
+fi
+_got="\$(git rev-parse HEAD)"
+if [ "\$_got" != "${sha}" ]; then
+  echo "ERROR: worker checkout is at \$_got, execution pin is ${sha}" >&2
+  exit 1
+fi
+echo "worker checkout pinned at ${sha}"
+PIN
+)" 300
+  echo "  Worker checkout pinned."
 }
 
 # ── Dependency installation ──────────────────────────────────────────────────
