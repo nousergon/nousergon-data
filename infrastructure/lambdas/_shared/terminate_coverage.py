@@ -37,6 +37,17 @@ from pathlib import Path
 
 _LAUNCH_ATTRS = frozenset({"launch", "launch_with_fallback"})
 _TERMINATE_ATTRS = frozenset({"terminate_on_failure", "terminate_instances"})
+# A SELF-STARTING launch (krepis.ec2_spot.launch_self_starting,
+# alpha-engine-config-I11597) is still a launcher, but it has no
+# launch->bootstrap window for the dispatcher to cover: the job and its
+# teardown ride the RunInstances call as user-data, which arms an ERR-trap
+# power-off before anything else and runs the job as a unit whose
+# ExecStopPost powers the box off however it ends (pinned by krepis'
+# tests/test_spot_bootstrap_self_start.py). The dispatcher does nothing after
+# the launch that could fail and orphan the box, so such a launch is covered
+# by construction. A dispatcher that ALSO launches the classic way still needs
+# its terminate call.
+_SELF_STARTING_LAUNCH_ATTRS = frozenset({"launch_self_starting"})
 
 
 def _call_attr_names(source: str) -> tuple[set[str], set[str]]:
@@ -50,7 +61,7 @@ def _call_attr_names(source: str) -> tuple[set[str], set[str]]:
         if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
             continue
         attr = node.func.attr
-        if attr in _LAUNCH_ATTRS:
+        if attr in _LAUNCH_ATTRS or attr in _SELF_STARTING_LAUNCH_ATTRS:
             launch_attrs.add(attr)
         if attr in _TERMINATE_ATTRS:
             terminate_attrs.add(attr)
@@ -67,7 +78,8 @@ def find_box_launchers(lambdas_root: Path) -> dict[str, bool]:
     for index_py in sorted(lambdas_root.glob("*/index.py")):
         launch_attrs, terminate_attrs = _call_attr_names(index_py.read_text())
         if launch_attrs:
-            result[index_py.parent.name] = bool(terminate_attrs)
+            only_self_starting = launch_attrs <= _SELF_STARTING_LAUNCH_ATTRS
+            result[index_py.parent.name] = only_self_starting or bool(terminate_attrs)
     return result
 
 

@@ -1,16 +1,20 @@
 """Tests for alpha-engine-thinktank-spot-dispatcher (config-I5208 §47).
 
-The load-bearing assertions here are about the budget/timeout coupling and the
-fail-loud posture. A dispatcher that launches a box whose deadline SSM will
-preempt reintroduces the exact lost-terminal-writes bug this migration exists
-to fix, so that inequality is asserted rather than left to a comment.
+The load-bearing assertions here are about the budget/timeout coupling, the
+fail-loud posture, and (alpha-engine-config-I11597) the self-starting launch:
+the box's user-data is its whole dispatch, and a retry of the same event
+launches nothing new. A dispatcher that launches a box whose deadline the job
+unit's cap will preempt reintroduces the exact lost-terminal-writes bug this
+migration exists to fix, so that inequality is asserted rather than left to a
+comment.
 """
 
 from __future__ import annotations
 
-import datetime
+import copy
 import importlib.util
 import os
+import re
 import sys
 
 import pytest
@@ -39,8 +43,6 @@ def _clean_env():
         "THINKTANK_SPOT_RUN_TIMEOUT_SECONDS",
         "THINKTANK_SPOT_WATCHDOG_SECONDS",
         "THINKTANK_SPOT_DISPATCH_ENABLED",
-        "THINKTANK_SPOT_SSM_ONLINE_BUDGET_SEC",
-        "THINKTANK_SPOT_ADOPT_WINDOW_SEC",
     ]
     saved = {k: os.environ.get(k) for k in keys}
     for k in keys:
@@ -53,17 +55,27 @@ def _clean_env():
             os.environ[k] = v
 
 
+class _Ctx:
+    """A stand-in Lambda context. Only the request id matters now: it is the
+    launch's idempotency key."""
+
+    def __init__(self, request_id: str = "req-1"):
+        self.aws_request_id = request_id
+
+
 class TestTimingCoupling:
-    def test_default_budget_is_below_the_ssm_timeout_by_more_than_the_reserve(self):
-        """The box's deadline must land before SSM's kill, with room for the
-        terminal writes. thinktank.run._TERMINAL_WRITE_RESERVE_S is 120s."""
+    def test_default_budget_is_below_the_unit_timeout_by_more_than_the_reserve(self):
+        """The box's deadline must land before the job unit's cap, with room
+        for the terminal writes. thinktank.run._TERMINAL_WRITE_RESERVE_S is
+        120s."""
         mod = _load()
         reserve = 120
         assert mod.RUN_BUDGET_SECONDS + reserve < mod.RUN_TIMEOUT_SECONDS
 
-    def test_watchdog_sits_above_the_ssm_timeout(self):
-        """SSM's own kill (which the bootstrap trap turns into a clean
-        self-terminate) must always win before the orphan watchdog fires."""
+    def test_watchdog_sits_above_the_unit_timeout(self):
+        """systemd's own kill at the cap (which the bootstrap trap and the
+        unit's ExecStopPost turn into a clean self-terminate) must always win
+        before the orphan watchdog fires."""
         mod = _load()
         assert mod.WATCHDOG_SECONDS > mod.RUN_TIMEOUT_SECONDS
 
@@ -80,52 +92,53 @@ class TestTimingCoupling:
             mod.handler({}, None)
 
     def test_budget_reaches_the_box_as_an_env_export(self):
-        """The bootstrap command is the only channel carrying the budget to
-        the box; if it is dropped the runner falls back to its own default and
-        the dispatcher's timeout coupling becomes a fiction."""
+        """The job script is the only channel carrying the budget to the box;
+        if it is dropped the runner falls back to its own default and the
+        dispatcher's timeout coupling becomes a fiction."""
         mod = _load()
-        cmd = mod._bootstrap_command("tok123")
+        cmd = mod._job_script("tok123")
         assert f"export THINKTANK_RUN_BUDGET_SECONDS={mod.RUN_BUDGET_SECONDS}" in cmd
 
 
-class TestBootstrapCommand:
+class TestJobScript:
     def test_execs_the_repo_owned_bootstrap_not_an_inline_copy(self):
         """§47 sub-rule (a): one shared entrypoint. The prelude must hand off
         to the version-controlled script rather than inline the run steps."""
-        cmd = _load()._bootstrap_command("tok")
+        cmd = _load()._job_script("tok")
         assert "exec bash infrastructure/thinktank_spot_bootstrap.sh" in cmd
 
-    def test_sets_home_because_ssm_runs_as_root_without_one(self):
-        cmd = _load()._bootstrap_command("tok")
+    def test_sets_home_because_the_unit_runs_as_root_without_one(self):
+        cmd = _load()._job_script("tok")
         assert "export HOME=/home/ec2-user" in cmd
 
     def test_installs_git_and_python_before_cloning(self):
         """Stock AL2023 ships neither; the clone is the first thing that needs
         git, so the install must precede it in the command text."""
-        cmd = _load()._bootstrap_command("tok")
+        cmd = _load()._job_script("tok")
         assert cmd.index("dnf install") < cmd.index("git clone")
 
     def test_arms_the_orphan_watchdog(self):
-        cmd = _load()._bootstrap_command("tok")
+        cmd = _load()._job_script("tok")
         assert "alpha-engine-thinktank-spot-watchdog" in cmd
 
     def test_prelude_failure_shuts_the_box_down(self):
         """A botched launch must never idle — spot-orphan-reaper is a 6.5h age
         cap, not a health check."""
-        cmd = _load()._bootstrap_command("tok")
+        cmd = _load()._job_script("tok")
         assert "shutdown -h now" in cmd
 
 
 class TestLibCallSignatures:
-    """Bind every spot_dispatch call against the REAL library signature.
+    """Bind every library call against the REAL library signature.
 
     The 2026-07-29 smoke run died on
     ``running_instance_ids() missing 1 required positional argument:
     'discriminator_tags'`` — an error every unit test above missed, because
-    they monkeypatch ``_running_boxes`` and the ``spot_dispatch`` functions
-    themselves, so no test ever touched the real signature. Mocks make a
-    call site untestable exactly where it talks to someone else's contract.
-    ``inspect.signature().bind()`` closes that without needing AWS.
+    they monkeypatch the lib functions themselves, so no test ever touched the
+    real signature. Mocks make a call site untestable exactly where it talks to
+    someone else's contract. ``inspect.signature().bind()`` closes that without
+    needing AWS. (The replay tests below go further and run the real krepis
+    launch against a fake EC2.)
     """
 
     def test_running_instance_ids_call_binds(self):
@@ -138,52 +151,33 @@ class TestLibCallSignatures:
             mod.INSTANCE_TAG_NAME, {}, region=mod.REGION
         )
 
-    def test_launch_with_fallback_call_binds(self):
+    def test_launch_self_starting_call_binds(self, monkeypatch):
         import inspect
 
-        from nousergon_lib import spot_dispatch as real
+        from krepis import ec2_spot as real
 
         mod = _load()
-        inspect.signature(real.launch_with_fallback).bind(
-            mod.INSTANCE_TYPES,
-            mod.SUBNETS,
-            image_id=mod.AMI_ID,
-            key_name=mod.KEY_NAME,
-            security_group_ids=[mod.SECURITY_GROUP],
-            iam_instance_profile=mod.IAM_PROFILE,
-            volume_size_gb=mod.VOLUME_SIZE_GB,
-            tag_name=mod.INSTANCE_TAG_NAME,
-            region=mod.REGION,
-            force_on_demand=False,
+        captured = {}
+
+        def _capture(*args, **kwargs):
+            captured["args"], captured["kwargs"] = args, kwargs
+            return real.SelfStartingLaunch("i-abc", "spot", False, False)
+
+        monkeypatch.setattr(mod.ec2_spot, "launch_self_starting", _capture)
+        mod._launch_instance("tok", "req-1")
+        inspect.signature(real.launch_self_starting).bind(
+            *captured["args"], **captured["kwargs"]
         )
 
-    def test_send_async_command_call_binds(self):
-        import inspect
-
-        from nousergon_lib import spot_dispatch as real
-
-        mod = _load()
-        inspect.signature(real.send_async_command).bind(
-            "i-abc",
-            mod._bootstrap_command("tok"),
-            comment="x",
-            region=mod.REGION,
-            cw_log_group=mod.CW_LOG_GROUP,
-            execution_timeout_seconds=mod.RUN_TIMEOUT_SECONDS,
-        )
-
-    def test_wait_ssm_online_and_terminate_calls_bind(self):
-        import inspect
-
-        from nousergon_lib import spot_dispatch as real
-
-        mod = _load()
-        inspect.signature(real.wait_ssm_online).bind(
-            "i-abc", region=mod.REGION, ssm_online_budget_sec=mod.SSM_ONLINE_BUDGET_SEC
-        )
-        inspect.signature(real.terminate_on_failure).bind(
-            "i-abc", region=mod.REGION, label="thinktank-spot"
-        )
+    def test_the_dispatcher_no_longer_talks_to_ssm(self):
+        """alpha-engine-config-I11597: no SSM wait, no send, no post-launch
+        terminate window. Read from the source so a revert cannot hide in a
+        helper."""
+        with open(os.path.join(_HERE, "index.py")) as fh:
+            src = fh.read()
+        for gone in ("wait_ssm_online", "send_async_command", "terminate_on_failure",
+                     "send_command", "describe_instance_information"):
+            assert not re.search(rf"\b{gone}\s*\(", src), f"{gone}( is back in index.py"
 
 
 class TestDispatchPosture:
@@ -200,47 +194,92 @@ class TestDispatchPosture:
         recorded, never silent."""
         mod = _load()
         monkeypatch.setattr(
-            mod, "_running_boxes", lambda: (_ for _ in ()).throw(mod.SpotProbeError("boom"))
+            mod, "_already_running", lambda: (_ for _ in ()).throw(mod.SpotProbeError("boom"))
         )
-        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False, extra_tags=None: ("i-abc", "spot"))
-        monkeypatch.setattr(mod.spot_dispatch, "wait_ssm_online", lambda *a, **k: None)
-        monkeypatch.setattr(mod.spot_dispatch, "send_async_command", lambda *a, **k: "cmd-1")
-        monkeypatch.setattr(mod, "_record_dispatch", lambda *a: True)
-        out = mod.handler({}, None)
+        monkeypatch.setattr(
+            mod,
+            "_launch_instance",
+            lambda *a, **k: mod.ec2_spot.SelfStartingLaunch("i-abc", "spot", False, False),
+        )
+        out = mod.handler({}, _Ctx())
         assert out["launched"] is True
         assert out["dedupe_degraded"] is True
 
     def test_existing_box_short_circuits_the_launch(self, monkeypatch):
         mod = _load()
+        monkeypatch.setattr(mod, "_already_running", lambda: ["i-live"])
         monkeypatch.setattr(
-            mod,
-            "_running_boxes",
-            lambda: [{"instance_id": "i-live", "launch_time": None, "tags": {}}],
+            mod, "_launch_instance", lambda *a, **k: pytest.fail("must not launch")
         )
-        out = mod.handler({}, None)
-        assert out["launched"] is False
-        assert out["reason"] == "already_running"
+        out = mod.handler({}, _Ctx())
+        assert out == {"launched": False, "reason": "already_running", "instance_ids": ["i-live"]}
 
-    def test_ssm_failure_terminates_the_box_before_raising(self, monkeypatch):
-        """Between launch and the bootstrap landing there is no watchdog on the
-        box yet, so this window must tear the box down itself."""
+    def test_launch_failure_raises_for_the_async_retry(self, monkeypatch):
         mod = _load()
-        terminated: list[str] = []
-        monkeypatch.setattr(mod, "_running_boxes", lambda: [])
-        monkeypatch.setattr(mod, "_launch_instance", lambda _run_token, force_on_demand=False, extra_tags=None: ("i-xyz", "spot"))
-        monkeypatch.setattr(
-            mod.spot_dispatch,
-            "wait_ssm_online",
-            lambda *a, **k: (_ for _ in ()).throw(RuntimeError("ssm never came online")),
-        )
-        monkeypatch.setattr(
-            mod.spot_dispatch,
-            "terminate_on_failure",
-            lambda iid, **k: terminated.append(iid),
-        )
-        with pytest.raises(RuntimeError, match="ssm never came online"):
-            mod.handler({}, None)
-        assert terminated == ["i-xyz"]
+        monkeypatch.setattr(mod, "_already_running", lambda: [])
+
+        def _exhausted(*a, **k):
+            raise mod.SpotLaunchError("spot + on-demand exhausted")
+
+        monkeypatch.setattr(mod, "_launch_instance", _exhausted)
+        with pytest.raises(mod.SpotLaunchError):
+            mod.handler({}, _Ctx())
+
+
+class TestRunToken:
+    def test_derived_from_the_request_id_in_the_old_shape(self):
+        """Same request -> same token (a replay must present the SAME tags and
+        user-data, or EC2 refuses the ClientToken); 32 hex chars, the shape
+        uuid4().hex had, so the completion-marker key format is unchanged."""
+        mod = _load()
+        a = mod._run_token("req-A")
+        assert a == mod._run_token("req-A")
+        assert a != mod._run_token("req-B")
+        assert re.fullmatch(r"[0-9a-f]{32}", a)
+
+    def test_handler_uses_the_request_id_as_the_idempotency_key(self, monkeypatch):
+        mod = _load()
+        seen = {}
+        monkeypatch.setattr(mod, "_already_running", lambda: [])
+
+        def _capture(run_token, idempotency_key, **_):
+            seen.update(run_token=run_token, key=idempotency_key)
+            return mod.ec2_spot.SelfStartingLaunch("i-abc", "spot", False, False)
+
+        monkeypatch.setattr(mod, "_launch_instance", _capture)
+        out = mod.handler({}, _Ctx("req-Q"))
+        assert seen == {"run_token": mod._run_token("req-Q"), "key": "req-Q"}
+        assert out["run_token"] == seen["run_token"]
+
+
+class TestUserData:
+    """The user-data IS the dispatch now: nothing follows it."""
+
+    def test_installs_and_starts_the_job_unit_without_blocking(self):
+        mod = _load()
+        ud = mod._user_data("tok123")
+        assert ud.startswith("#!/bin/bash\n")
+        assert mod._job_script("tok123") in ud, "the job must ride verbatim"
+        assert f"systemctl start --no-block {mod.JOB_UNIT}.service" in ud
+        assert "Type=oneshot" in ud
+        assert f"TimeoutStartSec={mod.RUN_TIMEOUT_SECONDS}" in ud
+        assert "ExecStopPost=/sbin/shutdown -h now" in ud
+
+    def test_fits_the_ec2_limit_with_room(self):
+        from krepis.ec2_spot import USER_DATA_MAX_BYTES
+
+        assert len(_load()._user_data("f" * 32).encode()) < USER_DATA_MAX_BYTES // 2
+
+    def test_carries_no_secret(self):
+        """User-data is readable via DescribeInstanceAttribute. It may NAME a
+        secret (an SSM parameter) but never carry one."""
+        ud = _load()._user_data("tok123")
+        for pattern in (
+            r"x-access-token", r"\bghp_", r"\bgithub_pat_", r"\bsk-[A-Za-z0-9]",
+            r"\bAKIA[0-9A-Z]{8}", r"--with-decryption", r"get-parameter",
+        ):
+            assert not re.search(pattern, ud), f"user-data matches {pattern}"
+        assert "KREPIS_ROUTER_CREDENTIAL_SECRET=ROUTER_CONSUMER_THINKTANK" in ud
 
 
 class TestDiscriminatorTags:
@@ -256,8 +295,8 @@ class TestDiscriminatorTags:
             captured.update(kwargs)
             return ("i-abc", "spot")
 
-        monkeypatch.setattr(mod.spot_dispatch, "launch_with_fallback", _fake_launch)
-        mod._launch_instance("tok123")
+        monkeypatch.setattr(mod.ec2_spot, "launch_self_starting", _fake_launch)
+        mod._launch_instance("tok123", "req-1")
         assert captured["extra_tags"] == {
             "thinktank-trading-day": mod._trading_day(),
             "thinktank-run-token": "tok123",
@@ -296,7 +335,7 @@ class TestRouterEnvReachesTheBox:
     edge, and the box cannot derive any of what that needs for itself."""
 
     def _prelude(self):
-        return _load()._bootstrap_command("tok123")
+        return _load()._job_script("tok123")
 
     def test_every_router_var_is_exported(self):
         prelude = self._prelude()
@@ -345,346 +384,225 @@ class TestRouterEnvReachesTheBox:
         assert "OPENROUTER" not in self._prelude()
 
 
-# ── Lambda-timeout headroom (alpha-engine-config-I11532) ──────────────────
-
-
-_DEPLOY_SH = os.path.join(_HERE, "deploy.sh")
-
-
-def _deploy_fn_timeout() -> int:
-    """FN_TIMEOUT as deploy.sh declares it — the ONE place the live timeout is
-    set. Parsed, not assumed: the I11532 equality survived review precisely
-    because this number and SSM_ONLINE_BUDGET_SEC lived in different files."""
-    import re
-
-    with open(_DEPLOY_SH) as fh:
-        found = re.findall(r"^FN_TIMEOUT=(\d+)\s*$", fh.read(), flags=re.M)
-    assert len(found) == 1, f"deploy.sh must declare FN_TIMEOUT exactly once, found {found}"
-    return int(found[0])
-
-
-class _Ctx:
-    """A stand-in Lambda context: a request id and a remaining-time clock."""
-
-    def __init__(self, request_id: str = "req-1", remaining_sec: float = 900.0):
-        self.aws_request_id = request_id
-        self._remaining_ms = int(remaining_sec * 1000)
-
-    def get_remaining_time_in_millis(self) -> int:
-        return self._remaining_ms
-
-
-class TestLambdaTimeoutHeadroom:
-    def test_index_mirrors_the_timeout_deploy_sh_declares(self):
-        assert _load().LAMBDA_TIMEOUT_SECONDS == _deploy_fn_timeout()
-
-    @staticmethod
-    def _fits(mod, timeout: int) -> bool:
-        """Everything between launch and return, strictly inside ``timeout``,
-        with the lib's instance_running waiter counted — it runs BEFORE the SSM
-        budget starts."""
-        return (
-            mod.INSTANCE_RUNNING_WAIT_MAX_SEC
-            + mod.SSM_ONLINE_BUDGET_SEC
-            + mod.DISPATCH_RESERVE_SEC
-            < timeout
-        )
-
-    def test_the_whole_dispatch_fits_strictly_inside_the_function_timeout(self):
-        """THE I11532 guard. 2026-09-23: timeout 300s == SSM_ONLINE_BUDGET_SEC
-        300s, so the wait was allowed to eat the invocation and the send never
-        happened."""
-        mod = _load()
-        timeout = _deploy_fn_timeout()
-        assert self._fits(mod, timeout), (
-            f"instance_running {mod.INSTANCE_RUNNING_WAIT_MAX_SEC}s + SSM Online "
-            f"{mod.SSM_ONLINE_BUDGET_SEC}s + reserve {mod.DISPATCH_RESERVE_SEC}s "
-            f"does not fit strictly inside deploy.sh FN_TIMEOUT={timeout}s"
-        )
-
-    def test_the_guard_rejects_the_2026_09_23_configuration(self):
-        """A guard that cannot fail proves nothing: the timeout that lost the
-        day, and a budget raised to eat the new headroom, must both be red."""
-        mod = _load()
-        assert not self._fits(mod, 300)
-        greedy = _load({"THINKTANK_SPOT_SSM_ONLINE_BUDGET_SEC": str(_deploy_fn_timeout())})
-        assert not self._fits(greedy, _deploy_fn_timeout())
-
-    def test_the_lib_waiter_ceiling_is_what_index_budgets_for(self):
-        """INSTANCE_RUNNING_WAIT_MAX_SEC is a mirror of a number inside the
-        REAL lib; read the lib, so a lib bump that lengthens the waiter fails
-        here instead of silently eating the headroom."""
-        import inspect
-        import re
-
-        from nousergon_lib import spot_dispatch as real
-
-        src = inspect.getsource(real.wait_ssm_online)
-        delay = re.search(r'"Delay":\s*(\d+)', src)
-        attempts = re.search(r'"MaxAttempts":\s*(\d+)', src)
-        assert delay and attempts, "wait_ssm_online's instance_running waiter changed shape"
-        assert int(delay.group(1)) * int(attempts.group(1)) <= _load().INSTANCE_RUNNING_WAIT_MAX_SEC
-
-    def test_the_wait_is_clamped_to_what_the_invocation_has_left(self):
-        """Runtime half: whatever the live timeout, the wait gives up with
-        enough left to terminate + raise, never gets killed mid-wait."""
-        mod = _load()
-        assert mod._ssm_online_budget(_Ctx(remaining_sec=900)) == mod.SSM_ONLINE_BUDGET_SEC
-        assert mod._ssm_online_budget(_Ctx(remaining_sec=300)) == 300 - 200 - 60
-        assert mod._ssm_online_budget(_Ctx(remaining_sec=100)) == 0
-        assert mod._ssm_online_budget(None) == mod.SSM_ONLINE_BUDGET_SEC
-
-    def test_adopt_window_covers_the_whole_async_retry_schedule(self):
-        """Initial invoke + ~1 min + retry + ~2 min + retry, each up to the
-        timeout: an orphan from the first attempt must still be adoptable by
-        the last."""
-        mod = _load()
-        timeout = _deploy_fn_timeout()
-        assert mod.ADOPT_WINDOW_SEC >= 2 * timeout + 60 + 120 + mod.DISPATCH_RESERVE_SEC
-        assert mod.ADOPT_WINDOW_SEC > timeout
-
-
-# ── Interrupted-dispatch recovery (alpha-engine-config-I11532) ────────────
+# ── The I11532 incident, replayed on the self-starting path (I11597) ──────
 
 
 class _LambdaKilled(BaseException):
     """Lambda's timeout is not an exception the handler can catch — the
     process just stops, so no `except Exception` cleanup runs. A BaseException
-    reproduces that: it sails past the terminate-on-failure handler exactly as
-    the 2026-09-23 kill did."""
+    reproduces that."""
 
 
 class _FakeEc2:
-    """Just enough EC2 for the handler's reads and writes, over a shared
-    instance table so a retry sees what the killed attempt left behind."""
+    """EC2 as the real launch path sees it, with the two behaviours the
+    self-starting design rests on: a ClientToken already seen with the same
+    parameters returns the SAME instance (a mismatch raises
+    IdempotentParameterMismatch), and DescribeInstances honours the Name,
+    state and client-token filters. Blind switches model DescribeInstances'
+    eventual consistency."""
 
-    def __init__(self, world: "_World"):
-        self.world = world
+    def __init__(self):
+        self.instances: dict[str, dict] = {}
+        self.by_token: dict[str, tuple[str, dict]] = {}
+        self.run_calls = 0
+        self.kill_after_next_launch = False
+        self.name_filter_blind = False
+        self.token_filter_blind = False
 
-    def describe_instances(self, InstanceIds):  # noqa: N803 - boto3 casing
-        insts = [
-            {
-                "InstanceId": iid,
-                "LaunchTime": box["launch_time"],
-                "Tags": [{"Key": k, "Value": v} for k, v in box["tags"].items()],
-            }
-            for iid, box in self.world.boxes.items()
-            if iid in InstanceIds
-        ]
-        return {"Reservations": [{"Instances": insts}]}
+    def run_instances(self, **kwargs):
+        from botocore.exceptions import ClientError
 
-    def create_tags(self, Resources, Tags):  # noqa: N803 - boto3 casing
-        for iid in Resources:
-            self.world.boxes[iid]["tags"].update({t["Key"]: t["Value"] for t in Tags})
-
-
-class _World:
-    def __init__(self, mod, monkeypatch):
-        self.mod = mod
-        self.boxes: dict[str, dict] = {}
-        self.sent: list[tuple[str, str]] = []
-        self.launched: list[str] = []
-        self.terminated: list[str] = []
-        self.ssm_waits: list[tuple[str, int]] = []
-        self.kill_during_ssm_wait = False
-        ec2 = _FakeEc2(self)
-        monkeypatch.setattr(mod.boto3, "client", lambda svc, **k: ec2)
-        monkeypatch.setattr(mod.spot_dispatch, "launch_with_fallback", self._launch)
-        monkeypatch.setattr(
-            mod.spot_dispatch, "running_instance_ids", lambda name, disc, region: list(self.boxes)
+        self.run_calls += 1
+        token = kwargs.get("ClientToken")
+        params = {k: copy.deepcopy(v) for k, v in kwargs.items() if k != "ClientToken"}
+        if token in self.by_token:
+            iid, seen = self.by_token[token]
+            if seen != params:
+                raise ClientError(
+                    {"Error": {"Code": "IdempotentParameterMismatch", "Message": "x"}},
+                    "RunInstances",
+                )
+            return {"Instances": [{"InstanceId": iid}]}
+        iid = f"i-{len(self.instances) + 1:04d}"
+        tags = next(
+            spec["Tags"] for spec in kwargs["TagSpecifications"]
+            if spec["ResourceType"] == "instance"
         )
-        monkeypatch.setattr(mod.spot_dispatch, "wait_ssm_online", self._wait)
-        monkeypatch.setattr(mod.spot_dispatch, "send_async_command", self._send)
-        monkeypatch.setattr(
-            mod.spot_dispatch, "terminate_on_failure", lambda iid, **k: self.terminated.append(iid)
-        )
-
-    def _launch(self, types, subnets, *, tag_name, extra_tags, **_):
-        iid = f"i-{len(self.boxes) + 1:04d}"
-        self.boxes[iid] = {
-            "launch_time": datetime.datetime.now(datetime.timezone.utc),
-            "tags": {"Name": tag_name, **extra_tags},
+        self.instances[iid] = {
+            "InstanceId": iid,
+            "ClientToken": token or "",
+            "State": {"Name": "running"},
+            "Tags": list(tags),
+            "UserData": kwargs.get("UserData"),
         }
-        self.launched.append(iid)
-        return iid, "spot"
-
-    def _wait(self, iid, *, region, ssm_online_budget_sec):
-        self.ssm_waits.append((iid, ssm_online_budget_sec))
-        if self.kill_during_ssm_wait:
+        if token:
+            self.by_token[token] = (iid, params)
+        if self.kill_after_next_launch:
+            self.kill_after_next_launch = False
             raise _LambdaKilled()
+        return {"Instances": [{"InstanceId": iid}]}
 
-    def _send(self, iid, command, **_):
-        cid = f"cmd-{len(self.sent) + 1}"
-        self.sent.append((iid, command))
-        return cid
+    def describe_instances(self, Filters=(), **_):  # noqa: N803 - boto3 casing
+        hits = list(self.instances.values())
+        for f in Filters:
+            name, values = f["Name"], set(f["Values"])
+            if name == "client-token":
+                if self.token_filter_blind:
+                    return {"Reservations": []}
+                hits = [i for i in hits if i["ClientToken"] in values]
+            elif name == "tag:Name":
+                if self.name_filter_blind:
+                    return {"Reservations": []}
+                hits = [
+                    i for i in hits
+                    if any(t["Key"] == "Name" and t["Value"] in values for t in i["Tags"])
+                ]
+            elif name == "instance-state-name":
+                hits = [i for i in hits if i["State"]["Name"] in values]
+            else:
+                raise AssertionError(f"unexpected filter {name}")
+        view = [{k: v for k, v in i.items() if k != "UserData"} for i in hits]
+        return {"Reservations": [{"Instances": view}]} if view else {"Reservations": []}
 
-    def age(self, iid, seconds):
-        self.boxes[iid]["launch_time"] = datetime.datetime.now(
-            datetime.timezone.utc
-        ) - datetime.timedelta(seconds=seconds)
+
+@pytest.fixture
+def ec2(monkeypatch):
+    """Route EVERY boto3 client the handler, nousergon_lib and krepis create
+    to one fake EC2. Asking for any other service fails the test — which is
+    how 'no SSM wait, no send' is asserted rather than assumed."""
+    import boto3
+
+    fake = _FakeEc2()
+
+    def _client(service, **_):
+        assert service == "ec2", f"the dispatcher asked for a {service!r} client"
+        return fake
+
+    monkeypatch.setattr(boto3, "client", _client)
+    return fake
 
 
-class TestInterruptedDispatchRecovery:
-    def _interrupted_first_attempt(self, mod, world, request_id="req-A"):
-        """Replay 2026-09-23: launch succeeds, Lambda dies in the SSM wait."""
-        world.kill_during_ssm_wait = True
+class TestLaunchRecord:
+    """alpha-engine-config-I5752: with no command_id, a reconciler judges a
+    self-started run from a launch record + the completion marker + instance
+    state. The record sits beside the marker, keyed the same way."""
+
+    def test_record_and_marker_share_one_key(self):
+        mod = _load()
+        token = "f" * 32
+        day = mod._trading_day()
+        ud = mod._user_data(token)
+        launched = f"s3://alpha-engine-research/thinktank/_control/launched/{day}-{token}.json"
+        assert mod._launch_record_uri(token) == launched
+        assert f"aws s3 cp - {launched} --region {mod.REGION}" in ud
+        completed = f"s3://alpha-engine-research/thinktank/_control/completed/{day}-{token}.json"
+        assert f'"completion_marker": "{completed}"' in ud
+
+    def test_marker_key_is_the_one_the_reaper_derives(self):
+        """Same key shape spot-orphan-reaper rebuilds from the discriminator
+        tags: {completion_prefix}{trading-day}-{run-token}.json."""
+        mod = _load()
+        tags = mod._discriminator_tags("tok")
+        assert mod._record_key(mod.COMPLETION_PREFIX, "tok") == (
+            f"thinktank/_control/completed/{tags['thinktank-trading-day']}-"
+            f"{tags['thinktank-run-token']}.json"
+        )
+
+    def test_record_carries_what_the_reconciler_needs(self):
+        ud = _load()._user_data("tok123")
+        for field in ('"run_token": "tok123"', '"budget_seconds": 5400', '"workload": "thinktank"',
+                      '"timeout_seconds": 7200', '"instance_id": "%s"', '"deadline_at": "%s"'):
+            assert field in ud, field
+
+    def test_the_user_data_is_replay_stable(self):
+        """EC2 only returns a ClientToken's instance for IDENTICAL parameters."""
+        mod = _load()
+        assert mod._user_data("tok123") == mod._user_data("tok123")
+
+
+class TestIncidentReplay:
+    """2026-09-23: the Lambda was killed right after the launch. Then the box
+    sat idle, because its job was a second step nobody took. Now the job rides
+    the launch, and the retry — same event, same request id — must not launch
+    a second box whichever EC2 view it gets."""
+
+    def _killed_first_attempt(self, mod, ec2):
+        ec2.kill_after_next_launch = True
         with pytest.raises(_LambdaKilled):
-            mod.handler({}, _Ctx(request_id=request_id))
-        world.kill_during_ssm_wait = False
-        assert world.launched == ["i-0001"] and world.sent == []
-        assert world.terminated == [], "a Lambda kill runs no cleanup"
-        box = world.boxes["i-0001"]
-        assert mod.COMMAND_ID_TAG not in box["tags"]
-        return box
+            mod.handler({}, _Ctx("req-A"))
+        assert list(ec2.instances) == ["i-0001"]
+        return ec2.instances["i-0001"]
 
-    def test_the_async_retry_sends_the_command_to_the_orphan_instead_of_skipping(
-        self, monkeypatch
-    ):
-        """THE closes-when case: launch happened, send never did. EventBridge's
-        retry (same request id) must finish the dispatch on that box — not
-        skip it as a healthy concurrent run, and not launch a second box."""
+    def test_the_box_carries_its_own_job(self, ec2):
+        """Nothing after RunInstances ran, and nothing needed to: the box's
+        user-data installs and starts the job, under the run token its tags
+        carry, so its completion marker is the one the reaper will look for."""
         mod = _load()
-        world = _World(mod, monkeypatch)
-        box = self._interrupted_first_attempt(mod, world)
-        world.age("i-0001", 60)  # the retry lands ~1 min later
+        box = self._killed_first_attempt(mod, ec2)
+        token = mod._run_token("req-A")
+        tags = {t["Key"]: t["Value"] for t in box["Tags"]}
+        assert tags["thinktank-run-token"] == token
+        assert tags["Name"] == mod.INSTANCE_TAG_NAME
+        assert box["UserData"] == mod._user_data(token)
+        assert f"export THINKTANK_SPOT_RUN_TOKEN={token}" in box["UserData"]
+        assert "exec bash infrastructure/thinktank_spot_bootstrap.sh" in box["UserData"]
+        assert f"systemctl start --no-block {mod.JOB_UNIT}.service" in box["UserData"]
 
-        out = mod.handler({}, _Ctx(request_id="req-A"))
-
-        assert out["launched"] is True and out["adopted"] is True
-        assert out["instance_id"] == "i-0001"
-        assert world.launched == ["i-0001"], "the retry must not launch a second box"
-        assert [iid for iid, _ in world.sent] == ["i-0001"]
-        # Same run token as the launch tagged, so the completion marker the box
-        # writes is the one spot-orphan-reaper reconstructs from its tags.
-        token = box["tags"]["thinktank-run-token"]
-        assert out["run_token"] == token
-        assert f"export THINKTANK_SPOT_RUN_TOKEN={token}" in world.sent[0][1]
-        assert box["tags"][mod.COMMAND_ID_TAG] == out["command_id"]
-        assert out["command_tagged"] is True
-
-    def test_an_orphan_older_than_any_invocation_is_adopted_by_any_request(
-        self, monkeypatch
-    ):
-        """If the retry's request id ever differs, age is the proof: no
-        invocation outlives the timeout, so nothing can still be dispatching."""
+    def test_retry_that_sees_the_box_skips_it(self, ec2):
+        """The pre-I11597 retry did exactly this and lost the day, because the
+        box it skipped had no job. Skipping is now CORRECT: the box is running
+        its job."""
         mod = _load()
-        world = _World(mod, monkeypatch)
-        self._interrupted_first_attempt(mod, world, request_id="req-A")
-        world.age("i-0001", mod.LAMBDA_TIMEOUT_SECONDS + 60)
-
-        out = mod.handler({}, _Ctx(request_id="req-B"))
-
-        assert out["adopted"] is True and [iid for iid, _ in world.sent] == ["i-0001"]
-
-    def test_a_young_undispatched_box_of_another_request_is_left_alone(self, monkeypatch):
-        """A duplicate EventBridge delivery or a manual invoke can arrive while
-        the first invocation is still legitimately waiting for SSM. Sending
-        then would double-run the box, so it skips, as before."""
-        mod = _load()
-        world = _World(mod, monkeypatch)
-        self._interrupted_first_attempt(mod, world, request_id="req-A")
-        world.age("i-0001", 120)
-
-        out = mod.handler({}, _Ctx(request_id="req-B"))
-
+        self._killed_first_attempt(mod, ec2)
+        launches = ec2.run_calls
+        out = mod.handler({}, _Ctx("req-A"))
         assert out == {"launched": False, "reason": "already_running", "instance_ids": ["i-0001"]}
-        assert world.sent == []
+        assert ec2.run_calls == launches and len(ec2.instances) == 1
 
-    def test_a_healthy_dispatched_box_still_skips_the_retry(self, monkeypatch):
-        """The guard's original job survives: a box that GOT its command is a
-        live run, and a retry must neither resend nor launch."""
+    def test_retry_whose_name_probe_is_blind_gets_the_same_box_back(self, ec2):
+        """DescribeInstances is eventually consistent: the Name probe can miss
+        a box launched seconds ago. The launch's own client-token probe finds
+        it and launches nothing."""
         mod = _load()
-        world = _World(mod, monkeypatch)
-        first = mod.handler({}, _Ctx(request_id="req-A"))
-        assert first["launched"] is True and first["adopted"] is False
-        assert world.boxes["i-0001"]["tags"][mod.COMMAND_ID_TAG] == first["command_id"]
-        world.age("i-0001", mod.LAMBDA_TIMEOUT_SECONDS + 60)
+        self._killed_first_attempt(mod, ec2)
+        ec2.name_filter_blind = True
+        launches = ec2.run_calls
+        out = mod.handler({}, _Ctx("req-A"))
+        assert out["launched"] is True and out["replayed"] is True
+        assert out["instance_id"] == "i-0001"
+        assert out["run_token"] == mod._run_token("req-A")
+        assert ec2.run_calls == launches and len(ec2.instances) == 1
 
-        for rid in ("req-A", "req-B"):
-            out = mod.handler({}, _Ctx(request_id=rid))
-            assert out["launched"] is False and out["reason"] == "already_running"
-        assert len(world.sent) == 1 and world.launched == ["i-0001"]
-
-    @pytest.mark.parametrize(
-        "mutate",
-        [
-            pytest.param(lambda b: b["tags"].update({"thinktank-trading-day": "2000-01-01"}), id="other-trading-day"),
-            pytest.param(lambda b: b["tags"].pop("thinktank-dispatch-request-id"), id="pre-I11532-box"),
-            pytest.param(lambda b: b["tags"].update({"termination-reason": "x"}), id="being-terminated"),
-        ],
-    )
-    def test_boxes_that_are_not_provably_this_days_orphan_are_skipped(
-        self, monkeypatch, mutate
-    ):
+    def test_retry_blind_to_everything_still_gets_the_same_box_back(self, ec2):
+        """Both probes blind: RunInstances itself is the last line. The replay
+        presents the same ClientToken with the same parameters (derived run
+        token, same tags, same user-data), and EC2 returns the original box."""
         mod = _load()
-        world = _World(mod, monkeypatch)
-        self._interrupted_first_attempt(mod, world)
-        mutate(world.boxes["i-0001"])
+        self._killed_first_attempt(mod, ec2)
+        ec2.name_filter_blind = ec2.token_filter_blind = True
+        out = mod.handler({}, _Ctx("req-A"))
+        assert out["launched"] is True and out["instance_id"] == "i-0001"
+        assert len(ec2.instances) == 1
 
-        out = mod.handler({}, _Ctx(request_id="req-A"))
-
-        assert out["launched"] is False and world.sent == []
-
-    def test_an_orphan_past_the_adopt_window_is_skipped(self, monkeypatch):
+    def test_a_different_event_after_the_box_is_gone_launches_normally(self, ec2):
         mod = _load()
-        world = _World(mod, monkeypatch)
-        self._interrupted_first_attempt(mod, world)
-        world.age("i-0001", mod.ADOPT_WINDOW_SEC + 60)
+        self._killed_first_attempt(mod, ec2)
+        ec2.instances["i-0001"]["State"]["Name"] = "terminated"
+        out = mod.handler({}, _Ctx("req-B"))
+        assert out["launched"] is True and out["replayed"] is False
+        assert out["instance_id"] == "i-0002"
 
-        out = mod.handler({}, _Ctx(request_id="req-A"))
-
-        assert out["launched"] is False and world.sent == []
-
-    def test_an_adopted_box_whose_ssm_still_fails_is_terminated_and_raises(
-        self, monkeypatch
-    ):
-        """Adoption keeps the fail-loud posture: if the orphan still cannot be
-        reached it is torn down and the error raised, so the next retry
-        launches a fresh box rather than finding the same orphan again."""
+    def test_a_healthy_dispatch_is_one_call_and_no_ssm(self, ec2):
         mod = _load()
-        world = _World(mod, monkeypatch)
-        self._interrupted_first_attempt(mod, world)
-
-        def _fail(*a, **k):
-            raise RuntimeError("SSM agent not Online")
-
-        monkeypatch.setattr(mod.spot_dispatch, "wait_ssm_online", _fail)
-        with pytest.raises(RuntimeError, match="not Online"):
-            mod.handler({}, _Ctx(request_id="req-A"))
-        assert world.terminated == ["i-0001"]
-
-    def test_the_launch_stamps_the_request_id_atomically(self, monkeypatch):
-        mod = _load()
-        world = _World(mod, monkeypatch)
-        mod.handler({}, _Ctx(request_id="req-Z"))
-        assert world.boxes["i-0001"]["tags"][mod.DISPATCH_REQUEST_ID_TAG] == "req-Z"
-
-    def test_a_tagging_failure_after_the_send_never_raises(self, monkeypatch):
-        """The command is already running; raising would trigger an async
-        retry that resends it. Report it, do not throw."""
-        mod = _load()
-        world = _World(mod, monkeypatch)
-
-        def _deny(**_):
-            raise RuntimeError("AccessDenied")
-
-        monkeypatch.setattr(_FakeEc2, "create_tags", lambda self, **k: _deny(**k))
-        out = mod.handler({}, _Ctx(request_id="req-A"))
-        assert out["launched"] is True and out["command_tagged"] is False
-        assert world.terminated == []
-
-    def test_a_failed_tag_read_degrades_to_launch_rather_than_skipping(self, monkeypatch):
-        """config#2267: an unreadable guard must never read as 'skip'."""
-        mod = _load()
-        world = _World(mod, monkeypatch)
-        world.boxes["i-9999"] = {
-            "launch_time": datetime.datetime.now(datetime.timezone.utc),
-            "tags": {"Name": mod.INSTANCE_TAG_NAME},
+        out = mod.handler({}, _Ctx("req-A"))
+        assert out == {
+            "launched": True,
+            "replayed": False,
+            "instance_id": "i-0001",
+            "market": "spot",
+            "run_token": mod._run_token("req-A"),
+            "launch_record": mod._launch_record_uri(mod._run_token("req-A")),
+            "dedupe_degraded": False,
+            "idempotency_probe_degraded": False,
         }
-
-        def _boom(self, InstanceIds):  # noqa: N803
-            raise RuntimeError("throttled")
-
-        monkeypatch.setattr(_FakeEc2, "describe_instances", _boom)
-        out = mod.handler({}, _Ctx(request_id="req-A"))
-        assert out["launched"] is True and out["dedupe_degraded"] is True
+        assert ec2.run_calls == 1
