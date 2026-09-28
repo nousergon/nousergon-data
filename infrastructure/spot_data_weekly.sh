@@ -1229,6 +1229,13 @@ if [ "$RUN_MODE" = "phase2-only" ]; then
     echo "  Budget chain  : workload ${PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS}s"\
          "< watchdog ${MAX_RUNTIME_SECONDS}s"\
          "< SF executionTimeout ${PHASE2_ONLY_EXECUTION_TIMEOUT_SECONDS}s"
+    # This cycle's FIRST entry, before the workload writes anything — the
+    # same write-once record as spot_data_phase1.sh (alpha-engine-config-I10194
+    # §3). Never from a --preflight-only run: it writes nothing and must not
+    # open the window.
+    if [ "$PREFLIGHT_ONLY" != "1" ]; then
+        record_stage_entry DataPhase2 "${EXECUTION_RUN_DATE:-}"
+    fi
     run_ssm "phase2-only" "$PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS" <<PHASE2_ONLY
 set -eo pipefail
 ${ENV_SOURCE}
