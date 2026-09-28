@@ -369,3 +369,123 @@ def test_the_committed_suffix_map_loads_and_has_four_entries():
         "RMS": "RMS.PA",
         "SU": "SU.PA",
     }
+
+
+# ── class rules: a never-priced instrument CLASS is declared once ─────────
+
+
+@pytest.fixture
+def class_rules_path(tmp_path):
+    return _write_yaml(
+        tmp_path,
+        "rules.yaml",
+        r"""
+schema_version: 1
+exclusions: []
+class_rules:
+  - class: contingent_value_right
+    pattern: '^[A-Z][A-Z0-9]*\.CVR$'
+    reason: "CVRs are not exchange-listed."
+    owner: brian
+    re_exam: "2027-03-28"
+  - class: fixed_income_cusip
+    pattern: '^[0-9]{3}[0-9A-Z]{5}[0-9]$'
+    validator: cusip_check_digit
+    reason: "CUSIP-keyed fixed income."
+    owner: brian
+    re_exam: "2027-03-28"
+""",
+    )
+
+
+def test_a_cvr_miss_is_a_named_class_rule_exclusion_not_an_undeclared_miss(
+    exclusions_path, suffix_map_path, class_rules_path
+):
+    """2026-09-28: ATAI.CVR was the one undeclared miss in D20."""
+    reading = _check(
+        exclusions_path=exclusions_path,
+        suffix_map_path=suffix_map_path,
+        denominator_symbols=["AAPL", "D05", "912810UJ5", "1299", "ATAI.CVR"],
+        class_rules=expectations.load_class_rules(class_rules_path),
+    )
+    assert reading.verdict == "ok"
+    assert reading.value == 1.0
+    assert "ATAI.CVR (contingent_value_right)" in reading.detail
+    assert "zero undeclared misses" in reading.detail
+
+
+def test_a_new_bond_is_covered_by_the_cusip_rule_only_when_its_check_digit_verifies(
+    exclusions_path, suffix_map_path, class_rules_path
+):
+    rules = expectations.load_class_rules(class_rules_path)
+    good = _check(
+        exclusions_path=exclusions_path, suffix_map_path=suffix_map_path,
+        denominator_symbols=["AAPL", "912828YK0"], class_rules=rules,
+    )
+    assert good.verdict == "ok"
+    # Same shape, wrong check digit: not a CUSIP, so still an undeclared miss.
+    bad = _check(
+        exclusions_path=exclusions_path, suffix_map_path=suffix_map_path,
+        denominator_symbols=["AAPL", "912828YK1"], class_rules=rules,
+    )
+    assert bad.verdict == "below_floor"
+    assert "UNDECLARED miss(es): 912828YK1" in bad.detail
+
+
+def test_a_rule_never_hides_an_ordinary_equity_miss(exclusions_path, suffix_map_path, class_rules_path):
+    reading = _check(
+        exclusions_path=exclusions_path, suffix_map_path=suffix_map_path,
+        denominator_symbols=["AAPL", "ATAI", "ATAI.CVR"],
+        class_rules=expectations.load_class_rules(class_rules_path),
+    )
+    assert reading.verdict == "below_floor"
+    assert "UNDECLARED miss(es): ATAI." in reading.detail
+
+
+def test_a_rule_matched_symbol_that_was_priced_counts_as_covered(
+    exclusions_path, suffix_map_path, class_rules_path
+):
+    reading = _check(
+        exclusions_path=exclusions_path, suffix_map_path=suffix_map_path,
+        denominator_symbols=["AAPL", "XYZ.CVR"], covered_symbols=["AAPL", "XYZ.CVR"],
+        class_rules=expectations.load_class_rules(class_rules_path),
+    )
+    assert reading.verdict == "ok"
+    assert "class-rule exclusion" not in reading.detail
+
+
+@pytest.mark.parametrize(
+    "rule, match",
+    [
+        ("class: contingent_value_right\n    pattern: '\\.CVR$'", "anchored"),
+        ("class: contingent_value_right\n    pattern: '^(CVR$'", "compile"),
+        ("class: warrant\n    pattern: '^X$'", "not one of"),
+        ("class: fixed_income_cusip\n    pattern: '^X$'\n    validator: luhn", "validator"),
+    ],
+)
+def test_load_class_rules_rejects_a_malformed_rule(tmp_path, rule, match):
+    p = _write_yaml(
+        tmp_path, "bad.yaml",
+        f"""
+class_rules:
+  - {rule}
+    reason: r
+    owner: brian
+    re_exam: "2027-03-28"
+""",
+    )
+    with pytest.raises(ValueError, match=match):
+        expectations.load_class_rules(p)
+
+
+def test_the_committed_contract_explains_the_2026_09_28_d20_miss():
+    """The live 09-28 reading: 65-symbol denominator, ATAI.CVR the only miss."""
+    rules = expectations.load_class_rules()
+    assert expectations.classify_by_rule("ATAI.CVR", rules) == "contingent_value_right"
+    reading = expectations.check_cardinality(
+        unit_id="D20",
+        denominator_symbols=["AAPL", "HOOD", "1299", "912810UJ5", "ATAI.CVR"],
+        covered_symbols=["AAPL", "HOOD"],
+    )
+    assert reading.verdict == "ok"
+    assert "ATAI.CVR (contingent_value_right)" in reading.detail

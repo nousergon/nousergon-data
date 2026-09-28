@@ -72,8 +72,9 @@ from __future__ import annotations
 
 import logging
 import pathlib
+import re
 from dataclasses import dataclass
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 import yaml
 from botocore.exceptions import ClientError
@@ -90,8 +91,10 @@ __all__ = [
     "cardinality_metric",
     "check_cardinality",
     "check_empty_fresh",
+    "classify_by_rule",
     "default_exclusions_path",
     "default_suffix_map_path",
+    "load_class_rules",
     "load_exclusions",
     "load_suffix_map",
     "publish_completeness_metric",
@@ -363,7 +366,34 @@ _DEFAULT_SUFFIX_MAP_PATH = _REPO_ROOT / "contracts" / "exclusions" / "suffix_nor
 #: declare. Closed, same rationale as `NA_TAXONOMY`
 #: (`data_gate/descriptors.py`): a class nobody defined a rendering for is a
 #: new engineering state, not a valid exclusion.
-EXCLUSION_CLASSES = frozenset({"fixed_income_cusip", "unsupported_exchange"})
+EXCLUSION_CLASSES = frozenset({"fixed_income_cusip", "unsupported_exchange", "contingent_value_right"})
+
+
+def _cusip_check_digit_ok(symbol: str) -> bool:
+    """True when ``symbol`` is a 9-character CUSIP whose check digit verifies
+    (the standard modulus-10 "double-add-double" over the first eight)."""
+    s = symbol.strip().upper()
+    if len(s) != 9 or not s[8].isdigit():
+        return False
+    total = 0
+    for i, ch in enumerate(s[:8]):
+        if ch.isdigit():
+            v = int(ch)
+        elif "A" <= ch <= "Z":
+            v = ord(ch) - ord("A") + 10
+        elif ch in "*@#":
+            v = 36 + "*@#".index(ch)
+        else:
+            return False
+        if i % 2:
+            v *= 2
+        total += v // 10 + v % 10
+    return (10 - total % 10) % 10 == int(s[8])
+
+
+#: Structural checks a class rule may require on top of its pattern. Closed:
+#: a rule naming a validator nobody implemented fails the load.
+CLASS_RULE_VALIDATORS = {"cusip_check_digit": _cusip_check_digit_ok}
 
 
 def default_exclusions_path() -> pathlib.Path:
@@ -407,6 +437,67 @@ def load_exclusions(path: pathlib.Path | None = None) -> dict[str, dict[str, str
     return out
 
 
+def load_class_rules(path: pathlib.Path | None = None) -> list[dict[str, Any]]:
+    """Parse the ``class_rules`` block of ``unpriced_symbols.yaml``.
+
+    A class rule declares an instrument CLASS the vendor chain can never price
+    (a contingent value right, a CUSIP-keyed bond), so a new instance of that
+    class is a declared exclusion the day it enters the universe instead of an
+    undeclared miss waiting for a hand-added row (2026-09-28: ATAI.CVR, a CVR
+    from the ATAI/Beckley merger, was an undeclared miss on every trading day
+    from 09-18). The rule is still a committed declaration, with a reason,
+    owner and re-exam date, and it only ever explains a MISS: a symbol it
+    matches that was priced counts as covered.
+
+    Fails loud on a malformed rule: unanchored or uncompilable pattern,
+    unknown class or validator, missing field.
+    """
+    p = path or _DEFAULT_EXCLUSIONS_PATH
+    document = yaml.safe_load(p.read_text(encoding="utf-8")) or {}
+    out: list[dict[str, Any]] = []
+    required = ("class", "pattern", "reason", "owner", "re_exam")
+    for row in document.get("class_rules") or []:
+        missing = [f for f in required if not str(row.get(f) or "").strip()]
+        if missing:
+            raise ValueError(f"{p}: class rule {row!r} is missing required field(s) {missing}")
+        cls = str(row["class"]).strip()
+        if cls not in EXCLUSION_CLASSES:
+            raise ValueError(f"{p}: class rule declares class {cls!r}, not one of {sorted(EXCLUSION_CLASSES)}")
+        pattern = str(row["pattern"]).strip()
+        if not (pattern.startswith("^") and pattern.endswith("$")):
+            raise ValueError(f"{p}: class rule pattern {pattern!r} must be anchored with ^...$")
+        try:
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise ValueError(f"{p}: class rule pattern {pattern!r} does not compile: {exc}") from exc
+        validator = str(row.get("validator") or "").strip() or None
+        if validator is not None and validator not in CLASS_RULE_VALIDATORS:
+            raise ValueError(
+                f"{p}: class rule validator {validator!r} is not one of {sorted(CLASS_RULE_VALIDATORS)}"
+            )
+        out.append({
+            "class": cls,
+            "pattern": compiled,
+            "validator": validator,
+            "reason": str(row["reason"]).strip(),
+            "owner": str(row["owner"]).strip(),
+            "re_exam": str(row["re_exam"]).strip(),
+        })
+    return out
+
+
+def classify_by_rule(symbol: str, class_rules: Sequence[Mapping[str, Any]]) -> str | None:
+    """The class of the first rule ``symbol`` satisfies, else None."""
+    for rule in class_rules:
+        if not rule["pattern"].match(symbol):
+            continue
+        validator = rule.get("validator")
+        if validator and not CLASS_RULE_VALIDATORS[validator](symbol):
+            continue
+        return rule["class"]
+    return None
+
+
 def load_suffix_map(path: pathlib.Path | None = None) -> dict[str, str]:
     """Parse ``contracts/exclusions/suffix_normalization.yaml`` into
     ``{denominator_symbol: priced_symbol}``.
@@ -437,6 +528,7 @@ def check_cardinality(
     covered_symbols: Any,
     exclusions: Mapping[str, Mapping[str, str]] | None = None,
     suffix_map: Mapping[str, str] | None = None,
+    class_rules: Sequence[Mapping[str, Any]] | None = None,
     floor: float = 1.0,
     staging: GuardStaging = CARDINALITY_GUARD,
 ) -> CardinalityReading:
@@ -457,6 +549,11 @@ def check_cardinality(
             ``load_suffix_map()``, applied to a denominator symbol before
             checking whether it was covered. ``None`` loads the committed
             contract.
+        class_rules: from ``load_class_rules()`` — declared instrument classes
+            that are never priced. Applied only to a symbol that is missing
+            after normalization and the per-symbol exclusions; each one it
+            explains is named with its class in the detail. ``None`` loads
+            the committed contract.
         floor: Minimum acceptable coverage ratio (D20's declared floor is 1.0).
 
     An empty denominator is `unmeasurable`, never a vacuous pass — a unit that
@@ -471,6 +568,8 @@ def check_cardinality(
         exclusions = load_exclusions()
     if suffix_map is None:
         suffix_map = load_suffix_map()
+    if class_rules is None:
+        class_rules = load_class_rules()
 
     denominator = {str(s).strip() for s in denominator_symbols if str(s).strip()}
     covered = {str(s).strip() for s in covered_symbols if str(s).strip()}
@@ -487,12 +586,18 @@ def check_cardinality(
 
     matched: list[str] = []
     undeclared_missing: list[str] = []
+    rule_excluded: list[tuple[str, str]] = []
     for symbol in sorted(effective_denominator):
         lookup = suffix_map.get(symbol, symbol)
         if lookup in covered or symbol in covered:
             matched.append(symbol)
+            continue
+        cls = classify_by_rule(symbol, class_rules)
+        if cls is not None:
+            rule_excluded.append((symbol, cls))
         else:
             undeclared_missing.append(symbol)
+    effective_denominator -= {s for s, _ in rule_excluded}
 
     n_effective = len(effective_denominator)
     n_matched = len(matched)
@@ -504,11 +609,17 @@ def check_cardinality(
         f"{', '.join(declared_excluded) if declared_excluded else 'none'}) "
         f"against a {len(denominator)}-symbol denominator, floor {floor}"
     )
+    if rule_excluded:
+        detail += (
+            f"; {len(rule_excluded)} class-rule exclusion(s): "
+            + ", ".join(f"{s} ({c})" for s, c in rule_excluded)
+        )
     if undeclared_missing:
         detail += (
             f" — {len(undeclared_missing)} UNDECLARED miss(es): "
             f"{', '.join(undeclared_missing)}. An undeclared missing symbol is a failure, "
-            "never a silent exclusion (plan §2 row 2): add a row to "
+            "never a silent exclusion (plan §2 row 2): add a row (or, for a whole "
+            "never-priced instrument class, a class rule) to "
             "contracts/exclusions/unpriced_symbols.yaml, or fix the fetch."
         )
     else:
