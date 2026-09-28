@@ -237,7 +237,10 @@ def test_the_record_covers_every_registered_unit_every_tick(arming, registry, ma
     expected = {f"overseer-{n}" for n in registry["playbooks"]}
     expected |= {f"t1-{e['name']}" for e in registry.get("t1_automations", [])}
     assert ids == expected
-    assert len(ids) == 9, "the I7056 cohort is nine components"
+    # The I7056 cohort was nine; alpha-engine-config-I11290 added the tenth,
+    # `t1-vcpu-runaway-responder-verify`. A pin, deliberately: a unit added or
+    # dropped without touching this line is the drift it exists to catch.
+    assert len(ids) == 10, "the I7056 cohort (nine) plus t1-vcpu-runaway-responder-verify"
 
 
 def test_the_record_names_the_ruling_behind_the_silence(arming, registry, manifest):
