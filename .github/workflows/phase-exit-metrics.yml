@@ -184,6 +184,49 @@ jobs:
       - name: Run executor_profile producer
         run: python -m data_gate.producers.executor_profile
 
+  cloudtrail_evidence:
+    name: bounded CloudTrail evidence
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}. The role does not exist yet until the nous-ergon-ops stack granting it (alpha-engine-config-I11061) has been applied. That apply is OPERATOR-GATED as a security boundary, not automated — see the issue for the exact command. This job staying red until then is the detector, per pull-request-policy 4.2 form 3."; exit 1 ;; esac
+
+      # Lower bound: verified apply run 36471214957 completed at 19:18:11Z.
+      - name: Export bounded CloudTrail evidence
+        timeout-minutes: 3
+        run: python -m data_gate.producers.cloudtrail_evidence --trail fleet-cloudtrail --since 2026-09-28T19:18:11Z
+
   cost_monthly:
     name: cost_monthly metric (4-week baseline)
     runs-on: ubuntu-latest
@@ -299,7 +342,7 @@ jobs:
   # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
   # naming every other job and an `if` gated to the default branch.
   notify-main-failure:
-    needs: [v1_data_stage, executor_profile, cost_monthly, trigger_observation]
+    needs: [v1_data_stage, executor_profile, cloudtrail_evidence, cost_monthly, trigger_observation]
     if: failure() && github.ref == 'refs/heads/main'
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit

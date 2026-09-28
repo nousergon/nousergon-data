@@ -85,6 +85,8 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # is no longer true; a cadence now runs both producers.
     "data_gate/producers/v1_data_stage.py": 1,
     "data_gate/producers/executor_profile.py": 1,
+    # I11689: cloudtrail_evidence latest is registered; per-run proofs share its writer.
+    "data_gate/producers/cloudtrail_evidence.py": 1,
     # alpha-engine-config-I11058 — the run-record writer both producers'
     # `main()` calls on both the success AND the error path (execution
     # signal class 1, observability-policy.md §3.1), one PUT call site
