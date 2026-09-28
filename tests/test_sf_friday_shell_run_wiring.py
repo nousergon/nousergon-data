@@ -1539,7 +1539,7 @@ class TestHappyPathTraversal:
             # ahead of CheckShellRun — same states, gate first.
             "SubstrateHealthGate",
             "CheckSubstrateHealthGate",
-            # alpha-engine-config-I11312: the observe-mode on-spot preflight
+            # alpha-engine-config-I11312: the enforce-mode on-spot preflight
             # pass sits between the gate's HEALTHY edge and CheckShellRun (a
             # green trace resolves its poll to Success and records it).
             "WeeklyPreflightOnSpot",
