@@ -174,6 +174,27 @@ class TestChainOrdering:
         # box-acquiring path ahead of CheckShellRun, so the skip edge below
         # bypasses no gate. HEALTHY -> on-spot preflight -> CheckShellRun.
         assert states["SubstrateHealthGate"]["Next"] == "CheckSubstrateHealthGate"
+        # config#2275: the HEALTHY rule now IsPresent-guards the verdict path
+        # (a 3-segment Lambda-payload path is never floorable), so the
+        # StringEquals lives inside the rule's And rather than at its top
+        # level. Match either shape so this stays robust to that detail.
+        def _rule_healthy(rule):
+            leaves = rule.get("And", [rule])
+            return any(leaf.get("StringEquals") == "HEALTHY" for leaf in leaves)
+
+        healthy = [
+            c["Next"]
+            for c in states["CheckSubstrateHealthGate"]["Choices"]
+            if _rule_healthy(c)
+        ]
+        # alpha-engine-config-I11312: HEALTHY enters the enforce-mode on-spot
+        # preflight pass; OK/unobserved exit to CheckShellRun, observed FAIL
+        # halts (pinned by tests/test_sf_preflight_on_spot_wiring.py).
+        assert healthy == ["WeeklyPreflightOnSpot"], (
+            "SubstrateHealthGate verdict=HEALTHY must proceed through the "
+            "on-spot preflight pass to CheckShellRun (and from there through "
+            "the skip chain into MorningEnrich)"
+        )
         assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
         assert states["CheckSubstrateHealthGate"]["Default"] == "ExtractSubstrateHealthGateError"
 
