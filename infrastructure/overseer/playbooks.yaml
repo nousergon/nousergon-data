@@ -2298,3 +2298,77 @@ t1_automations:
     rollback:
       description: "No state changed — folding into digest is lossless (the event is still in the ledger)."
     max_consecutive_failures: 2
+
+  # Third entry, and the first whose REMEDIATION is not executed by the drain
+  # (alpha-engine-config-I11290). The remediation is the Lambda
+  # nous-ergon-ops/infrastructure/lambdas/alpha-engine-vcpu-runaway-responder:
+  # EventBridge rule `alpha-engine-vcpu-runaway-responder-alarm-state` invokes
+  # it on `CloudWatch Alarm State Change` -> ALARM for the two vCPU-runaway
+  # alarms, and it STOPS off-policy instances (never terminates) under Brian's
+  # 2026-09-21 grant, quoted in its README. It acts before the drain sees the
+  # alarm, so what the drain executes here is overseer-policy.md §5 layer B
+  # over it: the upstream record (the alarm's own ALARM transition) must have a
+  # matching responder invocation, and an ALARM transition with NO invocation
+  # is the finding. The responder deliberately has no `-dead` alarm (it should
+  # ideally never run); this row is where its liveness is asserted.
+  #
+  # Declared BEFORE `VCPU_RESPONDER_MODE=enforce`, per I11290's closes-when.
+  # §6's ">=3 occurrences with the same root cause" bar is NOT met and nothing
+  # below claims it is: zero real ALARM transitions of either alarm as of
+  # 2026-09-28. The authority is the ruling on I11290, not ladder evidence --
+  # that bar governs promoting a recurring T3 class, and this remediation was
+  # specified and authorized directly. Stated so the delta is visible.
+  #
+  # `key_contains` is `alpha-engine-ec2-vcpu-`, NOT `vcpu-runaway`. The two
+  # watched alarms are `...-vcpu-ondemand-runaway` / `...-vcpu-spot-runaway`
+  # and contain no `vcpu-runaway`; the responder's OWN alarms
+  # (`alpha-engine-vcpu-runaway-responder-errors`, `-needs-human`) do, so the
+  # obvious substring would match exactly the wrong incidents. A cw-alarm item's
+  # corr_key is `cwalarm:aws.cloudwatch:<alarmName>`
+  # (alpha-engine-config scripts/alert_drain_ingest.py::compute_corr_key).
+  #
+  # Inert while `overseer-intake-cw-alarm-state` is paused in
+  # infrastructure/automation_pause.json: no cw-alarm item reaches the drain,
+  # so the liveness assertion is declared here but not yet running.
+  - name: vcpu-runaway-responder-verify
+    description: >-
+      For the two vCPU-runaway alarms (alpha-engine-ec2-vcpu-ondemand-runaway,
+      alpha-engine-ec2-vcpu-spot-runaway) entering ALARM: verify the
+      alpha-engine-vcpu-runaway-responder Lambda answered THIS transition,
+      record the mode and fleet counts it logged, and confirm against live EC2
+      that anything it stopped is stopped. An ALARM transition with no
+      responder invocation is a finding, declared and passed to T2. Read-only:
+      this entry never stops, starts or terminates anything.
+    authorized_by: alpha-engine-config-I11290
+    added: "2026-09-28"
+    match:
+      alert_class: cw_alarms_all
+      severities: [alarm]
+      key_contains: alpha-engine-ec2-vcpu-
+    triggers:
+      - surface: parent
+        ref: alert-drain
+        reason: >-
+          The drain-side verification is evaluated within the alert-drain run,
+          same shape as the two entries above. The responder Lambda's own
+          EventBridge rule is NOT declared as a leg here: arming for that rule
+          is owned by the Lambda's rows in nous-ergon-ops, and declaring it
+          would make trigger_surface_drift.py expect a `[wakes: ...]` marker
+          the responder's deploy.sh does not write.
+    remediation_steps:
+      - "Read `detail.alarmName`, `detail.state.value` and the envelope `time` (T) from the incident's CloudWatch Alarm State Change event. The alarm must be `alpha-engine-ec2-vcpu-ondemand-runaway` or `alpha-engine-ec2-vcpu-spot-runaway` in state `ALARM`; any other alarm or state, or a missing name or time, is `failed` (the match admitted an event this entry cannot evaluate)."
+      - "Run `aws logs filter-log-events --log-group-name /aws/lambda/alpha-engine-vcpu-runaway-responder --start-time <T-60s, epoch ms> --end-time <T+15min, epoch ms> --filter-pattern '\"<alarmName>\"'`. Discard every event whose message starts with `DRILL — ` (cost_control_drill.py and `deploy.sh --smoke` force dry-run and are not a response to this transition). Of the rest, the LAST is the invocation of record (async retries re-invoke after an error; the responder is idempotent)."
+      - "No surviving event, or `ResourceNotFoundException` on the log group: the outcome is `declined` — the responder did not answer this ALARM, which is the §5 layer-B finding this entry exists for. DECLARE it: the alarm name, T, the window and log group searched, `State` of rule `alpha-engine-vcpu-runaway-responder-alarm-state` (`aws events describe-rule`), and `State`/`LastUpdateStatus` from `aws lambda get-function-configuration --function-name alpha-engine-vcpu-runaway-responder`. Then fall through to T2."
+      - "Read the invocation's full record: `aws logs get-log-events --log-group-name /aws/lambda/alpha-engine-vcpu-runaway-responder --log-stream-name <that event's stream> --start-time <its timestamp> --start-from-head`, up to the next `REPORT RequestId:` line. Record on the incident the head verdict, the `Mode:` line (mode and kill switch), the `FLEET:` / `protected:` / `on policy:` / `stop candidate:` counts INCLUDING zeroes, any `CAP BOUND` line and every `ACTION` line."
+      - "If the record carries `[ERROR]` or `Task timed out` before its `REPORT` line, the responder ran and broke (a Telegram failure raises AFTER the stop, by design): the outcome is `declined`. Declare the error line with step 4's fields and fall through to T2."
+      - "If the head verdict is `VCPU RESPONDER — declined`, the outcome is `declined`: record the responder's `DECLINED:` line verbatim (kill switch off, empty injected declarations, misrouted alarm) and fall through to T2 — an ALARM whose response was switched off is still an ALARM nobody answered."
+      - "If `stop candidate: 0` (head `VCPU ALARM — nothing off-policy found`), the outcome is `verified`: the alarm fired on declared capacity and the responder classified and reported it. Record disposition `t1-resolved` with the counts and RESET consecutive_failures. The alarm's own SNS page is untouched by this entry."
+      - "If `stop candidate` > 0 and the mode is `dry-run`, the outcome is `declined`: nothing was stopped, by design, and the off-policy capacity is still running. Declare every STOP CANDIDATES line (instance id, type, lifecycle, Name, reasons) and fall through to T2."
+      - "If `stop candidate` > 0 and the mode is `enforce`: run `aws ec2 describe-instances --instance-ids <every id on an ACTION line> --query 'Reservations[].Instances[].[InstanceId,State.Name]'`. `verified` only when there is no `CAP BOUND` line, no `STOP FAILED` line, and every acted-on instance is LIVE `stopping` or `stopped` — the responder's own `✓ verified` is a claim and this is its check (invariant 10). Anything else is `declined`: declare each instance with its live state and fall through to T2."
+      - "The outcome is `failed` ONLY when the predicate could not be EVALUATED: a logs, events, lambda or ec2 call errors (AccessDenied, throttling past retries) rather than returning a result, or a found record has no parseable `Mode:` or `stop candidate:` line. Increment consecutive_failures on this and nothing else (config-I8686). An EMPTY log search is step 3's decline, never `failed`."
+    success_predicate:
+      description: "The responder answered THIS ALARM transition and left nothing off-policy running: a non-drill invocation naming the alarm is logged in [T-60s, T+15min], completed without error, and either reports `stop candidate: 0` or ran in `enforce` with every candidate live `stopping`/`stopped` and no CAP BOUND. No invocation, a responder decline, an errored run, a dry-run with candidates, or a partial stop is `declined` (declared, then T2); only being unable to read the evidence is `failed` (config-I8686)."
+      check: "filter-log-events on /aws/lambda/alpha-engine-vcpu-runaway-responder for the alarm name in [T-60s, T+15min] returns a non-DRILL head line whose record has no [ERROR] and (stop candidate == 0 OR (Mode == enforce AND no CAP BOUND AND no STOP FAILED AND describe-instances shows every acted-on id stopping|stopped))"
+    rollback:
+      description: "This entry is read-only (logs, events, lambda and ec2 describe calls), so it has nothing to roll back. The responder's own action is STOP, never terminate: a wrongly stopped instance is restored with its root volume intact by an operator `aws ec2 start-instances --instance-ids <id>`, never from here. The responder is switched off by `VCPU_RESPONDER_ENABLED=false` (kill switch) or held at `VCPU_RESPONDER_MODE=dry-run`, both reviewed one-line changes in nous-ergon-ops."
+    max_consecutive_failures: 2
