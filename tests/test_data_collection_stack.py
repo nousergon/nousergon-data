@@ -764,10 +764,15 @@ def test_apply_runs_only_on_main_and_never_on_a_pull_request():
     assert jobs["lint"].get("permissions", {}).get("id-token") is None
 
 
-def test_deploy_script_verifies_its_own_effect():
+def test_deploy_script_verifies_its_own_effect(stack):
     script = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text(encoding="utf-8")
     deploy_at = script.index("aws cloudformation deploy")
     assert "check-live" in script[deploy_at:], "a deploy must be followed by the live comparison"
     assert "--no-fail-on-empty-changeset" in script
-    for p in ("CollectionState=", "DailyHealState=", "ShadowSamedayState="):
+    # Every STATE_PARAMETERS entry, not a hand-kept subset: ShadowMorningState
+    # was added to the template but not to this line, so `cloudformation
+    # deploy` kept its previous ENABLED value and the cutover's DISABLED default
+    # never reached the live schedule (alpha-engine-config-I11269, 2026-09-28).
+    for name in stack.STATE_PARAMETERS:
+        p = f"{name}=$(field param-{name})"
         assert p in script, f"{p} must be passed explicitly so the template Default is authoritative"
