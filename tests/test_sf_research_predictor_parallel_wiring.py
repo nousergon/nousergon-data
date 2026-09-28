@@ -411,17 +411,30 @@ class TestBranchBContents:
         assert name in branch_b
 
     def test_skip_predictor_training_gate_preserved(self, branch_b):
-        """config#2253: the skip gate is now a TWO-rule Choice. Rule order
+        """config#2253: the skip gate is a multi-rule Choice. Rule order
         is load-bearing (ASL evaluates in order, first match wins):
         rule 0 = backtest-eval preset (skip AND mode) → straight to the
         skip terminal, NO freshness validation (the config#830 replay
         preset's contract is 'existing artifacts, whatever their vintage');
-        rule 1 = plain skip → the manifest-freshness validation task.
+        rule 1 = vacuous skip (alpha-engine-config-I11655: skip AND every
+        predictor-weights consumer skipped) → straight to the skip terminal,
+        because no stage that could read stale weights will run — its exact
+        flag set is pinned against scripts/weekly_sf_rerun.py in
+        tests/test_weekly_sf_rerun.py;
+        rule 2 = plain skip → the manifest-freshness validation task.
         Absent flag still defaults to PredictorTraining (scheduled runs
         unaffected)."""
         gate = branch_b["CheckSkipPredictorTraining"]
-        assert len(gate["Choices"]) == 2
-        preset_rule, plain_rule = gate["Choices"]
+        assert len(gate["Choices"]) == 3
+        preset_rule, vacuous_rule, plain_rule = gate["Choices"]
+        vacuous_vars = {cond["Variable"] for cond in vacuous_rule["And"]}
+        assert "$.skip_predictor_training" in vacuous_vars
+        assert "$.mode" not in vacuous_vars
+        assert len(vacuous_vars) > 1, (
+            "the vacuous-skip rule must test consumer skips as well as "
+            "skip_predictor_training, or it is a bypass of the validation"
+        )
+        assert vacuous_rule["Next"] == "PredictorTrainingSkipped"
         # Rule 0: skip + mode=backtest-eval — must come FIRST or the plain
         # skip rule would shadow it and mid-week replays would hard-fail
         # on a stale manifest.

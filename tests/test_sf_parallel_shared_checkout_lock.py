@@ -63,9 +63,16 @@ _SF_FILES = (
 )
 
 # Matches `git -C <path> pull` anywhere in a command string, capturing <path>.
-_GIT_PULL_RE = re.compile(r"git -C (\S+) pull")
+# alpha-engine-config-I11570: `exec_code_pin.sh <execution> <path>` pulls (or
+# checks out the execution's pinned SHA) into <path>, so it is the same
+# shared-checkout mutation and is captured the same way.
+_GIT_PULL_RE = re.compile(
+    r"git -C (\S+) pull|exec_code_pin\.sh \S+ (/home/ec2-user/[\w.-]+)"
+)
 # A `flock <lockfile> ... git -C <path> pull` guard on the SAME command string.
-_FLOCK_GIT_PULL_RE = re.compile(r"flock \S+ .*git -C (\S+) pull")
+_FLOCK_GIT_PULL_RE = re.compile(
+    r"flock \S+ .*(?:git -C (\S+) pull|exec_code_pin\.sh \S+ (/home/ec2-user/[\w.-]+))"
+)
 # `cp ... <dest>` — captures the destination (last path-looking token).
 _CP_RE = re.compile(r"\bcp\s+(?:--\S+\s+)*\S+\s+(\S+)")
 # `mkdir -p <path>`
@@ -112,9 +119,10 @@ def _paths_mutated_by_branch(branch_states: dict) -> dict[str, bool]:
     mutated: dict[str, bool] = {}
     for cmd in _iter_task_commands(branch_states):
         for m in _GIT_PULL_RE.finditer(cmd):
-            path = m.group(1)
+            path = m.group(1) or m.group(2)
             locked = bool(_FLOCK_GIT_PULL_RE.search(cmd)) and any(
-                fm.group(1) == path for fm in _FLOCK_GIT_PULL_RE.finditer(cmd)
+                (fm.group(1) or fm.group(2)) == path
+                for fm in _FLOCK_GIT_PULL_RE.finditer(cmd)
             )
             mutated[path] = mutated.get(path, True) and locked
         for m in _CP_RE.finditer(cmd):
@@ -239,11 +247,15 @@ def test_parity_parallel_pulls_are_flock_wrapped():
     seen_branches = 0
     for branch in parity["Branches"]:
         for cmd in _iter_task_commands(branch["States"]):
-            if "git -C /home/ec2-user/alpha-engine-backtester pull" in cmd:
+            # alpha-engine-config-I11570: the pull is issued through
+            # exec_code_pin.sh (pull on first use per execution, checkout of
+            # the pinned SHA afterwards) — still under the same lock.
+            if "exec_code_pin.sh {} /home/ec2-user/alpha-engine-backtester" in cmd:
                 seen_branches += 1
                 assert (
                     "flock -w 150 /home/ec2-user/.ae-git-sync.lock "
-                    "git -C /home/ec2-user/alpha-engine-backtester pull"
+                    "bash /home/ec2-user/alpha-engine-data/infrastructure/"
+                    "exec_code_pin.sh {} /home/ec2-user/alpha-engine-backtester"
                     in cmd
                 ), f"unlocked backtester pull found in a ParityParallel branch: {cmd!r}"
     assert seen_branches == 3, (
