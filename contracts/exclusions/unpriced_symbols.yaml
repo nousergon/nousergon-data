@@ -23,7 +23,8 @@
 # Schema:
 #   symbol: the RAW denominator symbol as it appears in
 #     metron/holdings_universe.json's `tickers` list (pre-normalization).
-#   class: one of `fixed_income_cusip` | `unsupported_exchange`.
+#   class: one of `fixed_income_cusip` | `unsupported_exchange` |
+#     `contingent_value_right`.
 #   reason: why this symbol cannot be priced by the current vendor chain.
 #   owner: who re-examines this exclusion.
 #   re_exam: ISO date — the exclusion is reviewed no later than this date
@@ -105,3 +106,41 @@ exclusions:
       guard to enforce (plan §4.5).
     owner: brian
     re_exam: "2026-12-14"
+
+# ── Class rules ────────────────────────────────────────────────────────────
+# A per-symbol row above is for a symbol whose reason is particular to it. An
+# instrument CLASS the vendor chain can never price is declared once here, so
+# a new instance of it is a declared exclusion the day it enters the universe
+# rather than an undeclared miss until somebody hand-adds a row (2026-09-28:
+# ATAI.CVR sat undeclared on every trading day from at least 09-18). Read by
+# `validators/expectations.py::load_class_rules`.
+#
+#   class, reason, owner, re_exam: as for a per-symbol row.
+#   pattern: an ANCHORED regex (^...$) over the raw denominator symbol.
+#   validator: optional structural check on top of the pattern (closed set,
+#     `CLASS_RULE_VALIDATORS`).
+#
+# A rule explains only a MISS. A symbol it matches that was priced counts as
+# covered, and anything missing that no row or rule explains is still an
+# undeclared miss and still a failure.
+class_rules:
+  - class: contingent_value_right
+    pattern: '^[A-Z][A-Z0-9]*\.CVR$'
+    reason: >-
+      Contingent value rights are issued to holders in a merger or
+      acquisition and are, with rare exceptions, non-transferable and never
+      exchange-listed, so no equity vendor publishes a close. The broker
+      snapshot values them. First instance: ATAI.CVR (ATAI/Beckley Psytech).
+    owner: brian
+    re_exam: "2027-03-28"
+
+  - class: fixed_income_cusip
+    pattern: '^[0-9]{3}[0-9A-Z]{5}[0-9]$'
+    validator: cusip_check_digit
+    reason: >-
+      A holding identified by a check-digit-valid 9-character CUSIP is a
+      bond, note, T-bill or CD position; neither polygon nor yfinance
+      carries CUSIP-keyed fixed-income quotes. Catches a newly bought bond
+      the day it appears, beside the per-symbol rows above.
+    owner: brian
+    re_exam: "2027-03-28"
