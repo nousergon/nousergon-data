@@ -28,8 +28,8 @@ signals:
     reason: No durable per-execution record independently confirmed for this trigger kind yet.
   cost:
     status: unknown
-    reason: No run-level cost record exists yet; component=data-collection cost tagging is phase-3 work
-      (plan P-21). Makes no LLM call.
+    reason: No run-level cost record exists yet; system=data-collection cost tagging is phase-3 work (plan
+      P-21). Makes no LLM call.
   resource:
     status: unknown
     reason: Spot-vs-on-demand and box headroom are not independently published per unit; read at the pipeline/dispatcher

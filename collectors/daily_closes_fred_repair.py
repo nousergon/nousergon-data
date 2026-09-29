@@ -69,7 +69,7 @@ from collectors.daily_closes import (
     _FRED_BASE,
     _FRED_INDEX_MAP,
     _FRED_TIMEOUT,
-    _scrub_api_key,
+    _mask_query_params,
 )
 
 
@@ -121,17 +121,17 @@ def _fetch_fred_range(
             if attempt < 3:
                 logger.warning(
                     "FRED %s range attempt %d failed: %s — retrying in %ds",
-                    series_id, attempt, _scrub_api_key(e), attempt * 3,
+                    series_id, attempt, _mask_query_params(e), attempt * 3,
                 )
                 time.sleep(attempt * 3)
             else:
                 logger.error(
                     "FRED %s range failed after 3 attempts: %s",
-                    series_id, _scrub_api_key(e),
+                    series_id, _mask_query_params(e),
                 )
                 raise RuntimeError(
                     f"FRED range fetch failed for {series_id} after retries: "
-                    f"{_scrub_api_key(last_err)}"
+                    f"{_mask_query_params(last_err)}"
                 ) from None
     out: dict[str, float] = {}
     for o in obs:
