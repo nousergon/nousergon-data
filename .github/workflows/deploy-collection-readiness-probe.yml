@@ -31,6 +31,10 @@ on:
       - 'data_gate/descriptors.py'
       - 'data_gate/__init__.py'
       - 'data_gate/run_manifest_predicate.py'
+      # alpha-engine-config-I11269: descriptors.py reads this at runtime, and
+      # _shared/package_data_gate.sh is the one list of what the zip carries.
+      - 'data_gate/config/consumer_repos.yaml'
+      - 'infrastructure/lambdas/_shared/package_data_gate.sh'
   workflow_dispatch:
 
 concurrency:

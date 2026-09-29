@@ -161,14 +161,9 @@ cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 # unit declares" (shared-code-policy §2); a second parser is how the Lambda and
 # the board start disagreeing about a unit's published keys.
 REPO_ROOT_DIR="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
-mkdir -p "${PKG}/data_gate" "${PKG}/registry.d/units"
-# alpha-engine-config-I11264: the predicate itself now lives in
-# data_gate/run_manifest_predicate.py, shared with the v1 consumers'
-# alpha-engine-collection-readiness-probe, so it rides in the zip too.
-cp "${REPO_ROOT_DIR}/data_gate/__init__.py" "${REPO_ROOT_DIR}/data_gate/descriptors.py" \
-  "${REPO_ROOT_DIR}/data_gate/run_manifest_predicate.py" "${PKG}/data_gate/"
-cp "${REPO_ROOT_DIR}"/registry.d/units/*.yaml "${PKG}/registry.d/units/"
-echo "Packaged $(ls "${PKG}/registry.d/units" | wc -l | tr -d ' ') unit descriptors + the data_gate loader"
+# shellcheck source=infrastructure/lambdas/_shared/package_data_gate.sh
+source "${SCRIPT_DIR}/../_shared/package_data_gate.sh"
+package_data_gate "${PKG}" "${REPO_ROOT_DIR}"
 
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
