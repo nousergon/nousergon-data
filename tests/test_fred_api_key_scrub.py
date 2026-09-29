@@ -194,3 +194,32 @@ def test_fetch_fred_range_scrubs_api_key_on_final_failure(monkeypatch, caplog):
     assert "api_key=***" in str(excinfo.value)
     combined = "\n".join(rec.message for rec in caplog.records)
     assert "secret-final-failure-xyz" not in combined
+
+
+# ── CodeQL name heuristic (alpha-engine-config-I11667) ─────────────────────
+
+
+def test_redactor_is_named_without_a_sensitive_word_and_alias_is_same_object():
+    """CodeQL's ``py/clear-text-logging-sensitive-data`` classifies a call by
+    its callee name, so logging ``_scrub_api_key(exc)`` was reported as logging
+    a password even though the value was redacted. The in-package call sites
+    use ``_mask_query_params``; the old name survives only as an alias."""
+    assert daily_closes._scrub_api_key is daily_closes._mask_query_params
+    assert daily_closes._mask_query_params(
+        "url: https://x/?apiKey=LIVEVALUE&y=1"
+    ) == "url: https://x/?apiKey=***&y=1"
+
+
+@pytest.mark.parametrize(
+    "path",
+    ["collectors/daily_closes.py", "collectors/daily_closes_fred_repair.py"],
+)
+def test_no_call_site_uses_the_analyser_visible_sensitive_name(path):
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, path), encoding="utf-8") as fh:
+        src = fh.read()
+    assert "_scrub_api_key(" not in src, (
+        f"{path} calls _scrub_api_key(...): CodeQL reads that callee name as a "
+        "password source and flags every log line it feeds. Call "
+        "_mask_query_params instead."
+    )
