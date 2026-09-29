@@ -18,8 +18,8 @@ origin: 'NOT YET SCHEDULED — alpha-engine-config-I11306. Must run post-close o
 owner: brian
 lifecycle: pending
 lifecycle_owner: brian
-lifecycle_reexam: '2026-09-28'
-pending_since: '2026-09-14'
+lifecycle_reexam: '2026-10-05'
+pending_since: '2026-09-21'
 promotes_when: the D48 unit descriptor's own successor (unset) goes live
 lifecycle_reason: 'Generated from registry.d/units/D48-*.yaml (P-08): the unit descriptor itself declares
   lifecycle: pending.'
