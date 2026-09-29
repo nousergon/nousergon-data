@@ -547,6 +547,11 @@ def _resolve_log(store: Any, log_location: str, store_uri: str) -> str | None:
     return f"`{log_location}` does not exist — the run log was never shipped"
 
 
+#: Manifest statuses that are not a failed run. `evidence.MANIFEST_STATUSES`
+#: is the vocabulary; everything outside this set is checked.
+_NOT_A_FAILURE = frozenset({"ok", "not_applicable"})
+
+
 def read_unresolved_logs(
     store: Any, *, trading_day: dt.date, units: Any = None
 ) -> tuple[list[UnresolvedLog], list[str]]:
@@ -580,7 +585,11 @@ def read_unresolved_logs(
             except Exception as exc:  # noqa: BLE001 — named, never swallowed
                 problems.append(f"{key}: unreadable ({type(exc).__name__}: {exc})")
                 continue
-            if not isinstance(doc, dict) or doc.get("status") == "ok":
+            # `not_applicable` is a cycle the unit correctly sat out (D37 outside
+            # the session window writes one a minute), not a failure: counting
+            # it listed 783 "failed runs" on 2026-09-28 (alpha-engine-config-I11583).
+            # Any status other than these two is still checked.
+            if not isinstance(doc, dict) or doc.get("status") in _NOT_A_FAILURE:
                 continue
             why = _resolve_log(store, str(doc.get("log_location") or ""), store_uri)
             if why is not None:

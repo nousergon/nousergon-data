@@ -16,8 +16,8 @@
 # alert).
 #
 # Cadence (UTC): twice daily — 00:15 (captures the month-start baseline within
-# 15 min of rollover) and 12:15. Cost Explorer bills $0.01/request (2 CE calls
-# per run ⇒ ~$1.2/mo, visible in the collector's own AWS row).
+# 15 min of rollover) and 12:15. Cost Explorer bills $0.01/request (3 CE calls
+# per run ⇒ ~$1.8/mo, visible in the collector's own AWS row).
 #   cron(15 0,12 * * ? *)
 #
 # Plus ONE monthly reconciliation run (alpha-engine-config#2849) — 03:00 UTC
@@ -97,7 +97,7 @@ SCHED_PREFIX="alpha-engine-expense-collector-"
 #
 # EventBridge Scheduler's DEFAULT IS 185 RETRIES over a 24h event age, and it
 # had never been set here. Each retry is a FRESH INVOCATION carrying a fresh
-# `CE_CALL_BUDGET`, and the two Cost Explorer calls happen EARLY in the
+# `CE_CALL_BUDGET`, and the three Cost Explorer calls happen EARLY in the
 # handler -- so a failure anywhere after them re-pays for them.
 #
 #   185 retries x 2 ticks/day x 2 CE calls = 740 calls/day = $7.40/day
@@ -108,7 +108,8 @@ SCHED_PREFIX="alpha-engine-expense-collector-"
 # added in I11201 bounds each run; this bounds how many runs there can be.
 # Both are needed, and neither substitutes for the other.
 #
-#   2 retries + 1 original x 2 ticks x 2 calls = 12 calls/day = $0.12/day
+#   2 retries + 1 original x 2 ticks x 3 calls = 18 calls/day = $0.18/day
+#   (third call: the per-system daily series, alpha-engine-config-I11707)
 #
 # Two is enough for a genuine transient (the provider adapters are already
 # fenced, so a retry here means the rollup WRITE or the SSM/S3 read failed)

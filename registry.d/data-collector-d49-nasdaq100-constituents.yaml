@@ -16,8 +16,8 @@ origin: NOT YET SCHEDULED. Belongs on the weekly membership cadence beside D01 (
 owner: brian
 lifecycle: pending
 lifecycle_owner: brian
-lifecycle_reexam: '2026-09-28'
-pending_since: '2026-09-14'
+lifecycle_reexam: '2026-10-05'
+pending_since: '2026-09-21'
 promotes_when: the D49 unit descriptor's own successor (unset) goes live
 lifecycle_reason: 'Generated from registry.d/units/D49-*.yaml (P-08): the unit descriptor itself declares
   lifecycle: pending.'
