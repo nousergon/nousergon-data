@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -586,19 +587,24 @@ def test_the_dispatcher_zip_carries_the_descriptors_it_grades(stack):
     """A descriptor edit must reach the deployed function on the merge button
     alone: deploy.sh packages the loader and the descriptors, and the deploy
     workflow's path filter fires on them. Without the filter the Lambda would go
-    on grading the previous descriptor set with nothing red."""
-    deploy = (REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "deploy.sh").read_text(
-        encoding="utf-8"
-    )
-    assert "data_gate/descriptors.py" in deploy
-    assert "data_gate/run_manifest_predicate.py" in deploy
-    assert "registry.d/units" in deploy
-    paths = yaml.safe_load(
-        (WORKFLOWS / "deploy-data-spot-dispatcher.yml").read_text(encoding="utf-8")
-    )[True]["push"]["paths"]
-    assert "registry.d/units/**" in paths
-    assert "data_gate/descriptors.py" in paths
-    assert "data_gate/run_manifest_predicate.py" in paths
+    on grading the previous descriptor set with nothing red.
+
+    Since alpha-engine-config-I11269 the file list is _shared/package_data_gate.sh
+    (tests/test_data_gate_lambda_package.py proves it suffices), so every file it
+    packages must be on BOTH packaging Lambdas' filters, as must the helper."""
+    helper = REPO / "infrastructure" / "lambdas" / "_shared" / "package_data_gate.sh"
+    text = helper.read_text(encoding="utf-8")
+    block = text[text.index("DATA_GATE_RUNTIME_FILES=(") : text.index(")", text.index("DATA_GATE_RUNTIME_FILES=("))]
+    runtime_files = re.findall(r'"([^"]+)"', block)
+    assert "data_gate/descriptors.py" in runtime_files
+    assert "data_gate/run_manifest_predicate.py" in runtime_files
+    assert "registry.d/units" in text
+    for workflow in ("deploy-data-spot-dispatcher.yml", "deploy-collection-readiness-probe.yml"):
+        paths = yaml.safe_load((WORKFLOWS / workflow).read_text(encoding="utf-8"))[True]["push"]["paths"]
+        assert "registry.d/units/**" in paths, workflow
+        assert "infrastructure/lambdas/_shared/package_data_gate.sh" in paths, workflow
+        for rel in runtime_files:
+            assert rel in paths, (workflow, rel)
 
 
 def test_yaml_aliases_are_refused(stack, tmp_path):

@@ -189,10 +189,10 @@ def test_the_role_can_read_manifests_and_nothing_else():
 
 
 def test_deploy_packages_the_shared_predicate_and_the_descriptors():
+    # The file list lives in _shared/package_data_gate.sh (alpha-engine-config-
+    # I11269); tests/test_data_gate_lambda_package.py proves it is sufficient.
     deploy = (_HERE / "deploy.sh").read_text(encoding="utf-8")
-    for path in ("data_gate/__init__.py", "data_gate/descriptors.py",
-                 "data_gate/run_manifest_predicate.py", "registry.d/units"):
-        assert path in deploy, path
+    assert 'package_data_gate "${PKG}" "${REPO_ROOT_DIR}"' in deploy
 
 
 if __name__ == "__main__":  # pragma: no cover

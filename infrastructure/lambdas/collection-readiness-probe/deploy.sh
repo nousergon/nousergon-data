@@ -83,11 +83,9 @@ cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 # resolve under /var/task. ONE implementation of the predicate, packaged twice —
 # never a copy that drifts (alpha-engine-config-I11264: "Do not reimplement the
 # predicate; share it").
-mkdir -p "${PKG}/data_gate" "${PKG}/registry.d/units"
-cp "${REPO_ROOT_DIR}/data_gate/__init__.py" "${REPO_ROOT_DIR}/data_gate/descriptors.py" \
-  "${REPO_ROOT_DIR}/data_gate/run_manifest_predicate.py" "${PKG}/data_gate/"
-cp "${REPO_ROOT_DIR}"/registry.d/units/*.yaml "${PKG}/registry.d/units/"
-echo "Packaged $(ls "${PKG}/registry.d/units" | wc -l | tr -d ' ') unit descriptors + the shared predicate"
+# shellcheck source=infrastructure/lambdas/_shared/package_data_gate.sh
+source "${SCRIPT_DIR}/../_shared/package_data_gate.sh"
+package_data_gate "${PKG}" "${REPO_ROOT_DIR}"
 
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
