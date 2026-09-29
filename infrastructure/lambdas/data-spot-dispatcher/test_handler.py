@@ -199,7 +199,7 @@ def test_spot_capacity_exhausted_still_falls_back_to_on_demand(monkeypatch):
 
 def test_every_launch_carries_the_cost_allocation_tag(monkeypatch):
     """alpha-engine-config-I10788: every launched instance — spot, the
-    on-demand fallback, AND force_on_demand — carries `component=data-
+    on-demand fallback, AND force_on_demand — carries `system=data-
     collection` in the SAME RunInstances TagSpecifications entry as the
     Name tag, unconditionally, so the resource class the issue's scope
     measurement found carrying no cost tag at all now does."""
@@ -213,11 +213,11 @@ def test_every_launch_carries_the_cost_allocation_tag(monkeypatch):
 
     instance_id, market = index._launch_instance()
     assert instance_id == "i-tagged"
-    assert seen_extra_tags[-1] == {"component": "data-collection"}
+    assert seen_extra_tags[-1] == {"system": "data-collection"}
 
     # force_on_demand path (spot-interruption retry) also carries it.
     instance_id, market = index._launch_instance(force_on_demand=True)
-    assert seen_extra_tags[-1] == {"component": "data-collection"}
+    assert seen_extra_tags[-1] == {"system": "data-collection"}
 
 
 def test_cost_tag_survives_alongside_per_run_identity_tags(monkeypatch):
@@ -247,7 +247,7 @@ def test_cost_tag_survives_alongside_per_run_identity_tags(monkeypatch):
     assert seen_extra_tags[-1] == {
         "execution-id": "exec-1",
         "run-date": "2026-09-21",
-        "component": "data-collection",
+        "system": "data-collection",
     }
 
 

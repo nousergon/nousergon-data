@@ -156,17 +156,14 @@ IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "alpha-engine-executor-pro
 # /tmp-100% failure mode that motivated this move (config#1767 gotcha).
 VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
 
-# Cost-allocation tag (alpha-engine-config-I10788). Per the binding plan
-# (`data_collection_plan_260914.md` §2 objective 8, `data_gate.clauses`'
-# `data.cost.monthly` literal text) the key/value is `component=data-collection`.
-# `alpha-engine-config-I10905` (gate:decision, OPEN/unruled as of 2026-09-21)
-# asks whether `component` or `system` should be the fleet-wide key — this
-# constant follows the plan's literal text as the stated ASSUMPTION per this
-# issue's dispatch instructions, not a resolution of I10905. `component` was
-# activated as a cost-allocation tag key in Billing 2026-09-21 (previously
-# INACTIVE — `aws ce list-cost-allocation-tags` showed only `system` Active),
-# so tagged spend under this key starts accruing in the cost-and-usage export
-# from this date forward, never retroactively.
+# Cost-allocation tag (alpha-engine-config-I10788, key ruled by
+# alpha-engine-config-I10905 on 2026-09-28): the fleet's one attribution key is
+# `system`, value = the component, so this is `system=data-collection`. The
+# first cut used `component=` per the plan's literal text while I10905 was
+# open; `component` was minority (4 resources against 44 `system`), so the key
+# moved and the value stayed. `system` is the key already Active as a
+# cost-allocation tag in Billing; tagged spend accrues from activation forward,
+# never retroactively.
 #
 # Applied on EVERY launch (spot AND on-demand, no conditional), unconditionally
 # merged into `extra_tags` in `_launch_instance` so it rides the SAME
@@ -181,7 +178,7 @@ VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
 # at all, fleet-wide, for every caller of this shared launch helper. Fixing
 # that is a `krepis` library change, out of this file's (and this repo's)
 # ownership; filed as alpha-engine-config-I10788's follow-up (see PR body).
-COST_TAG_KEY = "component"
+COST_TAG_KEY = "system"
 COST_TAG_VALUE = "data-collection"
 
 DATA_REPO = os.environ.get("DATA_SPOT_REPO", "nousergon/nousergon-data")

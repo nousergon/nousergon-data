@@ -776,3 +776,33 @@ def test_deploy_script_verifies_its_own_effect(stack):
     for name in stack.STATE_PARAMETERS:
         p = f"{name}=$(field param-{name})"
         assert p in script, f"{p} must be passed explicitly so the template Default is authoritative"
+
+# Resource types in this template that carry no `Tags` property in
+# CloudFormation, so the cost-attribution guard cannot require the key on them
+# (the stack-level tag reaches nothing here either). Explicit and closed: a new
+# resource type is taggable until someone argues otherwise.
+_UNTAGGABLE = {"AWS::Scheduler::Schedule"}
+_COST_TAG = {"Key": "system", "Value": "data-collection"}
+
+
+def test_every_taggable_resource_carries_the_ruled_cost_attribution_tag(tpl):
+    """alpha-engine-config-I10905 (ruled 2026-09-28): the fleet attributes cost
+    by `system`, value = the component. An untagged resource is missing from the
+    monthly cost row's denominator (`data.cost.monthly`), and a `component` tag
+    is the split the ruling closed."""
+    bad = []
+    for name, res in tpl["Resources"].items():
+        if res["Type"] in _UNTAGGABLE:
+            continue
+        tags = res.get("Properties", {}).get("Tags") or []
+        if _COST_TAG not in tags:
+            bad.append(f"{name} ({res['Type']}) lacks system=data-collection")
+        if any(t.get("Key") == "component" for t in tags):
+            bad.append(f"{name} carries the retired `component` cost key")
+    assert not bad, bad
+
+
+def test_deploy_script_tags_the_stack_with_the_ruled_key():
+    text = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text()
+    assert "system=data-collection" in text
+    assert "component=" not in text
