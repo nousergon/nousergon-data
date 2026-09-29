@@ -119,11 +119,37 @@ class FakeSSM:
         }
 
 
+def _daily_by_system_response(kw: dict) -> dict:
+    """A DAILY, GroupBy-TAG response over the requested window: every day
+    splits $2.00 crucible-v2 / $1.00 untagged."""
+    from datetime import date, timedelta
+    start = date.fromisoformat(kw["TimePeriod"]["Start"])
+    end = date.fromisoformat(kw["TimePeriod"]["End"])
+    periods, d = [], start
+    while d < end:
+        periods.append({
+            "TimePeriod": {"Start": d.isoformat(), "End": (d + timedelta(days=1)).isoformat()},
+            "Estimated": d >= end - timedelta(days=2),
+            "Groups": [
+                {"Keys": ["system$crucible-v2"], "Metrics": {"UnblendedCost": {"Amount": "2.00"}}},
+                {"Keys": ["system$"], "Metrics": {"UnblendedCost": {"Amount": "1.00"}}},
+            ],
+        })
+        d += timedelta(days=1)
+    return {"ResultsByTime": periods}
+
+
+def _is_daily_by_system(kw: dict) -> bool:
+    return kw.get("GroupBy") == [{"Type": "TAG", "Key": "system"}]
+
+
 class FakeCE:
     def __init__(self, fail_forecast: bool = False):
         self.fail_forecast = fail_forecast
 
     def get_cost_and_usage(self, **kw):
+        if _is_daily_by_system(kw):
+            return _daily_by_system_response(kw)
         return {"ResultsByTime": [{"Groups": [
             {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "8.10"}}},
             {"Keys": ["AmazonS3"], "Metrics": {"UnblendedCost": {"Amount": "4.24"}}},
@@ -1261,6 +1287,8 @@ class _CountingCE:
         self.calls.append("get_cost_and_usage")
         if self.deny:
             raise RuntimeError("AccessDeniedException")
+        if _is_daily_by_system(kw):
+            return _daily_by_system_response(kw)
         return {"ResultsByTime": [{"Groups": [
             {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "8.10"}}},
         ]}]}
@@ -1272,17 +1300,19 @@ class _CountingCE:
 
 class TestCostExplorerCallBudget:
     def test_the_default_budget_has_no_headroom_for_a_loop(self):
-        """A `collect` invocation makes exactly two CE calls. A budget with
+        """A `collect` invocation makes exactly three CE calls. A budget with
         room to spare cannot tell a loop from normal operation."""
-        assert index.CE_CALL_BUDGET == 2
+        assert index.CE_CALL_BUDGET == 3
 
     def test_a_normal_collect_fits_the_default_budget_exactly(self):
         raw = _CountingCE()
         ce = index._BudgetedCostExplorer(raw, budget=index.CE_CALL_BUDGET)
         row = index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast"]
-        assert ce.calls == 2
+        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast",
+                             "get_cost_and_usage"]
+        assert ce.calls == 3
         assert row["mtd_cost_usd"] == pytest.approx(8.10)
+        assert row["detail"]["daily_by_system"]["complete"] is True
 
     def test_the_over_budget_call_never_reaches_the_client(self):
         """The whole point: the request is refused BEFORE it is billed."""
@@ -1293,6 +1323,15 @@ class TestCostExplorerCallBudget:
         assert raw.calls == ["get_cost_and_usage"], (
             "the forecast call was past the budget and must never have been sent"
         )
+
+    def test_the_daily_series_call_is_budgeted_too(self):
+        """The third call is inside the budget, not beside it: a budget of two
+        refuses it before it is sent and fails the collect loudly."""
+        raw = _CountingCE()
+        ce = index._BudgetedCostExplorer(raw, budget=2)
+        with pytest.raises(index.CostExplorerCallBudgetExceeded):
+            index.collect_aws(index._month_window(NOW), {}, ce=ce)
+        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast"]
 
     def test_a_budget_of_zero_refuses_the_first_call(self):
         raw = _CountingCE()
@@ -1476,3 +1515,66 @@ def test_collect_reports_the_dispatch_outcome_in_its_result():
     src = inspect.getsource(index._collect)
     assert "_dispatch_spend_monitor()" in src
     assert "spend_monitor_dispatch" in src
+
+
+# --------------------------------------------------------------------------
+# Per-system daily series (alpha-engine-config-I11707)
+# --------------------------------------------------------------------------
+
+class TestDailyBySystem:
+    def test_window_covers_the_prior_month_and_thirty_one_days(self):
+        from datetime import datetime, timezone
+        # Mid-month: the prior month's 1st is the earlier bound.
+        assert index._daily_by_system_window(
+            datetime(2026, 9, 29, 12, tzinfo=timezone.utc)) == ("2026-08-01", "2026-09-29")
+        # Early March: 31 days back reaches past February's 1st.
+        assert index._daily_by_system_window(
+            datetime(2026, 3, 1, 0, 16, tzinfo=timezone.utc)) == ("2026-01-29", "2026-03-01")
+
+    def test_groups_split_by_system_and_sum_to_the_account_total(self):
+        from datetime import datetime, timezone
+        out = index.collect_aws_daily_by_system(
+            FakeCE(), datetime(2026, 9, 29, 12, tzinfo=timezone.utc))
+        assert out["tag_key"] == "system"
+        assert out["complete"] is True
+        assert len(out["days"]) == 59  # 2026-08-01 .. 2026-09-28
+        day = out["days"][0]
+        assert day["date"] == "2026-08-01"
+        assert day["by_system_usd"] == {"(untagged)": 1.0, "crucible-v2": 2.0}
+        assert out["days"][-1]["estimated"] is True
+
+    def test_a_second_page_is_recorded_as_incomplete_not_fetched(self):
+        from datetime import datetime, timezone
+
+        class _Paged(FakeCE):
+            def get_cost_and_usage(self, **kw):
+                return {**_daily_by_system_response(kw), "NextPageToken": "abc"}
+
+        out = index.collect_aws_daily_by_system(
+            _Paged(), datetime(2026, 9, 29, 12, tzinfo=timezone.utc))
+        assert out["complete"] is False
+
+    def test_a_failed_series_degrades_only_its_own_field(self):
+        class _DailyDenied(_CountingCE):
+            def get_cost_and_usage(self, **kw):
+                if _is_daily_by_system(kw):
+                    self.calls.append("get_cost_and_usage")
+                    raise RuntimeError("AccessDeniedException")
+                return super().get_cost_and_usage(**kw)
+
+        row = index.collect_aws(index._month_window(NOW), {}, ce=_DailyDenied())
+        assert row["mtd_cost_usd"] == pytest.approx(8.10)
+        assert "daily_by_system" not in row["detail"]
+        assert "AccessDenied" in row["detail"]["daily_by_system_error"]
+
+    def test_the_first_of_the_month_still_publishes_the_series(self, monkeypatch):
+        """The MTD window is empty on the 1st, but the closed-month read the
+        gates take on the 1st through the 3rd needs the series most then."""
+        from datetime import datetime, timezone
+        first = datetime(2026, 10, 1, 0, 16, tzinfo=timezone.utc)
+        monkeypatch.setattr(index, "_now_utc", lambda: first)
+        raw = _CountingCE()
+        row = index.collect_aws(index._month_window(first), {}, ce=raw)
+        assert raw.calls == ["get_cost_and_usage"]
+        series = row["detail"]["daily_by_system"]
+        assert series["start"] == "2026-08-31" and series["end"] == "2026-10-01"

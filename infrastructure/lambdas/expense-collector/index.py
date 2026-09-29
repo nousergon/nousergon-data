@@ -186,10 +186,29 @@ RECONCILIATION_PREFIX = "expenses/reconciliation/"
 # later multiplies it silently.
 #
 # Sized with NO HEADROOM for the calls that actually exist -- `collect` makes
-# two (`get_cost_and_usage` + `get_cost_forecast`), `reconcile` makes one. A
-# budget with room to spare cannot tell a loop from normal operation. Raise
-# `EXPENSE_CE_CALL_BUDGET` deliberately if a third call is genuinely added.
-CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "2"))
+# three (`get_cost_and_usage` by service, `get_cost_forecast`, and
+# `get_cost_and_usage` daily by `system` tag), `reconcile` makes one. A budget
+# with room to spare cannot tell a loop from normal operation. Raise
+# `EXPENSE_CE_CALL_BUDGET` deliberately if another call is genuinely added.
+#
+# The third call is alpha-engine-config-I11707: this Lambda is the fleet's ONLY
+# Cost Explorer identity. Crucible's dollar gates used to call CE themselves
+# (~27 requests/day across three GitHub roles, most of them denied); they now
+# read the per-system daily series below out of `expenses/latest.json`, so one
+# budgeted caller answers every spend question in the account.
+CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "3"))
+
+# The cost-allocation tag key every system's resources carry
+# (`system=crucible-v2`, ...). Grouping by it splits each day's account total
+# into one line per system; the untagged remainder is published under
+# UNTAGGED_SYSTEM so the groups still sum to the account total.
+SPEND_TAG_KEY = "system"
+UNTAGGED_SYSTEM = "(untagged)"
+# Crucible's cost clause grades the trailing 30 COMPLETE days and, on the 1st
+# through the 3rd, the whole prior calendar month. The series therefore starts
+# at the earlier of the prior month's 1st and 31 days ago -- at most ~62 daily
+# periods, one request.
+DAILY_BY_SYSTEM_MIN_DAYS = 31
 
 # Month-close reconciliation (alpha-engine-config#2849) — |delta_pct| beyond
 # this is "visible drift", not rounding/timing noise. Matches the console's
@@ -733,6 +752,57 @@ def _ce_unblended_by_service(ce, start: str, end: str) -> dict[str, float]:
     return by_service
 
 
+def _daily_by_system_window(now: datetime) -> tuple[str, str]:
+    """``[start, end)`` for the per-system daily series: ``end`` is today (UTC,
+    exclusive, so every period carried has closed) and ``start`` is the earlier
+    of the prior calendar month's 1st and ``DAILY_BY_SYSTEM_MIN_DAYS`` ago."""
+    today = now.date()
+    prior_month_start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
+    start = min(prior_month_start, today - timedelta(days=DAILY_BY_SYSTEM_MIN_DAYS))
+    return start.isoformat(), today.isoformat()
+
+
+def collect_aws_daily_by_system(ce, now: datetime) -> dict:
+    """One ``get_cost_and_usage`` call: DAILY unblended cost grouped by the
+    ``system`` tag (alpha-engine-config-I11707).
+
+    Each day carries Cost Explorer's own ``Estimated`` flag and one amount per
+    tag value; the groups of a day sum to the account total for that day. A
+    response carrying ``NextPageToken`` is recorded as ``complete: false``
+    rather than paged: a second page is a second billed request this budget
+    does not hold, and a consumer must treat a truncated series as unreadable,
+    never as cheap days.
+    """
+    start, end = _daily_by_system_window(now)
+    resp = ce.get_cost_and_usage(
+        TimePeriod={"Start": start, "End": end}, Granularity="DAILY",
+        Metrics=["UnblendedCost"],
+        GroupBy=[{"Type": "TAG", "Key": SPEND_TAG_KEY}],
+    )
+    days = []
+    for period in resp.get("ResultsByTime", []):
+        by_system: dict[str, float] = {}
+        for g in period.get("Groups", []):
+            # CE spells a tag group `<key>$<value>`, and the untagged
+            # remainder `<key>$`.
+            value = g["Keys"][0].split("$", 1)[-1] or UNTAGGED_SYSTEM
+            by_system[value] = by_system.get(value, 0.0) + float(
+                g["Metrics"]["UnblendedCost"]["Amount"])
+        days.append({
+            "date": period["TimePeriod"]["Start"],
+            "estimated": bool(period.get("Estimated", False)),
+            "by_system_usd": {k: round(v, 6) for k, v in sorted(by_system.items())},
+        })
+    return {
+        "tag_key": SPEND_TAG_KEY,
+        "untagged_key": UNTAGGED_SYSTEM,
+        "start": start,
+        "end": end,
+        "complete": not resp.get("NextPageToken"),
+        "days": days,
+    }
+
+
 def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
     ce = _ce_client() if ce is None else ce
     start = mw["start"].strftime("%Y-%m-%d")
@@ -742,7 +812,9 @@ def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
     next_month = (mw["start"].replace(day=28) + timedelta(days=4)).replace(day=1)
     row = _row("aws", "AWS", source="cost_explorer")
     if end <= start:  # first UTC day of the month — CE window would be empty
-        row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty")
+        row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty",
+                   detail={})
+        _attach_daily_by_system(row, ce, now)
         return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
     by_service = _ce_unblended_by_service(ce, start, end)
     mtd = round(sum(by_service.values()), 2)
@@ -789,7 +861,25 @@ def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
         # straight-line fallback below is the recorded degradation surface.
         logger.info("CE forecast unavailable (straight-line fallback): %s", exc)
         row["detail"]["projection_source"] = "straight_line"
+    _attach_daily_by_system(row, ce, now)
     return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+
+
+def _attach_daily_by_system(row: dict, ce, now: datetime) -> None:
+    """Adds ``detail.daily_by_system`` to the AWS row, or
+    ``detail.daily_by_system_error`` when Cost Explorer could not answer.
+
+    A failure here degrades only this field -- the month-to-date row above is
+    still true -- and its consumer (crucible's dollar gates) renders a missing
+    series UNMEASURABLE. A budget breach is re-raised like every other one.
+    """
+    try:
+        row["detail"]["daily_by_system"] = collect_aws_daily_by_system(ce, now)
+    except CostExplorerCallBudgetExceeded:
+        raise
+    except Exception as exc:  # noqa: BLE001 — recorded on the row, see docstring
+        logger.info("CE daily-by-system unavailable: %s", exc)
+        row["detail"]["daily_by_system_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
 
 def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
