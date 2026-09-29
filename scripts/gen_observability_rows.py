@@ -241,9 +241,15 @@ def build_row(unit) -> dict[str, Any]:
 
     if lifecycle in LIFECYCLE_NEEDS_REASON:
         row["lifecycle_owner"] = data.get("owner", "brian")
+        # A pending unit descriptor's own dates win. A generator-wide constant here
+        # expired every pending row on one day (2026-09-28) while the units
+        # themselves had been re-examined and carried later dates, and the
+        # registry publish went red on rows that were correct at the source.
+        # Pending rows only: other lifecycles' unit dates carry prose.
         row["lifecycle_reexam"] = REEXAM_DATE
         if lifecycle == "pending":
-            row["pending_since"] = "2026-09-14"
+            row["lifecycle_reexam"] = str(data.get("lifecycle_reexam") or REEXAM_DATE)
+            row["pending_since"] = str(data.get("pending_since") or "2026-09-14")
             row["promotes_when"] = (
                 f"the {unit.unit_id} unit descriptor's own successor "
                 f"({trigger.get('successor', 'unset')}) goes live"
