@@ -671,6 +671,16 @@ def test_an_ok_run_is_not_checked():
     assert found == []
 
 
+def test_a_not_applicable_run_is_not_checked():
+    """A cycle the unit correctly sat out is not a failed run
+    (alpha-engine-config-I11583: 783 D37 outside-session skips on 2026-09-28)."""
+    store = FakeStore({"runs/D17/2026-09-21/01ABC.json": _manifest(status="not_applicable")})
+    found, problems = report_module.read_unresolved_logs(
+        store, trading_day=_DAY, units=_UNITS
+    )
+    assert (found, problems) == ([], [])
+
+
 def test_a_listing_failure_is_a_named_problem_not_an_empty_result():
     class Blind(FakeStore):
         def list_keys(self, prefix: str = ""):
