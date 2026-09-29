@@ -1441,7 +1441,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
         _clause_objective(
             store,
             "data.cost.monthly",
-            "AWS spend tagged component=data-collection is within the ratified monthly "
+            "AWS spend tagged system=data-collection is within the ratified monthly "
             "ceiling, read from the cost-and-usage export (never per-run Cost Explorer API "
             "calls, billed at $0.01 each)",
             "metrics/cost/monthly/latest.json",
