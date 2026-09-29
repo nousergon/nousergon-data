@@ -14,19 +14,14 @@ Parquet objects to S3 on its own cadence; reading them back is a free S3 GET,
 however many times this producer runs, with NO per-request AWS cost API call
 anywhere in this module.
 
-**Tag key/value is `component=data-collection`, following the binding plan's
-literal text** (`data_collection_plan_260914.md` §2 objective 8;
-`data_gate.clauses`'s own `data.cost.monthly` description string). This is a
-STATED ASSUMPTION, not a resolution of `alpha-engine-config-I10905` (gate:
-decision, OPEN as of 2026-09-21): that issue asks whether `component` or
-`system` should be the fleet's ONE cost-attribution key, and its label is
-left untouched here. Measured before choosing anyway (`aws ce list-cost-
-allocation-tags`, 2026-09-21): `system` was the only ACTIVE cost-allocation
-tag key; `component` was INACTIVE. `component` was activated the same day —
-see the PR this module shipped in — so tagged spend under this key starts
-accruing in CUR from 2026-09-21 forward, never retroactively. If I10905
-rules `system` instead, `--tag-key` below is a one-flag change, not a
-rewrite.
+**Tag key/value is `system=data-collection`.** `alpha-engine-config-I10905`
+ruled 2026-09-28 that `system` is the fleet's ONE cost-attribution key (44
+resources in nous-ergon-ops templates against 4 `component`); the value names
+the component. The first cut of this module used `component=data-collection`
+from the binding plan's literal text while that issue was open. `system` is
+the key that was already ACTIVE as a cost-allocation tag (measured `aws ce
+list-cost-allocation-tags`, 2026-09-21), so tagged spend accrues in CUR from
+the activation date forward, never retroactively.
 
 **CUR location has no fleet default.** Unlike `executor_profile.py`'s
 CloudTrail archive (a stack output that already exists), no CUR/Data Export
@@ -71,8 +66,8 @@ _REGION = "us-east-1"
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_KEY = "data_collection/metrics/cost/monthly/latest.json"
 
-#: `alpha-engine-config-I10788` assumption — see module docstring.
-DEFAULT_TAG_KEY = "component"
+#: Key ruled by `alpha-engine-config-I10905` — see module docstring.
+DEFAULT_TAG_KEY = "system"
 DEFAULT_TAG_VALUE = "data-collection"
 
 #: CUR 2.0 / Data Exports column names (lowercase; user-defined tags are

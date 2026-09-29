@@ -704,7 +704,7 @@ def read_cost_baseline_measured(store: GateStore, *, weeks: int) -> Reading:
         return Reading(
             met=False,
             detail=(
-                f"no cost document at {key}. Nothing publishes tagged component=data-collection "
+                f"no cost document at {key}. Nothing publishes tagged system=data-collection "
                 "spend yet, so there is no baseline to compare a ceiling against — the exit's "
                 "measurement has not been taken."
             ),

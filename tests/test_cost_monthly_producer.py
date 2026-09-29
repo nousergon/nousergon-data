@@ -3,8 +3,7 @@ config-I10788).
 
 Covers: the CUR-partition walk's day-coverage contract (a billing period the
 export never delivered is a GAP, never a silent zero), the tag+date filter
-(`component=data-collection` per the plan's literal text, an assumption
-against the OPEN `alpha-engine-config-I10905`), the schema-mismatch fail-
+(`system=data-collection`, the key `alpha-engine-config-I10905` ruled), the schema-mismatch fail-
 loud path, and that `main()` refuses to run without an explicit CUR
 location rather than falling back to Cost Explorer.
 """
@@ -50,7 +49,7 @@ def _row(cost, usage_date, component="data-collection", other_component=None):
     return {
         "line_item_unblended_cost": cost,
         "line_item_usage_start_date": f"{usage_date}T00:00:00Z",
-        "resource_tags_user_component": other_component if other_component is not None else component,
+        "resource_tags_user_system": other_component if other_component is not None else component,
     }
 
 
@@ -86,12 +85,13 @@ def test_producers_expected_columns_are_the_names_the_codified_export_aliases_to
     assert f"AS {m._USAGE_START_COLUMN}" not in query  # not aliased — a base CUR column
     assert m._USAGE_START_COLUMN in query
     assert m._COST_COLUMN in query
-    tag_column = m._tag_column("component")
-    assert tag_column == "resource_tags_user_component"
-    assert f"resource_tags.user_component AS {tag_column}" in query
-    # The `system` alias also selected (unused today) so an alpha-engine-
-    # config-I10905 ruling toward `system` needs no export edit, only
-    # `--tag-key system` — confirm the alias exists under that name too.
+    # The producer's default key is the one alpha-engine-config-I10905 ruled.
+    assert m.DEFAULT_TAG_KEY == "system"
+    tag_column = m._tag_column(m.DEFAULT_TAG_KEY)
+    assert tag_column == "resource_tags_user_system"
+    assert f"resource_tags.user_system AS {tag_column}" in query
+    # `component` stays selected by the export (nous-ergon-ops owns it) but is
+    # no longer read here: a one-key fleet has one denominator.
     system_column = m._tag_column("system")
     assert f"resource_tags.user_system AS {system_column}" in query
 
@@ -118,7 +118,7 @@ def test_read_cur_window_sums_only_tagged_rows_in_window():
         reader,
         cur_bucket="bucket",
         cur_prefix="cur/nous-ergon-fleet-cur",
-        tag_key="component",
+        tag_key="system",
         tag_value="data-collection",
         start=dt.date(2026, 9, 1),
         end=dt.date(2026, 9, 30),
@@ -137,7 +137,7 @@ def test_read_cur_window_missing_period_is_a_gap_not_a_zero():
         reader,
         cur_bucket="bucket",
         cur_prefix="cur/nous-ergon-fleet-cur",
-        tag_key="component",
+        tag_key="system",
         tag_value="data-collection",
         start=dt.date(2026, 9, 1),
         end=dt.date(2026, 9, 3),
@@ -159,7 +159,7 @@ def test_read_cur_window_a_day_with_zero_matched_spend_still_counts_as_covered()
         reader,
         cur_bucket="bucket",
         cur_prefix="cur/x",
-        tag_key="component",
+        tag_key="system",
         tag_value="data-collection",
         start=dt.date(2026, 9, 1),
         end=dt.date(2026, 9, 5),
@@ -177,7 +177,7 @@ def test_read_cur_window_raises_on_schema_mismatch_rather_than_reporting_zero():
             reader,
             cur_bucket="bucket",
             cur_prefix="cur/x",
-            tag_key="component",
+            tag_key="system",
             tag_value="data-collection",
             start=dt.date(2026, 9, 1),
             end=dt.date(2026, 9, 2),
@@ -196,7 +196,7 @@ def test_build_metric_shape_matches_what_the_clause_reads():
     )
     metric = m.build_metric(
         window=window,
-        tag_key="component",
+        tag_key="system",
         tag_value="data-collection",
         cur_bucket="bucket",
         cur_prefix="cur/x",
@@ -205,7 +205,7 @@ def test_build_metric_shape_matches_what_the_clause_reads():
     # `read_cost_baseline_measured` reads exactly these two fields.
     assert metric["baseline"] == 12.34
     assert metric["days_covered"] == 28
-    assert metric["tag_key"] == "component"
+    assert metric["tag_key"] == "system"
     assert metric["tag_value"] == "data-collection"
 
 
@@ -280,7 +280,7 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, cap
     assert rc == 0
     assert len(s3.puts) == 2
     body = json.loads(s3.puts[0]["Body"])
-    assert body["tag_key"] == "component"
+    assert body["tag_key"] == "system"
     assert body["tag_value"] == "data-collection"
     assert s3.puts[0]["Key"] == m.DEFAULT_KEY
 
@@ -297,7 +297,7 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, cap
     assert "5.0" not in out and "$" not in out
     assert "curbucket" not in out
     assert "cur/x" not in out
-    assert "component" not in out and "data-collection" not in out
+    assert "system" not in out and "data-collection" not in out
     assert m.DEFAULT_KEY in out
     assert "days_covered=1" in out
 

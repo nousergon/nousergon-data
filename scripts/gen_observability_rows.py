@@ -290,7 +290,7 @@ def build_row(unit) -> dict[str, Any]:
         },
         "cost": {
             "status": "unknown",
-            "reason": "No run-level cost record exists yet; component=data-collection cost tagging "
+            "reason": "No run-level cost record exists yet; system=data-collection cost tagging "
             "is phase-3 work (plan P-21). Makes no LLM call.",
         },
         "resource": {
