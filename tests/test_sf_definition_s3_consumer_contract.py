@@ -133,6 +133,15 @@ def test_the_same_sha_tags_the_cloudformation_stack(deploy_sh):
     assert deploy_sh.count('--tags "Key=git-sha,Value=$GIT_SHA"') == 2  # create + update
 
 
+def test_the_stack_carries_the_fleet_cost_attribution_tag(deploy_sh):
+    """alpha-engine-config-I10905 ruled ``system`` as the fleet cost-attribution
+    key. A stack-level tag propagates to every taggable resource, so create and
+    update must both carry it — and the value is the stack's own name."""
+    tag = '"Key=system,Value=alpha-engine-orchestration"'
+    assert deploy_sh.count(tag) == 2  # create + update
+    assert "Key=component" not in deploy_sh
+
+
 def test_the_upload_precedes_the_state_machine_update(deploy_sh):
     """Order matters for what a *failed* deploy leaves behind. Uploading first
     means a failed ``update-state-machine`` leaves S3 holding the NEW definition

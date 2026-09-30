@@ -466,13 +466,18 @@ case "$STACK_STATUS" in
         ;;
 esac
 
+# Stack tags: git-sha (deploy-drift stamp) and system (fleet cost-attribution
+# key, alpha-engine-config-I10905). Stack-level tags propagate to every taggable
+# resource, so the deploy role needs the matching *:TagResource / ListTags*
+# actions per resource type; github-actions-cfn-sf-stack-deploy already holds
+# them (git-sha changes on every deploy and exercises the same calls).
 if [ "$STACK_STATUS" = "DOES_NOT_EXIST" ]; then
     echo "  Creating new stack..."
     aws cloudformation create-stack \
         --stack-name "$STACK_NAME" \
         --template-url "$TEMPLATE_URL" \
         --capabilities CAPABILITY_NAMED_IAM \
-        --tags "Key=git-sha,Value=$GIT_SHA" \
+        --tags "Key=git-sha,Value=$GIT_SHA" "Key=system,Value=alpha-engine-orchestration" \
         --query "StackId" --output text
     echo "  Waiting for stack creation..."
     aws cloudformation wait stack-create-complete --stack-name "$STACK_NAME"
@@ -485,7 +490,7 @@ else
         --stack-name "$STACK_NAME" \
         --template-url "$TEMPLATE_URL" \
         --capabilities CAPABILITY_NAMED_IAM \
-        --tags "Key=git-sha,Value=$GIT_SHA" \
+        --tags "Key=git-sha,Value=$GIT_SHA" "Key=system,Value=alpha-engine-orchestration" \
         --query "StackId" --output text > "$UPDATE_OUT" 2>&1
     UPDATE_RC=$?
     set -e
@@ -496,7 +501,7 @@ else
         # Only one AWS response is an acceptable no-op: template + tags unchanged.
         # Every other error (including IAM denial, validation, rollback state)
         # still exits non-zero because it means the deploy DIDN'T happen.
-        echo "  No updates needed (template + git-sha tag both current)."
+        echo "  No updates needed (template + git-sha + system tags both current)."
     else
         echo "  ERROR: update-stack failed with rc=$UPDATE_RC:"
         cat "$UPDATE_OUT"
