@@ -1,0 +1,86 @@
+name: Bar settlement sample (I11356)
+
+# alpha-engine-config-I11356: measure when the day's own daily bar stops
+# changing, so dates.SETTLED_AFTER_ET (18:15 ET, and with it the
+# ne-data-collection-eod cron) rests on three days of numbers instead of the
+# one-day 2026-09-21 bracket. Brian approved running it 2026-09-30..10-02.
+#
+# Five fetches per trading day of the same 50 tickers, at 16:45, 17:30, 18:15,
+# 18:45 and 22:30 ET (the last is the reference). Crons are UTC for EDT and only
+# act on the three sample dates, so the workflow is inert outside them and is
+# removed in the follow-up PR that carries the grading. Each run prints one
+# SETTLEMENT_SAMPLE JSON line to its log; the grader reads the logs, so the
+# workflow needs no AWS credentials and writes nothing.
+#
+# GitHub may start a scheduled run late; every sample records its own
+# fetched_at, and the grading uses that, not the cron slot.
+
+on:
+  schedule:
+    - cron: '45 20 * * 3-5'  # 16:45 EDT
+    - cron: '30 21 * * 3-5'  # 17:30 EDT
+    - cron: '15 22 * * 3-5'  # 18:15 EDT
+    - cron: '45 22 * * 3-5'  # 18:45 EDT
+    - cron: '30 2 * * 4-6'   # 22:30 EDT, the previous ET day
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  sample:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install yfinance
+        run: python -m pip install --quiet 'yfinance>=1.7.0'
+      - name: Fetch the day's own bar
+        env:
+          SAMPLE_DATES: '2026-09-30 2026-10-01 2026-10-02'
+        run: |
+          python - <<'PY'
+          import datetime as dt
+          import json
+          import os
+          from zoneinfo import ZoneInfo
+
+          import yfinance as yf
+
+          now = dt.datetime.now(dt.UTC)
+          day = now.astimezone(ZoneInfo("America/New_York")).date()
+          if day.isoformat() not in os.environ["SAMPLE_DATES"].split():
+              print(f"{day} is not a sample date; nothing to do")
+              raise SystemExit(0)
+
+          # The issue's 30 names (10+ from the 2026-09-21 worst-shortfall
+          # decile) plus 20 large caps for the liquid end of the range.
+          tickers = (
+              "ADSK AVTR BA CFR CNO CVNA DVA ECHO ESNT FFIN GEHC GM GPK GWW H HON HST "
+              "HUBB INTC KRYS MTG NCLH PNR PPC PSX TFC TKR UGI VEEV WTW "
+              "AAPL MSFT NVDA AMZN GOOGL META JPM XOM JNJ PG KO PEP WMT V MA UNH HD "
+              "CVX BAC COST"
+          ).split()
+          assert len(tickers) == 50, len(tickers)
+
+          frame = yf.download(
+              tickers, start=day.isoformat(), end=(day + dt.timedelta(days=1)).isoformat(),
+              auto_adjust=False, progress=False, group_by="column", threads=True,
+          )
+          rows, missing = {}, []
+          for t in tickers:
+              try:
+                  bar = frame.loc[frame.index.date == day]
+                  rows[t] = {c: float(bar[c][t].iloc[0]) for c in ("Close", "High", "Low", "Volume")}
+              except (KeyError, IndexError, ValueError):
+                  missing.append(t)
+          print("SETTLEMENT_SAMPLE " + json.dumps({
+              "fetched_at": now.isoformat(), "day": day.isoformat(),
+              "rows": rows, "missing": missing,
+          }, sort_keys=True))
+          if len(rows) < 45:
+              raise SystemExit(f"only {len(rows)}/50 tickers returned a bar for {day}: {missing}")
+          PY
