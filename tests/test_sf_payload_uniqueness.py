@@ -42,6 +42,8 @@ _INFRA = _REPO_ROOT / "infrastructure"
 _SF_SATURDAY = _INFRA / "step_function.json"
 _SF_WEEKDAY = _INFRA / "step_function_daily.json"
 _SF_EOD = _INFRA / "step_function_eod.json"
+# alpha-engine-config-I11269: the collector-gated half of the post-close run.
+_SF_EOD_RECONCILE = _INFRA / "step_function_eod_reconcile.json"
 # alpha-engine-config-I2544/I2545: the two child SFs split out of the
 
 
@@ -547,7 +549,7 @@ class TestWeekdaySSMFlowDoctorOrdering:
 # Computed by walking the EOD SF for every `$.X` reference in
 # Parameters / Choices / ResultPath / InputPath, then filtering to
 # top-level fields (single segment after `$`).
-def _eod_referenced_input_fields() -> frozenset[str]:
+def _eod_referenced_input_fields(path: Path = _SF_EOD) -> frozenset[str]:
     # Walk the parsed SF and capture the FIRST segment of every string value
     # that STARTS with ``$.`` (equivalent to the old ``"$.`` text regex, since
     # ``"$.`` only ever opens a JSON string value) — EXCEPT inside a
@@ -575,7 +577,7 @@ def _eod_referenced_input_fields() -> frozenset[str]:
             if m:
                 refs.add(m.group(1))
 
-    _walk(json.loads(_SF_EOD.read_text()))
+    _walk(json.loads(path.read_text()))
     return frozenset(refs)
 
 
@@ -803,9 +805,55 @@ class TestEODSFTopLevelFieldsClosed:
         }
     )
 
-    def test_eod_top_level_field_set_is_closed(self):
-        actual = _eod_referenced_input_fields()
-        unregistered = actual - self._EXPECTED_EOD_TOP_LEVEL_FIELDS
+    # alpha-engine-config-I11269 (post-close split, 2026-09-30): the EOD
+    # namespace above is now carried by TWO machines, and the registry stays
+    # ONE closed set — a field in either machine is the same namespace, handed
+    # between them only through the declared entry contract
+    # (infrastructure/sf_entry_contract.json). Each field that lives in only
+    # one machine is partitioned here, so each machine's set is pinned
+    # exactly, in both directions, rather than as a union that would let a
+    # field drift from one machine to the other unnoticed.
+    _POSTCLOSE_ONLY: frozenset[str] = frozenset({
+        # CaptureSnapshot and its bounded retry stay at 16:00.
+        "snapshot_result", "snapshot_poll", "skip_capture_snapshot",
+        "capture_snapshot_retry", "capture_snapshot_page_notify",
+        "capture_snapshot_irreversible_notify",
+        # DeployDriftCheck is not in the reconcile machine (follow-up: the
+        # crucible-predictor probe must declare its sf_name first).
+        "drift_result", "drift_error", "deploy_drift_degraded_notify",
+    })
+    _RECONCILE_ONLY: frozenset[str] = frozenset({
+        # The readiness wait and its fail-open normalizer.
+        "collection_readiness", "collection_readiness_error", "collection_readiness_poll",
+        "data_spot_error", "data_spot_failure_notify",
+        # EODReconcile, its precondition probe and the heal loop.
+        "eod_result", "eod_poll", "eod_skip_notify", "skip_eod_reconcile",
+        "skip_post_market_data", "precondition_probe", "ec2_instance_id",
+        "heal_loop", "heal_collection", "heal_error", "heal_replay_dispatch",
+        "heal_replay_dispatch_error", "heal_replay_dispatch_failed_notify",
+        "heal_converged_notify", "heal_nonconvergent_notify",
+        # The box stop on the success path, and the exercise tail after it.
+        "stop_result",
+        "weekly_exercise_run", "weekly_exercise_launch_error",
+        "weekly_exercise_launch_notify", "weekly_exercise_launch_notify_error",
+        "exercise_cadence_param", "exercise_cadence_read_error",
+        "exercise_cadence_degraded_notify", "exercise_cadence_degraded_notify_error",
+        "exercise_cadence_unknown_notify", "exercise_cadence_unknown_notify_error",
+    })
+
+    def _expected(self, path: Path) -> frozenset[str]:
+        other = self._RECONCILE_ONLY if path == _SF_EOD else self._POSTCLOSE_ONLY
+        return self._EXPECTED_EOD_TOP_LEVEL_FIELDS - other
+
+    def test_the_partitions_are_disjoint_subsets_of_the_registry(self):
+        assert self._POSTCLOSE_ONLY <= self._EXPECTED_EOD_TOP_LEVEL_FIELDS
+        assert self._RECONCILE_ONLY <= self._EXPECTED_EOD_TOP_LEVEL_FIELDS
+        assert not self._POSTCLOSE_ONLY & self._RECONCILE_ONLY
+
+    @pytest.mark.parametrize("path", [_SF_EOD, _SF_EOD_RECONCILE], ids=lambda p: p.name)
+    def test_eod_top_level_field_set_is_closed(self, path):
+        actual = _eod_referenced_input_fields(path)
+        unregistered = actual - self._expected(path)
         assert not unregistered, (
             f"EOD SF references top-level ``$.<X>`` field(s) not in the "
             f"closed registry: {sorted(unregistered)}. If the addition "
@@ -814,12 +862,13 @@ class TestEODSFTopLevelFieldsClosed:
             "contract — preventing silent ResultPath/input-field collisions."
         )
 
-    def test_no_registry_entry_missing_from_sf(self):
+    @pytest.mark.parametrize("path", [_SF_EOD, _SF_EOD_RECONCILE], ids=lambda p: p.name)
+    def test_no_registry_entry_missing_from_sf(self, path):
         """A registry entry for a field the SF no longer references
         means the field was renamed or removed without updating the
         registry — drift in the opposite direction."""
-        actual = _eod_referenced_input_fields()
-        missing = self._EXPECTED_EOD_TOP_LEVEL_FIELDS - actual
+        actual = _eod_referenced_input_fields(path)
+        missing = self._expected(path) - actual
         assert not missing, (
             f"_EXPECTED_EOD_TOP_LEVEL_FIELDS has registry entries no "
             f"longer in the EOD SF: {sorted(missing)}. Either re-add the "

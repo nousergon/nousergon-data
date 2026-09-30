@@ -77,6 +77,8 @@ _DEFS_WITH_SETTERS = (
     "step_function.json",
     "step_function_daily.json",
     "step_function_eod.json",
+    # alpha-engine-config-I11269: the collector-gated half of the old EOD SF.
+    "step_function_eod_reconcile.json",
 )
 
 _SNS_PUBLISH = "arn:aws:states:::sns:publish"
@@ -105,6 +107,13 @@ _NO_IMMEDIATE_PAGE: dict[tuple[str, str], str] = {
         "step_function_eod.json",
         "SetMutexAcquireDegradedFlag",
     ): "Same as the daily mutex path.",
+    (
+        "step_function_eod_reconcile.json",
+        "SetMutexAcquireDegradedFlag",
+    ): (
+        "Same as the daily mutex path (alpha-engine-config-I11269: the "
+        "reconcile machine carries its own copy of the EOD mutex block)."
+    ),
     (
         "step_function.json",
         "SetDirectorSubStatusDegradedSummary",
@@ -196,7 +205,9 @@ _NO_IMMEDIATE_PAGE: dict[tuple[str, str], str] = {
         "AlphaEngine/Substrate alarm."
     ),
     (
-        "step_function_eod.json",
+        # alpha-engine-config-I11269: moved with the heal loop into the
+        # collector-gated reconcile machine; the reason is unchanged.
+        "step_function_eod_reconcile.json",
         "SetDegradedFlag",
     ): (
         "EODReconcile skipped on a data gap routes into the heal loop "
@@ -362,7 +373,8 @@ def test_the_weekly_exercise_path_is_recognised_as_paging() -> None:
     `SetWeeklyExerciseDegradedFlag`. A name-prefix check reports it silent,
     which sends somebody to add a duplicate publish beside a working one.
     """
-    states = _states("step_function_eod.json")
+    # alpha-engine-config-I11269: the exercise launch lives in the reconcile machine.
+    states = _states("step_function_eod_reconcile.json")
     reached = _reaches_a_publish(states, "SetWeeklyExerciseDegradedFlag")
     assert reached == "WeeklyExerciseLaunchFailed"
     assert not reached.startswith("Publish")

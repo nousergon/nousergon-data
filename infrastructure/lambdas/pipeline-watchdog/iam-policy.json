@@ -20,7 +20,8 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
         "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline",
-        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-reconcile-pipeline"
       ]
     },
     {
@@ -32,7 +33,8 @@
       "Resource": [
         "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:*",
         "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:*",
-        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*"
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-trading-pipeline:*",
+        "arn:aws:states:us-east-1:711398986525:execution:ne-postclose-reconcile-pipeline:*"
       ]
     },
     {
@@ -74,7 +76,8 @@
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-preopen-trading-pipeline/*",
         "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*",
-        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/*"
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-weekly-freshness-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-reconcile-pipeline/*"
       ]
     },
     {
@@ -100,7 +103,8 @@
             "_alerts/_dedup/*",
             "_sf_completion/ne-preopen-trading-pipeline/*",
             "_sf_completion/ne-postclose-trading-pipeline/*",
-            "_sf_completion/ne-weekly-freshness-pipeline/*"
+            "_sf_completion/ne-weekly-freshness-pipeline/*",
+            "_sf_completion/ne-postclose-reconcile-pipeline/*"
           ]
         }
       }

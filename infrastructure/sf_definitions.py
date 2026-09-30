@@ -67,6 +67,7 @@ SF_DEFINITIONS: tuple[dict[str, str], ...] = (
     {"sf_name": "ne-weekly-freshness-pipeline", "definition_file": "step_function.json"},
     {"sf_name": "ne-preopen-trading-pipeline", "definition_file": "step_function_daily.json"},
     {"sf_name": "ne-postclose-trading-pipeline", "definition_file": "step_function_eod.json"},
+    {"sf_name": "ne-postclose-reconcile-pipeline", "definition_file": "step_function_eod_reconcile.json"},
     {"sf_name": "alpha-engine-groom-dispatch", "definition_file": "step_function_groom.json"},
 )
 

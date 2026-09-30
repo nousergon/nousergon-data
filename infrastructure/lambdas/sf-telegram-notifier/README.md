@@ -16,6 +16,7 @@ SF JSON definitions.
 | Saturday weekly pipeline | `ne-weekly-freshness-pipeline` | `Saturday SF` |
 | Weekday daily pipeline   | `ne-preopen-trading-pipeline`  | `Weekday SF` |
 | EOD post-market pipeline | `ne-postclose-trading-pipeline`      | `EOD SF` |
+| EOD post-close reconcile | `ne-postclose-reconcile-pipeline`    | `Post-close Reconcile SF` |
 
 | Status | Emoji | Push? | Extra detail |
 | --- | --- | --- | --- |
@@ -34,12 +35,14 @@ the first ISO-8601 date substring in the execution name.
 
 ### EOD artifact verification (alpha-engine-config#5289)
 
-A `ne-postclose-trading-pipeline` terminal rendering as SUCCEEDED or DEGRADED
+A `ne-postclose-reconcile-pipeline` terminal rendering as SUCCEEDED or DEGRADED
+(the machine that writes the eod_pnl row since the 2026-09-30 split; it was
+`ne-postclose-trading-pipeline` before)
 additionally verifies, via two read-only S3 checks against
 `alpha-engine-research`:
 
 1. the SF-envelope completion marker
-   (`_sf_completion/ne-postclose-trading-pipeline/{run_date}.json`), and
+   (`_sf_completion/ne-postclose-reconcile-pipeline/{run_date}.json`), and
 2. a `trades/eod_pnl.csv` row for `run_date`.
 
 Both present → one terse line (`Artifacts: ✓ …`). Either missing → an
@@ -55,7 +58,7 @@ SF status transition
        ▼
 EventBridge default bus
    (aws.states / Step Functions Execution Status Change,
-    filtered to the 3 alpha-engine SF ARNs)
+    filtered to the 4 alpha-engine pipeline SF ARNs)
        │
        ▼
 alpha-engine-sf-telegram-notifier  ──►  nousergon_lib.telegram.send_message
@@ -102,5 +105,6 @@ via `.github/workflows/deploy-sf-telegram-notifier.yml` on merge to `main`
   `arn:aws:states:…:execution:{alpha-engine-*,ne-*}:*`
 - `s3:GetObject` (a HeadObject call is authorized by GetObject — there is no `s3:HeadObject` action; alpha-engine-config-I7571) on
   `alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*` +
+  `alpha-engine-research/_sf_completion/ne-postclose-reconcile-pipeline/*` +
   `alpha-engine-research/trades/eod_pnl.csv` (EOD artifact verification,
   alpha-engine-config#5289)

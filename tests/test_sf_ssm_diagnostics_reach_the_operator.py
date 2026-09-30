@@ -32,6 +32,8 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DEFS = {
     "daily": _REPO_ROOT / "infrastructure" / "step_function_daily.json",
     "eod": _REPO_ROOT / "infrastructure" / "step_function_eod.json",
+    # alpha-engine-config-I11269: the collector-gated half of the post-close run.
+    "eod_reconcile": _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.json",
 }
 
 # States whose poll result carries no field containing script output.
@@ -50,10 +52,17 @@ _DEFS = {
 # pipeline cannot be rehearsed on demand (sf-pipeline-policy.md §7a). Tracked
 # with the two options in alpha-engine-config-I8703; consolidating them onto the
 # Lambda poller, which normalises absent fields, is the recommended route.
+#
+# alpha-engine-config-I11269 (post-close split, 2026-09-30): no new poller was
+# written. WaitForEOD MOVED, byte-identical, into the reconcile machine, and
+# WaitForRefreshExecutorDeploy is the same state carried by BOTH machines (each
+# boots the box, so each refreshes the checkout) — the uncovered code is the
+# same three pollers, now counted per machine they live in.
 _UNCOVERED_POLLERS = {
     ("eod", "WaitForCaptureSnapshot"),
-    ("eod", "WaitForEOD"),
     ("eod", "WaitForRefreshExecutorDeploy"),
+    ("eod_reconcile", "WaitForEOD"),
+    ("eod_reconcile", "WaitForRefreshExecutorDeploy"),
 }
 
 # A field whose value plausibly carries what the script printed.

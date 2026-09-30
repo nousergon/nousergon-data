@@ -1,5 +1,5 @@
 """Structural wiring for the declared weekly exercise-cadence gate
-(alpha-engine-config-I6689) inserted into step_function_eod.json between
+(alpha-engine-config-I6689) inserted into step_function_eod_reconcile.json between
 StopTradingInstance and LaunchWeeklyExerciseRun:
 
   StopTradingInstance -> ReadExerciseCadence -> CheckExerciseCadence
@@ -18,6 +18,12 @@ test_sf_weekly_exercise_chain_wiring.py and
 test_sf_eod_precondition_probe_wiring.py pin that the pre-existing launch
 (LaunchWeeklyExerciseRun onward) and postclose-failure-isolation properties
 are unchanged by this insertion.
+
+alpha-engine-config-I11269: the whole tail (StopTradingInstance onward) moved
+from step_function_eod.json into the collector-gated
+step_function_eod_reconcile.json when the post-close SF was split, so the
+fixture reads that file. The 16:00 machine carries none of these states —
+pinned in test_sf_postclose_reconcile_split.py.
 """
 
 from __future__ import annotations
@@ -34,7 +40,8 @@ _SSM_PARAM_NAME = "/alpha-engine/weekly-sf/exercise-cadence"
 
 @pytest.fixture(scope="module")
 def eod() -> dict:
-    return json.loads((_INFRA / "step_function_eod.json").read_text())["States"]
+    # alpha-engine-config-I11269: the cadence gate lives in the reconcile machine.
+    return json.loads((_INFRA / "step_function_eod_reconcile.json").read_text())["States"]
 
 
 class TestReadExerciseCadence:

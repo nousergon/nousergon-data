@@ -52,7 +52,9 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+# alpha-engine-config-I11269: every state this file pins moved to the
+# collector-gated reconcile machine when the post-close SF was split.
+_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.json"
 _PROBE_FN = "alpha-engine-eod-precondition-probe"
 _DISPATCHER_FN = "alpha-engine-data-spot-dispatcher"
 
@@ -407,9 +409,12 @@ class TestHealLoopDispatchChain:
 
 class TestHealDispatchReplay:
     """Deliverable #3(c): the auto-replay reuses I2700's PROVEN input shape
-    exactly (skip_post_market_data + skip_capture_snapshot), as a SEPARATE
-    self-referential execution (never an in-place jump back through
-    CaptureSnapshot, which already ran once earlier in this same execution)."""
+    (skip_post_market_data), as a SEPARATE self-referential execution.
+
+    Since the I11269 split the replay no longer carries
+    ``skip_capture_snapshot``: CaptureSnapshot lives in the 16:00
+    ne-postclose-trading-pipeline and is not a state of this machine, so the
+    flag would be an undeclared input no state reads."""
 
     def test_self_referential_start_execution(self, states):
         st = states["HealDispatchReplay"]
@@ -421,7 +426,10 @@ class TestHealDispatchReplay:
         inp = states["HealDispatchReplay"]["Parameters"]["Input"]
         assert inp["pipeline_role"] == "operator-replay"
         assert inp["skip_post_market_data"] is True
-        assert inp["skip_capture_snapshot"] is True
+        # CaptureSnapshot is not in this machine (I11269 split): the key must
+        # be absent, never silently re-added as a dead input.
+        assert "skip_capture_snapshot" not in inp
+        assert "CaptureSnapshot" not in states
         assert inp["run_date.$"] == "$.run_date"
         assert inp["trading_instance_id.$"] == "$.trading_instance_id"
         assert inp["ec2_instance_id.$"] == "$.ec2_instance_id"

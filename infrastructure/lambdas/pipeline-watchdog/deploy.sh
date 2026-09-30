@@ -10,6 +10,11 @@
 #   - Weekday SF: 24h window, watch-day = today is a NYSE trading day
 #   - EOD SF:     24h window, watch-day = today is a NYSE trading day
 #   - Saturday SF: 7d window, watch-day = today is Sunday
+#   - EOD reconcile SF (ne-postclose-reconcile-pipeline, split out of the EOD SF
+#     2026-09-30, alpha-engine-config-I11269 follow-up): same window/watch-day
+#     as the EOD SF, plus the prior-day failed-run check. Its ListExecutions /
+#     DescribeExecution / marker-read grants are in iam-policy.json and, like
+#     every grant here, reach the live role only via `--apply-iam`.
 # Plus (config#2412) a preopen schedule-buffer canary: reads the finish
 # time of the most recently CLOSED trading day's SUCCEEDED Weekday-SF
 # execution against the fixed 06:30 AM PT market open (hard floor 06:15 PT,

@@ -18,6 +18,7 @@ in parallel — channel independence preserved per plan doc §3.5.
 |---|---|---|
 | Weekday SF | 24h | TODAY is a NYSE trading day (via `nousergon_lib.trading_calendar`) |
 | EOD SF     | 24h | TODAY is a NYSE trading day |
+| EOD reconcile SF (`ne-postclose-reconcile-pipeline`, split out 2026-09-30) | same as EOD SF | TODAY is a NYSE trading day; also in the prior-day failed-run check |
 | Saturday SF | 7d  | TODAY is Sunday (Saturday SF fires Sat 09:00 UTC; by Sun 14:00 UTC any missed firing is 24+h overdue) |
 
 ## Preopen schedule-buffer canary (alpha-engine-config#2412)
@@ -67,13 +68,13 @@ expects**, does a matching execution exist?
 
 - Reads the declared cadence from SSM
   `/alpha-engine/weekly-sf/exercise-cadence` — the same parameter
-  `step_function_eod.json`'s `ReadExerciseCadence` task reads at execution
+  `step_function_eod_reconcile.json`'s `ReadExerciseCadence` task reads at execution
   time, so the detector's expectation is provably the launcher's behaviour.
 - Derives every expected slot over a trailing 5 days and classifies each:
   `OK` · `GATED_OFF` (the declaration does not expect this slot — reported,
   never conflated with silence) · `CRITICAL` (expected, absent → pages).
 - **Evaluates through YESTERDAY, not today.** Today's exercise slot is chained
-  off today's ~20:00 UTC postclose, hours after the 14:00 UTC cron; evaluating
+  off today's post-close reconcile (evening ET), hours after the 14:00 UTC cron; evaluating
   today would page on every trading day. Same retrospective discipline as the
   EOD window and the preopen canary.
 - Dedup is keyed on the **silent slot** (`role`+`day`) with a 7-day window, so

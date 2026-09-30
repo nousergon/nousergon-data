@@ -10,9 +10,14 @@ established, covering the two weekday pipelines instead of the Saturday one:
   step_function_daily.json). These gates test ONLY the flag itself — no
   pipeline_role conjunction, matching the weekly SF's shape.
 - ``ne-postclose-trading-pipeline`` ("eod") — skip gates: ``skip_refresh_
-  executor_deploy``, ``skip_post_market_data``, ``skip_capture_snapshot``,
-  ``skip_eod_reconcile`` (infrastructure/step_function_eod.json). These
-  gates structurally conjunct ``pipeline_role == "operator-replay"``
+  executor_deploy``, ``skip_capture_snapshot`` (infrastructure/
+  step_function_eod.json).
+- ``ne-postclose-reconcile-pipeline`` ("eod-reconcile", split out of the
+  post-close pipeline 2026-09-30, alpha-engine-config-I11269 follow-up) —
+  skip gates: ``skip_refresh_executor_deploy``, ``skip_post_market_data``,
+  ``skip_eod_reconcile`` (infrastructure/step_function_eod_reconcile.json).
+  Both post-close machines' gates structurally conjunct
+  ``pipeline_role == "operator-replay"``
   (config#1614) — the proven shape a manual operator replay has always used
   (I2700, first exercised 2026-07-13/07-15, and the shape the EOD SF's own
   closed self-heal loop now auto-dispatches via HealDispatchReplay). A skip
@@ -106,7 +111,8 @@ OPERATOR_REPLAY_ROLE = "operator-replay"
 
 # ---------------------------------------------------------------------------
 # Declarative stage tables — pinned against infrastructure/step_function_
-# daily.json / step_function_eod.json by tests/test_weekday_sf_rerun.py.
+# daily.json / step_function_eod.json / step_function_eod_reconcile.json by
+# tests/test_weekday_sf_rerun.py.
 # witness = the state the SF enters iff the stage completed successfully OR
 # was skipped; either way the rerun must not re-run it (originally-skipped
 # stages carry their flag from the preserved original input anyway).
@@ -128,7 +134,7 @@ class Stage:
 
 @dataclass(frozen=True)
 class Pipeline:
-    key: str                # "daily" | "eod"
+    key: str                # "daily" | "eod" | "eod-reconcile"
     label: str               # human label for messages, e.g. "preopen (daily)"
     sm_name: str             # deployed state-machine name
     stages: tuple            # tuple[Stage, ...] in chain order
@@ -179,19 +185,35 @@ DAILY_STAGES: tuple[Stage, ...] = (
           frozenset({"CheckDegradedOutcome"})),
 )
 
+# alpha-engine-config-I11269 follow-up (Brian, 2026-09-30): the post-close
+# pipeline was split. ne-postclose-trading-pipeline keeps only what needs the
+# close alone — executor refresh + CaptureSnapshot — and everything that
+# depends on ne-data-collection-eod (the readiness wait, the reconcile
+# precondition probe, EODReconcile) moved to ne-postclose-reconcile-pipeline.
+# The stage NAMES and FLAGS are unchanged, so a recovery input stays readable
+# across the split; each stage now lives in exactly one of the two tables.
 EOD_STAGES: tuple[Stage, ...] = (
+    Stage("refresh_executor_deploy", "skip_refresh_executor_deploy",
+          "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
+          frozenset({"CheckSkipCaptureSnapshot"})),
+    # CheckDegradedOutcome is entered iff CaptureSnapshot succeeded (or was
+    # skipped): the exhausted-retry route goes to HandleFailure instead.
+    Stage("capture_snapshot", "skip_capture_snapshot",
+          "CheckSkipCaptureSnapshot", "CaptureSnapshot",
+          frozenset({"CheckDegradedOutcome"})),
+)
+
+EOD_RECONCILE_STAGES: tuple[Stage, ...] = (
     Stage("refresh_executor_deploy", "skip_refresh_executor_deploy",
           "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
           frozenset({"CheckSkipPostMarketData"})),
     # alpha-engine-config-I11269: same repoint as morning_enrich above — the
-    # post-market spot legs left this definition for ne-data-collection-eod.
+    # post-market spot legs left for ne-data-collection-eod; the stage is the
+    # bounded readiness grade on its manifests. Not-ready is a DEGRADED bypass.
     Stage("post_market_data", "skip_post_market_data",
           "CheckSkipPostMarketData", "WaitForCollectionManifests",
-          frozenset({"CheckSkipCaptureSnapshot"}),
+          frozenset({"ProbeEODReconcilePrecondition"}),
           degraded_witness=frozenset({"ExtractCollectionNotReadyError"})),
-    Stage("capture_snapshot", "skip_capture_snapshot",
-          "CheckSkipCaptureSnapshot", "CaptureSnapshot",
-          frozenset({"ProbeEODReconcilePrecondition"})),
     Stage(
         "eod_reconcile", "skip_eod_reconcile",
         "CheckSkipEODReconcile", "EODReconcile",
@@ -217,7 +239,13 @@ EOD = Pipeline(
     key="eod", label="postclose (EOD)", sm_name="ne-postclose-trading-pipeline",
     stages=EOD_STAGES, role_conjunct=OPERATOR_REPLAY_ROLE, emitted_role=OPERATOR_REPLAY_ROLE,
 )
-PIPELINES: tuple[Pipeline, ...] = (DAILY, EOD)
+EOD_RECONCILE = Pipeline(
+    key="eod-reconcile", label="post-close reconcile (EOD)",
+    sm_name="ne-postclose-reconcile-pipeline",
+    stages=EOD_RECONCILE_STAGES, role_conjunct=OPERATOR_REPLAY_ROLE,
+    emitted_role=OPERATOR_REPLAY_ROLE,
+)
+PIPELINES: tuple[Pipeline, ...] = (DAILY, EOD, EOD_RECONCILE)
 STAGES_BY_NAME = {p.key: {s.name: s for s in p.stages} for p in PIPELINES}
 
 
@@ -488,7 +516,7 @@ def build_market_hours_override(
 def main(argv: list | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
     ap.add_argument("--execution-arn", required=True,
-                     help="failed weekday (preopen or EOD) execution to recover")
+                     help="failed weekday (preopen, post-close or post-close reconcile) execution to recover")
     mode = ap.add_mutually_exclusive_group()
     mode.add_argument("--dry-run", action="store_true", help="derive + print only (default)")
     mode.add_argument("--start", action="store_true", help="StartExecution with the derived input")

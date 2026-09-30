@@ -203,33 +203,40 @@ class TestTradingInstanceReadinessGate:
         )
 
 
-def test_guard_would_have_caught_the_pre_576_topology(sf_docs):
+@pytest.mark.parametrize("sf_file,first_work_gate,work_state", [
+    # alpha-engine-config-I11269: the EOD run is two machines since the
+    # post-close split; each boots the box and each gets the meta-test.
+    ("step_function_eod.json", "CheckSkipRefreshExecutorDeploy", "CaptureSnapshot"),
+    ("step_function_eod_reconcile.json", "CheckSkipPostMarketData", "EODReconcile"),
+])
+def test_guard_would_have_caught_the_pre_576_topology(sf_docs, sf_file, first_work_gate, work_state):
     """Meta-test: prove the guard is load-bearing, not vacuously green. Rewire
     a deep copy of the EOD SF back to its PRE-#576 topology — the entry paths
     (``CheckMutexRole`` default, ``AcquireMutex`` success/fail-open) routed
-    straight to ``CheckSkipPostMarketData``, skipping ``StartTradingInstance``
-    and the readiness poll entirely, which is the actual 2026-06-30 incident
-    shape — and confirm the SAME reachability check the parametrized test
-    above uses flags ``EODReconcile`` as reachable without crossing the gate.
-    If this meta-test doesn't fail on the old topology, the guard is vacuous."""
-    doc = sf_docs["step_function_eod.json"]
+    straight to a work gate, skipping ``StartTradingInstance`` and the
+    readiness poll entirely, which is the actual 2026-06-30 incident shape —
+    and confirm the SAME reachability check the parametrized test above uses
+    flags the machine's work state (``EODReconcile`` / ``CaptureSnapshot``) as
+    reachable without crossing the gate. If this meta-test doesn't fail on the
+    old topology, the guard is vacuous."""
+    doc = sf_docs[sf_file]
     states = json.loads(json.dumps(doc["States"]))  # deep copy — do not mutate the fixture
-    states["CheckMutexRole"]["Default"] = "CheckSkipPostMarketData"
-    states["AcquireMutex"]["Next"] = "CheckSkipPostMarketData"
+    states["CheckMutexRole"]["Default"] = first_work_gate
+    states["AcquireMutex"]["Next"] = first_work_gate
     for c in states["AcquireMutex"]["Catch"]:
         if "States.ALL" in c["ErrorEquals"]:
-            c["Next"] = "CheckSkipPostMarketData"
+            c["Next"] = first_work_gate
 
     sends = _send_command_states(states)
-    assert "EODReconcile" in sends
+    assert work_state in sends
 
     online_edges = set(_online_choice_edges(states))
     graph = _forward_graph(states)
     reachable_without_gate = _reachable(graph, doc["StartAt"], blocked_edges=online_edges)
 
-    assert "EODReconcile" in reachable_without_gate, (
+    assert work_state in reachable_without_gate, (
         "meta-test failed to reproduce the pre-#576 incident shape: "
-        "EODReconcile should be reachable without crossing the readiness "
+        f"{work_state} should be reachable without crossing the readiness "
         "gate once the mutex entry paths bypass StartTradingInstance — if "
         "it isn't, this meta-test isn't actually proving the guard above is "
         "load-bearing."

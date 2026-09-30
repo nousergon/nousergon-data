@@ -26,7 +26,18 @@
         "states:ListExecutions",
         "states:StartExecution"
       ],
-      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+      "Resource": [
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline",
+        "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-reconcile-pipeline"
+      ]
+    },
+    {
+      "Sid": "ListEodCollectionExecutions",
+      "Effect": "Allow",
+      "Action": [
+        "states:ListExecutions"
+      ],
+      "Resource": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-data-collection-eod"
     },
     {
       "Sid": "EodPnlRowRead",
@@ -36,7 +47,9 @@
       ],
       "Resource": [
         "arn:aws:s3:::alpha-engine-research/trades/eod_pnl.csv",
-        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*"
+        "arn:aws:s3:::alpha-engine-research/trades/snapshots/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-trading-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_sf_completion/ne-postclose-reconcile-pipeline/*"
       ]
     },
     {
@@ -50,7 +63,8 @@
         "StringLike": {
           "s3:prefix": [
             "trades/*",
-            "_sf_completion/ne-postclose-trading-pipeline/*"
+            "_sf_completion/ne-postclose-trading-pipeline/*",
+            "_sf_completion/ne-postclose-reconcile-pipeline/*"
           ]
         }
       }

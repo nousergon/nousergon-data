@@ -78,7 +78,7 @@ def fake_repo(cd, tmp_path, monkeypatch):
 # ── codified map against the real repo ──────────────────────────────────────
 
 
-def test_map_covers_all_four_orchestrated_state_machines(cd):
+def test_map_covers_all_five_orchestrated_state_machines(cd):
     # alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 advisory +
     # Sunday-modelzoo child SFs were retired (splits reversed — the weekly SF
     # runs the full inline pattern again), so the map is back to four.
@@ -87,6 +87,9 @@ def test_map_covers_all_four_orchestrated_state_machines(cd):
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
+        # alpha-engine-config-I11269: the collector-gated half of the old
+        # post-close SF, split out 2026-09-30.
+        "ne-postclose-reconcile-pipeline",
         "alpha-engine-groom-dispatch",
     }
 

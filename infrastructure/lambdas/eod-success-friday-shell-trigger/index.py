@@ -38,6 +38,18 @@ discipline — this Lambda is a new producer of shell-run starts):
 
 Non-Friday trading_day is the intended skip path and returns ``{"fired": False}``
 with a structured log line; this is NOT a swallow.
+
+**Still keyed on ne-postclose-trading-pipeline after the 2026-09-30 split**
+(alpha-engine-config-I11269 follow-up), deliberately. The split moved
+EODReconcile, StopTradingInstance and the weekly-exercise chain into
+``ne-postclose-reconcile-pipeline``; this trigger reads none of their outputs —
+the shell run short-circuits every workload — and the race it was built to
+avoid (``StopTradingInstance``) is no longer in the machine it watches, so the
+~16:20 ET post-close SUCCEEDED is a strictly earlier and still-correct signal
+that Friday closed. Its rule is PAUSED (automation_pause.json, I9751) and is
+created only by ``--bootstrap``, so re-pointing it would be a source change no
+merge applies and a standing EventBridge drift finding; if the ruling ever
+un-pauses it, re-point it then, with the bootstrap that applies it.
 """
 
 from __future__ import annotations

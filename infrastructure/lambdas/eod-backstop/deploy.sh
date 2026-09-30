@@ -14,6 +14,13 @@
 # box-must-be-running gate, which made a box-never-started day a silent
 # no-op). See index.py for the full guard rationale.
 #
+# SPLIT 2026-09-30 (alpha-engine-config-I11269 follow-up): this Lambda also
+# starts ne-postclose-reconcile-pipeline — on ne-data-collection-eod's terminal
+# event, and from a 02:15 UTC reconcile backstop. Both rules are reconciled on
+# every deploy (step 2b below), so they ship with the merge. The 22:30 UTC
+# post-close rule stays bootstrap-created, keyed since the split on the
+# CaptureSnapshot artifact rather than the eod_pnl row.
+#
 # Code-only auto-deploy on merge to main: .github/workflows/deploy-eod-
 # backstop.yml (config-I6690). Infra (IAM/EventBridge rule) stays operator-run
 # via --bootstrap/--apply-iam below — same narrow-OIDC-blast-radius rationale
@@ -197,6 +204,99 @@ if $BOOTSTRAP; then
 
   echo "  NOTE: rule is DISABLED. After soak: aws events enable-rule --name ${RULE_NAME} --region ${REGION}"
 fi
+
+# ----- 2b. Reconcile the post-close RECONCILE triggers (ALWAYS — not bootstrap-gated)
+#
+# alpha-engine-config-I11269 follow-up (2026-09-30): the collector-dependent
+# half of the post-close pipeline is its own state machine,
+# ne-postclose-reconcile-pipeline, and this Lambda is what starts it. Two
+# rules, reconciled on EVERY deploy (the sf-telegram-notifier §2b pattern,
+# config#1453) so the merge that ships the split also ships its trigger:
+# put-rule / put-targets / add-permission are idempotent create-or-update calls
+# the CI deploy identity (github-actions-lambda-deploy) already holds —
+# events:PutRule/PutTargets on *, lambda:AddPermission on
+# function:alpha-engine-*. Requires the Lambda to exist (it does since
+# config#1229's --bootstrap). State comes from automation_pause.json (I6619).
+#
+#   * alpha-engine-eod-reconcile-trigger — ne-data-collection-eod's terminal
+#     status change. SUCCEEDED / FAILED / TIMED_OUT (ABORTED is an operator's
+#     deliberate stop). The reconcile's OWN heal loop starts that collection as
+#     v1-eod-heal-*, and those terminals are excluded HERE and again in
+#     index.py, so a heal can never start a reconcile under the loop that
+#     launched it.
+#   * alpha-engine-eod-reconcile-backstop-daily — 02:15 UTC TUE-SAT (22:15 EDT
+#     / 21:15 EST on the MON-FRI trading evening), after the collection's
+#     18:15 ET cron plus the declared caps of every workload it runs
+#     (tests/test_v1_collection_readiness_wait.py derives the bound). Starts
+#     the reconcile iff the eod_pnl row is missing and nothing is running.
+#
+# The heredoc variable names below deliberately differ from EVENT_PATTERN /
+# RULE_NAME: infrastructure/eventbridge/check-drift.py discovers the FIRST of
+# each per deploy.sh, and that is still the 22:30 UTC post-close rule above.
+RECONCILE_TRIGGER_RULE="alpha-engine-eod-reconcile-trigger"
+RECONCILE_BACKSTOP_RULE="alpha-engine-eod-reconcile-backstop-daily"
+RECONCILE_FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+
+echo "Reconciling EventBridge rule: ${RECONCILE_TRIGGER_RULE}"
+COLLECTION_TERMINAL_PATTERN=$(cat <<EOF
+{
+  "source": ["aws.states"],
+  "detail-type": ["Step Functions Execution Status Change"],
+  "detail": {
+    "stateMachineArn": [
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-data-collection-eod"
+    ],
+    "status": ["SUCCEEDED", "FAILED", "TIMED_OUT"],
+    "name": [{"anything-but": {"prefix": "v1-eod-heal-"}}]
+  }
+}
+EOF
+)
+run aws events put-rule \
+  --name "${RECONCILE_TRIGGER_RULE}" --state "$(pause_state "${RECONCILE_TRIGGER_RULE}")" \
+  --event-pattern "${COLLECTION_TERMINAL_PATTERN}" \
+  --description "Start ne-postclose-reconcile-pipeline when ne-data-collection-eod reaches a terminal state (alpha-engine-eod-backstop event mode; heal executions excluded)" \
+  --region "${REGION}" \
+  --query 'RuleArn' --output text
+
+run aws events put-targets \
+  --rule "${RECONCILE_TRIGGER_RULE}" \
+  --targets "Id=1,Arn=${RECONCILE_FN_ARN}" \
+  --region "${REGION}"
+
+run_tolerating "ResourceConflictException" \
+  aws lambda add-permission \
+  --function-name "${FUNCTION_NAME}" \
+  --statement-id "eventbridge-${RECONCILE_TRIGGER_RULE}" \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RECONCILE_TRIGGER_RULE}" \
+  --region "${REGION}"
+
+echo "Reconciling EventBridge rule: ${RECONCILE_BACKSTOP_RULE}"
+run aws events put-rule \
+  --name "${RECONCILE_BACKSTOP_RULE}" \
+  --schedule-expression 'cron(15 2 ? * TUE-SAT *)' \
+  --state "$(pause_state "${RECONCILE_BACKSTOP_RULE}")" \
+  --description "Post-close RECONCILE backstop at 02:15 UTC TUE-SAT: start ne-postclose-reconcile-pipeline iff the evening's eod_pnl row is missing and no reconcile or EOD collection is running (alpha-engine-eod-backstop, mode=reconcile-backstop)." \
+  --region "${REGION}" \
+  --query 'RuleArn' --output text
+
+# JSON array form, not shorthand — shorthand's `Input={...}` cannot embed
+# nested JSON (the canary-replay-dispatcher lesson, config#2246).
+run aws events put-targets \
+  --rule "${RECONCILE_BACKSTOP_RULE}" \
+  --targets "[{\"Id\":\"1\",\"Arn\":\"${RECONCILE_FN_ARN}\",\"Input\":\"{\\\"mode\\\":\\\"reconcile-backstop\\\"}\"}]" \
+  --region "${REGION}"
+
+run_tolerating "ResourceConflictException" \
+  aws lambda add-permission \
+  --function-name "${FUNCTION_NAME}" \
+  --statement-id "eventbridge-${RECONCILE_BACKSTOP_RULE}" \
+  --action lambda:InvokeFunction \
+  --principal events.amazonaws.com \
+  --source-arn "arn:aws:events:${REGION}:${ACCOUNT_ID}:rule/${RECONCILE_BACKSTOP_RULE}" \
+  --region "${REGION}"
 
 # ----- 3. Update function code (always after bootstrap, idempotent) ---------
 

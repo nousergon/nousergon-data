@@ -27,8 +27,10 @@ not a hypothetical one):
     relying on partial-update preservation; this script remains the
     backstop for out-of-band drift.
   * `infrastructure/deploy-infrastructure.sh` — the EOD SF
-    (`ne-postclose-trading-pipeline`) is NOT in CloudFormation (script-
-    managed); its `EOD_LOGGING_CONFIG` literal there is the source of truth,
+    (`ne-postclose-trading-pipeline`) and its collector-dependent half
+    (`ne-postclose-reconcile-pipeline`, split out 2026-09-30) are NOT in
+    CloudFormation (script-managed); their `EOD_LOGGING_CONFIG` /
+    `EOD_RECONCILE_LOGGING_CONFIG` literals there are the source of truth,
     passed explicitly on every `update-state-machine` / `create-state-machine`
     call. The backlog-groom SF (`alpha-engine-groom-dispatch`) is also
     script-managed and, as of config#2748-adjacent (2026-07-16), likewise
@@ -188,7 +190,7 @@ def _discover_expected_from_cfn() -> list[dict]:
 
 def _discover_expected_from_deploy_script() -> list[dict]:
     """Extract expected LoggingConfiguration for the script-managed SFs
-    (EOD = explicit logging config; groom = deliberately no logging)."""
+    (EOD + EOD reconcile = explicit logging config; groom = explicit too)."""
     if not DEPLOY_INFRA_SH.is_file():
         return [{
             "sf_name": "<deploy-infrastructure-sh-missing>",
@@ -200,52 +202,58 @@ def _discover_expected_from_deploy_script() -> list[dict]:
     results: list[dict] = []
 
     # --- EOD: explicit LoggingConfiguration ---------------------------------
-    eod_arn_match = re.search(
-        r'EOD_ARN="arn:aws:states:\$REGION:\$\{ACCOUNT_ID\}:stateMachine:([\w-]+)"',
-        text,
-    )
-    eod_log_group_match = re.search(r'EOD_LOG_GROUP_NAME="([^"]+)"', text)
-    eod_config_match = re.search(r"EOD_LOGGING_CONFIG='(\{.*?\})'", text)
-
-    if eod_arn_match and eod_log_group_match and eod_config_match:
-        eod_name = eod_arn_match.group(1)
-        eod_log_group_name = eod_log_group_match.group(1)
-        # The logGroupArn value inside EOD_LOGGING_CONFIG is itself a shell
-        # variable substitution (`...logGroupArn":"'"$EOD_LOG_GROUP_ARN"'"}`),
-        # not a literal — pull level/includeExecutionData directly out of the
-        # literal JSON text, and trust EOD_LOG_GROUP_NAME (extracted above,
-        # itself a plain literal) for the log group name.
-        level_match = re.search(r'"level":"([^"]+)"', eod_config_match.group(1))
-        include_match = re.search(
-            r'"includeExecutionData":(true|false)', eod_config_match.group(1)
+    # Two script-managed post-close machines since the alpha-engine-config-I11269
+    # follow-up split (2026-09-30): EOD = ne-postclose-trading-pipeline,
+    # EOD_RECONCILE = ne-postclose-reconcile-pipeline. Same literal shape for
+    # both; the (?<![A-Z_]) lookbehind keeps EOD_ARN from matching inside
+    # EOD_RECONCILE_ARN's neighbours and vice versa.
+    for prefix in ("EOD", "EOD_RECONCILE"):
+        eod_arn_match = re.search(
+            rf'(?<![A-Z_]){prefix}_ARN="arn:aws:states:\$REGION:\$\{{ACCOUNT_ID\}}:stateMachine:([\w-]+)"',
+            text,
         )
-        if level_match and include_match:
-            results.append({
-                "sf_name": eod_name,
-                "source_file": DEPLOY_INFRA_SH,
-                "expected_level": level_match.group(1),
-                "expected_include_execution_data": include_match.group(1) == "true",
-                "expected_log_group_name": eod_log_group_name,
-            })
+        eod_log_group_match = re.search(rf'(?<![A-Z_]){prefix}_LOG_GROUP_NAME="([^"]+)"', text)
+        eod_config_match = re.search(rf"(?<![A-Z_]){prefix}_LOGGING_CONFIG='(\{{.*?\}})'", text)
+
+        if eod_arn_match and eod_log_group_match and eod_config_match:
+            eod_name = eod_arn_match.group(1)
+            eod_log_group_name = eod_log_group_match.group(1)
+            # The logGroupArn value inside EOD_LOGGING_CONFIG is itself a shell
+            # variable substitution (`...logGroupArn":"'"$EOD_LOG_GROUP_ARN"'"}`),
+            # not a literal — pull level/includeExecutionData directly out of the
+            # literal JSON text, and trust EOD_LOG_GROUP_NAME (extracted above,
+            # itself a plain literal) for the log group name.
+            level_match = re.search(r'"level":"([^"]+)"', eod_config_match.group(1))
+            include_match = re.search(
+                r'"includeExecutionData":(true|false)', eod_config_match.group(1)
+            )
+            if level_match and include_match:
+                results.append({
+                    "sf_name": eod_name,
+                    "source_file": DEPLOY_INFRA_SH,
+                    "expected_level": level_match.group(1),
+                    "expected_include_execution_data": include_match.group(1) == "true",
+                    "expected_log_group_name": eod_log_group_name,
+                })
+            else:
+                results.append({
+                    "sf_name": eod_name,
+                    "source_file": DEPLOY_INFRA_SH,
+                    "error": (
+                        f"{prefix}_LOGGING_CONFIG in {DEPLOY_INFRA_SH.name} didn't "
+                        f"parse as expected (level/includeExecutionData)"
+                    ),
+                })
         else:
             results.append({
-                "sf_name": eod_name,
+                "sf_name": f"<{prefix.lower()}-sf-unresolved>",
                 "source_file": DEPLOY_INFRA_SH,
                 "error": (
-                    f"EOD_LOGGING_CONFIG in {DEPLOY_INFRA_SH.name} didn't "
-                    f"parse as expected (level/includeExecutionData)"
+                    f"Couldn't find {prefix}_ARN / {prefix}_LOG_GROUP_NAME / "
+                    f"{prefix}_LOGGING_CONFIG literals in {DEPLOY_INFRA_SH.name} — "
+                    f"has the EOD deploy plumbing been refactored?"
                 ),
             })
-    else:
-        results.append({
-            "sf_name": "<eod-sf-unresolved>",
-            "source_file": DEPLOY_INFRA_SH,
-            "error": (
-                f"Couldn't find EOD_ARN / EOD_LOG_GROUP_NAME / "
-                f"EOD_LOGGING_CONFIG literals in {DEPLOY_INFRA_SH.name} — "
-                f"has the EOD deploy plumbing been refactored?"
-            ),
-        })
 
     # --- Groom: explicit LoggingConfiguration (config#2748-adjacent, 2026-07-16) ---
     # ERROR-level logging was enabled live to aid active groom-driver incident

@@ -122,6 +122,7 @@ SF_DEFINITIONS: tuple[dict, ...] = (
     {"sf_name": "ne-weekly-freshness-pipeline", "definition_file": "step_function.json"},
     {"sf_name": "ne-preopen-trading-pipeline", "definition_file": "step_function_daily.json"},
     {"sf_name": "ne-postclose-trading-pipeline", "definition_file": "step_function_eod.json"},
+    {"sf_name": "ne-postclose-reconcile-pipeline", "definition_file": "step_function_eod_reconcile.json"},
     {"sf_name": "alpha-engine-groom-dispatch", "definition_file": "step_function_groom.json"},
     # alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 advisory +
     # Sunday-modelzoo child SFs were RETIRED (splits reversed) — the weekly SF

@@ -190,6 +190,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
     # registry shrinks to {} rather than the entries going stale.
     "step_function_daily.json": {},
     "step_function_eod.json": {},
+    "step_function_eod_reconcile.json": {},
     "step_function_groom.json": {},
 }
 
@@ -208,6 +209,11 @@ _CATCH_EXEMPT: dict[str, dict[str, str]] = {
         "HandleFailure": "terminal failure notifier — routes to FailExecution; the shared failure sink itself, not something to re-catch into",
     },
     "step_function_eod.json": {
+        "WriteCompletionMarkerNormal": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
+        "WriteCompletionMarkerDegraded": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
+        "ForceStopInstance": "fail-safe teardown reached FROM the failure path (own Comment: 'always stop... even on failure') — a Catch here risks looping back into the failure path it is cleaning up after",
+    },
+    "step_function_eod_reconcile.json": {
         "WriteCompletionMarkerNormal": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "WriteCompletionMarkerDegraded": "config#2857/config#1724: deliberately UNCAUGHT — a marker write failure must propagate, not be masked",
         "ForceStopInstance": "fail-safe teardown reached FROM the failure path (own Comment: 'always stop... even on failure') — a Catch here risks looping back into the failure path it is cleaning up after",
@@ -256,6 +262,7 @@ _TERMINAL_DEGRADED_CHOICE: dict[str, str] = {
     "step_function.json": "CheckGateDegradedNotify",
     "step_function_daily.json": "CheckDegradedOutcome",
     "step_function_eod.json": "CheckDegradedOutcome",
+    "step_function_eod_reconcile.json": "CheckDegradedOutcome",
 }
 
 # The degraded-flag SETTER paths (the ResultPath a flag-writing Pass state
@@ -296,6 +303,7 @@ _DEGRADED_FLAG_JSONPATHS: dict[str, frozenset[str]] = {
     ),
     "step_function_daily.json": frozenset({"$.degraded_summary"}),
     "step_function_eod.json": frozenset({"$.degraded_summary"}),
+    "step_function_eod_reconcile.json": frozenset({"$.degraded_summary"}),
 }
 
 # States whose Catch is the shared hard-fail sink — reaching one of these
@@ -347,6 +355,15 @@ _FAILURE_FAMILY: dict[str, frozenset[str]] = {
             "MarketHoursOverrideMalformed",
         }
     ),
+    "step_function_eod_reconcile.json": frozenset(
+        {
+            "HandleFailure",
+            "FailExecution",
+            "MutexConflict",
+            "MarketHoursBlocked",
+            "MarketHoursOverrideMalformed",
+        }
+    ),
 }
 
 # Weekly-only: ResearchPredictorParallel's two branch terminals
@@ -370,6 +387,7 @@ _BRANCH_JOIN_HARD_FAIL: dict[str, frozenset[str]] = {
     ),
     "step_function_daily.json": frozenset(),
     "step_function_eod.json": frozenset(),
+    "step_function_eod_reconcile.json": frozenset(),
 }
 
 # A Catch OWNED by an sns:publish notifier Task is the config#1819
@@ -795,15 +813,10 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         ),
     },
     "step_function_eod.json": {
-        "WaitForCollectionManifests": (
-            "a raising probe is not a verdict either way: the Catch "
-            "records $.collection_readiness_error and spends one poll of the "
-            "bounded budget (CheckCollectionReadinessBudget), leaving the "
-            "seeded not-ready verdict in place. The flag is set where the "
-            "outcome is decided, on exhaustion: ExtractCollectionNotReadyError "
-            "-> ExtractDataSpotError -> SetDataSpotDegradedFlag writes "
-            "$.degraded_summary (alpha-engine-config-I11264)."
-        ),
+        # alpha-engine-config-I11269 follow-up (2026-09-30): the post-close
+        # machine keeps only CaptureSnapshot's two fail-CLOSED routes; the
+        # collector-dependent exemptions moved with their states to
+        # step_function_eod_reconcile.json below.
         "CaptureSnapshot": (
             "NOT fail-open (alpha-engine-config#5569): the Catch routes to "
             "CheckCaptureSnapshotRetryBudget — a bounded single retry that "
@@ -815,6 +828,17 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "Same route as CaptureSnapshot's Catch (config#5569): poll "
             "failure enters the same bounded-retry-then-HandleFailure "
             "path; fail-closed, not fail-open."
+        ),
+    },
+    "step_function_eod_reconcile.json": {
+        "WaitForCollectionManifests": (
+            "a raising probe is not a verdict either way: the Catch "
+            "records $.collection_readiness_error and spends one poll of the "
+            "bounded budget (CheckCollectionReadinessBudget), leaving the "
+            "seeded not-ready verdict in place. The flag is set where the "
+            "outcome is decided, on exhaustion: ExtractCollectionNotReadyError "
+            "-> ExtractDataSpotError -> SetDataSpotDegradedFlag writes "
+            "$.degraded_summary (alpha-engine-config-I11264)."
         ),
         "ProbeEODReconcilePrecondition": (
             "Deliberate documented SWALLOW — this state's own Comment "
@@ -1391,7 +1415,24 @@ def test_sf_file_set_matches_exemption_registry():
 #                  recovery a standing rule, and an 11h ceiling let one hung
 #                  execution hold the mutex past the close and take the
 #                  recovery with it.
-#   eod     28800  sf-pipeline-policy.md §4 gives the eod pipeline a ≤75-min
+#   eod      3600  alpha-engine-config-I11269 follow-up (Brian, 2026-09-30): the
+#                  post-close machine no longer waits on the collection. Its
+#                  worst case is the gates (~3 min), the box boot + SSM poll
+#                  (~4 min), RefreshExecutorDeploy (660 s task + poll) and two
+#                  CaptureSnapshot attempts (120 s executionTimeout each + poll)
+#                  — ~25 min, inside sf-pipeline-policy.md §4's ≤75-min eod
+#                  target; 1h is ~2.4x that.
+#   eod_reconcile
+#          14400  the collector-dependent half (EODReconcile, heal loop, box
+#                  stop, weekly-exercise chain), started on
+#                  ne-data-collection-eod's terminal event. Must cover the
+#                  short readiness grade plus one full HealStartCollection
+#                  (10800 s) and still end before the 22:00 PT (01:00 ET)
+#                  alpha-engine-stop-trading cost guard when started at the
+#                  collection's worst-case finish (18:15 ET + declared caps =
+#                  20:55 ET); tests/test_v1_collection_readiness_wait.py
+#                  re-derives both bounds.
+#   (pre-split eod, 28800, for the record:) sf-pipeline-policy.md §4 gives the eod pipeline a ≤75-min
 #                  wall-clock target and no numeric ceiling (it must "include
 #                  the bounded heal loop"). It was 14400 (4h, 2.1× the longest
 #                  execution observed over 2026-07-31→09-04). The decoupled
@@ -1409,7 +1450,8 @@ def test_sf_file_set_matches_exemption_registry():
 _TOP_LEVEL_TIMEOUT_CEILING = {
     "step_function.json": 43200,
     "step_function_daily.json": 7200,
-    "step_function_eod.json": 28800,
+    "step_function_eod.json": 3600,
+    "step_function_eod_reconcile.json": 14400,
     "step_function_groom.json": 15000,
 }
 
@@ -1536,6 +1578,11 @@ def test_degraded_flag_scope_is_the_three_scheduled_pipelines():
         "step_function.json",
         "step_function_daily.json",
         "step_function_eod.json",
+        # alpha-engine-config-I11269 follow-up (2026-09-30): the post-close
+        # pipeline's collector-dependent half, split into its own machine. It
+        # is the same scheduled pipeline (sf-pipeline-policy.md §1.1), so it
+        # stays in scope.
+        "step_function_eod_reconcile.json",
     ]
     groom = _load("step_function_groom.json")
     assert "WriteCompletionMarker" not in groom["States"], (
