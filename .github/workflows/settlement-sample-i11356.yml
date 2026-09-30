@@ -84,3 +84,11 @@ jobs:
           if len(rows) < 45:
               raise SystemExit(f"only {len(rows)}/50 tickers returned a bar for {day}: {missing}")
           PY
+
+  # A sample that fails is a missing data point in the grading, so it pages the
+  # same way every other scheduled workflow here does.
+  notify-main-failure:
+    needs: [sample]
+    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
