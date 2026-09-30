@@ -1,0 +1,283 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "CloudTrail bounded evidence v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "collected_at",
+    "source_sha",
+    "window",
+    "status",
+    "sample",
+    "configuration",
+    "coverage",
+    "limits",
+    "requests",
+    "compressed_bytes",
+    "decoded_bytes",
+    "errors"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": "cloudtrail_evidence.v1"
+    },
+    "collected_at": {
+      "type": "string"
+    },
+    "source_sha": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{40}$"
+    },
+    "window": {
+      "type": "object",
+      "required": [
+        "start",
+        "end"
+      ],
+      "properties": {
+        "start": {
+          "type": "string"
+        },
+        "end": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "status": {
+      "enum": [
+        "verified_sample",
+        "unobserved",
+        "error",
+        "configuration_mismatch"
+      ]
+    },
+    "sample": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "required": [
+            "archive_bucket",
+            "archive_key",
+            "event_id",
+            "event_time",
+            "operation",
+            "principal",
+            "bucket",
+            "key"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "archive_bucket": {
+              "type": "string",
+              "minLength": 1
+            },
+            "archive_key": {
+              "type": "string",
+              "minLength": 1
+            },
+            "event_id": {
+              "type": "string",
+              "minLength": 1
+            },
+            "event_time": {
+              "type": "string",
+              "minLength": 1
+            },
+            "operation": {
+              "type": "string",
+              "minLength": 1
+            },
+            "principal": {
+              "type": "string",
+              "minLength": 1
+            },
+            "bucket": {
+              "type": "string",
+              "minLength": 1
+            },
+            "key": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    "configuration": {
+      "type": "object",
+      "required": [
+        "selectors",
+        "lifecycle",
+        "selectors_match",
+        "lifecycle_matches"
+      ],
+      "properties": {
+        "selectors": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "lifecycle": {
+          "type": [
+            "object",
+            "null"
+          ]
+        },
+        "selectors_match": {
+          "type": "boolean"
+        },
+        "lifecycle_matches": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": false
+    },
+    "coverage": {
+      "type": "object",
+      "required": [
+        "full_cycle_verified",
+        "current_day_partial",
+        "truncated",
+        "regions",
+        "partitions",
+        "scope"
+      ],
+      "properties": {
+        "full_cycle_verified": {
+          "const": false
+        },
+        "current_day_partial": {
+          "const": true
+        },
+        "truncated": {
+          "type": "boolean"
+        },
+        "regions": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "partitions": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": [
+              "prefix",
+              "objects_read",
+              "listing_complete"
+            ],
+            "properties": {
+              "prefix": {
+                "type": "string"
+              },
+              "objects_read": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "listing_complete": {
+                "type": "boolean"
+              }
+            },
+            "additionalProperties": false
+          }
+        },
+        "scope": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": false
+    },
+    "limits": {
+      "type": "object",
+      "required": [
+        "requests",
+        "bytes",
+        "seconds"
+      ],
+      "properties": {
+        "requests": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "bytes": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seconds": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        }
+      },
+      "additionalProperties": false
+    },
+    "requests": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "compressed_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "decoded_bytes": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "stage",
+          "type"
+        ],
+        "properties": {
+          "stage": {
+            "type": "string"
+          },
+          "type": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "verified_sample"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "sample": {
+            "type": "object"
+          },
+          "configuration": {
+            "properties": {
+              "selectors_match": {
+                "const": true
+              },
+              "lifecycle_matches": {
+                "const": true
+              }
+            }
+          },
+          "errors": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}
