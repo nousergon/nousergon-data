@@ -90,7 +90,14 @@ _FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 #
 # Pinned as an exact set: the gap cannot widen while that issue is open, and
 # an entry cannot outlive its fix without failing.
-_KNOWN_UNBOUND_EXPIRY = "2026-10-01"
+# Deadline moved 2026-10-01 -> 2026-10-31 (alpha-engine-config-I6897, Brian's
+# ruling 2026-10-01). Reason: nine of the eleven entries are states of the v1
+# weekly and daily machines, which Crucible v2 phase 4 deletes (target 10-30,
+# alpha-engine-config-I9760). Choosing new budgets for stages that are about to
+# be deleted is work with no reader. If v1 is not deleted by 10-31, this fails
+# again and the budgets get chosen then. The two step_function_eod_reconcile
+# entries survive v1 and must be fixed, not re-dated, before this deadline.
+_KNOWN_UNBOUND_EXPIRY = "2026-10-31"
 
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
