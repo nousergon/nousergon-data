@@ -95,6 +95,18 @@ NO_DRY_PATH = "no_dry_path"
 # pattern, not a list — the definition's own contract with its launchers.
 PREFLIGHT_ARGS_REF = "$.preflight_args"
 
+# The execution-state path that names the LAUNCHER box — the one box the sweep
+# runs on and can reach. A sendCommand stage whose ``InstanceIds`` is anything
+# else runs on a box the sweep does not have (EvalJudgeProcess targets
+# ``$.eval_judge_instance_id``, a dedicated spot box its own dispatcher
+# bootstraps — alpha-engine-config-I9329). WHERE a stage runs is read from the
+# definition, never inferred from what happens to be cloned on the sweep box:
+# crucible-research was cloned onto the sweep box around 2026-09-26, the
+# launcher file appeared in the checkout, and the on-disk probe below flipped
+# the stage to SWEEPABLE — so the sweep ran it on a box with no eval-judge.env
+# and graded the box's absence as the stage's failure (alpha-engine-config-I11779).
+LAUNCHER_BOX_INSTANCE_REF = "$.ec2_instance_id"
+
 SSM_SEND_COMMAND = "arn:aws:states:::aws-sdk:ssm:sendCommand"
 
 _BOX_ROOT = "/home/ec2-user/"
@@ -177,6 +189,13 @@ def _raw_commands_expression(state: dict) -> str:
     if "commands.$" in params:
         return params["commands.$"]
     return json.dumps(params.get("commands", []))
+
+
+def _instance_target(state: dict) -> str | None:
+    """The box a sendCommand stage targets: its ``InstanceIds.$`` path, or
+    ``None`` when the definition names none (a literal list, or absent)."""
+    ref = state.get("Parameters", {}).get("InstanceIds.$")
+    return ref if isinstance(ref, str) and ref.strip() else None
 
 
 def _box_dir(commands: list[str]) -> str | None:
@@ -397,6 +416,31 @@ def derive_stages(
                         f"stage threads {PREFLIGHT_ARGS_REF} but no "
                         f"{'launcher script' if launcher is None else 'working directory'} "
                         "could be derived from its commands"
+                    ),
+                    commands=commands,
+                    execution_timeout_seconds=timeout,
+                )
+            )
+            continue
+
+        # WHERE the stage runs is decided by the definition, BEFORE any look at
+        # the sweep box's disk. The checkout probe answers "is the file here";
+        # it cannot answer "does the stage run here", and the two came apart
+        # the day a second repo was cloned onto the sweep box.
+        target = _instance_target(state)
+        if target != LAUNCHER_BOX_INSTANCE_REF:
+            stages.append(
+                Stage(
+                    name=name,
+                    classification=UNSWEEPABLE,
+                    box_dir=box_dir,
+                    repo=repo,
+                    launcher=launcher,
+                    reason=(
+                        f"stage runs on {target or 'an undeclared target'}, not on the "
+                        f"launcher box ({LAUNCHER_BOX_INSTANCE_REF}) the sweep runs on — "
+                        "its environment (env files, venv) exists only on that other "
+                        "box, so a checkout of its launcher here proves nothing"
                     ),
                     commands=commands,
                     execution_timeout_seconds=timeout,

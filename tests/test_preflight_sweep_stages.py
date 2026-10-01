@@ -23,6 +23,7 @@ import pytest
 
 from infrastructure.preflight_sweep_stages import (
     BOX_DIR_TO_REPO,
+    LAUNCHER_BOX_INSTANCE_REF,
     NO_DRY_PATH,
     SWEEPABLE,
     UNSWEEPABLE,
@@ -35,6 +36,10 @@ from infrastructure.preflight_sweep_stages import (
     map_binding_disagreement,
     upstream_dependencies,
     upstream_dependency_disagreement,
+)
+from infrastructure.preflight_sweep_stages import (  # noqa: E402 — private helpers under test
+    _instance_target,
+    _iter_send_command_states,
 )
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
@@ -406,20 +411,68 @@ def test_the_dedicated_box_declaration_and_the_definition_agree_today(stages, ma
     assert declared <= derived_unsweepable
 
 
+def _populate_every_launcher(definition, bindings, root):
+    """Give every stage's launcher a real, flag-carrying file under ``root``."""
+    probe = derive_stages(definition, bindings, CONTEXT, checkout_root="/nonexistent")
+    for stage in probe:
+        if not (stage.box_dir and stage.launcher):
+            continue
+        path = root / stage.box_dir / stage.launcher
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("#!/bin/bash\n# --preflight-only\n")
+
+
+def test_a_launcher_checked_out_on_the_sweep_box_does_not_make_a_dedicated_stage_sweepable(
+    definition, bindings, tmp_path
+):
+    """The 2026-10-01 regression (alpha-engine-config-I11779). crucible-research
+    was cloned onto the sweep box, so EvalJudgeProcess's launcher became present
+    on disk and the on-disk probe classified the stage SWEEPABLE — the sweep then
+    ran it on a box with no eval-judge.env and graded that as the stage's own
+    failure. Where a stage runs is a property of the DEFINITION
+    (``InstanceIds.$``), so a populated checkout must change nothing."""
+    _populate_every_launcher(definition, bindings, tmp_path)
+    stages = derive_stages(definition, bindings, CONTEXT, checkout_root=str(tmp_path))
+    judge = next(s for s in stages
+                 if s.name == "ResearchPredictorParallel.EvalJudgeProcess")
+    assert judge.classification is UNSWEEPABLE
+    assert "$.eval_judge_instance_id" in judge.reason
+    # Every stage that targets the launcher box IS reachable once its file exists.
+    training = next(s for s in stages
+                    if s.name == "ResearchPredictorParallel.PredictorTraining")
+    assert training.classification is SWEEPABLE
+    # And the acknowledgement still agrees with the definition.
+    assert manifest_disagreement(stages, load_manifest(MANIFEST_PATH)) == []
+
+
+def test_only_the_judge_stage_targets_a_box_other_than_the_launcher_box(definition):
+    """Pins the discriminator against the live definition: if a second stage
+    moves to its own box, it must be acknowledged (or the sweep fails), and this
+    list is where that is noticed at review time."""
+    off_launcher = sorted(
+        name
+        for name, state in _iter_send_command_states(definition["States"])
+        if _instance_target(state) != LAUNCHER_BOX_INSTANCE_REF
+    )
+    assert off_launcher == ["ResearchPredictorParallel.EvalJudgeProcess"]
+
+
 def test_a_dedicated_box_entry_for_a_stage_that_became_sweepable_is_a_finding(
     definition, bindings, tmp_path
 ):
-    """The stale direction. Give every launcher a real file on disk and the
-    acknowledged stage is no longer UNSWEEPABLE — the entry now suppresses
-    nothing and must be dropped, loudly."""
-    reachable = derive_stages(definition, bindings, CONTEXT, checkout_root="/nonexistent")
-    for stage in reachable:
-        if not (stage.box_dir and stage.launcher):
-            continue
-        path = tmp_path / stage.box_dir / stage.launcher
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text("#!/bin/bash\n# --preflight-only\n")
-    sweepable_stages = derive_stages(definition, bindings, CONTEXT,
+    """The stale direction. Re-point the acknowledged stage at the launcher box
+    (the cause of the acknowledgement is gone) and give its launcher a real
+    file: it is now SWEEPABLE, the entry suppresses nothing, and must be
+    dropped loudly."""
+    moved = json.loads(json.dumps(definition))
+    judge = next(
+        state
+        for name, state in _iter_send_command_states(moved["States"])
+        if name == "ResearchPredictorParallel.EvalJudgeProcess"
+    )
+    judge["Parameters"]["InstanceIds.$"] = LAUNCHER_BOX_INSTANCE_REF
+    _populate_every_launcher(moved, bindings, tmp_path)
+    sweepable_stages = derive_stages(moved, bindings, CONTEXT,
                                      checkout_root=str(tmp_path))
     ack = {"dedicated_box_stages": [
         {"stage": "ResearchPredictorParallel.EvalJudgeProcess",
