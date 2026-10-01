@@ -257,6 +257,59 @@ def test_a_new_execution_resolves_latest_main(box):
     assert _head(box) == newer
 
 
+def test_the_first_call_never_reads_fetch_head(box):
+    """alpha-engine-config-I11780: `git pull` reads the checkout's shared FETCH_HEAD,
+    so any fetch overlapping it in the same checkout fails the pin with "Cannot
+    fast-forward to multiple branches". The helper must not use pull at all."""
+    code = "\n".join(
+        ln for ln in _HELPER.read_text().splitlines() if not ln.lstrip().startswith("#")
+    )
+    assert not re.search(r"\bgit\b[^\n]*\bpull\b", code)
+    assert "--no-write-fetch-head" in code
+
+
+def test_a_fetch_racing_the_first_call_does_not_fail_the_pin(box):
+    """The 2026-10-01 failure (ModelZooSelect, rc=128). Hammer the checkout with
+    unlocked fetches while a fresh execution resolves main each round; main moves
+    every round so the helper really fetches. With `git pull` this fails in nearly
+    every round; it must succeed in all of them and land on the new tip."""
+    import threading
+
+    stop = threading.Event()
+
+    def hammer():
+        while not stop.is_set():
+            subprocess.run(
+                ["git", "fetch", "-q", "origin", "main"],
+                cwd=box["checkout"], capture_output=True,
+                env={**os.environ, "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1"},
+            )
+
+    t = threading.Thread(target=hammer, daemon=True)
+    t.start()
+    try:
+        for i in range(8):
+            tip = _commit(box["author"], f"round-{i}")
+            r = _pin(box, f"race-{i}")
+            assert r.returncode == 0, (i, r.stderr)
+            assert _head(box) == tip
+    finally:
+        stop.set()
+        t.join(timeout=10)
+
+
+def test_a_non_fast_forward_still_fails_loud_after_bounded_retries(box):
+    """The retry is for transient fetch trouble, not a way to swallow a diverged
+    checkout: a local commit that origin/main does not contain must still fail."""
+    (box["checkout"] / "local.txt").write_text("x")
+    _git("add", "local.txt", cwd=box["checkout"])
+    _git("commit", "-q", "-m", "local-only", cwd=box["checkout"])
+    _commit(box["author"], "B")
+    r = _pin(box, "diverged-1")
+    assert r.returncode != 0
+    assert "could not fast-forward" in r.stderr
+
+
 @pytest.mark.parametrize("bad", ["", "../escape", "a/b", ".."])
 def test_refuses_an_execution_name_that_is_not_a_path_component(box, bad):
     assert _pin(box, bad).returncode != 0

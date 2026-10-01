@@ -33,9 +33,47 @@
 # All output goes to stderr so a stage whose StandardOutputContent is parsed
 # (ResolveZooSpecs) is unaffected.
 #
-# The body is one function called on the last line: bash parses the whole
+# The body is one function (plus the helper above) called on the last line: bash parses the whole
 # function before running it, so the pull below rewriting this very file (it
 # lives in the alpha-engine-data checkout) cannot change what executes.
+
+# Advance <checkout> to the tip of origin/main WITHOUT `git pull`.
+#
+# WHY (alpha-engine-config-I11780). `git pull --ff-only origin main` runs a fetch and
+# then reads <checkout>/.git/FETCH_HEAD, which is shared per-checkout state: fetch
+# truncates it at start and appends at the end, so two fetches overlapping in one
+# checkout leave TWO for-merge lines and the pull dies with "fatal: Cannot fast-forward
+# to multiple branches." (rc=128). The flock this helper runs under serialises pin
+# calls only — any git fetch in that checkout that does not hold the lock defeats it.
+# Measured 2026-10-01 on preflight-sweep-20261001T080010Z (ModelZooSelect); the
+# mechanism reproduces locally (a pull racing a bare fetch fails 98 of 100 times).
+#
+# So nothing here reads FETCH_HEAD: the tip comes from `git ls-remote` (no local
+# state), the object is fetched by exact SHA with --no-write-fetch-head, and the move
+# is `git merge --ff-only <sha>`. The contract is unchanged — latest main at the
+# start of the execution, fast-forward only, HEAD left where a pull would leave it.
+# Bounded retry, because the remaining failure modes (network blip, a ref/index lock
+# held by that same unlocked writer) are transient; a non-fast-forward is not, and
+# still fails after the last attempt.
+_exec_code_pin_advance_to_main() {
+  local checkout="$1" tip attempt=1 max=3
+  while :; do
+    if tip="$(git -C "$checkout" ls-remote origin refs/heads/main | awk 'NR==1{print $1}')" \
+       && [[ "$tip" =~ ^[0-9a-f]{40}$ ]] \
+       && { git -C "$checkout" cat-file -e "${tip}^{commit}" 2>/dev/null \
+            || git -C "$checkout" fetch -q --no-write-fetch-head origin "$tip"; } \
+       && git -C "$checkout" merge -q --ff-only "$tip"; then
+      return 0
+    fi
+    if [ "$attempt" -ge "$max" ]; then
+      echo "exec-code-pin: could not fast-forward ${checkout} to origin/main after ${max} attempts" >&2
+      return 1
+    fi
+    echo "exec-code-pin: advancing ${checkout} to origin/main failed (attempt ${attempt}/${max}); retrying" >&2
+    sleep $((attempt * 2))
+    attempt=$((attempt + 1))
+  done
+}
 
 _exec_code_pin_main() {
   set -euo pipefail
@@ -82,7 +120,7 @@ _exec_code_pin_main() {
     return 0
   fi
 
-  git -C "$checkout" pull --ff-only origin main
+  _exec_code_pin_advance_to_main "$checkout"
   sha="$(git -C "$checkout" rev-parse HEAD)"
   mkdir -p "$pin_dir"
   local tmp
