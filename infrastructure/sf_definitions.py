@@ -203,7 +203,13 @@ CODIFIED_FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     # infrastructure/lambdas/collection-readiness-probe/deploy.sh; the three
     # states carry TimeoutSeconds 60, below it, so the state binds.
     "alpha-engine-collection-readiness-probe": 90,
-    "alpha-engine-data-spot-dispatcher": 600,
+    # alpha-engine-data-spot-dispatcher (600s) was removed 2026-10-01: the
+    # cutover (#1930) took its last invoking state out of the v1 SFs in
+    # SF_DEFINITIONS. The data-collection stack's ASL still invokes it, but
+    # through a ${DispatcherFunctionArn} substitution and outside
+    # SF_DEFINITIONS, so no graded state names it and the row became a
+    # [codified-but-uninvoked] finding in check-lambda-timeout-drift.py, which
+    # kept the daily SF-ARN Drift Check red.
     "alpha-engine-eod-precondition-probe": 30,
     "alpha-engine-evaluator": 660,
     "alpha-engine-evaluator-director": 900,
