@@ -171,6 +171,17 @@ class TestConcurrencyDedupe:
         assert result["reason"] == "concurrent_skip"
         assert result["existing_instance_ids"] == ["i-existing"]
 
+    def test_concurrent_skip_carries_the_marker_key_a_poller_would_read(self):
+        # The workflow polls the in-flight box's marker on concurrent_skip;
+        # without the key it polled the literal string "null" until timeout
+        # (nousergon-data#1998, run 36822071260 attempt 2).
+        _install_stubs(running_instance_ids_impl=lambda *a, **kw: ["i-existing"])
+        index = _reload_index()
+        result = index.handler({"mode": "scheduled"}, None)
+        assert result["reason"] == "concurrent_skip"
+        assert result["marker_key"] == f"tmp/canary/{result['run_token']}.json"
+        assert "dispatched_at" not in result
+
     def test_probe_error_degrades_but_still_launches(self):
         def _raise(*a, **kw):
             raise _SpotProbeError("probe boom")

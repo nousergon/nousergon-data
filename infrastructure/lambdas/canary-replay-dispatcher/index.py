@@ -368,8 +368,17 @@ def _launch_canary_replay_spot(mode: str, research_ref: str, data_ref: str,
             "canary-replay box already live for token=%s (%s) — skipping launch",
             run_token, existing,
         )
+        # marker_key is carried here too: the per-PR poller treats
+        # concurrent_skip as "poll the in-flight box's marker", and it can
+        # only do that if it is told WHERE. Omitting it made the poller poll
+        # the literal key "null" for its whole 20-minute budget (measured
+        # 2026-10-01 on nousergon-data#1998, run 36822071260 attempt 2: the
+        # attempt-1 box was still shutting down when the re-run dispatched).
+        # No dispatched_at: this call launched nothing, so the poller's
+        # freshness floor stays 0 and it accepts the live box's own marker.
         return {"launched": False, "reason": "concurrent_skip",
-                "existing_instance_ids": existing, "run_token": run_token}
+                "existing_instance_ids": existing, "run_token": run_token,
+                "marker_key": f"tmp/canary/{run_token}.json"}
 
     try:
         _clear_stale_marker(run_token)
