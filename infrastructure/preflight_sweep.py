@@ -71,6 +71,7 @@ import concurrent.futures
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 import traceback
@@ -355,13 +356,48 @@ class AwsSurface:
 # ── Stage execution ──────────────────────────────────────────────────────────
 
 
+# A stage command may carry a box-teardown line meant for the box the SF
+# dedicates to that stage. The sweep runs every stage on ONE shared launcher
+# box, so such a line is not the stage's own teardown here — it is a timer
+# that terminates the box the sweep itself is running on.
+#
+# Measured 2026-09-26..30 (alpha-engine-config-I11728): EvalJudgeProcess's
+# command is ``trap "systemd-run --on-active=120 --unit=eval-judge-spot-teardown
+# /sbin/shutdown -h now" EXIT``. It was ``unsweepable`` (no crucible-research
+# clone) until the bootstrap began cloning that repo; from then on the stage ran,
+# its EXIT trap armed a 120s shutdown, and the box died ~2 minutes later with
+# the other stages still in flight — before the report, the metric and the log
+# upload. Five days of ``alpha-engine-preflight-sweep-no-run``.
+_BOX_TEARDOWN_RE = re.compile(
+    r"(?<![\w-])(?:systemd-run|shutdown|poweroff|halt|reboot)(?![\w-])"
+)
+
+
+def _is_box_teardown(line: str) -> bool:
+    return bool(_BOX_TEARDOWN_RE.search(line))
+
+
 def _stage_script(stage: Stage) -> str:
-    """The shell body for one stage: exactly the commands the SF would send.
+    """The shell body for one stage: the commands the SF would send, minus any
+    line that would stop the shared sweep box.
 
     Rendered from the definition, so the sweep runs the pipeline's own command
-    rather than a re-implementation of it that can drift.
+    rather than a re-implementation of it that can drift. The only departure is
+    ``_is_box_teardown`` lines, which are replaced by a visible ``echo`` (never
+    dropped silently) because the sweep's box is shut down once, by
+    ``preflight_sweep.sh``'s EXIT trap, after the report is written.
     """
-    return "set -eo pipefail\n" + "\n".join(stage.commands) + "\n"
+    lines = []
+    for command in stage.commands:
+        if _is_box_teardown(command):
+            lines.append(
+                "echo '[preflight-sweep] suppressed a box-teardown line from the "
+                "stage command: the sweep box is shared and is stopped once, by "
+                "preflight_sweep.sh'"
+            )
+        else:
+            lines.append(command)
+    return "set -eo pipefail\n" + "\n".join(lines) + "\n"
 
 
 def run_stage(
