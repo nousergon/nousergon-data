@@ -75,7 +75,7 @@ _POSTCLOSE_CHAIN = [
     # itself — pinned separately in test_sf_capture_snapshot_retry_wiring.py.
     # alpha-engine-config-I11269: CaptureSnapshot is the LAST work task of the
     # post-close machine, so its skip edge lands on the degraded-outcome tail.
-    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "CheckDegradedOutcome"),
+    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "StopTradingInstance"),
 ]
 
 _RECONCILE_CHAIN = [
@@ -100,7 +100,7 @@ _MACHINES = {
     "reconcile": (_RECONCILE_PATH, _RECONCILE_CHAIN),
 }
 
-_POSTCLOSE_TAIL = ["CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+_POSTCLOSE_TAIL = ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 _RECONCILE_TAIL = [
     "StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence",
     "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
@@ -260,12 +260,14 @@ class TestEntryEdgesRouteThroughGates:
 
     def test_snapshot_success_enters_degraded_outcome(self, postclose):
         # alpha-engine-config-I11269: CaptureSnapshot is the post-close
-        # machine's last work task; its success enters the Option-A terminal
-        # (the precondition probe it used to feed moved to the reconcile
-        # machine, pinned below).
+        # machine's last work task; its success stops the box (2026-10-01,
+        # Brian: "stop it when postclose part 1 completes") and then enters
+        # the Option-A terminal (the precondition probe it used to feed moved
+        # to the reconcile machine, pinned below).
         succ = [c["Next"] for c in postclose["CheckSnapshotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckDegradedOutcome"]
+        assert succ == ["StopTradingInstance"]
+        assert postclose["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
 
     def test_precondition_probe_feeds_reconcile_gate(self, reconcile):
         # config-I2702: the verify-by-artifact precondition probe feeds
@@ -347,17 +349,14 @@ class TestPaths:
         # CheckDegradedOutcome to the ordinary NormalSucceeded terminal.
         assert order[-len(tail):] == tail, order
 
-    def test_postclose_success_path_leaves_the_box_up(self, postclose):
-        # alpha-engine-config-I11269: the 16:00 machine deliberately does NOT
-        # stop the trading box on success — crucible-executor's post-close
-        # timers (trader-reconcile 16:45 ET, eod-reconcile-standalone
-        # 21:05 UTC, reference-rate-publish 21:15 UTC) need it up, and the
-        # reconcile machine's StopTradingInstance (plus the 22:00 PT
-        # alpha-engine-stop-trading cost guard) is what stops it.
+    def test_postclose_success_path_stops_the_box(self, postclose):
+        # Brian, 2026-10-01: "lets just stop it when postclose part 1
+        # completes" — skipped or not, the 16:00 machine stops the trading
+        # box before its terminal; the reconcile machine starts it again.
         for flags in (set(), {c[2] for c in _POSTCLOSE_CHAIN}):
             order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags=flags)
-            assert "StopTradingInstance" not in order, order
-        assert "StopTradingInstance" not in postclose
+            assert "StopTradingInstance" in order, order
+            assert order.index("StopTradingInstance") < order.index("CheckDegradedOutcome")
 
     def test_full_skip_still_stops_the_instance(self, reconcile):
         order = _walk(reconcile, _RECONCILE_CHAIN, skip_flags={c[2] for c in _RECONCILE_CHAIN})
@@ -394,7 +393,7 @@ class TestPaths:
         order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
         assert order[:2] == ["InitCaptureSnapshotRetryCounter", "CaptureSnapshot"]
-        assert order[-3:] == _POSTCLOSE_TAIL
+        assert order[-len(_POSTCLOSE_TAIL):] == _POSTCLOSE_TAIL
 
     def test_skip_data_phase_resumes_at_precondition_probe(self, reconcile):
         # config#1767: skip_post_market_data skips the ENTIRE data phase (now

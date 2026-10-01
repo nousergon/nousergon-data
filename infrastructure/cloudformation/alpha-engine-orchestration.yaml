@@ -597,10 +597,10 @@ Resources:
   # Note: EventBridge Scheduler uses a different API than EventBridge Rules.
   # CloudFormation support for Scheduler is via AWS::Scheduler::Schedule.
   #
-  # Role: late-night cost-guard backstop. IdleStopTradingSchedule (17:45
-  # ET, below), ne-postclose-reconcile-pipeline's ``StopTradingInstance``
-  # and both post-close machines' ``ForceStopInstance`` are the
-  # authoritative stoppers (success or failure path). This scheduler only fires if both of those paths missed —
+  # Role: late-night cost-guard backstop. The EOD SF's
+  # ``StopTradingInstance`` + ``ForceStopInstance`` states are the
+  # authoritative stoppers right after market close (success or failure
+  # path). This scheduler only fires if both of those paths missed —
   # e.g. EOD SF never started, daemon never triggered the SF, or AWS
   # SDK call failures left the instance running past expected stop.
   # 10:00 PM PT places it ~8 h after market close, well outside any
@@ -619,46 +619,6 @@ Resources:
         Arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances'
         RoleArn: !Ref EventBridgeEc2RoleArn
         Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
-        RetryPolicy:
-          MaximumRetryAttempts: 3
-          MaximumEventAgeInSeconds: 3600
-
-  # --------------------------------------------------------------------------
-  # EventBridge Scheduler — Stop Trading Instance between the two post-close
-  # halves (17:45 ET)
-  # --------------------------------------------------------------------------
-  # Brian, 2026-10-01: "can we shut it down after postclose part 1 and boot
-  # it back up when part 2 is ready to begin?" Since the 2026-09-30 split
-  # (#1996) ne-postclose-trading-pipeline ends ~16:02 ET with the box up,
-  # and ne-postclose-reconcile-pipeline does not start until
-  # ne-data-collection-eod (18:15 ET) reaches a terminal state, ~20:00 ET.
-  # Nothing needs the box in between once crucible-executor's post-close
-  # timers have run: trader-reconcile 16:45 America/New_York,
-  # eod-reconcile-standalone 21:05 UTC and reference-rate-publish 21:15 UTC
-  # (17:05 / 17:15 EDT, 16:05 / 16:15 EST). 17:45 ET clears all three in
-  # both DST seasons and is 30 min before the collector even starts.
-  #
-  # Restart needs nothing new: the reconcile pipeline already opens with
-  # StartTradingInstance + the SSM-readiness poll (its re-runnability guard),
-  # and EODReconcile reads the S3 snapshot part 1 captured, not live IB.
-  # Pinned by tests/test_trading_box_idle_stop.py.
-  IdleStopTradingSchedule:
-    Type: AWS::Scheduler::Schedule
-    Properties:
-      Name: alpha-engine-idle-stop-trading
-      Description: Stop trading EC2 between postclose part 1 and the reconcile half (17:45 ET)
-      ScheduleExpression: 'cron(45 17 ? * MON-FRI *)'
-      ScheduleExpressionTimezone: 'America/New_York'
-      FlexibleTimeWindow:
-        Mode: 'OFF'
-      State: ENABLED
-      Target:
-        Arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances'
-        RoleArn: !Ref EventBridgeEc2RoleArn
-        Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
-        RetryPolicy:
-          MaximumRetryAttempts: 3
-          MaximumEventAgeInSeconds: 3600
 
   # --------------------------------------------------------------------------
   # CloudWatch Alarms

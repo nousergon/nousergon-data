@@ -196,11 +196,12 @@ EOD_STAGES: tuple[Stage, ...] = (
     Stage("refresh_executor_deploy", "skip_refresh_executor_deploy",
           "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
           frozenset({"CheckSkipCaptureSnapshot"})),
-    # CheckDegradedOutcome is entered iff CaptureSnapshot succeeded (or was
-    # skipped): the exhausted-retry route goes to HandleFailure instead.
+    # StopTradingInstance (and then CheckDegradedOutcome) is entered iff
+    # CaptureSnapshot succeeded (or was skipped): the exhausted-retry route
+    # goes to HandleFailure instead.
     Stage("capture_snapshot", "skip_capture_snapshot",
           "CheckSkipCaptureSnapshot", "CaptureSnapshot",
-          frozenset({"CheckDegradedOutcome"})),
+          frozenset({"StopTradingInstance", "CheckDegradedOutcome"})),
 )
 
 EOD_RECONCILE_STAGES: tuple[Stage, ...] = (

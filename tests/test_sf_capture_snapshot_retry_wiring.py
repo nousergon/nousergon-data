@@ -77,11 +77,12 @@ class TestRetryCounterInitialization:
         # entirely — this fix must not disturb that rerun path.
         # alpha-engine-config-I11269: CaptureSnapshot is the 16:00 machine's
         # last work task since the post-close split, so the bypass lands on
-        # its degraded-outcome tail (the precondition probe it used to reach
-        # moved to the reconcile machine). Still a bypass of the whole retry
-        # machinery, and still gated on operator-replay.
+        # its box stop and then the degraded-outcome tail (the precondition
+        # probe it used to reach moved to the reconcile machine). Still a
+        # bypass of the whole retry machinery, and still gated on
+        # operator-replay.
         st = eod["CheckSkipCaptureSnapshot"]
-        assert st["Choices"][0]["Next"] == "CheckDegradedOutcome"
+        assert st["Choices"][0]["Next"] == "StopTradingInstance"
         assert st["Default"] == "InitCaptureSnapshotRetryCounter"
         retry_states = {
             "InitCaptureSnapshotRetryCounter", "CaptureSnapshot", "WaitForCaptureSnapshot",

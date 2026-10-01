@@ -530,7 +530,7 @@
         {
           "Variable": "$.snapshot_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckDegradedOutcome"
+          "Next": "StopTradingInstance"
         },
         {
           "Variable": "$.snapshot_poll.Status",
@@ -843,7 +843,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckDegradedOutcome"
+          "Next": "StopTradingInstance"
         }
       ],
       "Default": "InitCaptureSnapshotRetryCounter"
@@ -857,9 +857,39 @@
       "ResultPath": "$.capture_snapshot_retry",
       "Next": "CaptureSnapshot"
     },
+    "StopTradingInstance": {
+      "Type": "Task",
+      "Comment": "Brian, 2026-10-01: \"lets just stop it when postclose part 1 completes\". Stops the trading box as soon as the close-time work (CaptureSnapshot) is done, on both the normal and the operator-replay skip path. Nothing else needs the box until ne-postclose-reconcile-pipeline, which starts it again itself (StartTradingInstance + SSM readiness) once ne-data-collection-eod (18:15 ET) finishes. crucible-executor's post-close timers (alpha-engine-trader-reconcile 16:45 America/New_York, alpha-engine-eod-reconcile-standalone 21:05 UTC, alpha-engine-reference-rate-publish 21:15 UTC) are all Persistent=true and documented to run late on the next boot for the same day, idempotently, so they now run at that evening boot instead of on a box this pipeline used to leave idling. Same task shape as the reconcile pipeline's StopTradingInstance; a hard failure routes to HandleFailure -> ForceStopInstance, and the 22:00 PT alpha-engine-stop-trading schedule remains the backstop.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.stop_result",
+      "Next": "CheckDegradedOutcome"
+    },
     "CheckDegradedOutcome": {
       "Type": "Choice",
-      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set by any Set*DegradedFlag state this execution passed (market-hours gate unverified, mutex fail-open, deploy-drift degrade/observe). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): this pipeline no longer stops the trading box on its success path. Measured before the split, the box was up from the ~16:00 ET close until this pipeline's StopTradingInstance at ~19:30-21:47 ET, and three co-tenant units on the box are scheduled inside that window and rely on it: crucible-executor alpha-engine-trader-reconcile.timer (16:45 America/New_York, moved there by alpha-engine-config-I11545 precisely to clear the measured v1 stop), alpha-engine-eod-reconcile-standalone.timer (21:05 UTC) and alpha-engine-reference-rate-publish.timer (21:15 UTC). Stopping the box minutes after the close would kill all three every day. Once those have run, the alpha-engine-idle-stop-trading schedule (17:45 America/New_York, Brian 2026-10-01) stops the box; ne-postclose-reconcile-pipeline starts it again itself, stops it after EODReconcile, and the 22:00 PT alpha-engine-stop-trading schedule remains the cost-guard backstop if the reconcile pipeline never runs. The failure path is unchanged: HandleFailure -> ForceStopInstance still releases the box on any hard failure here.",
+      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set by any Set*DegradedFlag state this execution passed (market-hours gate unverified, mutex fail-open, deploy-drift degrade/observe). Since 2026-10-01 (Brian: \"lets just stop it when postclose part 1 completes\") every route here has passed StopTradingInstance; the reconcile pipeline starts the box again for its own half.",
       "Choices": [
         {
           "And": [
@@ -934,7 +964,7 @@
     "DegradedRun": {
       "Type": "Fail",
       "Error": "DegradedRun",
-      "CausePath": "States.Format('EOD pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699): a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. The trading box is left running for ne-postclose-reconcile-pipeline, which stops it after EODReconcile.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
+      "CausePath": "States.Format('EOD pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699): a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. The trading box was stopped by StopTradingInstance; ne-postclose-reconcile-pipeline starts it again for its own half.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
       "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here. It WAS an enumeration, and it drifted \u2014 4 states set $.degraded_summary in this definition before the alpha-engine-config-I11269-follow-up split (SetDataSpotDegradedFlag, SetDegradedFlag, SetMutexAcquireDegradedFlag, SetWeeklyExerciseDegradedFlag) and the hardcoded string named one. On 2026-08-11 the preopen terminal asserted 'run_daemon_restart_failed and/or daily_data_spot_fail_open' when neither fired; the real reason, daily_scanner_fail_open, appeared nowhere, and the message sent the operator hunting for a PublishDataSpotFailureImmediate event that could not exist on that path. An enumeration that drifts is worse than boilerplate because it reads as specific (sf-pipeline-policy.md \u00a72.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not \u2014 a defensive fallback here would let that guarantee lapse silently. JsonToString takes the WHOLE summary rather than $.degraded_summary.stage_error, which not every path sets."
     },
     "HandleFailure": {
