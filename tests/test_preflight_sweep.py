@@ -87,6 +87,76 @@ def _stage(name="DataPhase1"):
     )
 
 
+# ── The sweep never stops its own (shared) box mid-run ───────────────────────
+# alpha-engine-config-I11728: EvalJudgeProcess's command arms a 120s
+# `systemd-run ... shutdown -h now` EXIT trap meant for its dedicated SF box.
+# On the sweep's shared launcher box that trap terminated the box ~2 minutes
+# into the run, before the report, metric or log upload, for five days.
+
+
+def _rendered_stages():
+    definition = json.loads(SF_PATH.read_text())
+    manifest = json.loads(MANIFEST_PATH.read_text())
+    from infrastructure.preflight_sweep_stages import (
+        apply_map_bindings,
+        derive_required_map_bindings,
+        derive_shell_run_bindings,
+        derive_stages,
+    )
+
+    base = derive_shell_run_bindings(definition)
+    base.setdefault("run_date", "2026-09-30")
+    bindings = apply_map_bindings(base, manifest)
+    context = {"Execution": {"Name": "preflight-sweep-test", "Id": "preflight-sweep:test"}}
+    return derive_stages(definition, bindings, context, "/home/ec2-user/")
+
+
+def test_a_stage_teardown_trap_is_suppressed_not_run():
+    stage = _stage()
+    stage.commands = [
+        "set -eo pipefail",
+        'trap "systemd-run --on-active=120 --unit=x /sbin/shutdown -h now >/dev/null 2>&1 || true" EXIT',
+        "echo hi",
+    ]
+    script = ps._stage_script(stage)
+    assert "systemd-run" not in script.replace("suppressed", "")
+    assert "shutdown -h" not in script
+    assert "suppressed a box-teardown line" in script
+    assert "echo hi" in script
+
+
+def test_ordinary_commands_are_not_mistaken_for_teardown():
+    for line in (
+        "cd /home/ec2-user/alpha-engine-data",
+        "bash infrastructure/spot_data_phase1.sh --preflight-only",
+        "python -m foo --halt-on-error --no-shutdown-hook",
+    ):
+        assert not ps._is_box_teardown(line), line
+
+
+def test_no_stage_the_sweep_runs_can_stop_the_shared_box():
+    """Every stage rendered from the REAL definition must come out of
+    `_stage_script` with no live shutdown/systemd-run line, whatever a future
+    stage adds to its own command."""
+    stages = _rendered_stages()
+    assert stages, "no stages rendered from step_function.json"
+    live = []
+    for st in stages:
+        for ln in ps._stage_script(st).splitlines():
+            if ln.startswith("echo '[preflight-sweep] suppressed"):
+                continue
+            if ps._is_box_teardown(ln):
+                live.append((st.name, ln))
+    assert not live, live
+
+
+def test_the_known_eval_judge_teardown_trap_is_actually_in_the_definition():
+    """Guards the guard: if the SF stops carrying the trap this test should be
+    revisited rather than the suppression silently becoming dead code."""
+    judge = [s for s in _rendered_stages() if s.name.endswith("EvalJudgeProcess")]
+    assert judge and any(ps._is_box_teardown(c) for c in judge[0].commands)
+
+
 # ── Per-stage verdicts ───────────────────────────────────────────────────────
 
 
