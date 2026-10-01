@@ -225,6 +225,7 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
         from collectors.constituents import (
             SectorCoverageIncomplete,
             _fetch_constituents,
+            _load_previous_snapshot,
             resolve_sector_coverage,
         )
         (
@@ -262,7 +263,14 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
         )
     unmapped = [t for t in tickers if t not in sector_map]
     try:
-        sector_fallback = resolve_sector_coverage(tickers, sector_map, sector_etf_map)
+        # Same previous snapshot collect() reads (alpha-engine-config-I11785),
+        # so a brand-new member collect() would withhold does not fail here.
+        previous = _load_previous_snapshot(
+            ctx.bucket, "market_data/", ctx.run_date or ctx.today,
+        )
+        sector_fallback, withheld = resolve_sector_coverage(
+            tickers, sector_map, sector_etf_map, previous=previous,
+        )
     except SectorCoverageIncomplete as exc:
         return CheckResult(
             name="constituents_fetch",
@@ -275,7 +283,12 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
             elapsed_seconds=time.time() - t0,
         )
 
-    ctx.fresh_constituents = set(tickers)
+    ctx.fresh_constituents = set(tickers) - set(withheld)
+    withheld_note = (
+        f"; {len(withheld)} brand-new member(s) collect() will withhold "
+        f"until classifiable ({', '.join(sorted(withheld))})"
+        if withheld else ""
+    )
     fallback_note = (
         f"; {len(sector_fallback)} sector(s) via collect()'s yfinance fallback "
         f"({', '.join(sorted(sector_fallback))})"
@@ -286,11 +299,12 @@ def check_constituents_fetch(ctx: PreflightContext) -> CheckResult:
         status="ok",
         message=(
             f"Wikipedia OK: {len(tickers)} tickers ({sp500} S&P 500 + {sp400} S&P 400)"
-            f"{fallback_note}"
+            f"{fallback_note}{withheld_note}"
         ),
         details={
             "total": len(tickers), "sp500": sp500, "sp400": sp400,
             "sector_fallback": sector_fallback,
+            "withheld_members": withheld,
         },
         elapsed_seconds=time.time() - t0,
     )
