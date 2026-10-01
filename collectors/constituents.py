@@ -260,6 +260,25 @@ _YF_INDUSTRY_TO_GICS: dict[str, str] = {
     "Packaging & Containers": "Materials",
 }
 
+# Declared sector for a member NO source can classify yet, keyed by ticker:
+# ``(gics_sector, valid_through, why)``. S&P adds a spin-off to the index on
+# its distribution date, so SPY holds the new ticker before Wikipedia lists it
+# and before yfinance has a quote for it (``sector=''``, ``industry=''``) —
+# 2026-10-01: VYLR (Vylor, Corteva's seed business) failed morning_enrich and
+# degraded that day's preopen run. Consulted only for members STILL unmapped
+# after Wikipedia and yfinance, so a real source always wins. ``valid_through``
+# is an ISO date after which the entry is ignored and the member raises as
+# before: a declaration must not outlive the lag it papers over.
+_SECTOR_OVERRIDES: dict[str, tuple[str, str, str]] = {
+    "VYLR": (
+        "Materials",
+        "2026-10-31",
+        "spin-off of CTVA (GICS Materials, Fertilizers & Agricultural "
+        "Chemicals), distributed 2026-10-01",
+    ),
+}
+
+
 # Pause between the fallback's per-ticker yfinance calls. Same value and
 # rationale as collectors/universe_classification.py (avoids HTTP 429). The
 # fallback only runs for members Wikipedia has not classified yet — a
@@ -578,8 +597,51 @@ def resolve_sector_coverage(
             f"for the universe. Sample: {unmapped[:10]}. Aborting before write."
         )
     sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
+    _apply_sector_overrides(tickers, sector_map, sector_etf_map, sector_fallback)
     _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
     return sector_fallback
+
+
+def _apply_sector_overrides(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_etf_map: dict[str, str],
+    sector_fallback: dict[str, dict[str, str]],
+    today: str | None = None,
+) -> None:
+    """Fill still-unmapped members from ``_SECTOR_OVERRIDES``, in place.
+
+    Runs after the yfinance fallback, so only a member neither Wikipedia nor
+    yfinance could classify is touched. An entry past its ``valid_through``
+    date is ignored and the member falls through to the coverage gate. The
+    evidence replaces the yfinance error in ``sector_fallback`` so the
+    published record says where the sector came from.
+    """
+    today = today or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    for ticker in tickers:
+        if ticker in sector_map or ticker not in _SECTOR_OVERRIDES:
+            continue
+        gics, valid_through, why = _SECTOR_OVERRIDES[ticker]
+        if today > valid_through:
+            logger.error(
+                "Sector override for %s expired %s — not applied; remove it "
+                "or confirm a source now classifies the ticker", ticker, valid_through,
+            )
+            continue
+        sector_map[ticker] = gics
+        sector_etf_map[ticker] = GICS_TO_ETF[gics]
+        prior = sector_fallback.get(ticker, {}).get("error")
+        sector_fallback[ticker] = {
+            "source": "declared_override",
+            "sector": gics,
+            "valid_through": valid_through,
+            "why": why,
+            **({"yfinance_error": prior} if prior else {}),
+        }
+        logger.warning(
+            "Sector override: %s -> %s (%s; valid through %s)",
+            ticker, gics, why, valid_through,
+        )
 
 
 def _fill_missing_sectors(

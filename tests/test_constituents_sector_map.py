@@ -732,3 +732,77 @@ def test_the_typed_error_is_narrow_enough_to_opt_out_of(tmp_path):
     """
     assert issubclass(constituents.ConstituentsUnavailable, RuntimeError)
     assert constituents.ConstituentsUnavailable is not RuntimeError
+
+
+def _vylr_fetch():
+    return (
+        ["AAPL", "VYLR"],
+        {"AAPL": "Information Technology"},
+        {"AAPL": "XLK"},
+        {},
+        2,
+        0,
+        constituents.SsgaWeights(),
+    )
+
+
+def test_declared_override_classifies_a_spin_off_no_source_knows_yet() -> None:
+    """2026-10-01: S&P added VYLR (Corteva's seed spin-off) on its
+    distribution date, before Wikipedia listed it and before yfinance had a
+    quote (sector='' industry=''). The declared override supplies the sector
+    and the published evidence says so, instead of failing morning_enrich."""
+    with patch("collectors.constituents._fetch_constituents", side_effect=_vylr_fetch), \
+         patch(
+             "collectors.constituents._yfinance_classification",
+             return_value={"VYLR": {"sector": "", "industry": ""}},
+         ), \
+         patch.object(constituents, "_SECTOR_OVERRIDES",
+                      {"VYLR": ("Materials", "2999-12-31", "spin-off of CTVA")}):
+        result = constituents.collect(bucket="any", dry_run=True)
+    assert result["status"] == "ok_dry_run"
+    assert "VYLR" in result["tickers"]
+
+
+def test_override_evidence_records_source_and_yfinance_error() -> None:
+    tickers = ["VYLR"]
+    sector_map: dict[str, str] = {}
+    etf_map: dict[str, str] = {}
+    fallback = {"VYLR": {"source": "yfinance", "error": "no GICS mapping"}}
+    with patch.object(constituents, "_SECTOR_OVERRIDES",
+                      {"VYLR": ("Materials", "2026-10-31", "spin-off of CTVA")}):
+        constituents._apply_sector_overrides(
+            tickers, sector_map, etf_map, fallback, today="2026-10-02"
+        )
+    assert sector_map == {"VYLR": "Materials"}
+    assert etf_map == {"VYLR": constituents.GICS_TO_ETF["Materials"]}
+    assert fallback["VYLR"]["source"] == "declared_override"
+    assert fallback["VYLR"]["yfinance_error"] == "no GICS mapping"
+
+
+def test_expired_override_is_ignored_and_the_gate_still_raises() -> None:
+    """A declaration must not outlive the lag it papers over: past
+    valid_through the member falls through to the coverage gate."""
+    with patch("collectors.constituents._fetch_constituents", side_effect=_vylr_fetch), \
+         patch(
+             "collectors.constituents._yfinance_classification",
+             return_value={"VYLR": {"sector": "", "industry": ""}},
+         ), \
+         patch.object(constituents, "_SECTOR_OVERRIDES",
+                      {"VYLR": ("Materials", "2000-01-01", "spin-off of CTVA")}):
+        with pytest.raises(constituents.SectorCoverageIncomplete):
+            constituents.collect(bucket="any", dry_run=True)
+
+
+def test_a_real_source_wins_over_the_override() -> None:
+    sector_map = {"VYLR": "Consumer Staples"}
+    etf_map = {"VYLR": "XLP"}
+    with patch.object(constituents, "_SECTOR_OVERRIDES",
+                      {"VYLR": ("Materials", "2999-12-31", "spin-off of CTVA")}):
+        constituents._apply_sector_overrides(["VYLR"], sector_map, etf_map, {})
+    assert sector_map["VYLR"] == "Consumer Staples"
+
+
+def test_every_declared_override_names_a_gics_sector_with_an_etf() -> None:
+    for ticker, (gics, valid_through, why) in constituents._SECTOR_OVERRIDES.items():
+        assert gics in constituents.GICS_TO_ETF, ticker
+        assert len(valid_through) == 10 and why, ticker
