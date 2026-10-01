@@ -652,15 +652,50 @@ def _clause_inventory_writers_declared(store: ev.GateStore, units: list[Unit]) -
     )
 
 
+#: The audit's own baseline date. A descriptor whose ``audit.baseline_date`` is
+#: this date is one of the audit's 46 units; a later date is a unit registered
+#: AFTER the audit (D48, D49: ``baseline_date: 2026-09-21``), which the audit's
+#: fixed §3/§5 tallies cannot contain. Counting those against the audit's totals
+#: turned phase 0 red on 2026-09-21 for registering more than the audit saw.
+AUDIT_BASELINE_DATE = "2026-09-14"
+
+
+def _audit_units(units: list[Unit]) -> tuple[list[Unit], list[Unit]]:
+    """Split descriptors into (the audit's units, units registered after it)."""
+    audited: list[Unit] = []
+    added: list[Unit] = []
+    for unit in units:
+        baseline = str(((unit.raw or {}).get("audit") or {}).get("baseline_date", ""))
+        (audited if baseline == AUDIT_BASELINE_DATE else added).append(unit)
+    return audited, added
+
+
+def _added_note(added: list[Unit]) -> str:
+    if not added:
+        return ""
+    return (
+        f"; {len(added)} unit(s) registered after the {AUDIT_BASELINE_DATE} audit, "
+        f"graded by their own clauses and not by the audit's tallies: "
+        f"{sorted(u.unit_id for u in added)}"
+    )
+
+
 def _clause_board_population_complete(store: ev.GateStore, units: list[Unit]) -> Clause:
-    """One descriptor per audit unit, and the count says so out loud."""
+    """One descriptor per audit unit, and the count says so out loud.
+
+    Only descriptors carrying the audit's own baseline date count toward the
+    audit's 46. A unit registered later is not a transcription slip; it is
+    named in the detail instead of moving the count.
+    """
     expected = 46
+    audited, added = _audit_units(units)
     return Clause(
         "data.board.population_complete",
         f"every one of the audit's {expected} units has a committed descriptor",
-        len(units) == expected,
-        f"{len(units)} descriptor(s) under registry.d/units against {expected} audit units"
-        + ("" if len(units) == expected else f"; missing or extra: {len(units) - expected:+d}"),
+        len(audited) == expected,
+        f"{len(audited)} audit descriptor(s) under registry.d/units against {expected} audit units"
+        + ("" if len(audited) == expected else f"; missing or extra: {len(audited) - expected:+d}")
+        + _added_note(added),
         ("registry.d/units/",),
         phase="data-phase0",
         source="registry.d/units",
@@ -676,8 +711,9 @@ def _clause_board_cells_reconciled(store: ev.GateStore, units: list[Unit]) -> Cl
     the only cheap check that exists against the one input everything else is
     built on.
     """
+    audited, added = _audit_units(units)
     totals: dict[str, int] = {}
-    for unit in units:
+    for unit in audited:
         for state in unit.cells.values():
             totals[state] = totals.get(state, 0) + 1
     expected = {"PRESENT": 214, "ABSENT": 126, "BROKEN": 46, "UNVERIFIED": 28}
@@ -688,7 +724,8 @@ def _clause_board_cells_reconciled(store: ev.GateStore, units: list[Unit]) -> Cl
         "(214 PRESENT / 126 ABSENT / 46 BROKEN / 28 UNVERIFIED over 414 cells)",
         met,
         f"transcribed {sum(totals.values())} cells as {totals}; audit §5 published {expected}"
-        + ("" if met else " — the transcription and the audit disagree"),
+        + ("" if met else " — the transcription and the audit disagree")
+        + _added_note(added),
         ("alpha-engine-config/private-docs/data_collection_audit_260914.md §5",),
         phase="data-phase0",
         source="registry.d/units",
