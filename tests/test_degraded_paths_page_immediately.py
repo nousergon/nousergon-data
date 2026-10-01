@@ -245,6 +245,7 @@ _NO_IMMEDIATE_PAGE.update({
         "ScannerResourceKillDegraded",
         "MarkRegimeSubstrateDegraded",
         "MarkChallengerShadowDegraded",
+        "MarkThinkTankCoverageDegraded",
         "MarkRegimeRetrospectiveEvalDegraded",
         "MarkEvalJudgeDegraded",
         "MarkEvalRollingMeanDegraded",
