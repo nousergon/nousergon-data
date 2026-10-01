@@ -311,7 +311,17 @@ def collect(
 
     # alpha-engine-config-I11468: threshold, yfinance fallback, full-coverage
     # gate — one function, shared with sf_preflight.check_constituents_fetch.
-    sector_fallback = resolve_sector_coverage(tickers, sector_map, sector_etf_map)
+    # alpha-engine-config-I11785: the previous snapshot lets it carry a known
+    # sector forward and withhold a brand-new member nothing can classify yet,
+    # instead of failing the run.
+    previous = _load_previous_snapshot(bucket, s3_prefix, run_date)
+    sector_fallback, withheld = resolve_sector_coverage(
+        tickers, sector_map, sector_etf_map, previous=previous,
+    )
+    if withheld:
+        tickers, sp500_count, sp400_count = _drop_withheld(
+            withheld, tickers, sp500_count, sp400_count, weights,
+        )
 
     # Sub-industry is additive/best-effort — NOT a hard gate like sector
     # above. Nothing downstream consumes it yet (config#934 narrow slice),
@@ -390,6 +400,9 @@ def collect(
         # Wikipedia's GICS table, with the raw yfinance evidence
         # (alpha-engine-config-I11468). Empty in a week with no index adds.
         "sector_fallback": sector_fallback,
+        # Brand-new index members left OUT of this snapshot because no source
+        # could classify them yet (alpha-engine-config-I11785). Empty normally.
+        "withheld_members": withheld,
         "sp500_count": sp500_count,
         "sp400_count": sp400_count,
         "total_count": len(tickers),
@@ -565,7 +578,8 @@ def resolve_sector_coverage(
     tickers: list[str],
     sector_map: dict[str, str],
     sector_etf_map: dict[str, str],
-) -> dict[str, dict[str, str]]:
+    previous: dict | None = None,
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
     """Complete ``sector_map`` / ``sector_etf_map`` for every member, or raise.
 
     alpha-engine-config-I11468, lifted out of ``collect()`` so the weekly
@@ -581,11 +595,26 @@ def resolve_sector_coverage(
        yfinance calls) onto yfinance's taxonomy.
     2. The members Wikipedia has not classified yet get a sector from
        yfinance (``_fill_missing_sectors``; mutates both maps in place).
-    3. EVERY member must then have a GICS sector AND a sector ETF, or
-       ``SectorCoverageIncomplete``.
+    3. Members still unmapped take a declared override
+       (``_SECTOR_OVERRIDES``), then the sector they carried in ``previous``,
+       the last snapshot published before this run (alpha-engine-config-I11785).
+       A real past GICS classification is not "Unknown"; it covers a member
+       whose sources blank transiently.
+    4. A member STILL unmapped that ``previous`` proves is brand new (absent
+       from its ``tickers``) is WITHHELD, not fatal (alpha-engine-config-I11785):
+       S&P adds a spin-off on its distribution date, before any source can
+       classify it (2026-10-01: VYLR degraded the preopen run). It is left out
+       of every map and returned in ``withheld``; ``collect()`` drops it from
+       the published roster and logs an ERROR, which is the alert. It enters
+       the universe on the first run a source classifies it.
+    5. EVERY remaining member must then have a GICS sector AND a sector ETF,
+       or ``SectorCoverageIncomplete``. With ``previous=None`` (no prior
+       snapshot readable) nothing can be proven new, so nothing is withheld
+       and an unclassifiable member raises exactly as before.
 
-    Returns the ``sector_fallback`` evidence ``collect()`` publishes
-    (``{}`` on a normal week, which makes no yfinance call at all).
+    Returns ``(sector_fallback, withheld)``: the fallback evidence
+    ``collect()`` publishes (``{}`` on a normal week, which makes no yfinance
+    call at all) and ``{ticker: evidence}`` for withheld new members.
     """
     unmapped = [t for t in tickers if t not in sector_map]
     if len(unmapped) > _UNMAPPED_SECTOR_HARD_FAIL_THRESHOLD:
@@ -598,8 +627,135 @@ def resolve_sector_coverage(
         )
     sector_fallback = _fill_missing_sectors(tickers, sector_map, sector_etf_map)
     _apply_sector_overrides(tickers, sector_map, sector_etf_map, sector_fallback)
-    _assert_full_sector_coverage(tickers, sector_map, sector_etf_map, sector_fallback)
-    return sector_fallback
+    withheld: dict[str, dict[str, str]] = {}
+    if previous is not None:
+        _carry_previous_sectors(tickers, sector_map, sector_etf_map, sector_fallback, previous)
+        withheld = _withhold_new_unclassified(tickers, sector_map, sector_fallback, previous)
+    remaining = [t for t in tickers if t not in withheld]
+    _assert_full_sector_coverage(remaining, sector_map, sector_etf_map, sector_fallback)
+    return sector_fallback, withheld
+
+
+def _carry_previous_sectors(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_etf_map: dict[str, str],
+    sector_fallback: dict[str, dict[str, str]],
+    previous: dict,
+) -> None:
+    """Fill still-unmapped members from the previous snapshot's sector, in place."""
+    prev_sectors = previous.get("sector_map") or {}
+    prev_date = previous.get("date", "unknown")
+    for ticker in tickers:
+        if ticker in sector_map:
+            continue
+        gics = prev_sectors.get(ticker)
+        if gics not in GICS_TO_ETF:
+            continue
+        sector_map[ticker] = gics
+        sector_etf_map[ticker] = GICS_TO_ETF[gics]
+        prior = sector_fallback.get(ticker, {}).get("error")
+        sector_fallback[ticker] = {
+            "source": "previous_snapshot",
+            "sector": gics,
+            "snapshot_date": prev_date,
+            **({"yfinance_error": prior} if prior else {}),
+        }
+        logger.warning(
+            "Sector carried from the %s snapshot: %s -> %s (no current source "
+            "classified it: %s)", prev_date, ticker, gics, prior,
+        )
+
+
+def _withhold_new_unclassified(
+    tickers: list[str],
+    sector_map: dict[str, str],
+    sector_fallback: dict[str, dict[str, str]],
+    previous: dict,
+) -> dict[str, dict[str, str]]:
+    """Return ``{ticker: evidence}`` for unmapped members absent from ``previous``.
+
+    Removes their entries from ``sector_fallback``: they are not published
+    members, so their evidence travels in ``withheld`` instead.
+    """
+    prev_tickers = set(previous.get("tickers") or [])
+    if not prev_tickers:
+        return {}
+    withheld: dict[str, dict[str, str]] = {}
+    for ticker in tickers:
+        if ticker in sector_map or ticker in prev_tickers:
+            continue
+        reason = (sector_fallback.pop(ticker, None) or {}).get(
+            "error", "no Wikipedia GICS row and no yfinance classification"
+        )
+        withheld[ticker] = {
+            "reason": reason,
+            "absent_from_snapshot": previous.get("date", "unknown"),
+        }
+    if withheld:
+        logger.error(
+            "Withholding %d brand-new index member(s) no source can classify yet "
+            "(alpha-engine-config-I11785): %s. They are left out of today's "
+            "constituents and join on the first run a source classifies them. "
+            "If one persists for days, add a dated _SECTOR_OVERRIDES entry.",
+            len(withheld), withheld,
+        )
+    return withheld
+
+
+def _load_previous_snapshot(bucket: str, s3_prefix: str, run_date: str) -> dict | None:
+    """The newest ``weekly/{date}/constituents.json`` dated before ``run_date``.
+
+    alpha-engine-config-I11785. ``None`` when none is readable, which makes
+    ``resolve_sector_coverage`` fail closed: nothing can be proven new, so
+    nothing is withheld.
+    """
+    try:
+        s3 = boto3.client("s3")
+        dates: list[str] = []
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(
+            Bucket=bucket, Prefix=f"{s3_prefix}weekly/", Delimiter="/",
+        ):
+            for cp in page.get("CommonPrefixes") or []:
+                date = cp.get("Prefix", "").rstrip("/").rsplit("/", 1)[-1]
+                if re.fullmatch(r"\d{4}-\d{2}-\d{2}", date) and date < run_date:
+                    dates.append(date)
+        for date in sorted(dates, reverse=True)[:5]:
+            try:
+                resp = s3.get_object(
+                    Bucket=bucket, Key=f"{s3_prefix}weekly/{date}/constituents.json",
+                )
+                snapshot = json.loads(resp["Body"].read())
+            except Exception:
+                continue
+            if isinstance(snapshot, dict) and snapshot.get("tickers"):
+                snapshot.setdefault("date", date)
+                return snapshot
+    except Exception as exc:
+        logger.warning("Previous constituents snapshot unreadable: %s", exc)
+    return None
+
+
+def _drop_withheld(
+    withheld: dict[str, dict[str, str]],
+    tickers: list[str],
+    sp500_count: int,
+    sp400_count: int,
+    weights: SsgaWeights,
+) -> tuple[list[str], int, int]:
+    """Remove withheld members from the roster, per-index lists and weights."""
+    for ticker in withheld:
+        index_name = weights.index_of.pop(ticker, None)
+        weights.weight_map.pop(ticker, None)
+        if index_name == "S&P 500":
+            sp500_count -= 1
+        elif index_name == "S&P 400":
+            sp400_count -= 1
+        for roster in weights.members_by_index.values():
+            if ticker in roster:
+                roster.remove(ticker)
+    return [t for t in tickers if t not in withheld], sp500_count, sp400_count
 
 
 def _apply_sector_overrides(
