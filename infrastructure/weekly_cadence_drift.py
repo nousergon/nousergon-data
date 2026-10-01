@@ -9,8 +9,9 @@ Choice hardcoded in ``step_function_eod.json``, no declared parameter
 anywhere) — flipping daily<->weekly meant an SF-topology edit. The manifest is
 now the single declared source; ``infrastructure/deploy-infrastructure.sh``
 writes it to SSM in the same step that updates the postclose SF definition
-(config#6689 deliverable 2), and ``infrastructure/step_function_eod.json``'s
-``ReadExerciseCadence`` task reads the SSM copy live at execution time. This
+(config#6689 deliverable 2), and ``infrastructure/step_function_eod_reconcile.json``'s
+``ReadExerciseCadence`` task (``step_function_eod.json``'s until the 2026-09-30
+post-close split) reads the SSM copy live at execution time. This
 script is the mirror of ``automation_pause.py``'s two-directional check for
 that pair: a manifest value nobody deployed is as much a bug as a live value
 nobody declared.

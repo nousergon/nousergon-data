@@ -1,0 +1,1711 @@
+{
+  "Comment": "Alpha Engine post-close RECONCILE pipeline \u2014 the half of the day's close-out that depends on the standalone EOD collection (ne-data-collection-eod, 18:15 ET = dates.SETTLED_AFTER_ET). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"). Started by alpha-engine-eod-backstop when that collection reaches a terminal state (SUCCEEDED / FAILED / TIMED_OUT; its own heal executions, named v1-eod-heal-*, excluded), and by the same Lambda's scheduled reconcile backstop (02:15 UTC TUE-SAT) if no reconcile produced the day's eod_pnl row. Re-runnable any time that evening: market-hours gate, mutex, trading-box start + SSM readiness, executor-checkout refresh, a short collection readiness grade, the reconcile precondition probe, EODReconcile (reads the snapshot ne-postclose-trading-pipeline captured at the close) or the self-heal loop, StopTradingInstance, the weekly-exercise cadence chain, and its own completion marker (_sf_completion/ne-postclose-reconcile-pipeline/{run_date}.json).",
+  "StartAt": "MarketHoursGate",
+  "TimeoutSeconds": 14400,
+  "States": {
+    "MarketHoursGate": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 (Brian ruling 2026-08-13, option c) \u2014 the \"no trading-pipeline start during NYSE market hours\" boundary, sited on the PIPELINE. It applies to this machine for the same reason it applies to the post-close pipeline: this one boots and then STOPS the trading box, which in-session would take the order-placing daemon down under a live market. Evening starts (the collection's terminal event, 19:00-21:00 ET; the reconcile backstop at 02:15 UTC) are always outside the half-open [09:30, 16:00) ET session. Identical Task to ne-postclose-trading-pipeline's: pure calendar math on alpha-engine-predictor-inference against $$.Execution.StartTime, execution_input passed whole so an override is honoured.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-predictor-inference:live",
+        "Payload": {
+          "action": "check_market_hours",
+          "now.$": "$$.Execution.StartTime",
+          "execution_input.$": "$$.Execution.Input"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException",
+            "States.TaskFailed"
+          ],
+          "IntervalSeconds": 3,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetMarketHoursUnverifiedDegraded",
+          "ResultPath": "$.market_hours_gate_error"
+        }
+      ],
+      "ResultPath": "$.market_hours_gate",
+      "Next": "MarketHoursGateChoice"
+    },
+    "MarketHoursGateChoice": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I7111 \u2014 the boundary itself. Keys on the gate's verdict, which is enumerated EXHAUSTIVELY: an absent or unrecognised verdict is a contract violation by our own Lambda and fails CLOSED via Default rather than proceeding to trade on an unverifiable answer (the config-I2767 lesson TradingDayGateChoice already carries). PROCEED_OVERRIDE is the ruling's second requirement \u2014 the boundary must be refusable deliberately, never bypassable accidentally \u2014 and it routes through a notify state so a crossed boundary is announced rather than silent.",
+      "Choices": [
+        {
+          "Not": {
+            "Variable": "$.market_hours_gate.Payload.verdict",
+            "IsPresent": true
+          },
+          "Comment": "alpha-engine-config-I7111 / config-I2767, added 2026-08-13. This rule must come FIRST and must be IsPresent-guarded. A Choice rule comparing a path that does not exist raises States.Runtime \u2014 it does NOT fall through to Default \u2014 so this Choice's own comment claiming an absent verdict 'fails CLOSED via Default' described behaviour ASL does not have. The 2026-08-13 preopen run proved it: verdict absent, States.Runtime at this state, execution dead 48s in with no SNS alert of any kind and no orders placed. Matching here short-circuits before any StringEquals touches the missing path, which is exactly how TradingDayGateChoice has been written since config-I2767.",
+          "Next": "StampMarketHoursVerdictMissing"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED",
+          "Comment": "Market closed. Every scheduled or event-driven start of this machine lands here: the collection's terminal event (~19:00-21:00 ET) and the reconcile backstop (02:15 UTC) are both after the 16:00 ET close.",
+          "Next": "CheckMutexRole"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "PROCEED_OVERRIDE",
+          "Comment": "In-session start with a complete, authored, unexpired, bounded override. Announced and recorded, never silent.",
+          "Next": "RecordMarketHoursOverride"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "BLOCKED",
+          "Comment": "In-session start with no override \u2014 the boundary doing its job.",
+          "Next": "NotifyMarketHoursBlocked"
+        },
+        {
+          "Variable": "$.market_hours_gate.Payload.verdict",
+          "StringEquals": "OVERRIDE_MALFORMED",
+          "Comment": "An override was offered and is not usable. Fails closed whether or not the market is open: a typo'd override is a mis-authorisation, and surfacing it on the quiet run is the only way it is not discovered on the run that matters.",
+          "Next": "NotifyMarketHoursOverrideMalformed"
+        }
+      ],
+      "Default": "NormalizeEODFailureContext"
+    },
+    "StampMarketHoursVerdictMissing": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7111. Same posture as the post-close pipeline: an unevaluable gate proceeds DEGRADED \u2014 reconciliation must still happen. Stamping $.market_hours_gate_error is required: both SetMarketHoursUnverifiedDegraded and NotifyMarketHoursUnverified read it.",
+      "Result": {
+        "Error": "MarketHoursGateContractViolation",
+        "Cause": "alpha-engine-config-I7111: the market-hours gate Lambda returned successfully but its payload carried no `verdict` key, so this execution cannot establish that it is starting outside the NYSE session. This is a contract violation by our own producer, not an invoke failure, so the Task's Catch never fires and $.market_hours_gate_error would otherwise be absent. Measured 2026-08-13 (execution 59c0ce46): the `live` alias of alpha-engine-predictor-inference was frozen at a version predating action=check_market_hours, so the invoke fell through to the default predict branch and answered the gate with {statusCode, body}. The full payload received is in $.market_hours_gate."
+      },
+      "ResultPath": "$.market_hours_gate_error",
+      "Next": "SetMarketHoursUnverifiedDegraded"
+    },
+    "RecordMarketHoursOverride": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 the override's audit surface. A crossed boundary is announced on the alert topic AND left in execution history with who authorised it, why, and until when. Catch continues to the pipeline: the authorisation was already validated and recorded, so a notify-side failure must not silently convert an approved recovery into a refusal.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 market-hours boundary OVERRIDDEN (authorised in-session start)",
+        "Message.$": "States.Format('An execution started INSIDE the NYSE regular session under an explicit market-hours override (alpha-engine-config-I7111). Execution: {}. Gate verdict: {}. This is a deliberate, time-boxed authorisation, not a bypass \u2014 the same record is in $.market_hours_gate in execution history.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
+    },
+    "NotifyMarketHoursBlocked": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a refusal is loud. sf-pipeline-policy \u00a72.3: a run that did not do its work must not read as a clean success to a status-keyed watcher, so this notifies and then ends in a Fail rather than a Succeed-skip. The message carries the exact override shape so the operator does not have to find it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 REFUSED (start inside NYSE market hours)",
+        "Message.$": "States.Format('Refused to start a trading pipeline inside the NYSE regular session (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_blocked_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursBlocked"
+        }
+      ],
+      "Next": "MarketHoursBlocked"
+    },
+    "MarketHoursBlocked": {
+      "Type": "Fail",
+      "Error": "MarketHoursBoundary",
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+    },
+    "NotifyMarketHoursOverrideMalformed": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 a rejected override is its own terminal, distinct from MarketHoursBlocked, because it calls for a different operator action: fix the override, not wait for the close. Kept separate rather than folded in so a status-keyed watcher can tell the two apart from the Error alone.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 REFUSED (market-hours override is not usable)",
+        "Message.$": "States.Format('A market-hours override was offered and rejected (alpha-engine-config-I7111). Execution: {}. Gate: {}. To authorise one in-session start, add a market_hours_override object to the execution input carrying reason, authorized_by and expires_at. All three are required and non-blank; expires_at must be an ISO-8601 instant AFTER the execution start and no more than 24h after it, so a line pasted into a runbook stops working instead of standing forever.', $$.Execution.Id, States.JsonToString($.market_hours_gate.Payload))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_override_malformed_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursOverrideMalformed"
+        }
+      ],
+      "Next": "MarketHoursOverrideMalformed"
+    },
+    "MarketHoursOverrideMalformed": {
+      "Type": "Fail",
+      "Error": "MarketHoursOverrideMalformed",
+      "Cause": "alpha-engine-config-I7111: the execution input carried a market_hours_override that is not a usable authorisation \u2014 missing or blank reason/authorized_by/expires_at, a non-object, an unparseable expires_at, an expires_at at or before the execution start, or one more than 24h after it. The specific rejection is in $.market_hours_gate.Payload.override.rejection. Deliberately fails closed even when the market is shut: a half-typed override is a mis-authorisation, and it is better found on the run where it did not matter."
+    },
+    "NotifyMarketHoursUnverified": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I7111 \u2014 fails OPEN, DEGRADED, like the post-close pipeline: NAV continuity (sf-pipeline-policy \u00a71.3) needs the day's eod_pnl.csv row, and nothing else in this pipeline touches alpha-engine-predictor-inference, so refusing here would newly break settlement on an outage that is otherwise irrelevant to it. Both automated starters are evening-only by construction.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 DEGRADED (market-hours gate could not be evaluated; settlement proceeds)",
+        "Message.$": "States.Format('The market-hours gate Lambda failed after retries (alpha-engine-config-I7111). This execution proceeds DEGRADED rather than refusing. Execution: {}. Error: {}.', $$.Execution.Id, States.JsonToString($.market_hours_gate_error))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.market_hours_unverified_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "CheckMutexRole"
+        }
+      ],
+      "Next": "CheckMutexRole"
+    },
+    "SetMarketHoursUnverifiedDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I7111 \u2014 Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag (config#6692/config-I2702 shape): threads $.degraded_summary onto the market-hours fail-open path WITHOUT changing its continuation, so CheckDegradedOutcome routes this execution's terminal to WriteCompletionMarkerDegraded/DegradedRun. A settlement run that could not verify its own start boundary is not a clean success. Last-write-wins if a later stage also degrades.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_market_hours_gate_unverified",
+        "stage_error.$": "$.market_hours_gate_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "NotifyMarketHoursUnverified"
+    },
+    "CheckMutexRole": {
+      "Type": "Choice",
+      "Comment": "L274 SF MutualExclusionGuard \u2014 gate at SF entry point, same allowlist as the post-close pipeline (daily / weekly / eod / shell-run / exercise acquire the DynamoDB mutex; absent/operator/recovery/smoke/backfill/operator-replay bypass). alpha-engine-eod-backstop starts this machine with pipeline_role='eod' from both of its reconcile paths (the collection's terminal event and the scheduled reconcile backstop). The mutex key carries $$.StateMachine.Name, so this machine never contends with ne-postclose-trading-pipeline.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "daily"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "weekly"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "eod"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "shell-run"
+                },
+                {
+                  "Variable": "$.pipeline_role",
+                  "StringEquals": "exercise"
+                }
+              ]
+            }
+          ],
+          "Next": "AcquireMutex"
+        }
+      ],
+      "Default": "StartTradingInstance"
+    },
+    "AcquireMutex": {
+      "Type": "Task",
+      "Comment": "L274 \u2014 DynamoDB conditional PUT. mutex_key = '{state-machine-name}#{pipeline_role}#{YYYY-MM-DDTHH:MM}' (UTC minute bucket parsed from $$.Execution.StartTime). Two duplicate cron-fired executions started in the same minute produce identical keys; the second loses with ConditionalCheckFailedException \u2192 MutexConflict Fail. No TTL / no release: the date+minute in the key is itself the staleness window. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Item": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}:{}', $$.StateMachine.Name, $.pipeline_role, States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
+          },
+          "execution_arn": {
+            "S.$": "$$.Execution.Id"
+          },
+          "started_at": {
+            "S.$": "$$.Execution.StartTime"
+          },
+          "state_machine": {
+            "S.$": "$$.StateMachine.Name"
+          },
+          "pipeline_role": {
+            "S.$": "$.pipeline_role"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(mutex_key)"
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDB.ConditionalCheckFailedException"
+          ],
+          "Comment": "Mutex held by another concurrent execution in the same minute bucket \u2014 the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
+          "Next": "MutexConflict",
+          "ResultPath": "$.mutex_conflict"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open: DynamoDB outage / IAM drift / transient SDK error must NOT block the EOD reconcile + instance-stop path. The mutex is best-effort architectural insurance; per feedback_no_silent_fails 'secondary observability' carve-out, the primary deliverable (reconcile + stop trading EC2) survives a mutex-side failure. The error is captured in $.mutex_error for forensic review. alpha-engine-config#6722: routes through SetMutexAcquireDegradedFlag so CheckDegradedOutcome's terminal reflects it.",
+          "Next": "SetMutexAcquireDegradedFlag",
+          "ResultPath": "$.mutex_error"
+        }
+      ],
+      "ResultPath": "$.mutex_result",
+      "Next": "StartTradingInstance"
+    },
+    "SetMutexAcquireDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6722 (Option-A parity, config#6692/config-I2702 shape): threads $.degraded_summary onto the mutex-acquire infra-error fail-open path (DynamoDB outage / IAM drift / transient SDK error \u2014 NOT the ConditionalCheckFailedException conflict case, which the separate MutexConflict Fail already handles) WITHOUT changing its fail-open continuation. Last-write-wins if a later stage also degrades. Does not clobber $.mutex_error (set by AcquireMutex's own Catch ResultPath).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_mutex_acquire_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.mutex_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "StartTradingInstance"
+    },
+    "MutexConflict": {
+      "Type": "Fail",
+      "Error": "MutexConflict",
+      "Cause": "L274: another ne-postclose-reconcile-pipeline execution with the same pipeline_role + start-minute already holds the mutex. Cost-guard note: HandleFailure -> ForceStopInstance is unreachable from a Fail state, but a duplicate execution by definition means another one IS running the cost-guard path; the trading instance still gets stopped."
+    },
+    "StartTradingInstance": {
+      "Type": "Task",
+      "Comment": "Re-runnability guard (2026-06-30 incident). The normal run enters with the box already up \u2014 ne-postclose-trading-pipeline leaves it running after CaptureSnapshot \u2014 but a reconcile-backstop run, an operator rerun or a heal replay can land on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped, and the first sendCommand would die with Ssm.InvalidInstanceIdException. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening.",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ec2_start_result",
+      "Next": "WaitForInstanceReady"
+    },
+    "WaitForInstanceReady": {
+      "Type": "Wait",
+      "Comment": "Initial settle before polling for SSM-agent registration. EC2 stopped\u2192running takes ~15-25s; polling describeInstanceInformation any earlier just burns API calls.",
+      "Seconds": 15,
+      "Next": "InitSSMPollCounter"
+    },
+    "InitSSMPollCounter": {
+      "Type": "Pass",
+      "Comment": "Initialize attempts counter for the SSM-readiness poll loop.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
+    },
+    "DescribeInstanceInfo": {
+      "Type": "Task",
+      "Comment": "Poll SSM-agent registration on the trading instance until PingStatus=Online, so the first EOD ssm:sendCommand never fires against a stopped / not-yet-registered box (the Ssm.InvalidInstanceIdException failure mode). Mirrors the daily SF DescribeInstanceInfo (config#1430).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:describeInstanceInformation",
+      "Parameters": {
+        "Filters": [
+          {
+            "Key": "InstanceIds",
+            "Values.$": "$.trading_instance_id"
+          }
+        ]
+      },
+      "TimeoutSeconds": 15,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.ssm_describe_result",
+      "Next": "SSMReadyChoice"
+    },
+    "SSMReadyChoice": {
+      "Type": "Choice",
+      "Comment": "PingStatus=Online -> CheckSkipRefreshExecutorDeploy (the executor-checkout refresh runs before any work step, so EODReconcile executes latest origin/main by construction). Otherwise wait + retry up to 12 attempts (~3 min total budget), then hard-fail to HandleFailure (notifies + ForceStopInstance). This NEVER silently skips EOD reconcile \u2014 an unreachable box fails the execution loud.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.ssm_describe_result.InstanceInformationList[0].PingStatus",
+              "StringEquals": "Online"
+            }
+          ],
+          "Next": "CheckSkipRefreshExecutorDeploy"
+        },
+        {
+          "Variable": "$.ssm_poll.attempts",
+          "NumericGreaterThanEquals": 12,
+          "Next": "SetSSMReadyExhaustedError"
+        }
+      ],
+      "Default": "WaitSSMPoll"
+    },
+    "SetSSMReadyExhaustedError": {
+      "Type": "Pass",
+      "Comment": "Normalize SSM-ready exhaustion into $.error so HandleFailure's States.JsonToString($.error) has an object to serialize \u2014 the Choice path from SSMReadyChoice does not carry a caught error (the SSM DescribeInstanceInfo calls succeeded; the agent simply never went Online). Without this, HandleFailure itself crashes with States.Runtime on the missing $.error JsonPath, masking the real 'trading instance unreachable' cause behind a broken error-reporting state.",
+      "Parameters": {
+        "error": "SSM agent did not come Online within 12 attempts (~3 min) \u2014 the trading instance is unreachable. The EOD pipeline cannot proceed without an SSM connection to the box (every work step is SSM:sendCommand)."
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "WaitSSMPoll": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "IncrementSSMPoll"
+    },
+    "IncrementSSMPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.ssm_poll.attempts, 1)"
+      },
+      "ResultPath": "$.ssm_poll",
+      "Next": "DescribeInstanceInfo"
+    },
+    "EODReconcile": {
+      "Type": "Task",
+      "Comment": "Run EOD reconciliation on trading EC2 \u2014 reads closes from ArcticDB + state from the S3 snapshot ne-postclose-trading-pipeline captured at the close (no live IB), computes P&L, writes the day's trades/eod_pnl.csv row, sends email. pipefail surfaces python crashes that tee would otherwise mask. Deploy-freshness is guaranteed UPSTREAM by this pipeline's own RefreshExecutorDeploy chokepoint (config#1549). eod_reconcile.py's ExecutorPreflight deploy-drift guard remains the authoritative fail-loud gate, and a missing snapshot (post-close pipeline failed twice) fails here loudly by design \u2014 there is no live-IB fallback.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug eod --log /var/log/eod.log -- python executor/eod_reconcile.py --date {}', $$.Execution.Name, $.run_date))",
+          "executionTimeout": [
+            "600"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 660,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.eod_result",
+      "Next": "WaitForEOD"
+    },
+    "WaitForEOD": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.eod_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
+      "ResultPath": "$.eod_poll",
+      "Next": "CheckEODStatus"
+    },
+    "CheckEODStatus": {
+      "Type": "Choice",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed.",
+      "Choices": [
+        {
+          "Variable": "$.eod_poll.Status",
+          "StringEquals": "Success",
+          "Next": "StopTradingInstance"
+        },
+        {
+          "Variable": "$.eod_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "EODWait"
+        },
+        {
+          "Variable": "$.eod_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "EODWait"
+        },
+        {
+          "Variable": "$.eod_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "EODWait"
+        }
+      ],
+      "Default": "EODStatusError"
+    },
+    "EODStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "eod_status",
+        "status.$": "$.eod_poll.Status",
+        "status_details.$": "$.eod_poll.StatusDetails",
+        "response_code.$": "$.eod_poll.ResponseCode",
+        "command_id.$": "$.eod_poll.CommandId",
+        "instance_id.$": "$.eod_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "EODWait": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "WaitForEOD"
+    },
+    "CheckSkipRefreshExecutorDeploy": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607) for the executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} (operator-replay only) routes past RefreshExecutorDeploy to CheckSkipPostMarketData; missing flag = run as normal. Kept in this machine even though the post-close pipeline refreshed the checkout hours earlier: this pipeline may be the one that BOOTS the box (backstop, rerun, heal replay), and alpha-engine-config-I7586 measured what a booted box does to the frozen pin \u2014 boot-pull moves the checkout, .frozen_executor_sha stays behind, and EODReconcile's ExecutorPreflight drift guard fails. Refreshing here re-freezes the pin to what is actually on the box.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
+              "Variable": "$.skip_refresh_executor_deploy",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_refresh_executor_deploy",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "CheckSkipPostMarketData"
+        }
+      ],
+      "Default": "RefreshExecutorDeploy"
+    },
+    "RefreshExecutorDeploy": {
+      "Type": "Task",
+      "Comment": "Hoisted deploy-drift chokepoint (config#1549), NARROWED to a conditional refresh (alpha-engine-config-I2722, 2026-07-16): fetches origin and compares local HEAD to origin/main FIRST; the expensive boot-pull.sh (multi-repo pull + pip install + systemd-unit sync + trades.db restore, up to the full 600s budget) only runs when the checkout has actually drifted. A hard-fail-on-any-invocation reading would false-fail every day an intraday executor merge lands (the exact scenario this chokepoint exists to catch), since boot-pull.sh's own boot-pull.service only fires on instance boot. Original rationale retained below for the drifted path, which is UNCHANGED byte-for-byte.\n\nRefreshes the trading instance's crucible-executor checkout to origin/main via the canonical boot-pull.sh ONCE at the top of the EOD pipeline, before any work step runs. The trading instance boot-pulls once each morning (boot-pull.service, ~6:10 AM PT), but executor PRs that merge during the trading day leave the checkout stale by EOD (2026-06-30 incident: 3 executor PRs merged 08:07\u201308:54 PT after the morning boot-pull). nousergon-data#574 patched only the EODReconcile step (the one work step carrying a drift guard); the earlier PostMarketData / PostMarketArcticAppend / CaptureSnapshot steps had no guard and would run stale intraday code silently. Refreshing here makes the whole run execute latest main by construction. FAIL-LOUD: boot-pull runs WITHOUT a `|| echo` swallow, so a failed refresh (auth/network/dep-install) surfaces as a non-zero SSM status \u2192 HandleFailure \u2192 ForceStopInstance BEFORE any stale-code work step runs (stronger than #574, whose swallow relied on the downstream reconcile guard). boot-pull runs as ec2-user (matching boot-pull.service User=ec2-user + the ec2-user-owned checkout / ~/.netrc); a root git fetch/reset would trip git's dubious-ownership guard (CVE-2022-24765). Re-freezes /home/ec2-user/.frozen_executor_sha to the just-refreshed HEAD (2026-07-09 incident, config#2042): config#1955's morning CodeFreshnessGate pin is what eod_reconcile.py's ExecutorPreflight.check_deploy_drift actually validates against \u2014 this step's premise ('the guard remains authoritative because the box now matches latest main') silently stopped holding the moment #1955 shipped a FIXED T0 pin file instead of a live-origin/main comparison. Two same-day executor PRs (#345, #346) merged between the morning freeze and this step, so the box moved past the stale morning pin and EODReconcile hard-failed 36min later with zero eod_report.json for the day. Re-freezing here \u2014 mirroring CodeFreshnessGate's own rev-parse-HEAD-to-pin-file line exactly \u2014 keeps the pin in lockstep with what this step just deployed, restoring the invariant the chokepoint comment already assumed. The fast (not-drifted) path also re-freezes the pin unconditionally (cheap, idempotent) rather than assuming it's already correct, so the lockstep invariant holds regardless of which branch ran.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -o pipefail",
+            "cd /home/ec2-user/alpha-engine",
+            "sudo -u ec2-user -H git fetch origin --quiet",
+            "LOCAL_SHA=$(sudo -u ec2-user git rev-parse HEAD)",
+            "REMOTE_SHA=$(sudo -u ec2-user git rev-parse origin/main)",
+            "if [ \"$LOCAL_SHA\" = \"$REMOTE_SHA\" ]; then",
+            "  echo \"checkout current ($LOCAL_SHA) -- skipping refresh\"",
+            "  sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'",
+            "else",
+            "  echo \"checkout drifted (local=$LOCAL_SHA remote=$REMOTE_SHA) -- running full refresh\"",
+            "  sudo -u ec2-user -H bash /home/ec2-user/alpha-engine/infrastructure/boot-pull.sh > /var/log/eod-bootpull.log 2>&1",
+            "  sudo -u ec2-user sh -c 'git -C /home/ec2-user/alpha-engine rev-parse HEAD > /home/ec2-user/.frozen_executor_sha'",
+            "fi"
+          ],
+          "executionTimeout": [
+            "600"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 660,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-loud: a failed executor-deploy refresh must halt EOD before any work step runs stale code. Don't paper over it \u2014 the whole point of the hoist is that non-guarded steps never run stale.",
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.refresh_executor_deploy_result",
+      "Next": "WaitForRefreshExecutorDeploy"
+    },
+    "WaitForRefreshExecutorDeploy": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.refresh_executor_deploy_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
+      "ResultPath": "$.refresh_executor_deploy_poll",
+      "Next": "CheckRefreshExecutorDeployStatus"
+    },
+    "CheckRefreshExecutorDeployStatus": {
+      "Type": "Choice",
+      "Comment": "Default routes to HandleFailure so any unexpected SSM status (Failed, Cancelled, TimedOut, ...) is surfaced, not silently swallowed \u2014 a stale checkout must never reach the work steps.",
+      "Choices": [
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipPostMarketData"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "RefreshExecutorDeployWait"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "RefreshExecutorDeployWait"
+        },
+        {
+          "Variable": "$.refresh_executor_deploy_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "RefreshExecutorDeployWait"
+        }
+      ],
+      "Default": "RefreshExecutorDeployStatusError"
+    },
+    "RefreshExecutorDeployWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForRefreshExecutorDeploy"
+    },
+    "RefreshExecutorDeployStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path \u2014 synthesize $.error from poll result so HandleFailure's JsonToString($.error) has something to stringify.",
+      "Parameters": {
+        "source": "refresh_executor_deploy_status",
+        "status.$": "$.refresh_executor_deploy_poll.Status",
+        "status_details.$": "$.refresh_executor_deploy_poll.StatusDetails",
+        "response_code.$": "$.refresh_executor_deploy_poll.ResponseCode",
+        "command_id.$": "$.refresh_executor_deploy_poll.CommandId",
+        "instance_id.$": "$.refresh_executor_deploy_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "CheckSkipPostMarketData": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate. Input {\"skip_post_market_data\": true} (operator-replay only) routes past the EOD collection readiness wait straight to ProbeEODReconcilePrecondition; missing flag = run as normal. The flag name is kept from the pre-split postclose pipeline because HealDispatchReplay's reconcile-only replay input and scripts/weekday_sf_rerun.py both emit it.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
+              "Variable": "$.skip_post_market_data",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_post_market_data",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ProbeEODReconcilePrecondition"
+        }
+      ],
+      "Default": "InitCollectionReadinessPoll"
+    },
+    "ExtractDataSpotError": {
+      "Type": "Pass",
+      "Comment": "FAIL-OPEN normalizer (config#1767 #4), repointed by alpha-engine-config-I11269: the standalone EOD collection had not published every unit this pipeline reads within the bounded wait (or published a failed one). Record as DATA, best-effort alert, then CONTINUE to the precondition probe \u2014 which decides reconcile vs self-heal on the one fact EODReconcile hard-depends on \u2014 then instance-stop. A data-phase miss must NOT block the EOD close-out. $.collection_readiness is always present here (SeedCollectionReadiness).",
+      "Parameters": {
+        "phase": "CollectionReadiness",
+        "source": "WaitForCollectionManifests (budget exhausted or producer settled not-ok)",
+        "readiness.$": "$.collection_readiness",
+        "poll.$": "$.collection_readiness_poll"
+      },
+      "ResultPath": "$.data_spot_error",
+      "Next": "SetDataSpotDegradedFlag"
+    },
+    "SetDataSpotDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6715 (config#6692 Option-A parity): threads $.degraded_summary onto the collection-not-ready fail-open path WITHOUT changing its continuation \u2014 Next still leads to PublishDataSpotFailureImmediate and on to ProbeEODReconcilePrecondition, so the run still proceeds to reconcile-or-heal and instance-stop. The flag is only read later by CheckDegradedOutcome, which routes the eventual TERMINAL to WriteCompletionMarkerDegraded -> DegradedRun instead of a plain SUCCEEDED execution. Does not clobber $.data_spot_error. Last write wins if a later stage also degrades; degraded=true is preserved either way.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_collection_not_ready_fail_open",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.data_spot_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishDataSpotFailureImmediate"
+    },
+    "PublishDataSpotFailureImmediate": {
+      "Type": "Task",
+      "Comment": "Best-effort SNS alert that the standalone EOD collection was not ready \u2014 surfaces the miss WITHOUT blocking reconcile/stop. Its own Catch also routes to the continue path so even an SNS failure cannot hard-fail the pipeline.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD collection NOT READY (fail-open, reconcile continues)",
+        "Message.$": "States.Format('The standalone EOD collection (ne-data-collection-eod) had not published every unit ne-postclose-reconcile-pipeline reads when this execution checked; the pipeline continued to the reconcile precondition probe + reconcile/self-heal + instance-stop (fail-open, config#1767). Detail: {}', States.JsonToString($.data_spot_error))"
+      },
+      "ResultPath": "$.data_spot_failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "ProbeEODReconcilePrecondition"
+        }
+      ],
+      "Next": "ProbeEODReconcilePrecondition"
+    },
+    "ProbeEODReconcilePrecondition": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #1: verify-by-artifact EOD-reconcile precondition probe. Replaces the old $.data_spot_error launch-phase flag test with a fresh S3 read (via alpha-engine-eod-precondition-probe) of the macro-freshness sentinel builders/daily_append.py writes only AFTER readback-verifying run_date's SPY close is queryable in ArcticDB \u2014 the actual precondition eod_reconcile.py's _spy_close hard-depends on, not merely 'did the launch/poll path see an error'. Called fresh at every reconcile-gate entry (including each HealReProbe iteration in the heal loop below) \u2014 never cached, never trusted from an earlier point in the execution.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-eod-precondition-probe",
+        "Payload": {
+          "run_date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SWALLOW (feedback_no_silent_fails): (a) failure mode swallowed = the precondition-probe Lambda itself errored (IAM drift, S3 outage, malformed sentinel JSON) \u2014 NOT a data-gap signal; (c) recording surface = $.precondition_probe is left ABSENT on this path, so CheckSkipEODReconcile's BooleanEquals-false test does not match and control falls through to its Default (EODReconcile) rather than silently skipping a possibly-fine reconcile. This is deliberately fail-SAFE-toward-reconcile, not fail-open: eod_reconcile.py's own _spy_close hard-fail (no fallback, by design) remains the authoritative backstop if the data is genuinely absent \u2014 a probe-infra failure can at worst cause one more HandleFailure page, never a silent false-green.",
+          "ResultPath": null,
+          "Next": "CheckSkipEODReconcile"
+        }
+      ],
+      "ResultPath": "$.precondition_probe",
+      "Next": "CheckSkipEODReconcile"
+    },
+    "CheckSkipEODReconcile": {
+      "Type": "Choice",
+      "Comment": "Per-task rerun gate (L4607). Input {\"skip_eod_reconcile\": true} (operator-replay only) routes past EODReconcile to StopTradingInstance; missing flag = run as normal. REPLACED 2026-07-15 (config-I2702 deliverable #1): gates on $.precondition_probe.Payload.precondition_met \u2014 a FRESH S3 read of the readback-verified macro-freshness sentinel, taken immediately before this Choice by ProbeEODReconcilePrecondition. IsPresent+BooleanEquals(false) (not merely absent) \u2014 a probe that never ran (its own Catch swallow) falls through to Default (EODReconcile), deliberately fail-safe-toward-reconcile; see ProbeEODReconcilePrecondition's Catch comment.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
+              "Variable": "$.skip_eod_reconcile",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.skip_eod_reconcile",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StopTradingInstance"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "BooleanEquals": false
+            }
+          ],
+          "Next": "SkipEODReconcileDataGap"
+        }
+      ],
+      "Default": "EODReconcile"
+    },
+    "SkipEODReconcileDataGap": {
+      "Type": "Task",
+      "Comment": "Loud, distinctly-labeled alert for a known/self-healing condition \u2014 NOT a silent swallow (feedback_no_silent_fails): the precondition probe confirmed run_date's SPY close is not yet verified-present in ArcticDB, so EODReconcile is skipped rather than left to guarantee-crash into the generic HandleFailure/FailExecution path. Control proceeds into the closed self-heal loop (SetDegradedFlag -> CheckHealLoopEligible -> InitHealLoop -> ...) which re-runs the standalone collection, re-probes, and auto-starts a reconcile-only replay execution of THIS machine the moment the precondition lands \u2014 paging only if it fails to converge within 2 attempts or by the probe-computed 09:00 UTC deadline (HealNonConvergent).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile SKIPPED (data gap, self-healing)",
+        "Message.$": "States.Format('EOD reconcile SKIPPED for {}: the precondition probe found run_date\\'s SPY close not yet verified-present in ArcticDB. Entering the closed-loop self-heal (dispatch missing workload(s) -> re-probe -> auto-replay) \u2014 no operator action required unless a follow-up DID-NOT-CONVERGE alert fires. Probe detail: {}', $.run_date, States.JsonToString($.precondition_probe))"
+      },
+      "ResultPath": "$.eod_skip_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Defense-in-depth, mirrors HandleFailure's own Catch: an SNS-side failure must not block entry into the self-heal loop.",
+          "ResultPath": null,
+          "Next": "SetDegradedFlag"
+        }
+      ],
+      "Next": "SetDegradedFlag"
+    },
+    "SetDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "config-I2702 deliverable #4: an execution that skips ANY load-bearing state (here: EODReconcile) must not end plain ExecutionSucceeded. Sets a persistent $.degraded_summary flag, checked once by CheckDegradedOutcome AFTER the cost-guard tail (StopTradingInstance) always completes, to route to the distinct DegradedRun terminal (Type: Fail) instead of NormalSucceeded. The DISTINCT NOTIFICATION half already fired above (SkipEODReconcileDataGap) and will fire again from HealConvergedNotify or HealNonConvergent.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_reconcile_skipped_data_gap",
+        "run_date.$": "$.run_date"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "CheckHealLoopEligible"
+    },
+    "CheckHealLoopEligible": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3: recursion guard. An operator-replay execution (pipeline_role=operator-replay \u2014 including a heal-dispatched replay itself, HealDispatchReplay below) that STILL finds the precondition unmet must not spawn a further self-heal loop. Page immediately instead. A collection-triggered or backstop-triggered execution (the normal case) enters the loop.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded \u2014 this SF has no InitializeInput floor, so $.pipeline_role is an execution-input key that is not provably present. Absent falls to Default InitHealLoop, i.e. the live-execution treatment, which is the correct reading for any non-replay trigger.",
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "InitHealLoop"
+    },
+    "InitHealLoop": {
+      "Type": "Pass",
+      "Comment": "config-I2702 deliverable #3: attempts counter for the closed self-heal loop. Mirrors the InitDataSpotRetryCounter/InitSSMPollCounter idiom already used elsewhere in this file. Bound at 2 attempts (issue's suggested default) \u2014 combined with the 09:00-UTC-next-day deadline the precondition probe computes, whichever gate trips first ends the loop (HealLoopGate).",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.heal_loop",
+      "Next": "HealLoopGate"
+    },
+    "HealLoopGate": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3(d): stop the loop and page loudly (never silently) once EITHER bound trips \u2014 2 attempts exhausted, or the probe-computed 09:00 UTC deadline has passed (checked against the MOST RECENT probe result; $.precondition_probe is always present here because SkipEODReconcileDataGap is only reachable after a successful ProbeEODReconcilePrecondition call).",
+      "Choices": [
+        {
+          "Or": [
+            {
+              "Variable": "$.heal_loop.attempts",
+              "NumericGreaterThanEquals": 2
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.precondition_probe.Payload.past_deadline",
+                  "BooleanEquals": true
+                }
+              ],
+              "Comment": "config-I2767: IsPresent-guarded \u2014 a probe payload without past_deadline previously threw States.Runtime inside this Or. Absent, the operand is simply false and the loop stays bounded by the attempts operand alone (2 attempts, then HealNonConvergent pages)."
+            }
+          ],
+          "Next": "HealNonConvergent"
+        }
+      ],
+      "Default": "HealStartCollection"
+    },
+    "HealReProbe": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(b): re-probe after the heal actuator (HealStartCollection, alpha-engine-config-I11266) returns. Overwrites $.precondition_probe with the FRESH result (never trusts the earlier probe) \u2014 HealCheckConverged and, on the next iteration, HealLoopGate's deadline check both read this latest value.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-eod-precondition-probe",
+        "Payload": {
+          "run_date.$": "$.run_date"
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A re-probe infra failure is not a convergence signal either way \u2014 try again next iteration rather than guessing.",
+          "ResultPath": "$.heal_error",
+          "Next": "HealLoopIncrement"
+        }
+      ],
+      "ResultPath": "$.precondition_probe",
+      "Next": "HealCheckConverged"
+    },
+    "HealCheckConverged": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #3(c): the precondition landed -> dispatch the reconcile-only replay. Not yet -> try again next iteration.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.precondition_probe.Payload.precondition_met",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767: IsPresent-guarded \u2014 a probe payload without precondition_met falls to Default HealLoopIncrement: not converged, loop stays bounded (2 attempts, then HealNonConvergent pages), never States.Runtime.",
+          "Next": "HealDispatchReplay"
+        }
+      ],
+      "Default": "HealLoopIncrement"
+    },
+    "HealLoopIncrement": {
+      "Type": "Pass",
+      "Comment": "Advances the heal-loop attempt counter and returns to HealLoopGate for the bound check. Mirrors IncrementCollectionReadinessPoll/IncrementSSMPoll.",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.heal_loop.attempts, 1)"
+      },
+      "ResultPath": "$.heal_loop",
+      "Next": "HealLoopGate"
+    },
+    "HealDispatchReplay": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution of THIS machine ($$.StateMachine.Id) with pipeline_role=operator-replay + skip_post_market_data=true. Deliberately a SEPARATE execution rather than looping this one back: the replay's own terminal is the convergence signal, independently observable by name (eod-heal-replay-{run_date}-*). Fire-and-forget (non-.sync). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): skip_capture_snapshot is gone from this Input because CaptureSnapshot is not in this machine \u2014 the post-close pipeline captured the snapshot at the close, and this replay never re-touches live IB. alpha-engine-config-I7586: skip_refresh_executor_deploy stays OUT of this Input \u2014 the parent stops the box (HealConvergedNotify -> StopTradingInstance), the replay's own StartTradingInstance boots it again, and a rebooted box is not on the SHA the parent froze; the replay's own RefreshExecutorDeploy is what makes its EODReconcile drift guard meaningful. skip_post_market_data is correct: the heal loop just re-ran the collection.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn.$": "$$.StateMachine.Id",
+        "Name.$": "States.Format('eod-heal-replay-{}-{}', $.run_date, $$.Execution.Name)",
+        "Input": {
+          "trading_instance_id.$": "$.trading_instance_id",
+          "ec2_instance_id.$": "$.ec2_instance_id",
+          "run_date.$": "$.run_date",
+          "triggered_by": "eod-self-heal",
+          "pipeline_role": "operator-replay",
+          "skip_post_market_data": true
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "The data healed but the StartExecution API call itself failed (IAM drift, throttling) \u2014 this is NOT a silent success; page immediately rather than pretending convergence.",
+          "ResultPath": "$.heal_replay_dispatch_error",
+          "Next": "HealReplayDispatchFailed"
+        }
+      ],
+      "ResultPath": "$.heal_replay_dispatch",
+      "Next": "HealConvergedNotify"
+    },
+    "HealReplayDispatchFailed": {
+      "Type": "Task",
+      "Comment": "Loud page: the precondition converged but the auto-replay StartExecution call itself failed \u2014 requires a MANUAL operator-replay of ne-postclose-reconcile-pipeline (pipeline_role=operator-replay, skip_post_market_data=true).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal \u2014 CONVERGED BUT REPLAY DISPATCH FAILED (operator action required)",
+        "Message.$": "States.Format('EOD self-heal for {} converged (SPY close now verified present) but the auto-replay StartExecution call itself failed: {}. Run a manual operator-replay of ne-postclose-reconcile-pipeline: pipeline_role=operator-replay, skip_post_market_data=true (scripts/weekday_sf_rerun.py eod-reconcile).', $.run_date, States.JsonToString($.heal_replay_dispatch_error))"
+      },
+      "ResultPath": "$.heal_replay_dispatch_failed_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
+    },
+    "HealConvergedNotify": {
+      "Type": "Task",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal \u2014 replay dispatched (convergence pending)",
+        "Message.$": "States.Format('EOD self-heal for {} re-ran the standalone EOD collection after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution of ne-postclose-reconcile-pipeline has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
+      },
+      "ResultPath": "$.heal_converged_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
+    },
+    "HealNonConvergent": {
+      "Type": "Task",
+      "Comment": "config-I2702 deliverable #3(d): THE loud page. Fires only when the heal loop exhausted its 2-attempt budget, passed the probe-computed 09:00 UTC deadline, or this is a replay execution that still can't converge (CheckHealLoopEligible). Genuinely requires operator attention \u2014 the automatic path has been exhausted.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Self-Heal \u2014 DID NOT CONVERGE (operator action required)",
+        "Message.$": "States.Format('EOD self-heal for {} did NOT converge: the automatic heal loop (re-run ne-data-collection-eod -> re-probe) exhausted its attempt budget and/or passed its deadline without SPY close landing in ArcticDB. pipeline_role={}, latest probe: {}. Manual intervention needed \u2014 investigate the collection failures, then run an operator-replay of ne-postclose-reconcile-pipeline (pipeline_role=operator-replay, skip_post_market_data=true) once the underlying data issue is fixed.', $.run_date, $.pipeline_role, States.JsonToString($.precondition_probe))"
+      },
+      "ResultPath": "$.heal_nonconvergent_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "StopTradingInstance"
+        }
+      ],
+      "Next": "StopTradingInstance"
+    },
+    "StopTradingInstance": {
+      "Type": "Task",
+      "Comment": "Stop the trading EC2 instance after EOD reconcile (or its skip/heal routes). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): this is now the ONLY success-path stop of the evening \u2014 ne-postclose-trading-pipeline leaves the box running after CaptureSnapshot so the co-tenant post-close timers on it keep the uptime window they were scheduled into (see that definition's CheckDegradedOutcome). Routes to the exercise-cadence tail and then CheckDegradedOutcome so a run that skipped EODReconcile ends in the distinct DegradedRun terminal (Type: Fail) (Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699).",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "HandleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.stop_result",
+      "Next": "ReadExerciseCadence"
+    },
+    "ReadExerciseCadence": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689 deliverable 2/3: reads the declared weekly-exercise cadence from SSM Parameter Store (source of truth: infrastructure/weekly_cadence.json, synced here by infrastructure/deploy-infrastructure.sh on every merge deploy) so flipping daily <-> weekly-only <-> off is a one-line manifest diff instead of an SF-topology edit. TimeoutSeconds=30 + Catch(States.ALL): per weekly-sf-policy \u00a75's run-day-gate precedent (WeeklyRunDayGateChoice: 'missing the weekly run is worse than a duplicate'), a read failure (most likely cause until the follow-up nous-ergon-ops IAM PR lands: alpha-engine-step-functions-role has no ssm:GetParameter on this resource yet \u2014 alpha-engine-config#6689 PR body names the exact grant) fails OPEN to the pre-existing 'run it' behavior rather than silently skipping the exercise launch, and pages so the degradation is visible instead of indistinguishable from a deliberate 'off'.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getParameter",
+      "Parameters": {
+        "Name": "/alpha-engine/weekly-sf/exercise-cadence"
+      },
+      "ResultSelector": {
+        "value.$": "$.Parameter.Value"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetCadenceReadDegraded",
+          "ResultPath": "$.exercise_cadence_read_error"
+        }
+      ],
+      "Next": "CheckExerciseCadence"
+    },
+    "SetCadenceReadDegraded": {
+      "Type": "Pass",
+      "Comment": "ReadExerciseCadence's Catch lands here. Floors $.exercise_cadence_param to a well-formed {'value': 'daily'} so CheckExerciseCadence takes the SAME branch the exercise launch always took before config#6689 \u2014 a missed exercise run is the worse failure mode (weekly-sf-policy \u00a75).",
+      "Result": {
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceReadDegraded"
+    },
+    "PublishCadenceReadDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert that the declared-cadence read degraded, mirroring PublishLibPinGateDegraded's config#2278 shape (config#1819 discipline: hardcoded Subject/Message constants, never States.Format against unbounded input; best-effort Catch so a publish failure can never block the fail-open path this alert decorates). TopicArn is hardcoded, NOT $.sns_topic_arn \u2014 the EOD SF was hardened 2026-05-14 to hardcode the alerts-topic ARN in every Publish state and never bind it from input (test_sf_eod_precondition_probe_wiring.py::TestHandleFailureCostGuardHardening pins the absence of that binding fleet-wide in this file).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine \u2014 weekly exercise-cadence read DEGRADED (defaulted to daily)",
+        "Message": "ReadExerciseCadence could not read /alpha-engine/weekly-sf/exercise-cadence from SSM (permission not yet granted \u2014 see alpha-engine-config#6689 \u2014 throttling, or a transient SSM fault). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. If the declared cadence is actually weekly-only or off, this run launched the exercise anyway; investigate the SSM read path before trusting any cadence flip. View pipeline status: https://dashboard.nousergon.ai/pipeline-status"
+      },
+      "ResultPath": "$.exercise_cadence_degraded_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_degraded_notify_error",
+          "Next": "CheckExerciseCadence"
+        }
+      ],
+      "Next": "CheckExerciseCadence",
+      "TimeoutSeconds": 30
+    },
+    "CheckExerciseCadence": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I6689 deliverable 2: gates LaunchWeeklyExerciseRun on the declared cadence. 'daily' preserves the pre-existing every-trading-day behavior exactly. 'weekly-only' / 'off' skip straight to CheckDegradedOutcome \u2014 LaunchWeeklyExerciseRun's OWN Next on ITS success path \u2014 so skipping the exercise launch never touches WeeklyExerciseLaunchFailed's routing (that state alerts only when the LAUNCH ITSELF fails, which cannot happen if it is never attempted). Default (value present but not one of the three declared literals \u2014 a manifest/SSM typo, or a future cadence value this SF has not been taught yet) is NOT a silent skip: it routes through SetCadenceUnknownValueDegraded to alert-then-launch, the same fail-toward-running posture as SetCadenceReadDegraded, rather than the invisible 'silently never ran' outcome. A missing/malformed $.exercise_cadence_param.value (ReadExerciseCadence's ResultSelector always sets it, or SetCadenceReadDegraded floors it) also falls through to Default by Step Functions Choice semantics \u2014 no separate IsPresent guard needed.",
+      "Choices": [
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "daily",
+          "Next": "LaunchWeeklyExerciseRun"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "weekly-only",
+          "Next": "CheckDegradedOutcome"
+        },
+        {
+          "Variable": "$.exercise_cadence_param.value",
+          "StringEquals": "off",
+          "Next": "CheckDegradedOutcome"
+        }
+      ],
+      "Default": "SetCadenceUnknownValueDegraded"
+    },
+    "SetCadenceUnknownValueDegraded": {
+      "Type": "Pass",
+      "Comment": "CheckExerciseCadence's Default: the read succeeded but matched none of daily/weekly-only/off. Decided posture (alpha-engine-config#6689): treat as daily (fail toward running the exercise \u2014 weekly-sf-policy \u00a75, missing a run is worse than an extra one) AND page, so 'ran anyway on an unrecognized value' is never mistaken for 'ran because cadence=daily was correctly read.' Captures the offending raw value under .raw BEFORE overwriting .value, so the alert below can name it.",
+      "Parameters": {
+        "raw.$": "$.exercise_cadence_param.value",
+        "value": "daily"
+      },
+      "ResultPath": "$.exercise_cadence_param",
+      "Next": "PublishCadenceUnknownValueDegraded"
+    },
+    "PublishCadenceUnknownValueDegraded": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I6689: alert on an unrecognized cadence value. Subject is a hardcoded constant (config#1819 discipline); the offending value is the one bounded dynamic field, threaded via States.Format \u2014 same pattern WeeklyRunDayGateFailed uses for its single bounded upstream field. TopicArn is hardcoded, NOT $.sns_topic_arn, per the same 2026-05-14 EOD-SF hardening as PublishCadenceReadDegraded above. Best-effort Catch.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine \u2014 weekly exercise-cadence value UNRECOGNIZED (defaulted to daily)",
+        "Message.$": "States.Format('ReadExerciseCadence returned a value CheckExerciseCadence does not recognize: {}. Expected one of daily | weekly-only | off (infrastructure/weekly_cadence.json). Proceeding FAIL-OPEN as cadence=daily: the exercise launch is NOT skipped. Check infrastructure/weekly_cadence.json and the live SSM parameter /alpha-engine/weekly-sf/exercise-cadence for a typo or an undeployed manifest edit.', $.exercise_cadence_param.raw)"
+      },
+      "ResultPath": "$.exercise_cadence_unknown_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort alert \u2014 a publish failure must not halt the fail-open path.",
+          "ResultPath": "$.exercise_cadence_unknown_notify_error",
+          "Next": "LaunchWeeklyExerciseRun"
+        }
+      ],
+      "Next": "LaunchWeeklyExerciseRun",
+      "TimeoutSeconds": 30
+    },
+    "LaunchWeeklyExerciseRun": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I5489 (Brian ruling 2026-07-29): kick the FULL weekly pipeline after every trading day's EOD close-out, gated by the declared cadence (CheckExerciseCadence). WHY CHAINED HERE: this machine only runs on a day the EOD collection ran, and by this point the collection + EODReconcile have settled the day's data, which is exactly what the weekly pipeline's data stages want. alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): moved here with the rest of the tail rather than left in ne-postclose-trading-pipeline, which now ends ~16:10 ET \u2014 an exercise launched there would read the day BEFORE the collector had written it. pipeline_role='exercise' (NOT 'weekly') is load-bearing: step_function.json's CheckWeeklyRunDayGate applies the run-day gate ONLY when pipeline_role=='weekly'. FIRE-AND-FORGET on purpose: states:startExecution WITHOUT .sync.",
+      "Resource": "arn:aws:states:::states:startExecution",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline",
+        "Input": {
+          "sns_topic_arn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+          "pipeline_role": "exercise",
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "alpha-engine-config#6722: a launch failure previously alerted via SNS (WeeklyExerciseLaunchFailed) but was never threaded into $.degraded_summary \u2014 routes through SetWeeklyExerciseDegradedFlag first so CheckDegradedOutcome's terminal reflects it too.",
+          "Next": "SetWeeklyExerciseDegradedFlag",
+          "ResultPath": "$.weekly_exercise_launch_error"
+        }
+      ],
+      "ResultPath": "$.weekly_exercise_run",
+      "Next": "CheckDegradedOutcome"
+    },
+    "SetWeeklyExerciseDegradedFlag": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#6722 (Option-A parity with SetDataSpotDegradedFlag/SetDegradedFlag/SetMutexAcquireDegradedFlag, config#6692/config-I2702 shape): threads $.degraded_summary onto the weekly-exercise sub-pipeline launch-failure path WITHOUT changing its continuation \u2014 Next still leads to WeeklyExerciseLaunchFailed's SNS alert exactly as before. Last-write-wins if a later stage also degrades. Does not clobber $.weekly_exercise_launch_error (set by LaunchWeeklyExerciseRun's own Catch ResultPath).",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_weekly_exercise_launch_failed",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.weekly_exercise_launch_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "WeeklyExerciseLaunchFailed"
+    },
+    "WeeklyExerciseLaunchFailed": {
+      "Type": "Task",
+      "Comment": "The exercise run failed to LAUNCH. Alert loudly, then continue to the normal terminal \u2014 this pipeline's own deliverable is complete by this point and must not be failed by a downstream pipeline's launch (weekly-sf-policy.md \u00a72.3 honest degradation).",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine \u2014 weekly EXERCISE run failed to launch",
+        "Message.$": "States.Format('ne-postclose-reconcile-pipeline completed but could not start the weekly exercise run. The weekly pipeline will NOT be exercised today. Error: {}', States.JsonToString($.weekly_exercise_launch_error))"
+      },
+      "ResultPath": "$.weekly_exercise_launch_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "CheckDegradedOutcome",
+          "ResultPath": "$.weekly_exercise_launch_notify_error"
+        }
+      ],
+      "Next": "CheckDegradedOutcome"
+    },
+    "CheckDegradedOutcome": {
+      "Type": "Choice",
+      "Comment": "config-I2702 deliverable #4: the ONE place that decides which terminal this execution reaches. $.degraded_summary is set by any Set*DegradedFlag state this execution passed \u2014 most importantly SetDegradedFlag, iff the precondition probe ever found the SPY close not-yet-verified-present this execution, regardless of whether the self-heal loop subsequently converged (HealConvergedNotify) or paged (HealNonConvergent): EODReconcile was skipped IN THIS EXECUTION either way.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.degraded_summary.degraded",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "config-I2767 (2026-07-16 incident): $.degraded_summary is only assigned on a degraded path \u2014 on a fully-green day the path is ABSENT and an unguarded dereference threw States.Runtime, failing the execution at its very last state. Absent flag = never degraded = NormalSucceeded via Default, which is the semantically exact reading, so no separate malformed route is needed here.",
+          "Next": "WriteCompletionMarkerDegraded"
+        }
+      ],
+      "Default": "WriteCompletionMarkerNormal"
+    },
+    "WriteCompletionMarkerNormal": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the normal outcome, immediately before the distinct NormalSucceeded terminal (config-I2702 deliverable #4 keeps Normal/Degraded as separate named states for the console/notification signal \u2014 this marker preserves that split rather than converging them, since both routes must still each reach their own named Succeed). The key is this machine's own prefix, _sf_completion/ne-postclose-reconcile-pipeline/ \u2014 it is the marker infrastructure/lambdas/eod_artifact_verification.py (sf-telegram-notifier and alpha-engine-eod-backstop) reads beside the eod_pnl.csv row. The post-close pipeline keeps writing its own sf_completion_ne_postclose_trading_pipeline marker. No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-postclose-reconcile-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-reconcile-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "NormalSucceeded"
+    },
+    "NormalSucceeded": {
+      "Type": "Succeed",
+      "Comment": "The ordinary, fully-green terminal \u2014 EODReconcile ran (or was validly skipped via an operator-replay skip_eod_reconcile flag), nothing degraded."
+    },
+    "WriteCompletionMarkerDegraded": {
+      "Type": "Task",
+      "Comment": "config#2857: SF-envelope completion marker \u2014 an end-of-SF terminal artifact, independent of downstream pipeline deliverables, that proves THIS Step Functions execution reached its real success terminal (config#1724 independent-signal doctrine). Written on the degraded outcome, immediately before the DegradedRun Fail terminal (config-I2702 deliverable #4 + Brian's 2026-07-28 Option-A ruling, alpha-engine-config#2699: the marker still fires so the completion artifact exists, but DegradedRun is Type: Fail so status-keyed watchers engage). The key is this machine's own prefix, _sf_completion/ne-postclose-reconcile-pipeline/ \u2014 it is the marker infrastructure/lambdas/eod_artifact_verification.py (sf-telegram-notifier and alpha-engine-eod-backstop) reads beside the eod_pnl.csv row. The post-close pipeline keeps writing its own sf_completion_ne_postclose_trading_pipeline marker. No swallow-all Catch here (unlike the SNS notifiers' config#1819 pattern): Retry covers transient S3 faults, but a marker that genuinely cannot be written means this execution's own completion is unverifiable \u2014 exactly the ambiguity this feature exists to surface, not mask. ResultPath is LOAD-BEARING, not hygiene (alpha-engine-config-I6891): a Task with no ResultPath defaults to $, so the putObject result REPLACES the whole state input and the DegradedRun terminal's CausePath dereference of $.degraded_summary.reason cannot resolve. The execution then fails with States.Runtime instead of DegradedRun \u2014 and Error: DegradedRun is a consumer contract: sf-telegram-notifier's _is_degraded_run() keys its DEGRADED rendering off exactly that string, so every honestly-degraded run rendered as an ordinary crash-red FAILED with a truncated cause. Shipped in both weekday definitions since config#6692/#6722; the weekly one inherited it by mirroring them and it is fixed in all three here.",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "alpha-engine-research",
+        "Key.$": "States.Format('_sf_completion/ne-postclose-reconcile-pipeline/{}.json', $.run_date)",
+        "ContentType": "application/json",
+        "Body.$": "States.Format('\\{\"sf\":\"ne-postclose-reconcile-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\"\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date)"
+      },
+      "ResultPath": "$.degraded_marker_result",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "MaxAttempts": 3,
+          "IntervalSeconds": 2,
+          "BackoffRate": 2.0,
+          "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
+        }
+      ],
+      "Next": "DegradedRun"
+    },
+    "DegradedRun": {
+      "Type": "Fail",
+      "Error": "DegradedRun",
+      "CausePath": "States.Format('EOD reconcile pipeline DEGRADED \u2014 reason: {}. Full degraded_summary: {}. Per the 2026-07-28 Option-A ruling (alpha-engine-config#2699): a degraded run must FAIL so status-keyed watchers (sf-watch, EventBridge, sf-telegram-notifier) engage with zero new plumbing. StopTradingInstance remains unconditionally reachable BEFORE this terminal.', $.degraded_summary.reason, States.JsonToString($.degraded_summary))",
+      "Comment": "alpha-engine-config-I6856: the Cause is DERIVED from $.degraded_summary, never an enumeration of the paths that can reach here \u2014 an enumeration drifts and then reads as specific (sf-pipeline-policy.md \u00a72.3 corollary). $.degraded_summary.reason is dereferenced UNGUARDED on purpose: CheckDegradedOutcome only routes here when degraded is true, every Set*DegradedFlag state sets reason, and tests/test_degraded_terminal_derives_its_cause.py fails the build if a new one does not."
+    },
+    "HandleFailure": {
+      "Type": "Task",
+      "Comment": "Failure alert via SNS \u2014 instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 FAILED",
+        "Message.$": "States.Format('EOD reconcile pipeline (ne-postclose-reconcile-pipeline) failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status', States.JsonToString($.error))"
+      },
+      "ResultPath": "$.failure_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Defense-in-depth: SNS publish failure must NOT block ForceStopInstance. The cost-guard fires regardless of alert delivery (avoids the 2026-05-14 incident where a malformed sns_topic_arn left the trading instance running).",
+          "Next": "ForceStopInstance",
+          "ResultPath": "$.failure_notify_error"
+        }
+      ],
+      "Next": "ForceStopInstance"
+    },
+    "ForceStopInstance": {
+      "Type": "Task",
+      "Comment": "Always stop trading instance even on failure \u2014 avoid cost overrun",
+      "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
+      "Parameters": {
+        "InstanceIds.$": "$.trading_instance_id"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.force_stop_result",
+      "Next": "FailExecution"
+    },
+    "FailExecution": {
+      "Type": "Fail",
+      "Error": "EODReconcilePipelineFailure",
+      "Cause": "EOD reconcile pipeline failed \u2014 trading instance stopped, check logs."
+    },
+    "NormalizeEODFailureContext": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config#5950. HandleFailure formats States.JsonToString($.error), and MarketHoursGateChoice's Default edge never sets it \u2014 on that path the failure REPORTER would raise States.Runtime, which no Catch can see, and the run would die with the reporting error in place of the real one. Mirrors the post-close pipeline's (and the weekly SF's NormalizeFailureContext, alpha-engine-config#2281) floor.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"error\":{\"phase\":\"Unknown\",\"source\":\"NormalizeEODFailureContext\",\"detail\":\"no error was set by the upstream Catch or Choice edge\"}}'),$,false)"
+      },
+      "OutputPath": "$.merged",
+      "Next": "HandleFailure"
+    },
+    "InitCollectionReadinessPoll": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11264: poll counter for the bounded readiness wait on the standalone nousergon-data-collection run manifests. Mirrors the InitSSMPollCounter idiom. The budget is in CheckCollectionReadinessBudget.",
+      "Result": {
+        "attempts": 0
+      },
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "SeedCollectionReadiness"
+    },
+    "SeedCollectionReadiness": {
+      "Type": "Pass",
+      "Comment": "Seeds $.collection_readiness so every later reader (the not-ready normalizer, the alert body) finds the path even when every poll raised into the Catch and no verdict was ever returned. A seed, not a verdict: ready=false.",
+      "Result": {
+        "ready": false,
+        "settled": false,
+        "missing": [],
+        "failed": [],
+        "failure_mode": "",
+        "baseline": "",
+        "summary": "no readiness verdict returned yet (every poll so far raised or none ran)"
+      },
+      "ResultPath": "$.collection_readiness",
+      "Next": "WaitForCollectionManifests"
+    },
+    "WaitForCollectionManifests": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11264 / -I11269: this pipeline runs no data stage of its own; the standalone nousergon-data-collection stack does (ne-data-collection-eod, 18:15 ET = dates.SETTLED_AFTER_ET). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): the pre-split postclose pipeline started at ~16:00 ET, BEFORE its producer, and polled for up to 59 x 300 s; this machine is started AFTER the producer reached a terminal state (alpha-engine-eod-backstop, on the collection's own Step Functions status-change event, or its scheduled reconcile backstop, which stands down while a collection is still RUNNING). So this wait is a GRADE plus a short race margin, not a producer runtime. The baseline cannot be $$.Execution.StartTime any more \u2014 every manifest this cycle wrote finished BEFORE this execution started \u2014 so it is derived from $.run_date: {run_date}T20:00:00Z is the NYSE close in EDT and an hour before it in EST, i.e. after the previous evening's collection could have finished (its heal is bounded by the 09:00 UTC deadline the precondition probe computes) and before this evening's collection can start (18:15 ET >= 22:15Z). Any manifest finishing after it is this cycle's, whenever this execution runs that evening; tests/test_v1_collection_readiness_wait.py derives the bound for both DST regimes. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by the same test. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
+      "Resource": "arn:aws:states:::lambda:invoke",
+      "Parameters": {
+        "FunctionName": "alpha-engine-collection-readiness-probe",
+        "Payload": {
+          "collection": "eod",
+          "units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
+          ],
+          "not_before.$": "States.Format('{}T20:00:00Z', $.run_date)",
+          "lookback_seconds": 0
+        }
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Lambda.ServiceException",
+            "Lambda.AWSLambdaException",
+            "Lambda.SdkClientException",
+            "Lambda.TooManyRequestsException"
+          ],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 3,
+          "BackoffRate": 2.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Not a verdict either way: record the raise and spend one poll of the bounded budget (CheckCollectionReadinessBudget).",
+          "ResultPath": "$.collection_readiness_error",
+          "Next": "CheckCollectionReadinessBudget"
+        }
+      ],
+      "ResultSelector": {
+        "ready.$": "$.Payload.readiness.ready",
+        "settled.$": "$.Payload.readiness.settled",
+        "missing.$": "$.Payload.readiness.missing",
+        "failed.$": "$.Payload.readiness.failed",
+        "failure_mode.$": "$.Payload.readiness.failure_mode",
+        "baseline.$": "$.Payload.readiness.baseline",
+        "summary.$": "$.Payload.readiness.summary"
+      },
+      "ResultPath": "$.collection_readiness",
+      "Next": "CheckCollectionReadiness"
+    },
+    "CheckCollectionReadiness": {
+      "Type": "Choice",
+      "Comment": "ready -> ProbeEODReconcilePrecondition. settled-but-not-ready (every unit has a manifest for this cycle and at least one failed the predicate) -> degrade NOW: no amount of waiting changes a published failure. Otherwise poll again inside the (short) budget.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.ready",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.ready",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ProbeEODReconcilePrecondition"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness.settled",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness.settled",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ExtractCollectionNotReadyError"
+        }
+      ],
+      "Default": "CheckCollectionReadinessBudget"
+    },
+    "CheckCollectionReadinessBudget": {
+      "Type": "Choice",
+      "Comment": "The wait is BOUNDED: 5 polls of 60 s. It is a race margin, not a producer runtime: this machine starts only after ne-data-collection-eod reached a terminal state (or, from the scheduled reconcile backstop, after that collection's declared worst case and only when no collection is RUNNING), so a unit still missing after five minutes is not going to publish by itself \u2014 the precondition probe and the self-heal loop that follow are what act on it. The pre-split postclose pipeline's 59 x 300 s budget existed because it started before its producer; that derivation now lives on the reconcile backstop's schedule, which tests/test_v1_collection_readiness_wait.py pins to fire after the collection's cron plus the declared caps of every workload writing a waited unit.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.collection_readiness_poll.attempts",
+              "NumericGreaterThanEquals": 5
+            }
+          ],
+          "Comment": "IsPresent-guarded (config#2275) although InitCollectionReadinessPoll seeds the counter on every path into this block: a Choice cannot Catch, so a guard costs nothing and an unguarded dereference is one refactor away from States.Runtime.",
+          "Next": "ExtractCollectionNotReadyError"
+        }
+      ],
+      "Default": "CollectionReadinessPollWait"
+    },
+    "CollectionReadinessPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "IncrementCollectionReadinessPoll"
+    },
+    "IncrementCollectionReadinessPoll": {
+      "Type": "Pass",
+      "Parameters": {
+        "attempts.$": "States.MathAdd($.collection_readiness_poll.attempts, 1)"
+      },
+      "ResultPath": "$.collection_readiness_poll",
+      "Next": "WaitForCollectionManifests"
+    },
+    "ExtractCollectionNotReadyError": {
+      "Type": "Pass",
+      "Comment": "Budget exhausted, or the producer settled with a failed unit. Route into the fail-open normalizer (ExtractDataSpotError -> SetDataSpotDegradedFlag -> PublishDataSpotFailureImmediate -> ProbeEODReconcilePrecondition): the precondition probe, reconcile or the heal loop, and StopTradingInstance all still run, and the terminal is DegradedRun.",
+      "Next": "ExtractDataSpotError"
+    },
+    "HealStartCollection": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I11266 (Brian ruling 2026-09-21 on alpha-engine-config-I11270, option (a)): the heal loop's ACTUATOR, repointed. It used to relaunch the post-market-data and post-market-arctic-append spots itself (HealLaunchPostMarketDataSpot / HealLaunchArcticAppendSpot) \u2014 a second writer of market_data/* and the ArcticDB universe/macro libraries inside the failure path. It now starts the standalone ne-data-collection-eod machine and waits for it (.sync:2), so the normal path and the heal path run ONE writer implementation. detect -> act -> verify -> close is unchanged: HealReProbe re-reads the precondition whatever this execution's outcome (a collection that FAILED on one unit may still have landed the SPY close the probe checks), HealCheckConverged and HealDispatchReplay follow exactly as before, and HealLoopGate's bound (attempts >= 2 or past_deadline) still ends the loop at HealNonConvergent. NOT a v1 data stage: it runs no collector, so it is deliberately absent from data_gate/producers/v1_data_stage.py::V1_DATA_STAGE_STATES \u2014 adding it there would red data.phase1.v1_data_stage_quiet on every healed day for the one writer the cutover wants. Input mirrors data-collection-eod's schedule Input minus the two workloads that write no verify_unit (pinned by tests/test_v1_collection_readiness_wait.py); require_trading_day is false because this pipeline only reaches here on a trading day it already ran for. The execution name keeps its v1-eod-heal- prefix on purpose: alpha-engine-eod-backstop's collection-terminal trigger ignores that prefix (in its EventBridge pattern AND in code), so this heal's own terminal event can never start a second reconcile underneath the loop that launched it.",
+      "Resource": "arn:aws:states:::states:startExecution.sync:2",
+      "Parameters": {
+        "StateMachineArn": "arn:aws:states:us-east-1:711398986525:stateMachine:ne-data-collection-eod",
+        "Name.$": "States.Format('v1-eod-heal-{}-{}', $.run_date, States.UUID())",
+        "Input": {
+          "collection": "eod",
+          "workloads": [
+            "post-market-data",
+            "post-market-arctic-append"
+          ],
+          "require_trading_day": false,
+          "verify_units": [
+            "D03",
+            "D19",
+            "D20",
+            "D21",
+            "D22",
+            "D23",
+            "D24",
+            "D25",
+            "D26",
+            "D27",
+            "D28",
+            "D29",
+            "D30",
+            "D31",
+            "D32"
+          ],
+          "AWS_STEP_FUNCTIONS_STARTED_BY_EXECUTION_ID.$": "$$.Execution.Id"
+        }
+      },
+      "TimeoutSeconds": 10800,
+      "ResultSelector": {
+        "status.$": "$.Status",
+        "execution_arn.$": "$.ExecutionArn"
+      },
+      "ResultPath": "$.heal_collection",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "A FAILED/TIMED_OUT collection is not a convergence verdict \u2014 the collection fails loud on ANY unit, while the precondition is the SPY close + macro sentinel. HealReProbe decides, exactly as it did after a failed spot.",
+          "ResultPath": "$.heal_error",
+          "Next": "HealReProbe"
+        }
+      ],
+      "Next": "HealReProbe"
+    }
+  }
+}

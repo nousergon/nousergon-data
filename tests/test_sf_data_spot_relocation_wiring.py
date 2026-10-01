@@ -27,6 +27,13 @@ This test pins, structurally (no live infra needed):
   4. The dispatcher Lambda's workload map still runs the SAME
      weekly_collector.py entrypoints (it is the standalone collection's
      launcher now; M0 data contract preserved).
+
+alpha-engine-config-I11269 (post-close split): the EOD readiness wait, the
+precondition probe and EODReconcile now live in the collector-gated
+ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json); the 16:00
+ne-postclose-trading-pipeline (step_function_eod.json) keeps CaptureSnapshot
+and waits for nothing. The ``eod`` fixture is therefore the reconcile machine,
+and every "gone" pin is asserted against BOTH EOD machines.
 """
 
 from __future__ import annotations
@@ -38,7 +45,9 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _DAILY = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
-_EOD = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+# alpha-engine-config-I11269: the EOD wait block lives in the reconcile machine.
+_EOD = _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.json"
+_EOD_POSTCLOSE = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 _DISPATCHER = _REPO_ROOT / "infrastructure" / "lambdas" / "data-spot-dispatcher"
 
 _LAMBDA_INVOKE = "arn:aws:states:::lambda:invoke"
@@ -55,6 +64,11 @@ def daily() -> dict:
 @pytest.fixture(scope="module")
 def eod() -> dict:
     return json.loads(_EOD.read_text())["States"]
+
+
+@pytest.fixture(scope="module")
+def eod_postclose() -> dict:
+    return json.loads(_EOD_POSTCLOSE.read_text())["States"]
 
 
 # ── Terminal HALT states each SF must NEVER reach from a data-phase failure ───
@@ -235,7 +249,7 @@ class TestWeekdayFailureIsolation(_WaitBlockIsolation):
 
 
 # ══════════════════════════════════════════════════════════════════════════
-# EOD (step_function_eod.json)
+# EOD (step_function_eod_reconcile.json + step_function_eod.json, I11269)
 # ══════════════════════════════════════════════════════════════════════════
 class TestEODDataPhaseOffTrading:
     @pytest.mark.parametrize(
@@ -269,30 +283,48 @@ class TestEODDataPhaseOffTrading:
             "HealCheckArcticAppendSpotStatus", "HealArcticAppendSpotWait",
         ],
     )
-    def test_relocated_state_absent(self, eod, gone):
-        assert gone not in eod, f"{gone} must not run from the v1 EOD SF"
+    def test_relocated_state_absent(self, eod, eod_postclose, gone):
+        assert gone not in eod, f"{gone} must not run from the v1 EOD reconcile SF"
+        assert gone not in eod_postclose, f"{gone} must not run from the v1 post-close SF"
 
-    def test_reconcile_snapshot_stop_path_intact(self, eod):
+    def test_reconcile_snapshot_stop_path_intact(self, eod, eod_postclose):
         # Deliverable #2: the reconcile/snapshot/instance-stop path stays on the box.
-        for kept in ("CaptureSnapshot", "EODReconcile", "StopTradingInstance"):
-            assert kept in eod, f"{kept} must remain in the EOD trading path"
+        # alpha-engine-config-I11269: split across the two EOD machines —
+        # CaptureSnapshot at 16:00, EODReconcile + the box stop after the
+        # collection.
+        assert "CaptureSnapshot" in eod_postclose, "CaptureSnapshot must remain in the 16:00 post-close SF"
+        for kept in ("EODReconcile", "StopTradingInstance"):
+            assert kept in eod, f"{kept} must remain in the EOD reconcile SF"
 
-    def test_no_ssm_send_targets_trading_instance_for_data(self, eod):
+    @pytest.mark.parametrize("machine", ["eod", "eod_postclose"])
+    def test_no_ssm_send_targets_trading_instance_for_data(self, request, machine):
         from tests.sf_command_utils import extract_commands
-        for name, st in eod.items():
+        for name, st in request.getfixturevalue(machine).items():
             if st.get("Resource") != _SSM_SEND:
                 continue
             joined = "\n".join(extract_commands(st))
             assert "--post-market-data" not in joined, f"{name} still fetches on-box"
             assert "--post-market-arctic-append" not in joined, f"{name} still appends on-box"
 
+    def test_the_postclose_sf_waits_for_no_collection(self, eod_postclose):
+        # alpha-engine-config-I11269: the 16:00 machine carries no part of the
+        # readiness wait and invokes neither the probe nor the dispatcher.
+        for name in _WAIT_BLOCK:
+            assert name not in eod_postclose, name
+        for fn in (_PROBE_FN, _DISPATCHER_FN):
+            offenders = sorted(n for n, st in eod_postclose.items() if _invokes(st, fn))
+            assert offenders == [], (fn, offenders)
+
 
 class TestEODFailureIsolation(_WaitBlockIsolation):
     """A not-ready EOD collection must NOT block reconcile + instance-stop — it
-    routes to CheckSkipCaptureSnapshot, never HandleFailure."""
+    routes to the precondition probe, never HandleFailure.
+
+    alpha-engine-config-I11269: the continue state was CheckSkipCaptureSnapshot
+    until the split moved CaptureSnapshot into the 16:00 machine."""
 
     SF = "eod"
-    CONTINUE = "CheckSkipCaptureSnapshot"
+    CONTINUE = "ProbeEODReconcilePrecondition"
     SKIP_GATE = "CheckSkipPostMarketData"
 
 

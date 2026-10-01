@@ -30,6 +30,13 @@
       "drift_probe_consumer": true
     },
     {
+      "pipeline": "ne-postclose-reconcile-pipeline",
+      "repo_path": "infrastructure/step_function_eod_reconcile.json",
+      "s3_key": "infrastructure/step_function_eod_reconcile.json",
+      "drift_probe_consumer": false,
+      "note": "The collector-dependent half of the post-close pipeline, split out 2026-09-30 (alpha-engine-config-I11269 follow-up). NOT a drift-probe consumer yet: it carries no DeployDriftCheck, because crucible-predictor inference/deploy_drift.py raises on an sf_name it does not declare. Adding the probe here is a follow-up that must land crucible-predictor's _SF_DEFINITION_PATHS entry first."
+    },
+    {
       "pipeline": "alpha-engine-groom-dispatch",
       "repo_path": "infrastructure/step_function_groom.json",
       "s3_key": "infrastructure/step_function_groom.json",

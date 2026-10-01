@@ -75,8 +75,20 @@ class TestRetryCounterInitialization:
         # The pre-existing skip_capture_snapshot=true operator-replay gate
         # still bypasses CaptureSnapshot (and therefore the retry machinery)
         # entirely — this fix must not disturb that rerun path.
+        # alpha-engine-config-I11269: CaptureSnapshot is the 16:00 machine's
+        # last work task since the post-close split, so the bypass lands on
+        # its degraded-outcome tail (the precondition probe it used to reach
+        # moved to the reconcile machine). Still a bypass of the whole retry
+        # machinery, and still gated on operator-replay.
         st = eod["CheckSkipCaptureSnapshot"]
-        assert st["Choices"][0]["Next"] == "ProbeEODReconcilePrecondition"
+        assert st["Choices"][0]["Next"] == "CheckDegradedOutcome"
+        assert st["Default"] == "InitCaptureSnapshotRetryCounter"
+        retry_states = {
+            "InitCaptureSnapshotRetryCounter", "CaptureSnapshot", "WaitForCaptureSnapshot",
+            "CheckSnapshotStatus", "CheckCaptureSnapshotRetryBudget",
+            "IncrementCaptureSnapshotRetry", "PageCaptureSnapshotFailureImmediate",
+        }
+        assert st["Choices"][0]["Next"] not in retry_states
 
 
 class TestThreeFailureModesFunnelIntoRetryBudget:

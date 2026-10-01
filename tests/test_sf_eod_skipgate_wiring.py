@@ -30,6 +30,15 @@ self-heal-outcome notifiers (`HealReplayDispatchFailed`/`HealConvergedNotify`/
 `HealNonConvergent`, pinned in test_sf_eod_precondition_probe_wiring.py).
 `TestSubstrateHealthCheckChainRemoved` below pins the chain's absence and the
 rewiring.
+
+alpha-engine-config-I11269 (post-close split): the EOD run is now TWO machines.
+``ne-postclose-trading-pipeline`` (step_function_eod.json) runs at ~16:00 ET
+and carries the gates that do not need the collector (deploy refresh +
+CaptureSnapshot); ``ne-postclose-reconcile-pipeline``
+(step_function_eod_reconcile.json) starts when ne-data-collection-eod finishes
+and carries the collector-dependent gates (collection wait + EODReconcile).
+Every gate is pinned against the machine it now lives in, and the
+operator-replay-only rule (config#1614) is asserted for BOTH machines.
 """
 
 from __future__ import annotations
@@ -40,42 +49,45 @@ from pathlib import Path
 import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
-_SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+_POSTCLOSE_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+_RECONCILE_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.json"
 
-# (gate, task, skip_flag, next_after_skip) in pipeline order.
+# (gate, task, skip_flag, next_after_skip) in pipeline order, per machine.
 #
 # config#1767 (Phase 2): the EOD data phase (PostMarketData + PostMarketArcticAppend)
 # was relocated OFF the always-on ae-trading box onto an ephemeral spot box.
-# CheckSkipPostMarketData now gates the whole spot data phase (LaunchPostMarketDataSpot)
-# and its skip edge jumps to CheckSkipCaptureSnapshot (the old
-# CheckSkipPostMarketArcticAppend gate was removed with the on-trading append state).
-# The spot data-phase wiring is pinned separately in
+# The old CheckSkipPostMarketArcticAppend gate was removed with the
+# on-trading append state. The spot data-phase wiring is pinned separately in
 # test_sf_data_spot_relocation_wiring.py.
 #
 # alpha-engine-config-I11269: the spot data phase is REMOVED — the standalone
 # ne-data-collection-eod schedule runs it — and CheckSkipPostMarketData now
 # gates the bounded readiness wait on that collection's run manifests
 # (WaitForCollectionManifests, I11264) instead.
-_CHAIN = [
+_POSTCLOSE_CHAIN = [
     # config#1549 — the hoisted top-of-pipeline executor-deploy refresh gate runs
-    # FIRST (right after the SSM-readiness gate), so the entire EOD run executes
+    # FIRST (right after the SSM-readiness gate), so the entire run executes
     # latest origin/main by construction. Skipping it resumes at the first work gate.
+    ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipCaptureSnapshot"),
+    # alpha-engine-config#5569 (2026-08-09): the Default runs through
+    # InitCaptureSnapshotRetryCounter (the same-day bounded-retry budget init
+    # for CaptureSnapshot's irreversible per-day deadline) before CaptureSnapshot
+    # itself — pinned separately in test_sf_capture_snapshot_retry_wiring.py.
+    # alpha-engine-config-I11269: CaptureSnapshot is the LAST work task of the
+    # post-close machine, so its skip edge lands on the degraded-outcome tail.
+    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "CheckDegradedOutcome"),
+]
+
+_RECONCILE_CHAIN = [
     ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
     # alpha-engine-config-I11269: CheckSkipPostMarketData's Default enters the
     # readiness wait (InitCollectionReadinessPoll -> ... ->
     # WaitForCollectionManifests) — pinned in test_sf_data_spot_relocation_wiring.py
-    # and tests/test_v1_collection_readiness_wait.py.
-    ("CheckSkipPostMarketData", "InitCollectionReadinessPoll", "skip_post_market_data", "CheckSkipCaptureSnapshot"),
-    # config-I2702 (2026-07-15): the skip edge now lands on
-    # ProbeEODReconcilePrecondition (the new verify-by-artifact precondition
-    # probe), not directly on CheckSkipEODReconcile — every path into the
-    # reconcile gate, skip or not, must probe fresh.
-    # alpha-engine-config#5569 (2026-08-09): the Default now runs through
-    # InitCaptureSnapshotRetryCounter (the new same-day bounded-retry budget
-    # init for CaptureSnapshot's irreversible per-day deadline) before
-    # CaptureSnapshot itself — pinned separately in
-    # test_sf_capture_snapshot_retry_wiring.py.
-    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "ProbeEODReconcilePrecondition"),
+    # and tests/test_v1_collection_readiness_wait.py. Its skip edge lands on
+    # ProbeEODReconcilePrecondition (config-I2702: every path into the
+    # reconcile gate, skip or not, must probe fresh). Before the split it
+    # landed on CheckSkipCaptureSnapshot, which is now in the other machine.
+    ("CheckSkipPostMarketData", "InitCollectionReadinessPoll", "skip_post_market_data", "ProbeEODReconcilePrecondition"),
     # alpha-engine-config-I2722 (2026-07-16): the skip edge used to land on
     # CheckSkipDailySubstrateHealthCheck; that gate + the whole
     # DailySubstrateHealthCheck chain were removed (spun out to a dashboard-box
@@ -83,15 +95,46 @@ _CHAIN = [
     ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "StopTradingInstance"),
 ]
 
+_MACHINES = {
+    "postclose": (_POSTCLOSE_PATH, _POSTCLOSE_CHAIN),
+    "reconcile": (_RECONCILE_PATH, _RECONCILE_CHAIN),
+}
+
+_POSTCLOSE_TAIL = ["CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+_RECONCILE_TAIL = [
+    "StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence",
+    "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
+]
+
+
+def _load(path: Path) -> dict:
+    return json.loads(path.read_text())["States"]
+
 
 @pytest.fixture(scope="module")
-def states() -> dict:
-    return json.loads(_SF_PATH.read_text())["States"]
+def postclose() -> dict:
+    return _load(_POSTCLOSE_PATH)
+
+
+@pytest.fixture(scope="module")
+def reconcile() -> dict:
+    return _load(_RECONCILE_PATH)
+
+
+# Backwards-compatible name for the collector-gated machine, where the
+# reconcile/heal/substrate assertions below live.
+@pytest.fixture(scope="module")
+def states(reconcile) -> dict:
+    return reconcile
+
+
+_ALL_GATES = [(m, *g) for m, (_p, chain) in _MACHINES.items() for g in chain]
 
 
 class TestGatePresenceAndShape:
-    @pytest.mark.parametrize("gate,task,flag,nxt", _CHAIN)
-    def test_gate_exists_and_shaped(self, states, gate, task, flag, nxt):
+    @pytest.mark.parametrize("machine,gate,task,flag,nxt", _ALL_GATES)
+    def test_gate_exists_and_shaped(self, machine, gate, task, flag, nxt):
+        states = _load(_MACHINES[machine][0])
         assert gate in states and states[gate]["Type"] == "Choice"
         c = states[gate]["Choices"][0]
         # config#1614: every skip gate requires BOTH the flag AND the
@@ -107,13 +150,24 @@ class TestGatePresenceAndShape:
         assert c["Next"] == nxt
         assert states[gate]["Default"] == task
 
+    @pytest.mark.parametrize("machine", sorted(_MACHINES))
+    def test_no_gate_for_a_task_the_machine_does_not_run(self, machine):
+        """alpha-engine-config-I11269: each skip gate lives in exactly the
+        machine that runs its task — a gate left behind in the other machine
+        would be a skip flag no state honours."""
+        states = _load(_MACHINES[machine][0])
+        declared = {g[0] for g in _MACHINES[machine][1]}
+        present = {n for n in states if n.startswith("CheckSkip")}
+        assert present == declared, (machine, present ^ declared)
+
 
 class TestEntryEdgesRouteThroughGates:
-    def test_mutex_paths_enter_instance_start_then_post_market_gate(self, states):
+    def test_mutex_paths_enter_instance_start_then_post_market_gate(self, postclose):
+        states = postclose
         # 2026-06-30: all three post-mutex entries now go through the
         # StartTradingInstance re-runnability guard first, which — once the box
-        # is SSM-Online — converges on the CheckSkipPostMarketData rerun-gate
-        # chain. (The ensure-running block is pinned in detail by
+        # is SSM-Online — converges on the rerun-gate chain. (The
+        # ensure-running block is pinned in detail by
         # test_sf_eod_instance_start_wiring.py.)
         # alpha-engine-config-I8102: the three mutex edges now enter
         # DeployDriftCheck, and EVERY route out of the drift block converges
@@ -154,189 +208,266 @@ class TestEntryEdgesRouteThroughGates:
                   if any(x.get("StringEquals") == "Online" for x in c.get("And", []))]
         assert online == ["CheckSkipRefreshExecutorDeploy"]
 
-    def test_refresh_success_enters_post_market_gate(self, states):
+    def test_reconcile_mutex_paths_enter_instance_start(self, reconcile):
+        # alpha-engine-config-I11269: the reconcile machine carries no
+        # DeployDriftCheck (the crucible-predictor probe does not declare its
+        # sf_name yet — tracked follow-up), so all three post-mutex entries go
+        # straight to the ensure-running guard. The invariant is the same: no
+        # ssm:sendCommand before the box is confirmed SSM-Online.
+        states = reconcile
+        assert "DeployDriftCheck" not in states
+        assert states["CheckMutexRole"]["Default"] == "StartTradingInstance"
+        assert states["AcquireMutex"]["Next"] == "StartTradingInstance"
+        failopen = [c["Next"] for c in states["AcquireMutex"]["Catch"]
+                    if "States.ALL" in c["ErrorEquals"]]
+        assert failopen == ["SetMutexAcquireDegradedFlag"]
+        assert states["SetMutexAcquireDegradedFlag"]["Next"] == "StartTradingInstance"
+        online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]
+                  if any(x.get("StringEquals") == "Online" for x in c.get("And", []))]
+        assert online == ["CheckSkipRefreshExecutorDeploy"]
+
+    @pytest.mark.parametrize("machine,first_work_gate", [
+        ("postclose", "CheckSkipCaptureSnapshot"),
+        ("reconcile", "CheckSkipPostMarketData"),
+    ])
+    def test_refresh_success_enters_first_work_gate(self, machine, first_work_gate):
         # config#1549: after the deploy refresh succeeds, control enters the
-        # first work gate (CheckSkipPostMarketData) — the whole run now executes
-        # on latest origin/main.
+        # first work gate — the whole run executes on latest origin/main.
+        states = _load(_MACHINES[machine][0])
         succ = [c["Next"] for c in states["CheckRefreshExecutorDeployStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipPostMarketData"]
+        assert succ == [first_work_gate]
 
-    def test_collection_ready_enters_snapshot_gate(self, states):
+    def test_collection_ready_enters_precondition_probe(self, reconcile):
         # alpha-engine-config-I11269: the three spot legs (post-market-data,
-        # post-market-arctic-append, edgar-pit-fundamentals-daily) whose Success
-        # edges used to chain into CheckSkipCaptureSnapshot are gone; the
-        # readiness wait's "ready" edge is the one entry now. The not-ready
-        # edges reach it too, through the fail-open normalizer.
-        ready = states["CheckCollectionReadiness"]["Choices"][0]
-        assert ready["Next"] == "CheckSkipCaptureSnapshot"
-        assert states["PublishDataSpotFailureImmediate"]["Next"] == "CheckSkipCaptureSnapshot"
+        # post-market-arctic-append, edgar-pit-fundamentals-daily) are gone;
+        # the readiness wait's "ready" edge is the one entry now. The not-ready
+        # edges reach it too, through the fail-open normalizer. Since the
+        # split, the next step is the precondition probe (CaptureSnapshot ran
+        # at 16:00 in the other machine).
+        ready = reconcile["CheckCollectionReadiness"]["Choices"][0]
+        assert ready["Next"] == "ProbeEODReconcilePrecondition"
+        assert reconcile["PublishDataSpotFailureImmediate"]["Next"] == "ProbeEODReconcilePrecondition"
 
-    def test_data_phase_no_longer_on_trading_box(self, states):
+    @pytest.mark.parametrize("machine", sorted(_MACHINES))
+    def test_data_phase_no_longer_on_trading_box(self, machine):
         # config#1767 deliverable #2: the EOD path retains NO data-phase SSM
         # states — reconcile/snapshot/stop stays, the data fetch/append moved.
+        states = _load(_MACHINES[machine][0])
         for gone in ("PostMarketData", "PostMarketArcticAppend", "CheckPostMarketStatus",
                      "CheckPostMarketArcticAppendStatus", "CheckSkipPostMarketArcticAppend"):
             assert gone not in states, f"{gone} should have moved to the spot dispatcher"
 
-    def test_snapshot_success_enters_reconcile_gate(self, states):
-        # config-I2702: CaptureSnapshot's success now enters the new
-        # verify-by-artifact precondition probe, which itself feeds
-        # CheckSkipEODReconcile (pinned separately below).
-        succ = [c["Next"] for c in states["CheckSnapshotStatus"]["Choices"]
+    def test_snapshot_success_enters_degraded_outcome(self, postclose):
+        # alpha-engine-config-I11269: CaptureSnapshot is the post-close
+        # machine's last work task; its success enters the Option-A terminal
+        # (the precondition probe it used to feed moved to the reconcile
+        # machine, pinned below).
+        succ = [c["Next"] for c in postclose["CheckSnapshotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["ProbeEODReconcilePrecondition"]
-        assert states["ProbeEODReconcilePrecondition"]["Next"] == "CheckSkipEODReconcile"
+        assert succ == ["CheckDegradedOutcome"]
 
-    def test_eod_success_enters_stop_trading_instance(self, states):
+    def test_precondition_probe_feeds_reconcile_gate(self, reconcile):
+        # config-I2702: the verify-by-artifact precondition probe feeds
+        # CheckSkipEODReconcile on every path.
+        assert reconcile["ProbeEODReconcilePrecondition"]["Next"] == "CheckSkipEODReconcile"
+
+    def test_eod_success_enters_stop_trading_instance(self, reconcile):
         # alpha-engine-config-I2722 (2026-07-16): CheckEODStatus's Success edge
         # used to feed CheckSkipDailySubstrateHealthCheck; that gate + chain
         # are removed, so it now routes directly to the cost-guard tail.
-        succ = [c["Next"] for c in states["CheckEODStatus"]["Choices"]
+        succ = [c["Next"] for c in reconcile["CheckEODStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
         assert succ == ["StopTradingInstance"]
 
 
-class TestPaths:
-    def _walk(self, states, skip_flags, pipeline_role="operator-replay"):
-        """Simulate the gate chain. Mirrors ASL Choice semantics: the skip
-        branch is taken only when the flag is set AND pipeline_role ==
-        "operator-replay" (config#1614)."""
-        gates = {c[0] for c in _CHAIN}
-        order, seen, cur = [], set(), "CheckSkipRefreshExecutorDeploy"
-        while cur and cur in states and cur not in seen:
-            seen.add(cur)
-            st = states[cur]
-            if cur in gates:
-                flag = next(c[2] for c in _CHAIN if c[0] == cur)
-                skip_taken = flag in skip_flags and pipeline_role == "operator-replay"
-                cur = st["Choices"][0]["Next"] if skip_taken else st["Default"]
-                continue
-            order.append(cur)
-            if st.get("End") or st["Type"] in ("Succeed", "Fail"):
-                break
-            if st["Type"] == "Choice":
-                succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
-                # config#1767: the spot launched-gate states branch on
-                # launched:true (BooleanEquals) — follow that on the happy path.
-                # config-I2767: the rule is now And[IsPresent, BooleanEquals]-
-                # guarded, so unwrap the And when matching.
-                def _ops(rule):
-                    merged = {}
-                    for op in rule.get("And", [rule]):
-                        merged.update(op)
-                    return merged
-                # alpha-engine-config-I11269: CheckCollectionReadiness's
-                # happy edge is ready == true (its first rule), the same shape.
-                launched = (
-                    [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
-                    if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
-                )
-                # alpha-engine-config-I6689: CheckExerciseCadence branches on
-                # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
-                # *SpotLaunched BooleanEquals — the happy-path simulation here
-                # always takes the "daily" branch (LaunchWeeklyExerciseRun),
-                # matching this SF's actual pre-config#6689 default behavior.
-                cadence_daily = (
-                    [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "daily"]
-                    if cur == "CheckExerciseCadence" else []
-                )
-                cur = (succ or launched or cadence_daily or [st.get("Default")])[0]
-            else:
-                cur = st.get("Next")
-        return order
+def _walk(states, chain, skip_flags, pipeline_role="operator-replay"):
+    """Simulate the gate chain. Mirrors ASL Choice semantics: the skip
+    branch is taken only when the flag is set AND pipeline_role ==
+    "operator-replay" (config#1614)."""
+    gates = {c[0] for c in chain}
+    order, seen, cur = [], set(), "CheckSkipRefreshExecutorDeploy"
+    while cur and cur in states and cur not in seen:
+        seen.add(cur)
+        st = states[cur]
+        if cur in gates:
+            flag = next(c[2] for c in chain if c[0] == cur)
+            skip_taken = flag in skip_flags and pipeline_role == "operator-replay"
+            cur = st["Choices"][0]["Next"] if skip_taken else st["Default"]
+            continue
+        order.append(cur)
+        if st.get("End") or st["Type"] in ("Succeed", "Fail"):
+            break
+        if st["Type"] == "Choice":
+            succ = [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "Success"]
+            # config#1767: the spot launched-gate states branch on
+            # launched:true (BooleanEquals) — follow that on the happy path.
+            # config-I2767: the rule is now And[IsPresent, BooleanEquals]-
+            # guarded, so unwrap the And when matching.
+            def _ops(rule):
+                merged = {}
+                for op in rule.get("And", [rule]):
+                    merged.update(op)
+                return merged
+            # alpha-engine-config-I11269: CheckCollectionReadiness's
+            # happy edge is ready == true (its first rule), the same shape.
+            launched = (
+                [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
+                if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
+            )
+            # alpha-engine-config-I6689: CheckExerciseCadence branches on
+            # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
+            # *SpotLaunched BooleanEquals — the happy-path simulation here
+            # always takes the "daily" branch (LaunchWeeklyExerciseRun),
+            # matching this SF's actual pre-config#6689 default behavior.
+            cadence_daily = (
+                [c["Next"] for c in st.get("Choices", []) if c.get("StringEquals") == "daily"]
+                if cur == "CheckExerciseCadence" else []
+            )
+            cur = (succ or launched or cadence_daily or [st.get("Default")])[0]
+        else:
+            cur = st.get("Next")
+    return order
 
-    def test_happy_path_runs_every_task_then_stops_instance(self, states):
-        order = self._walk(states, skip_flags=set())
-        tasks = [c[1] for c in _CHAIN]
+
+class TestPaths:
+    @pytest.mark.parametrize("machine,tail", [
+        ("postclose", _POSTCLOSE_TAIL),
+        ("reconcile", _RECONCILE_TAIL),
+    ])
+    def test_happy_path_runs_every_task_in_order(self, machine, tail):
+        path, chain = _MACHINES[machine]
+        states = _load(path)
+        order = _walk(states, chain, skip_flags=set())
+        tasks = [c[1] for c in chain]
         idxs = [order.index(t) for t in tasks]
         assert idxs == sorted(idxs), order
-        # config-I2702 deliverable #4: StopTradingInstance no longer
-        # terminates the execution directly — a fully-green run (no gap ever
+        # config-I2702 deliverable #4: a fully-green run (no gap ever
         # detected, $.degraded_summary never set) routes through
         # CheckDegradedOutcome to the ordinary NormalSucceeded terminal.
-        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-len(tail):] == tail, order
 
-    def test_full_skip_still_stops_the_instance(self, states):
-        order = self._walk(states, skip_flags={c[2] for c in _CHAIN})
-        for task in (c[1] for c in _CHAIN):
+    def test_postclose_success_path_leaves_the_box_up(self, postclose):
+        # alpha-engine-config-I11269: the 16:00 machine deliberately does NOT
+        # stop the trading box on success — crucible-executor's post-close
+        # timers (trader-reconcile 16:45 ET, eod-reconcile-standalone
+        # 21:05 UTC, reference-rate-publish 21:15 UTC) need it up, and the
+        # reconcile machine's StopTradingInstance (plus the 22:00 PT
+        # alpha-engine-stop-trading cost guard) is what stops it.
+        for flags in (set(), {c[2] for c in _POSTCLOSE_CHAIN}):
+            order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags=flags)
+            assert "StopTradingInstance" not in order, order
+        assert "StopTradingInstance" not in postclose
+
+    def test_full_skip_still_stops_the_instance(self, reconcile):
+        order = _walk(reconcile, _RECONCILE_CHAIN, skip_flags={c[2] for c in _RECONCILE_CHAIN})
+        for task in (c[1] for c in _RECONCILE_CHAIN):
             assert task not in order, f"{task} ran despite skip flag"
         # Cost-guard cleanup must ALWAYS run, then reach the normal terminal.
         # ProbeEODReconcilePrecondition still runs even on a fully-skipped
         # path (default pipeline_role="operator-replay" here) — same
         # unconditional-probe behavior pinned in
         # test_operator_replay_still_honors_skips below.
-        assert order == [
-            "ProbeEODReconcilePrecondition", "StopTradingInstance",
-            "ReadExerciseCadence", "CheckExerciseCadence",
-            "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
-        ]
+        assert order == ["ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
 
-    def test_skip_refresh_resumes_at_the_collection_wait(self, states):
+    def test_postclose_full_skip_reaches_normal_terminal(self, postclose):
+        order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags={c[2] for c in _POSTCLOSE_CHAIN})
+        for task in (c[1] for c in _POSTCLOSE_CHAIN):
+            assert task not in order, f"{task} ran despite skip flag"
+        assert order == _POSTCLOSE_TAIL
+
+    def test_skip_refresh_resumes_at_the_collection_wait(self, reconcile):
         # config#1549: skipping only the deploy refresh (e.g. an operator rerun
         # on a box already known fresh) resumes at the first work task, which
         # is the collection readiness wait (alpha-engine-config-I11269; it was
         # the spot data phase from config#1767 until then).
-        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
+        order = _walk(reconcile, _RECONCILE_CHAIN, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
         assert order[:3] == [
             "InitCollectionReadinessPoll", "SeedCollectionReadiness", "WaitForCollectionManifests",
         ]
-        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-7:] == _RECONCILE_TAIL
 
-    def test_skip_data_phase_resumes_at_snapshot(self, states):
-        # config#1767: skip_post_market_data now skips the ENTIRE spot data phase
-        # (fetch + append both on spot) and resumes at the snapshot gate — the
-        # old separate skip_post_market_arctic_append gate is gone.
-        # alpha-engine-config#5569: resumes at the new retry-counter init, then
-        # CaptureSnapshot itself (mirrors InitDataSpotRetryCounter above).
-        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
+    def test_skip_refresh_resumes_at_snapshot_in_postclose(self, postclose):
+        # alpha-engine-config#5569: resumes at the retry-counter init, then
+        # CaptureSnapshot itself.
+        order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags={"skip_refresh_executor_deploy"})
+        assert "RefreshExecutorDeploy" not in order
+        assert order[:2] == ["InitCaptureSnapshotRetryCounter", "CaptureSnapshot"]
+        assert order[-3:] == _POSTCLOSE_TAIL
+
+    def test_skip_data_phase_resumes_at_precondition_probe(self, reconcile):
+        # config#1767: skip_post_market_data skips the ENTIRE data phase (now
+        # the collection wait) — the old separate skip_post_market_arctic_append
+        # gate is gone. alpha-engine-config-I11269: with CaptureSnapshot in the
+        # 16:00 machine, the run resumes at the fresh precondition probe.
+        order = _walk(reconcile, _RECONCILE_CHAIN,
+                      skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
         assert "WaitForCollectionManifests" not in order
-        assert order[0] == "InitCaptureSnapshotRetryCounter"
-        assert order[1] == "CaptureSnapshot"
-        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[0] == "ProbeEODReconcilePrecondition"
+        assert order[1] == "EODReconcile"
+        assert order[-7:] == _RECONCILE_TAIL
 
-    def test_happy_path_waits_for_the_collection_before_the_snapshot(self, states):
-        # alpha-engine-config-I11269: the snapshot and reconcile read what the
-        # EOD collection wrote, so the wait precedes them; no spot launch runs.
-        order = self._walk(states, skip_flags={"skip_refresh_executor_deploy"})
-        assert order.index("WaitForCollectionManifests") < order.index("CaptureSnapshot")
+    def test_happy_path_waits_for_the_collection_before_the_reconcile(self, reconcile):
+        # alpha-engine-config-I11269: the reconcile reads what the EOD
+        # collection wrote, so the wait precedes the probe and EODReconcile;
+        # no spot launch runs.
+        order = _walk(reconcile, _RECONCILE_CHAIN, skip_flags={"skip_refresh_executor_deploy"})
+        assert order.index("WaitForCollectionManifests") < order.index("ProbeEODReconcilePrecondition")
+        assert order.index("WaitForCollectionManifests") < order.index("EODReconcile")
         assert not [n for n in order if n.startswith("Launch") and n.endswith("Spot")], order
+
+    def test_postclose_never_waits_for_the_collection(self, postclose):
+        # alpha-engine-config-I11269: the whole point of the split — nothing
+        # in the 16:00 machine depends on the collector.
+        for name in ("WaitForCollectionManifests", "InitCollectionReadinessPoll",
+                     "ProbeEODReconcilePrecondition", "EODReconcile", "HealStartCollection"):
+            assert name not in postclose, name
 
 
 class TestSkipFlagsInertOutsideOperatorReplay:
     """config#1614 closes-when: a skip flag on a non-operator-replay input is
     structurally ignored — the 2026-06-30 skip_capture_snapshot forced-green
-    vector no longer exists for live/daemon/watch-initiated runs."""
+    vector no longer exists for live/daemon/watch-initiated runs. Asserted on
+    both machines since the I11269 split."""
 
-    def test_all_skips_inert_on_live_eod_role(self, states):
-        order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role="eod")
-        for task in (c[1] for c in _CHAIN):
+    @pytest.mark.parametrize("machine,tail", [
+        ("postclose", _POSTCLOSE_TAIL),
+        ("reconcile", _RECONCILE_TAIL),
+    ])
+    def test_all_skips_inert_on_live_eod_role(self, machine, tail):
+        path, chain = _MACHINES[machine]
+        order = _walk(_load(path), chain, skip_flags={c[2] for c in chain}, pipeline_role="eod")
+        for task in (c[1] for c in chain):
             assert task in order, f"{task} was skipped despite non-replay role"
-        assert order[-7:] == ["StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+        assert order[-len(tail):] == tail
 
-    def test_all_skips_inert_when_role_absent(self, states):
-        order = self._walk(states, skip_flags={c[2] for c in _CHAIN}, pipeline_role=None)
-        for task in (c[1] for c in _CHAIN):
+    @pytest.mark.parametrize("machine", sorted(_MACHINES))
+    def test_all_skips_inert_when_role_absent(self, machine):
+        path, chain = _MACHINES[machine]
+        order = _walk(_load(path), chain, skip_flags={c[2] for c in chain}, pipeline_role=None)
+        for task in (c[1] for c in chain):
             assert task in order, f"{task} was skipped despite absent role"
 
-    def test_operator_replay_still_honors_skips(self, states):
-        order = self._walk(
-            states,
-            skip_flags={c[2] for c in _CHAIN},
+    def test_operator_replay_still_honors_skips(self, reconcile):
+        order = _walk(
+            reconcile, _RECONCILE_CHAIN,
+            skip_flags={c[2] for c in _RECONCILE_CHAIN},
             pipeline_role="operator-replay",
         )
         # config-I2702: even a fully-skipped operator-replay run still probes
         # the precondition fresh (ProbeEODReconcilePrecondition sits between
-        # the CheckSkipCaptureSnapshot skip edge and CheckSkipEODReconcile
+        # the CheckSkipPostMarketData skip edge and CheckSkipEODReconcile
         # unconditionally) before its own skip_eod_reconcile flag takes over.
-        assert order == [
-            "ProbeEODReconcilePrecondition", "StopTradingInstance",
-            "ReadExerciseCadence", "CheckExerciseCadence",
-            "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
-        ]
+        assert order == ["ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
 
-    _walk = TestPaths._walk
+    def test_operator_replay_still_honors_skips_in_postclose(self, postclose):
+        order = _walk(
+            postclose, _POSTCLOSE_CHAIN,
+            skip_flags={c[2] for c in _POSTCLOSE_CHAIN},
+            pipeline_role="operator-replay",
+        )
+        assert order == _POSTCLOSE_TAIL
 
 
 class TestSubstrateHealthCheckChainRemoved:
@@ -366,11 +497,13 @@ class TestSubstrateHealthCheckChainRemoved:
         "PublishSubstrateHealthCheckDegradedAlert",
     )
 
+    @pytest.mark.parametrize("machine", sorted(_MACHINES))
     @pytest.mark.parametrize("removed", _REMOVED_STATES)
-    def test_state_absent(self, states, removed):
-        assert removed not in states, (
+    def test_state_absent(self, machine, removed):
+        path = _MACHINES[machine][0]
+        assert removed not in _load(path), (
             f"{removed} should have been removed (alpha-engine-config-I2722 "
-            "substrate-check spin-out) — found it still in step_function_eod.json."
+            f"substrate-check spin-out) — found it still in {path.name}."
         )
 
     def test_check_eod_status_success_rewired_to_stop_trading_instance(self, states):
@@ -393,10 +526,12 @@ class TestSubstrateHealthCheckChainRemoved:
         assert len(catches) == 1
         assert catches[0]["Next"] == "StopTradingInstance"
 
-    def test_no_dangling_reference_to_removed_states_anywhere(self, states):
+    @pytest.mark.parametrize("machine", sorted(_MACHINES))
+    def test_no_dangling_reference_to_removed_states_anywhere(self, machine):
         """No Next/Default/Choices[].Next/Catch[].Next in the WHOLE SF may
         target any of the 7 removed states — a stricter, file-wide version of
         the per-predecessor checks above."""
+        states = _load(_MACHINES[machine][0])
         removed = set(self._REMOVED_STATES)
 
         def _refs(state):

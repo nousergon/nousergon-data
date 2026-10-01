@@ -74,6 +74,12 @@ has actually drifted. ``TestConditionalRefresh`` below pins the new shape;
 every pre-existing test above is UNCHANGED and still passes, since they all
 match on `"boot-pull.sh" in line` / `"sudo -u ec2-user"` / etc. without
 caring which branch of the if/else contains the matched line.
+
+alpha-engine-config-I11269 (post-close split): the EOD run is two machines
+now, and EACH one boots/uses the trading box and so EACH one carries its own
+top-of-pipeline RefreshExecutorDeploy. Every refresh pin below runs against
+both (the ``states`` fixture is parametrized); the reconcile-specific pins
+read the reconcile machine, where EODReconcile lives.
 """
 
 from __future__ import annotations
@@ -85,11 +91,28 @@ import pytest
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
+_RECONCILE_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.json"
+
+#: machine -> (definition, the first work gate the refresh must precede).
+_MACHINES = {
+    "postclose": (_SF_PATH, "CheckSkipCaptureSnapshot"),
+    "reconcile": (_RECONCILE_PATH, "CheckSkipPostMarketData"),
+}
+
+
+@pytest.fixture(scope="module", params=sorted(_MACHINES))
+def machine(request) -> str:
+    return request.param
 
 
 @pytest.fixture(scope="module")
-def states() -> dict:
-    return json.loads(_SF_PATH.read_text())["States"]
+def states(machine) -> dict:
+    return json.loads(_MACHINES[machine][0].read_text())["States"]
+
+
+@pytest.fixture(scope="module")
+def reconcile_states() -> dict:
+    return json.loads(_RECONCILE_PATH.read_text())["States"]
 
 
 @pytest.fixture(scope="module")
@@ -151,14 +174,15 @@ class TestRefreshHoistedToChokepoint:
         idx = _index_of(refresh_commands, "infrastructure/boot-pull.sh")
         assert "| tee " not in refresh_commands[idx]
 
-    def test_refresh_runs_before_any_work_step(self, states):
+    def test_refresh_runs_before_any_work_step(self, states, machine):
         # RefreshExecutorDeploy (via its Check…Status Success edge) enters the
-        # first work gate CheckSkipPostMarketData; and the SSM-readiness gate
-        # enters the refresh gate first. So the refresh is topologically
-        # upstream of every work step.
+        # machine's first work gate (CheckSkipCaptureSnapshot at 16:00,
+        # CheckSkipPostMarketData in the reconcile machine — I11269); and the
+        # SSM-readiness gate enters the refresh gate first. So the refresh is
+        # topologically upstream of every work step.
         succ = [c["Next"] for c in states["CheckRefreshExecutorDeployStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["CheckSkipPostMarketData"]
+        assert succ == [_MACHINES[machine][1]]
         online = [c["Next"] for c in states["SSMReadyChoice"]["Choices"]
                   if any(x.get("StringEquals") == "Online" for x in c.get("And", []))]
         assert online == ["CheckSkipRefreshExecutorDeploy"]
@@ -168,8 +192,8 @@ class TestReconcileNoLongerCarriesInlineRefresh:
     """#574's per-step boot-pull is removed from EODReconcile — the top-level
     RefreshExecutorDeploy chokepoint subsumes it (config#1549)."""
 
-    def test_eod_reconcile_has_no_inline_boot_pull(self, states):
-        params = states["EODReconcile"]["Parameters"]["Parameters"]
+    def test_eod_reconcile_has_no_inline_boot_pull(self, reconcile_states):
+        params = reconcile_states["EODReconcile"]["Parameters"]["Parameters"]
         # EODReconcile uses commands.$ (States.Array/States.Format for $.run_date).
         blob = params.get("commands.$") or json.dumps(params.get("commands", []))
         assert "boot-pull.sh" not in blob, (
@@ -178,8 +202,8 @@ class TestReconcileNoLongerCarriesInlineRefresh:
             "(config#1549). Leaving both would double-refresh."
         )
 
-    def test_eod_reconcile_still_runs_reconcile(self, states):
-        params = states["EODReconcile"]["Parameters"]["Parameters"]
+    def test_eod_reconcile_still_runs_reconcile(self, reconcile_states):
+        params = reconcile_states["EODReconcile"]["Parameters"]["Parameters"]
         blob = params.get("commands.$") or json.dumps(params.get("commands", []))
         assert "executor/eod_reconcile.py" in blob
 

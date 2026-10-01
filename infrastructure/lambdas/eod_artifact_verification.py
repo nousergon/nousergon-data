@@ -12,7 +12,7 @@ policy). Two consumers, one definition:
 Those two must never drift: a backstop that stands down on a day the notifier
 would call incomplete is the 2026-08-17 gap.
 
-A postclose (EOD) run's terminal SUCCEEDED/DEGRADED Telegram message must not
+A post-close reconcile run's terminal SUCCEEDED/DEGRADED Telegram message must not
 read "clean" when the day's load-bearing artifacts were never written — the
 core failure mode alpha-engine-config#5289 exists to catch: "A 'SUCCESS' that
 did not write its artifacts is the failure mode this issue exists to catch."
@@ -23,9 +23,10 @@ Two independent existence checks, both read-only S3 calls against the same
 bucket ``execution_digest.py`` already reads (``alpha-engine-research``):
 
   1. The SF-envelope completion marker
-     (``_sf_completion/ne-postclose-trading-pipeline/{run_date}.json``,
-     config#2857, written by ``step_function_eod.json``'s
-     WriteCompletionMarker/WriteCompletionMarkerDegraded states) — proves the
+     (``_sf_completion/ne-postclose-reconcile-pipeline/{run_date}.json``,
+     config#2857, written by ``step_function_eod_reconcile.json``'s
+     WriteCompletionMarkerNormal/WriteCompletionMarkerDegraded states —
+     ``step_function_eod.json`` until the 2026-09-30 split) — proves the
      Step Functions execution itself reached its real terminal, independent
      of downstream deliverables.
   2. A row in ``trades/eod_pnl.csv`` for ``run_date`` (ARTIFACT_REGISTRY
@@ -53,7 +54,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 S3_BUCKET = "alpha-engine-research"
-EOD_PIPELINE_NAME = "ne-postclose-trading-pipeline"
+#: The machine whose completion marker sits beside the eod_pnl row. Since the
+#: 2026-09-30 split (alpha-engine-config-I11269 follow-up) the row is written by
+#: ne-postclose-reconcile-pipeline's EODReconcile, so "did the EOD do its job"
+#: is that machine's marker + the row. ne-postclose-trading-pipeline still
+#: writes its own marker; its artifact is the CaptureSnapshot output, checked by
+#: alpha-engine-eod-backstop and alpha-engine-eod-snapshot-existence-check.
+EOD_PIPELINE_NAME = "ne-postclose-reconcile-pipeline"
 COMPLETION_MARKER_KEY_TEMPLATE = (
     "_sf_completion/" + EOD_PIPELINE_NAME + "/{run_date}.json"
 )

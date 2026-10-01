@@ -58,6 +58,9 @@ from flow_doctor_telegram import reset_flow_doctor_cache  # noqa: E402
 SATURDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-freshness-pipeline"
 WEEKDAY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-trading-pipeline"
+# 2026-09-30 split (alpha-engine-config-I11269 follow-up): the collector-dependent
+# half, which writes the eod_pnl row — and so carries the EOD artifact check.
+RECONCILE_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-postclose-reconcile-pipeline"
 
 
 def _event(status: str, sm_arn: str = SATURDAY_ARN, **detail_overrides) -> dict:
@@ -322,6 +325,7 @@ def test_label_lookup_table_covers_all_three_sfs():
     assert index._SF_LABELS["ne-weekly-freshness-pipeline"] == "Weekly Freshness SF"
     assert index._SF_LABELS["ne-preopen-trading-pipeline"] == "Pre-open Trading SF"
     assert index._SF_LABELS["ne-postclose-trading-pipeline"] == "Post-close Trading SF"
+    assert index._SF_LABELS["ne-postclose-reconcile-pipeline"] == "Post-close Reconcile SF"
 
 
 class TestPreflightLabel:
@@ -593,7 +597,8 @@ class TestDegradedRunMapping:
 
     def test_degraded_with_missing_pnl_row_renders_loud_artifact_block(self, monkeypatch):
         """The realistic combo: DegradedRun means EODReconcile (which writes
-        eod_pnl.csv) was skipped — the artifact check must say so."""
+        eod_pnl.csv) was skipped — the artifact check must say so. EODReconcile
+        lives in ne-postclose-reconcile-pipeline since the 2026-09-30 split."""
         _sf, _s3 = _eod_client_stubs(
             monkeypatch,
             describe_return={
@@ -604,10 +609,10 @@ class TestDegradedRunMapping:
             marker_present=True,
             csv_body=b"date,nav\n2026-08-07,100000\n",  # no 2026-08-08 row
         )
-        event = _event("FAILED", sm_arn=EOD_ARN)
+        event = _event("FAILED", sm_arn=RECONCILE_ARN)
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Post-close Trading SF — DEGRADED" in text
+        assert "Post-close Reconcile SF — DEGRADED" in text
         assert "⚠️ *ARTIFACT(S) MISSING*" in text
         assert "eod_pnl.csv row for 2026-08-08" in text
         assert "_sf_completion marker" not in text  # marker WAS written
@@ -653,9 +658,11 @@ class TestRunDateRendering:
 
 
 class TestEodArtifactVerification:
-    """alpha-engine-config#5289 scope item 4: postclose SUCCEEDED/DEGRADED
-    terminals get the day's artifacts verified against S3. Only the EOD
-    pipeline triggers this — preopen/weekly are unaffected."""
+    """alpha-engine-config#5289 scope item 4: post-close RECONCILE
+    SUCCEEDED/DEGRADED terminals get the day's artifacts verified against S3.
+    Only the machine that writes the eod_pnl row triggers this — since the
+    2026-09-30 split that is ne-postclose-reconcile-pipeline, not
+    ne-postclose-trading-pipeline; preopen/weekly are unaffected."""
 
     def test_succeeded_with_both_artifacts_present_stays_one_extra_line(self, monkeypatch):
         _sf, _s3 = _eod_client_stubs(
@@ -664,7 +671,7 @@ class TestEodArtifactVerification:
             marker_present=True,
             csv_body=b"date,nav\n2026-08-08,100000\n",
         )
-        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        event = _event("SUCCEEDED", sm_arn=RECONCILE_ARN)
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "Artifacts: ✓ completion marker + eod_pnl row (2026-08-08)" in text
@@ -679,10 +686,10 @@ class TestEodArtifactVerification:
             marker_present=True,
             csv_body=b"date,nav\n2026-08-07,100000\n",  # no row for run_date
         )
-        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        event = _event("SUCCEEDED", sm_arn=RECONCILE_ARN)
         result = index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
-        assert "Post-close Trading SF — SUCCEEDED" in text
+        assert "Post-close Reconcile SF — SUCCEEDED" in text
         assert "⚠️ *ARTIFACT(S) MISSING*" in text
         assert "eod_pnl.csv row for 2026-08-08" in text
         assert "_sf_completion marker" not in text
@@ -695,7 +702,7 @@ class TestEodArtifactVerification:
             marker_present=False,
             csv_body=b"date,nav\n2026-08-08,100000\n",
         )
-        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        event = _event("SUCCEEDED", sm_arn=RECONCILE_ARN)
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "⚠️ *ARTIFACT(S) MISSING*" in text
@@ -709,7 +716,7 @@ class TestEodArtifactVerification:
             marker_present=False,
             csv_body=b"date,nav\n2026-08-07,100000\n",
         )
-        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        event = _event("SUCCEEDED", sm_arn=RECONCILE_ARN)
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "_sf_completion marker for 2026-08-08" in text
@@ -720,10 +727,26 @@ class TestEodArtifactVerification:
             monkeypatch,
             describe_return={"input": "{}", "error": "", "cause": ""},
         )
-        event = _event("SUCCEEDED", sm_arn=EOD_ARN, name="exec-001")
+        event = _event("SUCCEEDED", sm_arn=RECONCILE_ARN, name="exec-001")
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "⚠️ *ARTIFACTS UNVERIFIED*" in text
+
+    def test_postclose_trading_succeeded_skips_artifact_check(self, monkeypatch):
+        """The post-close machine finishes at ~16:20 ET, before the row can
+        exist (EODReconcile runs after the 18:15 ET collection). Checking it
+        there would render every normal day as MISSING."""
+        _sf, _s3 = _eod_client_stubs(
+            monkeypatch,
+            describe_return={"input": '{"run_date": "2026-08-08"}', "error": "", "cause": ""},
+        )
+        event = _event("SUCCEEDED", sm_arn=EOD_ARN)
+        index.handler(event, None)
+        text = _telegram_mod.send_message.call_args.args[0]
+        assert "Post-close Trading SF — SUCCEEDED" in text
+        assert "Artifacts:" not in text
+        assert "ARTIFACT(S) MISSING" not in text
+        assert "ARTIFACTS UNVERIFIED" not in text
 
     def test_non_eod_pipeline_succeeded_skips_artifact_check(self, monkeypatch):
         _sf, _s3 = _eod_client_stubs(
@@ -748,7 +771,7 @@ class TestEodArtifactVerification:
                 "cause": "CaptureSnapshot state failed",
             },
         )
-        event = _event("FAILED", sm_arn=EOD_ARN)
+        event = _event("FAILED", sm_arn=RECONCILE_ARN)
         index.handler(event, None)
         text = _telegram_mod.send_message.call_args.args[0]
         assert "Artifacts:" not in text

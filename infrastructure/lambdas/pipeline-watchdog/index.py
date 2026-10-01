@@ -37,6 +37,12 @@ independence preserved per plan doc §3.5.
       the 2026-05-26 morning false-positive Telegram alert that drove
       this fix.
 
+  - **EOD reconcile SF** (``ne-postclose-reconcile-pipeline``, split out of
+      the EOD SF 2026-09-30)
+      Same watch-day and trading-day-aware window as the EOD SF: it is
+      started later the same evening, when ne-data-collection-eod reaches a
+      terminal state. It is also in the prior-day failed-run check.
+
   - **Saturday SF** (``ne-weekly-freshness-pipeline``)
       Watch-day: TODAY is Sunday (weekday 6) — Saturday SF fires at 09:00
       UTC Saturday; by Sunday 14:00 UTC any missed firing is 24+h overdue.
@@ -58,7 +64,7 @@ independence preserved per plan doc §3.5.
       alpha-engine-config#6738 / sf-pipeline-policy §2.6 rule 1)
       Watch-day: EVERY day. Reads the DECLARED exercise cadence from SSM
       ``/alpha-engine/weekly-sf/exercise-cadence`` — the same parameter the
-      postclose SF's ``ReadExerciseCadence`` task reads to decide whether to
+      post-close reconcile SF's ``ReadExerciseCadence`` task reads to decide whether to
       chain the exercise launch — derives every run-slot the declaration
       expects over a trailing 5-day window, and pages on any slot with NO
       matching execution. Where the Saturday-SF check above asks "did the
@@ -236,6 +242,14 @@ WEEKDAY_SF_ARN = (
 )
 EOD_SF_ARN = (
     f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+)
+# The collector-dependent half of the post-close pipeline, split into its own
+# machine 2026-09-30 (alpha-engine-config-I11269 follow-up). Started by
+# alpha-engine-eod-backstop on ne-data-collection-eod's terminal event (~19:30-
+# 21:00 ET) or its 02:15 UTC reconcile backstop — both the same PT calendar day
+# as the trading day, so the PT-date bucketing below is exact for it too.
+RECONCILE_SF_ARN = (
+    f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:ne-postclose-reconcile-pipeline"
 )
 
 # Watchdog-specific SNS topic — distinct from `alpha-engine-alerts` per
@@ -1229,7 +1243,8 @@ MARKER_BUCKET = os.environ.get("COMPLETION_MARKER_BUCKET", "alpha-engine-researc
 # follow the definitions' WriteCompletionMarker states: the {date} segment
 # is the UTC date-part of $$.Execution.StartTime — for the two
 # ``trading_day``-cadence pipelines every legal start (preopen 12:15 UTC,
-# postclose ~20:15–23:00 UTC incl. the backstop path) lands on the same UTC
+# postclose ~20:15–23:00 UTC incl. the backstop path; the split-out reconcile
+# ~23:30–02:15 UTC, i.e. still the same PT evening) lands on the same UTC
 # calendar date as the PT trading date, so a lookup by PT trading day is
 # exact. The ``weekly``-cadence entry's target date is instead derived by
 # ``_last_due_weekly_day`` (the real cycle day, not a trading day) and its
@@ -1239,6 +1254,7 @@ MARKER_BUCKET = os.environ.get("COMPLETION_MARKER_BUCKET", "alpha-engine-researc
 _FAILED_DAY_PIPELINES = (
     ("Weekday SF", WEEKDAY_SF_ARN, "ne-preopen-trading-pipeline", "trading_day"),
     ("EOD SF", EOD_SF_ARN, "ne-postclose-trading-pipeline", "trading_day"),
+    ("EOD reconcile SF", RECONCILE_SF_ARN, "ne-postclose-reconcile-pipeline", "trading_day"),
     ("Weekly SF", SATURDAY_SF_ARN, "ne-weekly-freshness-pipeline", "weekly"),
 )
 
@@ -1766,7 +1782,7 @@ def _check_weekly_silence(
             f"exercise launch was silent for two days with zero signal "
             f"(alpha-engine-config#6738 / #6689). Investigate the LAUNCHER, not the "
             f"pipeline: for an exercise slot check that day's "
-            f"ne-postclose-trading-pipeline execution reached LaunchWeeklyExerciseRun; "
+            f"ne-postclose-reconcile-pipeline execution reached LaunchWeeklyExerciseRun; "
             f"for a weekly slot check the alpha-engine-saturday EventBridge rule. "
             f"Reproduce locally: `./scripts/weekly_sf_silence_deadman.py --live "
             f"--window-days {SILENCE_WINDOW_DAYS} --json --no-notify`."
@@ -1850,6 +1866,21 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # after Memorial Day.
         window_seconds=_eod_window_seconds(now_utc),
     )
+    # alpha-engine-config-I11269 follow-up (2026-09-30): the reconcile half has
+    # its own trigger (the collection's terminal event), so it can go silent
+    # on its own. Same trading-day-aware window as the post-close SF: it fires
+    # later the same evening, so the previous trading day's run is the most
+    # recent one expected at 14:00 UTC.
+    eod_reconcile = _check_sf(
+        sf_label="EOD reconcile SF",
+        sf_arn=RECONCILE_SF_ARN,
+        is_watch_day=is_trading_today,
+        skip_reason_if_not_watching=(
+            "today is not a NYSE trading day (weekend / holiday) per "
+            "nousergon_lib.trading_calendar"
+        ),
+        window_seconds=_eod_window_seconds(now_utc),
+    )
     saturday = _check_sf(
         # alpha-engine-config-I8045: the weekly SF is the one state machine
         # with a run-day gate, so it is the one that needs GATE_SKIP bucketing.
@@ -1922,7 +1953,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "alert_detail": c.alert_detail,
                 "outcome": c.outcome,
             }
-            for c in (weekday, eod, saturday)
+            for c in (weekday, eod, eod_reconcile, saturday)
         ],
         "preopen_buffer_check": {
             "checked": preopen_buffer.checked,

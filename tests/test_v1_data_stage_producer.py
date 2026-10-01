@@ -35,6 +35,11 @@ V1_DEFINITIONS = {
     "ne-weekly-freshness-pipeline": REPO / "infrastructure" / "step_function.json",
     "ne-preopen-trading-pipeline": REPO / "infrastructure" / "step_function_daily.json",
     "ne-postclose-trading-pipeline": REPO / "infrastructure" / "step_function_eod.json",
+    # alpha-engine-config-I11269: the collector-gated half of the post-close
+    # run. It carries no data-spot stage (the producer does not survey it), and
+    # is in this map so the ASL guard below also covers it — a dispatcher task
+    # reintroduced there would otherwise escape.
+    "ne-postclose-reconcile-pipeline": REPO / "infrastructure" / "step_function_eod_reconcile.json",
 }
 DISPATCHER = "alpha-engine-data-spot-dispatcher"
 WEEKLY, PREOPEN, POSTCLOSE = m.V1_DATA_STAGE_STATE_MACHINE_ARNS
@@ -287,7 +292,8 @@ def test_heal_start_collection_is_deliberately_not_a_data_stage():
     running a collector, and BOTH files say so, so a future sweep does not add
     it and red the clause on every healed day."""
     assert "HealStartCollection" not in m.V1_DATA_STAGE_STATES
-    states = _definition("ne-postclose-trading-pipeline")["States"]
+    # alpha-engine-config-I11269: the heal loop lives in the reconcile machine.
+    states = _definition("ne-postclose-reconcile-pipeline")["States"]
     assert "HealStartCollection" in states
     assert "V1_DATA_STAGE_STATES" in states["HealStartCollection"]["Comment"]
     source = (REPO / "data_gate" / "producers" / "v1_data_stage.py").read_text(encoding="utf-8")

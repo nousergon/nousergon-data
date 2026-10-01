@@ -47,6 +47,10 @@ _SF_LABELS: dict[str, str] = {
     "ne-weekly-freshness-pipeline": "Weekly Freshness SF",
     "ne-preopen-trading-pipeline": "Pre-open Trading SF",
     "ne-postclose-trading-pipeline": "Post-close Trading SF",
+    # 2026-09-30 (alpha-engine-config-I11269 follow-up): the collector-dependent
+    # half of the post-close pipeline, split into its own machine. Its terminal
+    # is the one that carries the EOD artifact check below.
+    "ne-postclose-reconcile-pipeline": "Post-close Reconcile SF",
     # 2026-07-28: wired for FAILURE transitions only, via its own
     # `alpha-engine-groom-sf-failure` rule (see deploy.sh §2c). Successes are
     # reported by the SF's own NotifyCycleComplete roll-up, which names each
@@ -176,6 +180,9 @@ _CANONICAL_PIPELINE_ROLE = {
     "ne-weekly-freshness-pipeline": "weekly",
     "ne-preopen-trading-pipeline": "daily",
     "ne-postclose-trading-pipeline": "eod",
+    # Its starters (alpha-engine-eod-backstop's collection-terminal trigger and
+    # reconcile backstop) stamp pipeline_role="eod", the same canonical role.
+    "ne-postclose-reconcile-pipeline": "eod",
 }
 
 
@@ -354,7 +361,9 @@ def _build_message(
         lines.extend(digest_lines)
 
         # nousergon-data-i5289 (alpha-engine-config#5289 scope item 4): a
-        # postclose SUCCEEDED/DEGRADED terminal additionally gets its day's
+        # post-close RECONCILE SUCCEEDED/DEGRADED terminal (EOD_PIPELINE_NAME is
+        # ne-postclose-reconcile-pipeline since the 2026-09-30 split — the
+        # machine that writes the eod_pnl row) additionally gets its day's
         # artifacts verified — a "SUCCESS" that did not write eod_pnl.csv is
         # the failure mode this issue exists to catch. s3_client is already a
         # real client here (eod is never preflight, so the block above always

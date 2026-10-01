@@ -38,13 +38,16 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 # ── Discovery against the real repo state ───────────────────────────────────
 
 
-def test_discovers_all_four_orchestrated_state_machines(cd):
+def test_discovers_all_five_orchestrated_state_machines(cd):
     entries = cd._discover_expected_logging_configs()
     names = {e["sf_name"] for e in entries}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
+        # alpha-engine-config-I11269: the collector-gated half of the old
+        # post-close SF, split out 2026-09-30.
+        "ne-postclose-reconcile-pipeline",
         "alpha-engine-groom-dispatch",
         # alpha-engine-config-I2890 (2026-07-17): the I2544/I2545 advisory +
         # modelzoo child SFs were RETIRED (splits reversed) — their CFN

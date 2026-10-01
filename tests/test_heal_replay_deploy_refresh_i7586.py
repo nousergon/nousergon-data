@@ -30,6 +30,11 @@ so the flag was never exercised in production. That is luck, not coverage.
 
 The flag reads as a harmless optimisation and will be re-added by anyone
 reasoning from the parent's state alone. Hence a test rather than a comment.
+
+alpha-engine-config-I11269 (post-close split): the heal loop and its replay now
+live in ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json).
+The reasoning above is unchanged — the parent still stops the box right after
+dispatching — so every pin is kept and re-pointed at that definition.
 """
 
 from __future__ import annotations
@@ -41,7 +46,7 @@ import pytest
 
 SF = json.loads(
     (
-        Path(__file__).resolve().parents[1] / "infrastructure" / "step_function_eod.json"
+        Path(__file__).resolve().parents[1] / "infrastructure" / "step_function_eod_reconcile.json"
     ).read_text(encoding="utf-8")
 )
 STATES = SF["States"]
@@ -57,16 +62,26 @@ def test_the_replay_does_not_skip_the_deploy_refresh():
     )
 
 
-@pytest.mark.parametrize("flag", ["skip_post_market_data", "skip_capture_snapshot"])
-def test_the_other_two_skip_flags_are_retained(flag):
+@pytest.mark.parametrize("flag", ["skip_post_market_data"])
+def test_the_other_skip_flags_are_retained(flag):
     """Guard against an over-broad fix. Only the deploy-refresh flag has a
     premise a box restart invalidates.
 
-    `skip_capture_snapshot` is correct — the parent genuinely already captured,
-    and a second live-IB capture is precisely what it exists to avoid.
     `skip_post_market_data` is correct — the heal loop just ran it.
     """
     assert REPLAY_INPUT.get(flag) is True
+
+
+def test_a_second_live_ib_capture_is_structurally_impossible():
+    """`skip_capture_snapshot` used to be retained here because a second
+    live-IB capture is precisely what it exists to avoid. Since the I11269
+    split the replay targets THIS machine (``$$.StateMachine.Id``), which has
+    no CaptureSnapshot at all — the 16:00 ne-postclose-trading-pipeline owns
+    it — so the protection is structural and the flag would be a dead input.
+    Pinned both ways so neither half can drift back alone."""
+    assert STATES["HealDispatchReplay"]["Parameters"]["StateMachineArn.$"] == "$$.StateMachine.Id"
+    assert "CaptureSnapshot" not in STATES
+    assert "skip_capture_snapshot" not in REPLAY_INPUT
 
 
 def test_the_parent_still_stops_the_box_after_dispatching():

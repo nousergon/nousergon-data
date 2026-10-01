@@ -774,6 +774,10 @@ def test_handler_on_trading_day_checks_weekday_and_eod_skips_saturday():
     assert by_label["Weekday SF"]["alert_emitted"] is True
     assert by_label["EOD SF"]["checked"] is True
     assert by_label["EOD SF"]["alert_emitted"] is True
+    # 2026-09-30 split (alpha-engine-config-I11269 follow-up): the reconcile
+    # half has its own trigger and so its own liveness check, same watch-day.
+    assert by_label["EOD reconcile SF"]["checked"] is True
+    assert by_label["EOD reconcile SF"]["alert_emitted"] is True
     assert by_label["Saturday SF"]["checked"] is False
     assert "not Sunday" in by_label["Saturday SF"]["skip_reason"]
 
@@ -828,6 +832,7 @@ def test_handler_on_sunday_checks_saturday_sf_alone():
     by_label = {c["sf_label"]: c for c in summary["checks"]}
     assert by_label["Weekday SF"]["checked"] is False
     assert by_label["EOD SF"]["checked"] is False
+    assert by_label["EOD reconcile SF"]["checked"] is False
     assert by_label["Saturday SF"]["checked"] is True
     assert by_label["Saturday SF"]["alert_emitted"] is True
 
@@ -2332,3 +2337,35 @@ def test_the_other_two_pipelines_are_untouched_by_gate_bucketing():
         client=client,
     )
     assert result.outcome == "CLEAR"
+
+
+# ── 2026-09-30 split: the reconcile half is watched like the EOD SF ──────
+
+
+def test_the_reconcile_sf_is_in_the_prior_day_failed_run_check():
+    """alpha-engine-config-I11269 follow-up: EODReconcile, the eod_pnl row and
+    the weekly-exercise chain moved to ne-postclose-reconcile-pipeline, so a
+    day on which that machine ran and never succeeded must page exactly as the
+    EOD SF's did — keyed on its own marker prefix."""
+    rows = {row[0]: row for row in index._FAILED_DAY_PIPELINES}
+    label, arn, pipeline, cadence = rows["EOD reconcile SF"]
+    assert arn == index.RECONCILE_SF_ARN
+    assert arn.endswith(":stateMachine:ne-postclose-reconcile-pipeline")
+    assert pipeline == "ne-postclose-reconcile-pipeline"
+    assert cadence == "trading_day"
+    # The post-close SF keeps its own row — it still runs every trading day.
+    assert rows["EOD SF"][2] == "ne-postclose-trading-pipeline"
+
+
+def test_a_reconcile_started_after_midnight_utc_still_buckets_to_its_trading_day():
+    """The reconcile starts on the collection's terminal event (~23:30-01:00
+    UTC) or the 02:15 UTC backstop — the NEXT UTC day, but the same PT evening.
+    _statuses_for_day buckets by PT date, which is what keeps it exact."""
+    start = datetime(2026, 9, 30, 2, 20, tzinfo=timezone.utc)  # 19:20 PDT 09-29
+    client = MagicMock()
+    client.list_executions.side_effect = lambda **kw: (
+        {"executions": [{"name": "eod-reconcile-backstop-2026-09-29-1", "startDate": start}]}
+        if kw["statusFilter"] == "SUCCEEDED" else {"executions": []}
+    )
+    counts = index._statuses_for_day(client, index.RECONCILE_SF_ARN, date(2026, 9, 29))
+    assert counts == {"SUCCEEDED": 1}

@@ -15,6 +15,15 @@
 # it to ne-postclose-trading-pipeline. The JSON file is the authoritative
 # definition — wiring tests pin its contents.
 #
+# alpha-engine-config-I11269 follow-up (2026-09-30): the post-close pipeline is
+# now TWO machines — ne-postclose-trading-pipeline (step_function_eod.json:
+# gate, box start, executor refresh, CaptureSnapshot at the close) and
+# ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json: the
+# collector-dependent reconcile half). This fallback applies BOTH, each with
+# its own log group. It only UPDATES: the reconcile machine's first CREATE is
+# deploy-infrastructure.sh's job (update_or_create), so an absent machine here
+# is reported and the script fails rather than creating it without a stamp.
+#
 # Idempotent: re-running with the same definition is a no-op (AWS only
 # bumps the revision when the definition actually changes).
 #
@@ -31,45 +40,57 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFN_FILE="$SCRIPT_DIR/step_function_eod.json"
 
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text --region "$REGION")
-SM_ARN="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
 
-echo "=== Alpha Engine EOD Pipeline — SF Definition Update ==="
-echo "  Region:        $REGION"
-echo "  State machine: $SM_ARN"
-echo "  Definition:    $DEFN_FILE"
+apply_sf() {
+    local sm_name="$1" defn_file="$2"
+    local sm_arn="arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:${sm_name}"
+    local log_group_name="/aws/stepfunctions/${sm_name}"
+    local log_group_arn="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${log_group_name}:*"
+
+    echo "=== Alpha Engine post-close pipeline — SF Definition Update ==="
+    echo "  Region:        $REGION"
+    echo "  State machine: $sm_arn"
+    echo "  Definition:    $defn_file"
+    echo ""
+
+    if [ ! -f "$defn_file" ]; then
+        echo "ERROR: $defn_file not found" >&2
+        exit 1
+    fi
+
+    # Validate JSON before sending it to AWS.
+    python3 -c "import json,sys; json.load(open(sys.argv[1])); print('  Definition: JSON valid')" "$defn_file"
+
+    if ! aws stepfunctions describe-state-machine --state-machine-arn "$sm_arn" --query name --output text --region "$REGION" >/dev/null 2>&1; then
+        echo "ERROR: $sm_name does not exist. Its first create is deploy-infrastructure.sh's" >&2
+        echo "       update_or_create (stamped, with logging) — run that, not this fallback." >&2
+        exit 1
+    fi
+
+    echo "  Ensuring log group $log_group_name exists (idempotent)..."
+    aws logs create-log-group --log-group-name "$log_group_name" --region "$REGION" 2>/dev/null || true
+    aws logs put-retention-policy --log-group-name "$log_group_name" --retention-in-days 30 --region "$REGION"
+
+    aws stepfunctions update-state-machine \
+        --state-machine-arn "$sm_arn" \
+        --definition "file://$defn_file" \
+        --logging-configuration '{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$log_group_arn"'"}}]}' \
+        --region "$REGION" > /dev/null
+
+    echo "  State machine: definition updated (execution logging: ERROR level, enabled)"
+    echo ""
+    echo "Verify:"
+    echo "  aws stepfunctions describe-state-machine --state-machine-arn $sm_arn --query 'definition' --output text | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(\"States:\", list(d[\"States\"].keys()))'"
+    echo ""
+}
+
+apply_sf "ne-postclose-trading-pipeline"   "$SCRIPT_DIR/step_function_eod.json"
+apply_sf "ne-postclose-reconcile-pipeline" "$SCRIPT_DIR/step_function_eod_reconcile.json"
+
+echo "=== Post-close pipeline SF updates complete ==="
 echo ""
-
-if [ ! -f "$DEFN_FILE" ]; then
-    echo "ERROR: $DEFN_FILE not found" >&2
-    exit 1
-fi
-
-# Validate JSON before sending it to AWS.
-python3 -c "import json,sys; json.load(open(sys.argv[1])); print('  Definition: JSON valid')" "$DEFN_FILE"
-
-LOG_GROUP_NAME="/aws/stepfunctions/ne-postclose-trading-pipeline"
-LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${LOG_GROUP_NAME}:*"
-
-echo "  Ensuring EOD log group exists (idempotent)..."
-aws logs create-log-group --log-group-name "$LOG_GROUP_NAME" --region "$REGION" 2>/dev/null || true
-aws logs put-retention-policy --log-group-name "$LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
-
-aws stepfunctions update-state-machine \
-    --state-machine-arn "$SM_ARN" \
-    --definition "file://$DEFN_FILE" \
-    --logging-configuration '{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$LOG_GROUP_ARN"'"}}]}' \
-    --region "$REGION" > /dev/null
-
-echo "  State machine: definition updated (execution logging: ERROR level, enabled)"
-echo ""
-echo "=== EOD Pipeline SF Update Complete ==="
-echo ""
-echo "Verify:"
-echo "  aws stepfunctions describe-state-machine --state-machine-arn $SM_ARN --query 'definition' --output text | python3 -c 'import json,sys; d=json.loads(sys.stdin.read()); print(\"States:\", list(d[\"States\"].keys()))'"
-echo ""
-echo "First run with new chain: next daemon-triggered firing"
-echo "(daemon shutdown, weekday market close + IB delay grace)."
+echo "First run with new chain: next daemon-triggered post-close firing (~16:00 ET),"
+echo "and the reconcile half on the next ne-data-collection-eod terminal event."

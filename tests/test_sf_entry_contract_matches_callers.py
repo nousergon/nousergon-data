@@ -43,6 +43,12 @@ _CALLERS = {
     "step_function_eod.json": [
         _INFRA / "lambdas" / "eod-backstop" / "index.py",
     ],
+    # alpha-engine-config-I11269 follow-up (2026-09-30): the collector-dependent
+    # half of the post-close pipeline. Both its starters (the collection-terminal
+    # event trigger and the scheduled reconcile backstop) live in this Lambda.
+    "step_function_eod_reconcile.json": [
+        _INFRA / "lambdas" / "eod-backstop" / "index.py",
+    ],
     "step_function_groom.json": [
         _INFRA / "cloudformation" / "alpha-engine-orchestration.yaml",
     ],
@@ -138,6 +144,7 @@ def test_no_in_repo_caller_is_unpinned():
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
+        "ne-postclose-reconcile-pipeline",
     )
     unpinned = []
     for path in _INFRA.rglob("*"):

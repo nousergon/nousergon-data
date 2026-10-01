@@ -70,6 +70,23 @@
       "This is the ONLY definition whose contract is load-bearing: with an empty contract the EOD graph reports run_date unreachable at 15 states. Giving it an InitializeInput floor like the other two would have to stamp a trading day, not a calendar date (see NormalizeRunDates, alpha-engine-config#8809), so the floor is deliberately NOT copied here - tracked at alpha-engine-config-I9097."
     ]
   },
+  "step_function_eod_reconcile.json": {
+    "fields": [
+      "trading_instance_id",
+      "ec2_instance_id",
+      "sns_topic_arn",
+      "run_date",
+      "triggered_by",
+      "pipeline_role"
+    ],
+    "callers": [
+      "infrastructure/lambdas/eod-backstop/index.py :: _start_reconcile"
+    ],
+    "notes": [
+      "The collector-dependent half of the post-close pipeline, split out of step_function_eod.json 2026-09-30 (alpha-engine-config-I11269 follow-up). Same six-field shape as step_function_eod.json and for the same reason: no InitializeInput floor, and $.run_date is read directly (including WaitForCollectionManifests' {run_date}T20:00:00Z readiness baseline), so a start without it raises States.Runtime before any Catch.",
+      "Both of this machine's starters go through _start_reconcile: the collection-terminal event trigger (alpha-engine-eod-reconcile-trigger) and the scheduled reconcile backstop (alpha-engine-eod-reconcile-backstop-daily). The heal loop's HealDispatchReplay self-start is inside the definition, not an in-repo caller file, exactly as it was in the pre-split machine; no state reads $.sns_topic_arn (every SNS target is a hardcoded ARN), so the replay omitting it is not a reachability gap."
+    ]
+  },
   "step_function_groom.json": {
     "fields": [],
     "callers": [

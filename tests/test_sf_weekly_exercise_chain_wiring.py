@@ -8,6 +8,13 @@ is the binding constraint.
 These tests pin the three properties that make the chain safe to run daily:
 postclose can never be failed by it, the run-day gate is bypassed by role
 rather than by editing the gate, and a launch failure is loud.
+
+alpha-engine-config-I11269: the chain moved from the 16:00
+ne-postclose-trading-pipeline (step_function_eod.json) into the collector-gated
+ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json) — an
+exercise launched at ~16:10 would read the day before the collector wrote it.
+"postclose" below means that reconcile machine; the last test pins that the
+16:00 machine no longer launches anything.
 """
 
 from __future__ import annotations
@@ -23,6 +30,12 @@ _WEEKLY_ARN = "arn:aws:states:us-east-1:711398986525:stateMachine:ne-weekly-fres
 
 @pytest.fixture(scope="module")
 def eod() -> dict:
+    # alpha-engine-config-I11269: the exercise chain lives in the reconcile machine.
+    return json.loads((_INFRA / "step_function_eod_reconcile.json").read_text())["States"]
+
+
+@pytest.fixture(scope="module")
+def postclose_1600() -> dict:
     return json.loads((_INFRA / "step_function_eod.json").read_text())["States"]
 
 
@@ -140,3 +153,17 @@ def test_every_next_target_resolves(eod):
             if c.get("Next") and c["Next"] not in names:
                 dangling.append((k, c["Next"]))
     assert not dangling, f"unresolvable Next targets: {dangling}"
+
+
+def test_the_1600_machine_launches_no_exercise_run(postclose_1600):
+    """alpha-engine-config-I11269: exactly one machine launches the exercise
+    run per trading day. A copy left in the 16:00 machine would double-launch
+    it (and the first launch would read pre-collection data)."""
+    for name in ("ReadExerciseCadence", "CheckExerciseCadence", "LaunchWeeklyExerciseRun"):
+        assert name not in postclose_1600, name
+    launches = [
+        n for n, st in postclose_1600.items()
+        if st.get("Resource", "").startswith("arn:aws:states:::states:startExecution")
+        and "ne-weekly-freshness-pipeline" in json.dumps(st.get("Parameters", {}))
+    ]
+    assert launches == []

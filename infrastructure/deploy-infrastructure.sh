@@ -102,8 +102,9 @@ echo "==> Stamping Step Function definitions with git SHA..."
 SAT_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 DAILY_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 EOD_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
+EOD_RECONCILE_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
 GROOM_STAMPED="$(mktemp --suffix=.json 2>/dev/null || mktemp)"
-trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$GROOM_STAMPED'" EXIT
+trap "rm -f '$SAT_STAMPED' '$DAILY_STAMPED' '$EOD_STAMPED' '$EOD_RECONCILE_STAMPED' '$GROOM_STAMPED'" EXIT
 python3 -c "
 import json, sys
 path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -144,6 +145,16 @@ if orig.startswith('[git:'):
     orig = orig.split(' ', 1)[1] if ' ' in orig else ''
 d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
 json.dump(d, open(path_out, 'w'), indent=2)
+" "$SCRIPT_DIR/step_function_eod_reconcile.json" "$EOD_RECONCILE_STAMPED" "$GIT_SHA"
+python3 -c "
+import json, sys
+path_in, path_out, sha = sys.argv[1], sys.argv[2], sys.argv[3]
+d = json.load(open(path_in))
+orig = d.get('Comment', '')
+if orig.startswith('[git:'):
+    orig = orig.split(' ', 1)[1] if ' ' in orig else ''
+d['Comment'] = f'[git:{sha}] {orig}'.rstrip()
+json.dump(d, open(path_out, 'w'), indent=2)
 " "$SCRIPT_DIR/step_function_groom.json" "$GROOM_STAMPED" "$GIT_SHA"
 
 # ── 2b. Validate-ALL preflight BEFORE any S3 upload or update (config#1897) ──
@@ -157,7 +168,7 @@ json.dump(d, open(path_out, 'w'), indent=2)
 # step 3 — means a bad definition fails the deploy while NOTHING has been applied
 # yet, so the fleet's SFs are never left stamped at mixed SHAs (the 2026-07-07
 # incident, #676 → #677, where the weekly SF updated before the daily SF was
-# rejected). We validate ALL FOUR and only then abort, so one run surfaces every
+# rejected). We validate ALL FIVE (the post-close reconcile half joined 2026-09-30) and only then abort, so one run surfaces every
 # bad definition rather than one-at-a-time. (alpha-engine-config-I2890
 # 2026-07-17: the I2544/I2545 advisory + modelzoo child SFs were RETIRED —
 # splits reversed; the weekly SF carries the full inline pattern again.)
@@ -199,6 +210,7 @@ VALIDATION_FAILED=false
 validate_sf_definition "$SAT_STAMPED"      "Weekly-freshness pipeline"      || VALIDATION_FAILED=true
 validate_sf_definition "$DAILY_STAMPED"    "Pre-open trading pipeline"       || VALIDATION_FAILED=true
 validate_sf_definition "$EOD_STAMPED"      "Post-close trading pipeline"     || VALIDATION_FAILED=true
+validate_sf_definition "$EOD_RECONCILE_STAMPED" "Post-close reconcile pipeline" || VALIDATION_FAILED=true
 validate_sf_definition "$GROOM_STAMPED"    "Backlog groom pipeline"          || VALIDATION_FAILED=true
 if $VALIDATION_FAILED; then
     echo ""
@@ -222,6 +234,7 @@ echo "==> Uploading Step Function definitions to S3..."
 aws s3 cp "$SAT_STAMPED" "s3://$BUCKET/infrastructure/step_function.json" --quiet
 aws s3 cp "$DAILY_STAMPED" "s3://$BUCKET/infrastructure/step_function_daily.json" --quiet
 aws s3 cp "$EOD_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod.json" --quiet
+aws s3 cp "$EOD_RECONCILE_STAMPED" "s3://$BUCKET/infrastructure/step_function_eod_reconcile.json" --quiet
 aws s3 cp "$GROOM_STAMPED" "s3://$BUCKET/infrastructure/step_function_groom.json" --quiet
 echo "  Uploaded to s3://$BUCKET/infrastructure/"
 
@@ -241,6 +254,12 @@ echo "==> Updating Step Function definitions..."
 SAT_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline"
 DAILY_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline"
 EOD_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+# alpha-engine-config-I11269 follow-up (2026-09-30): the collector-dependent half
+# of the post-close pipeline (collection readiness wait, reconcile precondition
+# probe, EODReconcile + self-heal, box stop, weekly-exercise chain). Script-
+# managed like EOD — NOT in CloudFormation — so it is CREATED here on the first
+# deploy after the split merges, under the same shared SF execution role.
+EOD_RECONCILE_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:ne-postclose-reconcile-pipeline"
 GROOM_ARN="arn:aws:states:$REGION:${ACCOUNT_ID}:stateMachine:alpha-engine-groom-dispatch"
 # alpha-engine-config-I2544/I2545: CFN-managed pair, same update-if-present/
 # defer-to-CFN-if-absent pattern as SAT_ARN/DAILY_ARN (both are
@@ -319,6 +338,16 @@ aws logs create-log-group --log-group-name "$EOD_LOG_GROUP_NAME" --region "$REGI
 aws logs put-retention-policy --log-group-name "$EOD_LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
 EOD_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$EOD_LOG_GROUP_ARN"'"}}]}'
 
+# Same shape for the reconcile half (alpha-engine-config-I11269 follow-up):
+# its own /aws/stepfunctions/<name> log group, created idempotently before the
+# create-if-absent below, so the very first create carries logging.
+EOD_RECONCILE_LOG_GROUP_NAME="/aws/stepfunctions/ne-postclose-reconcile-pipeline"
+EOD_RECONCILE_LOG_GROUP_ARN="arn:aws:logs:${REGION}:${ACCOUNT_ID}:log-group:${EOD_RECONCILE_LOG_GROUP_NAME}:*"
+echo "  Ensuring EOD reconcile log group exists (idempotent)..."
+aws logs create-log-group --log-group-name "$EOD_RECONCILE_LOG_GROUP_NAME" --region "$REGION" 2>/dev/null || true
+aws logs put-retention-policy --log-group-name "$EOD_RECONCILE_LOG_GROUP_NAME" --retention-in-days 30 --region "$REGION"
+EOD_RECONCILE_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":true,"destinations":[{"cloudWatchLogsLogGroup":{"logGroupArn":"'"$EOD_RECONCILE_LOG_GROUP_ARN"'"}}]}'
+
 # CFN-pair logging configs — mirror the LoggingConfiguration blocks CFN
 # declares on SaturdayPipeline / WeekdayPipeline (level=ERROR,
 # includeExecutionData=true, the CFN-owned per-SF log groups).
@@ -343,6 +372,7 @@ GROOM_LOGGING_CONFIG='{"level":"ERROR","includeExecutionData":false,"destination
 update_or_defer_to_cfn "$SAT_ARN"  "$SAT_STAMPED"  "Weekly-freshness pipeline" "$SAT_LOGGING_CONFIG"
 update_or_defer_to_cfn "$DAILY_ARN" "$DAILY_STAMPED" "Pre-open trading pipeline" "$DAILY_LOGGING_CONFIG"
 update_or_create "$EOD_ARN" "$EOD_STAMPED" "ne-postclose-trading-pipeline" "Post-close trading pipeline" "$EOD_LOGGING_CONFIG"
+update_or_create "$EOD_RECONCILE_ARN" "$EOD_RECONCILE_STAMPED" "ne-postclose-reconcile-pipeline" "Post-close reconcile pipeline" "$EOD_RECONCILE_LOGGING_CONFIG"
 # CORRECTED 2026-07-12: was alpha-engine-groom-pipeline (the OLD name) — the EventBridge
 # Scheduler targets alpha-engine-groom-dispatch (created by the scheduled-groom-dispatcher
 # deploy.sh --bootstrap). Every deploy between config#2129 (2026-07-01) and this fix was
@@ -352,8 +382,8 @@ update_or_create "$GROOM_ARN" "$GROOM_STAMPED" "alpha-engine-groom-dispatch" "Ba
 
 # ── 3a. Sync the declared weekly exercise-cadence to SSM (config#6689) ───────
 # infrastructure/weekly_cadence.json is the single declared source for whether
-# infrastructure/step_function_eod.json's ReadExerciseCadence/CheckExerciseCadence
-# states launch the weekly pipeline after every trading day's postclose
+# infrastructure/step_function_eod_reconcile.json's ReadExerciseCadence/CheckExerciseCadence
+# states launch the weekly pipeline after every trading day's post-close reconcile
 # (exercise_cadence="daily", alpha-engine-config#5489), gate it to the Saturday
 # cron only ("weekly-only"), or treat no exercise launch as expected at all
 # ("off"). Writing it here — in the SAME step that just updated the EOD SF

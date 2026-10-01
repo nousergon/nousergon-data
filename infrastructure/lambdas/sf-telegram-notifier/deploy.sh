@@ -183,7 +183,8 @@ EVENT_PATTERN=$(cat <<EOF
     "stateMachineArn": [
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-weekly-freshness-pipeline",
       "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-preopen-trading-pipeline",
-      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline"
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-trading-pipeline",
+      "arn:aws:states:${REGION}:${ACCOUNT_ID}:stateMachine:ne-postclose-reconcile-pipeline"
     ],
     "status": ["RUNNING", "SUCCEEDED", "FAILED", "TIMED_OUT", "ABORTED"]
   }

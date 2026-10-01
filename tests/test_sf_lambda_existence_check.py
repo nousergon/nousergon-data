@@ -40,12 +40,15 @@ def _fake_run(returncode=0, stdout="", stderr=""):
 # ── the codified map against the real repo ──────────────────────────────────
 
 
-def test_map_covers_all_four_orchestrated_state_machines(cle):
+def test_map_covers_all_five_orchestrated_state_machines(cle):
     names = {e["sf_name"] for e in cle.SF_DEFINITIONS}
     assert names == {
         "ne-weekly-freshness-pipeline",
         "ne-preopen-trading-pipeline",
         "ne-postclose-trading-pipeline",
+        # alpha-engine-config-I11269: the collector-gated half of the old
+        # post-close SF, split out 2026-09-30.
+        "ne-postclose-reconcile-pipeline",
         "alpha-engine-groom-dispatch",
     }
 
@@ -57,8 +60,11 @@ def test_discovers_the_2026_07_08_incident_reference_class(cle):
     alpha-engine-data-spot-dispatcher (config#1767 Phase 2, nousergon-data#643).
     Those states were removed by alpha-engine-config-I11269; the same class now
     lives in the WaitForCollectionManifests poll naming
-    alpha-engine-collection-readiness-probe, a function the cutover introduces."""
-    refs = cle._discover_referenced_functions("ne-postclose-trading-pipeline", "step_function_eod.json")
+    alpha-engine-collection-readiness-probe, a function the cutover introduces
+    — and since the 2026-09-30 post-close split that poll lives in
+    ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json)."""
+    refs = cle._discover_referenced_functions(
+        "ne-postclose-reconcile-pipeline", "step_function_eod_reconcile.json")
     errors = [r for r in refs if "error" in r]
     assert not errors, f"unexpected parse errors: {errors}"
     normalized = {r["normalized_name"] for r in refs}
@@ -377,3 +383,13 @@ def test_main_drift_exits_1(cle, tmp_path, monkeypatch, capsys):
         exit_code = cle.main()
     assert exit_code == 1
     assert "drift detected" in capsys.readouterr().out
+
+
+def test_the_postclose_machine_references_no_collection_lambda(cle):
+    """alpha-engine-config-I11269: the 16:00 machine waits for nothing, so it
+    must reference neither the readiness probe nor the data-spot dispatcher."""
+    refs = cle._discover_referenced_functions("ne-postclose-trading-pipeline", "step_function_eod.json")
+    assert not [r for r in refs if "error" in r]
+    normalized = {r["normalized_name"] for r in refs}
+    assert "alpha-engine-collection-readiness-probe" not in normalized
+    assert "alpha-engine-data-spot-dispatcher" not in normalized

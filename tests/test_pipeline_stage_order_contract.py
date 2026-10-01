@@ -67,6 +67,10 @@ DEFINITIONS = {
     "ne-weekly-freshness-pipeline": "infrastructure/step_function.json",
     "ne-preopen-trading-pipeline": "infrastructure/step_function_daily.json",
     "ne-postclose-trading-pipeline": "infrastructure/step_function_eod.json",
+    # alpha-engine-config-I11269: the collector-gated half of the post-close
+    # run. Mapped ahead of the nousergon-lib release that declares its spine,
+    # so that release is guarded the moment the pin is bumped.
+    "ne-postclose-reconcile-pipeline": "infrastructure/step_function_eod_reconcile.json",
 }
 
 

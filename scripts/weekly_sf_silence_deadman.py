@@ -7,8 +7,9 @@ launched two ways: the Saturday EventBridge cron (``pipeline_role=weekly``,
 self-gated by ``step_function.json``'s ``WeeklyRunDayGateChoice`` to the one
 correct calendar day per week) and, when ``infrastructure/weekly_cadence.json``
 declares ``exercise_cadence=daily``, a chained launch from every trading day's
-postclose (``pipeline_role=exercise``, ``step_function_eod.json``'s
-``LaunchWeeklyExerciseRun``). Measured over 2026-07-26 -> 08-09: 4 of 10
+postclose (``pipeline_role=exercise``, ``LaunchWeeklyExerciseRun`` — in
+``step_function_eod_reconcile.json`` since the 2026-09-30 post-close split,
+``step_function_eod.json`` before it). Measured over 2026-07-26 -> 08-09: 4 of 10
 trading days got no exercise run with ZERO signal — postclose FAILED before
 the launch state on 07-27/07-28, and postclose never fired AT ALL on 08-05/
 08-06. Nothing paged on the silent days because the only prior deadman
@@ -275,7 +276,7 @@ def compute_expected_slots(
     distinction does not apply to it. A day gated on either path is skipped
     when ``cadence != "daily"`` — LaunchWeeklyExerciseRun's
     CheckExerciseCadence only fires the launch on 'daily'
-    (step_function_eod.json).
+    (step_function_eod_reconcile.json since the 2026-09-30 post-close split).
 
     Weekly slots: one per week whose last-trading-session-plus-one-day run
     date falls within the window. NEVER gated by cadence (declared or

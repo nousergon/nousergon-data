@@ -107,8 +107,11 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
         ("step_function_daily.json", "PredictorInference"),
         ("step_function_daily.json", "ReinvokePredictor"),
-        ("step_function_eod.json", "ProbeEODReconcilePrecondition"),
-        ("step_function_eod.json", "HealReProbe"),
+        # alpha-engine-config-I11269: both states MOVED (unchanged) into the
+        # collector-gated reconcile machine when the post-close SF was split —
+        # re-keyed, not resolved, so the debt stays counted.
+        ("step_function_eod_reconcile.json", "ProbeEODReconcilePrecondition"),
+        ("step_function_eod_reconcile.json", "HealReProbe"),
     }
 )
 
@@ -353,11 +356,14 @@ def test_every_codified_definition_is_walked() -> None:
     states were inverted (360s declared against a 300s function). Pinning the
     count against the shared module's list is what stops a fifth definition
     being added to the fleet and silently escaping this file.
+
+    alpha-engine-config-I11269: five since the post-close split added
+    step_function_eod_reconcile.json.
     """
     from infrastructure.sf_definitions import SF_DEFINITIONS
 
     assert set(_DEFS) == {d["definition_file"] for d in SF_DEFINITIONS}
-    assert len(_DEFS) == 4
+    assert len(_DEFS) == 5
 
 
 @pytest.mark.parametrize(
