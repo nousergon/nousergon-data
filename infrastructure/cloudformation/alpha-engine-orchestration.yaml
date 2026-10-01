@@ -619,6 +619,9 @@ Resources:
         Arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances'
         RoleArn: !Ref EventBridgeEc2RoleArn
         Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
 
   # --------------------------------------------------------------------------
   # EventBridge Scheduler — Stop Trading Instance between the two post-close
@@ -653,6 +656,9 @@ Resources:
         Arn: 'arn:aws:scheduler:::aws-sdk:ec2:stopInstances'
         RoleArn: !Ref EventBridgeEc2RoleArn
         Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
+        RetryPolicy:
+          MaximumRetryAttempts: 3
+          MaximumEventAgeInSeconds: 3600
 
   # --------------------------------------------------------------------------
   # CloudWatch Alarms
