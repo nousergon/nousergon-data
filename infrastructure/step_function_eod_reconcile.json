@@ -310,7 +310,7 @@
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). The normal run enters with the box already up \u2014 ne-postclose-trading-pipeline leaves it running after CaptureSnapshot \u2014 but a reconcile-backstop run, an operator rerun or a heal replay can land on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped, and the first sendCommand would die with Ssm.InvalidInstanceIdException. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening.",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Since 2026-10-01 this is the NORMAL path's box start, not only a guard: ne-postclose-trading-pipeline leaves the box running after CaptureSnapshot, the alpha-engine-idle-stop-trading schedule stops it at 17:45 America/New_York (Brian: \"shut it down after postclose part 1 and boot it back up when part 2 is ready to begin\"), and this pipeline starts after the 18:15 ET collection. It also covers a reconcile-backstop run, an operator rerun or a heal replay landing on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped, where the first sendCommand would otherwise die with Ssm.InvalidInstanceIdException. ec2:startInstances is a no-op if already running, so the pipeline stays idempotently re-runnable any time that evening.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
