@@ -227,6 +227,11 @@ CODIFIED_FUNCTION_TIMEOUTS_SEC: dict[str, int] = {
     # with memory, so it was CPU-throttled as well as memory-starved.
     "alpha-engine-weekly-coverage-sweep": 300,
     "alpha-engine-predictor-regime-retrospective-eval": 600,
+    # alpha-engine-config-I11378. Measured 2026-10-01 via
+    # `aws lambda list-functions`: 900s. The dispatcher boots the Think Tank box
+    # and returns in seconds; the weekly SF's ThinkTankCoverage state declares
+    # 300s, below it, so the state binds.
+    "alpha-engine-thinktank-spot-dispatcher": 900,
     "alpha-engine-predictor-regime-substrate": 300,
     # alpha-engine-replay-concordance was RETIRED from this pipeline by
     # alpha-engine-config-I10539 (Brian ruling 2026-09-16, option b): its

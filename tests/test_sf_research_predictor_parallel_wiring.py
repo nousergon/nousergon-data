@@ -86,7 +86,10 @@ _BRANCH_A_STATES = {
     # (CheckSkipThinkTankCoverage / ThinkTankCoverage / CheckThinkTankLaunched
     # / InitThinkTankPollCount / WaitForThinkTank / CheckThinkTankStatus /
     # ThinkTankWait / ThinkTankPollWait / MergeThinkTankPollCount /
-    # ThinkTankDegraded) was REMOVED from this branch. The Think Tank runs
+    # ThinkTankDegraded) was REMOVED from this branch. 2026-09-30 (Brian
+    # ruling, alpha-engine-config-I11378): CheckSkipThinkTankCoverage /
+    # ThinkTankCoverage came back as ONE fire-and-forget gap-fill dispatch,
+    # with no poll chain. The Think Tank runs
     # daily in shadow mode on its own EventBridge cadence
     # (alpha-research-thinktank-daily -> alpha-engine-thinktank-spot-
     # dispatcher) and is not part of the weekly pipeline; the RAG chain now
@@ -999,12 +1002,13 @@ class TestPerBranchErrorIsolation:
         ChallengerShadow is observe-only (producer leaderboard shadow feed)
         and must never hard-fail Branch A. alpha-engine-config#6722: the
         Catch now routes through MarkChallengerShadowDegraded before
-        converging on CheckSkipRAGIngestion exactly as before."""
+        converging on the next stage's gate exactly as before
+        (CheckSkipThinkTankCoverage since alpha-engine-config-I11378)."""
         catch_targets = [
             c["Next"] for c in branch_a["ChallengerShadow"]["Catch"]
         ]
         assert catch_targets == ["MarkChallengerShadowDegraded"]
-        assert branch_a["MarkChallengerShadowDegraded"]["Next"] == "CheckSkipRAGIngestion"
+        assert branch_a["MarkChallengerShadowDegraded"]["Next"] == "CheckSkipThinkTankCoverage"
         assert "BranchAFailed" not in catch_targets
 
     def test_dataphase2_failure_routes_to_branch_a_failed(self, branch_a):
@@ -1012,39 +1016,50 @@ class TestPerBranchErrorIsolation:
             "BranchAFailed"
         ]
 
-    def test_thinktank_chain_is_absent_from_the_weekly_pipeline(self, branch_a):
-        """Brian ruling 2026-08-10: the Think Tank runs daily in shadow mode
-        and is NOT part of the weekly SF.
+    def test_thinktank_gap_fill_is_one_fire_and_forget_dispatch(self, branch_a):
+        """Brian ruling 2026-09-30 (alpha-engine-config-I11378) reverses the
+        2026-08-10 removal: the weekly SF dispatches the Think Tank gap fill
+        again, because the 5/day daily drip cannot close the hole the weekly
+        churn of the pinned coverage window opens.
 
-        It used to be a gap_fill top-up inside this branch — a ten-state chain
-        (skip gate, spot dispatch, launch check, poll quartet, degraded
-        convergence) whose only job was to top up coverage the daily cadence
-        already owns. The daily EventBridge rule
-        ``alpha-research-thinktank-daily`` -> ``alpha-engine-thinktank-spot-
-        dispatcher`` is now the single producer, so the weekly pipeline neither
-        launches spot for it nor waits on it.
-
-        This asserts absence rather than deletion history: a future change that
-        re-adds any of these states to the weekly pipeline reverses a ruling and
-        must be a deliberate edit to this test, not a quiet re-wire."""
-        removed = {
-            "CheckSkipThinkTankCoverage", "ThinkTankCoverage",
+        What comes back is ONE dispatch, not the old ten-state chain. The box
+        self-terminates and is watched by the same completion marker / reaper
+        WatchKind / freshness row as the daily box, so the weekly pipeline
+        neither waits on it nor polls it. This asserts the poll chain stays
+        absent and the restored states are exactly the gate, the dispatch and
+        its degraded convergence."""
+        never_again = {
             "CheckThinkTankLaunched", "InitThinkTankPollCount",
             "WaitForThinkTank", "CheckThinkTankStatus", "ThinkTankWait",
             "ThinkTankPollWait", "MergeThinkTankPollCount", "ThinkTankDegraded",
         }
-        present = removed & set(branch_a)
+        present = never_again & set(branch_a)
         assert not present, (
-            f"the weekly SF carries Think Tank state(s) {sorted(present)}. The "
-            "Think Tank runs daily in shadow mode on its own cadence (Brian "
-            "ruling 2026-08-10) — the weekly pipeline must not launch or poll it."
+            f"the weekly SF carries Think Tank poll state(s) {sorted(present)}; the "
+            "restored gap fill is fire-and-forget (alpha-engine-config-I11378)."
         )
-        # Nothing may still route at the removed chain, and the RAG chain must
-        # land on the successor the chain used to converge on.
-        import json as _json
-        blob = _json.dumps(branch_a)
-        for name in removed:
-            assert f'"{name}"' not in blob, f"dangling reference to {name}"
+        gate = branch_a["CheckSkipThinkTankCoverage"]
+        assert gate["Default"] == "ThinkTankCoverage"
+        assert gate["Choices"][0]["Next"] == "CheckSkipRAGIngestion"
+
+        task = branch_a["ThinkTankCoverage"]
+        params = task["Parameters"]
+        assert params["FunctionName"] == "alpha-engine-thinktank-spot-dispatcher"
+        assert params["Payload"]["mode"] == "gap_fill"
+        # The Friday shell-run must not buy a box.
+        assert params["Payload"]["dry_run_llm.$"] == "$.research_dry"
+        assert task["Next"] == "CheckSkipRAGIngestion"
+        assert [c["Next"] for c in task["Catch"]] == ["MarkThinkTankCoverageDegraded"]
+        assert task["Catch"][0]["ErrorEquals"] == ["States.ALL"]
+        assert branch_a["MarkThinkTankCoverageDegraded"]["Next"] == "CheckSkipRAGIngestion"
+
+        # Reached from every ChallengerShadow exit, and the RAG chain still
+        # lands on the successor it always did.
+        assert branch_a["ChallengerShadow"]["Next"] == "CheckSkipThinkTankCoverage"
+        assert (
+            branch_a["CheckSkipChallengerShadow"]["Choices"][0]["Next"]
+            == "CheckSkipThinkTankCoverage"
+        )
         assert (
             branch_a["CheckSkipRAGIngestion"]["Choices"][0]["Next"]
             == "CheckSkipRegimeRetrospectiveEval"

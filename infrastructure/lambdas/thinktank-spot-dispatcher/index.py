@@ -212,8 +212,44 @@ KREPIS_APPCONFIG_ENVIRONMENT = os.environ.get(
 
 INSTANCE_TAG_NAME = "alpha-engine-thinktank-spot"
 
+# ── Run mode (alpha-engine-config-I11378) ──────────────────────────────────
+# Which pass the box runs, exported to it as THINKTANK_RUN_MODE and read by
+# crucible-research's infrastructure/thinktank_box_runner.py.
+#
+#   daily     the EventBridge rule's pass (no `mode` on its event): 5 new
+#             names a day, staleness refresh, sweep.
+#   gap_fill  the weekly SF's ThinkTankCoverage state (Brian ruling
+#             2026-09-30): run_daily(gap_fill_only=True) -- intake sized to the
+#             exact uncovered count of the PINNED attractiveness_top_60 window,
+#             every name in it, no stale refill. The 5/day drip cannot close a
+#             30+ name hole before the window's next weekly churn; this can.
+#
+# An unknown mode RAISES. Falling back to the daily pass would make a typo look
+# like a gap fill that ran.
+RUN_MODES = ("daily", "gap_fill")
 
-def _job_script(run_token: str) -> str:
+
+class ThinkTankBoxBusy(RuntimeError):
+    """A gap fill was asked for while a Think Tank box is already running.
+
+    The daily pass treats an existing box as "already done today" and returns
+    quietly. A gap fill cannot: the running box is a DIFFERENT pass, and two
+    boxes would load-mutate-save the same coverage ledger. So it raises, and
+    the weekly SF's non-blocking Catch records the stage as degraded instead
+    of reporting a gap fill that never happened.
+    """
+
+
+def _run_mode(event: dict) -> str:
+    mode = str(event.get("mode") or "daily").strip() or "daily"
+    if mode not in RUN_MODES:
+        raise ValueError(
+            f"unknown Think Tank run mode {mode!r}; expected one of {RUN_MODES}"
+        )
+    return mode
+
+
+def _job_script(run_token: str, mode: str = "daily") -> str:
     """The job the box runs at boot: install runtime, clone the research repo,
     exec the repo's bootstrap.
 
@@ -235,10 +271,21 @@ def _job_script(run_token: str) -> str:
     launch never idles (§47 sub-rule (b): these are the exact classes that
     only a real launch surfaces).
     """
+    if mode not in RUN_MODES:
+        raise ValueError(f"unknown Think Tank run mode {mode!r}")
     log = f"/var/log/thinktank-spot-bootstrap-{run_token}.log"
     s3_log = (
         f"s3://alpha-engine-research/_ssm_logs/thinktank-spot/"
         f"$(date -u +%Y-%m-%d)/$(hostname)-$(date -u +%H%M%S)-{run_token}.log"
+    )
+    # A gap fill needs a box runner that reads THINKTANK_RUN_MODE. One that
+    # predates it would silently run the DAILY pass instead, so the prelude
+    # refuses (and shuts the box down) rather than mislabel the run.
+    mode_guard = (
+        "grep -q THINKTANK_RUN_MODE infrastructure/thinktank_box_runner.py \\\n"
+        '  || fail "box runner predates THINKTANK_RUN_MODE; refusing to run a daily pass as a gap fill"\n'
+        if mode != "daily"
+        else ""
     )
     return f"""set -uo pipefail
 export HOME=/home/ec2-user
@@ -258,6 +305,7 @@ git clone --depth 1 --branch {RESEARCH_BRANCH} \\
   https://github.com/{RESEARCH_REPO}.git /home/ec2-user/crucible-research \\
   || fail "crucible-research clone failed"
 cd /home/ec2-user/crucible-research
+{mode_guard}export THINKTANK_RUN_MODE={mode}
 export THINKTANK_RUN_BUDGET_SECONDS={RUN_BUDGET_SECONDS}
 export THINKTANK_SPOT_RUN_TOKEN={run_token}
 export KREPIS_EXEC_CONTEXT={KREPIS_EXEC_CONTEXT}
@@ -280,7 +328,7 @@ def _launch_record_uri(run_token: str) -> str:
     return f"s3://{RECORD_BUCKET}/{_record_key(LAUNCH_RECORD_PREFIX, run_token)}"
 
 
-def _user_data(run_token: str) -> str:
+def _user_data(run_token: str, mode: str = "daily") -> str:
     """The box's whole dispatch: the job, installed and started at boot as a
     capped oneshot unit that powers the box off however it ends, preceded by
     the launch record a completion reconciler reads (I5752).
@@ -290,14 +338,15 @@ def _user_data(run_token: str) -> str:
     byte for byte, which EC2 requires before it hands back the ClientToken's
     instance."""
     return render_self_starting_user_data(
-        _job_script(run_token),
+        _job_script(run_token, mode),
         unit=JOB_UNIT,
-        description=f"daily Think Tank run (config-I5208 §47) {run_token}",
+        description=f"{mode} Think Tank run (config-I5208 §47) {run_token}",
         timeout_seconds=RUN_TIMEOUT_SECONDS,
         stop_grace_seconds=STOP_GRACE_SECONDS,
         launch_record_uri=_launch_record_uri(run_token),
         launch_record={
             "workload": "thinktank",
+            "mode": mode,
             "run_token": run_token,
             "trading_day": _trading_day(),
             "budget_seconds": RUN_BUDGET_SECONDS,
@@ -363,12 +412,13 @@ def _launch_instance(
     idempotency_key: str,
     force_on_demand: bool = False,
     extra_tags: dict | None = None,
+    mode: str = "daily",
 ) -> ec2_spot.SelfStartingLaunch:
     return ec2_spot.launch_self_starting(
         INSTANCE_TYPES,
         SUBNETS,
         idempotency_key=idempotency_key,
-        user_data=_user_data(run_token),
+        user_data=_user_data(run_token, mode),
         image_id=AMI_ID,
         key_name=KEY_NAME,
         security_group_ids=[SECURITY_GROUP],
@@ -409,7 +459,10 @@ def _already_running() -> list[str]:
 def handler(event: dict, context) -> dict:
     """EventBridge handler — launch the daily Think Tank box.
 
-    ``event`` may carry ``{"force_on_demand": bool}``. Returns
+    ``event`` may carry ``{"force_on_demand": bool}``, ``{"mode": "daily" |
+    "gap_fill"}`` (absent = daily; the weekly SF sends gap_fill) and
+    ``{"dry_run_llm": bool}`` (the SF's Friday shell-run signal: validate and
+    return without launching). Returns
     ``{"launched": True, "replayed", "instance_id", "market", "run_token",
     "launch_record", "dedupe_degraded", "idempotency_probe_degraded"}``, or
     ``{"launched": False, "reason": "already_running", "instance_ids"}``.
@@ -422,6 +475,14 @@ def handler(event: dict, context) -> dict:
     """
     event = event or {}
     force_on_demand = bool(event.get("force_on_demand", False))
+    mode = _run_mode(event)
+
+    if event.get("dry_run_llm") is True:
+        # The weekly SF's Friday preflight threads $.research_dry here. It
+        # proves the state reaches this function with a valid event; it must
+        # not buy a box or spend an LLM call.
+        logger.info("thinktank-spot dry run (mode=%s) — no launch", mode)
+        return {"launched": False, "reason": "dry_run", "mode": mode}
 
     # Per-run identity tags (config#5504): attribute the Think Tank box for EC2
     # cost measurement. This dispatcher is EventBridge-triggered (not SF), so
@@ -477,6 +538,11 @@ def handler(event: dict, context) -> dict:
         )
         dedupe_degraded = True
         running = []
+    if running and mode != "daily":
+        raise ThinkTankBoxBusy(
+            f"a Think Tank box is already running ({running}); not launching a "
+            f"concurrent {mode} pass over the same coverage ledger"
+        )
     if running:
         # Including the box an earlier attempt of THIS event launched before it
         # died: that box carries its job and is running it.
@@ -491,13 +557,15 @@ def handler(event: dict, context) -> dict:
             idempotency_key,
             force_on_demand=force_on_demand,
             extra_tags=extra_tags or None,
+            mode=mode,
         )
     except SpotLaunchError:
         logger.error("thinktank-spot launch failed (spot + on-demand exhausted)")
         raise
     logger.info(
-        "%s thinktank-spot box %s (%s), run_token=%s, request=%s",
+        "%s %s thinktank-spot box %s (%s), run_token=%s, request=%s",
         "replayed" if result.replayed else "launched",
+        mode,
         result.instance_id,
         result.market,
         run_token,
@@ -506,6 +574,7 @@ def handler(event: dict, context) -> dict:
 
     return {
         "launched": True,
+        "mode": mode,
         "replayed": result.replayed,
         "instance_id": result.instance_id,
         "market": result.market,
