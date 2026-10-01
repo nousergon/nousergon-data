@@ -51,9 +51,17 @@ jobs:
           import yfinance as yf
 
           now = dt.datetime.now(dt.UTC)
-          day = now.astimezone(ZoneInfo("America/New_York")).date()
+          now_et = now.astimezone(ZoneInfo("America/New_York"))
+          day = now_et.date()
           if day.isoformat() not in os.environ["SAMPLE_DATES"].split():
               print(f"{day} is not a sample date; nothing to do")
+              raise SystemExit(0)
+          # A scheduled run GitHub starts hours late can land before the next
+          # day's close (2026-10-01: the 22:30 ET slot ran at 05:16 ET), when
+          # the day has no bar yet. That is not a sample, and failing on it
+          # pages main-failure for nothing.
+          if now_et.time() < dt.time(16, 0):
+              print(f"{now_et:%H:%M} ET is before {day}'s close; nothing to sample")
               raise SystemExit(0)
 
           # The issue's 30 names (10+ from the 2026-09-21 worst-shortfall
