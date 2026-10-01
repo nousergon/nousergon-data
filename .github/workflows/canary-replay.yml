@@ -201,7 +201,15 @@ jobs:
               exit 1
             fi
           fi
-          MARKER_KEY=$(jq -r '.marker_key' "$RESP")
+          MARKER_KEY=$(jq -r '.marker_key // empty' "$RESP")
+          if [ -z "$MARKER_KEY" ]; then
+            # Fail in seconds, not after a 20-minute poll of the literal key
+            # "null" (nousergon-data#1998, run 36822071260 attempt 2: a
+            # concurrent_skip response from a dispatcher that did not yet
+            # return marker_key on that path).
+            echo "::error::canary-replay-dispatcher returned no marker_key (reason=${REASON}): $(cat "$RESP")"
+            exit 1
+          fi
           # `// 0` degrades safely if the dispatcher Lambda hasn't been
           # redeployed with dispatched_at yet (config-I2753 rollout: this
           # workflow and the Lambda deploy don't have to land in lockstep)
