@@ -14,11 +14,11 @@ After, two machines:
 * ``ne-postclose-trading-pipeline`` (``step_function_eod.json``) — same name,
   same ~16:00 ET daemon trigger. Market-hours gate, mutex, deploy-drift
   check, box start, SSM readiness, RefreshExecutorDeploy, CaptureSnapshot (with
-  its bounded same-day retry and pages), completion marker. It waits for
-  nothing and does NOT stop the box on success: crucible-executor's post-close
-  timers (trader-reconcile 16:45 ET, eod-reconcile-standalone 21:05 UTC,
-  reference-rate-publish 21:15 UTC) need it up. Its failure path still
-  force-stops it.
+  its bounded same-day retry and pages), box stop, completion marker. It waits
+  for nothing. Since 2026-10-01 (Brian: "lets just stop it when postclose
+  part 1 completes") it stops the box on success too; crucible-executor's
+  Persistent=true post-close timers catch up at the reconcile machine's boot.
+  Its failure path still force-stops it.
 * ``ne-postclose-reconcile-pipeline`` (``step_function_eod_reconcile.json``) —
   started by the eod-backstop Lambda when ``ne-data-collection-eod`` reaches a
   terminal state (``alpha-engine-eod-reconcile-trigger``), or by the 02:15 UTC
@@ -63,6 +63,7 @@ _SHARED = {
     "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
     "WaitForRefreshExecutorDeploy", "CheckRefreshExecutorDeployStatus",
     "RefreshExecutorDeployWait", "RefreshExecutorDeployStatusError",
+    "StopTradingInstance",
     "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
     "WriteCompletionMarkerDegraded", "DegradedRun",
     "HandleFailure", "ForceStopInstance", "FailExecution", "NormalizeEODFailureContext",
@@ -97,8 +98,8 @@ _COLLECTOR_DEPENDENT = {
 }
 
 _RECONCILE_ONLY = _COLLECTOR_DEPENDENT | {
-    # The success-path box stop and the weekly exercise tail after it.
-    "StopTradingInstance", "ReadExerciseCadence", "SetCadenceReadDegraded",
+    # The weekly exercise tail after the box stop.
+    "ReadExerciseCadence", "SetCadenceReadDegraded",
     "PublishCadenceReadDegraded", "CheckExerciseCadence", "SetCadenceUnknownValueDegraded",
     "PublishCadenceUnknownValueDegraded", "LaunchWeeklyExerciseRun",
     "SetWeeklyExerciseDegradedFlag", "WeeklyExerciseLaunchFailed",
@@ -188,22 +189,38 @@ def test_the_postclose_machine_depends_on_nothing_the_collector_writes(postclose
         assert needle not in blob, needle
 
 
-def test_the_postclose_success_path_does_not_stop_the_box(postclose):
-    """Deliberate: crucible-executor's post-close timers need the box after
-    16:00 (trader-reconcile 16:45 ET; eod-reconcile-standalone 21:05 UTC;
-    reference-rate-publish 21:15 UTC). The reconcile machine's
-    StopTradingInstance and the 22:00 PT alpha-engine-stop-trading cost guard
-    stop it. The FAILURE path still force-stops."""
+def test_the_postclose_machine_stops_the_box_as_soon_as_the_snapshot_is_done(postclose):
+    """Brian, 2026-10-01: "lets just stop it when postclose part 1 completes".
+    Every route into the Option-A terminals passes StopTradingInstance, and
+    nothing on the success path runs after it except the terminal router and
+    the completion marker. crucible-executor's post-close timers are
+    Persistent=true and catch up at the reconcile machine's boot. The
+    FAILURE path still force-stops."""
     states = postclose["States"]
-    assert "StopTradingInstance" not in states
-    stops = sorted(
-        n for n, st in states.items()
-        if st.get("Resource", "").endswith(":ec2:stopInstances")
-    )
-    assert stops == ["ForceStopInstance"]
+    before_stop = _reachable(states, postclose["StartAt"],
+                             blocked={"StopTradingInstance", "HandleFailure"})
+    assert not {"CheckDegradedOutcome", "NormalSucceeded", "DegradedRun"} & before_stop
+    after_stop = _reachable(states, "StopTradingInstance", blocked={"HandleFailure"})
+    assert after_stop == {
+        "StopTradingInstance", "CheckDegradedOutcome",
+        "WriteCompletionMarkerNormal", "NormalSucceeded",
+        "WriteCompletionMarkerDegraded", "DegradedRun",
+    }, after_stop
+    assert states["StopTradingInstance"]["Resource"].endswith(":ec2:stopInstances")
     assert states["HandleFailure"]["Next"] == "ForceStopInstance"
-    success = _reachable(states, "CheckSkipRefreshExecutorDeploy", blocked={"HandleFailure"})
-    assert "ForceStopInstance" not in success
+
+
+def test_the_box_timers_that_now_run_at_the_evening_boot_are_persistent():
+    """The stop above is safe only because these catch up on the next boot.
+    Pinned against crucible-executor's units when that checkout is beside
+    this one (as on the fleet laptop); skipped otherwise."""
+    systemd = REPO.parent / "crucible-executor" / "infrastructure" / "systemd"
+    if not systemd.is_dir():
+        pytest.skip("crucible-executor checkout not present")
+    for stem in ("alpha-engine-trader-reconcile", "alpha-engine-eod-reconcile-standalone",
+                 "alpha-engine-reference-rate-publish"):
+        text = (systemd / f"{stem}.timer").read_text(encoding="utf-8")
+        assert re.search(r"^Persistent=true$", text, re.MULTILINE), stem
 
 
 def test_the_reconcile_machine_takes_no_snapshot_and_runs_no_drift_gate(reconcile):

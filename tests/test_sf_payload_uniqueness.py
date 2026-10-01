@@ -838,8 +838,8 @@ class TestEODSFTopLevelFieldsClosed:
         "heal_loop", "heal_collection", "heal_error", "heal_replay_dispatch",
         "heal_replay_dispatch_error", "heal_replay_dispatch_failed_notify",
         "heal_converged_notify", "heal_nonconvergent_notify",
-        # The box stop on the success path, and the exercise tail after it.
-        "stop_result",
+        # The exercise tail after the box stop (stop_result is shared: both
+        # machines stop the box on success since 2026-10-01).
         "weekly_exercise_run", "weekly_exercise_launch_error",
         "weekly_exercise_launch_notify", "weekly_exercise_launch_notify_error",
         "exercise_cadence_param", "exercise_cadence_read_error",

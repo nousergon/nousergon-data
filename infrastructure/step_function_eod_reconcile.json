@@ -310,7 +310,7 @@
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). The normal run enters with the box already up \u2014 ne-postclose-trading-pipeline leaves it running after CaptureSnapshot \u2014 but a reconcile-backstop run, an operator rerun or a heal replay can land on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped, and the first sendCommand would die with Ssm.InvalidInstanceIdException. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening.",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Since 2026-10-01 this is the normal path's box start, not only a guard: ne-postclose-trading-pipeline stops the box as soon as CaptureSnapshot is done (Brian: \"lets just stop it when postclose part 1 completes\"). Its first boot of the evening is also when crucible-executor's Persistent=true post-close timers (trader-reconcile, eod-reconcile-standalone, reference-rate-publish) catch up. It still covers a reconcile-backstop run, an operator rerun or a heal replay landing on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
