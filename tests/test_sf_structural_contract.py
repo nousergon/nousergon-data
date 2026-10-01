@@ -598,6 +598,12 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
             "— see that entry for the full mechanism; verified by "
             "tests/test_sf_research_predictor_degraded_wiring.py."
         ),
+        "ResearchPredictorParallel.ThinkTankCoverage": (
+            "Same fold as Scanner (routes through MarkThinkTankCoverageDegraded) "
+            "— see that entry for the full mechanism; verified by "
+            "tests/test_sf_research_predictor_degraded_wiring.py "
+            "(alpha-engine-config-I11378)."
+        ),
         "ResearchPredictorParallel.RegimeRetrospectiveEval": (
             "Same fold as Scanner (routes through "
             "MarkRegimeRetrospectiveEvalDegraded) — see that entry for the "

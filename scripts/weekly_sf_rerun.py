@@ -433,8 +433,21 @@ STAGES: tuple[Stage, ...] = (
     Stage(
         "challenger_shadow", "skip_challenger_shadow",
         "CheckSkipChallengerShadow", "ChallengerShadow",
-        frozenset({"CheckSkipRAGIngestion"}),
+        # CheckSkipRAGIngestion stays a witness: it is downstream of this
+        # stage in the current graph too, and it is the ONLY successor a
+        # history from before alpha-engine-config-I11378 entered.
+        frozenset({"CheckSkipThinkTankCoverage", "CheckSkipRAGIngestion"}),
         degraded_witness=frozenset({"MarkChallengerShadowDegraded"}),
+    ),
+    # alpha-engine-config-I11378 (Brian ruling 2026-09-30): the weekly Think
+    # Tank gap fill is back, as ONE fire-and-forget dispatch (no poll chain).
+    # A rerun of a run that already dispatched it emits skip_thinktank_coverage
+    # so the rerun does not launch a second gap-fill box.
+    Stage(
+        "thinktank_coverage", "skip_thinktank_coverage",
+        "CheckSkipThinkTankCoverage", "ThinkTankCoverage",
+        frozenset({"CheckSkipRAGIngestion"}),
+        degraded_witness=frozenset({"MarkThinkTankCoverageDegraded"}),
     ),
     Stage(
         "rag_ingestion", "skip_rag_ingestion",
@@ -810,8 +823,10 @@ BRANCH_A_STAGES = frozenset({
     # CheckSkip* gate. thinktank_coverage was one of them until 2026-08-10,
     # when the ThinkTankCoverage chain was removed from the weekly SF
     # (Brian ruling: the Think Tank runs daily in shadow mode, outside this
-    # pipeline) — the daily EventBridge cadence owns it now.
+    # pipeline), and is one again since alpha-engine-config-I11378 restored
+    # the weekly gap fill (Brian ruling 2026-09-30).
     "scanner", "regime_substrate", "signals_envelope", "challenger_shadow",
+    "thinktank_coverage",
     "rag_ingestion", "regime_retrospective_eval",
     "data_phase2", "eval_judge", "rationale_clustering",
     "counterfactual",

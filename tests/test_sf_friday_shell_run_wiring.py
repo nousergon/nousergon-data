@@ -110,6 +110,9 @@ _EXPECTED_SKIPS = {
     # SignalsEnvelope and ChallengerShadow. Defaults false like its siblings.
     "skip_research_self_test",
     "skip_challenger_shadow",
+    # alpha-engine-config-I11378 (Brian ruling 2026-09-30): back with the
+    # restored weekly Think Tank gap fill (ThinkTankCoverage).
+    "skip_thinktank_coverage",
     "skip_rag_ingestion",
     "skip_regime_substrate",
     "skip_regime_retrospective_eval",

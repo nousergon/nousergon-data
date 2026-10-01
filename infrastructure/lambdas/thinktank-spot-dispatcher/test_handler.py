@@ -597,6 +597,7 @@ class TestIncidentReplay:
         out = mod.handler({}, _Ctx("req-A"))
         assert out == {
             "launched": True,
+            "mode": "daily",
             "replayed": False,
             "instance_id": "i-0001",
             "market": "spot",
@@ -606,3 +607,78 @@ class TestIncidentReplay:
             "idempotency_probe_degraded": False,
         }
         assert ec2.run_calls == 1
+
+
+# ── Run mode (alpha-engine-config-I11378) ───────────────────────────────────
+
+
+class TestRunMode:
+    """The weekly SF's ThinkTankCoverage state dispatches a gap_fill pass
+    through this same Lambda. The daily rule's event carries no mode and must
+    keep producing exactly the daily pass."""
+
+    def test_absent_mode_is_the_daily_pass(self):
+        mod = _load()
+        assert mod._run_mode({}) == "daily"
+        assert "export THINKTANK_RUN_MODE=daily\n" in mod._job_script("tok123")
+
+    def test_gap_fill_mode_reaches_the_box(self):
+        mod = _load()
+        script = mod._job_script("tok123", "gap_fill")
+        assert "export THINKTANK_RUN_MODE=gap_fill\n" in script
+        # Exported before the exec, so the bootstrap and the runner inherit it.
+        assert script.index("THINKTANK_RUN_MODE=gap_fill") < script.index(
+            "exec bash infrastructure/thinktank_spot_bootstrap.sh"
+        )
+
+    def test_gap_fill_refuses_a_runner_that_cannot_read_the_mode(self):
+        """An old box runner ignores the env and runs the DAILY pass, which
+        would be reported as a gap fill. The prelude checks and fails first."""
+        mod = _load()
+        script = mod._job_script("tok123", "gap_fill")
+        assert "grep -q THINKTANK_RUN_MODE infrastructure/thinktank_box_runner.py" in script
+        assert "grep -q THINKTANK_RUN_MODE" not in mod._job_script("tok123")
+
+    @pytest.mark.parametrize("mode", ["gapfill", "weekly", "gap_fill_plan"])
+    def test_unknown_mode_raises_before_any_launch(self, monkeypatch, mode):
+        mod = _load()
+        monkeypatch.setattr(mod, "_already_running", lambda: pytest.fail("must not probe"))
+        with pytest.raises(ValueError, match="unknown Think Tank run mode"):
+            mod.handler({"mode": mode}, _Ctx())
+
+    def test_dry_run_validates_and_launches_nothing(self, monkeypatch):
+        mod = _load()
+        monkeypatch.setattr(mod, "_already_running", lambda: pytest.fail("must not probe"))
+        monkeypatch.setattr(mod, "_launch_instance", lambda *a, **k: pytest.fail("must not launch"))
+        out = mod.handler({"mode": "gap_fill", "dry_run_llm": True}, _Ctx())
+        assert out == {"launched": False, "reason": "dry_run", "mode": "gap_fill"}
+
+    def test_gap_fill_over_a_running_box_raises_not_returns(self, monkeypatch):
+        """Two boxes would load-mutate-save one coverage ledger, and a quiet
+        `already_running` would let the SF report a gap fill that never ran."""
+        mod = _load()
+        monkeypatch.setattr(mod, "_already_running", lambda: ["i-live"])
+        monkeypatch.setattr(mod, "_launch_instance", lambda *a, **k: pytest.fail("must not launch"))
+        with pytest.raises(mod.ThinkTankBoxBusy):
+            mod.handler({"mode": "gap_fill"}, _Ctx())
+
+    def test_gap_fill_launch_carries_the_mode(self, monkeypatch):
+        mod = _load()
+        seen = {}
+        monkeypatch.setattr(mod, "_already_running", lambda: [])
+
+        def _capture(run_token, idempotency_key, **kw):
+            seen["mode"] = kw.get("mode")
+            return mod.ec2_spot.SelfStartingLaunch("i-abc", "spot", False, False)
+
+        monkeypatch.setattr(mod, "_launch_instance", _capture)
+        out = mod.handler({"mode": "gap_fill"}, _Ctx())
+        assert seen == {"mode": "gap_fill"}
+        assert out["launched"] is True and out["mode"] == "gap_fill"
+
+    def test_gap_fill_user_data_fits_and_is_replay_stable(self):
+        mod = _load()
+        a = mod._user_data("tok123", "gap_fill")
+        assert a == mod._user_data("tok123", "gap_fill")
+        assert a != mod._user_data("tok123")
+        assert len(a.encode()) < 16 * 1024
