@@ -759,16 +759,15 @@ def test_a_missing_verdict_is_filled_in_as_not_attempted_and_fails_the_run():
 
 
 def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
-    """A checkout where every declared launcher exists and implements the flag,
-    so the live definition's stages classify SWEEPABLE and actually run.
+    """A checkout where every declared launcher exists and implements the flag.
 
-    With ONE deliberate exception: a stage acknowledged in the manifest's
-    `dedicated_box_stages` runs on a box its own dispatcher creates, and the
-    sweep's launcher box does not carry that checkout at all. Fabricating its
-    launcher here would model a box that does not exist and would make the
-    acknowledgement read as stale on every run — which is exactly the
-    stale-entry finding manifest_disagreement is supposed to raise, so the
-    fixture must reproduce the real box's contents rather than defeat it.
+    That includes a stage acknowledged in the manifest's `dedicated_box_stages`:
+    crucible-research was cloned onto the sweep box around 2026-09-26, so the
+    judge's launcher IS on the real box's disk, and the stage must STILL be
+    classified by where the definition says it runs. This fixture used to leave
+    the launcher out, modelling a box that stopped existing — which is why no
+    test noticed when the real box gained the checkout and the sweep ran the
+    stage there (alpha-engine-config-I11779).
     """
     from infrastructure.preflight_sweep_stages import (
         derive_shell_run_bindings,
@@ -779,13 +778,10 @@ def _fake_checkout(root: pathlib.Path) -> pathlib.Path:
 
     definition = json.loads(SF_PATH.read_text())
     manifest = load_manifest(MANIFEST_PATH)
-    dedicated = {
-        entry["stage"] for entry in (manifest.get("dedicated_box_stages") or [])
-    }
     bindings = apply_map_bindings(derive_shell_run_bindings(definition), manifest)
     bindings.setdefault("run_date", "2026-08-14")
     for stage in derive_stages(definition, bindings, {"Execution": {"Name": "t", "Id": "t"}}, "/x"):
-        if not (stage.box_dir and stage.launcher) or stage.name in dedicated:
+        if not (stage.box_dir and stage.launcher):
             continue
         path = root / stage.box_dir / stage.launcher
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -1456,33 +1452,49 @@ def test_an_unacknowledged_unsweepable_stage_is_unchanged_and_still_fails(tmp_pa
                 if f.get("kind") == ps.FINDING_DEDICATED_BOX]
 
 
+def test_a_dedicated_box_stage_is_never_run_on_the_sweep_box(tmp_path):
+    """The 2026-10-01 failure (alpha-engine-config-I11779). With the judge's
+    launcher present in the sweep box's checkout, the stage must not be sent to
+    the sweep box: its env file exists only on the dedicated box, so running it
+    here reports the box's absence as the stage's failure."""
+    root = _fake_checkout(tmp_path)
+    assert (root / "crucible-research" / "evals" / "judge_spot_run.py").is_file(), (
+        "fixture must model the real box, which now carries the checkout"
+    )
+    scripts: list[str] = []
+
+    def runner(argv, **_kwargs):
+        scripts.append(argv[-1])
+        return subprocess.CompletedProcess(args=argv, returncode=0, stdout="", stderr="")
+
+    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=runner)
+    assert not [s for s in scripts if "eval-judge.env" in s or "judge_spot_run" in s]
+    row = _dedicated_result(report)
+    assert row["verdict"] == ps.UNSWEEPABLE_VERDICT
+    assert row["unsweepable_kind"] == ps.UNSWEEPABLE_DEDICATED_BOX
+    assert report.stages_failed == 0
+    assert not [f for f in report.coverage_findings
+                if f.get("kind") == ps.FINDING_MANIFEST_DISAGREEMENT]
+
+
 def test_a_stale_dedicated_box_acknowledgement_fails_the_run(tmp_path):
     """The acknowledgement is graded the other way too. A stage acknowledged as
-    unreachable that the sweep CAN now reach is a blocking finding — an entry
-    that outlives its cause is the silent exclusion this design exists to
-    prevent."""
+    unreachable that the sweep CAN now reach — the definition re-points it at the
+    launcher box — is a blocking finding: an entry that outlives its cause is
+    the silent exclusion this design exists to prevent."""
     root = _fake_checkout(tmp_path)
-    # Fabricate the launcher the real launcher box does not carry: the stage is
-    # now sweepable, so the declaration is stale.
-    manifest = json.loads(MANIFEST_PATH.read_text())
-    from infrastructure.preflight_sweep_stages import (
-        apply_map_bindings,
-        derive_shell_run_bindings,
-        derive_stages,
-    )
     definition = json.loads(SF_PATH.read_text())
-    bindings = apply_map_bindings(derive_shell_run_bindings(definition), manifest)
-    bindings.setdefault("run_date", "2026-08-14")
-    stage = next(
-        s for s in derive_stages(definition, bindings,
-                                 {"Execution": {"Name": "t", "Id": "t"}}, "/x")
-        if s.name == DEDICATED_STAGE
+    from infrastructure.preflight_sweep_stages import (
+        LAUNCHER_BOX_INSTANCE_REF,
+        _iter_send_command_states,
     )
-    path = root / stage.box_dir / stage.launcher
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("#!/bin/bash\n# --preflight-only\n")
+    judge = next(st for name, st in _iter_send_command_states(definition["States"])
+                 if name == DEDICATED_STAGE)
+    judge["Parameters"]["InstanceIds.$"] = LAUNCHER_BOX_INSTANCE_REF
+    moved = tmp_path / "step_function_moved.json"
+    moved.write_text(json.dumps(definition))
 
-    report = ps.sweep(SF_PATH, MANIFEST_PATH, str(root), "t", runner=_completed(0))
+    report = ps.sweep(moved, MANIFEST_PATH, str(root), "t", runner=_completed(0))
     stale = [f for f in report.coverage_findings
              if f.get("kind") == ps.FINDING_MANIFEST_DISAGREEMENT
              and DEDICATED_STAGE in f["finding"]]
