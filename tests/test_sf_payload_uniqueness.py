@@ -155,6 +155,12 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
+    # alpha-engine-config-I11378: the restored weekly Think Tank gap fill.
+    # mode=gap_fill selects the pass on the box; dry_run_llm keeps the Friday
+    # shell-run from buying one.
+    "ThinkTankCoverage": frozenset(
+        {"mode", "dry_run_llm.$", "execution_id.$", "run_date.$", "pipeline_role"}
+    ),
     # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
     "ResearchSelfTest": frozenset({"mode", "date.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(

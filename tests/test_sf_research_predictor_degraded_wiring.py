@@ -123,7 +123,9 @@ def test_init_predictor_degraded_seeds_false(branch_b):
 _BRANCH_A_MARK_STATES = {
     "MarkScannerDegraded": "CheckSkipRegimeSubstrate",
     "MarkRegimeSubstrateDegraded": "CheckSkipSignalsEnvelope",
-    "MarkChallengerShadowDegraded": "CheckSkipRAGIngestion",
+    "MarkChallengerShadowDegraded": "CheckSkipThinkTankCoverage",
+    # alpha-engine-config-I11378: the restored weekly Think Tank gap fill.
+    "MarkThinkTankCoverageDegraded": "CheckSkipRAGIngestion",
     "MarkRegimeRetrospectiveEvalDegraded": "CheckSkipDataPhase2",
     "MarkEvalJudgeDegraded": "EvalRollingMean",
     "MarkEvalRollingMeanDegraded": "CheckSkipRationaleClustering",

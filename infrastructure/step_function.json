@@ -151,9 +151,9 @@
     },
     "ApplyBacktestEvalPreset": {
       "Type": "Pass",
-      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config-I7726: also seeds skip_research_self_test true \u2014 the research module\u2019s known-answer battery verifies the RESEARCH instrument, which a Backtester+Evaluator-only replay neither exercises nor consumes, so running it would spend a Lambda invocation on a verdict about code this rerun does not touch. config#3134: also seeds skip_scanner and skip_challenger_shadow true (both are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json and re-calling the ChallengerShadow producer on every partial rerun for no benefit to the assessment). It also seeded skip_thinktank_coverage until 2026-08-10, when the ThinkTankCoverage chain was removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode, outside the weekly pipeline). ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
+      "Comment": "mode=backtest-eval ONLY (config#830; lane-A flags added config#3134). Seeds skip_* defaults that bypass every stage EXCEPT Backtester + Evaluator: the front half (lib-pin/morning-enrich/data-phase1/rag/regime/research/data-phase2/eval-judge chain/aggregate-costs/predictor-training), the post-backtest model block (predictor-backtest + portfolio-optimizer), parity, and the post-eval tail (health checks/report-card/director via skip_post_eval). skip_backtester / skip_evaluator are deliberately NOT set, so those two run. config-I7726: also seeds skip_research_self_test true \u2014 the research module\u2019s known-answer battery verifies the RESEARCH instrument, which a Backtester+Evaluator-only replay neither exercises nor consumes, so running it would spend a Lambda invocation on a verdict about code this rerun does not touch. config#3134: also seeds skip_scanner and skip_challenger_shadow true (both are observe-only/side-effect producers a Backtester+Evaluator-only assessment rerun does not need \u2014 a bare mode=backtest-eval run was previously re-scanning candidates.json and re-calling the ChallengerShadow producer on every partial rerun for no benefit to the assessment). It also seeded skip_thinktank_coverage until 2026-08-10, when the ThinkTankCoverage chain was removed from this SF (Brian ruling: the Think Tank runs daily in shadow mode, outside the weekly pipeline). alpha-engine-config-I11378 (Brian ruling 2026-09-30) restored the weekly Think Tank gap fill under its original ThinkTankCoverage name, so this preset seeds skip_thinktank_coverage true again. ALSO seeds skip_signals_envelope true HERE ONLY \u2014 SignalsEnvelope is LOAD-BEARING for a real weekly run (I2880 staleness guard; the executor hard-fails Monday without a fresh signals.json) and its own CheckSkipSignalsEnvelope gate defaults false for exactly that reason, but this preset's whole contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage' \u2014 a backtest-eval rerun never reaches the executor and never needs a refreshed signals.json, so skipping the envelope here is safe specifically because this preset already skips everything that would consume a stale one. Merge order States.JsonMerge(preset, $, false) makes the preset the BASE and the live input ($) WIN \u2014 so an operator can still override any single flag (e.g. {\"mode\": \"backtest-eval\", \"skip_parity\": false}) and it takes effect. Mirrors InitializeInput's JsonMerge-defaults idiom.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_research_self_test\":true,\"skip_challenger_shadow\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
+        "merged.$": "States.JsonMerge(States.StringToJson('{\"skip_lib_pin_drift_check\":true,\"skip_morning_enrich\":true,\"skip_data_phase1\":true,\"skip_scanner\":true,\"skip_signals_envelope\":true,\"skip_research_self_test\":true,\"skip_challenger_shadow\":true,\"skip_thinktank_coverage\":true,\"skip_rag_ingestion\":true,\"skip_regime_substrate\":true,\"skip_regime_retrospective_eval\":true,\"skip_research\":true,\"skip_data_phase2\":true,\"skip_eval_judge\":true,\"skip_rationale_clustering\":true,\"skip_counterfactual\":true,\"skip_aggregate_costs\":true,\"skip_predictor_training\":true,\"skip_predictor_backtest\":true,\"skip_portfolio_optimizer_backtest\":true,\"skip_parity\":true,\"skip_post_eval\":true}'),$,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckSkipLibPinDriftCheck"
@@ -1071,7 +1071,7 @@
             },
             "CheckSkipChallengerShadow": {
               "Type": "Choice",
-              "Comment": "Skip-gate (config#3134). {\"skip_challenger_shadow\": true} bypasses the ChallengerShadow Lambda invocation and jumps straight to CheckSkipRAGIngestion \u2014 ChallengerShadow's own Next/Catch convergence point, so skipping it is behaviorally identical to a ChallengerShadow run that did nothing. Defaults to running (Default: ChallengerShadow) so scheduled Saturday runs and unflagged reruns are unaffected. Set true by the mode=backtest-eval preset: the observe-only no_agent leaderboard shadow feed is not needed for a Backtester/Evaluator-only assessment rerun, and skipping it avoids re-invoking its LLM producer for no benefit (config#3134: the 2026-07-20 assessment-rerun arc re-called this producer on every one of six rerun attempts).",
+              "Comment": "Skip-gate (config#3134). {\"skip_challenger_shadow\": true} bypasses the ChallengerShadow Lambda invocation and jumps straight to CheckSkipThinkTankCoverage \u2014 ChallengerShadow's own Next/Catch convergence point, so skipping it is behaviorally identical to a ChallengerShadow run that did nothing. Defaults to running (Default: ChallengerShadow) so scheduled Saturday runs and unflagged reruns are unaffected. Set true by the mode=backtest-eval preset: the observe-only no_agent leaderboard shadow feed is not needed for a Backtester/Evaluator-only assessment rerun, and skipping it avoids re-invoking its LLM producer for no benefit (config#3134: the 2026-07-20 assessment-rerun arc re-called this producer on every one of six rerun attempts).",
               "Choices": [
                 {
                   "And": [
@@ -1084,7 +1084,7 @@
                       "BooleanEquals": true
                     }
                   ],
-                  "Next": "CheckSkipRAGIngestion"
+                  "Next": "CheckSkipThinkTankCoverage"
                 }
               ],
               "Default": "ChallengerShadow"
@@ -1123,7 +1123,7 @@
                 }
               ],
               "ResultPath": "$.challenger_shadow_result",
-              "Next": "CheckSkipRAGIngestion"
+              "Next": "CheckSkipThinkTankCoverage"
             },
             "MarkChallengerShadowDegraded": {
               "Type": "Pass",
@@ -1131,6 +1131,80 @@
               "Parameters": {
                 "degraded": true,
                 "routes.$": "States.Format('{},{}',$.research_degraded_local.routes,'MarkChallengerShadowDegraded')"
+              },
+              "ResultPath": "$.research_degraded_local",
+              "Next": "CheckSkipThinkTankCoverage"
+            },
+            "CheckSkipThinkTankCoverage": {
+              "Type": "Choice",
+              "Comment": "Skip-gate (alpha-engine-config-I11378). {\"skip_thinktank_coverage\": true} bypasses the ThinkTankCoverage dispatch and jumps to CheckSkipRAGIngestion, ThinkTankCoverage's own Next/Catch convergence point, so skipping it is behaviorally identical to a dispatch that launched nothing. Defaults to running so scheduled Saturday runs are unaffected. ApplyBacktestEvalPreset seeds it true again, as it did before 2026-08-10.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.skip_thinktank_coverage",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.skip_thinktank_coverage",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "CheckSkipRAGIngestion"
+                }
+              ],
+              "Default": "ThinkTankCoverage"
+            },
+            "ThinkTankCoverage": {
+              "Type": "Task",
+              "Comment": "Weekly Think Tank gap fill, RESTORED by Brian's ruling 2026-09-30 (alpha-engine-config-I11378). The ThinkTankCoverage chain was removed from this SF on 2026-08-10 (the Think Tank runs daily in shadow mode on its own cadence), and from then the only intake was the daily rule's 5 new names a day. The pinned coverage window (attractiveness_top_60, crucible-research producers.registry.PINNED_RESEARCH_PREFILTER) churns weekly, so a 30+ name hole never closed before the next churn and the thinktank_coverage challenger arm wrote no shadow signals after 2026-09-17. This state launches ONE Think Tank spot box in mode=gap_fill through the same dispatcher the daily rule uses: the box runs thinktank.run.run_daily(gap_fill_only=True), whose intake is sized to the exact uncovered count of the pinned window, all of it, with no stale refill. Fire-and-forget like the daily dispatch: the Lambda returns in seconds and the box self-terminates; its outcome is watched where the daily box's is (completion marker, spot-orphan-reaper's Think Tank WatchKind, the thinktank_challenger_selection freshness row). Placed after ChallengerShadow so it reads the SAME-DAY Scanner board, and before RAGIngestion so a RAG halt cannot cost the week's gap fill. The dispatcher RAISES ThinkTankBoxBusy instead of launching a second box over the same coverage ledger; that, like any failure here, is caught as degraded. dry_run_llm threads $.research_dry so the Friday shell-run validates the event without buying a box. Observe-only: does NOT gate the Predictor. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates and rides only as the box's run-date identity tag; the box keys its own artifacts off krepis/nousergon_lib now_dual() trading_day.",
+              "Resource": "arn:aws:states:::lambda:invoke",
+              "Parameters": {
+                "FunctionName": "alpha-engine-thinktank-spot-dispatcher",
+                "Payload": {
+                  "mode": "gap_fill",
+                  "dry_run_llm.$": "$.research_dry",
+                  "execution_id.$": "$$.Execution.Id",
+                  "run_date.$": "$.run_date",
+                  "pipeline_role": "weekly-thinktank-gap-fill"
+                }
+              },
+              "TimeoutSeconds": 300,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "Lambda.ServiceException",
+                    "Lambda.TooManyRequestsException",
+                    "Lambda.SdkClientException"
+                  ],
+                  "MaxAttempts": 2,
+                  "IntervalSeconds": 15,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Comment": "Observe-mode non-blocking, like ChallengerShadow: a failed or refused dispatch must NOT halt the pipeline. Routes through MarkThinkTankCoverageDegraded so the run records that no gap fill launched.",
+                  "Next": "MarkThinkTankCoverageDegraded",
+                  "ResultPath": "$.thinktank_coverage_error"
+                }
+              ],
+              "ResultSelector": {
+                "launched.$": "$.Payload.launched",
+                "mode.$": "$.Payload.mode"
+              },
+              "ResultPath": "$.thinktank_coverage_result",
+              "Next": "CheckSkipRAGIngestion"
+            },
+            "MarkThinkTankCoverageDegraded": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I11378: threads $.research_degraded_local=true onto ThinkTankCoverage's fail-open path without changing its continuation (still CheckSkipRAGIngestion), and appends this state's name to $.research_degraded_local.routes so the route is nameable on the report card and Director digest (same shape as MarkChallengerShadowDegraded).",
+              "Parameters": {
+                "degraded": true,
+                "routes.$": "States.Format('{},{}',$.research_degraded_local.routes,'MarkThinkTankCoverageDegraded')"
               },
               "ResultPath": "$.research_degraded_local",
               "Next": "CheckSkipRAGIngestion"

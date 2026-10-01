@@ -113,9 +113,11 @@ of `skip_backtester`.
 **Lane-A flags (config#3134)**: `skip_scanner`, `skip_signals_envelope`,
 `skip_challenger_shadow` extend this charter to the
 Scanner/SignalsEnvelope/ChallengerShadow research states inside
-`ResearchPredictorParallel`'s branch A (`skip_thinktank_coverage` was a
-fourth until 2026-08-10, when the ThinkTankCoverage chain was removed from
-this SF — the Think Tank runs daily in shadow mode on its own cadence).
+`ResearchPredictorParallel`'s branch A. `skip_thinktank_coverage` is a
+fourth: removed with the ThinkTankCoverage chain on 2026-08-10, it came back
+when alpha-engine-config-I11378 (Brian ruling 2026-09-30) restored the weekly
+Think Tank gap fill as one fire-and-forget dispatch of
+`alpha-engine-thinktank-spot-dispatcher` in `mode=gap_fill`.
 Previously none of them had a skip gate, so every partial rerun (e.g.
 `mode=backtest-eval`, see below) unconditionally re-scanned
 `candidates.json` and re-called the ChallengerShadow producer — real

@@ -257,6 +257,11 @@
       "disposition": "exempt",
       "substrate": "krepis.resource_kill probe over the parity spot instance",
       "reason": "Reads dmesg/exit status to tell an OOM kill from a workload failure. Runs no workload of its own. no paid-model call site in the substrate."
+    },
+    "ThinkTankCoverage": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/thinktank-spot-dispatcher (mode=gap_fill)",
+      "reason": "Boots the Think Tank gap-fill spot box and returns (alpha-engine-config-I11378). The box's model spend is metered by the Think Tank's own monthly cost ledger (thinktank/costs.py BudgetGuard) on the same callsites as the daily run, and the box finishes outside this execution; attributing it here would double-count it against a stage that made no model call."
     }
   }
 }

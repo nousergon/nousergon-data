@@ -91,6 +91,13 @@ WEEKLY_SF_LAMBDAS_NOT_CRITICAL: dict[str, str] = {
         "gaps. Its Catch routes to WeeklyCoverageSweepUnavailable, which "
         "pages; a regression cannot change what the run computes."
     ),
+    "thinktank-spot-dispatcher": (
+        "observe-only side launch (alpha-engine-config-I11378): the weekly "
+        "SF's ThinkTankCoverage state boots the Think Tank gap-fill box and "
+        "returns; its Catch routes to MarkThinkTankCoverageDegraded, so a "
+        "regression degrades the run but cannot fail it or change what it "
+        "computes. The Think Tank feeds a shadow arm only, never the Predictor."
+    ),
 }
 
 # §7.1 mechanism names/aliases a `Rehearsal-path:` trailer may cite. Matched

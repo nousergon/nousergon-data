@@ -88,6 +88,12 @@ class TestDerivePlan:
             # SignalsEnvelope and ChallengerShadow.
             "skip_research_self_test",
             "skip_challenger_shadow",
+            # alpha-engine-config-I11378: in this pre-2026-08-10 history the
+            # old ThinkTankCoverage chain sat AFTER RAG, so the restored
+            # stage's current-graph witness (CheckSkipRAGIngestion) reads as
+            # passed. Harmless: the stage is an observe-only gap fill, and a
+            # history this old is never the one being rerun.
+            "skip_thinktank_coverage",
             "skip_predictor_training",
         }
         assert plan.failed == ["rag_ingestion"]
@@ -132,6 +138,10 @@ class TestDerivePlan:
             # SignalsEnvelope and ChallengerShadow.
             "skip_research_self_test",
             "skip_challenger_shadow",
+            # alpha-engine-config-I11378: this history ran the old
+            # ThinkTankCoverage chain to completion, so a rerun must not
+            # launch a second gap fill.
+            "skip_thinktank_coverage",
             "skip_rag_ingestion",
             "skip_regime_retrospective_eval",
             # skip_research retired: alpha-engine-config-I2515 Phase B
@@ -852,7 +862,10 @@ class TestBacktestEvalPresetLaneA:
             # verdict about research code it does not touch.
             ("CheckSkipSignalsEnvelope", "CheckSkipResearchSelfTest"),
             ("CheckSkipResearchSelfTest", "CheckSkipChallengerShadow"),
-            ("CheckSkipChallengerShadow", "CheckSkipRAGIngestion"),
+            # alpha-engine-config-I11378 restored CheckSkipThinkTankCoverage
+            # between ChallengerShadow and RAG; the preset routes past both.
+            ("CheckSkipChallengerShadow", "CheckSkipThinkTankCoverage"),
+            ("CheckSkipThinkTankCoverage", "CheckSkipRAGIngestion"),
         ],
     )
     def test_preset_flags_route_past_each_lane_a_gate(

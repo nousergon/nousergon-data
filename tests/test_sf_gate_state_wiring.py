@@ -298,6 +298,8 @@ _RP_ROUTES = (
     "ScannerResourceKillDegraded",
     "MarkRegimeSubstrateDegraded",
     "MarkChallengerShadowDegraded",
+    # alpha-engine-config-I11378: the restored weekly Think Tank gap fill.
+    "MarkThinkTankCoverageDegraded",
     "MarkRegimeRetrospectiveEvalDegraded",
     "MarkEvalJudgeDegraded",
     "MarkEvalRollingMeanDegraded",
