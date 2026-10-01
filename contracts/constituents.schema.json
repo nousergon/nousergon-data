@@ -87,15 +87,15 @@
         "additionalProperties": false,
         "required": [
           "source",
-          "sector",
-          "yf_sector",
-          "yf_industry"
+          "sector"
         ],
         "properties": {
           "source": {
             "type": "string",
             "enum": [
-              "yfinance"
+              "yfinance",
+              "declared_override",
+              "previous_snapshot"
             ]
           },
           "sector": {
@@ -107,10 +107,88 @@
           },
           "yf_industry": {
             "type": "string"
+          },
+          "yfinance_error": {
+            "type": "string"
+          },
+          "valid_through": {
+            "type": "string"
+          },
+          "why": {
+            "type": "string"
+          },
+          "snapshot_date": {
+            "type": "string"
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "yfinance"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "yf_sector",
+                "yf_industry"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "declared_override"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "valid_through",
+                "why"
+              ]
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "source": {
+                  "const": "previous_snapshot"
+                }
+              }
+            },
+            "then": {
+              "required": [
+                "snapshot_date"
+              ]
+            }
+          }
+        ]
+      },
+      "description": "Constituents whose sector_map/sector_etf_map entry did not come from Wikipedia's GICS table. `source` says where it came from: `yfinance` (alpha-engine-config-I11468; `yf_sector`/`yf_industry` are the raw evidence it was mapped from), `declared_override` (a dated `_SECTOR_OVERRIDES` entry, `valid_through` + `why`), or `previous_snapshot` (the sector the member carried in the snapshot dated `snapshot_date`, alpha-engine-config-I11785). `yfinance_error` records a failed yfinance lookup that a later source covered. Every ticker in `tickers` has a sector_map entry; the producer raises or withholds rather than publish one without. Absent on snapshots written before I11468."
+    },
+    "withheld_members": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "reason",
+          "absent_from_snapshot"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
+          },
+          "absent_from_snapshot": {
+            "type": "string"
           }
         }
       },
-      "description": "Constituents whose sector_map/sector_etf_map entry came from the yfinance fallback rather than Wikipedia's GICS table (alpha-engine-config-I11468): `sector` is the GICS sector written to sector_map, `yf_sector`/`yf_industry` the raw yfinance evidence it was mapped from. Wikipedia lags brand-new index additions, so this is usually empty or a handful of names. Every ticker in `tickers` has a sector_map entry; the producer raises rather than publish one without. Absent on snapshots written before I11468."
+      "description": "Brand-new index members the funds hold but no source could classify yet, left OUT of `tickers` and every map for this snapshot (alpha-engine-config-I11785). `absent_from_snapshot` is the previous snapshot that proves the member is new. They join on the first run a source classifies them. Usually empty; absent on snapshots written before I11785."
     },
     "sp500_count": {
       "type": "integer",

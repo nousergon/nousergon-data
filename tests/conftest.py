@@ -99,6 +99,23 @@ def _isolate_entrant_seed_from_s3(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_previous_constituents_from_s3(monkeypatch):
+    """Keep ``constituents.collect()`` and the constituents preflight from
+    reading the real previous snapshot over S3 (alpha-engine-config-I11785).
+    Stubbed to "no previous snapshot", which is the fail-closed pre-I11785
+    behaviour. Tests that exercise withholding pass a snapshot explicitly or
+    patch the loader; test_constituents_withhold_new_members.py holds a
+    reference to the real function taken at import time. Only patched when
+    the module is already imported."""
+    import sys
+
+    cons = sys.modules.get("collectors.constituents")
+    if cons is not None and hasattr(cons, "_load_previous_snapshot"):
+        monkeypatch.setattr(cons, "_load_previous_snapshot", lambda *a, **k: None)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_secrets_from_ssm(monkeypatch):
     """Force every test to read secrets from env only, not SSM.
 
