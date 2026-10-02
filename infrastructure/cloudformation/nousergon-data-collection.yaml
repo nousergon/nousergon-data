@@ -369,6 +369,26 @@ Resources:
   # D34 would sit behind two workloads the consumer does not read, and the
   # bounded wait's budget (derived from the caps of every workload up to the
   # last one writing a waited unit) would have to cover them too.
+  #
+  # D03, D12 and D34 are RUN here but NOT named in verify_units
+  # (alpha-engine-config-I11812). Naming a unit is this machine's declaration
+  # that every Saturday run must publish it; these three legitimately publish
+  # nothing on a Saturday, and their manifests say so, so naming them failed
+  # the whole execution (and, through the same predicate, the v1 weekly's
+  # WaitForCollectionManifests) on every Saturday:
+  #   * D03 (prices) - Friday's EOD collection (data-collection-eod, which
+  #     still names D03) has already refreshed every ticker, and the staleness
+  #     scan (alpha-engine-config-I11518) correctly refreshes none: `failed`
+  #     EmptyProduction on 2026-09-25 21:53Z and 2026-09-26 09:42Z.
+  #   * D12 (features weekly) - D31 already published features/{date}/ on
+  #     Friday, so the phase same-date auto-skips: `not_applicable` on every
+  #     manifest since 2026-09-18, the clean Saturday 09-19 run included.
+  #   * D34 (chronic-gap-heal) - `chronic_polygon_gaps.tickers` is empty by
+  #     design (alpha-engine-config data/config.yaml, since 2026-05-27), so the
+  #     heal has nothing to do: `failed` EmptyProduction, reproduced locally.
+  # D03 stays graded by data-collection-eod. D12 and D34 are registered as
+  # uncovered against alpha-engine-config-I11812 pending a ruling on each
+  # (retire, or re-scope what its Saturday leg owns).
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -385,7 +405,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D03", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D12", "D13", "D14", "D15", "D16", "D17", "D34", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D13", "D14", "D15", "D16", "D17", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state

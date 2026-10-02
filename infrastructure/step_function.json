@@ -10024,7 +10024,7 @@
     },
     "WaitForCollectionManifests": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I11264 / -I11269: the weekly SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-weekly). It starts at 09:00 UTC Saturday (alpha-engine-saturday), which is the same instant as data-collection-weekly's 05:00 America/New_York under EDT and an hour BEFORE it under EST, so lookback_seconds is 0. The units are the weekly schedule's verify_units MINUS D15/D16/D46, whose v1 owners (DataPhase2, RAGIngestion) are still in this definition and still run inside ResearchPredictorParallel (alpha-engine-config-I10753 is their own cutover) \u2014 the derivation is pinned by tests/test_v1_collection_readiness_wait.py against each unit's trigger.owner. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
+      "Comment": "alpha-engine-config-I11264 / -I11269: the weekly SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-weekly). It starts at 09:00 UTC Saturday (alpha-engine-saturday), which is the same instant as data-collection-weekly's 05:00 America/New_York under EDT and an hour BEFORE it under EST, so lookback_seconds is 0. The units are the weekly schedule's verify_units MINUS D15/D16/D46, whose v1 owners (DataPhase2, RAGIngestion) are still in this definition and still run inside ResearchPredictorParallel (alpha-engine-config-I10753 is their own cutover). D03, D12 and D34 are not waited because the schedule no longer names them: each legitimately publishes nothing on a Saturday (D03 refreshed by Friday's EOD, D12 already published by D31, D34 has no chronic-gap tickers configured), and naming them settled this wait not-ready on every Saturday (alpha-engine-config-I11812) \u2014 the derivation is pinned by tests/test_v1_collection_readiness_wait.py against each unit's trigger.owner. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-collection-readiness-probe",
@@ -10033,7 +10033,6 @@
           "units": [
             "D01",
             "D02",
-            "D03",
             "D04",
             "D05",
             "D06",
@@ -10041,11 +10040,9 @@
             "D08",
             "D10",
             "D11",
-            "D12",
             "D13",
             "D14",
-            "D17",
-            "D34"
+            "D17"
           ],
           "not_before.$": "$$.Execution.StartTime",
           "lookback_seconds": 0
@@ -10136,7 +10133,7 @@
     },
     "CheckCollectionReadinessBudget": {
       "Type": "Choice",
-      "Comment": "The wait is BOUNDED: 87 polls of 300 s = 26100 s. Derived, not remembered (tests/test_v1_collection_readiness_wait.py recomputes it): up to 3600 s for the EST hour by which data-collection-weekly's 05:00 America/New_York cron trails this SF's 09:00 UTC start, plus the worst case of every standalone weekly workload up to the last one writing a unit this wait reads (morning-enrich, weekly-phase-one, chronic-gap-heal: one SSM-online budget of 300 s + the dispatcher's 7200 s cap each). Past that instant each of them has been hard-stopped by its own cap, so a not-ready answer can no longer turn ready by itself. The typical case is far shorter: the poll exits as soon as every unit is settled (v1's own MorningEnrich + DataPhase1 finished ~2h12m after the 09:00 UTC start on 2026-09-19).",
+      "Comment": "The wait is BOUNDED: 62 polls of 300 s = 18600 s. Derived, not remembered (tests/test_v1_collection_readiness_wait.py recomputes it): up to 3600 s for the EST hour by which data-collection-weekly's 05:00 America/New_York cron trails this SF's 09:00 UTC start, plus the worst case of every standalone weekly workload up to the last one writing a unit this wait reads (morning-enrich, weekly-phase-one: one SSM-online budget of 300 s + the dispatcher's 7200 s cap each; chronic-gap-heal no longer writes a waited unit since alpha-engine-config-I11812, so it no longer extends the budget, which was 87 polls). Past that instant each of them has been hard-stopped by its own cap, so a not-ready answer can no longer turn ready by itself. The typical case is far shorter: the poll exits as soon as every unit is settled (v1's own MorningEnrich + DataPhase1 finished ~2h12m after the 09:00 UTC start on 2026-09-19).",
       "Choices": [
         {
           "And": [
@@ -10149,7 +10146,7 @@
               "BooleanEquals": true
             }
           ],
-          "Comment": "shell_run: reachable only when the one dry probe RAISED (WaitForCollectionManifests' Catch). A probe that cannot run on Friday will not run on Saturday either, so the preflight fails loud now instead of polling for 87 x 300 s.",
+          "Comment": "shell_run: reachable only when the one dry probe RAISED (WaitForCollectionManifests' Catch). A probe that cannot run on Friday will not run on Saturday either, so the preflight fails loud now instead of polling for 62 x 300 s.",
           "Next": "ExtractCollectionNotReadyError"
         },
         {
@@ -10160,7 +10157,7 @@
             },
             {
               "Variable": "$.collection_readiness_poll.attempts",
-              "NumericGreaterThanEquals": 87
+              "NumericGreaterThanEquals": 62
             }
           ],
           "Comment": "IsPresent-guarded (config#2275) although InitCollectionReadinessPoll seeds the counter on every path into this block: a Choice cannot Catch, so a guard costs nothing and an unguarded dereference is one refactor away from States.Runtime.",
