@@ -23,15 +23,19 @@ component_id: "data-collector-d38-crypto-balances"
 owning_repo: "nousergon-data"
 title: "crypto-balances"
 component: 1
-lifecycle: disabled
-lifecycle_reexam: "2026-09-09 — OVERDUE"
+lifecycle: "in-service"
 owner: brian
 code_path: "collectors/crypto_balances.py:270; infrastructure/lambdas/crypto-balances/index.py:40"
 trigger:
   kind: "eventbridge-scheduler"
   owner: "alpha-engine-crypto-balances-15min"
   successor: unchanged by v2 phase 4
-  schedule: rate(15 minutes) — DISABLED live
+  # alpha-engine-config-I11812 (R2 (a), re-enable decision PR, 2026-10-02):
+  # once per trading day, after the close, instead of every 15 minutes (R2's
+  # proposed cadence). UTC, because the entry carries no timezone. The entry
+  # keeps its historical name `-15min`; renaming it is a delete + create that
+  # buys nothing but the label.
+  schedule: "cron(30 22 ? * MON-FRI *)"
   runs_on: lambda
 writes:
   - crypto/holdings.json
@@ -64,40 +68,55 @@ detectors:
         what makes this silent rather than merely broken.
 freshness:
   family: crypto
-  deadline: "per ruling R2 (plan §7); re-asked at D38's re-exam date"
+  deadline: "23:00 UTC on trading days (R2 (a), alpha-engine-config-I11812)"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
   denominator: null
   floor: null
   status: not_applicable
-  na_code: "N/A-NOT-RUN"
-  note: the schedule is DISABLED live
+  na_code: "N/A-NOT-IMPL"
+  note: >-
+      no completeness floor is declared yet. Each run manifest records the
+      balances written (`rows_out`) and the per-address fetch failures
+      (`address_fetch_failed` rejects) against the published wallet list
 guards:
   empty_fresh:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   cardinality:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   units:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   pit:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   vendor_fallback:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   success_without_output:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; R2
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"
@@ -124,3 +143,16 @@ clause_phase:
 notes: >-
     Ruling R2. P-23 is the interim: Metron renders the as-of and STALE rather than serving
     a 38-day-old number as current.
+
+    alpha-engine-config-I11812 (2026-10-02) takes R2's (a) branch: re-enable at a daily
+    cadence, because the crypto view is still a live consumer. Metron `main` serves
+    `GET /portfolios/{id}/crypto` (`api/routers/portfolios.py` -> `crypto.for_portfolio`,
+    which also records a snapshot per read) and `web/app/portfolios/[id]/crypto/page.tsx`;
+    two wallet addresses are registered (`metron/crypto/wallet_addresses.json`); and the
+    view received P-23 and its P-07 consumer pin in September, after the pause.
+    `crypto/holdings.json` is meanwhile 56 days stale (LastModified 2026-08-07T16:17Z). The
+    live Lambda's code dates from 2026-06-29, before the run-manifest work, so the same
+    change ships its code on merge (`.github/workflows/deploy-crypto-balances.yml`), which
+    also re-asserts the schedule's expression and state from `automation_pause.json`.
+    Still open after it: unsuppressing the `crypto_holdings` row in alpha-engine-config
+    `ARTIFACT_REGISTRY.yaml` with the daily cadence (a config-repo change).

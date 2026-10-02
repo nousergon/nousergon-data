@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # deploy.sh — Create or update the alpha-engine-crypto-balances Lambda and wire its
-# EventBridge Scheduler rate(15 min) rule (metron-ops#111).
+# EventBridge Scheduler rule, once per trading day after the close (metron-ops#111;
+# daily since alpha-engine-config-I11812, R2 (a) — it was rate(15 minutes)).
 #
 # The Lambda runs collectors/crypto_balances.collect() around the clock: reads Metron's
 # published wallet addresses, fetches BTC/ETH balances + prices, writes crypto/holdings.json.
@@ -34,7 +35,11 @@ POLICY_NAME="alpha-engine-crypto-balances-policy"
 SCHED_ROLE_NAME="alpha-engine-crypto-balances-scheduler-role"
 SCHED_POLICY_NAME="invoke-crypto-balances"
 SCHED_NAME="alpha-engine-crypto-balances-15min"
-SCHED_CRON="rate(15 minutes)"
+# Once per trading day, 22:30 UTC (R2 (a), alpha-engine-config-I11812). The
+# name keeps its historical `-15min` suffix: renaming a schedule is a delete +
+# create, and the name is referenced by automation_pause.json and D38's
+# descriptor. UTC: no ScheduleExpressionTimezone is passed.
+SCHED_CRON="cron(30 22 ? * MON-FRI *)"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
@@ -177,7 +182,7 @@ if $BOOTSTRAP; then
     echo "  Creating Scheduler execution role: ${SCHED_ROLE_NAME}"
     run aws iam create-role --role-name "${SCHED_ROLE_NAME}" \
       --assume-role-policy-document "${SCHED_TRUST}" \
-      --description "EventBridge Scheduler role: invoke ${FUNCTION_NAME} every 15 min" \
+      --description "EventBridge Scheduler role: invoke ${FUNCTION_NAME} on its schedule" \
       --query 'Role.RoleName' --output text
   else
     echo "  Scheduler execution role exists: ${SCHED_ROLE_NAME}"
@@ -189,7 +194,7 @@ if $BOOTSTRAP; then
 
   if ! $DRY_RUN; then echo "  Waiting 10s for Scheduler role propagation..."; sleep 10; fi
 
-  # --- 2d. The EventBridge Scheduler rule (rate 15 min, 24/7) ---
+  # --- 2d. The EventBridge Scheduler rule (SCHED_CRON) ---
   TARGET="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
   if aws scheduler get-schedule --name "${SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
     echo "  Updating Scheduler rule: ${SCHED_NAME} → ${SCHED_CRON}"
@@ -226,6 +231,23 @@ echo "Ensuring timeout/memory: 120s / 256MB"
 run aws lambda update-function-configuration --function-name "${FUNCTION_NAME}" \
   --timeout 120 --memory-size 256 --region "${REGION}" --query 'LastUpdateStatus' --output text
 echo "✓ Code deployed."
+
+# ----- 3b. Re-assert the schedule's expression + state (no IAM) -------------
+# alpha-engine-config-I11812. The schedule's cadence and its armed state are
+# owned by this repo (SCHED_CRON above, automation_pause.json via pause_state)
+# and re-asserted by every deploy, so the merge that changes either is the
+# apply — the same reasoning as alert-drain-liveness-probe's step 4b. Only
+# scheduler:UpdateSchedule + iam:PassRole on the existing scheduler role are
+# used; creating the schedule or its role stays --bootstrap.
+TARGET="{\"Arn\":\"${FN_ARN}\",\"RoleArn\":\"${SCHED_ROLE_ARN}\",\"Input\":\"{}\"}"
+if aws scheduler get-schedule --name "${SCHED_NAME}" --region "${REGION}" --query 'Name' --output text >/dev/null 2>&1; then
+  echo "Re-asserting Scheduler rule: ${SCHED_NAME} → ${SCHED_CRON} ($(pause_state "${SCHED_NAME}"))"
+  run aws scheduler update-schedule --name "${SCHED_NAME}" --state "$(pause_state "${SCHED_NAME}")" \
+    --schedule-expression "${SCHED_CRON}" --flexible-time-window '{"Mode":"OFF"}' \
+    --target "${TARGET}" --region "${REGION}" --query 'ScheduleArn' --output text
+else
+  echo "Scheduler rule ${SCHED_NAME} does not exist — run deploy.sh --bootstrap to create it."
+fi
 
 # ----- 4. Smoke (real invoke — writes crypto/holdings.json if addresses exist) ---
 
