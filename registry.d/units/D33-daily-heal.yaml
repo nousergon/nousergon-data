@@ -23,17 +23,21 @@ component_id: "data-collector-d33-daily-heal"
 owning_repo: "nousergon-data"
 title: "daily-heal"
 component: 1
-lifecycle: disabled
-lifecycle_reexam: >-
-    2026-09-09 — OVERDUE, which is itself why this row renders UNREPORTED rather than
-    DISABLED (plan §4.1 rendering table)
+lifecycle: "in-service"
 owner: brian
 code_path: "weekly_collector.py:2240"
 trigger:
-  kind: "eventbridge-rule"
-  owner: "alpha-engine-daily-heal"
-  successor: "ne-data-collection-daily-heal (nousergon-data-PR1701, DISABLED)"
-  schedule: "cron(0 9 ? * MON-FRI *) — DISABLED live"
+  # alpha-engine-config-I11812 (re-enable decision PR, 2026-10-02): the unit
+  # runs in the standalone stack's daily-heal machine, started at 05:00 ET on
+  # trading days by the Scheduler entry below (`DailyHealState` ENABLED, and
+  # `require_trading_day: true` in its Input). The v1 rule
+  # `alpha-engine-daily-heal` stays paused under the 2026-08-07 ruling and no
+  # longer describes this unit. Shape mirrors D17/D18 (nousergon-data-PR2018).
+  kind: "step-functions"
+  owner: "ne-data-collection-daily-heal"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-daily-heal"
+  successor: "ne-data-collection-daily-heal (nousergon-data-PR1701), ENABLED by alpha-engine-config-I11812; v1 was the alpha-engine-daily-heal rule"
+  schedule: "weekdays 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - "data/heal/daily/{date}.json"
@@ -66,42 +70,56 @@ detectors:
     state: BROKEN
     note: an alarm over a producer that NEVER RUNS. A detector that cannot fire is not a detector.
 freshness:
-  na_code: "N/A-NOT-RUN"
-  note: >-
-      the rule is DISABLED live; freshness on a disabled producer would be a permanent
-      false red
-  status: not_applicable
+  family: morning
+  deadline: "07:30 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
   denominator: null
   floor: null
   status: not_applicable
-  na_code: "N/A-NOT-RUN"
-  note: disabled
+  na_code: "N/A-MISSING-INPUT"
+  note: >-
+      a heal has no universe denominator; its output is a repair count
+      (`days_healed`), which the run manifest records and the heal summary
+      `data/heal/daily/{date}.json` carries
 guards:
   empty_fresh:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   cardinality:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   units:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   pit:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   vendor_fallback:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
   success_without_output:
-    state: not_applicable
-    na_code: "N/A-NOT-RUN"
-    note: DISABLED live; guards commission at P2 if R5 enables it
+    state: absent
+    note: >-
+        no code halts or refuses on this class for this unit (audit §4.1). The guard is
+        phase-2 work; the clause is UNMET until it exists and is commissioned by an
+        induced fault (P-19).
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"
@@ -125,4 +143,15 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
-notes: "Ruling R5. `DailyHealState` stays disabled through the cutover (plan §6.2 step 6)."
+notes: >-
+    Ruling R5 (2026-09-14) chose (a), enable the daily heal, timed for data phase 2.
+    alpha-engine-config-I11812 (2026-10-02) proposes enabling it now, in this PR, on the
+    evidence that the gap it closes is open today: the pending-upgrades ledger
+    `_data_quality/pending_upgrades.json` still holds 2026-09-30 as fallback-quality two
+    days later, because the 10-01 morning append that would have upgraded it failed, and
+    `_self_heal_missing_universe_days` has no caller other than this unit. While it ran
+    (2026-07-16 to 2026-08-04, 14 records under `data/heal/daily/`), it healed a day on
+    12 of 14 runs. Merging the PR is the ruling and the apply: `DailyHealState` Default
+    ENABLED, and the schedule moves from `pending` to `not_paused` in
+    `infrastructure/automation_pause.json`. Its guards are re-declared `absent` (phase-2
+    work), replacing the N/A-NOT-RUN codes a disabled unit carried.

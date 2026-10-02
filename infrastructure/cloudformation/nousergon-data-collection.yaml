@@ -23,7 +23,12 @@ Description: >-
 #   * DailyHealState    — the daily-heal schedule, separately, because its v1
 #                         rule `alpha-engine-daily-heal` is paused by Brian's
 #                         2026-08-07 ruling (infrastructure/automation_pause.json).
-#                         Cutover does not un-pause it; that is its own ruling.
+#                         Cutover did not un-pause it; that was its own ruling.
+#                         ENABLED by alpha-engine-config-I11812 (R5 (a), taken
+#                         now rather than at data phase 2; see D33's
+#                         descriptor). The v1 rule stays paused. Rollback is
+#                         reverting that change, which returns the schedule to
+#                         automation_pause.json `pending` with this Default.
 #
 # ENABLE = a PR that changes a Default below from DISABLED to ENABLED and, in
 # the SAME PR, moves the schedule's name in automation_pause.json from
@@ -46,9 +51,9 @@ Parameters:
     Description: State of the eod, morning and weekly schedules. See the declaration block.
   DailyHealState:
     Type: String
-    Default: DISABLED
+    Default: ENABLED
     AllowedValues: [DISABLED, ENABLED]
-    Description: State of the daily-heal schedule (paused by ruling 2026-08-07).
+    Description: State of the daily-heal schedule (ENABLED by alpha-engine-config-I11812).
   ShadowSamedayState:
     Type: String
     Default: DISABLED
@@ -385,6 +390,14 @@ Resources:
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
   # machine so the run's outcome is recorded rather than fired and forgotten.
+  #
+  # require_trading_day is TRUE (alpha-engine-config-I11812), like the eod and
+  # morning schedules. The heal targets the PREVIOUS trading day, so on a
+  # weekday holiday it would re-heal a day the prior run already healed, find
+  # nothing, publish no `staging/daily_closes/*` key, and fail VerifyRunManifests
+  # (`output_missing`) over a run that legitimately had nothing to do. Skipping
+  # non-trading days leaves exactly one heal per trading day, each one healing
+  # the day the previous EOD append marked fallback-quality.
   DailyHealSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -401,7 +414,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": false, "verify_units": ["D33"]}'
+        Input: '{"collection": "daily-heal", "workloads": ["daily-heal"], "require_trading_day": true, "verify_units": ["D33"]}'
 
   # Weekday shadow-sameday parity run (alpha-engine-config-I11233). Targets
   # the dispatcher LAMBDA DIRECTLY, not a state machine — the only schedule in

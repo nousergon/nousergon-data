@@ -42,8 +42,34 @@ from data_gate.read import evaluate, load_phases
 from tests.data_gate_support import EmptyStore, TRADING_DAY
 
 
+#: D33 and D38 as declared on 2026-09-20, when both were switched off live.
+#: alpha-engine-config-I11812 proposes re-enabling both (separate PRs, either
+#: order), so the disabled shapes this module exercises are pinned here rather
+#: than borrowed from whichever real unit happens to be off; without the pin the
+#: non-vacuity guard below fails the day the last one is switched back on.
+_PINNED_DISABLED = {
+    "D33": {
+        "kind": "eventbridge-rule",
+        "owner": "alpha-engine-daily-heal",
+        "schedule": "cron(0 9 ? * MON-FRI *) — DISABLED live",
+    },
+    "D38": {
+        "kind": "eventbridge-scheduler",
+        "owner": "alpha-engine-crypto-balances-15min",
+        "schedule": "rate(15 minutes) — DISABLED live",
+    },
+}
+
+
 def _units():
-    return load_units()
+    units = []
+    for unit in load_units():
+        if unit.unit_id in _PINNED_DISABLED:
+            trigger = {k: v for k, v in unit.raw["trigger"].items() if k != "started_by"}
+            trigger.update(_PINNED_DISABLED[unit.unit_id])
+            unit = type(unit)(unit_id=unit.unit_id, path=unit.path, raw={**unit.raw, "trigger": trigger})
+        units.append(unit)
+    return units
 
 
 def _clauses():
