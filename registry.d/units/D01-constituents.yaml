@@ -57,11 +57,17 @@ consumers:
 contract:
   schema: contracts/constituents.schema.json
   producer_test: tests/test_p07_contracts.py
-  consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "crucible:crucible/data/universe.py"
+  consumer_pins:
+    - repo: "crucible"
+      path: "tests/contracts/constituents.schema.json"
+      pins: "body_schema"
+      producer: "contracts/constituents.schema.json"
+      read_site: "crucible/data/universe.py::load_declared_universe"
+      note: "crucible/data/point_in_time.py reads this document's sector_map under the same pinned copy; its test drives the universe loader only"
+  # alpha-engine-config-I11282 (C10, 2026-10-02): the crucible pin landed in
+  # crucible-PR374 (tests/test_constituents_contract.py, a fixture trimmed
+  # from the real 2026-09-25 document, driven through the real
+  # load_declared_universe via the latest_weekly.json pointer).
 registry_rows:
   - constituents_dated
   # alpha-engine-config-I10870: the row for market_data/latest_weekly.json is

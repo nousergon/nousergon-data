@@ -79,23 +79,26 @@ consumers_reason: >-
 contract:
   schema: contracts/ndx_constituents.schema.json
   producer_test: tests/test_nasdaq100.py
-  consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "nousergon-data:collectors/index_contributions.py::_default_weights_source (D48)"
-registry_rows: []
-# alpha-engine-config-I11307: the ARTIFACT_REGISTRY row for these two key
-# templates is filed separately and deferred until this producer is scheduled,
-# per this repo's "never register a freshness entry ahead of its producer"
-# convention. The pinned PUT count in tests/test_artifact_registry_coverage.py
-# already accounts for the write site.
+  consumer_pins:
+    - repo: "nousergon-data"
+      path: "tests/test_ndx_constituents_consumer_contract.py"
+      pins: "in_repo_reader"
+      read_site: "collectors/index_contributions.py::_default_weights_source"
+      note: "D48, in-repo consumer; the test feeds the real producer's body to the real reader"
+registry_rows:
+  - ndx_constituents_latest
+  - ndx_constituents_dated
+# alpha-engine-config-I11307 / I11282 (C11, 2026-10-02): both rows are
+# registered and DECLARED OFF against alpha-engine-config-I11306, which clears
+# on the `index_contribution_producers_scheduled` milestone. Flipping this unit
+# to in-service while they are still declared off reads `artifact_registry` as
+# parked, so the promotion PR has to clear them.
 run_manifest_prefix: data_collection/runs/D49
 detectors:
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
     state: ABSENT
-    note: "deferred with the registry row — alpha-engine-config-I11307"
+    note: "row registered but declared off until alpha-engine-config-I11306 schedules the producer; the monitor grades nothing before then"
 freshness:
   family: "weekly-membership"
   status: proposed
