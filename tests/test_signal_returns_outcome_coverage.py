@@ -103,9 +103,7 @@ class TestCoverageGapDetection:
         # Shape of the real config#1860 gap: score_performance has rows for
         # an old date, but score_performance_outcomes has NONE for it.
         _seed_score_performance_only(tmp_db, ["2026-04-04"])
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["status"] == "ok"
         assert summary["gap_dates"] == ["2026-04-04"]
@@ -113,18 +111,14 @@ class TestCoverageGapDetection:
 
     def test_multiple_gap_dates_all_reported(self, tmp_db):
         _seed_score_performance_only(tmp_db, ["2026-04-04", "2026-04-11", "2026-04-12"])
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["gap_dates"] == ["2026-04-04", "2026-04-11", "2026-04-12"]
         assert summary["signal_dates_checked"] == 3
 
     def test_resolved_date_with_outcome_rows_not_flagged(self, tmp_db):
         _seed_resolved(tmp_db, "2026-03-02")
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["gap_dates"] == []
         assert summary["signal_dates_checked"] == 1
@@ -134,9 +128,7 @@ class TestCoverageGapDetection:
         # yet is expected to have no outcome rows — not a coverage gap.
         recent = "2026-07-20"
         _seed_score_performance_only(tmp_db, [recent])
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["gap_dates"] == []
         assert summary["signal_dates_checked"] == 0
@@ -144,9 +136,7 @@ class TestCoverageGapDetection:
     def test_mixed_gap_and_resolved_dates(self, tmp_db):
         _seed_resolved(tmp_db, "2026-03-02", symbol="MSFT")
         _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="AAPL")
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["gap_dates"] == ["2026-04-04"]
         assert summary["signal_dates_checked"] == 2
@@ -172,8 +162,6 @@ class TestCoverageGapDetection:
     def test_gap_count_reflects_multiple_symbols_same_date(self, tmp_db):
         _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="AAPL")
         _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="MSFT")
-        with mock.patch("collectors.signal_returns.date") as mock_date:
-            mock_date.today.return_value = _TODAY
-            mock_date.fromisoformat = date.fromisoformat
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["gap_counts"]["2026-04-04"] == 2
