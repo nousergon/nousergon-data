@@ -76,7 +76,14 @@ detectors:
     note: "prefix entry; first write pending (nousergon-data-PR1698 merged 2026-09-14)"
 freshness:
   family: "eod-spine"
-  deadline: "18:15 America/New_York"
+  # The family's worst-case write bound, by the same rule the weekly family
+  # uses (fire + declared runtime ceiling, plan §2 row 1): the 18:15 ET fire
+  # plus each verify_unit writer's SSM-online budget and declared cap,
+  # 18:15 + 95 + 65 = 20:55 ET (tests/test_data_collection_stack.py::
+  # test_the_eod_ordering_chain_is_derived_from_the_template). It read 18:15
+  # while the schedule was 16:45; once the fire moved to 18:15 that value
+  # equalled the fire time and could never be met. Still `proposed`.
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:

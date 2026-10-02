@@ -35,6 +35,7 @@ LIVE trigger is `data.phase1.triggers_reconciled`'s job
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -108,3 +109,32 @@ def test_measured_schedule_matches_the_in_repo_schedule_definition():
     assert props["Name"] == "data-collection-eod"
     assert props["ScheduleExpression"] == "cron(15 18 ? * MON-FRI *)"
     assert props["ScheduleExpressionTimezone"] == "America/New_York"
+
+
+def test_the_eod_spine_deadline_is_the_derived_worst_case_write_bound():
+    """`freshness.deadline` for the eod-spine family is the fire plus the declared
+    runtime ceiling of the workloads that write its units — the same rule the
+    weekly family's Sat 13:00 uses (05:00 + the machine timeout, plan §2 row 1).
+
+    Derived from the template and the dispatcher's caps, never remembered: when
+    the fire moved 16:45 -> 18:15 the old 18:15 deadline silently became equal to
+    the fire time, a clause no run could ever meet. A cron or cap change now
+    fails here until the deadline moves with it.
+    """
+    from infrastructure import data_collection_stack as stack
+
+    eod = {s["name"]: s for s in stack.schedules(stack.load_template())}["data-collection-eod"]
+    match = re.match(r"cron\((\d+) (\d+) ", eod["expression"])
+    assert match, eod["expression"]
+    fire = int(match.group(2)) * 60 + int(match.group(1))
+    worst = stack.worst_case_through_units(eod, eod["input"]["verify_units"])
+    bound = fire + -(-worst // 60)
+    expected = f"{bound // 60:02d}:{bound % 60:02d} America/New_York"
+
+    declared = {u.unit_id: (u.raw.get("freshness") or {}).get("deadline") for u in _eod_units()}
+    assert set(declared) == EOD_UNITS
+    wrong = {uid: d for uid, d in declared.items() if d != expected}
+    assert not wrong, (
+        f"eod-spine units must declare freshness.deadline {expected!r} (the EOD fire plus the "
+        f"declared caps of its unit writers); these do not: {wrong}"
+    )
