@@ -281,7 +281,9 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, cap
 
     monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
 
-    rc = m.main(["--days", "1", "--cur-bucket", "curbucket", "--cur-export-name", "cur/x"])
+    rc = m.main(
+        ["--days", "1", "--cur-bucket", "curbucket", "--cur-s3-prefix", "cur", "--cur-export-name", "x"]
+    )
     assert rc == 0
     assert len(s3.puts) == 2
     body = json.loads(s3.puts[0]["Body"])
@@ -361,3 +363,71 @@ def test_stdout_never_carries_the_metric_document_or_argument_values(monkeypatch
     assert "secret-project" not in out
     assert "baseline" not in out
     assert "cur_source" not in out
+
+
+def test_read_cur_window_days_before_the_tag_first_appears_are_uncovered_not_zero():
+    """A delivered period proves the export ran, not that our resources carried
+    the tag yet: a cost-allocation tag accrues from when it was applied, never
+    retroactively. Measured 2026-10-02: `system=data-collection` first appears
+    on 2026-09-29, and counting 09-04..09-28 as covered $0 days would publish a
+    28-day baseline built from three days of data."""
+    key = "cur/x/data/BILLING_PERIOD=2026-09/part-0.parquet"
+    rows = [_row(9.0, "2026-09-02", other_component="crucible-v2"), _row(1.0, "2026-09-04")]
+    reader = _FakeReader({key: _parquet_bytes(rows)})
+    window = m.read_cur_window(
+        reader,
+        cur_bucket="bucket",
+        cur_prefix="cur/x",
+        tag_key="system",
+        tag_value="data-collection",
+        start=dt.date(2026, 9, 1),
+        end=dt.date(2026, 9, 6),
+    )
+    assert window.uncovered_days == ("2026-09-01", "2026-09-02", "2026-09-03")
+    assert window.days_covered == 3  # 09-04 (tagged) and the $0 days after it
+    assert window.total_cost == pytest.approx(1.0)
+
+
+def test_read_cur_window_a_delivered_period_with_no_tagged_row_covers_nothing():
+    key = "cur/x/data/BILLING_PERIOD=2026-09/part-0.parquet"
+    reader = _FakeReader({key: _parquet_bytes([_row(9.0, "2026-09-02", other_component="crucible-v2")])})
+    window = m.read_cur_window(
+        reader,
+        cur_bucket="bucket",
+        cur_prefix="cur/x",
+        tag_key="system",
+        tag_value="data-collection",
+        start=dt.date(2026, 9, 1),
+        end=dt.date(2026, 9, 3),
+    )
+    assert window.days_covered == 0
+    assert window.uncovered_days == ("2026-09-01", "2026-09-02", "2026-09-03")
+
+
+def test_main_reads_under_the_s3_prefix_and_the_export_name(monkeypatch):
+    """AWS Data Exports delivers under `<S3Prefix>/<ExportName>/data/`. The
+    export name alone is not the path: every run until 2026-10-02 listed
+    `nous-ergon-fleet-cur/data/` and published days_covered=0 while the objects
+    sat at `nous-ergon-fleet-cur/nous-ergon-fleet-cur/data/`. With no
+    `--cur-s3-prefix`, the codified export's S3Prefix == Name layout is used."""
+    listed: list[str] = []
+
+    class _ListingS3(_PutCapturingS3):
+        def get_paginator(self, name):
+            class _Paginator:
+                def paginate(self, Bucket, Prefix):
+                    listed.append(Prefix)
+                    return [{"Contents": []}]
+
+            return _Paginator()
+
+    s3 = _ListingS3()
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None):
+            return s3
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+    assert m.main(["--days", "1", "--no-write", "--cur-bucket", "b", "--cur-export-name", "fleet-cur"]) == 0
+    assert listed and all(p.startswith("fleet-cur/fleet-cur/data/BILLING_PERIOD=") for p in listed)

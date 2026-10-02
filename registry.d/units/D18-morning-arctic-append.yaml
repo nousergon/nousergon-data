@@ -28,8 +28,14 @@ owner: brian
 code_path: "builders/daily_append.py:2960"
 trigger:
   kind: "step-functions"
-  owner: "ne-preopen-trading-pipeline"
-  successor: "ne-data-collection-morning (nousergon-data-PR1701, DISABLED)"
+  # Since the 2026-09-28 decoupled cutover (alpha-engine-config-I11264) this
+  # unit runs in the standalone stack's morning machine, started at 07:30 ET by
+  # the Scheduler entry below. ne-preopen-trading-pipeline (08:15 ET) no longer
+  # runs it; naming that machine here read DIVERGENT on
+  # data.phase1.triggers_reconciled every day (15 of 15 fires unmatched).
+  owner: "ne-data-collection-morning"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-morning"
+  successor: "ne-data-collection-morning (nousergon-data-PR1701), ENABLED at the 2026-09-28 cutover; v1 was ne-preopen-trading-pipeline"
   schedule: "weekdays 07:30 America/New_York"
   runs_on: "ec2-spot"
 writes:
