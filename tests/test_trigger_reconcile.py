@@ -172,14 +172,16 @@ def test_the_scope_is_not_vacuous(units):
 # ---------------------------------------------------------------------------
 
 
-def test_red_when_a_postclose_descriptor_is_edited_back_to_1645(units, live):
-    """The exact I11189 defect: D19 declares 16:45 over a pipeline that starts 16:00."""
-    edited = _edit(units, "D19", schedule="weekdays 16:45 America/New_York")
+def test_red_when_an_eod_descriptor_is_edited_back_to_the_v1_fire_time(units, live):
+    """The I11189 shape on the EOD units: D19 declares the v1 postclose SF's
+    16:00 over the Scheduler entry that has started it at 18:15 ET since the
+    decoupled cutover (alpha-engine-config-I11269)."""
+    edited = _edit(units, "D19", schedule="weekdays 16:00 America/New_York")
     reading = read_triggers_reconciled(_store(_document(live)), edited, as_of=READ_AT)
     assert not reading.met and not reading.unmeasurable, reading.detail
     assert "DIVERGENT D19" in reading.detail
-    assert "16:00 America/New_York" in reading.detail, (
-        "the finding must name where the live starts cluster"
+    assert "18:15 America/New_York" in reading.detail, (
+        "the finding must name where the live fires are"
     )
     assert "DIVERGENT D20" not in reading.detail
 
@@ -194,7 +196,7 @@ def test_red_when_a_rule_expression_is_edited(units, live):
 
 def test_a_drift_inside_the_tolerance_is_not_a_finding(units, live):
     shifted = copy.deepcopy(live)
-    key = "step-functions:ne-postclose-trading-pipeline"
+    key = "step-functions:ne-weekly-freshness-pipeline"
     shifted[key]["execution_starts"] = [
         _iso(
             dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -283,10 +285,10 @@ def test_an_owner_absent_from_the_document_is_unmeasurable(units, live):
     missing = {
         k: v
         for k, v in live.items()
-        if k != "step-functions:ne-postclose-trading-pipeline"
+        if k != "step-functions:ne-weekly-freshness-pipeline"
     }
     reading = read_triggers_reconciled(_store(_document(missing)), units, as_of=READ_AT)
-    assert reading.unmeasurable and "UNRECONCILABLE D19" in reading.detail
+    assert reading.unmeasurable and "UNRECONCILABLE D01" in reading.detail
 
 
 # ---------------------------------------------------------------------------
@@ -380,8 +382,27 @@ def test_d47_names_the_scheduler_entry_not_the_dispatcher_lambda(units):
 # ---------------------------------------------------------------------------
 
 
+#: The execution-history path needs a DAILY machine-started unit, and since the
+#: decoupled cutover no descriptor is one (D19-D32 key on the Scheduler entry
+#: that starts ne-data-collection-eod). D19 in its v1 shape — owned by
+#: ne-postclose-trading-pipeline, no started_by — exercises the same code path.
+_V1_POSTCLOSE = "step-functions:ne-postclose-trading-pipeline"
+
+
 def _d19(units) -> Unit:
-    return next(u for u in units if u.unit_id == "D19")
+    unit = next(u for u in units if u.unit_id == "D19")
+    raw = copy.deepcopy(unit.raw)
+    raw["trigger"].pop("started_by", None)
+    raw["trigger"].update(
+        owner="ne-postclose-trading-pipeline", schedule="weekdays 16:00 America/New_York"
+    )
+    return Unit(unit_id=unit.unit_id, path=unit.path, raw=raw)
+
+
+def _matching_starts(unit: Unit) -> list[str]:
+    """Execution starts 40s after every declared fire in the window."""
+    fires = fires_between(unit_cadence(unit.raw), WINDOW_START, NOW)
+    return sorted((_iso(f + dt.timedelta(seconds=40)) for f in fires), reverse=True)
 
 
 def test_manual_reruns_never_make_a_declared_fire_match(units):
@@ -390,7 +411,7 @@ def test_manual_reruns_never_make_a_declared_fire_match(units):
         _iso(NOW - dt.timedelta(days=d, hours=3, minutes=7)) for d in range(1, 20)
     ]
     observation = {
-        "step-functions:ne-postclose-trading-pipeline": {
+        _V1_POSTCLOSE: {
             "status": "observed",
             "execution_starts": reruns,
         }
@@ -401,13 +422,11 @@ def test_manual_reruns_never_make_a_declared_fire_match(units):
     assert result.outcome == "divergent", result.detail
 
 
-def test_one_missed_fire_is_tolerated_and_named(units, live):
-    starts = list(
-        live["step-functions:ne-postclose-trading-pipeline"]["execution_starts"]
-    )
+def test_one_missed_fire_is_tolerated_and_named(units):
+    starts = _matching_starts(_d19(units))
     dropped = starts.pop(5)
     observation = {
-        "step-functions:ne-postclose-trading-pipeline": {
+        _V1_POSTCLOSE: {
             "status": "observed",
             "execution_starts": starts,
         }
@@ -420,13 +439,11 @@ def test_one_missed_fire_is_tolerated_and_named(units, live):
 
 
 def test_a_schedule_moved_inside_the_window_is_caught_before_the_majority_shifts(
-    units, live
+    units,
 ):
     """The two most recent declared fires unmatched is a divergence even when
     older fires still match."""
-    starts = sorted(
-        live["step-functions:ne-postclose-trading-pipeline"]["execution_starts"]
-    )
+    starts = sorted(_matching_starts(_d19(units)))
     moved = starts[:-2] + [
         _iso(
             dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
@@ -435,7 +452,7 @@ def test_a_schedule_moved_inside_the_window_is_caught_before_the_majority_shifts
         for s in starts[-2:]
     ]
     observation = {
-        "step-functions:ne-postclose-trading-pipeline": {
+        _V1_POSTCLOSE: {
             "status": "observed",
             "execution_starts": moved,
         }
@@ -537,7 +554,9 @@ class _Scheduler:
 
 def test_producer_owner_set_is_derived_from_the_descriptors(units):
     keys = producer.owner_keys(units)
-    assert "step-functions:ne-postclose-trading-pipeline" in keys
+    assert "step-functions:ne-weekly-freshness-pipeline" in keys
+    assert "eventbridge-scheduler:nousergon-data-collection/data-collection-eod" in keys
+    assert "step-functions:ne-postclose-trading-pipeline" not in keys
     assert "eventbridge-rule:alpha-engine-daily-heal" in keys
     assert "eventbridge-scheduler:default/alpha-engine-crypto-balances-15min" in keys
     assert not any(k.startswith("github-actions") for k in keys)

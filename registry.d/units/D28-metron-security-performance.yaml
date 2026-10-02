@@ -28,9 +28,16 @@ owner: brian
 code_path: "collectors/metron_market_data.py:1728"
 trigger:
   kind: "step-functions"
-  owner: "ne-postclose-trading-pipeline"
-  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
-  schedule: "weekdays 16:00 America/New_York"
+  # Since the decoupled data cutover (alpha-engine-config-I11269; first
+  # standalone EOD run 2026-09-29) this unit runs in the standalone stack's EOD
+  # machine, started at 18:15 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule).
+  # ne-postclose-trading-pipeline (16:00 ET) no longer runs it: its data stages
+  # were removed by that same change.
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-postclose-trading-pipeline"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - market_data/security_performance/latest.json

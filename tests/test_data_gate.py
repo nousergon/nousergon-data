@@ -1547,7 +1547,11 @@ def _green_completeness(day: str) -> bytes:
 # Measured 2026-10-02: the 15:57Z gate read D20 UNMET against 2026-10-02.json,
 # six hours before the EOD run that writes it, with 2026-10-01.json GREEN on S3.
 _MIDDAY = dt.datetime(2026, 10, 2, 15, 57, 20, tzinfo=dt.timezone.utc)
-_EVENING = dt.datetime(2026, 10, 3, 3, 0, tzinfo=dt.timezone.utc)
+# D20 fires at 18:15 ET (data-collection-eod), so with the 6 h completion grace
+# Friday 10-02's run is due at 00:15 ET Saturday — past the end of 10-02, where
+# `cadence.gate_moment` caps a reading for that day. The first reading that
+# demands it is the next trading day's: Monday 10-05, 09:00 ET.
+_NEXT_MORNING = dt.datetime(2026, 10, 5, 13, 0, tzinfo=dt.timezone.utc)
 
 
 def test_a_completeness_reading_before_the_eod_run_is_due_grades_the_latest_due_day():
@@ -1590,11 +1594,11 @@ def test_todays_metric_is_graded_whenever_it_exists():
     assert reading.evidence == ("metrics/eod_completeness/2026-10-02.json",)
 
 
-def test_once_the_eod_run_is_due_an_absent_metric_for_today_is_unmet():
+def test_once_the_eod_run_is_due_an_absent_metric_for_that_day_is_unmet():
     unit = next(u for u in load_units() if u.unit_id == "D20")
     store = EmptyStore({"metrics/eod_completeness/2026-10-01.json": _green_completeness("2026-10-01")})
     reading = evidence.read_completeness_metric(
-        store, unit, trading_day=dt.date(2026, 10, 2), now=_EVENING
+        store, unit, trading_day=dt.date(2026, 10, 5), now=_NEXT_MORNING
     )
     assert reading.met is False
     assert reading.evidence == ("metrics/eod_completeness/2026-10-02.json",)
