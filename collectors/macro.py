@@ -144,11 +144,19 @@ def collect(
             "(research will fall back to its own computation)"
         )
 
+    # alpha-engine-config-I11812: the run manifest grades macro.json by
+    # `rows` (`run_units.PHASE_UNITS[("phase1", "macro")]`), and this function
+    # used to report only `fields` — so every run recorded macro.json at
+    # rows_out 0 and failed the weekly machine's completion floor. The count is
+    # the series that actually carry a value, computed BEFORE the bookkeeping
+    # `fetched_at` stamp: an all-null macro.json (FRED key missing and the
+    # market fetch failed) is an empty publish and must read 0, never ~20.
+    populated = _populated_series(macro)
     macro["fetched_at"] = datetime.now(timezone.utc).isoformat()
 
     if dry_run:
         logger.info("[dry-run] macro: %d fields fetched", len(macro))
-        return {"status": "ok_dry_run", "fields": len(macro)}
+        return {"status": "ok_dry_run", "fields": len(macro), "rows": populated}
 
     # Write to S3
     s3 = boto3.client("s3")
@@ -187,9 +195,25 @@ def collect(
     return {
         "status": "ok",
         "fields": len(macro),
+        "rows": populated,
         "macro_history": history_status,
         "release_calendar": release_status,
     }
+
+
+def _populated_series(macro: dict) -> int:
+    """How many top-level macro.json entries carry a value (a non-empty dict
+    counts once, as ``breadth`` does). ``None`` and NaN are not values."""
+    n = 0
+    for value in macro.values():
+        if value is None:
+            continue
+        if isinstance(value, float) and value != value:  # NaN
+            continue
+        if isinstance(value, dict) and not value:
+            continue
+        n += 1
+    return n
 
 
 def _fetch_fred() -> dict:
