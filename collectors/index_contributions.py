@@ -363,10 +363,14 @@ def _default_weights_source(bucket: str) -> WeightsSource:
                 Bucket=bucket, Key="market_data/index_constituents/NDX.json"
             )
             payload = json.loads(obj["Body"].read())
+            # `date`, not `as_of`: contracts/ndx_constituents.schema.json is
+            # closed and names the snapshot date `date`, the same field the
+            # SPX leg above reads. Pinned by
+            # tests/test_ndx_constituents_consumer_contract.py.
             return Weights(
                 weight_map=payload.get("weight_map") or {},
                 method=payload.get("weight_method", "unavailable"),
-                as_of=payload.get("as_of"),
+                as_of=payload.get("date"),
             )
         raise IndexContributionsUnavailable(f"no weights producer for index {index!r}")
 
