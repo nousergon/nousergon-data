@@ -1478,8 +1478,17 @@ class TestCadenceDeclaredSkipsAreCarried:
     def test_the_cadence_trigger_declares_skip_parity(self, mod):
         """The loader reads the real CFN, not a fixture: if the declaration
         moves or is renamed, this fails here rather than at 02:00 on a
-        Saturday."""
-        assert mod.cadence_declared_skips() == {"skip_parity": True}
+        Saturday.
+
+        skip_data_phase2 / skip_rag_ingestion joined it 2026-10-02
+        (alpha-engine-config-I11832): the v2 weekly collection is the one
+        writer of D15/D16/D46, so a mechanical rerun must not re-run the v1
+        copies either."""
+        assert mod.cadence_declared_skips() == {
+            "skip_parity": True,
+            "skip_data_phase2": True,
+            "skip_rag_ingestion": True,
+        }
 
     def test_the_emitted_input_carries_it(self, mod):
         plan = mod.derive_plan(_events("director_degraded"))

@@ -350,11 +350,37 @@ Resources:
           # each carries its own Input, unrelated to this rule. Re-exam
           # 2026-09-14: revert to "${AlertsTopic}" once phase 0 exits or
           # the old pipeline is retired.
+          #
+          # skip_data_phase2 + skip_rag_ingestion (alpha-engine-config-I11832,
+          # 2026-10-02): ONE writer per unit. The v2 weekly schedule
+          # (nousergon-data-collection.yaml :: WeeklySchedule, ENABLED,
+          # Sat 05:00 America/New_York = this rule's 09:00 UTC under EDT)
+          # runs `alternative-phase-two` (D15) and `rag-weekly-ingestion`
+          # (D16 + D46) — the SAME commands this SF's DataPhase2 and
+          # RAGIngestion states run, against the SAME keys
+          # (market_data/weekly/{date}/alternative/*, rag/manifest/{date}.json,
+          # rag/manifest/latest.json, rag/filing_changes/, the rag.* tables).
+          # Left on, the two writers overlap: v1's DataPhase2 starts
+          # ~ResearchPredictorParallel + 20 min, while v2's
+          # alternative-phase-two is still mid-crawl, and phase 2's same-date
+          # auto-skip only fires on a COMPLETED prior run's ok marker — so both
+          # crawl Finnhub at once (~54 req/min each against a 60/min limit,
+          # collectors/finnhub_client.py) and the later finisher's per-ticker
+          # JSON wins. No other v1 state reads either stage's result, and
+          # both sit at the tail of Branch A, after Scanner/SignalsEnvelope,
+          # so later readers get the same keys from the v2 writer. Both
+          # flags are plain boolean skip gates (CheckSkipDataPhase2,
+          # CheckSkipRAGIngestion) — no topology change, revertible by
+          # deleting these two lines. Pinned by
+          # tests/test_saturday_trigger_skips_v1_data_copies.py. The stages
+          # themselves leave the definition in I11832's own cutover.
           Input: !Sub |
             {
               "sns_topic_arn": "${AlertsMutedTopic}",
               "pipeline_role": "weekly",
-              "skip_parity": true
+              "skip_parity": true,
+              "skip_data_phase2": true,
+              "skip_rag_ingestion": true
             }
 
   # Friday-PM "shell run" cron rule (alpha-engine-friday-shell-run) RETIRED
