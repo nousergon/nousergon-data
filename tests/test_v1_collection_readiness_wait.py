@@ -327,10 +327,12 @@ def test_the_postclose_sf_ends_well_before_the_collection(day, schedules):
 
 def test_the_weekly_budget_covers_the_est_hour_and_the_caps(schedules):
     """data-collection-weekly's 05:00 ET trails the v1 09:00 UTC start by up to
-    3600 s (EST); then every workload through chronic-gap-heal (D34)."""
+    3600 s (EST); then every workload through weekly-phase-one, the last one
+    writing a waited unit since D34 stopped being waited
+    (alpha-engine-config-I11812; it was 87 polls through chronic-gap-heal)."""
     need = 3600 + _worst_case_through_last_waited_unit("step_function.json", schedules)
     assert _poll_wait("step_function.json") == POLL_SECONDS
-    assert _max_polls("step_function.json") == _ceil_polls(need) == 87
+    assert _max_polls("step_function.json") == _ceil_polls(need) == 62
 
 
 def test_the_weekly_readers_units_are_not_behind_workloads_it_does_not_read(schedules):
