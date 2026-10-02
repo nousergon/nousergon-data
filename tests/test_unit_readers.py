@@ -136,6 +136,73 @@ def test_a_grandfathered_prefix_covers_a_wildcard_key(units):
     assert reading.met, reading.detail
 
 
+_INDEX_CONTRIBUTION_ROWS = [
+    {"artifact_id": "index_contributions_dated", "s3_key_template": "market_data/index_contributions/*/{date}.json"},
+    {"artifact_id": "index_contributions_latest", "s3_key_template": "market_data/index_contributions/*/latest.json"},
+]
+
+
+def test_a_registry_wildcard_segment_covers_a_descriptor_placeholder_segment(units):
+    """D48 writes `market_data/index_contributions/{index}/...`. The registry
+    validator allows no `{index}` placeholder, so its rows spell that segment
+    `*` (alpha-engine-config-I10200). Before the fold the two never matched, and
+    this clause could not be cleared by any registry row at all."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source(
+        {"artifacts": copy.deepcopy(_INDEX_CONTRIBUTION_ROWS), "grandfathered_paths": []}
+    )
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D48"))
+    assert reading.met, reading.detail
+    assert "index_contributions_dated" in reading.detail
+    assert "index_contributions_latest" in reading.detail
+
+
+def test_withholding_one_wildcard_row_is_unmet_naming_its_key(units):
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source(
+        {"artifacts": copy.deepcopy(_INDEX_CONTRIBUTION_ROWS[1:]), "grandfathered_paths": []}
+    )
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D48"))
+    assert not reading.met and not reading.unmeasurable
+    assert "market_data/index_contributions/{index}/{date}.json" in reading.detail
+
+
+def test_only_a_whole_interior_wildcard_segment_is_folded(units):
+    """A trailing `*` names a directory, and `x*` is a prefix glob. Neither is a
+    segment the registry validator allows, so neither may match a templated key."""
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source(
+        {
+            "artifacts": [
+                {"artifact_id": "trailing", "s3_key_template": "market_data/index_contributions/*"},
+                {"artifact_id": "glob", "s3_key_template": "market_data/index_contributions/S*/latest.json"},
+            ],
+            "grandfathered_paths": [],
+        }
+    )
+    reading = unit_readers.read_artifact_registry(store, _unit(units, "D48"))
+    assert not reading.met
+    assert "registered []" in reading.detail
+
+
+def test_a_declared_off_row_on_a_pending_unit_is_not_parked(units):
+    """A unit that is not yet in service may carry a declared-off row: that is
+    how the registry says "the producer exists, nothing schedules it yet"
+    without paging. `_parked` only binds an in-service unit."""
+    rows = copy.deepcopy(_INDEX_CONTRIBUTION_ROWS)
+    for row in rows:
+        row["declared_off"] = {"since": "2026-10-02", "reason": "not scheduled yet"}
+    store = EmptyStore()
+    store.artifact_registry_source = _registry_source({"artifacts": rows, "grandfathered_paths": []})
+    unit = _unit(units, "D48")
+    assert unit.lifecycle == "pending"
+    reading = unit_readers.read_artifact_registry(store, unit)
+    assert reading.met, reading.detail
+    in_service = _unit(units, "D48", lifecycle="in-service")
+    reading = unit_readers.read_artifact_registry(store, in_service)
+    assert not reading.met and "parked" in reading.detail
+
+
 def test_a_declared_off_row_on_an_in_service_unit_is_parked_not_met(units):
     document = copy.deepcopy(_REGISTRY)
     document["artifacts"][0]["declared_off"] = {"since": "2026-09-01", "reason": "paused"}

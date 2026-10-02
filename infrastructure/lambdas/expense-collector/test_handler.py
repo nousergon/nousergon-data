@@ -537,13 +537,13 @@ class TestHandler:
         assert json.loads(store["expenses/latest.json"]) == doc
         rows = _rows_by_key(doc)
 
-        # AWS: grouped-service sum + CE MONTHLY forecast used DIRECTLY as the
-        # month-end total (NOT mtd+forecast — that double-counted; see
-        # fix/expense-aws-forecast-double-count). Forecast 25.00 > MTD 12.34.
+        # AWS: grouped-service sum; month-end projected from THIS month's
+        # usage — MTD 12.34 over the 16 posted days of 31 (Brian 2026-10-02),
+        # never AWS's forecast over prior months.
         assert rows["aws"]["mtd_cost_usd"] == pytest.approx(12.34)
-        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(25.00)
-        assert rows["aws"]["detail"]["projection_source"] == "ce_forecast_monthly"
-        assert rows["aws"]["pace"] == "under"  # 25.00 < 50 budget
+        assert rows["aws"]["projected_month_end_usd"] == pytest.approx(12.34 / 16 * 31, abs=0.01)
+        assert rows["aws"]["detail"]["projection_source"] == "mtd_run_rate"
+        assert rows["aws"]["pace"] == "under"  # 23.91 < 50 budget
         assert rows["aws"]["detail"]["top_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
 
         # EVERY service is reported, not just the top 8. Seven budget lines had
@@ -1298,19 +1298,47 @@ class _CountingCE:
         return {"Total": {"Amount": "25.00"}}
 
 
+class TestAwsProjectionIsThisMonthsRunRate:
+    """Brian 2026-10-02: projected spend comes from actual usage this month,
+    not a forecast over prior months ($317.59 against $0 of October usage)."""
+
+    def test_the_projection_is_mtd_over_posted_days(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        raw = _CountingCE()
+        row = index.collect_aws(index._month_window(NOW), {"aws": 50}, ce=raw)
+        assert "get_cost_forecast" not in raw.calls
+        assert row["projected_month_end_usd"] == pytest.approx(8.10 / 16 * 31, abs=0.01)
+        assert row["detail"]["projection_source"] == "mtd_run_rate"
+
+    def test_nothing_posted_yet_is_no_projection_not_zero(self, monkeypatch):
+        class _NothingPosted(_CountingCE):
+            def get_cost_and_usage(self, **kw):
+                if _is_daily_by_system(kw):
+                    return _daily_by_system_response(kw)
+                self.calls.append("get_cost_and_usage")
+                return {"ResultsByTime": [{"Groups": []}]}
+
+        day2 = datetime(2026, 10, 2, 12, 15, tzinfo=timezone.utc)
+        monkeypatch.setattr(index, "_now_utc", lambda: day2)
+        row = index.collect_aws(index._month_window(day2), {}, ce=_NothingPosted())
+        assert row["mtd_cost_usd"] == 0
+        assert row["projected_month_end_usd"] is None
+        assert row["pace"] is None
+        assert row["detail"]["projection_source"] == "pending_no_usage_posted"
+
+
 class TestCostExplorerCallBudget:
     def test_the_default_budget_has_no_headroom_for_a_loop(self):
-        """A `collect` invocation makes exactly three CE calls. A budget with
+        """A `collect` invocation makes exactly two CE calls. A budget with
         room to spare cannot tell a loop from normal operation."""
-        assert index.CE_CALL_BUDGET == 3
+        assert index.CE_CALL_BUDGET == 2
 
     def test_a_normal_collect_fits_the_default_budget_exactly(self):
         raw = _CountingCE()
         ce = index._BudgetedCostExplorer(raw, budget=index.CE_CALL_BUDGET)
         row = index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast",
-                             "get_cost_and_usage"]
-        assert ce.calls == 3
+        assert raw.calls == ["get_cost_and_usage", "get_cost_and_usage"]
+        assert ce.calls == 2
         assert row["mtd_cost_usd"] == pytest.approx(8.10)
         assert row["detail"]["daily_by_system"]["complete"] is True
 
@@ -1321,17 +1349,17 @@ class TestCostExplorerCallBudget:
         with pytest.raises(index.CostExplorerCallBudgetExceeded):
             index.collect_aws(index._month_window(NOW), {}, ce=ce)
         assert raw.calls == ["get_cost_and_usage"], (
-            "the forecast call was past the budget and must never have been sent"
+            "the daily-series call was past the budget and must never have been sent"
         )
 
     def test_the_daily_series_call_is_budgeted_too(self):
-        """The third call is inside the budget, not beside it: a budget of two
+        """The daily call is inside the budget, not beside it: a budget of one
         refuses it before it is sent and fails the collect loudly."""
         raw = _CountingCE()
-        ce = index._BudgetedCostExplorer(raw, budget=2)
+        ce = index._BudgetedCostExplorer(raw, budget=1)
         with pytest.raises(index.CostExplorerCallBudgetExceeded):
             index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage", "get_cost_forecast"]
+        assert raw.calls == ["get_cost_and_usage"]
 
     def test_a_budget_of_zero_refuses_the_first_call(self):
         raw = _CountingCE()

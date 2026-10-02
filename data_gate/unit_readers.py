@@ -76,6 +76,30 @@ def _normalized(template: str) -> str:
     return _PLACEHOLDER_RE.sub("{}", template)
 
 
+#: A whole path segment that is a bare `*`. ARTIFACT_REGISTRY's spelling for a
+#: segment whose value the producer chooses at write time
+#: (alpha-engine-config-I10200): its validator allows only `{date}`,
+#: `{trading_day}` and `{cycle_label}` as placeholders, because those are the
+#: only ones the freshness monitor can substitute.
+_WILDCARD_SEGMENT_RE = re.compile(r"(?<=/)\*(?=/)")
+
+
+def _registry_match_key(template: str) -> str:
+    """One spelling for a descriptor key template and a registry row template.
+
+    A descriptor names a producer-chosen segment as a placeholder
+    (`market_data/index_contributions/{index}/latest.json`, which
+    `shadow.parity` needs in order to resolve the key's contract), and the
+    registry can only name it as `*` (`.../index_contributions/*/latest.json`).
+    Before this, the two never matched, so a unit with such a key read UNMET
+    against a row that covers it exactly, and nothing a registry row could say
+    would ever clear it. Only a WHOLE interior segment is folded, which is the
+    one shape the registry validator allows, so a prefix glob or a trailing `*`
+    still matches nothing.
+    """
+    return _WILDCARD_SEGMENT_RE.sub("{}", _normalized(template))
+
+
 def _literal_prefix(template: str) -> str:
     """Everything up to the first bare wildcard, with every ``{placeholder}``
     normalized to a literal ``{}`` token first (alpha-engine-config-I10870).
@@ -359,7 +383,7 @@ def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
     for row in registry.artifacts:
         if str(row.get("s3_bucket") or "alpha-engine-research") != "alpha-engine-research":
             continue
-        by_template.setdefault(_normalized(str(row.get("s3_key_template") or "")), []).append(row)
+        by_template.setdefault(_registry_match_key(str(row.get("s3_key_template") or "")), []).append(row)
     prefixes = [
         _normalized(str(g.get("path_prefix") or ""))
         for g in registry.grandfathered
@@ -371,7 +395,7 @@ def read_artifact_registry(store: GateStore, unit: Unit) -> Reading:
     missing: list[str] = []
     parked: list[str] = []
     for key in keys:
-        rows = by_template.get(_normalized(key), [])
+        rows = by_template.get(_registry_match_key(key), [])
         if rows:
             registered.append(f"{key} -> {rows[0].get('artifact_id')}")
             parked.extend(_parked(rows[0], unit))

@@ -117,7 +117,11 @@ def test_an_on_demand_unit_with_an_old_manifest_reads_its_latest_invocation(tmp_
     # COLLECTED — the manifest's trading_day, not the gate's.
     probe = tmp_path / "probes" / "arctic" / "2026-08-03.json"
     probe.parent.mkdir(parents=True)
-    probe.write_text(json.dumps({"libraries": {"universe": {"read_ok": True, "row_count": 1}}}))
+    # Taken after the run finished (21:10Z), as the probe that evidences it must be.
+    probe.write_text(json.dumps({
+        "as_of_utc": "2026-08-03T23:30:00Z",
+        "libraries": {"universe": {"read_ok": True, "row_count": 1}},
+    }))
     reading =evidence.read_run_record(LocalStore(tmp_path), units["D35"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True and "2026-08-03" in reading.evidence[0]
 
@@ -142,7 +146,11 @@ def test_d42_grades_its_most_recent_migration_manifest(tmp_path, units):
     # day the run migrated — the manifest's trading_day, not the gate's.
     probe = tmp_path / "probes" / "arctic" / "2026-08-03.json"
     probe.parent.mkdir(parents=True)
-    probe.write_text(json.dumps({"libraries": {"universe": {"read_ok": True, "row_count": 1}}}))
+    # Taken after the run finished (21:10Z), as the probe that evidences it must be.
+    probe.write_text(json.dumps({
+        "as_of_utc": "2026-08-03T23:30:00Z",
+        "libraries": {"universe": {"read_ok": True, "row_count": 1}},
+    }))
     reading = evidence.read_run_record(LocalStore(tmp_path), units["D42"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True and "2026-08-03" in reading.evidence[0]
 
