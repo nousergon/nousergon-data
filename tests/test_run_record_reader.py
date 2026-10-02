@@ -314,3 +314,90 @@ def test_a_non_arcticdb_unit_needs_no_probe(tmp_path, units):
     reading = evidence.read_run_record(LocalStore(tmp_path), units["D19"], trading_day=TRADING_DAY)
     assert reading.met is True
     assert "probe" not in reading.detail
+
+
+# ── 5. The probe must post-date the run it evidences ────────────────────────
+
+_LIBS = {
+    name: {"read_ok": True, "row_count": 1000, "symbol_count": 10, "last_index_date": "2026-09-25"}
+    for name in ("universe", "macro", "delisted_history")
+}
+
+
+def _probe_on(root: pathlib.Path, day: str, as_of_utc: str) -> None:
+    path = root / "probes" / "arctic" / f"{day}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"schema_version": 1, "trading_day": day, "as_of_utc": as_of_utc,
+                                "libraries": _LIBS}))
+
+
+def _weekly_run(root: pathlib.Path, unit_id: str) -> None:
+    """D13/D14's Saturday 2026-09-26 run, filed under Friday 2026-09-25."""
+    path = root / "runs" / unit_id / "2026-09-25" / "RUN1.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(_manifest(
+        unit_id=unit_id, trading_day="2026-09-25", calendar_date="2026-09-26",
+        started="2026-09-26T10:23:00Z", finished="2026-09-26T10:24:01Z",
+        outputs=[{"key": "arcticdb/universe", "rows_out": 3461}], rows_out=3461,
+    )))
+
+
+_GATE_DAY = dt.date(2026, 10, 2)
+_GATE_NOW = dt.datetime(2026, 10, 2, 15, 57, tzinfo=dt.timezone.utc)
+
+
+@pytest.mark.parametrize("unit_id", ("D13", "D14"))
+def test_a_weekly_run_is_evidenced_by_the_first_probe_taken_after_it(tmp_path, units, unit_id):
+    """Measured 2026-10-02: D13/D14 read UNMEASURABLE on the absent
+    probes/arctic/2026-09-25.json (no scheduled probe existed before the
+    2026-09-28 cutover) while 2026-09-28.json, taken 2026-09-29T12:16Z, had read
+    every library back after the 2026-09-26 write."""
+    _weekly_run(tmp_path, unit_id)
+    _probe_on(tmp_path, "2026-09-28", "2026-09-29T12:16:58Z")
+    _probe_on(tmp_path, "2026-09-29", "2026-09-30T12:15:55Z")
+    reading = evidence.read_run_record(LocalStore(tmp_path), units[unit_id], trading_day=_GATE_DAY, now=_GATE_NOW)
+    assert reading.met is True, reading.detail
+    assert "probes/arctic/2026-09-28.json" in reading.evidence
+
+
+def test_a_day_keyed_probe_taken_before_the_run_is_not_evidence_of_it(tmp_path, units):
+    """Friday's EOD probe is taken the evening BEFORE the Saturday weekly write;
+    reading it as that write's read-back would be stale-green."""
+    _weekly_run(tmp_path, "D13")
+    _probe_on(tmp_path, "2026-09-25", "2026-09-25T23:31:00Z")
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D13"], trading_day=_GATE_DAY, now=_GATE_NOW)
+    assert reading.met is False
+    assert reading.unmeasurable is True
+    assert "not after the run" in reading.detail
+
+
+def test_a_later_probe_beyond_the_gate_day_is_never_read(tmp_path, units):
+    _weekly_run(tmp_path, "D13")
+    _probe_on(tmp_path, "2026-10-05", "2026-10-06T12:00:00Z")
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D13"], trading_day=_GATE_DAY, now=_GATE_NOW)
+    assert reading.met is False
+    assert reading.unmeasurable is True
+
+
+def test_a_probe_with_no_timestamp_cannot_evidence_a_run(tmp_path, units):
+    _weekly_run(tmp_path, "D13")
+    path = tmp_path / "probes" / "arctic" / "2026-09-28.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"libraries": _LIBS}))
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D13"], trading_day=_GATE_DAY, now=_GATE_NOW)
+    assert reading.met is False
+    assert reading.unmeasurable is True
+
+
+def test_the_first_post_dating_probe_is_graded_even_when_it_withholds(tmp_path, units):
+    """No skipping past a withheld probe to a greener later one."""
+    _weekly_run(tmp_path, "D13")
+    path = tmp_path / "probes" / "arctic" / "2026-09-28.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"as_of_utc": "2026-09-29T12:16:58Z", "libraries": {
+        **_LIBS, "universe": {"read_ok": False, "row_count": None}}}))
+    _probe_on(tmp_path, "2026-09-29", "2026-09-30T12:15:55Z")
+    reading = evidence.read_run_record(LocalStore(tmp_path), units["D13"], trading_day=_GATE_DAY, now=_GATE_NOW)
+    assert reading.met is False
+    assert reading.unmeasurable is True
+    assert "universe" in reading.detail
