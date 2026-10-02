@@ -146,6 +146,8 @@ def read_cur_window(
     uncovered_days: list[str] = []
     billing_periods_read: list[str] = []
 
+    delivered_days: set[str] = set()
+
     for period in periods:
         prefix = f"{cur_prefix}/data/BILLING_PERIOD={period}/"
         keys = [k for k in s3.list_objects(cur_bucket, prefix) if k.endswith(".parquet")]
@@ -203,8 +205,25 @@ def read_cur_window(
         day = dt.date(year, month, 1)
         while day.month == month:
             if start <= day <= end:
-                covered_days.add(day.isoformat())
+                delivered_days.add(day.isoformat())
             day += dt.timedelta(days=1)
+
+    # A delivered day counts as a measured $0 only once the tag is PROVEN to
+    # be on our resources: on or after the first day any row carries it. A
+    # cost-allocation tag accrues in CUR from when resources were tagged,
+    # never retroactively, so before that first tagged day an empty filter
+    # cannot tell "no spend" from "spend not yet tagged" — and counting those
+    # days would publish a 4-week baseline built from a few days of data.
+    # Measured 2026-10-02: `system=data-collection` (alpha-engine-config-
+    # I10905, applied 2026-09-28) first appears on 2026-09-29, so a 28-day
+    # window ending 2026-10-01 holds three tagged days, not 28. Same
+    # discipline as the missing-period gap above.
+    first_tagged = min(covered_days) if covered_days else None
+    for iso in sorted(delivered_days):
+        if first_tagged is not None and iso >= first_tagged:
+            covered_days.add(iso)
+        else:
+            uncovered_days.append(iso)
 
     days_requested = (end - start).days + 1
     return CostWindow(
@@ -285,6 +304,14 @@ def main(argv: list[str] | None = None) -> int:
         help="the export's name / S3 prefix (CUR delivers under <prefix>/<export-name>/data/"
         "BILLING_PERIOD=YYYY-MM/)",
     )
+    ap.add_argument(
+        "--cur-s3-prefix",
+        default=None,
+        help="the export's S3Prefix. AWS Data Exports delivers under <S3Prefix>/<ExportName>/data/"
+        "BILLING_PERIOD=YYYY-MM/, so the export name alone is not the object path. Defaults to "
+        "the export name: the fleet's one export is codified with S3Prefix == Name "
+        "(nous-ergon-ops infrastructure/billing/cur-export/export.json)",
+    )
     ap.add_argument("--tag-key", default=DEFAULT_TAG_KEY)
     ap.add_argument("--tag-value", default=DEFAULT_TAG_VALUE)
     ap.add_argument("--region", default=_REGION)
@@ -314,11 +341,17 @@ def main(argv: list[str] | None = None) -> int:
         end = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)  # yesterday: CUR lags
         start = end - dt.timedelta(days=args.days - 1)
 
+        # `<S3Prefix>/<ExportName>`, never the export name alone. Measured
+        # 2026-10-02: every run since the export landed listed
+        # `nous-ergon-fleet-cur/data/BILLING_PERIOD=…/`, found nothing, and
+        # published days_covered=0, while the objects sat one level deeper at
+        # `nous-ergon-fleet-cur/nous-ergon-fleet-cur/data/BILLING_PERIOD=…/`.
+        cur_path = f"{(args.cur_s3_prefix or args.cur_export_name).strip('/')}/{args.cur_export_name.strip('/')}"
         reader = _S3Reader(s3)
         window = read_cur_window(
             reader,
             cur_bucket=args.cur_bucket,
-            cur_prefix=args.cur_export_name,
+            cur_prefix=cur_path,
             tag_key=args.tag_key,
             tag_value=args.tag_value,
             start=start,
@@ -329,7 +362,7 @@ def main(argv: list[str] | None = None) -> int:
             tag_key=args.tag_key,
             tag_value=args.tag_value,
             cur_bucket=args.cur_bucket,
-            cur_prefix=args.cur_export_name,
+            cur_prefix=cur_path,
         )
         # NEVER the full document (alpha-engine-config-I11274, CodeQL "Clear-
         # text logging of sensitive information" on this exact line): this

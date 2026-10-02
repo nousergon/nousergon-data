@@ -186,17 +186,18 @@ RECONCILIATION_PREFIX = "expenses/reconciliation/"
 # later multiplies it silently.
 #
 # Sized with NO HEADROOM for the calls that actually exist -- `collect` makes
-# three (`get_cost_and_usage` by service, `get_cost_forecast`, and
-# `get_cost_and_usage` daily by `system` tag), `reconcile` makes one. A budget
+# two (`get_cost_and_usage` by service, and `get_cost_and_usage` daily by
+# `system` tag), `reconcile` makes one. `get_cost_forecast` was dropped
+# 2026-10-02: the projection is MTD run rate, not AWS's forecast. A budget
 # with room to spare cannot tell a loop from normal operation. Raise
 # `EXPENSE_CE_CALL_BUDGET` deliberately if another call is genuinely added.
 #
-# The third call is alpha-engine-config-I11707: this Lambda is the fleet's ONLY
+# The daily call is alpha-engine-config-I11707: this Lambda is the fleet's ONLY
 # Cost Explorer identity. Crucible's dollar gates used to call CE themselves
 # (~27 requests/day across three GitHub roles, most of them denied); they now
 # read the per-system daily series below out of `expenses/latest.json`, so one
 # budgeted caller answers every spend question in the account.
-CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "3"))
+CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "2"))
 
 # The cost-allocation tag key every system's resources carry
 # (`system=crucible-v2`, ...). Grouping by it splits each day's account total
@@ -809,7 +810,6 @@ def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
     now = _now_utc()
     end = (now.replace(hour=0, minute=0, second=0, microsecond=0)
            .strftime("%Y-%m-%d"))
-    next_month = (mw["start"].replace(day=28) + timedelta(days=4)).replace(day=1)
     row = _row("aws", "AWS", source="cost_explorer")
     if end <= start:  # first UTC day of the month — CE window would be empty
         row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty",
@@ -839,30 +839,32 @@ def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
                                                                key=lambda kv: -kv[1])},
                        "service_count": len(by_service)},
                note="Cost Explorer data lags ~24h")
-    try:
-        # CE's MONTHLY-granularity forecast over a partial-month window returns
-        # the FULL month-end total (already includes actuals-to-date) — the
-        # exact figure AWS's own console "forecasted month-end" tile shows. Use
-        # it DIRECTLY; adding MTD double-counts spend-to-date (that bug made a
-        # $103.25 month-end read as $152.14). The DAILY-granularity forecast
-        # would instead return the remainder-only, but MONTHLY is what matches
-        # the console, so we anchor to the provider-authoritative number.
-        fc = ce.get_cost_forecast(
-            TimePeriod={"Start": end, "End": next_month.strftime("%Y-%m-%d")},
-            Metric="UNBLENDED_COST", Granularity="MONTHLY")
-        row["projected_month_end_usd"] = round(float(fc["Total"]["Amount"]), 2)
-        row["detail"]["projection_source"] = "ce_forecast_monthly"
-    except CostExplorerCallBudgetExceeded:
-        # NOT an unavailable forecast. Degrading to the straight-line fallback
-        # here would convert "this code is looping on a billed API" into a
-        # detail field nobody reads (alpha-engine-config-I11201 deliverable 3).
-        raise
-    except Exception as exc:  # noqa: BLE001 — forecast is an enhancement; the
-        # straight-line fallback below is the recorded degradation surface.
-        logger.info("CE forecast unavailable (straight-line fallback): %s", exc)
-        row["detail"]["projection_source"] = "straight_line"
+    # Month-end projection from THIS month's actual usage (Brian 2026-10-02):
+    # MTD over the days Cost Explorer has posted, extended to the whole month.
+    # It used to be CE's own MONTHLY forecast, a model over PRIOR months, which
+    # on 2026-10-02 read $317.59 against $0 of October usage — September's
+    # one-off Cost Explorer burst still in its history. A forecast that does not
+    # come from the month it forecasts is not this month's pace. Dropping it
+    # also removes a billed $0.01 request from every run.
+    covered_days = (datetime.strptime(end, "%Y-%m-%d")
+                    - datetime.strptime(start, "%Y-%m-%d")).days
+    if mtd > 0:
+        observed_frac = covered_days * 86400.0 / mw["total_seconds"]
+        row["projected_month_end_usd"] = round(mtd / observed_frac, 2)
+        row["detail"]["projection_source"] = "mtd_run_rate"
+        row["detail"]["projection_basis"] = (
+            f"${mtd:.2f} over {covered_days} posted day(s) of "
+            f"{round(mw['total_seconds'] / 86400)}")
+    else:
+        # Nothing posted yet (CE lags ~24h). No projection rather than $0: an
+        # unposted month is not a cheap one, and $0 would grade "under".
+        row["detail"]["projection_source"] = "pending_no_usage_posted"
     _attach_daily_by_system(row, ce, now)
-    return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+    _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+    if row["detail"]["projection_source"] == "pending_no_usage_posted":
+        row["projected_month_end_usd"] = None
+        row["pace"] = None
+    return row
 
 
 def _attach_daily_by_system(row: dict, ce, now: datetime) -> None:
