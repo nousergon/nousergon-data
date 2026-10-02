@@ -110,6 +110,122 @@ def test_only_executor_writes_into_collection_prefixes_count():
     assert result.collection_writes == 2  # PutObject market_data + DeleteObject arcticdb, both by the executor
 
 
+class _LatencyS3(_FakeS3):
+    """`_FakeS3` whose every GetObject blocks for a fixed round-trip and
+    records how many were in flight at once."""
+
+    def __init__(self, objects, *, latency_s):
+        super().__init__(objects)
+        import threading
+
+        self._latency_s = latency_s
+        self._lock = threading.Lock()
+        self._in_flight = 0
+        self.peak_in_flight = 0
+
+    def get_object(self, Bucket, Key):
+        import time
+
+        with self._lock:
+            self._in_flight += 1
+            self.peak_in_flight = max(self.peak_in_flight, self._in_flight)
+        try:
+            time.sleep(self._latency_s)
+            return super().get_object(Bucket, Key)
+        finally:
+            with self._lock:
+                self._in_flight -= 1
+
+
+def _day_of_objects(n, *, day="2026/09/01"):
+    """`n` archive objects for one day; object i carries one executor write
+    whose key encodes i, plus one non-matching record."""
+    return {
+        f"AWSLogs/711398986525/CloudTrail/us-east-1/{day}/obj-{i:04d}.json.gz": [
+            _record("PutObject", f"market_data/obj-{i:04d}.json", _EXECUTOR),
+            _record("GetObject", f"market_data/obj-{i:04d}.json", _EXECUTOR),
+        ]
+        for i in range(n)
+    }
+
+
+def test_archive_objects_are_fetched_concurrently():
+    """alpha-engine-config-I11781: the walk is round-trip-bound, and a serial
+    walk of a ~15,000-object window overran the job's 15-minute cap every
+    night from 2026-09-29. The fetches must overlap."""
+    s3 = _LatencyS3(_day_of_objects(40), latency_s=0.05)
+    result = m.iter_archive_records(
+        s3,
+        bucket="archive",
+        prefix="AWSLogs/711398986525/CloudTrail",
+        region="us-east-1",
+        day=_day(2026, 9, 1),
+        keep=lambda r: r["eventName"] == "PutObject",
+        workers=8,
+    )
+    assert s3.peak_in_flight > 1
+    assert s3.peak_in_flight <= 8
+    assert result.objects_read == 40
+    assert result.records_scanned == 80
+
+
+def test_concurrent_walk_matches_a_serial_walk_exactly():
+    """Same records, same order, same counts with 1 worker or many — the
+    concurrency changes how long the walk takes and nothing it reports."""
+    objects = _day_of_objects(25)
+    kwargs = dict(
+        bucket="archive",
+        prefix="AWSLogs/711398986525/CloudTrail",
+        region="us-east-1",
+        day=_day(2026, 9, 1),
+        keep=lambda r: r["eventName"] == "PutObject",
+    )
+    serial = m.iter_archive_records(_LatencyS3(objects, latency_s=0), workers=1, **kwargs)
+    parallel = m.iter_archive_records(_LatencyS3(objects, latency_s=0), workers=16, **kwargs)
+    assert parallel == serial
+    assert [r["requestParameters"]["key"] for r in parallel.records] == [
+        f"market_data/obj-{i:04d}.json" for i in range(25)
+    ]
+
+
+def test_a_failed_object_fetch_still_propagates():
+    class _OneBadObject(_FakeS3):
+        def get_object(self, Bucket, Key):
+            if Key.endswith("obj-0003.json.gz"):
+                raise RuntimeError("AccessDenied")
+            return super().get_object(Bucket, Key)
+
+    import pytest
+
+    with pytest.raises(RuntimeError, match="AccessDenied"):
+        m.iter_archive_records(
+            _OneBadObject(_day_of_objects(8)),
+            bucket="archive",
+            prefix="AWSLogs/711398986525/CloudTrail",
+            region="us-east-1",
+            day=_day(2026, 9, 1),
+            keep=lambda r: True,
+            workers=4,
+        )
+
+
+def test_main_sizes_the_connection_pool_to_the_worker_count(monkeypatch):
+    """botocore's default pool is 10 connections; without matching it the
+    extra workers would queue on the pool and the overlap would cap at 10."""
+    s3 = _PutCapturingS3({})
+    seen = {}
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None, config=None):
+            seen["config"] = config
+            return s3
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+    assert m.main(["--days", "1", "--workers", "24"]) == 0
+    assert seen["config"].max_pool_connections == 24
+
+
 def test_build_metric_days_covered_distinguishes_partial_from_full_window():
     count = m.WriteCount(collection_writes=0, days_requested=7, days_covered=5, uncovered_days=("2026-09-01", "2026-09-02"))
     metric = m.build_metric(count=count, as_of=dt.datetime(2026, 9, 8, tzinfo=UTC))
@@ -147,7 +263,7 @@ def test_main_writes_the_metric_document(monkeypatch, capsys):
 
     class _FakeBoto3:
         @staticmethod
-        def client(name, region_name=None):
+        def client(name, region_name=None, config=None):
             assert name == "s3"
             return s3
 
@@ -193,7 +309,7 @@ def test_stdout_never_carries_a_cloudtrail_write_event_even_if_the_metric_grew_o
 
     class _FakeBoto3:
         @staticmethod
-        def client(name, region_name=None):
+        def client(name, region_name=None, config=None):
             return s3
 
     monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
@@ -214,7 +330,7 @@ def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):
 
     class _FakeBoto3:
         @staticmethod
-        def client(name, region_name=None):
+        def client(name, region_name=None, config=None):
             assert name == "s3"
             return s3
 
