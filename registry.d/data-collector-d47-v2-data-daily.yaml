@@ -11,7 +11,7 @@
 component_id: data-collector-d47-v2-data-daily
 owning_repo: nousergon-data
 substrate: eventbridge
-origin: crucible-v2-dispatcher
+origin: crucible-v2/data-daily
 owner: brian
 lifecycle: in-service
 authority_tier: t1
