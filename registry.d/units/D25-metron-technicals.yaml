@@ -40,11 +40,16 @@ consumers:
 contract:
   schema: contracts/technicals.schema.json
   producer_test: tests/test_technical_rating_contracts.py
-  consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "metron:tests/contracts/"
+  consumer_pins:
+    - repo: "metron"
+      path: "tests/contracts/technicals.schema.json"
+      pins: "body_schema"
+      producer: "contracts/technicals.schema.json"
+      read_site: "api/services/technicals.py::load_technicals"
+  # alpha-engine-config-I11282 (C10, 2026-10-02): metron-PR526. Its older
+  # tests/contracts/technicals_snapshot.schema.json is a consumer-authored
+  # per-field schema, not a copy of this contract, so it could never match
+  # the producer shape; the pin above is the byte copy.
 registry_rows:
   - metron_technicals
 run_manifest_prefix: data_collection/runs/D25
