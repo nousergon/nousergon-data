@@ -39,11 +39,15 @@ consumers:
 contract:
   schema: contracts/rating_performance.schema.json
   producer_test: "metron:tests/test_technical_rating_performance.py"
-  consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "metron"
+  consumer_pins:
+    - repo: "metron"
+      path: "tests/contracts/rating_performance.producer.schema.json"
+      pins: "body_schema"
+      producer: "contracts/rating_performance.schema.json"
+      read_site: "api/services/technical_rating_performance.py::load_rating_performance"
+      note: "metron's older tests/contracts/rating_performance.schema.json predates this producer and is not a copy of it (it types rating_version as a string; the producer writes an integer)"
+  # alpha-engine-config-I11282 (C10, 2026-10-02): metron-PR526, a fixture
+  # trimmed from the real 2026-10-01 artifact driven through the real reader.
 registry_rows:
   - metron_technical_rating_performance
 run_manifest_prefix: data_collection/runs/D27

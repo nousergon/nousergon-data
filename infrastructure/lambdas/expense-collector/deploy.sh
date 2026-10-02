@@ -97,7 +97,7 @@ SCHED_PREFIX="alpha-engine-expense-collector-"
 #
 # EventBridge Scheduler's DEFAULT IS 185 RETRIES over a 24h event age, and it
 # had never been set here. Each retry is a FRESH INVOCATION carrying a fresh
-# `CE_CALL_BUDGET`, and the three Cost Explorer calls happen EARLY in the
+# `CE_CALL_BUDGET`, and the two Cost Explorer calls happen EARLY in the
 # handler -- so a failure anywhere after them re-pays for them.
 #
 #   185 retries x 2 ticks/day x 2 CE calls = 740 calls/day = $7.40/day

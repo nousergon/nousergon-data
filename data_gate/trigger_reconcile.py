@@ -29,6 +29,20 @@ again (the issue's closes-when).
   declared fire inside the observed window must have an execution start within
   :data:`FIRE_TOLERANCE`. Manual reruns scatter across the day and never make a
   declared fire match; they are simply not counted.
+
+  **Unless the descriptor names what STARTS the machine.** A step-functions
+  unit may declare ``trigger.started_by`` — ``eventbridge-scheduler:<group>/<name>``
+  or ``eventbridge-rule:<rule>``, the schedule object that starts its machine —
+  and is then reconciled against THAT object, exactly as the two kinds below
+  are. Execution history is the fallback for a machine nothing schedulable
+  starts, not a better source when a schedule object exists: it cannot see a
+  DISABLED trigger, and a machine created at a cutover has too little history
+  to carry the majority test for three weeks. Measured 2026-10-02: D17/D18 run
+  in ``ne-data-collection-morning``, started at 07:30 ET by Scheduler entry
+  ``nousergon-data-collection/data-collection-morning`` since the 2026-09-28
+  decoupled cutover — four executions in a 21-day window — while their
+  descriptors still named ``ne-preopen-trading-pipeline``, which starts at
+  08:15 ET and no longer runs either of them.
 * ``eventbridge-rule`` / ``eventbridge-scheduler`` — the live ``State`` and
   ``ScheduleExpression`` (+ timezone). The DISABLED annotation after the em dash
   of ``trigger.schedule`` must agree with the live state in BOTH directions: an
@@ -151,12 +165,26 @@ def owner_key(unit: Unit) -> str | None:
     ``step-functions:<machine>`` (the ``:State`` suffix names a state INSIDE the
     machine; the machine is what starts), ``eventbridge-rule:<rule>`` on the
     default bus, ``eventbridge-scheduler:<group>/<name>`` (a bare name is the
-    ``default`` group). ``None`` for a kind the producer does not observe.
+    ``default`` group). A step-functions unit declaring ``trigger.started_by``
+    keys on that schedule object instead. ``None`` for a kind the producer does
+    not observe, or a ``started_by`` naming neither a rule nor a Scheduler entry.
     """
     trigger = _trigger(unit)
     kind = str(trigger.get("kind") or "")
     owner = str(trigger.get("owner") or "").strip()
     if kind not in OBSERVABLE_KINDS or not owner:
+        return None
+    started_by = str(trigger.get("started_by") or "").strip()
+    if kind == "step-functions" and started_by:
+        # The schedule object that starts the machine (module docstring). A
+        # value naming anything else is no live surface, never a silent
+        # fallback to execution history the descriptor chose not to declare.
+        by_kind, _, by_name = started_by.partition(":")
+        if by_kind == "eventbridge-rule" and by_name:
+            return f"eventbridge-rule:{by_name}"
+        if by_kind == "eventbridge-scheduler" and by_name:
+            group, _, name = by_name.rpartition("/")
+            return f"eventbridge-scheduler:{group or 'default'}/{name}" if name else None
         return None
     if kind == "step-functions":
         return f"step-functions:{owner.split(':', 1)[0]}"
@@ -545,7 +573,7 @@ def reconcile_unit(
             unit,
             f"{key} was not observed ({status}: {observation.get('error') or 'no detail'})",
         )
-    if kind == "step-functions":
+    if key.startswith("step-functions:"):
         return _reconcile_executions(
             unit, declared, observation, start=window_start, end=window_end
         )

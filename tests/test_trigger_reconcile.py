@@ -78,14 +78,32 @@ def _live_matching(units: list[Unit]) -> dict:
             }
             entry["execution_starts"] = sorted(starts, reverse=True)
         else:
+            expression, tz = _live_expression(unit)
             owners[key] = {
                 "kind": kind,
                 "status": "observed",
                 "state": "DISABLED" if declared_disabled(unit) else "ENABLED",
-                "schedule_expression": _declared_text(unit),
-                "timezone": "UTC",
+                "schedule_expression": expression,
+                "timezone": tz,
             }
     return owners
+
+
+_CRON_DOW = ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN")
+
+
+def _live_expression(unit: Unit) -> tuple[str, str]:
+    """The schedule object a declaration describes, as AWS would report it.
+
+    A ``cron(...)``/``rate(...)`` declaration IS the expression (UTC). A named
+    shape (``weekdays 07:30 America/New_York``) is what a Scheduler entry
+    carries as a cron plus ``ScheduleExpressionTimezone``."""
+    text = _declared_text(unit)
+    if text.startswith(("cron(", "rate(")):
+        return text, "UTC"
+    cadence = unit_cadence(unit.raw)
+    days = ",".join(_CRON_DOW[d] for d in sorted(cadence.weekdays))
+    return f"cron({cadence.minute} {cadence.hour} ? * {days} *)", cadence.tz
 
 
 def _document(owners: dict, *, as_of: dt.datetime = NOW) -> dict:
@@ -265,10 +283,96 @@ def test_an_owner_absent_from_the_document_is_unmeasurable(units, live):
     missing = {
         k: v
         for k, v in live.items()
-        if k != "step-functions:ne-preopen-trading-pipeline"
+        if k != "step-functions:ne-postclose-trading-pipeline"
     }
     reading = read_triggers_reconciled(_store(_document(missing)), units, as_of=READ_AT)
-    assert reading.unmeasurable and "UNRECONCILABLE D17" in reading.detail
+    assert reading.unmeasurable and "UNRECONCILABLE D19" in reading.detail
+
+
+# ---------------------------------------------------------------------------
+# trigger.started_by: a step-functions unit reconciled against what STARTS it
+# ---------------------------------------------------------------------------
+
+_MORNING = "eventbridge-scheduler:nousergon-data-collection/data-collection-morning"
+
+
+def _unit(units, unit_id: str) -> Unit:
+    return next(u for u in units if u.unit_id == unit_id)
+
+
+def test_morning_units_key_on_the_scheduler_entry_that_starts_their_machine(units):
+    """D17/D18 run in ne-data-collection-morning since the 2026-09-28 cutover;
+    the reconciler reads the Scheduler entry that starts it, not the v1 preopen
+    machine (08:15 ET) that read DIVERGENT for every fire."""
+    for unit_id in ("D17", "D18"):
+        unit = _unit(units, unit_id)
+        assert unit.raw["trigger"]["kind"] == "step-functions"
+        assert owner_key(unit) == _MORNING
+    assert _MORNING in producer.owner_keys(units)
+    assert "step-functions:ne-preopen-trading-pipeline" not in producer.owner_keys(units)
+
+
+def test_started_by_matches_the_live_morning_entry(units):
+    """The live entry as measured 2026-10-02: cron(30 7 ? * MON-FRI *) in
+    America/New_York reconciles with 'weekdays 07:30 America/New_York' across a
+    DST-free window and across the November shift alike."""
+    live = {
+        _MORNING: {
+            "kind": "eventbridge-scheduler",
+            "status": "observed",
+            "state": "ENABLED",
+            "schedule_expression": "cron(30 7 ? * MON-FRI *)",
+            "timezone": "America/New_York",
+        }
+    }
+    for end in (NOW, dt.datetime(2026, 11, 20, 5, 0, tzinfo=dt.timezone.utc)):
+        result = reconcile_unit(
+            _unit(units, "D17"), live, window_start=end - dt.timedelta(days=21), window_end=end
+        )
+        assert result.outcome == "reconciled", result.detail
+
+
+def test_started_by_red_when_the_entry_moves(units):
+    live = {
+        _MORNING: {
+            "kind": "eventbridge-scheduler",
+            "status": "observed",
+            "state": "ENABLED",
+            "schedule_expression": "cron(15 8 ? * MON-FRI *)",
+            "timezone": "America/New_York",
+        }
+    }
+    result = reconcile_unit(
+        _unit(units, "D18"), live, window_start=WINDOW_START, window_end=NOW
+    )
+    assert result.outcome == "divergent"
+
+
+def test_started_by_naming_no_schedule_object_is_unreconcilable(units):
+    edited = _edit(units, "D17", started_by="lambda:alpha-engine-data-spot-dispatcher")
+    unit = _unit(edited, "D17")
+    assert owner_key(unit) is None
+    result = reconcile_unit(unit, {}, window_start=WINDOW_START, window_end=NOW)
+    assert result.outcome == "unreconcilable"
+
+
+def test_d47_names_the_scheduler_entry_not_the_dispatcher_lambda(units):
+    """crucible-v2/data-daily, cron(15 21 ? * MON-FRI *) America/New_York since
+    alpha-engine-config-I11581. The old owner, the dispatcher Lambda, named no
+    schedule and read UNRECONCILABLE (ResourceNotFoundException)."""
+    d47 = _unit(units, "D47")
+    assert owner_key(d47) == "eventbridge-scheduler:crucible-v2/data-daily"
+    live = {
+        "eventbridge-scheduler:crucible-v2/data-daily": {
+            "kind": "eventbridge-scheduler",
+            "status": "observed",
+            "state": "ENABLED",
+            "schedule_expression": "cron(15 21 ? * MON-FRI *)",
+            "timezone": "America/New_York",
+        }
+    }
+    result = reconcile_unit(d47, live, window_start=WINDOW_START, window_end=NOW)
+    assert result.outcome == "reconciled", result.detail
 
 
 # ---------------------------------------------------------------------------
