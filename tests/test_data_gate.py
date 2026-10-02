@@ -1532,6 +1532,74 @@ def test_an_na_status_completeness_metric_is_unmeasurable():
     assert reading.unmeasurable is True
 
 
+def _green_completeness(day: str) -> bytes:
+    return json.dumps(
+        {
+            "status": "GREEN",
+            "value": 1.0,
+            "target": 1.0,
+            "status_reason": "D20: 57/57 covered — zero undeclared misses",
+            "last_updated_utc": f"{day}T22:23:29Z",
+        }
+    ).encode()
+
+
+# Measured 2026-10-02: the 15:57Z gate read D20 UNMET against 2026-10-02.json,
+# six hours before the EOD run that writes it, with 2026-10-01.json GREEN on S3.
+_MIDDAY = dt.datetime(2026, 10, 2, 15, 57, 20, tzinfo=dt.timezone.utc)
+_EVENING = dt.datetime(2026, 10, 3, 3, 0, tzinfo=dt.timezone.utc)
+
+
+def test_a_completeness_reading_before_the_eod_run_is_due_grades_the_latest_due_day():
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore({"metrics/eod_completeness/2026-10-01.json": _green_completeness("2026-10-01")})
+    reading = evidence.read_completeness_metric(
+        store, unit, trading_day=dt.date(2026, 10, 2), now=_MIDDAY
+    )
+    assert reading.met is True
+    assert reading.evidence == ("metrics/eod_completeness/2026-10-01.json",)
+    assert "not due yet" in reading.detail
+
+
+def test_a_missed_due_day_is_still_unmet_when_today_is_not_yet_due():
+    """The fallback day is held to the same standard: absent there is UNMET."""
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    reading = evidence.read_completeness_metric(
+        EmptyStore(), unit, trading_day=dt.date(2026, 10, 2), now=_MIDDAY
+    )
+    assert reading.met is False
+    assert reading.unmeasurable is False
+    assert "2026-10-01.json" in reading.detail
+
+
+def test_todays_metric_is_graded_whenever_it_exists():
+    """A newer reading always wins: today's RED is never masked by yesterday's GREEN."""
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore(
+        {
+            "metrics/eod_completeness/2026-10-01.json": _green_completeness("2026-10-01"),
+            "metrics/eod_completeness/2026-10-02.json": json.dumps(
+                {"status": "RED", "value": 0.9, "target": 1.0, "status_reason": "miss"}
+            ).encode(),
+        }
+    )
+    reading = evidence.read_completeness_metric(
+        store, unit, trading_day=dt.date(2026, 10, 2), now=_MIDDAY
+    )
+    assert reading.met is False
+    assert reading.evidence == ("metrics/eod_completeness/2026-10-02.json",)
+
+
+def test_once_the_eod_run_is_due_an_absent_metric_for_today_is_unmet():
+    unit = next(u for u in load_units() if u.unit_id == "D20")
+    store = EmptyStore({"metrics/eod_completeness/2026-10-01.json": _green_completeness("2026-10-01")})
+    reading = evidence.read_completeness_metric(
+        store, unit, trading_day=dt.date(2026, 10, 2), now=_EVENING
+    )
+    assert reading.met is False
+    assert reading.evidence == ("metrics/eod_completeness/2026-10-02.json",)
+
+
 def test_a_denied_completeness_read_is_unmeasurable():
     unit = next(u for u in load_units() if u.unit_id == "D20")
     reading = evidence.read_completeness_metric(DeniedStore(), unit, trading_day=TRADING_DAY)

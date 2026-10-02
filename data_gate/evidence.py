@@ -28,6 +28,7 @@ from __future__ import annotations
 import datetime as dt
 import pathlib
 from dataclasses import dataclass, field
+from zoneinfo import ZoneInfo
 
 from nousergon_lib.gates import LADDER_KEY, GateStore, read_store_document
 from nousergon_lib.run_manifest import SCHEMA_VERSION as _MANIFEST_SCHEMA
@@ -38,7 +39,13 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 import run_units
-from data_gate.cadence import Cadence, gate_moment, latest_due_fire, unit_cadence
+from data_gate.cadence import (
+    Cadence,
+    gate_moment,
+    latest_due_fire,
+    latest_trading_day_on_or_before,
+    unit_cadence,
+)
 from data_gate.descriptors import REPO_ROOT, Unit
 
 __all__ = [
@@ -310,7 +317,81 @@ def empty_success_runs(manifests: list[dict]) -> list[str]:
     return [str(m.get("run_id") or "?") for m in manifests if run_units.is_empty_success(m)]
 
 
-def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Reading | None:
+def _probe_written_at(document: dict) -> dt.datetime | None:
+    """When an ArcticDB probe record was taken. The producer writes ``as_of_utc``
+    (`collectors/arctic_probe.py::build_probe_record`); ``as_of`` is accepted for
+    records that predate that name."""
+    stamp = document.get("as_of_utc") or document.get("as_of")
+    return _parse_utc(stamp) if stamp else None
+
+
+def _probe_after_run(
+    store: GateStore, unit: Unit, *, collected: dt.date, finished: dt.datetime, through: dt.date
+) -> tuple[str, dict] | Reading | None:
+    """The first probe record taken AFTER ``finished``, keyed ``collected``..``through``.
+
+    The probe is only an independent read-back of a unit's ArcticDB write if it
+    was taken after that write. The day-keyed probe is right for the EOD and
+    morning machines, which run it as their final workload. It is wrong for the
+    Saturday weekly units (D13, D14): no weekly workload writes a probe, so
+    their day key (Friday) holds Friday's EOD probe, taken the evening BEFORE
+    the write it is read as evidence of, until a morning machine overwrites it.
+    And for a run that predates the 2026-09-28 cutover that first scheduled the
+    probe, the day key was never written at all: D13/D14's 2026-09-26 runs
+    (trading day 2026-09-25) read UNMEASURABLE for that reason while
+    ``probes/arctic/2026-09-28.json``, taken 2026-09-29T12:16Z, had read both
+    libraries back after them.
+
+    Returns the ``(key, document)`` of the earliest post-dating record; a red
+    Reading when a candidate could not be read; ``None`` when no record taken
+    after the run exists yet. A record whose timestamp does not parse cannot be
+    shown to post-date anything and is never selected.
+    """
+    base = _store_relative(str((unit.raw.get("arcticdb_evidence") or {}).get("via")))
+    prefix = base.rsplit("/", 1)[0] + "/"
+    candidates: list[tuple[dt.date, str]] = []
+    for key in store.list_keys(prefix):
+        day = _day_from_name(key)
+        if day is not None and collected <= day <= through:
+            candidates.append((day, key))
+    for _day, key in sorted(candidates):
+        read = read_store_document(store, key)
+        if read.problem is not None:
+            return Reading(
+                met=False,
+                detail=(
+                    f"{unit.unit_id} writes ArcticDB and its run evidence is the probe at {key}, "
+                    f"which could not be read: {read.problem}"
+                ),
+                evidence=(key,),
+                unmeasurable=True,
+                source="data_collection store",
+            )
+        if read.absent:
+            continue
+        document = read.document or {}
+        written = _probe_written_at(document)
+        if written is not None and written >= finished:
+            return key, document
+    return None
+
+
+def _day_from_name(key: str) -> dt.date | None:
+    stem = key.rsplit("/", 1)[-1].removesuffix(".json")
+    try:
+        return dt.date.fromisoformat(stem)
+    except ValueError:
+        return None
+
+
+def _read_arctic_probe(
+    store: GateStore,
+    unit: Unit,
+    trading_day: dt.date,
+    *,
+    finished: dt.datetime | None = None,
+    through: dt.date | None = None,
+) -> Reading | None:
     """The ArcticDB probe backing a unit that declares `arcticdb_evidence`.
 
     `alpha-engine-config-I10772` (P-05). The gate NEVER opens ArcticDB — the
@@ -327,12 +408,26 @@ def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Re
     MET on a withheld probe: a probe that stopped writing must make these
     clauses UNMEASURABLE rather than leave them stale-green, which is the whole
     reason the probe exists rather than a timestamp.
+
+    Given ``finished`` (the latest graded run's end), only a record taken
+    after it counts, found by :func:`_probe_after_run` from ``trading_day``
+    through ``through`` (the gate's own day). A day-keyed record taken BEFORE
+    the run is not evidence of it: that reading stays UNMEASURABLE, naming
+    both instants, until a later probe reads the library back.
     """
     declared = unit.raw.get("arcticdb_evidence") or {}
     via = declared.get("via")
     if not via:
         return None
     key = _store_relative(str(via).format(trading_day=trading_day.isoformat()))
+    if finished is not None:
+        found = _probe_after_run(
+            store, unit, collected=trading_day, finished=finished, through=max(through or trading_day, trading_day)
+        )
+        if isinstance(found, Reading):
+            return found
+        if found is not None:
+            return _grade_probe_document(*found, trading_day=trading_day)
     read = read_store_document(store, key)
     if read.problem is not None:
         return Reading(
@@ -359,6 +454,26 @@ def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Re
             source="data_collection store",
         )
     document = read.document or {}
+    if finished is not None:
+        written = _probe_written_at(document)
+        return Reading(
+            met=False,
+            detail=(
+                f"{unit.unit_id} writes ArcticDB and the probe at {key} was taken at "
+                f"{written.isoformat() if written else 'an unparseable time'}, not after the run it "
+                f"would evidence finished ({finished.isoformat()}), and no later probe exists through "
+                f"{max(through or trading_day, trading_day).isoformat()}. A probe that predates the "
+                "write is not a read-back of it: UNMEASURABLE until one is taken."
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    return _grade_probe_document(key, document, trading_day=trading_day)
+
+
+def _grade_probe_document(key: str, document: dict, *, trading_day: dt.date) -> Reading:
+    """Grade one probe record's `libraries` block (shared by both lookups above)."""
     libraries = document.get("libraries") or {}
     if not isinstance(libraries, dict) or not libraries:
         return Reading(
@@ -393,7 +508,7 @@ def _read_arctic_probe(store: GateStore, unit: Unit, trading_day: dt.date) -> Re
         detail=f"ArcticDB evidence from the in-region probe {key} — {summary}",
         evidence=(key,),
         source="data_collection store",
-        as_of=str(document.get("as_of") or trading_day.isoformat()),
+        as_of=str(document.get("as_of_utc") or document.get("as_of") or trading_day.isoformat()),
     )
 
 
@@ -729,7 +844,14 @@ def read_run_record(
         probe_day = dt.date.fromisoformat(recorded[-1]) if recorded else trading_day
     except ValueError:
         probe_day = trading_day
-    probe = _read_arctic_probe(store, unit, probe_day)
+    finishes = [f for m in manifests if (f := _parse_utc(m.get("finished"))) is not None]
+    probe = _read_arctic_probe(
+        store,
+        unit,
+        probe_day,
+        finished=max(finishes) if finishes else None,
+        through=trading_day,
+    )
     if probe is not None:
         if not probe.met:
             # The manifests exist; the ArcticDB half of the evidence does not.
@@ -844,7 +966,32 @@ def read_guard_commissioning(
     )
 
 
-def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.date) -> Reading:
+def completeness_due_day(unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None) -> dt.date:
+    """The trading day whose completeness metric should exist by the gate's moment.
+
+    The metric is published by the unit's own run, so a reading taken before
+    that run is due cannot demand it. Measured 2026-10-02: the 15:57Z gate
+    graded D20 against ``metrics/eod_completeness/2026-10-02.json`` six hours
+    before the 18:15 ET EOD collection that writes it, while
+    ``2026-10-01.json`` sat on S3 GREEN (57/57). Same question
+    `read_run_record` asks through `_cycle` — *which execution should exist by
+    now?* — answered from the unit's declared cadence (`data_gate.cadence`).
+
+    Only a ``scheduled`` cadence moves the day. Every other shape is graded
+    against the gate's own trading day, the strictest reading, exactly as
+    before.
+    """
+    cadence = unit_cadence(unit.raw)
+    if cadence.kind != "scheduled":
+        return trading_day
+    fire = latest_due_fire(cadence, as_of=gate_moment(trading_day, now))
+    fired_on = fire.astimezone(ZoneInfo(cadence.tz)).date()
+    return min(trading_day, latest_trading_day_on_or_before(fired_on))
+
+
+def read_completeness_metric(
+    store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None
+) -> Reading:
     """One unit's cardinality/completeness `MetricRecord` for a single trading day.
 
     `validators/expectations.py::publish_completeness_metric` writes this key
@@ -857,13 +1004,32 @@ def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.da
     (phase 3, a rolling 20-cycle SLO over ALL units in a freshness family):
     this clause is the single-day, single-unit reading that PROVES the guard
     ran and published something today.
+
+    The gate's own day is read first: a metric that already exists is the
+    newest evidence and is always graded. Only when it is ABSENT and the run
+    that writes it is not yet due (:func:`completeness_due_day`) does the
+    reading fall back to the latest day whose run IS due — and an absence
+    there is UNMET exactly as before. A missed run therefore still reads red
+    from the first gate reading after its fire plus the completion grace; what
+    no longer reads red is a run that has not happened yet.
     """
     key = f"metrics/eod_completeness/{trading_day.isoformat()}.json"
     read = read_store_document(store, key)
+    not_yet_due = ""
+    if read.absent and read.problem is None:
+        due_day = completeness_due_day(unit, trading_day=trading_day, now=now)
+        if due_day < trading_day:
+            not_yet_due = (
+                f"{trading_day.isoformat()}'s run is not due yet "
+                f"({unit_cadence(unit.raw).source} plus the completion grace), so this grades "
+                f"{due_day.isoformat()}, the latest day whose run is due. "
+            )
+            key = f"metrics/eod_completeness/{due_day.isoformat()}.json"
+            read = read_store_document(store, key)
     if read.problem is not None:
         return Reading(
             met=False,
-            detail=f"could not read {key}: {read.problem}",
+            detail=f"{not_yet_due}could not read {key}: {read.problem}",
             evidence=(key,),
             unmeasurable=True,
             source="data_collection store",
@@ -872,7 +1038,7 @@ def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.da
         return Reading(
             met=False,
             detail=(
-                f"no completeness metric at {key}. The cardinality guard "
+                f"{not_yet_due}no completeness metric at {key}. The cardinality guard "
                 "(validators/expectations.py::check_cardinality /"
                 "publish_completeness_metric) has not published a reading for this "
                 "trading day — nothing emits it yet, which is the P-13 gap this clause "
@@ -887,7 +1053,7 @@ def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.da
     if status in _METRIC_NA_STATUSES:
         return Reading(
             met=False,
-            detail=f"{key}: status={status} ({document.get('status_reason')})",
+            detail=f"{not_yet_due}{key}: status={status} ({document.get('status_reason')})",
             evidence=(key,),
             unmeasurable=True,
             source="data_collection store",
@@ -897,7 +1063,7 @@ def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.da
         return Reading(
             met=False,
             detail=(
-                f"{key} carries status {status!r}, outside the closed MetricRecord status "
+                f"{not_yet_due}{key} carries status {status!r}, outside the closed MetricRecord status "
                 f"vocabulary {sorted(_METRIC_REAL_STATUSES | _METRIC_NA_STATUSES)}"
             ),
             evidence=(key,),
@@ -908,7 +1074,7 @@ def read_completeness_metric(store: GateStore, unit: Unit, *, trading_day: dt.da
     return Reading(
         met=status == "GREEN",
         detail=(
-            f"{key}: status={status}, value={document.get('value')}, "
+            f"{not_yet_due}{key}: status={status}, value={document.get('value')}, "
             f"floor={document.get('target')} — {document.get('status_reason')}"
         ),
         evidence=(key,),
