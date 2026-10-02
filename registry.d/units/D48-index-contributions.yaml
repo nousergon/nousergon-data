@@ -85,23 +85,33 @@ consumers_reason: >-
 contract:
   schema: contracts/index_contributions.schema.json
   producer_test: tests/test_index_contributions.py
-  consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "metron:tests (benchmark-gap fixture pinned to schema_version 1, metron-ops-I346)"
-registry_rows: []
-# alpha-engine-config-I11297 / I11306: the ARTIFACT_REGISTRY freshness row is
-# DEFERRED until the producer is scheduled, per this repo's "never register a
-# freshness entry ahead of its producer" convention. Registering now would
-# report a false state=missing on every cycle. The pinned PUT count in
-# tests/test_artifact_registry_coverage.py carries the same deferral.
+  consumer_pins:
+    - repo: "metron"
+      path: "tests/contracts/index_contributions.schema.json"
+      pins: "body_schema"
+      producer: "contracts/index_contributions.schema.json"
+      read_site: "portfolio_analytics/index_contributions/spine_source.py::spine_index_contributions"
+  # alpha-engine-config-I11282 (C11, 2026-10-02): metron-PR526. The artifact
+  # has never been written (this unit is pending, I11306), so the consumer
+  # fixture is built from this schema and its stated unit identity rather
+  # than sampled.
+registry_rows:
+  - index_contributions_dated
+  - index_contributions_latest
+# alpha-engine-config-I11282 (C11, 2026-10-02): both rows are registered and
+# DECLARED OFF against alpha-engine-config-I11306, which clears on the
+# `index_contribution_producers_scheduled` milestone. That keeps the original
+# deferral's point (no false state=missing for a producer nothing runs) while
+# giving the gate rows to grade. The registry spells the `{index}` segment `*`.
+# Flipping this unit to in-service while the rows are still declared off reads
+# `artifact_registry` as parked (data_gate/unit_readers.py::_parked), so the
+# promotion PR has to clear them.
 run_manifest_prefix: data_collection/runs/D48
 detectors:
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
     state: ABSENT
-    note: "deferred with the registry row — alpha-engine-config-I11306"
+    note: "row registered but declared off until alpha-engine-config-I11306 schedules the producer; the monitor grades nothing before then"
 freshness:
   family: "eod-spine"
   status: proposed
