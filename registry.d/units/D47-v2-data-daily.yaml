@@ -29,9 +29,15 @@ owner: brian
 code_path: "crucible:crucible/track_a.py:702-705, crucible/data/daily.py:172"
 trigger:
   kind: "eventbridge-scheduler"
-  owner: "crucible-v2-dispatcher"
+  # The Scheduler entry that fires data.daily, not the dispatcher Lambda it
+  # targets (`crucible-v2-dispatcher` named no schedule, so the gate read
+  # UNRECONCILABLE: ResourceNotFoundException). 21:15 ET since
+  # alpha-engine-config-I11581 (nous-ergon-ops-PR1408,
+  # infrastructure/cloudformation/crucible-v2.yaml DailyDataScheduleInGroup);
+  # the value it replaces, a tz-less cron(30 18 ...), read as 18:30 UTC.
+  owner: "crucible-v2/data-daily"
   successor: is v2
-  schedule: "cron(30 18 ? * MON-FRI *)"
+  schedule: "weekdays 21:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - "crucible-v2 store: data/{trading_day}/panel.parquet"
