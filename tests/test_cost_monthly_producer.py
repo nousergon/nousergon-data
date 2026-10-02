@@ -244,8 +244,13 @@ def test_main_refuses_to_run_without_cur_location(monkeypatch):
 
 
 def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, capsys):
-    key = "cur/x/data/BILLING_PERIOD=2026-09/part-0.parquet"
-    payload = _parquet_bytes([_row(5.0, "2026-09-01")])
+    # main() reads the window ending YESTERDAY on the real clock, so the
+    # fixture's billing period must follow that clock. A hard-coded
+    # 2026-09 period stopped covering the window on 2026-10-02.
+    yesterday = dt.datetime.now(dt.timezone.utc).date() - dt.timedelta(days=1)
+    period = yesterday.strftime("%Y-%m")
+    key = f"cur/x/data/BILLING_PERIOD={period}/part-0.parquet"
+    payload = _parquet_bytes([_row(5.0, yesterday.isoformat())])
 
     class _FullS3(_PutCapturingS3):
         def get_paginator(self, name):
@@ -253,7 +258,7 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, cap
 
             class _Paginator:
                 def paginate(self, Bucket, Prefix):
-                    if Prefix == "cur/x/data/BILLING_PERIOD=2026-09/":
+                    if Prefix == f"cur/x/data/BILLING_PERIOD={period}/":
                         return [{"Contents": [{"Key": key}]}]
                     return [{"Contents": []}]
 
