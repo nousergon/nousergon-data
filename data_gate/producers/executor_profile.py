@@ -26,6 +26,17 @@ tested walker, never a second `lookup-events`-based audit path.
 predates the stack), this repo's default is the real, live value — override
 via ``NOUSERGON_DATA_CLOUDTRAIL_ARCHIVE`` only for a test double or a future
 account split.
+
+**Objects are fetched concurrently** (`alpha-engine-config-I11781`). The
+walk is latency-bound, not CPU-bound: one archive object is ~30 KB gzip and
+parses in ~2 ms, but a serial ``GetObject`` costs ~70-110 ms, so a 7-day
+window cost ``objects x round-trip``. The window grew from ~10,000 objects
+(670 s on 2026-09-28, the last run that finished) to ~15,000 by 2026-10-01
+as fleet CloudTrail volume rose, which crossed the job's 15-minute cap: every
+run from 2026-09-29 was cancelled mid-walk, before ``main()`` could write
+either the metric or an error run record. ``DEFAULT_WORKERS`` bounded
+threads overlap the round-trips; the per-day coverage contract, the filter
+and every count are unchanged, and records keep archive-key order.
 """
 
 from __future__ import annotations
@@ -37,6 +48,7 @@ import json
 import logging
 import os
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -47,6 +59,7 @@ __all__ = [
     "DEFAULT_BUCKET",
     "DEFAULT_KEY",
     "DEFAULT_OBJECT_BUCKET",
+    "DEFAULT_WORKERS",
     "EXECUTOR_ROLE_NAME",
     "ARCHIVE_VAR",
     "ArchiveRead",
@@ -86,6 +99,12 @@ DEFAULT_OBJECT_BUCKET = "alpha-engine-research"
 DEFAULT_BUCKET = "alpha-engine-research"
 DEFAULT_KEY = "data_collection/metrics/executor_profile/collection_writes/latest.json"
 
+#: Concurrent ``GetObject`` calls per archive day. The walk is bounded by
+#: round-trip latency, so this is what keeps a ~15,000-object window inside
+#: the job's timeout. ``main()`` sizes the boto3 connection pool to match —
+#: botocore's default pool of 10 would otherwise cap the overlap at 10.
+DEFAULT_WORKERS = 32
+
 _WRITE_EVENTS = frozenset({"PutObject", "DeleteObject", "CompleteMultipartUpload"})
 
 
@@ -123,6 +142,7 @@ def iter_archive_records(
     region: str,
     day: dt.date,
     keep: Any,
+    workers: int = DEFAULT_WORKERS,
 ) -> ArchiveRead:
     """Every record on ``day`` for which ``keep(record)`` is true.
 
@@ -130,17 +150,25 @@ def iter_archive_records(
     a trail always delivers, so a day with zero objects is a gap in what we
     can see, never evidence of a quiet day. Distinct from a day that
     delivered objects none of which matched ``keep``, which IS a real zero.
+
+    Objects are fetched on up to ``workers`` threads (boto3 clients are
+    thread-safe); results are consumed in archive-key order, so the kept
+    records are identical to a serial walk's. A failed fetch propagates.
     """
     keys = _archive_object_keys(s3, bucket=bucket, prefix=prefix, region=region, day=day)
     if not keys:
         return ArchiveRead(records=(), objects_read=0, records_scanned=0, covered=False)
+
+    def _scan(key: str) -> tuple[list[dict[str, Any]], int]:
+        records = _fetch_records(s3, bucket=bucket, key=key)
+        return [r for r in records if keep(r)], len(records)
+
     kept: list[dict[str, Any]] = []
     scanned = 0
-    for key in keys:
-        for record in _fetch_records(s3, bucket=bucket, key=key):
-            scanned += 1
-            if keep(record):
-                kept.append(record)
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        for matched, count in pool.map(_scan, keys):
+            kept.extend(matched)
+            scanned += count
     return ArchiveRead(records=tuple(kept), objects_read=len(keys), records_scanned=scanned, covered=True)
 
 
@@ -192,6 +220,7 @@ def count_collection_writes(
     object_bucket: str = DEFAULT_OBJECT_BUCKET,
     start: dt.date,
     end: dt.date,
+    workers: int = DEFAULT_WORKERS,
 ) -> WriteCount:
     """Executor writes into the collection prefixes over ``[start, end]``.
 
@@ -213,6 +242,7 @@ def count_collection_writes(
             region=region,
             day=day,
             keep=lambda r: _is_collection_write(r, object_bucket=object_bucket),
+            workers=workers,
         )
         objects_read += read.objects_read
         records_scanned += read.records_scanned
@@ -267,14 +297,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--archive", default=None, help=f"s3://<bucket>/<prefix> for the CloudTrail archive (default: {ARCHIVE_VAR} or the fleet default)")
     ap.add_argument("--region", default=_REGION)
     ap.add_argument("--days", type=int, default=7)
+    ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help="concurrent archive GetObject calls")
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args(argv)
 
     import boto3  # noqa: PLC0415 - deferred so import stays light for tests
+    from botocore.config import Config  # noqa: PLC0415
 
     from data_gate.producers._run_record import write_run_record  # noqa: PLC0415
 
-    s3 = boto3.client("s3", region_name=args.region)
+    workers = max(1, args.workers)
+    s3 = boto3.client("s3", region_name=args.region, config=Config(max_pool_connections=workers))
     archive_bucket, archive_prefix = _resolve_archive(args.archive)
 
     started_at = dt.datetime.now(dt.timezone.utc)
@@ -290,6 +323,7 @@ def main(argv: list[str] | None = None) -> int:
             object_bucket=args.object_bucket,
             start=start,
             end=end,
+            workers=workers,
         )
         metric = build_metric(count=count)
         # Same public-log posture as the sibling producers (alpha-engine-

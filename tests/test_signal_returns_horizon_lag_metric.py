@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
-from datetime import date
+from datetime import date, datetime, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -88,7 +88,7 @@ class TestEmitHorizonGradingLagMetric:
             lambda svc: cw if svc == "cloudwatch" else MagicMock(),
         )
         monkeypatch.setattr(
-            "collectors.signal_returns.date", _stub_today_factory(2026, 7, 19),
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
         )
 
         out = _emit_horizon_grading_lag_metric(db, forward_days=21)
@@ -127,7 +127,7 @@ class TestEmitHorizonGradingLagMetric:
             lambda svc: cw if svc == "cloudwatch" else MagicMock(),
         )
         monkeypatch.setattr(
-            "collectors.signal_returns.date", _stub_today_factory(2026, 7, 19),
+            "collectors.signal_returns._market_today", lambda: date(2026, 7, 19),
         )
 
         out = _emit_horizon_grading_lag_metric(db, forward_days=21)
@@ -157,12 +157,61 @@ class TestEmitHorizonGradingLagMetric:
         assert out["predictor_outcomes_lag_trading_days"] == 0
 
 
-def _stub_today_factory(year, month, day):
-    """Patches collectors.signal_returns's `date` name so date.today() is
-    deterministic, mirroring the pattern already used in
-    test_universe_returns_21d_log.py."""
-    class _S(date):
-        @classmethod
-        def today(cls):
-            return date(year, month, day)
-    return _S
+
+class TestGaugeReadsTheGradersClock:
+    """alpha-engine-config-I11445 moved universe_returns' "has this window
+    closed?" onto the exchange's calendar. The gauge kept the box's UTC
+    `date.today()`, so every run between 00:00 UTC and midnight ET emitted
+    lag=1 for a fully caught-up pipeline — the datapoints that latched both
+    horizon-lag alarms in ALARM from 2026-09-23 (09-23 00:37/01:51Z,
+    09-25 01:51/02:32/03:20Z; every run outside that gap read 0)."""
+
+    # 2026-09-25T01:51Z, one of the breaching runs: 21:51 ET on 2026-09-24.
+    _RUN_AT = datetime(2026, 9, 25, 1, 51, tzinfo=timezone.utc)
+
+    def _seed_caught_up_grader(self, db: str) -> None:
+        # The grader, on ET 2026-09-24, has graded 08-24 (window closed
+        # 09-23) and correctly left 08-25 open (window closes 09-24, the
+        # session Polygon still calls "today").
+        _seed_universe_returns(db, "2026-08-24", has_21d=True)
+        _seed_universe_returns(db, "2026-08-25", has_21d=False)
+        _seed_predictor_outcomes(db, "2026-08-24", horizon_days=21)
+        _seed_predictor_outcomes(db, "2026-08-25", horizon_days=None)
+
+    def test_utc_evening_run_on_caught_up_pipeline_emits_zero(self, monkeypatch):
+        from collectors.universe_returns import _market_today
+
+        db = _make_db()
+        self._seed_caught_up_grader(db)
+        cw = MagicMock()
+        monkeypatch.setattr(
+            "collectors.signal_returns.boto3.client",
+            lambda svc: cw if svc == "cloudwatch" else MagicMock(),
+        )
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today",
+            lambda: _market_today(self._RUN_AT),
+        )
+
+        out = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        assert out["universe_returns_lag_trading_days"] == 0
+        assert out["predictor_outcomes_lag_trading_days"] == 0
+        for m in cw.put_metric_data.call_args.kwargs["MetricData"]:
+            assert m["Value"] == 0.0
+
+    def test_the_utc_anchor_is_what_produced_the_false_lag(self, monkeypatch):
+        # Discriminator: the same DB judged on the box's UTC date reads lag=1.
+        # If this ever reads 0, the test above no longer proves anything.
+        db = _make_db()
+        self._seed_caught_up_grader(db)
+        monkeypatch.setattr(
+            "collectors.signal_returns.boto3.client", lambda svc: MagicMock(),
+        )
+        monkeypatch.setattr(
+            "collectors.signal_returns._market_today",
+            lambda: self._RUN_AT.date(),
+        )
+
+        out = _emit_horizon_grading_lag_metric(db, forward_days=21)
+        assert out["universe_returns_lag_trading_days"] == 1
+        assert out["predictor_outcomes_lag_trading_days"] == 1
