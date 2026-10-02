@@ -408,6 +408,15 @@ _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
     # `chronic-gap-heal` dispatcher workload now runs it on `WeeklySchedule`,
     # named in that schedule's `verify_units` below. This register is
     # asserted for EQUALITY — leaving the row after the fix fails on purpose.
+    #
+    # alpha-engine-config-I11812: run on WeeklySchedule but NOT named in its
+    # verify_units, because each legitimately publishes nothing on a Saturday
+    # and naming it failed every execution. D12: D31 already published
+    # features/{date}/ on Friday, so the phase same-date auto-skips. D34:
+    # chronic_polygon_gaps is empty by design, so the heal has nothing to do.
+    # Each needs a ruling: retire it, or re-scope what its Saturday leg owns.
+    "D12": "alpha-engine-config-I11812",
+    "D34": "alpha-engine-config-I11812",
 }
 
 
