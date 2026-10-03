@@ -386,11 +386,12 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
     data-order dependency on the other legs; alpha-engine-config-I11269 moves
     it from the tail to THIRD, because the v1 weekly SF now waits on D34 but
     not on D15/D16/D46, and at the tail its bounded wait would have to cover
-    two workloads it does not read (tests/test_v1_collection_readiness_wait.py)."""
+    two workloads it does not read (tests/test_v1_collection_readiness_wait.py).
+    alpha-engine-config-I11812 retires D34 and drops the workload: its ticker
+    list is empty by design, and D33's daily heal carries the same chronic heal."""
     weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
     assert weekly["workloads"] == [
-        "morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two",
-        "rag-weekly-ingestion",
+        "morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion",
     ]
     assert weekly["require_trading_day"] is False
 
@@ -415,10 +416,9 @@ _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
     # features/{date}/ on Friday, so the phase same-date auto-skips. D34:
     # chronic_polygon_gaps is empty by design, so the heal has nothing to do.
     # Each needs a ruling: retire it, or re-scope what its Saturday leg owns.
-    # D12 is RETIRED (its descriptor's `retirement:` block: D31 publishes the
-    # same keys every trading day), so it is no longer owed a schedule and
-    # leaves this register.
-    "D34": "alpha-engine-config-I11812",
+    # Both are now RETIRED (each descriptor's `retirement:` block; D12 because
+    # D31 publishes the same keys every trading day, D34 because D33 carries its
+    # heal), so neither is owed a schedule and both leave this register.
 }
 
 
