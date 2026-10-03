@@ -215,7 +215,9 @@ jobs:
     # partway through data-phase2/phase3 (runs 35806797260, 35825495053,
     # 35894773097, 35895185107), before the reliability gate ever ran. A
     # timeout surfaces as `cancelled`, which `notify-main-failure`'s
-    # `failure()` does not match, so nothing paged. Sized at ~1.5x the
+    # `failure()` did not match, so nothing paged (its `if:` now also
+    # matches a cancelled need in a run that was not itself cancelled --
+    # tests/test_workflow_notify_on_cancel.py). Sized at ~1.5x the
     # measured worst case (6 x 4.0 min + ~1 min install).
     timeout-minutes: 40
     # alpha-engine-config-I10823: the `consumers` column resolves each declared
@@ -366,6 +368,6 @@ jobs:
   # trigger this doesn't cover (e.g. a `workflow_dispatch` failure).
   notify-main-failure:
     needs: [read-gate]
-    if: failure() && github.ref == 'refs/heads/main'
+    if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
