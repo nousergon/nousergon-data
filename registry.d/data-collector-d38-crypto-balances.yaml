@@ -13,11 +13,7 @@ owning_repo: nousergon-data
 substrate: eventbridge
 origin: alpha-engine-crypto-balances-15min
 owner: brian
-lifecycle: disabled
-lifecycle_owner: brian
-lifecycle_reexam: '2026-09-28'
-lifecycle_reason: 'Generated from registry.d/units/D38-*.yaml (P-08): the unit descriptor declares lifecycle:
-  ''disabled'' — transcribed verbatim.'
+lifecycle: in-service
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D38''s own code path (collectors/crypto_balances.py:270;
   infrastructure/lambdas/crypto-balances/index.py:40) writes only the key templates its unit descriptor
