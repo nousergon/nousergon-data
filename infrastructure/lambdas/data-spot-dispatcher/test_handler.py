@@ -339,7 +339,7 @@ def _install_calendar(monkeypatch, answer):
 
 def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(monkeypatch):
     """Same two commands, same order as spot_data_phase1.sh; the subshell makes
-    PIPESTATUS[0] the pair's exit code, so a failed phase 1 cannot pass."""
+    its exit code the pair's, so a failed phase 1 cannot pass."""
     index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
     workload, cmd = index._resolve_workload({"workload": "weekly-phase-one"})
     assert workload == "weekly-phase-one"
@@ -347,7 +347,9 @@ def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(m
     phase1 = cmd.index("weekly_collector.py --phase 1")
     prune = cmd.index("builders.prune_delisted_tickers --apply")
     assert phase1 < prune
-    assert "&&" in cmd[phase1:prune]
+    # alpha-engine-config-I11812: phase 1's exit code no longer GATES the
+    # prune; `test_weekly_phase1_failure_still_runs_the_prune_*` below runs it.
+    assert "&&" not in cmd[phase1:prune]
     rendered = index._bootstrap_command("weekly-phase-one", cmd, "tok")
     assert f"\n{cmd}\nrc=$?" in rendered
     # No pipe any more: the renderer's run-log block `exec`s this shell's
@@ -355,6 +357,56 @@ def test_weekly_phase1_workload_runs_phase1_then_prune_as_one_pipeline_element(m
     # exit code (alpha-engine-config-I11353).
     assert "| tee -a" not in rendered.split("_run_log_shipper_loop")[-1]
     assert "rc=${PIPESTATUS[0]}" not in rendered
+
+
+def _run_weekly_phase1(monkeypatch, tmp_path, *, phase1_rc: int, prune_rc: int):
+    """Execute the REAL workload string in bash with a stub `python` on PATH
+    that records each leg and exits with the declared code."""
+    import subprocess
+
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    _workload, cmd = index._resolve_workload({"workload": "weekly-phase-one"})
+    calls = tmp_path / "calls.txt"
+    stub = tmp_path / "python"
+    stub.write_text(
+        "#!/usr/bin/env bash\n"
+        f'echo "$*" >> "{calls}"\n'
+        f'case "$*" in *"--phase 1"*) exit {phase1_rc} ;; *prune_delisted_tickers*) exit {prune_rc} ;; esac\n'
+        "exit 99\n"
+    )
+    stub.chmod(0o755)
+    env = {"PATH": f"{tmp_path}:/usr/bin:/bin"}
+    proc = subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True, timeout=30)
+    legs = calls.read_text().splitlines() if calls.exists() else []
+    return proc.returncode, legs
+
+
+def test_weekly_phase1_failure_still_runs_the_prune_and_still_fails(monkeypatch, tmp_path):
+    """alpha-engine-config-I11812, 2026-10-03: D02 degraded, `weekly_collector
+    --phase 1` exited 1, and the `&&` skipped the D14 prune — an unrelated unit
+    with its own manifest and its own verify_units entry. The prune now runs,
+    and the workload still exits 1 so the failure is reported."""
+    rc, legs = _run_weekly_phase1(monkeypatch, tmp_path, phase1_rc=1, prune_rc=0)
+    assert legs == ["weekly_collector.py --phase 1", "-m builders.prune_delisted_tickers --apply"]
+    assert rc == 1
+
+
+def test_weekly_phase1_exit_code_reports_a_failed_prune(monkeypatch, tmp_path):
+    rc, legs = _run_weekly_phase1(monkeypatch, tmp_path, phase1_rc=0, prune_rc=3)
+    assert len(legs) == 2
+    assert rc == 3
+
+
+def test_weekly_phase1_exit_code_prefers_phase1_when_both_fail(monkeypatch, tmp_path):
+    rc, legs = _run_weekly_phase1(monkeypatch, tmp_path, phase1_rc=2, prune_rc=3)
+    assert len(legs) == 2
+    assert rc == 2
+
+
+def test_weekly_phase1_clean_run_exits_zero(monkeypatch, tmp_path):
+    rc, legs = _run_weekly_phase1(monkeypatch, tmp_path, phase1_rc=0, prune_rc=0)
+    assert len(legs) == 2
+    assert rc == 0
 
 
 # ── alpha-engine-config-I11002: D34 (chronic-gap-heal) had no successor ──────

@@ -34,6 +34,7 @@ __all__ = [
     "COMPLETION_FAILURE_MODES",
     "DEFAULT_ROWS_OUT_FLOOR",
     "MANIFEST_BUCKET",
+    "SAME_DATE_NOOP_REASON",
     "completion_check",
     "parse_ts",
     "readiness_check",
@@ -126,6 +127,23 @@ EMPTY_FRESH_GUARD = "empty_fresh"
 #: `unverifiable` list on every completion-check response plus the WARNING log
 #: line below. Typing `writes:` entries (`kind: s3-key|arctic-library|table`) is
 #: the robust fix and is a tracked follow-up, not something to infer here.
+#: The ``not_applicable`` reason a run files when it found its trading day
+#: ALREADY published and wrote nothing new: a same-date auto-skip, or a
+#: same-date recompute that had nothing left to publish
+#: (`weekly_collector.py::_record_phase_lineage`). It is a statement ABOUT an
+#: earlier run, so it is graded by that earlier run — see
+#: `_carry_forward_same_date_noop`. Literal rather than imported from
+#: `run_units`: this module ships inside two Lambda zips that carry neither
+#: `run_units` nor `nousergon_lib`. `test_run_manifest_carry_forward.py` pins
+#: it to `run_units.NOT_RUN_NO_NEW_DATA_DECLARED`.
+SAME_DATE_NOOP_REASON = "no_new_data_declared"
+
+#: How many earlier same-day manifests the carry-forward will read before it
+#: gives up and reports the no-op as ungraded. A trading-day partition holds a
+#: handful of runs (one per attempt); a bound keeps a pathological partition
+#: from turning one check into hundreds of GETs.
+CARRY_FORWARD_MAX_READS = 20
+
 _NON_S3_WRITE = re.compile(r"(::|\s|<|>|\(|\))")
 _WRITE_TOKEN = re.compile(r"\{[a-z_]+\}|\*")
 _MAX_SUMMARY_CHARS = 4000
@@ -261,12 +279,88 @@ def _newest_manifest(s3, prefix: str, started_at):
     return key, doc
 
 
+def _is_same_date_noop(doc: dict) -> bool:
+    """Is this manifest a run that found its day already published?"""
+    return (
+        str(doc.get("status") or "") == "not_applicable"
+        and str(doc.get("reason") or "") == SAME_DATE_NOOP_REASON
+    )
+
+
+def _carry_forward_same_date_noop(s3, prefix: str, noop_key: str, noop_doc: dict):
+    """The newest REAL run of the same trading day that a no-op points back to.
+
+    The 2026-10-03 weekly (alpha-engine-config-I11812): `weekly-phase-one`
+    attempt 0 published D01, D05-D07, D10-D12 `ok`; the Step Function's retry
+    re-ran the workload, every one of those units same-date auto-skipped, and
+    each filed `not_applicable` as its NEWEST manifest. This predicate graded
+    only the newest, so a retry that changed nothing on S3 turned seven
+    published units into seven `run_not_ok` findings, and both the producer's
+    VerifyRunManifests and the v1 consumer's readiness wait failed the cycle.
+
+    A same-date no-op is a statement about an earlier run ("this day is already
+    published"), so it is graded BY that run: the newest manifest in the SAME
+    trading-day partition that is not itself a no-op. That run is graded
+    exactly as if it were the newest — its status, its outputs, its floors —
+    so a carried-forward `failed` is still `run_not_ok`, and a no-op with no
+    real run behind it is still a finding. Nothing here can turn a run that
+    did not publish into a pass.
+
+    The real run may have finished before this execution started (a NEW
+    execution whose units all auto-skip). That is accepted on purpose: the
+    no-op itself is fresh, it is this execution's evidence that the unit was
+    visited, and the earlier run is the only record of what was published.
+
+    Returns ``(key, doc)`` of the real run, or ``(None, None)``.
+    """
+    trading_day = str(noop_doc.get("trading_day") or "")
+    if not trading_day:
+        return None, None
+    day_prefix = f"{prefix.rstrip('/')}/{trading_day}/"
+    keys: list[str] = []
+    token = None
+    while True:
+        kwargs = {"Bucket": MANIFEST_BUCKET, "Prefix": day_prefix}
+        if token:
+            kwargs["ContinuationToken"] = token
+        page = s3.list_objects_v2(**kwargs)
+        keys.extend(o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(".json"))
+        if not page.get("IsTruncated"):
+            break
+        token = page.get("NextContinuationToken")
+    earlier = sorted((k for k in keys if k < noop_key), reverse=True)
+    for key in earlier[:CARRY_FORWARD_MAX_READS]:
+        doc = json.loads(s3.get_object(Bucket=MANIFEST_BUCKET, Key=key)["Body"].read())
+        if not _is_same_date_noop(doc):
+            return key, doc
+    return None, None
+
+
 def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], dict]:
     """Grade one unit's run against its descriptor. Returns (findings, row)."""
     prefix = str(raw["run_manifest_prefix"])
     row = {"unit": unit_id, "manifest": None, "status": None, "keys_checked": 0,
-           "unverifiable": [], "auto_skipped": False, "floor": None}
+           "unverifiable": [], "auto_skipped": False, "floor": None,
+           "carried_forward_from": None}
     key, doc = _newest_manifest(s3, prefix, started_at)
+    if doc is not None and _is_same_date_noop(doc):
+        real_key, real_doc = _carry_forward_same_date_noop(s3, prefix, key, doc)
+        if real_doc is None:
+            row["manifest"] = key
+            row["status"] = "not_applicable"
+            return [
+                _finding(
+                    "run_not_ok", unit_id, None,
+                    f"manifest {key} is a same-date no-op ({SAME_DATE_NOOP_REASON}: the "
+                    f"run found trading day {doc.get('trading_day')!r} already published) "
+                    f"but no earlier run of that day is on record to say what was "
+                    f"published, so there is nothing to grade. Naming a unit in "
+                    f"verify_units IS the machine's declaration that this run must publish "
+                    f"it, so `not_applicable` alone is not a pass.",
+                )
+            ], row
+        row["carried_forward_from"] = key
+        key, doc = real_key, real_doc
     if doc is None:
         stale = f" (newest is {key}, which finished before it)" if key else ""
         return [
@@ -285,10 +379,16 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
         return [
             _finding(
                 "run_not_ok", unit_id, None,
-                f"manifest {key} reports status={status!r} reason={str(doc.get('reason') or '')[:400]!r}. "
-                f"Naming a unit in verify_units IS the machine's declaration that this run must "
-                f"publish it, so `not_applicable` is not a pass here — a unit that may "
-                f"legitimately do nothing on this schedule is simply not named.",
+                f"manifest {key} reports status={status!r} reason={str(doc.get('reason') or '')[:400]!r}"
+                + (
+                    f" (graded through the same-date no-op {row['carried_forward_from']}, which "
+                    f"points back to it)"
+                    if row["carried_forward_from"] else ""
+                )
+                + ". "
+                "Naming a unit in verify_units IS the machine's declaration that this run must "
+                "publish it, so `not_applicable` is not a pass here — a unit that may "
+                "legitimately do nothing on this schedule is simply not named.",
             )
         ], row
 
