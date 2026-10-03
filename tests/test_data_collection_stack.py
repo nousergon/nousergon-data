@@ -418,9 +418,9 @@ _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
     # features/{date}/ on Friday, so the phase same-date auto-skips. D34:
     # chronic_polygon_gaps is empty by design, so the heal has nothing to do.
     # Each needs a ruling: retire it, or re-scope what its Saturday leg owns.
-    # D34 is RETIRED (its descriptor's `retirement:` block), so it is no longer
-    # owed a schedule and leaves this register.
-    "D12": "alpha-engine-config-I11812",
+    # Both are now RETIRED (each descriptor's `retirement:` block; D12 because
+    # D31 publishes the same keys every trading day, D34 because D33 carries its
+    # heal), so neither is owed a schedule and both leave this register.
 }
 
 
