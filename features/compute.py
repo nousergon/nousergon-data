@@ -697,10 +697,35 @@ def _apply_daily_delta(
     # 5/8, every other parquet ended at 5/6, ``max`` picked 5/8 → today
     # 5/9 → empty bdate_range → backfill regression preflight failed at
     # planned=5/6 < existing=5/8 across SPY/VIX/XL*/sampled-universe.
+    # Declared actions (corporate_actions.declared, alpha-engine-config-I11806):
+    # put each SOURCE frame on the declared basis on its own, before any early
+    # return and before the delta is merged in. ``apply_declared`` is
+    # evidence-gated, so an ArcticDB frame the morning sync already restated is
+    # a no-op, and the backfill's raw 10-year cache frame is restated every
+    # week however often the vendor refetches it.
+    declared_restated: set[str] = set()
+    # Tickers whose base frame spans the ex-date and is on the declared basis
+    # after this step. Only for those is the delta restated on its own below;
+    # a base that does not span the ex-date stays raw and the merged frame is
+    # restated as one, so no row is ever restated twice.
+    declared_base_ok: set[str] = set()
+    if registry is not None:
+        for ticker in ca.declared_tickers():
+            if ticker in price_data:
+                price_data[ticker], res = ca.apply_declared(
+                    price_data[ticker], ticker, context=f"base:{date_str}",
+                )
+                if any(r["status"] == "applied" for r in res):
+                    declared_restated.add(ticker)
+                if res and all(
+                    r["status"] in ("applied", "already_reflected") for r in res
+                ):
+                    declared_base_ok.add(ticker)
+
     candidate_dates = [_safe_last_date(df.index) for df in price_data.values()]
     valid_dates = [d for d in candidate_dates if d is not None]
     if not valid_dates:
-        return price_data, set()
+        return price_data, declared_restated
 
     slim_last_date = min(valid_dates)
     today = pd.Timestamp(date_str).normalize()
@@ -717,7 +742,7 @@ def _apply_daily_delta(
 
     if not ticker_rows:
         log.info("No daily_closes delta files found — using cache as-is")
-        return price_data, set()
+        return price_data, declared_restated
 
     # Registry-driven, authoritative split detection over the delta window
     # (PR3, config#1433). No-op when no registry (legacy / dry-run callers).
@@ -728,7 +753,8 @@ def _apply_daily_delta(
             run_id=f"apply_daily_delta:{date_str}",
         )
 
-    split_tickers: set[str] = set()
+    split_tickers: set[str] = set(declared_restated)
+    declared_set = ca.declared_tickers() if registry is not None else frozenset()
     n_updated = 0
 
     for ticker, slim_df in list(price_data.items()):
@@ -768,10 +794,29 @@ def _apply_daily_delta(
         delta_df["source"] = make_source_series(
             [r.get("source", "unknown") for r in delta], index=delta_df.index,
         )
+        if ticker in declared_base_ok:
+            # The daily-closes archive stays on the vendor basis, so its rows
+            # are restated on their own before they can override restated base
+            # rows; the frame-level evidence gate makes this a no-op when the
+            # delta does not span the ex-date boundary.
+            delta_df, res = ca.apply_declared(
+                delta_df, ticker, context=f"delta:{date_str}",
+            )
+            if any(r["status"] == "applied" for r in res):
+                split_tickers.add(ticker)
 
         combined = pd.concat([base, delta_df])
         # keep="last" so delta rows win on duplicate dates (matches predictor)
         combined = combined[~combined.index.duplicated(keep="last")].sort_index()
+        if ticker in declared_set:
+            # Final check on the merged frame: a no-op when both halves agreed;
+            # a mixed-basis merge is refused and logged at ERROR, never
+            # restated on top of itself.
+            combined, res = ca.apply_declared(
+                combined, ticker, context=f"combined:{date_str}",
+            )
+            if any(r["status"] == "applied" for r in res):
+                split_tickers.add(ticker)
 
         # Registry-driven full-history RESTATEMENT (data#1298, PR3 config#1433).
         #
@@ -889,6 +934,12 @@ def audit_action_jumps(
                 "audit_action_jumps: registry list_actions failed (%s) — "
                 "treating all residuals as suspected", exc,
             )
+        # Declared actions are known actions too (alpha-engine-config-I11806):
+        # a residual jump one of them explains is a MISSED restatement, not a
+        # suspected move. They live in the repo, not the registry.
+        vendor = [a for actions in splits_by_ticker.values() for a in actions]
+        for action in ca.merge_declared(vendor):
+            splits_by_ticker.setdefault(action.ticker, []).append(action)
 
     missed: dict[str, list[tuple[str, float, str]]] = {}
     suspected: dict[str, list[tuple[str, float]]] = {}

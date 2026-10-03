@@ -67,6 +67,10 @@ __all__ = [
     "STORE_ARCTICDB_UNIVERSE",
     "STORE_DAILY_CLOSES_ARCHIVE",
     "SyncResult",
+    "apply_declared",
+    "declared_actions",
+    "declared_tickers",
+    "merge_declared",
     "expected_factor",
     "dividend_factor",
     "total_return_series",
@@ -95,6 +99,13 @@ __all__ = [
 _TYPE_SPLIT = "split"
 _TYPE_DIVIDEND = "dividend"
 _TYPE_RENAME = "rename"
+# A spin-off restates the parent's price LEVEL by a declared CRSP relative-value
+# factor and leaves its volume alone (``corporate_actions.declared``,
+# alpha-engine-config-I11806). It never comes from polygon and never enters the
+# registry: it is evidence-gated in :func:`apply_declared`, not marker-gated.
+_TYPE_SPINOFF = "spinoff"
+# Action types that move the stored price level by a multiplicative factor.
+_PRICE_LEVEL_TYPES = (_TYPE_SPLIT, _TYPE_SPINOFF)
 
 # The logical store a restatement targets. Both the Saturday full backfill
 # (rebuilds from the S3 price cache) and the daily feature-snapshot delta
@@ -165,7 +176,7 @@ class CorporateAction:
     canonical id without the caller having to compute it.
     """
 
-    type: str  # "split" | "dividend" | "rename"
+    type: str  # "split" | "dividend" | "rename" | "spinoff"
     ticker: str
     ex_date: str  # YYYY-MM-DD; the adjustment applies to rows STRICTLY BEFORE this
     # split fields — fractional for spinoff-style records (1000:1061, 1:1.2);
@@ -179,6 +190,9 @@ class CorporateAction:
     # rename fields (detected by detect_renames; migrated by migrate_symbol)
     old_ticker: str | None = None
     new_ticker: str | None = None
+    # spin-off fields (declared only; see corporate_actions.declared)
+    price_factor: float | None = None
+    spun_ticker: str | None = None
     # provenance
     source: str = "polygon"
     raw: dict = field(default_factory=dict)
@@ -198,6 +212,8 @@ class CorporateAction:
             return f"{self.cash_amount}:{self.dividend_kind}"
         if self.type == _TYPE_RENAME:
             return f"{self.old_ticker}->{self.new_ticker}"
+        if self.type == _TYPE_SPINOFF:
+            return f"{self.price_factor:.10g}->{self.spun_ticker}"
         return ""
 
     def _compute_action_id(self) -> str:
@@ -291,6 +307,37 @@ class CorporateAction:
             raw=dict(raw or {}),
         )
 
+    @classmethod
+    def from_spinoff(
+        cls,
+        ticker: str,
+        ex_date: str,
+        price_factor: float,
+        *,
+        spun_ticker: str | None = None,
+        source: str = "declared",
+        raw: dict | None = None,
+    ) -> "CorporateAction":
+        """Build a spin-off action: every price of ``ticker`` strictly before
+        ``ex_date`` is multiplied by ``price_factor`` (0 < factor < 1); volume is
+        not scaled. Raises ``ValueError`` outside that range — a factor of 1 or
+        more is not a spin-off, and a silent no-op is worse than a loud failure.
+        """
+        f = float(price_factor)
+        if not (0.0 < f < 1.0):
+            raise ValueError(
+                f"spin-off price_factor must be in (0, 1), got {price_factor!r}"
+            )
+        return cls(
+            type=_TYPE_SPINOFF,
+            ticker=str(ticker),
+            ex_date=str(ex_date),
+            price_factor=f,
+            spun_ticker=(str(spun_ticker) if spun_ticker is not None else None),
+            source=source,
+            raw=dict(raw or {}),
+        )
+
     # ── (de)serialization ────────────────────────────────────────────────
     def to_dict(self) -> dict:
         """JSON-serializable view (the registry persists this + audit fields)."""
@@ -305,6 +352,8 @@ class CorporateAction:
             "dividend_kind": self.dividend_kind,
             "old_ticker": self.old_ticker,
             "new_ticker": self.new_ticker,
+            "price_factor": self.price_factor,
+            "spun_ticker": self.spun_ticker,
             "source": self.source,
             "raw": self.raw,
         }
@@ -323,6 +372,8 @@ class CorporateAction:
             dividend_kind=d.get("dividend_kind"),
             old_ticker=d.get("old_ticker"),
             new_ticker=d.get("new_ticker"),
+            price_factor=d.get("price_factor"),
+            spun_ticker=d.get("spun_ticker"),
             source=d.get("source", "polygon"),
             raw=d.get("raw") or {},
             # Trust the persisted id if present (it is content-addressed, so it
@@ -360,6 +411,8 @@ class CorporateAction:
             return f"dividend {self.cash_amount} ({self.dividend_kind})"
         if self.type == _TYPE_RENAME:
             return f"rename {self.old_ticker} -> {self.new_ticker}"
+        if self.type == _TYPE_SPINOFF:
+            return f"spin-off of {self.spun_ticker} (price factor {self.price_factor:.6g})"
         return self.type
 
 
@@ -377,8 +430,17 @@ def expected_factor(action: CorporateAction) -> float:
     factor of a single event evaluated one day before the ex date is exactly
     ``split_from/split_to``.
 
+    For a declared spin-off it is the declared CRSP relative-value
+    ``price_factor`` (``corporate_actions.declared``).
+
     Dividends/renames are not implemented this PR.
     """
+    if action.type == _TYPE_SPINOFF:
+        if not action.price_factor:
+            raise ValueError(
+                f"spin-off action {action.action_id} missing price_factor"
+            )
+        return float(action.price_factor)
     if action.type == _TYPE_SPLIT:
         if not action.split_from or not action.split_to:
             raise ValueError(
@@ -468,8 +530,8 @@ def price_evidence_orientation(
     mutate the price level) as does a malformed factor (``expected_factor``
     guards those upstream).
     """
-    if action.type != _TYPE_SPLIT:
-        return "direct"  # only splits mutate the price level; nothing to check
+    if action.type not in _PRICE_LEVEL_TYPES:
+        return "direct"  # only splits/spin-offs mutate the price level
     expected = expected_factor(action)
     if expected <= 0:
         return "direct"  # malformed ratio — expected_factor already guards this
@@ -763,6 +825,11 @@ def apply(
                 "corporate_actions.apply: rename actions are deferred to a later "
                 "PR of the program (splits only mutate the price level here)"
             )
+        elif a.type == _TYPE_SPINOFF:
+            raise ValueError(
+                "corporate_actions.apply: a spin-off is a declared action and is "
+                "evidence-gated, not registry-marker-gated — use apply_declared"
+            )
         else:
             raise ValueError(
                 f"corporate_actions.apply: unknown action type {a.type!r}"
@@ -912,6 +979,137 @@ def apply(
             registry.mark_applied(a, store, run_id=run_id)
 
     return restated, applied_results
+
+
+# ── declared actions: evidence-gated restatement (alpha-engine-config-I11806) ─
+
+
+def apply_declared(
+    df: pd.DataFrame,
+    ticker: str,
+    *,
+    actions: list | None = None,
+    context: str = "",
+) -> tuple[pd.DataFrame, list[dict]]:
+    """Restate ONE ticker's frame for the declared actions that name it.
+
+    ``actions`` defaults to :func:`corporate_actions.declared.declared_actions`.
+    Unlike :func:`apply`, nothing here reads or writes a registry marker. The
+    frame's own raw close decides, every call, through
+    :func:`price_evidence_orientation`:
+
+      * ``"direct"``: the ex-date boundary still prints the declared factor, so
+        the frame is on the raw vendor basis. Every price column strictly before
+        the ex-date is multiplied by the factor; volume is left alone for a
+        spin-off (``status="applied"``).
+      * ``"none"``: the boundary is already continuous, because this frame was
+        restated earlier or the vendor adjusted it on its own. Nothing changes
+        (``status="already_reflected"``), so a re-run never double-adjusts.
+      * ``"uncovered"``: the frame does not span the ex-date. Nothing to do
+        (``status="uncovered"``).
+      * ``"inverse"`` / ``"ambiguous"``: the frame mixes bases (part restated,
+        part raw). It is NOT restated and an ERROR is logged
+        (``status="refused"``); restating it would double-adjust the rows that
+        were already on the new basis.
+
+    Raises :class:`CorporateActionAuditError` if a restated frame still prints
+    the factor at the boundary, so a caller can never persist a half-applied
+    series. Returns ``(frame, results)``; the input frame is never mutated.
+    """
+    if actions is None:
+        from corporate_actions.declared import declared_actions
+
+        actions = declared_actions()
+    mine = [a for a in actions if a.ticker == ticker]
+    results: list[dict] = []
+    if df is None or getattr(df, "empty", True) or not mine or "Close" not in df.columns:
+        return df, results
+
+    out = df
+    where = f" [{context}]" if context else ""
+    for a in sorted(mine, key=lambda x: x.ex_date):
+        if a.type not in _PRICE_LEVEL_TYPES:
+            raise ValueError(
+                f"apply_declared: declared action {a.action_id} has type "
+                f"{a.type!r}; only split/spinoff restate a price level"
+            )
+        factor = expected_factor(a)
+        orientation = price_evidence_orientation(out["Close"], a)
+        base = {"action_id": a.action_id, "ticker": ticker, "factor": factor}
+        if orientation == "none":
+            results.append({**base, "n_rows_adjusted": 0, "status": "already_reflected"})
+            continue
+        if orientation == "uncovered":
+            results.append({**base, "n_rows_adjusted": 0, "status": "uncovered"})
+            continue
+        if orientation in ("inverse", "ambiguous"):
+            log.error(
+                "corporate_actions.apply_declared%s: %s %s — the close matches "
+                "the declared factor's %s around ex %s, so this frame mixes the "
+                "raw and restated bases. REFUSING to restate (it would "
+                "double-adjust the restated rows); action_id=%s",
+                where, ticker, a.human(),
+                "inverse" if orientation == "inverse" else "factor AND its inverse",
+                a.ex_date, a.action_id,
+            )
+            results.append({**base, "n_rows_adjusted": 0, "status": "refused"})
+            continue
+        # orientation == "direct": raw vendor basis — restate.
+        volume_cols = ("Volume",) if a.type == _TYPE_SPLIT else ()
+        restated = restate_series_for_splits(
+            out,
+            [{"execution_date": a.ex_date, "split_from": factor, "split_to": 1.0}],
+            volume_cols=volume_cols,
+        )
+        residual = price_evidence_orientation(restated["Close"], a)
+        if residual in ("direct", "inverse", "ambiguous"):
+            raise CorporateActionAuditError(
+                f"corporate_actions.apply_declared{where}: {ticker} {a.human()} "
+                f"still prints the factor at ex {a.ex_date} after restatement "
+                f"(orientation={residual}, action_id={a.action_id}) — refusing "
+                f"so the caller does not persist a half-applied series"
+            )
+        idx = out.index if isinstance(out.index, pd.DatetimeIndex) else pd.to_datetime(out.index)
+        n_rows = int((idx < pd.Timestamp(a.ex_date).normalize()).sum())
+        log.info(
+            "corporate_actions.apply_declared%s: %s %s — restated %d row(s) "
+            "before ex %s by %.6g (volume %s); action_id=%s",
+            where, ticker, a.human(), n_rows, a.ex_date, factor,
+            "scaled" if volume_cols else "unchanged", a.action_id,
+        )
+        out = restated
+        results.append({**base, "n_rows_adjusted": n_rows, "status": "applied"})
+    return out, results
+
+
+def _sync_declared_arcticdb_universe(
+    bucket: str, ticker: str, actions: list, run_id: str | None,
+) -> list[dict]:
+    """Bring ONE ArcticDB universe symbol onto the declared actions' basis.
+
+    Evidence-gated through :func:`apply_declared`, so it is safe to run every
+    morning: a symbol already restated reads as ``already_reflected`` and is not
+    rewritten. Writes only when a row actually changed.
+    """
+    from store.arctic_store import get_universe_lib, to_arctic_canonical
+
+    lib = get_universe_lib(bucket)
+    try:
+        df = lib.read(ticker).data
+    except Exception as exc:  # noqa: BLE001 - symbol absent ⇒ nothing to restate
+        # Named by type only: this path never calls polygon, and logging the
+        # exception text is what a clear-text-logging check cannot verify.
+        log.info(
+            "corporate_actions.sync: %s not in ArcticDB universe — no declared "
+            "restate (%s)", ticker, type(exc).__name__,
+        )
+        return []
+    restated, results = apply_declared(
+        df, ticker, actions=actions, context=f"sync:{run_id}",
+    )
+    if any(r["status"] == "applied" and r["n_rows_adjusted"] > 0 for r in results):
+        lib.write(ticker, to_arctic_canonical(restated), prune_previous_versions=True)
+    return [{**r, "store": STORE_ARCTICDB_UNIVERSE} for r in results]
 
 
 # ── sync: unified, pre-read orchestration across ALL stores (PR4, config#1433) ─
@@ -1211,6 +1409,7 @@ def sync(
     registry: "CorporateActionRegistry | None" = None,
     actions: list | None = None,
     dividend_actions: list | None = None,
+    declared: list | None = None,
 ) -> SyncResult:
     """Unified corporate-action restatement across ALL ``stores`` (PR4,
     config#1433) — ONE pre-read orchestration entry point so the split-boundary
@@ -1247,6 +1446,15 @@ def sync(
     restatement failed — but the failure is RECORDED (never silently swallowed),
     and the blocking backfill audit (PR3 §3) remains the train-write correctness
     gate.
+
+    Declared actions (``corporate_actions.declared``; ``declared`` defaults to
+    all of them, minus any a vendor record in ``actions`` supersedes) restate
+    the ArcticDB universe ONLY, evidence-gated by :func:`apply_declared` rather
+    than by a marker, and on every run rather than only when their ex-date is
+    in the window. They never restate the daily-closes archive: those per-date
+    parquets stay on the vendor's basis, because the 10-year price cache the
+    Saturday backfill merges them with is on it too, and restating one but not
+    the other would hand the backfill a mixed-basis series.
     """
     start_str = pd.Timestamp(start_date).strftime("%Y-%m-%d")
     end_str = pd.Timestamp(end_date).strftime("%Y-%m-%d")
@@ -1338,7 +1546,34 @@ def sync(
                 if r.get("status") == "applied" and r.get("n_rows_adjusted", 0) > 0:
                     restated_action_ids.add(r["action_id"])
 
+    # Declared actions: ArcticDB universe only, evidence-gated, every run.
+    declared_notices: list = []
+    if STORE_ARCTICDB_UNIVERSE in stores:
+        from corporate_actions.declared import merge_declared
+
+        declared_list = merge_declared(detected, declared)
+        for ticker in sorted({a.ticker for a in declared_list}):
+            if ticker_set is not None and ticker not in ticker_set:
+                continue
+            tdeclared = [a for a in declared_list if a.ticker == ticker]
+            try:
+                res = _sync_declared_arcticdb_universe(bucket, ticker, tdeclared, run_id)
+            except Exception as exc:  # noqa: BLE001 - per-ticker degrade, recorded
+                log.warning(
+                    "corporate_actions.sync: declared restate failed for "
+                    "ticker=%s (%s) — continuing; the backfill audit remains "
+                    "the correctness gate", ticker, type(exc).__name__,
+                )
+                continue
+            applied[STORE_ARCTICDB_UNIVERSE].extend(res)
+            for r in res:
+                if r.get("status") == "applied" and r.get("n_rows_adjusted", 0) > 0:
+                    declared_notices.extend(
+                        a for a in tdeclared if a.action_id == r["action_id"]
+                    )
+
     notices = [a for a in detected if a.action_id in restated_action_ids]
+    notices.extend(declared_notices)
     return SyncResult(
         detected=detected, applied=applied, notices=notices, dividends=dividends,
     )
@@ -1812,3 +2047,12 @@ def migrate_symbol(
         "action_id=%s", old_ticker, new_ticker, len(df), action.action_id,
     )
     return True
+
+
+# Declared-action helpers re-exported at package level. Imported last: the
+# declared module imports ``CorporateAction`` from this package lazily.
+from corporate_actions.declared import (  # noqa: E402
+    declared_actions,
+    declared_tickers,
+    merge_declared,
+)
