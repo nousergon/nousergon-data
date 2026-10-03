@@ -340,6 +340,44 @@ class _DegradedRun(RuntimeError):
         self.result = result
 
 
+class _MarkerNotOk(Exception):
+    """Raised INSIDE ``reg.phase(...)`` so the phase marker records ``error``.
+
+    alpha-engine-config-I11812 (the 2026-10-03 weekly). The registry's phase
+    context manager writes ``status: ok`` for any block that exits without
+    raising, and :func:`_phase_body` used to RETURN a ``degraded`` result from
+    inside that block. So `data/2026-10-02/.phases/historical_constituents.json`
+    said ``ok`` for a D02 that had degraded, with an empty ``artifact_keys``
+    list (degraded results deliberately never call ``record_artifact``). The
+    registry's auto-skip predicate is "status ok AND every declared artifact
+    still exists" — and every artifact in an empty list exists — so the Step
+    Function's retry auto-skipped the one unit it was retrying for.
+
+    The comment that used to sit above ``record_artifact`` below said
+    "record_artifact is what arms same-date auto-skip". It is not: the MARKER
+    STATUS arms it. So a marker now says ``ok`` only for a collector status of
+    ``ok``/``ok_dry_run``; every other status (``degraded``, ``partial``,
+    ``skipped``) is raised through the block as this exception, which makes the
+    registry write ``status: error`` naming it, and is caught just outside the
+    block so the collector's ORIGINAL result continues exactly as before — the
+    manifest, the aggregate status and the exit code do not move. Only the
+    marker does, and a retry now recomputes the phase instead of skipping it.
+    """
+
+    def __init__(self, name: str, result: dict) -> None:
+        detail = result.get("error") or result.get("detail") or result.get("reason") or ""
+        super().__init__(
+            f"{name} finished with status={result.get('status')!r}, which is not ok — "
+            f"marker withheld so a same-date rerun recomputes it. {detail}".strip()
+        )
+        self.result = result
+
+
+#: The collector statuses a phase marker may record as ``ok``. Anything else is
+#: a run a retry must recompute (`_MarkerNotOk`).
+_MARKER_OK_STATUSES = frozenset({"ok", "ok_dry_run"})
+
+
 class _PhaseNotApplicable(run_manifest.NotApplicable):
     """A phase that RAN and correctly published nothing new this cycle.
 
@@ -1118,6 +1156,36 @@ def _record_phase_lineage(
             f"({result.get('skip_reason')})",
         )
     if not run_ctx.outputs and not int(run_ctx.rows_out or 0):
+        # alpha-engine-config-I11812: a SAME-DATE recompute with nothing left
+        # to publish. On 2026-10-03 the weekly retry re-ran D03 (prices) and D08
+        # (universe_returns) — neither is auto-skippable — an hour after
+        # attempt 0 had published both `ok`; every ticker was already fresh, so
+        # each recorded no output and filed `failed` EmptyProduction as its
+        # NEWEST manifest, over a real `ok`. "This day is already published"
+        # is the lib's own definition of `no_new_data_declared`, so that is
+        # what such a run files, naming the run it defers to; the completion
+        # predicate grades that run (`data_gate/run_manifest_predicate.py::
+        # _carry_forward_same_date_noop`). Only an `ok` earlier run of the SAME
+        # unit and trading day qualifies — with none on record, the strict
+        # EmptyProduction path below is unchanged.
+        prior = _prior_same_date_ok_manifest(reg, unit.unit_id)
+        if prior is not None:
+            run_ctx.record_guard(
+                expectations.EMPTY_FRESH_GUARD.name,
+                mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+                verdict="not_applicable",
+                detail=(
+                    f"{unit.unit_id} recomputed trading day {reg.date} and had nothing new to "
+                    f"publish; {prior} already published it"
+                ),
+            )
+            raise _PhaseNotApplicable(
+                name,
+                result,
+                run_units.NOT_RUN_NO_NEW_DATA_DECLARED,
+                f"{unit.unit_id} same-date recompute published nothing new; {prior} already "
+                f"published trading day {reg.date}",
+            )
         run_units.record_empty_production(
             run_ctx,
             unit.unit_id,
@@ -1126,6 +1194,41 @@ def _record_phase_lineage(
                 f"published output"
             ),
         )
+
+
+def _prior_same_date_ok_manifest(reg: "PhaseRegistry", unit_id: str) -> str | None:
+    """The key of an earlier ``ok`` manifest of ``unit_id`` for ``reg.date``, or None.
+
+    Reads ``data_collection/runs/{unit}/{date}/`` — this run's own manifest is
+    not written yet, so everything listed is an earlier run. Any read failure
+    returns None, which keeps the caller on its strict ``failed`` path: being
+    unable to prove an earlier run published is never treated as proof.
+    """
+    prefix = f"{run_manifest.DEFAULT_MANIFEST_PREFIX.rstrip('/')}/{unit_id}/{reg.date}/"
+    try:
+        client = reg.s3_client
+        keys: list[str] = []
+        token = None
+        while True:
+            kwargs = {"Bucket": reg.bucket, "Prefix": prefix}
+            if token:
+                kwargs["ContinuationToken"] = token
+            page = client.list_objects_v2(**kwargs)
+            keys.extend(o["Key"] for o in page.get("Contents", []) if o["Key"].endswith(".json"))
+            if not page.get("IsTruncated"):
+                break
+            token = page.get("NextContinuationToken")
+        for key in sorted(keys, reverse=True):
+            doc = json.loads(client.get_object(Bucket=reg.bucket, Key=key)["Body"].read())
+            if doc.get("status") == "ok" and doc.get("trading_day") == reg.date:
+                return key
+    except Exception as exc:  # noqa: BLE001 - fall back to the strict path, loudly
+        logger.warning(
+            "%s: could not read earlier same-date manifests under s3://%s/%s (%s); "
+            "an empty recompute is recorded as EmptyProduction",
+            unit_id, reg.bucket, prefix, exc,
+        )
+    return None
 
 
 def _record_collector_guards(run_ctx, result: dict) -> None:
@@ -1223,6 +1326,33 @@ def _phase_body(
     outside it. Returning an error dict from inside the wrapper would file every
     collector failure as a successful run.
     """
+    try:
+        return _phase_body_marked(
+            reg,
+            name,
+            run_fn,
+            artifact_key=artifact_key,
+            supports_auto_skip=supports_auto_skip,
+            verify_artifact_exists=verify_artifact_exists,
+            bucket=bucket,
+        )
+    except _MarkerNotOk as not_ok:
+        # The marker is durable with `status: error`; the collector's own
+        # result continues to the manifest wrapper unchanged (`_MarkerNotOk`).
+        return not_ok.result
+
+
+def _phase_body_marked(
+    reg: "PhaseRegistry",
+    name: str,
+    run_fn,
+    *,
+    artifact_key: str | None,
+    supports_auto_skip: bool,
+    verify_artifact_exists: bool,
+    bucket: str | None,
+) -> dict:
+    """:func:`_phase_body`'s work, inside the phase marker's context manager."""
     with reg.phase(name, supports_auto_skip=supports_auto_skip) as ctx:
         if ctx.skipped:
             logger.info(
@@ -1272,14 +1402,19 @@ def _phase_body(
                     f"config-I2702 deliverable #2 — rc=0 must mean the artifact exists, "
                     f"never just 'the process did not crash')",
                 )
-        # `degraded` is deliberately NOT recorded as a completed artifact.
-        # record_artifact is what arms same-date auto-skip, and a rerun that
-        # skips a degraded phase returns `{"status": "ok", "auto_skipped":
+        # `degraded` is deliberately NOT recorded as a completed artifact, and
+        # (alpha-engine-config-I11812) its MARKER is not `ok` either: a rerun
+        # that skips a degraded phase returns `{"status": "ok", "auto_skipped":
         # True}` — the degradation would vanish on the second run, which is a
         # false green on exactly the day someone is rerunning to look at it.
-        # The cost is that a same-date rerun recomputes the snapshot; that is
-        # the right trade against losing the verdict.
-        if artifact_key and result.get("status") in ("ok", "ok_dry_run"):
+        # Withholding the artifact alone never prevented that, because the
+        # registry auto-skips on the marker's status and an empty artifact list
+        # validates trivially; `_MarkerNotOk` is what does. The cost is that a
+        # same-date rerun recomputes the phase; that is the right trade against
+        # losing the verdict.
+        if result.get("status") not in _MARKER_OK_STATUSES:
+            raise _MarkerNotOk(name, result)
+        if artifact_key:
             ctx.record_artifact(artifact_key)
         return result
 
