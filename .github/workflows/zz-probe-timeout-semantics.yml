@@ -17,11 +17,15 @@ jobs:
     if: ${{ always() }}
     runs-on: ubuntu-latest
     steps:
-      - run: |
-          echo "needs.slow.result=${{ needs.slow.result }}"
-          echo "cancelled()=${{ cancelled() }}"
-          echo "failure()=${{ failure() }}"
-          echo "success()=${{ success() }}"
+      - run: echo "needs.slow.result=${{ needs.slow.result }}"
+      - if: ${{ always() && cancelled() }}
+        run: echo "cancelled()=true"
+      - if: ${{ always() && !cancelled() }}
+        run: echo "cancelled()=false"
+      - if: ${{ always() && failure() }}
+        run: echo "failure()=true"
+      - if: ${{ always() && !failure() }}
+        run: echo "failure()=false"
   cond-not-cancelled:
     needs: [slow]
     if: ${{ always() && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
