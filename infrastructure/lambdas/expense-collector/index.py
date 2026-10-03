@@ -884,6 +884,23 @@ def _attach_daily_by_system(row: dict, ce, now: datetime) -> None:
         row["detail"]["daily_by_system_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
 
+def _bucket_in_month(bucket: dict, month_start: datetime) -> bool:
+    """True when a cost_report daily bucket starts on/after ``month_start``.
+    Only consulted for the widened first-of-month read
+    (alpha-engine-config-I11900), whose extra leading bucket belongs to the
+    PRIOR month. A bucket with no parseable ``starting_at`` raises rather
+    than guessing: counting it could add a whole prior-month day to MTD,
+    dropping it could hide spend, and a raise surfaces as ``provider_failed``.
+    """
+    raw = bucket.get("starting_at")
+    if not raw:
+        raise RuntimeError(f"cost_report bucket without starting_at: {sorted(bucket)}")
+    start = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    return start >= month_start
+
+
 def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
                       end: datetime | None = None, last_day: int | None = None) -> dict:
     """``end``/``last_day`` default to the live current-month read (open-ended
@@ -894,7 +911,8 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
     row = _row("anthropic_api", "Anthropic API")
     admin_key = secrets.get(SSM_ANTHROPIC_ADMIN)
     if admin_key:
-        starting = mw["start"].strftime("%Y-%m-%dT00:00:00Z")
+        month_start = mw["start"]
+        query_start = month_start
         # alpha-engine-config-I10013: the Admin API 400s with "Invalid date
         # range: ending date must be after starting date" whenever
         # ending_at is omitted and no full day has elapsed since
@@ -916,12 +934,29 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
         # `ending_at`, not `ending_before` — the old name was simply never
         # sent when `end` was None, which is the common (non-reconciliation)
         # path and why this went unnoticed until the zero-width case above.
+        #
+        # alpha-engine-config-I11900: that fix was necessary but NOT
+        # sufficient. On 2026-10-01 both runs still 400'd with the identical
+        # message on the FIRST request, carrying exactly the range this code
+        # built (starting_at=2026-10-01, ending_at=2026-10-02). The API
+        # clamps `ending_at` to the last COMPLETED daily bucket, so while the
+        # month's first day is in progress every range that starts at the
+        # month's start collapses to zero width, whatever `ending_at` says.
+        # So on that day the live read starts ONE DAY EARLIER (a completed
+        # bucket, so the range is non-empty) and keeps only buckets that
+        # start inside this month: MTD reads 0.00 from the API, which is what
+        # the API itself holds for this month until the 1st completes -- the
+        # same in-progress-day exclusion every other day of the month gets.
         if end is not None:
             ending = end
         else:
             now_ref = mw.get("now") or _now_utc()
-            ending = (now_ref.replace(hour=0, minute=0, second=0, microsecond=0)
-                     + timedelta(days=1))
+            today = now_ref.replace(hour=0, minute=0, second=0, microsecond=0)
+            ending = today + timedelta(days=1)
+            if today <= month_start:
+                query_start = month_start - timedelta(days=1)
+        starting = query_start.strftime("%Y-%m-%dT00:00:00Z")
+        widened = query_start < month_start
         url = ("https://api.anthropic.com/v1/organizations/cost_report"
                f"?starting_at={starting}&limit=31"
                f"&ending_at={ending.strftime('%Y-%m-%dT00:00:00Z')}")
@@ -930,6 +965,8 @@ def collect_anthropic(mw: dict, budgets: dict, secrets: dict, s3, *,
         while pages < 10:
             doc = _http_json(url + (f"&page={page}" if page else ""), headers)
             for bucket in doc.get("data", []):
+                if widened and not _bucket_in_month(bucket, month_start):
+                    continue
                 for res in bucket.get("results", []):
                     # cost_report `amount` is in CENTS (currency minor units),
                     # not dollars — verified live 2026-07-20 against list
