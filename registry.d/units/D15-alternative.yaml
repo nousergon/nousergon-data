@@ -28,12 +28,20 @@ owner: brian
 code_path: "collectors/alternative.py:631"
 trigger:
   kind: "step-functions"
-  owner: "ne-weekly-freshness-pipeline:DataPhase2"
+  # Runs in the standalone stack's weekly machine, started at Sat 05:00 ET by
+  # the Scheduler entry below (nousergon-data-collection.yaml::WeeklySchedule).
+  # The v1 DataPhase2 state is still in ne-weekly-freshness-pipeline's
+  # definition, but the Saturday cadence trigger passes skip_data_phase2
+  # (nousergon-data-PR2025), so v1 never runs it on schedule and this machine is
+  # the one writer.
+  owner: "ne-data-collection-weekly"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-weekly"
   successor: >-
     nousergon-data-collection/data-collection-weekly, dispatcher workload
-    `alternative-phase-two` (alpha-engine-config-I10753). DISABLED until the
-    phase-4 cutover PR (CollectionState ENABLED); SAME command
-    (`weekly_collector.py --phase 2`) the v1 DataPhase2 state ran.
+    `alternative-phase-two` (alpha-engine-config-I10753). ENABLED at the
+    decoupled cutover (alpha-engine-config-I11269); SAME command
+    (`weekly_collector.py --phase 2`) the v1 DataPhase2 state ran. v1 was
+    ne-weekly-freshness-pipeline:DataPhase2.
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
