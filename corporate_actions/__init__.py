@@ -1097,9 +1097,11 @@ def _sync_declared_arcticdb_universe(
     try:
         df = lib.read(ticker).data
     except Exception as exc:  # noqa: BLE001 - symbol absent ⇒ nothing to restate
+        # Named by type only: this path never calls polygon, and logging the
+        # exception text is what a clear-text-logging check cannot verify.
         log.info(
             "corporate_actions.sync: %s not in ArcticDB universe — no declared "
-            "restate (%s)", ticker, _scrub(exc),
+            "restate (%s)", ticker, type(exc).__name__,
         )
         return []
     restated, results = apply_declared(
@@ -1560,7 +1562,7 @@ def sync(
                 log.warning(
                     "corporate_actions.sync: declared restate failed for "
                     "ticker=%s (%s) — continuing; the backfill audit remains "
-                    "the correctness gate", ticker, _scrub(exc),
+                    "the correctness gate", ticker, type(exc).__name__,
                 )
                 continue
             applied[STORE_ARCTICDB_UNIVERSE].extend(res)
