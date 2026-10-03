@@ -258,19 +258,21 @@ def test_declared_states_at_the_decoupled_cutover(stack, tpl):
     flips the Default. This is that change: the same PR removes the v1 SFs'
     inline data stages, so collection is ENABLED and there is still one writer.
 
-    The daily heal stays DISABLED (its v1 rule is paused by the 2026-08-07
-    ruling; enabling it is a separate decision). Both SHADOW schedules turn
+    The daily heal was left DISABLED by the cutover (its v1 rule is paused by
+    the 2026-08-07 ruling; enabling it was a separate decision). That decision
+    is alpha-engine-config-I11812: DailyHealState is ENABLED, and the v1 rule
+    stays paused. Both SHADOW schedules turn
     DISABLED: once v1 stops writing the compared keys, a parity run would
     compare the collector with itself. `data.cutover_ready.parity` is frozen at
     the last pre-cutover report instead (tests/test_gate_read_follows_the_parity_publish.py)."""
     defaults = stack.parameter_defaults(tpl)
     assert defaults["CollectionState"] == "ENABLED"
-    assert defaults["DailyHealState"] == "DISABLED"
+    assert defaults["DailyHealState"] == "ENABLED"
     assert defaults["ShadowSamedayState"] == "DISABLED"
     assert defaults["ShadowMorningState"] == "DISABLED"
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
     assert {n: s["declared_state"] for n, s in by_name.items()} == {
-        "data-collection-daily-heal": "DISABLED",
+        "data-collection-daily-heal": "ENABLED",
         "data-collection-eod": "ENABLED",
         "data-collection-morning": "ENABLED",
         "data-collection-weekly": "ENABLED",
@@ -823,3 +825,15 @@ def test_deploy_script_tags_the_stack_with_the_ruled_key():
     text = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text()
     assert "system=data-collection" in text
     assert "component=" not in text
+
+
+def test_daily_heal_runs_on_trading_days_only(stack, tpl):
+    """alpha-engine-config-I11812. The heal targets the previous trading day, so
+    a weekday-holiday run would re-heal a day already healed, publish no
+    `staging/daily_closes/*` key and fail VerifyRunManifests over a run that
+    had nothing to do. One heal per trading day, like eod and morning."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    heal = by_name["data-collection-daily-heal"]["input"]
+    assert heal["require_trading_day"] is True
+    assert heal["workloads"] == ["daily-heal"]
+    assert heal["verify_units"] == ["D33"]
