@@ -36,6 +36,11 @@ from botocore.exceptions import ClientError
 from nousergon_lib.quant.horizons import DEFAULT_POLICY, HorizonPolicy
 
 from collectors.research_db_upload import upload_research_db
+# The grader's own "today" — the exchange's calendar date, not the UTC box's
+# (alpha-engine-config-I11445). Every check below that asks "has this
+# forward window closed yet?" must ask it on the SAME clock as
+# universe_returns, the code that does the closing.
+from collectors.universe_returns import _market_today
 from dates import default_run_date
 
 logger = logging.getLogger(__name__)
@@ -838,8 +843,10 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
             # `run_date` on this function's signature; not an artifact
             # write), grading whether TODAY, right now, "score_date old
             # enough to expect resolution" holds — replaying it is
-            # meaningless, there is no artifact to reproduce.
-            today = date.today()
+            # meaningless, there is no artifact to reproduce. Read on the
+            # exchange's calendar, matching the grader: a UTC anchor calls a
+            # window closed up to 4h before universe_returns will grade it.
+            today = _market_today()
             outcome_dates = {
                 r[0] for r in conn.execute(
                     "SELECT DISTINCT score_date FROM score_performance_outcomes"
@@ -1507,7 +1514,16 @@ def _emit_horizon_grading_lag_metric(db_path: str, forward_days: int) -> dict:
     # deliverable 5): a CloudWatch gauge of the REAL current grading lag,
     # not an artifact write — no `run_date` on this signature, nothing here
     # to replay.
-    today = date.today()
+    #
+    # On the EXCHANGE's calendar, the same clock universe_returns grades on
+    # (`_market_today`, alpha-engine-config-I11445). With the box's UTC
+    # `date.today()` here, a run between 00:00 UTC and midnight ET judged the
+    # session that had just closed as a closed forward date that the grader —
+    # correctly — still treats as open, and emitted lag=1 for a pipeline that
+    # was fully caught up. That is what latched both horizon-lag alarms in
+    # ALARM from 2026-09-23: every datapoint of 1.0 since 09-19 was emitted
+    # between 00:37 and 03:20 UTC, and every run outside that gap read 0.
+    today = _market_today()
 
     summary: dict = {"status": "ok", "forward_days": h}
     try:
