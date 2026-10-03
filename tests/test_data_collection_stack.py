@@ -258,19 +258,21 @@ def test_declared_states_at_the_decoupled_cutover(stack, tpl):
     flips the Default. This is that change: the same PR removes the v1 SFs'
     inline data stages, so collection is ENABLED and there is still one writer.
 
-    The daily heal stays DISABLED (its v1 rule is paused by the 2026-08-07
-    ruling; enabling it is a separate decision). Both SHADOW schedules turn
+    The daily heal was left DISABLED by the cutover (its v1 rule is paused by
+    the 2026-08-07 ruling; enabling it was a separate decision). That decision
+    is alpha-engine-config-I11812: DailyHealState is ENABLED, and the v1 rule
+    stays paused. Both SHADOW schedules turn
     DISABLED: once v1 stops writing the compared keys, a parity run would
     compare the collector with itself. `data.cutover_ready.parity` is frozen at
     the last pre-cutover report instead (tests/test_gate_read_follows_the_parity_publish.py)."""
     defaults = stack.parameter_defaults(tpl)
     assert defaults["CollectionState"] == "ENABLED"
-    assert defaults["DailyHealState"] == "DISABLED"
+    assert defaults["DailyHealState"] == "ENABLED"
     assert defaults["ShadowSamedayState"] == "DISABLED"
     assert defaults["ShadowMorningState"] == "DISABLED"
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
     assert {n: s["declared_state"] for n, s in by_name.items()} == {
-        "data-collection-daily-heal": "DISABLED",
+        "data-collection-daily-heal": "ENABLED",
         "data-collection-eod": "ENABLED",
         "data-collection-morning": "ENABLED",
         "data-collection-weekly": "ENABLED",
@@ -386,11 +388,12 @@ def test_weekly_mirrors_the_v1_order(stack, tpl):
     data-order dependency on the other legs; alpha-engine-config-I11269 moves
     it from the tail to THIRD, because the v1 weekly SF now waits on D34 but
     not on D15/D16/D46, and at the tail its bounded wait would have to cover
-    two workloads it does not read (tests/test_v1_collection_readiness_wait.py)."""
+    two workloads it does not read (tests/test_v1_collection_readiness_wait.py).
+    alpha-engine-config-I11812 retires D34 and drops the workload: its ticker
+    list is empty by design, and D33's daily heal carries the same chronic heal."""
     weekly = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-weekly"]["input"]
     assert weekly["workloads"] == [
-        "morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two",
-        "rag-weekly-ingestion",
+        "morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion",
     ]
     assert weekly["require_trading_day"] is False
 
@@ -415,8 +418,9 @@ _UNCOVERED_WITH_A_TRACKED_ISSUE: dict[str, str] = {
     # features/{date}/ on Friday, so the phase same-date auto-skips. D34:
     # chronic_polygon_gaps is empty by design, so the heal has nothing to do.
     # Each needs a ruling: retire it, or re-scope what its Saturday leg owns.
-    "D12": "alpha-engine-config-I11812",
-    "D34": "alpha-engine-config-I11812",
+    # Both are now RETIRED (each descriptor's `retirement:` block; D12 because
+    # D31 publishes the same keys every trading day, D34 because D33 carries its
+    # heal), so neither is owed a schedule and both leave this register.
 }
 
 
@@ -821,3 +825,15 @@ def test_deploy_script_tags_the_stack_with_the_ruled_key():
     text = (REPO / "infrastructure" / "deploy-data-collection-stack.sh").read_text()
     assert "system=data-collection" in text
     assert "component=" not in text
+
+
+def test_daily_heal_runs_on_trading_days_only(stack, tpl):
+    """alpha-engine-config-I11812. The heal targets the previous trading day, so
+    a weekday-holiday run would re-heal a day already healed, publish no
+    `staging/daily_closes/*` key and fail VerifyRunManifests over a run that
+    had nothing to do. One heal per trading day, like eod and morning."""
+    by_name = {s["name"]: s for s in stack.schedules(tpl)}
+    heal = by_name["data-collection-daily-heal"]["input"]
+    assert heal["require_trading_day"] is True
+    assert heal["workloads"] == ["daily-heal"]
+    assert heal["verify_units"] == ["D33"]
