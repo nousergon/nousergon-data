@@ -28,9 +28,16 @@ owner: brian
 code_path: "collectors/metron_market_data.py:1043"
 trigger:
   kind: "step-functions"
-  owner: "ne-postclose-trading-pipeline"
-  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
-  schedule: "weekdays 16:00 America/New_York"
+  # Since the decoupled data cutover (alpha-engine-config-I11269; first
+  # standalone EOD run 2026-09-29) this unit runs in the standalone stack's EOD
+  # machine, started at 18:15 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule).
+  # ne-postclose-trading-pipeline (16:00 ET) no longer runs it: its data stages
+  # were removed by that same change.
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-postclose-trading-pipeline"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - "market_data/close_history/{sym}.json"
@@ -61,7 +68,14 @@ run_manifest_prefix: data_collection/runs/D21
 detectors: []
 freshness:
   family: "eod-spine"
-  deadline: "18:15 America/New_York"
+  # The family's worst-case write bound, by the same rule the weekly family
+  # uses (fire + declared runtime ceiling, plan §2 row 1): the 18:15 ET fire
+  # plus each verify_unit writer's SSM-online budget and declared cap,
+  # 18:15 + 95 + 65 = 20:55 ET (tests/test_data_collection_stack.py::
+  # test_the_eod_ordering_chain_is_derived_from_the_template). It read 18:15
+  # while the schedule was 16:45; once the fire moved to 18:15 that value
+  # equalled the fire time and could never be met. Still `proposed`.
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
