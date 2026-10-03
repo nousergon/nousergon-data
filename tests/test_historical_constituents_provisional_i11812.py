@@ -146,8 +146,26 @@ def test_a_polygon_failure_fails_and_never_leaks_the_key():
         [MSG], OBSERVED, today="2026-10-03", confirm=boom, now=NOW,
     )
     assert out.unexplained == [MSG] and out.accepted == []
+    assert out.refused == ["VYLR: Polygon could not confirm it (RuntimeError)"]
     assert "SECRET123" not in out.refused[0]
-    assert "apiKey=***" in out.refused[0]
+
+
+def test_a_polygon_http_error_records_only_its_status():
+    import requests
+
+    resp = requests.Response()
+    resp.status_code = 503
+
+    def boom(ticker):
+        raise requests.HTTPError(
+            "503 for url https://api.polygon.io/v3/reference/tickers/VYLR?apiKey=SECRET123",
+            response=resp,
+        )
+
+    out = hc.provisional_spinoff_additions(
+        [MSG], OBSERVED, today="2026-10-03", confirm=boom, now=NOW,
+    )
+    assert out.refused == ["VYLR: Polygon could not confirm it (HTTPError, HTTP 503)"]
 
 
 def test_a_removal_is_never_a_candidate():
@@ -234,6 +252,40 @@ def test_collect_with_a_polygon_unconfirmed_addition_is_degraded():
     assert out["status"] == "degraded"
     assert out["reference_disagreements"] == [MSG]
     assert "no reference record" in out["detail"]
+
+
+def test_the_polygon_key_never_reaches_the_log_or_the_artifact(caplog):
+    added = _recent(2)
+    snaps = {_recent(4): ["A", "B"], added: ["A", "B", "VYLR"]}
+    rosters = hc.RosterSnapshots(snapshots=snaps, skipped={})
+    s3 = MagicMock()
+    real = hc.declared_spinoff_exceptions
+
+    def leaky(ticker):
+        raise RuntimeError(
+            "500 for url https://api.polygon.io/v3/reference/tickers/VYLR"
+            "?apiKey=SECRET123&api_key=SECRET456"
+        )
+
+    with caplog.at_level("DEBUG"), \
+         patch.object(hc, "load_roster_snapshots", return_value=rosters), \
+         patch.object(hc, "_fetch_changes_table", return_value=(None, "u")), \
+         patch.object(hc, "parse_changes_table", return_value=[]), \
+         patch.object(hc, "resolve_renames", return_value=hc.RenameResolution()), \
+         patch.object(hc, "declared_spinoff_exceptions",
+                      side_effect=lambda f, o, *, as_of: real(
+                          f, o, as_of=as_of, declarations=[])), \
+         patch.object(hc, "_polygon_ticker_details", side_effect=leaky), \
+         patch.object(hc.boto3, "client", return_value=s3):
+        out = hc.collect("bucket", ["A", "B", "VYLR"])
+
+    assert out["status"] == "degraded"
+    assert "provisional acceptance REFUSED" in caplog.text
+    written = s3.put_object.call_args.kwargs["Body"]
+    for secret in ("SECRET123", "SECRET456", "apiKey", "api_key"):
+        assert secret not in caplog.text
+        assert secret not in written
+        assert secret not in json.dumps(out)
 
 
 def test_the_guard_reading_fits_the_run_manifest_contract():

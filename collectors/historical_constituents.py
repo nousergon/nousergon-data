@@ -179,7 +179,6 @@ PROVISIONAL_LISTING_WINDOW_DAYS = 14
 #: The run-manifest guard name each provisional addition is recorded under.
 PROVISIONAL_ADDITION_GUARD = "d02_provisional_addition"
 
-_API_KEY_RE = re.compile(r"(?:apiKey|api_key)=[^&\s]+")
 
 # The changes table is not pinned to one page: on 2026-08-11 a Wikipedia editor
 # split it out of "List of S&P 500 companies" into its own article
@@ -580,11 +579,6 @@ class ProvisionalAdditions:
     refused: list[str] = field(default_factory=list)
 
 
-def _mask_api_key(msg: object) -> str:
-    """Mask a Polygon ``apiKey=...`` querystring in anything we log or publish."""
-    return _API_KEY_RE.sub(lambda m: m.group(0).split("=", 1)[0] + "=***", str(msg))
-
-
 def _polygon_ticker_details(ticker: str) -> dict | None:
     """Polygon's reference record for ``ticker`` (the default confirmer).
 
@@ -664,8 +658,16 @@ def provisional_spinoff_additions(
     try:
         details = confirm(ticker)
     except Exception as exc:  # noqa: BLE001 — a refusal, recorded and logged by the caller
+        # Only the ticker, the exception TYPE and the HTTP status are recorded.
+        # The exception's message is never used: a requests error embeds the
+        # request URL, and Polygon authenticates with ``apiKey`` in that URL's
+        # querystring, so the message is the key (CodeQL
+        # py/clear-text-logging-sensitive-data on nousergon-data-PR2041).
+        status = getattr(getattr(exc, "response", None), "status_code", None)
         out.refused.append(
-            f"{ticker}: Polygon could not confirm it ({type(exc).__name__}: {_mask_api_key(exc)})"
+            f"{ticker}: Polygon could not confirm it ({type(exc).__name__}"
+            + (f", HTTP {status}" if isinstance(status, int) else "")
+            + ")"
         )
         return out
     if not details:
