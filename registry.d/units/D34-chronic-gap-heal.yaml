@@ -23,9 +23,31 @@ component_id: "data-collector-d34-chronic-gap-heal"
 owning_repo: "nousergon-data"
 title: "chronic-gap-heal"
 component: 1
-lifecycle: "in-service"
+lifecycle: "retired"
 owner: brian
 code_path: "weekly_collector.py:3319"
+retirement:
+  ruling: >-
+    Proposed 2026-10-02 in alpha-engine-config-I11812 (C16 decision PR); Brian
+    rules by merging it, the same PR that records this block
+  reason: >-
+    nothing to do and covered elsewhere. Its only input, alpha-engine-config
+    `data/config.yaml` `chronic_polygon_gaps.tickers`, has been `{}` by design
+    since 2026-05-27 (BF-B/BRK-B/MOG-A resolved by the polygon dot-symbol bridge
+    2026-05-19, PSTG left the index 2026-05-27), so every standalone run wrote a
+    `failed` EmptyProduction manifest and repaired nothing (C15 local repro,
+    2026-10-02; no D34 manifest exists under data_collection/runs/D34/). Its
+    sole declared consumer, crucible-executor `upstream_artifact_gate.py`, reads
+    D17's key, not anything D34 alone publishes. And the heal it would perform
+    for a ticker added later is the second half of D33's daily heal
+    (`weekly_collector.py::_run_daily_heal` -> `_run_chronic_gap_heal`).
+  archive_prefix: "reference/price_cache/"
+  archive_note: >-
+    Retiring a producer never deletes its archive (standing preference: retain
+    all archives — data is an asset). Nothing is deleted. The `--chronic-gap-heal`
+    mode and the dispatcher's `chronic-gap-heal` workload key stay, so the heal
+    can still be run on demand.
+  no_successor_workload: true
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:MorningEnrich"
@@ -37,7 +59,9 @@ trigger:
   # anchor `data_gate/clauses.py::_replaced_by_standalone_stack` keys
   # membership on) is wired into the SAME `ne-data-collection-weekly` stack's
   # `WeeklySchedule`, alongside `morning-enrich`.
-  successor: "ne-data-collection-weekly chronic-gap-heal workload (nousergon-data-PR1701, DISABLED)"
+  # alpha-engine-config-I11812: the workload is removed from WeeklySchedule by
+  # the same change that retires this unit, so no schedule runs it.
+  successor: "RETIRED (alpha-engine-config-I11812) — no successor workload; see retirement: above"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 # alpha-engine-config-I10861: corrected from "staging/daily_closes/*", which
@@ -51,8 +75,11 @@ trigger:
 writes:
   - "reference/price_cache/*"
   - arcticdb/universe (library)
-consumers:
-  - "crucible-executor:executor/upstream_artifact_gate.py (via D17's key)"
+consumers: []
+consumers_reason: >-
+  No reader of anything D34 alone publishes. The previously listed
+  crucible-executor `executor/upstream_artifact_gate.py` reads D17's key, which
+  D17 publishes itself (retired under alpha-engine-config-I11812).
 contract:
   schema: contracts/arctic_universe.schema.json
   producer_test: tests/test_p07_contracts.py
@@ -172,3 +199,9 @@ notes: >-
     `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE` in the same
     change. `trigger.successor` corrected to name the actual workload, keeping the
     `nousergon-data-PR1701` anchor token.
+
+    RETIRED (alpha-engine-config-I11812, proposed 2026-10-02 by the C16 decision PR): see
+    the `retirement:` block. The same change drops the `chronic-gap-heal` workload from
+    `WeeklySchedule` and the D34 row from
+    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE`, which
+    nousergon-data-PR2016 had added when it un-named D34 from `verify_units`.

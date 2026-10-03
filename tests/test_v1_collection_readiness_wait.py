@@ -336,11 +336,15 @@ def test_the_weekly_budget_covers_the_est_hour_and_the_caps(schedules):
 
 
 def test_the_weekly_readers_units_are_not_behind_workloads_it_does_not_read(schedules):
-    """chronic-gap-heal (D34) runs before the two workloads whose units the v1
-    weekly does not wait on, so they never extend its budget."""
+    """Every workload writing a unit the v1 weekly waits on runs before the two
+    workloads whose units it does not wait on, so they never extend its budget.
+    (chronic-gap-heal used to be pinned third here; D34 is retired and the
+    workload no longer runs on this schedule, alpha-engine-config-I11812.)"""
     workloads = schedules["data-collection-weekly"]["input"]["workloads"]
-    assert workloads.index("chronic-gap-heal") < workloads.index("alternative-phase-two")
-    assert workloads.index("chronic-gap-heal") < workloads.index("rag-weekly-ingestion")
+    assert "chronic-gap-heal" not in workloads
+    for waited in ("morning-enrich", "weekly-phase-one"):
+        assert workloads.index(waited) < workloads.index("alternative-phase-two")
+        assert workloads.index(waited) < workloads.index("rag-weekly-ingestion")
 
 
 def test_the_preopen_wait_never_runs_past_the_open():

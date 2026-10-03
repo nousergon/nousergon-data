@@ -384,6 +384,15 @@ Resources:
   # D03 stays graded by data-collection-eod. D12 and D34 are registered as
   # uncovered against alpha-engine-config-I11812 pending a ruling on each
   # (retire, or re-scope what its Saturday leg owns).
+  #
+  # D34 RETIRED (alpha-engine-config-I11812, C16 decision PR; Brian rules by
+  # merging it). The `chronic-gap-heal` workload is no longer RUN here either:
+  # its ticker list has been empty by design since 2026-05-27, so every run
+  # wrote a `failed` EmptyProduction manifest and repaired nothing, and the
+  # chronic heal it would perform is the second half of D33's daily heal
+  # (`weekly_collector.py::_run_daily_heal` -> `_run_chronic_gap_heal`). The
+  # dispatcher key stays, so `--chronic-gap-heal` remains runnable on demand.
+  # The paragraphs above that describe D34 joining this schedule are history.
   WeeklySchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -400,7 +409,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "chronic-gap-heal", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D13", "D14", "D15", "D16", "D17", "D46"]}'
+        Input: '{"collection": "weekly", "workloads": ["morning-enrich", "weekly-phase-one", "alternative-phase-two", "rag-weekly-ingestion"], "require_trading_day": false, "verify_units": ["D01", "D02", "D04", "D05", "D06", "D07", "D08", "D10", "D11", "D13", "D14", "D15", "D16", "D17", "D46"]}'
 
   # Daily universe-gap heal. Replaces the orchestration stack's
   # alpha-engine-daily-heal rule (09:00 UTC = 05:00 EDT), now through a state
