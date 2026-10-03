@@ -990,7 +990,10 @@ class TestCollectAnthropicDateRange:
         seen_urls = []
         monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
         index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
-        assert "starting_at=2026-09-01T00:00:00Z" in seen_urls[0]
+        # I11900: that range still 400'd live on 2026-10-01 (the API clamps
+        # ending_at to the last completed day), so on the 1st the read starts
+        # a day early; prior-month buckets are dropped (tests below).
+        assert "starting_at=2026-08-31T00:00:00Z" in seen_urls[0]
         assert "ending_at=2026-09-02T00:00:00Z" in seen_urls[0]
 
     def test_first_of_month_midday_still_after_starting_at(self, monkeypatch):
@@ -1002,7 +1005,7 @@ class TestCollectAnthropicDateRange:
         seen_urls = []
         monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
         index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
-        assert "starting_at=2026-08-01T00:00:00Z" in seen_urls[0]
+        assert "starting_at=2026-07-31T00:00:00Z" in seen_urls[0]
         assert "ending_at=2026-08-02T00:00:00Z" in seen_urls[0]
 
     def test_december_to_january_boundary(self, monkeypatch):
@@ -1016,6 +1019,48 @@ class TestCollectAnthropicDateRange:
         index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
         assert "starting_at=2026-12-01T00:00:00Z" in seen_urls[0]
         assert "ending_at=2027-01-01T00:00:00Z" in seen_urls[0]
+
+    def test_second_of_month_is_not_widened(self, monkeypatch):
+        """Once the 1st has completed, the month's own start is a valid
+        range again; only the in-progress first day is widened (I11900)."""
+        now = datetime(2026, 10, 2, 0, 15, 51, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        seen_urls = []
+        monkeypatch.setattr(index, "_http_json", self._fake_http(seen_urls))
+        index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert "starting_at=2026-10-01T00:00:00Z" in seen_urls[0]
+        assert "ending_at=2026-10-03T00:00:00Z" in seen_urls[0]
+
+    def test_first_of_month_drops_the_prior_month_bucket(self, monkeypatch):
+        """alpha-engine-config-I11900, the live 2026-10-01T00:15:51Z run: the
+        widened read returns 09-30's completed bucket, which must not be
+        counted toward October's MTD; an October bucket, if present, is."""
+        now = datetime(2026, 10, 1, 0, 15, 51, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+
+        def _fake_http(url, headers=None):
+            assert "starting_at=2026-09-30T00:00:00Z" in url
+            return {"data": [
+                {"starting_at": "2026-09-30T00:00:00Z", "ending_at": "2026-10-01T00:00:00Z",
+                 "results": [{"amount": "5000"}]},
+                {"starting_at": "2026-10-01T00:00:00Z", "ending_at": "2026-10-02T00:00:00Z",
+                 "results": [{"amount": "250"}]},
+            ], "has_more": False}
+
+        monkeypatch.setattr(index, "_http_json", _fake_http)
+        row = index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
+        assert row["mtd_cost_usd"] == pytest.approx(2.50)
+        assert row["source"] == "admin_api"
+
+    def test_first_of_month_bucket_without_start_fails_loud(self, monkeypatch):
+        """A widened-read bucket that cannot be placed in a month raises (so
+        `provider_failed` fires) instead of guessing which month it is."""
+        now = datetime(2026, 10, 1, 12, 15, 51, tzinfo=timezone.utc)
+        mw = index._month_window(now)
+        monkeypatch.setattr(index, "_http_json", lambda url, headers=None: {
+            "data": [{"results": [{"amount": "100"}]}], "has_more": False})
+        with pytest.raises(RuntimeError, match="starting_at"):
+            index.collect_anthropic(mw, {}, {index.SSM_ANTHROPIC_ADMIN: "admin-key"}, None)
 
     def test_reconciliation_still_uses_the_closed_month_boundary(self, monkeypatch):
         """The reconciliation path (`end` explicitly given) must keep using
