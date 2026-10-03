@@ -209,6 +209,7 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
             "market_data/historical_constituents.json :: quality reports "
             "n_reference_disagreements == 0, n_recent_skipped_snapshots == 0 and "
             "n_replay_mismatches == 0 (explain a disagreement in collectors/data/sp500_known_retickers.json "
+            "or, for a spin-off addition, collectors/data/sp500_declared_spinoff_additions.json, "
             "only with evidence; a skipped snapshot needs a readable roster)"
         ),
     },

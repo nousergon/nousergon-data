@@ -139,6 +139,20 @@ _KNOWN_RETICKERS_PATH = (
     Path(__file__).resolve().parent / "data" / "sp500_known_retickers.json"
 )
 
+#: Spin-off additions the reference changes table does not list yet: a declared
+#: exception, published as one, never a silent pass. See the file's
+#: ``_comment`` and :func:`declared_spinoff_exceptions`
+#: (alpha-engine-config-I11812).
+_DECLARED_SPINOFF_ADDITIONS_PATH = (
+    Path(__file__).resolve().parent / "data" / "sp500_declared_spinoff_additions.json"
+)
+
+#: How far an observed addition may sit from a declaration's effective date
+#: and still be the event it declares. Index funds can hold an addition from
+#: the close before it takes effect, and a snapshot dates a change up to one
+#: cadence interval after it happens.
+SPINOFF_MATCH_WINDOW_DAYS = 7
+
 # The changes table is not pinned to one page: on 2026-08-11 a Wikipedia editor
 # split it out of "List of S&P 500 companies" into its own article
 # ("move to [[Historical components of the S&P 500]], format"), which failed
@@ -461,6 +475,64 @@ def divergences(
     for ticker, action in sorted(ref - obs):
         out.append(f"reference {action} {ticker} not observed")
     return out
+
+
+def declared_spinoff_exceptions(
+    found: list[str],
+    observed: list[ConstituentChange],
+    *,
+    as_of: str | None,
+    declarations: list[dict] | None = None,
+) -> tuple[list[str], list[str]]:
+    """Split :func:`divergences` output into ``(unexplained, declared)``.
+
+    A spin-off is added to the S&P 500 on its distribution date next to its
+    parent, so the roster gains a name with no matching removal. The
+    reference table can lag that by days (2026-10-01: VYLR, Corteva's seed
+    spin-off, failed the 10-03 weekly's D02 run). A committed declaration
+    explains ``observed added <ticker> not in reference``, and nothing else,
+    when ALL of these hold:
+
+    * the observed ADDED for that ticker is within
+      ``SPINOFF_MATCH_WINDOW_DAYS`` of the declared ``effective`` date;
+    * ``as_of`` (the newest roster snapshot) is on or before ``valid_through``.
+
+    An explained disagreement is returned in ``declared`` with its parent and
+    effective date so the artifact names it. Anything not matched stays
+    unexplained and still makes the run DEGRADED.
+    """
+    if declarations is None:
+        declarations = json.loads(
+            _DECLARED_SPINOFF_ADDITIONS_PATH.read_text()
+        )["spinoff_additions"]
+    added_on: dict[str, list[str]] = {}
+    for c in observed:
+        if c.action == ADDED:
+            added_on.setdefault(c.ticker, []).append(c.date)
+
+    def _days(a: str, b: str) -> int:
+        return abs((
+            datetime.strptime(a, "%Y-%m-%d") - datetime.strptime(b, "%Y-%m-%d")
+        ).days)
+
+    explained: dict[str, str] = {}
+    for d in declarations:
+        msg = f"observed {ADDED} {d['ticker']} not in reference"
+        if msg not in found:
+            continue
+        if as_of is not None and as_of > d["valid_through"]:
+            continue
+        if not any(
+            _days(date, d["effective"]) <= SPINOFF_MATCH_WINDOW_DAYS
+            for date in added_on.get(d["ticker"], [])
+        ):
+            continue
+        explained[msg] = (
+            f"{msg}: declared spin-off of {d['parent']} effective "
+            f"{d['effective']} (valid through {d['valid_through']})"
+        )
+    unexplained = [f for f in found if f not in explained]
+    return unexplained, [explained[f] for f in found if f in explained]
 
 
 def pending_reference_changes(
@@ -1117,13 +1189,25 @@ def collect(
         )
 
     found: list[str] = []
+    declared: list[str] = []
     if reference is not None:
-        found = divergences(
-            observed_sp500, reference, since=SNAPSHOT_CUTOVER, until=newest,
+        found, declared = declared_spinoff_exceptions(
+            divergences(
+                observed_sp500, reference, since=SNAPSHOT_CUTOVER, until=newest,
+            ),
+            observed_sp500,
+            as_of=newest,
         )
+        if declared:
+            logger.warning(
+                "historical_constituents: %d reference disagreement(s) explained "
+                "by a declaration in %s, not by the reference: %s",
+                len(declared), _DECLARED_SPINOFF_ADDITIONS_PATH.name, declared,
+            )
         attestation = {
             "status": "diverged" if found else "agreed",
             "divergences": found,
+            "declared_exceptions": declared,
             "since": SNAPSHOT_CUTOVER,
             "until": newest,
             "pending_reference_changes": (
@@ -1158,6 +1242,8 @@ def collect(
     quality = {
         "n_reference_disagreements": len(found),
         "reference_disagreements": found,
+        "n_declared_reference_exceptions": len(declared),
+        "declared_reference_exceptions": declared,
         "n_skipped_snapshots": len(rosters.skipped),
         "skipped_snapshots": dict(sorted(rosters.skipped.items())),
         "n_skipped_universe_snapshots": len(rosters.universe_skipped),
