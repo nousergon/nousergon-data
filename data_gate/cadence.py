@@ -77,8 +77,11 @@ def latest_trading_day_on_or_before(calendar_date: dt.date) -> dt.date:
 __all__ = [
     "COMPLETION_GRACE",
     "Cadence",
+    "due_fire",
+    "fire_selection_moment",
     "latest_due_fire",
     "latest_trading_day_on_or_before",
+    "manifest_ceiling",
     "parse_cron",
     "unit_cadence",
 ]
@@ -236,10 +239,67 @@ def gate_moment(trading_day: dt.date, now: dt.datetime | None = None) -> dt.date
     The end of that day in New York, or now if that is earlier — a gate reading
     today cannot demand a run scheduled for tonight, and a gate re-reading a past
     day must not be graded against runs that happened after it.
+
+    NOT the ceiling for choosing which fire to grade — that is
+    :func:`fire_selection_moment` (`alpha-engine-config-I11838`).
     """
-    end = dt.datetime.combine(trading_day, dt.time(23, 59, 59), tzinfo=ZoneInfo("America/New_York"))
-    moment = (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
-    return min(moment, end.astimezone(dt.timezone.utc))
+    return min(_now_utc(now), _end_of_trading_day(trading_day))
+
+
+def _end_of_trading_day(trading_day: dt.date) -> dt.datetime:
+    return dt.datetime.combine(
+        trading_day, dt.time(23, 59, 59), tzinfo=ZoneInfo("America/New_York")
+    ).astimezone(dt.timezone.utc)
+
+
+def _now_utc(now: dt.datetime | None) -> dt.datetime:
+    return (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc)
+
+
+def fire_selection_moment(trading_day: dt.date, now: dt.datetime | None = None) -> dt.datetime:
+    """The ceiling for SELECTING ``trading_day``'s due fire: the end of that day
+    in New York plus :data:`COMPLETION_GRACE`, or now if that is earlier.
+
+    `alpha-engine-config-I11838`, lifting `alpha-engine-config-I11354`'s fix out
+    of `standalone.py` so every scheduled-cadence reader selects the same fire.
+    :func:`gate_moment` is the wrong ceiling for this: :func:`latest_due_fire`
+    returns the newest fire whose ``fire + COMPLETION_GRACE`` has passed, so a
+    schedule firing later than 23:59:59 ET minus the grace (17:59 ET) could never
+    have its OWN day's fire selected by a reading for that day. The 18:15 ET EOD
+    run was graded only by the NEXT trading day's reading, and a missed Friday
+    run read green on `run_record` until Monday evening. The grace is a
+    completion allowance, so the instant by which D's fire should have finished
+    is legitimately ``end of D + grace``.
+
+    The clock still bounds it: a reading taken before ``fire + grace`` cannot
+    demand that fire. And no fire after the end of the day is reachable, because
+    ``fire + grace <= end + grace`` means ``fire <= end``.
+    """
+    return min(_now_utc(now), _end_of_trading_day(trading_day) + COMPLETION_GRACE)
+
+
+def due_fire(cadence: Cadence, *, trading_day: dt.date, now: dt.datetime | None = None) -> dt.datetime:
+    """The fire a reading for ``trading_day`` taken at ``now`` grades.
+
+    The one call every scheduled-cadence reader makes (`run_record`,
+    `completeness`, `survives_phase4`, the exit-criteria cycle counters), so
+    one reading cannot grade two different runs of the same schedule.
+    """
+    return latest_due_fire(cadence, as_of=fire_selection_moment(trading_day, now))
+
+
+def manifest_ceiling(fire: dt.datetime, *, trading_day: dt.date, now: dt.datetime | None = None) -> dt.datetime:
+    """The latest run START a reading for ``trading_day`` counts toward ``fire``.
+
+    The later of the end of the trading day (what :func:`gate_moment` always
+    allowed, so a late hand re-run that day still counts) and the fire's own
+    completion window (so a run of an 18:15 ET fire that started after
+    midnight still counts) — bounded by the clock. Deliberately NOT
+    :func:`fire_selection_moment`: a Saturday 05:00 ET weekly run must not be
+    counted toward the PREVIOUS Saturday's fire by a reading for Friday taken
+    after it started.
+    """
+    return min(_now_utc(now), max(_end_of_trading_day(trading_day), fire + COMPLETION_GRACE))
 
 
 def latest_due_fire(
