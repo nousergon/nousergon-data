@@ -162,10 +162,15 @@ class TestSourceCarriesTheEvidence:
         assert 'result.get("status") in ("ok", "degraded")' in src
 
     def test_degraded_does_not_arm_auto_skip(self):
-        """record_artifact arms same-date auto-skip, and an auto-skipped rerun
-        returns status=ok — the degradation would vanish on the second run."""
+        """An `ok` phase marker arms same-date auto-skip, and an auto-skipped
+        rerun returns status=ok — the degradation would vanish on the second
+        run. Withholding `record_artifact` alone never prevented that (an empty
+        artifact list validates trivially); the marker itself must not say
+        `ok` (alpha-engine-config-I11812, behaviour pinned in
+        tests/test_weekly_retry_marker_and_manifest_i11812.py)."""
         src = self._source("weekly_collector.py")
-        assert 'if artifact_key and result.get("status") in ("ok", "ok_dry_run"):' in src
+        assert 'if result.get("status") not in _MARKER_OK_STATUSES:' in src
+        assert "raise _MarkerNotOk(name, result)" in src
 
     def test_the_verdict_is_logged_at_error(self):
         src = self._source("features/compute.py")
