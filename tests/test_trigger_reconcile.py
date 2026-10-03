@@ -131,9 +131,56 @@ def _edit(units: list[Unit], unit_id: str, **trigger) -> list[Unit]:
     return edited
 
 
+#: The DISABLED-annotation, rule and Scheduler-entry tests below need one
+#: declared-disabled EventBridge rule and one declared-disabled Scheduler entry.
+#: They used to borrow D33 and D38, the two units then switched off live.
+#: alpha-engine-config-I11812 proposes re-enabling both, in separate PRs that
+#: may merge in either order, so the two shapes are pinned here as they were
+#: declared on 2026-09-20 instead of riding on whichever unit happens to be off.
+#: The real descriptors are still read for every other unit, and
+#: `test_the_live_descriptors_reconcile_with_their_own_declarations` below
+#: grades D33 and D38 as they are actually declared.
+_PINNED_DISABLED: dict[str, dict] = {
+    "D33": {
+        "kind": "eventbridge-rule",
+        "owner": "alpha-engine-daily-heal",
+        "schedule": "cron(0 9 ? * MON-FRI *) — DISABLED live",
+    },
+    "D38": {
+        "kind": "eventbridge-scheduler",
+        "owner": "alpha-engine-crypto-balances-15min",
+        "schedule": "rate(15 minutes) — DISABLED live",
+    },
+}
+
+
+def _pin_disabled(units: list[Unit]) -> list[Unit]:
+    pinned: list[Unit] = []
+    for unit in units:
+        if unit.unit_id in _PINNED_DISABLED:
+            raw = copy.deepcopy(unit.raw)
+            trigger = {k: v for k, v in raw["trigger"].items() if k != "started_by"}
+            trigger.update(_PINNED_DISABLED[unit.unit_id])
+            raw["trigger"] = trigger
+            unit = Unit(unit_id=unit.unit_id, path=unit.path, raw=raw)
+        pinned.append(unit)
+    return pinned
+
+
 @pytest.fixture(scope="module")
 def units() -> list[Unit]:
-    return load_units()
+    return _pin_disabled(load_units())
+
+
+def test_the_live_descriptors_reconcile_with_their_own_declarations():
+    """The pinned fixture above must not hide the real D33/D38 declarations:
+    they are graded here, unpinned, against live triggers synthesized from
+    those same declarations."""
+    real = load_units()
+    reading = read_triggers_reconciled(
+        _store(_document(_live_matching(real))), real, as_of=READ_AT
+    )
+    assert reading.met, reading.detail
 
 
 @pytest.fixture(scope="module")

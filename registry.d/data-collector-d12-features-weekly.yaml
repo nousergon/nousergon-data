@@ -13,7 +13,18 @@ owning_repo: nousergon-data
 substrate: step-functions
 origin: ne-weekly-freshness-pipeline:DataPhase1
 owner: brian
-lifecycle: in-service
+lifecycle: retired
+lifecycle_owner: brian
+lifecycle_reexam: '2026-09-28'
+lifecycle_reason: 'Generated from registry.d/units/D12-*.yaml (P-08): the unit descriptor declares lifecycle:
+  ''retired'' — Proposed 2026-10-02 in alpha-engine-config-I11812 (C16 decision PR); Brian rules by merging
+  it, the same PR that records this block. covered by D31. D12 and D31 are the same producer (`features/compute.py::compute_and_write`)
+  writing the same keys (`features/{date}/*.parquet` and `features/registry.json`) under the same contract,
+  consumer pin and registry row. D31 runs every trading day including Friday, so by the time the Saturday
+  phase runs for that Friday the snapshot already exists and the phase same-date auto-skips: every D12
+  manifest since the first one (2026-09-18 through 2026-09-25, nine manifests) is `not_applicable` / `no_new_data_declared`
+  with no outputs. Its consumers (crucible-research `scoring/factor_scoring.py` and `data/fetchers/feature_store_reader.py`,
+  crucible-dashboard `views/13_Feature_Store.py`) read `features/{date}/` keys D31 writes.'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D12''s own code path (features/compute.py:1103)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no

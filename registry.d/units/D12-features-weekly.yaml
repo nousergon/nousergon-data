@@ -23,13 +23,40 @@ component_id: "data-collector-d12-features-weekly"
 owning_repo: "nousergon-data"
 title: features (weekly)
 component: 1
-lifecycle: "in-service"
+lifecycle: "retired"
 owner: brian
 code_path: "features/compute.py:1103"
+retirement:
+  ruling: >-
+    Proposed 2026-10-02 in alpha-engine-config-I11812 (C16 decision PR); Brian
+    rules by merging it, the same PR that records this block
+  reason: >-
+    covered by D31. D12 and D31 are the same producer
+    (`features/compute.py::compute_and_write`) writing the same keys
+    (`features/{date}/*.parquet` and `features/registry.json`) under the same
+    contract, consumer pin and registry row. D31 runs every trading day
+    including Friday, so by the time the Saturday phase runs for that Friday
+    the snapshot already exists and the phase same-date auto-skips: every D12
+    manifest since the first one (2026-09-18 through 2026-09-25, nine
+    manifests) is `not_applicable` / `no_new_data_declared` with no outputs.
+    Its consumers (crucible-research `scoring/factor_scoring.py` and
+    `data/fetchers/feature_store_reader.py`, crucible-dashboard
+    `views/13_Feature_Store.py`) read `features/{date}/` keys D31 writes.
+  archive_prefix: "features/"
+  archive_note: >-
+    Retiring a producer never deletes its archive (standing preference: retain
+    all archives — data is an asset). Nothing is deleted. `weekly_collector.py
+    --phase 1` still runs the features step, which stays a free backstop: it
+    computes `features/{date}/` only when D31 did not publish that Friday, and
+    records under runs/D12/ as before (the D09 precedent: a retired unit whose
+    phase still runs).
+  no_successor_workload: true
 trigger:
   kind: "step-functions"
   owner: "ne-weekly-freshness-pipeline:DataPhase1"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  # alpha-engine-config-I11812: retired as a separately graded unit; D31
+  # (ne-data-collection-eod) publishes the same keys every trading day.
+  successor: "RETIRED (alpha-engine-config-I11812) — no successor workload; D31 publishes the same keys; see retirement: above"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
@@ -47,10 +74,14 @@ writes:
   # above (features/registry.py::GROUPS). The completion check could never
   # have passed for this unit while this entry stood, regardless of the
   # recording fix — no run writes this path.
-consumers:
-  - "crucible-research:scoring/factor_scoring.py"
-  - "crucible-research:data/fetchers/feature_store_reader.py"
-  - "crucible-dashboard:views/13_Feature_Store.py"
+consumers: []
+consumers_reason: >-
+  No reader depends on the WEEKLY run. crucible-research
+  `scoring/factor_scoring.py` and `data/fetchers/feature_store_reader.py` and
+  crucible-dashboard `views/13_Feature_Store.py` read `features/{date}/` and
+  `features/registry.json`, which D31 publishes every trading day; D31's
+  descriptor already lists them and carries the same contract and pin
+  (retired under alpha-engine-config-I11812).
 contract:
   schema:
     - "features/registry.py::CATALOG <-> SCHEMA.md §3"
@@ -161,3 +192,9 @@ clause_phase:
   detector: 3
   console_entity: 3
   survives_phase4: 1
+notes: >-
+    RETIRED (alpha-engine-config-I11812, proposed 2026-10-02 by the C16 decision PR): see
+    the `retirement:` block. nousergon-data-PR2016 un-named D12 from `WeeklySchedule`'s
+    `verify_units` and registered it in
+    `tests/test_data_collection_stack.py::_UNCOVERED_WITH_A_TRACKED_ISSUE`; this change
+    removes that register row, because a retired unit is owed no schedule.

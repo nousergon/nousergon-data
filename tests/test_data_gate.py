@@ -1320,7 +1320,34 @@ def test_units_covered_membership_keys_on_the_successor_not_the_trigger_kind(uni
     step-functions units. Keying membership on `kind == "step-functions"`
     dropped it silently, so `units_covered` could read a clean MET with D33's
     `survives_phase4` never graded at all. A gate that reads MET over an
-    ungraded member is worse than one that reads UNMET."""
+    ungraded member is worse than one that reads UNMET.
+
+    alpha-engine-config-I11812 re-declares D33 as a step-functions unit (its
+    standalone machine, `started_by` the Scheduler entry), which left NO real
+    replaced unit with a non-step-functions trigger. The regression is kept
+    meaningful by pinning D33's pre-I11812 trigger here: an `eventbridge-rule`
+    whose successor names the standalone stack is exactly the shape the
+    original defect dropped, and any future unit of that shape is still covered
+    by the real-descriptor assertions below."""
+    units = [
+        descriptors.Unit(
+            unit_id=u.unit_id,
+            path=u.path,
+            raw={
+                **u.raw,
+                "trigger": {
+                    "kind": "eventbridge-rule",
+                    "owner": "alpha-engine-daily-heal",
+                    "successor": "ne-data-collection-daily-heal (nousergon-data-PR1701, DISABLED)",
+                    "schedule": "cron(0 9 ? * MON-FRI *) — DISABLED live",
+                    "runs_on": "ec2-spot",
+                },
+            },
+        )
+        if u.unit_id == "D33"
+        else u
+        for u in units
+    ]
     members = {u.unit_id for u in clause_module._sf_only_units(units)}
     kinds = {
         u.unit_id: str((u.raw.get("trigger") or {}).get("kind") or "")
