@@ -1146,13 +1146,19 @@ class TestConsolidatedNotify:
         assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
         assert_degraded_continuation(states, "ReportCardDegraded", "PublishReportCardDegraded")
         assert states["PublishReportCardDegraded"]["Next"] == "CheckSkipScannerLeaderboard"
-        assert states["CheckSkipDirector"]["Default"] == "Director"
+        # alpha-engine-config-I11936: the Director runs on the weekly box; its
+        # gate_state is assembled by PrepareDirectorOnSpot first.
+        assert states["CheckSkipDirector"]["Default"] == "PrepareDirectorOnSpot"
+        assert states["PrepareDirectorOnSpot"]["Next"] == "Director"
         director = states["Director"]
         # alpha-engine-config-I11299: Director's success edge now passes through
         # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
         # whose degraded branch converges on it too. The witness property is
         # unchanged: every route here descends from that ONE success edge.
-        assert director["Next"] == "CheckDirectorRetroRefused"
+        # alpha-engine-config-I11936: the success edge is now the box's exit-code
+        # records, each landing where the Lambda Task's Next did.
+        for _rec in ("RecordDirectorClean", "RecordDirectorDegraded", "RecordDirectorRetroRefused", "RecordDirectorDegradedRetroRefused"):
+            assert states[_rec]["Next"] == "CheckDirectorRetroRefused"
         assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
         assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"
@@ -1200,7 +1206,12 @@ class TestConsolidatedNotify:
         advisory Lambdas (eval-judge / rationale-clustering / counterfactual)
         which all run dry via $.research_dry rather than skipping.
         """
-        for state_name in ("ReportCard", "Director"):
+        # alpha-engine-config-I11936: the Director is an SSM command on the
+        # weekly box now — the same two values ride its argv instead of a Payload.
+        commands = states["Director"]["Parameters"]["Parameters"]["commands.$"]
+        assert "--date {} --dry-run {}" in commands
+        assert ",$.run_date,$.research_dry," in commands
+        for state_name in ("ReportCard",):
             payload = states[state_name]["Parameters"]["Payload"]
             assert payload.get("dry_run.$") == "$.research_dry", (
                 f"{state_name}.Payload must thread dry_run.$=$.research_dry so the "
