@@ -96,7 +96,8 @@ _FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 # alpha-engine-config-I9760). Choosing new budgets for stages that are about to
 # be deleted is work with no reader. If v1 is not deleted by 10-31, this fails
 # again and the budgets get chosen then. The two step_function_eod_reconcile
-# entries survive v1 and must be fixed, not re-dated, before this deadline.
+# entries survived v1 and were FIXED, not re-dated (alpha-engine-config-I6897,
+# 2026-10-03): see the note where they used to sit in the set below.
 _KNOWN_UNBOUND_EXPIRY = "2026-10-31"
 
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
@@ -114,11 +115,17 @@ _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
         ("step_function.json", "DispatchWeeklyFreshnessSpot"),
         ("step_function_daily.json", "PredictorInference"),
         ("step_function_daily.json", "ReinvokePredictor"),
-        # alpha-engine-config-I11269: both states MOVED (unchanged) into the
-        # collector-gated reconcile machine when the post-close SF was split —
-        # re-keyed, not resolved, so the debt stays counted.
-        ("step_function_eod_reconcile.json", "ProbeEODReconcilePrecondition"),
-        ("step_function_eod_reconcile.json", "HealReProbe"),
+        # ProbeEODReconcilePrecondition and HealReProbe LEFT this set on
+        # 2026-10-03 (alpha-engine-config-I6897). Both invoke
+        # alpha-engine-eod-precondition-probe (function Timeout 30) and tied
+        # it at 30 -- the RACE branch. Their state budget is now 10, below the
+        # function, so States.Timeout names the state. Measured: 66 REPORT
+        # lines 2026-07-15..10-02, Duration+Init p95 3.50s, max 3.77s; 15
+        # ProbeEODReconcilePrecondition transits 2026-07-21..10-02, p95 3.77s,
+        # max 3.81s (HealReProbe never ran in that window; same function, same
+        # payload); no timeout of any kind. p95 x 1.5 is about 5.7s. A timeout on either
+        # state is caught: the first falls through toward reconcile and the
+        # second goes to the next heal iteration.
     }
 )
 
