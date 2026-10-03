@@ -385,12 +385,36 @@ _WORKLOADS: dict[str, str] = {
     # v2 phase 4 disables. SAME two commands in the SAME order that script's run
     # block executes (`weekly_collector.py --phase 1`, then
     # `builders.prune_delisted_tickers --apply`), so the data contract is
-    # unchanged. The subshell makes the pair one pipeline element: the tail runs
-    # `{cmd} 2>&1 | tee` and reads PIPESTATUS[0], which without the parentheses
-    # would report the prune alone and let a failed phase 1 pass.
+    # unchanged. The subshell makes the pair one unit whose exit code the tail
+    # reads, so a failed phase 1 can never pass.
+    #
+    # BOTH LEGS RUN, AND THE EXIT CODE STILL REPORTS EITHER FAILURE
+    # (alpha-engine-config-I11812). This was `phase1 && prune` until 2026-10-03.
+    # `weekly_collector --phase 1` exits 1 when ANY of its ~15 units is less
+    # than `ok`, and on 10-03 one unit was: D02 degraded on the VYLR spin-off.
+    # The `&&` then skipped D14 entirely — a unit with its own run manifest,
+    # its own `verify_units` entry and nothing to do with D02 — so one unit's
+    # degradation silently withheld an unrelated one. Same lesson as
+    # `shadow-weekday` below (I11200): a fail-loud exit contract is not a
+    # sequencing operator.
+    #
+    # Running the prune after a failed phase 1 is safe by the prune's own
+    # construction. It reads the constituents the `latest_weekly.json` pointer
+    # names and FAILS LOUD if they are absent or empty
+    # (`builders/_constituents_loader.py`); a phase 1 that did not advance the
+    # pointer leaves it on the previous week's roster, and a member added since
+    # is still protected by the second condition, because an actively traded
+    # name is not 14 days stale. It deletes only a ticker that is BOTH absent
+    # from constituents AND stale in ArcticDB for 14+ days, after retaining its
+    # history and checking for a rename (`builders/prune_delisted_tickers.py`
+    # docstring). It never reads D02's output.
+    #
+    # Exit code: phase 1's when it failed, else the prune's. `set +e` is scoped
+    # to this subshell.
     "weekly-phase-one": (
-        "( python weekly_collector.py --phase 1 "
-        "&& python -m builders.prune_delisted_tickers --apply )"
+        "( set +e; python weekly_collector.py --phase 1; PHASE1_RC=$?; "
+        "python -m builders.prune_delisted_tickers --apply; PRUNE_RC=$?; "
+        "[ $PHASE1_RC -ne 0 ] && exit $PHASE1_RC; exit $PRUNE_RC )"
     ),
     # alpha-engine-config-I10733: the filing-date-indexed EDGAR fundamentals
     # dataset (`collectors/edgar_pit_fundamentals.py`). In-region because it
