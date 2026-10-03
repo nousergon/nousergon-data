@@ -1363,7 +1363,7 @@ def _phase_body_marked(
                                       "published nothing on this run — clear the shadow prefix "
                                       "or --force-phases, a skipped shadow unit is not evidence")
             return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
-        result = run_fn() or {}
+        result = _annotate_phase_marker(reg, name, run_fn() or {})
         # alpha-engine-config-I11230 deliverable 4: the status vocabulary this
         # function branches on below is closed. A collector returning anything
         # outside it (a typo, a new status nobody wired here yet) must fail
@@ -5647,6 +5647,25 @@ def main() -> None:
             {k: v.get("status", "?") for k, v in results.get("collectors", {}).items()},
         )
         raise SystemExit(1)
+
+
+def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dict:
+    """Carry a collector's provisional acceptances onto its phase marker.
+
+    alpha-engine-config-I11812 (fix D): D02 may accept one Polygon-confirmed
+    spin-off addition without a committed declaration, and that must never be
+    silent. The artifact and the run manifest (a guard reading per addition)
+    already carry it; this puts the same ``provisional_additions`` list on the
+    marker a retry and an operator read first. A registry without
+    ``annotate_marker`` (a test double, the lib base class) is left alone.
+    Returns ``result`` unchanged. Defined down here, and called inline, so it
+    moves no line numbers in ``.debug-swallow-allowlist.yaml``.
+    """
+    accepted = result.get("provisional_additions") if isinstance(result, dict) else None
+    annotate = getattr(reg, "annotate_marker", None)
+    if accepted and callable(annotate):
+        annotate(name, provisional_additions=list(accepted))
+    return result
 
 
 if __name__ == "__main__":
