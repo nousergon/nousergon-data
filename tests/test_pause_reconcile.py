@@ -939,3 +939,92 @@ def test_main_calls_publish_paused_lanes_after_publish(mod, monkeypatch):
     assert calls == ["publish", "publish_paused_lanes"], (
         "publish_paused_lanes must run right after publish(), same --publish/--dry-run gate"
     )
+
+
+# ── the post-merge settle window (2026-10-03, #2022 / #2023 races) ───────────
+
+def _trig(name, state, surface="scheduler", group="default"):
+    t = {"surface": surface, "name": name, "state": state}
+    if surface == "scheduler":
+        t["group"] = group
+    return t
+
+
+class _Clock:
+    def __init__(self):
+        self.t = 0.0
+
+    def __call__(self):
+        return self.t
+
+    def sleep(self, s):
+        self.t += s
+
+
+def test_settle_returns_the_snapshot_once_the_finding_trigger_moves(mod):
+    """The 2026-10-03 shape: read DISABLED, then the on-merge deploy enables it."""
+    first = [_trig("data-collection-daily-heal", "DISABLED", group="nousergon-data-collection")]
+    finding = {"kind": "undeclared-dark", "surface": "scheduler",
+               "trigger": "nousergon-data-collection/data-collection-daily-heal"}
+    later = [_trig("data-collection-daily-heal", "ENABLED", group="nousergon-data-collection")]
+    reads = iter([first, later])
+    clock = _Clock()
+    fresh = mod.settle(first, [finding], 300, enumerate_=lambda: next(reads),
+                       sleep=clock.sleep, clock=clock, poll_s=30)
+    assert fresh == later
+    assert clock.t == 60, "stops polling as soon as every watched trigger moved"
+
+
+def test_settle_never_regrades_a_trigger_that_does_not_move(mod):
+    """A real finding is reported exactly as before — the window is a wait, not a filter."""
+    first = [_trig("tick", "DISABLED")]
+    finding = {"kind": "undeclared-dark", "surface": "scheduler", "trigger": "tick"}
+    clock = _Clock()
+    fresh = mod.settle(first, [finding], 300, enumerate_=lambda: list(first),
+                       sleep=clock.sleep, clock=clock, poll_s=30)
+    assert fresh is None
+    assert clock.t == 300
+
+
+def test_settle_is_off_without_a_budget_or_a_trigger_finding(mod):
+    first = [_trig("tick", "DISABLED")]
+    boom = lambda: (_ for _ in ()).throw(AssertionError("must not enumerate"))  # noqa: E731
+    f = {"kind": "undeclared-dark", "surface": "scheduler", "trigger": "tick"}
+    assert mod.settle(first, [f], 0, enumerate_=boom) is None
+    alarm = {"kind": "alarm-stale-disabled", "surface": "cloudwatch", "trigger": "a"}
+    assert mod.settle(first, [alarm], 300, enumerate_=boom) is None
+
+
+def test_main_regrades_on_the_settled_snapshot_and_renders_the_transient(mod, monkeypatch, capsys):
+    first = [_trig("tick", "DISABLED")]
+    later = [_trig("tick", "ENABLED")]
+    finding = {"kind": "undeclared-dark", "surface": "scheduler", "trigger": "tick", "detail": "d"}
+    monkeypatch.setattr(mod, "live_triggers", lambda: first)
+    monkeypatch.setattr(mod, "load_registry", lambda registry_dir=None: {})
+    monkeypatch.setattr(mod, "reconcile",
+                        lambda triggers, **kw: [finding] if triggers is first else [])
+    monkeypatch.setattr(mod, "settle", lambda trigs, findings, budget: later)
+    monkeypatch.setattr(mod, "declared_alarm_gaps", lambda manifest=None: [])
+    monkeypatch.setattr(sys, "argv", ["pause_reconcile.py", "--check", "--settle", "300"])
+    assert mod.main() == 0
+    out = capsys.readouterr().out
+    assert "converged-during-settle" in out and "scheduler:tick" in out
+
+
+def test_main_does_not_settle_by_default(mod, monkeypatch):
+    finding = {"kind": "undeclared-dark", "surface": "scheduler", "trigger": "tick", "detail": "d"}
+    monkeypatch.setattr(mod, "live_triggers", lambda: [_trig("tick", "DISABLED")])
+    monkeypatch.setattr(mod, "load_registry", lambda registry_dir=None: {})
+    monkeypatch.setattr(mod, "reconcile", lambda **kw: [finding])
+    monkeypatch.setattr(mod, "settle", lambda *a, **k: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setattr(mod, "declared_alarm_gaps", lambda manifest=None: [])
+    monkeypatch.setattr(sys, "argv", ["pause_reconcile.py", "--check"])
+    assert mod.main() == 1
+
+
+def test_the_workflow_settles_on_push_only(mod):
+    text = WORKFLOW.read_text(encoding="utf-8")
+    assert "--settle \"$SETTLE_SECONDS\"" in text
+    assert "github.event_name == 'push' && '300' || '0'" in text, (
+        "scheduled runs race no deploy; only a push grades a change its own "
+        "on-merge deploy is still applying")

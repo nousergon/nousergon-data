@@ -161,11 +161,23 @@ jobs:
       #
       # Exit 2 (could not run) fails this job; exit 1 (found drift) does not,
       # and fails the `verdict` job below instead — see the header.
+      #
+      # SETTLE ON PUSH ONLY (2026-10-03). A push that edits automation_pause.json
+      # starts this workflow in the same second as the deploy that applies the
+      # edit, so the first read can see a trigger before that deploy flips it:
+      # nousergon-data#2022 and #2023 each produced one `undeclared-dark` against a
+      # correct declaration that cleared with nothing changed. With --settle the
+      # reconciler waits (up to 300s, polling the 2s enumeration) for a finding's
+      # trigger to MOVE and then re-grades in full; a trigger that does not move
+      # is reported exactly as before. Scheduled runs race nothing and pass 0.
+      # Budget: ~3 min first pass + 300s + one ~150s re-grade < the 15-min timeout.
       - name: Pause manifest vs observability registry vs live AWS
         id: check
+        env:
+          SETTLE_SECONDS: ${{ github.event_name == 'push' && '300' || '0' }}
         run: |
           code=0
-          python3 infrastructure/pause_reconcile.py --check --publish --markdown "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT" || code=$?
+          python3 infrastructure/pause_reconcile.py --check --settle "$SETTLE_SECONDS" --publish --markdown "$GITHUB_STEP_SUMMARY" --github-output "$GITHUB_OUTPUT" || code=$?
           echo "reconciler exit code: $code"
           if [ "$code" -ge 2 ]; then
             echo "The reconciler could NOT run. This is a broken detector, not a clean fleet."
