@@ -50,10 +50,14 @@ __all__ = [
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
     "EXIT_CRITERION_CLAUSES",
+    "OBSERVATION_WINDOW_CLAUSE_PATTERNS",
+    "OBSERVATION_WINDOW_RULING",
+    "ObservationWindowClause",
     "PHASE1_UNITS_PRODUCED_CLAUSE",
     "RetiredClause",
     "UnconnectedClause",
     "base_clause_name",
+    "is_observation_window",
     "is_retired",
     "is_unconnected",
     "is_ungraded",
@@ -115,6 +119,25 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
     "data.phase2.vendor_divergence_emitted",
     "data.phase2.executor_collection_writes_zero",
     "data.phase3.sustained_window",
+)
+
+#: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
+#: (:data:`OBSERVATION_WINDOW_RULING`): every phase-2/3 clause whose requirement
+#: counts elapsed cycles or days and that `alpha-engine-config-I11305` does not
+#: already name. fnmatch patterns, so the eight per-family freshness SLO rows
+#: are one entry — the family list comes from the descriptors.
+#:
+#: NOT here, deliberately: I11305's five (`executor_collection_writes_zero`,
+#: `data.cost.monthly`, `data.pages.monthly`, `data.human_touch.monthly`,
+#: `data.phase3.sustained_window`), which that issue converts under its own
+#: deliverables; and `data.slo.completeness.*`, whose requirement ("every
+#: published key met its declared floor") reads ONE document and counts no
+#: elapsed time, so there is no window for the ruling to run behind.
+OBSERVATION_WINDOW_CLAUSE_PATTERNS: tuple[str, ...] = (
+    "data.phase2.eod_universe_covered",
+    "data.phase2.empty_fresh_free",
+    "data.phase2.vendor_divergence_emitted",
+    "data.slo.freshness.*",
 )
 
 CUTOVER_READY_ROLES: tuple[str, ...] = (
@@ -303,6 +326,128 @@ def _standing_clause(name: str, requirement: str, reading: ev.Reading, *, phase:
         source=reading.source,
         as_of=reading.as_of,
         ruling=ruling,
+    )
+
+
+#: Brian's ruling, 2026-10-03 23:34Z, on decision card
+#: ``cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG`` — he chose
+#: **"Extend ruling"** on the question *"Let the 19 phase 2–3 clauses that need
+#: weeks of history pass once the check is built and running?"*, whose stated
+#: consequence was that his 2026-09-21 time-gate ruling
+#: (`alpha-engine-config-I11305`) extends to them: each passes once its check
+#: is built and live, the observation window runs to completion behind it,
+#: and a later failed observation reopens it. The alternative put to him,
+#: "Keep strict", put phase 2 at 11-03 at the earliest and phase 3 at ~12-01.
+OBSERVATION_WINDOW_RULING = (
+    "Brian, 2026-10-03 (decision card cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG, "
+    "\"Extend ruling\"), extending his 2026-09-21 time-gate ruling (alpha-engine-config-I11305): "
+    "a clause that counts elapsed time passes once its check is built and live, the "
+    "observation window runs to completion behind it, and a later failed observation "
+    "reopens it."
+)
+
+
+@dataclass(frozen=True)
+class ObservationWindowClause(Clause):
+    """A clause that counts elapsed time, graded under Brian's 2026-10-03
+    extension of the time-gate ruling (:data:`OBSERVATION_WINDOW_RULING`).
+
+    Unlike :class:`StandingClause` it IS graded by its phase's gate — it is
+    never excluded from any arithmetic. What changes is only what MET means:
+
+    * **built and live** — the reader's :class:`~data_gate.evidence.
+      ObservationWindow` reports at least one REAL reading for every part of
+      the check. A declared-but-silent check, a missing metric document or an
+      UNMEASURABLE read is never MET.
+    * **no failed observation** — every observation made so far inside the
+      trailing window passed. The ruling forgives only the part of the window
+      not yet observed; a failure anywhere in it REOPENS the clause (UNMET),
+      and it stays open until the failure ages out of the window, which takes
+      exactly the clean run the original criterion needed after a failure.
+
+    ``window_complete`` keeps the ORIGINAL criterion's verdict (the full
+    window observed, none failed) on the row, so the window running behind
+    the clause stays visible and a consumer can still read the strict answer.
+    """
+
+    ruling: str = ""
+    window_observed: int = 0
+    window_required: int = 0
+    window_failures: tuple[str, ...] = ()
+    window_complete: bool = False
+
+
+def is_observation_window(clause: Clause) -> bool:
+    return isinstance(clause, ObservationWindowClause)
+
+
+def _observation_window_clause(
+    name: str, requirement: str, reading: ev.Reading, *, phase: str
+) -> Clause:
+    """One time-counting clause graded under :data:`OBSERVATION_WINDOW_RULING`.
+
+    Fails CLOSED: a reading with no window facts cannot show its check is
+    live, so it is UNMET with the reason rather than falling back to anything.
+    """
+    window = reading.window
+    common = dict(
+        phase=phase,
+        source=reading.source,
+        as_of=reading.as_of,
+        ruling=OBSERVATION_WINDOW_RULING,
+    )
+    if reading.unmeasurable:
+        return ObservationWindowClause(
+            name, requirement, False, reading.detail, reading.evidence, unmeasurable=True, **common
+        )
+    if window is None:
+        return ObservationWindowClause(
+            name,
+            requirement,
+            False,
+            "the reader reported no observation window, so nothing shows the check is live; "
+            f"UNMET (fails closed under the 2026-10-03 ruling). {reading.detail}",
+            reading.evidence,
+            **common,
+        )
+    facts = dict(
+        window_observed=window.observed,
+        window_required=window.required,
+        window_failures=window.failures,
+        window_complete=window.complete,
+    )
+    progress = f"{window.observed} of {window.required} {window.unit} observed"
+    if not window.live:
+        met = False
+        verdict = (
+            f"NOT LIVE: {window.not_live}. Under the 2026-10-03 ruling this passes only once "
+            "its check is built and has produced a real reading"
+        )
+    elif window.failures:
+        met = False
+        verdict = (
+            f"REOPENED: {len(window.failures)} failed observation(s) inside the trailing "
+            f"{window.required}-{window.unit} window ({progress}): {list(window.failures)[:6]}; "
+            "UNMET until they age out of the window"
+        )
+    else:
+        met = True
+        verdict = (
+            f"MET under the 2026-10-03 ruling: check live, {progress}, none failed; "
+            + (
+                "the full window is complete"
+                if window.complete
+                else "the window keeps running behind it and any failed observation reopens it"
+            )
+        )
+    return ObservationWindowClause(
+        name,
+        requirement,
+        met,
+        f"{verdict}. Original criterion: {reading.detail}",
+        reading.evidence,
+        **common,
+        **facts,
     )
 
 
@@ -591,6 +736,34 @@ def _clause_objective(store: ev.GateStore, name: str, requirement: str, key: str
         phase=f"data-phase{_OBJECTIVE_PHASE}",
         source=reading.source,
         as_of=reading.as_of,
+    )
+
+
+#: Plan §2 objective 1's window: the deadline met on >= 19 of every rolling 20
+#: scheduled cycles, and the payload's own as_of right on 20 of 20.
+SLO_FRESHNESS_CYCLES = 20
+
+
+def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
+    """One family's freshness SLO, graded under :data:`OBSERVATION_WINDOW_RULING`.
+
+    The SLO counts a 20-cycle window, so under Brian's 2026-10-03 ruling it
+    passes once its producer publishes a real ``ok``/``breach`` verdict and no
+    cycle observed so far fails the target — `evidence.read_windowed_objective`
+    states the producer contract that makes that readable.
+    """
+    key = f"metrics/slo/freshness/{family}/latest.json"
+    return _observation_window_clause(
+        f"data.slo.freshness.{family}",
+        (
+            f"the {family} family met its declared deadline on >= 19 of the last "
+            f"{SLO_FRESHNESS_CYCLES} scheduled cycles, AND the payload's own as_of equalled the "
+            f"cycle's trading day on {SLO_FRESHNESS_CYCLES} of {SLO_FRESHNESS_CYCLES} (a fresh "
+            "write of stale content fails). Graded under Brian's 2026-10-03 ruling: MET once the "
+            "SLO publishes a real verdict and no cycle observed so far fails the target"
+        ),
+        ev.read_windowed_objective(store, key, required=SLO_FRESHNESS_CYCLES, unit="cycle(s)"),
+        phase=f"data-phase{_OBJECTIVE_PHASE}",
     )
 
 
@@ -1328,13 +1501,14 @@ def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
 
 
 def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.eod_universe_covered",
         (
             f"the EOD spine priced the declared universe minus DECLARED exclusions on "
             f"{xc.PHASE2_EOD_COVERAGE_DAYS} CONSECUTIVE trading days (plan §6 phase-2 exit); a "
             "day with no completeness MetricRecord breaks the streak, because a missing "
-            "measurement is not a passing one"
+            "measurement is not a passing one. Graded under Brian's 2026-10-03 ruling: MET once "
+            "the guard has published a record and every day since inside the window is GREEN"
         ),
         xc.read_eod_universe_covered(
             store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS
@@ -1344,12 +1518,13 @@ def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.
 
 
 def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.empty_fresh_free",
         (
             f"zero empty-but-fresh writes over {xc.PHASE2_EMPTY_FRESH_CYCLES} EOD cycles, "
             "counted from the guards' own `empty_fresh` verdict and never from rows_out == 0 "
-            "(plan §2 objective 6, phase-2 exit)"
+            "(plan §2 objective 6, phase-2 exit). Graded under Brian's 2026-10-03 ruling: MET "
+            "once the guard has recorded a verdict and no cycle inside the window wrote empty"
         ),
         xc.read_empty_fresh_free(cycles, required_cycles=xc.PHASE2_EMPTY_FRESH_CYCLES),
         phase="data-phase2",
@@ -1357,13 +1532,15 @@ def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
 
 
 def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.vendor_divergence_emitted",
         (
             f"a vendor cross-check verdict was EMITTED on {xc.PHASE2_VENDOR_CYCLES} of "
             f"{xc.PHASE2_VENDOR_CYCLES} cycles, within bound or with each breach named (plan §6 "
             "phase-2 exit). A silent cycle is the failure: no verdict is indistinguishable from "
-            "agreement while being a total absence of measurement"
+            "agreement while being a total absence of measurement. Graded under Brian's "
+            "2026-10-03 ruling: MET once every graded schedule has emitted a verdict and no "
+            "cycle since has been silent or blind"
         ),
         xc.read_vendor_divergence_emitted(cycle_sets, required_cycles=xc.PHASE2_VENDOR_CYCLES),
         phase="data-phase2",
@@ -1455,16 +1632,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
         if unit.unit_id == "D20" and (unit.completeness or {}).get("denominator"):
             clauses.append(_clause_completeness(store, unit, trading_day=trading_day))
     for family in sorted({u.freshness_family for u in units if u.freshness_family}):
-        clauses.append(
-            _clause_objective(
-                store,
-                f"data.slo.freshness.{family}",
-                f"the {family} family met its declared deadline on >= 19 of the last 20 "
-                "scheduled cycles, AND the payload's own as_of equalled the cycle's trading "
-                "day on 20 of 20 (a fresh write of stale content fails)",
-                f"metrics/slo/freshness/{family}/latest.json",
-            )
-        )
+        clauses.append(_clause_slo_freshness(store, family))
         clauses.append(
             _clause_objective(
                 store,
