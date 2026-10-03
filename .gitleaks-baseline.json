@@ -187,5 +187,26 @@
   "Message": "Keep the stage-coverage window across a spot relaunch (#1972)\n\nThe spot-interruption relaunch re-execs the launcher with `exec bash \"$0\"`.\n_STAGE_WINDOW_START was not exported, so the relaunch recomputed it as \"now\"\nand graded the execution's own auto-skipped output as STALE. On\nrehearsal-2026-09-25-1 DataPhase1 that was six artifacts written by attempt 1\nat 21:52-22:12Z, judged against attempt 2's 22:19:59Z window.\n\nExport it in _spot_common.sh and in the spot_data_weekly.sh monolith, so a\nrelaunch keeps the execution's start and a fresh run still captures its own.\n\nRefs nousergon/alpha-engine-config#11607\n\nClaude-Session: https://claude.ai/code/session_01PU9ghbMcx3RDSd8V2om4v1\n\nSigned-off-by: Claude <noreply@anthropic.com>\nCo-authored-by: Claude <noreply@anthropic.com>\nCo-authored-by: claude[bot] <209825114+claude[bot]@users.noreply.github.com>",
   "Tags": [],
   "Fingerprint": "776d1d36890ef1f456bf8461924de692163fc67c:tests/test_stage_window_survives_spot_relaunch.py:generic-api-key:79"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 341,
+  "EndLine": 341,
+  "StartColumn": 21,
+  "EndColumn": 45,
+  "Match": "key\": \"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "tests/test_run_record_reader.py",
+  "SymlinkFile": "",
+  "Commit": "c17430ed932170043e2cb5b0b61f69d1c6b1d01f",
+  "Link": "https://github.com/nousergon/nousergon-data/blob/c17430ed932170043e2cb5b0b61f69d1c6b1d01f/tests/test_run_record_reader.py#L341",
+  "Entropy": 3.6168747,
+  "Author": "Brian McMahon",
+  "Email": "brian@nousergon.ai",
+  "Date": "2026-10-02T16:52:27Z",
+  "Message": "fix(data-gate): measure D20 completeness, D13/D14 ArcticDB evidence and the cost baseline from the evidence that exists (#2021)\n\nD20 completeness: grade the latest day whose EOD run is due when today's\nmetric is absent and its run is not yet due (scheduled cadence), instead of\nreading UNMET six hours before the run that writes it. Today's metric is\nalways graded when present; an absent due day is UNMET as before.\n\nD13/D14 run_record: the ArcticDB probe that evidences a run must be taken\nAFTER it. Use the first probe record keyed between the run's trading day and\nthe gate day whose as_of_utc post-dates the run's finish. A day-keyed probe\ntaken before the run (Friday's EOD probe vs the Saturday weekly write) no\nlonger reads as its read-back; the pre-cutover 2026-09-25 runs are evidenced\nby 2026-09-28.json, taken 2026-09-29T12:16Z.\n\ncost_monthly: read CUR under \u003cS3Prefix\u003e/\u003cExportName\u003e/data/ (Data Exports\nlayout), not \u003cExportName\u003e/data/, which listed nothing and published\ndays_covered=0. Delivered days before the tag first appears are uncovered,\nnot measured $0 (tag applied 2026-09-28, first tagged usage 2026-09-29).\n\nClaude-Session: https://claude.ai/code/session_01Szwv3KVpJTagJ7ZUvBezVA\n\nCo-authored-by: Claude \u003cnoreply@anthropic.com\u003e",
+  "Tags": [],
+  "Fingerprint": "c17430ed932170043e2cb5b0b61f69d1c6b1d01f:tests/test_run_record_reader.py:generic-api-key:341"
  }
 ]
