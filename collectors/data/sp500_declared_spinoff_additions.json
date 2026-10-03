@@ -1,0 +1,13 @@
+{
+ "_comment": "S&P 500 additions that are a corporate-action spin-off, which the reference changes table does not list yet. On the distribution date S&P adds the spun-off company alongside its parent, so the roster grows by one with no matching removal, and the Wikipedia table often catches up days later. Each entry explains ONE disagreement, 'observed added <ticker> not in reference', only when the observed addition falls within MATCH_WINDOW_DAYS of `effective` and the run's newest snapshot is on or before `valid_through`. Outside that window the disagreement counts again and the run is DEGRADED, so an entry nobody re-examines stops excusing anything. Every explained disagreement is published in the artifact under attestation.declared_exceptions and quality.declared_reference_exceptions. Each entry needs the parent, the effective date and the index provider's own announcement. alpha-engine-config-I11812.",
+ "schema_version": 1,
+ "spinoff_additions": [
+  {
+   "ticker": "VYLR",
+   "parent": "CTVA",
+   "effective": "2026-10-01",
+   "valid_through": "2026-10-31",
+   "evidence": "S&P Dow Jones Indices, 'Vylor Added to the S&P 500; Twilio Set to Join S&P 500; Others to Join S&P MidCap 400 and S&P SmallCap 600' (2026-10-01), https://press.spglobal.com/2026-10-01-Vylor-Added-to-the-S-P-500-Twilio-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600. Corteva's seed business spun off as Vylor and was added to the S&P 500 on its distribution date. The SPY roster went from 503 to 504 names on 2026-10-01 with no removal."
+  }
+ ]
+}
