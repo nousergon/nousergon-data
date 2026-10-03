@@ -2,7 +2,8 @@
 
 24/7 crypto wallet-balance producer for Metron's standalone crypto page (metron-ops#111).
 
-**What it does.** Every 15 minutes (EventBridge Scheduler `rate(15 minutes)`) the Lambda runs
+**What it does.** Once per trading day at 22:30 UTC (EventBridge Scheduler `cron(30 22 ? * MON-FRI *)`;
+every 15 minutes until alpha-engine-config-I11812, R2 (a)) the Lambda runs
 `collectors/crypto_balances.collect()`: reads Metron's published wallet addresses
 (`metron/crypto/wallet_addresses.json`), fetches BTC (Blockstream) + ETH (public JSON-RPC)
 balances and CoinGecko USD prices, and writes `crypto/holdings.json` for Metron to read back.
@@ -26,10 +27,12 @@ schedule.
 
 ## Deploy (operator)
 
-Managed outside CloudFormation. Merging the PR has **zero live effect** until bootstrapped.
+Managed outside CloudFormation. `--bootstrap` (roles, function, schedule) is an operator step and was
+run 2026-06-29; since alpha-engine-config-I11812 every merge touching this Lambda deploys its code and
+re-asserts its schedule (see "Deploy on merge" below).
 
 ```bash
-# first-time: create the Lambda + IAM roles + the 15-min EventBridge Scheduler rule
+# first-time: create the Lambda + IAM roles + the EventBridge Scheduler rule
 bash infrastructure/lambdas/crypto-balances/deploy.sh --bootstrap
 
 # subsequent code updates
@@ -49,4 +52,8 @@ The Lambda role (`iam-policy.json`) is least-privilege: read
 
 Register the `crypto/holdings.json` freshness row in
 `alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml` — **with/after** the producer is
-live (never ahead of it). Cadence ~15 min. (metron-ops#111)
+live (never ahead of it). Cadence: daily on trading days. (metron-ops#111)
+
+**Deploy on merge.** `.github/workflows/deploy-crypto-balances.yml` runs the flagless
+`deploy.sh` on every push to main touching this directory or the collector: code update, plus
+step 3b, which re-asserts the schedule expression and its state from `automation_pause.json`.
