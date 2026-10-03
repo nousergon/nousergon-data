@@ -82,6 +82,7 @@ import json
 import logging
 import subprocess
 import sys
+import time
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -187,6 +188,62 @@ def _paginate(cmd: list[str], key: str):
         token = page.get("NextToken")
         if not token:
             return
+
+
+#: How often the post-merge settle window re-reads live trigger state. One
+#: enumeration is two cheap list calls (~2s measured 2026-10-03), so polling it is
+#: affordable where re-running the whole reconcile (~150s) is not.
+SETTLE_POLL_SECONDS = 30
+
+
+def _join_key(t: dict) -> tuple[str, str]:
+    """(surface, name-as-a-finding-names-it) — the qualified ``group/name`` for a
+    Scheduler schedule outside the default group, as direction A reports it."""
+    group = t.get("group") if t["surface"] == "scheduler" else None
+    name = f"{group}/{t['name']}" if group and group != DEFAULT_SCHEDULE_GROUP else t["name"]
+    return t["surface"], name
+
+
+def settle(first: list[dict], findings: list[dict], budget_s: float, *,
+           enumerate_=None, sleep=time.sleep, clock=time.monotonic,
+           poll_s: float = SETTLE_POLL_SECONDS) -> list[dict] | None:
+    """A fresh live snapshot if a trigger named by a finding MOVED within
+    ``budget_s``, else None (alpha-engine-config-I7118 follow-up, 2026-10-03).
+
+    WHY. On a push, this workflow starts in the same second as the deploy that
+    APPLIES the change it grades, so it can read a trigger's state before that
+    deploy flips it. Measured twice on 2026-10-03: nousergon-data#2022 moved
+    ``data-collection-daily-heal`` to ``not_paused`` and the reconciler read it
+    DISABLED at ~00:46Z, before ``Deploy data-collection stack`` enabled it at
+    00:47:12Z; #2023 did the same with ``alpha-engine-crypto-balances-15min``
+    (read DISABLED, enabled by ``Deploy crypto-balances`` at 02:24:56Z). Both
+    runs reported ``undeclared-dark`` against declarations that were correct,
+    and both cleared with nothing changed.
+
+    This is a bounded wait for an applier, never a filter: a finding is only
+    re-graded when its trigger's live state actually changed, the re-grade is
+    the full reconcile on the fresh snapshot, and a finding whose trigger never
+    moves is reported exactly as before. Read-only — it calls the same two
+    list APIs as ``live_triggers()``.
+    """
+    enumerate_ = enumerate_ or live_triggers
+    watched = {(f["surface"], f["trigger"]) for f in findings
+               if f.get("surface") in ("events", "scheduler")}
+    if not watched or budget_s <= 0:
+        return None
+    before = {k: v for k, v in ((_join_key(t), t["state"]) for t in first) if k in watched}
+    deadline = clock() + budget_s
+    fresh: list[dict] | None = None
+    while clock() < deadline:
+        sleep(poll_s)
+        snap = enumerate_()
+        now = {_join_key(t): t["state"] for t in snap}
+        moved = {k for k in watched if now.get(k) != before.get(k)}
+        if moved:
+            fresh = snap
+            if moved == watched:
+                break
+    return fresh
 
 
 def sf_invoked_functions() -> set[str]:
@@ -1042,6 +1099,10 @@ def main() -> int:
                      help="append the rendered verdict to this file (use $GITHUB_STEP_SUMMARY)")
     ap_.add_argument("--github-output", type=Path, default=None,
                      help="append verdict/findings/headline to this file (use $GITHUB_OUTPUT)")
+    ap_.add_argument("--settle", type=float, default=0, metavar="SECONDS",
+                     help="on findings, wait up to SECONDS for their triggers' live state "
+                          "to move (an on-merge deploy still applying), then re-grade; "
+                          "the workflow passes it on push only")
     args = ap_.parse_args()
 
     noted: list[dict] = []
@@ -1049,6 +1110,24 @@ def main() -> int:
         triggers = live_triggers()
         rows = load_registry(args.registry_dir)
         findings = reconcile(rows=rows, triggers=triggers, noted=noted)
+        if findings and args.settle > 0:
+            fresh = settle(triggers, findings, args.settle)
+            if fresh is not None:
+                first, triggers, noted = findings, fresh, []
+                findings = reconcile(rows=rows, triggers=triggers, noted=noted)
+                still = {(f["kind"], f["trigger"]) for f in findings}
+                for f in first:
+                    if (f["kind"], f["trigger"]) not in still:
+                        # Rendered, never silent: a reader of the summary sees
+                        # the transient and that it converged.
+                        noted.append({
+                            "kind": "converged-during-settle",
+                            "id": f"{f['surface']}:{f['trigger']}",
+                            "detail": (f"[{f['kind']}] on the first read; the trigger's live "
+                                       "state changed within the settle window and the "
+                                       "full re-grade no longer reports it (an on-merge "
+                                       "deploy applying the change being graded)."),
+                        })
         gaps = declared_alarm_gaps()
     except RuntimeError as exc:
         # The verdict surfaces are written on the BREAKAGE path too, and say
