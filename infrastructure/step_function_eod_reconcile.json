@@ -825,7 +825,7 @@
           "run_date.$": "$.run_date"
         }
       },
-      "TimeoutSeconds": 30,
+      "TimeoutSeconds": 10,
       "Retry": [
         {
           "ErrorEquals": [
@@ -994,7 +994,7 @@
           "run_date.$": "$.run_date"
         }
       },
-      "TimeoutSeconds": 30,
+      "TimeoutSeconds": 10,
       "Retry": [
         {
           "ErrorEquals": [
