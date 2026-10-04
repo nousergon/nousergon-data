@@ -79,6 +79,12 @@ completeness:
   floor: null
   status: not_applicable
   na_code: "N/A-MISSING-INPUT"
+  # alpha-engine-config-I11812: the per-day staging parquet exists only for a day
+  # the heal actually healed. On a day it found nothing to heal the manifest
+  # carries the `empty_fresh` guard reading and the completion check must not
+  # fail the machine for the absence (data_gate/run_manifest_predicate.py).
+  conditional_writes:
+    - "staging/daily_closes/*"
   note: >-
       a heal has no universe denominator; its output is a repair count
       (`days_healed`), which the run manifest records and the heal summary
