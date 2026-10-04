@@ -757,9 +757,14 @@ STAGES: tuple[Stage, ...] = (
         # deriver reads the stage as complete. Listed so the lockstep test
         # sees every *Degraded state on the Director path, which is what
         # stops a future fold from silently meaning "re-run the advisory".
+        # alpha-engine-config-I11936: RecordDirectorDegraded /
+        # RecordDirectorDegradedRetroRefused are the box path's exit-code
+        # records (exit 20 / 22) and always precede DirectorSubStatusDegraded
+        # on the same route — same witness, same meaning.
         degraded_witness=frozenset({
             "PublishDirectorDegraded", "DirectorSubStatusDegraded",
             "SetDirectorSubStatusDegradedSummary",
+            "RecordDirectorDegraded", "RecordDirectorDegradedRetroRefused",
         }),
     ),
     Stage(
@@ -1023,7 +1028,17 @@ def box_dispatch_flags(sm_def: dict) -> tuple:
             "predicate. Add the stage's CheckSkip* gate (and its STAGES row) "
             "before extending the gate."
         )
-    for flag in reversed(list(kept)):
+    # alpha-engine-config-I11936: flags this script can never SET are tried for
+    # removal FIRST. With the Director on the box, both `skip_director` and the
+    # coarse `skip_post_eval` (emit_skip=False) cover the Director's span, and a
+    # plain finest-to-coarsest pass dropped the emittable one and kept the dead
+    # one — the I8167 failure below, reached by ordering alone. Every drop is
+    # still PROVEN redundant by the reachability re-check, so this changes only
+    # which of two equally-sound spellings survives.
+    candidates = sorted(
+        reversed(list(kept)), key=lambda f: STAGES_BY_FLAG[f].emit_skip
+    )
+    for flag in candidates:
         trial = [f for f in kept if f != flag]
         if not box_states_needing_dispatch(sm_def, {f: True for f in trial}):
             kept = trial
