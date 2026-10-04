@@ -81,11 +81,20 @@ guards:
         _SHORT_FETCH_ROW_THRESHOLD refuses a shorter fetch over a longer cache
         (collectors/prices.py:420-424)
   cardinality:
-    state: absent
+    state: present
+    code:
+      - "collectors/prices.py::collect"
+    evaluates: '"status": "ok" if not failed_tickers else "partial"'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Every ticker in the universe passed in whose parquet is missing or stale is refreshed,
+        and any one that is not written (short-fetch or behind-fetch refusal, vendor no data,
+        batch or refresh error) makes the result `partial`.
+        weekly_collector.py::_record_phase_lineage raises that as _DegradedRun, so the manifest
+        is filed degraded, and every unwritten key is named on it under guard `write_refused`
+        (prices.py::refused_keys_guard_entries). The floor is in effect 1.0 of the tickers
+        passed in (declared 0.99). It does not grade the denominator itself: a constituents list
+        that shrinks is D01's cardinality cell. Not in service until commissioned by an induced
+        fault (P-19, alpha-engine-config-I10786).
   units:
     state: present
     note: "PriceBar (sources/contract.py:106)"

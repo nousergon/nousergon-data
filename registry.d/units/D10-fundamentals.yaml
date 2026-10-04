@@ -119,11 +119,18 @@ guards:
         _FIELD_COLLAPSE_MIN_TICKERS gates a collapse REPORT, not a halt
         (collectors/fundamentals.py:716). A report is not a guard.
   units:
-    state: absent
+    state: partial
+    code:
+      - "collectors/fundamentals.py::collect"
+    evaluates: 'share >= _FIELD_COLLAPSE_FAIL_SHARE'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: the field-collapse gate returns `status: error` and writes nothing when one field
+        carries a single value for at least _FIELD_COLLAPSE_FAIL_SHARE (0.99) of the fetched
+        universe, which is how a units mismatch that saturates a clip bound shows up (the
+        gross_margin/roe percent-point incident, alpha-engine-config-I7569/I7583). A mis-scaled
+        field that stays inside its clip band is not caught; that half is the remaining work.
+        Not in service until commissioned by an induced fault (P-19,
+        alpha-engine-config-I10786).
   pit:
     state: absent
     note: >-
