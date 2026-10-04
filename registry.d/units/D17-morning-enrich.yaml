@@ -89,11 +89,17 @@ completeness:
   note: "after the symbol-normalization map (plan §2 row 2)"
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "weekly_collector.py::_record_mode_lineage"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        This unit runs whole-mode under weekly_collector.py::_run_whole_mode_unit;
+        _record_mode_lineage reads its published row count from run_units.MODE_ROWS and files
+        guard `data_empty_fresh` as `empty_fresh` on zero rows and `unmeasurable` when the
+        count is unreported — never a pass. Observe/enforce staging is declared once, in
+        validators/expectations.py::EMPTY_FRESH_GUARD (alpha-engine-config-I10785). Not in
+        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-

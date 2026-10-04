@@ -81,11 +81,19 @@ completeness:
   rows_out_floor_na_code: "N/A-NOT-IMPL"
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "weekly_collector.py::_record_phase_lineage"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        This unit publishes the ArcticDB `universe` and `macro` libraries through
+        weekly_collector.py::_phase_collect (extra_outputs=_arcticdb_backfill_extra_outputs);
+        _record_phase_lineage grades each library it wrote on its measured count via
+        _check_arctic_library_output — zero rows is `empty_fresh`. Filed on every manifest as
+        guard `data_empty_fresh` plus the data.D13.guard.empty_fresh MetricRecord (worst output
+        wins). Observe/enforce staging is declared once, in
+        validators/expectations.py::EMPTY_FRESH_GUARD (alpha-engine-config-I10785). Not in
+        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
@@ -108,11 +116,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        weekly_collector.py::_phase_collect -> _record_phase_lineage. Not in service until
+        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
 arcticdb_evidence:
   via: "data_collection/probes/arctic/{trading_day}.json"
   reason: >-
