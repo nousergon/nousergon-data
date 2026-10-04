@@ -105,6 +105,10 @@ DEFAULT_KEY = "data_collection/metrics/executor_profile/collection_writes/latest
 #: botocore's default pool of 10 would otherwise cap the overlap at 10.
 DEFAULT_WORKERS = 32
 
+#: ``DeleteObjects`` (the batch call) is deliberately absent: CloudTrail also
+#: emits one ``DeleteObject`` per key it removed, and those are what is
+#: counted — counting the batch too would double-count (see
+#: ``_object_bucket_and_key``).
 _WRITE_EVENTS = frozenset({"PutObject", "DeleteObject", "CompleteMultipartUpload"})
 
 
@@ -180,13 +184,36 @@ def _is_executor_identity(record: dict[str, Any]) -> bool:
     return needle in issuer_arn or needle in own_arn
 
 
-def _touches_collection_prefix(record: dict[str, Any], *, object_bucket: str) -> bool:
+def _object_bucket_and_key(record: dict[str, Any]) -> tuple[str, str]:
+    """The ``(bucket, key)`` an S3 data event wrote, or ``("", "")``.
+
+    A single-object call carries both in ``requestParameters``. A batch
+    ``DeleteObjects`` does not: CloudTrail logs one ``DeleteObject`` event
+    per deleted key with ``requestParameters: null``, and the object
+    appears only in ``resources[]`` as an ``AWS::S3::Object`` ARN
+    (``additionalEventData.parentRequestID`` ties it to the batch). ArcticDB
+    prunes this way, so reading ``requestParameters`` alone made every
+    batch-deleted key invisible: 13,400 executor deletes under
+    ``arcticdb/`` in the 2026-09-27..10-03 window were uncounted.
+    """
     params = record.get("requestParameters")
-    if not isinstance(params, dict):
+    if isinstance(params, dict) and params.get("bucketName"):
+        return str(params.get("bucketName")), str(params.get("key") or "").lstrip("/")
+    for resource in record.get("resources") or []:
+        if not isinstance(resource, dict) or resource.get("type") != "AWS::S3::Object":
+            continue
+        arn = str(resource.get("ARN") or "")
+        if not arn.startswith("arn:aws:s3:::"):
+            continue
+        bucket, _, key = arn.removeprefix("arn:aws:s3:::").partition("/")
+        return bucket, key.lstrip("/")
+    return "", ""
+
+
+def _touches_collection_prefix(record: dict[str, Any], *, object_bucket: str) -> bool:
+    bucket, key = _object_bucket_and_key(record)
+    if bucket != object_bucket:
         return False
-    if params.get("bucketName") != object_bucket:
-        return False
-    key = str(params.get("key") or "").lstrip("/")
     return any(key.startswith(p) for p in COLLECTION_PREFIXES)
 
 
