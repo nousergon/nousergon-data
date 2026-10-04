@@ -41,9 +41,9 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 import run_units
 from data_gate.cadence import (
     Cadence,
-    gate_moment,
-    latest_due_fire,
+    due_fire,
     latest_trading_day_on_or_before,
+    manifest_ceiling,
     unit_cadence,
 )
 from data_gate.descriptors import REPO_ROOT, Unit
@@ -608,8 +608,12 @@ def _cycle(
     """The manifests `read_run_record` grades, selected by the unit's cadence."""
     base = f"{_store_relative(unit.run_manifest_prefix)}/"
     if cadence.kind == "scheduled":
-        as_of = gate_moment(trading_day, now)
-        fire = latest_due_fire(cadence, as_of=as_of)
+        # alpha-engine-config-I11838: the fire is chosen against `end of day +
+        # grace`, as `survives_phase4` chooses it, so an 18:15 ET run is graded
+        # by the first reading for its own day taken after its grace; the
+        # manifests counted toward it stay bounded by `manifest_ceiling`.
+        fire = due_fire(cadence, trading_day=trading_day, now=now)
+        as_of = manifest_ceiling(fire, trading_day=trading_day, now=now)
         docs, problems, where = manifests_since(store, unit, since=fire, as_of=as_of)
         return Cycle(
             where=where,
@@ -984,7 +988,7 @@ def completeness_due_day(unit: Unit, *, trading_day: dt.date, now: dt.datetime |
     cadence = unit_cadence(unit.raw)
     if cadence.kind != "scheduled":
         return trading_day
-    fire = latest_due_fire(cadence, as_of=gate_moment(trading_day, now))
+    fire = due_fire(cadence, trading_day=trading_day, now=now)
     fired_on = fire.astimezone(ZoneInfo(cadence.tz)).date()
     return min(trading_day, latest_trading_day_on_or_before(fired_on))
 

@@ -129,7 +129,7 @@ jobs:
   # when) in the fallback Telegram alert.
   notify-main-failure:
     needs: [deploy-infrastructure]
-    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@fe3fbbb5e1969b4eb4e767bb1a9e94ff9cd6ec33 # main
     with:
       blast_radius_message: ${{ needs.deploy-infrastructure.outputs.blast_radius_message }}
