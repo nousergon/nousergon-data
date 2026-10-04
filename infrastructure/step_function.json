@@ -6780,36 +6780,43 @@
     },
     "Director": {
       "Type": "Task",
-      "Comment": "Director (Layer C, Part II) \u2014 the FINAL Saturday-SF task. A single structured Opus call over the fresh Report Card v2 (evaluator/{date}/report_card.json) produces an advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json + updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard (a failed ReportCard skips straight to notify \u2014 no card to weigh). FLAG-GATED: the alpha-engine-evaluator-director Lambda is a no-op (status=disabled) until DIRECTOR_ENABLED is flipped on. TERMINAL ON FAILURE (config#6408, Brian's 2026-08-04 operator ruling): the Director's Catch now routes to NormalizeFailureContext \u2014 a Director failure terminates the execution FAILED rather than reporting degraded success. Per the ruling, a weekly SF execution with a dead Director must not read as success. PREFLIGHT-AWARE (ROADMAP L4504): dry_run.$=$.research_dry. On the Friday-PM Preflight Pipeline (research_dry=true) the handler runs a no-Opus / no-write PROBE \u2014 it constructs the real Opus client (exercising the langchain-anthropic import + the SSM ANTHROPIC_API_KEY fetch / ReadAnthropicSecret IAM grant) and reads the carry-over ledger, then STOPS short of the paid .invoke() and writes NOTHING (no action_plan, no ledger mutation). This is load-bearing: the carry-over ledger is shared + non-date-scoped (director/carryover_ledger.json), so a preflight write would pollute the real Saturday run. A broken import / revoked key grant surfaces as a caught preflight failure ~18h before the real Saturday Director would hit it. | alpha-engine-config-I7282 (sf-pipeline-policy.md \u00a72.3a rule 3): the Payload now carries `gate_state` \u2014 the run's correctness-gate verdicts. Pre-fix this state received {date, dry_run(, snapshot)} and nothing else, so it rendered the week's numbers identically whether the pre-spend gates passed, failed, or never ran; \u00a72.3a rule 3 is explicit that a surface presenting the run's results without the verdict state is asserting a guarantee nobody established. It is not hypothetical: PipelineContractGate reads private-docs/PIPELINE_CONTRACT.yaml from raw.githubusercontent.com UNAUTHENTICATED and alpha-engine-config is PRIVATE, so the URL 404s and that gate has never measured anything on any run (config-I7281), while LibPinDriftCheck has been unmeasured since crucible-predictor#422 (config-I7171). Every field referenced here is seeded in InitializeInput's floor \u2014 see that state's Comment for the absent-on-the-clean-path hazard and why seeding is not optional. Contract: infrastructure/contracts/sf_gate_state.v1.schema.json (byte-identical copy at crucible-evaluator grading/contracts/, both pinned by sha256). Consumer: crucible-evaluator grading/pipeline_gates.py::read_gate_state. Wiring asserted by tests/test_sf_gate_state_wiring.py. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, and every artifact prefix and stage-coverage verdict this state produces keys off it. Downstream normalization with krepis.dates.resolve_trading_day is idempotent, so this is a no-op for consumers that already normalized and a convergence for those that did not.",
-      "Resource": "arn:aws:states:::lambda:invoke",
+      "Comment": "Director (Layer C, Part II) - the FINAL Saturday-SF task: one structured LLM call over the fresh Report Card v2 produces the advisory DirectorWeeklyActionPlan at director/{date}/action_plan.json and updates the carry-over ledger. Runs only after a SUCCESSFUL ReportCard. TERMINAL ON FAILURE (config#6408, Brian's 2026-08-04 ruling): every failure edge below converges on NormalizeFailureContext, as the Lambda's Catch did. PREFLIGHT-AWARE: --dry-run carries $.research_dry, so the Friday-PM preflight runs the no-LLM-call, no-write probe (ROADMAP L4504). gate_state (alpha-engine-config-I7282) arrives via PrepareDirectorOnSpot. PARTITION FAMILY = trading_day (alpha-engine-config-I8809). | alpha-engine-config-I11936 (Brian's 2026-10-03 ruling: move the Director off Lambda). The plan call outgrew AWS Lambda's 900s maximum: completed calls since 2026-09-19 took 379-596s against the Lambda's 600s plan ceiling, and watch-rerun-2026-10-02-1 died at StreamTotalTimeoutError (600s) still streaming reasoning, 0 answer characters; a full answer on that trajectory needs ~1,500s. The Director now runs on the weekly launcher spot ($.ec2_instance_id, DispatchWeeklyFreshnessSpot) over SSM, the WeeklyPreflightOnSpot / EvaluatorDiagnostics pattern: crucible-evaluator infrastructure/director_on_box.sh -> python -m director.box_run, which calls the SAME director.handler code the Lambda runs (director/<date>/action_plan.json, director/latest/, the carry-over ledger, the retro, the digest and the issues are written exactly as before). BOUNDED, NOT UNBOUNDED: the plan call's total_timeout is 1,800s (1.2 x the ~1,500s worst case, 3.0 x the 596s slowest completed call) inside a 2,700s in-process wall (crucible-evaluator director/hosting.py WEEKLY_SPOT); this command's executionTimeout of 3,600s is that wall plus a 900s provisioning allowance (evaluator clone/pin, gitleaks, the evaluator venv), and box_run clamps its wall to the DIRECTOR_SSM_DEADLINE_EPOCH exported on the first line so SSM's kill can never land mid-call. The Lambda alpha-engine-evaluator-director stays deployed and working - rollback is this state's Resource, not a code change.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
-        "FunctionName": "alpha-engine-evaluator-director:live",
-        "Payload": {
-          "date.$": "$.run_date",
-          "dry_run.$": "$.research_dry",
-          "gate_state": {
-            "schema_version": 1,
-            "gate_degraded.$": "$.gate_degraded",
-            "health_check_degraded.$": "$.health_check_degraded",
-            "parity_degraded.$": "$.parity_degraded",
-            "research_predictor_degraded.$": "$.research_predictor_degraded",
-            "lib_pin_drift.$": "$.libpin_drift_result.Payload",
-            "pipeline_contract.$": "$.pipeline_contract_result.Payload",
-            "research_predictor_degraded_routes.$": "$.research_predictor_degraded_routes.routes",
-            "parity_verdict_unknown.$": "$.parity_verdict_unknown"
-          }
-        }
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.ec2_instance_id",
+        "Parameters": {
+          "executionTimeout": [
+            "3600"
+          ],
+          "commands.$": "States.Array('set -eo pipefail','export DIRECTOR_SSM_DEADLINE_EPOCH=$(( $(date +%s) + 3600 ))','export HOME=/home/ec2-user','export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1','[ -d /home/ec2-user/crucible-evaluator/.git ] || sudo -u ec2-user git clone -q https://github.com/nousergon/crucible-evaluator.git /home/ec2-user/crucible-evaluator 1>&2',States.Format('sudo -u ec2-user flock -w 150 /home/ec2-user/.ae-git-sync.lock bash /home/ec2-user/alpha-engine-data/infrastructure/exec_code_pin.sh {} /home/ec2-user/crucible-evaluator',$$.Execution.Name),States.Format('cat > /tmp/director-gate-state-{}.json <<\"DIRECTOR_GATE_STATE_EOF\"',$$.Execution.Name),States.JsonToString($.director_gate_state),'DIRECTOR_GATE_STATE_EOF',States.Format('/home/ec2-user/alpha-engine-dashboard/.venv/bin/python -m krepis.ssm_log_capture run --correlation-id {} --slug director --log /var/log/director.log -- bash /home/ec2-user/crucible-evaluator/infrastructure/director_on_box.sh --date {} --dry-run {} --gate-state-file /tmp/director-gate-state-{}.json --deadline-epoch $DIRECTOR_SSM_DEADLINE_EPOCH --execution-name {}',$$.Execution.Name,$.run_date,$.research_dry,$$.Execution.Name,$$.Execution.Name))"
+        },
+        "TimeoutSeconds": 60
       },
-      "TimeoutSeconds": 930,
+      "TimeoutSeconds": 3660,
       "Retry": [
         {
           "ErrorEquals": [
-            "Lambda.ServiceException",
-            "Lambda.TooManyRequestsException"
+            "States.TaskFailed",
+            "States.Timeout"
           ],
-          "MaxAttempts": 1,
+          "Comment": "config#2279: declared spot-stage sendCommand convention - the 4+2 jittered ladder. SAFE here: this Retry fires only when the SendCommand API call itself failed, BEFORE the Director ran, so no plan, ledger or issue was written; post-delivery outcomes are owned by WaitForDirector + CheckDirectorStatus, which this ladder never re-enters.",
+          "MaxAttempts": 4,
           "IntervalSeconds": 30,
-          "BackoffRate": 1.0
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "config#2279: catch-all transient tier - same idempotency argument as the tier above.",
+          "MaxAttempts": 2,
+          "IntervalSeconds": 30,
+          "BackoffRate": 2.0,
+          "MaxDelaySeconds": 300,
+          "JitterStrategy": "FULL"
         }
       ],
       "Catch": [
@@ -6817,13 +6824,13 @@
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Comment": "config#6408 (Brian's 2026-08-04 operator ruling): Director failure is now TERMINAL \u2014 route to NormalizeFailureContext so the execution ends FAILED rather than reporting degraded success. The Director's Lambda error is captured at $.error (ResultPath) for HandleFailure's SNS alert.",
+          "Comment": "config#6408: a Director failure is TERMINAL - NormalizeFailureContext, error at $.error for HandleFailure's SNS alert, exactly as the Lambda Task's Catch routed.",
           "Next": "NormalizeFailureContext",
           "ResultPath": "$.error"
         }
       ],
-      "ResultPath": "$.director_result",
-      "Next": "CheckDirectorRetroRefused"
+      "ResultPath": "$.director_cmd",
+      "Next": "InitDirectorPollCount"
     },
     "CheckSkipAggregateCosts": {
       "Type": "Choice",
@@ -8156,7 +8163,7 @@
     },
     "CheckSpotDispatchNeeded": {
       "Type": "Choice",
-      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) \u2014 it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here \u2014 the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes. alpha-engine-config-I8167 (operator decision (a), 2026-08-24): the deriver's 8th conjunct is now skip_saturday_health_check rather than skip_post_eval, because skip_post_eval could never be reached from a mechanical recovery's Director-only input without also silently disabling ReportCard/Director/ScannerLeaderboard \u2014 see CheckSkipSaturdayHealthCheck. alpha-engine-config-I11269 (decoupled data cutover): MorningEnrich and DataPhase1 left this definition - the standalone ne-data-collection-weekly runs that work, and WaitForCollectionManifests is a Lambda poll that addresses no box - so the re-derived conjunction no longer carries skip_morning_enrich or skip_data_phase1 and is six conjuncts; the state counts quoted above are as of their own issues.",
+      "Comment": "config#2248 (root-cause fix for the always-on dashboard box SPOF): the 14 downstream sendCommand/Lambda states (MorningEnrich through WeeklySubstrateHealthCheck, plus SubstrateHealthGate's Payload) all key off $.ec2_instance_id. That field is no longer a hardcoded literal in the SaturdayTrigger EventBridge Input or the Friday shell-run trigger Lambda (both stripped by config#2248) \u2014 it is populated HERE, either by an already-present operator/rerun value (this Choice's first branch: scripts/weekly_sf_rerun.py's rerun_input() passes the ORIGINAL failed execution's ec2_instance_id through verbatim, so a watch-rerun reuses the same still-live launcher box instead of paying for a second spot launch) or by a fresh ephemeral spot this Choice's Default branch dispatches via DispatchWeeklyFreshnessSpot. Sits where CheckMutexRole's cadence-acquire path (via AcquireMutex) AND its bypass Default (operator/recovery/non-cadence roles, which skip the mutex entirely) BOTH converge -- so every execution passes through this gate exactly once, regardless of pipeline_role, never burning a spot launch on a mutex conflict -- and BEFORE CheckShellRun / any of the 14 consumer states (nothing may reference $.ec2_instance_id before this gate resolves it). alpha-engine-config-I8162 adds the SECOND branch: bypass the dispatch entirely when EVERY stage that SSM-invokes onto $.ec2_instance_id is skipped by this execution's input, landing straight on the same CheckShellRun convergence with no ec2_instance_id at all (nothing downstream dereferences it once all of those stages are gated off). Recovery is exactly when the skip set is largest, so the most often-unnecessary stage was the one that always ran: watch-rerun-2026-08-22-1 spent 4 of its 16 minutes in DispatchWeeklyFreshnessSpot -> WaitForWeeklyFreshnessSpotBootstrap. The conjunction is NOT hand-maintained here: it is DERIVED from scripts/weekly_sf_rerun.py's STAGES table by reachability over this definition (box_dispatch_flags) and pinned to this state by tests/test_weekly_sf_rerun.py::TestSpotDispatchOnlyWhenABoxStageSurvives. Edit it there, never here \u2014 the two drifting in the other direction denies a boot to a stage that then SSM-invokes onto a box it does not have, which FAILS a run rather than costing four minutes. alpha-engine-config-I8167 (operator decision (a), 2026-08-24): the deriver's 8th conjunct is now skip_saturday_health_check rather than skip_post_eval, because skip_post_eval could never be reached from a mechanical recovery's Director-only input without also silently disabling ReportCard/Director/ScannerLeaderboard \u2014 see CheckSkipSaturdayHealthCheck. alpha-engine-config-I11269 (decoupled data cutover): MorningEnrich and DataPhase1 left this definition - the standalone ne-data-collection-weekly runs that work, and WaitForCollectionManifests is a Lambda poll that addresses no box - so the re-derived conjunction no longer carries skip_morning_enrich or skip_data_phase1 and is six conjuncts; the state counts quoted above are as of their own issues. | alpha-engine-config-I11936: skip_director joins the all-skipped conjunction. The Director now runs ON this box (an SSM command, no longer a Lambda), so a Director-only recovery rerun - every box stage skipped, Director not - must still dispatch one; without this conjunct it would reach the Director with no $.ec2_instance_id.",
       "Choices": [
         {
           "Variable": "$.ec2_instance_id",
@@ -8233,6 +8240,18 @@
                 },
                 {
                   "Variable": "$.skip_saturday_health_check",
+                  "BooleanEquals": true
+                }
+              ]
+            },
+            {
+              "And": [
+                {
+                  "Variable": "$.skip_director",
+                  "IsPresent": true
+                },
+                {
+                  "Variable": "$.skip_director",
                   "BooleanEquals": true
                 }
               ]
@@ -8603,7 +8622,7 @@
           "Next": "CheckSkipScannerLeaderboard"
         }
       ],
-      "Default": "Director"
+      "Default": "PrepareDirectorOnSpot"
     },
     "CheckSkipScannerLeaderboard": {
       "Type": "Choice",
@@ -8770,7 +8789,7 @@
     },
     "CheckDirectorRetroRefused": {
       "Type": "Choice",
-      "Comment": "alpha-engine-config-I11299 \u2014 sf-pipeline-policy.md \u00a72.3a rules 2 and 3. A retro REFUSAL is a guard declining BY DESIGN: crucible-evaluator director/retro.py refuses to publish a RetroGrade when the judge resolved to the model that produced the plan it was asked to grade (root cause alpha-engine-config-I8202, fixed there). Nothing went wrong \u2014 what it leaves behind is an ABSENT VERDICT, and \u00a72.3a rule 2 says a missing verdict propagates as a named non-pass rather than as a pass, while rule 3 says every surface presenting the run's results carries that state. It is deliberately NOT a degradation: \u00a72.3b's third paragraph is what permits a nested non-pass not to degrade the stage while forbidding it to be silent. Treating a correct refusal as a failure is the shape corrected for the M slot on 2026-09-19 (nousergon-data-PR1816/PR1818: model_zoo_unservable terminates ExecutionSucceeded with degraded false and the refusal NAMED), and this is that precedent applied to the Director's retro leg \u2014 a 5.4-hour weekly cycle must not terminate Fail, and must not page, because a guard did its job. ORDERED BEFORE CheckDirectorSubResults and orthogonal to it: a run whose retro refused AND whose deploy-success leg errored records BOTH, because they are independent fields rather than one status string. Reads a BOOLEAN the producer emits on every fan-out summary (false included) rather than measuring an array's length, which a Choice cannot do. IsPresent-guarded per config#2275; a Director on an older image emits no such field and takes the Default, so this edge is inert rather than broken.",
+      "Comment": "alpha-engine-config-I11299 \u2014 sf-pipeline-policy.md \u00a72.3a rules 2 and 3. A retro REFUSAL is a guard declining BY DESIGN: crucible-evaluator director/retro.py refuses to publish a RetroGrade when the judge resolved to the model that produced the plan it was asked to grade (root cause alpha-engine-config-I8202, fixed there). Nothing went wrong \u2014 what it leaves behind is an ABSENT VERDICT, and \u00a72.3a rule 2 says a missing verdict propagates as a named non-pass rather than as a pass, while rule 3 says every surface presenting the run's results carries that state. It is deliberately NOT a degradation: \u00a72.3b's third paragraph is what permits a nested non-pass not to degrade the stage while forbidding it to be silent. Treating a correct refusal as a failure is the shape corrected for the M slot on 2026-09-19 (nousergon-data-PR1816/PR1818: model_zoo_unservable terminates ExecutionSucceeded with degraded false and the refusal NAMED), and this is that precedent applied to the Director's retro leg \u2014 a 5.4-hour weekly cycle must not terminate Fail, and must not page, because a guard did its job. ORDERED BEFORE CheckDirectorSubResults and orthogonal to it: a run whose retro refused AND whose deploy-success leg errored records BOTH, because they are independent fields rather than one status string. Reads a BOOLEAN the producer emits on every fan-out summary (false included) rather than measuring an array's length, which a Choice cannot do. IsPresent-guarded per config#2275; a Director on an older image emits no such field and takes the Default, so this edge is inert rather than broken. | alpha-engine-config-I11936: $.director_result is now written by the RecordDirector* Pass states from the box's exit code (21/22 = retro refused), still the immediate predecessor.",
       "Choices": [
         {
           "And": [
@@ -8797,7 +8816,7 @@
     },
     "CheckDirectorSubResults": {
       "Type": "Choice",
-      "Comment": "alpha-engine-config-I11299 (sf-pipeline-policy.md \u00a72.3b, clause SFP-2.3b-stage-status-is-the-worst-substatus). The Director returns ONE enclosing status over four independently-statused legs \u2014 retro, director_loop, director_issues, deploy_success \u2014 and every \u00a72.3 mechanism in this definition (the Catch above, the Mark*Degraded states, the completion marker) reads only the enclosing one. MEASURED on three of the four 2026-09-19 executions that entered Director \u2014 the scheduled run (3c2fe2f8-\u2026_d0e3eae8-\u2026) and watch-rerun-2026-09-18-1 and -3, the last two terminating ExecutionSucceeded with degraded_summary.degraded false: status 'ok' over retro 'error', a self-grading REFUSAL by the retro judge (its own root cause is alpha-engine-config-I8202, registry invariant 15 comparing entry ids rather than served models \u2014 a SEPARATE fix, and neither substitutes for the other). No RetroGrade was published for at least two consecutive weekly cycles with nothing anywhere going red \u2014 alpha-engine-config-I10169 one stage over. crucible-evaluator director/substatus.py now demotes the enclosing status to 'degraded' when any leg errors or reports a word in neither vocabulary; this Choice is the consumer that makes it visible to the state machine. IsPresent-guarded per config#2275, and $.director_result is written by the IMMEDIATE predecessor's ResultPath, which is the one-hop floor tests/test_sf_choice_guards.py traces. A Director that ran on an OLDER image still returns 'ok' and takes the Default \u2014 the edge is inert rather than broken, so the two repos may land in either order. 'disabled', 'dry_run' and every other status likewise take the Default: this rule fires on exactly one string.",
+      "Comment": "alpha-engine-config-I11299 (sf-pipeline-policy.md \u00a72.3b, clause SFP-2.3b-stage-status-is-the-worst-substatus). The Director returns ONE enclosing status over four independently-statused legs \u2014 retro, director_loop, director_issues, deploy_success \u2014 and every \u00a72.3 mechanism in this definition (the Catch above, the Mark*Degraded states, the completion marker) reads only the enclosing one. MEASURED on three of the four 2026-09-19 executions that entered Director \u2014 the scheduled run (3c2fe2f8-\u2026_d0e3eae8-\u2026) and watch-rerun-2026-09-18-1 and -3, the last two terminating ExecutionSucceeded with degraded_summary.degraded false: status 'ok' over retro 'error', a self-grading REFUSAL by the retro judge (its own root cause is alpha-engine-config-I8202, registry invariant 15 comparing entry ids rather than served models \u2014 a SEPARATE fix, and neither substitutes for the other). No RetroGrade was published for at least two consecutive weekly cycles with nothing anywhere going red \u2014 alpha-engine-config-I10169 one stage over. crucible-evaluator director/substatus.py now demotes the enclosing status to 'degraded' when any leg errors or reports a word in neither vocabulary; this Choice is the consumer that makes it visible to the state machine. IsPresent-guarded per config#2275, and $.director_result is written by the IMMEDIATE predecessor's ResultPath, which is the one-hop floor tests/test_sf_choice_guards.py traces. A Director that ran on an OLDER image still returns 'ok' and takes the Default \u2014 the edge is inert rather than broken, so the two repos may land in either order. 'disabled', 'dry_run' and every other status likewise take the Default: this rule fires on exactly one string. | alpha-engine-config-I11936: on the box path the status word is 'degraded' (exit 20/22) or 'not_degraded'; only the former fires this rule, as before.",
       "Choices": [
         {
           "And": [
@@ -9589,7 +9608,7 @@
     },
     "ResumeAfterSubstrateRelaunch": {
       "Type": "Choice",
-      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py.",
+      "Comment": "Re-enter the pipeline at the interrupted stage, keyed off the phase label the Extract*SubstrateLostError normalizer already writes to $.error.phase -- the same label that reaches the SNS body, so the recovery path and the failure telemetry cannot drift apart. Each target is the stage's Task state, whose Next is its Init*PollCount state, so the stage's poll counter resets naturally. Every rule IsPresent-guards the path before dereferencing it (config#2275). Default is fail-loud: an unrecognised phase means a stage gained a substrate-lost branch without gaining a resume target, and guessing would silently skip work. | alpha-engine-config-I11268: SubstrateHealthGate now sits on every path that ACQUIRES the weekly box, immediately after acquisition and before CheckShellRun, instead of behind CheckSkipMorningEnrich's Default edge. Previously skip_morning_enrich=true routed around the gate for the WHOLE weekly run (DataPhase1, ResearchPredictorParallel and every later box stage ran with it never evaluated). The only gate-free route to CheckShellRun is now CheckSpotDispatchNeeded's derived no-box-stage bypass, which acquires no box, so there is nothing to gate. Guarded by tests/test_sf_skip_edges_never_bypass_a_gate.py. | alpha-engine-config-I11936: Director/SubstrateLost re-enters Director (its gate_state is already on the execution record from PrepareDirectorOnSpot). The Director's writes are keyed by run_date and its issue filer skips an existing slug, so a re-entry after a reclaim re-runs the advisory rather than duplicating it.",
       "Choices": [
         {
           "And": [
@@ -10187,6 +10206,290 @@
         "source": "WaitForCollectionManifests (budget exhausted or producer settled not-ok)",
         "readiness.$": "$.collection_readiness",
         "poll.$": "$.collection_readiness_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "PrepareDirectorOnSpot": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11936: assemble the Director's gate_state - the SAME object, field for field, the Lambda Payload carried (alpha-engine-config-I7282, sf_gate_state.v1; every field is seeded in InitializeInput's floor) - at one path, so the Director state can hand it to the box with States.JsonToString inside a quoted heredoc. Not base64: States.Base64Encode caps its input at 10,000 characters and its failure is States.Runtime, which no Catch takes; a quoted heredoc has no size cap below SSM's own and no escaping surface (JsonToString emits one line, and a quoted delimiter disables every expansion).",
+      "Parameters": {
+        "schema_version": 1,
+        "gate_degraded.$": "$.gate_degraded",
+        "health_check_degraded.$": "$.health_check_degraded",
+        "parity_degraded.$": "$.parity_degraded",
+        "research_predictor_degraded.$": "$.research_predictor_degraded",
+        "lib_pin_drift.$": "$.libpin_drift_result.Payload",
+        "pipeline_contract.$": "$.pipeline_contract_result.Payload",
+        "research_predictor_degraded_routes.$": "$.research_predictor_degraded_routes.routes",
+        "parity_verdict_unknown.$": "$.parity_verdict_unknown"
+      },
+      "ResultPath": "$.director_gate_state",
+      "Next": "Director"
+    },
+    "InitDirectorPollCount": {
+      "Type": "Pass",
+      "Comment": "Poll-iteration budget seed (alpha-engine-config-I5687). Cap=72 = ceil(3600s executionTimeout / 60s wait * 1.2 slack), the DataPhase2 / EvaluatorDiagnostics convention.",
+      "Result": 0,
+      "ResultPath": "$.director_polls",
+      "Next": "WaitForDirector"
+    },
+    "WaitForDirector": {
+      "Type": "Task",
+      "Comment": "Poll the Director's SSM command until it reaches a terminal status.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.director_cmd.Command.CommandId",
+        "InstanceId.$": "$.ec2_instance_id[0]"
+      },
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "NormalizeFailureContext",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.director_poll",
+      "Next": "CheckDirectorStatus"
+    },
+    "CheckDirectorStatus": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I11936: the box's EXIT CODE is the Director's result. The two facts the downstream Choices route on - status == degraded (CheckDirectorSubResults) and retro_refused (CheckDirectorRetroRefused) - used to be fields of the Lambda Payload. Over SSM they are carried in the exit code (crucible-evaluator director/hosting.py: 0 clean, 20 degraded, 21 retro refused, 22 both), compared WHOLE as an integer: stdout is never parsed, because SSM keeps only its first ~24,000 characters and States.StringToJson on a malformed body raises an uncatchable States.Runtime (both measured here - see ReadModelZooArenaCycle). SSM reports any non-zero exit as Status Failed, so the three completed-but-non-zero codes are matched BEFORE the Default; every other Failed code (1 = the Director raised) falls to the terminal failure path. Poll budget per I5687.",
+      "Choices": [
+        {
+          "Variable": "$.director_poll.Status",
+          "StringEquals": "Success",
+          "Next": "RecordDirectorClean"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_poll.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.director_poll.ResponseCode",
+              "NumericEquals": 20
+            }
+          ],
+          "Next": "RecordDirectorDegraded"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_poll.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.director_poll.ResponseCode",
+              "NumericEquals": 21
+            }
+          ],
+          "Next": "RecordDirectorRetroRefused"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_poll.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.director_poll.ResponseCode",
+              "NumericEquals": 22
+            }
+          ],
+          "Next": "RecordDirectorDegradedRetroRefused"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.director_polls",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.director_poll.Status",
+                  "StringEquals": "InProgress"
+                },
+                {
+                  "Variable": "$.director_poll.Status",
+                  "StringEquals": "Pending"
+                },
+                {
+                  "Variable": "$.director_poll.Status",
+                  "StringEquals": "Delayed"
+                }
+              ]
+            },
+            {
+              "Variable": "$.director_polls",
+              "NumericLessThan": 72
+            }
+          ],
+          "Next": "DirectorWait"
+        }
+      ],
+      "Default": "DirectorLivenessGate"
+    },
+    "DirectorWait": {
+      "Type": "Pass",
+      "Comment": "Increment the poll counter, then wait - a counter that never increments is an unbounded loop wearing a bound.",
+      "Parameters": {
+        "polls.$": "States.MathAdd($.director_polls, 1)"
+      },
+      "ResultPath": "$.director_poll_count",
+      "Next": "DirectorPollWait"
+    },
+    "DirectorPollWait": {
+      "Type": "Wait",
+      "Seconds": 60,
+      "Next": "MergeDirectorPollCount"
+    },
+    "MergeDirectorPollCount": {
+      "Type": "Pass",
+      "InputPath": "$.director_poll_count.polls",
+      "ResultPath": "$.director_polls",
+      "Next": "WaitForDirector"
+    },
+    "RecordDirectorClean": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11936: exit code 0 -> the director_result shape the Lambda returned, restricted to the two fields the downstream Choices read. status is 'degraded' or 'not_degraded' - the exit code distinguishes no more than that, and this record claims no more than it measured; the full summary (ok / dry_run, every sub-status) is in the Director's log, shipped to s3://alpha-engine-research/_ssm_logs/director/.",
+      "Parameters": {
+        "Payload": {
+          "status": "not_degraded",
+          "retro_refused": false,
+          "host": "weekly-spot",
+          "exit_code": 0,
+          "command_id.$": "$.director_cmd.Command.CommandId",
+          "instance_id.$": "$.ec2_instance_id[0]"
+        }
+      },
+      "ResultPath": "$.director_result",
+      "Next": "CheckDirectorRetroRefused"
+    },
+    "RecordDirectorDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11936: exit code 20 -> the director_result shape the Lambda returned, restricted to the two fields the downstream Choices read. status is 'degraded' or 'not_degraded' - the exit code distinguishes no more than that, and this record claims no more than it measured; the full summary (ok / dry_run, every sub-status) is in the Director's log, shipped to s3://alpha-engine-research/_ssm_logs/director/.",
+      "Parameters": {
+        "Payload": {
+          "status": "degraded",
+          "retro_refused": false,
+          "host": "weekly-spot",
+          "exit_code": 20,
+          "command_id.$": "$.director_cmd.Command.CommandId",
+          "instance_id.$": "$.ec2_instance_id[0]"
+        }
+      },
+      "ResultPath": "$.director_result",
+      "Next": "CheckDirectorRetroRefused"
+    },
+    "RecordDirectorRetroRefused": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11936: exit code 21 -> the director_result shape the Lambda returned, restricted to the two fields the downstream Choices read. status is 'degraded' or 'not_degraded' - the exit code distinguishes no more than that, and this record claims no more than it measured; the full summary (ok / dry_run, every sub-status) is in the Director's log, shipped to s3://alpha-engine-research/_ssm_logs/director/.",
+      "Parameters": {
+        "Payload": {
+          "status": "not_degraded",
+          "retro_refused": true,
+          "host": "weekly-spot",
+          "exit_code": 21,
+          "command_id.$": "$.director_cmd.Command.CommandId",
+          "instance_id.$": "$.ec2_instance_id[0]"
+        }
+      },
+      "ResultPath": "$.director_result",
+      "Next": "CheckDirectorRetroRefused"
+    },
+    "RecordDirectorDegradedRetroRefused": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I11936: exit code 22 -> the director_result shape the Lambda returned, restricted to the two fields the downstream Choices read. status is 'degraded' or 'not_degraded' - the exit code distinguishes no more than that, and this record claims no more than it measured; the full summary (ok / dry_run, every sub-status) is in the Director's log, shipped to s3://alpha-engine-research/_ssm_logs/director/.",
+      "Parameters": {
+        "Payload": {
+          "status": "degraded",
+          "retro_refused": true,
+          "host": "weekly-spot",
+          "exit_code": 22,
+          "command_id.$": "$.director_cmd.Command.CommandId",
+          "instance_id.$": "$.ec2_instance_id[0]"
+        }
+      },
+      "ResultPath": "$.director_result",
+      "Next": "CheckDirectorRetroRefused"
+    },
+    "DirectorLivenessGate": {
+      "Type": "Choice",
+      "Comment": "config#6938 shape: StatusDetails Undeliverable/Terminated means the launcher box is GONE (a spot reclaim), not that the Director failed - a distinguishable phase (Director/SubstrateLost), so an operator can tell the two apart without opening the history. Both are TERMINAL (config#6408); see ExtractDirectorSubstrateLostError for why the reclaim does not take the relaunch.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.director_poll.StatusDetails",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.director_poll.StatusDetails",
+                  "StringEquals": "Undeliverable"
+                },
+                {
+                  "Variable": "$.director_poll.StatusDetails",
+                  "StringEquals": "Terminated"
+                }
+              ]
+            }
+          ],
+          "Next": "ExtractDirectorSubstrateLostError"
+        }
+      ],
+      "Default": "ExtractDirectorError"
+    },
+    "ExtractDirectorError": {
+      "Type": "Pass",
+      "Comment": "Normalize a Director SSM non-completion (a raised exception is exit 1; TimedOut is the 3,600s executionTimeout) into $.error. TERMINAL per config#6408.",
+      "Parameters": {
+        "phase": "Director",
+        "source": "CheckDirectorStatus.Default",
+        "poll.$": "$.director_poll"
+      },
+      "ResultPath": "$.error",
+      "Next": "NormalizeFailureContext"
+    },
+    "ExtractDirectorSubstrateLostError": {
+      "Type": "Pass",
+      "Comment": "config#6938 shape: the SUBSTRATE-LOST sibling of ExtractDirectorError - same normalization, distinguishable phase, so an operator can tell a spot reclaim from a Director failure without opening the history. TERMINAL, like every Director failure (config#6408): it deliberately does NOT take SubstrateRelaunchGate. The Director is the run's last box stage, after ReportCard; wiring a re-entry edge from here back through the relaunch machinery makes every upstream skip flag live across the whole post-ReportCard tail, which blows infrastructure/sf_reachability.py's path-sensitive walk past its bound (measured 2026-10-03, alpha-engine-config-I11936). Recovery is scripts/weekly_sf_rerun.py, which derives a Director-only rerun that dispatches a fresh box.",
+      "Parameters": {
+        "phase": "Director/SubstrateLost",
+        "source": "DirectorLivenessGate.SubstrateLost",
+        "poll.$": "$.director_poll"
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"

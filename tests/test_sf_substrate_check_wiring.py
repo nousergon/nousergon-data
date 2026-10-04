@@ -121,7 +121,10 @@ class TestChainOrdering:
         # per-stage skip gate (Default: Director); Director's success edge
         # lands on the DirectorComplete rerun witness before the notify gate.
         assert states["ReportCard"]["Next"] == "CheckSkipDirector"
-        assert states["CheckSkipDirector"]["Default"] == "Director"
+        # alpha-engine-config-I11936: the Director runs on the weekly box; its
+        # gate_state is assembled by PrepareDirectorOnSpot first.
+        assert states["CheckSkipDirector"]["Default"] == "PrepareDirectorOnSpot"
+        assert states["PrepareDirectorOnSpot"]["Next"] == "Director"
         assert all(
             c["Next"] == "ReportCardDegraded" for c in states["ReportCard"]["Catch"]
         )
@@ -133,7 +136,10 @@ class TestChainOrdering:
         # CheckDirectorSubResults (§2.3b), whose Default is DirectorComplete and
         # whose degraded branch converges on it too. The witness property is
         # unchanged: every route here descends from that ONE success edge.
-        assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+        # alpha-engine-config-I11936: the success edge is now the box's exit-code
+        # records, each landing where the Lambda Task's Next did.
+        for _rec in ("RecordDirectorClean", "RecordDirectorDegraded", "RecordDirectorRetroRefused", "RecordDirectorDegradedRetroRefused"):
+            assert states[_rec]["Next"] == "CheckDirectorRetroRefused"
         assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
         assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
         assert states["DirectorComplete"]["Next"] == "CheckSkipScannerLeaderboard"

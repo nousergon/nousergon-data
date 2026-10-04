@@ -28,6 +28,7 @@ would turn "the definition drifted" into "the stage passed".
 
 from __future__ import annotations
 
+import json
 import re
 
 __all__ = [
@@ -184,6 +185,29 @@ def _resolve(token: str, bindings: dict, context: dict) -> str:
     )
 
 
+def _render_json_to_string(element: str, bindings: dict) -> str:
+    """Render a top-level ``States.JsonToString($.path)`` command element.
+
+    Step Functions serialises the referenced value as compact JSON (no
+    whitespace), which is what this emits. Only a single ``$.`` execution-input
+    path is accepted; the referenced value must be present in ``bindings`` —
+    an absent one RAISES, same fail-loud rule as ``_resolve``.
+    """
+    inner = element[element.index("(") + 1 : element.rindex(")")].strip()
+    if not inner.startswith("$.") or "(" in inner:
+        raise UnresolvedReference(
+            f"States.JsonToString argument {inner[:60]!r} is not a $. path"
+        )
+    cur = bindings
+    for part in inner[2:].split("."):
+        if not isinstance(cur, dict) or part not in cur:
+            raise UnresolvedReference(
+                f"execution-input reference {inner!r} is not in the sweep's bindings"
+            )
+        cur = cur[part]
+    return json.dumps(cur, separators=(",", ":"))
+
+
 _PLACEHOLDER = re.compile(r"\{\}")
 
 
@@ -208,9 +232,13 @@ def render_commands(state: dict, bindings: dict, context: dict) -> list[str]:
         if lit is not None:
             out.append(lit)
             continue
+        if a.startswith("States.JsonToString(") and a.endswith(")"):
+            out.append(_render_json_to_string(a, bindings))
+            continue
         if not a.startswith("States.Format("):
             raise UnresolvedReference(
-                f"command element {a[:60]!r} is neither a literal nor States.Format"
+                f"command element {a[:60]!r} is neither a literal, States.Format "
+                "nor States.JsonToString"
             )
         fmt_inner = a[a.index("(") + 1 : a.rindex(")")]
         parts = _split_top_level(fmt_inner)
