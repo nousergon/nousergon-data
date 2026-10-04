@@ -78,7 +78,10 @@ def states() -> dict:
 
 
 def test_director_success_edge_goes_through_the_substatus_choices(states):
-    assert states["Director"]["Next"] == _REFUSAL_CHOICE
+    # alpha-engine-config-I11936: the success edge is now the box's exit-code
+    # records, each landing where the Lambda Task's Next did.
+    for _rec in ("RecordDirectorClean", "RecordDirectorDegraded", "RecordDirectorRetroRefused", "RecordDirectorDegradedRetroRefused"):
+        assert states[_rec]["Next"] == _REFUSAL_CHOICE
     assert states[_REFUSAL_CHOICE]["Default"] == _CHOICE
     assert states["SetDirectorRetroRefused"]["Next"] == _CHOICE
 
@@ -326,6 +329,9 @@ def test_the_refusal_flag_is_floored_so_the_markers_never_throw(states):
 def test_a_refusal_and_an_error_are_recorded_independently(states):
     """Ordered BEFORE the degraded Choice and orthogonal to it, so a run whose
     retro refused AND whose deploy-success leg errored records both."""
-    assert states["Director"]["Next"] == _REFUSAL_CHOICE
+    # alpha-engine-config-I11936: the success edge is now the box's exit-code
+    # records, each landing where the Lambda Task's Next did.
+    for _rec in ("RecordDirectorClean", "RecordDirectorDegraded", "RecordDirectorRetroRefused", "RecordDirectorDegradedRetroRefused"):
+        assert states[_rec]["Next"] == _REFUSAL_CHOICE
     assert states[_REFUSAL_CHOICE]["Default"] == _CHOICE
     assert states["SetDirectorRetroRefused"]["Next"] == _CHOICE
