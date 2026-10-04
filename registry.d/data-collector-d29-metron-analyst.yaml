@@ -11,7 +11,7 @@
 component_id: data-collector-d29-metron-analyst
 owning_repo: nousergon-data
 substrate: step-functions
-origin: ne-postclose-trading-pipeline
+origin: ne-data-collection-eod
 owner: brian
 lifecycle: in-service
 authority_tier: t1
@@ -42,7 +42,7 @@ signals:
 log_location: s3:alpha-engine-research/data_collection/logs/{workload}/{trading_day}/{instance_id}.log
 log_location_reason: The unit's spot box ships its WHOLE run log to this key on exit and every 60s while
   running (alpha-engine-config-I11353), and each of the unit's run manifests records the exact object
-  under `log_location`. Owning pipeline 'ne-postclose-trading-pipeline' (plan §4.4). The `_ssm_logs/data-spot/`
+  under `log_location`. Owning pipeline 'ne-data-collection-eod' (plan §4.4). The `_ssm_logs/data-spot/`
   path this row used to name was retired with that change; CloudWatch remains a capped live tail, never
   the record.
 alert_channel: sns:alpha-engine-alerts, via the owning pipeline's NotifyFailure state

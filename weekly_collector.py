@@ -1053,7 +1053,7 @@ def _record_phase_lineage(
                 artifact_key=artifact_key,
                 bucket=bucket,
                 s3_client=reg.s3_client,
-                rows_out=rows,
+                rows_out=rows, floor=run_units.rows_out_floor_for(unit.unit_id),  # declared floor (I10785)
                 rows_key=unit.rows_key,
             )
         ]
@@ -1075,7 +1075,7 @@ def _record_phase_lineage(
                     artifact_key=extra_key_name,
                     bucket=bucket,
                     s3_client=reg.s3_client,
-                    rows_out=extra_rows,
+                    rows_out=extra_rows, floor=run_units.rows_out_floor_for(unit.unit_id),
                 )
             )
 
