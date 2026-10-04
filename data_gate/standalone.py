@@ -38,11 +38,10 @@ from __future__ import annotations
 import datetime as dt
 import importlib.util
 from functools import lru_cache
-from zoneinfo import ZoneInfo
 
 from nousergon_lib.gates import GateStore
 
-from data_gate.cadence import COMPLETION_GRACE, gate_moment, latest_due_fire, parse_cron, unit_cadence
+from data_gate.cadence import COMPLETION_GRACE, fire_selection_moment, latest_due_fire, parse_cron, unit_cadence
 from data_gate.descriptors import REPO_ROOT, Unit
 from data_gate.evidence import Reading, manifests_since, read_run_record
 
@@ -317,39 +316,14 @@ def read_survives_phase4(
             source=_SOURCE_LIVE,
         )
 
-    # alpha-engine-config-I11354. `gate_moment` clamps the reading instant to
-    # the END of ``trading_day`` in New York, which is right for "do not grade D
-    # against runs that happened after D". It is WRONG as the ceiling for
-    # SELECTING D's own fire: `latest_due_fire` returns the newest fire whose
-    # ``fire + COMPLETION_GRACE`` has passed, so any schedule firing later than
-    # 23:59:59 ET minus the 6h grace — i.e. later than **17:59 ET** — has its own
-    # fire pushed past the ceiling on every read, and the clause silently grades
-    # D-1's run for D, for ever.
-    #
-    # Latent until now: the EOD schedule fired at 16:45 ET, 1h14m inside the
-    # boundary. Moving it to 18:15 ET (the settlement hour) crossed it, and three
-    # tests in tests/test_run_cadence_and_survives_phase4.py went red naming a
-    # fire one day early. The schedule is not the defect — a grading ceiling that
-    # silently excludes a legal fire time is.
-    #
-    # Fixed here rather than by keeping the schedule before 17:59: the grace is a
-    # COMPLETION allowance, so the instant by which D's fire should have finished
-    # is legitimately `end of D + grace`. Widened for fire selection only —
-    # `manifests_since` below still bounds manifests by the execution's own
-    # start/stop, so nothing from a later day can be counted toward D.
-    #
-    # `gate_moment(trading_day, <that ceiling>)` rather than calling it with
-    # ``now``: it returns ``min(now, end-of-day)``, so passing the widened
-    # ceiling as its ``now`` yields exactly ``min(widened, end-of-day)`` — which
-    # is the end of the day, never the widened value. The ceiling is therefore
-    # built here and `min`'d against the real clock directly.
-    _end_of_day = dt.datetime.combine(
-        trading_day, dt.time(23, 59, 59), tzinfo=ZoneInfo("America/New_York"),
-    ).astimezone(dt.timezone.utc)
-    as_of = min(
-        (now or dt.datetime.now(dt.timezone.utc)).astimezone(dt.timezone.utc),
-        _end_of_day + COMPLETION_GRACE,
-    )
+    # alpha-engine-config-I11354, lifted into `cadence.fire_selection_moment` by
+    # alpha-engine-config-I11838 so `run_record`, `completeness` and the
+    # exit-criteria cycle counters select the same fire this clause does: the
+    # end of the trading day plus the completion grace, bounded by the clock. A
+    # schedule firing after 17:59 ET (the 18:15 ET EOD) is graded for its own
+    # day. Widened for fire selection only — `_grade_schedule` bounds manifests
+    # by the execution's own start/stop, so nothing from a later day counts.
+    as_of = fire_selection_moment(trading_day, now)
     readings = [_grade_schedule(store, unit, s, live[s["qualified_name"]], as_of) for s in schedules]
     evidence = tuple(e for r in readings for e in r.evidence)
     failing = [r for r in readings if not r.met]

@@ -105,7 +105,9 @@ name: Data-collection daily report
 #
 # `tests/test_scheduled_workflow_reachability.py` requires it on EVERY
 # scheduled workflow in this repo, by job name, with `needs:` naming every
-# other job and an `if` gated to `refs/heads/main`. Separately, the data
+# other job and an `if` gated to `refs/heads/main` that also fires on a job
+# killed at its timeout-minutes (tests/test_workflow_notify_on_cancel.py).
+# Separately, the data
 # collector has no `alerts.sweep` equivalent at all, so this job's failures
 # would otherwise reach nobody until the observability row's absence deadline.
 
@@ -249,6 +251,6 @@ jobs:
   # naming every other job and an `if` gated to the default branch.
   notify-main-failure:
     needs: [report]
-    if: failure() && github.ref == 'refs/heads/main'
+    if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
