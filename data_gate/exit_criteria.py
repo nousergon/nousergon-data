@@ -38,7 +38,13 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 
 from data_gate.cadence import COMPLETION_GRACE, Cadence, fire_selection_moment, latest_due_fire, parse_cron
 from data_gate.descriptors import Unit
-from data_gate.evidence import EMPTY_FRESH_VERDICT, Reading, empty_fresh_runs, manifests_since
+from data_gate.evidence import (
+    EMPTY_FRESH_VERDICT,
+    ObservationWindow,
+    Reading,
+    empty_fresh_runs,
+    manifests_since,
+)
 from data_gate.standalone import stack_schedules
 
 __all__ = [
@@ -527,10 +533,21 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
         )
     offenders: list[str] = []
     observed = 0
+    # A cycle that recorded an `empty_fresh` guard verdict at all — pass or
+    # fail — is the proof the guard is BUILT and LIVE, which a cycle that only
+    # recorded manifests is not: before the guard ships, no write can carry
+    # its verdict, so "no offender" would be the absence of a check.
+    guarded = 0
     for cycle in cycles.cycles:
         manifests = cycle.all_manifests()
         if manifests:
             observed += 1
+        if any(
+            str(g.get("guard") or g.get("name") or "") == "empty_fresh"
+            for doc in manifests
+            for g in (doc.get("guards") or [])
+        ):
+            guarded += 1
         for run_id in empty_fresh_runs(manifests):
             offenders.append(f"{cycle.label}:{run_id}")
     met = observed >= required_cycles and not offenders
@@ -551,6 +568,17 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
         detail=detail,
         evidence=(cycles.schedule, "data_collection/runs/"),
         source=_SOURCE_CYCLES,
+        window=ObservationWindow(
+            live=guarded > 0 or bool(offenders),
+            observed=observed,
+            required=required_cycles,
+            failures=tuple(offenders),
+            not_live=(
+                f"no cycle of {cycles.schedule} recorded an `empty_fresh` guard verdict yet — "
+                "the guard has produced no reading, so no write has been checked"
+            ),
+            unit="cycle(s)",
+        ),
     )
 
 
@@ -591,12 +619,36 @@ def read_vendor_divergence_emitted(
     breaches: list[str] = []
     emitted = 0
     total = 0
+    # Brian's 2026-10-03 extension of the time-gate ruling (`ObservationWindow`):
+    # the check is LIVE once every graded schedule has emitted at least one
+    # verdict, and only a silent or blind cycle AFTER a schedule's first
+    # emitted verdict is a failed observation — a cycle before it is the guard
+    # not yet built, which is the part of the window the ruling forgives.
+    not_live: list[str] = []
+    window_failures: list[str] = []
     for cycles in cycle_sets:
         vendors = [u for u in cycles.units if VENDOR_GUARD in u.guards]
         if not vendors:
             continue
         graded.extend(f"{u.unit_id}@{cycles.schedule}" for u in vendors)
         total += len(cycles.cycles)
+        # Oldest first, so "after the first emitted verdict" is a walk forward.
+        went_live = False
+        for cycle in sorted(cycles.cycles, key=lambda c: c.fire):
+            verdicts = [
+                str(g.get("verdict"))
+                for unit in vendors
+                for _key, doc in cycle.manifests.get(unit.unit_id, [])
+                for g in (doc.get("guards") or [])
+                if str(g.get("guard") or g.get("name") or "") == VENDOR_GUARD
+            ]
+            if verdicts and not all(v == "unmeasurable" for v in verdicts):
+                went_live = True
+            elif went_live:
+                kind = "no verdict" if not verdicts else "verdict unmeasurable"
+                window_failures.append(f"{cycles.schedule}@{cycle.label}: {kind}")
+        if not went_live:
+            not_live.append(cycles.schedule)
         for cycle in cycles.cycles:
             verdicts = [
                 str(g.get("verdict"))
@@ -638,6 +690,18 @@ def read_vendor_divergence_emitted(
         detail=detail,
         evidence=tuple(c.schedule for c in cycle_sets) + ("data_collection/runs/",),
         source=_SOURCE_CYCLES,
+        window=ObservationWindow(
+            live=bool(graded) and not not_live,
+            observed=emitted,
+            required=required_cycles,
+            failures=tuple(window_failures),
+            not_live=(
+                "no unit verified by these schedules declares the guard"
+                if not graded
+                else f"no {VENDOR_GUARD} verdict has been emitted yet on {sorted(not_live)}"
+            ),
+            unit="cycle(s)",
+        ),
     )
 
 
@@ -679,11 +743,37 @@ def read_eod_universe_covered(
         f"ending {trading_day.isoformat()}, against the {days} the exit names; the window read "
         f"{dict(statuses[:6])}"
     )
+    # Brian's 2026-10-03 extension of the time-gate ruling (`ObservationWindow`):
+    # the check is LIVE from the first day that carries a MetricRecord; from
+    # then on, every day that is not GREEN — including a day with no record,
+    # because a missing measurement is not a passing one — is a failed
+    # observation. Days before the first record are the guard not yet built.
+    observed = 0
+    failures: list[str] = []
+    went_live = False
+    for day_iso, status in reversed(statuses):
+        if status == "ABSENT" and not went_live:
+            continue
+        went_live = True
+        observed += 1
+        if status != "GREEN":
+            failures.append(f"{day_iso}: {status}")
     return Reading(
         met=streak >= days,
         detail=detail,
         evidence=tuple(f"metrics/eod_completeness/{d}.json" for d, _ in statuses[:4]),
         source=_SOURCE_STORE,
+        window=ObservationWindow(
+            live=went_live,
+            observed=observed,
+            required=days,
+            failures=tuple(failures),
+            not_live=(
+                f"no metrics/eod_completeness/<day>.json in the {days} trading days ending "
+                f"{trading_day.isoformat()} — the completeness guard has produced no reading"
+            ),
+            unit="trading day(s)",
+        ),
     )
 
 
@@ -913,7 +1003,18 @@ def read_executor_collection_writes_zero(store: GateStore, *, days: int = 7) -> 
             source=_SOURCE_STORE,
         )
     covered = document.get("days_covered")
+    try:
+        covered_days = int(covered)
+    except (TypeError, ValueError):
+        covered_days = 0
     return Reading(
+        window=ObservationWindow(
+            live=True,
+            observed=covered_days,
+            required=days,
+            failures=(f"{count} executor write(s) into collection prefixes",) if count else (),
+            unit="day(s)",
+        ),
         met=count == 0 and str(covered) == str(days),
         detail=(
             f"{EXECUTOR_WRITES_KEY}: {count} executor write(s) into collection prefixes over "
@@ -956,6 +1057,12 @@ def read_sustained_window(
         day = subtract_trading_days(day, 1)
     clean = 0
     verdicts: list[str] = []
+    # Every day of the window is read (newest first), not only up to the first
+    # unclean one, so Brian's 2026-10-03 ruling (`ObservationWindow`) can name
+    # every failed observation inside it. `clean` keeps its original meaning:
+    # the consecutive clean run ending at `trading_day`.
+    per_day: list[tuple[str, str | None]] = []  # (day, failure or None); "ABSENT" marked
+    streak_open = True
     for day in days:
         key = f"gates/{gate}/{day.isoformat()}/gate.json"
         read = read_store_document(store, key)
@@ -968,26 +1075,34 @@ def read_sustained_window(
                 source=_SOURCE_GATE_HISTORY,
             )
         if read.absent:
-            verdicts.append(f"{day.isoformat()}:no reading")
-            break
-        rows = [
-            row
-            for row in (read.document or {}).get("clauses") or []
-            if row.get("name") != self_clause
-        ]
-        unmet = [str(r.get("name")) for r in rows if not r.get("met") and not r.get("unmeasurable")]
-        unmeas = [str(r.get("name")) for r in rows if r.get("unmeasurable")]
-        if not rows:
-            verdicts.append(f"{day.isoformat()}:reading carries no clauses")
-            break
-        if unmet or unmeas:
-            verdicts.append(
-                f"{day.isoformat()}:{len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE "
-                f"(first: {sorted(unmet + unmeas)[:3]})"
-            )
-            break
-        clean += 1
-        verdicts.append(f"{day.isoformat()}:clean")
+            verdict = f"{day.isoformat()}:no reading"
+            per_day.append((day.isoformat(), "ABSENT"))
+        else:
+            rows = [
+                row
+                for row in (read.document or {}).get("clauses") or []
+                if row.get("name") != self_clause
+            ]
+            unmet = [
+                str(r.get("name")) for r in rows if not r.get("met") and not r.get("unmeasurable")
+            ]
+            unmeas = [str(r.get("name")) for r in rows if r.get("unmeasurable")]
+            if not rows:
+                verdict = f"{day.isoformat()}:reading carries no clauses"
+            elif unmet or unmeas:
+                verdict = (
+                    f"{day.isoformat()}:{len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE "
+                    f"(first: {sorted(unmet + unmeas)[:3]})"
+                )
+            else:
+                verdict = f"{day.isoformat()}:clean"
+            per_day.append((day.isoformat(), None if verdict.endswith(":clean") else verdict))
+        if streak_open:
+            verdicts.append(verdict)
+            if verdict.endswith(":clean"):
+                clean += 1
+            else:
+                streak_open = False
 
     if weekly.unmeasurable:
         return Reading(
@@ -1003,6 +1118,26 @@ def read_sustained_window(
             break
         complete_saturdays += 1
 
+    # The ruling's window (`ObservationWindow`): live once a dated reading
+    # exists AND one Saturday has been complete; from then on, an unclean or
+    # missing reading, or an incomplete Saturday, is a failed observation.
+    observed = 0
+    failures: list[str] = []
+    readings_live = False
+    for day_iso, failure in reversed(per_day):
+        if failure == "ABSENT" and not readings_live:
+            continue
+        readings_live = True
+        observed += 1
+        if failure is not None:
+            failures.append(f"{day_iso}:no reading" if failure == "ABSENT" else failure)
+    saturdays_live = False
+    for cycle, _ok, missing in reversed(_cycle_verdict(weekly)):
+        if not missing:
+            saturdays_live = True
+        elif saturdays_live:
+            failures.append(f"{weekly.schedule}@{cycle.label}: incomplete Saturday")
+
     detail = (
         f"{clean}/{trading_days} consecutive trading day(s) whose dated {gate} reading carried "
         f"0 UNMET and 0 UNMEASURABLE clauses (this clause itself excluded, so the window is not "
@@ -1014,4 +1149,16 @@ def read_sustained_window(
         detail=detail,
         evidence=(f"gates/{gate}/", weekly.schedule),
         source=_SOURCE_GATE_HISTORY,
+        window=ObservationWindow(
+            live=readings_live and saturdays_live,
+            observed=observed,
+            required=trading_days,
+            failures=tuple(failures),
+            not_live=(
+                f"no dated {gate} reading in the window"
+                if not readings_live
+                else f"no complete {weekly.schedule} Saturday yet"
+            ),
+            unit="trading day(s)",
+        ),
     )
