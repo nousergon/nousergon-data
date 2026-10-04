@@ -97,8 +97,20 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
-    note: "only a read of HOLDINGS_UNIVERSE_KEY; no floor (alpha-engine-config-I5935). P-13."
+    state: present
+    code:
+      - "collectors/metron_market_data.py::_grade_cardinality"
+    records_as: data_cardinality
+    note: >-
+        collect() grades every scheduled run, including one whose write failed, through
+        _grade_cardinality: validators/expectations.py::check_cardinality compares the published
+        closes with metron/holdings_universe.json after the declared exclusions, suffix map and
+        class rules, at D20_COMPLETENESS_FLOOR (1.0, the declared floor), and names every
+        undeclared miss. The verdict is filed on the manifest as guard `data_cardinality` and as
+        data_collection/metrics/eod_completeness/{day}.json, which data.D20.completeness reads.
+        OBSERVE mode, staged on validators/expectations.py::CARDINALITY_GUARD
+        (alpha-engine-config-I10780, I10827). FX pairs are not graded by it. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

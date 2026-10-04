@@ -96,11 +96,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   units:
-    state: absent
+    state: partial
+    code:
+      - "builders/daily_append.py::_daily_append_impl"
+    evaluates: 'if splice_verdict == "refused":'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF, price scale only: every incoming bar goes through _splice_basis_guard, which
+        restates it onto the stored basis when a registered split explains the gap and refuses
+        it when a split-like ratio disagrees with a stored same-date row; a refused ticker is
+        counted as quality-blocked and not appended. A pure append with an unexplained
+        split-like ratio is written at ERROR, and the appended feature columns' units have no
+        runtime check; both are the remaining work. Not in service until commissioned by an
+        induced fault (P-19, alpha-engine-config-I10786).
   pit:
     state: present
     note: UniverseFreshnessViolation

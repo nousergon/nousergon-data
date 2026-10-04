@@ -98,11 +98,16 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/universe_classification.py::collect"
+    evaluates: 'ok_ratio < _MIN_OK_RATIO'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: collect() returns `status: error` and writes nothing when fewer than _MIN_OK_RATIO
+        (0.50) of the requested tickers came back classified, which catches a vendor collapse.
+        The declared floor is 1.0 of constituents; a run between 50% and 100% publishes as `ok`,
+        and that half is the remaining work. The threshold is not changed here. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

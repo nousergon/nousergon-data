@@ -78,11 +78,17 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/metron_market_data.py::_yfinance_analyst"
+    evaluates: 'floor=METRON_YF_COVERAGE_FLOOR'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: the analyst pass calls _log_yf_coverage with METRON_YF_COVERAGE_FLOOR (0.70),
+        which raises YfCoverageCollapse so the unit fails and the previous artifact stands when
+        it covers less than 70% of the held universe (alpha-engine-config-I11578; skipped under
+        20 requested symbols). The declared floor is 0.8; a run between 70% and 80% publishes,
+        and that half is the remaining work. Not in service until commissioned by an induced
+        fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-
