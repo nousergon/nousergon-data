@@ -162,11 +162,19 @@ phases:
           (data_gate/clauses.py::OBSERVATION_WINDOW_RULING): MET once every
           graded schedule has emitted and no cycle since was silent or blind
         clause: data.phase2.vendor_divergence_emitted
-      - criterion: >-
-          the executor profile shows no collection writes over 7 days. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
-        clause: data.phase2.executor_collection_writes_zero
+    notes: >-
+      "the executor profile shows no collection writes over 7 days" is NOT an exit criterion of
+      this rung — Brian's ruling, 2026-09-21 (verbatim): "i'm not clear why we need to time gate
+      anything, why not just collect the data when it is ready but not block subsequent issues",
+      applied to the five calendar-floored phase 2-3 clauses by alpha-engine-config-I11305. A
+      trailing 7-day CloudTrail window can only clear by the calendar advancing, so
+      `data.phase2.executor_collection_writes_zero` is a STANDING clause
+      (`data_gate/clauses.py::CALENDAR_FLOOR_STANDING_CLAUSES`): read and rendered every day
+      against the 7-days-and-0-writes target, graded by no gate. The criterion's other half —
+      the collection boxes actually running under their own workload identity, not the
+      executor profile (alpha-engine-config-I10756) — is not a wait and stays gating here as
+      the per-unit `identity` column. To revert: put the criterion back in this list and
+      build the clause with `_exit_clause` instead of `_standing_clause`.
 
   - id: data-phase3
     number: 3
@@ -176,12 +184,6 @@ phases:
     tracker_is_placeholder: false
     exit:
       - criterion: >-
-          all clauses MET, 0 UNMEASURABLE, 0 UNREPORTED, sustained over 20
-          consecutive trading days and 4 Saturdays. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
-        clause: data.phase3.sustained_window
-      - criterion: >-
           freshness SLO attainment >= 19/20 per family. Graded under Brian's
           2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
           MET once the family's SLO verdict is live and no cycle observed so
@@ -190,21 +192,24 @@ phases:
       - criterion: >-
           every published key met its declared completeness floor, per family
         exit_measured_by: data.slo.completeness.*
-      - criterion: >-
-          cost within the ratified ceiling for one full calendar month. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
-        exit_measured_by: data.cost.monthly
-      - criterion: >-
-          pages <= 2 in that month. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
-        exit_measured_by: data.pages.monthly
-      - criterion: >-
-          human mutating calls 0 outside the reserved list. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
-        exit_measured_by: data.human_touch.monthly
+    notes: >-
+      This rung exits on the board being green — every clause of phases 0-3 MET, which is
+      what `data_gate read --gate data-phase3` rolls up — on its non-calendar clauses. Four
+      criteria the plan names here are NOT exit criteria of this rung: "all clauses MET ...
+      sustained over 20 consecutive trading days and 4 Saturdays", "cost within the ratified
+      ceiling for one full calendar month", "pages <= 2 in that month" and "human mutating
+      calls 0 outside the reserved list". Brian's ruling, 2026-09-21 (verbatim): "i'm not
+      clear why we need to time gate anything, why not just collect the data when it is ready
+      but not block subsequent issues", applied to the five calendar-floored phase 2-3 clauses
+      by alpha-engine-config-I11305. Each can only clear by the calendar advancing, so
+      `data.phase3.sustained_window`, `data.cost.monthly`, `data.pages.monthly` and
+      `data.human_touch.monthly` are STANDING clauses
+      (`data_gate/clauses.py::CALENDAR_FLOOR_STANDING_CLAUSES`): read and rendered every day
+      against their ratified targets, graded by no gate. The sustain is a reliability soak,
+      and the irreversible step a soak protects is Crucible v2 phase 4's v1 deletion
+      (alpha-engine-config-I10655), which already gates on the `data-collection-reliability`
+      streaks. To revert: put the criteria back in this list and build the clauses with
+      `_exit_clause` / `_clause_objective` instead of `_standing_clause`.
 
 # A SUB-gate of phase 1, read before the v2 phase-4 maintenance window (plan
 # §6.2). Registered as a gate so it can be READ, but deliberately NOT a rung:
