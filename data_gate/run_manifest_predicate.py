@@ -119,6 +119,16 @@ MANIFEST_LOOKBACK_DAYS = int(os.environ.get("DATA_COLLECTION_MANIFEST_LOOKBACK_D
 #: every idempotent re-drive of the weekly phase 1 would be a failure.
 EMPTY_FRESH_GUARD = "empty_fresh"
 
+#: The NAME the empty-but-fresh guard is filed under on a run manifest
+#: (`nousergon_lib.expectations.EMPTY_FRESH_GUARD.name`). Literal because this
+#: module ships inside Lambda zips that carry no `nousergon_lib`;
+#: `test_d33_noop_heal_completion.py` pins it to the library's own value.
+#: NOTE: `EMPTY_FRESH_GUARD` above is the guard-CLASS spelling, not this name, so
+#: it never matches a recorded entry — the same-run `auto_skipped` exemption that
+#: reads it is inert today (the same-date carry-forward is what actually covers a
+#: retry). Left as it was: widening that exemption is a separate decision.
+EMPTY_FRESH_GUARD_RECORDED_NAME = "data_empty_fresh"
+
 #: A ``writes:`` entry that is a prose declaration rather than an S3 key
 #: template — `arcticdb/universe (library)`, `research.db::score_performance`,
 #: `predictor/price_cache/<macro series>`. These are COUNTED and returned under
@@ -340,7 +350,7 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
     """Grade one unit's run against its descriptor. Returns (findings, row)."""
     prefix = str(raw["run_manifest_prefix"])
     row = {"unit": unit_id, "manifest": None, "status": None, "keys_checked": 0,
-           "unverifiable": [], "auto_skipped": False, "floor": None,
+           "unverifiable": [], "auto_skipped": False, "floor": None, "conditional_skipped": [],
            "carried_forward_from": None}
     key, doc = _newest_manifest(s3, prefix, started_at)
     if doc is not None and _is_same_date_noop(doc):
@@ -401,6 +411,19 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
     row["auto_skipped"] = auto_skipped
     floor, floor_source = _rows_out_floor(unit_id, raw.get("completeness") or {})
     row["floor"] = floor if floor is not None else floor_source
+    # `completeness.conditional_writes` (alpha-engine-config-I11812, D33): a
+    # `writes:` template the unit publishes ONLY when it finds work. A heal that
+    # found nothing to heal measures zero rows and files the empty-but-fresh
+    # guard as `empty_fresh`; its per-day staging parquet legitimately does not
+    # exist, and requiring it would fail (and page) every no-op day.
+    # Deliberately narrower than `auto_skipped`: the exemption holds ONLY while
+    # the manifest's own guard reading says zero rows. A run that reports rows
+    # but records no key is still `output_missing`.
+    conditional = {str(w) for w in (raw.get("completeness") or {}).get("conditional_writes") or []}
+    measured_zero = any(
+        g.get("guard") == EMPTY_FRESH_GUARD_RECORDED_NAME and g.get("verdict") == "empty_fresh"
+        for g in (doc.get("guards") or [])
+    )
 
     findings: list[dict] = []
     for template in raw.get("writes") or []:
@@ -412,6 +435,9 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
         matched = [o for o in outputs if pattern.match(str(o.get("key") or ""))]
         if not matched:
             if auto_skipped:
+                continue
+            if str(template) in conditional and measured_zero:
+                row["conditional_skipped"].append(str(template))
                 continue
             findings.append(
                 _finding(
