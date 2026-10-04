@@ -399,6 +399,22 @@ STAGE_BUDGETS: dict[str, StageBudget] = {
         max_budget_seconds=900,
         pipeline_segment="sequential",
     ),
+    # alpha-engine-config-I11936: the Director, moved off Lambda onto the
+    # weekly box. Constant, not per-ticker: one LLM plan call over the report
+    # card. 3,600s = crucible-evaluator director/hosting.py's 2,700s in-process
+    # wall (a 1,800s plan ceiling — 1.2x the ~1,500s worst case, 3.0x the 596s
+    # slowest completed call — plus the retro reserve, the tail steps and the
+    # write reserve) + a 900s provisioning allowance (evaluator clone/pin,
+    # gitleaks, the evaluator venv on a fresh box). max == current on purpose:
+    # this is the hard upper bound the move must keep, not headroom to grow into.
+    "Director": StageBudget(
+        name="Director",
+        current_timeout_seconds=3_600,
+        per_ticker_cost_seconds=None,
+        fixed_overhead_seconds=3_600,
+        max_budget_seconds=3_600,
+        pipeline_segment="sequential",
+    ),
 }
 
 

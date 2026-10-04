@@ -1984,19 +1984,21 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
         with pytest.raises(SystemExit, match="emit_skip=False"):
             mod.box_dispatch_flags(sf_def)
 
-    def test_a_helper_generated_director_only_recovery_satisfies_the_bypass(
+    def test_a_helper_generated_director_only_recovery_still_dispatches_a_box(
         self, mod, sf_def
     ):
-        """alpha-engine-config-I8167 closes-when: a recovery whose chain
-        witnessed every box stage complete (everything but Director) derives
-        an input that SATISFIES CheckSpotDispatchNeeded's bypass conjunction.
-        Before this fix the bypass was unreachable from any input
-        derive_plan() could produce — its sole health-check conjunct
-        (skip_post_eval) carried emit_skip=False, so no derived input ever
-        set it. Synthesized minimally: one stateEnteredEventDetails per
-        witness state for each box-conjunct stage (8 until the I11269 cutover, 6
-        since), plus Director's
-        own work state entered-but-not-completed (the recovery target)."""
+        """alpha-engine-config-I11936 INVERTS the I8167 closes-when this test
+        used to pin. A recovery whose chain witnessed every box stage complete
+        except Director used to take the bypass, because the Director was a
+        Lambda and needed no box. The Director now runs ON the weekly box over
+        SSM, so that same recovery MUST dispatch one — taking the bypass would
+        reach the Director with no $.ec2_instance_id and fail on a path, not on
+        the Director. The I8167 property itself still holds and is still
+        pinned: every OTHER box conjunct is emitted (skip_saturday_health_check,
+        not the non-emittable skip_post_eval), and the bypass stays reachable
+        from a derived input — see the next test. Synthesized minimally: one
+        stateEnteredEventDetails per witness state for each box-conjunct stage,
+        plus Director's own work state entered-but-not-completed."""
         events = [
             {
                 "type": "ExecutionStarted",
@@ -2026,19 +2028,26 @@ class TestSpotDispatchOnlyWhenABoxStageSurvives:
         ]
         plan = mod.derive_plan(events)
         assert "director" in plan.failed
+        assert "skip_director" not in plan.skip_flags
 
         derived_box_flags = set(mod.box_dispatch_flags(sf_def))
-        assert derived_box_flags <= set(plan.skip_flags), (
-            f"missing box-conjunct flags: {derived_box_flags - set(plan.skip_flags)}"
-        )
-        assert all(plan.skip_flags[f] is True for f in derived_box_flags)
-        # skip_saturday_health_check specifically — not the old, non-emittable
-        # skip_post_eval conjunct — is what got emitted.
+        assert "skip_director" in derived_box_flags
+        # Every box conjunct OTHER than the Director's own is emitted — the
+        # I8167 property, unchanged.
+        assert derived_box_flags - {"skip_director"} <= set(plan.skip_flags)
         assert plan.skip_flags.get("skip_saturday_health_check") is True
 
         gate = sf_def["States"]["CheckSpotDispatchNeeded"]
-        assert _dispatch_gate_next(gate, plan.skip_flags) == mod.SPOT_DISPATCH_CONVERGENCE, (
-            "a helper-generated Director-only recovery input must take the "
-            "spot-dispatch bypass, not boot a box to re-run advisory, "
-            "idempotent health checks"
+        assert _dispatch_gate_next(gate, plan.skip_flags) == "DispatchWeeklyFreshnessSpot", (
+            "a Director-only recovery must boot the weekly box: the Director "
+            "runs on it (alpha-engine-config-I11936)"
         )
+
+    def test_a_recovery_with_director_complete_takes_the_bypass(self, mod, sf_def):
+        """The I8167 closes-when, restated for the box-hosted Director: when the
+        recovery has NO box stage left — the Director included — its derived
+        input takes the bypass and boots nothing."""
+        gate = sf_def["States"]["CheckSpotDispatchNeeded"]
+        flags = {f: True for f in mod.box_dispatch_flags(sf_def)}
+        assert all(mod.STAGES_BY_FLAG[f].emit_skip for f in flags)
+        assert _dispatch_gate_next(gate, flags) == mod.SPOT_DISPATCH_CONVERGENCE
