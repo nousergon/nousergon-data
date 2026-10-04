@@ -53,8 +53,40 @@ def _scopes(container, label="<root>"):
             yield from _scopes(inner, f"{label}/{name}<iter>")
 
 
+#: Substrate-lost sites that are deliberately TERMINAL — they keep the
+#: distinguishable phase but do NOT take the relaunch. Exhaustive, add-by-PR-only,
+#: each with its reason; every entry must still route to the loud terminal.
+#:
+#: ``ExtractDirectorSubstrateLostError`` (alpha-engine-config-I11936): the
+#: Director moved off Lambda onto the launcher box as the run's LAST box stage,
+#: after ReportCard. As a Lambda it never had a relaunch, so this is not a
+#: regression. A relaunch edge from there makes every upstream skip flag live
+#: across the whole post-ReportCard tail (liveness in
+#: ``infrastructure/sf_reachability.py`` is path-insensitive), and the
+#: path-sensitive walk then exceeds its 200,000-context bound — measured
+#: 2026-10-03, still running past 5,000,000. Recovery for a reclaim during the
+#: Director is ``scripts/weekly_sf_rerun.py``, whose Director-only rerun
+#: dispatches a fresh box.
+TERMINAL_SUBSTRATE_LOST = frozenset({"ExtractDirectorSubstrateLostError"})
+
+
 def _substrate_lost(states):
-    return {k: v for k, v in states.items() if k.endswith("SubstrateLostError")}
+    return {
+        k: v for k, v in states.items()
+        if k.endswith("SubstrateLostError") and k not in TERMINAL_SUBSTRATE_LOST
+    }
+
+
+def test_terminal_substrate_lost_sites_fail_loud(states):
+    for name in TERMINAL_SUBSTRATE_LOST:
+        st = states[name]
+        assert st["Next"] == "NormalizeFailureContext", name
+        assert st["ResultPath"] == "$.error", name
+        assert st["Parameters"]["phase"].endswith("/SubstrateLost"), name
+        assert not any(
+            leaf.get("StringEquals") == st["Parameters"]["phase"]
+            for rule in states[RESUME]["Choices"] for leaf in rule.get("And", [rule])
+        ), f"{name} is terminal; a resume target for it would be dead wiring"
 
 
 def test_every_top_level_substrate_lost_site_routes_to_the_gate(states):

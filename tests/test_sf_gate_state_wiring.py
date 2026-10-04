@@ -86,6 +86,35 @@ def states() -> dict:
     return json.loads(_WEEKLY.read_text())["States"]
 
 
+#: alpha-engine-config-I11936: the Director runs on the weekly box over SSM, not
+#: as a Lambda, so its gate_state is no longer a Payload field — the Pass state
+#: below assembles the SAME object and the Director's command hands it to the box
+#: (``test_the_director_command_ships_the_assembled_gate_state``).
+_DIRECTOR_GATE_STATE_PRODUCER = "PrepareDirectorOnSpot"
+
+
+def _payload(states: dict, surface: str) -> dict:
+    """The object carrying ``gate_state`` for ``surface``, in either home."""
+    if surface == "Director":
+        return {"gate_state": states[_DIRECTOR_GATE_STATE_PRODUCER]["Parameters"]}
+    return states[surface]["Parameters"]["Payload"]
+
+
+def test_the_director_command_ships_the_assembled_gate_state(states):
+    """The block is useless unless it reaches the box: the Director's SSM command
+    must write exactly the assembled path, inside a QUOTED heredoc (no shell
+    expansion of a JSON body), and point box_run at the file it wrote."""
+    prep = states[_DIRECTOR_GATE_STATE_PRODUCER]
+    assert prep["Type"] == "Pass"
+    assert prep["Next"] == "Director"
+    assert prep["ResultPath"] == "$.director_gate_state"
+    commands = states["Director"]["Parameters"]["Parameters"]["commands.$"]
+    assert "States.JsonToString($.director_gate_state)" in commands
+    assert '<<"DIRECTOR_GATE_STATE_EOF"' in commands
+    assert "--gate-state-file /tmp/director-gate-state-{}.json" in commands
+    assert "States.Base64Encode" not in commands
+
+
 @pytest.fixture(scope="module")
 def floor(states) -> dict:
     """``InitializeInput``'s innermost defaults blob — the seeded floor every
@@ -103,7 +132,7 @@ def floor(states) -> dict:
 
 @pytest.mark.parametrize("surface", _SURFACES)
 def test_surface_payload_carries_gate_state(states, surface):
-    payload = states[surface]["Parameters"]["Payload"]
+    payload = _payload(states, surface)
     assert "gate_state" in payload, (
         f"{surface} presents the weekly run's numbers and carries no gate "
         "verdict — sf-pipeline-policy.md §2.3a rule 3. A surface rendering the "
@@ -114,7 +143,7 @@ def test_surface_payload_carries_gate_state(states, surface):
 
 @pytest.mark.parametrize("surface", _SURFACES)
 def test_gate_state_carries_every_family_and_both_probes(states, surface):
-    gate_state = states[surface]["Parameters"]["Payload"]["gate_state"]
+    gate_state = _payload(states, surface)["gate_state"]
     assert gate_state["schema_version"] == 1
     for family in _FAMILIES:
         assert gate_state.get(f"{family}.$") == f"${'.'}{family}", (
@@ -129,7 +158,7 @@ def test_gate_state_carries_every_family_and_both_probes(states, surface):
 def test_both_surfaces_send_an_identical_block(states):
     """One contract, one schema, one consumer implementation. Two surfaces that
     drift apart is two consumers, and the second one is the one nobody tests."""
-    blocks = [states[s]["Parameters"]["Payload"]["gate_state"] for s in _SURFACES]
+    blocks = [_payload(states, s)["gate_state"] for s in _SURFACES]
     assert blocks[0] == blocks[1]
 
 
@@ -180,7 +209,7 @@ def test_every_gate_state_path_resolves_against_the_initialize_input_floor(
     since no degraded Pass state ran to write any of the fields. A reference that
     does not resolve is a ``States.Runtime`` on the healthy path.
     """
-    gate_state = states[surface]["Parameters"]["Payload"]["gate_state"]
+    gate_state = _payload(states, surface)["gate_state"]
     for key, path in gate_state.items():
         if not key.endswith(".$"):
             continue
@@ -406,7 +435,7 @@ def test_the_named_routes_field_is_seeded_not_absent(floor):
 
 @pytest.mark.parametrize("surface", _SURFACES)
 def test_both_surfaces_carry_the_named_routes(states, surface):
-    gate_state = states[surface]["Parameters"]["Payload"]["gate_state"]
+    gate_state = _payload(states, surface)["gate_state"]
     assert gate_state[f"{_RP_ROUTES_FIELD}.$"] == f"$.{_RP_ROUTES_FIELD}.routes", (
         f"{surface} renders the run's results without being able to name which "
         "ResearchPredictorParallel route fail-opened (sf-pipeline-policy.md "

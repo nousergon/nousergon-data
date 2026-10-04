@@ -78,16 +78,6 @@ entries:
       exercised by collect_deepseek above.
     expires: "2026-11-27"
     tracking: alpha-engine-config-I9295
-  - path: infrastructure/step_function.json
-    pattern: "anthropic:env_key"
-    reason: >-
-      Literal ANTHROPIC_API_KEY appears only inside a State "Comment"
-      documentation string describing the alpha-engine-evaluator-director
-      Lambda's SSM secret usage (that Lambda lives in crucible-evaluator,
-      not this repo) — prose, not a call site in nousergon-data. Not
-      excluded by the doc-extension carve-out because the file is .json.
-    expires: "2026-11-27"
-    tracking: alpha-engine-config-I9295
   - path: infrastructure/lambdas/eval-judge-spot-dispatcher/test_handler.py
     pattern: "anthropic:base_url"
     reason: >-
