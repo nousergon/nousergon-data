@@ -556,6 +556,34 @@ class PolygonClient:
         results.sort(key=lambda r: r["ex_dividend_date"])
         return results
 
+    def get_ticker_details(self, ticker: str) -> dict | None:
+        """Polygon's reference record for ONE ticker, or ``None`` if it has none.
+
+        Queries ``/v3/reference/tickers/{ticker}`` and returns its ``results``
+        object, which carries ``active`` and ``list_date`` among other fields.
+        A 404 whose body says ``status=NOT_FOUND`` returns ``None``: Polygon
+        does not know the symbol. Every other failure (403, 5xx after retries,
+        network) PROPAGATES with the apiKey scrubbed by the shared ``_get``
+        path, so a caller can tell "Polygon says no" from "Polygon did not
+        answer" (D02's provisional spin-off additions,
+        alpha-engine-config-I11812, treat both as not confirmed, but record
+        which one it was).
+        """
+        try:
+            data = self._get(f"/v3/reference/tickers/{ticker}")
+        except requests.HTTPError as exc:
+            resp = exc.response
+            if resp is not None and resp.status_code == 404:
+                try:
+                    body = resp.json()
+                except ValueError:
+                    body = {}
+                if body.get("status") == "NOT_FOUND":
+                    return None
+            raise
+        results = data.get("results")
+        return results if isinstance(results, dict) else None
+
     def get_ticker_events(self, ticker: str) -> list[dict]:
         """Fetch ticker-RENAME events for one ticker (corporate-actions PR6,
         config#1433).

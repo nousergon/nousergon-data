@@ -121,7 +121,7 @@ def test_a_current_source_beats_the_previous_sector() -> None:
 
 
 def test_a_declared_override_beats_withholding() -> None:
-    overrides = {"VYLR": ("Materials", "2099-12-31", "test")}
+    overrides = {"VYLR": (("Materials", "2000-01-01", "2099-12-31", "test"),)}
     _, payload = _collect(_PREVIOUS, overrides=overrides)
     assert "VYLR" in payload["tickers"]
     assert payload["sector_map"]["VYLR"] == "Materials"
