@@ -92,11 +92,17 @@ guards:
     state: present
     note: "the ONLY unit setting verify_artifact_exists=True (weekly_collector.py:2867)"
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/daily_closes.py::collect"
+    evaluates: 'source == "yfinance_only" and stock_coverage < _YFINANCE_MIN_COVERAGE'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: in yfinance_only mode collect() raises, writing nothing, when stock coverage of
+        the requested tickers is below _YFINANCE_MIN_COVERAGE (0.95). In this mode the coverage
+        count includes canonical rows retained from the existing parquet (skip_if_canonical), so
+        it grades the published object, not the fresh fetch alone. The declared floor is 1.0; a
+        run between 95% and 100% publishes, and that half is the remaining work. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: present
     note: PriceBar
