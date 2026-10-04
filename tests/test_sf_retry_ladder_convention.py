@@ -75,6 +75,11 @@ SPOT_STAGE_SEND_STATES = {
     # EvalJudgeProcessRetryGate, which launches a fresh box, and a coverage
     # shortfall is a verdict that a retry cannot change.
     "EvalJudgeProcess",
+    # alpha-engine-config-I11936: the Director moved off Lambda onto the
+    # weekly box over SSM. Same idempotency argument: the SEND can only fail
+    # before the Director runs; a delivered run is owned by WaitForDirector,
+    # and its failure is terminal (config#6408), never re-sent here.
+    "Director",
 }
 HEALTH_OBSERVE_SEND_STATES = {
     "SaturdayHealthCheck",

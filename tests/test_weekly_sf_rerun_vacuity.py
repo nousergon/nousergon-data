@@ -160,7 +160,6 @@ def test_the_scheduled_cadence_input_can_enter_every_spine_stage(mod, sf_def, sp
         ("skip_signals_envelope", "SignalsEnvelope"),
         ("skip_eval_judge", "EvalRollingMean"),
         ("skip_report_card", "ReportCard"),
-        ("skip_director", "Director"),
     ],
 )
 def test_clearing_one_flag_puts_exactly_that_stage_back(
@@ -172,6 +171,23 @@ def test_clearing_one_flag_puts_exactly_that_stage_back(
     assert payload.get(flag) is True, f"{flag} is not set in the captured input"
     relaxed = {k: v for k, v in payload.items() if k != flag}
     assert mod.enabled_spine_stages(sf_def, relaxed, spine) == (stage,)
+
+
+def test_clearing_skip_director_reopens_the_box_and_its_resume_targets(
+    mod, sf_def, spine
+):
+    """alpha-engine-config-I11936: the Director runs on the weekly box now, so
+    clearing `skip_director` is clearing a BOX stage. It used to put exactly
+    `Director` back (it was a Lambda); it now also dispatches the box, which
+    makes `ResumeAfterSubstrateRelaunch`'s targets reachable — the same
+    deliberate over-approximation the next test pins for `skip_rag_ingestion`.
+    Director is still among them: the sensitivity property holds."""
+    payload = _input(REAL_VACUOUS_INPUTS[0])
+    assert payload.get("skip_director") is True
+    relaxed = {k: v for k, v in payload.items() if k != "skip_director"}
+    enabled = mod.enabled_spine_stages(sf_def, relaxed, spine)
+    assert "Director" in enabled
+    assert set(enabled) == {"Director", "Backtester", "EvaluatorDiagnostics", "EvaluatorOptimize"}
 
 
 def test_re_enabling_a_box_stage_also_reopens_the_substrate_resume_targets(
