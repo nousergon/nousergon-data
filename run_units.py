@@ -74,6 +74,7 @@ __all__ = [
     "resolve_log_location",
     "recorded_entry",
     "resolve_trigger",
+    "rows_out_floor_for",
     "truncate_reason",
     "unit_for",
 ]
@@ -481,6 +482,38 @@ def _empty_declarations() -> dict[str, EmptyDeclaration]:
         declared = empty_declaration(unit.raw)
         if declared is not None:
             out[unit.unit_id] = declared
+    return out
+
+
+def rows_out_floor_for(unit_id: str) -> int | None:
+    """The absolute per-key ``rows_out`` floor ``unit_id`` DECLARES, or ``None``.
+
+    `alpha-engine-config-I10785` (P-18): the empty-but-fresh guard applies "the
+    declared floor from each unit's descriptor". The field is
+    ``completeness.rows_out_floor`` — the SAME declaration
+    `data_gate/run_manifest_predicate.py::_rows_out_floor` grades a finished
+    run's outputs against, so the guard that runs at publish time and the
+    completion check that runs after it read one number, never two.
+
+    Only an explicit declaration counts. The predicate's undeclared default
+    (``DEFAULT_ROWS_OUT_FLOOR = 1``) is already the guard's non-empty half
+    (``rows_out == 0`` is ``empty_fresh``), and ``completeness.floor`` is a
+    RATIO against a denominator, which is the cardinality guard's question, not
+    this one's. Read from ``registry.d/units/`` like :func:`empty_declaration_for`,
+    and cached for the same reason.
+    """
+    return _rows_out_floors().get(unit_id)
+
+
+@functools.lru_cache(maxsize=1)
+def _rows_out_floors() -> dict[str, int]:
+    from data_gate.descriptors import load_units  # local: keeps `yaml` off the CLI import path
+
+    out: dict[str, int] = {}
+    for unit in load_units():
+        declared = (unit.raw.get("completeness") or {}).get("rows_out_floor")
+        if declared is not None:
+            out[unit.unit_id] = int(declared)
     return out
 
 
