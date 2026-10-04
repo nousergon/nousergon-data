@@ -116,6 +116,26 @@ def _isolate_previous_constituents_from_s3(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_provisional_confirmer_from_polygon(monkeypatch):
+    """Keep D02's provisional spin-off confirmation (alpha-engine-config-I11812)
+    from calling the live Polygon API in any test that drives
+    ``historical_constituents.collect()`` with one unexplained addition. The
+    stub raises, which is the fail-closed answer: the addition is refused and
+    the run degrades exactly as it did before fix D. Tests of the confirmation
+    itself pass ``confirm=`` or patch the seam explicitly. Only patched when the
+    module is already imported."""
+    import sys
+
+    hc = sys.modules.get("collectors.historical_constituents")
+    if hc is not None and hasattr(hc, "_polygon_ticker_details"):
+        def _isolated(ticker):
+            raise RuntimeError("Polygon is not reachable from unit tests")
+
+        monkeypatch.setattr(hc, "_polygon_ticker_details", _isolated)
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _isolate_secrets_from_ssm(monkeypatch):
     """Force every test to read secrets from env only, not SSM.
 

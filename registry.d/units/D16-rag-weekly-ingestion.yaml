@@ -98,11 +98,17 @@ completeness:
   status: proposed
 guards:
   empty_fresh:
-    state: absent
+    state: partial
+    code:
+      - "rag/pipelines/run_weekly_ingestion_recorded.py::_body"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        RUN-level only: rag/pipelines/run_weekly_ingestion_recorded.py::_body files guard
+        `data_empty_fresh` `empty_fresh` (and fails the manifest) when the run published NO key
+        under any declared prefix, and `ok` otherwise. A published key carrying zero documents
+        is recorded with its measured rows_out but is not itself graded empty — that per-key
+        half is the remaining work. Not in service until commissioned by an induced fault
+        (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
