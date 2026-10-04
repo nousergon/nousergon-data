@@ -47,11 +47,17 @@ def test_the_leaf_runs_after_report_card_and_director(states):
     in a JSON object is not execution order, and asserting on it would pass for
     a state wired anywhere."""
     assert states["ReportCard"]["Next"] == "CheckSkipDirector"
-    assert states["CheckSkipDirector"]["Default"] == "Director"
+    # alpha-engine-config-I11936: the Director runs on the weekly box; its
+    # gate_state is assembled by PrepareDirectorOnSpot first.
+    assert states["CheckSkipDirector"]["Default"] == "PrepareDirectorOnSpot"
+    assert states["PrepareDirectorOnSpot"]["Next"] == "Director"
     # alpha-engine-config-I11299: Director's success edge now passes through
     # CheckDirectorSubResults (§2.3b); both of its routes converge on
     # DirectorComplete, so the ordering this test pins is unchanged.
-    assert states["Director"]["Next"] == "CheckDirectorRetroRefused"
+    # alpha-engine-config-I11936: the success edge is now the box's exit-code
+    # records, each landing where the Lambda Task's Next did.
+    for _rec in ("RecordDirectorClean", "RecordDirectorDegraded", "RecordDirectorRetroRefused", "RecordDirectorDegradedRetroRefused"):
+        assert states[_rec]["Next"] == "CheckDirectorRetroRefused"
     assert states["CheckDirectorRetroRefused"]["Default"] == "CheckDirectorSubResults"
     assert states["CheckDirectorSubResults"]["Default"] == "DirectorComplete"
     # Every edge that previously ended the advisory tail now enters the gate.
