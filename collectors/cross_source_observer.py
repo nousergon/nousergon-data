@@ -221,6 +221,20 @@ VENDOR_DIVERGENCE_METRIC_PREFIX = "data_collection/metrics/vendor_divergence/"
 VENDOR_DIVERGENCE_BREACH_BPS = 50.0    # a single symbol's disagreement bound
 VENDOR_DIVERGENCE_BOUND = 0.01         # share of the universe allowed to breach
 
+#: The run-manifest guard name the vendor cross-check verdict is recorded under.
+#: It IS ``data_gate.exit_criteria.VENDOR_GUARD`` — the string
+#: ``data.phase2.vendor_divergence_emitted`` matches a manifest's ``guards[]``
+#: entries on — and ``tests/test_vendor_divergence_metric.py`` pins the two
+#: equal, so a rename on either side is a red test rather than a clause that
+#: silently stops counting.
+VENDOR_CROSSCHECK_GUARD = "vendor_crosscheck"
+#: Observe mode: the verdict is recorded and never moves a run's exit code.
+VENDOR_CROSSCHECK_MODE = "observe"
+
+#: The two record statuses that are a MEASUREMENT (a comparison set existed).
+#: ``unmeasurable`` is the record of not having looked.
+_MEASURED_STATUSES = frozenset({"ok", "breach"})
+
 
 def compute_vendor_divergence(
     new_closes: dict,
@@ -318,6 +332,58 @@ def compute_vendor_divergence(
     }
 
 
+def vendor_divergence_key(run_date: str) -> str:
+    """The S3 key of ``run_date``'s vendor-divergence MetricRecord."""
+    return f"{VENDOR_DIVERGENCE_METRIC_PREFIX}{run_date}.json"
+
+
+def _read_existing_record(s3, bucket: str, key: str) -> Optional[dict]:
+    """The record already at ``key``, or ``None`` when there is none to keep.
+
+    A 404 is ``None``. An object that does not parse as a JSON record is also
+    ``None`` — it is not a measurement, so nothing is lost by replacing it.
+    Any OTHER read failure RAISES: treating "could not look" as "nothing
+    there" is exactly how a measured record gets overwritten blind.
+    """
+    from botocore.exceptions import ClientError
+
+    try:
+        obj = s3.get_object(Bucket=bucket, Key=key)
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey"):
+            return None
+        raise
+    try:
+        doc = json.loads(obj["Body"].read())
+    except (TypeError, ValueError):
+        return None
+    return doc if isinstance(doc, dict) else None
+
+
+def _supersedes(new: dict, existing: Optional[dict]) -> bool:
+    """Whether ``new`` may replace ``existing`` at the same trading-day key.
+
+    The first D17 pass for a trading day is the ONLY moment the whole
+    universe's yfinance closes (D19's write) and polygon's closes are both in
+    hand: that pass overwrites the yfinance rows, so every later pass over the
+    same day — the next mornings' backfill window, a same-morning rerun, the
+    D17 no-record fallback — sees a smaller comparison set or none at all.
+    Measured 2026-10-03 09:06Z: the 2026-10-02 record was written ``ok`` over
+    926 symbols and overwritten 0.3 s later by an ``unmeasurable`` one with
+    n=0, and the backfill window rewrote 2026-09-21 from n=926 to n=2. So a
+    record that measured nothing never replaces one that measured something,
+    and a measurement replaces another only over an equal-or-larger set.
+    """
+    if existing is None or existing.get("status") not in _MEASURED_STATUSES:
+        return True
+    if new.get("status") not in _MEASURED_STATUSES:
+        return False
+    try:
+        return int(new.get("n") or 0) >= int(existing.get("n") or 0)
+    except (TypeError, ValueError):
+        return True
+
+
 def write_vendor_divergence_metric(
     bucket: str,
     new_closes: dict,
@@ -329,15 +395,29 @@ def write_vendor_divergence_metric(
 ) -> dict:
     """Compute + PUT the vendor-divergence MetricRecord for ``run_date``.
 
+    Returns the record that STANDS at the key afterwards: the one just
+    written, or — when :func:`_supersedes` refuses the write — the larger
+    measurement already there, which is then the day's verdict.
+
     Producer write: unlike :func:`annotate_records`, this does NOT swallow a
-    write failure internally — a failed PUT propagates so the caller's own
-    fail-soft wrapper (mirroring the L1 observer's, in
+    write failure internally — a failed read or PUT propagates so the
+    caller's own fail-soft wrapper (mirroring the L1 observer's, in
     ``collectors.daily_closes.collect``) decides, loudly, whether to let
     ingestion continue. Never call this in dry-run mode.
     """
     record = compute_vendor_divergence(new_closes, prior_rows, run_date, **kwargs)
     s3 = s3_client or boto3.client("s3")
-    key = f"{VENDOR_DIVERGENCE_METRIC_PREFIX}{run_date}.json"
+    key = vendor_divergence_key(run_date)
+    existing = _read_existing_record(s3, bucket, key)
+    if not _supersedes(record, existing):
+        logger.info(
+            "vendor_divergence %s: kept the existing record at s3://%s/%s "
+            "(status=%s n=%s) over this run's (status=%s n=%d) — a later pass "
+            "over the same day sees a smaller comparison set, never a better one",
+            run_date, bucket, key, existing.get("status"), existing.get("n"),
+            record["status"], record["n"],
+        )
+        return existing
     s3.put_object(
         Bucket=bucket,
         Key=key,
@@ -351,3 +431,77 @@ def write_vendor_divergence_metric(
         len(record["breaching_symbols"]),
     )
     return record
+
+
+def vendor_crosscheck_guard_entry(record: Optional[dict], run_date: str) -> dict:
+    """The ``vendor_crosscheck`` run-manifest guard entry for one record.
+
+    Shaped for ``weekly_collector._record_collector_guards`` (the generic hook
+    that folds a collector's own ``result["guards"]`` onto its manifest), and
+    read back by ``data_gate.exit_criteria.read_vendor_divergence_emitted``.
+    The verdict is the record's own status: ``ok`` within bound, ``breach``
+    with every breaching symbol named in the record at ``key``, and
+    ``unmeasurable`` when there was no comparison set or the record could not
+    be written — never a pass.
+    """
+    key = vendor_divergence_key(run_date)
+    record = record or {}
+    status = record.get("status")
+    if status in _MEASURED_STATUSES:
+        breaching = record.get("breaching_symbols") or []
+        named = ", ".join(str(b.get("ticker")) for b in breaching[:10])
+        detail = (
+            f"yfinance vs polygon close for trading_day {run_date}: "
+            f"{len(breaching)} of {record.get('n')} symbol(s) beyond "
+            f"{record.get('breach_threshold_bps')} bps (share {record.get('value')}, "
+            f"bound {record.get('bound')}); champion {record.get('champion_vendor')}."
+            + (f" Breaching: {named}." if named else "")
+        )
+        verdict = status
+    elif "error" in record:
+        detail = (
+            f"the vendor_divergence record for trading_day {run_date} could not be "
+            f"written: {str(record['error'])[:300]}"
+        )
+        verdict = "unmeasurable"
+    else:
+        detail = (
+            f"no comparison for trading_day {run_date}: "
+            f"{record.get('reason') or 'no vendor_divergence record was produced'}"
+        )
+        verdict = "unmeasurable"
+    return {
+        "guard": VENDOR_CROSSCHECK_GUARD,
+        "mode": VENDOR_CROSSCHECK_MODE,
+        "verdict": verdict,
+        "detail": detail[:2000],
+        "key": key,
+        "value": record.get("value") if verdict in _MEASURED_STATUSES else None,
+        "baseline": record.get("bound") if verdict in _MEASURED_STATUSES else None,
+    }
+
+
+def vendor_crosscheck_not_applicable_entry(run_date: str) -> dict:
+    """The ``vendor_crosscheck`` entry for the EOD (yfinance) side of the pair.
+
+    D19 writes the yfinance closes the comparison reads, but polygon's close for
+    the same trading day is not published until the next morning on the free
+    tier, so there is nothing for this run to compare — the comparison is made
+    by D17's morning pass and recorded on D17's manifest. Recorded rather than
+    left silent: a run that says nothing is indistinguishable from a guard that
+    stopped running.
+    """
+    return {
+        "guard": VENDOR_CROSSCHECK_GUARD,
+        "mode": VENDOR_CROSSCHECK_MODE,
+        "verdict": "not_applicable",
+        "detail": (
+            f"EOD pass writes the yfinance side of trading_day {run_date}'s cross-check; "
+            "polygon's close for that day is not published until the next morning, so the "
+            "comparison is made by the morning polygon pass (D17) into "
+            f"{vendor_divergence_key(run_date)}."
+        ),
+        "key": vendor_divergence_key(run_date),
+        "value": None,
+        "baseline": None,
+    }
