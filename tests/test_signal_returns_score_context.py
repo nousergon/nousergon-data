@@ -394,6 +394,29 @@ class TestEmitContextCoverageMetric:
         assert out["rows_post_cutoff"] == 1
         assert out["coverage_pct"] == 100.0
 
+    def test_frozen_v1_tail_is_excluded_but_new_rows_still_gate(self, tmp_db, monkeypatch):
+        """alpha-engine-config-I11609: rows dated through the frozen v1 tail
+        (newest 2026-07-10) can never be backfilled and are excluded. A row
+        dated after it that lacks a canonical column is still a drift."""
+        from collectors.signal_returns import _SCORE_PERFORMANCE_V1_FROZEN_THROUGH
+        assert _SCORE_PERFORMANCE_V1_FROZEN_THROUGH == "2026-07-10"
+        assert _DRIFT_EFFECTIVE_DATE > _SCORE_PERFORMANCE_V1_FROZEN_THROUGH
+        # Live shape: v1 rows inside the old 05-17 window with NULL qual and sector.
+        self._seed_row(tmp_db, "OLD1", "2026-05-22", quant_score=70.0)
+        self._seed_row(tmp_db, "OLD2", _SCORE_PERFORMANCE_V1_FROZEN_THROUGH, quant_score=70.0)
+        cw = MagicMock()
+        monkeypatch.setattr("collectors.signal_returns.boto3.client",
+                            lambda svc: cw if svc == "cloudwatch" else MagicMock())
+
+        frozen_only = _emit_context_coverage_metric(tmp_db)
+        assert frozen_only["rows_post_cutoff"] == 0
+        assert frozen_only["frozen_through"] == "2026-07-10"
+
+        self._seed_row(tmp_db, "NEW1", _DRIFT_EFFECTIVE_DATE, quant_score=80.0)
+        with_new = _emit_context_coverage_metric(tmp_db)
+        assert with_new["rows_post_cutoff"] == 1
+        assert with_new["coverage_pct"] == 0.0
+
     def test_empty_post_cutoff_reports_100(self, tmp_db, monkeypatch):
         """No rows past effective_date — coverage undefined, report 100
         so the alarm doesn't fire on a legitimately-empty window."""
