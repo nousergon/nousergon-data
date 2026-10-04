@@ -197,19 +197,73 @@ def box(tmp_path: Path):
     first = _commit(author, "A")
     checkout = tmp_path / "alpha-engine-data"
     _git("clone", "-q", "--depth", "1", "--branch", "main", f"file://{origin}", str(checkout), cwd=tmp_path)
-    return {"tmp": tmp_path, "author": author, "checkout": checkout, "first": first}
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "aws").write_text(_FAKE_AWS)
+    (fake_bin / "aws").chmod(0o755)
+    return {
+        "tmp": tmp_path, "author": author, "checkout": checkout, "first": first,
+        "origin": origin, "fake_bin": fake_bin, "s3": tmp_path / "s3",
+        "pins": tmp_path / "pins",
+    }
 
 
-def _pin(box: dict, execution: str) -> subprocess.CompletedProcess:
+# A stand-in for the two `aws s3api` calls the helper makes, backed by a
+# directory. It answers a missing key the way the real CLI does (NoSuchKey on
+# stderr, rc 254). FAKE_S3_FAIL=get|put makes that verb fail with AccessDenied.
+# Every call is logged so a test can assert on the arguments.
+_FAKE_AWS = r"""#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$FAKE_S3_DIR.calls"
+[ "$1" = "s3api" ] || { echo "fake aws: unexpected $*" >&2; exit 2; }
+verb="$2"; shift 2
+bucket="" key="" body="" out=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --region|--content-type) shift 2 ;;
+    --bucket) bucket="$2"; shift 2 ;;
+    --key) key="$2"; shift 2 ;;
+    --body) body="$2"; shift 2 ;;
+    *) out="$1"; shift ;;
+  esac
+done
+obj="$FAKE_S3_DIR/$bucket/$key"
+case "$verb" in
+  get-object)
+    if [ "${FAKE_S3_FAIL:-}" = "get" ]; then
+      echo "An error occurred (AccessDenied) when calling the GetObject operation: Access Denied" >&2; exit 254
+    fi
+    if [ ! -f "$obj" ]; then
+      echo "An error occurred (NoSuchKey) when calling the GetObject operation: The specified key does not exist." >&2; exit 254
+    fi
+    cp "$obj" "$out"; echo '{"ContentLength": 41}' ;;
+  put-object)
+    if [ "${FAKE_S3_FAIL:-}" = "put" ]; then
+      echo "An error occurred (AccessDenied) when calling the PutObject operation: Access Denied" >&2; exit 254
+    fi
+    mkdir -p "$(dirname "$obj")"; cp "$body" "$obj"; echo '{"ETag": "x"}' ;;
+  *) echo "fake aws: unexpected verb $verb" >&2; exit 2 ;;
+esac
+"""
+
+
+def _pin(box: dict, execution: str, *, checkout: Path | None = None,
+         pins: Path | None = None, **extra_env: str) -> subprocess.CompletedProcess:
     env = {
         **os.environ,
-        "AE_EXEC_PIN_ROOT": str(box["tmp"] / "pins"),
+        "PATH": f"{box['fake_bin']}:{os.environ['PATH']}",
+        "FAKE_S3_DIR": str(box["s3"]),
+        "AE_EXEC_PIN_ROOT": str(pins or box["pins"]),
         "GIT_CONFIG_GLOBAL": "/dev/null", "GIT_CONFIG_NOSYSTEM": "1",
+        **extra_env,
     }
     return subprocess.run(
-        ["bash", str(_HELPER), execution, str(box["checkout"])],
+        ["bash", str(_HELPER), execution, str(checkout or box["checkout"])],
         env=env, capture_output=True, text=True,
     )
+
+
+def _mirrored(box: dict, execution: str, checkout: str = "alpha-engine-data") -> Path:
+    return box["s3"] / "alpha-engine-research" / "health" / "exec_code_pin" / execution / checkout
 
 
 def _head(box: dict) -> str:
@@ -319,6 +373,97 @@ def test_a_corrupt_pin_fails_loud(box):
     pin_dir = box["tmp"] / "pins" / "exec-1"
     pin_dir.mkdir(parents=True)
     (pin_dir / "alpha-engine-data").write_text("not-a-sha\n")
+    r = _pin(box, "exec-1")
+    assert r.returncode != 0
+    assert "not a 40-hex SHA" in r.stderr
+
+
+# ── 1c. the pin outlives the box (substrate-loss relaunch) ───────────────────
+
+
+def _replacement_box(box: dict) -> Path:
+    """What RelaunchWeeklyFreshnessSpot hands ResumeAfterSubstrateRelaunch: a
+    new box whose bootstrap cloned `--branch main` (at whatever main is NOW)
+    into the same path, with an empty pin root."""
+    fresh = box["tmp"] / "replacement" / "alpha-engine-data"
+    fresh.parent.mkdir()
+    _git("clone", "-q", "--depth", "1", "--branch", "main", f"file://{box['origin']}", str(fresh),
+         cwd=box["tmp"])
+    return fresh
+
+
+def test_the_first_call_mirrors_the_pin_before_recording_it(box):
+    r = _pin(box, "exec-1")
+    assert r.returncode == 0, r.stderr
+    assert _mirrored(box, "exec-1").read_text().strip() == box["first"]
+    assert r.stdout == ""
+
+
+def test_a_replacement_box_resumes_on_the_executions_pin_not_newer_main(box):
+    """The residue PR1966 named: the substrate-loss relaunch is a fresh clone
+    of main, so without a durable pin the resumed stage ran the newer main and
+    one execution ran two SHAs across the relaunch."""
+    assert _pin(box, "exec-1").returncode == 0
+    newer = _commit(box["author"], "B")  # main moves while the first box dies
+    fresh = _replacement_box(box)
+    assert _git("rev-parse", "HEAD", cwd=fresh) == newer
+    new_pins = box["tmp"] / "replacement-pins"
+
+    r = _pin(box, "exec-1", checkout=fresh, pins=new_pins)
+    assert r.returncode == 0, r.stderr
+    assert _git("rev-parse", "HEAD", cwd=fresh) == box["first"] != newer
+    assert "restored execution pin" in r.stderr
+    # The local pin is restored too, so the spot-worker pin (_spot_common.sh
+    # `_exec_code_pin_sha`, which reads the local file) follows it.
+    assert (new_pins / "exec-1" / "alpha-engine-data").read_text().strip() == box["first"]
+    assert r.stdout == ""
+
+
+def test_a_new_execution_on_a_replacement_box_still_resolves_latest_main(box):
+    assert _pin(box, "exec-1").returncode == 0
+    newer = _commit(box["author"], "B")
+    fresh = _replacement_box(box)
+    r = _pin(box, "exec-2", checkout=fresh, pins=box["tmp"] / "replacement-pins")
+    assert r.returncode == 0, r.stderr
+    assert _git("rev-parse", "HEAD", cwd=fresh) == newer
+    assert _mirrored(box, "exec-2").read_text().strip() == newer
+
+
+def test_s3_is_always_addressed_with_an_explicit_region(box):
+    """The sync runs under `sudo -u ec2-user`, which drops the stage's exported
+    AWS_REGION; the weekly box's SSM shell exports none (I11567)."""
+    assert _pin(box, "exec-1").returncode == 0
+    calls = Path(f"{box['s3']}.calls").read_text().splitlines()
+    assert calls, "the helper never consulted the mirror"
+    assert all("--region us-east-1" in c for c in calls), calls
+
+
+def test_an_unreadable_mirror_fails_loud_instead_of_resolving_main(box):
+    """Only NoSuchKey means 'first call'. Treating AccessDenied (or a network
+    error) as 'no pin' would put a replacement box back on newer main."""
+    r = _pin(box, "exec-1", FAKE_S3_FAIL="get")
+    assert r.returncode != 0
+    assert "could not read s3://" in r.stderr
+    assert not (box["pins"] / "exec-1" / "alpha-engine-data").exists()
+
+
+def test_an_unwritable_mirror_fails_the_first_call_with_no_local_pin(box):
+    """Mirror first, local second: a pin that exists only on this box would let
+    the execution proceed on a SHA a replacement box can never recover."""
+    r = _pin(box, "exec-1", FAKE_S3_FAIL="put")
+    assert r.returncode != 0
+    assert "could not write s3://" in r.stderr
+    assert not (box["pins"] / "exec-1" / "alpha-engine-data").exists()
+    # The re-issue, once S3 is back, resolves and mirrors normally.
+    r = _pin(box, "exec-1")
+    assert r.returncode == 0, r.stderr
+    assert _mirrored(box, "exec-1").read_text().strip() == box["first"]
+
+
+def test_a_corrupt_mirror_fails_loud(box):
+    obj = _mirrored(box, "exec-1")
+    obj.parent.mkdir(parents=True)
+    obj.write_text("not-a-sha\n")
     r = _pin(box, "exec-1")
     assert r.returncode != 0
     assert "not a 40-hex SHA" in r.stderr
