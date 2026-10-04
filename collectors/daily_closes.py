@@ -1456,11 +1456,18 @@ def collect(
     # raises into ingestion (mirrors the L1 observer wrapper above); the
     # write itself does not swallow a PUT failure, so a write error is loud
     # in this log rather than silent.
+    #
+    # The verdict also goes onto the run manifest as a `vendor_crosscheck`
+    # guard entry — `data.phase2.vendor_divergence_emitted` counts manifests,
+    # not metric objects, and before this no D17/D19 manifest carried one.
     vendor_divergence_record: dict = {}
+    vendor_guards: list[dict] = []
     if source == "polygon_only" and existing_rows_for_merge and polygon_count > 0 and not dry_run:
+        from collectors.cross_source_observer import (
+            vendor_crosscheck_guard_entry,
+            write_vendor_divergence_metric,
+        )
         try:
-            from collectors.cross_source_observer import write_vendor_divergence_metric
-
             prior_by_ticker = {
                 r["ticker"]: r for r in existing_rows_for_merge if r.get("ticker")
             }
@@ -1468,7 +1475,7 @@ def collect(
                 str(t): closes_df.loc[t, "Close"] for t in closes_df.index
             }
             vendor_divergence_record = write_vendor_divergence_metric(
-                bucket, new_closes_by_ticker, prior_by_ticker, run_date,
+                bucket, new_closes_by_ticker, prior_by_ticker, run_date, s3_client=s3,
             )
         except Exception as exc:  # metric must never break ingestion
             logger.error(
@@ -1477,6 +1484,11 @@ def collect(
                 run_date, source, exc,
             )
             vendor_divergence_record = {"error": str(exc)}
+        vendor_guards.append(vendor_crosscheck_guard_entry(vendor_divergence_record, run_date))
+    elif source == "yfinance_only" and not dry_run:
+        from collectors.cross_source_observer import vendor_crosscheck_not_applicable_entry
+
+        vendor_guards.append(vendor_crosscheck_not_applicable_entry(run_date))
 
     # ONE informational email per run for confirmed corporate-action
     # restatements — but only when THIS collect() owns the email (standalone
@@ -1535,11 +1547,12 @@ def collect(
             # the run manifest by `weekly_collector._record_collector_guards`.
             # Observe mode — never moves the exit code. I11559: plus the
             # reading for rows carried over from the existing object.
+            # I10783: plus the `vendor_crosscheck` verdict (observe mode too).
             "guards": _settlement_guards(
                 fetch_started_at, run_date, key,
                 carried_rows=carried_tickers,
                 carried_from=last_modified if head is not None else None,
-            ),
+            ) + vendor_guards,
         }
     except Exception as e:
         logger.error("Failed to write daily closes: %s", e)
@@ -1918,6 +1931,15 @@ def _collect_window(
     _target_guards = (_target or {}).get("guards")
     if _target_guards:
         aggregate["guards"] = list(_target_guards)
+    # alpha-engine-config-I10783: the TARGET date's vendor-divergence record,
+    # for the same reason. `weekly_collector`'s D17 fallback writes an
+    # UNMEASURABLE record whenever this key is absent from the result it gets
+    # — and in window mode that result is this aggregate, which never carried
+    # it, so every morning overwrote its own measured record (2026-10-02:
+    # `ok` over 926 symbols, then `unmeasurable` n=0 0.3 s later).
+    _target_vendor = (_target or {}).get("vendor_divergence")
+    if _target_vendor:
+        aggregate["vendor_divergence"] = _target_vendor
     return aggregate
 
 
