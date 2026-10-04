@@ -267,6 +267,10 @@ def test_the_alert_job_is_gated_to_the_default_branch():
         cond = load_workflow(path)["jobs"]["notify-main-failure"]["if"]
         assert "failure()" in cond, path.name
         assert "refs/heads/main" in cond, path.name
+        # A job killed at its timeout-minutes concludes `cancelled`, which
+        # `failure()` does not match (C23, executor_profile). The full
+        # truth table is tests/test_workflow_notify_on_cancel.py.
+        assert "contains(needs.*.result, 'cancelled')" in cond, path.name
 
 
 def test_every_workflow_parses_with_duplicate_keys_rejected():
