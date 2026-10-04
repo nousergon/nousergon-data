@@ -110,6 +110,51 @@ def test_only_executor_writes_into_collection_prefixes_count():
     assert result.collection_writes == 2  # PutObject market_data + DeleteObject arcticdb, both by the executor
 
 
+
+def _batch_delete_child(key, role_arn, *, bucket="alpha-engine-research"):
+    """The per-key event CloudTrail logs for one key of a ``DeleteObjects``
+    batch: ``requestParameters`` is null and the object is only in
+    ``resources[]`` (shape copied from a live 2026-09-28 archive record)."""
+    record = _record("DeleteObject", key, role_arn, bucket=bucket)
+    record["requestParameters"] = None
+    record["resources"] = [
+        {"accountId": "711398986525", "type": "AWS::S3::Bucket", "ARN": f"arn:aws:s3:::{bucket}"},
+        {"type": "AWS::S3::Object", "ARN": f"arn:aws:s3:::{bucket}/{key}"},
+    ]
+    record["additionalEventData"] = {"parentRequestID": "HA5SRS3HWH35JCJT"}
+    return record
+
+
+def test_batch_delete_child_events_count_from_their_resources():
+    key = "AWSLogs/711398986525/CloudTrail/us-east-1/2026/09/28/obj.json.gz"
+    batch_parent = _record("DeleteObjects", "", _EXECUTOR)  # the batch call itself: no key, never counted
+    batch_parent["requestParameters"] = {"bucketName": "alpha-engine-research", "delete": ""}
+    records = [
+        batch_parent,
+        _batch_delete_child("arcticdb/shadow_universe/sl/a", _EXECUTOR),
+        _batch_delete_child("arcticdb/shadow_universe/sl/b", _EXECUTOR),
+        _batch_delete_child("arcticdb/shadow_universe/sl/c", _COLLECTOR),  # component 1, not the executor
+        _batch_delete_child("signals/x.json", _EXECUTOR),  # outside collection prefixes
+        _batch_delete_child("arcticdb/universe/x", _EXECUTOR, bucket="some-other-bucket"),
+    ]
+    s3 = _FakeS3({key: records})
+    result = m.count_collection_writes(
+        s3,
+        archive_bucket="archive",
+        archive_prefix="AWSLogs/711398986525/CloudTrail",
+        region="us-east-1",
+        start=_day(2026, 9, 28),
+        end=_day(2026, 9, 28),
+    )
+    assert result.collection_writes == 2
+
+
+def test_a_record_with_neither_params_nor_an_object_resource_is_not_a_write():
+    record = _record("DeleteObject", "arcticdb/x", _EXECUTOR)
+    record["requestParameters"] = None
+    record["resources"] = [{"type": "AWS::S3::Bucket", "ARN": "arn:aws:s3:::alpha-engine-research"}]
+    assert not m._is_collection_write(record, object_bucket="alpha-engine-research")
+
 class _LatencyS3(_FakeS3):
     """`_FakeS3` whose every GetObject blocks for a fixed round-trip and
     records how many were in flight at once."""
