@@ -306,8 +306,8 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
         result.coverage += f"; {len(retired)} RETIRED clause(s) on the board are graded by no gate"
     if unconnected:
         result.coverage += (
-            f"; {len(unconnected)} UNCONNECTED consumers clause(s) (kept, no surviving consumer, "
-            "by recorded decision) are graded by no gate"
+            f"; {len(unconnected)} UNCONNECTED consumers/schema_contract clause(s) (kept, no "
+            "surviving consumer, by recorded decision) are graded by no gate"
         )
     return result
 
