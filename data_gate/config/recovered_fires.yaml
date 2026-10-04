@@ -1,0 +1,40 @@
+# Declared recoveries of ONE missed scheduled fire each — read by
+# `data_gate/standalone.py::read_survives_phase4` (alpha-engine-config-I11812).
+#
+# `survives_phase4` asks two things of a fire: did the schedule's own execution
+# start for it (within EXECUTION_START_WINDOW), and did that execution SUCCEED
+# with an ok scheduled manifest for the unit inside it. A recovery started by
+# hand can never satisfy the second half, by design: a hand run is not proof the
+# schedule survives.
+#
+# An entry here changes the second half for exactly one (schedule, fire) and
+# nothing else. For that fire the reader still requires the scheduled execution
+# named below to have started inside the 15-minute window (the trigger did its
+# job), then requires the declared recovery execution to be SUCCEEDED in live
+# state and to have started inside [fire, fire + COMPLETION_GRACE], and grades
+# each unit by the cycle counter's rule (`exit_criteria.collect_cycles`): an ok
+# scheduled-trigger manifest that started inside [fire, fire + COMPLETION_GRACE].
+# Every other fire of every schedule is graded exactly as before.
+#
+# An entry is INERT until `ruling:` names the ruling that admitted it. `pending`
+# keeps the normal grading and says on the row that a recovery is declared but
+# not yet ruled. Add-by-PR-only; one entry per fire, never a range.
+schema_version: data_recovered_fires.v1
+recovered_fires:
+  - schedule: data-collection-weekly
+    fire: "2026-10-03T09:00:00Z"
+    machine: ne-data-collection-weekly
+    # Started 09:00:40Z, inside the window. Ran every workload; FAILED at
+    # VerifyRunManifests 12:19:06Z: D02 degraded on VYLR (S&P 500 addition
+    # 10-01 with no Wikipedia changes-table row), and the RetryOnDemand of
+    # weekly-phase-one rewrote the newest D01/D02/D05/D06/D07/D10/D11/D12
+    # manifests as not_applicable (same-date auto-skip).
+    fire_execution: ff6ac0c4-10a8-471f-9905-d73f00012ff5
+    # Started by hand 12:57:49Z for the same trade date (verify_units D02, D14);
+    # SUCCEEDED 13:46:24Z, before any consumer read the week.
+    recovery_execution: weekly-recovery-2026-10-02-1
+    root_cause_fix: nousergon-data#2036 (declared S&P 500 spin-off additions); retry defects nousergon-data#2039, #2040
+    tracker: alpha-engine-config-I11812
+    # Replace with the link to Brian's "count it" ruling on ask 2 before this
+    # entry is merged. Until then the entry changes no reading.
+    ruling: pending
