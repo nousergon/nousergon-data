@@ -197,6 +197,13 @@ def _existing(rows: dict[str, float], last_modified: dt.datetime):
     return s3
 
 
+def _settlement_guards(result: dict) -> list[dict]:
+    """The result's `bar_settlement` readings — it also carries D17's
+    `vendor_crosscheck` verdict (alpha-engine-config-I10783), which these
+    tests are not about."""
+    return [g for g in result["guards"] if g["guard"] == "bar_settlement"]
+
+
 def _d17_collect(existing_rows: dict[str, float], polygon_serves: list[str]) -> dict:
     from unittest.mock import patch
 
@@ -226,15 +233,16 @@ def test_a_d17_file_carrying_a_provisional_row_records_both_readings():
     evidence as ambiguous. The row stays strict."""
     result = _d17_collect({"AAPL": 100.0, "CPRI": 15.195}, polygon_serves=["AAPL"])
     assert result["status"] == "ok"
-    verdicts = [g["verdict"] for g in result["guards"]]
+    settlement = _settlement_guards(result)
+    verdicts = [g["verdict"] for g in settlement]
     assert verdicts == ["settled", "provisional"]
     # alpha-engine-config-I11563: the carried reading names its row.
-    assert [g["key"] for g in result["guards"]] == [KEY, f"{KEY}#CPRI"]
-    assert "row CPRI" in result["guards"][1]["detail"]
+    assert [g["key"] for g in settlement] == [KEY, f"{KEY}#CPRI"]
+    assert "row CPRI" in settlement[1]["detail"]
     assert parity._bar_settlement_stamp({"guards": result["guards"]}, KEY) is None
 
 
 def test_a_d17_file_it_fully_refreshed_records_only_its_fetch():
     result = _d17_collect({"AAPL": 100.0}, polygon_serves=["AAPL"])
-    assert [g["verdict"] for g in result["guards"]] == ["settled"]
+    assert [g["verdict"] for g in _settlement_guards(result)] == ["settled"]
     assert parity._bar_settlement_stamp({"guards": result["guards"]}, KEY)["verdict"] == "settled"

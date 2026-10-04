@@ -97,7 +97,15 @@ on its own deadline.
 `AlphaEngine/Infra/spot_orphans_terminated` (Count, sum) with a `name` dimension
 (the terminated box's `Name` tag). Zero is the expected steady-state; any non-zero
 value is a process-quality signal worth investigating — the most likely cause is a
-launcher that shipped without arming its watchdog.
+launcher that shipped without arming its watchdog. It counts ONLY a box that
+outlived its own deadline (`reap_reason=deadline`); `alpha-engine-weekly-freshness-
+spot-reaped` pages on any non-zero point.
+
+`AlphaEngine/Infra/finished_run_boxes_ended` (Count, sum, same `name` dimension) is
+the designed teardown above: a finished weekly run's box (`reap_reason=execution-
+finished` or `rehearsal-finished`). It is not an orphan and nothing alarms on it.
+Until 2026-10-04 both reasons shared `spot_orphans_terminated`, so every finished
+weekly run paged an hour after it stopped (2026-10-03: ALARM 13:16Z and 17:16Z).
 
 `AlphaEngine/Infra/orphan_reaper_candidates` and `orphan_reaper_terminated` (Count)
 with a `market` dimension (`spot` / `on-demand`) are emitted on **every** run,
