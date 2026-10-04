@@ -93,11 +93,20 @@ completeness:
   status: proposed
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "weekly_collector.py::_record_phase_lineage"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Every key this unit publishes through weekly_collector.py::_phase_collect is graded
+        after the collector returns by _record_phase_lineage:
+        validators/expectations.py::check_empty_fresh HEADs it and reads a missing or zero-byte
+        object, or a zero row count, as `empty_fresh`; an unreported count is `unmeasurable`,
+        never a pass. Filed on every manifest as guard `data_empty_fresh` plus the
+        data.D15.guard.empty_fresh MetricRecord (worst key wins). Observe/enforce staging is
+        declared once, in validators/expectations.py::EMPTY_FRESH_GUARD
+        (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
+        (P-19, alpha-engine-config-I10786).
   cardinality:
     state: present_on_input
     note: >-
