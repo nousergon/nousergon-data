@@ -174,6 +174,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ParityParallel.WaitForPitParityLookaheadResourceKillCheck": "ssm:getCommandInvocation single poll — bounded by PitParityLookaheadResourceKillCheck's own 60s executionTimeout (alpha-engine-config-I7267)",
         "ParityParallel.WaitForPitParityWalkforwardResourceKillCheck": "ssm:getCommandInvocation single poll — bounded by PitParityWalkforwardResourceKillCheck's own 60s executionTimeout (alpha-engine-config-I7267)",
         "WaitForEvaluatorDiagnostics": "ssm:getCommandInvocation single poll — bounded by EvaluatorDiagnostics' own executionTimeout",
+        "WaitForDirector": "ssm:getCommandInvocation single poll — bounded by the Director command's own 3,600s executionTimeout (alpha-engine-config-I11936)",
         "WaitForEvaluatorOptimize": "ssm:getCommandInvocation single poll — bounded by EvaluatorOptimize's own executionTimeout",
         "WaitForSaturdayHealthCheck": "ssm:getCommandInvocation single poll — bounded by SaturdayHealthCheck's own executionTimeout",
         "WaitForWeeklySubstrateHealthCheck": "ssm:getCommandInvocation single poll — bounded by WeeklySubstrateHealthCheck's own executionTimeout",
