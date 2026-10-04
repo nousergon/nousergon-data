@@ -242,13 +242,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "ReportCard": frozenset({
         "date.$", "dry_run.$", "snapshot", "gate_state", "run_scope.$",
     }),
-    # Director (Layer C, Part II) — alpha-engine-evaluator-director:live. Final
-    # advisory task; reads the fresh report card, writes director/{date}/
-    # action_plan.json; flag-gated (DIRECTOR_ENABLED) + non-fatal (own Catch).
-    # dry_run.$=$.research_dry → no-Opus / no-write probe on the preflight (L4504).
-    # alpha-engine-config-I7282: same `gate_state` block as ReportCard, byte-
-    # identical (one contract, one consumer implementation).
-    "Director": frozenset({"date.$", "dry_run.$", "gate_state"}),
+    # Director: no longer a Lambda Payload (alpha-engine-config-I11936) — it runs
+    # on the weekly box over SSM; its date / dry_run / gate_state ride the SSM
+    # command (tests/test_sf_director_on_spot_wiring.py).
     # config#2248: launches the launcher spot that replaces the always-on
     # dashboard box as the $.ec2_instance_id source. It reads the rest of its
     # config from Lambda env vars.
