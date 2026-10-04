@@ -110,11 +110,19 @@ guards:
         half is the remaining work. Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "rag/pipelines/source_yield.py::assess"
+      - "rag/pipelines/run_weekly_ingestion_recorded.py::_record_source_yield"
+    evaluates: '"status": STATUS_DEGRADED if degraded else STATUS_OK'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF, at source grain: source_yield.assess grades every expected filing source and reads
+        one that offered zero documents, failed every document, or never reported as `degraded`;
+        _record_source_yield files that verdict on every D16 manifest as guard
+        `rag_source_yield` (observe, alpha-engine-config-I11472). A source that answers for only
+        part of the ticker scope is not graded, and the run is not refused, so per-ticker
+        collapse inside a source is the remaining work. Not in service until commissioned by an
+        induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

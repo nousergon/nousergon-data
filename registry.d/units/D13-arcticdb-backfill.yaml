@@ -101,11 +101,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   units:
-    state: absent
+    state: partial
+    code:
+      - "builders/backfill.py::backfill"
+    evaluates: 'if audit.missed:'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF, price scale only: before any ArcticDB write,
+        features/compute.py::audit_action_jumps classifies every residual price jump, and
+        backfill() raises CorporateActionAuditError when a registered split is still
+        un-flattened, so a series on two adjusted bases is never written (config#1433,
+        data#1298). A jump no registered action explains is logged and written, and the feature
+        columns' units have no runtime check here; both are the remaining work. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   pit:
     state: present
     note: UniverseFreshnessViolation (builders/daily_append.py)
