@@ -47,8 +47,8 @@ def _manifest(**over) -> dict:
         "calendar_date": TRADING_DAY.isoformat(),
         "status": "ok",
         "reason": "",
-        "started": "2026-09-14T21:00:00Z",
-        "finished": "2026-09-14T21:12:00Z",
+        "started": "2026-09-14T22:17:00Z",
+        "finished": "2026-09-14T22:29:00Z",
         "code_sha": "a" * 40,
         "log_location": "cloudwatch:/alpha-engine/data-spot",
         "inputs": [],
@@ -241,7 +241,7 @@ ARCTIC_UNITS = ("D13", "D18", "D32")
 def _probe(**libraries) -> dict:
     return {
         "schema_version": 1,
-        "as_of": f"{TRADING_DAY.isoformat()}T21:30:00Z",
+        "as_of": f"{TRADING_DAY.isoformat()}T22:45:00Z",
         "libraries": libraries,
     }
 
