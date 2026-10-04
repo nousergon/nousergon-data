@@ -31,6 +31,11 @@
       "stage": "ParityParallel.PitParityWalkforwardResourceKillCheck",
       "reason": "alpha-engine-config-I7267. Same shape and argument as PitParityLookaheadResourceKillCheck, for the walkforward pass's RESOURCE_KILL marker key.",
       "acknowledged": "2026-08-19"
+    },
+    {
+      "stage": "Director",
+      "reason": "PROPOSED for ratification (alpha-engine-config-I11936; the #7329 entries above are Brian-ratified, this one is not yet). The Director moved off Lambda onto the launcher box over SSM. Its dry path is the SF's own --dry-run $.research_dry (the no-LLM-call, no-write probe the Lambda already ran on the Friday preflight), not $.preflight_args, so the derivation classifies it no_dry_path. Threading $.preflight_args would make it SWEEPABLE only if the sweep's box carried a crucible-evaluator checkout, which its bootstrap does not clone and BOX_DIR_TO_REPO does not map - a sweep-box change out of this stage's risk. COMPENSATING SURFACES, concretely: (1) the Friday-PM shell run executes this exact command on a freshly dispatched launcher box with research_dry=true, so the clone/pin, gitleaks install, evaluator venv build, krepis.session_dlp preflight boot gate and LLM-client construction all run ~18h before the Saturday run; (2) every failure of this stage is TERMINAL (config#6408): it converges on NormalizeFailureContext -> HandleFailure, which pages.",
+      "acknowledged": "2026-10-03"
     }
   ],
 
@@ -91,6 +96,27 @@
       },
       "reason": "alpha-engine-config-I9329. EvalJudgeProcess's command reads $.eval_judge_submit.Payload.{batch_id,plan_s3_key}, which EvalJudgeSubmit* returns at RUN TIME — there is no execution input for the sweep to derive them from, so they are declared here for the same reason spec_id is. Both are placeholders and neither can select real work: evals/judge_spot_run.py returns 0 from its --preflight-only block BEFORE either value is read (the block runs the imports and one read-only list_objects_v2 against the bucket, then returns), and the sweep threads $.preflight_args exactly as every other sendCommand stage does. Nested rather than flat because sf_commands._resolve walks the dotted path through the binding, so a flat string would raise UnresolvedReference and the stage would be dropped — which is the failure this declaration exists to prevent. If the ordering in judge_spot_run.main ever changes so the plan key is read before the preflight return, the stage's preflight fails loudly against a plan that does not exist — the correct outcome, and not a silent pass.",
       "acknowledged": "2026-08-29"
+    },
+    "director_gate_state": {
+      "value": {
+        "schema_version": 1,
+        "gate_degraded": false,
+        "health_check_degraded": false,
+        "parity_degraded": false,
+        "research_predictor_degraded": false,
+        "lib_pin_drift": {
+          "status": "UNMEASURED",
+          "reason": "preflight-sweep-synthetic"
+        },
+        "pipeline_contract": {
+          "status": "UNMEASURED",
+          "reason": "preflight-sweep-synthetic"
+        },
+        "research_predictor_degraded_routes": [],
+        "parity_verdict_unknown": true
+      },
+      "reason": "alpha-engine-config-I11936. The Director's command reads $.director_gate_state, which PrepareDirectorOnSpot assembles at RUN TIME from the execution record (the sf_gate_state.v1 block the Lambda Payload carried) - there is no execution input for the sweep to derive it from, so it is declared here for the same reason spec_id and eval_judge_submit are. It exists only so the command RENDERS; the stage is no_dry_path (see its no_dry_path_stages entry), so the sweep never executes it, and the synthetic verdicts are UNMEASURED - never a pass.",
+      "acknowledged": "2026-10-03"
     }
   }
 }
