@@ -61,10 +61,16 @@ contract:
   schema: contracts/universe_classification.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "crucible:crucible/data/universe.py"
+  # No `unpinned_consumers` (alpha-engine-config-I10933, 2026-10-04). It used to
+  # name `crucible:crucible/data/universe.py`, carried over from the P-07 plan's
+  # boundary-table row 4, which groups constituents and classification. That
+  # module reads `constituents.json` (D01's key, pinned by D01's body_schema pin)
+  # and never this one; no file in crucible, crucible-executor, crucible-trader,
+  # crucible-backtester, crucible-dashboard, metron or nousergon-console names
+  # `universe_classification`. The only readers are the two crucible-research
+  # modules under `consumers` above, which `consumers_decision` already records.
+  # Re-add a consumer here, as a structured pin, in the same change that
+  # deletes `consumers_decision`.
 registry_rows:
   - universe_classification_latest
 run_manifest_prefix: data_collection/runs/D07
