@@ -332,10 +332,10 @@ def test_an_owner_absent_from_the_document_is_unmeasurable(units, live):
     missing = {
         k: v
         for k, v in live.items()
-        if k != "step-functions:ne-weekly-freshness-pipeline"
+        if k != "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
     }
     reading = read_triggers_reconciled(_store(_document(missing)), units, as_of=READ_AT)
-    assert reading.unmeasurable and "UNRECONCILABLE D01" in reading.detail
+    assert reading.unmeasurable and "UNRECONCILABLE D19" in reading.detail
 
 
 # ---------------------------------------------------------------------------
