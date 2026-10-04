@@ -26,13 +26,12 @@ chokepoints, no lib change):
      The Lambda returns immediately with the command_id — the Step Function polls
      ssm:GetCommandInvocation to a terminal status, exactly like the groom SF.
 
-The box does its Arctic write / S3 read+write via its OWN instance profile —
-today still `alpha-engine-executor-profile` -> `alpha-engine-executor-role`,
-the SAME profile `spot_data_weekly.sh` uses for the Saturday data spot, so the
-ArcticDB/S3 credentials already exist on the box and this Lambda passes NONE
-of them. `DATA_SPOT_IAM_PROFILE` is env-overridable to the narrower
-`nousergon-data-collection-box-profile` (alpha-engine-config-I10756) once that
-role is live — see the constant's definition below for the cutover sequencing.
+The box does its Arctic write / S3 read+write via its OWN instance profile,
+`nousergon-data-collection-box-profile` -> `nousergon-data-collection-box-role`
+(alpha-engine-config-I10756), so this Lambda passes NONE of those credentials.
+Until this default flipped, the box ran as the trading component's
+`alpha-engine-executor-profile`; `DATA_SPOT_IAM_PROFILE` still overrides it —
+see the constant's definition below.
 
 FAILURE ISOLATION (config#1767 deliverable #4, LOAD-BEARING): this Lambda is only
 the launcher. The fail-OPEN decision lives in the Step Function: a data-spot
@@ -132,26 +131,20 @@ KEY_NAME = os.environ.get("DATA_SPOT_KEY_NAME", "alpha-engine-key")
 # NO IB port exposure (config#1767 deliverable #3): reuse the standard fleet SG,
 # which does not open the IB Gateway port. The data spot only needs egress + SSM.
 SECURITY_GROUP = os.environ.get("DATA_SPOT_SECURITY_GROUP", "sg-03cd3c4bd91e610b0")
-# The box's Arctic-write + S3 read/write come from this profile — historically
-# the SAME one spot_data_weekly.sh grants the Saturday data spot (executor
-# role, component 3/crucible-trading). alpha-engine-config-I10756
-# (architecture.d/146, one workload identity per component) splits data
-# collection (component 1) onto its own `nousergon-data-collection-box-role`
-# / `nousergon-data-collection-box-profile` (nous-ergon-ops
-# `infrastructure/iam/nousergon-data-collection-box-role/`) so a grant widened
-# for collection can no longer widen the trader, and a CloudTrail S3 write is
-# attributable to one component. This Lambda's own iam-policy.json already
-# holds the PassRole grant for the new role (`PassDataCollectionBoxRoleToEc2`)
-# so DATA_SPOT_IAM_PROFILE can be overridden to
-# "nousergon-data-collection-box-profile" today (e.g. per-workload via the SF
-# input, or a per-environment Lambda env var) — the DEFAULT stays the
-# executor profile until nous-ergon-ops bootstraps the new role live
-# (create-role/create-instance-profile are operator-gated,
-# role-provisioning-notes.md). Flip the default in a follow-up once
-# `iam-drift-check.yml` shows the new role off its `NEVER BOOTSTRAPPED` list;
-# flipping it earlier fails every collection launch with an IAM error the
-# launch path cannot recover from.
-IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "alpha-engine-executor-profile")
+# The box's Arctic-write + S3 read/write come from this profile. It used to be
+# the trading component's `alpha-engine-executor-profile` (component 3), so
+# every collection write landed in CloudTrail as an executor write:
+# 163,899 executor writes into the collection prefixes over 2026-09-27..10-03,
+# all but 24 of them from boxes this Lambda launched — the reading that holds
+# `data.phase2.executor_collection_writes_zero` (alpha-engine-config-I11036)
+# UNMET. alpha-engine-config-I10756 (architecture.d/146, one workload identity
+# per component) gives data collection (component 1) its own
+# `nousergon-data-collection-box-role` / `nousergon-data-collection-box-profile`
+# (nous-ergon-ops `infrastructure/iam/nousergon-data-collection-box-role/`),
+# live since 2026-09-15; this Lambda's role may PassRole it to EC2
+# (`PassDataCollectionBoxRoleToEc2`). DATA_SPOT_IAM_PROFILE stays an override
+# (e.g. to roll back to the executor profile without a code change).
+IAM_PROFILE = os.environ.get("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")
 # Large ephemeral disk so daily_closes fetch + ArcticDB append never hit the
 # /tmp-100% failure mode that motivated this move (config#1767 gotcha).
 VOLUME_SIZE_GB = int(os.environ.get("DATA_SPOT_VOLUME_SIZE_GB", "60"))
