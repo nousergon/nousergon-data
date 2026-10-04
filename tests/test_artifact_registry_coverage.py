@@ -115,6 +115,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # applied and a scheduled run first writes the key — the same posture
     # cost_monthly.py took — then re-evaluated for a REGISTERED row.
     "data_gate/producers/trigger_observation.py": 1,
+    # alpha-engine-config-I10789 (P-22) — the SLO emitter: ONE `put_bytes`
+    # site (the PUT is routed through `data_gate.store`, so the run record via
+    # `_StoreS3Adapter.put_object` is not a direct boto3 site) writing the
+    # sixteen data_collection/metrics/slo/{freshness,completeness}/<family>/
+    # latest.json documents the data.slo.* clauses read. GRANDFATHERED in
+    # alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml
+    # (`data_collection/metrics/slo/`, alpha-engine-config-PR11962) until its
+    # IAM grant and scheduled job land — the trigger_observation posture.
+    "data_gate/producers/slo.py": 1,
     # alpha-engine-config-I11312 — the on-spot FULL-profile preflight pass's
     # observe-mode verdict, one object per execution under
     # health/weekly_preflight_on_spot/<run_date>/<execution>.json. GRANDFATHERED
