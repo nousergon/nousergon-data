@@ -99,11 +99,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        weekly_collector.py::_phase_collect -> _record_phase_lineage. Not in service until
+        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   vendor_crosscheck:
     state: absent
     note: "writes the same key as D17 in overwrite; the source stamp and divergence metric are P-16"
