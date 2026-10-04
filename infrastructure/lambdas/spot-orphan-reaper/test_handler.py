@@ -825,6 +825,34 @@ class TestFinishedExecutionBoxes:
         assert out["terminated"] == ["i-ok"]
         assert out["orphan_detail"][0]["reap_reason"] == "execution-finished"
 
+    def test_finished_run_box_is_not_counted_as_an_orphan(self, index_module):
+        # 2026-10-03: two finished weekly boxes (reason=execution-finished) were
+        # reaped by design and each paged alpha-engine-weekly-freshness-spot-reaped,
+        # which fires on any non-zero spot_orphans_terminated and describes a box
+        # that outlived its own deadline. The designed teardown has its own series.
+        for name in ("rehearsal-2026-09-24-1", "watch-rerun-2026-10-02-1"):
+            sfn = _sfn("FAILED", stopped_seconds_ago=3700)
+            out, _ec2, cw = _run_filtered(index_module, [_weekly_box("i-fin", name)], sfn)
+            assert out["terminated"] == ["i-fin"]
+            assert _metric_calls(cw, "spot_orphans_terminated") == []
+            (call,) = _metric_calls(cw, "finished_run_boxes_ended")
+            (point,) = [d for d in call.kwargs["MetricData"]
+                        if d["MetricName"] == "finished_run_boxes_ended"]
+            assert point["Dimensions"] == [
+                {"Name": "name", "Value": "alpha-engine-weekly-freshness-spot"}]
+            assert point["Value"] == 1.0
+
+    def test_a_weekly_box_past_its_own_deadline_is_still_an_orphan(self, index_module):
+        # The alarm keeps its meaning: a box that outlived its watchdog-deadline
+        # still lands on spot_orphans_terminated and not on the finished series.
+        past = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
+        fleet = [_box("i-late", "alpha-engine-weekly-freshness-spot", 50000,
+                      lifecycle=None, launch_market="on-demand", watchdog_deadline=past)]
+        out, _ec2, cw = _run_filtered(index_module, fleet)
+        assert out["orphan_detail"][0]["reap_reason"] == "deadline"
+        assert len(_metric_calls(cw, "spot_orphans_terminated")) == 1
+        assert _metric_calls(cw, "finished_run_boxes_ended") == []
+
     def test_production_run_inside_the_grace_is_kept(self, index_module):
         sfn = _sfn("FAILED", stopped_seconds_ago=600)
         out, ec2, _cw = _run_filtered(

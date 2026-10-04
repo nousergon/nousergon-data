@@ -372,7 +372,21 @@ def _notify_incomplete_reap(kind: WatchKind, instance_id: str, watch_tags: dict[
         logger.warning("%s incomplete-reap Telegram send failed (non-fatal): %s", kind.label, exc)
 
 
-def _emit_metric(cw, name: str, count: int) -> None:
+# alpha-engine-config-I11569 / I11108 deliverable 4 made ending a finished weekly
+# run's box the reaper's DESIGNED teardown: the weekly launcher is not
+# self-terminating (13h watchdog), so a box whose execution has stopped is ended
+# an hour later on purpose. That is not an orphan. It used to be counted on
+# ``spot_orphans_terminated`` all the same, and ``alpha-engine-weekly-freshness-
+# spot-reaped`` pages on any non-zero point of that series ("the watchdog-deadline
+# tag should make this impossible"), so every finished weekly run paged an hour
+# after it stopped (measured 2026-10-03: ALARM 13:16Z and 17:16Z, both
+# ``reason=execution-finished``). The designed teardown now has its own series;
+# ``spot_orphans_terminated`` is only a box that outlived its own deadline.
+ORPHAN_METRIC = "spot_orphans_terminated"
+FINISHED_BOX_METRIC = "finished_run_boxes_ended"
+
+
+def _emit_metric(cw, name: str, count: int, metric_name: str = ORPHAN_METRIC) -> None:
     """Emit one CloudWatch metric data point per terminated instance group."""
     if count == 0:
         return
@@ -380,7 +394,7 @@ def _emit_metric(cw, name: str, count: int) -> None:
         cw.put_metric_data(
             Namespace="AlphaEngine/Infra",
             MetricData=[{
-                "MetricName": "spot_orphans_terminated",
+                "MetricName": metric_name,
                 "Dimensions": [{"Name": "name", "Value": name}],
                 "Value": float(count),
                 "Unit": "Count",
@@ -440,6 +454,7 @@ def handler(event: dict, context) -> dict:
     orphans: list[dict] = []
     terminated: list[str] = []
     per_name_terminated: dict[str, int] = {}
+    per_name_finished: dict[str, int] = {}
     terminated_by_market: dict[str, int] = {}
     incomplete_reaps: dict[str, list[str]] = {wk.result_key: [] for wk in WATCH_KINDS}
 
@@ -502,7 +517,10 @@ def handler(event: dict, context) -> dict:
         try:
             ec2.terminate_instances(InstanceIds=[inst["instance_id"]])
             terminated.append(inst["instance_id"])
-            per_name_terminated[inst["name"]] = per_name_terminated.get(inst["name"], 0) + 1
+            # A deadline reap is the orphan the alarm exists for; a finished
+            # run's box is the designed teardown and is counted separately.
+            series = per_name_terminated if reap_reason == "deadline" else per_name_finished
+            series[inst["name"]] = series.get(inst["name"], 0) + 1
             terminated_by_market[inst["market"]] = terminated_by_market.get(inst["market"], 0) + 1
             logger.warning(
                 "Terminated orphan %s (%s, market=%s, reason=%s, age=%ds, reap_after=%ds, type=%s)",
@@ -525,6 +543,8 @@ def handler(event: dict, context) -> dict:
 
     for name, count in per_name_terminated.items():
         _emit_metric(cw, name, count)
+    for name, count in per_name_finished.items():
+        _emit_metric(cw, name, count, FINISHED_BOX_METRIC)
     _emit_scan_metrics(cw, scanned_by_market, terminated_by_market)
 
     return {

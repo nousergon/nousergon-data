@@ -1363,7 +1363,7 @@ def _phase_body_marked(
                                       "published nothing on this run — clear the shadow prefix "
                                       "or --force-phases, a skipped shadow unit is not evidence")
             return {"status": "ok", "auto_skipped": True, "skip_reason": ctx.skip_reason}
-        result = run_fn() or {}
+        result = _annotate_phase_marker(reg, name, run_fn() or {})
         # alpha-engine-config-I11230 deliverable 4: the status vocabulary this
         # function branches on below is closed. A collector returning anything
         # outside it (a typo, a new status nobody wired here yet) must fail
@@ -3392,12 +3392,24 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         # unconditional). So when the collector wrote no record, D17 writes the
         # UNMEASURABLE one — `compute_vendor_divergence` reports exactly that
         # for an empty comparison set, and never raises.
+        #
+        # In window mode `dc_result` is `_collect_window`'s aggregate, which
+        # carries the TARGET date's record under this same key (I10783 — until
+        # 2026-10-04 it did not, so this branch fired on every morning and
+        # overwrote the measured record). The writer also refuses to replace a
+        # measured record with an unmeasurable one, so this fallback can only
+        # ever fill an absence. The verdict that stands at the key goes onto
+        # D17's manifest as its `vendor_crosscheck` guard entry.
         if not dry_run and not (dc_result or {}).get("vendor_divergence"):
+            from collectors.cross_source_observer import vendor_crosscheck_guard_entry
+
+            fallback_record: dict = {}
             try:
                 from collectors.cross_source_observer import write_vendor_divergence_metric
 
-                write_vendor_divergence_metric(bucket, {}, {}, target_date)
+                fallback_record = write_vendor_divergence_metric(bucket, {}, {}, target_date)
             except Exception as exc:  # noqa: BLE001
+                fallback_record = {"error": str(exc)}
                 # Swallow rationale (repo fail-loud rule): (a) the failure mode
                 # swallowed is a failed PUT of the divergence METRIC, never a
                 # data write; (b) the primary deliverable — polygon's
@@ -3413,6 +3425,11 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                     "divergence is unrecorded for this run",
                     target_date, exc,
                 )
+            if isinstance(dc_result, dict):
+                dc_result["vendor_divergence"] = fallback_record
+                dc_result["guards"] = list(dc_result.get("guards") or []) + [
+                    vendor_crosscheck_guard_entry(fallback_record, target_date)
+                ]
     except Exception as e:
         logger.exception("Morning polygon enrichment failed for %s", target_date)
         results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
@@ -5647,6 +5664,25 @@ def main() -> None:
             {k: v.get("status", "?") for k, v in results.get("collectors", {}).items()},
         )
         raise SystemExit(1)
+
+
+def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dict:
+    """Carry a collector's provisional acceptances onto its phase marker.
+
+    alpha-engine-config-I11812 (fix D): D02 may accept one Polygon-confirmed
+    spin-off addition without a committed declaration, and that must never be
+    silent. The artifact and the run manifest (a guard reading per addition)
+    already carry it; this puts the same ``provisional_additions`` list on the
+    marker a retry and an operator read first. A registry without
+    ``annotate_marker`` (a test double, the lib base class) is left alone.
+    Returns ``result`` unchanged. Defined down here, and called inline, so it
+    moves no line numbers in ``.debug-swallow-allowlist.yaml``.
+    """
+    accepted = result.get("provisional_additions") if isinstance(result, dict) else None
+    annotate = getattr(reg, "annotate_marker", None)
+    if accepted and callable(annotate):
+        annotate(name, provisional_additions=list(accepted))
+    return result
 
 
 if __name__ == "__main__":
