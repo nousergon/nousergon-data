@@ -28,10 +28,17 @@ owner: brian
 code_path: "rag/pipelines/ingest_form4.py:559"
 trigger:
   kind: "step-functions"
-  owner: "ne-weekly-freshness-pipeline:RAGIngestion"
+  # Runs inside D16's `rag-weekly-ingestion` workload in the standalone stack's
+  # weekly machine, started at Sat 05:00 ET by the Scheduler entry below. The
+  # Saturday cadence trigger passes skip_rag_ingestion to the v1 weekly SF
+  # (nousergon-data-PR2025), so v1's RAGIngestion state never runs it on schedule.
+  owner: "ne-data-collection-weekly"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-weekly"
   successor: >-
     nousergon-data-collection/data-collection-weekly, dispatcher workload
-    `rag-weekly-ingestion` (alpha-engine-config-I10753) — SAME shared key as
+    `rag-weekly-ingestion` (alpha-engine-config-I10753), ENABLED at the
+    decoupled cutover (alpha-engine-config-I11269); v1 was
+    ne-weekly-freshness-pipeline:RAGIngestion — SAME shared key as
     D16, step 5 (`rag.pipelines.ingest_form4`) of the unchanged
     run_weekly_ingestion.sh. No separate dispatcher key: it is a substep of
     that one script, not a standalone entry point, and a second key would
