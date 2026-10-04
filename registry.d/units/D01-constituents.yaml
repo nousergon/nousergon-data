@@ -117,11 +117,18 @@ guards:
     state: absent
     note: "no floor against the prior week's ~900 (audit §4.1)"
   units:
-    state: absent
+    state: present
+    code:
+      - "collectors/constituents.py::_fetch_ssga_membership"
+    evaluates: 'lo <= raw_sum <= hi'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        The only scaled numeric field this unit publishes is the per-constituent index weight.
+        _fetch_ssga_membership DETECTS its units from the raw sum against _WEIGHT_SUM_BANDS
+        (percent or fractions) and raises when the sum fits neither, so the live weights are
+        refused; the run then serves the cached roster with weight_method `cache_no_weights` and
+        an empty weight_map (unknown weight, never a mis-scaled one). Detected units are
+        normalised to fractions within each index before publish. Not in service until
+        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   pit:
     state: absent
     note: >-

@@ -97,16 +97,22 @@ OPTIONAL_GUARD_CLASSES: tuple[str, ...] = ("vendor_crosscheck",)
 #: spelling (`empty_fresh`) keys the descriptor's `guards:` block, the clause
 #: (`data.<unit>.guard.empty_fresh`) and the commissioning record
 #: (`faults/<unit>/empty_fresh/latest.json`). The RECORDED name is what the
-#: code writes on a manifest — `validators/expectations.py::EMPTY_FRESH_GUARD.name`
-#: and `run_units.py::EMPTY_PRODUCTION_GUARD`. A reader matching manifest
+#: code writes on a manifest — `validators/expectations.py::EMPTY_FRESH_GUARD.name`,
+#: `validators/expectations.py::CARDINALITY_GUARD.name` and
+#: `run_units.py::EMPTY_PRODUCTION_GUARD`. A reader matching manifest
 #: entries on the class spelling matches nothing, silently (measured
 #: 2026-10-03: `run_manifest_predicate.EMPTY_FRESH_GUARD` is the class spelling).
 #: A descriptor guard block that declares `records_as` must use this value.
 #: Literal rather than imported because `data_gate` ships inside Lambda zips
 #: that carry no `nousergon_lib`; `tests/test_guard_declarations_read_the_code.py`
-#: pins both values to the producing modules.
+#: pins every value to the producing modules.
+#:
+#: A class with no entry here (`units`, and every unit-local check of the
+#: others) has no shared manifest name. Its guard block names the check itself
+#: instead: `evaluates`, a literal from the named code (see `_check_guard_code`).
 GUARD_RECORDED_NAMES: dict[str, str] = {
     "empty_fresh": "data_empty_fresh",
+    "cardinality": "data_cardinality",
     "success_without_output": "data_success_without_output",
 }
 
@@ -389,10 +395,15 @@ def _check_guard_code(path: pathlib.Path, name: str, block: dict[str, Any]) -> N
 
     `code` is a list of ``path::function`` references to where the guard is
     evaluated; `records_as` is the manifest name that code files it under.
-    Both are optional (a pre-existing `present` cell may cite prose), but when
-    present they are the declaration `tests/test_guard_declarations_read_the_code.py`
-    resolves against the source, so a malformed one is refused here rather
-    than skipped there.
+    Where the check is unit-local and files no shared name (a refusal that
+    returns `status: error` or raises, so the run fails and nothing is
+    published), `evaluates` instead quotes the check itself: a literal that
+    must appear in one of the named functions. A block naming `code` declares
+    one of the two, so every `code` reference says what it does with the class.
+    All three are optional (a pre-existing `present` cell may cite prose), but
+    when present they are the declaration
+    `tests/test_guard_declarations_read_the_code.py` resolves against the
+    source, so a malformed one is refused here rather than skipped there.
     """
     code = block.get("code")
     if code is not None:
@@ -408,6 +419,19 @@ def _check_guard_code(path: pathlib.Path, name: str, block: dict[str, Any]) -> N
                 raise DescriptorError(
                     f"{path.name}: guards.{name}.code entry {ref!r} is not `<path>.py::<function>`"
                 )
+        if block.get("records_as") is None and block.get("evaluates") is None:
+            raise DescriptorError(
+                f"{path.name}: guards.{name} names `code` but neither `records_as` (the manifest "
+                "name it files) nor `evaluates` (the check, quoted from that code)"
+            )
+    evaluates = block.get("evaluates")
+    if evaluates is not None:
+        if code is None:
+            raise DescriptorError(
+                f"{path.name}: guards.{name}.evaluates quotes a check but names no `code` to find it in"
+            )
+        if not isinstance(evaluates, str) or not evaluates.strip():
+            raise DescriptorError(f"{path.name}: guards.{name}.evaluates must be a non-empty string")
     recorded = block.get("records_as")
     if recorded is not None and recorded != GUARD_RECORDED_NAMES.get(name):
         raise DescriptorError(
