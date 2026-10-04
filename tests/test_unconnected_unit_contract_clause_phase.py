@@ -18,8 +18,13 @@ The plan settles which way it resolves, and it is not "carve the clause out":
   contract** (no reader yet, so after keyed readers)."* D14 carries the same
   routing.
 
-So the contract is still owed and still graded — in **phase 2**, after the
-keyed readers. Deferred, not forgiven.
+So the clause moves to **phase 2**, after the keyed readers.
+
+Since `alpha-engine-config-I10933` the phase-2 clause renders UNCONNECTED
+(graded by no gate) when the unit's contract names no consumer, mirroring the
+`consumers` clause — see `tests/test_schema_contract_unconnected.py`. The
+deferral below still holds: it is the phase the clause is graded in once a
+consumer is added and the decision block deleted.
 
 What this test grades is the PROPERTY, not the eight instances: no unit may
 have its `consumers` clause read as a recorded keep while a clause the SAME

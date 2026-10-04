@@ -30,7 +30,7 @@ import pathlib
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
 
-from nousergon_lib.gates import LADDER_KEY, GateStore, read_store_document
+from nousergon_lib.gates import LADDER_KEY, DocumentRead, GateStore, read_store_document
 from nousergon_lib.run_manifest import SCHEMA_VERSION as _MANIFEST_SCHEMA
 from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeAccessIssue]
     add_trading_days,
@@ -56,6 +56,7 @@ __all__ = [
     "PARITY_KEY_PREFIX",
     "PARITY_KEY_TEMPLATE",
     "GateStore",
+    "ObservationWindow",
     "Reading",
     "empty_fresh_runs",
     "empty_success_runs",
@@ -65,6 +66,7 @@ __all__ = [
     "read_guard_commissioning",
     "read_ladder_freshness",
     "read_objective",
+    "read_windowed_objective",
     "read_parity",
     "read_roles_bootstrapped",
     "read_run_record",
@@ -96,6 +98,47 @@ _METRIC_NA_STATUSES: frozenset[str] = frozenset(
 )
 
 @dataclass(frozen=True)
+class ObservationWindow:
+    """What a clause that counts ELAPSED time has observed of its window so far.
+
+    Brian's ruling, 2026-10-03 (decision card
+    ``cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG``, option "Extend
+    ruling"), extending his 2026-09-21 time-gate ruling
+    (`alpha-engine-config-I11305`): a clause whose requirement counts cycles or
+    days passes once its check is BUILT and LIVE, while the observation window
+    runs to completion behind it, and a later failed observation reopens it.
+    `clauses.py::ObservationWindowClause` turns this into a verdict; a reader
+    only reports the facts.
+
+    The ruling forgives exactly one thing: the part of the window that has NOT
+    BEEN OBSERVED YET. It never forgives an observation that happened and
+    failed — a failure anywhere in the trailing window holds the clause UNMET
+    until it ages out, which is the same number of clean observations the
+    original criterion needed after a failure.
+    """
+
+    #: At least one REAL reading exists for every part of the check — the check
+    #: is built and has produced output, not merely declared.
+    live: bool
+    #: Observations made so far inside the trailing window, and the count the
+    #: plan's original criterion names.
+    observed: int
+    required: int
+    #: Failed observations inside the trailing window, each named. Empty means
+    #: every observation made so far passed.
+    failures: tuple[str, ...] = ()
+    #: Why the check is not yet live, when it is not.
+    not_live: str = ""
+    #: What one observation is, for rendering ("trading day(s)", "cycle(s)").
+    unit: str = "observation(s)"
+
+    @property
+    def complete(self) -> bool:
+        """The ORIGINAL criterion's window: every required observation made, none failed."""
+        return self.live and self.observed >= self.required and not self.failures
+
+
+@dataclass(frozen=True)
 class Reading:
     """One evidence read: met, or unmeasurable, with what it looked at."""
 
@@ -105,6 +148,10 @@ class Reading:
     unmeasurable: bool = False
     source: str | None = None
     as_of: str | None = None
+    #: Set only by a reader whose requirement counts elapsed time — see
+    #: :class:`ObservationWindow`. ``met`` above keeps the ORIGINAL full-window
+    #: verdict; the ruling's verdict is derived from this by the clause.
+    window: ObservationWindow | None = None
 
 
 def _pending(key: str, what: str, *, source: str) -> Reading:
@@ -1089,7 +1136,10 @@ def read_completeness_metric(
 
 def read_objective(store: GateStore, key: str) -> Reading:
     """One objective/SLO metric document, or the reason there is none yet."""
-    read = read_store_document(store, key)
+    return _objective_reading(key, read_store_document(store, key))
+
+
+def _objective_reading(key: str, read: DocumentRead) -> Reading:
     if read.problem is not None:
         return Reading(
             met=False,
@@ -1129,6 +1179,62 @@ def read_objective(store: GateStore, key: str) -> Reading:
         evidence=(key,),
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
+    )
+
+
+def read_windowed_objective(
+    store: GateStore,
+    key: str,
+    *,
+    required: int,
+    unit: str,
+    observed_field: str = "cycles_observed",
+    required_field: str | None = None,
+) -> Reading:
+    """:func:`read_objective` for an objective whose target counts a WINDOW.
+
+    Same document, same verdict in ``met``; adds the :class:`ObservationWindow`
+    Brian's 2026-10-03 extension of the time-gate ruling grades. The producer
+    contract this states (no producer exists yet): ``status: ok`` means every
+    cycle observed so far inside the trailing window meets the target — a
+    partial window is NOT a breach — and ``status: breach`` means an
+    observation already made fails it. ``cycles_observed`` carries how much of
+    the window has been observed; its absence renders as 0 observed, never as
+    a complete window. A calendar-month objective names its own fields
+    (``days_observed`` / ``days_in_month``) through ``observed_field`` and
+    ``required_field``.
+    """
+    read = read_store_document(store, key)
+    reading = _objective_reading(key, read)
+    document: dict = {}
+    if read.problem is None and not read.absent:
+        document = read.document or {}
+    status = str(document.get("status") or "")
+    try:
+        observed = int(document.get(observed_field) or 0)
+    except (TypeError, ValueError):
+        observed = 0
+    if required_field is not None:
+        try:
+            required = int(document.get(required_field) or required)
+        except (TypeError, ValueError):
+            pass
+    live = status in {"ok", "breach"}
+    return Reading(
+        met=reading.met,
+        detail=reading.detail,
+        evidence=reading.evidence,
+        unmeasurable=reading.unmeasurable,
+        source=reading.source,
+        as_of=reading.as_of,
+        window=ObservationWindow(
+            live=live,
+            observed=observed,
+            required=required,
+            failures=(f"{key}: status=breach, value={document.get('value')}",) if status == "breach" else (),
+            not_live=f"{key} carries no ok/breach verdict yet — nothing publishes this number",
+            unit=unit,
+        ),
     )
 
 

@@ -170,8 +170,9 @@ def test_a_daily_unit_missing_today_is_unmet(tmp_path, units):
 
 
 def test_a_daily_unit_is_not_due_before_its_run_and_grace(tmp_path, units):
-    """At 10:00 ET the gate cannot demand tonight's 16:45 run: Monday's counts."""
-    _write(tmp_path, "D19", "2026-09-14", "MONDAY")
+    """At 10:00 ET the gate cannot demand tonight's 18:15 run: Monday's counts."""
+    # Started after Monday's 18:15 ET (22:15Z) fire, as a data-collection-eod run is.
+    _write(tmp_path, "D19", "2026-09-14", "MONDAY", started="2026-09-14T22:20:00Z", finished="2026-09-14T22:30:00Z")
     morning = dt.datetime(2026, 9, 15, 14, 0, tzinfo=UTC)
     reading = evidence.read_run_record(LocalStore(tmp_path), units["D19"], trading_day=TUESDAY, now=morning)
     assert reading.met is True, reading.detail
