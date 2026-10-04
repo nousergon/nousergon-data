@@ -243,6 +243,6 @@ jobs:
 
   notify-main-failure:
     needs: [build]
-    if: ${{ failure() && github.ref == 'refs/heads/main' }}
+    if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit

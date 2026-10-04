@@ -28,11 +28,19 @@ owner: brian
 code_path: rag/pipelines/run_weekly_ingestion.sh
 trigger:
   kind: "step-functions"
-  owner: "ne-weekly-freshness-pipeline:RAGIngestion"
+  # Runs in the standalone stack's weekly machine, started at Sat 05:00 ET by
+  # the Scheduler entry below (nousergon-data-collection.yaml::WeeklySchedule).
+  # The v1 RAGIngestion state is still in ne-weekly-freshness-pipeline's
+  # definition, but the Saturday cadence trigger passes skip_rag_ingestion
+  # (nousergon-data-PR2025), so v1 never runs it on schedule and this machine is
+  # the one writer.
+  owner: "ne-data-collection-weekly"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-weekly"
   successor: >-
     nousergon-data-collection/data-collection-weekly, dispatcher workload
-    `rag-weekly-ingestion` (alpha-engine-config-I10753). DISABLED until the
-    phase-4 cutover PR; SAME script (`bash
+    `rag-weekly-ingestion` (alpha-engine-config-I10753). ENABLED at the
+    decoupled cutover (alpha-engine-config-I11269); v1 was
+    ne-weekly-freshness-pipeline:RAGIngestion. SAME script (`bash
     rag/pipelines/run_weekly_ingestion.sh`, less the earnings-transcripts step
     retired 2026-09-24 by alpha-engine-config-I11472) the v1
     RAGIngestion state ran. Also covers D46 (step 5, Form 4) — D46 has no

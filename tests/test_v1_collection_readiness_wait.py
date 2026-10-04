@@ -61,9 +61,28 @@ def schedules():
     return {s["name"]: s for s in stack.schedules(stack.load_template())}
 
 
+#: Units the v1 weekly definition can still produce INLINE: their v1 stage is
+#: still a state in step_function.json (skipped on the Saturday cadence by
+#: nousergon-data-PR2025, but present for an off-cadence run). This used to be
+#: read off each descriptor's `trigger.owner` (`<machine>:<stage>`), until those
+#: named the live v2 owner, ne-data-collection-weekly (data.phase1.
+#: triggers_reconciled, alpha-engine-config-I11189): the owner field states what
+#: fires the unit now, not which v1 state once did. The descriptors still record
+#: the v1 stage in `trigger.successor`, which the fixture below cross-checks.
+V1_INLINE_STAGES = {
+    "D15": "ne-weekly-freshness-pipeline:DataPhase2",
+    "D16": "ne-weekly-freshness-pipeline:RAGIngestion",
+    "D46": "ne-weekly-freshness-pipeline:RAGIngestion",
+}
+
+
 @pytest.fixture(scope="module")
 def owners():
-    return {u.unit_id: str((u.raw.get("trigger") or {}).get("owner") or "") for u in load_units()}
+    units = {u.unit_id: u for u in load_units()}
+    for unit_id, stage in V1_INLINE_STAGES.items():
+        successor = str((units[unit_id].raw.get("trigger") or {}).get("successor") or "")
+        assert f"v1 was {stage}" in successor, (unit_id, successor)
+    return dict(V1_INLINE_STAGES)
 
 
 def _definition(name: str) -> dict:

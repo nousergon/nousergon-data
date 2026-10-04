@@ -28,8 +28,15 @@ owner: brian
 code_path: "collectors/universe_returns.py:207"
 trigger:
   kind: "step-functions"
-  owner: "ne-weekly-freshness-pipeline:DataPhase1"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
+  # Since the decoupled data cutover (alpha-engine-config-I11269) this unit runs
+  # in the standalone stack's weekly machine, dispatcher workload
+  # `weekly-phase-one`, started at Sat 05:00 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::WeeklySchedule).
+  # ne-weekly-freshness-pipeline no longer runs it: that change removed its
+  # DataPhase1 state, so the machine's Saturday starts are not this unit's run.
+  owner: "ne-data-collection-weekly"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-weekly"
+  successor: "ne-data-collection-weekly (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-weekly-freshness-pipeline:DataPhase1"
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
