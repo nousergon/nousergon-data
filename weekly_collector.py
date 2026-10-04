@@ -3392,12 +3392,24 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         # unconditional). So when the collector wrote no record, D17 writes the
         # UNMEASURABLE one — `compute_vendor_divergence` reports exactly that
         # for an empty comparison set, and never raises.
+        #
+        # In window mode `dc_result` is `_collect_window`'s aggregate, which
+        # carries the TARGET date's record under this same key (I10783 — until
+        # 2026-10-04 it did not, so this branch fired on every morning and
+        # overwrote the measured record). The writer also refuses to replace a
+        # measured record with an unmeasurable one, so this fallback can only
+        # ever fill an absence. The verdict that stands at the key goes onto
+        # D17's manifest as its `vendor_crosscheck` guard entry.
         if not dry_run and not (dc_result or {}).get("vendor_divergence"):
+            from collectors.cross_source_observer import vendor_crosscheck_guard_entry
+
+            fallback_record: dict = {}
             try:
                 from collectors.cross_source_observer import write_vendor_divergence_metric
 
-                write_vendor_divergence_metric(bucket, {}, {}, target_date)
+                fallback_record = write_vendor_divergence_metric(bucket, {}, {}, target_date)
             except Exception as exc:  # noqa: BLE001
+                fallback_record = {"error": str(exc)}
                 # Swallow rationale (repo fail-loud rule): (a) the failure mode
                 # swallowed is a failed PUT of the divergence METRIC, never a
                 # data write; (b) the primary deliverable — polygon's
@@ -3413,6 +3425,11 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                     "divergence is unrecorded for this run",
                     target_date, exc,
                 )
+            if isinstance(dc_result, dict):
+                dc_result["vendor_divergence"] = fallback_record
+                dc_result["guards"] = list(dc_result.get("guards") or []) + [
+                    vendor_crosscheck_guard_entry(fallback_record, target_date)
+                ]
     except Exception as e:
         logger.exception("Morning polygon enrichment failed for %s", target_date)
         results["collectors"]["daily_closes"] = {"status": "error", "error": str(e)}
