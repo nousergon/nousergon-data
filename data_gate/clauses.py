@@ -50,10 +50,14 @@ __all__ = [
     "CLAUSE_PREFIX",
     "CUTOVER_READY_CLAUSES",
     "EXIT_CRITERION_CLAUSES",
+    "OBSERVATION_WINDOW_CLAUSE_PATTERNS",
+    "OBSERVATION_WINDOW_RULING",
+    "ObservationWindowClause",
     "PHASE1_UNITS_PRODUCED_CLAUSE",
     "RetiredClause",
     "UnconnectedClause",
     "base_clause_name",
+    "is_observation_window",
     "is_retired",
     "is_unconnected",
     "is_ungraded",
@@ -114,6 +118,29 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
     "data.phase2.empty_fresh_free",
     "data.phase2.vendor_divergence_emitted",
     "data.phase2.executor_collection_writes_zero",
+    "data.phase3.sustained_window",
+)
+
+#: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
+#: (:data:`OBSERVATION_WINDOW_RULING`): EVERY phase-2/3 clause whose
+#: requirement counts elapsed cycles, days or a calendar month — the eleven
+#: the card named and, by the coordinator's follow-up the same night, the five
+#: `alpha-engine-config-I11305` named, so no phase-2/3 clause is graded by a
+#: calendar any more. fnmatch patterns, so the eight per-family freshness SLO
+#: rows are one entry — the family list comes from the descriptors.
+#:
+#: NOT here, deliberately: `data.slo.completeness.*`, whose requirement
+#: ("every published key met its declared floor") reads ONE document and
+#: counts no elapsed time, so there is no window for the ruling to run behind.
+OBSERVATION_WINDOW_CLAUSE_PATTERNS: tuple[str, ...] = (
+    "data.phase2.eod_universe_covered",
+    "data.phase2.empty_fresh_free",
+    "data.phase2.vendor_divergence_emitted",
+    "data.phase2.executor_collection_writes_zero",
+    "data.slo.freshness.*",
+    "data.cost.monthly",
+    "data.pages.monthly",
+    "data.human_touch.monthly",
     "data.phase3.sustained_window",
 )
 
@@ -195,9 +222,11 @@ class UnconnectedClause(Clause):
     * rendered on the board as ``UNCONNECTED`` (console ``DISABLED``: declared,
       with reason, owner and re-exam — `observability-policy` §8.3).
 
-    Only the ``consumers`` column changes; every other column of the unit is
-    still graded. A unit that is unconnected WITHOUT a decision stays an
-    ordinary UNMET clause (plan §3 finding).
+    Two columns change, both reading the SAME recorded decision: ``consumers``,
+    and ``schema_contract`` when the unit's own contract names no consumer at
+    all (`alpha-engine-config-I10933`, :func:`_schema_contract_is_unconnected`).
+    Every other column of the unit is still graded. A unit that is unconnected
+    WITHOUT a decision stays an ordinary UNMET clause (plan §3 finding).
     """
 
     decision: str = ""
@@ -306,6 +335,128 @@ def _standing_clause(name: str, requirement: str, reading: ev.Reading, *, phase:
     )
 
 
+#: Brian's ruling, 2026-10-03 23:34Z, on decision card
+#: ``cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG`` — he chose
+#: **"Extend ruling"** on the question *"Let the 19 phase 2–3 clauses that need
+#: weeks of history pass once the check is built and running?"*, whose stated
+#: consequence was that his 2026-09-21 time-gate ruling
+#: (`alpha-engine-config-I11305`) extends to them: each passes once its check
+#: is built and live, the observation window runs to completion behind it,
+#: and a later failed observation reopens it. The alternative put to him,
+#: "Keep strict", put phase 2 at 11-03 at the earliest and phase 3 at ~12-01.
+OBSERVATION_WINDOW_RULING = (
+    "Brian, 2026-10-03 (decision card cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG, "
+    "\"Extend ruling\"), extending his 2026-09-21 time-gate ruling (alpha-engine-config-I11305): "
+    "a clause that counts elapsed time passes once its check is built and live, the "
+    "observation window runs to completion behind it, and a later failed observation "
+    "reopens it."
+)
+
+
+@dataclass(frozen=True)
+class ObservationWindowClause(Clause):
+    """A clause that counts elapsed time, graded under Brian's 2026-10-03
+    extension of the time-gate ruling (:data:`OBSERVATION_WINDOW_RULING`).
+
+    Unlike :class:`StandingClause` it IS graded by its phase's gate — it is
+    never excluded from any arithmetic. What changes is only what MET means:
+
+    * **built and live** — the reader's :class:`~data_gate.evidence.
+      ObservationWindow` reports at least one REAL reading for every part of
+      the check. A declared-but-silent check, a missing metric document or an
+      UNMEASURABLE read is never MET.
+    * **no failed observation** — every observation made so far inside the
+      trailing window passed. The ruling forgives only the part of the window
+      not yet observed; a failure anywhere in it REOPENS the clause (UNMET),
+      and it stays open until the failure ages out of the window, which takes
+      exactly the clean run the original criterion needed after a failure.
+
+    ``window_complete`` keeps the ORIGINAL criterion's verdict (the full
+    window observed, none failed) on the row, so the window running behind
+    the clause stays visible and a consumer can still read the strict answer.
+    """
+
+    ruling: str = ""
+    window_observed: int = 0
+    window_required: int = 0
+    window_failures: tuple[str, ...] = ()
+    window_complete: bool = False
+
+
+def is_observation_window(clause: Clause) -> bool:
+    return isinstance(clause, ObservationWindowClause)
+
+
+def _observation_window_clause(
+    name: str, requirement: str, reading: ev.Reading, *, phase: str
+) -> Clause:
+    """One time-counting clause graded under :data:`OBSERVATION_WINDOW_RULING`.
+
+    Fails CLOSED: a reading with no window facts cannot show its check is
+    live, so it is UNMET with the reason rather than falling back to anything.
+    """
+    window = reading.window
+    common = dict(
+        phase=phase,
+        source=reading.source,
+        as_of=reading.as_of,
+        ruling=OBSERVATION_WINDOW_RULING,
+    )
+    if reading.unmeasurable:
+        return ObservationWindowClause(
+            name, requirement, False, reading.detail, reading.evidence, unmeasurable=True, **common
+        )
+    if window is None:
+        return ObservationWindowClause(
+            name,
+            requirement,
+            False,
+            "the reader reported no observation window, so nothing shows the check is live; "
+            f"UNMET (fails closed under the 2026-10-03 ruling). {reading.detail}",
+            reading.evidence,
+            **common,
+        )
+    facts = dict(
+        window_observed=window.observed,
+        window_required=window.required,
+        window_failures=window.failures,
+        window_complete=window.complete,
+    )
+    progress = f"{window.observed} of {window.required} {window.unit} observed"
+    if not window.live:
+        met = False
+        verdict = (
+            f"NOT LIVE: {window.not_live}. Under the 2026-10-03 ruling this passes only once "
+            "its check is built and has produced a real reading"
+        )
+    elif window.failures:
+        met = False
+        verdict = (
+            f"REOPENED: {len(window.failures)} failed observation(s) inside the trailing "
+            f"{window.required}-{window.unit} window ({progress}): {list(window.failures)[:6]}; "
+            "UNMET until they age out of the window"
+        )
+    else:
+        met = True
+        verdict = (
+            f"MET under the 2026-10-03 ruling: check live, {progress}, none failed; "
+            + (
+                "the full window is complete"
+                if window.complete
+                else "the window keeps running behind it and any failed observation reopens it"
+            )
+        )
+    return ObservationWindowClause(
+        name,
+        requirement,
+        met,
+        f"{verdict}. Original criterion: {reading.detail}",
+        reading.evidence,
+        **common,
+        **facts,
+    )
+
+
 def is_ungraded(clause: Clause) -> bool:
     """Published on the board, graded by no gate: RETIRED, UNCONNECTED, a
     DECLARED-DISABLED trigger, or a STANDING clause (a real reading excluded
@@ -347,6 +498,67 @@ def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase
     )
 
 
+def _schema_contract_is_unconnected(unit: Unit) -> bool:
+    """Whether ``unit``'s ``schema_contract`` clause renders UNCONNECTED.
+
+    `alpha-engine-config-I10933`. The requirement is *"publishes a versioned
+    schema with a producer test that validates a real fixture, **and every
+    consumer pins a copy**"*, and :func:`ev._read_schema_contract` grades the
+    pin half from ``contract.consumer_pins``. A unit KEPT with no surviving
+    consumer by a recorded decision can never hold an honest pin, so on the
+    ordinary path the clause is red forever for the one absence its sibling
+    ``consumers`` clause already reads as a closed decision. Same predicate as
+    that clause (:func:`_clause_consumers_unconnected`: ``connection ==
+    "unconnected"`` plus a recorded ``consumers_decision``), same declaration
+    source, no second record of the ruling.
+
+    One narrowing, and it only ever keeps a clause GRADED: if the unit's own
+    ``contract`` names a consumer anyway (``consumer_pins`` or
+    ``unpinned_consumers``), the descriptor contradicts its own "no consumer"
+    and the ordinary reading — which grades exactly that declared consumer —
+    is the finding that says so. Carving it out would hide the one signal
+    that the unit is not unconnected after all.
+    """
+    if unit.connection != "unconnected" or not unit.consumers_decision:
+        return False
+    contract = unit.raw.get("contract") or {}
+    return not (contract.get("consumer_pins") or contract.get("unpinned_consumers"))
+
+
+def _clause_schema_contract_unconnected(unit: Unit, name: str, requirement: str, phase: str) -> Clause:
+    """The ``schema_contract`` clause of a kept-unconnected unit (I10933).
+
+    Rendered exactly as :func:`_clause_consumers_unconnected` renders the
+    ``consumers`` clause — never MET, never UNMET, graded by no gate — and it
+    still says what the producer side holds, so the board shows whether a
+    schema exists for the day a consumer is added (deleting
+    ``consumers_decision`` in that change returns this clause to ordinary
+    grading, pin half included).
+    """
+    decision = unit.consumers_decision
+    files = ev._declared_schema_files(unit)
+    missing = [f for f in files if not (ev.REPO_ROOT / f).exists()]
+    if not files:
+        producer = "no schema or producer test is declared"
+    elif missing:
+        producer = f"the descriptor declares {files} but {missing} is/are not in the tree"
+    else:
+        producer = f"producer side present ({files})"
+    return UnconnectedClause(
+        name,
+        requirement,
+        False,
+        f"UNCONNECTED: {unit.unit_id} is kept with no surviving consumer — {unit.connection_reason} "
+        f"— so no consumer can pin a copy; {producer}. Graded by no gate until a consumer is "
+        "declared and the `consumers_decision` block is deleted.",
+        (unit.path.relative_to(unit.path.parents[2]).as_posix(),),
+        phase=phase,
+        source="registry.d/units (consumers_decision)",
+        as_of=decision["ruled_on"],
+        decision=f"{decision['decision']} by {decision['ruled_by']} {decision['ruled_on']} ({decision['ruling']})",
+    )
+
+
 #: The phase a kept-unconnected unit's `schema_contract` clause is deferred to.
 #: Plan §3 ("a key with no surviving consumer after phase 4 gets **no** new
 #: contract") read together with §8's per-unit rows, which route D02 and D14 —
@@ -373,10 +585,15 @@ def _clause_phase(unit: Unit, column: str) -> str:
 
     Plan §3 settles which way: contracts are built *for keys with a surviving
     consumer* in phase 1, and the kept zero-consumer remainder in phase 2. So
-    the clause is DEFERRED, not carved out — it is still graded, still red
-    until a contract exists, and it lands in the phase the plan schedules it
-    in. `max` so a descriptor that already declares a later phase keeps it:
-    this only ever moves a clause later, never earlier.
+    the clause is DEFERRED to phase 2. `max` so a descriptor that already
+    declares a later phase keeps it: this only ever moves a clause later,
+    never earlier.
+
+    Since `alpha-engine-config-I10933` the deferred clause renders UNCONNECTED
+    (graded by no gate) when the unit's contract names no consumer — see
+    :func:`_schema_contract_is_unconnected`. The phase still matters: it is the
+    phase the clause is graded in the moment a consumer is added and the
+    decision block deleted.
     """
     declared = unit.clause_phase[column]
     if (
@@ -410,6 +627,8 @@ def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: d
         return _retired(unit, name, requirement, phase)
     if column == "consumers" and unit.connection == "unconnected":
         return _clause_consumers_unconnected(unit, name, requirement, phase)
+    if column == "schema_contract" and _schema_contract_is_unconnected(unit):
+        return _clause_schema_contract_unconnected(unit, name, requirement, phase)
     if column == "run_record":
         disabled = _disabled_trigger_cadence(unit)
         if disabled is not None:
@@ -591,6 +810,93 @@ def _clause_objective(store: ev.GateStore, name: str, requirement: str, key: str
         phase=f"data-phase{_OBJECTIVE_PHASE}",
         source=reading.source,
         as_of=reading.as_of,
+    )
+
+
+#: Plan §2 objective 1's window: the deadline met on >= 19 of every rolling 20
+#: scheduled cycles, and the payload's own as_of right on 20 of 20.
+SLO_FRESHNESS_CYCLES = 20
+
+
+def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
+    """One family's freshness SLO, graded under :data:`OBSERVATION_WINDOW_RULING`.
+
+    The SLO counts a 20-cycle window, so under Brian's 2026-10-03 ruling it
+    passes once its producer publishes a real ``ok``/``breach`` verdict and no
+    cycle observed so far fails the target — `evidence.read_windowed_objective`
+    states the producer contract that makes that readable.
+    """
+    key = f"metrics/slo/freshness/{family}/latest.json"
+    return _observation_window_clause(
+        f"data.slo.freshness.{family}",
+        (
+            f"the {family} family met its declared deadline on >= 19 of the last "
+            f"{SLO_FRESHNESS_CYCLES} scheduled cycles, AND the payload's own as_of equalled the "
+            f"cycle's trading day on {SLO_FRESHNESS_CYCLES} of {SLO_FRESHNESS_CYCLES} (a fresh "
+            "write of stale content fails). Graded under Brian's 2026-10-03 ruling: MET once the "
+            "SLO publishes a real verdict and no cycle observed so far fails the target"
+        ),
+        ev.read_windowed_objective(store, key, required=SLO_FRESHNESS_CYCLES, unit="cycle(s)"),
+        phase=f"data-phase{_OBJECTIVE_PHASE}",
+    )
+
+
+#: A calendar month's default length for rendering, when the producer's
+#: document does not state ``days_in_month`` itself.
+MONTHLY_WINDOW_DAYS = 30
+
+_MONTHLY_RULING_SENTENCE = (
+    " Graded under Brian's 2026-10-03 ruling: MET once the monthly document publishes a real "
+    "verdict and no day observed so far in the month fails it (producer contract: "
+    "status ok/breach, days_observed, days_in_month)"
+)
+
+
+def _monthly_clause(store: ev.GateStore, name: str, requirement: str, key: str) -> Clause:
+    """One calendar-month objective under :data:`OBSERVATION_WINDOW_RULING`."""
+    return _observation_window_clause(
+        name,
+        requirement + _MONTHLY_RULING_SENTENCE,
+        ev.read_windowed_objective(
+            store,
+            key,
+            required=MONTHLY_WINDOW_DAYS,
+            unit="day(s)",
+            observed_field="days_observed",
+            required_field="days_in_month",
+        ),
+        phase=f"data-phase{_OBJECTIVE_PHASE}",
+    )
+
+
+def _clause_cost_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.cost.monthly",
+        "AWS spend tagged system=data-collection is within the ratified monthly ceiling, read "
+        "from the cost-and-usage export (never per-run Cost Explorer API calls, billed at $0.01 "
+        "each).",
+        "metrics/cost/monthly/latest.json",
+    )
+
+
+def _clause_pages_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.pages.monthly",
+        "pages <= 2 per month outside declared vendor outages.",
+        "metrics/pages/monthly/latest.json",
+    )
+
+
+def _clause_human_touch_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.human_touch.monthly",
+        "human-originated mutating CloudTrail calls on component resources = 0 per month "
+        "outside the reserved list, read from the CloudTrail S3 ARCHIVE rather than "
+        "lookup-events.",
+        "metrics/human_touch/monthly/latest.json",
     )
 
 
@@ -1328,13 +1634,14 @@ def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
 
 
 def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.eod_universe_covered",
         (
             f"the EOD spine priced the declared universe minus DECLARED exclusions on "
             f"{xc.PHASE2_EOD_COVERAGE_DAYS} CONSECUTIVE trading days (plan §6 phase-2 exit); a "
             "day with no completeness MetricRecord breaks the streak, because a missing "
-            "measurement is not a passing one"
+            "measurement is not a passing one. Graded under Brian's 2026-10-03 ruling: MET once "
+            "the guard has published a record and every day since inside the window is GREEN"
         ),
         xc.read_eod_universe_covered(
             store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS
@@ -1344,12 +1651,13 @@ def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.
 
 
 def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.empty_fresh_free",
         (
             f"zero empty-but-fresh writes over {xc.PHASE2_EMPTY_FRESH_CYCLES} EOD cycles, "
             "counted from the guards' own `empty_fresh` verdict and never from rows_out == 0 "
-            "(plan §2 objective 6, phase-2 exit)"
+            "(plan §2 objective 6, phase-2 exit). Graded under Brian's 2026-10-03 ruling: MET "
+            "once the guard has recorded a verdict and no cycle inside the window wrote empty"
         ),
         xc.read_empty_fresh_free(cycles, required_cycles=xc.PHASE2_EMPTY_FRESH_CYCLES),
         phase="data-phase2",
@@ -1357,13 +1665,15 @@ def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
 
 
 def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.vendor_divergence_emitted",
         (
             f"a vendor cross-check verdict was EMITTED on {xc.PHASE2_VENDOR_CYCLES} of "
             f"{xc.PHASE2_VENDOR_CYCLES} cycles, within bound or with each breach named (plan §6 "
             "phase-2 exit). A silent cycle is the failure: no verdict is indistinguishable from "
-            "agreement while being a total absence of measurement"
+            "agreement while being a total absence of measurement. Graded under Brian's "
+            "2026-10-03 ruling: MET once every graded schedule has emitted a verdict and no "
+            "cycle since has been silent or blind"
         ),
         xc.read_vendor_divergence_emitted(cycle_sets, required_cycles=xc.PHASE2_VENDOR_CYCLES),
         phase="data-phase2",
@@ -1371,11 +1681,13 @@ def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> C
 
 
 def _clause_phase2_executor_collection_writes_zero(store: ev.GateStore) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.executor_collection_writes_zero",
         (
             "the executor profile shows no collection writes over 7 days (plan §6 phase-2 exit) "
-            "— the producer/consumer separation the collector split exists to establish"
+            "— the producer/consumer separation the collector split exists to establish. Graded "
+            "under Brian's 2026-10-03 ruling: MET once the profile is published and shows zero "
+            "writes, however many of the 7 days it covers so far"
         ),
         xc.read_executor_collection_writes_zero(store),
         phase="data-phase2",
@@ -1386,7 +1698,7 @@ def _clause_phase3_sustained_window(
     store: ev.GateStore, weekly: xc.CycleSet, *, trading_day: dt.date
 ) -> Clause:
     name = "data.phase3.sustained_window"
-    return _exit_clause(
+    return _observation_window_clause(
         name,
         (
             f"every clause MET with 0 UNMEASURABLE and 0 UNREPORTED, SUSTAINED over "
@@ -1394,7 +1706,9 @@ def _clause_phase3_sustained_window(
             "Saturdays (plan §6 phase-3 exit), read from the gate's own dated readings — which "
             "are never overwritten, and are therefore the only record a sustain claim can "
             "honestly be built on. This clause is excluded from the readings it grades, so the "
-            "window is not its own precondition"
+            "window is not its own precondition. Graded under Brian's 2026-10-03 ruling: MET "
+            "once a dated reading and a complete Saturday exist and every reading and Saturday "
+            "inside the window since is clean"
         ),
         xc.read_sustained_window(
             store,
@@ -1455,16 +1769,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
         if unit.unit_id == "D20" and (unit.completeness or {}).get("denominator"):
             clauses.append(_clause_completeness(store, unit, trading_day=trading_day))
     for family in sorted({u.freshness_family for u in units if u.freshness_family}):
-        clauses.append(
-            _clause_objective(
-                store,
-                f"data.slo.freshness.{family}",
-                f"the {family} family met its declared deadline on >= 19 of the last 20 "
-                "scheduled cycles, AND the payload's own as_of equalled the cycle's trading "
-                "day on 20 of 20 (a fresh write of stale content fails)",
-                f"metrics/slo/freshness/{family}/latest.json",
-            )
-        )
+        clauses.append(_clause_slo_freshness(store, family))
         clauses.append(
             _clause_objective(
                 store,
@@ -1474,34 +1779,9 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
                 f"metrics/slo/completeness/{family}/latest.json",
             )
         )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.cost.monthly",
-            "AWS spend tagged system=data-collection is within the ratified monthly "
-            "ceiling, read from the cost-and-usage export (never per-run Cost Explorer API "
-            "calls, billed at $0.01 each)",
-            "metrics/cost/monthly/latest.json",
-        )
-    )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.pages.monthly",
-            "pages <= 2 per month outside declared vendor outages",
-            "metrics/pages/monthly/latest.json",
-        )
-    )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.human_touch.monthly",
-            "human-originated mutating CloudTrail calls on component resources = 0 per month "
-            "outside the reserved list, read from the CloudTrail S3 ARCHIVE rather than "
-            "lookup-events",
-            "metrics/human_touch/monthly/latest.json",
-        )
-    )
+    clauses.append(_clause_cost_monthly(store))
+    clauses.append(_clause_pages_monthly(store))
+    clauses.append(_clause_human_touch_monthly(store))
     # The phase EXIT criteria (`alpha-engine-config-I10954`). The cycle sets are
     # collected ONCE per schedule and shared by every clause that counts over
     # them: four clauses re-deriving the same twenty-cycle window would list the
