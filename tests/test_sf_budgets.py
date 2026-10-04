@@ -174,6 +174,9 @@ class TestSsmExecutionTimeoutPins:
     def test_weekly_substrate_health_check(self):
         self._check("WeeklySubstrateHealthCheck")
 
+    def test_director(self):
+        self._check("Director")
+
     def test_coverage_complete(self):
         """Every SSM-bearing SF stage is in the budget table, and vice versa."""
         # Discover which SF Task states carry an SSM executionTimeout.

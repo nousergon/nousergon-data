@@ -65,6 +65,9 @@ ALL_CHECK_STATUS_STATES = [
     # is bounded too; its budget is derived in
     # tests/test_v1_collection_readiness_wait.py.
     "CheckDataPhase2Status",
+    # alpha-engine-config-I11936: the Director moved off Lambda onto the
+    # weekly box; its poll loop carries the same bounded shape.
+    "CheckDirectorStatus",
     # alpha-engine-config-I9329: EvalJudgeProcess moved off Lambda onto a
     # dedicated spot box, so the eval-judge chain acquired the same two
     # bounded poll loops every other spot stage has — one over the box's
