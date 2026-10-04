@@ -36,7 +36,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
     subtract_trading_days,
 )
 
-from data_gate.cadence import COMPLETION_GRACE, Cadence, gate_moment, latest_due_fire, parse_cron
+from data_gate.cadence import COMPLETION_GRACE, Cadence, fire_selection_moment, latest_due_fire, parse_cron
 from data_gate.descriptors import Unit
 from data_gate.evidence import (
     EMPTY_FRESH_VERDICT,
@@ -323,7 +323,12 @@ def collect_cycles(
             "board cannot grade a cycle over a unit it does not carry"
         )
         return result
-    as_of = gate_moment(trading_day, now)
+    # alpha-engine-config-I11838: the same fire-selection ceiling every other
+    # scheduled reader uses, so a cycle counter and `run_record` never grade
+    # different runs in one reading. Listing up to it is safe: each manifest is
+    # bucketed below by its fire's own `[fire, fire + grace]` window, and no
+    # selected fire lies after the end of the trading day.
+    as_of = fire_selection_moment(trading_day, now)
     fires = due_fires(cadence, as_of=as_of, count=count)
     if not fires:
         result.unreadable = (
