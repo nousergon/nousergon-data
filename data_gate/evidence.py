@@ -1087,7 +1087,7 @@ def read_completeness_metric(
     )
 
 
-def read_objective(store: GateStore, key: str) -> Reading:
+def read_objective(store: GateStore, key: str, *, now: dt.datetime | None = None) -> Reading:
     """One objective/SLO metric document, or the reason there is none yet."""
     read = read_store_document(store, key)
     if read.problem is not None:
@@ -1123,13 +1123,55 @@ def read_objective(store: GateStore, key: str) -> Reading:
         )
     value = document.get("value")
     baseline = document.get("baseline")
+    # A document may declare when it stops being evidence (`data_gate/producers
+    # /slo.py`, alpha-engine-config-I10789). Past that instant the emitter has
+    # stopped, and its last answer — green or red — is no longer a reading:
+    # UNMEASURABLE, never the stale verdict. Opt-in, so a producer that does
+    # not declare it is graded exactly as before.
+    stale_after = _parse_stamp(document.get("stale_after_utc"))
+    if document.get("stale_after_utc") is not None and stale_after is None:
+        return Reading(
+            met=False,
+            detail=f"{key} carries stale_after_utc {document.get('stale_after_utc')!r}, which does not parse",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
+    if stale_after is not None and (now or dt.datetime.now(dt.timezone.utc)) > stale_after:
+        return Reading(
+            met=False,
+            detail=(
+                f"{key} is stale: generated {document.get('generated_utc')}, no longer evidence after "
+                f"{document.get('stale_after_utc')}. Its emitter has stopped; the last answer was "
+                f"status={status}, value={value}."
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
+    summary = " ".join(str(document.get("summary") or "").split())
     return Reading(
         met=status == "ok",
-        detail=f"{key}: status={status}, value={value}, baseline={baseline}",
+        detail=f"{key}: status={status}, value={value}, baseline={baseline}" + (f" — {summary}" if summary else ""),
         evidence=(key,),
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
     )
+
+
+def _parse_stamp(stamp: object) -> dt.datetime | None:
+    """An ISO-8601 instant as aware UTC, or ``None`` when absent or unparseable."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def read_ladder_freshness(
