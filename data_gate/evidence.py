@@ -1178,7 +1178,15 @@ def _objective_reading(key: str, read: DocumentRead) -> Reading:
     )
 
 
-def read_windowed_objective(store: GateStore, key: str, *, required: int, unit: str) -> Reading:
+def read_windowed_objective(
+    store: GateStore,
+    key: str,
+    *,
+    required: int,
+    unit: str,
+    observed_field: str = "cycles_observed",
+    required_field: str | None = None,
+) -> Reading:
     """:func:`read_objective` for an objective whose target counts a WINDOW.
 
     Same document, same verdict in ``met``; adds the :class:`ObservationWindow`
@@ -1188,7 +1196,9 @@ def read_windowed_objective(store: GateStore, key: str, *, required: int, unit: 
     partial window is NOT a breach — and ``status: breach`` means an
     observation already made fails it. ``cycles_observed`` carries how much of
     the window has been observed; its absence renders as 0 observed, never as
-    a complete window.
+    a complete window. A calendar-month objective names its own fields
+    (``days_observed`` / ``days_in_month``) through ``observed_field`` and
+    ``required_field``.
     """
     read = read_store_document(store, key)
     reading = _objective_reading(key, read)
@@ -1197,9 +1207,14 @@ def read_windowed_objective(store: GateStore, key: str, *, required: int, unit: 
         document = read.document or {}
     status = str(document.get("status") or "")
     try:
-        observed = int(document.get("cycles_observed") or 0)
+        observed = int(document.get(observed_field) or 0)
     except (TypeError, ValueError):
         observed = 0
+    if required_field is not None:
+        try:
+            required = int(document.get(required_field) or required)
+        except (TypeError, ValueError):
+            pass
     live = status in {"ok", "breach"}
     return Reading(
         met=reading.met,

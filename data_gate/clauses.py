@@ -122,22 +122,26 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
 )
 
 #: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
-#: (:data:`OBSERVATION_WINDOW_RULING`): every phase-2/3 clause whose requirement
-#: counts elapsed cycles or days and that `alpha-engine-config-I11305` does not
-#: already name. fnmatch patterns, so the eight per-family freshness SLO rows
-#: are one entry — the family list comes from the descriptors.
+#: (:data:`OBSERVATION_WINDOW_RULING`): EVERY phase-2/3 clause whose
+#: requirement counts elapsed cycles, days or a calendar month — the eleven
+#: the card named and, by the coordinator's follow-up the same night, the five
+#: `alpha-engine-config-I11305` named, so no phase-2/3 clause is graded by a
+#: calendar any more. fnmatch patterns, so the eight per-family freshness SLO
+#: rows are one entry — the family list comes from the descriptors.
 #:
-#: NOT here, deliberately: I11305's five (`executor_collection_writes_zero`,
-#: `data.cost.monthly`, `data.pages.monthly`, `data.human_touch.monthly`,
-#: `data.phase3.sustained_window`), which that issue converts under its own
-#: deliverables; and `data.slo.completeness.*`, whose requirement ("every
-#: published key met its declared floor") reads ONE document and counts no
-#: elapsed time, so there is no window for the ruling to run behind.
+#: NOT here, deliberately: `data.slo.completeness.*`, whose requirement
+#: ("every published key met its declared floor") reads ONE document and
+#: counts no elapsed time, so there is no window for the ruling to run behind.
 OBSERVATION_WINDOW_CLAUSE_PATTERNS: tuple[str, ...] = (
     "data.phase2.eod_universe_covered",
     "data.phase2.empty_fresh_free",
     "data.phase2.vendor_divergence_emitted",
+    "data.phase2.executor_collection_writes_zero",
     "data.slo.freshness.*",
+    "data.cost.monthly",
+    "data.pages.monthly",
+    "data.human_touch.monthly",
+    "data.phase3.sustained_window",
 )
 
 CUTOVER_READY_ROLES: tuple[str, ...] = (
@@ -764,6 +768,65 @@ def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
         ),
         ev.read_windowed_objective(store, key, required=SLO_FRESHNESS_CYCLES, unit="cycle(s)"),
         phase=f"data-phase{_OBJECTIVE_PHASE}",
+    )
+
+
+#: A calendar month's default length for rendering, when the producer's
+#: document does not state ``days_in_month`` itself.
+MONTHLY_WINDOW_DAYS = 30
+
+_MONTHLY_RULING_SENTENCE = (
+    " Graded under Brian's 2026-10-03 ruling: MET once the monthly document publishes a real "
+    "verdict and no day observed so far in the month fails it (producer contract: "
+    "status ok/breach, days_observed, days_in_month)"
+)
+
+
+def _monthly_clause(store: ev.GateStore, name: str, requirement: str, key: str) -> Clause:
+    """One calendar-month objective under :data:`OBSERVATION_WINDOW_RULING`."""
+    return _observation_window_clause(
+        name,
+        requirement + _MONTHLY_RULING_SENTENCE,
+        ev.read_windowed_objective(
+            store,
+            key,
+            required=MONTHLY_WINDOW_DAYS,
+            unit="day(s)",
+            observed_field="days_observed",
+            required_field="days_in_month",
+        ),
+        phase=f"data-phase{_OBJECTIVE_PHASE}",
+    )
+
+
+def _clause_cost_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.cost.monthly",
+        "AWS spend tagged system=data-collection is within the ratified monthly ceiling, read "
+        "from the cost-and-usage export (never per-run Cost Explorer API calls, billed at $0.01 "
+        "each).",
+        "metrics/cost/monthly/latest.json",
+    )
+
+
+def _clause_pages_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.pages.monthly",
+        "pages <= 2 per month outside declared vendor outages.",
+        "metrics/pages/monthly/latest.json",
+    )
+
+
+def _clause_human_touch_monthly(store: ev.GateStore) -> Clause:
+    return _monthly_clause(
+        store,
+        "data.human_touch.monthly",
+        "human-originated mutating CloudTrail calls on component resources = 0 per month "
+        "outside the reserved list, read from the CloudTrail S3 ARCHIVE rather than "
+        "lookup-events.",
+        "metrics/human_touch/monthly/latest.json",
     )
 
 
@@ -1548,11 +1611,13 @@ def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> C
 
 
 def _clause_phase2_executor_collection_writes_zero(store: ev.GateStore) -> Clause:
-    return _exit_clause(
+    return _observation_window_clause(
         "data.phase2.executor_collection_writes_zero",
         (
             "the executor profile shows no collection writes over 7 days (plan §6 phase-2 exit) "
-            "— the producer/consumer separation the collector split exists to establish"
+            "— the producer/consumer separation the collector split exists to establish. Graded "
+            "under Brian's 2026-10-03 ruling: MET once the profile is published and shows zero "
+            "writes, however many of the 7 days it covers so far"
         ),
         xc.read_executor_collection_writes_zero(store),
         phase="data-phase2",
@@ -1563,7 +1628,7 @@ def _clause_phase3_sustained_window(
     store: ev.GateStore, weekly: xc.CycleSet, *, trading_day: dt.date
 ) -> Clause:
     name = "data.phase3.sustained_window"
-    return _exit_clause(
+    return _observation_window_clause(
         name,
         (
             f"every clause MET with 0 UNMEASURABLE and 0 UNREPORTED, SUSTAINED over "
@@ -1571,7 +1636,9 @@ def _clause_phase3_sustained_window(
             "Saturdays (plan §6 phase-3 exit), read from the gate's own dated readings — which "
             "are never overwritten, and are therefore the only record a sustain claim can "
             "honestly be built on. This clause is excluded from the readings it grades, so the "
-            "window is not its own precondition"
+            "window is not its own precondition. Graded under Brian's 2026-10-03 ruling: MET "
+            "once a dated reading and a complete Saturday exist and every reading and Saturday "
+            "inside the window since is clean"
         ),
         xc.read_sustained_window(
             store,
@@ -1642,34 +1709,9 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
                 f"metrics/slo/completeness/{family}/latest.json",
             )
         )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.cost.monthly",
-            "AWS spend tagged system=data-collection is within the ratified monthly "
-            "ceiling, read from the cost-and-usage export (never per-run Cost Explorer API "
-            "calls, billed at $0.01 each)",
-            "metrics/cost/monthly/latest.json",
-        )
-    )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.pages.monthly",
-            "pages <= 2 per month outside declared vendor outages",
-            "metrics/pages/monthly/latest.json",
-        )
-    )
-    clauses.append(
-        _clause_objective(
-            store,
-            "data.human_touch.monthly",
-            "human-originated mutating CloudTrail calls on component resources = 0 per month "
-            "outside the reserved list, read from the CloudTrail S3 ARCHIVE rather than "
-            "lookup-events",
-            "metrics/human_touch/monthly/latest.json",
-        )
-    )
+    clauses.append(_clause_cost_monthly(store))
+    clauses.append(_clause_pages_monthly(store))
+    clauses.append(_clause_human_touch_monthly(store))
     # The phase EXIT criteria (`alpha-engine-config-I10954`). The cycle sets are
     # collected ONCE per schedule and shared by every clause that counts over
     # them: four clauses re-deriving the same twenty-cycle window would list the

@@ -998,7 +998,18 @@ def read_executor_collection_writes_zero(store: GateStore, *, days: int = 7) -> 
             source=_SOURCE_STORE,
         )
     covered = document.get("days_covered")
+    try:
+        covered_days = int(covered)
+    except (TypeError, ValueError):
+        covered_days = 0
     return Reading(
+        window=ObservationWindow(
+            live=True,
+            observed=covered_days,
+            required=days,
+            failures=(f"{count} executor write(s) into collection prefixes",) if count else (),
+            unit="day(s)",
+        ),
         met=count == 0 and str(covered) == str(days),
         detail=(
             f"{EXECUTOR_WRITES_KEY}: {count} executor write(s) into collection prefixes over "
@@ -1041,6 +1052,12 @@ def read_sustained_window(
         day = subtract_trading_days(day, 1)
     clean = 0
     verdicts: list[str] = []
+    # Every day of the window is read (newest first), not only up to the first
+    # unclean one, so Brian's 2026-10-03 ruling (`ObservationWindow`) can name
+    # every failed observation inside it. `clean` keeps its original meaning:
+    # the consecutive clean run ending at `trading_day`.
+    per_day: list[tuple[str, str | None]] = []  # (day, failure or None); "ABSENT" marked
+    streak_open = True
     for day in days:
         key = f"gates/{gate}/{day.isoformat()}/gate.json"
         read = read_store_document(store, key)
@@ -1053,26 +1070,34 @@ def read_sustained_window(
                 source=_SOURCE_GATE_HISTORY,
             )
         if read.absent:
-            verdicts.append(f"{day.isoformat()}:no reading")
-            break
-        rows = [
-            row
-            for row in (read.document or {}).get("clauses") or []
-            if row.get("name") != self_clause
-        ]
-        unmet = [str(r.get("name")) for r in rows if not r.get("met") and not r.get("unmeasurable")]
-        unmeas = [str(r.get("name")) for r in rows if r.get("unmeasurable")]
-        if not rows:
-            verdicts.append(f"{day.isoformat()}:reading carries no clauses")
-            break
-        if unmet or unmeas:
-            verdicts.append(
-                f"{day.isoformat()}:{len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE "
-                f"(first: {sorted(unmet + unmeas)[:3]})"
-            )
-            break
-        clean += 1
-        verdicts.append(f"{day.isoformat()}:clean")
+            verdict = f"{day.isoformat()}:no reading"
+            per_day.append((day.isoformat(), "ABSENT"))
+        else:
+            rows = [
+                row
+                for row in (read.document or {}).get("clauses") or []
+                if row.get("name") != self_clause
+            ]
+            unmet = [
+                str(r.get("name")) for r in rows if not r.get("met") and not r.get("unmeasurable")
+            ]
+            unmeas = [str(r.get("name")) for r in rows if r.get("unmeasurable")]
+            if not rows:
+                verdict = f"{day.isoformat()}:reading carries no clauses"
+            elif unmet or unmeas:
+                verdict = (
+                    f"{day.isoformat()}:{len(unmet)} UNMET, {len(unmeas)} UNMEASURABLE "
+                    f"(first: {sorted(unmet + unmeas)[:3]})"
+                )
+            else:
+                verdict = f"{day.isoformat()}:clean"
+            per_day.append((day.isoformat(), None if verdict.endswith(":clean") else verdict))
+        if streak_open:
+            verdicts.append(verdict)
+            if verdict.endswith(":clean"):
+                clean += 1
+            else:
+                streak_open = False
 
     if weekly.unmeasurable:
         return Reading(
@@ -1088,6 +1113,26 @@ def read_sustained_window(
             break
         complete_saturdays += 1
 
+    # The ruling's window (`ObservationWindow`): live once a dated reading
+    # exists AND one Saturday has been complete; from then on, an unclean or
+    # missing reading, or an incomplete Saturday, is a failed observation.
+    observed = 0
+    failures: list[str] = []
+    readings_live = False
+    for day_iso, failure in reversed(per_day):
+        if failure == "ABSENT" and not readings_live:
+            continue
+        readings_live = True
+        observed += 1
+        if failure is not None:
+            failures.append(f"{day_iso}:no reading" if failure == "ABSENT" else failure)
+    saturdays_live = False
+    for cycle, _ok, missing in reversed(_cycle_verdict(weekly)):
+        if not missing:
+            saturdays_live = True
+        elif saturdays_live:
+            failures.append(f"{weekly.schedule}@{cycle.label}: incomplete Saturday")
+
     detail = (
         f"{clean}/{trading_days} consecutive trading day(s) whose dated {gate} reading carried "
         f"0 UNMET and 0 UNMEASURABLE clauses (this clause itself excluded, so the window is not "
@@ -1099,4 +1144,16 @@ def read_sustained_window(
         detail=detail,
         evidence=(f"gates/{gate}/", weekly.schedule),
         source=_SOURCE_GATE_HISTORY,
+        window=ObservationWindow(
+            live=readings_live and saturdays_live,
+            observed=observed,
+            required=trading_days,
+            failures=tuple(failures),
+            not_live=(
+                f"no dated {gate} reading in the window"
+                if not readings_live
+                else f"no complete {weekly.schedule} Saturday yet"
+            ),
+            unit="trading day(s)",
+        ),
     )
