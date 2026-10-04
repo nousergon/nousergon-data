@@ -798,6 +798,29 @@ def _backfill_outcome_records(
 # so a future gap is caught the SAME WEEK it happens instead of months later
 # via manual forensics.
 
+# Score dates DECLARED unresolvable (alpha-engine-config-I11609). These are
+# FROZEN legacy v1-research rows stamped on a weekend before trading-day
+# normalization. Their universe_returns rows carry close_price and NO forward
+# returns at any horizon. Measured on s3://alpha-engine-research/research.db
+# 2026-10-04: 03-28 (18 rows), 03-29 (17) and 04-04 (14) score rows join to
+# ~11.95k universe_returns rows each with return_5d and return_21d 0/11.95k
+# non-null. The outcome JOIN can therefore never resolve them. No weekend
+# score_date has been seeded since 04-04, and score_performance has gained no
+# row since 2026-07-10, because the quant-only envelope rates every name HOLD
+# (I11481). The rows cannot change.
+#
+# The rule is narrow on purpose. Exact dates, each with its reason. Never a
+# weekday rule and never a cutoff: a NEW weekend or unresolved date is still
+# a gap and still WARNs. A declared date is reported under
+# ``declared_unresolvable``, not dropped, so the summary still shows it.
+# Closes when v1 score_performance is decommissioned or the dates are
+# re-anchored to the prior session (issue options (a) and (c)).
+_DECLARED_UNRESOLVABLE_SCORE_DATES: dict[str, str] = {
+    "2026-03-28": "weekend v1 legacy score_date; universe_returns has no forward returns (I11609)",
+    "2026-03-29": "weekend v1 legacy score_date; universe_returns has no forward returns (I11609)",
+    "2026-04-04": "weekend v1 legacy score_date; universe_returns has no forward returns (I11609)",
+}
+
 
 def _check_outcome_store_coverage(db_path: str) -> dict:
     """WARN (with counts) when a ``score_performance`` signal date has ZERO
@@ -856,6 +879,7 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
             checked = 0
             gap_dates: list[str] = []
             gap_counts: dict[str, int] = {}
+            declared: dict[str, int] = {}
             for sig_date in signal_dates:
                 # Grace window: a date whose primary (21d) horizon hasn't
                 # closed yet is EXPECTED to have no outcome rows — that's
@@ -870,6 +894,9 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
                         "SELECT COUNT(*) FROM score_performance WHERE score_date = ?",
                         (sig_date,),
                     ).fetchone()[0]
+                    if sig_date in _DECLARED_UNRESOLVABLE_SCORE_DATES:
+                        declared[sig_date] = row_count
+                        continue
                     gap_dates.append(sig_date)
                     gap_counts[sig_date] = row_count
 
@@ -877,6 +904,7 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
                 signal_dates_checked=checked,
                 gap_dates=gap_dates,
                 gap_counts=gap_counts,
+                declared_unresolvable=declared,
             )
         finally:
             conn.close()
@@ -889,6 +917,13 @@ def _check_outcome_store_coverage(db_path: str) -> dict:
         summary["error"] = str(exc)
         return summary
 
+    if summary.get("declared_unresolvable"):
+        logger.info(
+            "score_performance_outcomes: %d declared-unresolvable legacy "
+            "score_date(s) still without outcome rows, as declared: %s "
+            "(alpha-engine-config-I11609).",
+            len(summary["declared_unresolvable"]), summary["declared_unresolvable"],
+        )
     if summary["gap_dates"]:
         logger.warning(
             "score_performance_outcomes coverage gap: %d signal date(s) with "
@@ -1339,12 +1374,26 @@ _CANONICAL_CONTEXT_COLUMNS = (
     "market_regime",
 )
 
-# Effective date for the drift gate — first Saturday SF run AFTER this PR
-# merges. Rows with `score_date >= _DRIFT_EFFECTIVE_DATE` are counted
-# against the producer's coverage contract. Pre-cutover rows are excluded
-# so the gate isn't polluted by legacy NULLs the backfill step is still
-# catching up on.
-_DRIFT_EFFECTIVE_DATE = "2026-05-17"
+# Newest score_date of the FROZEN v1 legacy tail (alpha-engine-config-I11609).
+# score_performance has gained no row since 2026-07-10. Its seed path inserts
+# only rating == "BUY", and since 2026-07-18 the quant-only signals envelope
+# rates every name HOLD (signals/2026-10-02: 904/904 HOLD). The 214 rows
+# dated 2026-05-17..2026-07-10 are v1-research rows. Measured 2026-10-04:
+# 171 of them lack a canonical column (sector_modifier NULL in 140, qual_score
+# in 72, quant_score in 8). _backfill_score_context has already run over
+# them, and the signals that would fill them do not exist. The gauge read
+# 20.09 every day from August to October because it measured rows that
+# cannot change. No alarm consumes it.
+_SCORE_PERFORMANCE_V1_FROZEN_THROUGH = "2026-07-10"
+
+# Effective date for the drift gate. Rows with `score_date >=
+# _DRIFT_EFFECTIVE_DATE` are counted against the producer's coverage
+# contract. Earlier rows are excluded so legacy NULLs do not pollute the
+# gate. It was first set to 2026-05-17, the first Saturday SF after the
+# producer fix. It now starts the day after the frozen v1 tail above
+# (alpha-engine-config-I11609), so the gate measures only rows a producer can
+# still write. Any new row that lacks a canonical column still WARNs.
+_DRIFT_EFFECTIVE_DATE = "2026-07-11"
 
 
 def _emit_context_coverage_metric(db_path: str) -> dict:
@@ -1382,6 +1431,7 @@ def _emit_context_coverage_metric(db_path: str) -> dict:
                     rows_fully_populated=0,
                     coverage_pct=100.0,
                     note="no rows past effective_date — coverage undefined",
+                    frozen_through=_SCORE_PERFORMANCE_V1_FROZEN_THROUGH,
                 )
             else:
                 null_clause = " OR ".join(

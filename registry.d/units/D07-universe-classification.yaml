@@ -61,10 +61,16 @@ contract:
   schema: contracts/universe_classification.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "crucible:crucible/data/universe.py"
+  # No `unpinned_consumers` (alpha-engine-config-I10933, 2026-10-04). It used to
+  # name `crucible:crucible/data/universe.py`, carried over from the P-07 plan's
+  # boundary-table row 4, which groups constituents and classification. That
+  # module reads `constituents.json` (D01's key, pinned by D01's body_schema pin)
+  # and never this one; no file in crucible, crucible-executor, crucible-trader,
+  # crucible-backtester, crucible-dashboard, metron or nousergon-console names
+  # `universe_classification`. The only readers are the two crucible-research
+  # modules under `consumers` above, which `consumers_decision` already records.
+  # Re-add a consumer here, as a structured pin, in the same change that
+  # deletes `consumers_decision`.
 registry_rows:
   - universe_classification_latest
 run_manifest_prefix: data_collection/runs/D07
@@ -83,11 +89,20 @@ completeness:
   status: proposed
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "weekly_collector.py::_record_phase_lineage"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Every key this unit publishes through weekly_collector.py::_phase_collect is graded
+        after the collector returns by _record_phase_lineage:
+        validators/expectations.py::check_empty_fresh HEADs it and reads a missing or zero-byte
+        object, or a zero row count, as `empty_fresh`; an unreported count is `unmeasurable`,
+        never a pass. Filed on every manifest as guard `data_empty_fresh` plus the
+        data.D07.guard.empty_fresh MetricRecord (worst key wins). Observe/enforce staging is
+        declared once, in validators/expectations.py::EMPTY_FRESH_GUARD
+        (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
+        (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
@@ -113,11 +128,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        weekly_collector.py::_phase_collect -> _record_phase_lineage. Not in service until
+        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"

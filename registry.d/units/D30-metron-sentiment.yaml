@@ -28,9 +28,16 @@ owner: brian
 code_path: "collectors/metron_market_data.py:1409"
 trigger:
   kind: "step-functions"
-  owner: "ne-postclose-trading-pipeline"
-  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
-  schedule: "weekdays 16:00 America/New_York"
+  # Since the decoupled data cutover (alpha-engine-config-I11269; first
+  # standalone EOD run 2026-09-29) this unit runs in the standalone stack's EOD
+  # machine, started at 18:15 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule).
+  # ne-postclose-trading-pipeline (16:00 ET) no longer runs it: its data stages
+  # were removed by that same change.
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-postclose-trading-pipeline"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - market_data/sentiment/latest.json
@@ -52,7 +59,14 @@ run_manifest_prefix: data_collection/runs/D30
 detectors: []
 freshness:
   family: "eod-spine"
-  deadline: "18:15 America/New_York"
+  # The family's worst-case write bound, by the same rule the weekly family
+  # uses (fire + declared runtime ceiling, plan §2 row 1): the 18:15 ET fire
+  # plus each verify_unit writer's SSM-online budget and declared cap,
+  # 18:15 + 95 + 65 = 20:55 ET (tests/test_data_collection_stack.py::
+  # test_the_eod_ordering_chain_is_derived_from_the_template). It read 18:15
+  # while the schedule was 16:45; once the fire moved to 18:15 that value
+  # equalled the fire time and could never be met. Still `proposed`.
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
@@ -61,11 +75,20 @@ completeness:
   status: proposed
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "weekly_collector.py::_record_phase_lineage"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Every key this unit publishes through weekly_collector.py::_phase_collect is graded
+        after the collector returns by _record_phase_lineage:
+        validators/expectations.py::check_empty_fresh HEADs it and reads a missing or zero-byte
+        object, or a zero row count, as `empty_fresh`; an unreported count is `unmeasurable`,
+        never a pass. Filed on every manifest as guard `data_empty_fresh` plus the
+        data.D30.guard.empty_fresh MetricRecord (worst key wins). Observe/enforce staging is
+        declared once, in validators/expectations.py::EMPTY_FRESH_GUARD
+        (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
+        (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
@@ -91,11 +114,18 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        weekly_collector.py::_phase_collect -> _record_phase_lineage. Not in service until
+        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"

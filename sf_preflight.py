@@ -690,7 +690,7 @@ def check_backfill_source_freshness(ctx: PreflightContext) -> CheckResult:
     import pandas as pd
 
     t0 = time.time()
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", region_name=_REGION)
 
     # ArcticDB SPY last_date — reuse macro_lib from check_arctic_connectivity.
     if ctx.macro_lib is None:
@@ -798,7 +798,7 @@ def check_postflight_contracts(ctx: PreflightContext) -> CheckResult:
     import time
     import boto3
     t0 = time.time()
-    s3 = boto3.client("s3")
+    s3 = boto3.client("s3", region_name=_REGION)
     issues: list[str] = []
 
     def _read(key: str) -> "dict | None":
@@ -1368,7 +1368,7 @@ def check_definition_input_coherence(ctx: PreflightContext) -> CheckResult:
 
     t0 = time.time()
 
-    sfn = _boto3.client("stepfunctions")
+    sfn = _boto3.client("stepfunctions", region_name=_REGION)
     try:
         live = _json.loads(
             sfn.describe_state_machine(stateMachineArn=_WEEKLY_SF_ARN)["definition"]
@@ -1609,7 +1609,7 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
         )
 
     import boto3 as _boto3
-    s3 = _boto3.client("s3")
+    s3 = _boto3.client("s3", region_name=_REGION)
     violations: list[str] = []
     verified: list[str] = []
 
@@ -1722,9 +1722,9 @@ def check_lambda_memory_headroom(ctx: PreflightContext) -> CheckResult:
 
     t0 = time.time()
 
-    sfn = _boto3.client("stepfunctions")
-    lam = _boto3.client("lambda")
-    cw = _boto3.client("cloudwatch")
+    sfn = _boto3.client("stepfunctions", region_name=_REGION)
+    lam = _boto3.client("lambda", region_name=_REGION)
+    cw = _boto3.client("cloudwatch", region_name=_REGION)
 
     try:
         live = _json.loads(
@@ -2198,9 +2198,9 @@ def check_sf_iam_reachability(ctx: PreflightContext) -> CheckResult:
     import boto3
 
     t0 = time.time()
-    sfn = boto3.client("stepfunctions")
-    iam = boto3.client("iam")
-    lam = boto3.client("lambda")
+    sfn = boto3.client("stepfunctions", region_name=_REGION)
+    iam = boto3.client("iam", region_name=_REGION)
+    lam = boto3.client("lambda", region_name=_REGION)
 
     failures: list[str] = []
     checked = 0

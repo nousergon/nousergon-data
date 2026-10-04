@@ -257,9 +257,11 @@ class UnconnectedClause(Clause):
     * rendered on the board as ``UNCONNECTED`` (console ``DISABLED``: declared,
       with reason, owner and re-exam — `observability-policy` §8.3).
 
-    Only the ``consumers`` column changes; every other column of the unit is
-    still graded. A unit that is unconnected WITHOUT a decision stays an
-    ordinary UNMET clause (plan §3 finding).
+    Two columns change, both reading the SAME recorded decision: ``consumers``,
+    and ``schema_contract`` when the unit's own contract names no consumer at
+    all (`alpha-engine-config-I10933`, :func:`_schema_contract_is_unconnected`).
+    Every other column of the unit is still graded. A unit that is unconnected
+    WITHOUT a decision stays an ordinary UNMET clause (plan §3 finding).
     """
 
     decision: str = ""
@@ -531,6 +533,67 @@ def _clause_consumers_unconnected(unit: Unit, name: str, requirement: str, phase
     )
 
 
+def _schema_contract_is_unconnected(unit: Unit) -> bool:
+    """Whether ``unit``'s ``schema_contract`` clause renders UNCONNECTED.
+
+    `alpha-engine-config-I10933`. The requirement is *"publishes a versioned
+    schema with a producer test that validates a real fixture, **and every
+    consumer pins a copy**"*, and :func:`ev._read_schema_contract` grades the
+    pin half from ``contract.consumer_pins``. A unit KEPT with no surviving
+    consumer by a recorded decision can never hold an honest pin, so on the
+    ordinary path the clause is red forever for the one absence its sibling
+    ``consumers`` clause already reads as a closed decision. Same predicate as
+    that clause (:func:`_clause_consumers_unconnected`: ``connection ==
+    "unconnected"`` plus a recorded ``consumers_decision``), same declaration
+    source, no second record of the ruling.
+
+    One narrowing, and it only ever keeps a clause GRADED: if the unit's own
+    ``contract`` names a consumer anyway (``consumer_pins`` or
+    ``unpinned_consumers``), the descriptor contradicts its own "no consumer"
+    and the ordinary reading — which grades exactly that declared consumer —
+    is the finding that says so. Carving it out would hide the one signal
+    that the unit is not unconnected after all.
+    """
+    if unit.connection != "unconnected" or not unit.consumers_decision:
+        return False
+    contract = unit.raw.get("contract") or {}
+    return not (contract.get("consumer_pins") or contract.get("unpinned_consumers"))
+
+
+def _clause_schema_contract_unconnected(unit: Unit, name: str, requirement: str, phase: str) -> Clause:
+    """The ``schema_contract`` clause of a kept-unconnected unit (I10933).
+
+    Rendered exactly as :func:`_clause_consumers_unconnected` renders the
+    ``consumers`` clause — never MET, never UNMET, graded by no gate — and it
+    still says what the producer side holds, so the board shows whether a
+    schema exists for the day a consumer is added (deleting
+    ``consumers_decision`` in that change returns this clause to ordinary
+    grading, pin half included).
+    """
+    decision = unit.consumers_decision
+    files = ev._declared_schema_files(unit)
+    missing = [f for f in files if not (ev.REPO_ROOT / f).exists()]
+    if not files:
+        producer = "no schema or producer test is declared"
+    elif missing:
+        producer = f"the descriptor declares {files} but {missing} is/are not in the tree"
+    else:
+        producer = f"producer side present ({files})"
+    return UnconnectedClause(
+        name,
+        requirement,
+        False,
+        f"UNCONNECTED: {unit.unit_id} is kept with no surviving consumer — {unit.connection_reason} "
+        f"— so no consumer can pin a copy; {producer}. Graded by no gate until a consumer is "
+        "declared and the `consumers_decision` block is deleted.",
+        (unit.path.relative_to(unit.path.parents[2]).as_posix(),),
+        phase=phase,
+        source="registry.d/units (consumers_decision)",
+        as_of=decision["ruled_on"],
+        decision=f"{decision['decision']} by {decision['ruled_by']} {decision['ruled_on']} ({decision['ruling']})",
+    )
+
+
 #: The phase a kept-unconnected unit's `schema_contract` clause is deferred to.
 #: Plan §3 ("a key with no surviving consumer after phase 4 gets **no** new
 #: contract") read together with §8's per-unit rows, which route D02 and D14 —
@@ -557,10 +620,15 @@ def _clause_phase(unit: Unit, column: str) -> str:
 
     Plan §3 settles which way: contracts are built *for keys with a surviving
     consumer* in phase 1, and the kept zero-consumer remainder in phase 2. So
-    the clause is DEFERRED, not carved out — it is still graded, still red
-    until a contract exists, and it lands in the phase the plan schedules it
-    in. `max` so a descriptor that already declares a later phase keeps it:
-    this only ever moves a clause later, never earlier.
+    the clause is DEFERRED to phase 2. `max` so a descriptor that already
+    declares a later phase keeps it: this only ever moves a clause later,
+    never earlier.
+
+    Since `alpha-engine-config-I10933` the deferred clause renders UNCONNECTED
+    (graded by no gate) when the unit's contract names no consumer — see
+    :func:`_schema_contract_is_unconnected`. The phase still matters: it is the
+    phase the clause is graded in the moment a consumer is added and the
+    decision block deleted.
     """
     declared = unit.clause_phase[column]
     if (
@@ -594,6 +662,8 @@ def _clause_base(store: ev.GateStore, unit: Unit, column: str, *, trading_day: d
         return _retired(unit, name, requirement, phase)
     if column == "consumers" and unit.connection == "unconnected":
         return _clause_consumers_unconnected(unit, name, requirement, phase)
+    if column == "schema_contract" and _schema_contract_is_unconnected(unit):
+        return _clause_schema_contract_unconnected(unit, name, requirement, phase)
     if column == "run_record":
         disabled = _disabled_trigger_cadence(unit)
         if disabled is not None:
