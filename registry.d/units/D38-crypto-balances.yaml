@@ -82,11 +82,16 @@ completeness:
       (`address_fetch_failed` rejects) against the published wallet list
 guards:
   empty_fresh:
-    state: absent
+    state: partial
+    code:
+      - "infrastructure/lambdas/crypto-balances/index.py::_record_run"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        SKIP path only: infrastructure/lambdas/crypto-balances/index.py::_record_run files
+        guard `data_empty_fresh` `empty_fresh` when collect() returns status=skipped and the
+        holdings key is not refreshed. On the ok path the key is recorded with
+        rows_out=n_balances but a zero-balance write is not graded — the remaining half. Not in
+        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
@@ -112,11 +117,19 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        run_units.py::recorded_entry (its `_checked` wrapper), which this unit's entry point
+        calls with its unit id. Not in service until commissioned by an induced fault (P-19,
+        alpha-engine-config-I10786).
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"
