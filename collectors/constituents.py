@@ -260,21 +260,52 @@ _YF_INDUSTRY_TO_GICS: dict[str, str] = {
     "Packaging & Containers": "Materials",
 }
 
+# yfinance ``info['industry']`` values that are a placeholder, not a
+# classification: the member is treated as unclassified (``_yf_to_gics``
+# returns None) whatever ``sector`` says, so a declared override or the
+# previous snapshot can still cover it. "Shell Companies" is what yfinance
+# shows for a when-issued listing before the issuer's profile lands: on
+# 2026-10-01/02 it gave VYLR (Corteva's seed spin-off) sector "Financial
+# Services", industry "Shell Companies", which mapped to Financials and
+# shadowed the declared override. GICS has no shell-company sub-industry, and
+# S&P does not admit a shell to the S&P 500 or 400.
+_YF_PLACEHOLDER_INDUSTRIES: frozenset[str] = frozenset({"Shell Companies"})
+
 # Declared sector for a member NO source can classify yet, keyed by ticker:
-# ``(gics_sector, valid_through, why)``. S&P adds a spin-off to the index on
-# its distribution date, so SPY holds the new ticker before Wikipedia lists it
-# and before yfinance has a quote for it (``sector=''``, ``industry=''``) —
-# 2026-10-01: VYLR (Vylor, Corteva's seed business) failed morning_enrich and
-# degraded that day's preopen run. Consulted only for members STILL unmapped
-# after Wikipedia and yfinance, so a real source always wins. ``valid_through``
-# is an ISO date after which the entry is ignored and the member raises as
-# before: a declaration must not outlive the lag it papers over.
-_SECTOR_OVERRIDES: dict[str, tuple[str, str, str]] = {
+# a tuple of ``(gics_sector, valid_from, valid_through, why)`` segments, ISO
+# dates, inclusive at both ends. S&P adds a spin-off to the index on its
+# distribution date, so SPY holds the new ticker before Wikipedia lists it and
+# before yfinance has a real profile for it (``sector=''`` or a "Shell
+# Companies" placeholder) — 2026-10-01: VYLR (Vylor, Corteva's seed business)
+# failed morning_enrich and degraded that day's preopen run. Consulted only
+# for members STILL unmapped after Wikipedia and yfinance, so a real source
+# always wins. More than one segment expresses a GICS change S&P announces
+# with an effective date. Outside every segment the entry is ignored and the
+# member falls through as before: a declaration must not outlive the lag it
+# papers over.
+#
+# VYLR source: S&P Dow Jones Indices, "Vylor Added to the S&P 500; Twilio Set
+# to Join S&P 500; Others to Join S&P MidCap 400 and S&P SmallCap 600",
+# 2026-10-01, https://press.spglobal.com/2026-10-01-Vylor-Added-to-the-S-P-500-Twilio-Set-to-Join-S-P-500-Others-to-Join-S-P-MidCap-400-and-S-P-SmallCap-600
+# — VYLR joined the S&P 500 on 2026-10-01 in Corteva's (Materials) slot and
+# "will have a GICS change to Consumer Staples effective on October 6"
+# (prior to the open).
+_SECTOR_OVERRIDES: dict[str, tuple[tuple[str, str, str, str], ...]] = {
     "VYLR": (
-        "Materials",
-        "2026-10-31",
-        "spin-off of CTVA (GICS Materials, Fertilizers & Agricultural "
-        "Chemicals), distributed 2026-10-01",
+        (
+            "Materials",
+            "2026-10-01",
+            "2026-10-05",
+            "spin-off of CTVA, added to the S&P 500 2026-10-01 in CTVA's GICS "
+            "sector (Materials) per S&P DJI's 2026-10-01 release",
+        ),
+        (
+            "Consumer Staples",
+            "2026-10-06",
+            "2026-10-31",
+            "S&P DJI 2026-10-01 release: GICS change to Consumer Staples "
+            "effective 2026-10-06",
+        ),
     ),
 }
 
@@ -565,10 +596,13 @@ def _yfinance_classification(tickers: list[str]) -> dict[str, dict[str, str]]:
 def _yf_to_gics(sector: str, industry: str) -> str | None:
     """Map a yfinance sector/industry pair onto a GICS sector, or None.
 
-    Industry overrides win; an unknown or empty sector is None (unclassified),
-    never passed through — a non-GICS name would have no sector ETF and would
+    A placeholder industry (``_YF_PLACEHOLDER_INDUSTRIES``) is None whatever
+    the sector says. Industry overrides win; an unknown or empty sector is
+    None (unclassified), never passed through — a non-GICS name would have no sector ETF and would
     be a new bucket the executor's sector caps do not know.
     """
+    if industry in _YF_PLACEHOLDER_INDUSTRIES:
+        return None
     if industry in _YF_INDUSTRY_TO_GICS:
         return _YF_INDUSTRY_TO_GICS[industry]
     return _YF_SECTOR_TO_GICS.get(sector)
@@ -768,8 +802,9 @@ def _apply_sector_overrides(
     """Fill still-unmapped members from ``_SECTOR_OVERRIDES``, in place.
 
     Runs after the yfinance fallback, so only a member neither Wikipedia nor
-    yfinance could classify is touched. An entry past its ``valid_through``
-    date is ignored and the member falls through to the coverage gate. The
+    yfinance could classify is touched. The segment whose
+    ``valid_from``..``valid_through`` holds ``today`` applies; with none, the
+    entry is ignored and the member falls through to the coverage gate. The
     evidence replaces the yfinance error in ``sector_fallback`` so the
     published record says where the sector came from.
     """
@@ -777,13 +812,18 @@ def _apply_sector_overrides(
     for ticker in tickers:
         if ticker in sector_map or ticker not in _SECTOR_OVERRIDES:
             continue
-        gics, valid_through, why = _SECTOR_OVERRIDES[ticker]
-        if today > valid_through:
+        segments = _SECTOR_OVERRIDES[ticker]
+        current = [seg for seg in segments if seg[1] <= today <= seg[2]]
+        if not current:
             logger.error(
-                "Sector override for %s expired %s — not applied; remove it "
-                "or confirm a source now classifies the ticker", ticker, valid_through,
+                "Sector override for %s has no segment covering %s (declared "
+                "%s..%s) — not applied; remove it or confirm a source now "
+                "classifies the ticker",
+                ticker, today, min(seg[1] for seg in segments),
+                max(seg[2] for seg in segments),
             )
             continue
+        gics, _valid_from, valid_through, why = current[0]
         sector_map[ticker] = gics
         sector_etf_map[ticker] = GICS_TO_ETF[gics]
         prior = sector_fallback.get(ticker, {}).get("error")

@@ -81,7 +81,7 @@ import json
 import logging
 import re
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from io import StringIO
 from pathlib import Path
 
@@ -153,6 +153,33 @@ _DECLARED_SPINOFF_ADDITIONS_PATH = (
 #: cadence interval after it happens.
 SPINOFF_MATCH_WINDOW_DAYS = 7
 
+#: PROVISIONAL spin-off additions (alpha-engine-config-I11812, "fix D", ruled
+#: by Brian 2026-10-03). The 10-03 weekly failed D02 on VYLR, a spin-off the
+#: reference table had not caught up with, and the only way through was a
+#: hand-written declaration. A single unexplained ``observed added`` is now
+#: accepted WITHOUT one when Polygon confirms the symbol is an active, newly
+#: listed name, under three bounds, each of which fails the run as before:
+#:
+#: * at most ``PROVISIONAL_MAX_PER_RUN`` such additions in a run — two
+#:   unexplained additions is not a spin-off lagging a table, it is a gap;
+#: * Polygon must confirm it: the ticker exists, is ``active``, and its
+#:   ``list_date`` is within ``PROVISIONAL_LISTING_WINDOW_DAYS`` of the
+#:   snapshot that first shows the addition;
+#: * it expires ``PROVISIONAL_DEADLINE_DAYS`` after that snapshot. By then the
+#:   reference lists it, or a declaration in
+#:   ``sp500_declared_spinoff_additions.json`` explains it — either removes
+#:   the disagreement before this code sees it — or the run fails again.
+#:
+#: Every acceptance is published (artifact, run manifest guard, phase marker)
+#: as ``provisional_additions``; it is never a silent pass.
+PROVISIONAL_MAX_PER_RUN = 1
+PROVISIONAL_DEADLINE_DAYS = 14
+PROVISIONAL_LISTING_WINDOW_DAYS = 14
+
+#: The run-manifest guard name each provisional addition is recorded under.
+PROVISIONAL_ADDITION_GUARD = "d02_provisional_addition"
+
+
 # The changes table is not pinned to one page: on 2026-08-11 a Wikipedia editor
 # split it out of "List of S&P 500 companies" into its own article
 # ("move to [[Historical components of the S&P 500]], format"), which failed
@@ -167,6 +194,8 @@ _HEADERS = {"User-Agent": "alpha-engine-data/1.0 (historical-constituents)"}
 
 ADDED = "added"
 REMOVED = "removed"
+
+_OBSERVED_ADDED_RE = re.compile(rf"^observed {ADDED} (\S+) not in reference$")
 
 
 @dataclass(frozen=True)
@@ -533,6 +562,173 @@ def declared_spinoff_exceptions(
         )
     unexplained = [f for f in found if f not in explained]
     return unexplained, [explained[f] for f in found if f in explained]
+
+
+@dataclass
+class ProvisionalAdditions:
+    """What :func:`provisional_spinoff_additions` decided.
+
+    ``unexplained`` is the disagreement list with every accepted addition
+    removed; it is what grades the run. ``accepted`` is the published record,
+    one dict per addition. ``refused`` says, per candidate, why it was NOT
+    accepted, so a run that still fails names the bound it hit.
+    """
+
+    unexplained: list[str]
+    accepted: list[dict] = field(default_factory=list)
+    refused: list[str] = field(default_factory=list)
+
+
+def _polygon_ticker_details(ticker: str) -> dict | None:
+    """Polygon's reference record for ``ticker`` (the default confirmer).
+
+    Imported lazily, like the rename client: this module's pure layer is
+    unit-tested without the Polygon client or its secret."""
+    from polygon_client import polygon_client
+
+    return polygon_client().get_ticker_details(ticker)
+
+
+def _iso_day(raw: object) -> datetime | None:
+    try:
+        return datetime.strptime(str(raw)[:10], "%Y-%m-%d")
+    except ValueError:
+        return None
+
+
+def provisional_spinoff_additions(
+    found: list[str],
+    observed: list[ConstituentChange],
+    *,
+    today: str,
+    confirm=None,
+    now: str | None = None,
+) -> ProvisionalAdditions:
+    """Accept at most one Polygon-confirmed spin-off addition PROVISIONALLY.
+
+    ``found`` is the disagreement list left after the committed declarations
+    (:func:`declared_spinoff_exceptions`). Only ``observed added <ticker> not
+    in reference`` entries are candidates; nothing else is ever excused here.
+    The bounds are the ones on ``PROVISIONAL_MAX_PER_RUN``: more than one
+    candidate refuses them all, a candidate past its deadline (``today`` after
+    the observed addition plus ``PROVISIONAL_DEADLINE_DAYS``) is refused
+    without asking Polygon, and Polygon must answer that the ticker is
+    ``active`` with a ``list_date`` within ``PROVISIONAL_LISTING_WINDOW_DAYS``
+    of the observed addition. A Polygon failure is a refusal, never a pass.
+
+    The deadline is anchored to the snapshot that first OBSERVED the
+    addition, not to the run that confirmed it, so it cannot be renewed by
+    re-confirming every week and needs no state carried between runs.
+
+    ``confirm`` maps a ticker to Polygon's reference record (``None`` when
+    Polygon does not know it); it defaults to the live client.
+    """
+    candidates: dict[str, str] = {}
+    for f in found:
+        m = _OBSERVED_ADDED_RE.match(f)
+        if m:
+            candidates[m.group(1)] = f
+    out = ProvisionalAdditions(unexplained=list(found))
+    if not candidates:
+        return out
+    if len(candidates) > PROVISIONAL_MAX_PER_RUN:
+        out.refused.append(
+            f"{len(candidates)} additions not in reference {sorted(candidates)}: at most "
+            f"{PROVISIONAL_MAX_PER_RUN} may be accepted provisionally in one run, so none is"
+        )
+        return out
+
+    ticker, msg = next(iter(candidates.items()))
+    added_dates = sorted(c.date for c in observed if c.action == ADDED and c.ticker == ticker)
+    if not added_dates:
+        out.refused.append(f"{ticker}: no observed addition to anchor a deadline to")
+        return out
+    added_on = added_dates[-1]
+    added_day = datetime.strptime(added_on, "%Y-%m-%d")
+    deadline = (added_day + timedelta(days=PROVISIONAL_DEADLINE_DAYS)).strftime("%Y-%m-%d")
+    if today > deadline:
+        out.refused.append(
+            f"{ticker}: provisional acceptance EXPIRED {deadline} ({PROVISIONAL_DEADLINE_DAYS}d "
+            f"after the addition observed {added_on}); the reference does not list it and no "
+            f"declaration in {_DECLARED_SPINOFF_ADDITIONS_PATH.name} explains it"
+        )
+        return out
+
+    confirm = confirm or _polygon_ticker_details
+    try:
+        details = confirm(ticker)
+    except Exception as exc:  # noqa: BLE001 — a refusal, recorded and logged by the caller
+        # Only the ticker, the exception TYPE and the HTTP status are recorded.
+        # The exception's message is never used: a requests error embeds the
+        # request URL, and Polygon authenticates with ``apiKey`` in that URL's
+        # querystring, so the message is the key (CodeQL
+        # py/clear-text-logging-sensitive-data on nousergon-data-PR2041).
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        out.refused.append(
+            f"{ticker}: Polygon could not confirm it ({type(exc).__name__}"
+            + (f", HTTP {status}" if isinstance(status, int) else "")
+            + ")"
+        )
+        return out
+    if not details:
+        out.refused.append(f"{ticker}: Polygon has no reference record for it")
+        return out
+    if details.get("active") is not True:
+        out.refused.append(f"{ticker}: Polygon reports it inactive (active={details.get('active')!r})")
+        return out
+    listed = _iso_day(details.get("list_date"))
+    if listed is None:
+        out.refused.append(
+            f"{ticker}: Polygon gives no usable list_date ({details.get('list_date')!r})"
+        )
+        return out
+    gap = abs((listed - added_day).days)
+    if gap > PROVISIONAL_LISTING_WINDOW_DAYS:
+        out.refused.append(
+            f"{ticker}: Polygon list_date {listed:%Y-%m-%d} is {gap}d from the addition observed "
+            f"{added_on} (window {PROVISIONAL_LISTING_WINDOW_DAYS}d) — not a new listing"
+        )
+        return out
+
+    out.accepted.append({
+        "ticker": ticker,
+        "reason": (
+            f"{msg}: accepted provisionally as a spin-off/new listing — Polygon reports it "
+            f"active, listed {listed:%Y-%m-%d}, {gap}d from the addition observed {added_on}"
+        ),
+        "observed_added_on": added_on,
+        "polygon_list_date": f"{listed:%Y-%m-%d}",
+        "confirmed_at": now or datetime.now(timezone.utc).isoformat(),
+        "deadline": deadline,
+        "clears_when": (
+            f"the reference changes table lists it, or {_DECLARED_SPINOFF_ADDITIONS_PATH.name} "
+            f"declares it, before {deadline}; after that the run fails"
+        ),
+    })
+    out.unexplained = [f for f in found if f != msg]
+    return out
+
+
+def provisional_addition_guards(accepted: list[dict], *, key: str) -> list[dict]:
+    """One run-manifest guard reading per provisional addition.
+
+    ``weekly_collector._record_collector_guards`` folds these onto D02's run
+    manifest, so an addition accepted without a declaration is on the record
+    the completion predicate and the board read, not only in the artifact.
+    """
+    return [
+        {
+            "guard": PROVISIONAL_ADDITION_GUARD,
+            "mode": "enforce",
+            "verdict": "ok",
+            "detail": (
+                f"provisional_addition ticker={a['ticker']} deadline={a['deadline']} "
+                f"confirmed_at={a['confirmed_at']}: {a['reason']}"
+            )[:2000],
+            "key": key,
+        }
+        for a in accepted
+    ]
 
 
 def pending_reference_changes(
@@ -1024,6 +1220,7 @@ def _verdict(
     unresolved: list[str],
     deferred: list[str],
     replay: list[str] | tuple = (),
+    provisional_refused: list[str] | tuple = (),
 ) -> tuple[str, str | None]:
     """The stage's own status and, when DEGRADED, the defect named in full.
 
@@ -1047,6 +1244,10 @@ def _verdict(
             f"{len(unexplained)} unexplained reference disagreement(s): {unexplained}"
             + (f" (unresolved swaps: {unresolved})" if unresolved else "")
             + (f" (rename check deferred for: {deferred})" if deferred else "")
+            + (
+                f" (provisional acceptance refused: {list(provisional_refused)})"
+                if provisional_refused else ""
+            )
         )
     if recent_skips:
         parts.append(
@@ -1190,6 +1391,7 @@ def collect(
 
     found: list[str] = []
     declared: list[str] = []
+    provisional = ProvisionalAdditions(unexplained=[])
     if reference is not None:
         found, declared = declared_spinoff_exceptions(
             divergences(
@@ -1204,10 +1406,31 @@ def collect(
                 "by a declaration in %s, not by the reference: %s",
                 len(declared), _DECLARED_SPINOFF_ADDITIONS_PATH.name, declared,
             )
+        # Fix D (alpha-engine-config-I11812): one Polygon-confirmed spin-off
+        # addition that no declaration explains yet is accepted PROVISIONALLY,
+        # with a deadline, and published as such. See PROVISIONAL_MAX_PER_RUN.
+        provisional = provisional_spinoff_additions(
+            found, observed_sp500, today=datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        )
+        found = provisional.unexplained
+        if provisional.accepted:
+            logger.warning(
+                "historical_constituents: %d addition(s) accepted PROVISIONALLY without a "
+                "declaration (Polygon-confirmed new listing; each fails the run after its "
+                "deadline unless the reference or a declaration replaces it): %s",
+                len(provisional.accepted), provisional.accepted,
+            )
+        if provisional.refused:
+            logger.warning(
+                "historical_constituents: provisional acceptance REFUSED: %s",
+                provisional.refused,
+            )
         attestation = {
             "status": "diverged" if found else "agreed",
             "divergences": found,
             "declared_exceptions": declared,
+            "provisional_additions": provisional.accepted,
+            "provisional_additions_refused": provisional.refused,
             "since": SNAPSHOT_CUTOVER,
             "until": newest,
             "pending_reference_changes": (
@@ -1235,7 +1458,7 @@ def collect(
     status, detail = _verdict(
         unexplained=found, recent_skips=recent_skips,
         unresolved=unresolved_sp500, deferred=resolution.deferred,
-        replay=replay,
+        replay=replay, provisional_refused=provisional.refused,
     )
     # One block, written into the artifact AND returned, so the published
     # file, the run manifest and the DEGRADED alert read the same numbers.
@@ -1244,6 +1467,11 @@ def collect(
         "reference_disagreements": found,
         "n_declared_reference_exceptions": len(declared),
         "declared_reference_exceptions": declared,
+        # Never silent: the run manifest (as a guard reading per addition) and
+        # the phase marker carry this same list (alpha-engine-config-I11812).
+        "n_provisional_additions": len(provisional.accepted),
+        "provisional_additions": provisional.accepted,
+        "provisional_additions_refused": provisional.refused,
         "n_skipped_snapshots": len(rosters.skipped),
         "skipped_snapshots": dict(sorted(rosters.skipped.items())),
         "n_skipped_universe_snapshots": len(rosters.universe_skipped),
@@ -1339,6 +1567,8 @@ def collect(
         "status": status, "n_changes": len(changes), "n_snapshots": len(pit),
         **quality,
     }
+    if provisional.accepted:
+        out["guards"] = provisional_addition_guards(provisional.accepted, key=key)
     if detail:
         out["detail"] = detail
     return out

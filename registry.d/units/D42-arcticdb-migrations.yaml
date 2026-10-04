@@ -117,11 +117,19 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::record_empty_production"
+    records_as: data_success_without_output
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        run_units.py::record_empty_production runs on every completed run that recorded no
+        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
+        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
+        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
+        process exit code is unchanged; the record is the consequence. Reached through
+        run_units.py::recorded_entry (its `_checked` wrapper), which this unit's entry point
+        calls with its unit id. Not in service until commissioned by an induced fault (P-19,
+        alpha-engine-config-I10786).
 arcticdb_evidence:
   via: "data_collection/probes/arctic/{trading_day}.json"
   reason: >-
