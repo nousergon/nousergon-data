@@ -899,7 +899,10 @@ def test_the_weekday_case_stays_upstream_pending_when_nothing_is_populated_withi
     # alpha-engine-config-I11269: -2 (MorningEnrich, DataPhase1) — the
     # decoupled data cutover moved that work to ne-data-collection-weekly; the
     # wait that replaced them is a Lambda poll, not a sendCommand stage.
-    assert len(report.results) == report.stages_declared == 21
+    # alpha-engine-config-I11936: +1 (Director) — moved off Lambda onto the
+    # weekly spot over SSM; an acknowledged no-dry-path stage (its own
+    # --dry-run is what the Friday preflight already runs).
+    assert len(report.results) == report.stages_declared == 22
     # It does not page and it does not claim a clean run.
     assert report.outcome == ps.OUTCOME_DEGRADED
     ps.emit(report, aws, "arn:sns")
