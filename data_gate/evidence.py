@@ -56,11 +56,15 @@ __all__ = [
     "PARITY_FRESHNESS_TRADING_DAYS",
     "PARITY_KEY_PREFIX",
     "PARITY_KEY_TEMPLATE",
+    "CurrentEvidence",
     "GateStore",
+    "Observation",
     "ObservationWindow",
     "Reading",
     "empty_fresh_runs",
     "empty_success_runs",
+    "combine_current",
+    "current_evidence",
     "parity_store_key",
     "read_base",
     "read_completeness_metric",
@@ -100,6 +104,103 @@ _METRIC_NA_STATUSES: frozenset[str] = frozenset(
 )
 
 @dataclass(frozen=True)
+class Observation:
+    """One observation a windowed reader made — the input to the version-bound read.
+
+    Brian's ruling, 2026-10-04 (option (c) on `alpha-engine-config-I11973`):
+    release is gated by CURRENT, version-bound evidence, so a reader that
+    counts a window also reports each observation it made, newest first, with
+    the code identity it ran under. :func:`current_evidence` turns the list into
+    the verdict; the reader only reports facts.
+    """
+
+    #: What the observation was ("2026-10-02", "2026-10-02T22:15Z").
+    label: str
+    #: The code identity the observation ran under (the run manifests'
+    #: ``code_sha``, or a producer document's own). Empty when the producer
+    #: records none — then only the newest observation can be bound to the
+    #: version running now, so it is the whole of the current evidence.
+    version: str = ""
+    #: Why it failed, or ``None`` when it passed.
+    failure: str | None = None
+    #: ``False``: the observation was DUE and nothing recorded it. Never a pass.
+    present: bool = True
+
+
+@dataclass(frozen=True)
+class CurrentEvidence:
+    """Option (c)'s release evidence: the observations made on the code running now.
+
+    ``observed`` is the run of consecutive observations, back from the newest,
+    that ran the newest observation's ``version``. Any failure inside that run
+    blocks; a failure on an EARLIER version does not — a verified remedy does
+    not wait for old failures to age out of the window. A newest observation
+    that is due and missing is ``stale``: missing proof blocks exactly as a
+    failure does.
+    """
+
+    version: str
+    observed: int
+    failures: tuple[str, ...] = ()
+    stale: str = ""
+    latest: str = ""
+
+    @property
+    def clean(self) -> bool:
+        return not self.stale and self.observed > 0 and not self.failures
+
+
+def current_evidence(observations: list[Observation]) -> CurrentEvidence:
+    """The version-bound evidence in ``observations`` (newest first).
+
+    * no observation, or a newest observation that is missing: ``stale``;
+    * otherwise the newest observation plus every consecutive older one that
+      ran the SAME, non-empty version. An unknown version binds only the newest
+      observation, because nothing shows an older one ran the same code. A
+      missing observation ends the run: it carries no version to match.
+    """
+    if not observations:
+        return CurrentEvidence(version="", observed=0, stale="no observation has been made yet")
+    newest = observations[0]
+    if not newest.present:
+        return CurrentEvidence(
+            version=newest.version,
+            observed=0,
+            stale=f"the latest due observation ({newest.label}) recorded nothing",
+            latest=newest.label,
+        )
+    run = [newest]
+    if newest.version:
+        for observation in observations[1:]:
+            if not observation.present or observation.version != newest.version:
+                break
+            run.append(observation)
+    return CurrentEvidence(
+        version=newest.version,
+        observed=len(run),
+        failures=tuple(f"{o.label}: {o.failure}" for o in run if o.failure is not None),
+        latest=newest.label,
+    )
+
+
+def combine_current(parts: list[tuple[str, CurrentEvidence]]) -> CurrentEvidence | None:
+    """Several independent paths' current evidence as one (each must be clean).
+
+    Each part is ``(path label, evidence)``; the label prefixes every version,
+    failure and staleness so the row names which scheduled path blocks.
+    """
+    if not parts:
+        return None
+    return CurrentEvidence(
+        version="; ".join(f"{label}={e.version or '?'}" for label, e in parts),
+        observed=min(e.observed for _, e in parts),
+        failures=tuple(f"{label}@{f}" for label, e in parts for f in e.failures),
+        stale="; ".join(f"{label}: {e.stale}" for label, e in parts if e.stale),
+        latest="; ".join(f"{label}={e.latest}" for label, e in parts if e.latest),
+    )
+
+
+@dataclass(frozen=True)
 class ObservationWindow:
     """What a clause that counts ELAPSED time has observed of its window so far.
 
@@ -133,6 +234,11 @@ class ObservationWindow:
     not_live: str = ""
     #: What one observation is, for rendering ("trading day(s)", "cycle(s)").
     unit: str = "observation(s)"
+    #: Brian's 2026-10-04 option (c) (:class:`CurrentEvidence`): the
+    #: version-bound evidence that gates release. ``None`` from a reader that
+    #: does not report it — the clause then keeps the 2026-10-03 trailing-window
+    #: rule, which is stricter, never laxer.
+    current: CurrentEvidence | None = None
 
     @property
     def complete(self) -> bool:
@@ -1384,7 +1490,42 @@ def read_windowed_objective(
             failures=(f"{key}: status=breach, value={document.get('value')}",) if status == "breach" else (),
             not_live=f"{key} carries no ok/breach verdict yet — nothing publishes this number",
             unit=unit,
+            current=_objective_current(document) if live else None,
         ),
+    )
+
+
+def _objective_current(document: dict) -> CurrentEvidence | None:
+    """Option (c)'s current evidence out of a windowed objective document.
+
+    The producer contract (`data_gate/producers/slo.py`, nousergon-data PR2055):
+    ``cycles`` is one row per cycle of the window — ``trading_day``,
+    ``observed``, ``met``, ``misses`` and optionally ``code_sha``. When the
+    document carries those rows, the newest OBSERVED cycle (plus the older ones
+    that ran its ``code_sha``, when rows carry one) is the current evidence.
+
+    ``None`` for a document with no per-cycle rows (the monthly documents): it
+    cannot separate a current failure from an old one, so the clause keeps the
+    2026-10-03 rule, where a ``breach`` anywhere in the window blocks — stricter,
+    never laxer.
+    """
+    rows = document.get("cycles")
+    if not isinstance(rows, list) or not rows:
+        return None
+    observed_rows = sorted(
+        (r for r in rows if isinstance(r, dict) and r.get("observed", True)),
+        key=lambda r: str(r.get("trading_day") or ""),
+        reverse=True,
+    )
+    return current_evidence(
+        [
+            Observation(
+                label=str(r.get("trading_day") or "?"),
+                version=str(r.get("code_sha") or ""),
+                failure=None if r.get("met") else f"missed ({r.get('misses') or 'no detail'})",
+            )
+            for r in observed_rows
+        ]
     )
 
 

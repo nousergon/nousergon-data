@@ -399,7 +399,10 @@ BAR_SETTLEMENT_GUARD = GuardStaging(
     promotion_criterion=(
         "The standalone postclose schedule fetches at or after "
         f"{SETTLED_AFTER_ET} ET (Brian's ruling on alpha-engine-config-I11354), "
-        "AND 10 consecutive scheduled D03+D19 runs record verdict='settled', "
+        "AND the codified per-guard risk-based criterion holds "
+        "(data_gate/guard_promotion.py, bar_settlement: moderate risk — the latest "
+        "scheduled D03+D19 runs record verdict='settled'; Brian's 2026-10-04 option (c) "
+        "on alpha-engine-config-I11973 replaced the ten-run count), "
         "AND the 3-day settlement-time sample (alpha-engine-config-I11356) "
         f"confirms {SETTLED_AFTER_ET} ET rather than the one-day 2026-09-21 "
         "bracket this threshold currently rests on."
