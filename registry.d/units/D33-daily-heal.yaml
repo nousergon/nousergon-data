@@ -58,8 +58,14 @@ consumers_decision:
   reexam: >-
     data phase 2 heal verifier lands as this key's consumer (add it, delete this block)
 contract:
-  schema: null
-  producer_test: null
+  # alpha-engine-config-I10933: the heal summary data/heal/daily/{date}.json is
+  # this unit's own key. Its staging/daily_closes/{day}.parquet writes go through
+  # the same collectors.daily_closes path as D17/D19, whose contract
+  # (staging_daily_closes.schema.json) already governs those rows. No pin until
+  # the data phase-2 heal verifier lands as the consumer (it pins
+  # daily_heal_summary.schema.json, and consumers_decision goes).
+  schema: contracts/daily_heal_summary.schema.json
+  producer_test: tests/test_daily_heal_summary_contract.py
   consumer_pins: []
 registry_rows:
   - daily_heal_summary
