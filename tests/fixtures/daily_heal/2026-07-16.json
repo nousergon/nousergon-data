@@ -1,0 +1,29 @@
+{
+  "mode": "daily_heal",
+  "date": "2026-07-16",
+  "started_at": "2026-07-17T09:02:46.004177+00:00",
+  "collectors": {
+    "universe_gap_heal": {
+      "status": "ok",
+      "scan_window_td": 5,
+      "max_per_run": 1,
+      "missing_days": [],
+      "fallback_quality_days": [],
+      "ledger_days": [],
+      "healed_days": [],
+      "deferred_days": [],
+      "errors": []
+    },
+    "chronic_gap_heal": {
+      "mode": "chronic_gap_heal",
+      "date": "2026-07-16",
+      "started_at": "2026-07-17T09:02:46.653591+00:00",
+      "collectors": {},
+      "status": "ok",
+      "completed_at": "2026-07-17T09:02:46.653836+00:00"
+    }
+  },
+  "completed_at": "2026-07-17T09:02:46.690397+00:00",
+  "days_healed": 0,
+  "status": "ok"
+}

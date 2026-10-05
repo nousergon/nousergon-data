@@ -49,6 +49,7 @@ _RECORDED_TOKENS = {
 
 _ENTRY_CALL = re.compile(r"(?:recorded_entry|manual_run)\(\s*\"(D\d+[A-Z]?)\"")
 _CARDINALITY_CALL = re.compile(r"check_cardinality\(\s*unit_id=\"(D\d+[A-Z]?)\"")
+_GRADE_CALL = re.compile(r"grade_published_outputs\(\s*\w+,\s*\"(D\d+[A-Z]?)\"")
 
 
 def _units():
@@ -87,6 +88,21 @@ def _cardinality_graded_units() -> frozenset[str]:
         if rel.startswith((".venv/", "tests/")) or "/test_" in rel or rel.startswith("test_"):
             continue
         found.update(_CARDINALITY_CALL.findall(path.read_text(encoding="utf-8")))
+    return frozenset(found)
+
+
+@functools.lru_cache(maxsize=1)
+def _published_graded_units() -> frozenset[str]:
+    """Entry-point units whose published keys `run_units.grade_published_outputs`
+    grades, by literal unit id (D39, D16, D46)."""
+    found: set[str] = set()
+    for path in REPO.rglob("*.py"):
+        rel = path.relative_to(REPO).as_posix()
+        if rel.startswith((".venv/", "tests/")) or "/test_" in rel or rel.startswith("test_"):
+            continue
+        if path.name == "run_units.py":
+            continue
+        found.update(_GRADE_CALL.findall(path.read_text(encoding="utf-8")))
     return frozenset(found)
 
 
@@ -177,6 +193,10 @@ def test_the_unit_reaches_the_code_it_declares(unit, cls, block):
                 f"{uid} reaches neither _phase_collect, _run_whole_mode_unit, nor a "
                 "recorded_entry/manual_run call with its unit id"
             )
+        elif func == "grade_published_outputs":
+            assert uid in _published_graded_units(), (
+                f"{uid}: no grade_published_outputs(<ctx>, {uid!r}, ...) call reaches {ref}"
+            )
         elif func == "_grade_cardinality":
             assert uid in _cardinality_graded_units(), (
                 f"{uid}: no check_cardinality(unit_id={uid!r}) call reaches {ref}"
@@ -199,7 +219,7 @@ def test_a_unit_on_the_shared_path_does_not_declare_the_class_absent():
     stale = []
     for unit in _units():
         uid = unit.unit_id
-        if uid in _phase_units() | _mode_units():
+        if uid in _phase_units() | _mode_units() | _published_graded_units():
             if unit.guards["empty_fresh"]["state"] == "absent":
                 stale.append(f"{uid}.empty_fresh")
         if uid in _phase_units() | _mode_units() | _entry_units():

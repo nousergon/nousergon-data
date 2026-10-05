@@ -222,6 +222,7 @@ BACKLOG_REPOS = (
     "nousergon/vires-ops", "nousergon/telos-ops",
     "nousergon/claude-code-config", "nousergon/nousergon-console",
     "nousergon/oiax", "nousergon/scannerctl",
+    "nousergon/evidence-review",
 )
 # config-I3227: the org this Lambda's PR enumeration searches org-wide. Never
 # a hardcoded repo list (config#2294 precedent — see alpha-engine-config's
