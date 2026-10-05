@@ -17,9 +17,12 @@ evidence and the clause is never MET.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import pathlib
+import random
 import re
+import time
 from typing import Any
 
 import yaml
@@ -29,9 +32,14 @@ from data_gate.evidence import GateStore, Reading
 from data_gate.sources import GATE_ROLE, GITHUB_TOKEN_ENV, SourceUnavailable
 
 __all__ = [
+    "IdentityPlan",
     "OBSERVABILITY_ROWS_DIR",
+    "SimulateRow",
+    "ThrottledSimulation",
     "UnattributableSimulation",
     "WRITER_IDENTITIES_PATH",
+    "identity_plan",
+    "load_identities",
     "partial_exclusion_reading",
     "read_artifact_registry",
     "read_consumers",
@@ -594,6 +602,147 @@ class UnattributableSimulation(RuntimeError):
 _POLICY_VARIABLE_RE = re.compile(r"\$\{[^}]*\}")
 
 
+# ---------------------------------------------------------------------------
+# Pacing — alpha-engine-config-I11279 deliverable 3.
+#
+# `read_identity` makes one call per (action, resource) — the only attributable
+# shape (I10929) — so one full board read is several hundred calls in a burst.
+# On the 2026-09-21 board `data.D27.identity` read UNMEASURABLE on `Throttling`
+# after botocore's own retries ran out. Two bounded measures, never an
+# unbounded retry: a floor on the interval between calls (so the burst never
+# forms), and a jittered exponential backoff on a throttle code that gives up
+# after SIMULATE_MAX_ATTEMPTS and raises `ThrottledSimulation`, which the
+# reader renders UNMEASURABLE naming the throttle.
+# ---------------------------------------------------------------------------
+
+#: AWS error codes that mean "slow down", not "no".
+THROTTLE_CODES: frozenset[str] = frozenset(
+    {"Throttling", "ThrottlingException", "RequestLimitExceeded", "TooManyRequestsException"}
+)
+#: Attempts per call, counting the first. Worst-case added sleep per call is the
+#: sum of the first SIMULATE_MAX_ATTEMPTS-1 backoff caps (0.5+1+2+4 = 7.5 s).
+SIMULATE_MAX_ATTEMPTS = 5
+SIMULATE_BACKOFF_BASE_S = 0.5
+SIMULATE_BACKOFF_CAP_S = 8.0
+#: Floor between two consecutive simulate calls from this process (<= 10/s).
+SIMULATE_MIN_INTERVAL_S = 0.1
+
+# Seams, so tests never sleep and can pin the jitter.
+_sleep = time.sleep
+_clock = time.monotonic
+_jitter = random.random
+_last_call: list[float] = []
+
+
+class ThrottledSimulation(RuntimeError):
+    """A simulate call still throttled after `SIMULATE_MAX_ATTEMPTS` attempts."""
+
+
+def _error_code(exc: BaseException) -> str:
+    response = getattr(exc, "response", None)
+    if isinstance(response, dict):
+        return str((response.get("Error") or {}).get("Code") or "")
+    return ""
+
+
+def _pace() -> None:
+    now = _clock()
+    if _last_call:
+        wait = SIMULATE_MIN_INTERVAL_S - (now - _last_call[0])
+        if wait > 0:
+            _sleep(wait)
+            now += wait
+        _last_call[0] = now
+    else:
+        _last_call.append(now)
+
+
+def _paced_simulate(client, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """``client.simulate_principal_policy(**kwargs)``, paced, with bounded jittered backoff."""
+    for attempt in range(1, SIMULATE_MAX_ATTEMPTS + 1):
+        _pace()
+        try:
+            return client.simulate_principal_policy(**kwargs)
+        except Exception as exc:  # noqa: BLE001 - re-raised unless it is a throttle
+            code = _error_code(exc)
+            if code not in THROTTLE_CODES:
+                raise
+            if attempt == SIMULATE_MAX_ATTEMPTS:
+                raise ThrottledSimulation(
+                    f"{code} on every one of {attempt} attempt(s) simulating {kwargs.get('ActionNames')} on "
+                    f"{kwargs.get('ResourceArns')} (jittered backoff, cap {SIMULATE_BACKOFF_CAP_S}s)"
+                ) from exc
+            _sleep(_jitter() * min(SIMULATE_BACKOFF_CAP_S, SIMULATE_BACKOFF_BASE_S * 2 ** (attempt - 1)))
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+# ---------------------------------------------------------------------------
+# The simulate plan — alpha-engine-config-I11279 deliverable 1.
+#
+# Every (role, action, resource) the identity column asks IAM about, derived
+# from the descriptors and writer_identities.yaml by the SAME function the
+# reader issues its calls from. `data_gate/simulate_plan.py` aggregates it per
+# board, and the roles it names are what the gate's own role must be allowed to
+# `iam:SimulatePrincipalPolicy` — so that Resource list is generated, not kept
+# by hand (I11279: its third drift in a month left five clauses UNMEASURABLE).
+# ---------------------------------------------------------------------------
+
+
+@dataclasses.dataclass(frozen=True)
+class SimulateRow:
+    """One ``SimulatePrincipalPolicy`` call the identity column makes."""
+
+    unit_id: str
+    role: str
+    action: str
+    resource: str
+    #: ``allowed`` for a declared target, ``denied`` for the undeclared probe.
+    expect: str
+
+
+@dataclasses.dataclass(frozen=True)
+class IdentityPlan:
+    """What `read_identity` will ask IAM about for one unit, or why it asks nothing."""
+
+    unit_id: str
+    role: str | None
+    role_arn: str | None
+    bucket: str
+    targets: tuple[str, ...]
+    ungradable: tuple[str, ...]
+    probe: str
+    rows: tuple[SimulateRow, ...]
+
+
+def load_identities(path: pathlib.Path | None = None) -> dict[str, Any]:
+    return _load_identities(path or WRITER_IDENTITIES_PATH)
+
+
+def identity_plan(unit: Unit, config: dict[str, Any]) -> IdentityPlan:
+    """The calls `read_identity` makes for ``unit`` — declared PutObjects, then the probe's Put and Delete.
+
+    No rows when the unit is retired, declares `partial_exclusion` on
+    ``identity``, has no declared role, or declares nothing simulable: in each
+    case the reader answers from the descriptor or config without calling IAM.
+    """
+    runs_on = str((unit.raw.get("trigger") or {}).get("runs_on") or "")
+    role = None if unit.retired or partial_exclusion_reading(unit, "identity") else _declared_role(config, unit, runs_on)
+    bucket = str(config["bucket"])
+    keys, libraries, ungradable = s3_write_targets(unit)
+    targets = tuple(sorted({_concrete(k) for k in keys} | {f"arcticdb/{lib}/gate-probe" for lib in libraries}))
+    probe = f"arn:aws:s3:::{bucket}/{config['undeclared_probe_key']}"
+    role_arn = f"arn:aws:iam::{config['account_id']}:role/{role}" if role else None
+    rows: tuple[SimulateRow, ...] = ()
+    if role and targets:
+        rows = tuple(
+            SimulateRow(unit.unit_id, role, "s3:PutObject", f"arn:aws:s3:::{bucket}/{t}", "allowed") for t in targets
+        ) + (
+            SimulateRow(unit.unit_id, role, "s3:PutObject", probe, "denied"),
+            SimulateRow(unit.unit_id, role, "s3:DeleteObject", probe, "denied"),
+        )
+    return IdentityPlan(unit.unit_id, role, role_arn, bucket, targets, tuple(ungradable), probe, rows)
+
+
 def _simulate_one(client, role_arn: str, action: str, resource: str) -> str:
     """The decision for exactly ONE (action, resource) pair, asserted attributable.
 
@@ -609,7 +758,7 @@ def _simulate_one(client, role_arn: str, action: str, resource: str) -> str:
         kwargs: dict[str, Any] = {"PolicySourceArn": role_arn, "ActionNames": [action], "ResourceArns": [resource]}
         if marker:
             kwargs["Marker"] = marker
-        response = client.simulate_principal_policy(**kwargs)
+        response = _paced_simulate(client, kwargs)
         for result in response.get("EvaluationResults") or []:
             names.append(str(result.get("EvalResourceName")))
             decisions.append(str(result.get("EvalDecision")))
@@ -669,7 +818,11 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
     config = _load_identities(path)
     runs_on = str((unit.raw.get("trigger") or {}).get("runs_on") or "")
     config_ref = path.relative_to(REPO_ROOT).as_posix() if path.is_relative_to(REPO_ROOT) else str(path)
-    role = _declared_role(config, unit, runs_on)
+    # Every IAM call below is a row of this plan, and nothing else is called:
+    # `tests/test_simulate_plan.py` holds the reader to it, and the gate role's
+    # simulate grant is generated from the same plan (I11279).
+    plan = identity_plan(unit, config)
+    role = plan.role
     ref = _descriptor_ref(unit)
     if not role:
         return Reading(
@@ -683,10 +836,10 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
             evidence=(config_ref, ref),
             source=config_ref,
         )
-    bucket = str(config["bucket"])
-    keys, libraries, ungradable = s3_write_targets(unit)
-    targets = sorted({_concrete(k) for k in keys} | {f"arcticdb/{lib}/gate-probe" for lib in libraries})
-    role_arn = f"arn:aws:iam::{config['account_id']}:role/{role}"
+    bucket = plan.bucket
+    targets = plan.targets
+    ungradable = list(plan.ungradable)
+    role_arn = plan.role_arn
     evidence = (f"iam:{role}", config_ref, ref)
     if not targets:
         return Reading(
@@ -705,12 +858,10 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
             unmeasurable=True,
             source="iam:SimulatePrincipalPolicy",
         )
-    probe = f"arn:aws:s3:::{bucket}/{config['undeclared_probe_key']}"
-    declared_arns = [f"arn:aws:s3:::{bucket}/{t}" for t in targets]
+    probe = plan.probe
+    declared_arns = [row.resource for row in plan.rows if row.expect == "allowed"]
     try:
-        writes = _simulate(client, role_arn, "s3:PutObject", declared_arns)
-        probe_put = _simulate(client, role_arn, "s3:PutObject", [probe]).get(probe)
-        probe_delete = _simulate(client, role_arn, "s3:DeleteObject", [probe]).get(probe)
+        verdicts = {(row.action, row.resource): _simulate_one(client, role_arn, row.action, row.resource) for row in plan.rows}
     except UnattributableSimulation as exc:
         # Never a denial: a response we cannot tie to the ARN we asked about is
         # a response we did not get. Deliberate swallow — (a) the failure mode
@@ -724,13 +875,21 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
             unmeasurable=True,
             source="iam:SimulatePrincipalPolicy",
         )
+    except ThrottledSimulation as exc:
+        # Deliberate swallow, bounded upstream: `_paced_simulate` already backed
+        # off SIMULATE_MAX_ATTEMPTS times with jitter (I11279 deliverable 3).
+        # Never MET, never UNMET — the throttle is named on this row.
+        return Reading(
+            met=False,
+            detail=f"IAM throttled simulating {role}: {exc}",
+            evidence=evidence,
+            unmeasurable=True,
+            source="iam:SimulatePrincipalPolicy",
+        )
     except Exception as exc:  # noqa: BLE001 - classified by AWS error code below
         # Deliberate: the failure mode is "this role could not be simulated";
         # every other clause survives; the recording surface is this row.
-        code = ""
-        response = getattr(exc, "response", None)
-        if isinstance(response, dict):
-            code = str((response.get("Error") or {}).get("Code") or "")
+        code = _error_code(exc)
         if code == "NoSuchEntity":
             return Reading(
                 met=False,
@@ -753,7 +912,11 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
             unmeasurable=True,
             source="iam:SimulatePrincipalPolicy",
         )
-    denied = sorted(arn.split(":::", 1)[1] for arn in declared_arns if writes.get(arn) != "allowed")
+    probe_put = verdicts.get(("s3:PutObject", probe))
+    probe_delete = verdicts.get(("s3:DeleteObject", probe))
+    denied = sorted(
+        arn.split(":::", 1)[1] for arn in declared_arns if verdicts.get(("s3:PutObject", arn)) != "allowed"
+    )
     problems: list[str] = []
     if denied:
         problems.append(f"{role} may NOT PutObject on declared key(s) {denied}")
