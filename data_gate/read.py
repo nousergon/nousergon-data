@@ -306,8 +306,8 @@ def evaluate(store, *, gate: str, trading_day: dt.date, all_clauses=None) -> Gat
         result.coverage += f"; {len(retired)} RETIRED clause(s) on the board are graded by no gate"
     if unconnected:
         result.coverage += (
-            f"; {len(unconnected)} UNCONNECTED consumers clause(s) (kept, no surviving consumer, "
-            "by recorded decision) are graded by no gate"
+            f"; {len(unconnected)} UNCONNECTED consumers/schema_contract clause(s) (kept, no "
+            "surviving consumer, by recorded decision) are graded by no gate"
         )
     return result
 
@@ -437,6 +437,20 @@ def _board_document(
         }
         if standing:
             row["standing_ruling"] = getattr(clause, "ruling", "")
+        if clause_module.is_observation_window(clause):
+            # Brian's 2026-10-03 extension of the time-gate ruling
+            # (`clauses.ObservationWindowClause`): graded by its phase's gate
+            # like any clause, so `state` above IS its gated verdict. This block
+            # keeps the window running behind it visible — how much has been
+            # observed, any failure that reopened it, and the ORIGINAL
+            # full-window verdict — so the ruling never hides the strict answer.
+            row["observation_window"] = {
+                "observed": clause.window_observed,
+                "required": clause.window_required,
+                "failures": list(clause.window_failures),
+                "complete": clause.window_complete,
+                "ruling": clause.ruling,
+            }
         if unit_id in per_unit:
             row.update(per_unit[unit_id])
         rows.append(row)

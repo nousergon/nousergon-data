@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/universe_classification.schema.json",
   "title": "Universe classification (market_data/universe_classification/{run_date,latest}.json, schema_version 1)",
-  "description": "Producer: collectors/universe_classification.py::collect (UNIVERSE_CLASSIFICATION_SCHEMA_VERSION). Sector/country/industry per ticker via yfinance Ticker.info, keyed over the full constituents.json universe. Consumer: crucible/data/universe.py, crucible-executor. Plan \u00a73 boundary table row 4.",
+  "description": "Producer: collectors/universe_classification.py::collect (UNIVERSE_CLASSIFICATION_SCHEMA_VERSION). Sector/country/industry per ticker via yfinance Ticker.info, keyed over the full constituents.json universe. Consumer: crucible-research scoring/universe_board.py and scoring/attractiveness_history.py only (v1, retiring in Crucible v2 phase 4); crucible/data/universe.py and crucible-executor read constituents.json, not this key. Plan \u00a73 boundary table row 4.",
   "type": "object",
   "additionalProperties": false,
   "required": [

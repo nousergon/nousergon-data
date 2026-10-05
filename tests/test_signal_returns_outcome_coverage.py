@@ -99,21 +99,24 @@ _TODAY = date(2026, 7, 21)
 
 
 class TestCoverageGapDetection:
+    # The generic gap shapes below use 2026-04-06 (a session). 2026-04-04, the
+    # real config#1860 date, is now a DECLARED-unresolvable legacy date
+    # (alpha-engine-config-I11609); see TestDeclaredUnresolvable.
     def test_flags_resolved_age_date_with_zero_outcome_rows(self, tmp_db):
         # Shape of the real config#1860 gap: score_performance has rows for
         # an old date, but score_performance_outcomes has NONE for it.
-        _seed_score_performance_only(tmp_db, ["2026-04-04"])
+        _seed_score_performance_only(tmp_db, ["2026-04-06"])
         with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
         assert summary["status"] == "ok"
-        assert summary["gap_dates"] == ["2026-04-04"]
-        assert summary["gap_counts"] == {"2026-04-04": 1}
+        assert summary["gap_dates"] == ["2026-04-06"]
+        assert summary["gap_counts"] == {"2026-04-06": 1}
 
     def test_multiple_gap_dates_all_reported(self, tmp_db):
-        _seed_score_performance_only(tmp_db, ["2026-04-04", "2026-04-11", "2026-04-12"])
+        _seed_score_performance_only(tmp_db, ["2026-04-06", "2026-04-11", "2026-04-12"])
         with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
-        assert summary["gap_dates"] == ["2026-04-04", "2026-04-11", "2026-04-12"]
+        assert summary["gap_dates"] == ["2026-04-06", "2026-04-11", "2026-04-12"]
         assert summary["signal_dates_checked"] == 3
 
     def test_resolved_date_with_outcome_rows_not_flagged(self, tmp_db):
@@ -135,10 +138,10 @@ class TestCoverageGapDetection:
 
     def test_mixed_gap_and_resolved_dates(self, tmp_db):
         _seed_resolved(tmp_db, "2026-03-02", symbol="MSFT")
-        _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="AAPL")
+        _seed_score_performance_only(tmp_db, ["2026-04-06"], symbol="AAPL")
         with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
-        assert summary["gap_dates"] == ["2026-04-04"]
+        assert summary["gap_dates"] == ["2026-04-06"]
         assert summary["signal_dates_checked"] == 2
 
     def test_no_score_performance_rows_at_all(self, tmp_db):
@@ -160,8 +163,57 @@ class TestCoverageGapDetection:
         assert "error" in summary
 
     def test_gap_count_reflects_multiple_symbols_same_date(self, tmp_db):
-        _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="AAPL")
-        _seed_score_performance_only(tmp_db, ["2026-04-04"], symbol="MSFT")
+        _seed_score_performance_only(tmp_db, ["2026-04-06"], symbol="AAPL")
+        _seed_score_performance_only(tmp_db, ["2026-04-06"], symbol="MSFT")
         with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
             summary = _check_outcome_store_coverage(tmp_db)
-        assert summary["gap_counts"]["2026-04-04"] == 2
+        assert summary["gap_counts"]["2026-04-06"] == 2
+
+
+class TestDeclaredUnresolvable:
+    """alpha-engine-config-I11609: frozen weekend v1 legacy score_dates.
+
+    03-28, 03-29 and 04-04 have universe_returns rows with no forward
+    returns at any horizon, so they can never resolve. They are declared by
+    exact date and reported. They are not counted as gaps. Everything else
+    still WARNs.
+    """
+
+    def test_live_shape_declared_dates_are_reported_not_gaps(self, tmp_db, caplog):
+        _seed_resolved(tmp_db, "2026-03-02", symbol="MSFT")
+        _seed_score_performance_only(tmp_db, ["2026-03-28", "2026-03-29", "2026-04-04"])
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
+            with caplog.at_level("INFO", logger="collectors.signal_returns"):
+                summary = _check_outcome_store_coverage(tmp_db)
+        assert summary["gap_dates"] == []
+        assert summary["declared_unresolvable"] == {
+            "2026-03-28": 1, "2026-03-29": 1, "2026-04-04": 1,
+        }
+        assert summary["signal_dates_checked"] == 4
+        assert not [r for r in caplog.records
+                    if r.levelname == "WARNING" and "coverage gap" in r.getMessage()]
+
+    def test_an_undeclared_weekend_date_still_warns(self, tmp_db, caplog):
+        # The declaration is exact dates, never a weekday rule: a NEW weekend
+        # score_date would be a producer regression and must still surface.
+        _seed_score_performance_only(tmp_db, ["2026-04-04", "2026-04-11"])
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
+            with caplog.at_level("WARNING", logger="collectors.signal_returns"):
+                summary = _check_outcome_store_coverage(tmp_db)
+        assert summary["gap_dates"] == ["2026-04-11"]
+        assert summary["declared_unresolvable"] == {"2026-04-04": 1}
+        assert any("coverage gap" in r.getMessage() for r in caplog.records)
+
+    def test_a_declared_date_that_resolves_is_simply_covered(self, tmp_db):
+        _seed_resolved(tmp_db, "2026-04-04", symbol="AAPL")
+        with mock.patch("collectors.signal_returns._market_today", return_value=_TODAY):
+            summary = _check_outcome_store_coverage(tmp_db)
+        assert summary["gap_dates"] == []
+        assert summary["declared_unresolvable"] == {}
+
+    def test_declaration_is_exactly_the_three_measured_dates(self):
+        from collectors.signal_returns import _DECLARED_UNRESOLVABLE_SCORE_DATES
+        assert sorted(_DECLARED_UNRESOLVABLE_SCORE_DATES) == [
+            "2026-03-28", "2026-03-29", "2026-04-04",
+        ]
+        assert all("I11609" in why for why in _DECLARED_UNRESOLVABLE_SCORE_DATES.values())

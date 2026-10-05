@@ -61,10 +61,16 @@ contract:
   schema: contracts/universe_classification.schema.json
   producer_test: tests/test_p07_contracts.py
   consumer_pins: []
-  # alpha-engine-config-I11282: declared as a consumer pin, but names no pinned
-  # contract file the gate can resolve and compare — graded as a finding.
-  unpinned_consumers:
-    - "crucible:crucible/data/universe.py"
+  # No `unpinned_consumers` (alpha-engine-config-I10933, 2026-10-04). It used to
+  # name `crucible:crucible/data/universe.py`, carried over from the P-07 plan's
+  # boundary-table row 4, which groups constituents and classification. That
+  # module reads `constituents.json` (D01's key, pinned by D01's body_schema pin)
+  # and never this one; no file in crucible, crucible-executor, crucible-trader,
+  # crucible-backtester, crucible-dashboard, metron or nousergon-console names
+  # `universe_classification`. The only readers are the two crucible-research
+  # modules under `consumers` above, which `consumers_decision` already records.
+  # Re-add a consumer here, as a structured pin, in the same change that
+  # deletes `consumers_decision`.
 registry_rows:
   - universe_classification_latest
 run_manifest_prefix: data_collection/runs/D07
@@ -98,11 +104,16 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/universe_classification.py::collect"
+    evaluates: 'ok_ratio < _MIN_OK_RATIO'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: collect() returns `status: error` and writes nothing when fewer than _MIN_OK_RATIO
+        (0.50) of the requested tickers came back classified, which catches a vendor collapse.
+        The declared floor is 1.0 of constituents; a run between 50% and 100% publishes as `ok`,
+        and that half is the remaining work. The threshold is not changed here. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

@@ -28,9 +28,16 @@ owner: brian
 code_path: "collectors/metron_market_data.py:1118"
 trigger:
   kind: "step-functions"
-  owner: "ne-postclose-trading-pipeline"
-  successor: "ne-data-collection-eod (nousergon-data-PR1701, DISABLED)"
-  schedule: "weekdays 16:00 America/New_York"
+  # Since the decoupled data cutover (alpha-engine-config-I11269; first
+  # standalone EOD run 2026-09-29) this unit runs in the standalone stack's EOD
+  # machine, started at 18:15 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule).
+  # ne-postclose-trading-pipeline (16:00 ET) no longer runs it: its data stages
+  # were removed by that same change.
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-postclose-trading-pipeline"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   - market_data/sectors/latest.json
@@ -69,7 +76,14 @@ detectors:
         until the gate measures it
 freshness:
   family: "eod-spine"
-  deadline: "18:15 America/New_York"
+  # The family's worst-case write bound, by the same rule the weekly family
+  # uses (fire + declared runtime ceiling, plan §2 row 1): the 18:15 ET fire
+  # plus each verify_unit writer's SSM-online budget and declared cap,
+  # 18:15 + 95 + 65 = 20:55 ET (tests/test_data_collection_stack.py::
+  # test_the_eod_ordering_chain_is_derived_from_the_template). It read 18:15
+  # while the schedule was 16:45; once the fire moved to 18:15 that value
+  # equalled the fire time and could never be met. Still `proposed`.
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
@@ -93,11 +107,18 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/metron_market_data.py::_yfinance_classification"
+      - "collectors/metron_market_data.py::_yfinance_earnings"
+    evaluates: 'floor=METRON_YF_COVERAGE_FLOOR'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: the sector and earnings passes call _log_yf_coverage with METRON_YF_COVERAGE_FLOOR
+        (0.70), which raises YfCoverageCollapse so the unit fails and the previous artifact
+        stands when either covers less than 70% of the held universe
+        (alpha-engine-config-I11578; skipped under 20 requested symbols). The declared floor is
+        1.0, and the countries map has no floor; both are the remaining work. Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-
