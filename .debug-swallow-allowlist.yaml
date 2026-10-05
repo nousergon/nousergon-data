@@ -37,7 +37,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: features/compute.py
-    line: 1162
+    line: 1290
     reason: >-
       (a) failure mode swallowed: the exact-date S3 fundamentals key missing
       or unreadable. (c) recording surface: none needed at this step —
