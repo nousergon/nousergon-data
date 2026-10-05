@@ -1,0 +1,38 @@
+{
+  "mode": "daily_heal",
+  "date": "2026-08-04",
+  "started_at": "2026-08-05T09:02:46.518745+00:00",
+  "collectors": {
+    "universe_gap_heal": {
+      "status": "ok",
+      "scan_window_td": 5,
+      "max_per_run": 1,
+      "missing_days": [],
+      "fallback_quality_days": [],
+      "ledger_days": [
+        "2026-08-04"
+      ],
+      "healed_days": [
+        {
+          "date": "2026-08-04",
+          "kind": "ledger",
+          "tickers": 929,
+          "weekly_date": "2026-08-04"
+        }
+      ],
+      "deferred_days": [],
+      "errors": []
+    },
+    "chronic_gap_heal": {
+      "mode": "chronic_gap_heal",
+      "date": "2026-08-04",
+      "started_at": "2026-08-05T09:26:18.597667+00:00",
+      "collectors": {},
+      "status": "ok",
+      "completed_at": "2026-08-05T09:26:18.598131+00:00"
+    }
+  },
+  "completed_at": "2026-08-05T09:26:18.626127+00:00",
+  "days_healed": 1,
+  "status": "ok"
+}
