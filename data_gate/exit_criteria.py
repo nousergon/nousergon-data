@@ -68,6 +68,8 @@ __all__ = [
     "SCHEDULE_MORNING",
     "SCHEDULE_WEEKLY",
     "V1_DATA_STAGE_KEY",
+    "VENDOR_DIVERGENCE_DAILY_DAYS",
+    "VENDOR_DIVERGENCE_METRIC_KEY",
     "collect_cycles",
     "read_code_identity_delta",
     "read_consecutive_cycles",
@@ -77,6 +79,7 @@ __all__ = [
     "read_executor_collection_writes_zero",
     "read_sustained_window",
     "read_v1_data_stage_quiet",
+    "read_vendor_divergence_daily",
     "read_vendor_divergence_emitted",
     "schedule_cadence",
 ]
@@ -785,6 +788,145 @@ def read_vendor_divergence_emitted(
             ),
             unit="cycle(s)",
             current=combine_current(current_parts),
+        ),
+    )
+
+
+#: alpha-engine-config-I10783's closes-when, verbatim: "The divergence metric
+#: is emitted on every trading day for at least 10 consecutive trading days".
+#: The issue's own figure, read here, not a threshold this module chose.
+VENDOR_DIVERGENCE_DAILY_DAYS = 10
+
+#: The daily vendor-divergence MetricRecord, relative to the store root
+#: (``data_collection/``). It IS
+#: ``collectors/cross_source_observer.py::VENDOR_DIVERGENCE_METRIC_PREFIX`` minus
+#: that root; ``tests/test_vendor_divergence_daily_reader.py`` pins the two, so a
+#: rename on either side is a red test rather than a reader that silently reads
+#: nothing.
+VENDOR_DIVERGENCE_METRIC_KEY = "metrics/vendor_divergence/{day}.json"
+
+#: The record statuses that are a MEASUREMENT — a comparison set existed. The
+#: same set as ``cross_source_observer._MEASURED_STATUSES``. ``breach`` counts:
+#: the closes-when asks that the metric be EMITTED, and a breach is a finding
+#: about the vendors, stated, not an absence of measurement.
+_VENDOR_MEASURED = frozenset({"ok", "breach"})
+
+
+def _vendor_day_status(day: dt.date, document: dict) -> tuple[bool, str]:
+    """``(qualifies, label)`` for one day's record. A record only qualifies if it
+    is a measurement OF THAT DAY: a measured status, a comparison count above
+    zero, its own ``trading_day`` naming the key's day, and — for a breach —
+    each breaching symbol named."""
+    status = str(document.get("status") or "?")
+    recorded_day = str(document.get("trading_day") or "")
+    if recorded_day != day.isoformat():
+        return False, f"record names trading_day {recorded_day or '<none>'!r}"
+    if status not in _VENDOR_MEASURED:
+        reason = str(document.get("reason") or "").strip()
+        return False, f"{status}" + (f" ({reason})" if reason else "")
+    n = document.get("n")
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return False, f"{status} with n={n!r} (no pair compared)"
+    if status == "breach" and not document.get("breaching_symbols"):
+        return False, f"breach with n={n} naming no symbol"
+    return True, f"{status} n={n}"
+
+
+def read_vendor_divergence_daily(
+    store: GateStore, *, trading_day: dt.date, days: int
+) -> Reading:
+    """The vendor-divergence MetricRecord on ``days`` CONSECUTIVE trading days.
+
+    alpha-engine-config-I10783's remaining closes-when clause. The run-manifest
+    count (:func:`read_vendor_divergence_emitted`) asks whether a cycle carried a
+    ``vendor_crosscheck`` VERDICT; this reads the METRIC document itself,
+    ``data_collection/metrics/vendor_divergence/<day>.json``, one per trading
+    day, which is what the issue's deliverable and closes-when name.
+
+    **The newest day may be pending, never missing.** D17's morning run writes
+    day T's record at T+1 ~09:06 UTC (polygon's free-tier close is T+1), so a
+    reading taken on T before that run has no record for T yet. An ABSENT
+    record for ``trading_day`` itself is labelled PENDING and the window ends
+    at the previous trading day; an absent record for any older day breaks the
+    streak, because a missing measurement is not a passing one.
+
+    Every non-qualifying day is NAMED with what its record said. The strict
+    criterion (``met``) is the streak; the :class:`ObservationWindow` carries
+    the same facts for the 2026-10-03 time-gate extension, live from the first
+    measured day.
+    """
+    statuses: list[tuple[str, bool, str]] = []
+    pending: str | None = None
+    day = trading_day
+    evidence: list[str] = []
+    while len(statuses) < days:
+        key = VENDOR_DIVERGENCE_METRIC_KEY.format(day=day.isoformat())
+        read = read_store_document(store, key)
+        if read.problem is not None:
+            return Reading(
+                met=False,
+                detail=f"could not read {key}: {read.problem}",
+                evidence=(key,),
+                unmeasurable=True,
+                source=_SOURCE_STORE,
+            )
+        if read.absent and day == trading_day and pending is None:
+            pending = day.isoformat()
+        elif read.absent:
+            statuses.append((day.isoformat(), False, "ABSENT"))
+            evidence.append(key)
+        else:
+            qualifies, label = _vendor_day_status(day, read.document or {})
+            statuses.append((day.isoformat(), qualifies, label))
+            evidence.append(key)
+        day = subtract_trading_days(day, 1)
+    streak = 0
+    for _day, qualifies, _label in statuses:
+        if not qualifies:
+            break
+        streak += 1
+    failed = [f"{d}: {label}" for d, ok, label in statuses if not ok]
+    window_end = statuses[0][0] if statuses else trading_day.isoformat()
+    window_start = statuses[-1][0] if statuses else trading_day.isoformat()
+    detail = (
+        f"{streak} consecutive trading day(s) with a measured vendor-divergence record ending "
+        f"{window_end}, against the {days} alpha-engine-config-I10783's closes-when names "
+        f"(window {window_start}..{window_end})"
+    )
+    if pending:
+        detail += f"; {pending} PENDING (its record is written by the next morning's D17 run)"
+    if failed:
+        detail += f"; days that did not qualify: {failed}"
+    # The 2026-10-03 extension of the time-gate ruling (`ObservationWindow`):
+    # live from the first day carrying a MEASURED record; from then on every
+    # day that does not qualify — absent, unmeasurable or malformed — is a
+    # failed observation. Days before the first measurement are the check not
+    # yet producing a reading.
+    observed = 0
+    failures: list[str] = []
+    went_live = False
+    for day_iso, qualifies, label in reversed(statuses):
+        if not qualifies and not went_live:
+            continue
+        went_live = True
+        observed += 1
+        if not qualifies:
+            failures.append(f"{day_iso}: {label}")
+    return Reading(
+        met=streak >= days,
+        detail=detail,
+        evidence=tuple(evidence[:4]) or (VENDOR_DIVERGENCE_METRIC_KEY,),
+        source=_SOURCE_STORE,
+        window=ObservationWindow(
+            live=went_live,
+            observed=observed,
+            required=days,
+            failures=tuple(failures),
+            not_live=(
+                f"no measured metrics/vendor_divergence/<day>.json in the {days} trading days "
+                f"ending {window_end} — every record there is absent or unmeasurable"
+            ),
+            unit="trading day(s)",
         ),
     )
 

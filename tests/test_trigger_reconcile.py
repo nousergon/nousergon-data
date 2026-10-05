@@ -241,19 +241,23 @@ def test_red_when_a_rule_expression_is_edited(units, live):
     assert "DIVERGENT D33" in reading.detail and not reading.met
 
 
-def test_a_drift_inside_the_tolerance_is_not_a_finding(units, live):
-    shifted = copy.deepcopy(live)
-    key = "step-functions:ne-weekly-freshness-pipeline"
-    shifted[key]["execution_starts"] = [
-        _iso(
-            dt.datetime.fromisoformat(s.replace("Z", "+00:00"))
-            + FIRE_TOLERANCE
-            - dt.timedelta(minutes=1)
-        )
-        for s in shifted[key]["execution_starts"]
-    ]
-    reading = read_triggers_reconciled(_store(_document(shifted)), units, as_of=READ_AT)
-    assert reading.met, reading.detail
+def test_a_drift_inside_the_tolerance_is_not_a_finding(units):
+    """Execution-history path: every start sits just inside FIRE_TOLERANCE of its
+    declared fire. D19 in its v1 shape (see `_d19`), since no in-service
+    descriptor reconciles from execution history any more: D03 was the last,
+    until it moved to the EOD Scheduler entry (alpha-engine-config-I11832)."""
+    unit = _d19(units)
+    fires = fires_between(unit_cadence(unit.raw), WINDOW_START, NOW)
+    starts = sorted(
+        (_iso(f + FIRE_TOLERANCE - dt.timedelta(minutes=1)) for f in fires), reverse=True
+    )
+    result = reconcile_unit(
+        unit,
+        {_V1_POSTCLOSE: {"status": "observed", "execution_starts": starts}},
+        window_start=WINDOW_START,
+        window_end=NOW,
+    )
+    assert result.outcome == "reconciled", result.detail
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +605,10 @@ class _Scheduler:
 
 def test_producer_owner_set_is_derived_from_the_descriptors(units):
     keys = producer.owner_keys(units)
-    assert "step-functions:ne-weekly-freshness-pipeline" in keys
+    # No in-service descriptor names a v1 machine any more (D03 was the last,
+    # alpha-engine-config-I11832): the producer need not survey one.
+    assert "step-functions:ne-weekly-freshness-pipeline" not in keys
+    assert "eventbridge-scheduler:nousergon-data-collection/data-collection-weekly" in keys
     assert "eventbridge-scheduler:nousergon-data-collection/data-collection-eod" in keys
     assert "step-functions:ne-postclose-trading-pipeline" not in keys
     assert "eventbridge-rule:alpha-engine-daily-heal" in keys

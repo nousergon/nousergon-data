@@ -84,7 +84,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # documents). This comment used to say "no row yet, deliberately" — that
     # is no longer true; a cadence now runs both producers.
     "data_gate/producers/v1_data_stage.py": 1,
-    "data_gate/producers/executor_profile.py": 1,
+    # 2 since alpha-engine-config-I11063: the same run also PUTs the
+    # executor's observed write set to
+    # metrics/executor_profile/write_set/latest.json (evidence for the
+    # executor role's IAM narrowing; no clause reads it). Grandfathered
+    # under `data_collection/metrics/executor_profile/write_set/` in
+    # ARTIFACT_REGISTRY.yaml until its first scheduled write lands.
+    "data_gate/producers/executor_profile.py": 2,
     # I11689: cloudtrail_evidence latest is registered; per-run proofs share its writer.
     "data_gate/producers/cloudtrail_evidence.py": 1,
     # alpha-engine-config-I11058 — the run-record writer both producers'

@@ -102,11 +102,23 @@ completeness:
       coverage-of-FILERS floor and is proposed low until measured
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::grade_published_outputs"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        D46's keys ride D16's manifest.
+        rag/pipelines/run_weekly_ingestion_recorded.py::_grade_published grades them under
+        D46's own unit id through run_units.py::grade_published_outputs: the parquet's row count is read from its
+        footer and latest.json's from its `row_count`, then
+        validators/expectations.py::check_empty_fresh reads a missing or zero-byte object, or
+        a zero count, as `empty_fresh` (under a declared completeness.rows_out_floor,
+        `below_floor`; an unreadable footer, `unmeasurable`). A D16 run that wrote no key
+        under data/insider_transactions/ grades D46 `empty_fresh`. Filed as guard
+        `data_empty_fresh` plus the data.D46.guard.empty_fresh MetricRecord (worst key wins).
+        Before this the parquet was recorded as 1 row on every run: 38 zero-row parquets
+        (2026-05-13 to 2026-09-24) went ungraded. Not in service until commissioned by an
+        induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-
