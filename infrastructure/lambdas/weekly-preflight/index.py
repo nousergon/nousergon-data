@@ -276,6 +276,11 @@ def handler(event: dict, context) -> dict:
             capabilities=sfp.LAMBDA_CAPABILITIES,
             run_date=run_date,
             skip_flags=skip_flags,
+            # Read above since I8809 but never forwarded until
+            # watch-rerun-2026-10-02-2: the check fell back to run_date (the
+            # TRADING day), the weaker reference I8809 exists to forbid.
+            calendar_date=calendar_date,
+            mode=event.get("mode"),
         )
     except Exception as exc:
         _emit_preflight_metrics(

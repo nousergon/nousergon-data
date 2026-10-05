@@ -106,7 +106,7 @@ def test_run_timestamp_fields_are_declared_provenance_where_a_contract_declares_
     contracts declare such a field."""
     import json
 
-    TIMESTAMPS = {"as_of", "generated_at", "generated_utc", "fetched_at", "produced_at"}
+    TIMESTAMPS = {"as_of", "available_at", "generated_at", "generated_utc", "fetched_at", "produced_at"}
     offenders = []
     for path in sorted(_CONTRACTS_DIR.glob("*.schema.json")):
         doc = json.loads(path.read_text())
