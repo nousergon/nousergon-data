@@ -23,8 +23,12 @@ condition (a) on `alpha-engine-config-I12023`). A frozen exception clears only
 when ALL of these hold:
 
 * every breaching path is listed (``attributions`` + ``unattributed`` covers
-  exactly ``breaches`` distinct paths) — a record that lists fewer paths than
-  the report measured proves nothing about the rest;
+  exactly that many distinct paths) — and the count is the MEASUREMENT's, never
+  the record's own claim: a mismatch row's ``values.breaches`` or a prior-day
+  pair's ``breaches`` from the report, and for an ``in_region_only`` row the
+  ``breach_paths`` of an in-region comparator artifact the record pins by key
+  and SHA-256 (the listed paths must be exactly those). A record that lists
+  fewer paths than were measured proves nothing about the rest;
 * ``unattributed`` is empty — one unattributed path leaves the whole key red;
 * every attribution names its SETTLING INPUT(S) (the bar / release that moved
   between v1's read and the shadow's), each declared once per exception with
@@ -34,7 +38,9 @@ when ALL of these hold:
 * the input really was unsettled at v1's read, by the named lag
   (`settling_lag_rule`) — never by a threshold chosen here;
 * the settled value comes from an INDEPENDENT source: v1's own later object
-  version written before the cutover (`SETTLED_SOURCE_V1_LATER`), or a
+  version written before the cutover (`SETTLED_SOURCE_V1_LATER`, which must
+  also declare ``same_definition: true`` and a ``definition_note`` — same field definition and precision
+  as the input, so v1's hundreds-rounded volume never serves), or a
   third-party vendor read (`SETTLED_SOURCE_VENDOR`). The collector itself is
   never a source — that would be the self-comparison the freeze exists to
   refuse;
@@ -58,9 +64,10 @@ from __future__ import annotations
 import datetime as dt
 import hashlib
 import math
+import json
 import re
 from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 
 __all__ = [
     "ADJUDICATION_KEY_PREFIX",
@@ -74,6 +81,7 @@ __all__ = [
     "SETTLED_SOURCE_VENDOR",
     "adjudication_record_keys",
     "grade_record",
+    "report_breach_counts",
     "report_exceptions",
     "settling_lag_rule",
 ]
@@ -152,8 +160,9 @@ def settling_lag_rule(
 
     The lag is the vendor contract's, by input kind (module docstring):
     `dates.bar_settlement` for a bar; the vendor's own first-release time for a
-    release. A release attribution with no vendor release time is not
-    decidable — that is ``pending`` work, never a guess.
+    release. With no settled read yet there is no release time, which is
+    ``pending`` work, never a guess; a settled vendor read that omits
+    ``released_at_utc`` is INVALID before this is ever asked (`_grade_input`).
     """
     if kind == INPUT_KIND_BAR:
         from dates import BAR_PROVISIONAL, bar_settlement
@@ -288,6 +297,11 @@ def _grade_input(item: Mapping[str, Any], cutover_utc: dt.datetime, rel: float, 
         if source_kind == SETTLED_SOURCE_V1_LATER:
             if not settled.get("source_key") or not settled.get("source_version_id"):
                 return INVALID, f"{ident}: a v1 later version needs source_key AND source_version_id"
+            if settled.get("same_definition") is not True or not str(settled.get("definition_note") or "").strip():
+                return INVALID, (
+                    f"{ident}: a v1 later version is a reference only when it declares same_definition: true "
+                    "and a definition_note (same field definition and precision as the input) — a hundreds-rounded volume is not one"
+                )
             try:
                 written = _parse_utc(settled.get("source_last_modified_utc"), "settled.source_last_modified_utc")
             except ValueError as exc:
@@ -332,17 +346,88 @@ def _grade_input(item: Mapping[str, Any], cutover_utc: dt.datetime, rel: float, 
 _SEVERITY = (INVALID, BREACH, PRECISION_LIMITED, PENDING, CLEARED)
 
 
-def _grade_exception(entry: Mapping[str, Any], kind: str, cutover_utc: dt.datetime, rel: float, absolute: float) -> ExceptionGrade:
+def report_breach_counts(report: Mapping[str, Any]) -> dict[str, int | None]:
+    """The breach count the REPORT measured per exception — never the record's own claim.
+
+    A mismatch row's ``values.breaches`` and a prior-day pair's ``breaches``.
+    An ``in_region_only`` row measured nothing (``None``): its count comes from
+    the pinned in-region comparator artifact instead (`_grade_exception`).
+    """
+    out: dict[str, int | None] = {}
+    for row in report.get("keys") or []:
+        key = str(row.get("key"))
+        verdict = str(row.get("verdict") or "")
+        if verdict == "in_region_only":
+            out[key] = None
+        else:
+            count = (row.get("values") or {}).get("breaches")
+            out[key] = int(count) if isinstance(count, int) and not isinstance(count, bool) else None
+    for example in (report.get("prior_day_settled") or {}).get("unsettled_examples") or []:
+        count = example.get("breaches")
+        out[str(example.get("key"))] = int(count) if isinstance(count, int) and not isinstance(count, bool) else None
+    return out
+
+
+def _comparator_paths(measured: Mapping[str, Any], fetch_bytes: Callable[[str], bytes] | None) -> tuple[list[str] | None, str]:
+    """The breaching paths of a pinned in-region comparator artifact, or ``(None, why)``."""
+    artifact = measured.get("artifact") or {}
+    key, digest = artifact.get("key"), artifact.get("sha256")
+    if not key or not digest:
+        return None, "an in_region_only row needs measured.artifact {key, sha256}: the in-region comparison it was measured by"
+    if fetch_bytes is None:
+        return None, f"cannot read the comparator artifact {key}"
+    try:
+        raw = fetch_bytes(key)
+    except Exception as exc:  # noqa: BLE001 - graded INVALID, which is red and named
+        return None, f"cannot read the comparator artifact {key}: {type(exc).__name__}: {exc}"
+    actual = hashlib.sha256(raw).hexdigest()
+    if actual != digest:
+        return None, f"comparator artifact {key} hashes to {actual}, not the pinned {digest}"
+    try:
+        paths = json.loads(raw.decode("utf-8")).get("breach_paths")
+    except (ValueError, AttributeError) as exc:
+        return None, f"comparator artifact {key} is not a JSON object with breach_paths: {exc}"
+    if not isinstance(paths, list) or not all(isinstance(p, str) and p for p in paths):
+        return None, f"comparator artifact {key} carries no breach_paths list"
+    return paths, ""
+
+
+def _grade_exception(
+    entry: Mapping[str, Any],
+    kind: str,
+    report_breaches: int | None,
+    cutover_utc: dt.datetime,
+    rel: float,
+    absolute: float,
+    fetch_bytes: Callable[[str], bytes] | None,
+) -> ExceptionGrade:
     key = str(entry.get("key"))
     measured = entry.get("measured") or {}
-    try:
-        breaches = int(measured.get("breaches"))
-    except (TypeError, ValueError):
-        return ExceptionGrade(key, kind, INVALID, "measured.breaches is required")
+    expected_paths: set[str] | None = None
+    if kind == KIND_IN_REGION_ONLY:
+        paths_from_artifact, why = _comparator_paths(measured, fetch_bytes)
+        if paths_from_artifact is None:
+            return ExceptionGrade(key, kind, INVALID, why)
+        expected_paths = set(paths_from_artifact)
+        breaches = len(expected_paths)
+    else:
+        if report_breaches is None:
+            return ExceptionGrade(
+                key, kind, INVALID,
+                "the report row carries no breach count, so there is nothing to pin the path list to",
+            )
+        breaches = report_breaches
+    if measured.get("breaches") is not None and measured.get("breaches") != breaches:
+        return ExceptionGrade(
+            key, kind, INVALID,
+            f"record claims {measured.get('breaches')} breach(es); the measurement it must match has {breaches}",
+            paths=breaches,
+        )
     if breaches <= 0:
-        return ExceptionGrade(key, kind, INVALID, "measured.breaches must be positive for an exception")
-    if kind == KIND_IN_REGION_ONLY and not measured.get("comparator"):
-        return ExceptionGrade(key, kind, INVALID, "an in_region_only row needs the in-region measurement's comparator")
+        return ExceptionGrade(
+            key, kind, INVALID,
+            "no value breach was measured, so this exception is not a settling difference",
+        )
 
     inputs = {}
     for item in entry.get("inputs") or []:
@@ -364,6 +449,10 @@ def _grade_exception(entry: Mapping[str, Any], kind: str, cutover_utc: dt.dateti
             key, kind, INVALID,
             f"lists {len(paths)} path(s) for {breaches} measured breach(es) — every breaching path must be accounted for",
             paths=breaches,
+        )
+    if expected_paths is not None and set(paths) != expected_paths:
+        return ExceptionGrade(
+            key, kind, INVALID, "the listed paths are not the comparator artifact's breach_paths", paths=breaches,
         )
 
     path_verdicts: list[tuple[str, str]] = []
@@ -411,6 +500,7 @@ def grade_record(
     cutover_utc: str,
     rel: float | None = None,
     absolute: float | None = None,
+    fetch_bytes: Callable[[str], bytes] | None = None,
 ) -> Adjudication:
     """Grade the newest adjudication record against the report it must cite."""
     if rel is None or absolute is None:
@@ -445,6 +535,7 @@ def grade_record(
     if unknown:
         return invalid(f"adjudicates key(s) the report does not carry as exceptions: {unknown}")
     cut = _parse_utc(cutover_utc, "cutover_utc")
+    counts = report_breach_counts(report)
     grades = []
     for key, kind in sorted(expected.items()):
         entry = entries.get(key)
@@ -454,7 +545,7 @@ def grade_record(
         if entry.get("kind") != kind:
             grades.append(ExceptionGrade(key, kind, INVALID, f"record says kind {entry.get('kind')!r}, report says {kind!r}"))
             continue
-        grades.append(_grade_exception(entry, kind, cut, rel, absolute))
+        grades.append(_grade_exception(entry, kind, counts.get(key), cut, rel, absolute, fetch_bytes))
     return Adjudication(
         record_key=record_key,
         cleared=bool(grades) and all(g.verdict == CLEARED for g in grades),

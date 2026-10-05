@@ -33,6 +33,8 @@ AFTER = dt.date(2026, 10, 2)
 REPORT_KEY = evidence.parity_store_key(CUTOVER_DAY)
 RECORD_0 = f"parity_adjudication/{CUTOVER_DAY.isoformat()}/0001.json"
 RECORD_1 = f"parity_adjudication/{CUTOVER_DAY.isoformat()}/0002.json"
+ARTIFACT_KEY = f"parity_adjudication/{CUTOVER_DAY.isoformat()}/artifacts/arcticdb-universe.json"
+ARTIFACT_BYTES = json.dumps({"comparator": "shadow.parity._compare_frames as_of cutover", "breach_paths": ["A.Close"]}).encode()
 
 # v1 read the bar at 16:08 ET on the bar's own day: provisional by `dates.bar_settlement`.
 V1_READ_PROVISIONAL = "2026-09-28T20:08:48Z"
@@ -44,7 +46,8 @@ class _Store:
     uri = "file://test"
 
     def __init__(self, documents: dict[str, dict]) -> None:
-        self.raw = {k: json.dumps(v, sort_keys=True).encode("utf-8") for k, v in documents.items()}
+        self.raw = {k: v if isinstance(v, bytes) else json.dumps(v, sort_keys=True).encode("utf-8")
+                    for k, v in documents.items()}
 
     def list_keys(self, prefix: str = ""):
         return [k for k in sorted(self.raw) if k.startswith(prefix)]
@@ -64,7 +67,7 @@ def _report() -> dict:
         "met": False,
         "summary": {"total": 4, "match": 2, "mismatch": 1, "in_region_only": 1, "settling_bar_keys": 1, "v1_cause": 0},
         "keys": [
-            {"key": "market_data/technicals/rating_performance.json", "verdict": "mismatch"},
+            {"key": "market_data/technicals/rating_performance.json", "verdict": "mismatch", "values": {"breaches": 2}},
             {"key": "arcticdb/universe", "verdict": "in_region_only"},
             {"key": "a.json", "verdict": "match"},
             {"key": "b.json", "verdict": "match"},
@@ -94,7 +97,8 @@ def _bar(ident: str, *, v1=175.19, shadow=175.21, settled=175.21, read=V1_READ_P
                                "retrieved_at_utc": "2026-10-06T14:00:00Z", "value": settled}
         else:
             item["settled"] = {"source_kind": adj.SETTLED_SOURCE_V1_LATER, "source_key": item["source_key"],
-                               "source_version_id": "later", "source_last_modified_utc": source, "value": settled}
+                               "source_version_id": "later", "source_last_modified_utc": source, "value": settled,
+                               "same_definition": True, "definition_note": "the same daily Close field"}
         if quantum is not None:
             item["settled"]["quantum"] = quantum
     return item
@@ -119,7 +123,7 @@ def _record(report_bytes: bytes, *, supersedes=None) -> dict:
             {
                 "key": "arcticdb/universe",
                 "kind": "in_region_only",
-                "measured": {"breaches": 1, "comparator": "shadow.parity._compare_frames as_of cutover"},
+                "measured": {"artifact": {"key": ARTIFACT_KEY, "sha256": hashlib.sha256(ARTIFACT_BYTES).hexdigest()}},
                 "inputs": [_bar("A")],
                 "attributions": [{"path": "A.Close", "inputs": ["A"]}],
             },
@@ -144,7 +148,7 @@ def _store(record_mutator=None, *, extra_records: list[dict] | None = None) -> _
     record = _record(report_bytes)
     if record_mutator:
         record_mutator(record)
-    docs = {REPORT_KEY: report, RECORD_0: record}
+    docs = {REPORT_KEY: report, RECORD_0: record, ARTIFACT_KEY: ARTIFACT_BYTES}
     for i, extra in enumerate(extra_records or []):
         docs[f"parity_adjudication/{CUTOVER_DAY.isoformat()}/{i + 2:04d}.json"] = extra
     return _Store(docs)
@@ -161,6 +165,7 @@ def _grades(store):
         json.loads(store.get_bytes(keys[-1])), record_key=keys[-1], report_key=REPORT_KEY,
         report=json.loads(report_bytes), report_bytes=report_bytes,
         previous_record_key=keys[-2] if len(keys) > 1 else None, cutover_utc=CUTOVER_UTC,
+        fetch_bytes=store.get_bytes,
     )
 
 
@@ -207,11 +212,61 @@ def test_one_unattributed_path_leaves_the_whole_key_red():
     assert _read(_store(mutate)).met is False
 
 
-def test_listing_fewer_paths_than_the_measured_breaches_proves_nothing():
+def test_listing_fewer_paths_than_the_report_measured_proves_nothing():
     def mutate(record):
-        record["exceptions"][0]["measured"]["breaches"] = 17
+        record["exceptions"][0]["attributions"].pop()
     grade = {g.key: g for g in _grades(_store(mutate)).grades}["market_data/technicals/rating_performance.json"]
     assert grade.verdict == adj.INVALID and "every breaching path" in grade.detail
+
+
+def test_the_breach_count_is_the_reports_not_the_records_claim():
+    """The review's blocking change: a record cannot shrink the measurement to fit its own path list."""
+    def mutate(record):
+        record["exceptions"][0]["measured"]["breaches"] = 1
+        record["exceptions"][0]["attributions"].pop()
+    grade = {g.key: g for g in _grades(_store(mutate)).grades}["market_data/technicals/rating_performance.json"]
+    assert grade.verdict == adj.INVALID and "the measurement it must match has 2" in grade.detail
+
+
+def test_a_report_row_without_a_breach_count_cannot_be_adjudicated():
+    store = _store()
+    report = json.loads(store.get_bytes(REPORT_KEY))
+    del report["keys"][0]["values"]
+    record = json.loads(store.get_bytes(RECORD_0))
+    record["report"]["sha256"] = hashlib.sha256(json.dumps(report, sort_keys=True).encode()).hexdigest()
+    store = _Store({REPORT_KEY: report, RECORD_0: record, ARTIFACT_KEY: ARTIFACT_BYTES})
+    grade = {g.key: g for g in _grades(store).grades}["market_data/technicals/rating_performance.json"]
+    assert grade.verdict == adj.INVALID and "no breach count" in grade.detail
+
+
+def test_an_in_region_row_takes_its_paths_from_the_pinned_comparator_artifact():
+    def tampered(record):
+        record["exceptions"][1]["measured"]["artifact"]["sha256"] = "f" * 64
+    grade = {g.key: g for g in _grades(_store(tampered)).grades}["arcticdb/universe"]
+    assert grade.verdict == adj.INVALID and "not the pinned" in grade.detail
+
+    def other_path(record):
+        record["exceptions"][1]["attributions"] = [{"path": "B.Close", "inputs": ["A"]}]
+    grade = {g.key: g for g in _grades(_store(other_path)).grades}["arcticdb/universe"]
+    assert grade.verdict == adj.INVALID and "breach_paths" in grade.detail
+
+    def no_artifact(record):
+        record["exceptions"][1]["measured"] = {"breaches": 1}
+    grade = {g.key: g for g in _grades(_store(no_artifact)).grades}["arcticdb/universe"]
+    assert grade.verdict == adj.INVALID and "artifact" in grade.detail
+
+
+def test_a_v1_later_reference_must_declare_the_same_definition():
+    """v1's hundreds-rounded volume is a different definition and never a reference."""
+    def mutate(record):
+        del record["exceptions"][2]["inputs"][0]["settled"]["same_definition"]
+    grade = {g.key: g for g in _grades(_store(mutate)).grades}["features/2026-09-25/technical.parquet"]
+    assert grade.verdict == adj.INVALID and "same_definition" in grade.detail
+
+    def no_note(record):
+        record["exceptions"][2]["inputs"][0]["settled"]["definition_note"] = " "
+    grade = {g.key: g for g in _grades(_store(no_note)).grades}["features/2026-09-25/technical.parquet"]
+    assert grade.verdict == adj.INVALID and "definition_note" in grade.detail
 
 
 def test_a_pending_resettle_is_red_and_named():
@@ -293,7 +348,7 @@ def test_the_newest_record_must_supersede_its_predecessor():
     assert reading.met is True and reading.evidence == (REPORT_KEY, RECORD_1)
 
 
-def test_a_release_without_the_vendors_release_time_is_pending():
+def test_a_release_without_the_vendors_release_time_is_invalid():
     def mutate(record):
         item = record["exceptions"][1]["inputs"][0]
         item["kind"] = adj.INPUT_KIND_RELEASE

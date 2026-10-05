@@ -2200,4 +2200,5 @@ def _read_parity_adjudication(store: GateStore, report_key: str, report_day: dt.
         report_bytes=report_bytes,
         previous_record_key=previous,
         cutover_utc=CUTOVER_UTC,
+        fetch_bytes=store.get_bytes,
     )
