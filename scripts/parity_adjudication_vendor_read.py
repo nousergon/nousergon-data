@@ -47,8 +47,8 @@ CHUNK = 76
 def _fred(path: str, **params) -> dict:
     import requests
 
-    params.update(api_key=os.environ["FRED_API_KEY"], file_type="json")
-    response = requests.get(f"{FRED_BASE}/{path}", params=params, timeout=30)
+    query = {**params, "api_key": os.environ["FRED_API_KEY"], "file_type": "json"}
+    response = requests.get(f"{FRED_BASE}/{path}", params=query, timeout=30)
     if response.status_code != 200:
         # Never echo the URL: it carries the key.
         raise RuntimeError(f"FRED {path} returned HTTP {response.status_code}")
