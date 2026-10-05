@@ -84,11 +84,23 @@ completeness:
   note: "latest.json measured at 201 B, which no current guard questions"
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "run_units.py::grade_published_outputs"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Both keys a run publishes (data/inst_ownership/{quarter}/latest.parquet, and the
+        latest.json sidecar on a weekly run) are graded once every quarter is written, by
+        data/derived/inst_ownership.py::_grade_published calling
+        run_units.py::grade_published_outputs. That runs
+        validators/expectations.py::check_empty_fresh on each key: a missing or zero-byte
+        object, or a zero row count, is `empty_fresh`, and a count under a declared
+        completeness.rows_out_floor is `below_floor`. Filed on the manifest as guard
+        `data_empty_fresh` plus the data.D39.guard.empty_fresh MetricRecord (worst key wins).
+        A zero-row result never reaches a write: _run_cli exits 1 first. Observe/enforce
+        staging is declared once, in validators/expectations.py::EMPTY_FRESH_GUARD
+        (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
+        (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-

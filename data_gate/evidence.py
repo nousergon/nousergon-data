@@ -39,6 +39,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 import run_units
+from contracts import pit
 from data_gate.cadence import (
     Cadence,
     due_fire,
@@ -68,6 +69,7 @@ __all__ = [
     "read_objective",
     "read_windowed_objective",
     "read_parity",
+    "read_pit",
     "read_roles_bootstrapped",
     "read_run_record",
     "read_stack_check_live",
@@ -1014,6 +1016,154 @@ def read_guard_commissioning(
         evidence=(key,),
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
+    )
+
+
+#: How many offending keys a PIT reading names in its detail before it counts
+#: the rest. The full list is in the manifests the evidence tuple names.
+_PIT_NAMED = 8
+
+
+def read_pit(store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None) -> Reading:
+    """Every key this unit's current cycle published, graded point-in-time.
+
+    `data_collection_plan_260914.md` §2 objective 4, plan item P-15
+    (`alpha-engine-config-I10782`): every published record carries ``as_of``
+    and ``available_at``, and ``available_at <= manifest.finished``. The
+    producer records the stamps it wrote as one ``data_pit`` guard entry per
+    key (`contracts/pit.py::pit_guard_entry`); this reads them back off the
+    SAME manifests `read_run_record` grades (selected by the unit's cadence
+    through :func:`_cycle`) and checks, per output:
+
+    * a ``data_pit`` entry exists for the key — an output with none is UNMET
+      and NAMED, never skipped: "not stamped" is the finding this clause exists
+      to surface, and a reader that graded only the keys that happen to carry a
+      stamp would read green over every unit that carries none;
+    * its verdict is ``ok`` — the producer could read both stamps;
+    * ``as_of``'s first instant <= ``available_at`` <= the manifest's
+      ``finished``. The upper bound is the plan's clause: a record whose own
+      stamp says it was knowable only AFTER the run that published it finished
+      was not written by that run, or carries a clock nobody can trust.
+
+    Keys `contracts/pit.py::pit_exemption` exempts (ArcticDB library refs) are
+    counted and named as exempt, not graded. The read never opens a published
+    object: the manifest is the evidence, so this needs no read on any
+    published prefix.
+
+    Listing or read failure is UNMEASURABLE; absence is UNMET — the same split
+    as `read_run_record`.
+    """
+    cadence = unit_cadence(unit.raw)
+    unit_prefix = f"{_store_relative(unit.run_manifest_prefix)}/"
+    try:
+        cycle = _cycle(store, unit, cadence, trading_day=trading_day, now=now)
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        # A deliberate catch, not a swallow: the failure mode is "this unit's
+        # manifest prefix could not be listed", every other clause on the board
+        # survives it, and the recording surface is this UNMEASURABLE row.
+        return Reading(
+            met=False,
+            detail=f"could not list {unit_prefix}: {type(exc).__name__}: {exc}",
+            evidence=(f"{unit_prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    prefix = cycle.where
+    if cycle.problems:
+        return Reading(
+            met=False,
+            detail=f"{len(cycle.problems)} manifest(s) under {prefix} unreadable: {cycle.problems[:4]}",
+            evidence=tuple(cycle.keys[:8]) or (f"{prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if not cycle.keys:
+        if cadence.kind == "on_demand":
+            return Reading(
+                met=True,
+                detail=(
+                    f"not applicable: {unit.unit_id} runs on demand ({cadence.source}) and no "
+                    f"invocation is recorded under {unit_prefix}, so nothing was published to stamp"
+                ),
+                evidence=(f"{unit_prefix}*.json",),
+                source="data_collection store",
+            )
+        return Reading(
+            met=False,
+            detail=(
+                f"no run manifest {cycle.expected}, under {prefix}: no published key on record to "
+                "grade point-in-time" + _cadence_note(cadence)
+            ),
+            evidence=(f"{prefix}*.json",),
+            source="data_collection store",
+        )
+
+    stamped: list[str] = []
+    exempt: list[str] = []
+    unstamped: list[str] = []
+    failing: list[str] = []
+    finishes: list[dt.datetime] = []
+    for manifest in cycle.manifests:
+        finished = _parse_utc(manifest.get("finished"))
+        if finished is not None:
+            finishes.append(finished)
+        stamps = {}
+        for entry in manifest.get("guards") or ():
+            read = pit.read_pit_entry(entry) if isinstance(entry, dict) else None
+            if read is not None:
+                stamps[read.key] = read  # the LAST reading for a key is the one that stands
+        for output in manifest.get("outputs") or ():
+            key = str((output or {}).get("key") or "")
+            if not key:
+                continue
+            if pit.pit_exemption(key) is not None:
+                exempt.append(key)
+                continue
+            found = stamps.get(key)
+            if found is None:
+                unstamped.append(key)
+            elif found.verdict != "ok":
+                failing.append(f"{key}: verdict {found.verdict!r} — {found.detail[:200]}")
+            elif found.available_at is None or found.as_of_floor is None:
+                failing.append(f"{key}: the data_pit entry's value/baseline are not POSIX seconds")
+            elif found.available_at < found.as_of_floor:
+                failing.append(f"{key}: available_at precedes the start of its as_of day")
+            elif finished is None:
+                failing.append(f"{key}: the manifest's `finished` ({manifest.get('finished')!r}) does not parse")
+            elif found.available_at > finished:
+                failing.append(
+                    f"{key}: available_at {pit.format_available_at(found.available_at)} is after the "
+                    f"publishing run finished ({pit.format_available_at(finished)})"
+                )
+            else:
+                stamped.append(key)
+
+    graded = len(stamped) + len(unstamped) + len(failing)
+    detail = (
+        f"{len(stamped)}/{graded} published key(s) stamped point-in-time (as_of <= available_at <= "
+        f"manifest finished) across {len(cycle.manifests)} run(s) under {prefix}"
+    )
+    if exempt:
+        detail += f"; {len(exempt)} exempt ({pit.pit_exemption(exempt[0])}): {sorted(set(exempt))[:_PIT_NAMED]}"
+    if unstamped:
+        detail += (
+            f"; {len(unstamped)} published with NO {pit.PIT_GUARD_NAME} stamp on its manifest: "
+            f"{unstamped[:_PIT_NAMED]}"
+        )
+    if failing:
+        detail += f"; {len(failing)} failed: {failing[:_PIT_NAMED]}"
+    if graded == 0 and not exempt:
+        detail += (
+            f"; statuses {sorted({str(m.get('status')) for m in cycle.manifests})} published no "
+            "output, so nothing was graded — and nothing graded is not graded clean"
+        )
+    met = (graded > 0 or bool(exempt)) and not unstamped and not failing
+    return Reading(
+        met=met,
+        detail=detail,
+        evidence=tuple(cycle.keys[:8]),
+        source="data_collection store",
+        as_of=pit.format_available_at(max(finishes)) if finishes else None,
     )
 
 
