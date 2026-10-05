@@ -35,6 +35,5 @@ recovered_fires:
     recovery_execution: weekly-recovery-2026-10-02-1
     root_cause_fix: nousergon-data#2036 (declared S&P 500 spin-off additions); retry defects nousergon-data#2039, #2040
     tracker: alpha-engine-config-I11812
-    # Replace with the link to Brian's "count it" ruling on ask 2 before this
-    # entry is merged. Until then the entry changes no reading.
-    ruling: pending
+    # Brian ruled "count it" on 2026-10-05 20:14Z (ask 2).
+    ruling: https://github.com/nousergon/alpha-engine-config/issues/11812#issuecomment-6002163196
