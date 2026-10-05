@@ -87,8 +87,11 @@ def _install_stub(results, n_fail=None, raises=None, required=None):
     # undeclared-defaults-to-True direction and defeat the test).
     stub.CHECK_REQUIRED = {f"check_{n}": (n in required_names) for n in all_names}
 
-    def run_preflight(bucket=None, capabilities=None, run_date=None, skip_flags=None):
+    def run_preflight(bucket=None, capabilities=None, run_date=None, skip_flags=None,
+                      calendar_date=None, mode=None):
         recorded["bucket"] = bucket
+        recorded["calendar_date"] = calendar_date
+        recorded["mode"] = mode
         recorded["capabilities"] = capabilities
         # alpha-engine-config-I7443: the handler forwards the SF execution
         # input so check_skip_flag_artifact_coherence can verify each skip
@@ -343,6 +346,21 @@ class WeeklyPreflightExecutionInputForwardingTests(unittest.TestCase):
                 "skip_aggregate_costs": False,
             },
         )
+
+    def test_calendar_date_and_mode_reach_run_preflight(self):
+        """watch-rerun-2026-10-02-2: the handler read calendar_date (I8809)
+        and dropped it, so the coherence check compared against run_date --
+        the TRADING day -- and its message printed 2026-10-02 for an input
+        carrying calendar_date 2026-10-03. mode keys the SF's backtest-eval
+        bypass of the same guard."""
+        recorded = _install_stub([_Result("sf_iam_reachability", "ok")])
+        self._handler()(
+            {"run_date": "2026-10-02", "calendar_date": "2026-10-03",
+             "mode": "backtest-eval", "skip_predictor_training": True},
+            None,
+        )
+        self.assertEqual(recorded["calendar_date"], "2026-10-03")
+        self.assertEqual(recorded["mode"], "backtest-eval")
 
     def test_non_skip_keys_are_not_forwarded_as_skip_flags(self):
         """Only skip_* keys — pipeline_role and sns_topic_arn are not claims."""
