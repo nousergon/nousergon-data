@@ -698,6 +698,12 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         "guard has been COMMISSIONED by an induced fault (observability-policy §9.1: a guard "
         "that has never fired is not in service)"
     )
+    if guard == "pit":
+        requirement = (
+            f"every key {unit.unit_id} publishes carries `as_of` and `available_at`, with as_of <= "
+            "available_at <= the publishing run's manifest `finished` (data_collection_plan_260914.md "
+            "§2 objective 4, P-15), AND " + requirement
+        )
     if unit.retired:
         return _retired(unit, name, requirement, "data-phase2")
     if state == "not_applicable":
@@ -715,6 +721,8 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
             as_of=str(unit.raw["audit"]["baseline_date"]),
         )
     reading = ev.read_guard_commissioning(store, unit, guard, trading_day=trading_day)
+    if guard == "pit":
+        reading = _pit_and_commissioning(ev.read_pit(store, unit, trading_day=trading_day), reading)
     if reading.unmeasurable:
         return unmeasurable(
             name,
@@ -733,6 +741,26 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         phase="data-phase2",
         source=reading.source,
         as_of=reading.as_of,
+    )
+
+
+def _pit_and_commissioning(stamps: ev.Reading, commissioning: ev.Reading) -> ev.Reading:
+    """``data.<unit>.guard.pit``: the stamps on what was published, AND the guard commissioned.
+
+    `alpha-engine-config-I10782` puts the point-in-time check itself into this
+    clause; it does not take commissioning OUT. Phase 2's exit is "every
+    applicable guard clause enforcing and commissioned" (plan §6), so a unit
+    whose every key is stamped still reads UNMET here until its induced-fault
+    record exists — and the detail says which half is missing, so the two are
+    never confused. Either half unmeasurable makes the clause unmeasurable.
+    """
+    return ev.Reading(
+        met=stamps.met and commissioning.met,
+        detail=f"point-in-time: {stamps.detail} || commissioning: {commissioning.detail}",
+        evidence=tuple(dict.fromkeys(stamps.evidence + commissioning.evidence)),
+        unmeasurable=stamps.unmeasurable or commissioning.unmeasurable,
+        source=stamps.source or commissioning.source,
+        as_of=stamps.as_of or commissioning.as_of,
     )
 
 
