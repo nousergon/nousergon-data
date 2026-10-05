@@ -273,6 +273,11 @@ def read_promotion(
             f"READY TO PROMOTE: the codified criterion holds; promotion is a deliberate PR "
             f"flipping {promotion.staging} to ENFORCE"
         )
+        if promotion.preconditions:
+            verdict += (
+                f", which must also confirm {len(promotion.preconditions)} declared "
+                "precondition(s) no reader grades"
+            )
     elif enforcing:
         verdict = "ENFORCING WITHOUT ITS CODIFIED EVIDENCE"
     else:
