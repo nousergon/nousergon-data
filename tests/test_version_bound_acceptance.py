@@ -286,3 +286,19 @@ def test_empty_fresh_reads_the_guard_under_the_name_the_producer_records():
     )
     assert clause.met, clause.detail
     assert "NOT LIVE" not in clause.detail
+
+
+def test_eod_coverage_does_not_demand_a_day_whose_run_is_not_due_yet():
+    """The 10-05 dry run: graded before the 18:15 ET EOD, the day's record is not missing."""
+    from nousergon_lib.trading_calendar import subtract_trading_days  # pyright: ignore[reportAttributeAccessIssue]
+
+    yesterday = subtract_trading_days(TRADING_DAY, 1)
+    store = EmptyStore(
+        {f"metrics/eod_completeness/{yesterday.isoformat()}.json": json.dumps({"status": "GREEN"}).encode()}
+    )
+    reading = xc.read_eod_universe_covered(store, trading_day=TRADING_DAY, days=10, due_day=yesterday)
+    assert reading.window is not None and reading.window.current is not None
+    assert reading.window.current.clean and reading.window.current.latest == yesterday.isoformat()
+    # Due and missing is still missing proof.
+    reading = xc.read_eod_universe_covered(store, trading_day=TRADING_DAY, days=10, due_day=TRADING_DAY)
+    assert reading.window.current.stale

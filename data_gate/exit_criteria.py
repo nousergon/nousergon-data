@@ -790,7 +790,7 @@ def read_vendor_divergence_emitted(
 
 
 def read_eod_universe_covered(
-    store: GateStore, *, trading_day: dt.date, days: int
+    store: GateStore, *, trading_day: dt.date, days: int, due_day: dt.date | None = None
 ) -> Reading:
     """Full EOD universe coverage on ``days`` CONSECUTIVE trading days.
 
@@ -864,6 +864,10 @@ def read_eod_universe_covered(
             # evidence (plus older days that carry the same `code_sha`, when the
             # MetricRecord carries one). A newest day with no record is missing
             # proof, never a pass.
+            # ``due_day`` (`evidence.completeness_due_day`): a newer day whose
+            # EOD run is not yet due and has no record is not missing proof —
+            # it is skipped, exactly as `read_completeness_metric` skips it. A
+            # record that already exists is always graded.
             current=current_evidence(
                 [
                     Observation(
@@ -873,6 +877,11 @@ def read_eod_universe_covered(
                         present=status != "ABSENT",
                     )
                     for day_iso, status in statuses
+                    if not (
+                        status == "ABSENT"
+                        and due_day is not None
+                        and dt.date.fromisoformat(day_iso) > due_day
+                    )
                 ]
             ),
         ),

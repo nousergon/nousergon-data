@@ -1733,7 +1733,14 @@ def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
     )
 
 
-def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+def _clause_phase2_eod_universe_covered(
+    store: ev.GateStore, *, trading_day: dt.date, units: list[Unit] | None = None
+) -> Clause:
+    # The day whose record should exist by now (`ev.completeness_due_day`, the
+    # EOD spine D20's cadence): the current evidence is never a day whose run
+    # has not fired yet. Without the units, the gate's own day is due.
+    spine = next((u for u in units or [] if u.unit_id == "D20"), None)
+    due_day = ev.completeness_due_day(spine, trading_day=trading_day) if spine else None
     return _observation_window_clause(
         "data.phase2.eod_universe_covered",
         (
@@ -1745,7 +1752,7 @@ def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.
             "the 10-day window stays on the row as an observation"
         ),
         xc.read_eod_universe_covered(
-            store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS
+            store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS, due_day=due_day
         ),
         phase="data-phase2",
         version_bound=True,
@@ -1943,7 +1950,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase1_v1_data_stage_quiet(store))
     clauses.append(_clause_phase1_triggers_reconciled(store, units, trading_day=trading_day))
     clauses.append(_clause_phase1_cost_baseline_measured(store))
-    clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
+    clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day, units=units))
     clauses.append(_clause_phase2_empty_fresh_free(eod))
     clauses.append(_clause_phase2_vendor_divergence_emitted([eod, morning, weekly]))
     clauses.append(_clause_phase2_executor_collection_writes_zero(store))
