@@ -16,7 +16,7 @@ import pytest
 from nousergon_lib.run_identity import new_run_id
 from nousergon_lib.trading_calendar import subtract_trading_days
 
-from data_gate import evidence
+from data_gate import clauses, evidence
 from data_gate.descriptors import Unit, load_units
 from data_gate.producers import slo
 from tests.data_gate_support import DeniedStore, EmptyStore
@@ -229,12 +229,41 @@ def test_a_failed_run_is_a_miss():
     assert "1 failed" in fresh["cycles"][0]["misses"]["DX1"]
 
 
-def test_a_short_history_is_a_breach_naming_the_window():
+def test_a_short_clean_history_is_ok_naming_how_much_of_the_window_is_observed():
+    """The 2026-10-03 ruling's producer contract (`evidence.read_windowed_objective`):
+    cycles before the family's first run manifest are the unobserved part of the
+    window, not misses, so five clean cycles are ``ok`` with ``cycles_observed: 5``."""
     store = EmptyStore()
     for day in SESSIONS[:5]:
         _manifest(store, "DX1", day, finished=_eod(day, 17, 0))
     fresh = _fresh(_build(store, [_unit("DX1")])[0])
-    assert (fresh["status"], fresh["value"], fresh["attainment"]) == ("breach", 5, 0.25)
+    assert (fresh["status"], fresh["value"], fresh["attainment"]) == ("ok", 5, 1.0)
+    assert (fresh["cycles_observed"], fresh["cycles_graded"]) == (5, 20)
+    assert fresh["first_observed_cycle"] == SESSIONS[4].isoformat()
+    assert [c["observed"] for c in fresh["cycles"]] == [True] * 5 + [False] * 15
+    assert "5 of 20 cycles observed" in fresh["summary"]
+
+
+def test_a_cycle_with_no_run_after_the_window_started_is_a_miss_not_unobserved():
+    store = EmptyStore()
+    for day in SESSIONS[2:7]:
+        _manifest(store, "DX1", day, finished=_eod(day, 17, 0))
+    fresh = _fresh(_build(store, [_unit("DX1")])[0])
+    assert (fresh["status"], fresh["value"], fresh["cycles_observed"]) == ("breach", 5, 7)
+    assert set(fresh["cycles"][0]["misses"]) == set(fresh["cycles"][1]["misses"]) == {"DX1"}
+
+
+def test_one_late_cycle_in_a_partial_window_is_tolerated_as_in_a_full_one():
+    """>= 19 of 20: one missed deadline does not fail the target over a full
+    window, so it does not over a partial one either — it is reported in the
+    cycle rows and the summary, and a second one breaches."""
+    store = EmptyStore()
+    for day in SESSIONS[:6]:
+        _manifest(store, "DX1", day, finished=_eod(day, 19, 0) if day == SESSIONS[1] else _eod(day, 17, 0))
+    fresh = _fresh(_build(store, [_unit("DX1")])[0])
+    assert (fresh["status"], fresh["value"], fresh["cycles_observed"]) == ("ok", 5, 6)
+    assert fresh["cycles"][1]["misses"]["DX1"].startswith("late")
+    assert "1 missed" in fresh["summary"]
 
 
 def test_a_family_with_no_scheduled_unit_is_a_breach_not_vacuously_ok():
@@ -380,6 +409,64 @@ def test_a_document_without_stale_after_is_graded_as_before():
     gate_store = EmptyStore({"metrics/cost/monthly/latest.json": json.dumps({"status": "ok", "value": 1}).encode()})
     reading = evidence.read_objective(gate_store, "metrics/cost/monthly/latest.json")
     assert reading.met is True and reading.unmeasurable is False
+
+
+def _windowed_clause(documents, family="eod-spine"):
+    """The emitted document read back through the REAL windowed reader and the
+    REAL ruling grader — exactly `clauses._clause_slo_freshness`, with the
+    reader's clock pinned to the replay instant so ``stale_after_utc`` holds."""
+    gate_store = EmptyStore({k: json.dumps(v).encode() for k, v in documents.items()})
+    reading = evidence.read_windowed_objective(
+        gate_store,
+        slo.slo_key("freshness", family),
+        required=clauses.SLO_FRESHNESS_CYCLES,
+        unit="cycle(s)",
+        now=NOW,
+    )
+    return reading, clauses._observation_window_clause(
+        f"data.slo.freshness.{family}", "freshness SLO", reading, phase="data-phase2"
+    )
+
+
+def test_a_partial_clean_window_reads_met_with_its_progress_through_the_windowed_reader():
+    store = EmptyStore()
+    for day in SESSIONS[:4]:
+        _manifest(store, "DX1", day, finished=_eod(day, 17, 0))
+    reading, clause = _windowed_clause(_build(store, [_unit("DX1")])[0])
+    assert reading.unmeasurable is False
+    assert (reading.window.live, reading.window.observed, reading.window.required) == (True, 4, 20)
+    assert reading.window.failures == ()
+    assert clause.met is True, clause.detail
+    assert "MET under the 2026-10-03 ruling" in clause.detail
+    assert "4 of 20 cycle(s) observed" in clause.detail
+    assert (clause.window_observed, clause.window_complete) == (4, False)
+
+
+def test_a_real_miss_in_a_partial_window_still_reopens_the_clause_through_the_windowed_reader():
+    # Two missed deadlines in six observed cycles: the >= 19 of 20 target is
+    # already failed, whatever the next fourteen cycles do.
+    store = EmptyStore()
+    for day in SESSIONS[:6]:
+        late = day in (SESSIONS[1], SESSIONS[3])
+        _manifest(store, "DX1", day, finished=_eod(day, 19, 0) if late else _eod(day, 17, 0))
+    documents = _build(store, [_unit("DX1")])[0]
+    assert (_fresh(documents)["status"], _fresh(documents)["cycles_observed"]) == ("breach", 6)
+    reading, clause = _windowed_clause(documents)
+    assert reading.window.observed == 6 and len(reading.window.failures) == 1
+    assert clause.met is False
+    assert "REOPENED" in clause.detail and "6 of 20 cycle(s) observed" in clause.detail
+
+    # A stale-content cycle fails the 20-of-20 as_of rule on its own.
+    store = EmptyStore()
+    for day in SESSIONS[:3]:
+        _manifest(store, "DX1", day, finished=_eod(day, 17, 0), recorded_day=SESSIONS[3] if day == SESSIONS[0] else None)
+    reading, clause = _windowed_clause(_build(store, [_unit("DX1")])[0])
+    assert clause.met is False and "REOPENED" in clause.detail and "3 of 20 cycle(s) observed" in clause.detail
+
+
+def test_a_family_with_no_recorded_run_is_never_met_through_the_windowed_reader():
+    _reading, clause = _windowed_clause(_build(EmptyStore(), [_unit("DX1")])[0])
+    assert clause.met is False and "0 of 20 cycle(s) observed" in clause.detail
 
 
 @pytest.mark.parametrize("argv", [["--store", "{tmp}", "--now", "2026-10-03T01:00:00Z"]])

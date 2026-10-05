@@ -8,10 +8,12 @@ Writes, under ``s3://alpha-engine-research/data_collection``::
     metrics/slo/completeness/<family>/latest.json
 
 one pair per freshness family the unit descriptors declare — the exact keys
-`data_gate/clauses.py::generate` already reads through
-`evidence.read_objective`. Until this module those keys had no writer, so all
-16 rows read "no metric document ... an objective with no emitter is
-unobserved, not met".
+`data_gate/clauses.py::generate` already reads: freshness through
+`evidence.read_windowed_objective` (graded under Brian's 2026-10-03
+observation-window ruling, `clauses.py::OBSERVATION_WINDOW_RULING`),
+completeness through `evidence.read_objective`. Until this module those keys
+had no writer, so all 16 rows read "no metric document ... an objective with
+no emitter is unobserved, not met".
 
 **Computed from the run manifests, never from S3 HEAD** (plan §2 row 1:
 "computed from run manifests, not HEAD alone"). A HEAD on a published key says
@@ -31,9 +33,24 @@ that recorded a different session cannot satisfy it.
 **Freshness** — per cycle, per unit: an ``ok`` manifest from a counted trigger
 (:data:`COUNTED_TRIGGERS`) whose ``finished`` is at or before the deadline and
 whose own ``trading_day`` equals the cycle's. A family cycle is met when every
-graded unit met it. ``status: ok`` needs >= 19 of the last 20 cycles met and
-the as-of check holding on every cycle that had a run, over a full 20-cycle
-window (plan §2 row 1). The intraday family's deadline is a slot rule instead
+graded unit met it. The target is plan §2 row 1's: >= 19 of the last 20
+cycles met, and the as-of check holding on every cycle that had a run.
+
+**Freshness is a WINDOWED objective** — the producer contract
+`evidence.read_windowed_objective` states for the 2026-10-03 ruling. A cycle
+is OBSERVED from the family's first recorded run manifest in the trailing
+window onward (any status, any trigger: a manifest is the record that the
+cycle was being collected); cycles older than that predate the check and are
+the part of the window not yet observed, never misses. ``cycles_observed``
+carries that count. ``status: ok`` means the observations made so far do not
+fail the target — at most ``WINDOW - FRESHNESS_REQUIRED`` missed deadlines and
+no as-of mismatch — so a partial window with no failed observation is ``ok``,
+exactly as the full-window rule would read it; ``status: breach`` means an
+observation already made fails it, which no later cycle can undo until it ages
+out. Over a full window this is the original rule unchanged. A family with no
+observed cycle at all is a breach, never a vacuous ``ok``.
+
+The intraday family's deadline is a slot rule instead
 (``age <= N minutes in >= P% of session slots``): each session slot is fresh
 when an ``ok`` run finished in the N minutes before it.
 
@@ -383,6 +400,10 @@ class UnitCycle:
     excluded_triggers: dict[str, int] = field(default_factory=dict)
     had_run: bool = False
     as_of_ok: bool = True
+    #: The cycle's partition listed at least one run manifest, whatever its
+    #: status or trigger — the record that the unit was being collected then.
+    #: The family's oldest recorded cycle is where its observation window starts.
+    recorded: bool = False
 
 
 def _counted_ok(docs: list[tuple[str, dict]]) -> tuple[list[dict], dict[str, int]]:
@@ -554,15 +575,18 @@ def _grade_family(
                     UnitCycle(plan.unit.unit_id, trading_day, instant, "unreadable", "unreadable", f"could not list {prefix}")
                 )
                 continue
+            recorded = bool(keys)
             if plan.deadline.kind == "slots":
                 opened, closed = _session_bounds(trading_day)
                 lead = dt.timedelta(minutes=plan.deadline.max_age_minutes)
                 keys = [k for k in keys if (t := _ulid_instant(k)) is None or opened - lead <= t <= closed]
                 docs = reader.read(keys)
-                results.append(_grade_slots(plan.unit, docs, trading_day=trading_day, deadline=plan.deadline))
+                graded = _grade_slots(plan.unit, docs, trading_day=trading_day, deadline=plan.deadline)
             else:
                 docs = reader.read(keys)
-                results.append(_grade_point(plan.unit, docs, trading_day=trading_day, deadline=instant))
+                graded = _grade_point(plan.unit, docs, trading_day=trading_day, deadline=instant)
+            graded.recorded = recorded
+            results.append(graded)
     return results, not_graded, cycle_days, len(reader.problems) - problems_before
 
 
@@ -588,6 +612,13 @@ def _family_documents(
         for trigger, n in r.excluded_triggers.items():
             excluded_triggers[trigger] = excluded_triggers.get(trigger, 0) + n
 
+    # The freshness window is observed from the family's oldest recorded cycle
+    # onward (module docstring): an older cycle predates the check, so it is the
+    # unobserved part of the window the 2026-10-03 ruling forgives, never a miss.
+    recorded_days = [r.trading_day for r in results if r.recorded]
+    first_observed = min(recorded_days) if recorded_days else None
+    observed_days = {d for d in cycle_days if first_observed is not None and d >= first_observed}
+
     fresh_rows, comp_rows = [], []
     fresh_met = asof_checked = asof_ok = comp_met = 0
     comp_excluded = sorted({r.unit_id for r in results if r.completeness == "excluded"})
@@ -595,7 +626,7 @@ def _family_documents(
         rows = by_day.get(day, [])
         misses = [r for r in rows if r.freshness != "met"]
         met = bool(rows) and not misses
-        fresh_met += met
+        fresh_met += met and day in observed_days
         ran = [r for r in rows if r.had_run]
         if ran:
             asof_checked += 1
@@ -604,6 +635,7 @@ def _family_documents(
             {
                 "trading_day": day.isoformat(),
                 "deadline_utc": _iso(max(r.deadline for r in rows)) if rows else None,
+                "observed": day in observed_days,
                 "met": met,
                 "misses": {r.unit_id: f"{r.freshness}: {r.detail}"[:300] for r in misses},
             }
@@ -639,26 +671,47 @@ def _family_documents(
         "code_sha": code_sha,
     }
 
+    cycles_observed = len(observed_days)
+    fresh_misses = cycles_observed - fresh_met
     if not graded_units:
         why = f"no unit in the {family} family has a scheduled cycle and a declared deadline to grade"
         fresh_status, fresh_summary = "breach", why
-    elif not window_full:
+    elif not cycles_observed:
         fresh_status = "breach"
-        fresh_summary = f"{fresh_met}/{len(cycle_days)} cycles met; only {len(cycle_days)} of {WINDOW} cycles exist"
+        fresh_summary = (
+            f"0 of {WINDOW} cycles observed: no graded unit in the {family} family recorded a run manifest "
+            f"in the trailing {len(cycle_days)} cycles, so nothing shows the check is live"
+        )
     else:
-        ok = fresh_met >= FRESHNESS_REQUIRED and asof_ok == asof_checked
+        # The ORIGINAL rule's failure condition, applied to the observations made
+        # so far: more misses than the window allows, or any as_of mismatch, is
+        # a failure no later cycle can undo. Over a full window this is exactly
+        # `fresh_met >= FRESHNESS_REQUIRED and asof_ok == asof_checked`.
+        ok = fresh_misses <= WINDOW - FRESHNESS_REQUIRED and asof_ok == asof_checked
         fresh_status = "ok" if ok else "breach"
         fresh_summary = (
-            f"{fresh_met}/{WINDOW} cycles met the deadline (needs {FRESHNESS_REQUIRED}); "
-            f"as_of matched on {asof_ok}/{asof_checked} cycles with a run (needs all)"
+            f"{fresh_met}/{cycles_observed} cycles met the deadline (needs {FRESHNESS_REQUIRED} of {WINDOW}; "
+            f"{fresh_misses} missed, {WINDOW - FRESHNESS_REQUIRED} allowed); "
+            f"as_of matched on {asof_ok}/{asof_checked} cycles with a run (needs all); "
+            f"{cycles_observed} of {WINDOW} cycles observed"
         )
+        if cycles_observed < WINDOW:
+            fresh_summary += (
+                f" since the family's first recorded run manifest ({first_observed}); the window keeps "
+                "running and a failed observation reopens it"
+            )
     freshness = {
         **common,
         "objective": "freshness",
         "status": fresh_status,
         "value": fresh_met,
         "baseline": FRESHNESS_REQUIRED,
-        "attainment": round(fresh_met / len(cycle_days), 4) if cycle_days else None,
+        # `evidence.read_windowed_objective`'s observed_field: how much of the
+        # window has been observed. `cycles_graded` (in `common`) stays the
+        # count of cycles the window spans.
+        "cycles_observed": cycles_observed,
+        "first_observed_cycle": first_observed.isoformat() if first_observed else None,
+        "attainment": round(fresh_met / cycles_observed, 4) if cycles_observed else None,
         "as_of_matched": asof_ok,
         "as_of_checked": asof_checked,
         "as_of_source": (
