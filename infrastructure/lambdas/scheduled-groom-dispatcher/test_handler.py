@@ -3928,3 +3928,10 @@ def test_lane_yield_starvation_ignores_non_yield_skip_reasons(monkeypatch):
     ys = result["lane_yield_starvation"]
     assert ys["starved_lanes"] == []
     assert ys["paged"] == 0
+
+
+def test_evidence_review_is_appended_to_backlog_mirror(monkeypatch):
+    # alpha-engine-config-I11991: enrolled as a backlog repo, appended last so
+    # the order-sensitive mirror is not renumbered.
+    idx = _load(monkeypatch)
+    assert idx.BACKLOG_REPOS[-2:] == ("nousergon/scannerctl", "nousergon/evidence-review")
