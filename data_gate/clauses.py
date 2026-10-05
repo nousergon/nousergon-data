@@ -698,6 +698,12 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         "guard has been COMMISSIONED by an induced fault (observability-policy §9.1: a guard "
         "that has never fired is not in service)"
     )
+    if guard == "pit":
+        requirement = (
+            f"every key {unit.unit_id} publishes carries `as_of` and `available_at`, with as_of <= "
+            "available_at <= the publishing run's manifest `finished` (data_collection_plan_260914.md "
+            "§2 objective 4, P-15), AND " + requirement
+        )
     if unit.retired:
         return _retired(unit, name, requirement, "data-phase2")
     if state == "not_applicable":
@@ -715,6 +721,8 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
             as_of=str(unit.raw["audit"]["baseline_date"]),
         )
     reading = ev.read_guard_commissioning(store, unit, guard, trading_day=trading_day)
+    if guard == "pit":
+        reading = _pit_and_commissioning(ev.read_pit(store, unit, trading_day=trading_day), reading)
     if reading.unmeasurable:
         return unmeasurable(
             name,
@@ -733,6 +741,26 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         phase="data-phase2",
         source=reading.source,
         as_of=reading.as_of,
+    )
+
+
+def _pit_and_commissioning(stamps: ev.Reading, commissioning: ev.Reading) -> ev.Reading:
+    """``data.<unit>.guard.pit``: the stamps on what was published, AND the guard commissioned.
+
+    `alpha-engine-config-I10782` puts the point-in-time check itself into this
+    clause; it does not take commissioning OUT. Phase 2's exit is "every
+    applicable guard clause enforcing and commissioned" (plan §6), so a unit
+    whose every key is stamped still reads UNMET here until its induced-fault
+    record exists — and the detail says which half is missing, so the two are
+    never confused. Either half unmeasurable makes the clause unmeasurable.
+    """
+    return ev.Reading(
+        met=stamps.met and commissioning.met,
+        detail=f"point-in-time: {stamps.detail} || commissioning: {commissioning.detail}",
+        evidence=tuple(dict.fromkeys(stamps.evidence + commissioning.evidence)),
+        unmeasurable=stamps.unmeasurable or commissioning.unmeasurable,
+        source=stamps.source or commissioning.source,
+        as_of=stamps.as_of or commissioning.as_of,
     )
 
 
@@ -1680,6 +1708,44 @@ def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> C
     )
 
 
+#: Why :func:`_clause_vendor_divergence_daily` is STANDING. Not a Brian ruling
+#: and not presented as one: the row is alpha-engine-config-I10783's own
+#: closes-when, which no plan phase exit names (plan §6's phase-2 exit is the
+#: 20-cycle MANIFEST count, `data.phase2.vendor_divergence_emitted`). Putting
+#: it in a gate's arithmetic would change that gate's verdict, which is a
+#: ruling this module does not make; until one does, it is read and rendered
+#: every day with its real state and blocks nothing.
+VENDOR_DIVERGENCE_DAILY_STANDING = (
+    "alpha-engine-config-I10783 closes-when reader: reported daily, gates no phase. Not a "
+    "plan phase exit (plan §6 phase 2 grades the manifest count, "
+    "data.phase2.vendor_divergence_emitted); joining a gate's arithmetic needs a ruling."
+)
+
+
+def _clause_vendor_divergence_daily(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    """alpha-engine-config-I10783's closes-when, read from the metric documents.
+
+    STANDING (:data:`VENDOR_DIVERGENCE_DAILY_STANDING`): it carries the
+    reader's real ``met`` (the strict streak) and its detail names every day
+    in the window that did not qualify.
+    """
+    return _standing_clause(
+        "data.standing.vendor_divergence_daily",
+        (
+            "the vendor-divergence MetricRecord (data_collection/metrics/vendor_divergence/"
+            f"<day>.json) is MEASURED on {xc.VENDOR_DIVERGENCE_DAILY_DAYS} CONSECUTIVE trading "
+            "days — status ok or breach with each breaching symbol named, never unmeasurable "
+            "or absent (alpha-engine-config-I10783 closes-when). STANDING: reported daily, "
+            "gates no phase."
+        ),
+        xc.read_vendor_divergence_daily(
+            store, trading_day=trading_day, days=xc.VENDOR_DIVERGENCE_DAILY_DAYS
+        ),
+        phase="data-phase2",
+        ruling=VENDOR_DIVERGENCE_DAILY_STANDING,
+    )
+
+
 def _clause_phase2_executor_collection_writes_zero(store: ev.GateStore) -> Clause:
     return _observation_window_clause(
         "data.phase2.executor_collection_writes_zero",
@@ -1812,6 +1878,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
     clauses.append(_clause_phase2_empty_fresh_free(eod))
     clauses.append(_clause_phase2_vendor_divergence_emitted([eod, morning, weekly]))
+    clauses.append(_clause_vendor_divergence_daily(store, trading_day=trading_day))
     clauses.append(_clause_phase2_executor_collection_writes_zero(store))
     clauses.append(_clause_phase3_sustained_window(store, weekly, trading_day=trading_day))
     return clauses
