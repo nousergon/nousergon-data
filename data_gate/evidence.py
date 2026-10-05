@@ -2133,6 +2133,18 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             " — the report claims met:true while carrying the exceptions above, so it is "
             "read UNMET"
         )
+    evidence_keys: tuple[str, ...] = (key,)
+    if not met:
+        # alpha-engine-config-I12023: the report's own reading above is never
+        # rewritten. A separate, append-only adjudication record citing it may
+        # prove every exception away on independent evidence; only then does
+        # the clause read MET, and the detail still prints the failed reading.
+        adjudication = _read_parity_adjudication(store, key, report_day, document)
+        if adjudication is not None:
+            evidence_keys = (key, adjudication.record_key)
+            detail += " — " + adjudication.summary()
+            if adjudication.cleared:
+                met = True
     if frozen:
         # No window phrase: freshness is not applied to a frozen reading
         # (alpha-engine-config-I11269), so a countdown would misdescribe it.
@@ -2148,7 +2160,45 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     return Reading(
         met=met,
         detail=detail,
-        evidence=(key,),
+        evidence=evidence_keys,
         source="data_collection store",
         as_of=as_of,
+    )
+
+
+def _read_parity_adjudication(store: GateStore, report_key: str, report_day: dt.date, report: dict):
+    """The graded newest adjudication record for ``report_key``, or ``None`` if none exists.
+
+    A record that cannot be listed or read is graded INVALID, never skipped —
+    an adjudication someone filed and the gate silently ignored would hide
+    exactly the disposition `alpha-engine-config-I12023` asks to be visible.
+    """
+    from data_gate import parity_adjudication as adj
+    from data_gate.cutover import CUTOVER_UTC
+
+    prefix = f"{adj.ADJUDICATION_KEY_PREFIX}{report_day.isoformat()}/"
+    try:
+        records = adj.adjudication_record_keys(store.list_keys(prefix), report_day)
+    except Exception as exc:  # noqa: BLE001 - recorded as an invalid adjudication, which is red
+        return adj.Adjudication(record_key=prefix, cleared=False, problem=f"could not list: {type(exc).__name__}: {exc}")
+    if not records:
+        return None
+    newest = records[-1]
+    previous = records[-2] if len(records) > 1 else None
+    read = read_store_document(store, newest)
+    if read.problem is not None or read.absent or not isinstance(read.document, dict):
+        return adj.Adjudication(record_key=newest, cleared=False, problem=f"could not read: {read.problem or 'absent'}")
+    try:
+        report_bytes = store.get_bytes(report_key)
+    except Exception as exc:  # noqa: BLE001 - same: red, named
+        return adj.Adjudication(record_key=newest, cleared=False, problem=f"could not re-read {report_key}: {exc}")
+    return adj.grade_record(
+        read.document,
+        record_key=newest,
+        report_key=report_key,
+        report=report,
+        report_bytes=report_bytes,
+        previous_record_key=previous,
+        cutover_utc=CUTOVER_UTC,
+        fetch_bytes=store.get_bytes,
     )
