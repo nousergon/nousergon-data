@@ -90,7 +90,9 @@ __all__ = [
     "GuardReading",
     "cardinality_metric",
     "check_cardinality",
+    "SPINE_WINDOW_GUARD",
     "check_empty_fresh",
+    "check_spine_window",
     "classify_by_rule",
     "default_exclusions_path",
     "default_suffix_map_path",
@@ -98,6 +100,7 @@ __all__ = [
     "load_exclusions",
     "load_suffix_map",
     "publish_completeness_metric",
+    "read_spine_window",
     "verdict_metric",
 ]
 
@@ -686,6 +689,189 @@ def publish_completeness_metric(
         ContentType="application/json",
     )
     return key
+
+
+# ---------------------------------------------------------------------------
+# Spine window — the cardinality guard's SESSION axis (`alpha-engine-config-I10780`)
+# ---------------------------------------------------------------------------
+
+#: `sf-pipeline-policy` §7a staging for the spine-window reading. Separate from
+#: `CARDINALITY_GUARD` because it answers a question that guard cannot:
+#: ``check_cardinality`` grades ONE session's symbol set as the collector holds
+#: it, so (a) a session the EOD run never published leaves no reading at all on
+#: the producer side, and (b) a symbol published with a bar from an EARLIER
+#: session counts as covered, because the guard sees the key, not the bar date.
+#: Measured 2026-10-05 over 2026-08-03..2026-10-02 (44 NYSE sessions): two
+#: sessions absent (08-05, 08-06), and nine symbol-days carried a bar two
+#: sessions old (e.g. FNILX/FTIHX/FZILX on 09-23, ATAI on 09-15) while the
+#: per-day reading counted them covered.
+#:
+#: **Promotion criterion: 10 consecutive clean trading days**, the same count
+#: and the same `unmeasurable`-is-not-clean rule as `CARDINALITY_GUARD`, on the
+#: same tracker.
+SPINE_WINDOW_GUARD = GuardStaging(
+    name="data_spine_window",
+    mode=GuardMode.OBSERVE,
+    promotion_criterion=(
+        "enforce after 10 consecutive clean trading days — the EOD spine-window verdict `ok` "
+        "(every session in the window published, non-empty and dated to its session; every "
+        "undeclared symbol carrying a bar within the declared lag) on each, `unmeasurable` not "
+        "counting as clean (data_collection_plan_260914.md §4.5); Re-exam tracked on "
+        "alpha-engine-config-I10780"
+    ),
+    tracked_issue="alpha-engine-config-I10780",
+)
+
+#: The verdicts `check_spine_window` can return. `empty_fresh` is reserved for
+#: the session THIS run published: an empty earlier session is graded
+#: `below_floor` and named, because `data_gate/evidence.py::empty_fresh_runs`
+#: attributes any `empty_fresh` verdict on a manifest to the run that carries it.
+SPINE_WINDOW_VERDICTS = ("ok", "empty_fresh", "below_floor", "unmeasurable")
+
+
+def read_spine_window(
+    s3_client: Any,
+    bucket: str,
+    sessions: Sequence[str],
+    *,
+    prefix: str = "market_data/eod_closes/",
+) -> dict[str, Mapping[str, Any] | None]:
+    """GET each session's published spine document → ``{session: doc | None}``.
+
+    ``None`` is a real 404. A zero-byte object reads as ``{}`` (empty-but-fresh,
+    graded by ``check_spine_window``). Any other read error, or a body that is
+    not JSON, RAISES — "could not look" is never read as "absent" or as
+    "present"; the caller grades it ``unmeasurable``.
+    """
+    import json
+
+    out: dict[str, Mapping[str, Any] | None] = {}
+    for day in sessions:
+        key = f"{prefix}{day}.json"
+        try:
+            obj = s3_client.get_object(Bucket=bucket, Key=key)
+        except ClientError as exc:
+            code = str(exc.response.get("Error", {}).get("Code") or "")
+            if code in ("NoSuchKey", "404", "NotFound"):
+                out[day] = None
+                continue
+            raise
+        raw = obj["Body"].read()
+        out[day] = json.loads(raw) if raw else {}
+    return out
+
+
+def check_spine_window(
+    *,
+    unit_id: str,
+    session: str,
+    documents: Mapping[str, Mapping[str, Any] | None],
+    denominator_symbols: Any,
+    max_bar_lag_sessions: int,
+    bar_lag: Any,
+    exclusions: Mapping[str, Mapping[str, str]] | None = None,
+    suffix_map: Mapping[str, str] | None = None,
+    class_rules: Sequence[Mapping[str, Any]] | None = None,
+    floor: float = 1.0,
+) -> GuardReading:
+    """Grade the published EOD spine across a window of sessions.
+
+    Two axes, one reading:
+
+    * **sessions** — every session in ``documents`` must have a published
+      document (``None`` = missing), with a non-empty ``closes`` map (else
+      empty-but-fresh), whose ``as_of`` is that session (else misdated: a copy
+      of another day's spine under this day's key).
+    * **symbols, on ``session``** — ``check_cardinality`` over the symbols
+      whose ``bar_date`` is within ``max_bar_lag_sessions`` trading sessions of
+      ``session`` (``bar_lag(bar_date, session) -> int``). A symbol published
+      with an older bar is NOT covered for this session and is named with its
+      lag; exclusions, suffix map and class rules apply exactly as in
+      ``check_cardinality``.
+
+    Earlier sessions are graded on the session axis only: the universe is read
+    once, today, and grading last week's spine against today's holdings would
+    name every newly bought symbol as a miss.
+
+    ``documents`` must contain ``session``. Verdict: ``empty_fresh`` when
+    ``session`` itself published an empty spine; ``below_floor`` when any
+    session is missing, empty or misdated, or the symbol axis is below
+    ``floor``; ``unmeasurable`` when the symbol axis could not be graded (empty
+    denominator); else ``ok``.
+    """
+    if session not in documents:
+        raise ValueError(f"{unit_id}: documents must include the graded session {session!r}")
+
+    missing: list[str] = []
+    empty: list[str] = []
+    misdated: list[str] = []
+    for day in sorted(documents):
+        doc = documents[day]
+        if doc is None:
+            missing.append(day)
+            continue
+        closes = doc.get("closes")
+        if not isinstance(closes, Mapping) or not closes:
+            empty.append(day)
+            continue
+        if str(doc.get("as_of") or "") != day:
+            misdated.append(f"{day} (as_of {doc.get('as_of')!r})")
+
+    current = documents[session]
+    current_closes = (current or {}).get("closes")
+    fresh: list[str] = []
+    stale: list[str] = []
+    if isinstance(current_closes, Mapping):
+        for symbol, point in sorted(current_closes.items()):
+            bar = point.get("bar_date") if isinstance(point, Mapping) else None
+            try:
+                lag = int(bar_lag(str(bar), session)) if bar else None
+            except (TypeError, ValueError):
+                lag = None
+            if lag is not None and lag <= max_bar_lag_sessions:
+                fresh.append(str(symbol))
+            else:
+                stale.append(f"{symbol}@{bar} (lag {lag if lag is not None else 'unreadable'})")
+
+    symbols = check_cardinality(
+        unit_id=unit_id,
+        denominator_symbols=denominator_symbols,
+        covered_symbols=fresh,
+        exclusions=exclusions,
+        suffix_map=suffix_map,
+        class_rules=class_rules,
+        floor=floor,
+    )
+
+    n_sessions = len(documents)
+    n_good = n_sessions - len(missing) - len(empty) - len(misdated)
+    days = sorted(documents)
+    detail = (
+        f"{unit_id} spine {days[0]}..{days[-1]}: {n_good}/{n_sessions} session(s) published, "
+        "non-empty and dated to their session"
+    )
+    if missing:
+        detail += f"; MISSING session(s): {', '.join(missing)}"
+    if empty:
+        detail += f"; EMPTY-but-fresh session(s): {', '.join(empty)}"
+    if misdated:
+        detail += f"; MISDATED session(s): {', '.join(misdated)}"
+    if stale:
+        detail += (
+            f"; {len(stale)} symbol(s) on {session} with a bar older than "
+            f"{max_bar_lag_sessions} session(s), not counted covered: {', '.join(stale)}"
+        )
+    detail += f". Symbol axis on {session}: {symbols.detail}"
+
+    if session in empty:
+        verdict = "empty_fresh"
+    elif missing or empty or misdated or symbols.verdict == "below_floor":
+        verdict = "below_floor"
+    elif symbols.verdict == "unmeasurable":
+        verdict = "unmeasurable"
+    else:
+        verdict = "ok"
+    return GuardReading(verdict, detail, value=symbols.value, baseline=float(floor))
 
 
 def report(
