@@ -75,6 +75,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import logging
 import os
@@ -93,6 +94,10 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 SCRIPT_PATH = REPO_ROOT / "rag" / "pipelines" / "run_weekly_ingestion.sh"
 BUCKET = "alpha-engine-research"
 
+#: D46's declared write prefix. Its keys ride this manifest but are graded under
+#: D46, not D16 (`_grade_published`, alpha-engine-config-I10785).
+D46_PREFIX = "data/insider_transactions/"
+
 #: Every S3 prefix D16's descriptor declares under `writes:` (all six entries
 #: — the three `rag/manifest*`/`rag/filing_changes*` literals collapse to
 #: their shared parent prefix; `rag/watermarks/` and `rag/corpus_freshness/`
@@ -108,7 +113,7 @@ OUTPUT_PREFIXES: tuple[str, ...] = (
     "rag/filing_changes/",
     "rag/corpus_freshness/",
     "health/rag_ingestion_progress/",
-    "data/insider_transactions/",
+    D46_PREFIX,
 )
 
 
@@ -187,17 +192,43 @@ def _s3_client() -> Any:
     return boto3.client("s3")
 
 
-def _get_json(s3: Any, key: str) -> Any:
-    """Read one object back as JSON, or None — a presence/content probe, never
+def _get_body(s3: Any, key: str) -> bytes | None:
+    """Read one object's bytes back, or None — a presence/content probe, never
     load-bearing for the pipeline's own success/failure."""
     try:
-        body = s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
+        return s3.get_object(Bucket=BUCKET, Key=key)["Body"].read()
     except Exception as exc:  # noqa: BLE001 -- read-back probe, not the pipeline's own write
         logger.warning("D16: could not read s3://%s/%s back (%s)", BUCKET, key, exc)
+        return None
+
+
+def _parse_json(body: bytes | None) -> Any:
+    """One read-back object as JSON, or None when it is absent or not JSON."""
+    if body is None:
         return None
     try:
         return json.loads(body)
     except (TypeError, ValueError):
+        return None
+
+
+def _parquet_rows(body: bytes | None) -> int | None:
+    """The row count in a parquet object's footer, or None when it cannot be read.
+
+    D46's ``data/insider_transactions/{run_stamp}_result.parquet`` is the one
+    non-JSON key this wrapper records. Before alpha-engine-config-I10785 it fell
+    through to the singleton ``1`` below, so the manifest said 1 row for every
+    one of the 38 zero-row Form 4 parquets written between 2026-05-13 and
+    2026-09-24 (measured from the objects, 2026-10-05).
+    """
+    if not body:
+        return None
+    try:
+        import pyarrow.parquet as pq
+
+        return int(pq.ParquetFile(io.BytesIO(body)).metadata.num_rows)
+    except Exception as exc:  # noqa: BLE001 -- unreadable is `unmeasurable`, recorded by the guard
+        logger.warning("D16: could not read a parquet footer (%s: %s)", type(exc).__name__, exc)
         return None
 
 
@@ -208,6 +239,9 @@ def _rows_out_for(doc: Any, key: str) -> int:
       ``totals.documents``.
     * ``rag/filing_changes/*.json`` (``filing_change_detection.main``) carries
       ``n_analyzed``.
+    * ``data/insider_transactions/latest.json`` (D46,
+      ``ingest_form4.write_form4_parquet``) carries ``row_count``, the length of
+      the parquet it points at.
     * A per-source watermark object (``_watermarks.RagWatermarkStore``) is a
       flat ``{"ticker::doc_type": iso_ts}`` map — its own length IS the count
       of tickers advanced.
@@ -222,6 +256,8 @@ def _rows_out_for(doc: Any, key: str) -> int:
             return int(totals["documents"])
         if "n_analyzed" in doc:
             return int(doc["n_analyzed"])
+        if key.startswith(D46_PREFIX) and "row_count" in doc:
+            return int(doc["row_count"])
         if key.startswith("rag/watermarks/v1/"):
             return len(doc)
     return 1
@@ -245,37 +281,65 @@ def _iter_new_keys(s3: Any, prefix: str, since: datetime) -> list[str]:
     return keys
 
 
-def _record_outputs(ctx: run_units.run_manifest.UnitRun, s3: Any, since: datetime) -> int:
+def _record_outputs(ctx: run_units.run_manifest.UnitRun, s3: Any, since: datetime) -> list[tuple[str, int | None]]:
     """Record every object this run actually published, with a measured count.
 
     Reads the artifacts each ingestion step already wrote — never the run's
-    logs. Returns how many keys were found, so the caller can tell a
-    genuinely silent run from a script that exited 0 and wrote nothing.
+    logs. Returns ``(key, rows)`` for every key found, so the caller can tell a
+    genuinely silent run from a script that exited 0 and wrote nothing, and
+    grade each key (:func:`_grade_published`). ``rows`` is ``None`` for a
+    parquet whose footer could not be read: the guard grades that
+    ``unmeasurable``. The manifest's ``rows_out`` cannot be ``None``, so it
+    keeps the old singleton ``1`` for that key.
     """
-    published = 0
+    published: list[tuple[str, int | None]] = []
     for prefix in OUTPUT_PREFIXES:
         for key in _iter_new_keys(s3, prefix, since):
-            doc = _get_json(s3, key)
-            ctx.record_output(key, rows_out=_rows_out_for(doc, key))
-            published += 1
+            body = _get_body(s3, key)
+            if key.endswith(".parquet"):
+                rows = _parquet_rows(body)
+            else:
+                rows = _rows_out_for(_parse_json(body), key)
+            ctx.record_output(key, rows_out=1 if rows is None else rows)
+            published.append((key, rows))
     return published
+
+
+def _grade_published(
+    ctx: run_units.run_manifest.UnitRun, s3: Any, published: list[tuple[str, int | None]]
+) -> None:
+    """The per-key empty-but-fresh + floor guard, for D16's keys and D46's.
+
+    alpha-engine-config-I10785 (P-18). Before this, D16 filed one RUN-level
+    reading (``ok`` when any key landed), so a published key carrying zero
+    documents was recorded but never graded, and D46 (step 5 of this script,
+    graded against this same manifest) was never graded at all. Each unit's keys
+    are graded under its own unit id, so each gets its own
+    ``data.<unit>.guard.empty_fresh`` metric and its own declared floor. A run
+    in which D46 wrote nothing under its prefix grades D46 ``empty_fresh``.
+    """
+    d46 = [(k, r) for k, r in published if k.startswith(D46_PREFIX)]
+    d16 = [(k, r) for k, r in published if not k.startswith(D46_PREFIX)]
+    source_path = "rag/pipelines/run_weekly_ingestion_recorded.py::_body"
+    run_units.grade_published_outputs(
+        ctx, "D16", d16, bucket=BUCKET, s3_client=s3, source_path=source_path,
+    )
+    run_units.grade_published_outputs(
+        ctx, "D46", d46, bucket=BUCKET, s3_client=s3, source_path=source_path,
+    )
 
 
 def _body(ctx: run_units.run_manifest.UnitRun, *, dry_run: bool, run_date: str) -> dict[str, Any]:
     since = _utcnow()
     yield_dir = str(source_yield.yield_dir(None) / f"d16-{since.strftime('%Y%m%dT%H%M%SZ')}")
     exit_code = _run_ingestion_script(dry_run, run_date, yield_dir=yield_dir)
-    published = 0 if dry_run else _record_outputs(ctx, _s3_client(), since)
+    s3 = None if dry_run else _s3_client()
+    outputs = [] if dry_run else _record_outputs(ctx, s3, since)
+    published = len(outputs)
     _record_source_yield(ctx, yield_dir)
 
     if published:
-        ctx.record_guard(
-            expectations.EMPTY_FRESH_GUARD.name,
-            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
-            verdict="ok",
-            detail=f"D16 published {published} key(s) under {', '.join(OUTPUT_PREFIXES)}",
-            value=float(ctx.rows_out),
-        )
+        _grade_published(ctx, s3, outputs)
     else:
         ctx.record_guard(
             expectations.EMPTY_FRESH_GUARD.name,
