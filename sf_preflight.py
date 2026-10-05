@@ -142,6 +142,10 @@ class PreflightContext:
     # pre-I8809 behaviour verbatim.
     calendar_date: "str | None" = None
     skip_flags: dict = field(default_factory=dict)
+    # The execution input's ``mode`` (e.g. ``backtest-eval``), when the caller
+    # has it. Read only by check_skip_flag_artifact_coherence, to honour the
+    # SF's own mode-keyed bypass of the weights-freshness proof.
+    mode: "str | None" = None
     fresh_constituents: "set[str] | None" = None  # populated by check_constituents_fetch
     arctic_universe_symbols: "set[str] | None" = None  # populated by check_arctic_connectivity
     polygon_returned_tickers: "set[str] | None" = None  # populated by check_polygon_grouped_coverage
@@ -1535,6 +1539,13 @@ class SkipArtifactPredicate:
     kind: str          # "last_modified_gte_calendar_date" | "key_exists"
     sf_guard: str      # the in-SF state that owns the authoritative check
     note: str = ""
+    # The SF's OWN routes around ``sf_guard``: each entry is one Choice rule
+    # (an AND of ``(input_key, required_value)`` pairs, the claimed flag
+    # itself implied) under which the SF sends this skip straight to its
+    # skipped terminal WITHOUT running the guard. When one holds, the SF
+    # demands no artifact, so neither may this check. Pinned rule-for-rule
+    # against the definition by tests/test_sf_preflight.py.
+    sf_bypass_rules: "tuple[tuple[tuple[str, object], ...], ...]" = ()
 
 
 # Registry. Deliberately small and evidence-backed: an entry is added only
@@ -1557,8 +1568,48 @@ SKIP_ARTIFACT_PREDICATES: "tuple[SkipArtifactPredicate, ...]" = (
             "(alpha-engine-config-I8809: the reference is the CALENDAR date, "
             "because LastModified is a wall-clock write time)"
         ),
+        # CheckSkipPredictorTraining's two rules that reach
+        # PredictorTrainingSkipped without ValidatePredictorSkipWeightsFresh:
+        # (1) the config#830 backtest-eval replay preset, (2) the
+        # alpha-engine-config-I11655 VACUOUS skip -- every stage that consumes
+        # the weights is skipped too, so "this cycle's training completed" is a
+        # claim nothing this run reads. Missing (2) here is what failed
+        # watch-rerun-2026-10-02-2 at WeeklyPreflightGate in 20 seconds while
+        # the SF itself would have routed it straight past the guard.
+        sf_bypass_rules=(
+            (("mode", "backtest-eval"),),
+            (
+                ("skip_backtester", True),
+                ("skip_predictor_backtest", True),
+                ("skip_portfolio_optimizer_backtest", True),
+                ("skip_parity", True),
+                ("skip_evaluator", True),
+            ),
+        ),
     ),
 )
+
+
+def _sf_bypass_rule_holding(
+    pred: SkipArtifactPredicate, ctx: "PreflightContext"
+) -> "tuple[tuple[str, object], ...] | None":
+    """The first of ``pred.sf_bypass_rules`` the execution input satisfies.
+
+    Same semantics as the SF's ``IsPresent`` + ``BooleanEquals`` /
+    ``StringEquals`` pairs: a key must be present AND equal, by type, to the
+    required value. A string ``"true"`` is not ``True`` -- the SF would not
+    route it either.
+    """
+    view = dict(ctx.skip_flags)
+    if ctx.mode is not None:
+        view["mode"] = ctx.mode
+    for rule in pred.sf_bypass_rules:
+        if all(
+            k in view and type(view[k]) is type(v) and view[k] == v
+            for k, v in rule
+        ):
+            return rule
+    return None
 
 
 def _coherence_reference(ctx: "PreflightContext") -> str:
@@ -1612,8 +1663,19 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
     s3 = _boto3.client("s3", region_name=_REGION)
     violations: list[str] = []
     verified: list[str] = []
+    bypassed: list[str] = []
 
     for pred in claimed:
+        rule = _sf_bypass_rule_holding(pred, ctx)
+        if rule is not None:
+            # The SF routes this skip around its own guard, so it demands no
+            # artifact. Demanding one here would make this gate STRICTER than
+            # the authority it copies -- and only ever on recovery reruns.
+            bypassed.append(
+                f"{pred.flag} (SF bypasses {pred.sf_guard}: "
+                + " AND ".join(f"{k}={v!r}" for k, v in rule) + ")"
+            )
+            continue
         key = pred.key.replace("{run_date}", ctx.run_date)
         try:
             head = s3.head_object(Bucket=ctx.bucket, Key=key)
@@ -1681,21 +1743,32 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
             ),
             details={
                 "run_date": ctx.run_date,
+                "calendar_date": ctx.calendar_date,
                 "violations": violations,
                 "verified": verified,
+                "bypassed": bypassed,
                 "claims_checked": len(claimed),
             },
             elapsed_seconds=time.time() - t0,
         )
 
+    parts = []
+    if verified:
+        parts.append(
+            f"{len(verified)} skip claim(s) backed by a live artifact "
+            f"({'; '.join(verified)})"
+        )
+    if bypassed:
+        parts.append(
+            f"{len(bypassed)} skip claim(s) the SF itself does not validate "
+            f"({'; '.join(bypassed)})"
+        )
     return CheckResult(
         name=name,
         status="ok",
-        message=(
-            f"run_date={ctx.run_date}: {len(verified)} skip claim(s) backed by "
-            f"a live artifact ({'; '.join(verified)})"
-        ),
-        details={"run_date": ctx.run_date, "verified": verified,
+        message=f"run_date={ctx.run_date}: " + "; ".join(parts),
+        details={"run_date": ctx.run_date, "calendar_date": ctx.calendar_date,
+                 "verified": verified, "bypassed": bypassed,
                  "claims_checked": len(claimed)},
         elapsed_seconds=time.time() - t0,
     )
@@ -2514,6 +2587,8 @@ def run_preflight(
     run_date: "str | None" = None,
     skip_flags: "dict | None" = None,
     checks: "list | None" = None,
+    calendar_date: "str | None" = None,
+    mode: "str | None" = None,
 ) -> tuple[int, list[CheckResult]]:
     """Execute the checks this environment can run. Returns (n_failures, results).
 
@@ -2527,6 +2602,10 @@ def run_preflight(
     has it (alpha-engine-config-I7443). Both default to absent so every
     existing caller — the CLI, the spot box — is unchanged and
     ``check_skip_flag_artifact_coherence`` reports "nothing claimed".
+    ``calendar_date`` and ``mode`` are the same input's wall-clock day and
+    preset: the first is what a LastModified is compared against
+    (alpha-engine-config-I8809), the second keys one of the SF's own bypasses
+    of the weights-freshness proof.
 
     ``checks`` narrows the run to a subset of ``CHECKS`` (order preserved
     as given). Default None runs every check, so every existing caller is
@@ -2544,6 +2623,7 @@ def run_preflight(
     ctx = PreflightContext(
         bucket=bucket, today=today, prior_trading_day=prior,
         run_date=run_date, skip_flags=dict(skip_flags or {}),
+        calendar_date=calendar_date, mode=mode,
     )
 
     results: list[CheckResult] = []

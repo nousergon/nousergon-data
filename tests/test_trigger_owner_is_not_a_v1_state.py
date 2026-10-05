@@ -4,8 +4,8 @@
 step-functions unit against the live surface its ``trigger.owner`` names
 (`data_gate/trigger_reconcile.py::owner_key`). Until 2026-10-03 fifteen units
 (D01-D08, D10, D11, D13-D16, D46) still named ``ne-weekly-freshness-pipeline:
-DataPhase1`` / ``:DataPhase2`` / ``:RAGIngestion`` (fourteen are relabelled
-here; D03 is registered below as pending), so the clause matched their
+DataPhase1`` / ``:DataPhase2`` / ``:RAGIngestion`` (fourteen were relabelled
+by nousergon-data-PR2033, D03 by alpha-engine-config-I11832), so the clause matched their
 declared Saturday fire against that machine's Saturday starts and read MET. But
 the decoupled cutover (alpha-engine-config-I11269, nousergon-data-PR1930)
 removed DataPhase1 from the v1 weekly definition, and the Saturday cadence
@@ -42,14 +42,12 @@ V1_MACHINES = (
 #: it. May only SHRINK: an entry whose unit no longer names a v1 state fails
 #: `test_the_pending_register_only_shrinks`.
 #:
-#: D03 is in BOTH live entries' verify_units history; nousergon-data-PR2016
-#: dropped it from the weekly check, so its graded leg is ne-data-collection-eod
-#: (alpha-engine-config-I11832, decision 2). Declaring the EOD fire (18:15 ET)
-#: needs nousergon-data-PR2030's fire-selection ceiling, exactly as D19-D32 in
-#: nousergon-data-PR2024 do, so it moves with that PR, not this one.
-PENDING_V1_STATE_OWNERS = {
-    "D03": "nousergon-data-PR2024 (EOD relabel, waits on nousergon-data-PR2030)",
-}
+#: Empty since alpha-engine-config-I11832: D03, the last entry, moved to
+#: ne-data-collection-eod (nousergon-data-PR2016 dropped it from the weekly
+#: check, so its graded leg is the EOD machine; nousergon-data-PR2030's
+#: fire-selection ceiling, which declaring the 18:15 ET fire needed, merged
+#: 2026-10-04). Adding an entry back needs an issue that moves it.
+PENDING_V1_STATE_OWNERS: dict[str, str] = {}
 
 
 def _v1_state(unit: Unit) -> str | None:

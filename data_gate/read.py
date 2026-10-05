@@ -449,8 +449,23 @@ def _board_document(
                 "required": clause.window_required,
                 "failures": list(clause.window_failures),
                 "complete": clause.window_complete,
-                "ruling": clause.ruling,
+                # The mechanism this block describes — the 2026-10-03 window.
+                # What GATED `state` is `acceptance_ruling` (the clause's own).
+                "ruling": clause_module.OBSERVATION_WINDOW_RULING,
+                "acceptance_ruling": clause.ruling,
             }
+            current = clause.current
+            if current is not None:
+                # Brian's 2026-10-04 option (c): the version-bound evidence
+                # that gated `state` above. The window block keeps the long
+                # window visible; this block says what release was graded on.
+                row["observation_window"]["current"] = {
+                    "version": current.version,
+                    "observed": current.observed,
+                    "latest": current.latest,
+                    "failures": list(current.failures),
+                    "stale": current.stale,
+                }
         if unit_id in per_unit:
             row.update(per_unit[unit_id])
         rows.append(row)
