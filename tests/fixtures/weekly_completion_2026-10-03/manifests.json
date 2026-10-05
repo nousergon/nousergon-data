@@ -1,0 +1,1162 @@
+{
+ "_source": "Every data_run_manifest.v1 under s3://alpha-engine-research/data_collection/runs/<unit>/2026-10-02/ last modified between the Sat 2026-10-03 weekly fire (ne-data-collection-weekly:ff6ac0c4, 09:00:40Z) and the end of weekly-recovery-2026-10-02-1 (13:46:24Z), read-only, 2026-10-05. Trimmed to the fields data_gate/run_manifest_predicate.py reads; reason capped at 240 chars. D34 wrote none (retired, its workload dropped).",
+ "fire": "2026-10-03T09:00:40Z",
+ "fire_execution_stopped": "2026-10-03T12:19:06Z",
+ "recovery_execution_stopped": "2026-10-03T13:46:24Z",
+ "fire_verdict_as_run": {
+  "ok": false,
+  "units_failed": [
+   "D01",
+   "D02",
+   "D05",
+   "D06",
+   "D07",
+   "D08",
+   "D10",
+   "D11"
+  ],
+  "failure_mode": "run_not_ok"
+ },
+ "manifests": [
+  {
+   "key": "data_collection/runs/D01/2026-10-02/01M40GE4VGZH6G4JTPRF7RNJKA.json",
+   "last_modified": "2026-10-03T09:10:06Z",
+   "manifest": {
+    "unit": "D01",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:10:03Z",
+    "finished": "2026-10-03T09:10:05Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/weekly/2026-10-02/constituents.json",
+      "rows_out": 904
+     },
+     {
+      "key": "market_data/latest_weekly.json",
+      "rows_out": 904
+     },
+     {
+      "key": "data/sector_map.json",
+      "rows_out": 904
+     },
+     {
+      "key": "reference/price_cache/sector_map.json",
+      "rows_out": 904
+     },
+     {
+      "key": "data/sub_industry_map.json",
+      "rows_out": 903
+     },
+     {
+      "key": "reference/price_cache/sub_industry_map.json",
+      "rows_out": 903
+     },
+     {
+      "key": "data/sub_sector_etf_map.json",
+      "rows_out": 904
+     },
+     {
+      "key": "reference/price_cache/sub_sector_etf_map.json",
+      "rows_out": 904
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D01/2026-10-02/01M40NWEFMCE0NPWV57ZKFWY13.json",
+   "last_modified": "2026-10-03T10:45:15Z",
+   "manifest": {
+    "unit": "D01",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:14Z",
+    "finished": "2026-10-03T10:45:14Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D01/2026-10-02/01M40XJVKT1V525TEZQVN3XVAK.json",
+   "last_modified": "2026-10-03T12:59:50Z",
+   "manifest": {
+    "unit": "D01",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T12:59:49Z",
+    "finished": "2026-10-03T12:59:49Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D02/2026-10-02/01M40GE6V29Y40VMRZNVDG1QNE.json",
+   "last_modified": "2026-10-03T09:10:19Z",
+   "manifest": {
+    "unit": "D02",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:10:05Z",
+    "finished": "2026-10-03T09:10:18Z",
+    "status": "failed",
+    "reason": "_DegradedRun: historical_constituents produced a DEGRADED artifact: historical_constituents: 1 unexplained reference disagreement(s): ['observed added VYLR not in reference'] (unresolved swaps: [\"2026-04-11: out=['HOLX'] in=['CASY']\", \"2026",
+    "outputs": [
+     {
+      "key": "market_data/historical_constituents.json",
+      "rows_out": 813
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D02/2026-10-02/01M40NWESNCM00HFH23GK8MMK8.json",
+   "last_modified": "2026-10-03T10:45:16Z",
+   "manifest": {
+    "unit": "D02",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:15Z",
+    "finished": "2026-10-03T10:45:15Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D02/2026-10-02/01M40XJVVJXPK39ZT2GX05P8EV.json",
+   "last_modified": "2026-10-03T13:00:02Z",
+   "manifest": {
+    "unit": "D02",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T12:59:49Z",
+    "finished": "2026-10-03T13:00:01Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/historical_constituents.json",
+      "rows_out": 813
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D03/2026-10-02/01M40GEM4GGDQ3G35QWT6ZBYV8.json",
+   "last_modified": "2026-10-03T09:10:20Z",
+   "manifest": {
+    "unit": "D03",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:10:19Z",
+    "finished": "2026-10-03T09:10:19Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "reference/price_cache/VYLR.parquet",
+      "rows_out": 2
+     }
+    ],
+    "guards": [
+     {
+      "guard": "bar_settlement",
+      "verdict": "settled"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D03/2026-10-02/01M40NWF23TRSHVJ6EQ308S72Z.json",
+   "last_modified": "2026-10-03T10:45:17Z",
+   "manifest": {
+    "unit": "D03",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:15Z",
+    "finished": "2026-10-03T10:45:16Z",
+    "status": "failed",
+    "reason": "EmptyProduction: D03 published nothing on this run and does not declare empty_is_valid: phase 'prices' reported status='ok' and recorded no published output",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_success_without_output",
+      "verdict": "empty_fresh"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D03/2026-10-02/01M40XK7PT2KH53TMHFVMS23W2.json",
+   "last_modified": "2026-10-03T13:00:03Z",
+   "manifest": {
+    "unit": "D03",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:01Z",
+    "finished": "2026-10-03T13:00:02Z",
+    "status": "failed",
+    "reason": "EmptyProduction: D03 published nothing on this run and does not declare empty_is_valid: phase 'prices' reported status='ok' and recorded no published output",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_success_without_output",
+      "verdict": "empty_fresh"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D04/2026-10-02/01M40GEN0BMHJEYMQK75J74VG5.json",
+   "last_modified": "2026-10-03T09:10:22Z",
+   "manifest": {
+    "unit": "D04",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:10:19Z",
+    "finished": "2026-10-03T09:10:21Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "reference/price_cache/TWO.parquet",
+      "rows_out": 2504
+     },
+     {
+      "key": "reference/price_cache/HYOAS.parquet",
+      "rows_out": 786
+     },
+     {
+      "key": "reference/price_cache/BAA10Y.parquet",
+      "rows_out": 2499
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D04/2026-10-02/01M40NWG06D0JH8Y8J696R9CZH.json",
+   "last_modified": "2026-10-03T10:45:18Z",
+   "manifest": {
+    "unit": "D04",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:16Z",
+    "finished": "2026-10-03T10:45:17Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "reference/price_cache/TWO.parquet",
+      "rows_out": 2504
+     },
+     {
+      "key": "reference/price_cache/HYOAS.parquet",
+      "rows_out": 786
+     },
+     {
+      "key": "reference/price_cache/BAA10Y.parquet",
+      "rows_out": 2499
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D04/2026-10-02/01M40XK8MMXRC7TRS4CCRM1V0S.json",
+   "last_modified": "2026-10-03T13:00:18Z",
+   "manifest": {
+    "unit": "D04",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:02Z",
+    "finished": "2026-10-03T13:00:17Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "reference/price_cache/TWO.parquet",
+      "rows_out": 2504
+     },
+     {
+      "key": "reference/price_cache/HYOAS.parquet",
+      "rows_out": 786
+     },
+     {
+      "key": "reference/price_cache/BAA10Y.parquet",
+      "rows_out": 2499
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D05/2026-10-02/01M40GEPAQM6RW5FHW62QXD2H0.json",
+   "last_modified": "2026-10-03T09:13:16Z",
+   "manifest": {
+    "unit": "D05",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:10:21Z",
+    "finished": "2026-10-03T09:13:15Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/weekly/2026-10-02/macro.json",
+      "rows_out": 18
+     },
+     {
+      "key": "market_data/macro_history.parquet",
+      "rows_out": 30604
+     },
+     {
+      "key": "market_data/macro_release_calendar.parquet",
+      "rows_out": 23
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D05/2026-10-02/01M40NWHACHN8P90SYRRR5YJRM.json",
+   "last_modified": "2026-10-03T10:45:18Z",
+   "manifest": {
+    "unit": "D05",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:17Z",
+    "finished": "2026-10-03T10:45:17Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D05/2026-10-02/01M40XKQM7HAEBBM1J5XPSKKC2.json",
+   "last_modified": "2026-10-03T13:00:18Z",
+   "manifest": {
+    "unit": "D05",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:17Z",
+    "finished": "2026-10-03T13:00:17Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D06/2026-10-02/01M40GM0RQKKP16FY9EB9JM4GJ.json",
+   "last_modified": "2026-10-03T09:21:37Z",
+   "manifest": {
+    "unit": "D06",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:13:15Z",
+    "finished": "2026-10-03T09:21:36Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/weekly/2026-10-02/short_interest.json",
+      "rows_out": 902
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D06/2026-10-02/01M40NWHCWA1QWGGE0BMVPZXG1.json",
+   "last_modified": "2026-10-03T10:45:18Z",
+   "manifest": {
+    "unit": "D06",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:17Z",
+    "finished": "2026-10-03T10:45:17Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D06/2026-10-02/01M40XKQPEWNH4VCT71K38RR69.json",
+   "last_modified": "2026-10-03T13:00:19Z",
+   "manifest": {
+    "unit": "D06",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:17Z",
+    "finished": "2026-10-03T13:00:18Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D07/2026-10-02/01M40H39CB6EJ8JTJDNGNG6XF4.json",
+   "last_modified": "2026-10-03T09:29:58Z",
+   "manifest": {
+    "unit": "D07",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:21:36Z",
+    "finished": "2026-10-03T09:29:57Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/universe_classification/2026-10-02.json",
+      "rows_out": 903
+     },
+     {
+      "key": "market_data/universe_classification/latest.json",
+      "rows_out": 903
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D07/2026-10-02/01M40NWHHRCJY976X0YXA7Z16T.json",
+   "last_modified": "2026-10-03T10:45:19Z",
+   "manifest": {
+    "unit": "D07",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:18Z",
+    "finished": "2026-10-03T10:45:18Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D07/2026-10-02/01M40XKQSTSB1VAY7MS9CBWSA3.json",
+   "last_modified": "2026-10-03T13:00:19Z",
+   "manifest": {
+    "unit": "D07",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:18Z",
+    "finished": "2026-10-03T13:00:18Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D08/2026-10-02/01M40HJM8RPCBZ4FF2B7Q3M0A0.json",
+   "last_modified": "2026-10-03T09:35:08Z",
+   "manifest": {
+    "unit": "D08",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:29:58Z",
+    "finished": "2026-10-03T09:35:07Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "research.db",
+      "rows_out": 125575
+     },
+     {
+      "key": "backups/research_2026-10-02.db",
+      "rows_out": 125575
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D08/2026-10-02/01M40NWKCWRNPVQK2SXGZ3RP5G.json",
+   "last_modified": "2026-10-03T10:45:22Z",
+   "manifest": {
+    "unit": "D08",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:19Z",
+    "finished": "2026-10-03T10:45:21Z",
+    "status": "failed",
+    "reason": "EmptyProduction: D08 published nothing on this run and does not declare empty_is_valid: phase 'universe_returns' reported status='ok' and recorded no published output",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_success_without_output",
+      "verdict": "empty_fresh"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D08/2026-10-02/01M40XKSGS4J5ZZ1N81XNYPG23.json",
+   "last_modified": "2026-10-03T13:00:22Z",
+   "manifest": {
+    "unit": "D08",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:19Z",
+    "finished": "2026-10-03T13:00:21Z",
+    "status": "failed",
+    "reason": "EmptyProduction: D08 published nothing on this run and does not declare empty_is_valid: phase 'universe_returns' reported status='ok' and recorded no published output",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_success_without_output",
+      "verdict": "empty_fresh"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D10/2026-10-02/01M40HX62RHS7TM84DJHM7QCWH.json",
+   "last_modified": "2026-10-03T09:52:19Z",
+   "manifest": {
+    "unit": "D10",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:35:44Z",
+    "finished": "2026-10-03T09:52:18Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "archive/fundamentals/2026-10-02.json",
+      "rows_out": 903
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D10/2026-10-02/01M40NXP0WXA9750PNXV4HX5QA.json",
+   "last_modified": "2026-10-03T10:45:56Z",
+   "manifest": {
+    "unit": "D10",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:55Z",
+    "finished": "2026-10-03T10:45:55Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D10/2026-10-02/01M40XMX1NK5VMGGDHY3V93K5K.json",
+   "last_modified": "2026-10-03T13:00:57Z",
+   "manifest": {
+    "unit": "D10",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:56Z",
+    "finished": "2026-10-03T13:00:56Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D11/2026-10-02/01M40JVGZNQVPRDTKFWAK9XE8P.json",
+   "last_modified": "2026-10-03T09:55:19Z",
+   "manifest": {
+    "unit": "D11",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:52:18Z",
+    "finished": "2026-10-03T09:55:18Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/valuation_medians/latest.json",
+      "rows_out": 1016
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D11/2026-10-02/01M40NXP38Y5ADCK8VPF027HYN.json",
+   "last_modified": "2026-10-03T10:45:56Z",
+   "manifest": {
+    "unit": "D11",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:55Z",
+    "finished": "2026-10-03T10:45:55Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D11/2026-10-02/01M40XMX4G4CDKZFG0YF1Y6RXW.json",
+   "last_modified": "2026-10-03T13:00:57Z",
+   "manifest": {
+    "unit": "D11",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:56Z",
+    "finished": "2026-10-03T13:00:56Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D12/2026-10-02/01M40K1006ESXVCF10Y99X2Q4J.json",
+   "last_modified": "2026-10-03T09:55:19Z",
+   "manifest": {
+    "unit": "D12",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:55:18Z",
+    "finished": "2026-10-03T09:55:18Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D12/2026-10-02/01M40NXP8WZRF112721N5B0KF0.json",
+   "last_modified": "2026-10-03T10:45:56Z",
+   "manifest": {
+    "unit": "D12",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:55Z",
+    "finished": "2026-10-03T10:45:55Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D12/2026-10-02/01M40XMX9RZRZFCHSDXEZ9WQYQ.json",
+   "last_modified": "2026-10-03T13:00:57Z",
+   "manifest": {
+    "unit": "D12",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:56Z",
+    "finished": "2026-10-03T13:00:56Z",
+    "status": "not_applicable",
+    "reason": "no_new_data_declared",
+    "outputs": [],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D13/2026-10-02/01M40K1056ASB02RTR0E7YN1WH.json",
+   "last_modified": "2026-10-03T10:41:58Z",
+   "manifest": {
+    "unit": "D13",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:55:18Z",
+    "finished": "2026-10-03T10:41:57Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "arcticdb/universe",
+      "rows_out": 910
+     },
+     {
+      "key": "arcticdb/macro",
+      "rows_out": 2552
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D13/2026-10-02/01M40NXPC9D9TKKPY1RPE8KVZK.json",
+   "last_modified": "2026-10-03T11:26:55Z",
+   "manifest": {
+    "unit": "D13",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T10:45:55Z",
+    "finished": "2026-10-03T11:26:54Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "arcticdb/universe",
+      "rows_out": 910
+     },
+     {
+      "key": "arcticdb/macro",
+      "rows_out": 2552
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D13/2026-10-02/01M40XMXE9XW9B7E1PKWBGQE86.json",
+   "last_modified": "2026-10-03T13:44:51Z",
+   "manifest": {
+    "unit": "D13",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:00:56Z",
+    "finished": "2026-10-03T13:44:50Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "arcticdb/universe",
+      "rows_out": 910
+     },
+     {
+      "key": "arcticdb/macro",
+      "rows_out": 2552
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "not_applicable"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D14/2026-10-02/01M40R8XD4QCY2D49FGM0KJG5V.json",
+   "last_modified": "2026-10-03T11:27:02Z",
+   "manifest": {
+    "unit": "D14",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T11:27:00Z",
+    "finished": "2026-10-03T11:27:01Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "builders/prune_audit/2026-10-02-2026-10-03T112701Z-apply.json",
+      "rows_out": 0
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D14/2026-10-02/01M4105FYRJ7G7AE2FZ1D2J0TB.json",
+   "last_modified": "2026-10-03T13:44:58Z",
+   "manifest": {
+    "unit": "D14",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T13:44:57Z",
+    "finished": "2026-10-03T13:44:57Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "builders/prune_audit/2026-10-02-2026-10-03T134457Z-apply.json",
+      "rows_out": 0
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D15/2026-10-02/01M40REQMRE4Q9RH3AH6CADV41.json",
+   "last_modified": "2026-10-03T12:03:22Z",
+   "manifest": {
+    "unit": "D15",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T11:30:11Z",
+    "finished": "2026-10-03T12:03:21Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "market_data/weekly/2026-10-02/alternative/manifest.json",
+      "rows_out": 904
+     },
+     {
+      "key": "market_data/weekly/2026-10-02/alternative/scope.json",
+      "rows_out": 904
+     }
+    ],
+    "guards": [
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D16/2026-10-02/01M40THCM2GKRF2WGEXW9CYKKD.json",
+   "last_modified": "2026-10-03T12:17:43Z",
+   "manifest": {
+    "unit": "D16",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T12:06:35Z",
+    "finished": "2026-10-03T12:17:42Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "rag/manifest/2026-10-02.json",
+      "rows_out": 98340
+     },
+     {
+      "key": "rag/manifest/latest.json",
+      "rows_out": 98340
+     },
+     {
+      "key": "rag/filing_changes/2026-10-02.json",
+      "rows_out": 1649
+     },
+     {
+      "key": "rag/filing_changes/latest.json",
+      "rows_out": 1649
+     },
+     {
+      "key": "rag/corpus_freshness/latest.json",
+      "rows_out": 1
+     },
+     {
+      "key": "health/rag_ingestion_progress/2026-10-02.json",
+      "rows_out": 1
+     },
+     {
+      "key": "data/insider_transactions/2610031212_result.parquet",
+      "rows_out": 1
+     },
+     {
+      "key": "data/insider_transactions/latest.json",
+      "rows_out": 1
+     }
+    ],
+    "guards": [
+     {
+      "guard": "rag_source_yield",
+      "verdict": "degraded"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "ok"
+     }
+    ]
+   }
+  },
+  {
+   "key": "data_collection/runs/D17/2026-10-02/01M40G0SXNGPQGFRF4N38WH976.json",
+   "last_modified": "2026-10-03T09:06:06Z",
+   "manifest": {
+    "unit": "D17",
+    "trading_day": "2026-10-02",
+    "started": "2026-10-03T09:02:46Z",
+    "finished": "2026-10-03T09:06:05Z",
+    "status": "ok",
+    "reason": "",
+    "outputs": [
+     {
+      "key": "staging/daily_closes/2026-10-02.parquet",
+      "rows_out": 9306
+     }
+    ],
+    "guards": [
+     {
+      "guard": "bar_settlement",
+      "verdict": "settled"
+     },
+     {
+      "guard": "data_empty_fresh",
+      "verdict": "unmeasurable"
+     }
+    ]
+   }
+  }
+ ]
+}
