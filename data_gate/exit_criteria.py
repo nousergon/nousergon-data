@@ -37,11 +37,15 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 from data_gate.cadence import COMPLETION_GRACE, Cadence, fire_selection_moment, latest_due_fire, parse_cron
-from data_gate.descriptors import Unit
+from data_gate.descriptors import GUARD_RECORDED_NAMES, Unit
 from data_gate.evidence import (
     EMPTY_FRESH_VERDICT,
+    CurrentEvidence,
+    Observation,
     ObservationWindow,
     Reading,
+    combine_current,
+    current_evidence,
     empty_fresh_runs,
     manifests_since,
 )
@@ -382,6 +386,27 @@ def _cycle_verdict(cycles: CycleSet) -> list[tuple[Cycle, set[str], list[str]]]:
     return rows
 
 
+def cycle_version(cycle: Cycle, unit_ids: set[str] | None = None) -> str:
+    """The collector code a cycle ran: its ok scheduled manifests' ``code_sha``.
+
+    Brian's 2026-10-04 option (c) binds release evidence to the code version
+    running now (`evidence.CurrentEvidence`). `run_units.recorded_entry` stamps
+    every manifest with the box's own post-pull ``git rev-parse HEAD``
+    (`read_code_identity_delta`), so this is measured, never assumed. A cycle
+    that ran more than one tree renders every sha, joined — it is a version of
+    its own, and matches no single-tree cycle. Empty when no manifest carries
+    one, which binds only that cycle (`evidence.current_evidence`).
+    """
+    shas = {
+        str(doc.get("code_sha") or "").strip()
+        for unit_id, docs in cycle.manifests.items()
+        if unit_ids is None or unit_id in unit_ids
+        for _key, doc in docs
+        if doc.get("trigger") == "scheduled"
+    }
+    return "+".join(sorted(sha for sha in shas if sha))
+
+
 def read_consecutive_cycles(cycles: CycleSet, *, required: int) -> Reading:
     """``required`` consecutive complete cycles, counted back from the most recent.
 
@@ -514,6 +539,14 @@ def read_code_identity_delta(cycles: CycleSet) -> Reading:
     )
 
 
+#: The empty-but-fresh guard as a manifest records it. The producer files it
+#: under its RECORDED name (`data_empty_fresh`, `descriptors.GUARD_RECORDED_NAMES`);
+#: matching only the class spelling found nothing on live manifests, so the
+#: check read NOT LIVE however often the guard ran. Both are accepted, so a
+#: fixture or an older manifest spelled by class still counts.
+_EMPTY_FRESH_NAMES = frozenset({"empty_fresh", GUARD_RECORDED_NAMES["empty_fresh"]})
+
+
 def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
     """Objective 6 at the phase-2 exit: zero empty-but-fresh writes over N cycles.
 
@@ -541,18 +574,38 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
     # recorded manifests is not: before the guard ships, no write can carry
     # its verdict, so "no offender" would be the absence of a check.
     guarded = 0
+    # Option (c) (`evidence.CurrentEvidence`), newest first like the cycles:
+    # a cycle that recorded nothing is MISSING proof, and a cycle that recorded
+    # manifests with no `empty_fresh` verdict is the guard going SILENT — both
+    # block when they are current, because silent telemetry is not a pass.
+    observations: list[Observation] = []
     for cycle in cycles.cycles:
         manifests = cycle.all_manifests()
         if manifests:
             observed += 1
-        if any(
-            str(g.get("guard") or g.get("name") or "") == "empty_fresh"
+        verdicted = any(
+            str(g.get("guard") or g.get("name") or "") in _EMPTY_FRESH_NAMES
             for doc in manifests
             for g in (doc.get("guards") or [])
-        ):
+        )
+        if verdicted:
             guarded += 1
-        for run_id in empty_fresh_runs(manifests):
-            offenders.append(f"{cycle.label}:{run_id}")
+        cycle_offenders = [f"{cycle.label}:{run_id}" for run_id in empty_fresh_runs(manifests)]
+        offenders.extend(cycle_offenders)
+        if cycle_offenders:
+            failure: str | None = f"empty-but-fresh write(s) {cycle_offenders[:4]}"
+        elif not verdicted:
+            failure = "no `empty_fresh` guard verdict recorded — the guard was silent"
+        else:
+            failure = None
+        observations.append(
+            Observation(
+                label=cycle.label,
+                version=cycle_version(cycle),
+                failure=failure,
+                present=bool(manifests),
+            )
+        )
     met = observed >= required_cycles and not offenders
     detail = (
         f"{len(offenders)} empty-but-fresh write(s) (guard verdict {EMPTY_FRESH_VERDICT!r}) over "
@@ -581,6 +634,7 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
                 "the guard has produced no reading, so no write has been checked"
             ),
             unit="cycle(s)",
+            current=current_evidence(observations),
         ),
     )
 
@@ -629,12 +683,41 @@ def read_vendor_divergence_emitted(
     # not yet built, which is the part of the window the ruling forgives.
     not_live: list[str] = []
     window_failures: list[str] = []
+    # Option (c) (`evidence.CurrentEvidence`): per graded schedule, its newest
+    # cycle and the ones before it that ran the same collector code. A silent
+    # or blind current cycle blocks; one before the current version does not.
+    current_parts: list[tuple[str, CurrentEvidence]] = []
     for cycles in cycle_sets:
         vendors = [u for u in cycles.units if VENDOR_GUARD in u.guards]
         if not vendors:
             continue
         graded.extend(f"{u.unit_id}@{cycles.schedule}" for u in vendors)
         total += len(cycles.cycles)
+        vendor_ids = {u.unit_id for u in vendors}
+        observations: list[Observation] = []
+        for cycle in cycles.cycles:  # newest first
+            docs = [d for uid in vendor_ids for _k, d in cycle.manifests.get(uid, [])]
+            verdicts = [
+                str(g.get("verdict"))
+                for d in docs
+                for g in (d.get("guards") or [])
+                if str(g.get("guard") or g.get("name") or "") == VENDOR_GUARD
+            ]
+            if not verdicts:
+                failure: str | None = "no verdict"
+            elif any(v == "unmeasurable" for v in verdicts):
+                failure = "verdict unmeasurable"
+            else:
+                failure = None
+            observations.append(
+                Observation(
+                    label=cycle.label,
+                    version=cycle_version(cycle, vendor_ids),
+                    failure=failure,
+                    present=bool(docs),
+                )
+            )
+        current_parts.append((cycles.schedule, current_evidence(observations)))
         # Oldest first, so "after the first emitted verdict" is a walk forward.
         went_live = False
         for cycle in sorted(cycles.cycles, key=lambda c: c.fire):
@@ -704,6 +787,7 @@ def read_vendor_divergence_emitted(
                 else f"no {VENDOR_GUARD} verdict has been emitted yet on {sorted(not_live)}"
             ),
             unit="cycle(s)",
+            current=combine_current(current_parts),
         ),
     )
 
@@ -848,7 +932,7 @@ def read_vendor_divergence_daily(
 
 
 def read_eod_universe_covered(
-    store: GateStore, *, trading_day: dt.date, days: int
+    store: GateStore, *, trading_day: dt.date, days: int, due_day: dt.date | None = None
 ) -> Reading:
     """Full EOD universe coverage on ``days`` CONSECUTIVE trading days.
 
@@ -858,6 +942,7 @@ def read_eod_universe_covered(
     breaks the streak: a missing measurement is not a passing one.
     """
     statuses: list[tuple[str, str]] = []
+    versions: dict[str, str] = {}
     day = trading_day
     for _ in range(days):
         key = f"metrics/eod_completeness/{day.isoformat()}.json"
@@ -873,7 +958,9 @@ def read_eod_universe_covered(
         if read.absent:
             statuses.append((day.isoformat(), "ABSENT"))
         else:
-            statuses.append((day.isoformat(), str((read.document or {}).get("status") or "?")))
+            document = read.document or {}
+            statuses.append((day.isoformat(), str(document.get("status") or "?")))
+            versions[day.isoformat()] = str(document.get("code_sha") or "")
         day = subtract_trading_days(day, 1)
     streak = 0
     for _day, status in statuses:
@@ -915,6 +1002,30 @@ def read_eod_universe_covered(
                 f"{trading_day.isoformat()} — the completeness guard has produced no reading"
             ),
             unit="trading day(s)",
+            # Option (c): the newest trading day's record is the current
+            # evidence (plus older days that carry the same `code_sha`, when the
+            # MetricRecord carries one). A newest day with no record is missing
+            # proof, never a pass.
+            # ``due_day`` (`evidence.completeness_due_day`): a newer day whose
+            # EOD run is not yet due and has no record is not missing proof —
+            # it is skipped, exactly as `read_completeness_metric` skips it. A
+            # record that already exists is always graded.
+            current=current_evidence(
+                [
+                    Observation(
+                        label=day_iso,
+                        version=versions.get(day_iso, ""),
+                        failure=None if status == "GREEN" else status,
+                        present=status != "ABSENT",
+                    )
+                    for day_iso, status in statuses
+                    if not (
+                        status == "ABSENT"
+                        and due_day is not None
+                        and dt.date.fromisoformat(day_iso) > due_day
+                    )
+                ]
+            ),
         ),
     )
 

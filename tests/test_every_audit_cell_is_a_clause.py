@@ -196,6 +196,11 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 # v2 phase 4's irreversible v1-pipeline deletion — a
                 # data-phase exit precondition, not a per-unit audit cell.
                 "data.standing.",
+                # Brian's 2026-10-04 option (c) (alpha-engine-config-I11973):
+                # one row per STAGED guard grading the phase-2 exit's
+                # "enforcing" half (`data_gate/guard_promotion.py`) — a fleet
+                # guard's promotion, not a per-unit audit cell.
+                "data.guard_promotion.",
             )
         )
         and not name.endswith(".completeness")
