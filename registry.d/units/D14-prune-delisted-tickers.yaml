@@ -59,12 +59,18 @@ consumers_decision:
 contract:
   schema: contracts/arctic_universe.schema.json
   producer_test: tests/test_p07_contracts.py
-  consumer_pins:
-    - repo: "crucible"
-      path: "tests/contracts/arctic_universe.schema.json"
-      pins: "body_schema"
-      producer: "contracts/arctic_universe.schema.json"
-      read_site: "crucible/data/sources.py::ArcticPriceSource.load_panel"
+  consumer_pins: []
+  # No crucible pin (alpha-engine-config-I10933 / I10873, 2026-10-05). It used to
+  # pin `crucible:tests/contracts/arctic_universe.schema.json` with read site
+  # `crucible/data/sources.py::ArcticPriceSource.load_panel`, carried over from
+  # P-07 (#1711). That reader opens the `universe` library, which D13/D18/D32/
+  # D35/D42/D43/D47 write and pin. It never opens `delisted_history`, the
+  # library this unit publishes. No file in crucible, crucible-executor,
+  # crucible-trader, crucible-backtester, crucible-dashboard, crucible-research,
+  # crucible-evaluator, metron or nousergon-console names `delisted_history`.
+  # The schema above still describes the body, because a retained frame is the
+  # universe frame copied verbatim. Re-add a consumer here, as a structured pin,
+  # in the same change that deletes `consumers_decision`.
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D14
 detectors: []

@@ -28,9 +28,20 @@ owner: brian
 code_path: "collectors/prices.py:76"
 trigger:
   kind: "step-functions"
-  owner: "ne-weekly-freshness-pipeline:DataPhase1"
-  successor: "ne-data-collection-weekly (nousergon-data-PR1701, DISABLED)"
-  schedule: "Sat 05:00 America/New_York"
+  # alpha-engine-config-I11832, decision 2. Since the decoupled data cutover
+  # (alpha-engine-config-I11269) D03 is verified by the standalone EOD machine,
+  # started at 18:15 ET by the Scheduler entry below
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule,
+  # verify_units). The weekly machine still RUNS the prices workload, but
+  # nousergon-data-PR2016 dropped D03 from its verify_units: on a Saturday the
+  # Friday EOD run has already refreshed every ticker, so the weekly leg
+  # legitimately publishes nothing and is not what this unit is graded on.
+  # ne-weekly-freshness-pipeline no longer runs it either (DataPhase1 was
+  # removed from that definition by the same cutover).
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (nousergon-data-PR1701), ENABLED at the decoupled cutover (alpha-engine-config-I11269); v1 was ne-weekly-freshness-pipeline:DataPhase1"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
 writes:
   # alpha-engine-config-I10895: corrected from the retired "predictor/price_cache/*.parquet"

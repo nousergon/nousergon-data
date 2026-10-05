@@ -162,14 +162,16 @@ def test_the_guard_ships_in_observe_mode_with_a_promotion_criterion():
     refused every write the then-16:45 ET schedule made — i.e. halted EOD
     collection instead of measuring it. The schedule has since moved to the
     settlement hour, which is the FIRST of the three promotion conditions; the
-    other two (10 clean cycles, and I11356's 3-day sample) are still open, so
-    the guard stays in observe."""
+    other two (the codified per-guard criterion that replaced the ten-run count
+    under Brian's 2026-10-04 option (c), and I11356's 3-day sample) are still
+    open, so the guard stays in observe."""
     guard = dates.BAR_SETTLEMENT_GUARD
     assert guard.name == "bar_settlement"
     assert guard.mode.value == "observe"
     assert not guard.enforcing
     assert guard.tracked_issue == "alpha-engine-config-I11354"
     assert "18:15" in guard.promotion_criterion
+    assert "data_gate/guard_promotion.py" in guard.promotion_criterion
 
 
 def test_the_guard_entry_is_shaped_for_record_collector_guards():
