@@ -527,6 +527,301 @@ def test_the_merge_drops_an_after_scope_stage_the_incumbent_recorded():
 
 
 # ---------------------------------------------------------------------------
+# alpha-engine-config-I11984 — the cadence branch the run actually took
+# ---------------------------------------------------------------------------
+#
+# Three more verbatim captures, trimmed to the events the derivation reads
+# (state names, ``previousEventId``, failure-event error names) and cut at the
+# ``RunScope`` ``TaskStateEntered`` event, each paired with the definition its
+# execution ran against (``describe-state-machine-for-execution``, Comments
+# stripped):
+#
+# ``*_2026-10-03_first_saturday``  ``watch-rerun-2026-10-02-1``. CheckMonthlyCadence
+#     routed to EvalJudgeSubmitFirstSaturday; the spot graded 96/96 and
+#     CheckEvalJudgeProcessStatus saw Success. The stored row said
+#     ``EvalJudgeSubmitWeekly`` / ENABLED_FAILED / "never entered".
+# ``*_2026-09-26_weekly``  the scheduled 2026-09-26 run: the weekly branch, sync
+#     submit (``processing_status=ended_sync``), spot grading, clean.
+# ``*_2026-08-29_eval_judge_failed``  the scheduled 2026-08-29 run: Submit
+#     SUCCEEDED returning ``status=ERROR`` (credit balance) and the branch
+#     routed to MarkEvalJudgeDegraded (alpha-engine-config-I9636). The old
+#     derivation read the Submit Task's clean exit and graded it COMPLETED.
+
+_CYCLE_FIXTURES = {
+    "first_saturday": "2026-10-03_first_saturday",
+    "weekly": "2026-09-26_weekly",
+    "genuine_failure": "2026-08-29_eval_judge_failed",
+}
+
+
+@pytest.fixture(scope="module")
+def cycle_scopes():
+    return {
+        key: build_run_scope(
+            _load(f"definition_{tag}.json.gz"),
+            _load(f"history_{tag}_at_run_scope.json.gz"),
+            run_date=tag[:10],
+        )
+        for key, tag in _CYCLE_FIXTURES.items()
+    }
+
+
+def test_the_first_saturday_judge_run_is_completed_on_its_own_branch(cycle_scopes):
+    """The I11984 close condition: ENABLED_COMPLETED with correct entry
+    provenance, read off the branch the run took."""
+    row = cycle_scopes["first_saturday"]["stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_COMPLETED
+    assert row["entry_state"] == "EvalJudgeSubmitFirstSaturday"
+    assert row["entry_state_source"] == "execution_history"
+    assert row["entry_route"] == [{
+        "choice": "CheckMonthlyCadence",
+        "taken": "EvalJudgeSubmitFirstSaturday",
+        "definition_default": "EvalJudgeSubmitWeekly",
+        "source": "execution_history",
+    }]
+    assert row["completion_witness"]["rejoined_at"] == "CheckSkipRationaleClustering"
+    assert "never entered" not in row["reason"]
+
+
+def test_the_first_saturday_cycle_as_a_whole(cycle_scopes):
+    """Nothing else on that run moved: the one ENABLED_FAILED was EvalJudge."""
+    assert cycle_scopes["first_saturday"]["counts"] == {
+        DISABLED: 8, ENABLED_COMPLETED: 19, ENABLED_FAILED: 0, NOT_REACHED: 0,
+    }
+
+
+def test_the_weekly_judge_run_is_completed_on_the_weekly_branch(cycle_scopes):
+    row = cycle_scopes["weekly"]["stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_COMPLETED
+    assert row["entry_state"] == "EvalJudgeSubmitWeekly"
+    assert row["entry_route"][0]["taken"] == "EvalJudgeSubmitWeekly"
+    assert row["entry_route"][0]["source"] == "execution_history"
+    assert cycle_scopes["weekly"]["counts"][ENABLED_FAILED] == 0
+
+
+def test_a_genuine_judge_failure_is_still_a_failure(cycle_scopes):
+    """Following the observed branch must not turn into reading the Submit
+    Task's exit as the stage's result: on 2026-08-29 that exit was clean and
+    the judge graded nothing."""
+    row = cycle_scopes["genuine_failure"]["stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_FAILED
+    assert row["entry_state"] == "EvalJudgeSubmitWeekly"
+    assert row["failed_state"] == "MarkEvalJudgeDegraded"
+    assert "EvalJudge" in cycle_scopes["genuine_failure"]["graded_stages"]
+
+
+def test_work_entry_follows_the_observed_cadence_choice():
+    definition = _load("definition_2026-10-03_first_saturday.json.gz")
+    history = _load("history_2026-10-03_first_saturday_at_run_scope.json.gz")
+    assert work_entry(definition, "ComputeEvalCadence") == ("EvalJudgeSubmitWeekly", [])
+    assert work_entry(definition, "ComputeEvalCadence", history) == (
+        "EvalJudgeSubmitFirstSaturday", [],
+    )
+
+
+# Synthetic histories over the DEPLOYING definition, for the branch shapes no
+# captured run has exercised yet. Every path is checked edge-by-edge against
+# the definition first, so a fixture cannot describe a run the machine could
+# not have made.
+
+_SUBMIT = {
+    "weekly": "EvalJudgeSubmitWeekly",
+    "first_saturday": "EvalJudgeSubmitFirstSaturday",
+}
+_INTO_JUDGE = ["CheckSkipEvalJudge", "ComputeEvalCadence", "CheckMonthlyCadence"]
+_POLL_ONCE = [
+    "WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus",
+    "EvalJudgeProcessWait", "EvalJudgeProcessPollWait",
+    "MergeEvalJudgeProcessPollCount",
+]
+_SPOT_UP = [
+    "PrepareEvalJudgeSpotDispatch", "DispatchEvalJudgeSpot",
+    "MergeEvalJudgeSpotInstanceId", "InitEvalJudgeSpotBootstrapPollCount",
+    "WaitForEvalJudgeSpotBootstrap", "CheckEvalJudgeSpotBootstrapStatus",
+    "EvalJudgeProcess", "InitEvalJudgeProcessPollCount",
+]
+_REJOIN = ["EvalRollingMean", "CheckSkipRationaleClustering"]
+_PROCESS_SUCCESS = ["WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus"]
+
+
+def _judge_path(cadence: str, shape: str) -> tuple[list[str], dict, bool]:
+    """(states in order, {state: error raised before its exit}, run died)."""
+    submit = _SUBMIT[cadence]
+    head = [*_INTO_JUDGE, submit]
+    if shape == "sync_spot":        # processing_status=ended_sync
+        return [*head, "EvalJudgeSubmitOutcome", *_SPOT_UP,
+                *_POLL_ONCE, *_PROCESS_SUCCESS, *_REJOIN], {}, False
+    if shape == "async_spot":       # status=OK, a long process poll
+        return [*head, "EvalJudgeSubmitOutcome", *_SPOT_UP,
+                *_POLL_ONCE * 4, *_PROCESS_SUCCESS, *_REJOIN], {}, False
+    if shape == "sync_empty_plan":  # status=EMPTY: nothing to grade, no spot
+        return [*head, "EvalJudgeSubmitOutcome", "EvalJudgeEmptyPlan",
+                *_REJOIN], {}, False
+    if shape == "relaunched":       # spot terminated, relaunched, then Success
+        return [*head, "EvalJudgeSubmitOutcome", *_SPOT_UP, *_POLL_ONCE,
+                "WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus",
+                "EvalJudgeProcessLivenessGate", "EvalJudgeSpotRelaunch",
+                *_SPOT_UP[1:], *_PROCESS_SUCCESS, *_REJOIN], {}, False
+    if shape == "submit_raised":
+        return [*head, f"Extract{submit}Error", "MarkEvalJudgeDegraded",
+                *_REJOIN], {submit: "Lambda.Unknown"}, False
+    if shape == "submit_returned_error":
+        return [*head, "EvalJudgeSubmitOutcome",
+                "ExtractEvalJudgeSubmitOutcomeError", "MarkEvalJudgeDegraded",
+                *_REJOIN], {}, False
+    if shape == "process_failed":   # SSM Status=Failed, no relaunch left
+        return [*head, "EvalJudgeSubmitOutcome", *_SPOT_UP, *_POLL_ONCE,
+                "WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus",
+                "EvalJudgeProcessLivenessGate", "ExtractEvalJudgeProcessError",
+                "MarkEvalJudgeDegraded", *_REJOIN], {}, False
+    if shape == "died_mid_process":
+        return [*head, "EvalJudgeSubmitOutcome", *_SPOT_UP, *_POLL_ONCE,
+                "WaitForEvalJudgeProcess"], {}, True
+    raise ValueError(shape)
+
+
+def _edges(body: dict) -> set:
+    out = {body.get("Next"), body.get("Default")}
+    out |= {c.get("Next") for c in body.get("Choices", []) or []}
+    out |= {c.get("Next") for c in body.get("Catch", []) or []}
+    return out - {None}
+
+
+def _history_for(definition: dict, path: list[str], raised: dict, died: bool):
+    from run_scope import flatten_states
+
+    states = flatten_states(definition["States"])
+    for here, there in zip(path, path[1:]):
+        assert there in _edges(states[here]), f"{here} has no edge to {there}"
+    events, prev, next_id = [], 0, 1
+    for i, name in enumerate(path):
+        kind = states[name]["Type"]
+        events.append(_ev(next_id, prev, f"{kind}StateEntered", name))
+        prev, next_id = next_id, next_id + 1
+        if died and i == len(path) - 1:
+            events.append(_ev(next_id, prev, "ExecutionFailed",
+                              executionFailedEventDetails={"error": "States.Timeout"}))
+            break
+        if name in raised:
+            events.append(_ev(next_id, prev, "TaskFailed",
+                              taskFailedEventDetails={"error": raised[name]}))
+            prev, next_id = next_id, next_id + 1
+        events.append(_ev(next_id, prev, f"{kind}StateExited", name))
+        prev, next_id = next_id, next_id + 1
+    return events
+
+
+@pytest.mark.parametrize("cadence", sorted(_SUBMIT))
+@pytest.mark.parametrize("shape", [
+    "sync_spot", "async_spot", "sync_empty_plan", "relaunched",
+])
+def test_every_clean_judge_branch_is_completed(repo_definition, cadence, shape):
+    history = _history_for(repo_definition, *_judge_path(cadence, shape))
+    row = build_run_scope(repo_definition, history, run_date="2026-10-02")[
+        "stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_COMPLETED, row["reason"]
+    assert row["entry_state"] == _SUBMIT[cadence]
+    assert row["entry_route"][0]["taken"] == _SUBMIT[cadence]
+    assert row["entry_route"][0]["source"] == "execution_history"
+    assert row["completion_witness"]["rejoined_at"] == "CheckSkipRationaleClustering"
+
+
+@pytest.mark.parametrize("cadence", sorted(_SUBMIT))
+@pytest.mark.parametrize("shape, failed_state", [
+    ("submit_raised", None),
+    ("submit_returned_error", "ExtractEvalJudgeSubmitOutcomeError"),
+    ("process_failed", "ExtractEvalJudgeProcessError"),
+    ("died_mid_process", "WaitForEvalJudgeProcess"),
+])
+def test_every_genuine_judge_failure_is_failed_on_either_cadence(
+    repo_definition, cadence, shape, failed_state
+):
+    """The other half of the close condition. The first three each leave the
+    Submit Task with a CLEAN exit on the sync path, which is exactly what the
+    old derivation read as completion."""
+    history = _history_for(repo_definition, *_judge_path(cadence, shape))
+    row = build_run_scope(repo_definition, history, run_date="2026-10-02")[
+        "stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_FAILED, row["reason"]
+    assert row["entry_state"] == _SUBMIT[cadence]
+    assert row["failed_state"] == (failed_state or _SUBMIT[cadence])
+    if shape == "submit_raised":
+        assert row["caught_error"] == "Lambda.Unknown"
+
+
+def test_a_skipped_judge_keeps_its_skip_attribution(repo_definition):
+    """Following the observed route must not touch a skip: the gate's own
+    flag is named, and the entry state is labelled as the definition's
+    Default rather than as something the run did."""
+    history = _history_for(
+        repo_definition, ["CheckSkipEvalJudge", "CheckSkipRationaleClustering"],
+        {}, False,
+    )
+    row = build_run_scope(repo_definition, history, run_date="2026-10-02")[
+        "stages"]["EvalJudge"]
+    assert row["disposition"] == DISABLED
+    assert row["disabled_by"] == "skip_eval_judge"
+    assert row["entry_state_source"] == "definition_default"
+
+
+def test_the_completion_witness_is_local_to_the_selected_branch(repo_definition):
+    """A run that went on to a later stage proves nothing about this one: the
+    judge died mid-poll, and a later gate's exit must not complete it."""
+    history = _history_for(
+        repo_definition, *_judge_path("first_saturday", "died_mid_process"),
+    )
+    # Drop the ExecutionFailed: the run carries on elsewhere (another branch,
+    # a relaunch hub) while the judge's own poll state was entered and never
+    # exited.
+    assert history.pop()["type"] == "ExecutionFailed"
+    last = history[-1]["id"]
+    history += [
+        _ev(last + 1, 0, "ChoiceStateEntered", "CheckSkipRationaleClustering"),
+        _ev(last + 2, last + 1, "ChoiceStateExited", "CheckSkipRationaleClustering"),
+    ]
+    row = build_run_scope(repo_definition, history, run_date="2026-10-02")[
+        "stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_FAILED
+    assert row["failed_state"] == "WaitForEvalJudgeProcess"
+
+
+def test_a_stored_wrong_branch_row_is_replaced_by_the_corrected_derivation(
+    cycle_scopes,
+):
+    """The sweep path for rows already written (backtest/2026-10-02): the
+    corrected row outranks the stored ENABLED_FAILED under the existing merge
+    rule, so re-deriving and merging through ``merge_run_scopes`` corrects it
+    without a special case."""
+    incumbent = {
+        "run_date": "2026-10-02", "execution_arn": "arn:stored",
+        "stages": {"EvalJudge": {
+            "disposition": ENABLED_FAILED,
+            "entry_state": "EvalJudgeSubmitWeekly",
+            "reason": "CheckSkipEvalJudge took its default branch but "
+                      "EvalJudgeSubmitWeekly was never entered",
+        }},
+    }
+    merged, _ = merge_run_scopes(
+        incumbent, json.loads(json.dumps(cycle_scopes["first_saturday"])),
+    )
+    row = merged["stages"]["EvalJudge"]
+    assert row["disposition"] == ENABLED_COMPLETED
+    assert row["entry_state"] == "EvalJudgeSubmitFirstSaturday"
+
+
+def test_an_init_flag_writing_degraded_false_is_not_a_failure():
+    from run_scope import records_error
+
+    assert not records_error({"Type": "Pass", "ResultPath": "$.research_degraded_local",
+                              "Result": {"degraded": False, "routes": ""}})
+    assert records_error({"Type": "Pass", "ResultPath": "$.research_degraded_local",
+                          "Parameters": {"degraded": True, "routes.$": "$.x"}})
+    assert records_error({"Type": "Pass", "ResultPath": "$.eval_judge_error"})
+    assert records_error({"Type": "Fail"})
+    assert not records_error({"Type": "Task", "ResultPath": "$.eval_judge_error"})
+
+
+# ---------------------------------------------------------------------------
 # The handler — its failure posture, which is the part that can hurt
 # ---------------------------------------------------------------------------
 
