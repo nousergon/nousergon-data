@@ -261,6 +261,10 @@ MODE_UNITS: dict[str, str] = {
     "daily_heal": "D33",
     "chronic_gap_heal": "D34",
     "daily_arctic_append": "D32",
+    # alpha-engine-config-I12023 (Crucible v2 ruling 6024224623 §2): the
+    # morning rebuild of features/{D-1} from the settled bar
+    # (features/settled_regrade.py). Shares D31's feature keys.
+    "features_settled_regrade": "D50",
 }
 
 
@@ -282,12 +286,18 @@ class ModeRows:
         counts_list: ``rows_key`` names a list whose LENGTH is the count (the
             two heal units report healed items, not a number).
         rejected_keys: ``(key, reason)`` pairs in that same dict.
+        library_ref: The ArcticDB library the count is recorded against as an
+            output (``arcticdb/universe`` for the appends and heals). ``None``
+            for a unit that writes no library: its S3 keys are recorded one by
+            one from its own result instead, and a library output it never
+            wrote would be a false publish claim.
     """
 
     collector: str
     rows_key: str
     counts_list: bool = False
     rejected_keys: tuple[tuple[str, str], ...] = ()
+    library_ref: str | None = "arcticdb/universe"
 
 
 #: mode -> where that mode's row count lives. A mode in :data:`MODE_UNITS` with
@@ -304,6 +314,10 @@ MODE_ROWS: dict[str, ModeRows] = {
     # The two heal units publish DAYS and TICKERS respectively, as lists.
     "daily_heal": ModeRows("universe_gap_heal", "healed_days", counts_list=True),
     "chronic_gap_heal": ModeRows("chronic_gap_self_heal", "healed", counts_list=True),
+    # D50 publishes S3 keys only: `tickers_computed` is the row count of the
+    # rebuilt snapshot (features.compute.FeatureBuild.n_ok), the same key D31's
+    # PhaseUnit reads.
+    "features_settled_regrade": ModeRows("features", "tickers_computed", library_ref=None),
 }
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase

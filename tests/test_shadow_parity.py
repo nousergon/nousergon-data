@@ -1427,3 +1427,20 @@ def test_cutover_gate_reads_unsettled_prior_day_as_unmet():
     reading = ev.read_parity(store, trading_day=TRADING_DAY)
     assert reading.met is False
     assert "prior_day_settled.unsettled=1" in reading.detail
+
+
+def test_d50_rebuild_shares_d31_features_prefix_and_adds_its_marker_row():
+    """D50 rewrites D31's features/{date}/ parquet keys in place
+    (`writes_shared_with: [D31]`, alpha-engine-config-I12023), so the parquet
+    half is ONE comparison attributed to both units, never a second row that
+    double-counts the same bytes. Its settlement.json marker is its own key."""
+    targets = parity.expand_writes(load_units(), TRADING_DAY)
+    day = TRADING_DAY.isoformat()
+    prefix = [t for t in targets if t.kind == "prefix" and t.value == f"features/{day}/"]
+    assert len(prefix) == 1
+    assert set(prefix[0].unit_id.split(",")) == {"D31", "D50"}
+    marker = [t for t in targets if t.value == f"features/{day}/settlement.json"]
+    assert len(marker) == 1
+    assert marker[0].unit_id == "D50"
+    assert marker[0].kind == "key"
+    assert marker[0].reason == ""

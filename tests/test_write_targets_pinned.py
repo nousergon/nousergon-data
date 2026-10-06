@@ -89,6 +89,18 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
         (),
         (),
     ),
+    # alpha-engine-config-I12023. D50 rewrites D31's own feature keys from the
+    # settled bar and adds the settlement.json marker beside them. The matching
+    # ARTIFACT_REGISTRY row for the marker is a companion alpha-engine-config
+    # change named in this PR; the parquet keys are D31's existing row.
+    "D50": (
+        (
+            "features/{date}/*.parquet",
+            "features/{date}/settlement.json",
+        ),
+        (),
+        (),
+    ),
     "D03": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D04": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D05": (
