@@ -1416,6 +1416,24 @@ def _objective_reading(key: str, read: DocumentRead) -> Reading:
         )
     document = read.document or {}
     status = str(document.get("status") or "")
+    if status == PENDING_TARGET:
+        # A DECLARED state, not the undefined-status finding below: the
+        # producer measured its number but the target it grades against is
+        # not ratified yet (`data.cost.monthly` before Brian rules R6's
+        # ceiling). Shows the figure and how much of the window is measured;
+        # never MET, because there is nothing to be within.
+        return Reading(
+            met=False,
+            detail=(
+                f"{key}: status={PENDING_TARGET}, value={document.get('value')}, "
+                f"{_maturity(document)}; target not ratified yet "
+                f"(target={document.get('target')}, proposed={document.get('proposed_ceiling_usd')}), "
+                "so there is no ok/breach verdict to grade"
+            ),
+            evidence=(key,),
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
     if status not in {"ok", "breach"}:
         return Reading(
             met=False,
@@ -1436,6 +1454,26 @@ def _objective_reading(key: str, read: DocumentRead) -> Reading:
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
     )
+
+
+#: The one non-verdict status an objective document may declare: measured,
+#: target not ratified. Published by `data_gate/producers/cost_monthly.py`.
+PENDING_TARGET = "pending_target"
+
+
+def _maturity(document: dict) -> str:
+    """How much of its window an objective document has measured."""
+    parts = []
+    if "days_observed" in document:
+        parts.append(
+            f"{document.get('days_observed')} of {document.get('days_in_month', '?')} day(s) of "
+            f"{document.get('month', 'the month')} observed"
+        )
+    if "days_covered" in document:
+        parts.append(
+            f"baseline {document.get('days_covered')} of {document.get('days_requested', '?')} day(s) covered"
+        )
+    return "; ".join(parts) or "no observation counts published"
 
 
 def read_windowed_objective(
@@ -1488,7 +1526,12 @@ def read_windowed_objective(
             observed=observed,
             required=required,
             failures=(f"{key}: status=breach, value={document.get('value')}",) if status == "breach" else (),
-            not_live=f"{key} carries no ok/breach verdict yet — nothing publishes this number",
+            not_live=(
+                f"{key} publishes its number ({_maturity(document)}) but its target is not "
+                "ratified yet, so there is no ok/breach verdict"
+                if status == PENDING_TARGET
+                else f"{key} carries no ok/breach verdict yet — nothing publishes this number"
+            ),
             unit=unit,
             current=_objective_current(document) if live else None,
         ),

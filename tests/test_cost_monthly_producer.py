@@ -307,6 +307,12 @@ def test_main_writes_the_metric_document_when_cur_is_configured(monkeypatch, cap
     assert "system" not in out and "data-collection" not in out
     assert m.DEFAULT_KEY in out
     assert "days_covered=1" in out
+    # The monthly verdict rides the same document: no ceiling is ratified,
+    # so it is the declared pending state, with the month measured so far.
+    assert body["status"] == m.PENDING_TARGET
+    assert body["days_observed"] >= 1
+    assert body["target"] is None
+    assert f"month_status={m.PENDING_TARGET}" in out
 
 
 def test_stdout_never_carries_the_metric_document_or_argument_values(monkeypatch, capsys):
@@ -431,3 +437,144 @@ def test_main_reads_under_the_s3_prefix_and_the_export_name(monkeypatch):
     monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
     assert m.main(["--days", "1", "--no-write", "--cur-bucket", "b", "--cur-export-name", "fleet-cur"]) == 0
     assert listed and all(p.startswith("fleet-cur/fleet-cur/data/BILLING_PERIOD=") for p in listed)
+
+
+# --- data.cost.monthly's calendar-month verdict (audit gap A9) -------------
+
+
+def test_the_committed_ceiling_config_is_unratified_and_loads():
+    """The checked-in declaration loads, and its ceiling stays null until Brian
+    ratifies one: a number landing here without `ratified_by` is refused."""
+    config = m.load_ceiling_config()
+    assert config.ceiling_usd is None
+    assert config.proposed_baseline_multiplier == 1.2
+    assert config.proposed_baseline_days == 28
+
+
+def test_a_ceiling_without_ratified_by_is_refused(tmp_path):
+    path = tmp_path / "c.yaml"
+    path.write_text("ceiling_usd: 10\nratified_by: null\n")
+    with pytest.raises(ValueError, match="ratified_by"):
+        m.load_ceiling_config(path)
+    path.write_text("ceiling_usd: 10\nratified_by: cmsg_x\n")
+    assert m.load_ceiling_config(path).ceiling_usd == 10.0
+
+
+def test_monthly_status_is_pending_without_a_ceiling_and_cumulative_with_one():
+    assert m.monthly_status(5.0, None) == m.PENDING_TARGET
+    assert m.monthly_status(5.0, 10.0) == "ok"
+    assert m.monthly_status(10.0, 10.0) == "ok"
+    assert m.monthly_status(10.01, 10.0) == "breach"
+
+
+def test_no_proposal_is_computed_from_a_partial_baseline():
+    config = m.CeilingConfig(None, None, 1.2, 28)
+    partial = m.CostWindow(total_cost=7.0, days_requested=28, days_covered=7)
+    assert m.proposed_ceiling(partial, 31, config) is None
+    full = m.CostWindow(total_cost=28.0, days_requested=28, days_covered=28)
+    assert m.proposed_ceiling(full, 31, config) == pytest.approx(37.2)
+
+
+def test_month_to_date_reads_from_the_first_of_the_month_and_carries_the_tag_proof():
+    """Oct 1 had no tagged row but the tag was proven on Sep 29, so Oct 1 is a
+    measured day, not an uncovered one."""
+    reader = _FakeReader(
+        {
+            "cur/x/data/BILLING_PERIOD=2026-09/a.parquet": _parquet_bytes([_row(1.0, "2026-09-29")]),
+            "cur/x/data/BILLING_PERIOD=2026-10/a.parquet": _parquet_bytes(
+                [_row(2.0, "2026-10-02"), _row(3.0, "2026-10-03")]
+            ),
+        }
+    )
+    config = m.CeilingConfig(None, None, 1.2, 28)
+    baseline = m.read_cur_window(
+        reader,
+        cur_bucket="b",
+        cur_prefix="cur/x",
+        tag_key="system",
+        tag_value="data-collection",
+        start=dt.date(2026, 9, 6),
+        end=dt.date(2026, 10, 3),
+    )
+    assert baseline.first_tagged_day == "2026-09-29"
+    month = m.month_to_date(
+        reader,
+        cur_bucket="b",
+        cur_prefix="cur/x",
+        tag_key="system",
+        tag_value="data-collection",
+        end=dt.date(2026, 10, 3),
+        baseline=baseline,
+        config=config,
+    )
+    assert month.month == "2026-10"
+    assert month.days_in_month == 31
+    assert month.window.total_cost == 5.0
+    assert month.window.days_covered == 3
+    assert month.window.uncovered_days == ()
+    assert month.status == m.PENDING_TARGET
+    assert month.proposed_ceiling_usd is None
+
+
+def test_build_metric_publishes_the_fields_the_monthly_clause_reads():
+    window = m.CostWindow(total_cost=12.34, days_requested=28, days_covered=28)
+    month = m.MonthToDate(
+        month="2026-10",
+        window=m.CostWindow(total_cost=4.0, days_requested=5, days_covered=5),
+        days_in_month=31,
+        status=m.PENDING_TARGET,
+        ceiling_usd=None,
+        ratified_by=None,
+        proposed_ceiling_usd=16.37,
+    )
+    metric = m.build_metric(
+        window=window,
+        tag_key="system",
+        tag_value="data-collection",
+        cur_bucket="bucket",
+        cur_prefix="cur/x",
+        as_of=dt.datetime(2026, 10, 6, tzinfo=UTC),
+        month=month,
+    )
+    assert metric["status"] == m.PENDING_TARGET
+    assert metric["value"] == 4.0
+    assert metric["days_observed"] == 5 and metric["days_in_month"] == 31
+    assert metric["target"] is None and metric["proposed_ceiling_usd"] == 16.37
+    # The baseline fields the phase-1 STANDING row reads are untouched.
+    assert metric["baseline"] == 12.34 and metric["days_covered"] == 28
+
+
+def test_the_published_document_renders_as_a_declared_pending_state_on_the_board():
+    """End to end through the clause: the A9 gap was `status ''` rendering as
+    an undefined-status finding. Now the row says what is measured and why
+    there is no verdict, and it is still never MET."""
+    from data_gate import clauses as clause_module
+    from tests.data_gate_support import EmptyStore
+
+    window = m.CostWindow(total_cost=0.64, days_requested=28, days_covered=7)
+    month = m.MonthToDate(
+        month="2026-10",
+        window=m.CostWindow(total_cost=0.4, days_requested=5, days_covered=5),
+        days_in_month=31,
+        status=m.PENDING_TARGET,
+        ceiling_usd=None,
+        ratified_by=None,
+        proposed_ceiling_usd=None,
+    )
+    document = m.build_metric(
+        window=window,
+        tag_key="system",
+        tag_value="data-collection",
+        cur_bucket="bucket",
+        cur_prefix="cur/x",
+        month=month,
+    )
+    store = EmptyStore({"metrics/cost/monthly/latest.json": json.dumps(document).encode()})
+    clause = clause_module._clause_cost_monthly(store)
+    assert not clause.met and not clause.unmeasurable
+    assert "NOT LIVE" in clause.detail
+    assert "not ratified" in clause.detail
+    assert "5 of 31 day(s) of 2026-10 observed" in clause.detail
+    assert "baseline 7 of 28 day(s) covered" in clause.detail
+    assert "closed set" not in clause.detail
+    assert clause.window_observed == 5 and clause.window_required == 31
