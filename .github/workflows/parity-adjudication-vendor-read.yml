@@ -1,0 +1,57 @@
+name: Parity Adjudication Vendor Read
+
+# Reads the vendor's SETTLED values a frozen-parity adjudication needs
+# (alpha-engine-config-I12023, data_gate/parity_adjudication.py): Polygon
+# grouped daily bars at full precision, and FRED ALFRED vintages. Read-only —
+# it writes nothing; the payload is printed to the job log with its SHA-256.
+# Runs here because CI already holds POLYGON_API_KEY / FRED_API_KEY and the
+# laptop and cloud sessions cannot reach either vendor.
+#
+# Cost: one grouped-daily call per date plus two FRED calls per observation.
+# Triggers: by hand, or on a PR that changes the reader itself (so the PR that
+# changes it shows it working).
+
+permissions: {}
+
+on:
+  workflow_dispatch:
+    inputs:
+      dates:
+        description: "Comma-separated trading days for Polygon grouped daily (YYYY-MM-DD)"
+        required: false
+        default: "2026-09-25,2026-09-28"
+      fred:
+        description: "Comma-separated SERIES:OBSERVATION_DATE for ALFRED vintages"
+        required: false
+        default: "DGS10:2026-09-25,DGS2:2026-09-25,T10Y2Y:2026-09-28,T10YIE:2026-09-28"
+  pull_request:
+    branches: [main]
+    paths:
+      - "scripts/parity_adjudication_vendor_read.py"
+      - ".github/workflows/parity-adjudication-vendor-read.yml"
+
+jobs:
+  read:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Read vendor settled values
+        env:
+          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
+          FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+          DATES: ${{ inputs.dates || '2026-09-25,2026-09-28' }}
+          FRED: ${{ inputs.fred || 'DGS10:2026-09-25,DGS2:2026-09-25,T10Y2Y:2026-09-28,T10YIE:2026-09-28' }}
+        run: python scripts/parity_adjudication_vendor_read.py --dates "$DATES" --fred "$FRED"
