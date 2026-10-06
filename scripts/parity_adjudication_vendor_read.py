@@ -13,6 +13,10 @@ Read-only: it writes nothing anywhere. It prints:
 * ``polygon_grouped_daily``: every ticker's bar for each requested date, from
   the SAME call and parameters the collector uses
   (`polygon_client.get_grouped_daily`, ``adjusted=true``), at full precision;
+  a requested ticker the grouped file omits (OTC symbols such as GTBIF are not
+  in it) is read from the per-ticker aggregates endpoint instead
+  (`polygon_client.get_single_day_bar`, also ``adjusted=true``) and kept apart
+  under ``per_ticker`` so the record can cite which call served each bar;
 * ``fred_vintages``: for each requested ``SERIES:OBSERVATION_DATE``, every
   ALFRED vintage of that observation (``realtime_start`` is the release date),
   plus the series' ``last_updated`` timestamp.
@@ -63,20 +67,34 @@ def _fred(path: str, **params) -> dict:
 def read_polygon(dates: list[str], tickers: set[str] | None = None) -> dict:
     from polygon_client import PolygonClient
 
+    def row(bar: dict) -> list:
+        return [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"], bar.get("vwap")]
+
     client = PolygonClient()
-    out = {}
+    out: dict[str, dict] = {}
+    per_ticker: dict[str, dict] = {}
     for day in dates:
         bars = client.get_grouped_daily(day)
         out[day] = {
-            ticker: [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"], bar.get("vwap")]
+            ticker: row(bar)
             for ticker, bar in sorted(bars.items())
             if tickers is None or ticker in tickers
         }
         missing = sorted(tickers - out[day].keys()) if tickers else []
         print(f"polygon grouped daily {day}: {len(bars)} tickers, {len(out[day])} kept; "
               f"absent from the vendor file: {missing}", flush=True)
+        if missing:
+            # A NAMED ticker the grouped file omits is read from the per-ticker
+            # endpoint; None records that the vendor has no bar for it either.
+            found = {ticker: client.get_single_day_bar(ticker, day) for ticker in missing}
+            per_ticker[day] = {ticker: (row(bar) if bar else None) for ticker, bar in found.items()}
+            unread = sorted(t for t, bar in found.items() if not bar)
+            print(f"polygon per-ticker {day}: {len(missing) - len(unread)} of {len(missing)} read; "
+                  f"no bar from either call: {unread}", flush=True)
     return {"call": "/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true",
-            "fields": ["open", "high", "low", "close", "volume", "vwap"], "dates": out}
+            "fields": ["open", "high", "low", "close", "volume", "vwap"], "dates": out,
+            "per_ticker_call": "/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}?adjusted=true",
+            "per_ticker": per_ticker}
 
 
 def read_fred(specs: list[str]) -> dict:
