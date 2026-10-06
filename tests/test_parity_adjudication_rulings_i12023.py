@@ -519,3 +519,124 @@ def test_a_group_and_explicit_inputs_compose_on_one_path():
 def test_settled_inputs_digest_is_order_independent_and_value_exact():
     assert adj.settled_inputs_digest({"a": 1.5, "b": 2}) == adj.settled_inputs_digest({"b": 2, "a": 1.5})
     assert adj.settled_inputs_digest({"a": 1.5}) != adj.settled_inputs_digest({"a": 1.5000001})
+
+
+# --------------------------------------------------------------------------
+# 6. shared inputs (issuecomment-6025196251 ruling 2: iv_vs_rv)
+# --------------------------------------------------------------------------
+
+IV_KEY = "market_data/weekly/2026-09-25/alternative/A.json"
+
+
+def _read(version_id="3HL4kqtJlcpXroDTDmJ+rmSpXd3dIbrHY", kind=adj.SHARED_EVIDENCE_RUN_MANIFEST, ref="manifest.json#inputs"):
+    return {"version_id": version_id, "evidence": {"kind": kind, "ref": ref}}
+
+
+def _iv(*, v1_read=None, shadow_read=None, v1=0.31, shadow=0.31, **over):
+    item = {
+        "id": "2026-09-25:A:atm_iv", "kind": adj.INPUT_KIND_SHARED, "source_key": IV_KEY,
+        "field": "options_flow.expected_move_pct", "v1_value": v1, "shadow_value": shadow,
+        "shared": {"v1_read": v1_read or _read(ref="v1 scanner run log line 412"),
+                   "shadow_read": shadow_read or _read()},
+    }
+    item.update(over)
+    return item
+
+
+def _iv_vs_rv(*, iv=None, close_settled=175.21, value=1.07, with_bar=True, recompute=True):
+    iv = iv or _iv()
+    inputs = [iv]
+    refs = [iv["id"]]
+    if with_bar:
+        bar = _bar("2026-09-25:A:Close", v1=175.19, shadow=175.21, settled=close_settled)
+        bar["row_date"], bar["v1_read_utc"] = "2026-09-25", "2026-09-25T20:07:56Z"
+        inputs.append(bar)
+        refs.append(bar["id"])
+    attribution = {"path": "A.iv_vs_rv", "inputs": refs}
+    if recompute:
+        known = {i["id"]: (i["shadow_value"] if i["kind"] == adj.INPUT_KIND_SHARED else i["settled"]["value"])
+                 for i in inputs}
+        attribution["recompute"] = _recompute(known, value, 1.07)
+    return {"inputs": inputs, "attributions": [attribution]}
+
+
+def test_a_shared_input_on_evidenced_equal_versions_clears_beside_a_settled_bar_and_a_recompute():
+    grade = _grade(_iv_vs_rv(), 1)
+    assert grade.verdict == adj.CLEARED, grade.detail
+
+
+@pytest.mark.parametrize("side", ["v1_read", "shadow_read"])
+@pytest.mark.parametrize("hole", ["missing", "no_version", "no_ref"])
+def test_a_side_whose_read_version_is_not_evidenced_stays_pending(side, hole):
+    iv = _iv()
+    if hole == "missing":
+        del iv["shared"][side]
+    elif hole == "no_version":
+        iv["shared"][side]["version_id"] = ""
+    else:
+        iv["shared"][side]["evidence"]["ref"] = " "
+    grade = _grade(_iv_vs_rv(iv=iv), 1)
+    assert grade.verdict == adj.PENDING and "not evidenced" in grade.detail
+
+
+def test_equal_values_never_stand_in_for_version_evidence():
+    iv = _iv()
+    iv["shared"] = {}
+    assert _grade(_iv_vs_rv(iv=iv), 1).verdict == adj.PENDING
+
+
+def test_different_versions_are_not_a_shared_input():
+    grade = _grade(_iv_vs_rv(iv=_iv(shadow_read=_read(version_id="other"))), 1)
+    assert grade.verdict == adj.BREACH and "not shared" in grade.detail
+
+
+def test_the_same_version_with_different_values_is_invalid():
+    grade = _grade(_iv_vs_rv(iv=_iv(shadow=0.32)), 1)
+    assert grade.verdict == adj.INVALID and "extraction" in grade.detail
+
+
+def test_evidence_must_be_one_of_the_declared_kinds():
+    grade = _grade(_iv_vs_rv(iv=_iv(v1_read=_read(kind="equal_values"))), 1)
+    assert grade.verdict == adj.INVALID and "evidence.kind" in grade.detail
+
+
+@pytest.mark.parametrize("extra", [{"settled": {"value": 0.31}}, {"source_version_id": "x"}, {"regrade": {}}])
+def test_a_shared_input_carries_no_settling_read(extra):
+    assert _grade(_iv_vs_rv(iv=_iv(**extra)), 1).verdict == adj.INVALID
+
+
+def test_a_shared_input_without_a_recompute_is_invalid():
+    grade = _grade(_iv_vs_rv(recompute=False), 1)
+    assert grade.verdict == adj.INVALID and "recompute" in grade.detail
+
+
+def test_a_path_whose_every_input_is_shared_explains_nothing():
+    grade = _grade(_iv_vs_rv(with_bar=False), 1)
+    assert grade.verdict == adj.INVALID and "every input it cites is shared" in grade.detail
+
+
+def test_the_non_shared_input_must_still_clear_on_its_own():
+    grade = _grade(_iv_vs_rv(close_settled=175.30), 1)
+    assert grade.verdict == adj.BREACH
+
+
+def test_the_recompute_must_still_reproduce_the_path():
+    assert _grade(_iv_vs_rv(value=1.12), 1).verdict == adj.BREACH
+
+
+def test_a_recompute_digest_covers_the_shared_value():
+    entry = _iv_vs_rv()
+    entry["inputs"][0]["v1_value"] = entry["inputs"][0]["shadow_value"] = 0.29
+    grade = _grade(entry, 1)
+    assert grade.verdict == adj.INVALID and "settled_inputs_sha256" in grade.detail
+
+
+def test_a_shared_input_may_be_a_group_member():
+    entry = _iv_vs_rv()
+    iv, bar = entry["inputs"]
+    entry["input_groups"] = {"IVRV:A": {"definition": "A's IV snapshot and its realized-vol closes",
+                                        "members": [iv["id"], bar["id"]]}}
+    entry["attributions"][0]["inputs"] = []
+    entry["attributions"][0]["input_groups"] = ["IVRV:A"]
+    grade = _grade(entry, 1)
+    assert grade.verdict == adj.CLEARED, grade.detail
