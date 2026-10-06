@@ -1804,6 +1804,26 @@ def build_feature_frame(
 
 
 
+def dead_column_scope() -> tuple[list[str], frozenset[str]]:
+    """The columns the dead-column postflight grades, and the ones it exempts.
+
+    Macro-group columns broadcast one value to the whole universe by
+    construction, so they are not graded. ``ALL_NULL_EXPECTED``
+    (``vwap_divergence_pct``) is all-NaN on the latest row of every daily run by
+    design and joins the exempt set. One definition, shared by
+    :func:`compute_and_write` and the D50 settled regrade
+    (`features.settled_regrade`), so the two can never grade different columns.
+    """
+    non_macro = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
+    return non_macro, frozenset(ZERO_VARIANCE_EXEMPT | ALL_NULL_EXPECTED)
+
+
+def assert_snapshot_columns_live(features_df: pd.DataFrame) -> None:
+    """The ``zero_variance_fatal=True`` postflight: raise before anything is written."""
+    columns, exempt = dead_column_scope()
+    assert_no_dead_feature_columns(features_df, columns, exempt=exempt)
+
+
 def compute_and_write(
     date_str: str,
     bucket: str = DEFAULT_BUCKET,
@@ -1906,7 +1926,7 @@ def compute_and_write(
     # excluded — they broadcast one value to the whole universe on a date BY
     # CONSTRUCTION (e.g. the VIX level), so zero cross-sectional variance
     # there is the expected shape, not a defect.
-    _non_macro_features = [f for f in FEATURES if f not in GROUPS.get("macro", ())]
+    _non_macro_features, _dead_column_exempt = dead_column_scope()
     # alpha-engine-config-I7572: ALL_NULL_EXPECTED (vwap_divergence_pct) is
     # all-NaN on the latest row EVERY daily run by pipeline design (see
     # postflight.ALL_NULL_EXPECTED) — union it into the exempt set so the
@@ -1916,7 +1936,6 @@ def compute_and_write(
     # vwap_divergence_pct from the zero-variance check — harmless in
     # practice, since a column that is structurally all-NaN can never
     # accumulate the min_non_null floor that check requires to fire.
-    _dead_column_exempt = ZERO_VARIANCE_EXEMPT | ALL_NULL_EXPECTED
     if zero_variance_fatal:
         assert_no_dead_feature_columns(
             features_df, _non_macro_features, exempt=_dead_column_exempt,
