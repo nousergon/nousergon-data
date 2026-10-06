@@ -53,6 +53,7 @@ from dates import (
     FutureBarError,
     as_trading_day,
     assert_no_bar_after,
+    assert_settled_bar,
     bar_settlement_guard_entry,
     clip_to_trading_day,
     default_run_date,
@@ -245,6 +246,9 @@ def collect(
     # one fetch window and its OPENING edge is the conservative one — a run that
     # starts before the bar settles does not become settled because it ran long.
     fetch_started_at = datetime.now(timezone.utc)
+    # ENFORCE raise site (`dates.BAR_SETTLEMENT_GUARD`): refuse to open a fetch
+    # for day D's own bar before it settles, so nothing provisional is written.
+    assert_settled_bar(fetch_started_at, trading_day, unit="D03")
     short_fetch_retries: dict[str, int] = {}
     failure_reasons: dict[str, str] = {}
     refreshed, failed_tickers, written = _refresh_stale(
@@ -292,10 +296,11 @@ def collect(
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
         # alpha-engine-config-I11354: grade THIS run's bar on the settlement
-        # clock and carry the verdict on D03's manifest. Observe mode — the
-        # reading never moves the exit code; it is what a promotion to enforce
-        # (and Brian's ruling on the 16:45 ET `data-collection-eod` schedule)
-        # will be argued from. `_record_collector_guards` folds this on.
+        # clock and carry the verdict on D03's manifest. The ENFORCE half is
+        # `assert_settled_bar` at the fetch's opening edge above, so a run that
+        # reaches here was settled; the reading stays on the manifest as the
+        # evidence the promotion row reads. `_record_collector_guards` folds
+        # this on.
         "guards": [
             bar_settlement_guard_entry(
                 fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
