@@ -50,8 +50,13 @@ def _fred(path: str, **params) -> dict:
     query = {**params, "api_key": os.environ["FRED_API_KEY"], "file_type": "json"}
     response = requests.get(f"{FRED_BASE}/{path}", params=query, timeout=30)
     if response.status_code != 200:
-        # Never echo the URL: it carries the key.
-        raise RuntimeError(f"FRED {path} returned HTTP {response.status_code}")
+        # Never echo the URL: it carries the key. FRED's own error_message names
+        # the offending variable, which is what makes a 400 diagnosable.
+        try:
+            detail = str(response.json().get("error_message", ""))[:300]
+        except ValueError:
+            detail = ""
+        raise RuntimeError(f"FRED {path} returned HTTP {response.status_code}: {detail}")
     return response.json()
 
 
@@ -75,11 +80,21 @@ def read_fred(specs: list[str]) -> dict:
     out = {}
     for spec in specs:
         series, observation = spec.split(":")
-        vintages = _fred(
-            "series/observations", series_id=series, realtime_start="1776-07-04",
-            realtime_end="9999-12-31", observation_start=observation, observation_end=observation,
-        ).get("observations", [])
-        meta = (_fred("series", series_id=series).get("seriess") or [{}])[0]
+        try:
+            # Vintages of one observation can only be published on or after it,
+            # so the real-time window starts there rather than at FRED's epoch.
+            vintages = _fred(
+                "series/observations", series_id=series, realtime_start=observation,
+                realtime_end=dt.date.today().isoformat(), observation_start=observation,
+                observation_end=observation,
+            ).get("observations", [])
+            meta = (_fred("series", series_id=series).get("seriess") or [{}])[0]
+        except RuntimeError as exc:
+            # One unreadable series must not discard the whole read (the Polygon
+            # half is the larger, slower one); it is recorded and fails the run.
+            out[spec] = {"error": str(exc)}
+            print(f"fred {spec}: ERROR {exc}", flush=True)
+            continue
         out[spec] = {
             "vintages": [{k: v.get(k) for k in ("date", "value", "realtime_start", "realtime_end")} for v in vintages],
             "series_last_updated": meta.get("last_updated"),
@@ -116,6 +131,10 @@ def main(argv: list[str] | None = None) -> int:
     for i in range(0, len(encoded), CHUNK):
         print(encoded[i:i + CHUNK])
     print("END-PARITY-VENDOR-READ")
+    failed = [spec for spec, row in (document["fred_vintages"] or {}).items() if "error" in row]
+    if failed:
+        print(f"FRED read failed for {', '.join(failed)}; payload above carries the rest", flush=True)
+        return 1
     return 0
 
 
