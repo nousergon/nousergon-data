@@ -70,14 +70,16 @@ place to read what happened.
 
 ## IAM & security group (deliverable #3)
 
-- **Spot box role:** reuses `alpha-engine-executor-profile` /
-  `alpha-engine-executor-role` — the SAME profile `spot_data_weekly.sh` grants
-  the Saturday data spot, which already has ArcticDB S3 read/write for the
-  enrich paths. No new role is minted; the Saturday spot role is mirrored.
+- **Spot box role:** `nousergon-data-collection-box-profile` /
+  `nousergon-data-collection-box-role` — data collection's own identity
+  (alpha-engine-config-I10756), not the trading executor's. It used to reuse
+  `alpha-engine-executor-profile`, which made every collection write an
+  executor write in CloudTrail (alpha-engine-config-I11036).
+  `DATA_SPOT_IAM_PROFILE` overrides it.
 - **Security group:** the standard fleet SG (`sg-03cd3c4bd91e610b0`); no IB
   Gateway port (4001/4002) is opened — the data spot only needs egress + SSM.
 - **Lambda execution role:** `iam-policy.json` (ec2:RunInstances / CreateTags /
-  Describe*, iam:PassRole for the executor role, ssm:SendCommand /
+  Describe*, iam:PassRole for the collection-box and executor roles, ssm:SendCommand /
   DescribeInstanceInformation, ec2:TerminateInstances scoped to the
   `alpha-engine-data-spot` tag; plus sns:Publish on `alpha-engine-alerts` +
   ssm:GetParameter on the Telegram secrets + s3:GetObject/PutObject on the
