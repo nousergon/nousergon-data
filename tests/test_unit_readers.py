@@ -308,16 +308,17 @@ def test_every_partial_exclusion_column_reads_met_never_unmeasurable(units):
     real evidence checks — so a declared exclusion always short-circuits.
 
     `detector` joined them in `alpha-engine-config-I10795`
-    (`detector_readers.read_detector`, D35 and D43).
+    (`detector_readers.read_detector`, D35 and D43), and `console_entity` in
+    its part 2 (`console_entity_readers.read_console_entity`, D35 and D43).
 
     Deliberately does NOT require every declared column to be one of these:
-    `console_entity`/`schema_contract` also appear in some
+    `schema_contract` also appears in some
     units' `partial_exclusion.columns` (D35, D43) but are graded by a
     DIFFERENT, pre-existing mechanism this reader package does not own —
     `partial_exclusion` documents the unit's whole excluded-column set even
     where only a subset routes through `partial_exclusion_reading` today.
     """
-    from data_gate import detector_readers, standalone
+    from data_gate import console_entity_readers, detector_readers, standalone
 
     store = EmptyStore()  # no artifact_registry_source, no iam_client, no manifests, no
     # scheduler/sfn client: every real evidence path below would read UNMEASURABLE if reached.
@@ -327,6 +328,7 @@ def test_every_partial_exclusion_column_reads_met_never_unmeasurable(units):
         "identity": lambda unit: unit_readers.read_identity(store, unit),
         "survives_phase4": lambda unit: standalone.read_survives_phase4(store, unit, trading_day=TRADING_DAY),
         "detector": lambda unit: detector_readers.read_detector(store, unit),
+        "console_entity": lambda unit: console_entity_readers.read_console_entity(store, unit),
     }
     checked = 0
     for unit in units:
