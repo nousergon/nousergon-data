@@ -41,6 +41,7 @@ from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exc
 from data_gate import evidence as ev
 from data_gate import exit_criteria as xc
 from data_gate import guard_promotion as gp
+from data_gate import panel as daily_panel
 from data_gate import standalone
 from data_gate import trigger_reconcile as tr
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
@@ -122,6 +123,7 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
     "data.phase2.vendor_divergence_emitted",
     "data.phase2.executor_collection_writes_zero",
     "data.phase3.sustained_window",
+    "data.phase3.daily_panel_adopted",
 )
 
 #: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
@@ -1930,6 +1932,21 @@ def _clause_guard_promotion(
     )
 
 
+def _clause_phase3_daily_panel_adopted(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    """The daily panel acceptance clause (audit gap A10, alpha-engine-config-I10791 / -I10795).
+
+    Not an observation window: adoption is a STATE (published, pinned, proven
+    equivalent once, old path gone), and each leg reads current evidence —
+    see `data_gate/panel.py`.
+    """
+    return _exit_clause(
+        daily_panel.PANEL_CLAUSE,
+        daily_panel.PANEL_REQUIREMENT,
+        daily_panel.read_daily_panel_adopted(store, trading_day=trading_day),
+        phase="data-phase3",
+    )
+
+
 # Every `_clause_*` above is wrapped so a raising clause becomes ONE
 # UNMEASURABLE row instead of darkening the ladder. Applied by walking this
 # module's globals, so a clause added tomorrow is contained without anyone
@@ -2022,6 +2039,7 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_vendor_divergence_daily(store, trading_day=trading_day))
     clauses.append(_clause_phase2_executor_collection_writes_zero(store))
     clauses.append(_clause_phase3_sustained_window(store, weekly, trading_day=trading_day))
+    clauses.append(_clause_phase3_daily_panel_adopted(store, trading_day=trading_day))
     for promotion in gp.GUARD_PROMOTIONS:
         clauses.append(
             _clause_guard_promotion(
