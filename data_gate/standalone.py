@@ -19,6 +19,13 @@ A unit the stack covers reads MET only when, for EVERY schedule that lists it:
    inside that execution — a manifest from a hand run, or from the v1 pipeline,
    cannot stand in, because it did not run inside the standalone machine.
 
+One declared exception (alpha-engine-config-I11812): a fire named in
+``data_gate/config/recovered_fires.yaml`` with a recorded ruling, whose own
+execution started in the window but did not SUCCEED, is graded by the cycle
+counter's rule instead of 2-3 — the declared recovery execution SUCCEEDED inside
+``[fire, fire + COMPLETION_GRACE]`` and the unit holds an ok scheduled manifest
+that started in that interval. Every other fire is graded as above.
+
 UNMET with the reason otherwise; UNMEASURABLE only when a read was denied or
 failed (or the store carries no AWS clients at all — every test fixture).
 
@@ -37,9 +44,14 @@ from __future__ import annotations
 
 import datetime as dt
 import importlib.util
+import pathlib
+from dataclasses import dataclass
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 
+import yaml
 from nousergon_lib.gates import GateStore
+from nousergon_lib.trading_calendar import is_trading_day  # pyright: ignore[reportAttributeAccessIssue]
 
 from data_gate.cadence import COMPLETION_GRACE, fire_selection_moment, latest_due_fire, parse_cron, unit_cadence
 from data_gate.descriptors import REPO_ROOT, Unit
@@ -47,7 +59,10 @@ from data_gate.evidence import Reading, manifests_since, read_run_record
 
 __all__ = [
     "EXECUTION_START_WINDOW",
+    "RECOVERED_FIRES_PATH",
+    "RecoveredFire",
     "covering_schedules",
+    "load_recovered_fires",
     "stack_schedules",
     "read_standalone_workload_declared",
     "read_survives_phase4",
@@ -61,6 +76,23 @@ _STACK_HELPER = REPO_ROOT / "infrastructure" / "data_collection_stack.py"
 EXECUTION_START_WINDOW = dt.timedelta(minutes=15)
 
 _SOURCE_LIVE = "scheduler:GetSchedule + states:ListExecutions + data_collection store"
+
+#: Declared recoveries of one missed fire each (alpha-engine-config-I11812).
+#: The file's header is the contract; `_grade_recovered_fire` is its reader.
+RECOVERED_FIRES_PATH = REPO_ROOT / "data_gate" / "config" / "recovered_fires.yaml"
+_RECOVERED_FIRES_SCHEMA = "data_recovered_fires.v1"
+_RECOVERED_FIRE_FIELDS = (
+    "schedule",
+    "fire",
+    "machine",
+    "fire_execution",
+    "recovery_execution",
+    "root_cause_fix",
+    "tracker",
+    "ruling",
+)
+#: The `ruling:` value that keeps a declared recovery inert.
+_RULING_PENDING = "pending"
 
 #: `read_standalone_workload_declared` reads the committed stack definition and
 #: the committed descriptor, and NOTHING else. Named so a reader can tell the
@@ -89,6 +121,111 @@ def stack_schedules() -> tuple[dict, ...]:
     return _stack_schedules()
 
 
+@dataclass(frozen=True)
+class RecoveredFire:
+    """One declared recovery of one missed fire — see `recovered_fires.yaml`."""
+
+    schedule: str
+    fire: dt.datetime
+    machine: str
+    fire_execution: str
+    recovery_execution: str
+    root_cause_fix: str
+    tracker: str
+    ruling: str
+
+    @property
+    def ruled(self) -> bool:
+        return self.ruling.strip().lower() != _RULING_PENDING
+
+    def names(self, execution: dict, which: str) -> bool:
+        """Whether ``execution`` is this declaration's ``which`` execution of its machine."""
+        return str(execution.get("executionArn") or "").endswith(f":{self.machine}:{getattr(self, which)}")
+
+
+def _is_fire_of(schedule: dict, fire: dt.datetime) -> bool:
+    cadence = parse_cron(
+        schedule["expression"],
+        tz=schedule["timezone"],
+        trading_days_only=bool(schedule["input"].get("require_trading_day")),
+    )
+    local = fire.astimezone(ZoneInfo(cadence.tz))
+    if cadence.trading_days_only and not is_trading_day(local.date()):
+        return False
+    return (
+        local.weekday() in cadence.weekdays
+        and (local.hour, local.minute, local.second, local.microsecond) == (cadence.hour, cadence.minute, 0, 0)
+    )
+
+
+def load_recovered_fires(path: pathlib.Path | None = None) -> tuple[RecoveredFire, ...]:
+    """Every declared recovery, refusing any shape that could widen one.
+
+    Raises rather than skipping, and `contain_clause_exceptions` turns the raise
+    into UNMEASURABLE rows: a declaration this loader silently dropped, or read
+    more broadly than written, is a gate reading nobody ruled on.
+    """
+    if path is None:
+        return _committed_recovered_fires()
+    return _parse_recovered_fires(path)
+
+
+@lru_cache(maxsize=1)
+def _committed_recovered_fires() -> tuple[RecoveredFire, ...]:
+    return _parse_recovered_fires(RECOVERED_FIRES_PATH)
+
+
+def _parse_recovered_fires(path: pathlib.Path) -> tuple[RecoveredFire, ...]:
+    if not path.exists():
+        return ()
+    doc = yaml.safe_load(path.read_text()) or {}
+    if doc.get("schema_version") != _RECOVERED_FIRES_SCHEMA:
+        raise ValueError(f"{path.name}: schema_version is {doc.get('schema_version')!r}, not {_RECOVERED_FIRES_SCHEMA!r}")
+    entries = doc.get("recovered_fires") or []
+    if not isinstance(entries, list):
+        raise ValueError(f"{path.name}: recovered_fires is {type(entries).__name__}, not a list")
+    by_name = {s["name"]: s for s in _stack_schedules()}
+    seen: set[tuple[str, dt.datetime]] = set()
+    out: list[RecoveredFire] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ValueError(f"{path.name}: an entry is {type(entry).__name__}, not a mapping: {entry!r}")
+        missing = [f for f in _RECOVERED_FIRE_FIELDS if not str(entry.get(f) or "").strip()]
+        extra = sorted(set(entry) - set(_RECOVERED_FIRE_FIELDS))
+        if missing or extra:
+            raise ValueError(f"{path.name}: entry {entry.get('fire')!r} is missing {missing} / carries unknown {extra}")
+        schedule = by_name.get(str(entry["schedule"]))
+        if schedule is None:
+            raise ValueError(f"{path.name}: schedule {entry['schedule']!r} is not in the committed stack")
+        try:
+            fire = dt.datetime.strptime(str(entry["fire"]), "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        except ValueError as exc:
+            raise ValueError(f"{path.name}: fire {entry['fire']!r} is not YYYY-MM-DDTHH:MM:SSZ") from exc
+        if not _is_fire_of(schedule, fire):
+            raise ValueError(
+                f"{path.name}: {entry['fire']} is not a fire of {schedule['name']} ({schedule['expression']} "
+                f"{schedule['timezone']}) — a declaration names one real fire, never a window"
+            )
+        if (schedule["name"], fire) in seen:
+            raise ValueError(f"{path.name}: {schedule['name']} {entry['fire']} is declared twice")
+        seen.add((schedule["name"], fire))
+        out.append(
+            RecoveredFire(
+                schedule=schedule["name"],
+                fire=fire,
+                **{f: str(entry[f]).strip() for f in _RECOVERED_FIRE_FIELDS if f not in ("schedule", "fire")},
+            )
+        )
+    return tuple(out)
+
+
+def _recovery_for(schedule: dict, fire: dt.datetime) -> RecoveredFire | None:
+    return next(
+        (r for r in load_recovered_fires() if r.schedule == schedule["name"] and r.fire == fire),
+        None,
+    )
+
+
 def covering_schedules(unit_id: str) -> list[dict]:
     """Every standalone schedule whose ``verify_units`` names this unit."""
     return [s for s in _stack_schedules() if unit_id in (s["input"].get("verify_units") or [])]
@@ -103,6 +240,138 @@ def _error_code(exc: Exception) -> str:
 
 def _unmeasurable(detail: str, evidence: tuple[str, ...]) -> Reading:
     return Reading(met=False, detail=detail, evidence=evidence, unmeasurable=True, source=_SOURCE_LIVE)
+
+
+def _executions_since(sfn, machine_arn: str, since: dt.datetime) -> list[dict]:
+    """Every execution of the machine that started at or after ``since``."""
+    kwargs = {"stateMachineArn": machine_arn, "maxResults": 100}
+    found: list[dict] = []
+    while True:
+        page = sfn.list_executions(**kwargs)
+        for execution in page.get("executions", []):
+            if execution["startDate"].astimezone(dt.timezone.utc) < since:
+                return found
+            found.append(execution)
+        token = page.get("nextToken")
+        if not token:
+            return found
+        kwargs["nextToken"] = token
+
+
+def _parse_started(stamp: object) -> dt.datetime | None:
+    try:
+        return dt.datetime.fromisoformat(str(stamp).replace("Z", "+00:00")).astimezone(dt.timezone.utc)
+    except (TypeError, ValueError):
+        return None
+
+
+def _grade_recovered_fire(
+    store: GateStore,
+    unit: Unit,
+    recovery: RecoveredFire,
+    machine: str,
+    fire_execution: dict,
+    as_of: dt.datetime,
+    evidence: tuple[str, ...],
+) -> Reading:
+    """A declared, ruled recovery of ``recovery.fire`` — see `recovered_fires.yaml`.
+
+    Reached only when the fire's own execution started inside the window and is
+    not SUCCEEDED. Three conditions, every one read from live state or the
+    store, never from the declaration's prose:
+
+    1. the execution that started for the fire IS the declared one;
+    2. the declared recovery execution is SUCCEEDED, on the same machine, and
+       started inside [fire, fire + COMPLETION_GRACE] and before ``as_of``;
+    3. the unit holds an ok scheduled-trigger manifest that started inside
+       [fire, fire + COMPLETION_GRACE] — the cycle counter's rule.
+    """
+    fire_s = recovery.fire.strftime("%Y-%m-%dT%H:%MZ")
+    declared = f"data_gate/config/recovered_fires.yaml ({recovery.tracker}; ruling {recovery.ruling})"
+    evidence = evidence + ("data_gate/config/recovered_fires.yaml",)
+    if not machine.endswith(f":{recovery.machine}") or not recovery.names(fire_execution, "fire_execution"):
+        return Reading(
+            met=False,
+            detail=(
+                f"a recovery is declared for the {fire_s} fire of {recovery.machine}/{recovery.fire_execution}, "
+                f"but the execution that started for it is {fire_execution.get('executionArn')} on {machine}"
+            ),
+            evidence=evidence,
+            source=_SOURCE_LIVE,
+        )
+    window_end = recovery.fire + COMPLETION_GRACE
+    try:
+        candidates = _executions_since(store.sfn_client, machine, recovery.fire)  # type: ignore[attr-defined]
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        return _unmeasurable(f"could not list executions of {machine}: {type(exc).__name__}: {exc}", evidence)
+    rec = next((e for e in candidates if recovery.names(e, "recovery_execution")), None)
+    if rec is None:
+        return Reading(
+            met=False,
+            detail=(
+                f"the declared recovery {recovery.recovery_execution} of the {fire_s} fire is not an execution "
+                f"of {machine} started at or after the fire"
+            ),
+            evidence=evidence,
+            source=_SOURCE_LIVE,
+        )
+    evidence = evidence + (str(rec.get("executionArn")),)
+    rec_start = rec["startDate"].astimezone(dt.timezone.utc)
+    rec_stop = rec.get("stopDate")
+    if str(rec.get("status")) != "SUCCEEDED" or rec_stop is None:
+        return Reading(
+            met=False,
+            detail=f"the declared recovery {recovery.recovery_execution} of the {fire_s} fire is {rec.get('status')}, not SUCCEEDED",
+            evidence=evidence,
+            source=_SOURCE_LIVE,
+        )
+    rec_stop = rec_stop.astimezone(dt.timezone.utc)
+    if rec_start > window_end or rec_stop > as_of:
+        return Reading(
+            met=False,
+            detail=(
+                f"the declared recovery {recovery.recovery_execution} started {rec_start:%Y-%m-%dT%H:%MZ} and stopped "
+                f"{rec_stop:%Y-%m-%dT%H:%MZ}; it must start by {window_end:%Y-%m-%dT%H:%MZ} (fire + completion grace) "
+                "and finish before the reading"
+            ),
+            evidence=evidence,
+            source=_SOURCE_LIVE,
+        )
+    ceiling = min(window_end, as_of)
+    try:
+        docs, problems, where = manifests_since(store, unit, since=recovery.fire, as_of=ceiling)
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        return _unmeasurable(f"could not list {unit.run_manifest_prefix}: {type(exc).__name__}: {exc}", evidence)
+    if problems:
+        return _unmeasurable(f"manifest(s) unreadable under {where}: {problems[:4]}", evidence)
+    unparsed = [k for k, d in docs if _parse_started(d.get("started")) is None]
+    if unparsed:
+        return _unmeasurable(f"`started` does not parse on {unparsed[:4]} under {where}", evidence)
+    ok = [k for k, d in docs if d.get("trigger") == "scheduled" and d.get("status") == "ok"]
+    if not ok:
+        seen = sorted({f"{d.get('trigger')}/{d.get('status')}" for _, d in docs}) or ["none"]
+        return Reading(
+            met=False,
+            detail=(
+                f"a ruled recovery of the {fire_s} fire is declared ({declared}) and "
+                f"{recovery.recovery_execution} SUCCEEDED, but {unit.unit_id} has no ok scheduled-trigger manifest "
+                f"started in [{fire_s}, {window_end:%Y-%m-%dT%H:%MZ}] (seen: {seen}; under {where})"
+            ),
+            evidence=evidence + tuple(k for k, _ in docs),
+            source=_SOURCE_LIVE,
+        )
+    return Reading(
+        met=True,
+        detail=(
+            f"the {fire_s} execution {recovery.fire_execution} started in the window and was {fire_execution.get('status')}; "
+            f"counted under the declared recovery {recovery.recovery_execution} (SUCCEEDED "
+            f"{rec_stop:%Y-%m-%dT%H:%MZ}; {declared}): {len(ok)} ok scheduled manifest(s) in "
+            f"[{fire_s}, {window_end:%Y-%m-%dT%H:%MZ}]"
+        ),
+        evidence=evidence + tuple(ok),
+        source=_SOURCE_LIVE,
+        as_of=str(rec_stop.isoformat()),
+    )
 
 
 def _execution_for(sfn, machine_arn: str, fire: dt.datetime) -> dict | None:
@@ -154,9 +423,21 @@ def _grade_schedule(store: GateStore, unit: Unit, schedule: dict, live: dict, as
     status = str(execution.get("status"))
     evidence = evidence + (str(execution.get("executionArn")),)
     if status != "SUCCEEDED":
+        # alpha-engine-config-I11812: one declared, ruled recovery of exactly
+        # this (schedule, fire) may stand in for the SUCCEEDED half. Any other
+        # fire — and this one while its ruling is pending — reads as before.
+        recovery = _recovery_for(schedule, fire)
+        if recovery is not None and recovery.ruled:
+            return _grade_recovered_fire(store, unit, recovery, machine, execution, as_of, evidence)
+        pending = (
+            f" (a recovery is declared for this fire in data_gate/config/recovered_fires.yaml but its ruling "
+            f"is pending: {recovery.tracker})"
+            if recovery is not None
+            else ""
+        )
         return Reading(
             met=False,
-            detail=f"the {fire_s} execution of {machine} is {status}, not SUCCEEDED",
+            detail=f"the {fire_s} execution of {machine} is {status}, not SUCCEEDED{pending}",
             evidence=evidence,
             source=_SOURCE_LIVE,
         )
