@@ -69,6 +69,17 @@ def units() -> dict[str, descriptors.Unit]:
     return {u.unit_id: u for u in descriptors.load_units()}
 
 
+@pytest.fixture(autouse=True)
+def _declarations_alone(monkeypatch):
+    """Grade the declaration path on its own.
+
+    The standing partial-run rule (tests/test_partial_run_weekly.py) would count
+    these weekly fires with or without a declaration, which is what it is for;
+    these tests pin what a declaration does when nothing else would.
+    """
+    monkeypatch.setattr(standalone, "PARTIAL_RUN_SCHEDULES", frozenset())
+
+
 @pytest.fixture
 def declare(monkeypatch):
     """Replace the committed declarations for one test."""

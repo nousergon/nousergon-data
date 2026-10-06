@@ -26,6 +26,16 @@ counter's rule instead of 2-3 — the declared recovery execution SUCCEEDED insi
 ``[fire, fire + COMPLETION_GRACE]`` and the unit holds an ok scheduled manifest
 that started in that interval. Every other fire is graded as above.
 
+One standing rule (Brian, 2026-10-06, alpha-engine-config-I11812): a fire of a
+schedule in ``PARTIAL_RUN_SCHEDULES`` whose own execution started in the window
+but did not SUCCEED still counts when the week completed across partial runs —
+an execution of the same machine started in ``[fire, fire + PARTIAL_RUN_WINDOW)``
+SUCCEEDED before the reading, and the unit holds an ok scheduled manifest that
+started inside one of the executions started in that interval. "The weekly SF
+has failed on its first try every single week since it began"; a week the
+machine finished by reruns is a week the schedule survived. The trigger still
+has to fire: a fire with no execution of its own is UNMET as before.
+
 UNMET with the reason otherwise; UNMEASURABLE only when a read was denied or
 failed (or the store carries no AWS clients at all — every test fixture).
 
@@ -59,6 +69,8 @@ from data_gate.evidence import Reading, manifests_since, read_run_record
 
 __all__ = [
     "EXECUTION_START_WINDOW",
+    "PARTIAL_RUN_SCHEDULES",
+    "PARTIAL_RUN_WINDOW",
     "RECOVERED_FIRES_PATH",
     "RecoveredFire",
     "covering_schedules",
@@ -76,6 +88,14 @@ _STACK_HELPER = REPO_ROOT / "infrastructure" / "data_collection_stack.py"
 EXECUTION_START_WINDOW = dt.timedelta(minutes=15)
 
 _SOURCE_LIVE = "scheduler:GetSchedule + states:ListExecutions + data_collection store"
+
+#: Schedules whose fire counts when it completes across partial runs (Brian,
+#: 2026-10-06, alpha-engine-config-I11812). Weekly only, by that ruling.
+PARTIAL_RUN_SCHEDULES = frozenset({"data-collection-weekly"})
+#: How long after its fire a weekly week may still be completed by reruns. Six
+#: days keeps every rerun of a week ahead of the next Saturday's fire, so no
+#: execution can count for two fires.
+PARTIAL_RUN_WINDOW = dt.timedelta(days=6)
 
 #: Declared recoveries of one missed fire each (alpha-engine-config-I11812).
 #: The file's header is the contract; `_grade_recovered_fire` is its reader.
@@ -374,6 +394,107 @@ def _grade_recovered_fire(
     )
 
 
+def _grade_partial_runs(
+    store: GateStore,
+    unit: Unit,
+    fire: dt.datetime,
+    machine: str,
+    fire_execution: dict,
+    as_of: dt.datetime,
+    evidence: tuple[str, ...],
+) -> Reading:
+    """A weekly fire completed across partial runs — see the module docstring.
+
+    Reached only when the fire's own execution started inside the window and is
+    not SUCCEEDED. Two conditions, both read from live state and the store:
+
+    1. some execution of ``machine`` started in [fire, fire + PARTIAL_RUN_WINDOW)
+       is SUCCEEDED and stopped before ``as_of`` — the week was finished;
+    2. the unit holds an ok scheduled-trigger manifest that started inside one of
+       those executions (the fire's own included) — the unit was produced by
+       the machine, not by a hand run beside it.
+    """
+    fire_s = fire.strftime("%Y-%m-%dT%H:%MZ")
+    status = str(fire_execution.get("status"))
+    window_end = min(fire + PARTIAL_RUN_WINDOW, as_of)
+    try:
+        runs = [
+            e
+            for e in _executions_since(store.sfn_client, machine, fire)  # type: ignore[attr-defined]
+            if e["startDate"].astimezone(dt.timezone.utc) < window_end
+        ]
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        return _unmeasurable(f"could not list executions of {machine}: {type(exc).__name__}: {exc}", evidence)
+    finished = sorted(
+        (
+            e
+            for e in runs
+            if str(e.get("status")) == "SUCCEEDED"
+            and e.get("stopDate") is not None
+            and e["stopDate"].astimezone(dt.timezone.utc) <= as_of
+        ),
+        key=lambda e: e["stopDate"],
+    )
+    if not finished:
+        seen = sorted({str(e.get("status")) for e in runs})
+        return Reading(
+            met=False,
+            detail=(
+                f"the {fire_s} execution of {machine} is {status}, not SUCCEEDED, and no rerun of that week "
+                f"started before {window_end:%Y-%m-%dT%H:%MZ} has SUCCEEDED yet ({len(runs)} execution(s): {seen})"
+            ),
+            evidence=evidence + tuple(str(e.get("executionArn")) for e in runs),
+            source=_SOURCE_LIVE,
+        )
+    completed = finished[0]
+    spans = [
+        (e["startDate"].astimezone(dt.timezone.utc), e["stopDate"].astimezone(dt.timezone.utc))
+        for e in runs
+        if e.get("stopDate") is not None
+    ]
+    ceiling = min(max(stop for _, stop in spans), as_of)
+    try:
+        docs, problems, where = manifests_since(store, unit, since=fire, as_of=ceiling)
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        return _unmeasurable(f"could not list {unit.run_manifest_prefix}: {type(exc).__name__}: {exc}", evidence)
+    if problems:
+        return _unmeasurable(f"manifest(s) unreadable under {where}: {problems[:4]}", evidence)
+    unparsed = [k for k, d in docs if _parse_started(d.get("started")) is None]
+    if unparsed:
+        return _unmeasurable(f"`started` does not parse on {unparsed[:4]} under {where}", evidence)
+
+    def _inside_a_run(doc: dict) -> bool:
+        started = _parse_started(doc.get("started"))
+        return started is not None and any(lo <= started <= hi for lo, hi in spans)
+
+    ok = [k for k, d in docs if d.get("trigger") == "scheduled" and d.get("status") == "ok" and _inside_a_run(d)]
+    runs_evidence = tuple(str(e.get("executionArn")) for e in runs)
+    if not ok:
+        seen = sorted({f"{d.get('trigger')}/{d.get('status')}" for _, d in docs}) or ["none"]
+        return Reading(
+            met=False,
+            detail=(
+                f"the {fire_s} week of {machine} completed across partial runs ({completed.get('executionArn')} "
+                f"SUCCEEDED), but {unit.unit_id} has no ok scheduled-trigger manifest started inside any of its "
+                f"{len(runs)} execution(s) (seen: {seen}; under {where})"
+            ),
+            evidence=evidence + runs_evidence + tuple(k for k, _ in docs),
+            source=_SOURCE_LIVE,
+        )
+    stop = completed["stopDate"].astimezone(dt.timezone.utc)
+    return Reading(
+        met=True,
+        detail=(
+            f"the {fire_s} execution was {status}; the week completed across {len(runs)} partial run(s) "
+            f"({completed.get('executionArn')} SUCCEEDED {stop:%Y-%m-%dT%H:%MZ}) and {unit.unit_id} recorded "
+            f"{len(ok)} ok scheduled manifest(s) inside them (partial-run rule, alpha-engine-config-I11812)"
+        ),
+        evidence=evidence + runs_evidence + tuple(ok),
+        source=_SOURCE_LIVE,
+        as_of=str(stop.isoformat()),
+    )
+
+
 def _execution_for(sfn, machine_arn: str, fire: dt.datetime) -> dict | None:
     """The execution that started for ``fire``, newest-first, stopping once past it."""
     kwargs = {"stateMachineArn": machine_arn, "maxResults": 100}
@@ -429,6 +550,8 @@ def _grade_schedule(store: GateStore, unit: Unit, schedule: dict, live: dict, as
         recovery = _recovery_for(schedule, fire)
         if recovery is not None and recovery.ruled:
             return _grade_recovered_fire(store, unit, recovery, machine, execution, as_of, evidence)
+        if schedule["name"] in PARTIAL_RUN_SCHEDULES:
+            return _grade_partial_runs(store, unit, fire, machine, execution, as_of, evidence)
         pending = (
             f" (a recovery is declared for this fire in data_gate/config/recovered_fires.yaml but its ruling "
             f"is pending: {recovery.tracker})"
