@@ -329,7 +329,8 @@ _BASE_EVIDENCE_KEY: dict[str, str] = {
     # Read for real since `alpha-engine-config-I10810` — kept here because the
     # UNMET/UNMEASURABLE details still name the key they looked at.
     "run_record": "{prefix}/{trading_day}/*.json",
-    "detector": "data_collection/commissioning/<detector>/latest.json (phase 3)",
+    # Read for real since `alpha-engine-config-I10795`: `data_gate/detector_readers.py`.
+    "detector": "data_collection/commissioning/<unit>/<detector-kind>/latest.json",
     "console_entity": "console:/component/<component_id> (phase 3)",
     "survives_phase4": "{prefix}/{trading_day}/*.json under the standalone stack (phase 1)",
 }
@@ -1052,6 +1053,12 @@ def read_base(store: GateStore, unit: Unit, column: str, *, trading_day: dt.date
         from data_gate import standalone
 
         return standalone.read_survives_phase4(store, unit, trading_day=trading_day)
+    if column == "detector":
+        # `alpha-engine-config-I10795` (A3, part 1). Imported here: the module
+        # imports `Reading` from this one.
+        from data_gate import detector_readers
+
+        return detector_readers.read_detector(store, unit)
     if column in {"observability_row", "artifact_registry", "consumers", "identity"}:
         # `alpha-engine-config-I10823`. Imported here, not at module top:
         # `unit_readers` imports `Reading` from this module.
