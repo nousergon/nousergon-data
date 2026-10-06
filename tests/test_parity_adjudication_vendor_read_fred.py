@@ -68,3 +68,20 @@ def test_main_prints_the_payload_and_fails_when_a_series_failed(fred, capsys):
     assert vendor_read.main(["--fred", "BAD:2026-09-25,DGS10:2026-09-25"]) == 1
     printed = capsys.readouterr().out
     assert "BEGIN-PARITY-VENDOR-READ" in printed and "END-PARITY-VENDOR-READ" in printed
+
+
+def test_the_ticker_filter_keeps_only_named_tickers_and_names_the_absent(monkeypatch, capsys):
+    import sys
+    import types
+
+    bar = {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10, "vwap": 1.2}
+
+    class FakeClient:
+        def get_grouped_daily(self, day):
+            return {"AAA": bar, "BBB": bar, "CCC": bar}
+
+    monkeypatch.setitem(sys.modules, "polygon_client", types.SimpleNamespace(PolygonClient=FakeClient))
+    out = vendor_read.read_polygon(["2026-09-28"], {"AAA", "CCC", "ZZZ"})
+    assert sorted(out["dates"]["2026-09-28"]) == ["AAA", "CCC"]
+    assert "['ZZZ']" in capsys.readouterr().out
+    assert sorted(vendor_read.read_polygon(["2026-09-28"])["dates"]["2026-09-28"]) == ["AAA", "BBB", "CCC"]
