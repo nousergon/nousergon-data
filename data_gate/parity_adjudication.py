@@ -75,6 +75,16 @@ issuecomment-6023457908 and -6024224623). Each is a proof shape, never a toleran
   moved only inside the input tolerance; it is required for any path that cites
   a named ``input_groups`` entry, whose every member is graded (a pending
   member makes the path pending, a breaching one a breach).
+* **Shared input** (``kind: shared``, issuecomment-6025196251 ruling 2). An
+  input BOTH sides read at the same S3 key and VersionId contributes no
+  difference, so it cannot be a cause and needs no vendor read — the yfinance
+  IV snapshot behind ``iv_vs_rv``, which no vendor can re-serve. It is cleared
+  only on READ EVIDENCE: each side's VersionId with the run log, manifest or
+  object-version listing it came from; a side not evidenced is ``pending``, and
+  equal values never stand in for it. A shared input explains nothing by
+  itself: it may be cited only beside a recompute and beside at least one
+  non-shared input, which must clear on its own. It does not establish that the
+  snapshot was correct — that is vendor vetting, not parity.
 
 An attribution whose settled value has not been read yet is ``pending``: red,
 named, and counted — it is the state exceptions 1, 2 and 6 of the 09-28
@@ -103,12 +113,14 @@ __all__ = [
     "ExceptionGrade",
     "INPUT_KIND_BAR",
     "INPUT_KIND_RELEASE",
+    "INPUT_KIND_SHARED",
     "PRECISION_LIMITED",
     "QUANTIZED_EQUAL",
     "REGRADE_TRIGGER_SCHEDULED",
     "CAST_TRUNC",
     "SETTLED_SOURCE_V1_LATER",
     "SETTLED_SOURCE_VENDOR",
+    "SHARED_EVIDENCE_KINDS",
     "adjudication_record_keys",
     "grade_record",
     "report_breach_counts",
@@ -135,7 +147,20 @@ INPUT_KIND_BAR = "bar"
 #: release, which only the vendor's own vintage record can say — so a release
 #: attribution must carry ``released_at_utc`` from the settled (vendor) read.
 INPUT_KIND_RELEASE = "release"
-INPUT_KINDS = frozenset({INPUT_KIND_BAR, INPUT_KIND_RELEASE})
+#: An input both sides read at the SAME S3 key and VersionId (module docstring,
+#: "Shared input"): not a settling input, so it has no lag and no settled read.
+INPUT_KIND_SHARED = "shared"
+INPUT_KINDS = frozenset({INPUT_KIND_BAR, INPUT_KIND_RELEASE, INPUT_KIND_SHARED})
+
+#: Where a side's read VersionId may be evidenced from — what the side itself
+#: recorded at read time, or the object's version history bounding what any
+#: read in that window could have returned. Never the two values being equal.
+SHARED_EVIDENCE_RUN_LOG = "run_log"
+SHARED_EVIDENCE_RUN_MANIFEST = "run_manifest"
+SHARED_EVIDENCE_OBJECT_VERSIONS = "object_versions"
+SHARED_EVIDENCE_KINDS = frozenset({
+    SHARED_EVIDENCE_RUN_LOG, SHARED_EVIDENCE_RUN_MANIFEST, SHARED_EVIDENCE_OBJECT_VERSIONS,
+})
 
 #: v1's own later object version, written BEFORE the cutover (so v1, not the
 #: collector, wrote it).
@@ -356,7 +381,8 @@ def _trunc(value: Any) -> int:
 def settled_inputs_digest(settled_values: Mapping[str, Any]) -> str:
     """SHA-256 of the vendor-settled input values a recompute proof was computed from.
 
-    ``{input id: settled.value}`` → canonical JSON (sorted ``[id, value]`` pairs,
+    ``{input id: settled.value}`` (a shared input contributes its own value, read
+    identically by both sides) → canonical JSON (sorted ``[id, value]`` pairs,
     compact separators, no NaN). A record builder computes it with this same
     function; `_grade_recompute` recomputes it from the record's own inputs, so a
     recompute cannot silently have used values other than the settled ones.
@@ -525,6 +551,8 @@ def _grade_input(
     kind = item.get("kind")
     if kind not in INPUT_KINDS:
         return INVALID, f"{ident}: kind {kind!r} is not one of {sorted(INPUT_KINDS)}"
+    if kind == INPUT_KIND_SHARED:
+        return _grade_shared(item, ident, mode)
     if not item.get("source_key") or not item.get("source_version_id"):
         return INVALID, f"{ident}: must name the v1 source_key AND source_version_id it was read from"
     try:
@@ -633,6 +661,78 @@ def _grade_input(
     return CLEARED, f"{ident}: settled value matches the shadow"
 
 
+def _grade_shared(item: Mapping[str, Any], ident: str, mode: str) -> tuple[str, str]:
+    """A shared input: both sides read the same S3 key at the same VersionId, on read evidence.
+
+    CLEARED only when each side's VersionId is evidenced and they are equal;
+    PENDING while either side is not evidenced (never inferred from equal
+    values); BREACH when the sides read different versions — then the input is
+    not shared and must be attributed as a settling input instead.
+    """
+    if mode == _MODE_STRICT:
+        return INVALID, (
+            f"{ident}: a shared input contributes no difference, so it may be cited only beside a recompute proof"
+        )
+    if any(field_name in item for field_name in ("settled", "regrade", "source_version_id")):
+        return INVALID, (
+            f"{ident}: a shared input has no settling read, regrade or single source_version_id — "
+            "each side's read is evidenced under shared.v1_read / shared.shadow_read"
+        )
+    if not item.get("source_key"):
+        return INVALID, f"{ident}: a shared input must name the S3 source_key both sides read"
+    if "v1_value" not in item or "shadow_value" not in item:
+        return INVALID, f"{ident}: needs both v1_value and shadow_value"
+    shared = item.get("shared")
+    if not isinstance(shared, Mapping):
+        return INVALID, f"{ident}: a shared input needs shared.v1_read and shared.shadow_read"
+    versions: dict[str, str] = {}
+    unevidenced: list[str] = []
+    for side in ("v1_read", "shadow_read"):
+        read = shared.get(side)
+        if read is None:
+            unevidenced.append(side)
+            continue
+        if not isinstance(read, Mapping):
+            return INVALID, f"{ident}: shared.{side} must be an object {{version_id, evidence}}"
+        evidence = read.get("evidence")
+        if evidence is not None and (
+            not isinstance(evidence, Mapping) or evidence.get("kind") not in SHARED_EVIDENCE_KINDS
+        ):
+            return INVALID, (
+                f"{ident}: shared.{side}.evidence.kind must be one of {sorted(SHARED_EVIDENCE_KINDS)}"
+            )
+        if not read.get("version_id") or evidence is None or not str(evidence.get("ref") or "").strip():
+            unevidenced.append(side)
+            continue
+        versions[side] = str(read["version_id"])
+    if unevidenced:
+        return PENDING, (
+            f"{ident}: the VersionId {' and '.join(unevidenced)} read is not evidenced yet — "
+            "equal values never stand in for it"
+        )
+    if versions["v1_read"] != versions["shadow_read"]:
+        return BREACH, (
+            f"{ident}: v1 read VersionId {versions['v1_read']} and the shadow {versions['shadow_read']} — "
+            "different versions, so this input is not shared"
+        )
+    if not _exactly_equal(item["v1_value"], item["shadow_value"]):
+        return INVALID, (
+            f"{ident}: both sides read VersionId {versions['v1_read']} of {item['source_key']} yet record "
+            "different values — the extraction differs, not the input"
+        )
+    return CLEARED, f"{ident}: both sides read VersionId {versions['v1_read']} of {item['source_key']}"
+
+
+def _reference_value(item: Mapping[str, Any]) -> tuple[bool, Any]:
+    """``(known, value)`` an input contributes to a recompute: its settled read, or a shared input's own value."""
+    if item.get("kind") == INPUT_KIND_SHARED:
+        return ("shadow_value" in item), item.get("shadow_value")
+    settled = item.get("settled")
+    if not settled or "value" not in settled:
+        return False, None
+    return True, settled["value"]
+
+
 def _grade_recompute(
     path: str,
     recompute: Any,
@@ -660,13 +760,13 @@ def _grade_recompute(
         return INVALID, f"{path}: recompute.value must be the recomputed number"
     if "shadow_value" not in recompute:
         return INVALID, f"{path}: recompute.shadow_value (the shadow's derived value it must reproduce) is required"
-    unsettled = [i for i in input_ids if not inputs[i].get("settled") or "value" not in inputs[i]["settled"]]
+    unsettled = [i for i in input_ids if not _reference_value(inputs[i])[0]]
     if unsettled:
         return PENDING, f"{path}: recompute awaits the settled read of {len(unsettled)} input(s); first: {unsettled[0]}"
     key = tuple(input_ids)
     if key not in digests:
         try:
-            digests[key] = settled_inputs_digest({i: inputs[i]["settled"]["value"] for i in input_ids})
+            digests[key] = settled_inputs_digest({i: _reference_value(inputs[i])[1] for i in input_ids})
         except (TypeError, ValueError) as exc:
             return INVALID, f"{path}: the settled inputs cannot be digested: {exc}"
     if recompute.get("settled_inputs_sha256") != digests[key]:
@@ -842,6 +942,12 @@ def _grade_exception(
                 "only when a recompute from its settled members reproduces it",
             ))
             continue
+        if refs and not group_refs and all(inputs[r].get("kind") == INPUT_KIND_SHARED for r in refs):
+            path_verdicts.append((
+                INVALID,
+                f"{path}: every input it cites is shared, so nothing differs that could explain the breach",
+            ))
+            continue
         if group_refs and not refs and not any(group_moved[g] for g in group_refs):
             path_verdicts.append((INVALID, f"{path}: no member of {group_refs} differs between v1 and the shadow"))
             continue
@@ -871,7 +977,10 @@ def _grade_exception(
         grade.verdict, grade.detail = UNATTRIBUTED, f"{len(unattributed)} of {breaches} path(s) unattributed; first: {unattributed[0]}"
         return grade
     if pending:
-        grade.verdict, grade.detail = PENDING, f"{pending} of {breaches} path(s) await the settled re-check"
+        first_pending = next(why for v, why in path_verdicts if v == PENDING)
+        grade.verdict, grade.detail = PENDING, (
+            f"{pending} of {breaches} path(s) await the settled re-check; first: {first_pending}"
+        )
         return grade
     grade.detail = f"{breaches}/{breaches} path(s) attributed to inputs that settled to the shadow's value"
     if quantized:
