@@ -514,12 +514,13 @@ class TestDispatcherLambdaAndIam:
         )
         assert "ALPHA_ENGINE_EXPERIMENT_ID=reference" in rendered
 
-    def test_dispatcher_uses_executor_profile_no_ib_exposure(self):
-        # Deliverable #3: the spot reuses the Saturday spot's Arctic-write/S3
-        # profile (alpha-engine-executor-profile) and the standard fleet SG (no
-        # IB port). This mirrors spot_data_weekly.sh rather than minting a role.
+    def test_dispatcher_uses_collection_box_profile_no_ib_exposure(self):
+        # The spot runs under data collection's own identity, not the trading
+        # executor's (alpha-engine-config-I10756 / I11036): an executor-profile
+        # default made every collection write an executor write. Standard
+        # fleet SG, no IB port.
         src = (_DISPATCHER / "index.py").read_text()
-        assert "alpha-engine-executor-profile" in src
+        assert 'os.environ.get("DATA_SPOT_IAM_PROFILE", "nousergon-data-collection-box-profile")' in src
         # No IB gateway port opened anywhere in the launcher.
         assert "4001" not in src and "4002" not in src
 
