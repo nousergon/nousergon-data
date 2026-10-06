@@ -89,6 +89,14 @@ _AUDIT_FACTOR_REL_TOL = 0.15
 # ex_date; allow a few days' slack for weekend/holiday gaps between ex_date and
 # the first observed row.
 _AUDIT_EX_DATE_WINDOW_DAYS = 4
+# A vendor that has registered a split serves its ADJUSTED bars for every date
+# before the ex_date already scaled by the split factor (polygon
+# ``adjusted=true``). A re-fetched staging row for such a date is the SAME bar
+# the store already holds, rescaled — not a new observation — so its ratio to
+# the stored row is the factor to rounding, never "factor x a market move".
+# 2% covers feed rounding (a $4.75 vs $9.50 close is exact; half-cent quotes
+# on a $1 name are 0.5%) while staying far from any real split ratio.
+_VENDOR_PREADJUST_REL_TOL = 0.02
 # The logical store split restatement targets (shared by the Saturday backfill
 # and the daily feature-snapshot delta — see corporate_actions.STORE_*).
 _RESTATE_STORE = ca.STORE_ARCTICDB_UNIVERSE
@@ -660,6 +668,103 @@ def _detect_split_actions(
     return by_ticker
 
 
+def _undo_vendor_preadjustment(
+    ticker: str, base: pd.DataFrame, delta_df: pd.DataFrame, actions: list,
+) -> tuple[pd.DataFrame, list[tuple[str, str]]]:
+    """Put delta rows the vendor pre-adjusted for a registered split back on the
+    store's basis, so the split decision is made ONCE, by ``ca.apply``.
+
+    Observed 2026-10-05 (PSKY): polygon registered a 2-for-1 split executing
+    10-05, and its adjusted bars halved every earlier date. The settled
+    re-fetch then rewrote staging rows 09-30..10-02 at half price while the
+    store still held the market's prices, so the overlay put a fabricated
+    -49% jump at 10-02. The market printed no split on 10-05 ($9.26-$9.87,
+    10-02 close $9.50), so ``ca.apply``'s price-evidence gate refused to
+    restate, and the audit reported the jump as an un-flattened KNOWN split.
+    Two worse outcomes sit next to it. A real split would be double-adjusted,
+    because ``ca.apply`` halves the already-halved rows again. And when the
+    store ends before the halved rows, the only boundary left in the evidence
+    window is the market's x2 back up on the ex_date, which ``ca.apply`` reads
+    as an INVERTED feed record and uses to double the whole history.
+
+    Each pre-ex delta row is classified as on the store's basis or on the
+    vendor's adjusted basis:
+
+    * a row whose date the store also holds is pre-adjusted when the two
+      closes differ by the factor within ``_VENDOR_PREADJUST_REL_TOL`` (the same
+      bar rescaled, so the ratio is exact to feed rounding);
+    * a row with no stored twin inherits the previous row's basis, and switches
+      only where the step from the previous close matches the factor (onto the
+      vendor's basis) or its inverse (back off it), within the audit's own
+      ``_AUDIT_FACTOR_REL_TOL``. The walk starts from the last stored close
+      before the first delta row.
+
+    Pre-adjusted rows are undone: prices divided by the factor, volume
+    multiplied back. Rows on or after the ex_date are the market's own prints
+    and are never touched. Near-1 factors are skipped, as in
+    ``ca.price_evidence_orientation``, where the factor is indistinguishable
+    from ordinary drift. Returns the corrected delta and
+    ``[(date, action_id), ...]`` for every row undone.
+    """
+    undone: list[tuple[str, str]] = []
+    if delta_df.empty or base.empty or "Close" not in base.columns:
+        return delta_df, undone
+    stored_close = base["Close"].astype("float64")
+    out = delta_df
+    for action in actions:
+        if getattr(action, "type", None) != "split":
+            continue
+        try:
+            factor = ca.expected_factor(action)
+            ex = pd.Timestamp(action.ex_date).normalize()
+        except Exception:  # noqa: BLE001 - malformed record, nothing to undo
+            continue
+        if factor <= 0 or 1.0 / ca._ORIENTATION_MIN_SEPARATION < factor < ca._ORIENTATION_MIN_SEPARATION:
+            continue
+        pre_ex = sorted(d for d in out.index if d < ex)
+        if not pre_ex:
+            continue
+        earlier = stored_close[stored_close.index < pre_ex[0]]
+        prev_close = float(earlier.iloc[-1]) if not earlier.empty else float("nan")
+        on_vendor_basis = False
+        hit = []
+        for d in pre_ex:
+            close = float(out.loc[d, "Close"])
+            twin = float(stored_close.loc[d]) if d in stored_close.index else float("nan")
+            if twin > 0:
+                on_vendor_basis = abs(close / twin - factor) <= _VENDOR_PREADJUST_REL_TOL * factor
+            elif prev_close > 0 and close > 0:
+                step = close / prev_close
+                if not on_vendor_basis and abs(step - factor) <= _AUDIT_FACTOR_REL_TOL * factor:
+                    on_vendor_basis = True
+                elif on_vendor_basis and abs(step - 1.0 / factor) <= _AUDIT_FACTOR_REL_TOL / factor:
+                    on_vendor_basis = False
+            if on_vendor_basis:
+                hit.append(d)
+            prev_close = close
+        if not hit:
+            continue
+        if out is delta_df:
+            out = delta_df.copy()
+        for col in ("Open", "High", "Low", "Close", "VWAP"):
+            if col in out.columns:
+                out.loc[hit, col] = out.loc[hit, col] / factor
+        if "Volume" in out.columns:
+            volume = out["Volume"]
+            restored = (volume.loc[hit].astype("float64") * factor).round()
+            if pd.api.types.is_integer_dtype(volume.dtype):
+                restored = restored.astype(volume.dtype)
+            out.loc[hit, "Volume"] = restored
+        undone.extend((pd.Timestamp(d).strftime("%Y-%m-%d"), action.action_id) for d in hit)
+    if undone:
+        log.warning(
+            "%s: %d delta row(s) arrived pre-adjusted by the vendor for a "
+            "registered split; restored to the store's basis before restatement: %s",
+            ticker, len(undone), undone,
+        )
+    return out, undone
+
+
 def _apply_daily_delta(
     s3, bucket: str, date_str: str, price_data: dict[str, pd.DataFrame],
     *, registry=None,
@@ -722,11 +827,29 @@ def _apply_daily_delta(
     # Registry-driven, authoritative split detection over the delta window
     # (PR3, config#1433). No-op when no registry (legacy / dry-run callers).
     actions_by_ticker: dict[str, list] = {}
+    # Every registered split, for undoing vendor pre-adjustment on delta rows.
+    # Wider than ``actions_by_ticker`` (this window's detections) on purpose: a
+    # vendor rescales history as soon as it registers the split, which can be
+    # before the ex_date reaches this window.
+    registered_splits: dict[str, list] = {}
     if registry is not None:
         actions_by_ticker = _detect_split_actions(
             slim_last_date, today, registry,
             run_id=f"apply_daily_delta:{date_str}",
         )
+        try:
+            for action in registry.list_actions(types=["split"]):
+                registered_splits.setdefault(action.ticker, []).append(action)
+        except Exception as exc:  # noqa: BLE001 - degrade, never hard-fail the load
+            log.warning(
+                "registry list_actions failed (%s) — vendor pre-adjustment "
+                "not checked this pass", exc,
+            )
+        for ticker, detected in actions_by_ticker.items():
+            known = {a.action_id for a in registered_splits.get(ticker, [])}
+            registered_splits.setdefault(ticker, []).extend(
+                a for a in detected if a.action_id not in known
+            )
 
     split_tickers: set[str] = set()
     n_updated = 0
@@ -768,6 +891,11 @@ def _apply_daily_delta(
         delta_df["source"] = make_source_series(
             [r.get("source", "unknown") for r in delta], index=delta_df.index,
         )
+
+        if registered_splits.get(ticker):
+            delta_df, _undone = _undo_vendor_preadjustment(
+                ticker, base, delta_df, registered_splits[ticker],
+            )
 
         combined = pd.concat([base, delta_df])
         # keep="last" so delta rows win on duplicate dates (matches predictor)
