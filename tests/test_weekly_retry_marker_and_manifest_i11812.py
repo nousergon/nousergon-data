@@ -205,14 +205,21 @@ def test_a_retry_auto_skip_does_not_mask_the_published_run():
     assert row["manifest"] != row["carried_forward_from"]
 
 
-def test_a_new_execution_whose_units_all_auto_skip_still_verifies():
+def test_a_new_execution_whose_units_all_auto_skip_still_verifies(monkeypatch):
     """The recovery shape: a NEW execution, started after attempt 0 finished.
     The no-op is fresh; the run it points back to is older and still graded."""
+    from datetime import date, datetime, timezone
+
+    # The manifests carry the real clock, so `later` is wall-clock now while DAY
+    # is fixed. Widen the listing lookback to reach DAY from today; without this
+    # the test went red once today passed DAY + MANIFEST_LOOKBACK_DAYS (10-06).
+    monkeypatch.setattr(
+        predicate, "MANIFEST_LOOKBACK_DAYS",
+        (datetime.now(timezone.utc).date() - date.fromisoformat(DAY)).days + predicate.MANIFEST_LOOKBACK_DAYS,
+    )
     s3 = MemS3()
     _collect_d02(s3, _attempt(s3), "ok", [])
     time.sleep(1.1)
-    from datetime import datetime, timezone
-
     later = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     _collect_d02(s3, _attempt(s3), "ok", [])
     assert _verify(s3, ["D02"], started_at=later)["ok"] is True
