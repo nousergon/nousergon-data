@@ -60,7 +60,7 @@ def _fred(path: str, **params) -> dict:
     return response.json()
 
 
-def read_polygon(dates: list[str]) -> dict:
+def read_polygon(dates: list[str], tickers: set[str] | None = None) -> dict:
     from polygon_client import PolygonClient
 
     client = PolygonClient()
@@ -70,8 +70,11 @@ def read_polygon(dates: list[str]) -> dict:
         out[day] = {
             ticker: [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"], bar.get("vwap")]
             for ticker, bar in sorted(bars.items())
+            if tickers is None or ticker in tickers
         }
-        print(f"polygon grouped daily {day}: {len(out[day])} tickers", flush=True)
+        missing = sorted(tickers - out[day].keys()) if tickers else []
+        print(f"polygon grouped daily {day}: {len(bars)} tickers, {len(out[day])} kept; "
+              f"absent from the vendor file: {missing}", flush=True)
     return {"call": "/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true",
             "fields": ["open", "high", "low", "close", "volume", "vwap"], "dates": out}
 
@@ -107,7 +110,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dates", default="")
     parser.add_argument("--fred", default="")
+    parser.add_argument("--tickers", default="",
+                        help="Comma-separated tickers to keep from each grouped file; empty keeps all. "
+                             "The full file is ~12.5k tickers, too large to recover from a job log.")
     args = parser.parse_args(argv)
+    tickers = {t.strip() for t in args.tickers.split(",") if t.strip()} or None
     dates = [d for d in args.dates.split(",") if d]
     specs = [s for s in args.fred.split(",") if s]
     for day in dates:
@@ -121,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
     document = {
         "schema_version": "parity_adjudication_vendor_read.v1",
         "retrieved_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "polygon_grouped_daily": read_polygon(dates) if dates else None,
+        "polygon_grouped_daily": read_polygon(dates, tickers) if dates else None,
+        "polygon_tickers_filter": sorted(tickers) if tickers else None,
         "fred_vintages": read_fred(specs) if specs else None,
     }
     raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
