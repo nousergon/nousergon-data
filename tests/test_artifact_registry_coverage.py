@@ -516,6 +516,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # policy-observability: modules log their metrics, the console points
     # at the source — Brian ruling 2026-08-03).
     "scripts/weekly_sf_recovery_metric.py": 1,
+    # alpha-engine-config-I11984 — the operator-run stored-row sweep. Its one
+    # PUT rewrites an existing backtest/{run_date}/run_scope.json, already
+    # registered as the `weekly_run_scope` ARTIFACT_REGISTRY row (produced by
+    # the weekly SF's RunScope stage). Only with --apply, conditional on the
+    # ETag it read; it creates no new artifact.
+    "scripts/sweep_run_scope_rows.py": 1,
 }
 
 
