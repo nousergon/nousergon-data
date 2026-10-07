@@ -5,6 +5,7 @@ from __future__ import annotations
 import contextlib
 import logging
 import os
+import types
 from pathlib import Path
 from typing import Any, Dict, Iterator, Optional, Sequence
 
@@ -23,6 +24,49 @@ _INIT_ATTEMPTED: set[str] = set()
 # fires for the `owner_repo` values test fixtures actually use, and only
 # when a caller passes `owner_repo` in `context` at all.
 TEST_NAMESPACE_OWNER_REPOS = frozenset({"ae-test", "alpha-engine-test"})
+
+# Packages whose ``send_message`` is the REAL Telegram transport. The raw
+# fallback below refuses to call one of these when flow-doctor is deliberately
+# off (see ``_raw_fallback_refusal``); a test double installed over
+# ``send_message`` lives in some other module and is still called, so handler
+# tests that assert on the fallback keep working.
+_REAL_TRANSPORT_PACKAGES = frozenset({"krepis", "nousergon_lib"})
+_FALSY_ENV = frozenset({"", "0", "false", "no", "off"})
+
+
+def _flow_doctor_disabled() -> bool:
+    """True when ``FLOW_DOCTOR_DISABLED`` is set truthy (tests/conftest.py sets it)."""
+    return os.environ.get("FLOW_DOCTOR_DISABLED", "").strip().lower() not in _FALSY_ENV
+
+
+def _is_real_transport(transport: Any) -> bool:
+    module = getattr(transport, "__module__", None) or ""
+    return (
+        isinstance(transport, types.FunctionType)
+        and module.split(".", 1)[0] in _REAL_TRANSPORT_PACKAGES
+    )
+
+
+def _raw_fallback_refusal(transport: Any) -> Optional[str]:
+    """Why the raw ``send_message`` fallback must not run, or None if it may.
+
+    The fallback exists for PRODUCTION: flow-doctor failed to start, and a
+    lifecycle message reaching Telegram undeduplicated beats it reaching
+    nobody. When flow-doctor is DELIBERATELY off — ``FLOW_DOCTOR_DISABLED``
+    truthy, or running under pytest — the fallback is not a degraded path but
+    a bypass of the kill switch and dedup, and with ``TELEGRAM_BOT_TOKEN`` /
+    ``TELEGRAM_CHAT_ID`` in an agent session's env it delivered fixture data
+    to the operator's real chat (groom cycle COMPLETE pings replaying the
+    2026-07-30 fixture). Only the real transport is refused; a mocked
+    ``send_message`` is the test asserting on this path and still runs.
+    """
+    if not _is_real_transport(transport):
+        return None
+    if _flow_doctor_disabled():
+        return "FLOW_DOCTOR_DISABLED is set"
+    if os.environ.get("PYTEST_CURRENT_TEST"):
+        return "running under pytest"
+    return None
 
 
 def reset_flow_doctor_cache() -> None:
@@ -126,7 +170,7 @@ def get_flow_doctor(
     if flow_name in _INIT_ATTEMPTED:
         return None
     _INIT_ATTEMPTED.add(flow_name)
-    if os.environ.get("FLOW_DOCTOR_ENABLED", "1") != "1":
+    if os.environ.get("FLOW_DOCTOR_ENABLED", "1") != "1" or _flow_doctor_disabled():
         _FLOW_DOCTOR_BY_NAME[flow_name] = None
         return None
     try:
@@ -263,6 +307,14 @@ def notify_via_flow_doctor(
             rate_limit_exempt_severities=rate_limit_exempt_severities,
         )
         if fd is None:
+            refusal = _raw_fallback_refusal(send_message)
+            if refusal is not None:
+                logger.warning(
+                    "notify_via_flow_doctor: flow-doctor is deliberately off (%s) "
+                    "— not falling back to a raw Telegram send for %r (flow=%s)",
+                    refusal, dedup_key, flow_name,
+                )
+                return False
             return send_message(text, disable_notification=silent)
 
         subject = text.replace("*", "").strip()

@@ -306,7 +306,8 @@ def _write_row_backfill_safe(
             existing_series = lib.read(symbol).data
         except Exception:
             # Symbol doesn't exist yet — first write is always an append.
-            lib.write(symbol, new_row, prune_previous_versions=True)
+            # No prune: see the backfill branch below.
+            lib.write(symbol, new_row)
             return "append"
 
     if existing_series.empty or target_ts >= existing_series.index.max():
@@ -324,7 +325,14 @@ def _write_row_backfill_safe(
     new_row = _align_schema_for_update(new_row, existing_series)
     combined = pd.concat([existing_series, new_row])
     combined = combined[~combined.index.duplicated(keep="last")].sort_index()
-    lib.write(symbol, combined, prune_previous_versions=True)
+    # Never prune previous versions here (alpha-engine-config-I12115). Two
+    # readers depend on them: ``shadow/recompute_lineage.py`` reads
+    # ``as_of=<timestamp>`` (the parity ``v1_cause`` evidence) and
+    # crucible-research's faithful replay reads ``as_of=<version>``. Pruning
+    # also had to walk each symbol's whole version chain (~830 deep) and
+    # then delete it: on 2026-10-07 that made daily-heal's 3600s budget run
+    # out in the first of seven universe chunks.
+    lib.write(symbol, combined, prune_previous_versions=False)
     return "backfill"
 
 
@@ -1844,8 +1852,9 @@ def daily_append(
 
         Background: a re-run with ``skip_if_exists=False`` enters
         ``_write_row_backfill_safe``'s backfill branch on every ticker
-        (target_ts == existing.index.max()), which calls
-        ``lib.write(combined, prune_previous_versions=True)`` per ticker.
+        (target_ts == existing.index.max()), which called
+        ``lib.write(combined, prune_previous_versions=True)`` per ticker
+        (it no longer prunes, alpha-engine-config-I12115).
         904 × ~1.5s = ~22 min — over the SSM 1200s timeout. The 2026-05-01
         EOD SF rerun timed out exactly here after our manual recovery
         run had already written today's rows.
@@ -3016,8 +3025,10 @@ def _daily_append_impl(
                     universe_lib.update_batch(update_payloads, upsert=True)
                     if update_payloads else []
                 )
+                # Backfill writes keep previous versions, for the same reason
+                # as ``_write_row_backfill_safe`` (alpha-engine-config-I12115).
                 write_results = (
-                    universe_lib.write_batch(write_payloads, prune_previous_versions=True)
+                    universe_lib.write_batch(write_payloads, prune_previous_versions=False)
                     if write_payloads else []
                 )
             write_wall = time.time() - t_write0
