@@ -96,6 +96,17 @@ RISK_FACTOR_ETFS = [
 # close_history already comes via RISK_FACTOR_ETFS; the union just guarantees coverage and
 # gives the live estimate a single source for every proxy. All USD.
 FUND_PROXY_ETFS = ["SPY", "IXUS"]
+# The real funds behind Metron's Demo household (metron api/services/demo_household.py:
+# each ``DEMO-<SYM>`` is priced daily by chaining ``<SYM>``'s real close from this
+# close_history, metron#530). The household's single stocks are SP1500 names, so the
+# price-derived universe already carries them; its funds are not, and nobody's held
+# universe is a dependable source — before this list VTI and BND had no close_history at
+# all, so DEMO-VTI and DEMO-BND (~19% of the household) stayed at the fixture's 08-15
+# close. VOO is listed too: it is only published today because a real tenant holds it,
+# and the demo must not freeze when that holding is sold. Mirrors the non-equity rows of
+# metron's ``SECURITY_META`` (drift-guarded in tests/test_metron_etf_drift_guard.py).
+# Close history only: no fundamentals/technicals/intraday fan-out. All USD.
+DEMO_HOUSEHOLD_FUND_ETFS = ["VTI", "VOO", "BND"]
 # Reference data — GICS sector per held symbol + SPY's sector weights (Brinson
 # attribution), and each held symbol's next earnings date (Calendar page). Moves
 # Metron's last yfinance fetches to the spine so Metron reads ALL external data here.
@@ -1783,10 +1794,12 @@ def collect_history(
     # Held symbols + the factor/sector ETFs Metron's risk/attribution need (metron-ops#43),
     # + the major-index ETF proxies (so the Overview markets strip resolves YTD/LTM for
     # QQQ/IWM/ONEQ — not just SPY, which only worked because it's in RISK_FACTOR_ETFS),
-    # + the fund-proxy ETFs (close_history backstop for the late-fund-NAV reconcile). All
+    # + the fund-proxy ETFs (close_history backstop for the late-fund-NAV reconcile),
+    # + the Demo household's funds (its DEMO- twins are chained off these closes). All
     # USD, independent of holdings — without them the spine has no close_history for these.
     hist_symbols = sorted(
         set(ccy_by_yf) | set(RISK_FACTOR_ETFS) | set(INDEX_PROXY_SYMBOLS) | set(FUND_PROXY_ETFS)
+        | set(DEMO_HOUSEHOLD_FUND_ETFS)
     )
     closes = (
         close_history_source

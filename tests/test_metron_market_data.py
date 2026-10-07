@@ -236,14 +236,51 @@ class TestHistory:
         assert set(mmd.RISK_FACTOR_ETFS) <= set(requested)  # all factor ETFs requested
         assert set(mmd.INDEX_PROXY_SYMBOLS) <= set(requested)  # QQQ/IWM/ONEQ get close_history → YTD/LTM
         assert set(mmd.FUND_PROXY_ETFS) <= set(requested)  # IXUS published for the fund reconcile
+        assert set(mmd.DEMO_HOUSEHOLD_FUND_ETFS) <= set(requested)  # VTI/BND chain the demo household
         assert "AAPL" in requested  # held symbols still included
         puts = _puts(s3)
         for etf in ("SPY", "XLK", "MTUM", "QQQ", "IWM", "ONEQ", "IXUS"):
             key = f"market_data/close_history/{etf}.json"
             assert key in puts and puts[key]["currency"] == "USD"
         assert result["close_series"] == len(set(
-            ["AAPL", "1299.HK", *mmd.RISK_FACTOR_ETFS, *mmd.INDEX_PROXY_SYMBOLS, *mmd.FUND_PROXY_ETFS]
+            ["AAPL", "1299.HK", *mmd.RISK_FACTOR_ETFS, *mmd.INDEX_PROXY_SYMBOLS, *mmd.FUND_PROXY_ETFS,
+             *mmd.DEMO_HOUSEHOLD_FUND_ETFS]
         ))
+
+    def test_publishes_demo_household_fund_history_when_nobody_holds_them(self):
+        # metron#530 prices each DEMO-<SYM> by chaining <SYM>'s real close from the
+        # consolidated close_history. VTI and BND are neither SP1500 constituents nor in
+        # the held universe, so before DEMO_HOUSEHOLD_FUND_ETFS they had no series at all
+        # and DEMO-VTI / DEMO-BND froze at the fixture's 08-15 close. They must be
+        # requested and land in BOTH the per-symbol file and the consolidated artifact the
+        # Metron reader prefers, as USD, with nothing about the universe naming them.
+        s3 = _universe_s3(_UNIVERSE)
+        assert not {"VTI", "BND"} & {h["yf_symbol"] for h in _UNIVERSE["holdings"]}
+        requested: list[str] = []
+
+        def close_hist(syms):
+            requested.extend(syms)
+            return {s: [("2026-08-14", 100.0), ("2026-10-05", 101.0)] for s in syms}
+
+        result = mmd.collect_history(
+            bucket="b", s3_client=s3, run_date="2026-10-05",
+            close_history_source=close_hist, fx_history_source=lambda c: {},
+        )
+        assert result["status"] == "ok"
+        assert {"VTI", "BND"} <= set(requested)
+        assert len(requested) == len(set(requested))  # VOO etc. requested once, never twice
+        puts = _puts(s3)
+        consolidated = puts[mmd.CONSOLIDATED_CLOSE_HISTORY_KEY]
+        for etf in ("VTI", "BND"):
+            per_symbol = puts[f"market_data/close_history/{etf}.json"]
+            assert per_symbol["currency"] == "USD"
+            assert per_symbol["closes"][-1] == ["2026-10-05", 101.0]
+            assert consolidated["series"][etf][-1] == ["2026-10-05", 101.0]
+            assert consolidated["currency"][etf] == "USD"
+
+    def test_demo_household_funds_are_the_ones_metron_530_left_unpriced(self):
+        # Pins the item: the two symbols metron#530 reports as `unpriced` are listed.
+        assert {"VTI", "BND"} <= set(mmd.DEMO_HOUSEHOLD_FUND_ETFS)
 
     def test_history_dry_run_and_empty_universe(self):
         s3 = _universe_s3(_UNIVERSE)

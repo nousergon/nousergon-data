@@ -107,3 +107,43 @@ def test_fund_proxy_etfs_has_no_duplicates():
     assert len(mmd.FUND_PROXY_ETFS) == len(set(mmd.FUND_PROXY_ETFS)), (
         f"duplicate symbol(s) in FUND_PROXY_ETFS: {mmd.FUND_PROXY_ETFS}"
     )
+
+
+def test_demo_household_fund_etfs_cover_metrons_demo_household_funds():
+    """metron#530 prices every ``DEMO-<SYM>`` in the Demo household by chaining ``<SYM>``'s
+    real close from the spine's close_history. The household's single stocks are SP1500
+    constituents, so the price-derived universe publishes them; its FUNDS are not, and a
+    fund the producer does not list here has no close_history unless some real tenant
+    happens to hold it — the DEMO- twin then freezes at the fixture's last close (VTI and
+    BND did exactly that from 2026-08-15). So every non-equity row of metron's
+    ``SECURITY_META`` must map, via ``REFERENCE_SYMBOLS``, into ``DEMO_HOUSEHOLD_FUND_ETFS``.
+
+    Subset (``<=``), not equality, for the same reason as the fund-proxy guard above:
+    publishing one more USD series than the household needs costs one close_history file."""
+    demo_household = pytest.importorskip(
+        "api.services.demo_household",
+        reason="metron not co-installed (data-repo CI); drift guard runs on the box / when metron is installed",
+    )
+
+    metron_funds = {
+        demo_household.REFERENCE_SYMBOLS[sym]
+        for sym, (_name, asset_class, _sector) in demo_household.SECURITY_META.items()
+        if asset_class != "equity"
+    }
+    producer_etfs = set(mmd.DEMO_HOUSEHOLD_FUND_ETFS)
+
+    missing_from_producer = metron_funds - producer_etfs
+
+    assert metron_funds <= producer_etfs, (
+        "metron's Demo household holds a fund the spine does not publish close_history for "
+        "— its DEMO- twin will freeze at the fixture's last close (metron#530). "
+        f"Add to DEMO_HOUSEHOLD_FUND_ETFS: {sorted(missing_from_producer)}."
+    )
+
+
+def test_demo_household_fund_etfs_has_no_duplicates():
+    """Mirrors the duplicate guards above — a dup would mask a real drift in the subset
+    comparison."""
+    assert len(mmd.DEMO_HOUSEHOLD_FUND_ETFS) == len(set(mmd.DEMO_HOUSEHOLD_FUND_ETFS)), (
+        f"duplicate symbol(s) in DEMO_HOUSEHOLD_FUND_ETFS: {mmd.DEMO_HOUSEHOLD_FUND_ETFS}"
+    )
