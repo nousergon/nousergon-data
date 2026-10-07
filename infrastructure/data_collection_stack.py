@@ -246,7 +246,11 @@ UNIT_WRITERS: dict[str, dict[str, str]] = {
         )},
         "D32": "post-market-arctic-append",
     },
-    "data-collection-morning": {"D17": "morning-enrich", "D18": "morning-arctic-append"},
+    "data-collection-morning": {
+        "D17": "morning-enrich",
+        "D18": "morning-arctic-append",
+        "D50": "features-settled-regrade",
+    },
     "data-collection-weekly": {
         "D17": "morning-enrich",
         **{u: "weekly-phase-one" for u in (
@@ -254,6 +258,22 @@ UNIT_WRITERS: dict[str, dict[str, str]] = {
             "D12", "D13", "D14",
         )},
         "D34": "chronic-gap-heal",
+    },
+}
+
+
+#: verify_units a v1 readiness wait deliberately does NOT read, per schedule,
+#: each with its reason. A declared exclusion, not a filter: the wait's units
+#: are otherwise derived as exactly the schedule's verify_units, and
+#: tests/test_v1_collection_readiness_wait.py asserts this table both ways.
+READINESS_WAIT_EXCLUSIONS: dict[str, dict[str, str]] = {
+    "data-collection-morning": {
+        "D50": (
+            "features/{D-1} settled rebuild (alpha-engine-config-I12023). The preopen "
+            "pipeline's PredictorInference reads ArcticDB (D18), not features/, so "
+            "waiting on D50 would hold the trading morning on an artifact it does not "
+            "read; the morning SF's own VerifyRunManifests grades it."
+        ),
     },
 }
 
