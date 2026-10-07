@@ -108,6 +108,14 @@ detectors:
   - kind: "crucible-gate"
     via: crucible board (component 2)
     state: PRESENT
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # The crucible board's row ids for this unit's three jobs (crucible/board.py,
+    # `component:{name}` over crucible/components.yaml); all three present on the
+    # live 2026-10-06 board.
+    subject:
+      - "component:data.daily"
+      - "component:data.weekly"
+      - "component:data.heal"
 freshness:
   na_code: "N/A-NOT-IMPL"
   note: "graded on the crucible board, not this one"
