@@ -75,8 +75,13 @@ def _read(unit, document) -> cer.Reading:
 
 
 def test_the_reader_grades_every_unit_the_stub_covered():
-    """40 graded + the 2 declared exclusions = the 42 phase-0 stubs it replaced."""
-    assert len(GRADED) + len(EXCLUDED) == 42, [u.unit_id for u in GRADED]
+    """Graded + the 2 declared exclusions = every live `console_entity` clause the
+    phase-0 stub covered (42 at the reader's birth; derived, not pinned, so a unit
+    added under `registry.d/units/` — D50 on 2026-10-06 — is graded, not missed)."""
+    board = clause_module.generate(EmptyStore(), ALL_UNITS, load_phases(), trading_day=TRADING_DAY)
+    live = [c for c in board if c.name.endswith(".console_entity") and not clause_module.is_retired(c)]
+    assert len(GRADED) + len(EXCLUDED) == len(live), [u.unit_id for u in GRADED]
+    assert len(GRADED) + len(EXCLUDED) >= 42, "fewer units than the stub covered"
 
 
 @pytest.mark.parametrize("unit", GRADED, ids=lambda u: u.unit_id)
@@ -263,7 +268,7 @@ def test_a_malformed_receipt_is_unmeasurable(d03):
 def test_no_console_entity_clause_renders_the_phase0_stub_or_reads_met_without_a_receipt():
     board = clause_module.generate(EmptyStore(), load_units(), load_phases(), trading_day=TRADING_DAY)
     rows = [c for c in board if c.name.endswith(".console_entity") and not clause_module.is_retired(c)]
-    assert len(rows) == 42, len(rows)
+    assert len(rows) == len(GRADED) + len(EXCLUDED) >= 42, len(rows)
     for clause in rows:
         assert "no reader is built" not in clause.detail, clause.name
         assert not getattr(clause, "unmeasurable", False), clause.name
