@@ -5,20 +5,27 @@ name: Live Polygon Smoke
 # pattern shipped 2026-05-26 for the same class of bug (mocked tests
 # pass; live API returns 4xx because the payload shape drifted).
 #
-# Triggers ONLY on PRs touching files that affect the Polygon payload
+# Triggers on pushes to main (and by hand) touching files that affect the Polygon payload
 # shape or the consumers that read its response. Other PRs skip.
 #
 # Cost: one grouped-daily call (~$0.01) per triggered run. Negligible
 # vs the cost of one silent-failed MorningEnrich on a trading day.
 #
-# Secret gate: requires repo secret POLYGON_API_KEY. Forks without the
-# secret get a clean skip (the script exits 0 when the env var is
-# unset) rather than a failing CI status.
+# Key: read from SSM at runtime (`/alpha-engine/POLYGON_API_KEY`) under
+# `github-actions-vendor-key-read`, whose trust admits only this workflow on
+# main. All secrets live in SSM (Brian, 2026-10-05). Until then this workflow
+# read a `POLYGON_API_KEY` repo secret that never existed, so every run skipped and
+# still showed green (alpha-engine-config-I12023). It runs after merge rather
+# than on the PR because a role holding a live key must not be assumable from
+# an unreviewed branch; a failure is red main CI. The key step fails loud when
+# the parameter is unreadable, so a skip can no longer pass for a check.
 
-permissions: {}
+permissions:
+  contents: read
+  id-token: write
 
 on:
-  pull_request:
+  push:
     branches: [main]
     paths:
       - "polygon_client.py"
@@ -26,6 +33,7 @@ on:
       - "collectors/nasdaq_snapshot.py"
       - "tests/live_smoke/polygon_smoke.py"
       - ".github/workflows/live-polygon-smoke.yml"
+  workflow_dispatch:
 
 jobs:
   smoke:
@@ -45,7 +53,26 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      # This repository is public and its run logs are public; GitHub masks
+      # SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-vendor-key-read
+          aws-region: us-east-1
+
+      - name: Read the Polygon key from SSM (masked)
+        run: |
+          value="$(aws ssm get-parameter --name /alpha-engine/POLYGON_API_KEY --with-decryption --query Parameter.Value --output text)"
+          if [ -z "$value" ] || [ "$value" = "None" ]; then
+            echo "::error::/alpha-engine/POLYGON_API_KEY is empty or unreadable"
+            exit 1
+          fi
+          echo "::add-mask::$value"
+          echo "POLYGON_API_KEY=$value" >> "$GITHUB_ENV"
+
       - name: Dispatch live-Polygon smoke
-        env:
-          POLYGON_API_KEY: ${{ secrets.POLYGON_API_KEY }}
         run: python tests/live_smoke/polygon_smoke.py

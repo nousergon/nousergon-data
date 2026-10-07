@@ -13,6 +13,10 @@ Read-only: it writes nothing anywhere. It prints:
 * ``polygon_grouped_daily``: every ticker's bar for each requested date, from
   the SAME call and parameters the collector uses
   (`polygon_client.get_grouped_daily`, ``adjusted=true``), at full precision;
+  a requested ticker the grouped file omits (OTC symbols such as GTBIF are not
+  in it) is read from the per-ticker aggregates endpoint instead
+  (`polygon_client.get_single_day_bar`, also ``adjusted=true``) and kept apart
+  under ``per_ticker`` so the record can cite which call served each bar;
 * ``fred_vintages``: for each requested ``SERIES:OBSERVATION_DATE``, every
   ALFRED vintage of that observation (``realtime_start`` is the release date),
   plus the series' ``last_updated`` timestamp.
@@ -50,36 +54,68 @@ def _fred(path: str, **params) -> dict:
     query = {**params, "api_key": os.environ["FRED_API_KEY"], "file_type": "json"}
     response = requests.get(f"{FRED_BASE}/{path}", params=query, timeout=30)
     if response.status_code != 200:
-        # Never echo the URL: it carries the key.
-        raise RuntimeError(f"FRED {path} returned HTTP {response.status_code}")
+        # Never echo the URL: it carries the key. FRED's own error_message names
+        # the offending variable, which is what makes a 400 diagnosable.
+        try:
+            detail = str(response.json().get("error_message", ""))[:300]
+        except ValueError:
+            detail = ""
+        raise RuntimeError(f"FRED {path} returned HTTP {response.status_code}: {detail}")
     return response.json()
 
 
-def read_polygon(dates: list[str]) -> dict:
+def read_polygon(dates: list[str], tickers: set[str] | None = None) -> dict:
     from polygon_client import PolygonClient
 
+    def row(bar: dict) -> list:
+        return [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"], bar.get("vwap")]
+
     client = PolygonClient()
-    out = {}
+    out: dict[str, dict] = {}
+    per_ticker: dict[str, dict] = {}
     for day in dates:
         bars = client.get_grouped_daily(day)
         out[day] = {
-            ticker: [bar["open"], bar["high"], bar["low"], bar["close"], bar["volume"], bar.get("vwap")]
+            ticker: row(bar)
             for ticker, bar in sorted(bars.items())
+            if tickers is None or ticker in tickers
         }
-        print(f"polygon grouped daily {day}: {len(out[day])} tickers", flush=True)
+        missing = sorted(tickers - out[day].keys()) if tickers else []
+        print(f"polygon grouped daily {day}: {len(bars)} tickers, {len(out[day])} kept; "
+              f"absent from the vendor file: {missing}", flush=True)
+        if missing:
+            # A NAMED ticker the grouped file omits is read from the per-ticker
+            # endpoint; None records that the vendor has no bar for it either.
+            found = {ticker: client.get_single_day_bar(ticker, day) for ticker in missing}
+            per_ticker[day] = {ticker: (row(bar) if bar else None) for ticker, bar in found.items()}
+            unread = sorted(t for t, bar in found.items() if not bar)
+            print(f"polygon per-ticker {day}: {len(missing) - len(unread)} of {len(missing)} read; "
+                  f"no bar from either call: {unread}", flush=True)
     return {"call": "/v2/aggs/grouped/locale/us/market/stocks/{date}?adjusted=true",
-            "fields": ["open", "high", "low", "close", "volume", "vwap"], "dates": out}
+            "fields": ["open", "high", "low", "close", "volume", "vwap"], "dates": out,
+            "per_ticker_call": "/v2/aggs/ticker/{ticker}/range/1/day/{date}/{date}?adjusted=true",
+            "per_ticker": per_ticker}
 
 
 def read_fred(specs: list[str]) -> dict:
     out = {}
     for spec in specs:
         series, observation = spec.split(":")
-        vintages = _fred(
-            "series/observations", series_id=series, realtime_start="1776-07-04",
-            realtime_end="9999-12-31", observation_start=observation, observation_end=observation,
-        ).get("observations", [])
-        meta = (_fred("series", series_id=series).get("seriess") or [{}])[0]
+        try:
+            # Vintages of one observation can only be published on or after it,
+            # so the real-time window starts there rather than at FRED's epoch.
+            vintages = _fred(
+                "series/observations", series_id=series, realtime_start=observation,
+                realtime_end=dt.date.today().isoformat(), observation_start=observation,
+                observation_end=observation,
+            ).get("observations", [])
+            meta = (_fred("series", series_id=series).get("seriess") or [{}])[0]
+        except RuntimeError as exc:
+            # One unreadable series must not discard the whole read (the Polygon
+            # half is the larger, slower one); it is recorded and fails the run.
+            out[spec] = {"error": str(exc)}
+            print(f"fred {spec}: ERROR {exc}", flush=True)
+            continue
         out[spec] = {
             "vintages": [{k: v.get(k) for k in ("date", "value", "realtime_start", "realtime_end")} for v in vintages],
             "series_last_updated": meta.get("last_updated"),
@@ -92,7 +128,11 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--dates", default="")
     parser.add_argument("--fred", default="")
+    parser.add_argument("--tickers", default="",
+                        help="Comma-separated tickers to keep from each grouped file; empty keeps all. "
+                             "The full file is ~12.5k tickers, too large to recover from a job log.")
     args = parser.parse_args(argv)
+    tickers = {t.strip() for t in args.tickers.split(",") if t.strip()} or None
     dates = [d for d in args.dates.split(",") if d]
     specs = [s for s in args.fred.split(",") if s]
     for day in dates:
@@ -106,7 +146,8 @@ def main(argv: list[str] | None = None) -> int:
     document = {
         "schema_version": "parity_adjudication_vendor_read.v1",
         "retrieved_at_utc": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-        "polygon_grouped_daily": read_polygon(dates) if dates else None,
+        "polygon_grouped_daily": read_polygon(dates, tickers) if dates else None,
+        "polygon_tickers_filter": sorted(tickers) if tickers else None,
         "fred_vintages": read_fred(specs) if specs else None,
     }
     raw = json.dumps(document, sort_keys=True, separators=(",", ":")).encode("utf-8")
@@ -116,6 +157,10 @@ def main(argv: list[str] | None = None) -> int:
     for i in range(0, len(encoded), CHUNK):
         print(encoded[i:i + CHUNK])
     print("END-PARITY-VENDOR-READ")
+    failed = [spec for spec, row in (document["fred_vintages"] or {}).items() if "error" in row]
+    if failed:
+        print(f"FRED read failed for {', '.join(failed)}; payload above carries the rest", flush=True)
+        return 1
     return 0
 
 

@@ -465,6 +465,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
     # retired the S3 mirror) — no new registry row needed.
     "features/metron_supplemental.py": 1,
+    # D50 settled rebuild of features/{D-1} (alpha-engine-config-I12023): the
+    # group parquets plus the settlement.json marker. Both land under the
+    # grandfathered "features/" path_prefix, so no new registry row is needed.
+    "features/settled_regrade.py": 2,
     "features/writer.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
