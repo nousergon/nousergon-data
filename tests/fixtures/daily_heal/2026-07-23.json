@@ -1,0 +1,37 @@
+{
+  "mode": "daily_heal",
+  "date": "2026-07-23",
+  "started_at": "2026-07-24T09:02:42.216296+00:00",
+  "collectors": {
+    "universe_gap_heal": {
+      "status": "ok",
+      "scan_window_td": 5,
+      "max_per_run": 1,
+      "missing_days": [],
+      "fallback_quality_days": [],
+      "ledger_days": [
+        "2026-07-23"
+      ],
+      "healed_days": [],
+      "deferred_days": [],
+      "errors": [
+        {
+          "date": "2026-07-23",
+          "kind": "ledger",
+          "reason": "universe data plane is at schema v0 but this producer emits schema v1: a schema-additive change was deployed WITHOUT its data migration. Pending migration(s) ['0001'] must be applied in-region (see migrations/README.md) before any universe append. Refusing to write \u2014 this is the config-I3236 failure caught pre-write instead of as 904/904 StreamDescriptorMismatch."
+        }
+      ]
+    },
+    "chronic_gap_heal": {
+      "mode": "chronic_gap_heal",
+      "date": "2026-07-23",
+      "started_at": "2026-07-24T09:02:45.487854+00:00",
+      "collectors": {},
+      "status": "ok",
+      "completed_at": "2026-07-24T09:02:45.489470+00:00"
+    }
+  },
+  "completed_at": "2026-07-24T09:02:45.532155+00:00",
+  "days_healed": 0,
+  "status": "ok"
+}

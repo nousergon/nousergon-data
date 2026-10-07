@@ -1798,7 +1798,7 @@ def _run_dry_run() -> int:
     return 0 if mapping else 1
 
 
-def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> None:
+def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global_sidecar: bool) -> list[tuple[str, int]]:
     """Record one quarter's published keys with the row count that landed.
 
     ``write_inst_ownership_parquet`` writes a run-scoped artifact under a run id
@@ -1806,19 +1806,35 @@ def _record_written_quarter(ctx, bucket: str, prefix: str, rows: list, *, global
     Those two are what the manifest names, so a reader can go straight from the
     record to the object — and ``rows_out`` is ``len(rows)``, the count the
     producer itself measured, never a 0 standing in for an unreported one.
+
+    Returns the ``(key, rows_out)`` pairs it recorded, which
+    :func:`_grade_published` grades once the whole run has written.
     """
     quarter = rows[0].quarter
-    ctx.record_output(
-        f"{prefix}/{quarter}/latest.parquet",
-        rows_out=len(rows),
-        schema_version=str(SCHEMA_VERSION),
-    )
+    recorded = [(f"{prefix}/{quarter}/latest.parquet", len(rows))]
     if global_sidecar:
-        ctx.record_output(
-            f"{prefix}/latest.json",
-            rows_out=len(rows),
-            schema_version=str(SCHEMA_VERSION),
-        )
+        recorded.append((f"{prefix}/latest.json", len(rows)))
+    for key, rows_out in recorded:
+        ctx.record_output(key, rows_out=rows_out, schema_version=str(SCHEMA_VERSION))
+    return recorded
+
+
+def _grade_published(ctx, bucket: str, s3_client: Any, published: list[tuple[str, int]]) -> None:
+    """The empty-but-fresh + floor guard over every key this D39 run published.
+
+    `alpha-engine-config-I10785` (P-18). ``_run_cli`` already exits 1 when
+    ``compute_and_write_inst_ownership`` returns no rows, so a zero COUNT never
+    reaches here. What the count cannot show is the object itself: a PUT that
+    did not land, or a zero-byte object, behind a count that says 850. The
+    shared check HEADs each key and applies D39's declared
+    ``completeness.rows_out_floor`` when one is set. Graded once per run, after
+    every quarter is written, so the run carries one board metric.
+    """
+    run_units.grade_published_outputs(
+        ctx, "D39", published,
+        bucket=bucket, s3_client=s3_client,
+        source_path="data/derived/inst_ownership.py::_run_cli",
+    )
 
 
 def main() -> None:
@@ -1976,6 +1992,7 @@ def _run_cli(args, run_ctx) -> None:
             sys.exit(1)
         window_cache: dict[str, zipfile.ZipFile] = {}
         total_rows = 0
+        published: list[tuple[str, int]] = []
         for period in report_periods:
             print(f"Processing report period {period.isoformat()}...")
             try:
@@ -1997,10 +2014,11 @@ def _run_cli(args, run_ctx) -> None:
                 )
                 sys.exit(1)
             print(f"  wrote {len(rows)} rows for {rows[0].quarter}")
-            _record_written_quarter(
+            published += _record_written_quarter(
                 run_ctx, args.bucket, DEFAULT_S3_PREFIX, rows, global_sidecar=False,
             )
             total_rows += len(rows)
+        _grade_published(run_ctx, args.bucket, s3, published)
         print(
             f"Backfill complete: {len(report_periods)} period(s), "
             f"{total_rows} total rows"
@@ -2020,9 +2038,10 @@ def _run_cli(args, run_ctx) -> None:
         print("No data processed (see logs for details).", file=sys.stderr)
         sys.exit(1)
 
-    _record_written_quarter(
+    published = _record_written_quarter(
         run_ctx, args.bucket, DEFAULT_S3_PREFIX, rows, global_sidecar=True,
     )
+    _grade_published(run_ctx, args.bucket, s3, published)
     print(f"Written: {len(rows)} rows for {rows[0].quarter}")
     print(f"Sample: {rows[0].ticker} — {rows[0].n_funds_holding} funds, "
           f"{rows[0].total_shares_held:,.0f} shares")

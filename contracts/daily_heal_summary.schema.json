@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/daily_heal_summary.schema.json",
+  "title": "Daily heal summary (data/heal/daily/{date}.json)",
+  "description": "Producer: weekly_collector.py::_run_daily_heal (D33 daily-heal, alpha-engine-config-I10933). One record per run, written for the healed trading day whether or not anything was healed. The universe-gap heal's healed_days drive the staging/daily_closes/{day}.parquet keys the run manifest records (weekly_collector.py::_daily_heal_daily_closes_keys); those parquet rows are governed by staging_daily_closes.schema.json, shared with D17/D19. No surviving consumer today (consumers_decision kept-unconnected); the data phase-2 heal verifier is the planned reader and pins this file when it lands.",
+  "x-key-pattern": "data/heal/daily/{date}.json",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["mode", "date", "started_at", "collectors", "completed_at", "days_healed", "status"],
+  "properties": {
+    "mode": {"const": "daily_heal"},
+    "date": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "The trading day healed (the prior trading day relative to the run), not the run date."
+    },
+    "started_at": {"type": "string", "description": "ISO-8601 UTC timestamp."},
+    "completed_at": {"type": "string", "description": "ISO-8601 UTC timestamp."},
+    "days_healed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "universe-gap days healed plus chronic-gap tickers healed; the value of the daily_heal_days_healed metric. 0 is a valid, fresh reading."
+    },
+    "status": {
+      "const": "ok",
+      "description": "Always ok: both sub-heals are best-effort and a blown-up heal raises instead of returning (see the producer's docstring)."
+    },
+    "collectors": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["universe_gap_heal", "chronic_gap_heal"],
+      "properties": {
+        "universe_gap_heal": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["status"],
+          "properties": {
+            "status": {"enum": ["ok", "skipped", "error"]},
+            "error": {"type": "string"},
+            "scan_window_td": {"type": "integer", "minimum": 0},
+            "max_per_run": {"type": "integer", "minimum": 0},
+            "missing_days": {"$ref": "#/$defs/day_list"},
+            "fallback_quality_days": {"$ref": "#/$defs/day_list"},
+            "ledger_days": {"$ref": "#/$defs/day_list"},
+            "deferred_days": {"$ref": "#/$defs/day_list"},
+            "healed_days": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["date", "kind", "tickers", "weekly_date"],
+                "properties": {
+                  "date": {"$ref": "#/$defs/day"},
+                  "kind": {"$ref": "#/$defs/heal_kind"},
+                  "tickers": {"type": "integer", "minimum": 0},
+                  "weekly_date": {"type": "string"}
+                }
+              }
+            },
+            "errors": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["date", "kind", "reason"],
+                "properties": {
+                  "date": {"$ref": "#/$defs/day"},
+                  "kind": {"$ref": "#/$defs/heal_kind"},
+                  "reason": {"type": "string"}
+                }
+              }
+            }
+          },
+          "if": {"properties": {"status": {"const": "ok"}}},
+          "then": {"required": ["healed_days", "errors"]},
+          "else": {"required": ["error"]}
+        },
+        "chronic_gap_heal": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["mode", "status"],
+          "properties": {
+            "mode": {"const": "chronic_gap_heal"},
+            "status": {"type": "string"},
+            "collectors": {"type": "object"}
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "day": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+    "day_list": {"type": "array", "items": {"$ref": "#/$defs/day"}},
+    "heal_kind": {"enum": ["missing", "fallback_quality", "ledger"]}
+  }
+}

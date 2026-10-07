@@ -89,6 +89,33 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
         (),
         (),
     ),
+    # alpha-engine-config-I12023. D50 rewrites D31's own feature keys from the
+    # settled bar and adds the settlement.json marker beside them. The matching
+    # ARTIFACT_REGISTRY row for the marker is a companion alpha-engine-config
+    # change named in this PR; the parquet keys are D31's existing row.
+    "D50": (
+        (
+            "features/{date}/*.parquet",
+            "features/{date}/settlement.json",
+        ),
+        (),
+        (),
+    ),
+    # alpha-engine-config-I10791 (plan P-25). The daily panel, its manifest and
+    # its parity receipt, each templated so it resolves to its own contract
+    # (contracts/daily_panel*.schema.json). ARTIFACT_REGISTRY rows are DEFERRED
+    # with the schedule under the same "never register a freshness entry ahead
+    # of its producer" rule as D48/D49; until then D51.artifact_registry reads
+    # red at phase 3, which is the honest state.
+    "D51": (
+        (
+            "data_collection/panel/{trading_day}/manifest.json",
+            "data_collection/panel/{trading_day}/panel.parquet",
+            "data_collection/panel/{trading_day}/parity.json",
+        ),
+        (),
+        (),
+    ),
     "D03": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D04": (("reference/price_cache/{ticker}.parquet",), (), ()),
     "D05": (

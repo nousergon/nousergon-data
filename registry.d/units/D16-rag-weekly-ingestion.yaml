@@ -87,6 +87,11 @@ detectors:
     via: "no-heartbeat"
     state: UNVERIFIED
     note: the alarm exists; its EXECUTION is not verified. P3 commissioning.
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # Live CloudWatch alarm (AlphaEngine Heartbeat, Process=rag-ingestion), emitted by
+    # rag/pipelines/run_weekly_ingestion.sh on success; codified in
+    # infrastructure/cloudformation/alpha-engine-orchestration.yaml.
+    subject: "alpha-engine-rag-ingestion-no-heartbeat"
 freshness:
   family: weekly
   deadline: "Sat 13:00 America/New_York"
@@ -98,17 +103,22 @@ completeness:
   status: proposed
 guards:
   empty_fresh:
-    state: partial
+    state: present
     code:
       - "rag/pipelines/run_weekly_ingestion_recorded.py::_body"
+      - "run_units.py::grade_published_outputs"
     records_as: data_empty_fresh
     note: >-
-        RUN-level only: rag/pipelines/run_weekly_ingestion_recorded.py::_body files guard
-        `data_empty_fresh` `empty_fresh` (and fails the manifest) when the run published NO key
-        under any declared prefix, and `ok` otherwise. A published key carrying zero documents
-        is recorded with its measured rows_out but is not itself graded empty — that per-key
-        half is the remaining work. Not in service until commissioned by an induced fault
-        (P-19, alpha-engine-config-I10786).
+        Both halves. RUN level: rag/pipelines/run_weekly_ingestion_recorded.py::_body files
+        guard `data_empty_fresh` `empty_fresh` (and fails the manifest) when the run published
+        NO key under any declared prefix. PER KEY: otherwise _grade_published grades every
+        published D16 key through run_units.py::grade_published_outputs, which runs
+        validators/expectations.py::check_empty_fresh on it with the count read from the
+        object itself (totals.documents, n_analyzed, watermark length; 1 for the singleton
+        status objects): a missing or zero-byte object, or a zero count, is `empty_fresh`, and
+        a count under a declared completeness.rows_out_floor is `below_floor`. Filed per key,
+        plus the data.D16.guard.empty_fresh MetricRecord (worst key wins). Not in service
+        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: partial
     code:

@@ -107,22 +107,29 @@ __all__ = [
 #: `sf-pipeline-policy` §7a: the staging, its promotion criterion and its
 #: tracker, declared in the guard's OWN module.
 #:
-#: **Promotion criterion: 10 consecutive clean scheduled cycles** — a cycle
-#: being clean when every unit's `empty_fresh` verdict on that cycle is `ok`
-#: (an `unmeasurable` verdict is NOT clean; it means a unit still reports no row
-#: count, and promoting over it would enforce a predicate on units it cannot
-#: read). The count is the rolling board Signal from
-#: `data.<unit>.guard.empty_fresh`. Promotion is a deliberate PR flipping `mode`
-#: to `GuardMode.ENFORCE`, with the ten cycles named in its body.
+#: **Promotion criterion: the codified per-guard, risk-based criterion** in
+#: `data_gate/guard_promotion.py` (entry ``data_empty_fresh``, HIGH risk — the
+#: raise below halts the shared `_phase_collect` chokepoint), graded on the
+#: board as ``data.guard_promotion.data_empty_fresh``: every unit that records
+#: this guard shows a clean verdict on the latest due cycle of its schedule
+#: (`unmeasurable` is NOT clean; it means a unit still reports no row count, and
+#: promoting over it would enforce a predicate on units it cannot read), plus an
+#: induced-fault commissioning record per unit. Brian's 2026-10-04 option (c)
+#: (alpha-engine-config-I11973) replaced the adopted ten-clean-cycle count.
+#: Promotion is a deliberate PR flipping `mode` to `GuardMode.ENFORCE` and the
+#: entry's `mode` with it, citing that row in its body.
 #:
 #: `Re-exam:` is tracked on alpha-engine-config-I10785.
 EMPTY_FRESH_GUARD = GuardStaging(
     name="data_empty_fresh",
     mode=GuardMode.OBSERVE,
     promotion_criterion=(
-        "enforce after 10 consecutive clean scheduled cycles — every unit's "
-        "empty_fresh verdict `ok` on each, `unmeasurable` not counting as clean "
-        "(data_collection_plan_260914.md §4.5); Re-exam tracked on "
+        "enforce once the codified per-guard risk-based criterion holds "
+        "(data_gate/guard_promotion.py, data_empty_fresh: high risk) — every unit "
+        "recording this guard clean on the latest due scheduled cycle, `unmeasurable` "
+        "not counting as clean, and commissioned by an induced fault; Brian's "
+        "2026-10-04 option (c) on alpha-engine-config-I11973 replaced the ten-cycle "
+        "count (data_collection_plan_260914.md §4.5); Re-exam tracked on "
         "alpha-engine-config-I10785"
     ),
     tracked_issue="alpha-engine-config-I10785",
@@ -329,19 +336,24 @@ def verdict_metric(unit_id: str, reading: GuardReading, *, source_path: str) -> 
 #: independent evidence (a guard parked in observe mode forever is the same
 #: defect one direction over, so each needs its own criterion and tracker).
 #:
-#: **Promotion criterion: 10 consecutive clean trading days** — a day being
-#: clean when the EOD spine's ``cardinality`` verdict is ``ok`` (coverage >=
-#: floor with zero undeclared misses; `unmeasurable` does not count, matching
-#: `EMPTY_FRESH_GUARD`'s rule). Matches the issue's phase-2 promotion
-#: criterion and `data-phase2`'s exit line in `registry.d/phases.yaml` /
-#: `data_gate/config/phases.yaml` ("EOD spine priced == universe minus
-#: declared exclusions on 10 consecutive trading days").
+#: **Promotion criterion: the codified per-guard, risk-based criterion** in
+#: `data_gate/guard_promotion.py` (entry ``data_cardinality``, MODERATE risk —
+#: one unit's own output, and no ENFORCE raise site exists yet), graded on the
+#: board as ``data.guard_promotion.data_cardinality``: the EOD spine's
+#: ``cardinality`` verdict ``ok`` (coverage >= floor with zero undeclared
+#: misses; `unmeasurable` does not count, matching `EMPTY_FRESH_GUARD`'s rule)
+#: on the latest due scheduled cycle, plus an induced-fault commissioning
+#: record. Brian's 2026-10-04 option (c) (alpha-engine-config-I11973) replaced
+#: the adopted ten-clean-trading-day count.
 CARDINALITY_GUARD = GuardStaging(
     name="data_cardinality",
     mode=GuardMode.OBSERVE,
     promotion_criterion=(
-        "enforce after 10 consecutive clean trading days — the EOD spine's cardinality "
-        "verdict `ok` (coverage >= floor, zero undeclared misses) on each "
+        "enforce once the codified per-guard risk-based criterion holds "
+        "(data_gate/guard_promotion.py, data_cardinality: moderate risk) — the EOD spine's "
+        "cardinality verdict `ok` (coverage >= floor, zero undeclared misses) on the latest "
+        "due scheduled cycle and commissioned by an induced fault; Brian's 2026-10-04 option "
+        "(c) on alpha-engine-config-I11973 replaced the ten-day count "
         "(data_collection_plan_260914.md §4.5); Re-exam tracked on alpha-engine-config-I10780"
     ),
     tracked_issue="alpha-engine-config-I10780",
