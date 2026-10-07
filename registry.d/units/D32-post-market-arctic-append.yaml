@@ -60,6 +60,13 @@ detectors:
   - kind: "cloudwatch-alarm"
     via: "eod-precondition-probe + heal loop"
     state: PRESENT
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # No CloudWatch alarm carries this path. The probe (alpha-engine-eod-precondition-probe)
+    # reads the sentinels D32 writes; on a gap, ne-postclose-reconcile-pipeline's
+    # SkipEODReconcileDataGap state publishes "Alpha Engine EOD Reconcile SKIPPED (data
+    # gap, self-healing)" to alpha-engine-alerts and enters the heal loop. The subject is
+    # that publishing state (live definition read 2026-10-07).
+    subject: "ne-postclose-reconcile-pipeline:SkipEODReconcileDataGap"
 freshness:
   family: "eod-spine"
   # The family's worst-case write bound, by the same rule the weekly family

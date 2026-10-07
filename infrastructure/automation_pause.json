@@ -47,6 +47,7 @@
     "crucible-v2/weekly": "EventBridge Scheduler schedule, group crucible-v2 (verified live 2026-09-04, State=ENABLED). KEPT - same rationale, same group and same origin as crucible-v2/heartbeat above: v2 build infrastructure outside the 2026-08-07 v1 pause's scope. alpha-engine-config-I9994.",
     "crucible-v2/alerts-sweep": "EventBridge Scheduler schedule, group crucible-v2 (verified live 2026-09-04, State=ENABLED). KEPT - same rationale, same group and same origin as crucible-v2/heartbeat above. alpha-engine-config-I9994.",
     "crucible-v2/data-daily": "EventBridge Scheduler schedule, group crucible-v2 (verified live 2026-09-04, State=ENABLED). KEPT - same rationale, same group and same origin as crucible-v2/heartbeat above. alpha-engine-config-I9994.",
+    "crucible-v2/serve-daily-m": "EventBridge Scheduler schedule, group crucible-v2 (verified live 2026-10-07, State=ENABLED, cron(15 22 ? * MON-FRI *) America/New_York, target crucible-v2-dispatcher). KEPT - same rationale and same group as crucible-v2/heartbeat above: created by nous-ergon-ops infrastructure/cloudformation/crucible-v2.yaml (ServeDailyMScheduleInGroup, nous-ergon-ops-PR1588, alpha-engine-config-I12047) to publish the M feed every weekday, v2 build infrastructure outside the 2026-08-07 v1 pause's scope. Found 2026-10-06 by automation_pause.py's trigger-undeclared check (Pause Check Alert run 37548712046).",
     "crucible-v2-spot-interruption-redispatch": "EventPattern rule on the default bus, no schedule (verified live 2026-09-15, State=ENABLED). KEPT - created by nous-ergon-ops infrastructure/cloudformation/crucible-v2.yaml (SpotInterruptionRedispatchRule, alpha-engine-config-I10732): routes EC2 Spot Instance Interruption Warning to crucible-v2-dispatcher, which re-dispatches a reclaimed crucible-v2 job and ignores instances not tagged system=crucible-v2. It spawns work only in response to a reclaim of work v2 already launched, so it is recovery for the v2 build, not a v1 process the 2026-08-07 ruling names - same rationale as crucible-v2/heartbeat above. Found 2026-09-15 by automation_pause.py's trigger-undeclared check."
   },
   "pending": {
@@ -106,7 +107,7 @@
         "alpha-engine-canary-replay-liveness-probe-tick"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-errors": {
       "reason": "sf-watch liveness-probe Errors; silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984) disabling sf-watch while the three scheduled pipelines are made reliable by hand. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -115,7 +116,7 @@
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-throttles": {
       "reason": "sf-watch liveness-probe Throttles; same ruling and same watched triggers as alpha-engine-watch-plane-sf-watch-liveness-probe-errors. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -124,7 +125,7 @@
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-ssm-reachability-probe-dead": {
       "reason": "SSM reachability probe deadman; silenced while alpha-engine-ssm-reachability-probe-5min is paused. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -132,7 +133,7 @@
         "alpha-engine-ssm-reachability-probe-5min"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-ssm-reachability-probe-unreachable": {
       "reason": "SSM reachability probe unreachable-count; same watched trigger as alpha-engine-ssm-reachability-probe-dead, but treat_missing_data=notBreaching (alpha-engine-ssm-reachability-probe-dead is the breaching sibling that actually needs silencing). Its ActionsEnabled state is not graded by --check/--enforce (alpha-engine-config-I8712); it is declared here only so the mute-or-not-mute of this alarm has a record, per the paused_alarms._why ADDENDUM above. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -140,7 +141,7 @@
         "alpha-engine-ssm-reachability-probe-5min"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-errors": {
       "reason": "overseer liveness-probe Errors. Period=28800 with treat_missing_data=breaching, so an 8h window with no invocation latches ALARM - and the probe's only two triggers are paused. Added 2026-08-14 (alpha-engine-config-I7023): this alarm and its two siblings were the four still paging Brian after the I7174 reconciler silenced the rest, because the I7174 entry list was built from the alarms observed in ALARM on 2026-08-13 and these read OK at that moment - the backstop responder was re-invoking the probe on every firing (alpha-engine-config-I7330), manufacturing the datapoint that cleared them. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -149,7 +150,7 @@
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-throttles": {
       "reason": "overseer liveness-probe Throttles; same shape, same window and same paused triggers as the Errors sibling above. Added 2026-08-14 (alpha-engine-config-I7023). Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -158,7 +159,7 @@
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-liveness-probe-invocations-floor": {
       "reason": "invocations-floor on the overseer liveness probe. This is the alarm whose ENTIRE job is detecting a probe that stopped running, so while the probe is deliberately stopped it can only report the pause back to us. Added 2026-08-14 (alpha-engine-config-I7023). Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -167,7 +168,7 @@
         "alpha-engine-overseer-liveness-1450-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-sf-watch-liveness-probe-invocations-floor": {
       "reason": "invocations-floor on the sf-watch liveness probe. Its -errors and -throttles siblings were declared under I7174 and this one was not, so it stayed armed on the same paused triggers - the family-completeness check added with this entry is what makes that shape impossible to repeat. Silenced under Brian's 2026-08-12 ruling (alpha-engine-config-I6984); re-exam 2026-09-09, same predicate as the sf-watch entries it watches. Re-examined 2026-09-12: pause re-affirmed by Brian (only merge-drain restored); re_exam moved to I6984's own backstop 2026-10-12.",
@@ -176,7 +177,7 @@
         "alpha-engine-sf-watch-liveness-1445-daily"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor": {
       "reason": "invocations-floor on the overseer alert-drain liveness probe; treat_missing_data=breaching is correct when alert-drain is supposed to run and wrong while it is declared off (Brian 2026-08-23: response-plane pause includes the drain; same watches as pre-I8110).",
@@ -187,7 +188,7 @@
         "alpha-engine-alert-drain-2200utc"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-intake-age": {
       "reason": "overseer intake queue age; a CONSEQUENCE of alert-drain being paused (nothing drains the intake queue the alarm's tap fills), not of its own trigger. Watches the same alert-drain schedules the drain itself needs running.",
@@ -198,7 +199,7 @@
         "alpha-engine-alert-drain-2200utc"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-intake-dlq-depth": {
       "reason": "overseer intake DLQ depth; same consequence and same watched triggers as alpha-engine-watch-plane-overseer-intake-age.",
@@ -209,7 +210,7 @@
         "alpha-engine-alert-drain-2200utc"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     },
     "alpha-engine-watch-plane-overseer-intake-dlq-severe-content": {
       "reason": "Severe-content count on the overseer intake DLQ. Same watched triggers and same argument as its two declared siblings (-age, -dlq-depth): while alert-drain is paused this alarm reports the pause and nothing else.",
@@ -220,7 +221,7 @@
         "alpha-engine-alert-drain-2200utc"
       ],
       "issue": "alpha-engine-config-I6984",
-      "re_exam": "2026-10-12"
+      "re_exam": "2026-12-01"
     }
   },
   "armed_alarms": {

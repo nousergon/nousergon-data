@@ -80,8 +80,51 @@ def test_the_ticker_filter_keeps_only_named_tickers_and_names_the_absent(monkeyp
         def get_grouped_daily(self, day):
             return {"AAA": bar, "BBB": bar, "CCC": bar}
 
+        def get_single_day_bar(self, ticker, day):
+            return None
+
     monkeypatch.setitem(sys.modules, "polygon_client", types.SimpleNamespace(PolygonClient=FakeClient))
     out = vendor_read.read_polygon(["2026-09-28"], {"AAA", "CCC", "ZZZ"})
     assert sorted(out["dates"]["2026-09-28"]) == ["AAA", "CCC"]
     assert "['ZZZ']" in capsys.readouterr().out
     assert sorted(vendor_read.read_polygon(["2026-09-28"])["dates"]["2026-09-28"]) == ["AAA", "BBB", "CCC"]
+
+
+def test_a_named_ticker_the_grouped_file_omits_is_read_per_ticker_and_kept_apart(monkeypatch, capsys):
+    """OTC symbols (GTBIF, MARUY, TELWY) are not in the grouped file (alpha-engine-config-I12023)."""
+    import sys
+    import types
+
+    bar = {"open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10, "vwap": 1.2}
+    otc = {"open": 8.1, "high": 8.4, "low": 7.9, "close": 8.25, "volume": 31337.0, "vwap": None}
+    asked = []
+
+    class FakeClient:
+        def get_grouped_daily(self, day):
+            return {"AAA": bar}
+
+        def get_single_day_bar(self, ticker, day):
+            asked.append((ticker, day))
+            return otc if ticker == "GTBIF" else None
+
+    monkeypatch.setitem(sys.modules, "polygon_client", types.SimpleNamespace(PolygonClient=FakeClient))
+    out = vendor_read.read_polygon(["2026-09-28"], {"AAA", "GTBIF", "ZZZ"})
+    assert sorted(out["dates"]["2026-09-28"]) == ["AAA"]
+    assert out["per_ticker"]["2026-09-28"] == {"GTBIF": [8.1, 8.4, 7.9, 8.25, 31337.0, None], "ZZZ": None}
+    assert sorted(asked) == [("GTBIF", "2026-09-28"), ("ZZZ", "2026-09-28")]
+    assert "1 of 2 read; no bar from either call: ['ZZZ']" in capsys.readouterr().out
+
+
+def test_an_unfiltered_read_never_calls_the_per_ticker_endpoint(monkeypatch):
+    import sys
+    import types
+
+    class FakeClient:
+        def get_grouped_daily(self, day):
+            return {"AAA": {"open": 1, "high": 1, "low": 1, "close": 1, "volume": 1}}
+
+        def get_single_day_bar(self, ticker, day):
+            raise AssertionError("no named ticker, so nothing is absent")
+
+    monkeypatch.setitem(sys.modules, "polygon_client", types.SimpleNamespace(PolygonClient=FakeClient))
+    assert vendor_read.read_polygon(["2026-09-28"])["per_ticker"] == {}

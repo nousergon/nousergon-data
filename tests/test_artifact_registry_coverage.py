@@ -121,6 +121,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # applied and a scheduled run first writes the key — the same posture
     # cost_monthly.py took — then re-evaluated for a REGISTERED row.
     "data_gate/producers/trigger_observation.py": 1,
+    # alpha-engine-config-I10795 (A3 part 2, the receipt WRITER) — one PUT
+    # site, the per-unit console reachability receipt
+    # data_collection/console_entity/<unit_id>/latest.json read by the 42
+    # `console_entity` clauses (plus the shared _run_record.py PUT, counted
+    # there). Runs on the console box, not in Actions. Its ARTIFACT_REGISTRY
+    # entry (`data_collection/console_entity/` grandfathered) rides an
+    # alpha-engine-config PR with the schedule; pinned here so the guard is
+    # honest in the meantime.
+    "data_gate/producers/console_entity.py": 1,
     # alpha-engine-config-I11312 — the on-spot FULL-profile preflight pass's
     # observe-mode verdict, one object per execution under
     # health/weekly_preflight_on_spot/<run_date>/<execution>.json. GRANDFATHERED
@@ -379,6 +388,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # point of the original deferral, which was no false state=missing every cycle
     # for a producer nothing runs (alpha-engine-config-I11282).
     "collectors/index_contributions.py": 1,
+    # alpha-engine-config-I10791 (plan P-25) — the daily panel publisher's ONE
+    # put_object site (`_s3_io.put`), writing data_collection/panel/{trading_day}/
+    # panel.parquet, manifest.json and parity.json. The ARTIFACT_REGISTRY rows are
+    # DEFERRED until the producer is scheduled (D51, lifecycle pending), per "never
+    # register a freshness entry ahead of its producer"; until then
+    # data.D51.artifact_registry reads red at phase 3, which is the honest state.
+    "builders/daily_panel.py": 1,
     # alpha-engine-config-I10783 (data-collector plan P-16) —
     # write_vendor_divergence_metric's one PUT site:
     # data_collection/metrics/vendor_divergence/{trading_day}.json, written by
@@ -465,6 +481,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
     # retired the S3 mirror) — no new registry row needed.
     "features/metron_supplemental.py": 1,
+    # D50 settled rebuild of features/{D-1} (alpha-engine-config-I12023): the
+    # group parquets plus the settlement.json marker. Both land under the
+    # grandfathered "features/" path_prefix, so no new registry row is needed.
+    "features/settled_regrade.py": 2,
     "features/writer.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
@@ -512,6 +532,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # policy-observability: modules log their metrics, the console points
     # at the source — Brian ruling 2026-08-03).
     "scripts/weekly_sf_recovery_metric.py": 1,
+    # alpha-engine-config-I11984 — the operator-run stored-row sweep. Its one
+    # PUT rewrites an existing backtest/{run_date}/run_scope.json, already
+    # registered as the `weekly_run_scope` ARTIFACT_REGISTRY row (produced by
+    # the weekly SF's RunScope stage). Only with --apply, conditional on the
+    # ETag it read; it creates no new artifact.
+    "scripts/sweep_run_scope_rows.py": 1,
 }
 
 

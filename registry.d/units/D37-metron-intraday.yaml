@@ -87,9 +87,18 @@ detectors:
   - kind: "box-timer-health"
     via: "timer-level exit/streak"
     state: PRESENT
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # check_box_timer_health.py (nous-ergon-ops) keys each finding `timer/<service>`;
+    # read live in s3://alpha-engine-research/ops/checks/box_timer_health/latest.json.
+    subject: "timer/metron-intraday.service"
   - kind: "code-refusal"
-    via: "empty-write refusal (metron_market_data.py:2331-2348)"
+    via: "empty-write refusal (collectors/metron_market_data.py::collect_intraday)"
     state: PRESENT
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # The refusal logs "Refusing to overwrite market_data/intraday/latest.json" and
+    # returns status=error when indices or fund_proxies come back empty. The via
+    # used to cite lines 2331-2348, which no longer hold this code.
+    subject: "market_data/intraday/latest.json"
 freshness:
   family: intraday
   deadline: "age <= 10 minutes in >= 99% of session slots"

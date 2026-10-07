@@ -284,8 +284,13 @@ def assert_no_bar_after(
 # So: the official closing print is FINAL well before 18:15 ET, and
 # consolidated volume is not final that evening at all. This module grades the
 # price axis, which is what every feature, technical and trading decision
-# depends on. A same-evening volume is provisional by construction and is not
-# something a later cron fixes.
+# depends on. A same-evening volume is provisional by construction. The next
+# morning's Polygon T+1 overwrite (D17) settles it in `staging/daily_closes`,
+# D18 carries it into ArcticDB, and D50 (`features/settled_regrade.py`)
+# rebuilds the published `features/{D}` snapshot from it in the same morning
+# schedule (Crucible v2 ruling on alpha-engine-config-I12023). Every artifact
+# written the evening of D carries provisional volume until that regrade, and
+# one written by a unit nothing regrades carries it for good.
 # ---------------------------------------------------------------------------
 
 #: The ET wall-clock time from which day D's official closing print is treated
@@ -296,8 +301,13 @@ def assert_no_bar_after(
 #: the consolidated tape is final by ~17:30 ET and the vendor publishes the
 #: official close by then. The 3-day sample at 16:45 / 17:30 / 18:15 / 18:45
 #: that would turn a one-day bracket into a measured threshold is tracked as
-#: `alpha-engine-config-I11356`; until it lands this constant is a stated
-#: assumption, not a measurement.
+#: `alpha-engine-config-I11356`.
+#:
+#: **I11356 measured it** (2026-09-30 → 10-02, 50 tickers, 16:47–22:35 ET):
+#: `Close` was final at the first 16:47 ET fetch on all three days; `Volume`
+#: froze at a provisional figure until ~21:00–22:30 ET. The value stays 18:15
+#: (I11356 closing comment, 2026-10-03): earlier gains nothing for `Close`, and
+#: provisional Volume is overwritten by the D+1 morning polygon pass.
 SETTLED_AFTER_ET = "18:15"
 
 #: The exchange clock every settlement judgement is made on. Never UTC: the
@@ -369,13 +379,6 @@ def bar_settlement(
     return BAR_SETTLED if local.timetz().replace(tzinfo=None) >= _time(hh, mm) else BAR_PROVISIONAL
 
 
-#: Observe-mode staging for the ``bar_settlement`` reading
-#: (`sf-pipeline-policy.md` §7a). It ships OBSERVE because promoting it to
-#: ENFORCE today would refuse every D03/D19 write the 16:45 ET
-#: `data-collection-eod` schedule makes — i.e. it would halt the fleet's EOD
-#: collection rather than report on it. Moving that schedule is a pipeline-
-#: timing decision reserved to Brian; this guard is the measurement he rules
-#: from.
 #: The guard name a collector records a VENDOR's own publish time under
 #: (`alpha-engine-config-I11203`). Its `key` is ``"<live key>#<json path>"``
 #: (``market_data/macro/latest.json#$.series.DGS10``) and its `value` is the
@@ -393,9 +396,18 @@ VENDOR_PUBLISHED_AT_GUARD = "vendor_published_at"
 #: release date at 00:00 UTC, as POSIX seconds (`alpha-engine-config-I11203`).
 VENDOR_FIRST_RELEASED_GUARD = "vendor_first_released"
 
+#: Staging for the ``bar_settlement`` reading (`sf-pipeline-policy.md` §7a).
+#: It shipped OBSERVE because enforcing it against the 16:45 ET
+#: `data-collection-eod` schedule would have refused every D03/D19 write that
+#: schedule made. That schedule now fires at :data:`SETTLED_AFTER_ET`
+#: (`nousergon-data-PR1868`, Brian's ruling on alpha-engine-config-I11354), the
+#: 3-day sample (alpha-engine-config-I11356) kept 18:15 ET, and the codified
+#: per-guard criterion (`data_gate/guard_promotion.py`) reads READY on the
+#: scheduled D03/D19 runs, so it is promoted to ENFORCE here. The raise site is
+#: :func:`assert_settled_bar`, called before either collector's vendor fetch.
 BAR_SETTLEMENT_GUARD = GuardStaging(
     name="bar_settlement",
-    mode=GuardMode.OBSERVE,
+    mode=GuardMode.ENFORCE,
     promotion_criterion=(
         "The standalone postclose schedule fetches at or after "
         f"{SETTLED_AFTER_ET} ET (Brian's ruling on alpha-engine-config-I11354), "
@@ -409,6 +421,38 @@ BAR_SETTLEMENT_GUARD = GuardStaging(
     ),
     tracked_issue="alpha-engine-config-I11354",
 )
+
+
+class UnsettledBarError(RuntimeError):
+    """A D03/D19 fetch for day D's own bar opened before :data:`SETTLED_AFTER_ET`."""
+
+
+def assert_settled_bar(
+    fetched_at_utc: "datetime | str",
+    trading_day: "date | datetime | str",
+    *,
+    unit: str,
+) -> None:
+    """The ENFORCE raise site for :data:`BAR_SETTLEMENT_GUARD`.
+
+    Called at the OPENING edge of a D03/D19 vendor fetch, before anything is
+    fetched or written, so a refused run publishes nothing rather than an
+    unsettled bar. A settled fetch returns ``None``. A provisional one goes
+    through :meth:`GuardStaging.verdict`: logged at ERROR in either mode, and
+    raised as :class:`UnsettledBarError` only while the staging is ENFORCE — so
+    demoting the guard back to OBSERVE is the one-line revert.
+    """
+    if bar_settlement(fetched_at_utc, trading_day) == BAR_SETTLED:
+        return
+    BAR_SETTLEMENT_GUARD.verdict(
+        logging.getLogger(__name__),
+        (
+            f"{unit}: fetch for trading_day {as_trading_day(trading_day).isoformat()} "
+            f"opened at {fetched_at_utc} — before the {SETTLED_AFTER_ET} ET settlement "
+            "threshold, so day D's bar is provisional (alpha-engine-config-I11354)"
+        ),
+        raise_with=UnsettledBarError,
+    )
 
 
 def bar_settlement_guard_entry(

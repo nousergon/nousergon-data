@@ -76,7 +76,19 @@ def dispatcher():
         sys.modules[name] = mod
 
     stub("boto3", client=lambda *a, **k: None)  # noqa: ARG005
-    stub("flow_doctor_telegram", notify_via_flow_doctor=lambda *a, **k: True)  # noqa: ARG005
+    # ALWAYS stubbed, never "only if unimportable": with infrastructure/lambdas
+    # on sys.path the real sender imports fine, and the real sender falls back
+    # to a raw Telegram send when flow-doctor is not running. That is how a
+    # local run of this file sent "Groom cycle 0 12 * * * COMPLETE — degraded"
+    # to the operator's real chat, replaying the 07-30 fixture below.
+    #
+    # Installed for the import only and restored afterwards: the dispatcher
+    # binds the stub at import time, and leaving it in sys.modules would shadow
+    # the real module for every later test in this process.
+    prior_fdt = sys.modules.get("flow_doctor_telegram")
+    fdt_stub = types.ModuleType("flow_doctor_telegram")
+    fdt_stub.notify_via_flow_doctor = lambda *a, **k: True  # noqa: ARG005
+    sys.modules["flow_doctor_telegram"] = fdt_stub
     # nousergon_lib.spot_dispatch imports `from krepis import alerts` at module
     # scope; krepis is a runtime dep of the Lambda bundle, not of this test
     # suite's env.
@@ -94,7 +106,13 @@ def dispatcher():
     # must FAIL this suite, not quietly skip 9 assertions — a skipped guard is
     # indistinguishable from a passing one in CI output, which is the same
     # absence-of-signal defect these tests exist to prevent (policy §2.4).
-    spec.loader.exec_module(module)
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        if prior_fdt is None:
+            sys.modules.pop("flow_doctor_telegram", None)
+        else:
+            sys.modules["flow_doctor_telegram"] = prior_fdt
     return module
 
 
@@ -354,8 +372,11 @@ def test_groom_sf_failures_reach_telegram():
 # starved cycles rendered identically to a healthy light-backlog one.
 
 
-def test_concurrency_skip_is_degraded_not_a_clean_complete(dispatcher):
+def test_concurrency_skip_is_degraded_not_a_clean_complete(dispatcher, monkeypatch):
     """The exact shape of the 2026-07-30 05:00 execution."""
+    sent = []
+    monkeypatch.setattr(
+        dispatcher, "_notify_cycle", lambda text, **kw: sent.append(text))
     out = dispatcher._notify_cycle_complete({
         "schedInput": {"schedule": "0 12 * * *"},
         "decideResult": {"Payload": {"decide": {
@@ -370,13 +391,15 @@ def test_concurrency_skip_is_degraded_not_a_clean_complete(dispatcher):
     assert out["skip_reason"] == "concurrent_cycle_skip"
     assert out["skip_healthy"] is False
     assert out["lanes"] == 0
+    assert len(sent) == 1, "the roll-up goes through the (patched) notifier"
 
 
-def test_blocking_execution_is_named_in_the_rollup(dispatcher):
+def test_blocking_execution_is_named_in_the_rollup(dispatcher, monkeypatch):
     """§2.4: a failure notification carries the real cause, not a pointer."""
     captured = {}
-    dispatcher._notify_cycle = lambda text, **kw: captured.update(
-        {"text": text, **kw})
+    monkeypatch.setattr(
+        dispatcher, "_notify_cycle",
+        lambda text, **kw: captured.update({"text": text, **kw}))
     dispatcher._notify_cycle_complete({
         "schedInput": {"schedule": "0 4 * * *"},
         "decideResult": {"Payload": {"decide": {
