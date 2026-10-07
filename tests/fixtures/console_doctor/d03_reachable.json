@@ -1,0 +1,90 @@
+{
+    "broken": null,
+    "facts": {
+        "adapters_asked": [
+            "registry",
+            "pipeline-reliability"
+        ],
+        "claim_classes": [
+            "DECLARATION",
+            "OBSERVATION"
+        ],
+        "entity_kind": "component",
+        "entity_state": "HEALTHY",
+        "reporting_claims": 1
+    },
+    "identifier": "data-collector-d03-prices",
+    "index": {
+        "age_seconds": null,
+        "bootstrap": false,
+        "build_seconds": null,
+        "built_at": null,
+        "cadence_overrun": false,
+        "last_error": null,
+        "refresh_seconds": null,
+        "sources": [
+            {
+                "cadence_seconds": null,
+                "elapsed_seconds": null,
+                "fetched_at": null,
+                "name": "registry",
+                "status": "ok",
+                "unavailable": []
+            },
+            {
+                "cadence_seconds": null,
+                "elapsed_seconds": null,
+                "fetched_at": null,
+                "name": "pipeline-reliability",
+                "status": "ok",
+                "unavailable": []
+            }
+        ],
+        "stale": false,
+        "stale_since": null,
+        "staleness_basis": "not computable \u2014 no source declared a cadence"
+    },
+    "ok": true,
+    "remedy": null,
+    "schema_version": 1,
+    "steps": [
+        {
+            "detail": "declared by registry",
+            "name": "registry row",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "1 claim(s) from pipeline-reliability",
+            "name": "adapter claim",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "component in state HEALTHY",
+            "name": "merged entity",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "resolves by identifier",
+            "name": "search-reachable",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "listed under /component",
+            "name": "structure-reachable",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "1 inbound edge(s)",
+            "name": "relation-reachable",
+            "ok": true,
+            "remedy": null
+        }
+    ],
+    "summary": "data-collector-d03-prices: on the surface, reachable on all three paths",
+    "view": "doctor"
+}

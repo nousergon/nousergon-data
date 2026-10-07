@@ -65,6 +65,7 @@ from nousergon_lib.gates import read_store_document
 
 from data_gate.descriptors import Unit
 from data_gate.evidence import GateStore, Reading, _parse_utc
+from data_gate.producers.console_entity import RECEIPT_KEY, RECEIPT_SCHEMA
 
 __all__ = [
     "COMPONENT_STATES",
@@ -76,10 +77,11 @@ __all__ = [
     "receipt_key",
 ]
 
-RECEIPT_SCHEMA = "data_console_entity.v1"
-
-#: Relative to the store root (`s3://alpha-engine-research/data_collection`).
-RECEIPT_KEY = "console_entity/{unit_id}/latest.json"
+#: Defined ONCE, beside the writer (`data_gate/producers/console_entity.py`),
+#: which runs on the console box from a light import path. The reader takes
+#: them from there so the two ends cannot spell the schema or the key apart.
+#: RECEIPT_KEY is relative to the store root
+#: (`s3://alpha-engine-research/data_collection`).
 
 #: The ladder's own freshness bound (`clauses.py`, `read_ladder_freshness`):
 #: the gate reads daily, so a receipt one missed day old is still current and

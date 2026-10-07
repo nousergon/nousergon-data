@@ -121,6 +121,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # applied and a scheduled run first writes the key — the same posture
     # cost_monthly.py took — then re-evaluated for a REGISTERED row.
     "data_gate/producers/trigger_observation.py": 1,
+    # alpha-engine-config-I10795 (A3 part 2, the receipt WRITER) — one PUT
+    # site, the per-unit console reachability receipt
+    # data_collection/console_entity/<unit_id>/latest.json read by the 42
+    # `console_entity` clauses (plus the shared _run_record.py PUT, counted
+    # there). Runs on the console box, not in Actions. Its ARTIFACT_REGISTRY
+    # entry (`data_collection/console_entity/` grandfathered) rides an
+    # alpha-engine-config PR with the schedule; pinned here so the guard is
+    # honest in the meantime.
+    "data_gate/producers/console_entity.py": 1,
     # alpha-engine-config-I11312 — the on-spot FULL-profile preflight pass's
     # observe-mode verdict, one object per execution under
     # health/weekly_preflight_on_spot/<run_date>/<execution>.json. GRANDFATHERED
