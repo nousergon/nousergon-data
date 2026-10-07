@@ -554,6 +554,9 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload == "post-market-arctic-append":
             # Same arc: measured 24.7-28.1 min.
             expected = 3600
+        elif workload == "features-settled-regrade":
+            # D50 (alpha-engine-config-I12023): one D31 compute, ~24 min.
+            expected = 3600
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
@@ -561,6 +564,17 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         index._send_bootstrap("i-x", workload, cmd, "tok")
         assert ssm.sent[-1]["Parameters"]["executionTimeout"] == [str(expected)]
     assert index._max_runtime_seconds(None) == index.MAX_RUNTIME_SECONDS
+
+
+def test_features_settled_regrade_runs_d50_with_no_trading_day(monkeypatch):
+    """alpha-engine-config-I12023: the D50 rebuild resolves to its own
+    weekly_collector mode. It needs no ``trading_day``: like every morning
+    unit it keys the last closed session on the box (``default_run_date``)."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert "features-settled-regrade" not in index._WORKLOADS_REQUIRING_TRADING_DAY
+    resolved, cmd = index._resolve_workload({"workload": "features-settled-regrade"})
+    assert resolved == "features-settled-regrade"
+    assert cmd == "python weekly_collector.py --features-settled-regrade"
 
 
 def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch):

@@ -462,61 +462,74 @@ class TestBranchBContents:
         assert gate["Default"] == "PredictorTraining"
 
     def test_validated_skip_path_wiring(self, branch_b):
-        """config#2253: the plain-skip path must VALIDATE the operator's
-        weights-are-already-live claim against the live weights manifest
-        before the branch may read as succeeded.
+        """config#2253, re-pointed by alpha-engine-config-I12050: the
+        plain-skip path must VALIDATE the operator's training-already-ran
+        claim before the branch may read as succeeded.
 
-        Surface choice is load-bearing: manifest.json is written
-        UNCONDITIONALLY by every non-dry training run (promotion-gate
-        independent), while weights/meta/archive/{date}/ is TRADING-DAY
-        keyed (config#1015 — Friday) and would NEVER match the Saturday
-        calendar $.run_date this validation compares against."""
+        Surface choice is load-bearing. The witness is
+        arena/model/{run_date}.verdict -- written by ModelZooSelect for every
+        cycle that trained and selected, keyed by the trading day, and the same
+        object ReadModelZooArenaCycle reads on the unskipped path. It is NOT
+        the live weights manifest: since alpha-engine-config-I9018 training
+        never writes predictor/weights/meta/, so that manifest dates the last
+        PROMOTION and refused every recovery after a non-promoting cycle."""
         v = branch_b["ValidatePredictorSkipWeightsFresh"]
         assert v["Type"] == "Task"
-        assert v["Resource"] == "arn:aws:states:::aws-sdk:s3:headObject"
+        assert v["Resource"] == "arn:aws:states:::aws-sdk:s3:getObject"
         assert v["Parameters"]["Bucket"] == "alpha-engine-research"
-        assert v["Parameters"]["Key"] == (
-            "predictor/weights/meta/manifest.json"
+        assert v["Parameters"]["Key.$"] == (
+            "States.Format('arena/model/{}.verdict', $.run_date)"
         )
-        # ResultSelector lifts the DATE part of LastModified so the Choice
-        # can do a lexicographic (== chronological for YYYY-MM-DD) compare.
-        sel = v["ResultSelector"]["manifest_last_modified_date.$"]
-        assert "States.StringSplit($.LastModified, 'T')" in sel
+        # Same object, same key expression as the unskipped path's reader.
+        assert v["Parameters"] == branch_b["ReadModelZooArenaCycle"]["Parameters"]
+        assert "predictor/weights/meta/manifest.json" not in json.dumps(
+            v["Parameters"]
+        )
+        # No ResultSelector: a path that does not resolve there is
+        # States.Runtime, which no Catch absorbs. The body rides whole.
+        assert "ResultSelector" not in v
         assert v["ResultPath"] == "$.predictor_skip_validation"
-        # Fail loud: any S3/serialization error is a branch failure, not a
-        # silent fall-through to either skipping OR re-training.
+        # Fail loud: any S3 error -- NoSuchKey, the 'never trained' case,
+        # included -- is a branch failure, not a silent fall-through to either
+        # skipping OR re-training.
         assert [c["Next"] for c in v["Catch"]] == ["BranchBFailed"]
+        assert all(c["ErrorEquals"] == ["States.ALL"] for c in v["Catch"])
         assert all(c["ResultPath"] == "$.error" for c in v["Catch"])
         assert v["Next"] == "CheckPredictorSkipWeightsFresh"
 
     def test_validated_skip_freshness_choice(self, branch_b):
-        """manifest date >= run_date → skip terminal; stale → synthesized
-        $.error → BranchBFailed (never a silent skip onto stale weights,
-        never an implicit re-run of the 1h training spot the operator
-        asked to skip)."""
+        """A known decision.status word -> skip terminal; anything else ->
+        synthesized $.error -> BranchBFailed (never a silent skip onto
+        weights this cycle never selected, never an implicit re-run of the 1h
+        training spot the operator asked to skip)."""
         c = branch_b["CheckPredictorSkipWeightsFresh"]
         assert c["Type"] == "Choice"
-        (fresh,) = c["Choices"]
-        conds = {
-            k: v for cond in fresh["And"] for k, v in cond.items()
-            if k != "Variable"
+        (known,) = c["Choices"]
+        assert known["Next"] == "PredictorTrainingSkipped"
+        guard, or_ = known["And"]
+        # IsPresent in the same And as the dereference (config#2275).
+        assert guard == {
+            "Variable": "$.predictor_skip_validation.Body", "IsPresent": True,
         }
+        arms = or_["Or"]
         assert all(
-            cond["Variable"]
-            == "$.predictor_skip_validation.manifest_last_modified_date"
-            for cond in fresh["And"]
-        )
-        # Shape guard: no fleet SF consumed the aws-sdk:s3 LastModified
-        # serialization before — a non-ISO value (HTTP-date/epoch) must
-        # fail LOUD, not silently wrong-pass a lexicographic compare.
-        assert conds["StringMatches"] == "20*-*-*"
-        # alpha-engine-config-I8809: the left side is an S3 LastModified — a
-        # wall-clock write time — so the reference is the execution's CALENDAR
-        # date. $.run_date became the cycle's TRADING day at NormalizeRunDates,
-        # and comparing against it would make this guard strictly WEAKER on
-        # every Saturday run.
-        assert conds["StringGreaterThanEqualsPath"] == "$.calendar_date"
-        assert fresh["Next"] == "PredictorTrainingSkipped"
+            set(a) == {"Variable", "StringEquals"}
+            and a["Variable"] == "$.predictor_skip_validation.Body"
+            for a in arms
+        ), "whole-body StringEquals only -- never a substring/pattern match"
+        # Exactly the words CheckModelZooVerdict accepts on the unskipped path:
+        # the four that reach BranchBComplete directly plus 'unservable',
+        # which reaches it through its notice. A cycle that held or found
+        # nothing servable still trained and selected.
+        verdict = branch_b["CheckModelZooVerdict"]
+        unskipped_words = {
+            cond["StringEquals"]
+            for rule in verdict["Choices"] if "And" in rule
+            for cond in rule["And"] if "StringEquals" in cond
+        }
+        assert {a["StringEquals"] for a in arms} == unskipped_words == {
+            "decided", "held", "unmeasurable", "unservable", "bootstrap",
+        }
         assert c["Default"] == "PredictorSkipWeightsStale"
         # The stale Pass synthesizes $.error (a Choice.Default transition
         # does not populate an error path — the config#2160 States.Runtime
@@ -525,9 +538,12 @@ class TestBranchBContents:
         assert stale["Type"] == "Pass"
         assert stale["ResultPath"] == "$.error"
         assert stale["Parameters"]["Error"] == "PredictorSkipWeightsStale"
-        # alpha-engine-config-I8809: the Cause prints the reference it actually
-        # compared against, which is now the CALENDAR date.
-        assert "$.calendar_date" in stale["Parameters"]["Cause.$"]
+        cause = stale["Parameters"]["Cause.$"]
+        assert "arena/model/{}.verdict" in cause
+        assert "$.run_date" in cause
+        # It may reference only what every reaching path carries.
+        assert "$.predictor_skip_validation" not in cause
+        assert "$.calendar_date" not in cause
         assert stale["Next"] == "BranchBFailed"
 
     def test_skip_terminal_reads_as_succeeded_branch(self, branch_b):

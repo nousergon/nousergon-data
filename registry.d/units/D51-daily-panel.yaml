@@ -1,4 +1,4 @@
-# Unit descriptor — data collector unit D50 (the daily panel, plan P-25).
+# Unit descriptor — data collector unit D51 (the daily panel, plan P-25).
 #
 # `console-policy` §2.6: onboarding a module is writing THIS FILE. Registered
 # the same PR the producer module lands, because `data.inventory.writers_declared`
@@ -11,8 +11,8 @@
 # graded at phase 2 by construction (`data_gate/clauses.py::_clause_guard`).
 #
 # PUBLIC REPO. Key templates and code paths only.
-unit_id: D50
-component_id: "data-collector-d50-daily-panel"
+unit_id: D51
+component_id: "data-collector-d51-daily-panel"
 owning_repo: "nousergon-data"
 title: "Daily panel: one long OHLCV panel per session, compiled once from ArcticDB universe"
 component: 1
@@ -62,7 +62,7 @@ contract:
       read_site: "crucible/data/sources.py::PublishedPanelSource"
       note: "contracts/daily_panel.py::CONSUMER; pending the crucible consumer PR"
 registry_rows: []
-run_manifest_prefix: data_collection/runs/D50
+run_manifest_prefix: data_collection/runs/D51
 detectors:
   - kind: "crucible-gate"
     via: "data.phase3.daily_panel_adopted (published leg)"
