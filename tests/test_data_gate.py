@@ -156,9 +156,11 @@ def test_the_board_is_red_at_birth(board):
     # it is held to the `not applicable:` prefix instead, so it MET's even
     # against this test's empty/no-source board. D47's `partial_exclusion`
     # (component 2, plan §8.1) adds `.identity` to the set this PR wave lands.
+    # The `.detector` reader (alpha-engine-config-I10795) honours D35's and
+    # D43's `partial_exclusion` the same way.
     declared_na = [c for c in base if c.met and c.detail.startswith("not applicable")]
     assert all(
-        c.name.endswith((".run_record", ".survives_phase4", ".artifact_registry", ".identity"))
+        c.name.endswith((".run_record", ".survives_phase4", ".artifact_registry", ".identity", ".detector"))
         for c in declared_na
     ), declared_na
     met = [c for c in base if c.met and c not in declared_na]
