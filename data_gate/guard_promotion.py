@@ -160,11 +160,13 @@ GUARD_PROMOTIONS: tuple[GuardPromotion, ...] = (
     GuardPromotion(
         name="bar_settlement",
         staging="dates.py::BAR_SETTLEMENT_GUARD",
-        mode="observe",
+        mode="enforce",
         risk="moderate",
         blast_radius=(
-            "the D03/D19 daily-close fetches; no ENFORCE raise site exists yet, so promotion "
-            "also writes one — the verdict is recorded on the manifest and read by shadow parity"
+            "the D03/D19 daily-close fetches: dates.assert_settled_bar refuses a fetch for day "
+            "D's own bar opened before SETTLED_AFTER_ET, failing that unit's phase before "
+            "anything is written; the verdict is also recorded on the manifest and read by "
+            "shadow parity"
         ),
         guard_class=None,
         units=("D03", "D19"),
