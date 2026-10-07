@@ -182,7 +182,7 @@ _TIMEOUT_EXEMPT: dict[str, dict[str, str]] = {
         "ResearchPredictorParallel.WaitForEvalJudgeSpotBootstrap": "ssm:getCommandInvocation single poll — bounded by the eval-judge dispatcher's own 1800s bootstrap executionTimeout (alpha-engine-config-I9329)",
         "ResearchPredictorParallel.WaitForEvalJudgeProcess": "ssm:getCommandInvocation single poll — bounded by EvalJudgeProcess' own 10800s executionTimeout (alpha-engine-config-I9329)",
         # s3:headObject / s3:putObject — single-object API call, sub-second.
-        "ResearchPredictorParallel.ValidatePredictorSkipWeightsFresh": "s3:headObject freshness check — SDK call, not a wait",
+        "ResearchPredictorParallel.ValidatePredictorSkipWeightsFresh": "s3:getObject arena-verdict read — SDK call, not a wait (alpha-engine-config-I12050)",
         "WriteCompletionMarker": "s3:putObject completion marker — SDK call, not a wait (config#2857)",
     },
     # alpha-engine-config#6693: every state formerly exempted here now
