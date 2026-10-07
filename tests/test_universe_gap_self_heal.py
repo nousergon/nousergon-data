@@ -476,6 +476,39 @@ class TestSelfHealMissingUniverseDays:
         assert [h["date"] for h in summary["healed_days"]] == [day]
         assert [h["kind"] for h in summary["healed_days"]] == ["fallback_quality"]
 
+    def test_ledger_day_not_before_target_is_not_a_candidate(self):
+        """EOD marks the session it just wrote the same evening; that
+        session's Polygon correction is the NEXT morning's append, which
+        runs after this heal. A ledger day >= target_date is not overdue yet
+        and must not take the per-run budget from an older entry that is.
+        Measured 2026-10-05/06: the target day won the single slot both runs
+        and 2026-09-30 was deferred both times."""
+        overdue = "2026-06-10"
+        with self._patches([], fallback_quality=[], ledger={
+            TARGET: {"reason": "fallback_quality", "detected_at": "2026-06-25T23:28:00+00:00"},
+            "2026-06-26": {"reason": "fallback_quality", "detected_at": "2026-06-26T23:28:00+00:00"},
+            overdue: {"reason": "fallback_quality", "detected_at": "2026-06-10T23:28:00+00:00"},
+        }) as p:
+            summary = _self_heal_missing_universe_days(
+                "bkt", TARGET, config={}, max_heal_days=1
+            )
+        assert [h["date"] for h in summary["healed_days"]] == [overdue]
+        assert summary["deferred_days"] == []
+        # The artifact still reports the whole ledger.
+        assert summary["ledger_days"] == ["2026-06-26", TARGET, overdue]
+        assert p.append.call_args.kwargs["date_str"] == overdue
+
+    def test_ledger_holding_only_the_target_day_is_a_clean_noop(self):
+        with self._patches([], fallback_quality=[], ledger={
+            TARGET: {"reason": "fallback_quality", "detected_at": "2026-06-25T23:28:00+00:00"},
+        }) as p:
+            summary = _self_heal_missing_universe_days(
+                "bkt", TARGET, config={}, max_heal_days=1
+            )
+        assert summary["healed_days"] == [] and summary["deferred_days"] == []
+        p.append.assert_not_called()
+        p.clear_ledger.assert_not_called()
+
     def test_ledger_read_failure_degrades_to_window_only_never_below(self):
         """A ledger read failure (network blip, AccessDenied) must degrade to
         the sliding-window detectors' existing coverage — never raise, never

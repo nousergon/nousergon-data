@@ -3939,10 +3939,25 @@ def _self_heal_missing_universe_days(
     # ledger-marked) — de-dup against both. Missing days are the more severe
     # gap, so they get healed first; ledger-only days (already outside the
     # window) come last since the window-scan days are the fresher signal.
+    #
+    # Ledger days are held to the same horizon as both window detectors:
+    # strictly before ``target_date``. The ledger is unbounded in the past
+    # (config#2672) but NOT in the future: EOD marks the session it just
+    # wrote the same evening, and that session's own Polygon correction is
+    # the next morning's append, which runs after this heal (05:00 ET). A
+    # ledger day >= target_date is therefore not yet overdue, and admitting
+    # it let the newest entry win the per-run budget every weekday, so an
+    # older entry that really was overdue was deferred indefinitely
+    # (2026-09-30 deferred on 10-05 and 10-06 while the heal re-healed the
+    # day the morning append was about to correct). Its row stays in
+    # ``ledger_days`` for the artifact; it is simply not a candidate yet.
     combined = (
         missing
         + [d for d in fallback_quality if d not in missing]
-        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+        + [
+            d for d in ledger_days
+            if d < target_date and d not in missing and d not in fallback_quality
+        ]
     )
     if not combined:
         logger.info(
