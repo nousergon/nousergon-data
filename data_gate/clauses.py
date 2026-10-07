@@ -1281,7 +1281,14 @@ def _sf_only_units(units: list[Unit]) -> list[Unit]:
     Includes retired members; `_clause_cutover_ready_units_covered` drops them
     for grading and uses the difference to reconcile against the plan's 37.
     """
-    return [unit for unit in units if _replaced_by_standalone_stack(unit)]
+    # A unit registered AFTER the audit (`audit.baseline_date` later than
+    # AUDIT_BASELINE_DATE) was born on the standalone stack, or is not
+    # scheduled at all: it has no v1 trigger for phase 4 to remove, so it is
+    # not one of the plan's SF-only units. D50 (alpha-engine-config-I12023) is
+    # the first such unit whose kind is `step-functions`; counting it moved the
+    # reconciliation off the plan's 37 for a unit the plan could not contain.
+    audited, _added = _audit_units(units)
+    return [unit for unit in audited if _replaced_by_standalone_stack(unit)]
 
 
 def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:

@@ -465,6 +465,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
     # retired the S3 mirror) — no new registry row needed.
     "features/metron_supplemental.py": 1,
+    # D50 settled rebuild of features/{D-1} (alpha-engine-config-I12023): the
+    # group parquets plus the settlement.json marker. Both land under the
+    # grandfathered "features/" path_prefix, so no new registry row is needed.
+    "features/settled_regrade.py": 2,
     "features/writer.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
@@ -512,6 +516,12 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # policy-observability: modules log their metrics, the console points
     # at the source — Brian ruling 2026-08-03).
     "scripts/weekly_sf_recovery_metric.py": 1,
+    # alpha-engine-config-I11984 — the operator-run stored-row sweep. Its one
+    # PUT rewrites an existing backtest/{run_date}/run_scope.json, already
+    # registered as the `weekly_run_scope` ARTIFACT_REGISTRY row (produced by
+    # the weekly SF's RunScope stage). Only with --apply, conditional on the
+    # ETag it read; it creates no new artifact.
+    "scripts/sweep_run_scope_rows.py": 1,
 }
 
 

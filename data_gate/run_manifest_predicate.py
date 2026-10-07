@@ -31,9 +31,11 @@ import os
 import re
 
 __all__ = [
+    "AWAITS_PRODUCER_RETRY",
     "COMPLETION_FAILURE_MODES",
     "DEFAULT_ROWS_OUT_FLOOR",
     "MANIFEST_BUCKET",
+    "PRODUCER_ATTEMPTS_PER_WORKLOAD",
     "SAME_DATE_NOOP_REASON",
     "completion_check",
     "parse_ts",
@@ -258,12 +260,11 @@ def _finding(mode: str, unit_id: str, key: str | None, detail: str) -> dict:
     return {"mode": mode, "unit": unit_id, "key": key, "detail": detail}
 
 
-def _newest_manifest(s3, prefix: str, started_at):
-    """The unit's newest run manifest, if it finished at or after ``started_at``.
+def _recent_manifest_keys(s3, prefix: str, started_at) -> list[str]:
+    """Every manifest key under the unit's prefix from the lookback day on.
 
-    ``run_id`` is a ULID and the day partition is an ISO date, so the prefix
-    lists in execution order and ``max()`` IS the newest run — if THAT one
-    predates this execution, every other one does too.
+    ``run_id`` is a ULID and the day partition is an ISO date, so the keys sort
+    in execution order.
     """
     from datetime import timedelta
 
@@ -280,6 +281,17 @@ def _newest_manifest(s3, prefix: str, started_at):
         if not page.get("IsTruncated"):
             break
         token = page.get("NextContinuationToken")
+    return keys
+
+
+def _newest_manifest(s3, prefix: str, started_at):
+    """The unit's newest run manifest, if it finished at or after ``started_at``.
+
+    ``run_id`` is a ULID and the day partition is an ISO date, so the prefix
+    lists in execution order and ``max()`` IS the newest run — if THAT one
+    predates this execution, every other one does too.
+    """
+    keys = _recent_manifest_keys(s3, prefix, started_at)
     if not keys:
         return None, None
     key = max(keys)
@@ -564,6 +576,79 @@ def _completion_check(event: dict, s3_client=None) -> dict:
 #     exactly as `_completion_check` does — the v1 SF's Catch counts that as
 #     one not-ready poll, so a persistent raise exhausts the bounded budget and
 #     degrades loudly rather than proceeding on an unmeasured claim.
+#
+# A failed manifest is not always the producer's last word
+# (alpha-engine-config-I11812, weekly failure class K02). The producer runs a
+# failed workload ONE more time, on demand (`data-collection.asl.json`
+# `CheckRetryBudget` -> `RetryOnDemand`), and since nousergon-data#2039 that
+# retry recomputes a degraded unit. So "every unit has a manifest and one
+# failed" is settled only once the producer has visited that unit as many times
+# as it ever will. Before that, a weekly consumer that reads the attempt-0
+# failure as settled fails the whole Saturday pipeline closed while the retry
+# that would have fixed it is still running — exactly the shape #2040 made
+# reachable, because the D14 prune that used to leave the wait unsettled now
+# runs even when phase 1 fails.
+
+
+#: How many times the producer runs one workload in one execution: the first
+#: launch plus `CheckRetryBudget`'s single on-demand retry. Literal because this
+#: module ships in Lambda zips without the ASL;
+#: `tests/test_readiness_awaits_producer_retry.py` derives it from the ASL.
+PRODUCER_ATTEMPTS_PER_WORKLOAD = 2
+
+#: Collections whose v1 consumer waits out the producer's retry before reading
+#: a failed unit as settled. Exactly the collections whose consumer FAILS CLOSED
+#: on not-ready (the weekly: `ExtractCollectionNotReadyError` ->
+#: `NormalizeFailureContext`), where reading a retryable failure as final costs
+#: the whole run. The morning and EOD consumers fail OPEN on a trading clock
+#: (prior-close data, then trading continues), so they keep degrading at once;
+#: moving them would change when a trading morning acts, which is a separate
+#: decision. `tests/test_readiness_awaits_producer_retry.py` derives this set
+#: from the three v1 definitions.
+AWAITS_PRODUCER_RETRY = frozenset({"weekly"})
+
+
+def _fresh_visits(s3, prefix: str, baseline, cap: int) -> int:
+    """How many of the unit's runs finished at or after ``baseline``, up to ``cap``.
+
+    Newest first, stopping at the first run older than the baseline (the keys
+    sort in execution order, so every earlier one is older too) or at ``cap``,
+    so a check costs at most ``cap`` GETs per failed unit.
+    """
+    count = 0
+    for key in sorted(_recent_manifest_keys(s3, prefix, baseline), reverse=True):
+        if count >= cap:
+            break
+        doc = json.loads(s3.get_object(Bucket=MANIFEST_BUCKET, Key=key)["Body"].read())
+        if _parse_ts(doc.get("finished"), where=f"{key}:finished") < baseline:
+            break
+        count += 1
+    return count
+
+
+def _retry_pending(s3, raw: dict, row: dict, findings: list[dict], baseline) -> bool:
+    """Can the producer's own retry still replace this unit's failure?
+
+    Only a unit that RAN and filed ``failed`` qualifies: that is the outcome
+    the producer retries, and a recompute can turn it into ``ok``. A no-op with
+    nothing behind it, a missing output or a short row count on an ``ok`` run
+    is the producer's settled account of what it did, and stays terminal. And
+    only while the unit has fewer fresh runs than the producer will ever make:
+    once the retry has visited it, the newest run IS the last word.
+
+    If the failed workload exits 0 there is no retry, and the unit stays
+    pending until the consumer's bounded budget runs out. That fails closed
+    exactly as before, only later, and the producer's own VerifyRunManifests
+    has already paged on it by then.
+    """
+    if row.get("status") != "failed":
+        return False
+    if any(f["mode"] != "run_not_ok" for f in findings):
+        return False
+    visits = _fresh_visits(
+        s3, str(raw["run_manifest_prefix"]), baseline, PRODUCER_ATTEMPTS_PER_WORKLOAD
+    )
+    return visits < PRODUCER_ATTEMPTS_PER_WORKLOAD
 
 
 def _readiness_check(event: dict, s3_client=None) -> dict:
@@ -571,9 +656,10 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
 
     Returns ``{"readiness": {...}}`` — ``ready``, ``settled``, the units still
     ``missing`` a manifest, the units whose manifest exists but ``failed`` the
-    predicate, the first ``failure_mode`` in `COMPLETION_FAILURE_MODES`
-    precedence, a ``summary`` and the ``baseline`` the manifests were graded
-    against.
+    predicate, the subset of those still ``retry_pending`` (a weekly unit the
+    producer's on-demand retry has not visited yet, so ``settled`` stays false),
+    the first ``failure_mode`` in `COMPLETION_FAILURE_MODES` precedence, a
+    ``summary`` and the ``baseline`` the manifests were graded against.
     """
     from datetime import timedelta
 
@@ -597,7 +683,9 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
     descriptors = _unit_descriptors()
     s3 = s3_client if s3_client is not None else _s3_client()
 
+    awaits_retry = collection in AWAITS_PRODUCER_RETRY
     findings: list[dict] = []
+    retry_pending: list[str] = []
     for unit_id in units:
         raw = descriptors.get(unit_id)
         if raw is None:
@@ -606,26 +694,38 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
                 f"registry.d/units/; a consumer waiting on a unit nobody declared "
                 f"would grade nothing and read as ready."
             )
-        unit_findings, _row = _check_unit(s3, unit_id, raw, baseline)
+        unit_findings, row = _check_unit(s3, unit_id, raw, baseline)
         findings.extend(unit_findings)
+        if awaits_retry and unit_findings and _retry_pending(s3, raw, row, unit_findings, baseline):
+            retry_pending.append(unit_id)
 
     missing = sorted({f["unit"] for f in findings if f["mode"] == "manifest_missing"})
     failed = sorted({f["unit"] for f in findings if f["mode"] != "manifest_missing"})
+    retry_pending = sorted(retry_pending)
     mode = next(
         (m for m in COMPLETION_FAILURE_MODES if any(f["mode"] == m for f in findings)), ""
     )
     ready = not findings
-    settled = not missing
+    # Settled = waiting longer cannot change the answer: every unit has a
+    # manifest for this cycle AND no failed unit can still be replaced by the
+    # producer's own retry.
+    settled = not missing and not retry_pending
     summary = (
         f"collection {collection}: READY over {len(units)} unit(s)"
         if ready
         else f"collection {collection}: not ready over {len(units)} unit(s); "
-        f"missing={missing} failed={failed}; first mode {mode}. "
+        f"missing={missing} failed={failed}"
+        + (
+            f" retry_pending={retry_pending} (failed on the producer's first attempt; "
+            f"its on-demand retry has not visited them yet)"
+            if retry_pending else ""
+        )
+        + f"; first mode {mode}. "
         + " | ".join(f"[{f['mode']}] {f['unit']} {f['key'] or ''}: {f['detail']}" for f in findings)
     )[:_MAX_SUMMARY_CHARS]
     logger.info(
-        "readiness-check %s: ready=%s settled=%s missing=%s failed=%s",
-        collection, ready, settled, missing, failed,
+        "readiness-check %s: ready=%s settled=%s missing=%s failed=%s retry_pending=%s",
+        collection, ready, settled, missing, failed, retry_pending,
     )
     return {
         "readiness": {
@@ -633,6 +733,7 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
             "settled": settled,
             "missing": missing,
             "failed": failed,
+            "retry_pending": retry_pending,
             "failure_mode": mode,
             "baseline": baseline.isoformat().replace("+00:00", "Z"),
             "summary": summary,
