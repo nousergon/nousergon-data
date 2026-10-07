@@ -363,7 +363,7 @@ def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
 #: edgar-pit-fundamentals-daily reads the `universe` library for split-adjusted
 #: closes (collectors/edgar_pit_fundamentals.py::ArcticPriceReader) and writes
 #: S3 objects only.
-_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily"}
+_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade"}
 
 
 def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
@@ -373,11 +373,34 @@ def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
     describes it. Until alpha-engine-config-I11269 that meant "last"; the EOD
     schedule now carries edgar after it, which writes no ArcticDB."""
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
-    assert by_name["data-collection-morning"]["input"]["workloads"][-1] == "arctic-probe"
+    # The morning schedule carries D50 (features-settled-regrade,
+    # alpha-engine-config-I12023) after the probe: it rewrites S3 feature keys
+    # from the settled bar and writes no ArcticDB.
+    morning = by_name["data-collection-morning"]["input"]["workloads"]
+    after_morning = morning[morning.index("arctic-probe") + 1:]
+    assert after_morning == ["features-settled-regrade"]
+    assert set(after_morning) <= _NON_ARCTIC_WRITERS
     eod = by_name["data-collection-eod"]["input"]["workloads"]
     after = eod[eod.index("arctic-probe") + 1:]
     assert after == ["edgar-pit-fundamentals-daily"]
     assert set(after) <= _NON_ARCTIC_WRITERS
+
+
+def test_the_morning_regrade_follows_the_settle_and_is_verified(stack, tpl):
+    """alpha-engine-config-I12023: D50 rebuilds features/{D-1} from the bar D17
+    settled, so it runs after morning-enrich in the same strictly ordered Map,
+    and its run manifest is part of the morning completion claim."""
+    morning = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-morning"]["input"]
+    assert morning["workloads"] == [
+        "morning-enrich", "morning-arctic-append", "arctic-probe", "features-settled-regrade",
+    ]
+    assert morning["verify_units"] == ["D17", "D18", "D50"]
+    assert stack.UNIT_WRITERS["data-collection-morning"]["D50"] == "features-settled-regrade"
+    # The whole morning chain still fits the collection machine's ceiling.
+    import json as _json
+
+    ceiling = _json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
+    assert stack.worst_case_seconds(morning["workloads"], through="features-settled-regrade") <= ceiling
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):

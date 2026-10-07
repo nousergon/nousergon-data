@@ -143,7 +143,11 @@ def test_the_board_is_red_at_birth(board):
     # this line to be edited deliberately when a unit is added, so the edit is
     # the acknowledgement — a new producer's clauses must be COUNTED as red, not
     # absorbed into a total nobody re-reads.
-    assert len(base) == 432
+    # 432 -> 441: D50 (features/{D-1} settled regrade, alpha-engine-config-I12023)
+    # adds its nine.
+    # 441 -> 450: D51 (the daily panel, alpha-engine-config-I10791) adds its
+    # nine, all graded at phase 3.
+    assert len(base) == 450
     # A declared not-applicable (an on-demand unit with no invocation to record,
     # no scheduled trigger for phase 4 to remove, or a `partial_exclusion`
     # naming a column no artifact/registry/identity read could ever grade for
@@ -152,9 +156,14 @@ def test_the_board_is_red_at_birth(board):
     # it is held to the `not applicable:` prefix instead, so it MET's even
     # against this test's empty/no-source board. D47's `partial_exclusion`
     # (component 2, plan §8.1) adds `.identity` to the set this PR wave lands.
+    # The `.detector` reader (alpha-engine-config-I10795) honours D35's and
+    # D43's `partial_exclusion` the same way, and so does `.console_entity`
+    # (I10795 part 2).
     declared_na = [c for c in base if c.met and c.detail.startswith("not applicable")]
     assert all(
-        c.name.endswith((".run_record", ".survives_phase4", ".artifact_registry", ".identity"))
+        c.name.endswith(
+            (".run_record", ".survives_phase4", ".artifact_registry", ".identity", ".detector", ".console_entity")
+        )
         for c in declared_na
     ), declared_na
     met = [c for c in base if c.met and c not in declared_na]

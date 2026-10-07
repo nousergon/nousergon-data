@@ -45,7 +45,9 @@ then repeat every week:
     ``source`` is then ``parent_gate``.
 
 ``ENABLED_COMPLETED``
-    Dispatched, entered, exited cleanly. Graded.
+    Dispatched, and the branch it actually took reached its rejoin with no
+    failure recorded on the way (section 2b, alpha-engine-config-I11984).
+    Graded.
 
 ``ENABLED_FAILED``
     Dispatched and entered, but never exited cleanly. **Graded, and graded as a
@@ -221,7 +223,8 @@ def _successors(state: dict) -> Iterable[str]:
 
 #: How far to look past a routing state for the real work state behind a gate.
 #: The longest such run in this machine is CheckSkipEvalJudge -> ComputeEvalCadence
-#: -> CheckMonthlyCadence -> EvalJudgeSubmit* (3). The bound exists so a
+#: -> CheckMonthlyCadence -> EvalJudgeSubmit* (3) — and which EvalJudgeSubmit*
+#: is decided by the history, not the Default (alpha-engine-config-I11984). The bound exists so a
 #: definition change that turns a gate's target into a long routing chain
 #: degrades to "no work state found" rather than wandering the machine.
 _WORK_LOOKAHEAD = 6
@@ -231,8 +234,21 @@ _WORK_LOOKAHEAD = 6
 _WORK_TYPES = frozenset({"Task", "Parallel", "Map"})
 
 
-def work_entry(definition: dict, entry: str | None) -> tuple[str | None, list[str]]:
+def work_entry(
+    definition: dict, entry: str | None, history: list[dict] | None = None,
+) -> tuple[str | None, list[str]]:
     """The first real work state behind a gate's enabled branch.
+
+    With ``history``, a routing Choice the execution entered is followed down
+    the branch the execution OBSERVED taking, not down its ``Default``
+    (alpha-engine-config-I11984). ``CheckSkipEvalJudge`` reaches its Task
+    through ``CheckMonthlyCadence``, whose ``Default`` is
+    ``EvalJudgeSubmitWeekly``; on a first Saturday the run takes
+    ``EvalJudgeSubmitFirstSaturday`` instead. Reading the Default named a state
+    the run never entered and graded a 96/96 judge run as ENABLED_FAILED
+    ("never entered") on 2026-10-03. Without ``history`` — or for a Choice the
+    run never entered — the walk falls back to the Default, as before; see
+    :func:`work_route` for the provenance of each hop.
 
     A bounded forward walk over `Default` / `Next` / first-choice edges — NOT a
     reachability or dominance analysis over the whole machine. Both of those
@@ -248,16 +264,36 @@ def work_entry(definition: dict, entry: str | None) -> tuple[str | None, list[st
     A short local walk needs neither property to be true. It answers only "which
     state does this gate switch on", which is all the disposition needs.
     """
+    work, passed, _route = work_route(definition, entry, history)
+    return work, passed
+
+
+def work_route(
+    definition: dict, entry: str | None, history: list[dict] | None = None,
+) -> tuple[str | None, list[str], list[dict]]:
+    """:func:`work_entry`, plus the provenance of every routing Choice crossed.
+
+    Each element of the returned route names the Choice, the branch taken, the
+    definition's ``Default`` and the ``source`` of the decision —
+    ``execution_history`` when the run was observed leaving that Choice,
+    ``definition_default`` when it was not (a gate never entered, or a replay
+    without a history). Nested ``CheckSkip`` gates are reported separately (the
+    second element) and, as before, are walked through their enabled branch:
+    whether an inner gate SKIPPED is decided by :func:`gate_decisions`.
+    """
     states = flatten_states(definition.get("States", {}))
+    observed = _observed_choice_exits(history) if history else {}
     name = entry
     passed: list[str] = []
+    route: list[dict] = []
     for _ in range(_WORK_LOOKAHEAD):
         if not name or name not in states:
-            return None, passed
+            return None, passed, route
         body = states[name]
         if body.get("Type") in _WORK_TYPES:
-            return name, passed
-        if name.startswith(_GATE_PREFIX) and body.get("Type") == "Choice":
+            return name, passed, route
+        is_gate = name.startswith(_GATE_PREFIX) and body.get("Type") == "Choice"
+        if is_gate:
             # A gate nested behind this one. Recorded so an outer gate that says
             # "run" over an inner gate that says "skip" is reported as DISABLED
             # by the inner flag, rather than as an outer stage that mysteriously
@@ -267,8 +303,18 @@ def work_entry(definition: dict, entry: str | None) -> tuple[str | None, list[st
         if not nxt:
             choices = body.get("Choices") or []
             nxt = choices[0].get("Next") if choices else None
+        if body.get("Type") == "Choice" and not is_gate:
+            taken = observed.get(name)
+            route.append({
+                "choice": name,
+                "taken": taken if taken else nxt,
+                "definition_default": body.get("Default"),
+                "source": "execution_history" if taken else "definition_default",
+            })
+            if taken:
+                nxt = taken
         name = nxt
-    return None, passed
+    return None, passed, route
 
 
 #: The state this Lambda runs as. Gates downstream of it cannot be in the
@@ -785,6 +831,224 @@ def gate_decisions(gates: dict[str, dict], history: list[dict]) -> dict[str, str
 
 
 # ---------------------------------------------------------------------------
+# 2b. The selected branch — what the run actually walked behind each gate
+#     (alpha-engine-config-I11984)
+# ---------------------------------------------------------------------------
+#
+# Measured 2026-10-03, ``watch-rerun-2026-10-02-1``: ``CheckSkipEvalJudge`` took
+# its default branch, ``CheckMonthlyCadence`` routed the first Saturday of the
+# month to ``EvalJudgeSubmitFirstSaturday``, the spot graded 96/96 and
+# ``CheckEvalJudgeProcessStatus`` saw ``Success``. The stored row said
+# ``entry_state=EvalJudgeSubmitWeekly`` / ``ENABLED_FAILED`` / "never entered",
+# because the work walk read ``CheckMonthlyCadence``'s ``Default`` instead of
+# the branch the run took, and the Director reported an outage that did not
+# happen. Two rules close it:
+#
+# 1. A routing Choice between a gate and its work state is followed down the
+#    branch the HISTORY shows it taking (:func:`work_route`).
+# 2. The stage's outcome is the selected branch's END-TO-END result, read off
+#    that branch's own event chain from its work state to where it rejoins the
+#    machine — never off a later stage's exit. For EvalJudge the Submit Task
+#    exiting cleanly proves only that a plan was submitted: on 2026-08-29
+#    Submit SUCCEEDED returning ``status=ERROR`` and the branch routed to
+#    ``MarkEvalJudgeDegraded`` (alpha-engine-config-I9636). Reading the Task's
+#    exit alone would grade that week a completion.
+
+_EXECUTION_FAILED_TYPES = frozenset(
+    {"ExecutionFailed", "ExecutionAborted", "ExecutionTimedOut"}
+)
+
+
+def _state_name(event: dict) -> str | None:
+    for key in ("stateEnteredEventDetails", "stateExitedEventDetails"):
+        name = (event.get(key) or {}).get("name")
+        if isinstance(name, str) and name:
+            return name
+    return None
+
+
+def _observed_choice_exits(history: list[dict] | None) -> dict[str, str]:
+    """For every Choice the run left, the state it entered next (last visit).
+
+    Resolved through the ``previousEventId`` chain, for the same reason as
+    :func:`gate_decisions`: adjacency is wrong inside a Parallel.
+    """
+    if not isinstance(history, list):
+        return {}
+    entered_after: dict[Any, str] = {}
+    for event in history:
+        if isinstance(event, dict) and event.get("type", "").endswith(_ENTERED_SUFFIX):
+            name = _state_name(event)
+            if name and event.get("previousEventId") not in entered_after:
+                entered_after[event.get("previousEventId")] = name
+    taken: dict[str, str] = {}
+    for event in history:
+        if not isinstance(event, dict) or event.get("type") != "ChoiceStateExited":
+            continue
+        name = _state_name(event)
+        nxt = entered_after.get(event.get("id"))
+        if name and nxt:
+            taken[name] = nxt
+    return taken
+
+
+class _History:
+    """One pass over the history, indexed for chain walking."""
+
+    def __init__(self, history: list[dict]):
+        events = [e for e in history if isinstance(e, dict)]
+        self.by_id = {e.get("id"): e for e in events}
+        self.position = {id(e): i for i, e in enumerate(events)}
+        self.entered_after: dict[Any, dict] = {}
+        self.entries: dict[str, list[dict]] = {}
+        self.exits: dict[str, list[dict]] = {}
+        self.execution_failed = False
+        for event in events:
+            kind = event.get("type", "")
+            if kind in _EXECUTION_FAILED_TYPES:
+                self.execution_failed = True
+            name = _state_name(event)
+            if not name:
+                continue
+            if kind.endswith(_ENTERED_SUFFIX):
+                self.entries.setdefault(name, []).append(event)
+                self.entered_after.setdefault(event.get("previousEventId"), event)
+            elif kind.endswith(_EXITED_SUFFIX):
+                self.exits.setdefault(name, []).append(event)
+
+    def exit_for(self, entered: dict) -> dict | None:
+        """The first exit of the same state recorded after ``entered``."""
+        name = _state_name(entered)
+        at = self.position[id(entered)]
+        for event in self.exits.get(name or "", []):
+            if self.position[id(event)] > at:
+                return event
+        return None
+
+    def caught_error(self, exited: dict) -> str | None:
+        previous = self.by_id.get(exited.get("previousEventId")) or {}
+        if previous.get("type", "").endswith(_FAILURE_SUFFIXES):
+            return _error_name(previous) or "unknown error"
+        return None
+
+
+def records_error(body: dict) -> bool:
+    """Whether entering this state means the branch has recorded a failure.
+
+    Read off the definition, not off state names: a ``Fail`` state, or a
+    ``Pass`` whose ``ResultPath`` writes an error (``$.error``,
+    ``$.eval_judge_error``, ...) or sets a ``*degraded*`` field to true. The
+    last clause deliberately excludes the ``Init*DegradedFlag`` states, which
+    write ``degraded: false`` on every healthy run.
+    """
+    kind = body.get("Type")
+    if kind == "Fail":
+        return True
+    if kind != "Pass":
+        return False
+    result_path = body.get("ResultPath")
+    if not isinstance(result_path, str):
+        return False
+    leaf = result_path.rsplit(".", 1)[-1].lower()
+    if leaf == "error" or leaf.endswith("_error"):
+        return True
+    if "degraded" in leaf:
+        result = body.get("Result", body.get("Parameters"))
+        if result is True:
+            return True
+        if isinstance(result, dict) and result.get("degraded") is True:
+            return True
+    return False
+
+
+#: How many states one branch walk may visit. The EvalJudge poll loops visit
+#: ~5 states per 30 s poll for up to three hours; this bounds a walk over a
+#: corrupt history without ever truncating a real one.
+_BRANCH_STEP_LIMIT = 20000
+
+
+def branch_outcome(
+    states: dict[str, dict],
+    hist: _History,
+    work_state: str,
+    stops: Iterable[str],
+) -> dict:
+    """The selected branch's end-to-end result, from its own event chain.
+
+    Starts at the LAST entry of ``work_state`` (a relaunched stage is judged by
+    its final attempt) and follows ``previousEventId`` forward until the branch
+    rejoins the machine: a state in ``stops`` (the gate's skip targets and
+    :data:`SCOPE_STATE`), any other ``CheckSkip`` gate, a ``Succeed``, or the
+    end of a Parallel branch. Every witness is local to that walk — a later
+    stage's exit is never read as this one's completion.
+
+    A failure is any of: a state on the walk that exited straight after a
+    failure event (its ``Catch`` routed on); a state that
+    :func:`records_error`; a state entered and never exited; a run that ended
+    before the branch rejoined. A failure is CLEARED when the walk later
+    re-enters a state it had already visited before the failure — the branch
+    looped back and tried again (a relaunch, a reissue), so only the last
+    attempt counts, the same rule :func:`caught_failures` applies to a state.
+    """
+    stop_set = set(stops)
+    entries = hist.entries.get(work_state) or []
+    step = entries[-1] if entries else None
+    seen: set[str] = set()
+    pending: dict | None = None
+    walked: list[str] = []
+
+    def done(**extra: Any) -> dict:
+        failure = None
+        if pending is not None:
+            failure = {k: v for k, v in pending.items() if k != "seen_before"}
+        return {"failure": failure, "walked": len(walked), **extra}
+
+    while step is not None and len(walked) < _BRANCH_STEP_LIMIT:
+        name = _state_name(step) or ""
+        body = states.get(name, {})
+        if walked and (
+            name in stop_set
+            or name.startswith(_GATE_PREFIX)
+            or body.get("Type") == "Succeed"
+        ):
+            return done(rejoined_at=name)
+        if pending is not None and name in pending["seen_before"]:
+            pending = None
+        seen.add(name)
+        walked.append(name)
+        if pending is None and records_error(body):
+            pending = {
+                "kind": "error_state", "state": name,
+                "seen_before": frozenset(seen),
+            }
+        exited = hist.exit_for(step)
+        if exited is None:
+            if pending is None:
+                pending = {
+                    "kind": "not_exited", "state": name,
+                    "seen_before": frozenset(seen),
+                }
+            return done(rejoined_at=None)
+        error = hist.caught_error(exited)
+        if error and pending is None:
+            pending = {
+                "kind": "caught", "state": name, "error": error,
+                "seen_before": frozenset(seen),
+            }
+        if body and body.get("Type") != "Choice" and (
+            body.get("End") or not body.get("Next")
+        ):
+            return done(rejoined_at=None, branch_end=name)
+        step = hist.entered_after.get(exited.get("id"))
+        if step is None and hist.execution_failed and pending is None:
+            pending = {
+                "kind": "run_ended", "state": name,
+                "seen_before": frozenset(seen),
+            }
+    return done(rejoined_at=None)
+
+
+# ---------------------------------------------------------------------------
 # 3. Assembly — one row per gate, every row carrying its own provenance
 # ---------------------------------------------------------------------------
 
@@ -812,6 +1076,7 @@ def build_run_scope(
     entered = set(entered_sequence(history))
     decisions = gate_decisions(gates, history)
     caught = caught_failures(history)
+    hist = _History(history)
 
     states = flatten_states(definition.get("States", {}))
     flags = input_flags if isinstance(input_flags, dict) else {}
@@ -847,13 +1112,26 @@ def build_run_scope(
                 ),
             }
             continue
-        entry, nested = work_entry(definition, gate.get("on_enabled"))
+        # The route is resolved against the history only for a gate the run
+        # entered: for any other row the entry state is the definition's
+        # Default, and says so (alpha-engine-config-I11984).
+        entry, nested, route = work_route(
+            definition, gate.get("on_enabled"),
+            history if decision is not None else None,
+        )
         row: dict[str, Any] = {
             "gate": name,
             "flag": gate["flag"],
             "entry_state": entry,
             "entry_state_type": states.get(entry, {}).get("Type") if entry else None,
         }
+        if route:
+            row["entry_route"] = route
+            row["entry_state_source"] = (
+                "execution_history"
+                if all(hop["source"] == "execution_history" for hop in route)
+                else "definition_default"
+            )
         if decision == DISABLED:
             row.update(
                 disposition=DISABLED,
@@ -869,6 +1147,7 @@ def build_run_scope(
                 row.update(
                     disposition=ENABLED_FAILED,
                     source="execution_history",
+                    failed_state=entry,
                     reason=(
                         f"dispatched: {entry} was entered and never exited — the "
                         "stage did not complete."
@@ -878,6 +1157,7 @@ def build_run_scope(
                 row.update(
                     disposition=ENABLED_FAILED,
                     source="execution_history",
+                    failed_state=entry,
                     caught_error=caught[entry],
                     reason=(
                         f"dispatched: {entry} raised {caught[entry]} and its "
@@ -886,11 +1166,58 @@ def build_run_scope(
                     ),
                 )
             elif entry and entry in entered:
-                row.update(
-                    disposition=ENABLED_COMPLETED,
-                    source="execution_history",
-                    reason=f"dispatched: {entry} was entered and exited cleanly.",
+                outcome = branch_outcome(
+                    states, hist, entry,
+                    stops=[*gate["on_disabled"], scope_state],
                 )
+                failure = outcome["failure"]
+                if failure is None:
+                    end = outcome.get("rejoined_at") or outcome.get("branch_end")
+                    row.update(
+                        disposition=ENABLED_COMPLETED,
+                        source="execution_history",
+                        completion_witness={
+                            "rejoined_at": outcome.get("rejoined_at"),
+                            "branch_end": outcome.get("branch_end"),
+                            "states_walked": outcome["walked"],
+                        },
+                        reason=(
+                            f"dispatched: {entry} was entered and exited cleanly"
+                            + (
+                                f", and its branch reached {end} with no "
+                                "failure recorded on the way."
+                                if end else "."
+                            )
+                        ),
+                    )
+                else:
+                    failed_state = failure["state"]
+                    kind = failure["kind"]
+                    if kind == "caught":
+                        detail = (
+                            f"{failed_state} raised {failure['error']} and its "
+                            "Catch routed the run on"
+                        )
+                    elif kind == "error_state":
+                        detail = f"the branch routed to {failed_state}, which records a failure"
+                    elif kind == "not_exited":
+                        detail = f"{failed_state} was entered and never exited"
+                    else:
+                        detail = (
+                            f"the execution ended after {failed_state}, before "
+                            "the branch rejoined"
+                        )
+                    row.update(
+                        disposition=ENABLED_FAILED,
+                        source="execution_history",
+                        failed_state=failed_state,
+                        reason=(
+                            f"dispatched: {entry} was entered, but {detail} — "
+                            "the stage did not complete."
+                        ),
+                    )
+                    if kind == "caught":
+                        row["caught_error"] = failure["error"]
             else:
                 inner = next(
                     (g for g in nested if decisions.get(g) == DISABLED), None

@@ -1,0 +1,80 @@
+{
+    "broken": "adapter claim",
+    "facts": {
+        "adapters_asked": [
+            "registry-1"
+        ],
+        "claim_classes": [
+            "DECLARATION"
+        ],
+        "entity_kind": "component",
+        "entity_state": "UNREPORTED",
+        "reporting_claims": 0
+    },
+    "identifier": "data-collector-d03-prices",
+    "index": {
+        "age_seconds": 0.877622,
+        "bootstrap": false,
+        "build_seconds": 0.00914189000013721,
+        "built_at": "2026-10-07T03:30:42.033140+00:00",
+        "cadence_overrun": false,
+        "last_error": null,
+        "refresh_seconds": 60.0,
+        "sources": [
+            {
+                "cadence_seconds": null,
+                "elapsed_seconds": 0.0042646590000003926,
+                "fetched_at": "2026-10-07T03:30:42.028259+00:00",
+                "name": "registry-1",
+                "status": "ok",
+                "unavailable": []
+            }
+        ],
+        "stale": false,
+        "stale_since": null,
+        "staleness_basis": "not computable \u2014 no source declared a cadence"
+    },
+    "ok": false,
+    "remedy": "check that the emission is landing where an enabled adapter reads, and that the adapter's key_pattern matches the path it is written to. An adapter that ran fine and found nothing looks exactly like one that was never enabled \u2014 compare its status in the index freshness block.",
+    "schema_version": 1,
+    "steps": [
+        {
+            "detail": "declared by registry-1",
+            "name": "registry row",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "nothing reported on it; 1 source(s) were asked (registry-1)",
+            "name": "adapter claim",
+            "ok": false,
+            "remedy": "check that the emission is landing where an enabled adapter reads, and that the adapter's key_pattern matches the path it is written to. An adapter that ran fine and found nothing looks exactly like one that was never enabled \u2014 compare its status in the index freshness block."
+        },
+        {
+            "detail": "component in state UNREPORTED",
+            "name": "merged entity",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "resolves by identifier",
+            "name": "search-reachable",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "listed under /component",
+            "name": "structure-reachable",
+            "ok": true,
+            "remedy": null
+        },
+        {
+            "detail": "nothing links to it",
+            "name": "relation-reachable",
+            "ok": false,
+            "remedy": "reachable by name and by structure but not by relation, so it is findable only by someone who already knows it exists (\u00a73.1). Declare `produces`/`consumes` in its emission, or the artifact it reads, and the reverse edge is derived."
+        }
+    ],
+    "summary": "data-collector-d03-prices: adapter claim \u2014 nothing reported on it; 1 source(s) were asked (registry-1)",
+    "view": "doctor"
+}

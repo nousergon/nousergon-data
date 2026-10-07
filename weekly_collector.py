@@ -1516,6 +1516,15 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
     return reg.phase(name, supports_auto_skip=False, **log_ctx)
 
 
+#: The ``skip_reason`` prefixes a whole-mode unit may report, each matched to
+#: :data:`run_units.NOT_RUN_NO_NEW_DATA_DECLARED` against the lib's own
+#: definition ("a target date already published"): MorningEnrich's
+#: ``stale_overwrite`` (its target date is already appended to ArcticDB), and
+#: D50's ``already_regraded`` (features/{D-1} was already rebuilt from the
+#: current settled bar, `features.settled_regrade`). Any other reason fails loud.
+_CLASSIFIED_SKIP_REASONS: tuple[str, ...] = ("stale_overwrite", "already_regraded")
+
+
 def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) -> dict:
     """Run a whole-mode unit under the run-manifest wrapper.
 
@@ -1539,7 +1548,8 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
 
     ``skip_reason`` is matched explicitly against a known producer, never
     guess-bucketed (`alpha-engine-config-I10831` deliverable 1, corrected
-    2026-09-15). Today the ONLY producer among the five wrapped modes is
+    2026-09-15). D50's ``already_regraded`` is the second producer
+    (:data:`_CLASSIFIED_SKIP_REASONS`, same member, same reasoning); the first is
     :func:`_should_skip_morning_enrich`'s ``stale_overwrite`` reason —
     MorningEnrich's own freshness guard, skipping because its target date is
     already appended to ArcticDB. That is
@@ -1594,7 +1604,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
             # guard verdict — an unrecognized reason is not a not_applicable
             # candidate at all (see this function's docstring;
             # alpha-engine-config-I10831, corrected 2026-09-15).
-            if not detail.startswith("stale_overwrite"):
+            if not detail.startswith(_CLASSIFIED_SKIP_REASONS):
                 raise _CollectorError(
                     mode,
                     f"{mode} returned status=skipped with an unclassified skip_reason "
@@ -1706,6 +1716,17 @@ def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
 #: mode starts carrying a collector's readings by a deliberate edit here.
 _MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
     "morning_enrich": ("daily_closes",),
+    # D50 carries D17's settlement onto every key it rebuilt, row by row for
+    # the tickers D17 carried provisional (features/settled_regrade.py).
+    "features_settled_regrade": ("features",),
+}
+
+#: mode -> the nested collectors whose recorded READS (``input_refs``,
+#: `features.input_record`) a whole-mode unit folds onto its manifest's
+#: ``inputs`` — `_phase_collect`'s I11203 folding, one level down. D50's are
+#: the D31-pinned objects, the live daily_closes and its ArcticDB read.
+_MODE_INPUT_COLLECTORS: dict[str, tuple[str, ...]] = {
+    "features_settled_regrade": ("features",),
 }
 
 
@@ -1720,7 +1741,31 @@ def _mode_collector_guards(mode: str, result: dict | None) -> list[dict]:
     return guards
 
 
+def _settled_regrade_keys(result: dict) -> dict[str, int]:
+    """Every key D50 wrote this run, with its row count: each rebuilt feature
+    group (``groups_written``, whatever groups the snapshot produced) and the
+    ``settlement.json`` marker, written last. Empty when it wrote nothing."""
+    features = (result.get("collectors") or {}).get("features") or {}
+    if features.get("status") != "ok":
+        return {}
+    day = result.get("date")
+    keys = {
+        f"features/{day}/{group}.parquet": int(rows or 0)
+        for group, rows in (features.get("groups_written") or {}).items()
+    }
+    if features.get("marker_key"):
+        keys[features["marker_key"]] = 1
+    return keys
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "features_settled_regrade": (
+        (
+            lambda r: list(_settled_regrade_keys(r)),
+            lambda r: bool(_settled_regrade_keys(r)),
+            _settled_regrade_keys,
+        ),
+    ),
     "morning_enrich": (
         (
             lambda r: [f"staging/daily_closes/{r.get('date')}.parquet"],
@@ -1782,9 +1827,20 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     for key_or_keys, present_fn, rows_fn in _MODE_EXTRA_OUTPUTS.get(mode, ()):
         if present_fn(result):
             keys = key_or_keys(result) if callable(key_or_keys) else (key_or_keys,)
-            rows_out = int(rows_fn(result) or 0)
+            rows = rows_fn(result)
             for k in keys:
+                rows_out = int((rows.get(k) if isinstance(rows, dict) else rows) or 0)
                 run_ctx.record_output(k, rows_out=rows_out)
+
+    for name in _MODE_INPUT_COLLECTORS.get(mode, ()):
+        nested = (result.get("collectors") or {}).get(name) or {}
+        for ref in nested.get("input_refs") or ():
+            run_ctx.record_input(
+                str(ref["key"]),
+                etag=ref.get("etag"),
+                version=ref.get("version"),
+                schema_version=ref.get("schema_version"),
+            )
 
     spec = run_units.MODE_ROWS.get(mode)
     published = (result.get("collectors") or {}).get(spec.collector, {}) if spec else {}
@@ -1819,7 +1875,8 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     # empty-but-fresh objective needs; the ArcticDB probe
     # (data_collection/probes/arctic/{trading_day}.json) is the independent
     # read-back of the same write.
-    run_ctx.record_output("arcticdb/universe", rows_out=rows)
+    if spec.library_ref is not None:
+        run_ctx.record_output(spec.library_ref, rows_out=rows)
     _record_rejections(run_ctx, published, spec.rejected_keys)
     run_ctx.record_guard(
         expectations.EMPTY_FRESH_GUARD.name,
@@ -1857,6 +1914,11 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
     if getattr(args, "daily_heal", False):
         return _run_whole_mode_unit("daily_heal", _run_daily_heal, config, args)
+
+    if getattr(args, "features_settled_regrade", False):
+        return _run_whole_mode_unit(
+            "features_settled_regrade", _run_features_settled_regrade, config, args
+        )
 
     if args.daily:
         return _run_daily(config, args)
@@ -3237,11 +3299,17 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     failure — predictor inference reads ArcticDB right after this runs and
     must see polygon-corrected data, not silently-stale yfinance values.
 
-    Skips the feature_store snapshot step (that already ran with yfinance EOD;
-    re-running it is expensive and the polygon delta on OHLCV is typically <1%).
-    daily_append's per-ticker compute_features call recomputes per-ticker
-    features inside ArcticDB based on the polygon-overwritten row, which is
-    what downstream consumers actually read.
+    Does not itself rebuild the feature_store snapshot. D31 published
+    ``features/{D}`` the previous evening from the bar as it stood then, and
+    the polygon overwrite here moves that bar (Volume in particular: the
+    same-evening consolidated volume is provisional by construction,
+    alpha-engine-config-I11354). The rebuild is its own unit, D50
+    (``--features-settled-regrade``, `features/settled_regrade.py`), which the
+    same morning schedule runs after this unit and D18, so the published
+    snapshot is rebuilt from the settled bar this writes (Crucible v2 ruling on
+    alpha-engine-config-I12023). daily_append's per-ticker compute_features
+    call separately recomputes per-ticker features inside ArcticDB from the
+    polygon-overwritten row.
     """
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
@@ -3871,10 +3939,25 @@ def _self_heal_missing_universe_days(
     # ledger-marked) — de-dup against both. Missing days are the more severe
     # gap, so they get healed first; ledger-only days (already outside the
     # window) come last since the window-scan days are the fresher signal.
+    #
+    # Ledger days are held to the same horizon as both window detectors:
+    # strictly before ``target_date``. The ledger is unbounded in the past
+    # (config#2672) but NOT in the future: EOD marks the session it just
+    # wrote the same evening, and that session's own Polygon correction is
+    # the next morning's append, which runs after this heal (05:00 ET). A
+    # ledger day >= target_date is therefore not yet overdue, and admitting
+    # it let the newest entry win the per-run budget every weekday, so an
+    # older entry that really was overdue was deferred indefinitely
+    # (2026-09-30 deferred on 10-05 and 10-06 while the heal re-healed the
+    # day the morning append was about to correct). Its row stays in
+    # ``ledger_days`` for the artifact; it is simply not a candidate yet.
     combined = (
         missing
         + [d for d in fallback_quality if d not in missing]
-        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+        + [
+            d for d in ledger_days
+            if d < target_date and d not in missing and d not in fallback_quality
+        ]
     )
     if not combined:
         logger.info(
@@ -5605,6 +5688,15 @@ def _parse_args() -> argparse.Namespace:
              "today's UTC date (or --date); skip_if_exists short-circuits reruns.",
     )
     parser.add_argument(
+        "--features-settled-regrade", dest="features_settled_regrade", action="store_true",
+        help="D50: rebuild features/{D-1} from the settled bar D17 wrote this morning, every "
+             "other input pinned to the VersionId D-1's D31 run recorded "
+             "(features/settled_regrade.py; Crucible v2 ruling on alpha-engine-config-I12023). "
+             "Writes features/{D-1}/*.parquet then features/{D-1}/settlement.json; never "
+             "registry.json, schema_version.json or metron_supplemental. A repeat is "
+             "not_applicable. --date overrides the trading day.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -5655,7 +5747,9 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False):
+        # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
+        # and macro libraries, the same surface D31 reads under --daily.
         # --daily-arctic-append reads the daily_closes PostMarketData wrote +
         # the ArcticDB universe libraries — same preflight surface as --daily.
         # --daily-heal (alpha-engine-config-I2717) reads the same two surfaces
@@ -5767,6 +5861,44 @@ def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dic
     annotate = getattr(reg, "annotate_marker", None)
     if accepted and callable(annotate):
         annotate(name, provisional_additions=list(accepted))
+    return result
+
+
+def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dict:
+    """D50: rebuild ``features/{D-1}`` from the settled bar (`features.settled_regrade`).
+
+    Runs in ``ne-data-collection-morning`` after D17 settled
+    ``staging/daily_closes/{D-1}`` and D18 appended it. The trading day is the
+    one every whole-mode unit keys its manifest by (``--date`` or
+    :func:`default_run_date`, the last closed session), so this unit, D17 and
+    D18 all file under D-1. A refused precondition returns ``status: error``,
+    which the wrapper records as ``failed`` and ``main`` exits 1 on.
+    """
+    import boto3
+
+    from features import settled_regrade
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = settled_regrade.regrade(
+        run_date,
+        bucket=config["bucket"],
+        client=boto3.client("s3"),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    status = collector.get("status")
+    result = {
+        "mode": "features_settled_regrade",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"features": collector},
+    }
+    if status == "skipped":
+        result["skip_reason"] = collector.get("skip_reason")
+    if status == "error":
+        result["error"] = collector.get("error")
     return result
 
 
