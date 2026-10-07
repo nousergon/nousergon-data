@@ -143,6 +143,21 @@ GUARD_PROMOTIONS: tuple[GuardPromotion, ...] = (
         tracked_issue="alpha-engine-config-I10780",
     ),
     GuardPromotion(
+        name="data_spine_window",
+        staging="validators/expectations.py::SPINE_WINDOW_GUARD",
+        mode="observe",
+        risk="moderate",
+        blast_radius=(
+            "the EOD spine's (D20) own run; no ENFORCE raise site exists yet, so promotion also "
+            "writes one — the window verdict is recorded on the manifest and never acted on, today"
+        ),
+        guard_class=None,
+        units=("D20",),
+        clean_verdicts=frozenset({"ok"}),
+        preconditions=(),
+        tracked_issue="alpha-engine-config-I10780",
+    ),
+    GuardPromotion(
         name="bar_settlement",
         staging="dates.py::BAR_SETTLEMENT_GUARD",
         mode="observe",

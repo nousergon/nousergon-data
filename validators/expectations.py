@@ -725,11 +725,13 @@ SPINE_WINDOW_GUARD = GuardStaging(
     name="data_spine_window",
     mode=GuardMode.OBSERVE,
     promotion_criterion=(
-        "enforce after 10 consecutive clean trading days — the EOD spine-window verdict `ok` "
-        "(every session in the window published, non-empty and dated to its session; every "
-        "undeclared symbol carrying a bar within the declared lag) on each, `unmeasurable` not "
-        "counting as clean (data_collection_plan_260914.md §4.5); Re-exam tracked on "
-        "alpha-engine-config-I10780"
+        "enforce once the codified per-guard risk-based criterion holds "
+        "(data_gate/guard_promotion.py, data_spine_window: moderate risk) — the EOD spine-window "
+        "verdict `ok` (every session in the window published, non-empty and dated to its "
+        "session; every undeclared symbol carrying a bar within the declared lag) on the latest "
+        "due scheduled cycle, `unmeasurable` not counting as clean; Brian's 2026-10-04 option "
+        "(c) on alpha-engine-config-I11973 replaced the ten-day count "
+        "(data_collection_plan_260914.md §4.5); Re-exam tracked on alpha-engine-config-I10780"
     ),
     tracked_issue="alpha-engine-config-I10780",
 )
