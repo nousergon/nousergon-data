@@ -1527,6 +1527,14 @@ _CLOUDWATCH_PERIOD = 86400  # 1-day period (granular enough for a weekly pipelin
 # from the rerun helper, from sf-watch, or hand-authored — fails in seconds
 # rather than after a spot launch. `tests/test_sf_preflight.py` pins this
 # predicate against the SF definition's own Choice so the two cannot drift.
+#
+# alpha-engine-config-I12050: the predictor entry used to HeadObject the LIVE
+# weights manifest and compare its LastModified with calendar_date. Since
+# alpha-engine-config-I9018 training never writes that manifest -- only
+# promote_to_champion does -- so the predicate measured the last PROMOTION,
+# and watch-rerun-2026-10-02-2 was told "no completed PredictorTraining" about
+# a cycle whose training had finished the day before. It now reads the arena
+# verdict ModelZooSelect writes for the trading day, as the SF guard does.
 
 
 @dataclass(frozen=True)
@@ -1536,7 +1544,7 @@ class SkipArtifactPredicate:
     flag: str          # the execution-input key, e.g. "skip_predictor_training"
     stage: str         # human name for the message
     key: str           # S3 key, may contain "{run_date}"
-    kind: str          # "last_modified_gte_calendar_date" | "key_exists"
+    kind: str          # "body_is_known_word" | "key_exists"
     sf_guard: str      # the in-SF state that owns the authoritative check
     note: str = ""
     # The SF's OWN routes around ``sf_guard``: each entry is one Choice rule
@@ -1546,6 +1554,10 @@ class SkipArtifactPredicate:
     # demands no artifact, so neither may this check. Pinned rule-for-rule
     # against the definition by tests/test_sf_preflight.py.
     sf_bypass_rules: "tuple[tuple[tuple[str, object], ...], ...]" = ()
+    # kind="body_is_known_word" only: the WHOLE object body must equal one of
+    # these, exactly as the SF guard's StringEquals arms compare it. Pinned
+    # against the definition by tests/test_sf_preflight.py.
+    accepted_bodies: "tuple[str, ...]" = ()
 
 
 # Registry. Deliberately small and evidence-backed: an entry is added only
@@ -1558,15 +1570,18 @@ SKIP_ARTIFACT_PREDICATES: "tuple[SkipArtifactPredicate, ...]" = (
     SkipArtifactPredicate(
         flag="skip_predictor_training",
         stage="PredictorTraining",
-        key="predictor/weights/meta/manifest.json",
-        kind="last_modified_gte_calendar_date",
+        key="arena/model/{run_date}.verdict",
+        kind="body_is_known_word",
         sf_guard="CheckPredictorSkipWeightsFresh",
         note=(
-            "manifest LastModified date >= calendar_date proves a non-dry "
-            "training run completed FOR THIS cycle; an earlier date means the "
-            "skip would silently reuse the previous cycle's weights "
-            "(alpha-engine-config-I8809: the reference is the CALENDAR date, "
-            "because LastModified is a wall-clock write time)"
+            "ModelZooSelect writes arena/model/{run_date}.verdict for every "
+            "cycle that trained and selected, whatever it decided; its "
+            "existence with a known status word proves THIS trading day's "
+            "training completed. Not the live weights manifest: that moves "
+            "only on promotion (alpha-engine-config-I9018 / I12050)"
+        ),
+        accepted_bodies=(
+            "decided", "held", "unmeasurable", "unservable", "bootstrap",
         ),
         # CheckSkipPredictorTraining's two rules that reach
         # PredictorTrainingSkipped without ValidatePredictorSkipWeightsFresh:
@@ -1610,17 +1625,6 @@ def _sf_bypass_rule_holding(
         ):
             return rule
     return None
-
-
-def _coherence_reference(ctx: "PreflightContext") -> str:
-    """The date an S3 LastModified is compared against.
-
-    ``alpha-engine-config-I8809``: the execution's CALENDAR date, falling back
-    to ``run_date`` for callers that predate the field. Never silently: the two
-    are identical for every caller that has not been through
-    ``NormalizeRunDates``, so the fallback changes no existing answer.
-    """
-    return ctx.calendar_date or ctx.run_date or ""
 
 
 def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
@@ -1678,7 +1682,11 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
             continue
         key = pred.key.replace("{run_date}", ctx.run_date)
         try:
-            head = s3.head_object(Bucket=ctx.bucket, Key=key)
+            if pred.kind == "body_is_known_word":
+                obj = s3.get_object(Bucket=ctx.bucket, Key=key)
+                body = obj["Body"].read().decode("utf-8")
+            else:
+                s3.head_object(Bucket=ctx.bucket, Key=key)
         except Exception as exc:
             code = ""
             resp = getattr(exc, "response", None)
@@ -1702,36 +1710,20 @@ def check_skip_flag_artifact_coherence(ctx: PreflightContext) -> CheckResult:
             verified.append(f"{pred.flag} (artifact present)")
             continue
 
-        # last_modified_gte_calendar_date — mirrors CheckPredictorSkipWeightsFresh:
-        # the ISO date part, shape-guarded, compared lexicographically.
-        last_modified = head.get("LastModified")
-        lm_date = (
-            last_modified.strftime("%Y-%m-%d")
-            if hasattr(last_modified, "strftime")
-            else str(last_modified)[:10]
-        )
-        # The SF's own StringMatches '20*-*-*' shape guard, replicated: a
-        # non-ISO serialization must become a LOUD failure, never a silent
-        # lexicographic wrong-pass.
-        if not (len(lm_date) == 10 and lm_date.startswith("20")
-                and lm_date[4] == "-" and lm_date[7] == "-"):
+        # body_is_known_word -- mirrors CheckPredictorSkipWeightsFresh: the
+        # WHOLE body against a closed vocabulary, never a substring, and an
+        # unrecognised word is a refusal rather than a guess (the producer
+        # cannot write a word outside its schema enum, so one here means the
+        # two vocabularies drifted).
+        if body not in pred.accepted_bodies:
             violations.append(
-                f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified "
-                f"parsed as {lm_date!r}, which is not YYYY-MM-DD — cannot "
-                f"compare against calendar_date {_coherence_reference(ctx)}"
+                f"{pred.flag}=true but s3://{ctx.bucket}/{key} holds {body[:40]!r}, "
+                f"not one of {', '.join(pred.accepted_bodies)} -- no completed "
+                f"{pred.stage} is recorded for trading day {ctx.run_date}. "
+                f"Re-run WITHOUT {pred.flag} (see {pred.sf_guard})"
             )
             continue
-        reference = _coherence_reference(ctx)
-        if lm_date < reference:
-            violations.append(
-                f"{pred.flag}=true but s3://{ctx.bucket}/{key} LastModified date "
-                f"{lm_date} < calendar_date {reference} — no completed {pred.stage} "
-                f"for this cycle. Either re-run WITHOUT {pred.flag}, or pass "
-                f"the ORIGINAL run_date if this is a cross-UTC-midnight recovery "
-                f"rerun (see {pred.sf_guard})"
-            )
-            continue
-        verified.append(f"{pred.flag} (artifact dated {lm_date} >= {reference})")
+        verified.append(f"{pred.flag} (artifact present, {body!r})")
 
     if violations:
         return CheckResult(

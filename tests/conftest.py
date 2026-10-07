@@ -154,6 +154,34 @@ def _isolate_secrets_from_ssm(monkeypatch):
     clear_cache()
 
 
+@pytest.fixture(autouse=True)
+def _botocore_dispatch_is_restored():
+    """Fail the test that leaves ``BaseClient._make_api_call`` replaced.
+
+    Several suites (and ``shadow/interceptor.py`` itself) patch that one
+    method by hand. A patch that is not restored is process-global: under
+    ``--dist loadfile`` every later file on the same xdist worker inherits it,
+    and the failure surfaces in whichever unrelated file happens to be
+    scheduled next — tests/test_features_settled_regrade.py's 21 setup errors
+    (KeyError 'VersionId', because the leaked stub answered every S3 call with
+    ``{}``) came from tests/test_shadow_parity.py. Checking here names the
+    test that leaked and puts the real method back so the rest of the worker
+    is not poisoned.
+    """
+    import botocore.client
+
+    real = botocore.client.BaseClient._make_api_call
+    yield
+    leaked = botocore.client.BaseClient._make_api_call
+    if leaked is not real:
+        botocore.client.BaseClient._make_api_call = real
+        pytest.fail(
+            f"botocore.client.BaseClient._make_api_call was left replaced by {leaked!r}; "
+            "restore it (and shadow.interceptor._ORIGINAL) before the test ends",
+            pytrace=False,
+        )
+
+
 def recent_trading_day_str() -> str:
     """Most recent NYSE trading day as of now, ISO ``YYYY-MM-DD``.
 
