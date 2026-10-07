@@ -557,6 +557,9 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload == "features-settled-regrade":
             # D50 (alpha-engine-config-I12023): one D31 compute, ~24 min.
             expected = 3600
+        elif workload == "daily-panel-publish":
+            # D51 (alpha-engine-config-I10791): one universe read, ~83 s measured.
+            expected = 1800
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
@@ -575,6 +578,17 @@ def test_features_settled_regrade_runs_d50_with_no_trading_day(monkeypatch):
     resolved, cmd = index._resolve_workload({"workload": "features-settled-regrade"})
     assert resolved == "features-settled-regrade"
     assert cmd == "python weekly_collector.py --features-settled-regrade"
+
+
+def test_daily_panel_publish_runs_d51_with_no_trading_day(monkeypatch):
+    """alpha-engine-config-I10791: the EOD stage resolves to the panel
+    builder's publish command. It needs no ``trading_day``: the builder keys
+    the last closed session on the box (``default_run_date``)."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert "daily-panel-publish" not in index._WORKLOADS_REQUIRING_TRADING_DAY
+    resolved, cmd = index._resolve_workload({"workload": "daily-panel-publish"})
+    assert resolved == "daily-panel-publish"
+    assert cmd == "python -m builders.daily_panel publish"
 
 
 def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch):

@@ -300,9 +300,12 @@ def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
     # alpha-engine-config-I11269: edgar-pit-fundamentals-daily joins at the
     # tail (it was the v1 postclose SF's LaunchEdgarPitFundamentalsDailySpot
     # leg). It has no unit descriptor, so verify_units is unchanged.
+    # alpha-engine-config-I10791: daily-panel-publish (D51) follows it. D51
+    # writes a run manifest but is deliberately not a verify_unit yet — see
+    # test_the_daily_panel_follows_the_append_and_runs_last.
     assert eod["workloads"] == [
         "post-market-data", "post-market-arctic-append", "arctic-probe",
-        "edgar-pit-fundamentals-daily",
+        "edgar-pit-fundamentals-daily", "daily-panel-publish",
     ]
     assert eod["require_trading_day"] is True
     assert "verify_keys" not in eod
@@ -363,7 +366,7 @@ def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
 #: edgar-pit-fundamentals-daily reads the `universe` library for split-adjusted
 #: closes (collectors/edgar_pit_fundamentals.py::ArcticPriceReader) and writes
 #: S3 objects only.
-_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade"}
+_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade", "daily-panel-publish"}
 
 
 def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
@@ -382,7 +385,9 @@ def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
     assert set(after_morning) <= _NON_ARCTIC_WRITERS
     eod = by_name["data-collection-eod"]["input"]["workloads"]
     after = eod[eod.index("arctic-probe") + 1:]
-    assert after == ["edgar-pit-fundamentals-daily"]
+    # D51 (daily-panel-publish, alpha-engine-config-I10791) reads the
+    # `universe` library and writes S3 keys only.
+    assert after == ["edgar-pit-fundamentals-daily", "daily-panel-publish"]
     assert set(after) <= _NON_ARCTIC_WRITERS
 
 
@@ -401,6 +406,27 @@ def test_the_morning_regrade_follows_the_settle_and_is_verified(stack, tpl):
 
     ceiling = _json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
     assert stack.worst_case_seconds(morning["workloads"], through="features-settled-regrade") <= ceiling
+
+
+def test_the_daily_panel_follows_the_append_and_runs_last(stack, tpl):
+    """alpha-engine-config-I10791: D51 compiles the session's panel from the
+    `universe` library, so it runs after the append that wrote the session, and
+    LAST, so a refused compile withholds no other workload. It is not a
+    verify_unit (the v1 reconcile heal mirrors verify_units and runs only the
+    two collector workloads), and the whole chain still fits the machine."""
+    eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
+    workloads = eod["workloads"]
+    assert workloads[-1] == "daily-panel-publish"
+    assert workloads.index("post-market-arctic-append") < workloads.index("daily-panel-publish")
+    assert "D51" not in eod["verify_units"]
+    assert "D51" not in stack.UNIT_WRITERS["data-collection-eod"]
+    import json as _json
+
+    ceiling = _json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
+    assert stack.worst_case_seconds(workloads, through="daily-panel-publish") <= ceiling
+    # Declared cap, not the 7200 s default (data-spot-dispatcher/index.py).
+    _default, overrides, _ssm = stack.dispatcher_runtime_caps()
+    assert overrides["daily-panel-publish"] == 1800
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):

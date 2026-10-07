@@ -247,6 +247,14 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # rather than inherited because it extends the morning schedule's worst
     # case (`data_collection_stack.worst_case_seconds`).
     "features-settled-regrade": 3600,
+    # D51 (alpha-engine-config-I10791): one read of the `universe` library
+    # over a 600-calendar-day window and two PUTs. Measured 83 s for the full
+    # universe (910 symbols, 375,310 rows) from OUTSIDE the region on
+    # 2026-10-06 (nousergon-data-PR2085), plus box boot and the venv build.
+    # Declared rather than inherited so the EOD schedule's worst case
+    # (`data_collection_stack.worst_case_seconds`) does not carry the 7200 s
+    # default for a workload this small.
+    "daily-panel-publish": 1800,
 }
 
 
@@ -444,6 +452,15 @@ _WORKLOADS: dict[str, str] = {
     # LAST, after `arctic-probe`: it writes S3 keys only and no ArcticDB, so
     # the probe still describes the morning's final library state.
     "features-settled-regrade": "python weekly_collector.py --features-settled-regrade",
+    # alpha-engine-config-I10791 (plan P-25, amendment 1): D51, the daily
+    # panel, compiled once from the ArcticDB `universe` library and published
+    # to `data_collection/panel/{trading_day}/` (`builders/daily_panel.py`).
+    # The EOD schedule runs it LAST: it must follow `post-market-arctic-append`
+    # (it reads the session that append wrote), it writes no ArcticDB, and a
+    # failure here withholds no other workload. No `trading_day` template: the
+    # builder keys the last closed session on the box (`default_run_date`),
+    # which at the 18:15 ET fire is the session that just closed.
+    "daily-panel-publish": "python -m builders.daily_panel publish",
     # alpha-engine-config-I10753: the five weekly units with no standalone
     # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
     # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no

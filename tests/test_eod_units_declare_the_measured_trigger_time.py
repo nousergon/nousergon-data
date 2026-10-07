@@ -55,8 +55,11 @@ MEASURED_SCHEDULE = "weekdays 18:15 America/New_York"
 
 #: The units the EOD machine owns: D19-D32, plus D03 (prices), which is in its
 #: verify_units and, since nousergon-data-PR2016 dropped it from the weekly
-#: check, graded only there (alpha-engine-config-I11832).
-EOD_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03"}
+#: check, graded only there (alpha-engine-config-I11832), plus D51 (the daily
+#: panel, alpha-engine-config-I10791), the machine's last workload. D51 is not in
+#: the eod-spine freshness family: it is not a verify_unit, so its deadline is
+#: not the family's derived bound.
+EOD_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03", "D51"}
 
 #: The family whose `freshness.deadline` is the EOD fire plus its writers' caps.
 #: D03 keeps its own `weekly` freshness family: that axis is the freshness SLO's
@@ -69,7 +72,7 @@ def _eod_units():
 
 
 def test_the_eod_units_are_owned_by_the_standalone_machine():
-    """Non-vacuity guard and the owner pin in one: exactly D19-D32 and D03."""
+    """Non-vacuity guard and the owner pin in one: exactly D19-D32, D03 and D51."""
     assert {u.unit_id for u in _eod_units()} == EOD_UNITS
 
 

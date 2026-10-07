@@ -21,12 +21,20 @@ panel is either the contract or absent, and an absent panel is a red leg on
 ``data.phase3.daily_panel_adopted`` rather than a thin artifact every
 consumer reads as fine.
 
-**What this slice is not.** No schedule, no stack wiring and no unit
-descriptor: those are the next slice (the ``ne-data-collection-eod`` stage
-after the ArcticDB append, plus the IAM write grant on ``data_collection/panel/``).
-Run by hand, in-region, until then:
+**Scheduled publish (D51).** ``ne-data-collection-eod`` runs
+``python -m builders.daily_panel publish`` as its last workload, after the
+ArcticDB ``universe`` append (dispatcher workload ``daily-panel-publish``).
+With no ``--date`` the session is ``dates.default_run_date()``, the last
+closed NYSE session, which at the 18:15 ET fire is today. A non-dry-run
+publish writes one ``data_collection/runs/D51/{trading_day}/`` run manifest
+recording both keys it published; a refused compile files that manifest as
+``failed`` and exits 1, which fails the workload.
 
-    python -m builders.daily_panel publish --date 2026-10-02 [--dry-run]
+``parity`` stays operator-run. The consumer's own compile for a session is
+written by crucible's 22:15 ET ``data.daily``, after this stage has finished,
+so no scheduled run can write that session's receipt:
+
+    python -m builders.daily_panel publish [--date 2026-10-02] [--dry-run]
     python -m builders.daily_panel parity --date 2026-10-02 --consumer-panel s3://.../panel.parquet
 """
 
@@ -50,6 +58,8 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_BUCKET = "alpha-engine-research"
 MODULE = "builders.daily_panel"
+#: The unit descriptor this process is (registry.d/units/D51-daily-panel.yaml).
+UNIT_ID = "D51"
 
 #: The calendar window the compile requests. Sized to cover the deepest
 #: consumer: crucible's feature catalogue needs 313 sessions
@@ -280,12 +290,77 @@ def _read_uri(uri: str) -> bytes:
     return Path(uri).read_bytes()
 
 
+def default_session() -> dt.date:
+    """The session a scheduled publish keys on: the last closed NYSE session.
+
+    ``dates.default_run_date`` is the collectors' one trading-day chokepoint; at
+    the EOD collection's 18:15 ET fire it is the session that closed at 16:00.
+    """
+    from dates import default_run_date
+
+    return dt.date.fromisoformat(default_run_date())
+
+
+def _compile_and_publish(args: argparse.Namespace, trading_day: dt.date, put) -> dict:
+    panel = compile_panel(
+        args.bucket, trading_day=trading_day, lookback_days=args.lookback_days, region=args.region
+    )
+    return publish(panel, trading_day=trading_day, lookback_days=args.lookback_days, put=put)
+
+
+def record_publish_outputs(ctx: Any, manifest: dict) -> None:
+    """Record the two keys a publish wrote on the D51 run manifest.
+
+    The parquet carries the panel's row count. The manifest is one document, so
+    it records one row; the run is graded on the keys being present, and the
+    panel's depth is on the manifest itself (``row_count``, ``symbol_count``).
+    """
+    ctx.record_output(manifest["panel_key"], rows_out=int(manifest["row_count"]))
+    ctx.record_output(dp.manifest_key(dt.date.fromisoformat(manifest["trading_day"])), rows_out=1)
+
+
+def recorded_publish(
+    args: argparse.Namespace,
+    trading_day: dt.date,
+    put,
+    *,
+    entry: Callable[..., Any] | None = None,
+) -> dict | None:
+    """Publish as unit D51 and write its run manifest; ``None`` when refused.
+
+    A :class:`PanelCompileError` files the manifest as ``failed`` with the
+    refusal as its reason (``run_units.EntryRunFailed``), so a refused session
+    is a red run record and never a missing one. ``entry`` is injectable for
+    tests; production uses ``run_units.recorded_entry``.
+    """
+    import run_units
+
+    def _body(ctx) -> dict:
+        try:
+            manifest = _compile_and_publish(args, trading_day, put)
+        except PanelCompileError as exc:
+            logger.error("%s", exc)
+            raise run_units.EntryRunFailed(f"daily panel for {trading_day} refused: {exc}") from exc
+        record_publish_outputs(ctx, manifest)
+        return manifest
+
+    if entry is None:
+        return run_units.recorded_entry("D51", _body, trigger="scheduled", trading_day=trading_day.isoformat())
+    return entry(UNIT_ID, _body, trigger="scheduled", trading_day=trading_day.isoformat())
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m builders.daily_panel", description=__doc__.split("\n\n")[0])
     sub = parser.add_subparsers(dest="command", required=True)
     for name in ("publish", "parity"):
         p = sub.add_parser(name)
-        p.add_argument("--date", required=True, type=dt.date.fromisoformat, help="the NYSE session (YYYY-MM-DD)")
+        p.add_argument(
+            "--date",
+            required=name == "parity",
+            default=None,
+            type=dt.date.fromisoformat,
+            help="the NYSE session (YYYY-MM-DD); publish defaults to the last closed session",
+        )
         p.add_argument("--bucket", default=DEFAULT_BUCKET)
         p.add_argument(
             "--dry-run",
@@ -304,20 +379,29 @@ def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     dry_run_dir = Path(args.dry_run) if args.dry_run else None
     get, put = _s3_io(args.bucket, dry_run_dir)
-    try:
-        if args.command == "publish":
-            panel = compile_panel(
-                args.bucket, trading_day=args.date, lookback_days=args.lookback_days, region=args.region
-            )
-            result = publish(panel, trading_day=args.date, lookback_days=args.lookback_days, put=put)
+    if args.command == "publish":
+        trading_day = args.date or default_session()
+        if dry_run_dir is not None:
+            # A dry run writes no S3 key, so it has no run to record.
+            try:
+                result = _compile_and_publish(args, trading_day, put)
+            except PanelCompileError as exc:
+                logger.error("%s", exc)
+                return 1
         else:
-            result = parity(
-                trading_day=args.date,
-                get=get,
-                consumer_payload=_read_uri(args.consumer_panel),
-                consumer_key=args.consumer_panel,
-                put=put,
-            )
+            result = recorded_publish(args, trading_day, put)
+            if result is None:
+                return 1
+        print(json.dumps(result, indent=2))
+        return 0
+    try:
+        result = parity(
+            trading_day=args.date,
+            get=get,
+            consumer_payload=_read_uri(args.consumer_panel),
+            consumer_key=args.consumer_panel,
+            put=put,
+        )
     except PanelCompileError as exc:
         logger.error("%s", exc)
         return 1

@@ -16,30 +16,24 @@ component_id: "data-collector-d51-daily-panel"
 owning_repo: "nousergon-data"
 title: "Daily panel: one long OHLCV panel per session, compiled once from ArcticDB universe"
 component: 1
-lifecycle: pending
+lifecycle: "in-service"
 owner: brian
-code_path: "builders/daily_panel.py:174"
-pending_since: "2026-10-06"
-lifecycle_reexam: "2026-10-08"
-lifecycle_reason: >-
-    First slice: the producer module, its contract and an operator-run CLI
-    (alpha-engine-config-I10791). Not yet scheduled: the stage after the EOD
-    ArcticDB append, and the collection-box write grant on
-    data_collection/panel/, are the next slice. Until then the unit writes
-    nothing on a schedule.
-lifecycle_owner: brian
-promotes_when: >-
-    The EOD collection runs `python -m builders.daily_panel publish` after the
-    ArcticDB append and data_collection/panel/{trading_day}/manifest.json is
-    current for the latest session. Flip lifecycle to in-service and declare the
-    cadence in the same PR.
+code_path: "builders/daily_panel.py:322 -> builders/daily_panel.py:184 (publish)"
 trigger:
-  kind: "manual"
+  kind: "step-functions"
+  # The LAST workload of the standalone stack's EOD machine, after the
+  # `universe` append wrote the session (post-market-arctic-append, D32),
+  # the ArcticDB probe and the EDGAR daily
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule,
+  # alpha-engine-config-I10791). Not in that schedule's verify_units yet: the
+  # v1 reconcile heal mirrors verify_units with the two collector workloads
+  # only. A refused publish fails the execution through its exit code, and its
+  # run manifest reads `failed`.
+  owner: "ne-data-collection-eod"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
+  successor: "ne-data-collection-eod (alpha-engine-config-I10791); no v1 predecessor — v1 never published a panel, crucible's data.daily compiled its own"
+  schedule: "weekdays 18:15 America/New_York"
   runs_on: "ec2-spot"
-  detail: >-
-    NOT YET SCHEDULED. Operator-run in-region (`python -m builders.daily_panel
-    publish --date <session>`); belongs on ne-data-collection-eod after the
-    universe append.
 writes:
   - "data_collection/panel/{trading_day}/panel.parquet"
   - "data_collection/panel/{trading_day}/manifest.json"
@@ -61,14 +55,34 @@ contract:
       producer: "contracts/daily_panel.schema.json"
       read_site: "crucible/data/sources.py::PublishedPanelSource"
       note: "contracts/daily_panel.py::CONSUMER; pending the crucible consumer PR"
-registry_rows: []
+# The manifest is written LAST and names the parquet's sha256, so one row on it
+# is the publish's liveness. The parquet and the operator-run parity receipt sit
+# under the same `data_collection/panel/` prefix (alpha-engine-config
+# ARTIFACT_REGISTRY companion to this change).
+registry_rows:
+  - daily_panel_manifest
 run_manifest_prefix: data_collection/runs/D51
 detectors:
   - kind: "crucible-gate"
     via: "data.phase3.daily_panel_adopted (published leg)"
     state: ABSENT
-    note: "no freshness-monitor row until the unit is scheduled"
+    note: "graded on the board; reads PRESENT once a scheduled publish lands"
+  - kind: "sf-execution"
+    via: "ne-data-collection-eod"
+    state: PRESENT
+    note: "a refused publish exits 1, which fails the workload on its on-demand retry and so the EOD execution, which pages"
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: ABSENT
+    note: "daily_panel_manifest is an alpha-engine-config ARTIFACT_REGISTRY companion to this change"
 freshness:
+  # Proposed, and NOT derived like the eod-spine family's bound: the panel is
+  # not a verify_unit and runs after edgar-pit-fundamentals-daily, whose cap is
+  # the dispatcher's 7200 s default, so its worst case is later than this.
+  # 20:55 is the eod-spine deadline the ARTIFACT_REGISTRY contract enforces on
+  # every row this machine produces (alpha-engine-config-I11561). Measured
+  # 2026-09-30..10-06 the machine finishes 99-109 min after its 18:15 fire.
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "alpha-engine-config-I10791 (with the schedule)"
 completeness:

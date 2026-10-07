@@ -195,3 +195,108 @@ def test_the_cli_dry_run_writes_locally_and_never_to_s3(tmp_path, monkeypatch):
     assert put_calls == []
     assert (tmp_path / dp.panel_key(DAY)).is_file()
     assert (tmp_path / dp.manifest_key(DAY)).is_file()
+
+
+# -- the scheduled EOD stage (D51, alpha-engine-config-I10791) ----------------
+
+
+class _Ctx:
+    def __init__(self):
+        self.outputs: list[tuple[str, int]] = []
+
+    def record_output(self, key, *, rows_out, **_kw):
+        self.outputs.append((key, rows_out))
+
+
+def _args(**overrides):
+    import argparse
+
+    base = {"bucket": "b", "lookback_days": LOOKBACK, "region": None}
+    base.update(overrides)
+    return argparse.Namespace(**base)
+
+
+def _fake_entry(calls, ctx):
+    def entry(unit_id, body, *, trigger, trading_day):
+        import run_units
+
+        calls.append({"unit_id": unit_id, "trigger": trigger, "trading_day": trading_day})
+        try:
+            return body(ctx)
+        except run_units.EntryRunFailed as failed:
+            calls[-1]["failed"] = str(failed)
+            return failed.value
+
+    return entry
+
+
+def test_the_scheduled_publish_records_both_keys_as_d51(monkeypatch):
+    """The run manifest is D51's, keyed on the session, and lists the two keys a
+    publish wrote: the parquet with the panel's row count, then the manifest."""
+    compiled = _compiled()
+    monkeypatch.setattr(pub, "compile_panel", lambda bucket, **kw: compiled)
+    sink, ctx, calls = _Sink(), _Ctx(), []
+    manifest = pub.recorded_publish(_args(), DAY, sink.put, entry=_fake_entry(calls, ctx))
+    assert calls == [{"unit_id": "D51", "trigger": "scheduled", "trading_day": "2026-10-02"}]
+    assert ctx.outputs == [(dp.panel_key(DAY), len(compiled)), (dp.manifest_key(DAY), 1)]
+    assert manifest["row_count"] == len(compiled)
+    assert sink.order == [dp.panel_key(DAY), dp.manifest_key(DAY)]
+
+
+def test_a_refused_scheduled_publish_files_a_failed_run_and_writes_nothing(monkeypatch):
+    def refuse(bucket, **kw):
+        raise pub.PanelCompileError("the universe library returned zero symbols")
+
+    monkeypatch.setattr(pub, "compile_panel", refuse)
+    sink, ctx, calls = _Sink(), _Ctx(), []
+    assert pub.recorded_publish(_args(), DAY, sink.put, entry=_fake_entry(calls, ctx)) is None
+    assert "zero symbols" in calls[0]["failed"]
+    assert ctx.outputs == [] and sink.objects == {}
+
+
+def test_the_scheduled_publish_runs_through_the_real_record_wrapper(monkeypatch):
+    """`run_units.recorded_entry` itself (no manifest written): a publish that
+    recorded its outputs returns the manifest, so the wrapper's empty-production
+    guard never fires on a real publish."""
+    import functools
+
+    import run_units
+
+    compiled = _compiled()
+    monkeypatch.setattr(pub, "compile_panel", lambda bucket, **kw: compiled)
+    sink = _Sink()
+    entry = functools.partial(run_units.recorded_entry, write=False, code_sha="3f9c2a7d1b4e6f8091a2b3c4d5e6f708192a3b4c")
+    manifest = pub.recorded_publish(_args(), DAY, sink.put, entry=entry)
+    assert manifest is not None and manifest["trading_day"] == "2026-10-02"
+    assert dp.manifest_key(DAY) in sink.objects
+
+
+def test_the_cli_publish_defaults_to_the_last_closed_session_and_records_it(monkeypatch):
+    """The EOD workload passes no --date (dispatcher `daily-panel-publish`), so the
+    builder keys `dates.default_run_date()`; a non-dry-run publish goes through
+    the recorded path, and a refusal exits 1."""
+    seen = {}
+    monkeypatch.setattr(pub, "default_session", lambda: DAY)
+    monkeypatch.setattr(pub, "_s3_io", lambda bucket, dry_run_dir: (None, None))
+
+    def fake_recorded(args, trading_day, put):
+        seen["trading_day"] = trading_day
+        return seen.get("result")
+
+    monkeypatch.setattr(pub, "recorded_publish", fake_recorded)
+    assert pub.main(["publish"]) == 1  # refused: recorded_publish returned None
+    assert seen["trading_day"] == DAY
+    seen["result"] = {"trading_day": "2026-10-02"}
+    assert pub.main(["publish"]) == 0
+
+
+def test_parity_still_requires_an_explicit_session():
+    with pytest.raises(SystemExit):
+        pub.main(["parity", "--consumer-panel", "x"])
+
+
+def test_the_default_session_is_the_collectors_trading_day_chokepoint(monkeypatch):
+    import dates
+
+    monkeypatch.setattr(dates, "default_run_date", lambda: "2026-10-02")
+    assert pub.default_session() == DAY
