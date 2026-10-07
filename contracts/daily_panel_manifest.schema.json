@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/daily_panel_manifest.schema.json",
+  "title": "Daily panel manifest (data_collection/panel/{trading_day}/manifest.json, data_daily_panel_manifest.v1)",
+  "description": "The sidecar every daily panel publish writes AFTER its parquet (alpha-engine-config-I10791 / P-25). It binds the parquet to its contract version and content hash, so a consumer can refuse a panel it cannot account for (wrong schema version, wrong day, hash mismatch) instead of reading whatever bytes are at the key, and so the phase-3 acceptance clause `data.phase3.daily_panel_adopted` can grade the publish without reading the parquet. Written last: a manifest with no parquet behind it, or a parquet with no manifest, is an incomplete publish, never a partial success. ONE DEFINITION of keys and versions: contracts/daily_panel.py. PRODUCER TEST: tests/test_daily_panel_contract.py.",
+  "x-key-pattern": "data_collection/panel/{trading_day}/manifest.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "panel_schema_version", "trading_day", "panel_key", "panel_sha256",
+    "panel_bytes", "columns", "row_count", "symbol_count", "symbols_on_trading_day",
+    "session_count", "first_session", "last_session", "lookback_calendar_days", "source",
+    "generated_at", "producer"
+  ],
+  "properties": {
+    "schema_version": {"const": "data_daily_panel_manifest.v1"},
+    "panel_schema_version": {"const": "daily_panel.v1", "description": "The row contract the parquet conforms to (daily_panel.schema.json)."},
+    "trading_day": {"$ref": "#/$defs/day", "description": "The session the panel ends on; also the {trading_day} in both keys."},
+    "panel_key": {"type": "string", "pattern": "^data_collection/panel/\\d{4}-\\d{2}-\\d{2}/panel\\.parquet$"},
+    "panel_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the exact parquet bytes written to panel_key."},
+    "panel_bytes": {"type": "integer", "minimum": 1},
+    "columns": {
+      "type": "array",
+      "description": "The parquet's columns in order; must equal contracts/daily_panel.py::PANEL_COLUMNS.",
+      "items": {"type": "string"},
+      "minItems": 7,
+      "maxItems": 7
+    },
+    "row_count": {"type": "integer", "minimum": 1},
+    "symbol_count": {"type": "integer", "minimum": 1, "description": "Distinct tickers anywhere in the window."},
+    "symbols_on_trading_day": {"type": "integer", "minimum": 1, "description": "Distinct tickers with a row ON trading_day. A panel with none is refused before publish."},
+    "session_count": {"type": "integer", "minimum": 1, "description": "Distinct sessions in the window: the panel's DEPTH, which a consumer compares with the depth its feature layer needs."},
+    "first_session": {"$ref": "#/$defs/day"},
+    "last_session": {"$ref": "#/$defs/day", "description": "Must equal trading_day."},
+    "lookback_calendar_days": {"type": "integer", "minimum": 1, "description": "The window (trading_day - lookback, trading_day] the compile requested."},
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["store", "library"],
+      "properties": {
+        "store": {"const": "arcticdb"},
+        "library": {"const": "universe"}
+      }
+    },
+    "generated_at": {"type": "string", "x-provenance": true, "description": "ISO-8601 UTC instant the publish completed. Provenance: differs on every re-production of the same panel."},
+    "producer": {
+      "type": "object",
+      "x-provenance": true,
+      "additionalProperties": true,
+      "required": ["module", "code_sha"],
+      "properties": {
+        "module": {"type": "string", "minLength": 1},
+        "code_sha": {"type": "string", "minLength": 1, "description": "Commit of the producer code that compiled the panel ('unknown' only when no git context exists, which the producer records rather than hides)."}
+      }
+    }
+  },
+  "$defs": {
+    "day": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+  }
+}

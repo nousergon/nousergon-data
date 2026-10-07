@@ -75,6 +75,12 @@ detectors:
     via: "arctic-migration-dispatcher errors/throttles"
     state: PRESENT
     note: alarm JSON exists; EXECUTION not verified. P3.
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # The errors half only. The per-function throttles alarm was folded into the
+    # account-wide alpha-engine-watch-plane-lambda-throttles-account
+    # (alpha-engine-config-I11792), which does not name the function, so it cannot
+    # be D42's subject.
+    subject: "alpha-engine-watch-plane-arctic-migration-dispatcher-errors"
 freshness:
   na_code: "N/A-NOT-RUN"
   note: >-

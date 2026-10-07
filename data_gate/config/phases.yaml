@@ -213,6 +213,14 @@ phases:
           2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
           MET once the check is live with no failed observation in the window
         exit_measured_by: data.human_touch.monthly
+      - criterion: >-
+          the daily panel is ADOPTED (plan P-25, amendment 1; audit gap A10,
+          alpha-engine-config-I10791): versioned contract + producer test, the
+          panel published for the latest due session, the consumer pinning it
+          with its read site live, one real same-trading-day parity receipt
+          equivalent under the declared tolerance, and the direct-ArcticDB
+          compile removed from the consumer's data.daily
+        clause: data.phase3.daily_panel_adopted
 
 # A SUB-gate of phase 1, read before the v2 phase-4 maintenance window (plan
 # §6.2). Registered as a gate so it can be READ, but deliberately NOT a rung:

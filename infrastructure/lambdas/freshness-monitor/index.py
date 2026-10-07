@@ -693,7 +693,42 @@ def parse_producer_trigger(value: Any) -> tuple[str, str] | None:
         parts = name.split("/")
         if len(parts) != 3 or not all(p.strip() for p in parts):
             return None
+    if surface == "scheduler" and split_schedule_name(name) is None:
+        return None
     return surface, name
+
+
+# A Scheduler schedule's identity is (group, name), not name — its ARN is
+# `schedule/<group>/<name>`, and `get_schedule(Name=n)` with no GroupName looks
+# ONLY in the `default` group. alpha-engine-config-I12058: the registry already
+# declares `scheduler:nousergon-data-collection/data-collection-daily-heal`, and
+# this Lambda passed that whole string as Name, so the lookup could never
+# succeed and a named-group producer could never be read as DISABLED. Same
+# class as alpha-engine-config-I10003 (pause_reconcile.py). Schedule and group
+# names are both `[0-9a-zA-Z-_.]+`, so a single `/` is unambiguous.
+DEFAULT_SCHEDULE_GROUP = "default"
+
+
+def split_schedule_name(name: str) -> tuple[str, str] | None:
+    """``"<group>/<name>"`` → ``(group, name)``; a bare ``"<name>"`` →
+    ``("default", name)``. Anything with more than one ``/`` or an empty
+    segment is malformed and returns ``None`` — a trigger that cannot name one
+    schedule must not suppress against a guess."""
+    parts = [p.strip() for p in name.split("/")]
+    if len(parts) == 1 and parts[0]:
+        return DEFAULT_SCHEDULE_GROUP, parts[0]
+    if len(parts) == 2 and all(parts):
+        return parts[0], parts[1]
+    return None
+
+
+def schedule_trigger(group: str | None, name: str) -> str:
+    """The registry-grammar trigger for a schedule: bare in the default group,
+    group-qualified everywhere else — the inverse of :func:`split_schedule_name`,
+    so the inventory and the registry name a schedule the same way."""
+    if not group or group == DEFAULT_SCHEDULE_GROUP:
+        return f"scheduler:{name}"
+    return f"scheduler:{group}/{name}"
 
 
 def _load_json_with_age_ceiling(
@@ -852,7 +887,10 @@ def resolve_disabled_producers(
                     disabled[trigger] = f"EventBridge rule {name} is DISABLED"
             else:
                 client = scheduler_client or boto3.client("scheduler")
-                state = client.get_schedule(Name=name).get("State", "")
+                group, schedule = split_schedule_name(name)  # parsed above
+                state = client.get_schedule(
+                    GroupName=group, Name=schedule,
+                ).get("State", "")
                 if state == "DISABLED":
                     disabled[trigger] = f"Scheduler schedule {name} is DISABLED"
         except Exception as exc:  # noqa: BLE001 — fail toward paging, never toward silence
@@ -1261,8 +1299,13 @@ def enumerate_disabled_schedules(
         for page in paginator.paginate():
             for sch in page.get("Schedules", []):
                 if sch.get("State") == "DISABLED":
+                    # Group-qualified outside `default` (I12058): ListSchedules
+                    # walks every group, and a bare name here would never
+                    # join to the registry's `scheduler:<group>/<name>`.
                     out.append({
-                        "trigger": f"scheduler:{sch['Name']}",
+                        "trigger": schedule_trigger(
+                            sch.get("GroupName"), sch["Name"],
+                        ),
                         "name": sch["Name"],
                         "surface": "scheduler",
                         "schedule": sch.get("ScheduleExpression", ""),
