@@ -16,12 +16,22 @@ poll of this function.
 ## What it does
 
 `{"collection", "units": [...], "not_before": $$.Execution.StartTime, "lookback_seconds"}`
-→ `{"readiness": {"ready", "settled", "missing", "failed", "failure_mode", "baseline", "summary"}}`.
+→ `{"readiness": {"ready", "settled", "missing", "failed", "retry_pending", "failure_mode", "baseline", "summary"}}`.
 
 It runs `data_gate/run_manifest_predicate.py::readiness_check` — the SAME `_check_unit`
 the producer's `VerifyRunManifests` runs through the data-spot dispatcher's
 `completion-check`. `ready` = no finding; `settled` = every unit has a manifest for
-this cycle, so waiting longer cannot change the answer.
+this cycle and no failed unit can still be replaced by the producer, so waiting
+longer cannot change the answer.
+
+`retry_pending` (alpha-engine-config-I11812, weekly failure class K02): the producer
+runs a failed workload once more on demand, and that retry recomputes a degraded unit.
+For the weekly, whose v1 consumer fails CLOSED on not-ready, a unit that filed `failed`
+and has fewer fresh runs than the producer's two attempts is `retry_pending` and keeps
+`settled` false, so the wait polls on instead of failing the Saturday while the retry
+is still running. If no retry comes, the bounded budget ends the wait at the same
+fail-closed state. The morning and EOD consumers fail open on a trading clock and keep
+degrading at once (`AWAITS_PRODUCER_RETRY`).
 
 ## Why a separate function
 

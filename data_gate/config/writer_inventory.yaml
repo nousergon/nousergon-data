@@ -310,6 +310,11 @@ excluded_paths:
     reason: An ops metric about the pipeline, not a published data key.
   - glob: "scripts/weekly_sf_silence_deadman.py"
     reason: A deadman for the pipeline — the ops plane.
+  - glob: "scripts/sweep_run_scope_rows.py"
+    reason: >-
+      alpha-engine-config-I11984: operator-run correction of the weekly SF's own
+      run_scope.json (the alpha-engine-weekly-run-scope Lambda's ops artifact),
+      not a published data key.
 
 # Descriptors whose `code_path` names no in-repo Python file, so the REVERSE
 # direction (descriptor -> write site) cannot be checked by an AST scan. Named

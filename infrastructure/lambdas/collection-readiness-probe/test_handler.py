@@ -125,6 +125,22 @@ def test_settled_but_not_ready_when_the_run_failed(probe):
     assert out["failure_mode"] == "run_not_ok"
 
 
+def test_a_weekly_failure_the_producers_retry_can_still_fix_is_not_settled(probe):
+    """alpha-engine-config-I11812 (K02): the weekly consumer fails CLOSED, so a
+    unit that failed on the producer's first attempt keeps the wait polling
+    until the on-demand retry has visited it, instead of failing the Saturday."""
+    failed = _d20(status="failed", reason="_DegradedRun: 1 disagreement", outputs=[])
+    out = probe({_D20_KEY: failed}).handler(_event(collection="weekly"), None)["readiness"]
+    assert out["ready"] is False and out["settled"] is False
+    assert out["failed"] == ["D20"] and out["retry_pending"] == ["D20"]
+    # ...and once the retry has filed its own run, the answer is final.
+    retried = _d20(status="failed", reason="_DegradedRun: still", outputs=[],
+                   finished="2026-09-24T23:10:00Z")
+    out = probe({_D20_KEY: failed, "data_collection/runs/D20/2026-09-24/01K5BB.json": retried}
+                ).handler(_event(collection="weekly"), None)["readiness"]
+    assert out["settled"] is True and out["retry_pending"] == []
+
+
 def test_the_lookback_admits_a_producer_that_finished_before_the_consumer_started(probe):
     """Preopen shape: the morning collection fires at 07:30 ET, the preopen SF
     at 08:15 ET, so a manifest that finished at 08:05 ET is this cycle's."""
