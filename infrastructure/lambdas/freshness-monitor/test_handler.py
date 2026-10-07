@@ -2765,6 +2765,65 @@ def test_resolve_disabled_producers_reads_live_state():
     ) == {"scheduler:s": "Scheduler schedule s is DISABLED"}
 
 
+class _GroupedScheduler:
+    """Answers get_schedule the way AWS does: by (GroupName, Name), with an
+    omitted GroupName meaning `default`. Anything else is ResourceNotFound."""
+
+    def __init__(self, schedules):
+        self._schedules = schedules  # {(group, name): state}
+        self.calls = []
+
+    def get_schedule(self, **kwargs):
+        self.calls.append(kwargs)
+        key = (kwargs.get("GroupName", "default"), kwargs["Name"])
+        if key not in self._schedules:
+            raise RuntimeError(f"ResourceNotFoundException: {key}")
+        return {"State": self._schedules[key]}
+
+
+def test_named_group_schedule_trigger_resolves_disabled():
+    """alpha-engine-config-I12058. The registry declares
+    `scheduler:nousergon-data-collection/data-collection-daily-heal`; a lookup
+    that passes the whole string as Name with no GroupName can never succeed,
+    so a paused named-group producer could never be read as DISABLED."""
+    import index
+    client = _GroupedScheduler({
+        ("nousergon-data-collection", "data-collection-daily-heal"): "DISABLED",
+    })
+    trig = "scheduler:nousergon-data-collection/data-collection-daily-heal"
+    assert index.resolve_disabled_producers({trig}, scheduler_client=client) == {
+        trig: "Scheduler schedule nousergon-data-collection/"
+              "data-collection-daily-heal is DISABLED",
+    }
+    assert client.calls == [{
+        "GroupName": "nousergon-data-collection",
+        "Name": "data-collection-daily-heal",
+    }]
+
+
+def test_bare_schedule_trigger_reads_the_default_group():
+    import index
+    client = _GroupedScheduler({("default", "alpha-engine-saturday"): "DISABLED"})
+    assert index.resolve_disabled_producers(
+        {"scheduler:alpha-engine-saturday"}, scheduler_client=client,
+    ) == {"scheduler:alpha-engine-saturday":
+          "Scheduler schedule alpha-engine-saturday is DISABLED"}
+    assert client.calls == [{"GroupName": "default", "Name": "alpha-engine-saturday"}]
+
+
+def test_scheduler_trigger_group_grammar():
+    import index
+    assert index.parse_producer_trigger("scheduler:g/s") == ("scheduler", "g/s")
+    assert index.split_schedule_name("g/s") == ("g", "s")
+    assert index.split_schedule_name("s") == ("default", "s")
+    # More than one `/`, or an empty segment, cannot name one schedule.
+    for bad in ("scheduler:a/b/c", "scheduler:/s", "scheduler:g/"):
+        assert index.parse_producer_trigger(bad) is None, bad
+    assert index.schedule_trigger("default", "s") == "scheduler:s"
+    assert index.schedule_trigger(None, "s") == "scheduler:s"
+    assert index.schedule_trigger("g", "s") == "scheduler:g/s"
+
+
 def test_resolve_disabled_producers_fails_toward_paging():
     """An unresolvable trigger — denied, throttled, renamed, absent — is
     treated as ENABLED. A suppression path that fails open is a monitor that
@@ -2968,6 +3027,27 @@ def test_inventory_enumerates_disabled_rules_no_registry_row_names():
         "alpha-research-thinktank-daily",
         "alpha-engine-ssm-reachability-probe-5min",
     }, "ENABLED rules must not appear; both DISABLED ones must"
+
+
+def test_inventory_names_a_named_group_schedule_the_way_the_registry_does():
+    """alpha-engine-config-I12058. ListSchedules walks every group; a bare
+    `scheduler:<name>` row for a named-group schedule never joins the
+    registry's `scheduler:<group>/<name>`, so `referenced_by_registry` and the
+    latch sweep's Pause-owner match are both wrong for it."""
+    import importlib
+    import index
+    importlib.reload(index)
+    rows = index.enumerate_disabled_schedules(_FakeEvents([]), _FakeScheduler([
+        {"Name": "data-collection-daily-heal", "State": "DISABLED",
+         "GroupName": "nousergon-data-collection"},
+        {"Name": "alpha-engine-saturday", "State": "DISABLED",
+         "GroupName": "default"},
+        {"Name": "heartbeat", "State": "ENABLED", "GroupName": "crucible-v2"},
+    ]))
+    assert {r["trigger"] for r in rows} == {
+        "scheduler:nousergon-data-collection/data-collection-daily-heal",
+        "scheduler:alpha-engine-saturday",
+    }
 
 
 def test_an_unenumerable_surface_is_an_error_row_never_an_empty_inventory():
