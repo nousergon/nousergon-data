@@ -145,7 +145,9 @@ def test_the_board_is_red_at_birth(board):
     # absorbed into a total nobody re-reads.
     # 432 -> 441: D50 (features/{D-1} settled regrade, alpha-engine-config-I12023)
     # adds its nine.
-    assert len(base) == 441
+    # 441 -> 450: D51 (the daily panel, alpha-engine-config-I10791) adds its
+    # nine, all graded at phase 3.
+    assert len(base) == 450
     # A declared not-applicable (an on-demand unit with no invocation to record,
     # no scheduled trigger for phase 4 to remove, or a `partial_exclusion`
     # naming a column no artifact/registry/identity read could ever grade for

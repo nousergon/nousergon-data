@@ -379,6 +379,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # point of the original deferral, which was no false state=missing every cycle
     # for a producer nothing runs (alpha-engine-config-I11282).
     "collectors/index_contributions.py": 1,
+    # alpha-engine-config-I10791 (plan P-25) — the daily panel publisher's ONE
+    # put_object site (`_s3_io.put`), writing data_collection/panel/{trading_day}/
+    # panel.parquet, manifest.json and parity.json. The ARTIFACT_REGISTRY rows are
+    # DEFERRED until the producer is scheduled (D51, lifecycle pending), per "never
+    # register a freshness entry ahead of its producer"; until then
+    # data.D51.artifact_registry reads red at phase 3, which is the honest state.
+    "builders/daily_panel.py": 1,
     # alpha-engine-config-I10783 (data-collector plan P-16) —
     # write_vendor_divergence_metric's one PUT site:
     # data_collection/metrics/vendor_divergence/{trading_day}.json, written by
