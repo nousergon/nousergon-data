@@ -2433,7 +2433,15 @@ def collect_technicals(
                     len(technicals), len(yf_symbols))
         return {"status": "ok_dry_run", "technicals": len(technicals), "universe": len(yf_symbols)}
     try:
-        _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact)
+        # alpha-engine-config-I12082: semantic admission at the publish boundary.
+        # Shadow by default (logs, writes anyway); NOUSERGON_ADMISSION_MODE=enforce
+        # refuses before the write and lands in the except below.
+        from contracts.admission import TECHNICALS, publish_admitted
+
+        publish_admitted(
+            lambda: _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact),
+            artifact, TECHNICALS, run_date=run_date, population=yf_symbols,
+        )
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] technicals write failed: %s", e)
         return {"status": "error", "error": str(e)}
