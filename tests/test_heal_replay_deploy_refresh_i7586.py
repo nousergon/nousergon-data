@@ -90,7 +90,11 @@ def test_the_parent_still_stops_the_box_after_dispatching():
     module should be revisited rather than silently kept.
     """
     assert STATES["HealDispatchReplay"]["Next"] == "HealConvergedNotify"
-    assert STATES["HealConvergedNotify"]["Next"] == "StopTradingInstance"
+    # alpha-engine-config-I12020: the stop is entered through the bounded
+    # trader-reconcile drain, whose every edge still ends at the stop -- so
+    # the parent still stops the box underneath the child.
+    assert STATES["HealConvergedNotify"]["Next"] == "DrainTraderReconcile"
+    assert STATES["CheckTraderReconcileDrainStatus"]["Choices"][0]["Next"] == "StopTradingInstance"
 
 
 def test_the_dispatch_is_still_fire_and_forget():
