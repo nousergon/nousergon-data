@@ -1815,8 +1815,20 @@ def collect_chain_histories(sf, sm_arn: str, run_date: str, source: dict) -> tup
 # seconds into the rerun.")
 # ---------------------------------------------------------------------------
 
-PREDICTOR_MANIFEST_BUCKET = "alpha-engine-research"
-PREDICTOR_MANIFEST_KEY = "predictor/weights/meta/manifest.json"
+PREDICTOR_SKIP_VERDICT_BUCKET = "alpha-engine-research"
+#: alpha-engine-config-I12050: the record that THIS trading day's training and
+#: model-zoo selection completed -- the same object, and the same key, the SF's
+#: ValidatePredictorSkipWeightsFresh reads. Not the live weights manifest:
+#: since alpha-engine-config-I9018 that moves only on promotion, so it dated the
+#: last PROMOTION and refused every recovery after a cycle that did not promote.
+PREDICTOR_SKIP_VERDICT_KEY = "arena/model/{trading_day}.verdict"
+#: arena_cycle.schema.json's decision.status enum, as the SF's
+#: CheckPredictorSkipWeightsFresh accepts it (pinned by
+#: tests/test_weekly_sf_rerun.py). Every word passes: a cycle that held or found
+#: nothing servable still trained and selected.
+PREDICTOR_SKIP_VERDICT_WORDS: tuple[str, ...] = (
+    "decided", "held", "unmeasurable", "unservable", "bootstrap",
+)
 
 
 class SkipCoherenceError(Exception):
@@ -1928,23 +1940,27 @@ def refuse_vacuous_rerun(
     )
 
 
-def _predictor_manifest_date(s3) -> str:
-    """HeadObject the live weights manifest; return LastModified DATE."""
+def _predictor_cycle_verdict(s3, trading_day: str) -> str:
+    """GetObject arena/model/{trading_day}.verdict; return its whole body.
+
+    Any S3 error -- NoSuchKey included, which is the "this cycle never reached
+    ModelZooSelect" case -- raises SkipCoherenceError, mirroring the SF's own
+    Catch on ValidatePredictorSkipWeightsFresh: an unreadable record cannot
+    witness the claim.
+    """
+    key = PREDICTOR_SKIP_VERDICT_KEY.format(trading_day=trading_day)
     try:
-        head = s3.head_object(Bucket=PREDICTOR_MANIFEST_BUCKET, Key=PREDICTOR_MANIFEST_KEY)
-    except Exception as exc:  # noqa: BLE001 — cannot PROVE freshness on any S3 error; fail loud, mirrors the SF's own Catch
+        obj = s3.get_object(Bucket=PREDICTOR_SKIP_VERDICT_BUCKET, Key=key)
+        return obj["Body"].read().decode("utf-8")
+    except Exception as exc:  # noqa: BLE001 — cannot PROVE the cycle trained on any S3 error; fail loud, mirrors the SF's own Catch
         raise SkipCoherenceError(
-            f"skip_predictor_training=true but HeadObject on "
-            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
-            f"failed ({exc!r}) — cannot verify weights freshness. Refusing "
-            "to emit a plan the SF's own ValidatePredictorSkipWeightsFresh "
-            "would also reject. Re-run WITHOUT skip_predictor_training, or "
-            "investigate the manifest."
+            f"skip_predictor_training=true but GetObject on "
+            f"s3://{PREDICTOR_SKIP_VERDICT_BUCKET}/{key} failed ({exc!r}) — "
+            f"no completed PredictorTraining + ModelZooSelect is recorded for "
+            f"trading day {trading_day}. Refusing to emit a plan the SF's own "
+            "ValidatePredictorSkipWeightsFresh would also reject. Re-run "
+            "WITHOUT skip_predictor_training (alpha-engine-config-I12050)."
         ) from exc
-    last_modified = head["LastModified"]
-    if hasattr(last_modified, "astimezone"):
-        return last_modified.astimezone(timezone.utc).date().isoformat()
-    return str(last_modified).split("T", 1)[0]
 
 
 #: alpha-engine-config-I11655: the skip flags of every weekly-SF stage that
@@ -1976,18 +1992,6 @@ PREDICTOR_WEIGHTS_CONSUMER_SKIPS: tuple[str, ...] = (
     "skip_evaluator",
 )
 
-#: The furthest the I8809 clamp may move calendar_date. The case it exists
-#: for is a recovery launched on a later wall-clock day than the training it
-#: reuses: across one UTC midnight (1 day), or over a weekend or a one-day
-#: market holiday (up to 3). Anything further is not the same launch drifting
-#: over midnight, it is a different week. The bound is checked TOGETHER with
-#: "the clamp leaves the trading day unchanged" (see
-#: coerce_calendar_date_for_predictor_skip), because the SF's NormalizeRunDates
-#: re-derives run_date from calendar_date: a clamp that changes the trading
-#: day re-dates every downstream stage, not just this check.
-PREDICTOR_SKIP_CLAMP_MAX_DAYS = 3
-
-
 def predictor_weights_consumers_all_skipped(emitted_input: dict) -> bool:
     """True iff the emitted input skips EVERY predictor-weights consumer.
 
@@ -2005,99 +2009,56 @@ def predictor_skip_needs_freshness(emitted_input: dict) -> bool:
     Only when skip_predictor_training is set AND some weights consumer still
     runs. When every consumer is skipped, the SF routes straight to
     PredictorTrainingSkipped (alpha-engine-config-I11655), so there is no
-    freshness predicate to satisfy and nothing to clamp for.
+    freshness predicate to satisfy.
     """
     return bool(emitted_input.get("skip_predictor_training")) and not (
         predictor_weights_consumers_all_skipped(emitted_input)
     )
 
 
-def coerce_calendar_date_for_predictor_skip(
-    s3, calendar_date: str, emitted_input: dict
-) -> tuple[str, str | None]:
-    """Clamp calendar_date to the manifest's LastModified date, within bounds.
+def predictor_skip_trading_day(plan: "RerunPlan") -> str:
+    """The trading day the SF's ValidatePredictorSkipWeightsFresh will key on.
 
-    The SF predicate is manifest DATE >= calendar_date. A recovery launched on
-    a later wall-clock day than the training it reuses must not re-stamp a
-    calendar_date the weights cannot satisfy (alpha-engine-config-I8809).
-
-    alpha-engine-config-I11655 bounds it in two ways:
-
-    * No clamp at all when no weights consumer runs, because the SF does not
-      check freshness then. A Director-only rerun keeps its derived
-      calendar_date.
-    * When a consumer does run, clamp only if the move is at most
-      PREDICTOR_SKIP_CLAMP_MAX_DAYS and leaves the trading day unchanged.
-      Otherwise refuse. NormalizeRunDates re-derives run_date from
-      calendar_date, so a larger clamp would silently re-grade a different
-      week. watch-rerun-2026-09-25-1 was clamped 2026-09-26 -> 2026-09-12,
-      and every downstream stage ran for 2026-09-11.
+    NormalizeRunDates re-derives $.run_date from calendar_date
+    (alpha-engine-config-I8809), so that is the answer whenever the emitted
+    input carries one; run_date otherwise.
     """
-    if not predictor_skip_needs_freshness(emitted_input):
-        return calendar_date, None
-    manifest_date = _predictor_manifest_date(s3)
-    if manifest_date >= calendar_date:
-        return calendar_date, None
-    gap_days = (date.fromisoformat(calendar_date) - date.fromisoformat(manifest_date)).days
-    cycle = resolve_trading_day(calendar_date)
-    clamped_cycle = resolve_trading_day(manifest_date)
-    if gap_days > PREDICTOR_SKIP_CLAMP_MAX_DAYS or clamped_cycle != cycle:
-        running = [
-            flag.removeprefix("skip_") for flag in PREDICTOR_WEIGHTS_CONSUMER_SKIPS
-            if emitted_input.get(flag) is not True
-        ]
-        raise SkipCoherenceError(
-            f"skip_predictor_training=true, and this rerun still runs stages "
-            f"that consume the predictor weights ({', '.join(running)}), but "
-            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} was "
-            f"last written {manifest_date}, {gap_days} day(s) before "
-            f"calendar_date {calendar_date}. Clamping calendar_date to "
-            f"{manifest_date} would not be a cross-midnight correction (bound: "
-            f"{PREDICTOR_SKIP_CLAMP_MAX_DAYS} days, same trading day). The SF's "
-            "NormalizeRunDates re-derives run_date from calendar_date, so "
-            f"EVERY downstream stage would run for trading day {clamped_cycle} "
-            f"instead of {cycle}. That is the watch-rerun-2026-09-25-1 regrade "
-            "(alpha-engine-config-I11655). Refusing. Re-run WITHOUT "
-            "skip_predictor_training so PredictorTraining runs for this cycle."
-        )
-    return manifest_date, (
-        f"calendar_date clamped {calendar_date} -> {manifest_date} for "
-        f"skip_predictor_training ({gap_days} day(s), trading day {cycle} "
-        f"unchanged; manifest LastModified is the latest provable weights "
-        f"date; SF CheckPredictorSkipWeightsFresh compares against "
-        f"calendar_date, not run_date -- alpha-engine-config-I8809 / I11655)"
-    )
+    if plan.calendar_date:
+        return resolve_trading_day(plan.calendar_date)
+    return plan.run_date
 
 
-def check_predictor_skip_freshness(s3, calendar_date: str, emitted_input: dict) -> None:
-    """Mirror ValidatePredictorSkipWeightsFresh: if the SF will validate this
-    input's skip_predictor_training claim (see predictor_skip_needs_freshness),
-    HeadObject the live weights manifest and require its
-    LastModified DATE >= calendar_date (lexicographic YYYY-MM-DD compare, same as
-    the SF's CheckPredictorSkipWeightsFresh Choice state). Raises
+def check_predictor_skip_freshness(s3, trading_day: str, emitted_input: dict) -> None:
+    """Mirror ValidatePredictorSkipWeightsFresh / CheckPredictorSkipWeightsFresh.
+
+    If the SF will validate this input's skip_predictor_training claim (see
+    predictor_skip_needs_freshness), read arena/model/{trading_day}.verdict and
+    require its whole body to be a known decision.status word. Raises
     SkipCoherenceError rather than emitting an input the SF will only reject
-    after a dispatch is already spent.
+    after a dispatch is already spent (alpha-engine-config-I7443).
 
-    Any S3 error (missing manifest, AccessDenied, throttling exhausted) is
-    treated the same as the SF's own Catch on ValidatePredictorSkipWeightsFresh
-    — fail loud rather than silently trust an unverifiable freshness claim.
+    alpha-engine-config-I12050: this used to compare the live weights
+    manifest's LastModified with calendar_date and CLAMP calendar_date back to
+    it. The manifest dates the last promotion, not the last training, so after
+    a non-promoting cycle the clamp either regraded another week (I11655) or
+    refused a recovery whose training had completed. The verdict is keyed by
+    trading day, so there is nothing left to clamp.
     """
     if not predictor_skip_needs_freshness(emitted_input):
         return
-    manifest_date = _predictor_manifest_date(s3)
-    if manifest_date < calendar_date:
+    body = _predictor_cycle_verdict(s3, trading_day)
+    if body not in PREDICTOR_SKIP_VERDICT_WORDS:
+        key = PREDICTOR_SKIP_VERDICT_KEY.format(trading_day=trading_day)
         raise SkipCoherenceError(
             f"skip_predictor_training=true but "
-            f"s3://{PREDICTOR_MANIFEST_BUCKET}/{PREDICTOR_MANIFEST_KEY} "
-            f"LastModified date {manifest_date} < calendar_date {calendar_date} — no "
-            "completed predictor training for this cycle; refusing to "
-            "launch onto stale weights (same predicate as the SF's own "
-            "ValidatePredictorSkipWeightsFresh / PredictorSkipWeightsStale — "
-            "checked here BEFORE a dispatch, not after one; "
-            "alpha-engine-config-I7443). Either re-run WITHOUT "
-            "skip_predictor_training, or pass an explicit calendar_date "
-            "at or before the manifest date if this is a cross-UTC-midnight "
-            "recovery rerun."
+            f"s3://{PREDICTOR_SKIP_VERDICT_BUCKET}/{key} holds {body[:40]!r}, "
+            f"not one of {', '.join(PREDICTOR_SKIP_VERDICT_WORDS)} — no "
+            f"completed PredictorTraining + ModelZooSelect is recorded for "
+            f"trading day {trading_day}; refusing to launch onto weights this "
+            "cycle never selected (same predicate as the SF's own "
+            "CheckPredictorSkipWeightsFresh / PredictorSkipWeightsStale, "
+            "checked here BEFORE a dispatch). Re-run WITHOUT "
+            "skip_predictor_training (alpha-engine-config-I12050)."
         )
 
 
@@ -2106,24 +2067,25 @@ def apply_predictor_skip_coherence(plan: "RerunPlan", s3) -> None:
 
     Reads the document that would actually be dispatched (cadence-declared
     skips included), because that is what the SF's CheckSkipPredictorTraining
-    evaluates. Mutates plan.calendar_date only through the bounded clamp.
-    Raises SkipCoherenceError.
+    evaluates. Never moves plan.calendar_date. Raises SkipCoherenceError.
     """
     emitted = plan.rerun_input()
     if emitted.get("skip_predictor_training") and not predictor_skip_needs_freshness(emitted):
         plan.notes.append(
             "skip_predictor_training: every predictor-weights consumer is "
             "skipped, so the SF routes straight to PredictorTrainingSkipped "
-            "without the freshness proof. calendar_date kept at "
-            f"{plan.calendar_date} (alpha-engine-config-I11655)"
+            "without the freshness proof (alpha-engine-config-I11655)"
         )
         return
-    plan.calendar_date, clamp_note = coerce_calendar_date_for_predictor_skip(
-        s3, plan.calendar_date, emitted
+    if not emitted.get("skip_predictor_training"):
+        return
+    trading_day = predictor_skip_trading_day(plan)
+    check_predictor_skip_freshness(s3, trading_day, emitted)
+    plan.notes.append(
+        f"skip_predictor_training: arena/model/{trading_day}.verdict is "
+        "present with a known status word, so this cycle trained and selected "
+        "(alpha-engine-config-I12050)"
     )
-    if clamp_note:
-        plan.notes.append(clamp_note)
-    check_predictor_skip_freshness(s3, plan.calendar_date, emitted)
 
 
 # ---------------------------------------------------------------------------

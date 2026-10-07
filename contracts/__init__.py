@@ -262,3 +262,10 @@ def validate_rag_manifest(data: dict) -> list[str]:
     build_manifest, D16). Consumer: crucible-dashboard loaders/s3_loader.py::
     load_rag_manifest (alpha-engine-config-I10873, P-07)."""
     return _validate(data, "rag_manifest")
+
+
+def validate_daily_heal_summary(data: dict) -> list[str]:
+    """Validate data/heal/daily/{date}.json (weekly_collector.py::_run_daily_heal,
+    D33). No surviving consumer today; the data phase-2 heal verifier is the
+    planned reader (alpha-engine-config-I10933)."""
+    return _validate(data, "daily_heal_summary")

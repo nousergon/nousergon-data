@@ -697,6 +697,14 @@ class _FakeS3:
         body, _ = self.objects[Key]
         return {"Body": io.BytesIO(body)}
 
+    def head_object(self, Bucket, Key):  # noqa: N803
+        """What the empty-but-fresh guard HEADs (alpha-engine-config-I10785)."""
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "404", "Message": "Not Found"}}, "HeadObject")
+        return {"ContentLength": len(self.objects[Key][0])}
+
 
 @pytest.fixture
 def d16(monkeypatch):
@@ -729,9 +737,17 @@ def _d16_fixture_objects(after):
         "rag/filing_changes/latest.json": (filing_body, ts),
         "rag/corpus_freshness/latest.json": (json.dumps({"status": "fresh"}).encode(), ts),
         "health/rag_ingestion_progress/2026-09-19.json": (json.dumps({"step": 10, "of": 10}).encode(), ts),
-        "data/insider_transactions/2609190500_result.parquet": (b"PAR1-fake-parquet-bytes", ts),
-        "data/insider_transactions/latest.json": (json.dumps({"rows": 17}).encode(), ts),
+        "data/insider_transactions/2609190500_result.parquet": (_form4_parquet(17), ts),
+        "data/insider_transactions/latest.json": (json.dumps({"row_count": 17}).encode(), ts),
     }
+
+
+def _form4_parquet(n_rows: int) -> bytes:
+    import pandas as pd
+
+    buf = io.BytesIO()
+    pd.DataFrame({"ticker": ["AAPL"] * n_rows}).to_parquet(buf, index=False)
+    return buf.getvalue()
 
 
 def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
@@ -757,11 +773,14 @@ def test_d16_writes_one_manifest_with_measured_outputs(sink, d16, monkeypatch):
         "rag/filing_changes/latest.json": 42,
         "rag/corpus_freshness/latest.json": 1,
         "health/rag_ingestion_progress/2026-09-19.json": 1,
-        "data/insider_transactions/2609190500_result.parquet": 1,
-        "data/insider_transactions/latest.json": 1,
+        # D46's two keys carry their MEASURED count (parquet footer, sidecar
+        # `row_count`), not the singleton 1 (alpha-engine-config-I10785).
+        "data/insider_transactions/2609190500_result.parquet": 17,
+        "data/insider_transactions/latest.json": 17,
     }
-    verdicts = {g["verdict"] for g in manifest["guards"]}
-    assert "ok" in verdicts
+    empty_fresh = [g for g in manifest["guards"] if g["guard"] == "data_empty_fresh"]
+    assert {g["key"] for g in empty_fresh} == set(keyed)
+    assert {g["verdict"] for g in empty_fresh} == {"ok"}
 
 
 def test_d16_records_the_source_yield_verdict_as_a_guard(sink, d16, monkeypatch, tmp_path):
