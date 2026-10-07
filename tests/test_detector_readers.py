@@ -110,9 +110,17 @@ def test_declared_family_without_a_receipt_is_unmet(units, unit_id, kind):
 
 @pytest.mark.parametrize("unit_id, kind", DECLARED_FAMILIES)
 def test_declared_family_receipt_without_a_declared_subject_is_unmeasurable(units, unit_id, kind):
-    """The reader will not guess which alarm "no-heartbeat" means."""
+    """The reader will not guess which alarm "no-heartbeat" means.
+
+    `subject` is stripped rather than assumed absent: the committed descriptors
+    declare one for every prose detector (alpha-engine-config-I10795), and this
+    case is about the entry that does not.
+    """
     unit = units[unit_id]
-    only = _with_detectors(unit, [d for d in unit.raw["detectors"] if d["kind"] == kind])
+    undeclared = [
+        {k: v for k, v in d.items() if k != "subject"} for d in unit.raw["detectors"] if d["kind"] == kind
+    ]
+    only = _with_detectors(unit, undeclared)
     store = _store(unit_id, kind, _receipt(unit_id, kind, "anything"))
     reading = detector_readers.read_detector(store, only)
     assert reading.unmeasurable and not reading.met
