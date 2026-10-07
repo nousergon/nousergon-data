@@ -52,7 +52,7 @@ import boto3
 import pandas as pd
 import requests
 
-from dates import SETTLED_AFTER_ET, bar_settlement_guard_entry
+from dates import SETTLED_AFTER_ET, assert_settled_bar, bar_settlement_guard_entry
 from nousergon_lib.secrets import get_secret
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
@@ -936,6 +936,10 @@ def collect(
     # the window fan-out so a single-date call and each per-date call inside a
     # window are graded identically.
     fetch_started_at = datetime.now(timezone.utc)
+    # ENFORCE raise site (`dates.BAR_SETTLEMENT_GUARD`): refuse to open a fetch
+    # for day D's own bar before it settles, so nothing provisional is written.
+    if not dry_run:
+        assert_settled_bar(fetch_started_at, run_date, unit="D19")
 
     if window_days > 1:
         return _collect_window(
