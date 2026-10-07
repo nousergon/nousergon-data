@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/daily_panel.schema.json",
+  "title": "Daily panel (data_collection/panel/{trading_day}/panel.parquet), one row (daily_panel.v1)",
+  "description": "The data collector's daily panel product (plan amendment 1, foundation rule architecture.d/146, alpha-engine-config-I10791 / P-25). ONE long-form price panel per trading day, compiled ONCE from the ArcticDB `universe` library over a trailing window, so crucible v2's `data.daily` reads it instead of compiling its own from raw ArcticDB. This schema validates ONE ROW of the parquet after `df.to_dict('records')` with `trading_day` rendered as an ISO date; the persisted artifact is the parquet and the row shape is the contract. Columns, their ORDER, and their unit suffixes are crucible's `crucible/data/sources.py::PANEL_COLUMNS` exactly (crucible's own `panel.v1`): a consumer that swaps its source must not be able to see a different shape. Keyed (trading_day, ticker), unique, sorted by (trading_day, ticker); the panel carries rows for its own trading_day. Prices and volume are RAW (`_raw`), never adjusted or normalized, and never null: the upstream ArcticDB row contract (arctic_universe.schema.json) forbids a missing OHLCV value, and a zero-fill would be the well-formed-artifact-containing-nothing shape. The day-level facts (row/symbol/session counts, window, content hash) live in the sidecar manifest, daily_panel_manifest.schema.json. ONE DEFINITION of keys, columns and the parity comparator: contracts/daily_panel.py. PRODUCER TEST: tests/test_daily_panel_contract.py. Consumer: crucible (v2 data.daily), pinned at crucible:tests/contracts/daily_panel.schema.json (contracts/daily_panel.py::CONSUMER).",
+  "x-key-pattern": "data_collection/panel/{trading_day}/panel.parquet",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trading_day", "ticker", "open_raw", "high_raw", "low_raw", "close_raw", "volume_raw"],
+  "properties": {
+    "trading_day": {
+      "type": "string",
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}$",
+      "description": "The NYSE session this bar belongs to (YYYY-MM-DD). Stored in the parquet as a date; rendered ISO for validation."
+    },
+    "ticker": {
+      "type": "string",
+      "minLength": 1,
+      "description": "ArcticDB `universe` symbol key, exactly as the library stores it (no renaming)."
+    },
+    "open_raw": {"type": "number", "exclusiveMinimum": 0, "description": "Raw open price, native currency (ArcticDB `Open`)."},
+    "high_raw": {"type": "number", "exclusiveMinimum": 0, "description": "Raw high price (ArcticDB `High`)."},
+    "low_raw": {"type": "number", "exclusiveMinimum": 0, "description": "Raw low price (ArcticDB `Low`)."},
+    "close_raw": {"type": "number", "exclusiveMinimum": 0, "description": "Raw close price (ArcticDB `Close`)."},
+    "volume_raw": {"type": "number", "minimum": 0, "description": "Raw share volume (ArcticDB `Volume`)."}
+  }
+}
