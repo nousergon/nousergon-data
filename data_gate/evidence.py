@@ -39,6 +39,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 import run_units
+from contracts import pit
 from data_gate.cadence import (
     Cadence,
     due_fire,
@@ -55,11 +56,15 @@ __all__ = [
     "PARITY_FRESHNESS_TRADING_DAYS",
     "PARITY_KEY_PREFIX",
     "PARITY_KEY_TEMPLATE",
+    "CurrentEvidence",
     "GateStore",
+    "Observation",
     "ObservationWindow",
     "Reading",
     "empty_fresh_runs",
     "empty_success_runs",
+    "combine_current",
+    "current_evidence",
     "parity_store_key",
     "read_base",
     "read_completeness_metric",
@@ -68,6 +73,7 @@ __all__ = [
     "read_objective",
     "read_windowed_objective",
     "read_parity",
+    "read_pit",
     "read_roles_bootstrapped",
     "read_run_record",
     "read_stack_check_live",
@@ -96,6 +102,103 @@ _METRIC_REAL_STATUSES: frozenset[str] = frozenset({"GREEN", "WATCH", "RED"})
 _METRIC_NA_STATUSES: frozenset[str] = frozenset(
     {"N/A-NOT-IMPL", "N/A-NOT-RUN", "N/A-LOW-N", "N/A-MISSING-INPUT"}
 )
+
+@dataclass(frozen=True)
+class Observation:
+    """One observation a windowed reader made — the input to the version-bound read.
+
+    Brian's ruling, 2026-10-04 (option (c) on `alpha-engine-config-I11973`):
+    release is gated by CURRENT, version-bound evidence, so a reader that
+    counts a window also reports each observation it made, newest first, with
+    the code identity it ran under. :func:`current_evidence` turns the list into
+    the verdict; the reader only reports facts.
+    """
+
+    #: What the observation was ("2026-10-02", "2026-10-02T22:15Z").
+    label: str
+    #: The code identity the observation ran under (the run manifests'
+    #: ``code_sha``, or a producer document's own). Empty when the producer
+    #: records none — then only the newest observation can be bound to the
+    #: version running now, so it is the whole of the current evidence.
+    version: str = ""
+    #: Why it failed, or ``None`` when it passed.
+    failure: str | None = None
+    #: ``False``: the observation was DUE and nothing recorded it. Never a pass.
+    present: bool = True
+
+
+@dataclass(frozen=True)
+class CurrentEvidence:
+    """Option (c)'s release evidence: the observations made on the code running now.
+
+    ``observed`` is the run of consecutive observations, back from the newest,
+    that ran the newest observation's ``version``. Any failure inside that run
+    blocks; a failure on an EARLIER version does not — a verified remedy does
+    not wait for old failures to age out of the window. A newest observation
+    that is due and missing is ``stale``: missing proof blocks exactly as a
+    failure does.
+    """
+
+    version: str
+    observed: int
+    failures: tuple[str, ...] = ()
+    stale: str = ""
+    latest: str = ""
+
+    @property
+    def clean(self) -> bool:
+        return not self.stale and self.observed > 0 and not self.failures
+
+
+def current_evidence(observations: list[Observation]) -> CurrentEvidence:
+    """The version-bound evidence in ``observations`` (newest first).
+
+    * no observation, or a newest observation that is missing: ``stale``;
+    * otherwise the newest observation plus every consecutive older one that
+      ran the SAME, non-empty version. An unknown version binds only the newest
+      observation, because nothing shows an older one ran the same code. A
+      missing observation ends the run: it carries no version to match.
+    """
+    if not observations:
+        return CurrentEvidence(version="", observed=0, stale="no observation has been made yet")
+    newest = observations[0]
+    if not newest.present:
+        return CurrentEvidence(
+            version=newest.version,
+            observed=0,
+            stale=f"the latest due observation ({newest.label}) recorded nothing",
+            latest=newest.label,
+        )
+    run = [newest]
+    if newest.version:
+        for observation in observations[1:]:
+            if not observation.present or observation.version != newest.version:
+                break
+            run.append(observation)
+    return CurrentEvidence(
+        version=newest.version,
+        observed=len(run),
+        failures=tuple(f"{o.label}: {o.failure}" for o in run if o.failure is not None),
+        latest=newest.label,
+    )
+
+
+def combine_current(parts: list[tuple[str, CurrentEvidence]]) -> CurrentEvidence | None:
+    """Several independent paths' current evidence as one (each must be clean).
+
+    Each part is ``(path label, evidence)``; the label prefixes every version,
+    failure and staleness so the row names which scheduled path blocks.
+    """
+    if not parts:
+        return None
+    return CurrentEvidence(
+        version="; ".join(f"{label}={e.version or '?'}" for label, e in parts),
+        observed=min(e.observed for _, e in parts),
+        failures=tuple(f"{label}@{f}" for label, e in parts for f in e.failures),
+        stale="; ".join(f"{label}: {e.stale}" for label, e in parts if e.stale),
+        latest="; ".join(f"{label}={e.latest}" for label, e in parts if e.latest),
+    )
+
 
 @dataclass(frozen=True)
 class ObservationWindow:
@@ -131,6 +234,11 @@ class ObservationWindow:
     not_live: str = ""
     #: What one observation is, for rendering ("trading day(s)", "cycle(s)").
     unit: str = "observation(s)"
+    #: Brian's 2026-10-04 option (c) (:class:`CurrentEvidence`): the
+    #: version-bound evidence that gates release. ``None`` from a reader that
+    #: does not report it — the clause then keeps the 2026-10-03 trailing-window
+    #: rule, which is stricter, never laxer.
+    current: CurrentEvidence | None = None
 
     @property
     def complete(self) -> bool:
@@ -1017,6 +1125,154 @@ def read_guard_commissioning(
     )
 
 
+#: How many offending keys a PIT reading names in its detail before it counts
+#: the rest. The full list is in the manifests the evidence tuple names.
+_PIT_NAMED = 8
+
+
+def read_pit(store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None) -> Reading:
+    """Every key this unit's current cycle published, graded point-in-time.
+
+    `data_collection_plan_260914.md` §2 objective 4, plan item P-15
+    (`alpha-engine-config-I10782`): every published record carries ``as_of``
+    and ``available_at``, and ``available_at <= manifest.finished``. The
+    producer records the stamps it wrote as one ``data_pit`` guard entry per
+    key (`contracts/pit.py::pit_guard_entry`); this reads them back off the
+    SAME manifests `read_run_record` grades (selected by the unit's cadence
+    through :func:`_cycle`) and checks, per output:
+
+    * a ``data_pit`` entry exists for the key — an output with none is UNMET
+      and NAMED, never skipped: "not stamped" is the finding this clause exists
+      to surface, and a reader that graded only the keys that happen to carry a
+      stamp would read green over every unit that carries none;
+    * its verdict is ``ok`` — the producer could read both stamps;
+    * ``as_of``'s first instant <= ``available_at`` <= the manifest's
+      ``finished``. The upper bound is the plan's clause: a record whose own
+      stamp says it was knowable only AFTER the run that published it finished
+      was not written by that run, or carries a clock nobody can trust.
+
+    Keys `contracts/pit.py::pit_exemption` exempts (ArcticDB library refs) are
+    counted and named as exempt, not graded. The read never opens a published
+    object: the manifest is the evidence, so this needs no read on any
+    published prefix.
+
+    Listing or read failure is UNMEASURABLE; absence is UNMET — the same split
+    as `read_run_record`.
+    """
+    cadence = unit_cadence(unit.raw)
+    unit_prefix = f"{_store_relative(unit.run_manifest_prefix)}/"
+    try:
+        cycle = _cycle(store, unit, cadence, trading_day=trading_day, now=now)
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        # A deliberate catch, not a swallow: the failure mode is "this unit's
+        # manifest prefix could not be listed", every other clause on the board
+        # survives it, and the recording surface is this UNMEASURABLE row.
+        return Reading(
+            met=False,
+            detail=f"could not list {unit_prefix}: {type(exc).__name__}: {exc}",
+            evidence=(f"{unit_prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    prefix = cycle.where
+    if cycle.problems:
+        return Reading(
+            met=False,
+            detail=f"{len(cycle.problems)} manifest(s) under {prefix} unreadable: {cycle.problems[:4]}",
+            evidence=tuple(cycle.keys[:8]) or (f"{prefix}*.json",),
+            unmeasurable=True,
+            source="data_collection store",
+        )
+    if not cycle.keys:
+        if cadence.kind == "on_demand":
+            return Reading(
+                met=True,
+                detail=(
+                    f"not applicable: {unit.unit_id} runs on demand ({cadence.source}) and no "
+                    f"invocation is recorded under {unit_prefix}, so nothing was published to stamp"
+                ),
+                evidence=(f"{unit_prefix}*.json",),
+                source="data_collection store",
+            )
+        return Reading(
+            met=False,
+            detail=(
+                f"no run manifest {cycle.expected}, under {prefix}: no published key on record to "
+                "grade point-in-time" + _cadence_note(cadence)
+            ),
+            evidence=(f"{prefix}*.json",),
+            source="data_collection store",
+        )
+
+    stamped: list[str] = []
+    exempt: list[str] = []
+    unstamped: list[str] = []
+    failing: list[str] = []
+    finishes: list[dt.datetime] = []
+    for manifest in cycle.manifests:
+        finished = _parse_utc(manifest.get("finished"))
+        if finished is not None:
+            finishes.append(finished)
+        stamps = {}
+        for entry in manifest.get("guards") or ():
+            read = pit.read_pit_entry(entry) if isinstance(entry, dict) else None
+            if read is not None:
+                stamps[read.key] = read  # the LAST reading for a key is the one that stands
+        for output in manifest.get("outputs") or ():
+            key = str((output or {}).get("key") or "")
+            if not key:
+                continue
+            if pit.pit_exemption(key) is not None:
+                exempt.append(key)
+                continue
+            found = stamps.get(key)
+            if found is None:
+                unstamped.append(key)
+            elif found.verdict != "ok":
+                failing.append(f"{key}: verdict {found.verdict!r} — {found.detail[:200]}")
+            elif found.available_at is None or found.as_of_floor is None:
+                failing.append(f"{key}: the data_pit entry's value/baseline are not POSIX seconds")
+            elif found.available_at < found.as_of_floor:
+                failing.append(f"{key}: available_at precedes the start of its as_of day")
+            elif finished is None:
+                failing.append(f"{key}: the manifest's `finished` ({manifest.get('finished')!r}) does not parse")
+            elif found.available_at > finished:
+                failing.append(
+                    f"{key}: available_at {pit.format_available_at(found.available_at)} is after the "
+                    f"publishing run finished ({pit.format_available_at(finished)})"
+                )
+            else:
+                stamped.append(key)
+
+    graded = len(stamped) + len(unstamped) + len(failing)
+    detail = (
+        f"{len(stamped)}/{graded} published key(s) stamped point-in-time (as_of <= available_at <= "
+        f"manifest finished) across {len(cycle.manifests)} run(s) under {prefix}"
+    )
+    if exempt:
+        detail += f"; {len(exempt)} exempt ({pit.pit_exemption(exempt[0])}): {sorted(set(exempt))[:_PIT_NAMED]}"
+    if unstamped:
+        detail += (
+            f"; {len(unstamped)} published with NO {pit.PIT_GUARD_NAME} stamp on its manifest: "
+            f"{unstamped[:_PIT_NAMED]}"
+        )
+    if failing:
+        detail += f"; {len(failing)} failed: {failing[:_PIT_NAMED]}"
+    if graded == 0 and not exempt:
+        detail += (
+            f"; statuses {sorted({str(m.get('status')) for m in cycle.manifests})} published no "
+            "output, so nothing was graded — and nothing graded is not graded clean"
+        )
+    met = (graded > 0 or bool(exempt)) and not unstamped and not failing
+    return Reading(
+        met=met,
+        detail=detail,
+        evidence=tuple(cycle.keys[:8]),
+        source="data_collection store",
+        as_of=pit.format_available_at(max(finishes)) if finishes else None,
+    )
+
+
 def completeness_due_day(unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None) -> dt.date:
     """The trading day whose completeness metric should exist by the gate's moment.
 
@@ -1234,7 +1490,42 @@ def read_windowed_objective(
             failures=(f"{key}: status=breach, value={document.get('value')}",) if status == "breach" else (),
             not_live=f"{key} carries no ok/breach verdict yet — nothing publishes this number",
             unit=unit,
+            current=_objective_current(document) if live else None,
         ),
+    )
+
+
+def _objective_current(document: dict) -> CurrentEvidence | None:
+    """Option (c)'s current evidence out of a windowed objective document.
+
+    The producer contract (`data_gate/producers/slo.py`, nousergon-data PR2055):
+    ``cycles`` is one row per cycle of the window — ``trading_day``,
+    ``observed``, ``met``, ``misses`` and optionally ``code_sha``. When the
+    document carries those rows, the newest OBSERVED cycle (plus the older ones
+    that ran its ``code_sha``, when rows carry one) is the current evidence.
+
+    ``None`` for a document with no per-cycle rows (the monthly documents): it
+    cannot separate a current failure from an old one, so the clause keeps the
+    2026-10-03 rule, where a ``breach`` anywhere in the window blocks — stricter,
+    never laxer.
+    """
+    rows = document.get("cycles")
+    if not isinstance(rows, list) or not rows:
+        return None
+    observed_rows = sorted(
+        (r for r in rows if isinstance(r, dict) and r.get("observed", True)),
+        key=lambda r: str(r.get("trading_day") or ""),
+        reverse=True,
+    )
+    return current_evidence(
+        [
+            Observation(
+                label=str(r.get("trading_day") or "?"),
+                version=str(r.get("code_sha") or ""),
+                failure=None if r.get("met") else f"missed ({r.get('misses') or 'no detail'})",
+            )
+            for r in observed_rows
+        ]
     )
 
 
@@ -1842,6 +2133,18 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
             " — the report claims met:true while carrying the exceptions above, so it is "
             "read UNMET"
         )
+    evidence_keys: tuple[str, ...] = (key,)
+    if not met:
+        # alpha-engine-config-I12023: the report's own reading above is never
+        # rewritten. A separate, append-only adjudication record citing it may
+        # prove every exception away on independent evidence; only then does
+        # the clause read MET, and the detail still prints the failed reading.
+        adjudication = _read_parity_adjudication(store, key, report_day, document)
+        if adjudication is not None:
+            evidence_keys = (key, adjudication.record_key)
+            detail += " — " + adjudication.summary()
+            if adjudication.cleared:
+                met = True
     if frozen:
         # No window phrase: freshness is not applied to a frozen reading
         # (alpha-engine-config-I11269), so a countdown would misdescribe it.
@@ -1857,7 +2160,45 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     return Reading(
         met=met,
         detail=detail,
-        evidence=(key,),
+        evidence=evidence_keys,
         source="data_collection store",
         as_of=as_of,
+    )
+
+
+def _read_parity_adjudication(store: GateStore, report_key: str, report_day: dt.date, report: dict):
+    """The graded newest adjudication record for ``report_key``, or ``None`` if none exists.
+
+    A record that cannot be listed or read is graded INVALID, never skipped —
+    an adjudication someone filed and the gate silently ignored would hide
+    exactly the disposition `alpha-engine-config-I12023` asks to be visible.
+    """
+    from data_gate import parity_adjudication as adj
+    from data_gate.cutover import CUTOVER_UTC
+
+    prefix = f"{adj.ADJUDICATION_KEY_PREFIX}{report_day.isoformat()}/"
+    try:
+        records = adj.adjudication_record_keys(store.list_keys(prefix), report_day)
+    except Exception as exc:  # noqa: BLE001 - recorded as an invalid adjudication, which is red
+        return adj.Adjudication(record_key=prefix, cleared=False, problem=f"could not list: {type(exc).__name__}: {exc}")
+    if not records:
+        return None
+    newest = records[-1]
+    previous = records[-2] if len(records) > 1 else None
+    read = read_store_document(store, newest)
+    if read.problem is not None or read.absent or not isinstance(read.document, dict):
+        return adj.Adjudication(record_key=newest, cleared=False, problem=f"could not read: {read.problem or 'absent'}")
+    try:
+        report_bytes = store.get_bytes(report_key)
+    except Exception as exc:  # noqa: BLE001 - same: red, named
+        return adj.Adjudication(record_key=newest, cleared=False, problem=f"could not re-read {report_key}: {exc}")
+    return adj.grade_record(
+        read.document,
+        record_key=newest,
+        report_key=report_key,
+        report=report,
+        report_bytes=report_bytes,
+        previous_record_key=previous,
+        cutover_utc=CUTOVER_UTC,
+        fetch_bytes=store.get_bytes,
     )

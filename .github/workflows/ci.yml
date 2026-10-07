@@ -94,7 +94,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-cov pytest-xdist
+          pip install pytest pytest-cov pytest-xdist "moto[s3]"
 
       # config-I11309: 8,540+ tests in one process cost 12-13m of a 17-27m
       # cycle, and strict-up-to-date restarts every open PR's cycle on every

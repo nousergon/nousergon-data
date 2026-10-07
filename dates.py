@@ -284,8 +284,13 @@ def assert_no_bar_after(
 # So: the official closing print is FINAL well before 18:15 ET, and
 # consolidated volume is not final that evening at all. This module grades the
 # price axis, which is what every feature, technical and trading decision
-# depends on. A same-evening volume is provisional by construction and is not
-# something a later cron fixes.
+# depends on. A same-evening volume is provisional by construction. The next
+# morning's Polygon T+1 overwrite (D17) settles it in `staging/daily_closes`,
+# D18 carries it into ArcticDB, and D50 (`features/settled_regrade.py`)
+# rebuilds the published `features/{D}` snapshot from it in the same morning
+# schedule (Crucible v2 ruling on alpha-engine-config-I12023). Every artifact
+# written the evening of D carries provisional volume until that regrade, and
+# one written by a unit nothing regrades carries it for good.
 # ---------------------------------------------------------------------------
 
 #: The ET wall-clock time from which day D's official closing print is treated
@@ -399,7 +404,10 @@ BAR_SETTLEMENT_GUARD = GuardStaging(
     promotion_criterion=(
         "The standalone postclose schedule fetches at or after "
         f"{SETTLED_AFTER_ET} ET (Brian's ruling on alpha-engine-config-I11354), "
-        "AND 10 consecutive scheduled D03+D19 runs record verdict='settled', "
+        "AND the codified per-guard risk-based criterion holds "
+        "(data_gate/guard_promotion.py, bar_settlement: moderate risk — the latest "
+        "scheduled D03+D19 runs record verdict='settled'; Brian's 2026-10-04 option (c) "
+        "on alpha-engine-config-I11973 replaced the ten-run count), "
         "AND the 3-day settlement-time sample (alpha-engine-config-I11356) "
         f"confirms {SETTLED_AFTER_ET} ET rather than the one-day 2026-09-21 "
         "bracket this threshold currently rests on."

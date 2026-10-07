@@ -373,6 +373,31 @@ class _MarkerNotOk(Exception):
         self.result = result
 
 
+class _GuardRejectedPublish(_MarkerNotOk):
+    """An ENFORCING write-time guard rejected this run's publish: withhold ``ok``.
+
+    `alpha-engine-config-I10786` (P-19, guard commissioning). The empty-but-fresh
+    guard grades in :func:`_record_phase_lineage`, which runs AFTER the phase
+    marker is written. So the first induced fault under an enforcing guard
+    (an empty frame published under ``status: ok``) filed a ``failed`` manifest
+    over an ``ok`` marker naming the rejected artifact — and the Step Function's
+    on-demand retry, like every same-date rerun after it, auto-skipped the very
+    artifact the guard had just refused: the I11812 defect, reached through the
+    guard instead of through ``degraded``. Raised inside ``reg.phase(...)`` by
+    :func:`_phase_collect`'s pre-marker check, ONLY when the guard enforces, so
+    the marker records ``error`` and a retry recomputes. Observe mode never
+    raises it: there the verdict has no consequence, by definition.
+    """
+
+    def __init__(self, name: str, result: dict, detail: str) -> None:
+        Exception.__init__(
+            self,
+            f"{name}: enforcing empty_fresh guard rejected this publish — marker withheld so a "
+            f"same-date rerun recomputes it. {detail}",
+        )
+        self.result = result
+
+
 #: The collector statuses a phase marker may record as ``ok``. Anything else is
 #: a run a retry must recompute (`_MarkerNotOk`).
 _MARKER_OK_STATUSES = frozenset({"ok", "ok_dry_run"})
@@ -832,6 +857,22 @@ def _phase_collect(
     unit = run_units.unit_for(reg.data_mode, name)
     captured: dict = {}
 
+    def _withhold_marker_if_rejected(result: dict) -> None:
+        # `alpha-engine-config-I10786` (P-19): an ENFORCING empty_fresh guard
+        # must reject the publish BEFORE the phase marker says `ok`, or the
+        # retry auto-skips the artifact it just refused (`_GuardRejectedPublish`).
+        # The same readings `_record_phase_lineage` files below; observe mode
+        # returns at once, so nothing changes until the guard is promoted.
+        if not expectations.EMPTY_FRESH_GUARD.enforcing or result.get("status") == "ok_dry_run":
+            return
+        readings = _grade_publish(
+            unit, _rows_out(result, unit.rows_key), artifact_key, bucket or reg.bucket, reg,
+            _extra_writes(result, extra_outputs),
+        )
+        worst = _worst_reading(readings)
+        if not worst.clean:
+            raise _GuardRejectedPublish(name, result, worst.detail)
+
     def _body(run_ctx) -> dict:
         try:
             result = _phase_body(
@@ -842,6 +883,7 @@ def _phase_collect(
                 supports_auto_skip=supports_auto_skip,
                 verify_artifact_exists=verify_artifact_exists,
                 bucket=bucket,
+                before_marker=_withhold_marker_if_rejected,
             )
         except _CollectorError as ce:
             # The manifest is about to be written with `status: failed`. Fold on
@@ -999,29 +1041,9 @@ def _record_phase_lineage(
     # (`rows_fn`). Same auto-skip/dry-run gating as the primary artifact_key: a
     # cache-hit or dry run wrote nothing new, so it claims nothing new.
     if not auto_skipped and not dry:
-        for extra_key, present_fn, rows_fn in extra_outputs:
-            if present_fn(result):
-                # `extra_key` is either a literal key, or a ``result -> list[str]``
-                # callable for a unit whose per-run key set is only known from
-                # what it actually wrote (e.g. one key per currency/symbol) —
-                # never a fixed count guessed ahead of the run.
-                keys = extra_key(result) if callable(extra_key) else (extra_key,)
-                # `rows_fn(result)` is either a single count (applied to every
-                # key this call site declares — the I10855 shape, unchanged)
-                # or a ``{key: rows}`` mapping for a unit whose keys carry
-                # DIFFERENT counts each (e.g. one price-cache parquet per
-                # ticker) — alpha-engine-config-I11026. A key absent from the
-                # mapping records 0 rather than raising: `extra_key` is the
-                # single source of what was published, so a mapping that
-                # under-reports a key `extra_key` names is a producer bug to
-                # surface via the empty-fresh guard below, not to hide here.
-                rows_val = rows_fn(result)
-                per_key_rows = rows_val if isinstance(rows_val, dict) else None
-                default_rows = 0 if per_key_rows is not None else int(rows_val or 0)
-                for k in keys:
-                    rows_out = int(per_key_rows.get(k, 0) or 0) if per_key_rows is not None else default_rows
-                    run_ctx.record_output(k, rows_out=rows_out)
-                    extra_written.append((k, rows_out))
+        extra_written = _extra_writes(result, extra_outputs)
+        for k, rows_out in extra_written:
+            run_ctx.record_output(k, rows_out=rows_out)
     if not auto_skipped and not dry:
         _record_rejections(run_ctx, result, unit.rejected_keys)
     if not dry:  # I11231: an auto-skip claims no output but still READ (D26's ledger version).
@@ -1047,37 +1069,7 @@ def _record_phase_lineage(
             )
         ]
     else:
-        readings = [
-            expectations.check_empty_fresh(
-                unit_id=unit.unit_id,
-                artifact_key=artifact_key,
-                bucket=bucket,
-                s3_client=reg.s3_client,
-                rows_out=rows, floor=run_units.rows_out_floor_for(unit.unit_id),  # declared floor (I10785)
-                rows_key=unit.rows_key,
-            )
-        ]
-        # `alpha-engine-config-I10785` (P-18): "every published key passes a
-        # non-empty + floor check before the PUT" — a unit recording extra
-        # outputs (`I10855`) publishes real keys this guard would otherwise
-        # never look at. Each is graded on its OWN row count (the same number
-        # `run_ctx.record_output` above was just given), never the primary
-        # key's count standing in for a key it did not measure.
-        for extra_key_name, extra_rows in extra_written:
-            if extra_key_name.startswith(_ARCTIC_LIBRARY_REF_PREFIX):
-                readings.append(
-                    _check_arctic_library_output(unit.unit_id, extra_key_name, extra_rows)
-                )
-                continue
-            readings.append(
-                expectations.check_empty_fresh(
-                    unit_id=unit.unit_id,
-                    artifact_key=extra_key_name,
-                    bucket=bucket,
-                    s3_client=reg.s3_client,
-                    rows_out=extra_rows, floor=run_units.rows_out_floor_for(unit.unit_id),
-                )
-            )
+        readings = _grade_publish(unit, rows, artifact_key, bucket, reg, extra_written)
 
     for reading in readings:
         expectations.report(reading, unit_id=unit.unit_id)
@@ -1194,6 +1186,89 @@ def _record_phase_lineage(
                 f"published output"
             ),
         )
+
+
+def _extra_writes(
+    result: dict, extra_outputs: tuple[tuple[str, object, object], ...]
+) -> list[tuple[str, int]]:
+    """Every extra key this run actually wrote, paired with its measured rows.
+
+    alpha-engine-config-I10855: a unit that publishes MORE than one declared key
+    records every one it actually wrote THIS run — never copied from the
+    descriptor (`present_fn`), and never a 0 standing in for an uncounted write
+    (`rows_fn`). Pure: read from the collector's own ``result``, so the
+    lineage that records these keys and the enforce-mode marker check in
+    :func:`_phase_collect` (`alpha-engine-config-I10786`) see one list, never two.
+    """
+    written: list[tuple[str, int]] = []
+    for extra_key, present_fn, rows_fn in extra_outputs:
+        if not present_fn(result):
+            continue
+        # `extra_key` is either a literal key, or a ``result -> list[str]``
+        # callable for a unit whose per-run key set is only known from
+        # what it actually wrote (e.g. one key per currency/symbol) —
+        # never a fixed count guessed ahead of the run.
+        keys = extra_key(result) if callable(extra_key) else (extra_key,)
+        # `rows_fn(result)` is either a single count (applied to every
+        # key this call site declares — the I10855 shape, unchanged)
+        # or a ``{key: rows}`` mapping for a unit whose keys carry
+        # DIFFERENT counts each (e.g. one price-cache parquet per
+        # ticker) — alpha-engine-config-I11026. A key absent from the
+        # mapping records 0 rather than raising: `extra_key` is the
+        # single source of what was published, so a mapping that
+        # under-reports a key `extra_key` names is a producer bug to
+        # surface via the empty-fresh guard, not to hide here.
+        rows_val = rows_fn(result)
+        per_key_rows = rows_val if isinstance(rows_val, dict) else None
+        default_rows = 0 if per_key_rows is not None else int(rows_val or 0)
+        for k in keys:
+            rows_out = int(per_key_rows.get(k, 0) or 0) if per_key_rows is not None else default_rows
+            written.append((k, rows_out))
+    return written
+
+
+def _grade_publish(
+    unit: run_units.PhaseUnit,
+    rows: int | None,
+    artifact_key: str | None,
+    bucket: str | None,
+    reg: "PhaseRegistry",
+    extra_written: list[tuple[str, int]],
+) -> list["expectations.GuardReading"]:
+    """The empty-but-fresh readings for every key this run published.
+
+    `alpha-engine-config-I10785` (P-18): "every published key passes a
+    non-empty + floor check before the PUT" — a unit recording extra
+    outputs (`I10855`) publishes real keys this guard would otherwise
+    never look at. Each is graded on its OWN row count (the same number
+    `run_ctx.record_output` is given), never the primary key's count
+    standing in for a key it did not measure.
+    """
+    floor = run_units.rows_out_floor_for(unit.unit_id)  # declared floor (I10785)
+    readings = [
+        expectations.check_empty_fresh(
+            unit_id=unit.unit_id,
+            artifact_key=artifact_key,
+            bucket=bucket,
+            s3_client=reg.s3_client,
+            rows_out=rows, floor=floor,
+            rows_key=unit.rows_key,
+        )
+    ]
+    for extra_key_name, extra_rows in extra_written:
+        if extra_key_name.startswith(_ARCTIC_LIBRARY_REF_PREFIX):
+            readings.append(_check_arctic_library_output(unit.unit_id, extra_key_name, extra_rows))
+            continue
+        readings.append(
+            expectations.check_empty_fresh(
+                unit_id=unit.unit_id,
+                artifact_key=extra_key_name,
+                bucket=bucket,
+                s3_client=reg.s3_client,
+                rows_out=extra_rows, floor=floor,
+            )
+        )
+    return readings
 
 
 def _prior_same_date_ok_manifest(reg: "PhaseRegistry", unit_id: str) -> str | None:
@@ -1317,6 +1392,7 @@ def _phase_body(
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
+    before_marker=None,
 ) -> dict:
     """The phase-registry half of :func:`_phase_collect`.
 
@@ -1335,6 +1411,7 @@ def _phase_body(
             supports_auto_skip=supports_auto_skip,
             verify_artifact_exists=verify_artifact_exists,
             bucket=bucket,
+            before_marker=before_marker,
         )
     except _MarkerNotOk as not_ok:
         # The marker is durable with `status: error`; the collector's own
@@ -1351,8 +1428,14 @@ def _phase_body_marked(
     supports_auto_skip: bool,
     verify_artifact_exists: bool,
     bucket: str | None,
+    before_marker=None,
 ) -> dict:
-    """:func:`_phase_body`'s work, inside the phase marker's context manager."""
+    """:func:`_phase_body`'s work, inside the phase marker's context manager.
+
+    ``before_marker(result)``, when given, runs last inside the block, after
+    every status check has passed: raising :class:`_MarkerNotOk` from it is how
+    a caller withholds the ``ok`` marker (`alpha-engine-config-I10786`).
+    """
     with reg.phase(name, supports_auto_skip=supports_auto_skip) as ctx:
         if ctx.skipped:
             logger.info(
@@ -1414,6 +1497,8 @@ def _phase_body_marked(
         # losing the verdict.
         if result.get("status") not in _MARKER_OK_STATUSES:
             raise _MarkerNotOk(name, result)
+        if before_marker is not None:
+            before_marker(result)
         if artifact_key:
             ctx.record_artifact(artifact_key)
         return result
@@ -1429,6 +1514,15 @@ def _maybe_phase(reg: "PhaseRegistry | None", name: str, **log_ctx):
     if reg is None:
         return nullcontext()
     return reg.phase(name, supports_auto_skip=False, **log_ctx)
+
+
+#: The ``skip_reason`` prefixes a whole-mode unit may report, each matched to
+#: :data:`run_units.NOT_RUN_NO_NEW_DATA_DECLARED` against the lib's own
+#: definition ("a target date already published"): MorningEnrich's
+#: ``stale_overwrite`` (its target date is already appended to ArcticDB), and
+#: D50's ``already_regraded`` (features/{D-1} was already rebuilt from the
+#: current settled bar, `features.settled_regrade`). Any other reason fails loud.
+_CLASSIFIED_SKIP_REASONS: tuple[str, ...] = ("stale_overwrite", "already_regraded")
 
 
 def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) -> dict:
@@ -1454,7 +1548,8 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
 
     ``skip_reason`` is matched explicitly against a known producer, never
     guess-bucketed (`alpha-engine-config-I10831` deliverable 1, corrected
-    2026-09-15). Today the ONLY producer among the five wrapped modes is
+    2026-09-15). D50's ``already_regraded`` is the second producer
+    (:data:`_CLASSIFIED_SKIP_REASONS`, same member, same reasoning); the first is
     :func:`_should_skip_morning_enrich`'s ``stale_overwrite`` reason —
     MorningEnrich's own freshness guard, skipping because its target date is
     already appended to ArcticDB. That is
@@ -1509,7 +1604,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
             # guard verdict — an unrecognized reason is not a not_applicable
             # candidate at all (see this function's docstring;
             # alpha-engine-config-I10831, corrected 2026-09-15).
-            if not detail.startswith("stale_overwrite"):
+            if not detail.startswith(_CLASSIFIED_SKIP_REASONS):
                 raise _CollectorError(
                     mode,
                     f"{mode} returned status=skipped with an unclassified skip_reason "
@@ -1621,6 +1716,17 @@ def _chronic_gap_heal_price_cache_keys(result: dict) -> list[str]:
 #: mode starts carrying a collector's readings by a deliberate edit here.
 _MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
     "morning_enrich": ("daily_closes",),
+    # D50 carries D17's settlement onto every key it rebuilt, row by row for
+    # the tickers D17 carried provisional (features/settled_regrade.py).
+    "features_settled_regrade": ("features",),
+}
+
+#: mode -> the nested collectors whose recorded READS (``input_refs``,
+#: `features.input_record`) a whole-mode unit folds onto its manifest's
+#: ``inputs`` — `_phase_collect`'s I11203 folding, one level down. D50's are
+#: the D31-pinned objects, the live daily_closes and its ArcticDB read.
+_MODE_INPUT_COLLECTORS: dict[str, tuple[str, ...]] = {
+    "features_settled_regrade": ("features",),
 }
 
 
@@ -1635,7 +1741,31 @@ def _mode_collector_guards(mode: str, result: dict | None) -> list[dict]:
     return guards
 
 
+def _settled_regrade_keys(result: dict) -> dict[str, int]:
+    """Every key D50 wrote this run, with its row count: each rebuilt feature
+    group (``groups_written``, whatever groups the snapshot produced) and the
+    ``settlement.json`` marker, written last. Empty when it wrote nothing."""
+    features = (result.get("collectors") or {}).get("features") or {}
+    if features.get("status") != "ok":
+        return {}
+    day = result.get("date")
+    keys = {
+        f"features/{day}/{group}.parquet": int(rows or 0)
+        for group, rows in (features.get("groups_written") or {}).items()
+    }
+    if features.get("marker_key"):
+        keys[features["marker_key"]] = 1
+    return keys
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "features_settled_regrade": (
+        (
+            lambda r: list(_settled_regrade_keys(r)),
+            lambda r: bool(_settled_regrade_keys(r)),
+            _settled_regrade_keys,
+        ),
+    ),
     "morning_enrich": (
         (
             lambda r: [f"staging/daily_closes/{r.get('date')}.parquet"],
@@ -1697,9 +1827,20 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     for key_or_keys, present_fn, rows_fn in _MODE_EXTRA_OUTPUTS.get(mode, ()):
         if present_fn(result):
             keys = key_or_keys(result) if callable(key_or_keys) else (key_or_keys,)
-            rows_out = int(rows_fn(result) or 0)
+            rows = rows_fn(result)
             for k in keys:
+                rows_out = int((rows.get(k) if isinstance(rows, dict) else rows) or 0)
                 run_ctx.record_output(k, rows_out=rows_out)
+
+    for name in _MODE_INPUT_COLLECTORS.get(mode, ()):
+        nested = (result.get("collectors") or {}).get(name) or {}
+        for ref in nested.get("input_refs") or ():
+            run_ctx.record_input(
+                str(ref["key"]),
+                etag=ref.get("etag"),
+                version=ref.get("version"),
+                schema_version=ref.get("schema_version"),
+            )
 
     spec = run_units.MODE_ROWS.get(mode)
     published = (result.get("collectors") or {}).get(spec.collector, {}) if spec else {}
@@ -1734,7 +1875,8 @@ def _record_mode_lineage(run_ctx, mode: str, unit_id: str, result: dict) -> None
     # empty-but-fresh objective needs; the ArcticDB probe
     # (data_collection/probes/arctic/{trading_day}.json) is the independent
     # read-back of the same write.
-    run_ctx.record_output("arcticdb/universe", rows_out=rows)
+    if spec.library_ref is not None:
+        run_ctx.record_output(spec.library_ref, rows_out=rows)
     _record_rejections(run_ctx, published, spec.rejected_keys)
     run_ctx.record_guard(
         expectations.EMPTY_FRESH_GUARD.name,
@@ -1772,6 +1914,11 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
     if getattr(args, "daily_heal", False):
         return _run_whole_mode_unit("daily_heal", _run_daily_heal, config, args)
+
+    if getattr(args, "features_settled_regrade", False):
+        return _run_whole_mode_unit(
+            "features_settled_regrade", _run_features_settled_regrade, config, args
+        )
 
     if args.daily:
         return _run_daily(config, args)
@@ -3152,11 +3299,17 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     failure — predictor inference reads ArcticDB right after this runs and
     must see polygon-corrected data, not silently-stale yfinance values.
 
-    Skips the feature_store snapshot step (that already ran with yfinance EOD;
-    re-running it is expensive and the polygon delta on OHLCV is typically <1%).
-    daily_append's per-ticker compute_features call recomputes per-ticker
-    features inside ArcticDB based on the polygon-overwritten row, which is
-    what downstream consumers actually read.
+    Does not itself rebuild the feature_store snapshot. D31 published
+    ``features/{D}`` the previous evening from the bar as it stood then, and
+    the polygon overwrite here moves that bar (Volume in particular: the
+    same-evening consolidated volume is provisional by construction,
+    alpha-engine-config-I11354). The rebuild is its own unit, D50
+    (``--features-settled-regrade``, `features/settled_regrade.py`), which the
+    same morning schedule runs after this unit and D18, so the published
+    snapshot is rebuilt from the settled bar this writes (Crucible v2 ruling on
+    alpha-engine-config-I12023). daily_append's per-ticker compute_features
+    call separately recomputes per-ticker features inside ArcticDB from the
+    polygon-overwritten row.
     """
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
@@ -5520,6 +5673,15 @@ def _parse_args() -> argparse.Namespace:
              "today's UTC date (or --date); skip_if_exists short-circuits reruns.",
     )
     parser.add_argument(
+        "--features-settled-regrade", dest="features_settled_regrade", action="store_true",
+        help="D50: rebuild features/{D-1} from the settled bar D17 wrote this morning, every "
+             "other input pinned to the VersionId D-1's D31 run recorded "
+             "(features/settled_regrade.py; Crucible v2 ruling on alpha-engine-config-I12023). "
+             "Writes features/{D-1}/*.parquet then features/{D-1}/settlement.json; never "
+             "registry.json, schema_version.json or metron_supplemental. A repeat is "
+             "not_applicable. --date overrides the trading day.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -5570,7 +5732,9 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False):
+        # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
+        # and macro libraries, the same surface D31 reads under --daily.
         # --daily-arctic-append reads the daily_closes PostMarketData wrote +
         # the ArcticDB universe libraries — same preflight surface as --daily.
         # --daily-heal (alpha-engine-config-I2717) reads the same two surfaces
@@ -5682,6 +5846,44 @@ def _annotate_phase_marker(reg: "PhaseRegistry", name: str, result: dict) -> dic
     annotate = getattr(reg, "annotate_marker", None)
     if accepted and callable(annotate):
         annotate(name, provisional_additions=list(accepted))
+    return result
+
+
+def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dict:
+    """D50: rebuild ``features/{D-1}`` from the settled bar (`features.settled_regrade`).
+
+    Runs in ``ne-data-collection-morning`` after D17 settled
+    ``staging/daily_closes/{D-1}`` and D18 appended it. The trading day is the
+    one every whole-mode unit keys its manifest by (``--date`` or
+    :func:`default_run_date`, the last closed session), so this unit, D17 and
+    D18 all file under D-1. A refused precondition returns ``status: error``,
+    which the wrapper records as ``failed`` and ``main`` exits 1 on.
+    """
+    import boto3
+
+    from features import settled_regrade
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = settled_regrade.regrade(
+        run_date,
+        bucket=config["bucket"],
+        client=boto3.client("s3"),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    status = collector.get("status")
+    result = {
+        "mode": "features_settled_regrade",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"features": collector},
+    }
+    if status == "skipped":
+        result["skip_reason"] = collector.get("skip_reason")
+    if status == "error":
+        result["error"] = collector.get("error")
     return result
 
 

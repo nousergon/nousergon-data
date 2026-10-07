@@ -315,15 +315,22 @@ def test_main_writes_the_metric_document(monkeypatch, capsys):
     monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
     rc = m.main(["--days", "3"])
     assert rc == 0
-    # Two PUTs: the metric document, then the run record (alpha-engine-config-I11058).
-    assert len(s3.puts) == 2
+    # Three PUTs: the metric document, the write set (alpha-engine-config-
+    # I11063), then the run record (alpha-engine-config-I11058).
+    assert len(s3.puts) == 3
     body = json.loads(s3.puts[0]["Body"])
     assert body["collection_writes"] == 0
     assert body["days_covered"] == 0  # no archive objects in this fake
     assert s3.puts[0]["Key"] == m.DEFAULT_KEY
 
-    run_record = json.loads(s3.puts[1]["Body"])
-    assert s3.puts[1]["Key"].startswith("data_collection/runs/executor_profile/")
+    write_set = json.loads(s3.puts[1]["Body"])
+    assert s3.puts[1]["Key"] == m.WRITE_SET_KEY
+    assert write_set["schema_version"] == m.WRITE_SET_SCHEMA
+    assert write_set["groups"] == []
+    assert write_set["days_covered"] == 0
+
+    run_record = json.loads(s3.puts[2]["Body"])
+    assert s3.puts[2]["Key"].startswith("data_collection/runs/executor_profile/")
     assert run_record["producer"] == "executor_profile"
     assert run_record["status"] == "ok"
     assert run_record["error"] is None
@@ -393,3 +400,153 @@ def test_main_writes_an_error_run_record_and_still_raises(monkeypatch):
     assert s3.puts[0]["Key"].startswith("data_collection/runs/executor_profile/")
     assert run_record["status"] == "error"
     assert "boom" in run_record["error"]
+
+
+# ── write set (alpha-engine-config-I11063) ──────────────────────────────────
+
+
+def _timed(record, when, session="i-0abc"):
+    record["eventTime"] = when
+    role = record["userIdentity"]["sessionContext"]["sessionIssuer"]["arn"].rsplit("/", 1)[-1]
+    record["userIdentity"]["arn"] = f"arn:aws:sts::711398986525:assumed-role/{role}/{session}"
+    return record
+
+
+def _count(records, *, day=(2026, 10, 1)):
+    key = "AWSLogs/711398986525/CloudTrail/us-east-1/%04d/%02d/%02d/obj.json.gz" % day
+    return m.count_collection_writes(
+        _FakeS3({key: records}),
+        archive_bucket="archive",
+        archive_prefix="AWSLogs/711398986525/CloudTrail",
+        region="us-east-1",
+        start=_day(*day),
+        end=_day(*day),
+    )
+
+
+def test_key_group_shapes():
+    assert m.key_group("research.db") == "research.db"
+    assert m.key_group("health/daily_data.json") == "health/"
+    assert m.key_group("trades/eod_pnl.csv") == "trades/"
+    assert m.key_group("trades/logs/2026-10-01/daemon.log") == "trades/logs/"
+    assert m.key_group("trades/2026-10-01/reconciliation_audit.json") == "trades/{date}/"
+    assert m.key_group("signals/20261001/signals.json") == "signals/{date}/"
+    assert m.key_group("data/date=2026-10-01/x.parquet") == "data/{date}/"
+    assert m.key_group("arcticdb/universe/sym/AAPL/x") == "arcticdb/universe/"
+    # Shapes measured in the live archive, 2026-09-28..10-04:
+    assert m.key_group("arcticdb/universe1775588378382498816/tdata/x") == "arcticdb/universe{id}/"
+    assert (
+        m.key_group("arcticdb/shadow_20260928_universe1790636813936307712/x")
+        == "arcticdb/shadow_{date}_universe{id}/"
+    )
+    assert m.key_group("_preflight_sweep/preflight-sweep-20261001T080010Z/a.json") == "_preflight_sweep/preflight-sweep-{date}/"
+    assert m.key_group("decision_artifacts/2026/10/01/x.json") == "decision_artifacts/{date}/"
+    assert m.key_group("predictor/model_zoo/x.json") == "predictor/model_zoo/"
+
+
+def test_write_set_covers_every_executor_write_and_the_count_is_its_collection_subset():
+    count = _count(
+        [
+            _timed(_record("PutObject", "trades/eod_pnl.csv", _EXECUTOR), "2026-10-01T21:05:00Z"),
+            _timed(_record("PutObject", "trades/trades_full.csv", _EXECUTOR), "2026-10-01T21:05:01Z"),
+            _timed(_record("PutObject", "market_data/weekly/2026-10-01/b.json", _EXECUTOR), "2026-10-01T22:00:00Z", "i-0def"),
+            _timed(_record("GetObject", "trades/eod_pnl.csv", _EXECUTOR), "2026-10-01T21:06:00Z"),  # read
+            _timed(_record("PutObject", "signals/x.json", _COLLECTOR), "2026-10-01T21:00:00Z"),  # other role
+            _timed(_record("PutObject", "trades/x.csv", _EXECUTOR, bucket="other-bucket"), "2026-10-01T21:00:00Z"),
+            _timed(_batch_delete_child("arcticdb/shadow_universe/sl/a", _EXECUTOR), "2026-10-01T23:00:00Z"),
+        ]
+    )
+    assert count.collection_writes == 2  # market_data + the batch-deleted arcticdb key
+    doc = m.build_write_set(count=count, as_of=dt.datetime(2026, 10, 2, tzinfo=UTC))
+    assert doc["total_writes"] == 4
+    assert doc["collection_writes"] == 2
+    assert doc["window"] == {"start": "2026-10-01", "end": "2026-10-01"}
+    assert doc["by_top_level"] == {"arcticdb/": 1, "market_data/": 1, "trades/": 2}
+    groups = {g["prefix"]: g for g in doc["groups"]}
+    assert set(groups) == {"trades/", "market_data/weekly/", "arcticdb/shadow_universe/"}
+    trades = groups["trades/"]
+    assert trades["keys"] == ["trades/eod_pnl.csv", "trades/trades_full.csv"]
+    assert trades["keys_complete"] is True
+    assert trades["events"] == {"PutObject": 2}
+    assert trades["collection"] is False
+    assert trades["days"] == ["2026-10-01"]
+    assert trades["first_seen"] == "2026-10-01T21:05:00Z"
+    assert trades["last_seen"] == "2026-10-01T21:05:01Z"
+    assert trades["sessions"] == ["i-0abc"]
+    assert groups["market_data/weekly/"]["collection"] is True
+    assert groups["market_data/weekly/"]["sessions"] == ["i-0def"]
+    assert groups["arcticdb/shadow_universe/"]["events"] == {"DeleteObject": 1}
+
+
+def test_a_failed_write_is_counted_and_marked():
+    denied = _timed(_record("PutObject", "health/x.json", _EXECUTOR), "2026-10-01T10:00:00Z")
+    denied["errorCode"] = "AccessDenied"
+    doc = m.build_write_set(count=_count([denied]))
+    (group,) = doc["groups"]
+    assert group["writes"] == 1
+    assert group["failed"] == 1
+
+
+def test_a_long_tail_of_keys_is_a_sample_not_a_claim():
+    records = [
+        _timed(_record("PutObject", f"corporate_actions/actions/{i:03d}.json", _EXECUTOR), "2026-10-01T10:00:00Z")
+        for i in range(m.MAX_KEYS_PER_GROUP + 5)
+    ]
+    (group,) = m.build_write_set(count=_count(records))["groups"]
+    assert group["prefix"] == "corporate_actions/actions/"
+    assert group["writes"] == m.MAX_KEYS_PER_GROUP + 5
+    assert len(group["keys"]) == m.MAX_KEYS_PER_GROUP
+    assert group["keys_complete"] is False
+
+
+def test_a_fanned_out_top_level_folds_into_one_group():
+    n = m.MAX_GROUPS_PER_TOP_LEVEL + 1
+    records = [
+        _timed(_record("PutObject", f"prices/T{i:03d}/close.json", _EXECUTOR), "2026-10-01T10:00:00Z")
+        for i in range(n)
+    ] + [_timed(_record("PutObject", "health/x.json", _EXECUTOR), "2026-10-01T10:00:00Z")]
+    doc = m.build_write_set(count=_count(records))
+    groups = {g["prefix"]: g for g in doc["groups"]}
+    assert set(groups) == {"prices/*", "health/"}
+    assert groups["prices/*"]["writes"] == n
+    assert groups["prices/*"]["merged_groups"] == n
+    assert doc["total_writes"] == n + 1
+
+
+def test_write_set_carries_the_metric_coverage_so_a_partial_window_reads_partial():
+    count = m.WriteCount(collection_writes=0, days_requested=7, days_covered=5, uncovered_days=("2026-09-01", "2026-09-02"))
+    doc = m.build_write_set(count=count)
+    assert doc["days_requested"] == 7
+    assert doc["days_covered"] == 5
+    assert doc["uncovered_days"] == ["2026-09-01", "2026-09-02"]
+
+
+def test_write_set_never_reaches_stdout_and_can_go_to_a_local_file(monkeypatch, capsys, tmp_path):
+    key = "AWSLogs/711398986525/CloudTrail/us-east-1/2026/09/01/obj.json.gz"
+    record = _timed(_record("PutObject", "trades/eod_pnl.csv", _EXECUTOR), "2026-09-01T21:05:00Z")
+    s3 = _PutCapturingS3({key: [record]})
+
+    class _FakeBoto3:
+        @staticmethod
+        def client(name, region_name=None, config=None):
+            return s3
+
+    import datetime as _dt
+
+    class _FixedDate(_dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _dt.datetime(2026, 9, 2, 1, 0, tzinfo=tz)
+
+    monkeypatch.setitem(__import__("sys").modules, "boto3", _FakeBoto3())
+    monkeypatch.setattr(m.dt, "datetime", _FixedDate)
+    out_file = tmp_path / "write_set.json"
+    assert m.main(["--days", "1", "--no-write", "--write-set-file", str(out_file)]) == 0
+    assert s3.puts == []  # --no-write: nothing goes to S3
+    doc = json.loads(out_file.read_text())
+    assert doc["total_writes"] == 1
+    assert doc["groups"][0]["keys"] == ["trades/eod_pnl.csv"]
+    out = capsys.readouterr().out
+    assert "trades/eod_pnl.csv" not in out
+    assert "i-0abc" not in out
+    assert "arn:aws" not in out

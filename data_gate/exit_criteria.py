@@ -37,11 +37,15 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 from data_gate.cadence import COMPLETION_GRACE, Cadence, fire_selection_moment, latest_due_fire, parse_cron
-from data_gate.descriptors import Unit
+from data_gate.descriptors import GUARD_RECORDED_NAMES, Unit
 from data_gate.evidence import (
     EMPTY_FRESH_VERDICT,
+    CurrentEvidence,
+    Observation,
     ObservationWindow,
     Reading,
+    combine_current,
+    current_evidence,
     empty_fresh_runs,
     manifests_since,
 )
@@ -64,6 +68,8 @@ __all__ = [
     "SCHEDULE_MORNING",
     "SCHEDULE_WEEKLY",
     "V1_DATA_STAGE_KEY",
+    "VENDOR_DIVERGENCE_DAILY_DAYS",
+    "VENDOR_DIVERGENCE_METRIC_KEY",
     "collect_cycles",
     "read_code_identity_delta",
     "read_consecutive_cycles",
@@ -73,6 +79,7 @@ __all__ = [
     "read_executor_collection_writes_zero",
     "read_sustained_window",
     "read_v1_data_stage_quiet",
+    "read_vendor_divergence_daily",
     "read_vendor_divergence_emitted",
     "schedule_cadence",
 ]
@@ -379,6 +386,27 @@ def _cycle_verdict(cycles: CycleSet) -> list[tuple[Cycle, set[str], list[str]]]:
     return rows
 
 
+def cycle_version(cycle: Cycle, unit_ids: set[str] | None = None) -> str:
+    """The collector code a cycle ran: its ok scheduled manifests' ``code_sha``.
+
+    Brian's 2026-10-04 option (c) binds release evidence to the code version
+    running now (`evidence.CurrentEvidence`). `run_units.recorded_entry` stamps
+    every manifest with the box's own post-pull ``git rev-parse HEAD``
+    (`read_code_identity_delta`), so this is measured, never assumed. A cycle
+    that ran more than one tree renders every sha, joined — it is a version of
+    its own, and matches no single-tree cycle. Empty when no manifest carries
+    one, which binds only that cycle (`evidence.current_evidence`).
+    """
+    shas = {
+        str(doc.get("code_sha") or "").strip()
+        for unit_id, docs in cycle.manifests.items()
+        if unit_ids is None or unit_id in unit_ids
+        for _key, doc in docs
+        if doc.get("trigger") == "scheduled"
+    }
+    return "+".join(sorted(sha for sha in shas if sha))
+
+
 def read_consecutive_cycles(cycles: CycleSet, *, required: int) -> Reading:
     """``required`` consecutive complete cycles, counted back from the most recent.
 
@@ -511,6 +539,14 @@ def read_code_identity_delta(cycles: CycleSet) -> Reading:
     )
 
 
+#: The empty-but-fresh guard as a manifest records it. The producer files it
+#: under its RECORDED name (`data_empty_fresh`, `descriptors.GUARD_RECORDED_NAMES`);
+#: matching only the class spelling found nothing on live manifests, so the
+#: check read NOT LIVE however often the guard ran. Both are accepted, so a
+#: fixture or an older manifest spelled by class still counts.
+_EMPTY_FRESH_NAMES = frozenset({"empty_fresh", GUARD_RECORDED_NAMES["empty_fresh"]})
+
+
 def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
     """Objective 6 at the phase-2 exit: zero empty-but-fresh writes over N cycles.
 
@@ -538,18 +574,38 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
     # recorded manifests is not: before the guard ships, no write can carry
     # its verdict, so "no offender" would be the absence of a check.
     guarded = 0
+    # Option (c) (`evidence.CurrentEvidence`), newest first like the cycles:
+    # a cycle that recorded nothing is MISSING proof, and a cycle that recorded
+    # manifests with no `empty_fresh` verdict is the guard going SILENT — both
+    # block when they are current, because silent telemetry is not a pass.
+    observations: list[Observation] = []
     for cycle in cycles.cycles:
         manifests = cycle.all_manifests()
         if manifests:
             observed += 1
-        if any(
-            str(g.get("guard") or g.get("name") or "") == "empty_fresh"
+        verdicted = any(
+            str(g.get("guard") or g.get("name") or "") in _EMPTY_FRESH_NAMES
             for doc in manifests
             for g in (doc.get("guards") or [])
-        ):
+        )
+        if verdicted:
             guarded += 1
-        for run_id in empty_fresh_runs(manifests):
-            offenders.append(f"{cycle.label}:{run_id}")
+        cycle_offenders = [f"{cycle.label}:{run_id}" for run_id in empty_fresh_runs(manifests)]
+        offenders.extend(cycle_offenders)
+        if cycle_offenders:
+            failure: str | None = f"empty-but-fresh write(s) {cycle_offenders[:4]}"
+        elif not verdicted:
+            failure = "no `empty_fresh` guard verdict recorded — the guard was silent"
+        else:
+            failure = None
+        observations.append(
+            Observation(
+                label=cycle.label,
+                version=cycle_version(cycle),
+                failure=failure,
+                present=bool(manifests),
+            )
+        )
     met = observed >= required_cycles and not offenders
     detail = (
         f"{len(offenders)} empty-but-fresh write(s) (guard verdict {EMPTY_FRESH_VERDICT!r}) over "
@@ -578,6 +634,7 @@ def read_empty_fresh_free(cycles: CycleSet, *, required_cycles: int) -> Reading:
                 "the guard has produced no reading, so no write has been checked"
             ),
             unit="cycle(s)",
+            current=current_evidence(observations),
         ),
     )
 
@@ -626,12 +683,41 @@ def read_vendor_divergence_emitted(
     # not yet built, which is the part of the window the ruling forgives.
     not_live: list[str] = []
     window_failures: list[str] = []
+    # Option (c) (`evidence.CurrentEvidence`): per graded schedule, its newest
+    # cycle and the ones before it that ran the same collector code. A silent
+    # or blind current cycle blocks; one before the current version does not.
+    current_parts: list[tuple[str, CurrentEvidence]] = []
     for cycles in cycle_sets:
         vendors = [u for u in cycles.units if VENDOR_GUARD in u.guards]
         if not vendors:
             continue
         graded.extend(f"{u.unit_id}@{cycles.schedule}" for u in vendors)
         total += len(cycles.cycles)
+        vendor_ids = {u.unit_id for u in vendors}
+        observations: list[Observation] = []
+        for cycle in cycles.cycles:  # newest first
+            docs = [d for uid in vendor_ids for _k, d in cycle.manifests.get(uid, [])]
+            verdicts = [
+                str(g.get("verdict"))
+                for d in docs
+                for g in (d.get("guards") or [])
+                if str(g.get("guard") or g.get("name") or "") == VENDOR_GUARD
+            ]
+            if not verdicts:
+                failure: str | None = "no verdict"
+            elif any(v == "unmeasurable" for v in verdicts):
+                failure = "verdict unmeasurable"
+            else:
+                failure = None
+            observations.append(
+                Observation(
+                    label=cycle.label,
+                    version=cycle_version(cycle, vendor_ids),
+                    failure=failure,
+                    present=bool(docs),
+                )
+            )
+        current_parts.append((cycles.schedule, current_evidence(observations)))
         # Oldest first, so "after the first emitted verdict" is a walk forward.
         went_live = False
         for cycle in sorted(cycles.cycles, key=lambda c: c.fire):
@@ -701,12 +787,152 @@ def read_vendor_divergence_emitted(
                 else f"no {VENDOR_GUARD} verdict has been emitted yet on {sorted(not_live)}"
             ),
             unit="cycle(s)",
+            current=combine_current(current_parts),
+        ),
+    )
+
+
+#: alpha-engine-config-I10783's closes-when, verbatim: "The divergence metric
+#: is emitted on every trading day for at least 10 consecutive trading days".
+#: The issue's own figure, read here, not a threshold this module chose.
+VENDOR_DIVERGENCE_DAILY_DAYS = 10
+
+#: The daily vendor-divergence MetricRecord, relative to the store root
+#: (``data_collection/``). It IS
+#: ``collectors/cross_source_observer.py::VENDOR_DIVERGENCE_METRIC_PREFIX`` minus
+#: that root; ``tests/test_vendor_divergence_daily_reader.py`` pins the two, so a
+#: rename on either side is a red test rather than a reader that silently reads
+#: nothing.
+VENDOR_DIVERGENCE_METRIC_KEY = "metrics/vendor_divergence/{day}.json"
+
+#: The record statuses that are a MEASUREMENT — a comparison set existed. The
+#: same set as ``cross_source_observer._MEASURED_STATUSES``. ``breach`` counts:
+#: the closes-when asks that the metric be EMITTED, and a breach is a finding
+#: about the vendors, stated, not an absence of measurement.
+_VENDOR_MEASURED = frozenset({"ok", "breach"})
+
+
+def _vendor_day_status(day: dt.date, document: dict) -> tuple[bool, str]:
+    """``(qualifies, label)`` for one day's record. A record only qualifies if it
+    is a measurement OF THAT DAY: a measured status, a comparison count above
+    zero, its own ``trading_day`` naming the key's day, and — for a breach —
+    each breaching symbol named."""
+    status = str(document.get("status") or "?")
+    recorded_day = str(document.get("trading_day") or "")
+    if recorded_day != day.isoformat():
+        return False, f"record names trading_day {recorded_day or '<none>'!r}"
+    if status not in _VENDOR_MEASURED:
+        reason = str(document.get("reason") or "").strip()
+        return False, f"{status}" + (f" ({reason})" if reason else "")
+    n = document.get("n")
+    if not isinstance(n, int) or isinstance(n, bool) or n <= 0:
+        return False, f"{status} with n={n!r} (no pair compared)"
+    if status == "breach" and not document.get("breaching_symbols"):
+        return False, f"breach with n={n} naming no symbol"
+    return True, f"{status} n={n}"
+
+
+def read_vendor_divergence_daily(
+    store: GateStore, *, trading_day: dt.date, days: int
+) -> Reading:
+    """The vendor-divergence MetricRecord on ``days`` CONSECUTIVE trading days.
+
+    alpha-engine-config-I10783's remaining closes-when clause. The run-manifest
+    count (:func:`read_vendor_divergence_emitted`) asks whether a cycle carried a
+    ``vendor_crosscheck`` VERDICT; this reads the METRIC document itself,
+    ``data_collection/metrics/vendor_divergence/<day>.json``, one per trading
+    day, which is what the issue's deliverable and closes-when name.
+
+    **The newest day may be pending, never missing.** D17's morning run writes
+    day T's record at T+1 ~09:06 UTC (polygon's free-tier close is T+1), so a
+    reading taken on T before that run has no record for T yet. An ABSENT
+    record for ``trading_day`` itself is labelled PENDING and the window ends
+    at the previous trading day; an absent record for any older day breaks the
+    streak, because a missing measurement is not a passing one.
+
+    Every non-qualifying day is NAMED with what its record said. The strict
+    criterion (``met``) is the streak; the :class:`ObservationWindow` carries
+    the same facts for the 2026-10-03 time-gate extension, live from the first
+    measured day.
+    """
+    statuses: list[tuple[str, bool, str]] = []
+    pending: str | None = None
+    day = trading_day
+    evidence: list[str] = []
+    while len(statuses) < days:
+        key = VENDOR_DIVERGENCE_METRIC_KEY.format(day=day.isoformat())
+        read = read_store_document(store, key)
+        if read.problem is not None:
+            return Reading(
+                met=False,
+                detail=f"could not read {key}: {read.problem}",
+                evidence=(key,),
+                unmeasurable=True,
+                source=_SOURCE_STORE,
+            )
+        if read.absent and day == trading_day and pending is None:
+            pending = day.isoformat()
+        elif read.absent:
+            statuses.append((day.isoformat(), False, "ABSENT"))
+            evidence.append(key)
+        else:
+            qualifies, label = _vendor_day_status(day, read.document or {})
+            statuses.append((day.isoformat(), qualifies, label))
+            evidence.append(key)
+        day = subtract_trading_days(day, 1)
+    streak = 0
+    for _day, qualifies, _label in statuses:
+        if not qualifies:
+            break
+        streak += 1
+    failed = [f"{d}: {label}" for d, ok, label in statuses if not ok]
+    window_end = statuses[0][0] if statuses else trading_day.isoformat()
+    window_start = statuses[-1][0] if statuses else trading_day.isoformat()
+    detail = (
+        f"{streak} consecutive trading day(s) with a measured vendor-divergence record ending "
+        f"{window_end}, against the {days} alpha-engine-config-I10783's closes-when names "
+        f"(window {window_start}..{window_end})"
+    )
+    if pending:
+        detail += f"; {pending} PENDING (its record is written by the next morning's D17 run)"
+    if failed:
+        detail += f"; days that did not qualify: {failed}"
+    # The 2026-10-03 extension of the time-gate ruling (`ObservationWindow`):
+    # live from the first day carrying a MEASURED record; from then on every
+    # day that does not qualify — absent, unmeasurable or malformed — is a
+    # failed observation. Days before the first measurement are the check not
+    # yet producing a reading.
+    observed = 0
+    failures: list[str] = []
+    went_live = False
+    for day_iso, qualifies, label in reversed(statuses):
+        if not qualifies and not went_live:
+            continue
+        went_live = True
+        observed += 1
+        if not qualifies:
+            failures.append(f"{day_iso}: {label}")
+    return Reading(
+        met=streak >= days,
+        detail=detail,
+        evidence=tuple(evidence[:4]) or (VENDOR_DIVERGENCE_METRIC_KEY,),
+        source=_SOURCE_STORE,
+        window=ObservationWindow(
+            live=went_live,
+            observed=observed,
+            required=days,
+            failures=tuple(failures),
+            not_live=(
+                f"no measured metrics/vendor_divergence/<day>.json in the {days} trading days "
+                f"ending {window_end} — every record there is absent or unmeasurable"
+            ),
+            unit="trading day(s)",
         ),
     )
 
 
 def read_eod_universe_covered(
-    store: GateStore, *, trading_day: dt.date, days: int
+    store: GateStore, *, trading_day: dt.date, days: int, due_day: dt.date | None = None
 ) -> Reading:
     """Full EOD universe coverage on ``days`` CONSECUTIVE trading days.
 
@@ -716,6 +942,7 @@ def read_eod_universe_covered(
     breaks the streak: a missing measurement is not a passing one.
     """
     statuses: list[tuple[str, str]] = []
+    versions: dict[str, str] = {}
     day = trading_day
     for _ in range(days):
         key = f"metrics/eod_completeness/{day.isoformat()}.json"
@@ -731,7 +958,9 @@ def read_eod_universe_covered(
         if read.absent:
             statuses.append((day.isoformat(), "ABSENT"))
         else:
-            statuses.append((day.isoformat(), str((read.document or {}).get("status") or "?")))
+            document = read.document or {}
+            statuses.append((day.isoformat(), str(document.get("status") or "?")))
+            versions[day.isoformat()] = str(document.get("code_sha") or "")
         day = subtract_trading_days(day, 1)
     streak = 0
     for _day, status in statuses:
@@ -773,6 +1002,30 @@ def read_eod_universe_covered(
                 f"{trading_day.isoformat()} — the completeness guard has produced no reading"
             ),
             unit="trading day(s)",
+            # Option (c): the newest trading day's record is the current
+            # evidence (plus older days that carry the same `code_sha`, when the
+            # MetricRecord carries one). A newest day with no record is missing
+            # proof, never a pass.
+            # ``due_day`` (`evidence.completeness_due_day`): a newer day whose
+            # EOD run is not yet due and has no record is not missing proof —
+            # it is skipped, exactly as `read_completeness_metric` skips it. A
+            # record that already exists is always graded.
+            current=current_evidence(
+                [
+                    Observation(
+                        label=day_iso,
+                        version=versions.get(day_iso, ""),
+                        failure=None if status == "GREEN" else status,
+                        present=status != "ABSENT",
+                    )
+                    for day_iso, status in statuses
+                    if not (
+                        status == "ABSENT"
+                        and due_day is not None
+                        and dt.date.fromisoformat(day_iso) > due_day
+                    )
+                ]
+            ),
         ),
     )
 

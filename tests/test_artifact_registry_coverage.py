@@ -84,7 +84,13 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # documents). This comment used to say "no row yet, deliberately" — that
     # is no longer true; a cadence now runs both producers.
     "data_gate/producers/v1_data_stage.py": 1,
-    "data_gate/producers/executor_profile.py": 1,
+    # 2 since alpha-engine-config-I11063: the same run also PUTs the
+    # executor's observed write set to
+    # metrics/executor_profile/write_set/latest.json (evidence for the
+    # executor role's IAM narrowing; no clause reads it). Grandfathered
+    # under `data_collection/metrics/executor_profile/write_set/` in
+    # ARTIFACT_REGISTRY.yaml until its first scheduled write lands.
+    "data_gate/producers/executor_profile.py": 2,
     # I11689: cloudtrail_evidence latest is registered; per-run proofs share its writer.
     "data_gate/producers/cloudtrail_evidence.py": 1,
     # alpha-engine-config-I11058 — the run-record writer both producers'
@@ -459,6 +465,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # ARTIFACT_REGISTRY.yaml (per-feature parquet artifacts, ArcticDB migration
     # retired the S3 mirror) — no new registry row needed.
     "features/metron_supplemental.py": 1,
+    # D50 settled rebuild of features/{D-1} (alpha-engine-config-I12023): the
+    # group parquets plus the settlement.json marker. Both land under the
+    # grandfathered "features/" path_prefix, so no new registry row is needed.
+    "features/settled_regrade.py": 2,
     "features/writer.py": 1,
     "preflight.py": 1,
     "rag/pipelines/emit_manifest.py": 2,
