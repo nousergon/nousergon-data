@@ -239,6 +239,14 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     "shadow-morning": 7200,
     "post-market-data": 5400,
     "post-market-arctic-append": 3600,
+    # D50 (alpha-engine-config-I12023): one D31 feature compute over pinned
+    # inputs, no fetch. Sized from D31's own run on 2026-09-23 (v1 manifest,
+    # `shadow/recompute_lineage.py` docstring): 24 min, 21 of them the
+    # corporate-action jump audit this rebuild runs too, plus box boot and the
+    # venv build. About twice that, like the append beside it, and declared
+    # rather than inherited because it extends the morning schedule's worst
+    # case (`data_collection_stack.worst_case_seconds`).
+    "features-settled-regrade": 3600,
 }
 
 
@@ -429,6 +437,13 @@ _WORKLOADS: dict[str, str] = {
     # ArcticDB evidence without ever opening ArcticDB itself, which is
     # unreachable from the laptop (alpha-engine-config-I9771).
     "arctic-probe": "python -m collectors.arctic_probe",
+    # alpha-engine-config-I12023 (Crucible v2 ruling 6024224623 §2): D50, the
+    # scheduled rebuild of features/{D-1} from the bar D17 settled this
+    # morning, every other input pinned to the VersionId D-1's D31 run
+    # recorded (`features/settled_regrade.py`). The morning schedule runs it
+    # LAST, after `arctic-probe`: it writes S3 keys only and no ArcticDB, so
+    # the probe still describes the morning's final library state.
+    "features-settled-regrade": "python weekly_collector.py --features-settled-regrade",
     # alpha-engine-config-I10753: the five weekly units with no standalone
     # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
     # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no
