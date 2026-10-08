@@ -482,11 +482,15 @@ class TestHealOutcomeNotifications:
         "HealConvergedNotify", "HealReplayDispatchFailed", "HealNonConvergent",
     ])
     def test_reaches_cost_guard_tail_on_success_and_on_sns_failure(self, states, state_name):
+        # alpha-engine-config-I12020: the cost-guard tail is entered through
+        # the bounded trader-reconcile drain (DrainTraderReconcile), every
+        # edge of which ends at StopTradingInstance
+        # (tests/test_sf_trader_reconcile_drain.py).
         st = states[state_name]
-        assert st["Next"] == "StopTradingInstance"
+        assert st["Next"] == "DrainTraderReconcile"
         catches = [c for c in st["Catch"] if c["ErrorEquals"] == ["States.ALL"]]
         assert len(catches) == 1
-        assert catches[0]["Next"] == "StopTradingInstance"
+        assert catches[0]["Next"] == "DrainTraderReconcile"
 
     def test_nonconvergent_never_reaches_a_halt_state(self, states):
         _HALT = {"HandleFailure", "FailExecution", "ForceStopInstance"}

@@ -103,6 +103,11 @@ _RECONCILE_ONLY = _COLLECTOR_DEPENDENT | {
     "PublishCadenceReadDegraded", "CheckExerciseCadence", "SetCadenceUnknownValueDegraded",
     "PublishCadenceUnknownValueDegraded", "LaunchWeeklyExerciseRun",
     "SetWeeklyExerciseDegradedFlag", "WeeklyExerciseLaunchFailed",
+    # alpha-engine-config-I12020: the bounded drain in front of the box stop
+    # that keeps the box up for the v2 trader's boot-time reconcile.
+    "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
+    "TraderReconcileDrainWait", "ExtractTraderReconcileDrainStatusError",
+    "SetTraderReconcileDrainDegraded", "PublishTraderReconcileDrainUnsettled",
 }
 
 
