@@ -98,6 +98,13 @@ POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset({
     # D49, Nasdaq-100 membership + weights (alpha-engine-config-I11296). Same
     # reasoning; it is D48's weight source for the NDX leg.
     "D49",
+    # D50, the morning rebuild of features/{D-1} from the settled bar
+    # (alpha-engine-config-I12023, Crucible v2 ruling 2026-10-06). Registered
+    # after the baseline; the audit scored no such unit.
+    "D50",
+    # D51, the daily panel (alpha-engine-config-I10791, plan P-25 amendment 1):
+    # a phase-3 product the audit predates.
+    "D51",
 })
 
 AUDIT_UNITS = 46
@@ -196,6 +203,11 @@ def test_every_generated_base_clause_maps_back_to_a_cell():
                 # v2 phase 4's irreversible v1-pipeline deletion — a
                 # data-phase exit precondition, not a per-unit audit cell.
                 "data.standing.",
+                # Brian's 2026-10-04 option (c) (alpha-engine-config-I11973):
+                # one row per STAGED guard grading the phase-2 exit's
+                # "enforcing" half (`data_gate/guard_promotion.py`) — a fleet
+                # guard's promotion, not a per-unit audit cell.
+                "data.guard_promotion.",
             )
         )
         and not name.endswith(".completeness")

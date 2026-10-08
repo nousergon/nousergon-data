@@ -418,6 +418,30 @@ class TestRunEndToEnd:
         ):
             pf.run()
 
+    def test_daily_freshness_uses_the_new_york_day_after_utc_midnight(self):
+        """2026-10-08 02:31Z is 22:31 ET on 10-07: SPY at the 10-06 close is one
+        session behind, not two, so an evening heal run must not be refused."""
+        import pandas as pd
+        from datetime import datetime, timezone
+
+        pf = _make("daily")
+        mock_arctic_obj = MagicMock()
+        mock_lib = MagicMock()
+        mock_lib.read.return_value = MagicMock(
+            data=pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp("2026-10-06")]))
+        )
+        mock_arctic_obj.get_library.return_value = mock_lib
+
+        class _Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 8, 2, 31, tzinfo=timezone.utc)
+
+        with patch("arcticdb.Arctic", return_value=mock_arctic_obj), patch(
+            "preflight.datetime", _Clock, create=True
+        ), patch("datetime.datetime", _Clock):
+            pf._check_macro_spy_fresh_trading_days(max_stale=1)
+
     def test_phase2_requires_fmp_stable(self):
         pf = _make("phase2")
         mock_s3 = MagicMock()

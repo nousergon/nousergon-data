@@ -99,23 +99,36 @@ def _all_states(states: dict):
                 yield from _all_states(state[key]["States"])
 
 
-def expected_wait_units(definition: dict, verify_units: list[str], owners: dict[str, str]) -> list[str]:
+def expected_wait_units(
+    definition: dict,
+    verify_units: list[str],
+    owners: dict[str, str],
+    excluded: dict[str, str] | None = None,
+) -> list[str]:
     """The schedule's verify_units, minus any unit whose v1 owner STAGE is still
     in this definition — that stage still produces it inline (DataPhase2 and
-    RAGIngestion for D15/D16/D46, alpha-engine-config-I10753's own cutover)."""
+    RAGIngestion for D15/D16/D46, alpha-engine-config-I10753's own cutover) —
+    and minus the schedule's DECLARED readiness exclusions
+    (`data_collection_stack.READINESS_WAIT_EXCLUSIONS`: D50, which the preopen
+    predictor does not read, alpha-engine-config-I12023)."""
     present = {name for name, _ in _all_states(definition["States"])}
     out = []
     for unit in verify_units:
         _machine, _, stage = owners.get(unit, "").partition(":")
         if stage and stage in present:
             continue
+        if unit in (excluded or {}):
+            continue
         out.append(unit)
     return out
 
 
-def wait_unit_problems(definition: dict, schedule_input: dict, owners: dict[str, str]) -> list[str]:
+def wait_unit_problems(
+    definition: dict, schedule_input: dict, owners: dict[str, str], schedule: str = ""
+) -> list[str]:
     payload = definition["States"]["WaitForCollectionManifests"]["Parameters"]["Payload"]
-    want = expected_wait_units(definition, schedule_input["verify_units"], owners)
+    excluded = stack.READINESS_WAIT_EXCLUSIONS.get(schedule, {})
+    want = expected_wait_units(definition, schedule_input["verify_units"], owners, excluded)
     problems = []
     if payload["units"] != want:
         problems.append(f"units {payload['units']} != derived {want}")
@@ -130,7 +143,41 @@ def wait_unit_problems(definition: dict, schedule_input: dict, owners: dict[str,
 @pytest.mark.parametrize("filename", sorted(V1))
 def test_each_wait_reads_exactly_the_units_its_schedule_verifies(filename, schedules, owners):
     _machine, schedule = V1[filename]
-    assert wait_unit_problems(_definition(filename), schedules[schedule]["input"], owners) == []
+    assert wait_unit_problems(_definition(filename), schedules[schedule]["input"], owners, schedule) == []
+
+
+def test_readiness_exclusions_are_declared_verify_units_with_a_reason(schedules):
+    """Each exclusion names a unit its schedule really verifies, says why, and
+    is consumed by a v1 wait on that schedule — a stale or speculative
+    exclusion is a unit silently dropped from a consumer's predicate."""
+    waited_schedules = {sched for _m, sched in V1.values()}
+    for schedule, excluded in stack.READINESS_WAIT_EXCLUSIONS.items():
+        assert schedule in waited_schedules, schedule
+        verify_units = schedules[schedule]["input"]["verify_units"]
+        for unit, reason in excluded.items():
+            assert unit in verify_units, (schedule, unit)
+            assert reason.strip(), (schedule, unit)
+
+
+def test_the_preopen_wait_stays_on_d17_and_d18(schedules):
+    """alpha-engine-config-I12023: D50 joins the morning verify_units, and the
+    trading morning does not wait for it — the predictor reads ArcticDB."""
+    assert schedules["data-collection-morning"]["input"]["verify_units"] == ["D17", "D18", "D50"]
+    units = _definition("step_function_daily.json")["States"]["WaitForCollectionManifests"][
+        "Parameters"]["Payload"]["units"]
+    assert units == ["D17", "D18"]
+    assert set(stack.READINESS_WAIT_EXCLUSIONS["data-collection-morning"]) == {"D50"}
+
+
+def test_an_undeclared_morning_unit_still_fails_the_preopen_wait(schedules, owners):
+    """Mutation: the exclusion is not a wildcard. A further morning
+    verify_unit that is not declared excluded must appear in the wait."""
+    schedule_input = copy.deepcopy(schedules["data-collection-morning"]["input"])
+    schedule_input["verify_units"].append("D48")
+    problems = wait_unit_problems(
+        _definition("step_function_daily.json"), schedule_input, owners, "data-collection-morning"
+    )
+    assert problems and "D48" in problems[0]
 
 
 def test_a_unit_added_to_a_schedule_fails_its_consumer(schedules, owners):
@@ -138,7 +185,7 @@ def test_a_unit_added_to_a_schedule_fails_its_consumer(schedules, owners):
     post-close reconcile wait does not read is caught."""
     schedule_input = copy.deepcopy(schedules["data-collection-eod"]["input"])
     schedule_input["verify_units"].append("D48")
-    problems = wait_unit_problems(_definition(EOD_RECONCILE), schedule_input, owners)
+    problems = wait_unit_problems(_definition(EOD_RECONCILE), schedule_input, owners, "data-collection-eod")
     assert problems and "D48" in problems[0]
 
 

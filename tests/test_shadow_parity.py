@@ -149,15 +149,25 @@ def test_a_client_created_before_activation_is_still_redirected():
     convention.
     """
     import boto3
+    import botocore.client
 
+    real = botocore.client.BaseClient._make_api_call
     client = boto3.client("s3", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
     seen: list[dict] = []
     activate(ROOT)
+    saved = interceptor._ORIGINAL
     try:
         interceptor._ORIGINAL = lambda self, op, params: seen.append({"op": op, **params}) or {}
         client.put_object(Bucket="alpha-engine-research", Key="market_data/technicals/latest.json", Body=b"{}")
     finally:
+        # Put the real original back BEFORE deactivate(): uninstall() restores
+        # whatever `_ORIGINAL` holds onto BaseClient, so leaving the stub there
+        # made every later boto3 call in this xdist worker return `{}` — which
+        # is how tests/test_features_settled_regrade.py failed 21 setups with
+        # KeyError 'VersionId' whenever loadfile put it after this file.
+        interceptor._ORIGINAL = saved
         deactivate()
+    assert botocore.client.BaseClient._make_api_call is real
     assert seen and seen[0]["Key"] == "staging/shadow/2026-09-12/market_data/technicals/latest.json"
 
 
@@ -1427,3 +1437,20 @@ def test_cutover_gate_reads_unsettled_prior_day_as_unmet():
     reading = ev.read_parity(store, trading_day=TRADING_DAY)
     assert reading.met is False
     assert "prior_day_settled.unsettled=1" in reading.detail
+
+
+def test_d50_rebuild_shares_d31_features_prefix_and_adds_its_marker_row():
+    """D50 rewrites D31's features/{date}/ parquet keys in place
+    (`writes_shared_with: [D31]`, alpha-engine-config-I12023), so the parquet
+    half is ONE comparison attributed to both units, never a second row that
+    double-counts the same bytes. Its settlement.json marker is its own key."""
+    targets = parity.expand_writes(load_units(), TRADING_DAY)
+    day = TRADING_DAY.isoformat()
+    prefix = [t for t in targets if t.kind == "prefix" and t.value == f"features/{day}/"]
+    assert len(prefix) == 1
+    assert set(prefix[0].unit_id.split(",")) == {"D31", "D50"}
+    marker = [t for t in targets if t.value == f"features/{day}/settlement.json"]
+    assert len(marker) == 1
+    assert marker[0].unit_id == "D50"
+    assert marker[0].kind == "key"
+    assert marker[0].reason == ""

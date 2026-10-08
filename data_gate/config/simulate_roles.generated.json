@@ -1,0 +1,37 @@
+{
+  "schema_version": "data_gate_simulate_roles.v1",
+  "generated_by": "python -m data_gate.simulate_plan roles --write",
+  "derived_from": [
+    "data_gate/config/writer_identities.yaml",
+    "registry.d/units/*.yaml (non-retired, identity not partially excluded, >=1 simulable write)"
+  ],
+  "gate_role": "github-actions-data-gate-read",
+  "grant": {
+    "repo": "nous-ergon-ops",
+    "path": "infrastructure/iam/github-actions-data-gate-read/data-gate-read.json",
+    "sid": "DataGateSimulateWriterIdentities",
+    "action": "iam:SimulatePrincipalPolicy"
+  },
+  "roles": [
+    {
+      "role": "alpha-engine-crypto-balances-role",
+      "arn": "arn:aws:iam::711398986525:role/alpha-engine-crypto-balances-role"
+    },
+    {
+      "role": "alpha-engine-dashboard-role",
+      "arn": "arn:aws:iam::711398986525:role/alpha-engine-dashboard-role"
+    },
+    {
+      "role": "alpha-engine-executor-role",
+      "arn": "arn:aws:iam::711398986525:role/alpha-engine-executor-role"
+    },
+    {
+      "role": "nousergon-data-collection-box-role",
+      "arn": "arn:aws:iam::711398986525:role/nousergon-data-collection-box-role"
+    },
+    {
+      "role": "nousergon-data-inst-ownership-sync",
+      "arn": "arn:aws:iam::711398986525:role/nousergon-data-inst-ownership-sync"
+    }
+  ]
+}

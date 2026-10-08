@@ -1208,40 +1208,56 @@ def _skip_ctx(run_date="2026-08-16", **flags) -> sfp.PreflightContext:
     )
 
 
+def _s3_with_verdict(body: str) -> MagicMock:
+    """An S3 client whose arena/model/{run_date}.verdict holds ``body``."""
+    import io as _io
+
+    s3 = MagicMock()
+    s3.get_object.side_effect = lambda **kw: {"Body": _io.BytesIO(body.encode())}
+    return s3
+
+
 def _s3_with_last_modified(day: str) -> MagicMock:
+    """The OLD witness: a live weights manifest dated ``day``. Kept so the
+    regression tests can hand the check the stale-manifest world that
+    misfired and show it is no longer consulted (alpha-engine-config-I12050)."""
     s3 = MagicMock()
     s3.head_object.return_value = {
         "LastModified": _dt.fromisoformat(f"{day}T12:00:00+00:00").astimezone(_tz.utc)
     }
+    s3.get_object.side_effect = _NotFound()
     return s3
 
 
-def test_skip_coherence_fails_when_artifact_predates_run_date():
-    """THE regression: manifest dated 2026-08-15, run_date 2026-08-16."""
-    ctx = _skip_ctx(run_date="2026-08-16", skip_predictor_training=True)
-    with patch("boto3.client", return_value=_s3_with_last_modified("2026-08-15")):
+@pytest.mark.parametrize(
+    "word", ["decided", "held", "unmeasurable", "unservable", "bootstrap"]
+)
+def test_skip_coherence_passes_on_every_known_verdict_word(word):
+    """Every decision.status word means the cycle trained and selected --
+    including the ones that promoted nothing."""
+    ctx = _skip_ctx(run_date="2026-08-14", skip_predictor_training=True)
+    s3 = _s3_with_verdict(word)
+    with patch("boto3.client", return_value=s3):
         res = sfp.check_skip_flag_artifact_coherence(ctx)
-    assert res.status == "fail"
-    assert "2026-08-15 < calendar_date 2026-08-16" in res.details["violations"][0]
-    assert "CheckPredictorSkipWeightsFresh" in res.details["violations"][0]
-
-
-def test_skip_coherence_passes_when_artifact_is_current():
-    ctx = _skip_ctx(run_date="2026-08-15", skip_predictor_training=True)
-    with patch("boto3.client", return_value=_s3_with_last_modified("2026-08-15")):
-        res = sfp.check_skip_flag_artifact_coherence(ctx)
-    assert res.status == "ok"
+    assert res.status == "ok", res.message
     assert res.details["claims_checked"] == 1
+    s3.get_object.assert_called_once_with(
+        Bucket="alpha-engine-research", Key="arena/model/2026-08-14.verdict"
+    )
+    s3.head_object.assert_not_called()
 
 
-def test_skip_coherence_fails_when_the_artifact_does_not_exist():
+def test_skip_coherence_fails_when_the_cycle_has_no_verdict():
+    """No verdict for this trading day: the cycle never reached
+    ModelZooSelect, so the skip claim is false."""
     ctx = _skip_ctx(skip_predictor_training=True)
     s3 = MagicMock()
-    s3.head_object.side_effect = _NotFound()
+    s3.get_object.side_effect = _NotFound()
     with patch("boto3.client", return_value=s3):
         res = sfp.check_skip_flag_artifact_coherence(ctx)
     assert res.status == "fail"
     assert "does not exist" in res.details["violations"][0]
+    assert "arena/model/2026-08-16.verdict" in res.details["violations"][0]
 
 
 def test_skip_coherence_unreadable_artifact_is_unknown_not_pass():
@@ -1250,24 +1266,40 @@ def test_skip_coherence_unreadable_artifact_is_unknown_not_pass():
     through — the same rule that made the watchdog's UNREADABLE page."""
     ctx = _skip_ctx(skip_predictor_training=True)
     s3 = MagicMock()
-    s3.head_object.side_effect = RuntimeError("s3 5xx")
+    s3.get_object.side_effect = RuntimeError("s3 5xx")
     with patch("boto3.client", return_value=s3):
         res = sfp.check_skip_flag_artifact_coherence(ctx)
     assert res.status == "fail"
     assert "unreadable" in res.details["violations"][0]
 
 
-def test_skip_coherence_rejects_a_non_iso_last_modified_instead_of_wrong_passing():
-    """The SF's StringMatches '20*-*-*' shape guard, replicated. A non-ISO
-    serialization compared lexicographically could SILENTLY wrong-pass; it
-    must become the loud path instead."""
+@pytest.mark.parametrize("body", ["", "Decided", "decided\n", "promoted", "unservable "])
+def test_skip_coherence_rejects_an_unknown_word_instead_of_guessing(body):
+    """The SF's StringEquals arms compare the WHOLE body. A body outside the
+    vocabulary (case, whitespace, a new word) means the producer and this
+    check drifted: refuse, never pass."""
     ctx = _skip_ctx(skip_predictor_training=True)
-    s3 = MagicMock()
-    s3.head_object.return_value = {"LastModified": "Sat, 15 Aug 2026 12:00:00 GMT"}
-    with patch("boto3.client", return_value=s3):
+    with patch("boto3.client", return_value=_s3_with_verdict(body)):
         res = sfp.check_skip_flag_artifact_coherence(ctx)
     assert res.status == "fail"
-    assert "not YYYY-MM-DD" in res.details["violations"][0]
+    assert "not one of" in res.details["violations"][0]
+
+
+def test_skip_coherence_ignores_the_promotion_only_live_manifest():
+    """THE regression (alpha-engine-config-I12050). The 2026-10-02 cycle
+    trained and its selection was 'unservable', so the live manifest still
+    read 2026-09-12. The old predicate called that "no completed
+    PredictorTraining for this cycle"; the check must now pass on the
+    verdict and never consult the manifest."""
+    ctx = _skip_ctx(run_date="2026-10-02", skip_predictor_training=True)
+    s3 = _s3_with_verdict("unservable")
+    s3.head_object.return_value = {
+        "LastModified": _dt(2026, 9, 12, 15, 45, tzinfo=_tz.utc)
+    }
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "ok", res.message
+    s3.head_object.assert_not_called()
 
 
 def test_skip_coherence_is_silent_when_the_flag_is_not_claimed():
@@ -1280,6 +1312,7 @@ def test_skip_coherence_is_silent_when_the_flag_is_not_claimed():
     assert res.status == "ok"
     assert res.details["claims_checked"] == 0
     s3.head_object.assert_not_called()
+    s3.get_object.assert_not_called()
 
 
 def test_skip_coherence_without_execution_input_is_ok_not_fail():
@@ -1328,33 +1361,224 @@ def test_skip_predicate_matches_the_sf_definitions_own_guard():
         )
 
     # The predictor entry specifically: the object path must match the
-    # HeadObject the SF performs, or the preflight asserts against a
-    # different artifact than the guard it claims to mirror.
+    # GetObject the SF performs, or the preflight asserts against a different
+    # artifact than the guard it claims to mirror. The SF formats the key
+    # from $.run_date; the preflight from ctx.run_date, the same trading day.
     validate = states["ValidatePredictorSkipWeightsFresh"]
-    sf_target = validate["Parameters"]["Key"]
+    assert validate["Resource"] == "arn:aws:states:::aws-sdk:s3:getObject"
+    sf_target = validate["Parameters"]["Key.$"]
+    assert sf_target == "States.Format('arena/model/{}.verdict', $.run_date)"
     pred = next(p for p in sfp.SKIP_ARTIFACT_PREDICATES
                 if p.flag == "skip_predictor_training")
-    assert pred.key == sf_target, (
+    assert pred.key == "arena/model/{run_date}.verdict", (
         f"preflight checks {pred.key!r} but ValidatePredictorSkipWeightsFresh "
-        f"heads {sf_target!r} — the two have drifted"
+        f"reads {sf_target!r} — the two have drifted"
     )
 
-    # ...and the comparison must still be >= the CALENDAR date, not something
-    # else. alpha-engine-config-I8809: this was `$.run_date` until 2026-08-27,
-    # when NormalizeRunDates made $.run_date the cycle's TRADING day. The left
-    # side is an S3 LastModified — a wall-clock write time — so against the
-    # trading day the guard becomes strictly WEAKER on every Saturday run: a
-    # manifest written on Friday would satisfy "a training run completed for
-    # this cycle". Both sides moved together; that is what this pin exists for.
-    choice = states["CheckPredictorSkipWeightsFresh"]["Choices"][0]["And"]
-    assert any(
-        c.get("StringGreaterThanEqualsPath") == "$.calendar_date" for c in choice
-    ), (
-        "CheckPredictorSkipWeightsFresh no longer compares >= $.calendar_date; "
-        "check_skip_flag_artifact_coherence's last_modified_gte_calendar_date "
-        "predicate is now wrong"
+    # ...and the accepted words must be exactly the ones the SF's Choice
+    # lets through to PredictorTrainingSkipped (alpha-engine-config-I12050).
+    (rule,) = states["CheckPredictorSkipWeightsFresh"]["Choices"]
+    assert rule["Next"] == "PredictorTrainingSkipped"
+    (or_,) = [c for c in rule["And"] if "Or" in c]
+    sf_words = {c["StringEquals"] for c in or_["Or"]}
+    assert pred.kind == "body_is_known_word"
+    assert set(pred.accepted_bodies) == sf_words
+    assert len(pred.accepted_bodies) == len(sf_words)
+
+
+# ── watch-rerun-2026-10-02-2: the SF's own bypasses of the guard ───────────
+#
+# alpha-engine-config-I11655 gave CheckSkipPredictorTraining a VACUOUS-skip
+# rule (every weights consumer skipped -> PredictorTrainingSkipped, no
+# HeadObject) and taught scripts/weekly_sf_rerun.py the same rule, but not
+# this check. watch-rerun-2026-10-02-2 -- a Director-only recovery whose
+# predecessor HAD run PredictorTraining (promotion BLOCKed, so the serving
+# manifest stayed at 2026-09-12) -- then failed WeeklyPreflightGate in 20
+# seconds on a claim the SF itself would never have tested.
+
+#: The execution input of watch-rerun-2026-10-02-2, verbatim (its skip_*
+#: keys, run_date, calendar_date; no mode).
+_WATCH_RERUN_2026_10_02_2 = {
+    "calendar_date": "2026-10-03",
+    "run_date": "2026-10-02",
+    "skip_backtester": True,
+    "skip_challenger_shadow": True,
+    "skip_counterfactual": True,
+    "skip_data_phase2": True,
+    "skip_eval_judge": True,
+    "skip_evaluator": True,
+    "skip_morning_enrich": True,
+    "skip_parity": True,
+    "skip_portfolio_optimizer_backtest": True,
+    "skip_predictor_backtest": True,
+    "skip_predictor_training": True,
+    "skip_rag_ingestion": True,
+    "skip_rationale_clustering": True,
+    "skip_regime_retrospective_eval": True,
+    "skip_regime_substrate": True,
+    "skip_research_self_test": True,
+    "skip_saturday_health_check": True,
+    "skip_scanner": True,
+    "skip_signals_envelope": True,
+    "skip_thinktank_coverage": True,
+}
+
+
+def _ctx_from_input(event: dict) -> sfp.PreflightContext:
+    """Build the context exactly as the WeeklyPreflight handler does."""
+    return sfp.PreflightContext(
+        bucket="alpha-engine-research",
+        today="2026-10-04",
+        prior_trading_day="2026-10-02",
+        run_date=event.get("run_date"),
+        calendar_date=event.get("calendar_date"),
+        mode=event.get("mode"),
+        skip_flags={k: v for k, v in event.items() if k.startswith("skip_")},
     )
-    assert pred.kind == "last_modified_gte_calendar_date"
+
+
+def test_watch_rerun_2026_10_02_2_input_passes_without_a_head_object():
+    """THE regression. Serving manifest dated 2026-09-12, every weights
+    consumer skipped: the SF ends at PredictorTrainingSkipped with no
+    HeadObject, so this check must neither fail nor spend the S3 call."""
+    ctx = _ctx_from_input(_WATCH_RERUN_2026_10_02_2)
+    s3 = _s3_with_last_modified("2026-09-12")
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(ctx)
+    assert res.status == "ok", res.message
+    assert res.details["claims_checked"] == 1
+    assert res.details["verified"] == []
+    assert len(res.details["bypassed"]) == 1
+    assert "CheckPredictorSkipWeightsFresh" in res.details["bypassed"][0]
+    s3.head_object.assert_not_called()
+    s3.get_object.assert_not_called()
+
+
+def test_watch_rerun_2026_10_02_2_input_through_run_preflight():
+    """Same input, through run_preflight's own keywords -- the path the
+    Lambda takes -- so a dropped kwarg cannot hide behind a hand-built ctx."""
+    event = _WATCH_RERUN_2026_10_02_2
+    s3 = _s3_with_last_modified("2026-09-12")
+    with patch("boto3.client", return_value=s3):
+        _, results = sfp.run_preflight(
+            capabilities=sfp.LAMBDA_CAPABILITIES,
+            run_date=event["run_date"],
+            calendar_date=event["calendar_date"],
+            skip_flags={k: v for k, v in event.items() if k.startswith("skip_")},
+            checks=[sfp.check_skip_flag_artifact_coherence],
+        )
+    (res,) = results
+    assert res.status == "ok", res.message
+    s3.head_object.assert_not_called()
+    s3.get_object.assert_not_called()
+
+
+@pytest.mark.parametrize("consumer", [
+    "skip_backtester",
+    "skip_predictor_backtest",
+    "skip_portfolio_optimizer_backtest",
+    "skip_parity",
+    "skip_evaluator",
+])
+def test_one_running_weights_consumer_restores_the_freshness_proof(consumer):
+    """The bypass is all-five-or-nothing, like the SF rule: re-enable any one
+    consumer and the proof is demanded again -- absent verdict fails, the
+    real 2026-10-02 verdict passes (alpha-engine-config-I12050: before, the
+    2026-09-12 live manifest failed this input although the cycle trained)."""
+    event = dict(_WATCH_RERUN_2026_10_02_2)
+    event.pop(consumer)
+    with patch("boto3.client", return_value=_s3_with_last_modified("2026-09-12")):
+        res = sfp.check_skip_flag_artifact_coherence(_ctx_from_input(event))
+    assert res.status == "fail"
+    assert "arena/model/2026-10-02.verdict" in res.details["violations"][0]
+    s3 = _s3_with_verdict("unservable")
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(_ctx_from_input(event))
+    assert res.status == "ok", res.message
+    s3.get_object.assert_called_once_with(
+        Bucket="alpha-engine-research", Key="arena/model/2026-10-02.verdict"
+    )
+
+
+def test_a_string_true_consumer_skip_does_not_bypass():
+    """The SF uses BooleanEquals: a string "true" routes to the guard, so it
+    must here too."""
+    event = dict(_WATCH_RERUN_2026_10_02_2, skip_evaluator="true")
+    with patch("boto3.client", return_value=_s3_with_last_modified("2026-09-12")):
+        res = sfp.check_skip_flag_artifact_coherence(_ctx_from_input(event))
+    assert res.status == "fail"
+
+
+def test_backtest_eval_mode_bypasses_like_the_sf():
+    event = {"run_date": "2026-10-02", "calendar_date": "2026-10-03",
+             "mode": "backtest-eval", "skip_predictor_training": True}
+    s3 = _s3_with_last_modified("2026-09-12")
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(_ctx_from_input(event))
+    assert res.status == "ok"
+    s3.head_object.assert_not_called()
+    s3.get_object.assert_not_called()
+
+
+def test_the_key_is_the_trading_day_not_the_calendar_date():
+    """alpha-engine-config-I12050: the verdict is keyed by the cycle's
+    trading day ($.run_date past NormalizeRunDates), as ReadModelZooArenaCycle
+    keys it. A Saturday calendar_date must not leak into the key, and no
+    wall-clock comparison against it remains."""
+    event = {"run_date": "2026-10-02", "calendar_date": "2026-10-03",
+             "skip_predictor_training": True}
+    s3 = _s3_with_verdict("held")
+    with patch("boto3.client", return_value=s3):
+        res = sfp.check_skip_flag_artifact_coherence(_ctx_from_input(event))
+    assert res.status == "ok", res.message
+    s3.get_object.assert_called_once_with(
+        Bucket="alpha-engine-research", Key="arena/model/2026-10-02.verdict"
+    )
+
+
+def _sf_choice_conditions(rule: dict) -> dict:
+    """Flatten one Choice rule's And into {input_key: required_value}."""
+    out: dict = {}
+    for c in rule.get("And", [rule]):
+        key = c["Variable"].removeprefix("$.")
+        if "BooleanEquals" in c:
+            out[key] = c["BooleanEquals"]
+        elif "StringEquals" in c:
+            out[key] = c["StringEquals"]
+        else:
+            assert c.get("IsPresent") is True, f"unmodelled condition {c}"
+    return out
+
+
+def test_bypass_rules_match_the_sf_rule_for_rule():
+    """Anti-drift pin for sf_bypass_rules. Every CheckSkipPredictorTraining
+    rule that reaches PredictorTrainingSkipped without the guard must be a
+    declared bypass, and nothing else may be one: a missing rule is
+    watch-rerun-2026-10-02-2, an extra rule would wave through a claim the
+    SF still tests."""
+    import json
+    from pathlib import Path
+
+    defn = json.loads(
+        (Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json").read_text()
+    )
+    branch = defn["States"]["ResearchPredictorParallel"]["Branches"]
+    states = next(b["States"] for b in branch if "CheckSkipPredictorTraining" in b["States"])
+    rules = states["CheckSkipPredictorTraining"]["Choices"]
+
+    sf_bypasses = set()
+    for rule in rules:
+        if rule["Next"] != "PredictorTrainingSkipped":
+            continue
+        cond = _sf_choice_conditions(rule)
+        assert cond.pop("skip_predictor_training") is True
+        sf_bypasses.add(frozenset(cond.items()))
+    assert sf_bypasses, "the SF no longer bypasses the guard at all"
+
+    pred = next(p for p in sfp.SKIP_ARTIFACT_PREDICATES
+                if p.flag == "skip_predictor_training")
+    declared = {frozenset(r) for r in pred.sf_bypass_rules}
+    assert declared == sf_bypasses
 
 
 def test_weekly_preflight_receives_the_execution_input():

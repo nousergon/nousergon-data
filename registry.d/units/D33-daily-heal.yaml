@@ -58,8 +58,14 @@ consumers_decision:
   reexam: >-
     data phase 2 heal verifier lands as this key's consumer (add it, delete this block)
 contract:
-  schema: null
-  producer_test: null
+  # alpha-engine-config-I10933: the heal summary data/heal/daily/{date}.json is
+  # this unit's own key. Its staging/daily_closes/{day}.parquet writes go through
+  # the same collectors.daily_closes path as D17/D19, whose contract
+  # (staging_daily_closes.schema.json) already governs those rows. No pin until
+  # the data phase-2 heal verifier lands as the consumer (it pins
+  # daily_heal_summary.schema.json, and consumers_decision goes).
+  schema: contracts/daily_heal_summary.schema.json
+  producer_test: tests/test_daily_heal_summary_contract.py
   consumer_pins: []
 registry_rows:
   - daily_heal_summary
@@ -69,6 +75,10 @@ detectors:
     via: "alpha-engine-daily-heal-days-healed"
     state: BROKEN
     note: an alarm over a producer that NEVER RUNS. A detector that cannot fire is not a detector.
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # Live alarm on AlphaEngine/Data daily_heal_days_healed, emitted by
+    # weekly_collector.py's daily heal; codified in alpha-engine-orchestration.yaml.
+    subject: "alpha-engine-daily-heal-days-healed"
 freshness:
   family: morning
   deadline: "07:30 America/New_York"

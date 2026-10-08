@@ -54,7 +54,9 @@ _CALENDAR_SITES = {
     # An S3 LastModified is a wall-clock write time. Against the trading day
     # these comparisons become strictly WEAKER on every Saturday run.
     "CheckUniverseMembershipFresh",
-    "CheckPredictorSkipWeightsFresh",
+    # CheckPredictorSkipWeightsFresh LEFT this set with alpha-engine-config-I12050:
+    # it no longer compares a LastModified at all. It reads the arena verdict
+    # keyed by the trading day (see test_predictor_skip_guard_is_trading_day_keyed).
     # The converter itself — calendar_date IN, trading_day OUT. The only site
     # in the graph that legitimately touches both.
     "NormalizeRunDates",
@@ -276,7 +278,6 @@ def test_the_lambda_that_reads_the_sweep_actually_deploys_on_merge():
     "state,field",
     [
         ("CheckUniverseMembershipFresh", "pointer_last_modified_date"),
-        ("CheckPredictorSkipWeightsFresh", "manifest_last_modified_date"),
     ],
 )
 def test_last_modified_comparisons_use_the_calendar_date(state, field):
@@ -290,3 +291,21 @@ def test_last_modified_comparisons_use_the_calendar_date(state, field):
     (cmp_,) = [c for c in choice if "StringGreaterThanEqualsPath" in c]
     assert cmp_["Variable"].endswith(field)
     assert cmp_["StringGreaterThanEqualsPath"] == "$.calendar_date"
+
+
+def test_predictor_skip_guard_is_trading_day_keyed():
+    """alpha-engine-config-I12050. The skip_predictor_training guard used to
+    compare the live weights manifest's LastModified with calendar_date. That
+    manifest moves only on promotion, so the guard now reads
+    arena/model/{run_date}.verdict -- the cycle's own record, keyed like every
+    arena prefix by the TRADING day -- and no wall-clock comparison remains.
+    """
+    states = _states()
+    validate = states["ValidatePredictorSkipWeightsFresh"]
+    assert validate["Parameters"]["Key.$"] == (
+        "States.Format('arena/model/{}.verdict', $.run_date)"
+    )
+    assert "PARTITION FAMILY = trading_day" in validate["Comment"]
+    check = states["CheckPredictorSkipWeightsFresh"]
+    assert "PARTITION FAMILY = trading_day" in check["Comment"]
+    assert "$.calendar_date" not in json.dumps(check["Choices"])

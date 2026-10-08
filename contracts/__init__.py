@@ -262,3 +262,30 @@ def validate_rag_manifest(data: dict) -> list[str]:
     build_manifest, D16). Consumer: crucible-dashboard loaders/s3_loader.py::
     load_rag_manifest (alpha-engine-config-I10873, P-07)."""
     return _validate(data, "rag_manifest")
+
+
+def validate_daily_heal_summary(data: dict) -> list[str]:
+    """Validate data/heal/daily/{date}.json (weekly_collector.py::_run_daily_heal,
+    D33). No surviving consumer today; the data phase-2 heal verifier is the
+    planned reader (alpha-engine-config-I10933)."""
+    return _validate(data, "daily_heal_summary")
+
+
+# ── P-25 (alpha-engine-config-I10791): the data collector's daily panel product.
+# Keys, columns, the sidecar and the parity comparator live in contracts/daily_panel.py.
+
+
+def validate_daily_panel_row(data: dict) -> list[str]:
+    """Validate ONE ROW of data_collection/panel/{trading_day}/panel.parquet (rendered via
+    contracts.daily_panel.panel_row_records). Consumer: crucible v2 data.daily."""
+    return _validate(data, "daily_panel")
+
+
+def validate_daily_panel_manifest(data: dict) -> list[str]:
+    """Validate data_collection/panel/{trading_day}/manifest.json (the panel's sidecar)."""
+    return _validate(data, "daily_panel_manifest")
+
+
+def validate_daily_panel_parity(data: dict) -> list[str]:
+    """Validate data_collection/panel/{trading_day}/parity.json (the same-day parity receipt)."""
+    return _validate(data, "daily_panel_parity")

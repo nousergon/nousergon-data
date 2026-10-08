@@ -40,6 +40,8 @@ from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exc
 
 from data_gate import evidence as ev
 from data_gate import exit_criteria as xc
+from data_gate import guard_promotion as gp
+from data_gate import panel as daily_panel
 from data_gate import standalone
 from data_gate import trigger_reconcile as tr
 from data_gate.descriptors import AUDIT_COLUMNS, GUARD_CLASSES, OPTIONAL_GUARD_CLASSES, Unit
@@ -53,6 +55,8 @@ __all__ = [
     "OBSERVATION_WINDOW_CLAUSE_PATTERNS",
     "OBSERVATION_WINDOW_RULING",
     "ObservationWindowClause",
+    "VERSION_BOUND_ACCEPTANCE_RULING",
+    "VERSION_BOUND_CLAUSE_PATTERNS",
     "PHASE1_UNITS_PRODUCED_CLAUSE",
     "RetiredClause",
     "UnconnectedClause",
@@ -119,6 +123,7 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
     "data.phase2.vendor_divergence_emitted",
     "data.phase2.executor_collection_writes_zero",
     "data.phase3.sustained_window",
+    "data.phase3.daily_panel_adopted",
 )
 
 #: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
@@ -388,10 +393,60 @@ OBSERVATION_WINDOW_RULING = (
 )
 
 
+#: Brian's ruling, 2026-10-04 18:39Z, option (c) on the decision card in the
+#: Data Collector thread (recorded on `alpha-engine-config-I11973`, comment
+#: 5983159736): release acceptance is gated by CURRENT, VERSION-BOUND evidence.
+#: Any current failure, or stale or missing proof, blocks; a verified remedy
+#: does not wait for old failures to age out. The long windows stay visible —
+#: observed, incomplete until earned — and v1 deletion stays reliability-gated.
+#: It supersedes the 2026-10-03 trailing-window "no failed observation" half of
+#: :data:`OBSERVATION_WINDOW_RULING` for every clause whose reader reports its
+#: version-bound evidence; the built-and-live half is unchanged.
+VERSION_BOUND_ACCEPTANCE_RULING = (
+    "Brian, 2026-10-04 (option (c), alpha-engine-config-I11973): release is gated by current, "
+    "version-bound evidence — any current failure or stale/missing proof blocks, a verified "
+    "remedy does not wait for old failures to age out, and the long window stays visible as "
+    "an observation until earned. Supersedes the trailing-window half of the 2026-10-03 "
+    "ruling (cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG); its built-and-live half "
+    "stands."
+)
+
+
+#: The clauses :data:`VERSION_BOUND_ACCEPTANCE_RULING` grades: the eleven
+#: time-counted phase-2/3 clauses whose evidence is current completeness,
+#: freshness or live non-silent telemetry. fnmatch patterns, like
+#: :data:`OBSERVATION_WINDOW_CLAUSE_PATTERNS`.
+#:
+#: NOT here: the five long windows option (c) names as observed STANDING rows —
+#: the 20-day/4-Saturday sustain, the monthly cost/pages/human-touch and the
+#: executor's 7-day history. Converting those is nousergon-data PR2047
+#: (`alpha-engine-config-I11305`); until it merges they keep the 2026-10-03
+#: rule exactly, which is stricter than (c), never laxer.
+VERSION_BOUND_CLAUSE_PATTERNS: tuple[str, ...] = (
+    "data.phase2.eod_universe_covered",
+    "data.phase2.empty_fresh_free",
+    "data.phase2.vendor_divergence_emitted",
+    "data.slo.freshness.*",
+)
+
+
 @dataclass(frozen=True)
 class ObservationWindowClause(Clause):
     """A clause that counts elapsed time, graded under Brian's 2026-10-03
-    extension of the time-gate ruling (:data:`OBSERVATION_WINDOW_RULING`).
+    extension of the time-gate ruling (:data:`OBSERVATION_WINDOW_RULING`) as
+    amended by his 2026-10-04 option (c) (:data:`VERSION_BOUND_ACCEPTANCE_RULING`).
+
+    **Option (c), for a reader that reports version-bound evidence**
+    (`evidence.CurrentEvidence`): MET = the check is built and live (below) AND
+    the observations made on the collector code running now — the newest one,
+    plus every consecutive older one that ran the same ``code_sha`` — include
+    at least one and none failed, and the newest due observation is not
+    missing. A failure on an EARLIER code version no longer holds the clause:
+    it stays on the row (``window_failures``) with the original full-window
+    verdict (``window_complete``), so the long window is observed, not hidden.
+
+    **The 2026-10-03 rule, for a reader that does not** (``current`` is
+    ``None``) — stricter, never laxer:
 
     Unlike :class:`StandingClause` it IS graded by its phase's gate — it is
     never excluded from any arithmetic. What changes is only what MET means:
@@ -416,6 +471,9 @@ class ObservationWindowClause(Clause):
     window_required: int = 0
     window_failures: tuple[str, ...] = ()
     window_complete: bool = False
+    #: Option (c)'s version-bound evidence (`evidence.CurrentEvidence`), or
+    #: ``None`` when the reader reports none and the 2026-10-03 rule grades.
+    current: ev.CurrentEvidence | None = None
 
 
 def is_observation_window(clause: Clause) -> bool:
@@ -423,19 +481,23 @@ def is_observation_window(clause: Clause) -> bool:
 
 
 def _observation_window_clause(
-    name: str, requirement: str, reading: ev.Reading, *, phase: str
+    name: str, requirement: str, reading: ev.Reading, *, phase: str, version_bound: bool = False
 ) -> Clause:
-    """One time-counting clause graded under :data:`OBSERVATION_WINDOW_RULING`.
+    """One time-counting clause graded under :data:`OBSERVATION_WINDOW_RULING`,
+    or — ``version_bound`` — under :data:`VERSION_BOUND_ACCEPTANCE_RULING`.
 
     Fails CLOSED: a reading with no window facts cannot show its check is
     live, so it is UNMET with the reason rather than falling back to anything.
+    A ``version_bound`` clause whose reader reported no version-bound evidence
+    (a document with no per-cycle rows) is graded on the full trailing window
+    instead — the 2026-10-03 rule, stricter than (c), never laxer.
     """
     window = reading.window
     common = dict(
         phase=phase,
         source=reading.source,
         as_of=reading.as_of,
-        ruling=OBSERVATION_WINDOW_RULING,
+        ruling=VERSION_BOUND_ACCEPTANCE_RULING if version_bound else OBSERVATION_WINDOW_RULING,
     )
     if reading.unmeasurable:
         return ObservationWindowClause(
@@ -456,14 +518,18 @@ def _observation_window_clause(
         window_required=window.required,
         window_failures=window.failures,
         window_complete=window.complete,
+        current=window.current if version_bound else None,
     )
     progress = f"{window.observed} of {window.required} {window.unit} observed"
+    current = window.current if version_bound else None
     if not window.live:
         met = False
         verdict = (
             f"NOT LIVE: {window.not_live}. Under the 2026-10-03 ruling this passes only once "
             "its check is built and has produced a real reading"
         )
+    elif current is not None:
+        met, verdict = _version_bound_verdict(window, current, progress)
     elif window.failures:
         met = False
         verdict = (
@@ -481,6 +547,11 @@ def _observation_window_clause(
                 else "the window keeps running behind it and any failed observation reopens it"
             )
         )
+    if version_bound and current is None and window.live:
+        verdict = (
+            "the reader reported no version-bound evidence (no per-cycle rows), so this is "
+            f"graded on the full trailing window — stricter than option (c), never laxer: {verdict}"
+        )
     return ObservationWindowClause(
         name,
         requirement,
@@ -489,6 +560,33 @@ def _observation_window_clause(
         reading.evidence,
         **common,
         **facts,
+    )
+
+
+def _version_bound_verdict(
+    window: ev.ObservationWindow, current: ev.CurrentEvidence, progress: str
+) -> tuple[bool, str]:
+    """Option (c)'s verdict for a live check (:data:`VERSION_BOUND_ACCEPTANCE_RULING`)."""
+    version = current.version or "an unrecorded code version, so only the newest observation"
+    history = (
+        f"long window observed, not gating: {progress}, original full-window verdict "
+        f"{'complete' if window.complete else 'incomplete'}"
+        + (f", {len(window.failures)} failed observation(s) on record" if window.failures else "")
+    )
+    if current.stale:
+        return False, (
+            f"STALE: {current.stale}. Under the 2026-10-04 option (c) ruling missing proof blocks "
+            f"release exactly as a failure does ({history})"
+        )
+    if current.failures:
+        return False, (
+            f"CURRENT FAILURE on {version}: {list(current.failures)[:6]}. Under the 2026-10-04 "
+            f"option (c) ruling a failure on the code running now blocks release until a remedy "
+            f"is observed ({history})"
+        )
+    return True, (
+        f"MET on current version-bound evidence (2026-10-04 option (c)): {current.observed} "
+        f"observation(s) on {version}, latest {current.latest}, none failed; {history}"
     )
 
 
@@ -733,6 +831,12 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         "guard has been COMMISSIONED by an induced fault (observability-policy §9.1: a guard "
         "that has never fired is not in service)"
     )
+    if guard == "pit":
+        requirement = (
+            f"every key {unit.unit_id} publishes carries `as_of` and `available_at`, with as_of <= "
+            "available_at <= the publishing run's manifest `finished` (data_collection_plan_260914.md "
+            "§2 objective 4, P-15), AND " + requirement
+        )
     if unit.retired:
         return _retired(unit, name, requirement, "data-phase2")
     if state == "not_applicable":
@@ -750,6 +854,8 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
             as_of=str(unit.raw["audit"]["baseline_date"]),
         )
     reading = ev.read_guard_commissioning(store, unit, guard, trading_day=trading_day)
+    if guard == "pit":
+        reading = _pit_and_commissioning(ev.read_pit(store, unit, trading_day=trading_day), reading)
     if reading.unmeasurable:
         return unmeasurable(
             name,
@@ -768,6 +874,26 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
         phase="data-phase2",
         source=reading.source,
         as_of=reading.as_of,
+    )
+
+
+def _pit_and_commissioning(stamps: ev.Reading, commissioning: ev.Reading) -> ev.Reading:
+    """``data.<unit>.guard.pit``: the stamps on what was published, AND the guard commissioned.
+
+    `alpha-engine-config-I10782` puts the point-in-time check itself into this
+    clause; it does not take commissioning OUT. Phase 2's exit is "every
+    applicable guard clause enforcing and commissioned" (plan §6), so a unit
+    whose every key is stamped still reads UNMET here until its induced-fault
+    record exists — and the detail says which half is missing, so the two are
+    never confused. Either half unmeasurable makes the clause unmeasurable.
+    """
+    return ev.Reading(
+        met=stamps.met and commissioning.met,
+        detail=f"point-in-time: {stamps.detail} || commissioning: {commissioning.detail}",
+        evidence=tuple(dict.fromkeys(stamps.evidence + commissioning.evidence)),
+        unmeasurable=stamps.unmeasurable or commissioning.unmeasurable,
+        source=stamps.source or commissioning.source,
+        as_of=stamps.as_of or commissioning.as_of,
     )
 
 
@@ -854,12 +980,14 @@ SLO_FRESHNESS_CYCLES = 20
 
 
 def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
-    """One family's freshness SLO, graded under :data:`OBSERVATION_WINDOW_RULING`.
+    """One family's freshness SLO, graded under :data:`VERSION_BOUND_ACCEPTANCE_RULING`.
 
-    The SLO counts a 20-cycle window, so under Brian's 2026-10-03 ruling it
-    passes once its producer publishes a real ``ok``/``breach`` verdict and no
-    cycle observed so far fails the target — `evidence.read_windowed_objective`
-    states the producer contract that makes that readable.
+    The SLO counts a 20-cycle window. Under Brian's 2026-10-04 option (c) it
+    passes once its producer publishes a real ``ok``/``breach`` verdict and the
+    newest observed cycle in the document's ``cycles`` rows met the target;
+    a document without per-cycle rows keeps the 2026-10-03 reading, where a
+    ``breach`` anywhere in the window blocks — `evidence.read_windowed_objective`
+    states the producer contract.
     """
     key = f"metrics/slo/freshness/{family}/latest.json"
     return _observation_window_clause(
@@ -868,11 +996,13 @@ def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
             f"the {family} family met its declared deadline on >= 19 of the last "
             f"{SLO_FRESHNESS_CYCLES} scheduled cycles, AND the payload's own as_of equalled the "
             f"cycle's trading day on {SLO_FRESHNESS_CYCLES} of {SLO_FRESHNESS_CYCLES} (a fresh "
-            "write of stale content fails). Graded under Brian's 2026-10-03 ruling: MET once the "
-            "SLO publishes a real verdict and no cycle observed so far fails the target"
+            "write of stale content fails). Graded under Brian's 2026-10-04 option (c): MET once "
+            "the SLO publishes a real verdict and its newest observed cycle met the target; the "
+            "20-cycle attainment stays on the row as an observation"
         ),
         ev.read_windowed_objective(store, key, required=SLO_FRESHNESS_CYCLES, unit="cycle(s)"),
         phase=f"data-phase{_OBJECTIVE_PHASE}",
+        version_bound=True,
     )
 
 
@@ -1206,7 +1336,14 @@ def _sf_only_units(units: list[Unit]) -> list[Unit]:
     Includes retired members; `_clause_cutover_ready_units_covered` drops them
     for grading and uses the difference to reconcile against the plan's 37.
     """
-    return [unit for unit in units if _replaced_by_standalone_stack(unit)]
+    # A unit registered AFTER the audit (`audit.baseline_date` later than
+    # AUDIT_BASELINE_DATE) was born on the standalone stack, or is not
+    # scheduled at all: it has no v1 trigger for phase 4 to remove, so it is
+    # not one of the plan's SF-only units. D50 (alpha-engine-config-I12023) is
+    # the first such unit whose kind is `step-functions`; counting it moved the
+    # reconciliation off the plan's 37 for a unit the plan could not contain.
+    audited, _added = _audit_units(units)
+    return [unit for unit in audited if _replaced_by_standalone_stack(unit)]
 
 
 def _clause_cutover_ready_stack_check_live(store: ev.GateStore) -> Clause:
@@ -1688,20 +1825,29 @@ def _clause_phase1_cost_baseline_measured(store: ev.GateStore) -> Clause:
     )
 
 
-def _clause_phase2_eod_universe_covered(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+def _clause_phase2_eod_universe_covered(
+    store: ev.GateStore, *, trading_day: dt.date, units: list[Unit] | None = None
+) -> Clause:
+    # The day whose record should exist by now (`ev.completeness_due_day`, the
+    # EOD spine D20's cadence): the current evidence is never a day whose run
+    # has not fired yet. Without the units, the gate's own day is due.
+    spine = next((u for u in units or [] if u.unit_id == "D20"), None)
+    due_day = ev.completeness_due_day(spine, trading_day=trading_day) if spine else None
     return _observation_window_clause(
         "data.phase2.eod_universe_covered",
         (
             f"the EOD spine priced the declared universe minus DECLARED exclusions on "
             f"{xc.PHASE2_EOD_COVERAGE_DAYS} CONSECUTIVE trading days (plan §6 phase-2 exit); a "
             "day with no completeness MetricRecord breaks the streak, because a missing "
-            "measurement is not a passing one. Graded under Brian's 2026-10-03 ruling: MET once "
-            "the guard has published a record and every day since inside the window is GREEN"
+            "measurement is not a passing one. Graded under Brian's 2026-10-04 option (c): MET "
+            "once the guard has published a record and the CURRENT trading day's record is GREEN; "
+            "the 10-day window stays on the row as an observation"
         ),
         xc.read_eod_universe_covered(
-            store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS
+            store, trading_day=trading_day, days=xc.PHASE2_EOD_COVERAGE_DAYS, due_day=due_day
         ),
         phase="data-phase2",
+        version_bound=True,
     )
 
 
@@ -1711,11 +1857,13 @@ def _clause_phase2_empty_fresh_free(cycles: xc.CycleSet) -> Clause:
         (
             f"zero empty-but-fresh writes over {xc.PHASE2_EMPTY_FRESH_CYCLES} EOD cycles, "
             "counted from the guards' own `empty_fresh` verdict and never from rows_out == 0 "
-            "(plan §2 objective 6, phase-2 exit). Graded under Brian's 2026-10-03 ruling: MET "
-            "once the guard has recorded a verdict and no cycle inside the window wrote empty"
+            "(plan §2 objective 6, phase-2 exit). Graded under Brian's 2026-10-04 option (c): MET "
+            "once the guard has recorded a verdict and no cycle on the collector code running now "
+            "wrote empty or went silent; the 20-cycle window stays on the row as an observation"
         ),
         xc.read_empty_fresh_free(cycles, required_cycles=xc.PHASE2_EMPTY_FRESH_CYCLES),
         phase="data-phase2",
+        version_bound=True,
     )
 
 
@@ -1727,11 +1875,50 @@ def _clause_phase2_vendor_divergence_emitted(cycle_sets: list[xc.CycleSet]) -> C
             f"{xc.PHASE2_VENDOR_CYCLES} cycles, within bound or with each breach named (plan §6 "
             "phase-2 exit). A silent cycle is the failure: no verdict is indistinguishable from "
             "agreement while being a total absence of measurement. Graded under Brian's "
-            "2026-10-03 ruling: MET once every graded schedule has emitted a verdict and no "
-            "cycle since has been silent or blind"
+            "2026-10-04 option (c): MET once every graded schedule has emitted a verdict and no "
+            "cycle on the collector code running now has been silent or blind"
         ),
         xc.read_vendor_divergence_emitted(cycle_sets, required_cycles=xc.PHASE2_VENDOR_CYCLES),
+        version_bound=True,
         phase="data-phase2",
+    )
+
+
+#: Why :func:`_clause_vendor_divergence_daily` is STANDING. Not a Brian ruling
+#: and not presented as one: the row is alpha-engine-config-I10783's own
+#: closes-when, which no plan phase exit names (plan §6's phase-2 exit is the
+#: 20-cycle MANIFEST count, `data.phase2.vendor_divergence_emitted`). Putting
+#: it in a gate's arithmetic would change that gate's verdict, which is a
+#: ruling this module does not make; until one does, it is read and rendered
+#: every day with its real state and blocks nothing.
+VENDOR_DIVERGENCE_DAILY_STANDING = (
+    "alpha-engine-config-I10783 closes-when reader: reported daily, gates no phase. Not a "
+    "plan phase exit (plan §6 phase 2 grades the manifest count, "
+    "data.phase2.vendor_divergence_emitted); joining a gate's arithmetic needs a ruling."
+)
+
+
+def _clause_vendor_divergence_daily(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    """alpha-engine-config-I10783's closes-when, read from the metric documents.
+
+    STANDING (:data:`VENDOR_DIVERGENCE_DAILY_STANDING`): it carries the
+    reader's real ``met`` (the strict streak) and its detail names every day
+    in the window that did not qualify.
+    """
+    return _standing_clause(
+        "data.standing.vendor_divergence_daily",
+        (
+            "the vendor-divergence MetricRecord (data_collection/metrics/vendor_divergence/"
+            f"<day>.json) is MEASURED on {xc.VENDOR_DIVERGENCE_DAILY_DAYS} CONSECUTIVE trading "
+            "days — status ok or breach with each breaching symbol named, never unmeasurable "
+            "or absent (alpha-engine-config-I10783 closes-when). STANDING: reported daily, "
+            "gates no phase."
+        ),
+        xc.read_vendor_divergence_daily(
+            store, trading_day=trading_day, days=xc.VENDOR_DIVERGENCE_DAILY_DAYS
+        ),
+        phase="data-phase2",
+        ruling=VENDOR_DIVERGENCE_DAILY_STANDING,
     )
 
 
@@ -1778,6 +1965,50 @@ def _clause_phase3_sustained_window(
         ),
         phase="data-phase3",
         ruling=CALENDAR_FLOOR_STANDING_RULING,
+    )
+
+
+def _clause_guard_promotion(
+    store: ev.GateStore,
+    units: list[Unit],
+    cycle_sets: list[xc.CycleSet],
+    promotion: gp.GuardPromotion,
+    *,
+    trading_day: dt.date,
+) -> Clause:
+    """One staged guard's promotion, graded on its codified per-guard criterion.
+
+    Brian's 2026-10-04 option (c) (:data:`data_gate.guard_promotion.PROMOTION_RULING`)
+    replaced the adopted ten-clean-cycle criterion. The phase-2 exit reads
+    "every applicable guard clause is ENFORCING and commissioned"; the per-unit
+    ``data.<unit>.guard.<class>`` clauses grade the commissioning half, and
+    this row grades the enforcing half, which nothing graded before.
+    """
+    return _exit_clause(
+        gp.clause_name(promotion),
+        (
+            f"{promotion.name} ({promotion.staging}) is promoted to ENFORCE by a deliberate PR "
+            f"once its codified per-guard risk-based criterion holds — {promotion.risk} risk: "
+            f"{gp.RISK_TIERS[promotion.risk]}. {gp.PROMOTION_RULING} Tracked on "
+            f"{promotion.tracked_issue}"
+        ),
+        gp.read_promotion(store, promotion, units, cycle_sets, trading_day=trading_day),
+        phase="data-phase2",
+    )
+
+
+def _clause_phase3_daily_panel_adopted(store: ev.GateStore, *, trading_day: dt.date) -> Clause:
+    """The daily panel acceptance clause (audit gap A10, alpha-engine-config-I10791 / -I10795).
+
+    Not an observation window: adoption is a STATE (published, pinned, proven
+    equivalent once, old path gone), and each leg reads current evidence —
+    see `data_gate/panel.py`.
+    """
+    return _exit_clause(
+        daily_panel.PANEL_CLAUSE,
+        daily_panel.PANEL_REQUIREMENT,
+        daily_panel.read_daily_panel_adopted(store, trading_day=trading_day),
+        phase="data-phase3",
     )
 
 
@@ -1867,9 +2098,17 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase1_v1_data_stage_quiet(store))
     clauses.append(_clause_phase1_triggers_reconciled(store, units, trading_day=trading_day))
     clauses.append(_clause_phase1_cost_baseline_measured(store))
-    clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day))
+    clauses.append(_clause_phase2_eod_universe_covered(store, trading_day=trading_day, units=units))
     clauses.append(_clause_phase2_empty_fresh_free(eod))
     clauses.append(_clause_phase2_vendor_divergence_emitted([eod, morning, weekly]))
+    clauses.append(_clause_vendor_divergence_daily(store, trading_day=trading_day))
     clauses.append(_clause_phase2_executor_collection_writes_zero(store))
     clauses.append(_clause_phase3_sustained_window(store, weekly, trading_day=trading_day))
+    clauses.append(_clause_phase3_daily_panel_adopted(store, trading_day=trading_day))
+    for promotion in gp.GUARD_PROMOTIONS:
+        clauses.append(
+            _clause_guard_promotion(
+                store, units, [eod, morning, weekly], promotion, trading_day=trading_day
+            )
+        )
     return clauses

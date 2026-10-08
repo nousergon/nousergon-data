@@ -98,8 +98,18 @@ def test_ruled_clauses_stay_graded_by_their_phases_gate(board):
 
 
 def test_every_ruled_clause_carries_the_ruling_with_its_date_and_decision(board):
+    # Brian's 2026-10-04 option (c) (`VERSION_BOUND_ACCEPTANCE_RULING`) amends
+    # the 2026-10-03 rule for the eleven current-evidence clauses; the rest keep
+    # the 2026-10-03 rule. Both rulings stay recorded verbatim.
     for clause in _ruled(board):
-        assert clause.ruling == clause_module.OBSERVATION_WINDOW_RULING
+        bound = any(
+            fnmatch.fnmatch(clause.name, p) for p in clause_module.VERSION_BOUND_CLAUSE_PATTERNS
+        )
+        assert clause.ruling == (
+            clause_module.VERSION_BOUND_ACCEPTANCE_RULING
+            if bound
+            else clause_module.OBSERVATION_WINDOW_RULING
+        ), clause.name
     ruling = clause_module.OBSERVATION_WINDOW_RULING
     assert "Brian, 2026-10-03" in ruling
     assert "cmsg_01N3B1WSaV2QaHy37cD37vyxEhCi3VxEhH8FEwvdjdfxfG" in ruling
@@ -157,17 +167,26 @@ def test_eod_coverage_passes_on_a_partial_clean_window():
     assert not clause.window_complete, "the ORIGINAL 10-day criterion is not yet met"
 
 
-def test_eod_coverage_reopens_on_a_red_day_inside_the_window():
+def test_eod_coverage_keeps_an_older_red_day_on_record_without_gating_on_it():
+    """Option (c), 2026-10-04: a remedied failure does not wait to age out."""
     store = _completeness_store(["GREEN", "RED", "GREEN"])
     clause = clause_module._clause_phase2_eod_universe_covered(store, trading_day=TRADING_DAY)
-    assert not clause.met and "REOPENED" in clause.detail
+    assert clause.met, clause.detail
+    assert any("RED" in f for f in clause.window_failures), "the old failure stays visible"
+    assert not clause.window_complete
+
+
+def test_eod_coverage_blocks_on_a_red_current_day():
+    store = _completeness_store(["RED", "GREEN", "GREEN"])
+    clause = clause_module._clause_phase2_eod_universe_covered(store, trading_day=TRADING_DAY)
+    assert not clause.met and "CURRENT FAILURE" in clause.detail
 
 
 def test_eod_coverage_treats_a_missing_day_after_going_live_as_a_failure():
     """A missing measurement is not a passing one — once the guard is live."""
     store = _completeness_store([None, "GREEN", "GREEN"])
     clause = clause_module._clause_phase2_eod_universe_covered(store, trading_day=TRADING_DAY)
-    assert not clause.met and "ABSENT" in clause.detail
+    assert not clause.met and "STALE" in clause.detail
 
 
 def test_eod_coverage_full_clean_window_is_also_the_original_verdict():
@@ -212,11 +231,20 @@ def test_empty_fresh_passes_once_the_guard_is_live_and_clean():
     assert clause.window_observed == 3 and not clause.window_complete
 
 
-def test_empty_fresh_reopens_on_one_empty_write_in_the_window():
+def test_empty_fresh_blocks_on_an_empty_write_in_the_current_cycle():
+    clause = clause_module._clause_phase2_empty_fresh_free(
+        _cycles([["empty_fresh"], ["ok"], ["ok"]], guard="empty_fresh")
+    )
+    assert not clause.met and "CURRENT FAILURE" in clause.detail
+
+
+def test_empty_fresh_keeps_an_older_empty_write_on_record_without_gating_on_it():
+    """The fixture's cycles carry no code_sha, so only the newest binds (option (c))."""
     clause = clause_module._clause_phase2_empty_fresh_free(
         _cycles([["ok"], ["empty_fresh"], ["ok"]], guard="empty_fresh")
     )
-    assert not clause.met and "REOPENED" in clause.detail
+    assert clause.met, clause.detail
+    assert clause.window_failures, "the old empty write stays on the row"
 
 
 # --- vendor_divergence_emitted ----------------------------------------------
@@ -240,18 +268,26 @@ def test_vendor_divergence_forgives_silence_before_the_guard_shipped_only():
     assert clause.met, clause.detail
 
 
-def test_vendor_divergence_reopens_on_a_silent_cycle_after_going_live():
+def test_vendor_divergence_blocks_on_a_silent_current_cycle_after_going_live():
     clause = clause_module._clause_phase2_vendor_divergence_emitted(
         _vendor_sets([None, ["ok"], ["ok"]])
     )
-    assert not clause.met and "REOPENED" in clause.detail
+    assert not clause.met and "STALE" in clause.detail
 
 
-def test_vendor_divergence_reopens_on_a_blind_cycle_after_going_live():
+def test_vendor_divergence_blocks_on_a_blind_current_cycle_after_going_live():
     clause = clause_module._clause_phase2_vendor_divergence_emitted(
         _vendor_sets([["unmeasurable"], ["ok"]])
     )
-    assert not clause.met and "REOPENED" in clause.detail
+    assert not clause.met and "CURRENT FAILURE" in clause.detail
+
+
+def test_vendor_divergence_keeps_an_older_blind_cycle_on_record_without_gating_on_it():
+    clause = clause_module._clause_phase2_vendor_divergence_emitted(
+        _vendor_sets([["ok"], ["unmeasurable"], ["ok"]])
+    )
+    assert clause.met, clause.detail
+    assert clause.window_failures
 
 
 # --- freshness SLO ----------------------------------------------------------

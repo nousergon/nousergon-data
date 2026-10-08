@@ -146,21 +146,30 @@ phases:
           by an induced fault
         exit_measured_by: data.D*.guard.*
       - criterion: >-
+          the enforcing half, per staged guard: promoted to ENFORCE by a
+          deliberate PR once its codified per-guard risk-based criterion holds,
+          which needs at least one actual scheduled execution — the current one —
+          clean. Brian's 2026-10-04 option (c) replaced the ten-clean-cycle
+          criterion (data_gate/guard_promotion.py::PROMOTION_RULING)
+        exit_measured_by: data.guard_promotion.*
+      - criterion: >-
           the EOD spine's priced universe == the declared universe minus declared
-          exclusions on 10 consecutive trading days. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the check is live with no failed observation in the window
+          exclusions. Graded under Brian's 2026-10-04 option (c)
+          (data_gate/clauses.py::VERSION_BOUND_ACCEPTANCE_RULING): MET once the
+          check is live and the CURRENT trading day is covered; the 10-day
+          window is observed on the row, not gating
         clause: data.phase2.eod_universe_covered
       - criterion: >-
-          empty-but-fresh count 0 over 20 cycles. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the guard is live with no empty write in the window
+          empty-but-fresh count 0. Graded under Brian's 2026-10-04 option (c)
+          (data_gate/clauses.py::VERSION_BOUND_ACCEPTANCE_RULING): MET once the
+          guard is live and no cycle on the collector code running now wrote
+          empty or went silent; the 20-cycle window is observed, not gating
         clause: data.phase2.empty_fresh_free
       - criterion: >-
-          vendor divergence emitted on 20 of 20 cycles within bound, or each
-          breach named. Graded under Brian's 2026-10-03 ruling
-          (data_gate/clauses.py::OBSERVATION_WINDOW_RULING): MET once every
-          graded schedule has emitted and no cycle since was silent or blind
+          vendor divergence emitted on every cycle within bound, or each
+          breach named. Graded under Brian's 2026-10-04 option (c)
+          (data_gate/clauses.py::VERSION_BOUND_ACCEPTANCE_RULING): MET once every
+          graded schedule has emitted and no current cycle was silent or blind
         clause: data.phase2.vendor_divergence_emitted
     notes: >-
       "the executor profile shows no collection writes over 7 days" is NOT an exit criterion of
@@ -185,13 +194,20 @@ phases:
     exit:
       - criterion: >-
           freshness SLO attainment >= 19/20 per family. Graded under Brian's
-          2026-10-03 ruling (data_gate/clauses.py::OBSERVATION_WINDOW_RULING):
-          MET once the family's SLO verdict is live and no cycle observed so
-          far fails it
+          2026-10-04 option (c) (VERSION_BOUND_ACCEPTANCE_RULING): MET once the
+          family's SLO verdict is live and its newest observed cycle met it
         exit_measured_by: data.slo.freshness.*
       - criterion: >-
           every published key met its declared completeness floor, per family
         exit_measured_by: data.slo.completeness.*
+      - criterion: >-
+          the daily panel is ADOPTED (plan P-25, amendment 1; audit gap A10,
+          alpha-engine-config-I10791): versioned contract + producer test, the
+          panel published for the latest due session, the consumer pinning it
+          with its read site live, one real same-trading-day parity receipt
+          equivalent under the declared tolerance, and the direct-ArcticDB
+          compile removed from the consumer's data.daily
+        clause: data.phase3.daily_panel_adopted
     notes: >-
       This rung exits on the board being green — every clause of phases 0-3 MET, which is
       what `data_gate read --gate data-phase3` rolls up — on its non-calendar clauses. Four

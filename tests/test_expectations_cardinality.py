@@ -279,7 +279,9 @@ def test_the_guard_ships_observing_with_its_own_promotion_criterion_and_tracker(
     guard = expectations.CARDINALITY_GUARD
     assert guard.mode is GuardMode.OBSERVE
     assert not guard.enforcing
-    assert "10 consecutive clean" in guard.promotion_criterion
+    # Brian's 2026-10-04 option (c): the codified per-guard criterion, not a count.
+    assert "data_gate/guard_promotion.py" in guard.promotion_criterion
+    assert "10 consecutive" not in guard.promotion_criterion
     assert guard.tracked_issue == "alpha-engine-config-I10780"
 
 

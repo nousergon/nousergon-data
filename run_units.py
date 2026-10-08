@@ -57,6 +57,7 @@ __all__ = [
     "PHASE_UNITS",
     "TRIGGER_ENV",
     "EMPTY_PRODUCTION_GUARD",
+    "EMPTY_FRESH_SEVERITY",
     "EMPTY_IS_VALID_FIELD",
     "EmptyDeclaration",
     "EmptyProduction",
@@ -66,6 +67,7 @@ __all__ = [
     "PhaseUnit",
     "empty_declaration",
     "empty_declaration_for",
+    "grade_published_outputs",
     "is_empty_success",
     "manifest_sink",
     "manual_run",
@@ -156,6 +158,9 @@ _D03_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
     ("failed_vendor_no_data", "vendor_no_data"),
     ("failed_batch_fetch_error", "batch_fetch_error"),
     ("failed_refresh_error", "refresh_error"),
+    # Not a failure (``prices.SKIP_STOPPED_PRINTING``): recorded so the manifest
+    # still names every ticker the run did not write.
+    ("skipped_stopped_printing", "stopped_printing_suspected"),
 )
 
 
@@ -259,6 +264,10 @@ MODE_UNITS: dict[str, str] = {
     "daily_heal": "D33",
     "chronic_gap_heal": "D34",
     "daily_arctic_append": "D32",
+    # alpha-engine-config-I12023 (Crucible v2 ruling 6024224623 §2): the
+    # morning rebuild of features/{D-1} from the settled bar
+    # (features/settled_regrade.py). Shares D31's feature keys.
+    "features_settled_regrade": "D50",
 }
 
 
@@ -280,12 +289,18 @@ class ModeRows:
         counts_list: ``rows_key`` names a list whose LENGTH is the count (the
             two heal units report healed items, not a number).
         rejected_keys: ``(key, reason)`` pairs in that same dict.
+        library_ref: The ArcticDB library the count is recorded against as an
+            output (``arcticdb/universe`` for the appends and heals). ``None``
+            for a unit that writes no library: its S3 keys are recorded one by
+            one from its own result instead, and a library output it never
+            wrote would be a false publish claim.
     """
 
     collector: str
     rows_key: str
     counts_list: bool = False
     rejected_keys: tuple[tuple[str, str], ...] = ()
+    library_ref: str | None = "arcticdb/universe"
 
 
 #: mode -> where that mode's row count lives. A mode in :data:`MODE_UNITS` with
@@ -302,6 +317,10 @@ MODE_ROWS: dict[str, ModeRows] = {
     # The two heal units publish DAYS and TICKERS respectively, as lists.
     "daily_heal": ModeRows("universe_gap_heal", "healed_days", counts_list=True),
     "chronic_gap_heal": ModeRows("chronic_gap_self_heal", "healed", counts_list=True),
+    # D50 publishes S3 keys only: `tickers_computed` is the row count of the
+    # rebuilt snapshot (features.compute.FeatureBuild.n_ok), the same key D31's
+    # PhaseUnit reads.
+    "features_settled_regrade": ModeRows("features", "tickers_computed", library_ref=None),
 }
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase
@@ -575,6 +594,110 @@ def record_empty_production(run_ctx, unit_id: str, *, detail: str) -> None:
         )[:2000],
     )
     raise run_manifest.NotApplicable(declared.reason, f"{unit_id}: {detail}")
+
+
+#: Severity a guard verdict carries onto a unit's single per-run board metric
+#: (:func:`grade_published_outputs`). The same ranking as
+#: ``weekly_collector.py::_EMPTY_FRESH_SEVERITY``, which grades the
+#: `_phase_collect` units; `tests/test_grade_published_outputs.py` pins the two
+#: together so an entry-point unit and a phase unit cannot rank one verdict
+#: differently.
+EMPTY_FRESH_SEVERITY: dict[str, int] = {
+    "ok": 0,
+    "not_applicable": 0,
+    "unmeasurable": 1,
+    "below_floor": 2,
+    "empty_fresh": 2,
+}
+
+
+def grade_published_outputs(
+    run_ctx,
+    unit_id: str,
+    outputs: list[tuple[str, int | None]],
+    *,
+    bucket: str,
+    s3_client: Any,
+    source_path: str,
+):
+    """Grade every key an entry-point unit published: present, non-empty, above its floor.
+
+    `alpha-engine-config-I10785` (P-18): "every published key passes a non-empty
+    + floor check". `weekly_collector.py::_record_phase_lineage` does this for
+    the `_phase_collect` units. A unit with its own entry point (a
+    :func:`recorded_entry` caller: D39, D16, D46) never passes through that
+    code, so until this function it either filed a hand-written `ok` or nothing
+    at all. This is the same check for those units, and it runs the same steps:
+
+    * every ``(key, rows_out)`` pair goes through
+      ``validators/expectations.py::check_empty_fresh``. That HEADs the object,
+      reads a missing or zero-byte object or a zero count as ``empty_fresh``,
+      and a count under the unit's DECLARED ``completeness.rows_out_floor``
+      (:func:`rows_out_floor_for`) as ``below_floor``. A ``None`` count is
+      ``unmeasurable``, never a pass;
+    * each verdict is logged (ERROR when not clean) and filed on the manifest
+      as guard ``data_empty_fresh`` (``expectations.EMPTY_FRESH_GUARD.name``);
+    * the WORST verdict becomes the run's one ``data.<unit>.guard.empty_fresh``
+      MetricRecord, so a broken second key cannot hide behind a clean first one;
+    * an empty ``outputs`` list is itself ``empty_fresh``. The caller grades
+      what the unit claims to have published, and a claim of nothing is the
+      empty write.
+
+    OBSERVE mode (`sf-pipeline-policy` §7a): the verdict is on the record and
+    the exit code does not move. Once ``EMPTY_FRESH_GUARD`` is promoted, a
+    non-clean verdict raises :class:`EntryRunFailed`, which
+    :func:`recorded_entry` files as a ``failed`` manifest.
+
+    Returns the worst :class:`validators.expectations.GuardReading`.
+    """
+    # Local import: this module is vendored flat into the D38 Lambda package,
+    # which carries no `validators/` package. Only callers of this function
+    # need it.
+    from validators import expectations
+
+    floor = rows_out_floor_for(unit_id)
+    readings = [
+        expectations.check_empty_fresh(
+            unit_id=unit_id,
+            artifact_key=key,
+            bucket=bucket,
+            s3_client=s3_client,
+            rows_out=rows,
+            floor=floor,
+        )
+        for key, rows in outputs
+    ]
+    if not readings:
+        readings = [
+            expectations.GuardReading(
+                "empty_fresh",
+                f"{unit_id} completed and published NO key — a run that claims a "
+                "terminal state with no artifact behind it",
+                value=0.0,
+                baseline=None if floor is None else float(floor),
+            )
+        ]
+
+    for reading in readings:
+        expectations.report(reading, unit_id=unit_id)
+        run_ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict=reading.verdict,
+            detail=reading.detail,
+            key=reading.key,
+            value=reading.value,
+            baseline=reading.baseline,
+        )
+
+    worst = max(
+        readings,
+        key=lambda r: (EMPTY_FRESH_SEVERITY.get(r.verdict, 2), 1 if r.verdict == "ok" else 0),
+    )
+    run_ctx.record_metric(expectations.verdict_metric(unit_id, worst, source_path=source_path))
+    if expectations.EMPTY_FRESH_GUARD.enforcing and not worst.clean:
+        raise EntryRunFailed(f"{unit_id} empty_fresh guard: {worst.detail}")
+    return worst
 
 
 def unit_for(mode: str, phase: str) -> PhaseUnit:
