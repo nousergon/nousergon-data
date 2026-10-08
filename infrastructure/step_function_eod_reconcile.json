@@ -528,7 +528,7 @@
         {
           "Variable": "$.eod_poll.Status",
           "StringEquals": "Success",
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         },
         {
           "Variable": "$.eod_poll.Status",
@@ -873,7 +873,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         },
         {
           "And": [
@@ -1096,10 +1096,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "DrainTraderReconcile"
     },
     "HealConvergedNotify": {
       "Type": "Task",
@@ -1118,10 +1118,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "DrainTraderReconcile"
     },
     "HealNonConvergent": {
       "Type": "Task",
@@ -1140,10 +1140,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "DrainTraderReconcile"
     },
     "StopTradingInstance": {
       "Type": "Task",
@@ -1706,6 +1706,185 @@
         }
       ],
       "Next": "HealReProbe"
+    },
+    "DrainTraderReconcile": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12020 (2026-10-07 boot race). The box this machine starts is also where crucible-executor's Persistent=true alpha-engine-trader-reconcile timer catches up (see StartTradingInstance): it fires at THIS boot, and nothing in this machine waited for it, so StopTradingInstance (~2 min after StartTradingInstance on 2026-10-07) raced the v2 trader's own reconciliation. That run connected ~58s after the cold boot, before the dockerised IB Gateway had finished logging in, and was filed as an expired session. crucible-trader now waits, bounded (default 300s), for the gateway's API port before it connects; this state is what keeps the box up for that wait. Waits until alpha-engine-trader-reconcile.service is neither queued nor running (systemctl ActiveState not active/activating/reloading AND no pending job), bounded at 1080s in-script (the trader's 300s gateway wait plus its provisioning, venv build and the reconcile itself, with headroom; the unit's own TimeoutStartSec is 30min) under a 1200s executionTimeout. Settles immediately on a box where the run already finished (the 02:15 UTC backstop, an operator rerun, a heal replay) and on a box with no such unit. FAIL-OPEN toward the stop, never toward an idle box: an exhausted budget, a non-Success status or any SSM error routes to SetTraderReconcileDrainDegraded and then StopTradingInstance. The cost guard and the reconcile terminal are this machine's deliverables; the trader reconcile files its own run manifest, and the recording surface for a drain that did not settle is $.trader_reconcile_drain_error plus the degraded terminal.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -u",
+            "unit=alpha-engine-trader-reconcile.service",
+            "deadline=$((SECONDS+1080))",
+            "while :; do",
+            "  state=$(systemctl show -p ActiveState --value \"$unit\")",
+            "  queued=$(systemctl list-jobs --no-legend \"$unit\" | wc -l)",
+            "  if [ \"$state\" != activating ] && [ \"$state\" != active ] && [ \"$state\" != reloading ] && [ \"$queued\" -eq 0 ]; then",
+            "    echo \"$unit settled: ActiveState=$state Result=$(systemctl show -p Result --value \"$unit\")\"",
+            "    exit 0",
+            "  fi",
+            "  if [ \"$SECONDS\" -ge \"$deadline\" ]; then",
+            "    echo \"$unit still ActiveState=$state (queued jobs: $queued) after 1080s; stopping the box anyway\" >&2",
+            "    exit 1",
+            "  fi",
+            "  sleep 10",
+            "done"
+          ],
+          "executionTimeout": [
+            "1200"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 1260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open toward the stop: a drain that could not even be sent must never leave the box running.",
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_result",
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "WaitForTraderReconcileDrain": {
+      "Type": "Task",
+      "Comment": "Poll the DrainTraderReconcile invocation. Same retry shape as WaitForRefreshExecutorDeploy; every error fails open to SetTraderReconcileDrainDegraded -> StopTradingInstance. Maps StandardErrorContent only (the drain's unsettled diagnostic is written to stderr); stdout is never mapped into SF state (test_sf_ssm_diagnostics_reach_the_operator.py, the DataLimitExceeded class).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.trader_reconcile_drain_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.trader_reconcile_drain_poll",
+      "Next": "CheckTraderReconcileDrainStatus"
+    },
+    "CheckTraderReconcileDrainStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> StopTradingInstance. InProgress/Pending/Delayed -> keep polling. Anything else (Failed: the in-script budget ran out; TimedOut; Cancelled) -> SetTraderReconcileDrainDegraded, which still stops the box.",
+      "Choices": [
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Success",
+          "Next": "StopTradingInstance"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "TraderReconcileDrainWait"
+        }
+      ],
+      "Default": "ExtractTraderReconcileDrainStatusError"
+    },
+    "TraderReconcileDrainWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "SetTraderReconcileDrainDegraded": {
+      "Type": "Pass",
+      "Comment": "The trader-reconcile drain did not settle (budget exhausted, non-Success status, or an SSM error). Recorded on $.degraded_summary so CheckDegradedOutcome routes to the DegradedRun terminal instead of a plain SUCCEEDED, pages immediately (PublishTraderReconcileDrainUnsettled, sf-pipeline-policy.md \u00a75), then the box is stopped regardless. Same shape as SetMutexAcquireDegradedFlag.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_trader_reconcile_drain_unsettled",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.trader_reconcile_drain_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishTraderReconcileDrainUnsettled"
+    },
+    "ExtractTraderReconcileDrainStatusError": {
+      "Type": "Pass",
+      "Comment": "Copies the terminal non-Success poll (Failed when the in-script budget ran out; TimedOut; Cancelled) into $.trader_reconcile_drain_error, the same field DrainTraderReconcile's and WaitForTraderReconcileDrain's Catch write, so SetTraderReconcileDrainDegraded reads one path on every route into it.",
+      "InputPath": "$.trader_reconcile_drain_poll",
+      "ResultPath": "$.trader_reconcile_drain_error",
+      "Next": "SetTraderReconcileDrainDegraded"
+    },
+    "PublishTraderReconcileDrainUnsettled": {
+      "Type": "Task",
+      "Comment": "Best-effort immediate page that the v2 trader's reconcile was still queued or running when this machine had to stop the box (or that the drain could not be read). Its own Catch routes to StopTradingInstance too, so an SNS failure cannot leave the box running.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine trader reconcile NOT DRAINED (box stopped anyway)",
+        "Message.$": "States.Format('ne-postclose-reconcile-pipeline stopped the trading box for {} while alpha-engine-trader-reconcile.service had not settled (still queued or running past the drain budget, or the drain could not be read). The v2 trader reconcile may have been cut off by the stop; check its run manifest for the day. Detail: {}', $.run_date, States.JsonToString($.trader_reconcile_drain_error))"
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "An alert failure must not block the cost-guard stop.",
+          "Next": "StopTradingInstance",
+          "ResultPath": "$.trader_reconcile_drain_notify_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_notify",
+      "Next": "StopTradingInstance"
     }
   }
 }

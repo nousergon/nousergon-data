@@ -608,6 +608,11 @@ class TestEODSFTopLevelFieldsClosed:
     # fields. Snapshot from step_function_eod.json on 2026-05-27.
     _EXPECTED_EOD_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         {
+            # alpha-engine-config-I12020 — DrainTraderReconcile's send/poll
+            # results, its fail-open error and its best-effort page.
+            "trader_reconcile_drain_result", "trader_reconcile_drain_poll",
+            "trader_reconcile_drain_error", "trader_reconcile_drain_notify",
+            "trader_reconcile_drain_notify_error",
             # alpha-engine-config#5950 — NormalizeEODFailureContext's scratch
             # key. HandleFailure formats States.JsonToString($.error), and three
             # inbound edges never set it (MarketHoursGateChoice's Default, and
@@ -841,6 +846,10 @@ class TestEODSFTopLevelFieldsClosed:
         "exercise_cadence_param", "exercise_cadence_read_error",
         "exercise_cadence_degraded_notify", "exercise_cadence_degraded_notify_error",
         "exercise_cadence_unknown_notify", "exercise_cadence_unknown_notify_error",
+        # The trader-reconcile drain in front of the box stop (I12020).
+        "trader_reconcile_drain_result", "trader_reconcile_drain_poll",
+        "trader_reconcile_drain_error", "trader_reconcile_drain_notify",
+        "trader_reconcile_drain_notify_error",
     })
 
     def _expected(self, path: Path) -> frozenset[str]:
