@@ -48,15 +48,6 @@
       ]
     },
     {
-      "Sid": "CostExplorerRead",
-      "Effect": "Allow",
-      "Action": [
-        "ce:GetCostAndUsage",
-        "ce:GetCostForecast"
-      ],
-      "Resource": "*"
-    },
-    {
       "Sid": "ExpenseArtifactsReadWrite",
       "Effect": "Allow",
       "Action": [
@@ -89,6 +80,29 @@
             "expenses/*",
             "decision_artifacts/_cost_raw/*",
             "config/expense_budgets.json"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "BillingExportRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::nous-ergon-fleet-cur-exports/nous-ergon-fleet-cur/*"
+    },
+    {
+      "Sid": "BillingExportList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::nous-ergon-fleet-cur-exports",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "nous-ergon-fleet-cur/*"
           ]
         }
       }
