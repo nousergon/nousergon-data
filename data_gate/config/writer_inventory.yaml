@@ -315,6 +315,12 @@ excluded_paths:
       alpha-engine-config-I11984: operator-run correction of the weekly SF's own
       run_scope.json (the alpha-engine-weekly-run-scope Lambda's ops artifact),
       not a published data key.
+  - glob: "scripts/restore_heal_prune_261007.py"
+    reason: >-
+      alpha-engine-config-I12115: one-off operator recovery that removes the
+      delete markers the 2026-10-07 daily-heal prune left on ArcticDB objects.
+      It writes no data and never publishes a key; it only makes existing
+      object versions current again.
 
 # Descriptors whose `code_path` names no in-repo Python file, so the REVERSE
 # direction (descriptor -> write site) cannot be checked by an AST scan. Named

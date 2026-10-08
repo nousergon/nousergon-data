@@ -123,8 +123,11 @@ guards:
         undeclared miss. The verdict is filed on the manifest as guard `data_cardinality` and as
         data_collection/metrics/eod_completeness/{day}.json, which data.D20.completeness reads.
         OBSERVE mode, staged on validators/expectations.py::CARDINALITY_GUARD
-        (alpha-engine-config-I10780, I10827). FX pairs are not graded by it. Not in service
-        until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
+        (alpha-engine-config-I10780, I10827). FX pairs are not graded by it. The session axis
+        rides beside it as guard `data_spine_window` (collectors/metron_market_data.py::
+        _grade_spine_window, also OBSERVE): the last 5 published sessions read back and graded
+        for a missing, empty or misdated session and for a bar older than 1 session. Not in
+        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

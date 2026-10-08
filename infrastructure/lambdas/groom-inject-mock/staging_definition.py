@@ -35,12 +35,23 @@ from pathlib import Path
 from typing import Any
 
 #: Applied to every TimeoutSeconds in the definition, including the top-level
-#: one. 720 turns the 21600s lane budget into 30s and the 72000s execution
-#: ceiling into 100s, so a full three-attempt relaunch exhaustion — the exact
-#: 18h shape observed in production on 2026-07-29 — completes in ~90 seconds.
-TIMEOUT_DIVISOR = 720
+#: one. 240 turns the 13800s lane budget into 57s and the 15000s execution
+#: ceiling into 62s.
+#:
+#: The divisor is bounded from BELOW as well as above: it must keep the GAP
+#: between the execution ceiling and the lane budget at least
+#: MIN_TIMEOUT_SECONDS wide, because after a lane times out the recovery path
+#: (marker check, HandleFailure, sweep dispatch, NotifyCycleComplete) has to
+#: finish inside that gap. Production's gap is 1200s (15000 vs 13800, since
+#: data#1219 on 2026-08-03). This was 720, which floored that gap to ONE second
+#: (19s lane, 20s ceiling) while the recovery path takes ~1.1s on staging, so
+#: the timeout scenarios raced the ceiling: passing runs ended at 19.83-19.95s,
+#: and on 2026-09-13 (relaunch_guard_refuses) and 2026-10-04
+#: (box_dies_mid_bootstrap) the execution hit the ceiling at 20.0s with
+#: NotifyCycleComplete in flight and graded TIMED_OUT (alpha-engine-config-I11980).
+TIMEOUT_DIVISOR = 240
 
-#: Never scale below this. A 360s state at /720 would be 0.5s and would start
+#: Never scale below this. A 60s state at /240 would be 0.25s and would start
 #: failing on Lambda cold starts, turning the harness flaky — which is how an
 #: exercise programme gets switched off.
 MIN_TIMEOUT_SECONDS = 5

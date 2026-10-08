@@ -157,21 +157,55 @@ def test_an_unparseable_fetch_time_raises_rather_than_defaulting():
 # ── the guard entry ──────────────────────────────────────────────────────────
 
 
-def test_the_guard_ships_in_observe_mode_with_a_promotion_criterion():
-    """`sf-pipeline-policy.md` §7a. Enforcing when this shipped would have
-    refused every write the then-16:45 ET schedule made — i.e. halted EOD
-    collection instead of measuring it. The schedule has since moved to the
-    settlement hour, which is the FIRST of the three promotion conditions; the
-    other two (the codified per-guard criterion that replaced the ten-run count
-    under Brian's 2026-10-04 option (c), and I11356's 3-day sample) are still
-    open, so the guard stays in observe."""
+def test_the_guard_is_promoted_to_enforce_on_its_promotion_criterion():
+    """`sf-pipeline-policy.md` §7a. It shipped OBSERVE because enforcing against
+    the then-16:45 ET schedule would have halted EOD collection instead of
+    measuring it. All three promotion conditions now hold: the schedule fires at
+    the settlement hour (nousergon-data-PR1868), the codified per-guard
+    criterion (Brian's 2026-10-04 option (c)) reads READY on the scheduled
+    D03/D19 runs, and I11356's 3-day sample kept 18:15 ET."""
     guard = dates.BAR_SETTLEMENT_GUARD
     assert guard.name == "bar_settlement"
-    assert guard.mode.value == "observe"
-    assert not guard.enforcing
+    assert guard.mode.value == "enforce"
+    assert guard.enforcing
     assert guard.tracked_issue == "alpha-engine-config-I11354"
     assert "18:15" in guard.promotion_criterion
     assert "data_gate/guard_promotion.py" in guard.promotion_criterion
+
+
+# ── the ENFORCE raise site ───────────────────────────────────────────────────
+
+
+def test_a_fetch_opened_before_settlement_is_refused():
+    """The v1 16:06 ET fetch of 2026-09-21 — the measured unsettled bar."""
+    with pytest.raises(dates.UnsettledBarError, match="D19.*18:15"):
+        dates.assert_settled_bar(_et(2026, 9, 21, 16, 6), "2026-09-21", unit="D19")
+
+
+def test_the_settlement_minute_itself_is_allowed():
+    """The EOD cron fires AT the threshold; the boundary is inclusive."""
+    assert dates.assert_settled_bar(_et(2026, 9, 21, 18, 15), "2026-09-21", unit="D03") is None
+    assert dates.assert_settled_bar(_et(2026, 9, 21, 18, 18, 21), "2026-09-21", unit="D19") is None
+
+
+def test_a_later_day_fetch_is_allowed():
+    """Backfills, reruns and the D+1 morning enrich read a settled bar."""
+    assert dates.assert_settled_bar(_et(2026, 9, 22, 7, 30), "2026-09-21", unit="D19") is None
+
+
+def test_observe_mode_logs_and_does_not_raise(monkeypatch, caplog):
+    """Demoting the staging back to OBSERVE is the one-line revert."""
+    import dataclasses
+
+    from nousergon_lib.guard_mode import GuardMode
+
+    monkeypatch.setattr(
+        dates, "BAR_SETTLEMENT_GUARD",
+        dataclasses.replace(dates.BAR_SETTLEMENT_GUARD, mode=GuardMode.OBSERVE),
+    )
+    with caplog.at_level("ERROR"):
+        assert dates.assert_settled_bar(_et(2026, 9, 21, 16, 6), "2026-09-21", unit="D03") is None
+    assert "[OBSERVE]" in caplog.text and "D03" in caplog.text
 
 
 def test_the_guard_entry_is_shaped_for_record_collector_guards():
@@ -183,7 +217,7 @@ def test_the_guard_entry_is_shaped_for_record_collector_guards():
     )
     assert set(entry) == {"guard", "mode", "verdict", "detail", "key", "value", "baseline"}
     assert entry["guard"] == "bar_settlement"
-    assert entry["mode"] == "observe"
+    assert entry["mode"] == "enforce"
     assert entry["verdict"] == "provisional"
     assert entry["key"] == "staging/daily_closes/2026-09-21.parquet"
     assert entry["value"] == pytest.approx(16.1, abs=0.01)
@@ -238,12 +272,12 @@ def test_d03_prices_collect_records_the_verdict(monkeypatch):
     assert len(result["guards"]) == 1
     entry = result["guards"][0]
     assert entry["guard"] == "bar_settlement"
-    assert entry["mode"] == "observe"
+    assert entry["mode"] == "enforce"
     assert entry["verdict"] in ("settled", "provisional")
     assert entry["key"].endswith("*.parquet")
 
 
-def test_d03_grades_provisional_when_the_fetch_opens_before_settlement(monkeypatch):
+def test_d03_refuses_a_fetch_opened_before_settlement(monkeypatch):
     """Pinned against a frozen clock rather than wall time — a test whose
     verdict depends on when CI happens to run measures nothing."""
     from collectors import prices
@@ -259,8 +293,15 @@ def test_d03_grades_provisional_when_the_fetch_opens_before_settlement(monkeypat
 
     monkeypatch.setattr(prices, "datetime", _FrozenDatetime)
 
-    result = prices.collect("bkt", ["AAA"], reference_date="2026-09-21")
-    assert result["guards"][0]["verdict"] == "provisional"
+    # ENFORCE: the fetch is refused at its opening edge — nothing is refreshed.
+    refreshed: list[str] = []
+    monkeypatch.setattr(
+        prices, "_refresh_stale",
+        lambda *a, **k: refreshed.append("called") or (1, [], [("AAA", 10)]),
+    )
+    with pytest.raises(dates.UnsettledBarError, match="D03"):
+        prices.collect("bkt", ["AAA"], reference_date="2026-09-21")
+    assert refreshed == []
 
     class _SettledDatetime(datetime):
         @classmethod
@@ -270,6 +311,37 @@ def test_d03_grades_provisional_when_the_fetch_opens_before_settlement(monkeypat
     monkeypatch.setattr(prices, "datetime", _SettledDatetime)
     result = prices.collect("bkt", ["AAA"], reference_date="2026-09-21")
     assert result["guards"][0]["verdict"] == "settled"
+
+
+def test_d19_refuses_a_fetch_opened_before_settlement(monkeypatch):
+    """D19's raise site sits before the window fan-out and before any vendor
+    call, so a refused run writes no `staging/daily_closes/{D}.parquet`."""
+    from collectors import daily_closes
+
+    monkeypatch.setattr(daily_closes.boto3, "client", lambda *a, **k: object())
+
+    class _FrozenDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return _et(2026, 9, 21, 16, 6).astimezone(tz or timezone.utc)
+
+    monkeypatch.setattr(daily_closes, "datetime", _FrozenDatetime)
+    with pytest.raises(dates.UnsettledBarError, match="D19"):
+        daily_closes.collect("bkt", ["AAA"], run_date="2026-09-21", source="yfinance_only")
+
+
+def test_d19_dry_run_is_not_refused(monkeypatch):
+    """A dry run fetches nothing it publishes; the guard gates writes only."""
+    from collectors import daily_closes
+
+    called: list[str] = []
+    monkeypatch.setattr(
+        daily_closes, "assert_settled_bar", lambda *a, **k: called.append("x"),
+    )
+    monkeypatch.setattr(daily_closes.boto3, "client", lambda *a, **k: (_ for _ in ()).throw(RuntimeError("stop")))
+    with pytest.raises(RuntimeError, match="stop"):
+        daily_closes.collect("bkt", ["AAA"], run_date="2026-09-21", dry_run=True, source="yfinance_only")
+    assert called == []
 
 
 def test_d19_post_close_skip_grades_the_existing_object_not_this_run():

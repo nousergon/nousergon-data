@@ -102,6 +102,9 @@ POST_BASELINE_UNIT_IDS: frozenset[str] = frozenset({
     # (alpha-engine-config-I12023, Crucible v2 ruling 2026-10-06). Registered
     # after the baseline; the audit scored no such unit.
     "D50",
+    # D51, the daily panel (alpha-engine-config-I10791, plan P-25 amendment 1):
+    # a phase-3 product the audit predates.
+    "D51",
 })
 
 AUDIT_UNITS = 46
