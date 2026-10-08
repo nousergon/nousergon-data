@@ -158,6 +158,9 @@ _D03_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
     ("failed_vendor_no_data", "vendor_no_data"),
     ("failed_batch_fetch_error", "batch_fetch_error"),
     ("failed_refresh_error", "refresh_error"),
+    # Not a failure (``prices.SKIP_STOPPED_PRINTING``): recorded so the manifest
+    # still names every ticker the run did not write.
+    ("skipped_stopped_printing", "stopped_printing_suspected"),
 )
 
 

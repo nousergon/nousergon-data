@@ -99,3 +99,46 @@ def load_constituents_for_run_date(
             f"universe OR delete every symbol on the prune path)."
         )
     return set(tickers), weekly_date
+
+
+def load_newest_dated_constituents(
+    s3,
+    bucket: str,
+    on_or_before: str,
+    market_prefix: str = "market_data/",
+) -> tuple[set[str], str]:
+    """The newest ``{market_prefix}weekly/{date}/constituents.json`` with
+    ``date <= on_or_before`` — the universe as of the most recent refresh.
+
+    The weekday EOD collection needs this, not the pointer: MorningEnrich
+    refreshes membership every trading morning from the SSGA holdings files
+    and writes it dated (on the prior trading day's axis, since it runs before
+    the open), but ``latest_weekly.json`` advances only on Saturday. Reading
+    the pointer at EOD meant a mid-week delisting stayed in the evening
+    universe until the weekend (2026-10-07: WBD and PSKY, removed from the
+    10-06 morning file, still refreshed at EOD and hard-failed D03).
+
+    Raises if no dated partition at or before ``on_or_before`` holds a
+    non-empty ``tickers`` list, so a caller can fall back to the pointer.
+    """
+    root = f"{market_prefix.rstrip('/')}/weekly/"
+    paginator = s3.get_paginator("list_objects_v2")
+    partitions = [
+        cp["Prefix"][len(root):].rstrip("/")
+        for page in paginator.paginate(Bucket=bucket, Prefix=root, Delimiter="/")
+        for cp in page.get("CommonPrefixes", []) or []
+    ]
+    dates = [d for d in partitions if len(d) == 10 and d <= on_or_before]
+    for d in sorted(dates, reverse=True):
+        key = f"{root}{d}/constituents.json"
+        try:
+            payload = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        except s3.exceptions.NoSuchKey:
+            continue  # a weekly partition without a constituents file
+        tickers = payload.get("tickers")
+        if tickers:
+            return set(tickers), d
+        log.warning("constituents.json at s3://%s/%s has no tickers — skipping", bucket, key)
+    raise RuntimeError(
+        f"no dated constituents.json under s3://{bucket}/{root} on or before {on_or_before}"
+    )
