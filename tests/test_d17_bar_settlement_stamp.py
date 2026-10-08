@@ -103,7 +103,7 @@ def test_d17_manifest_carries_the_bar_settlement_stamp_for_the_key_it_wrote(monk
     (stamp,) = _stamps(manifest)
     assert stamp["key"] == KEY
     assert stamp["verdict"] == "settled"
-    assert stamp["mode"] == "observe"
+    assert stamp["mode"] == "enforce"
     assert [o["key"] for o in manifest["outputs"]] == [KEY]
 
 

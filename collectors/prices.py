@@ -33,6 +33,7 @@ behind) whether ``collect()`` runs weekly (full-universe rebuild) or daily
 
 from __future__ import annotations
 
+import io
 import logging
 import tempfile
 from datetime import date, datetime, timedelta, timezone
@@ -53,6 +54,7 @@ from dates import (
     FutureBarError,
     as_trading_day,
     assert_no_bar_after,
+    assert_settled_bar,
     bar_settlement_guard_entry,
     clip_to_trading_day,
     default_run_date,
@@ -106,6 +108,26 @@ FAIL_BEHIND_FETCH = "behind_fetch_guard_refused"
 FAIL_NO_DATA = "vendor_no_data"
 FAIL_BATCH_ERROR = "batch_fetch_error"
 FAIL_REFRESH_ERROR = "refresh_error"
+
+#: A ticker the short-fetch guard refused AFTER it had already stopped printing:
+#: its cached parquet ends before the session preceding the run's expected last
+#: bar, so the cache missed at least one completed session before this run, and
+#: the run's own canonical closes (``staging/daily_closes/{trading_day}``) carry
+#: no close for it, and the vendor now answers its full-period request with a
+#: stub. That is a delisting or rename (WBD and PSKY after 2026-10-05, measured 2026-10-07: 1
+#: and 49 rows against a 2,512-row cache), not a transient short answer — there
+#: is no newer history to refresh. The guard still refuses the upload and the
+#: cache is preserved; the ticker is reported under its own key and does NOT
+#: degrade ``status``, because until the weekly constituents run drops it, a
+#: failure here hard-failed every weekday EOD collection (and with it the
+#: ArcticDB append and EODReconcile). Not a ``FAIL_*`` cause: those sum to
+#: ``failed``, and this is not a failed refresh.
+SKIP_STOPPED_PRINTING = "stopped_printing_suspected"
+SKIP_STOPPED_PRINTING_RESULT_KEY = "skipped_stopped_printing"
+
+#: Where ``collectors/daily_closes.py`` publishes the run's canonical closes —
+#: the independent witness that a stopped-printing ticker had no close today.
+_DAILY_CLOSES_PREFIX = "staging/daily_closes/"
 
 #: reason -> the ``collect()`` result key carrying its count. Mirrored as
 #: literals in ``run_units.PHASE_UNITS`` (D03) and in the result dict below;
@@ -245,12 +267,16 @@ def collect(
     # one fetch window and its OPENING edge is the conservative one — a run that
     # starts before the bar settles does not become settled because it ran long.
     fetch_started_at = datetime.now(timezone.utc)
+    # ENFORCE raise site (`dates.BAR_SETTLEMENT_GUARD`): refuse to open a fetch
+    # for day D's own bar before it settles, so nothing provisional is written.
+    assert_settled_bar(fetch_started_at, trading_day, unit="D03")
     short_fetch_retries: dict[str, int] = {}
     failure_reasons: dict[str, str] = {}
+    stopped_printing: dict[str, str] = {}
     refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
         trading_day=trading_day, short_fetch_retries=short_fetch_retries,
-        failure_reasons=failure_reasons,
+        failure_reasons=failure_reasons, stopped_printing=stopped_printing,
     )
     # A failed ticker with no observed cause is an error of the refresh, never
     # a guard refusal — so the per-cause counts always sum to `failed`.
@@ -284,6 +310,9 @@ def collect(
         "failed_vendor_no_data": failure_counts[FAIL_NO_DATA],
         "failed_batch_fetch_error": failure_counts[FAIL_BATCH_ERROR],
         "failed_refresh_error": failure_counts[FAIL_REFRESH_ERROR],
+        # Not part of `failed` (see SKIP_STOPPED_PRINTING): refused and
+        # preserved, but nothing newer exists to refresh.
+        "skipped_stopped_printing": len(stopped_printing),
         "total": len(all_tickers),
         # alpha-engine-config-I11026: the per-ticker keys + row counts this
         # run actually uploaded — never a copy of `stale` (attempted, not
@@ -292,10 +321,11 @@ def collect(
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
         # alpha-engine-config-I11354: grade THIS run's bar on the settlement
-        # clock and carry the verdict on D03's manifest. Observe mode — the
-        # reading never moves the exit code; it is what a promotion to enforce
-        # (and Brian's ruling on the 16:45 ET `data-collection-eod` schedule)
-        # will be argued from. `_record_collector_guards` folds this on.
+        # clock and carry the verdict on D03's manifest. The ENFORCE half is
+        # `assert_settled_bar` at the fetch's opening edge above, so a run that
+        # reaches here was settled; the reading stays on the manifest as the
+        # evidence the promotion row reads. `_record_collector_guards` folds
+        # this on.
         "guards": [
             bar_settlement_guard_entry(
                 fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
@@ -309,6 +339,9 @@ def collect(
         # a split scan failure names the whole fresh set, so cap the sample).
         result["split_forced_refresh"] = len(split_forced)
         result["split_forced_sample"] = dict(list(split_forced.items())[:20])
+    if stopped_printing:
+        # {ticker: cached last bar}, bounded like `failed_tickers`.
+        result["stopped_printing_tickers"] = dict(list(stopped_printing.items())[:20])
     if short_fetch_retries:
         # alpha-engine-config-I11287: never silent — every ticker that
         # entered the short-fetch guard's bounded retry is named here with
@@ -1045,6 +1078,7 @@ def _refresh_stale(
     trading_day: "str | date",
     short_fetch_retries: "dict[str, int] | None" = None,
     failure_reasons: "dict[str, str] | None" = None,
+    stopped_printing: "dict[str, str] | None" = None,
 ) -> tuple[int, list[str], list[tuple[str, int]]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
 
@@ -1118,6 +1152,46 @@ def _refresh_stale(
     def _fail(ticker: str, reason: str) -> None:
         failed_tickers.append(ticker)
         _reasons[ticker] = reason
+
+    _stopped: "dict[str, str]" = stopped_printing if stopped_printing is not None else {}
+    # The session before the expected last bar: a cache ending before it
+    # already missed a completed session before this run (SKIP_STOPPED_PRINTING).
+    prior_session = _expected_last_bar(expected_last - timedelta(days=1))
+
+    _closes: "list[set[str] | None]" = []
+
+    def _closed_today() -> "set[str] | None":
+        # The run's own canonical closes (daily_closes runs before prices).
+        # Unreadable or absent -> None, which never excuses a refusal.
+        if not _closes:
+            key = f"{_DAILY_CLOSES_PREFIX}{as_trading_day(trading_day).isoformat()}.parquet"
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                _closes.append({str(t) for t in pd.read_parquet(io.BytesIO(body)).index})
+            except Exception:  # noqa: BLE001 - conservative: no evidence, no excuse
+                logger.warning("Stopped-printing check: %s unreadable; no refusal is excused", key)
+                _closes.append(None)
+        return _closes[0]
+
+    def _stopped_printing(ticker: str, fetched_rows: int, existing_rows: int) -> bool:
+        cached_last = _existing_parquet_last_bar(s3, bucket, s3_prefix, ticker)
+        if cached_last is None or cached_last >= prior_session:
+            return False
+        closed = _closed_today()
+        if closed is None or ticker in closed:
+            return False
+        logger.warning(
+            "Short-fetch refused for %s, and it has STOPPED PRINTING: the cached "
+            "parquet (%d rows) ends %s, before the %s session, today's closes have "
+            "no row for it, and the vendor now returns %d rows — a delisting/rename "
+            "candidate, not a failed refresh. "
+            "Existing history preserved; not counted as a failure (%s).",
+            ticker, existing_rows, cached_last.isoformat(), prior_session.isoformat(),
+            fetched_rows, SKIP_STOPPED_PRINTING,
+        )
+        hole_filler.discard(ticker)
+        _stopped[ticker] = cached_last.isoformat()
+        return True
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -1265,6 +1339,8 @@ def _refresh_stale(
                                     new_df = retried_df
                                 else:
                                     recovered_len = len(retried_df) if retried_df is not None else original_len
+                                    if _stopped_printing(ticker, recovered_len, existing_rows):
+                                        continue
                                     logger.error(
                                         "Short-fetch REFUSED for %s after %d retr%s: "
                                         "yfinance returned %d rows (best of %d/%d attempts) "
@@ -1282,6 +1358,8 @@ def _refresh_stale(
                                     continue
                             else:
                                 _retry_counts[ticker] = 0
+                                if _stopped_printing(ticker, original_len, existing_rows):
+                                    continue
                                 logger.error(
                                     "Short-fetch REFUSED for %s: yfinance returned %d rows "
                                     "for period=%s but the existing price-cache parquet has "

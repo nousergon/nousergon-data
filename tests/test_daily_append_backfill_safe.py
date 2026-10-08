@@ -167,17 +167,41 @@ def test_target_equal_to_latest_takes_append_path():
     lib.update.assert_called_once()
 
 
-def test_lib_write_called_with_prune_previous_versions():
-    """write() with prune_previous_versions=True keeps storage small —
-    backfill is rare enough that we don't need version history bloat."""
+def test_backfill_write_keeps_previous_versions():
+    """The backfill write must NOT prune previous versions
+    (alpha-engine-config-I12115).
+
+    This test used to assert the opposite, on a 2026-04 storage rationale
+    ("backfill is rare enough that we don't need version history bloat").
+    Two readers have since come to depend on old versions:
+    ``shadow/recompute_lineage.py`` reads the universe ``as_of`` a recorded
+    timestamp (the parity ``v1_cause`` evidence) and crucible-research's
+    faithful replay reads ``as_of`` a recorded version. And on 2026-10-07 the
+    prune made daily-heal's backfill of 2026-09-30 spend its whole 3600s
+    budget on the first of seven universe chunks: ~12 min walking ~830-deep
+    version chains, then ~19 min of DeleteObjects.
+    """
     lib = MagicMock()
     existing = _series(["2026-04-20", "2026-04-21"])
     new_row = _new_row("2026-04-15")
 
-    _write_row_backfill_safe(lib, "AAPL", new_row, existing_series=existing)
+    mode = _write_row_backfill_safe(lib, "AAPL", new_row, existing_series=existing)
+
+    assert mode == "backfill"
+    call_kwargs = lib.write.call_args.kwargs
+    assert call_kwargs.get("prune_previous_versions", False) is False
+
+
+def test_first_write_to_nonexistent_symbol_does_not_prune():
+    """The first-write fallback does not prune either. It runs when
+    ``lib.read`` raises, which is not proof the symbol has no versions."""
+    lib = MagicMock()
+    lib.read.side_effect = Exception("symbol not found")
+
+    _write_row_backfill_safe(lib, "NEW_TICKER", _new_row("2026-04-23"))
 
     call_kwargs = lib.write.call_args.kwargs
-    assert call_kwargs.get("prune_previous_versions") is True
+    assert call_kwargs.get("prune_previous_versions", False) is False
 
 
 def test_passing_existing_series_avoids_extra_lib_read():

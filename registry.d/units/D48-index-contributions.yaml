@@ -37,8 +37,13 @@ component: 1
 lifecycle: pending
 owner: brian
 code_path: "collectors/index_contributions.py:1"
-pending_since: "2026-09-21"
-lifecycle_reexam: "2026-10-05"
+# RE-EXAMINED 2026-10-06: first declared pending 2026-09-21 with a 2026-10-05
+# re-exam. On the re-exam nothing runs it yet: the scheduling work,
+# alpha-engine-config-I11306, is still open. Re-declared pending for one more
+# 14-day window (the ops ceiling, PENDING_MAX_DAYS), not promoted and not
+# removed. The date is Brian's call; a second extension needs a new reason.
+pending_since: "2026-10-06"
+lifecycle_reexam: "2026-10-20"
 lifecycle_reason: >-
     Producer module merged without a trigger. Scheduling and the ops-side
     observability/authority rows are operational assembly and belong in the ops

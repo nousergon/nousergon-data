@@ -3939,10 +3939,25 @@ def _self_heal_missing_universe_days(
     # ledger-marked) — de-dup against both. Missing days are the more severe
     # gap, so they get healed first; ledger-only days (already outside the
     # window) come last since the window-scan days are the fresher signal.
+    #
+    # Ledger days are held to the same horizon as both window detectors:
+    # strictly before ``target_date``. The ledger is unbounded in the past
+    # (config#2672) but NOT in the future: EOD marks the session it just
+    # wrote the same evening, and that session's own Polygon correction is
+    # the next morning's append, which runs after this heal (05:00 ET). A
+    # ledger day >= target_date is therefore not yet overdue, and admitting
+    # it let the newest entry win the per-run budget every weekday, so an
+    # older entry that really was overdue was deferred indefinitely
+    # (2026-09-30 deferred on 10-05 and 10-06 while the heal re-healed the
+    # day the morning append was about to correct). Its row stays in
+    # ``ledger_days`` for the artifact; it is simply not a candidate yet.
     combined = (
         missing
         + [d for d in fallback_quality if d not in missing]
-        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+        + [
+            d for d in ledger_days
+            if d < target_date and d not in missing and d not in fallback_quality
+        ]
     )
     if not combined:
         logger.info(
@@ -4638,22 +4653,46 @@ def _augment_with_macro_daily_tickers(tickers: list[str]) -> list[str]:
     return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
 
-def _load_daily_universe_tickers(config: dict) -> list[str]:
+def _load_daily_universe_tickers(config: dict, run_date: str | None = None) -> list[str]:
     """Load the daily universe (S3 constituents → Wikipedia fallback) plus the
     macro daily tickers. Shared by :func:`_run_daily` and
     :func:`_run_daily_arctic_append` so a split EOD run (PostMarketData computes,
     PostMarketArcticAppend appends) feeds daily_append the identical
     expected-ticker scope. Returns ``[]`` when no constituents are resolvable —
-    callers treat that as a hard failure."""
+    callers treat that as a hard failure.
+
+    With ``run_date``, reads the NEWEST dated constituents on or before it —
+    this morning's MorningEnrich refresh — not the Saturday-only
+    ``latest_weekly.json`` pointer, so a mid-week delisting or rename leaves
+    the evening universe the same day it leaves the morning's (2026-10-07:
+    WBD/PSKY, see ``builders._constituents_loader.load_newest_dated_constituents``).
+    The pointer stays the fallback."""
     tickers: list[str] = []
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    try:
-        existing = constituents.load_from_s3(config["bucket"], market_prefix)
-        if existing:
-            tickers = existing.get("tickers", [])
-            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
-    except Exception as exc:
-        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
+    if run_date:
+        try:
+            from builders._constituents_loader import load_newest_dated_constituents
+            tickers_set, dated = load_newest_dated_constituents(
+                boto3.client("s3"), config["bucket"], run_date, market_prefix,
+            )
+            tickers = sorted(tickers_set)
+            logger.info(
+                "Loaded %d tickers from S3 constituents (newest dated <= %s: %s)",
+                len(tickers), run_date, dated,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Dated constituents read on or before %s failed (%s) — falling back "
+                "to the latest_weekly.json pointer", run_date, exc,
+            )
+    if not tickers:
+        try:
+            existing = constituents.load_from_s3(config["bucket"], market_prefix)
+            if existing:
+                tickers = existing.get("tickers", [])
+                logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+        except Exception as exc:
+            logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
             tickers, _, _, _, _, _, _ = constituents._fetch_constituents()
@@ -4684,7 +4723,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    tickers = _load_daily_universe_tickers(config)
+    tickers = _load_daily_universe_tickers(config, run_date)
     if not tickers:
         logger.error("No tickers available for daily closes")
         results["status"] = "failed"
@@ -5274,7 +5313,7 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    tickers = _load_daily_universe_tickers(config)
+    tickers = _load_daily_universe_tickers(config, run_date)
     if not tickers:
         logger.error("No tickers available for ArcticDB append")
         results["status"] = "failed"

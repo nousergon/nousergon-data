@@ -87,6 +87,11 @@ detectors:
     via: "no-heartbeat"
     state: UNVERIFIED
     note: the alarm exists; its EXECUTION is not verified. P3 commissioning.
+    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
+    # Live CloudWatch alarm (AlphaEngine Heartbeat, Process=rag-ingestion), emitted by
+    # rag/pipelines/run_weekly_ingestion.sh on success; codified in
+    # infrastructure/cloudformation/alpha-engine-orchestration.yaml.
+    subject: "alpha-engine-rag-ingestion-no-heartbeat"
 freshness:
   family: weekly
   deadline: "Sat 13:00 America/New_York"

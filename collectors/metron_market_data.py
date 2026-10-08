@@ -1400,29 +1400,33 @@ def collect(
         _write_json(s3_client, bucket, f"{FX_PREFIX}latest.json", fx_artifact)
     except Exception as e:  # fail loud to the phase registry — never a silent producer
         logger.error("[metron_market_data] artifact write failed: %s", e)
+        graded = _grade_cardinality(
+            s3_client, bucket, run_date,
+            denominator=yf_symbols, covered=(), closes_key=closes_key,
+            write_failure=f"{type(e).__name__}: {e}",
+        )
+        graded["guards"].append(_grade_spine_window(s3_client, bucket, run_date, denominator=yf_symbols))
         return {
             "status": "error", "error": str(e),
             # The failure path emits the same telemetry as the success path,
             # except the completion claim (`observability-policy` §3.1): the
             # trading day still gets a completeness document, graded
             # UNMEASURABLE, so the board reads red rather than absent.
-            **_grade_cardinality(
-                s3_client, bucket, run_date,
-                denominator=yf_symbols, covered=(), closes_key=closes_key,
-                write_failure=f"{type(e).__name__}: {e}",
-            ),
+            **graded,
         }
 
     logger.info("[metron_market_data] wrote %d closes + %d fx → s3://%s/%s{,latest}",
                 len(closes), len(rates), bucket, CLOSES_PREFIX)
+    graded = _grade_cardinality(
+        s3_client, bucket, run_date,
+        denominator=yf_symbols, covered=closes.keys(), closes_key=closes_key,
+    )
+    graded["guards"].append(_grade_spine_window(s3_client, bucket, run_date, denominator=yf_symbols))
     return {
         "status": "ok", "universe": len(holdings),
         "closes": len(closes), "fx": len(rates), "stale_bars": stale,
         "closes_key": closes_key, "fx_key": fx_key,
-        **_grade_cardinality(
-            s3_client, bucket, run_date,
-            denominator=yf_symbols, covered=closes.keys(), closes_key=closes_key,
-        ),
+        **graded,
     }
 
 
@@ -1525,6 +1529,82 @@ def _grade_cardinality(
             }
         ],
         "metrics": [metric],
+    }
+
+
+#: PROPOSED, not ratified — threshold values are Brian's (alpha-engine-config-I10780).
+#: How many trading sessions, ending at the run's own, the spine-window reading
+#: grades on every EOD run. Five (one trading week) means a session the EOD run
+#: never published is named on each of the next four runs, not only the next one.
+D20_SPINE_WINDOW_SESSIONS = 5
+
+#: PROPOSED, not ratified — threshold values are Brian's (alpha-engine-config-I10780).
+#: The oldest bar, in trading sessions behind the graded session, that still counts
+#: a symbol as covered for that session. Measured 2026-10-05 over the 42 published
+#: spines 2026-08-03..2026-10-02 (3,024 symbol-days): lag 0 on 2,833, lag 1 on 182,
+#: lag 2 on 9. Every lag-1 row is structural — mutual-fund NAVs (FNILX, FTIHX, FZILX,
+#: VMFXX) strike after the 18:15 ET fetch, and the SGX/HKEX listings (D05.SI,
+#: 1299.HK) did until 2026-09-03 — so 0 would hold the reading red every day on
+#: instruments that cannot do better, while 1 still names each lag-2 day.
+D20_MAX_BAR_LAG_SESSIONS = 1
+
+
+def _grade_spine_window(s3_client: Any, bucket: str, run_date: str, *, denominator) -> dict:
+    """D20's spine-window reading, as one manifest guard entry (`alpha-engine-config-I10780`).
+
+    Reads BACK the last :data:`D20_SPINE_WINDOW_SESSIONS` published
+    ``market_data/eod_closes/{session}.json`` documents — this run's included, so
+    the reading is of what a consumer will read, not of what this process meant
+    to write — and grades them with ``validators/expectations.py::check_spine_window``:
+    a missing, empty or misdated session, and a symbol whose bar is older than
+    :data:`D20_MAX_BAR_LAG_SESSIONS`, are each named. Runs on the failure path
+    too, so a run whose write failed still records which sessions the spine has.
+
+    OBSERVE mode (`sf-pipeline-policy` §7a), staged on
+    ``expectations.SPINE_WINDOW_GUARD``: logged at ERROR when not clean, filed on
+    the run manifest, no exit code moves. It NEVER raises — a measurement must not
+    gate the thing it measures; a failure to read is graded ``unmeasurable``.
+    """
+    staging = expectations.SPINE_WINDOW_GUARD
+    try:
+        from nousergon_lib.dates import previous_trading_day, trading_days_stale
+
+        sessions = [run_date]
+        day = date.fromisoformat(run_date)
+        for _ in range(D20_SPINE_WINDOW_SESSIONS - 1):
+            day = previous_trading_day(day)
+            sessions.append(day.isoformat())
+        documents = expectations.read_spine_window(s3_client, bucket, sessions, prefix=CLOSES_PREFIX)
+        reading = expectations.check_spine_window(
+            unit_id="D20",
+            session=run_date,
+            documents=documents,
+            denominator_symbols=denominator,
+            max_bar_lag_sessions=D20_MAX_BAR_LAG_SESSIONS,
+            bar_lag=lambda bar, session: trading_days_stale(date.fromisoformat(bar), session),
+            floor=D20_COMPLETENESS_FLOOR,
+        )
+    except Exception as exc:  # noqa: BLE001 -- see the rationale below
+        # DELIBERATE catch-all. (a) Failure mode: the window could not be read or
+        # graded (S3 error, unparseable document, calendar or contract load
+        # failure). (b) The closes are already written; this is a measurement of
+        # them and must not fail the EOD run. (c) Recording surface: the
+        # `unmeasurable` verdict below, logged at ERROR by `report` and filed on
+        # this run's manifest — never a pass.
+        reading = expectations.GuardReading(
+            "unmeasurable",
+            f"D20 spine window could not be graded for {run_date}: {type(exc).__name__}: {exc}",
+            baseline=D20_COMPLETENESS_FLOOR,
+        )
+    expectations.report(reading, unit_id="D20", staging=staging)
+    return {
+        "guard": staging.name,
+        "mode": staging.mode.value,
+        "verdict": reading.verdict,
+        "detail": reading.detail[:2000],
+        "key": f"{CLOSES_PREFIX}{run_date}.json",
+        "value": reading.value,
+        "baseline": reading.baseline,
     }
 
 
@@ -2433,7 +2513,15 @@ def collect_technicals(
                     len(technicals), len(yf_symbols))
         return {"status": "ok_dry_run", "technicals": len(technicals), "universe": len(yf_symbols)}
     try:
-        _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact)
+        # alpha-engine-config-I12082: semantic admission at the publish boundary.
+        # Shadow by default (logs, writes anyway); NOUSERGON_ADMISSION_MODE=enforce
+        # refuses before the write and lands in the except below.
+        from contracts.admission import TECHNICALS, publish_admitted
+
+        publish_admitted(
+            lambda: _write_json(s3_client, bucket, f"{TECHNICALS_PREFIX}latest.json", artifact),
+            artifact, TECHNICALS, run_date=run_date, population=yf_symbols,
+        )
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] technicals write failed: %s", e)
         return {"status": "error", "error": str(e)}
