@@ -20,14 +20,18 @@ lifecycle: pending
 owner: brian
 code_path: "builders/daily_panel.py:174"
 pending_since: "2026-10-06"
-lifecycle_reexam: "2026-10-08"
+lifecycle_reexam: "2026-10-23"
 lifecycle_reason: >-
     The producer module, its contract, an operator-run CLI and the collector's
     whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
     alpha-engine-config-I10791). Not yet scheduled: naming `daily-panel` in the
     ne-data-collection-eod schedule waits on the collection-box write grant on
     data_collection/panel/ (a scheduled run would fail on AccessDenied). Until
-    then the unit writes nothing on a schedule.
+    then the unit writes nothing on a schedule. Re-exam moved 2026-10-08 ->
+    2026-10-23 on 2026-10-09: the write grant had still not landed (no
+    data_collection/panel/ grant under nous-ergon-ops infrastructure/iam/ on
+    main), so the gap stands for the same reason; the passed date was failing
+    alpha-engine-config's producer<->ARTIFACT_REGISTRY contract check.
 lifecycle_owner: brian
 promotes_when: >-
     The EOD collection runs `weekly_collector.py --daily-panel` after the
