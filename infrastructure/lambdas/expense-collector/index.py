@@ -4,10 +4,11 @@ by the console's Expenses page (alpha-engine-dashboard ``views/50_Expenses.py``)
 
 Providers collected per run (adapter registry, one row each):
 
-  - **aws**            Cost Explorer month-to-date unblended cost + CE forecast
-                       (+ top-services breakdown). CE bills $0.01/request — the
-                       2-runs/day cadence costs ~$1.2/mo, which shows up in its
-                       own row.
+  - **aws**            the CUR 2.0 billing export's parquet files
+                       (``s3://nous-ergon-fleet-cur-exports``): month-to-date
+                       unblended cost per service, a run-rate projection, and
+                       the per-``system``-tag daily series. ZERO Cost Explorer
+                       calls (alpha-engine-config-I12168).
   - **anthropic_api**  Admin API ``/v1/organizations/cost_report`` when
                        ``/alpha-engine/expenses/ANTHROPIC_ADMIN_KEY`` exists;
                        until then falls back to summing the research fleet's
@@ -102,9 +103,11 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import boto3
+
+import cur_parquet
 
 from flow_doctor_telegram import notify_via_flow_doctor
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
@@ -173,31 +176,77 @@ COST_RAW_PREFIX = "decision_artifacts/_cost_raw/"
 ALERT_STATE_PREFIX = "expenses/alert_state/"
 RECONCILIATION_PREFIX = "expenses/reconciliation/"
 
-# Cost Explorer per-invocation call budget (alpha-engine-config-I11201, the
-# residual of -I10389). `ce:GetCostAndUsage` and `ce:GetCostForecast` are
-# billed PER REQUEST at $0.01 -- three orders of magnitude above a typical AWS
-# read -- and 2026-09-03..09-06 an unbounded caller issued 44,167 of them for
-# $441.67, more than either of the account's two prior FULL months' bills.
+# AWS spend source: the CUR 2.0 billing export, NEVER Cost Explorer
+# (alpha-engine-config-I12168, Brian 2026-10-08: "shut Cost Explorer down
+# completely and bypass it"). Every Cost Explorer request bills $0.01, an
+# unbounded caller burned $441.67 in four days (I10389), and AWS Support
+# processes that credit only once the account makes no Cost Explorer calls at
+# all. This Lambda was the last machine caller; it now reads the export the
+# console's v2 cost pane already reads. `test_handler.py::TestNoCostExplorer`
+# fails on any `ce` client, and the role's iam-policy.json grants no `ce:`.
 #
-# This Lambda is the only CE caller in the fleet that runs UNATTENDED on a
-# schedule, so it is the one that can repeat that burst with nobody reading
-# its output. Its call count was previously bounded only by its cron, which is
-# a property of the SCHEDULE, not a control: any retry-on-transient added
-# later multiplies it silently.
-#
-# Sized with NO HEADROOM for the calls that actually exist -- `collect` makes
-# two (`get_cost_and_usage` by service, and `get_cost_and_usage` daily by
-# `system` tag), `reconcile` makes one. `get_cost_forecast` was dropped
-# 2026-10-02: the projection is MTD run rate, not AWS's forecast. A budget
-# with room to spare cannot tell a loop from normal operation. Raise
-# `EXPENSE_CE_CALL_BUDGET` deliberately if another call is genuinely added.
-#
-# The daily call is alpha-engine-config-I11707: this Lambda is the fleet's ONLY
-# Cost Explorer identity. Crucible's dollar gates used to call CE themselves
-# (~27 requests/day across three GitHub roles, most of them denied); they now
-# read the per-system daily series below out of `expenses/latest.json`, so one
-# budgeted caller answers every spend question in the account.
-CE_CALL_BUDGET = int(os.environ.get("EXPENSE_CE_CALL_BUDGET", "2"))
+# The export is codified in nous-ergon-ops `infrastructure/billing/cur-export/`.
+# Its name and S3 prefix are both `nous-ergon-fleet-cur`, so data lands one
+# level deeper than either alone suggests (measured 2026-10-02).
+CUR_BUCKET = os.environ.get("EXPENSE_CUR_BUCKET", "nous-ergon-fleet-cur-exports")
+CUR_DATA_PREFIX = "nous-ergon-fleet-cur/nous-ergon-fleet-cur/data"
+CUR_COST = "line_item_unblended_cost"
+CUR_USAGE_START = "line_item_usage_start_date"
+CUR_PRODUCT = "line_item_product_code"
+CUR_USAGE_TYPE = "line_item_usage_type"
+CUR_LINE_TYPE = "line_item_line_item_type"
+CUR_SYSTEM_TAG = "resource_tags_user_system"
+CUR_SERVICE_COLUMNS = (CUR_COST, CUR_USAGE_START, CUR_PRODUCT, CUR_USAGE_TYPE, CUR_LINE_TYPE)
+# The export refreshes up to three times a day. A period file older than this
+# means the export itself has stopped; republishing it under a fresh `as_of`
+# would hide that from every consumer, which grade freshness on `as_of`.
+CUR_MAX_AGE_HOURS = float(os.environ.get("EXPENSE_CUR_MAX_AGE_HOURS", "36"))
+# Through this day of the month the PRIOR period's days are still flagged
+# `estimated` (AWS finalises the bill in the first days of the month).
+CUR_FINALISED_BY_DAY = 5
+# Covered usage and its negation cancel; the recurring fee is the commitment.
+_CUR_NETTING_LINE_TYPES = {"SavingsPlanCoveredUsage", "SavingsPlanNegation"}
+
+# Export product code -> the SERVICE name Cost Explorer emitted, which
+# EXPENSE_BUDGETS.yaml keys every AWS line on. Kept in step with
+# alpha-engine-config `scripts/aws_spend_cur.py::PRODUCT_TO_SERVICE`. Every
+# code the account billed under in 2026-09/10 is here; a new one publishes
+# under its raw code and is graded `unbudgeted` by the monitor (loud).
+PRODUCT_TO_SERVICE = {
+    "AmazonS3": "Amazon Simple Storage Service",
+    "AmazonStates": "AWS Step Functions",
+    "AWSStepFunctions": "AWS Step Functions",
+    "AmazonCloudWatch": "AmazonCloudWatch",
+    "AWSCostExplorer": "AWS Cost Explorer",
+    "AmazonVPC": "Amazon Virtual Private Cloud",
+    "AmazonECR": "Amazon EC2 Container Registry (ECR)",
+    "AWSSystemsManager": "AWS Systems Manager",
+    "AmazonDynamoDB": "Amazon DynamoDB",
+    "AWSLambda": "AWS Lambda",
+    "AmazonSNS": "Amazon Simple Notification Service",
+    "AWSQueueService": "Amazon Simple Queue Service",
+    "AWSEvents": "CloudWatch Events",
+    "awskms": "AWS Key Management Service",
+    "AWSCloudTrail": "AWS CloudTrail",
+    "AWSBudgets": "AWS Budgets",
+    "AmazonCloudFront": "Amazon CloudFront",
+    "AmazonEFS": "Amazon Elastic File System",
+    "AWSCloudFormation": "AWS CloudFormation",
+    "AWSGlue": "AWS Glue",
+    "AWSResourceGroupsTaggingAPI": "AWS Resource Groups Tagging API",
+    "AmazonEventBridgeScheduler": "Amazon EventBridge Scheduler",
+    "CodeBuild": "CodeBuild",
+    "AWSCodeBuild": "CodeBuild",
+    "AmazonSES": "Amazon Simple Email Service",
+    "AmazonPolly": "Amazon Polly",
+    "AWSFIS": "AWS Fault Injection Simulator",
+    "ComputeSavingsPlans": "Savings Plans for AWS Compute usage",
+}
+EC2_COMPUTE = "Amazon Elastic Compute Cloud - Compute"
+# Cost Explorer's "EC2 - Compute" is instance hours; everything else EC2 bills
+# (EBS, snapshots, CPU credits, ...) is "EC2 - Other".
+_EC2_COMPUTE_MARKERS = ("BoxUsage", "SpotUsage", "DedicatedUsage", "HostUsage",
+                        "ReservedHostUsage", "UnusedBox")
 
 # The cost-allocation tag key every system's resources carry
 # (`system=crucible-v2`, ...). Grouping by it splits each day's account total
@@ -208,7 +257,7 @@ UNTAGGED_SYSTEM = "(untagged)"
 # Crucible's cost clause grades the trailing 30 COMPLETE days and, on the 1st
 # through the 3rd, the whole prior calendar month. The series therefore starts
 # at the earlier of the prior month's 1st and 31 days ago -- at most ~62 daily
-# periods, one request.
+# days, at most three billing periods.
 DAILY_BY_SYSTEM_MIN_DAYS = 31
 
 # Month-close reconciliation (alpha-engine-config#2849) — |delta_pct| beyond
@@ -653,202 +702,298 @@ def _load_ssm(names: list[str]) -> dict[str, str]:
 # Provider adapters
 # ---------------------------------------------------------------------------
 
-class CostExplorerCallBudgetExceeded(RuntimeError):
-    """This invocation asked Cost Explorer more times than its declared budget.
+# ---------------------------------------------------------------------------
+# AWS: the billing export, never Cost Explorer (alpha-engine-config-I12168)
+# ---------------------------------------------------------------------------
+#
+# Every AWS figure this Lambda publishes is read from the CUR 2.0 billing
+# export's parquet files. The account makes ZERO Cost Explorer calls: AWS
+# Support processes the I10389 $441.67 credit only once they have stopped
+# (Brian, 2026-10-08). The output schema is unchanged — `all_services_usd`,
+# `top_services_usd` and `daily_by_system` carry the same keys, spelled the
+# same way, so the console, aws_spend_monitor.py and crucible's dollar gates
+# read this file exactly as before.
+#
+# Measured 2026-10-08 against the Cost Explorer reading of the same morning:
+# per-service figures agree to the cent on every fully-posted day, and the
+# per-`system` daily series matches day for day; the only differences were
+# the export being three hours FRESHER.
 
-    Raised BEFORE the request is made, so the over-budget call is never billed.
-    Deliberately NOT a provider-adapter failure: every other exception in this
-    module degrades one row and lets the rollup publish, because one provider
-    outage must not blank the others. This one escapes both `fenced` helpers
-    and fails the whole invocation, because it does not mean "AWS did not
-    answer" -- it means THIS CODE IS LOOPING ON A BILLED API, and the correct
-    response to that is to stop, loudly, while the loop is still cheap.
+def _list_cur_period(s3, period: str) -> list[dict]:
+    """The parquet objects for one billing period (``YYYY-MM``), sorted."""
+    prefix = f"{CUR_DATA_PREFIX}/BILLING_PERIOD={period}/"
+    out: list[dict] = []
+    token = None
+    while True:
+        kw = {"Bucket": CUR_BUCKET, "Prefix": prefix}
+        if token:
+            kw["ContinuationToken"] = token
+        resp = s3.list_objects_v2(**kw)
+        out += [o for o in resp.get("Contents", []) if o["Key"].endswith(".parquet")]
+        if not resp.get("IsTruncated"):
+            return sorted(out, key=lambda o: o["Key"])
+        token = resp["NextContinuationToken"]
+
+
+def read_cur_period(s3, period: str, columns: tuple[str, ...]) -> dict | None:
+    """Every line of one billing period, or None when the export has not
+    written that period yet.
+
+    Returns ``{"rows": [...], "refreshed_at": <newest object LastModified>}``.
+    A period whose files lack a requested column (the service columns were
+    added to the export on 2026-10-02; 2026-09 has none) raises
+    :class:`CurColumnsMissing`, never an empty answer.
     """
+    objects = _list_cur_period(s3, period)
+    if not objects:
+        return None
+    rows: list[dict] = []
+    for obj in objects:
+        body = s3.get_object(Bucket=CUR_BUCKET, Key=obj["Key"])["Body"].read()
+        try:
+            rows += cur_parquet.read_rows(body, list(columns))
+        except KeyError as exc:
+            raise CurColumnsMissing(
+                f"billing export period {period} has no column(s) {exc.args[0]}") from None
+    refreshed = max(o["LastModified"] for o in objects)
+    return {"rows": rows, "refreshed_at": refreshed}
 
 
-class _BudgetedCostExplorer:
-    """Counting proxy over a boto3 ``ce`` client, one per invocation.
+class CurColumnsMissing(RuntimeError):
+    """The export's files for a period do not carry a column this read needs."""
 
-    Wraps the client rather than the two call sites so that a THIRD CE call
-    added later is budgeted by construction -- the failure mode this exists to
-    prevent is a new caller nobody remembered to cap. Every attribute lookup
-    that names a billable Cost Explorer operation is metered; a failed request
-    still counts, since a denial is billed like any other request and an
-    unbounded retry on one is exactly the 2026-09 burst's shape.
+
+def _usage_day(row: dict) -> str:
+    ts = row.get(CUR_USAGE_START)
+    return ts.strftime("%Y-%m-%d") if ts is not None else ""
+
+
+def service_for(product: str | None, usage_type: str | None, line_type: str | None) -> str:
+    """The Cost Explorer SERVICE name one export line bills under.
+
+    EXPENSE_BUDGETS.yaml keys every AWS budget line on these names, and the
+    console and aws_spend_monitor.py read them, so the export's product codes
+    are translated back rather than every consumer re-keyed. Mirrors
+    alpha-engine-config ``scripts/aws_spend_cur.py::service_for``; a code
+    missing from the map is published under its raw code, which the monitor
+    grades `unbudgeted` — loud, never dropped.
     """
-
-    #: Per-request-billed operations. An operation absent here passes through
-    #: unmetered, so the list is deliberately broad rather than the two in use.
-    BILLED = frozenset({
-        "get_cost_and_usage", "get_cost_and_usage_with_resources",
-        "get_cost_forecast", "get_usage_forecast", "get_dimension_values",
-        "get_tags", "get_reservation_coverage", "get_savings_plans_coverage",
-        "list_cost_allocation_tags", "get_cost_categories",
-    })
-
-    def __init__(self, client, *, budget: int) -> None:
-        self._client = client
-        self._budget = budget
-        self._calls = 0
-
-    @property
-    def calls(self) -> int:
-        return self._calls
-
-    @property
-    def budget(self) -> int:
-        return self._budget
-
-    def __getattr__(self, name: str):
-        attr = getattr(self._client, name)
-        if name not in self.BILLED:
-            return attr
-
-        def _metered(*args, **kwargs):
-            if self._calls >= self._budget:
-                raise CostExplorerCallBudgetExceeded(
-                    f"Cost Explorer call budget of {self._budget} exhausted for this "
-                    f"invocation, on `{name}`. ce is billed per request at $0.01 -- "
-                    "raising rather than spending past the declared budget "
-                    "(alpha-engine-config-I11201). If a third CE call is genuinely "
-                    "needed, raise EXPENSE_CE_CALL_BUDGET deliberately."
-                )
-            self._calls += 1
-            return attr(*args, **kwargs)
-
-        return _metered
+    if line_type == "Tax":
+        return "Tax"
+    if line_type == "SavingsPlanRecurringFee":
+        return "Savings Plans for AWS Compute usage"
+    product = product or "(none)"
+    if product == "AmazonEC2":
+        ut = usage_type or ""
+        return (EC2_COMPUTE if any(m in ut for m in _EC2_COMPUTE_MARKERS)
+                else "EC2 - Other")
+    return PRODUCT_TO_SERVICE.get(product, product)
 
 
-def _ce_client(budget: int | None = None):
-    """The ONLY way this module gets a Cost Explorer client.
+def _estimated(day: str, today: date) -> bool:
+    """Whether a day's figures may still move.
 
-    A raw, unwrapped Cost Explorer client constructed anywhere else would be
-    an unbudgeted caller, which is the whole defect (I11201), so this factory
-    holds the module's only such construction and `test_handler.py`'s
-    `TestCostExplorerCallBudget` asserts that by reading this file.
+    The export's selected columns carry no finalisation flag. Days of the open
+    billing period always may; the prior period stays provisional through the
+    5th, by which AWS has finalised the month's bill. Crucible reads a closed
+    month only on the 1st-3rd, so it keeps treating that read as PROVISIONAL,
+    as it did when the flag came from Cost Explorer.
     """
-    return _BudgetedCostExplorer(
-        boto3.client("ce", region_name="us-east-1"),
-        budget=CE_CALL_BUDGET if budget is None else budget,
-    )
+    d = date.fromisoformat(day)
+    if (d.year, d.month) == (today.year, today.month):
+        return True
+    prior = (today.replace(day=1) - timedelta(days=1))
+    return (d.year, d.month) == (prior.year, prior.month) and today.day <= CUR_FINALISED_BY_DAY
 
 
-def _ce_unblended_by_service(ce, start: str, end: str) -> dict[str, float]:
-    """Shared Cost Explorer ``get_cost_and_usage`` call (grouped by SERVICE,
-    MONTHLY granularity) — used both for the live current-month MTD read
-    (``collect_aws``) and the closed-prior-month reconciliation re-query
-    (``reconcile_aws``), so the two never drift on how a service total is
-    summed."""
-    resp = ce.get_cost_and_usage(
-        TimePeriod={"Start": start, "End": end}, Granularity="MONTHLY",
-        Metrics=["UnblendedCost"],
-        GroupBy=[{"Type": "DIMENSION", "Key": "SERVICE"}],
-    )
-    by_service: dict[str, float] = {}
-    for period in resp.get("ResultsByTime", []):
-        for g in period.get("Groups", []):
-            svc = g["Keys"][0]
-            by_service[svc] = by_service.get(svc, 0.0) + float(
-                g["Metrics"]["UnblendedCost"]["Amount"])
-    return by_service
+def _periods_between(start: date, end: date) -> list[str]:
+    """Billing periods (``YYYY-MM``) touched by ``[start, end)``."""
+    out, cur = [], start.replace(day=1)
+    while cur < end:
+        out.append(cur.strftime("%Y-%m"))
+        cur = (cur.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return out
 
 
 def _daily_by_system_window(now: datetime) -> tuple[str, str]:
     """``[start, end)`` for the per-system daily series: ``end`` is today (UTC,
-    exclusive, so every period carried has closed) and ``start`` is the earlier
-    of the prior calendar month's 1st and ``DAILY_BY_SYSTEM_MIN_DAYS`` ago."""
+    exclusive) and ``start`` is the earlier of the prior calendar month's 1st
+    and ``DAILY_BY_SYSTEM_MIN_DAYS`` ago."""
     today = now.date()
     prior_month_start = (today.replace(day=1) - timedelta(days=1)).replace(day=1)
     start = min(prior_month_start, today - timedelta(days=DAILY_BY_SYSTEM_MIN_DAYS))
     return start.isoformat(), today.isoformat()
 
 
-def collect_aws_daily_by_system(ce, now: datetime) -> dict:
-    """One ``get_cost_and_usage`` call: DAILY unblended cost grouped by the
-    ``system`` tag (alpha-engine-config-I11707).
+def collect_aws_daily_by_system(s3, now: datetime) -> dict:
+    """DAILY unblended cost per ``system`` tag value, from the export's
+    ``resource_tags_user_system`` column (alpha-engine-config-I11707's series,
+    I12168's source).
 
-    Each day carries Cost Explorer's own ``Estimated`` flag and one amount per
-    tag value; the groups of a day sum to the account total for that day. A
-    response carrying ``NextPageToken`` is recorded as ``complete: false``
-    rather than paged: a second page is a second billed request this budget
-    does not hold, and a consumer must treat a truncated series as unreadable,
-    never as cheap days.
+    The tag column exists because `system` is an ACTIVATED cost-allocation
+    tag — the same condition Cost Explorer's tag grouping needed — so the
+    per-system split is the one Cost Explorer returned, not an approximation.
+    The untagged remainder is published under ``UNTAGGED_SYSTEM`` so a day's
+    groups still sum to the account total.
+
+    Only days the export has POSTED are published: a day after the newest
+    usage day in the export carries nothing but forward-dated Savings Plan
+    fees, and publishing it would read as a $0.36 day. Crucible asks for that
+    day, finds none, and grades UNMEASURABLE — never cheap. ``complete`` is
+    false when a billing period inside the window has no export at all.
     """
-    start, end = _daily_by_system_window(now)
-    resp = ce.get_cost_and_usage(
-        TimePeriod={"Start": start, "End": end}, Granularity="DAILY",
-        Metrics=["UnblendedCost"],
-        GroupBy=[{"Type": "TAG", "Key": SPEND_TAG_KEY}],
-    )
+    start_s, end_s = _daily_by_system_window(now)
+    start, end = date.fromisoformat(start_s), date.fromisoformat(end_s)
+    by_day: dict[str, dict[str, float]] = {}
+    complete = True
+    read_periods: set[str] = set()
+    for period in _periods_between(start, end):
+        got = read_cur_period(s3, period, (CUR_COST, CUR_USAGE_START, CUR_SYSTEM_TAG))
+        if got is None:
+            complete = False
+            continue
+        read_periods.add(period)
+        for r in got["rows"]:
+            day = _usage_day(r)
+            if not (start_s <= day < end_s):
+                continue
+            system = r.get(CUR_SYSTEM_TAG) or UNTAGGED_SYSTEM
+            per = by_day.setdefault(day, {})
+            per[system] = per.get(system, 0.0) + float(r.get(CUR_COST) or 0.0)
+    newest = _newest_posted_day(s3, now)
     days = []
-    for period in resp.get("ResultsByTime", []):
-        by_system: dict[str, float] = {}
-        for g in period.get("Groups", []):
-            # CE spells a tag group `<key>$<value>`, and the untagged
-            # remainder `<key>$`.
-            value = g["Keys"][0].split("$", 1)[-1] or UNTAGGED_SYSTEM
-            by_system[value] = by_system.get(value, 0.0) + float(
-                g["Metrics"]["UnblendedCost"]["Amount"])
+    d = start
+    while d < end:
+        key = d.isoformat()
+        if key > newest:
+            break
+        if key[:7] not in read_periods:
+            # No export for this period: its days are absent, never $0.
+            d += timedelta(days=1)
+            continue
+        by_system = by_day.get(key, {})
         days.append({
-            "date": period["TimePeriod"]["Start"],
-            "estimated": bool(period.get("Estimated", False)),
+            "date": key,
+            "estimated": _estimated(key, now.date()),
             "by_system_usd": {k: round(v, 6) for k, v in sorted(by_system.items())},
         })
+        d += timedelta(days=1)
     return {
         "tag_key": SPEND_TAG_KEY,
         "untagged_key": UNTAGGED_SYSTEM,
-        "start": start,
-        "end": end,
-        "complete": not resp.get("NextPageToken"),
+        "start": start_s,
+        "end": end_s,
+        "complete": complete,
+        "posted_through": newest,
+        "source": "billing_export",
         "days": days,
     }
 
 
-def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
-    ce = _ce_client() if ce is None else ce
-    start = mw["start"].strftime("%Y-%m-%d")
+def _newest_posted_day(s3, now: datetime) -> str | None:
+    """The newest usage day in the open period carrying real usage (line type
+    ``Usage``), before today."""
+    period = now.strftime("%Y-%m")
+    newest = None
+    try:
+        got = read_cur_period(s3, period, (CUR_USAGE_START, CUR_LINE_TYPE))
+    except CurColumnsMissing:
+        got = None
+    if got:
+        today = now.date().isoformat()
+        days = [_usage_day(r) for r in got["rows"]
+                if r.get(CUR_LINE_TYPE) == "Usage" and _usage_day(r) < today]
+        newest = max(days) if days else None
+    if newest is None:
+        # Nothing posted in the open period yet: the newest posted day is the
+        # end of the prior period, which is closed.
+        newest = (now.date().replace(day=1) - timedelta(days=1)).isoformat()
+    return newest
+
+
+def _unblended_by_service(rows: list[dict], start: str, end: str) -> dict[str, float]:
+    """Sum export lines with a usage day in ``[start, end)`` by Cost Explorer
+    service name. Savings Plan covered usage and its negation cancel by
+    construction and are skipped, as Cost Explorer's unblended view nets them."""
+    by_service: dict[str, float] = {}
+    for r in rows:
+        if r.get(CUR_LINE_TYPE) in _CUR_NETTING_LINE_TYPES:
+            continue
+        day = _usage_day(r)
+        if not (start <= day < end):
+            continue
+        svc = service_for(r.get(CUR_PRODUCT), r.get(CUR_USAGE_TYPE), r.get(CUR_LINE_TYPE))
+        by_service[svc] = by_service.get(svc, 0.0) + float(r.get(CUR_COST) or 0.0)
+    return by_service
+
+
+def _attach_daily_by_system(row: dict, s3, now: datetime) -> None:
+    """Adds ``detail.daily_by_system`` to the AWS row, or
+    ``detail.daily_by_system_error`` when the export could not answer.
+
+    A failure here degrades only this field -- the month-to-date row is still
+    true -- and its consumer (crucible's dollar gates) renders a missing
+    series UNMEASURABLE.
+    """
+    try:
+        row["detail"]["daily_by_system"] = collect_aws_daily_by_system(s3, now)
+    except Exception as exc:  # noqa: BLE001 — recorded on the row, see docstring
+        logger.info("billing-export daily-by-system unavailable: %s", exc)
+        row["detail"]["daily_by_system_error"] = f"{type(exc).__name__}: {exc}"[:300]
+
+
+def collect_aws(mw: dict, budgets: dict, s3=None) -> dict:
+    s3 = boto3.client("s3", region_name=REGION) if s3 is None else s3
     now = _now_utc()
-    end = (now.replace(hour=0, minute=0, second=0, microsecond=0)
-           .strftime("%Y-%m-%d"))
-    row = _row("aws", "AWS", source="cost_explorer")
-    if end <= start:  # first UTC day of the month — CE window would be empty
-        row.update(mtd_cost_usd=0.0, note="month just started — Cost Explorer window empty",
-                   detail={})
-        _attach_daily_by_system(row, ce, now)
-        return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
-    by_service = _ce_unblended_by_service(ce, start, end)
+    start = mw["start"].strftime("%Y-%m-%d")
+    today = now.strftime("%Y-%m-%d")
+    row = _row("aws", "AWS", source="billing_export")
+    got = read_cur_period(s3, mw["period"], CUR_SERVICE_COLUMNS)
+    if got is None:
+        if now.day == 1:
+            # The export writes a new period within the first day; until it
+            # does, the month genuinely has nothing posted.
+            row.update(mtd_cost_usd=0.0, detail={},
+                       note="month just started — billing export has no period yet")
+            _attach_daily_by_system(row, s3, now)
+            return _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
+        raise RuntimeError(
+            f"billing export has no files for {mw['period']} on day {now.day} — "
+            f"s3://{CUR_BUCKET}/{CUR_DATA_PREFIX}/BILLING_PERIOD={mw['period']}/ is "
+            "empty, so this is no number, not $0")
+    age_h = (now - got["refreshed_at"]).total_seconds() / 3600.0
+    if age_h > CUR_MAX_AGE_HOURS:
+        # A stale export would be republished under a fresh `as_of`, and
+        # every consumer grades freshness on `as_of`. Fail the row instead.
+        raise RuntimeError(
+            f"billing export for {mw['period']} last refreshed {age_h:.1f}h ago "
+            f"(> {CUR_MAX_AGE_HOURS}h): the export has stopped, so these figures "
+            "would be stale behind a fresh as_of")
+    newest = _newest_posted_day(s3, now)
+    # MTD over the POSTED days only, never past today: the export books the
+    # Savings Plan fee for every remaining day of the month in advance.
+    end = min(today, (date.fromisoformat(newest) + timedelta(days=1)).isoformat())
+    end = max(end, start)
+    by_service = _unblended_by_service(got["rows"], start, end)
     mtd = round(sum(by_service.values()), 2)
-    # EVERY service, not the top 8. The truncation was free to remove — this
-    # data already came back in the single CE call above and was being thrown
-    # away — and it was actively blocking budget work: on 2026-09-20 seven
-    # budget lines (DynamoDB, Lambda, SNS, EventBridge, KMS, Step Functions,
-    # SSM) had to be REASONED from AWS list pricing rather than measured,
-    # because every one of them fell below the 8th-largest service ($4.35) and
-    # so was invisible here. A budget you cannot measure is a budget you cannot
-    # tighten, and cushions cannot be sized in cents against a number that does
-    # not exist.
-    #
-    # `top_services_usd` is KEPT, unchanged, because the console Expenses page
-    # and aws_spend_monitor.py both read that key. Removing it to "clean up"
-    # would break two consumers for no gain.
+    # EVERY service, not the top 8 (2026-09-20: seven budget lines fell below
+    # the 8th-largest service and had to be reasoned rather than measured).
+    # `top_services_usd` is KEPT because the console Expenses page and
+    # aws_spend_monitor.py both read that key.
     top = dict(sorted(by_service.items(), key=lambda kv: -kv[1])[:8])
     row.update(mtd_cost_usd=mtd,
                detail={"top_services_usd": {k: round(v, 2) for k, v in top.items()},
                        "all_services_usd": {k: round(v, 4)
                                             for k, v in sorted(by_service.items(),
                                                                key=lambda kv: -kv[1])},
-                       "service_count": len(by_service)},
-               note="Cost Explorer data lags ~24h")
-    # Month-end projection from THIS month's actual usage (Brian 2026-10-02):
-    # MTD over the days Cost Explorer has posted, extended to the whole month.
-    # It used to be CE's own MONTHLY forecast, a model over PRIOR months, which
-    # on 2026-10-02 read $317.59 against $0 of October usage — September's
-    # one-off Cost Explorer burst still in its history. A forecast that does not
-    # come from the month it forecasts is not this month's pace. Dropping it
-    # also removes a billed $0.01 request from every run.
-    covered_days = (datetime.strptime(end, "%Y-%m-%d")
-                    - datetime.strptime(start, "%Y-%m-%d")).days
-    if mtd > 0:
+                       "service_count": len(by_service),
+                       "export_refreshed_at": got["refreshed_at"].isoformat(),
+                       "posted_through": newest if newest >= start else None},
+               note="AWS billing export (CUR 2.0); lags ~24h, refreshed up to 3x/day")
+    # Month-end projection from THIS month's posted usage (Brian 2026-10-02):
+    # MTD over the posted days, extended to the whole month.
+    covered_days = (date.fromisoformat(end) - date.fromisoformat(start)).days
+    if mtd > 0 and covered_days > 0:
         observed_frac = covered_days * 86400.0 / mw["total_seconds"]
         row["projected_month_end_usd"] = round(mtd / observed_frac, 2)
         row["detail"]["projection_source"] = "mtd_run_rate"
@@ -856,32 +1001,15 @@ def collect_aws(mw: dict, budgets: dict, ce=None) -> dict:
             f"${mtd:.2f} over {covered_days} posted day(s) of "
             f"{round(mw['total_seconds'] / 86400)}")
     else:
-        # Nothing posted yet (CE lags ~24h). No projection rather than $0: an
-        # unposted month is not a cheap one, and $0 would grade "under".
+        # Nothing posted yet. No projection rather than $0: an unposted month
+        # is not a cheap one, and $0 would grade "under".
         row["detail"]["projection_source"] = "pending_no_usage_posted"
-    _attach_daily_by_system(row, ce, now)
+    _attach_daily_by_system(row, s3, now)
     _finish_usd_row(row, mw, _budget_usd(budgets, "aws"))
     if row["detail"]["projection_source"] == "pending_no_usage_posted":
         row["projected_month_end_usd"] = None
         row["pace"] = None
     return row
-
-
-def _attach_daily_by_system(row: dict, ce, now: datetime) -> None:
-    """Adds ``detail.daily_by_system`` to the AWS row, or
-    ``detail.daily_by_system_error`` when Cost Explorer could not answer.
-
-    A failure here degrades only this field -- the month-to-date row above is
-    still true -- and its consumer (crucible's dollar gates) renders a missing
-    series UNMEASURABLE. A budget breach is re-raised like every other one.
-    """
-    try:
-        row["detail"]["daily_by_system"] = collect_aws_daily_by_system(ce, now)
-    except CostExplorerCallBudgetExceeded:
-        raise
-    except Exception as exc:  # noqa: BLE001 — recorded on the row, see docstring
-        logger.info("CE daily-by-system unavailable: %s", exc)
-        row["detail"]["daily_by_system_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
 
 def _bucket_in_month(bucket: dict, month_start: datetime) -> bool:
@@ -1564,11 +1692,18 @@ def _reconciliation_row(key: str, prior_doc: dict | None, actual_final: float | 
     }
 
 
-def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, ce=None) -> dict:
-    ce = _ce_client() if ce is None else ce
-    by_service = _ce_unblended_by_service(
-        ce, prior_mw["start"].strftime("%Y-%m-%d"), prior_mw["end"].strftime("%Y-%m-%d"))
-    return _reconciliation_row("aws", prior_doc, round(sum(by_service.values()), 2))
+def reconcile_aws(prior_mw: dict, budgets: dict, prior_doc: dict | None, s3=None) -> dict:
+    """The closed month's FINAL AWS bill: every line of that billing period in
+    the export, which AWS rewrites in place until the bill is final."""
+    s3 = boto3.client("s3", region_name=REGION) if s3 is None else s3
+    got = read_cur_period(s3, prior_mw["period"], (CUR_COST, CUR_USAGE_START))
+    if got is None:
+        return _reconciliation_row("aws", prior_doc, None, status="not_available",
+                                   note=f"billing export has no period {prior_mw['period']}")
+    total = sum(float(r.get(CUR_COST) or 0.0) for r in got["rows"])
+    return _reconciliation_row(
+        "aws", prior_doc, round(total, 2),
+        note=f"billing export, refreshed {got['refreshed_at']:%Y-%m-%d %H:%MZ}")
 
 
 def reconcile_anthropic(prior_mw: dict, budgets: dict, secrets: dict, s3,
@@ -1671,12 +1806,6 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
     def fenced(key: str, fn) -> None:
         try:
             providers[key] = fn()
-        except CostExplorerCallBudgetExceeded:
-            # Escapes the fence deliberately (alpha-engine-config-I11201): a
-            # budget breach is not a provider outage, it is this code looping
-            # on a $0.01-per-request API. Recording it as one row's `note` is
-            # how the 2026-09 burst ran four days instead of four minutes.
-            raise
         except Exception as exc:  # noqa: BLE001 — one provider's re-query outage
             # must not blank the others' reconciliation rows.
             _log_provider_failed(key, exc)
@@ -1684,7 +1813,7 @@ def run_reconciliation(s3, now: datetime, budgets: dict, secrets: dict) -> dict:
             providers[key] = _reconciliation_row(key, prior_doc, None, status="error",
                                                  note=str(exc)[:300])
 
-    fenced("aws", lambda: reconcile_aws(prior_mw, budgets, prior_doc))
+    fenced("aws", lambda: reconcile_aws(prior_mw, budgets, prior_doc, s3))
     fenced("anthropic_api",
           lambda: reconcile_anthropic(prior_mw, budgets, secrets, s3, prior_doc))
     fenced("openrouter", lambda: reconcile_counter_diff(
@@ -1898,14 +2027,12 @@ def _collect(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # failure's recording surface is this row's error field (+ CW logs).
         try:
             rows.append(fn())
-        except CostExplorerCallBudgetExceeded:
-            raise  # see the reconciliation fence's rationale (I11201)
         except Exception as exc:  # noqa: BLE001 — see fence rationale above
             _log_provider_failed(key, exc)
             logger.exception("provider %s failed", key)
             rows.append(_row(key, label, status="error", error=str(exc)[:300]))
 
-    fenced("aws", "AWS", lambda: collect_aws(mw, budgets))
+    fenced("aws", "AWS", lambda: collect_aws(mw, budgets, s3))
     fenced("anthropic_api", "Anthropic API",
            lambda: collect_anthropic(mw, budgets, secrets, s3))
     if "openrouter" in counter_errors:

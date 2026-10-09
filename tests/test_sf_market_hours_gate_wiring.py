@@ -129,6 +129,17 @@ def _matches(rule: dict, doc: dict) -> bool:
     )
 
 
+def _past_pre_session(states: dict, target: str) -> str:
+    """2026-10-09: a market-closed verdict on a box-stopping machine passes the
+    pre-session window refusal [08:00, 09:30) ET before the mutex. Outside that
+    window the chain continues to its Default. Pinned in
+    tests/test_sf_pre_session_window_and_box_ownership.py."""
+    if target != "StampStartClockUtc":
+        return target
+    assert states[target]["Next"] == "PreSessionWindowChoice"
+    return states["PreSessionWindowChoice"]["Default"]
+
+
 def evaluate(choice: dict, doc: dict) -> str:
     for rule in choice["Choices"]:
         if _matches(rule, doc):
@@ -163,8 +174,9 @@ class TestGateIsAtTheHead:
     def test_gate_precedes_the_mutex(self, defs, name):
         # Ordering is deliberate: a run refused for starting in-session must
         # not first take a minute-bucket mutex key it will never use.
-        choice = defs[name]["States"]["MarketHoursGateChoice"]
-        assert evaluate(choice, _payload("PROCEED")) == "CheckMutexRole"
+        states = defs[name]["States"]
+        choice = states["MarketHoursGateChoice"]
+        assert _past_pre_session(states, evaluate(choice, _payload("PROCEED"))) == "CheckMutexRole"
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_gate_precedes_every_state_that_spends(self, defs, name):
@@ -252,8 +264,9 @@ def _through_normalizers(states: dict, name: str) -> str:
 class TestChoiceRouting:
     @pytest.mark.parametrize("name", _BOTH)
     def test_a_closed_market_proceeds(self, defs, name):
-        choice = defs[name]["States"]["MarketHoursGateChoice"]
-        assert evaluate(choice, _payload("PROCEED")) == "CheckMutexRole"
+        states = defs[name]["States"]
+        choice = states["MarketHoursGateChoice"]
+        assert _past_pre_session(states, evaluate(choice, _payload("PROCEED"))) == "CheckMutexRole"
 
     @pytest.mark.parametrize("name", _BOTH)
     def test_an_in_session_start_is_refused(self, defs, name):
@@ -506,7 +519,7 @@ class TestUnverifiedPostureDiffersOnPurpose:
         assert degraded["ResultPath"] == "$.degraded_summary"
         assert degraded["Parameters"]["degraded"] is True
         assert degraded["Next"] == "NotifyMarketHoursUnverified"
-        assert states["NotifyMarketHoursUnverified"]["Next"] == "CheckMutexRole"
+        assert _past_pre_session(states, states["NotifyMarketHoursUnverified"]["Next"]) == "CheckMutexRole"
 
     def test_postclose_degradation_reaches_the_terminal_selector(self, defs):
         # A settlement run that could not verify its own start boundary is not

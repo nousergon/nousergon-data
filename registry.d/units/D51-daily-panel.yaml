@@ -22,14 +22,15 @@ code_path: "builders/daily_panel.py:174"
 pending_since: "2026-10-06"
 lifecycle_reexam: "2026-10-08"
 lifecycle_reason: >-
-    First slice: the producer module, its contract and an operator-run CLI
-    (alpha-engine-config-I10791). Not yet scheduled: the stage after the EOD
-    ArcticDB append, and the collection-box write grant on
-    data_collection/panel/, are the next slice. Until then the unit writes
-    nothing on a schedule.
+    The producer module, its contract, an operator-run CLI and the collector's
+    whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
+    alpha-engine-config-I10791). Not yet scheduled: naming `daily-panel` in the
+    ne-data-collection-eod schedule waits on the collection-box write grant on
+    data_collection/panel/ (a scheduled run would fail on AccessDenied). Until
+    then the unit writes nothing on a schedule.
 lifecycle_owner: brian
 promotes_when: >-
-    The EOD collection runs `python -m builders.daily_panel publish` after the
+    The EOD collection runs `weekly_collector.py --daily-panel` after the
     ArcticDB append and data_collection/panel/{trading_day}/manifest.json is
     current for the latest session. Flip lifecycle to in-service and declare the
     cadence in the same PR.
@@ -37,7 +38,8 @@ trigger:
   kind: "manual"
   runs_on: "ec2-spot"
   detail: >-
-    NOT YET SCHEDULED. Operator-run in-region (`python -m builders.daily_panel
+    NOT YET SCHEDULED. Operator-run in-region (`python weekly_collector.py
+    --daily-panel [--date <session>]`, or `python -m builders.daily_panel
     publish --date <session>`); belongs on ne-data-collection-eod after the
     universe append.
 writes:
