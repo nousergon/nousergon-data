@@ -64,13 +64,18 @@ def test_every_route_into_the_stop_comes_through_the_drain():
     feeders = {n for n, st in STATES.items() if "StopTradingInstance" in _targets(st)}
     assert feeders <= set(DRAIN), sorted(feeders - set(DRAIN))
     # And the drain is actually entered from the work paths, not orphaned.
+    # Since 2026-10-09 the work paths enter it through the box-ownership
+    # check (tests/test_sf_pre_session_window_and_box_ownership.py): an owned
+    # box is drained and stopped, a box another actor started is neither.
     into_drain = {n for n, st in STATES.items() if "DrainTraderReconcile" in _targets(st)}
+    assert into_drain == {"CheckBoxOwnedBeforeStop"}
+    into_guard = {n for n, st in STATES.items() if "CheckBoxOwnedBeforeStop" in _targets(st)}
     assert {"CheckEODStatus", "CheckSkipEODReconcile",
-            "HealReplayDispatchFailed", "HealNonConvergent"} <= into_drain
+            "HealReplayDispatchFailed", "HealNonConvergent"} <= into_guard
     # HealConvergedNotify is deliberately NOT a feeder: after a successful
     # dispatch the replay owns the box and runs its OWN drain before its own
     # stop (tests/test_heal_replay_owns_the_trading_box.py).
-    assert "HealConvergedNotify" not in into_drain
+    assert "HealConvergedNotify" not in into_drain | into_guard
 
 
 def test_the_drain_fails_open_toward_the_stop():

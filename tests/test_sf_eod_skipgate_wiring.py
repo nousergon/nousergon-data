@@ -94,8 +94,10 @@ _RECONCILE_CHAIN = [
     # systemd timer), so this now routes straight to the cost-guard tail --
     # entered, since alpha-engine-config-I12020, through the bounded
     # trader-reconcile drain (DrainTraderReconcile) that keeps the box up
-    # until the v2 trader's boot-time reconcile has settled.
-    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "DrainTraderReconcile"),
+    # until the v2 trader's boot-time reconcile has settled. Since 2026-10-09
+    # the drain is itself entered through CheckBoxOwnedBeforeStop: a box this
+    # execution did not start is neither drained nor stopped.
+    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckBoxOwnedBeforeStop"),
 ]
 
 _MACHINES = {
@@ -106,9 +108,11 @@ _MACHINES = {
 _POSTCLOSE_TAIL = ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
 #: alpha-engine-config-I12020: the reconcile machine enters its stop through
 #: the trader-reconcile drain; the drain's happy edge is Success.
-_RECONCILE_STOP_ENTRY = "DrainTraderReconcile"
+#: 2026-10-09: and the drain through the box-ownership check, whose happy
+#: edge (this execution started the box) is owned == true.
+_RECONCILE_STOP_ENTRY = "CheckBoxOwnedBeforeStop"
 _RECONCILE_TAIL = [
-    "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
+    "CheckBoxOwnedBeforeStop", "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
     "StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence",
     "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
 ]
@@ -323,7 +327,8 @@ def _walk(states, chain, skip_flags, pipeline_role="operator-replay"):
             # happy edge is ready == true (its first rule), the same shape.
             launched = (
                 [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
-                if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
+                if cur.endswith("SpotLaunched")
+                or cur in ("CheckCollectionReadiness", "CheckBoxOwnedBeforeStop") else []
             )
             # alpha-engine-config-I6689: CheckExerciseCadence branches on
             # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
