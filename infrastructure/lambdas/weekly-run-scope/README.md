@@ -52,8 +52,8 @@ that is neither *disabled* nor *failed*.
 | Disposition | Meaning | Graded? |
 |---|---|---|
 | `DISABLED` | Its gate was entered and took the skip branch, or a parent gate whose enabled branch is the only way in did (`source: parent_gate`). `disabled_by` names the flag. | No — a decision |
-| `ENABLED_COMPLETED` | Dispatched, entered, exited cleanly | Yes |
-| `ENABLED_FAILED` | Dispatched and entered, never exited cleanly — including a raise that a `Catch` routed on (`caught_error`) | **Yes, as a failure** |
+| `ENABLED_COMPLETED` | Dispatched, and the branch it took reached its rejoin with no failure recorded on the way (`completion_witness`) | Yes |
+| `ENABLED_FAILED` | Dispatched and entered, but its branch did not complete — a raise a `Catch` routed on (`caught_error`), a route into an error-recording state, a state never exited (`failed_state` names where) | **Yes, as a failure** |
 | `NOT_REACHED` | The gate was never entered — the run ended upstream | No — an absence of evidence |
 
 Gated stages that run after `RunScope` itself (`ReportCard`, `Director`,
@@ -92,6 +92,33 @@ property to be true. Cross-branch blame was dropped entirely: a `NOT_REACHED`
 row reports the run's own input flag as an explanation, which is a fact rather
 than an inference, because a wrong parent flag is worse than none — the flag it
 names is not the flag to flip.
+
+## The branch the run took, not the one the definition defaults to
+
+alpha-engine-config-I11984. `CheckSkipEvalJudge` reaches its Task through
+`CheckMonthlyCadence`, whose `Default` is `EvalJudgeSubmitWeekly`; on the first
+Saturday of a month the run takes `EvalJudgeSubmitFirstSaturday`. On 2026-10-03
+the walk read the Default, found it never entered, and wrote EvalJudge as
+`ENABLED_FAILED` for a run that graded 96/96 — and the Director reported the
+outage. Two rules now hold:
+
+- **A routing Choice the run entered is followed down the branch it took.**
+  Each row carries `entry_route` (choice, branch taken, the definition's
+  Default, and whether the history or the Default decided it) and
+  `entry_state_source`. A gate the run never entered still shows the Default,
+  labelled `definition_default`.
+- **The outcome is the selected branch's end-to-end result**, read off that
+  branch's own `previousEventId` chain from its work state to where it rejoins
+  the machine (the gate's skip target, the next `CheckSkip` gate, `RunScope`,
+  or the end of a Parallel branch). A Task's clean exit is not completion: on
+  2026-08-29 `EvalJudgeSubmitWeekly` SUCCEEDED returning `status=ERROR` and
+  the branch routed to `MarkEvalJudgeDegraded`. A failure the branch then
+  looped back from (a relaunch, a reissue) is cleared, so the final attempt
+  decides — the rule `caught_failures` already applied to a single state.
+
+An error-recording state is read off the definition, not off names: a `Fail`,
+or a `Pass` whose `ResultPath` writes an error (`$.error`, `$.*_error`) or sets
+a `*degraded*` field true.
 
 ## Failure posture
 
@@ -134,3 +161,11 @@ executions in `fixtures/`:
   terminated **SUCCEEDED** carrying 22 `skip_*` flags. Scope says 3 of 29.
 - `history_real_run_failed.json` — `watch-rerun-2026-08-15-1`, the last run that
   did real work, with `skip_parity` set.
+- `*_2026-10-03_first_saturday`, `*_2026-09-26_weekly`,
+  `*_2026-08-29_eval_judge_failed` (gzipped, trimmed to the fields the
+  derivation reads, each with the definition its execution ran against) — the
+  first-Saturday judge run, a clean weekly one, and a genuine judge failure
+  (alpha-engine-config-I11984). Synthetic histories over
+  `infrastructure/step_function.json` cover sync / async / empty-plan /
+  relaunched / died-mid-poll on both cadences; each synthetic path is checked
+  edge-by-edge against the definition first.

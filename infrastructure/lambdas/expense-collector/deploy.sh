@@ -10,20 +10,24 @@
 # (s3://alpha-engine-research/expenses/latest.json + monthly/{YYYY-MM}.json).
 #
 # IAM (iam-policy.json): logs + ssm:GetParameter(s) for provider keys +
-# ce:GetCostAndUsage/GetCostForecast + s3 Get/Put under expenses/* + s3 Get on
+# s3 Get/List on the CUR billing export (s3://nous-ergon-fleet-cur-exports/
+# nous-ergon-fleet-cur/*) + s3 Get/Put under expenses/* + s3 Get on
 # config/expense_budgets.json and decision_artifacts/_cost_raw/* + Telegram
 # SSM params and the flow-doctor DynamoDB dedup store (config#2843 over-budget
-# alert).
+# alert). NO `ce:` action: AWS spend comes from the billing export, never Cost
+# Explorer (alpha-engine-config-I12168).
 #
 # Cadence (UTC): twice daily — 00:15 (captures the month-start baseline within
-# 15 min of rollover) and 12:15. Cost Explorer bills $0.01/request (3 CE calls
-# per run ⇒ ~$1.8/mo, visible in the collector's own AWS row).
+# 15 min of rollover) and 12:15. Each run reads a handful of small parquet
+# objects from the billing export (S3 GETs, fractions of a cent per month).
 #   cron(15 0,12 * * ? *)
 #
 # Plus ONE monthly reconciliation run (alpha-engine-config#2849) — 03:00 UTC
 # on the 2nd of each month, after every provider has finalized the prior
 # month's numbers (AWS CE data lags ~24h; GitHub/Anthropic/Neon settle same-
 # day-ish; the 2nd gives every provider a full day's slack past rollover).
+# The AWS row re-reads the closed period from the billing export, which AWS
+# keeps rewriting until the bill is final.
 # Same Lambda, same code — the ONLY difference from the twice-daily rule is
 # the Scheduler target's `Input`, which flips `event["mode"]` to "reconcile"
 # (see index.py::handler's dispatch). No separate function/deploy path.
@@ -91,35 +95,23 @@ SCHED_INPUTS=(
 )
 SCHED_PREFIX="alpha-engine-expense-collector-"
 
-# Retry bound (alpha-engine-config-I11206, Brian's ruling 2026-09-20: exempt
-# the collector from the Cost Explorer breaker "as long as we have the
-# safeguards in place not to get runaway cost accumulation").
+# Retry bound (alpha-engine-config-I11206). EventBridge Scheduler's DEFAULT IS
+# 185 RETRIES over a 24h event age, and it had never been set here. Each retry
+# is a FRESH invocation that re-reads every provider, so a failure anywhere
+# after the reads re-pays for them.
 #
-# EventBridge Scheduler's DEFAULT IS 185 RETRIES over a 24h event age, and it
-# had never been set here. Each retry is a FRESH INVOCATION carrying a fresh
-# `CE_CALL_BUDGET`, and the two Cost Explorer calls happen EARLY in the
-# handler -- so a failure anywhere after them re-pays for them.
-#
-#   185 retries x 2 ticks/day x 2 CE calls = 740 calls/day = $7.40/day
-#   ~$222/month, against a $139 ACCOUNT budget and a $6 Cost Explorer line.
-#
-# That is the 2026-09 incident's exact shape (alpha-engine-config-I10389): a
-# per-call cap that says nothing about call COUNT. The per-invocation budget
-# added in I11201 bounds each run; this bounds how many runs there can be.
-# Both are needed, and neither substitutes for the other.
-#
-#   2 retries + 1 original x 2 ticks x 3 calls = 18 calls/day = $0.18/day
-#   (third call: the per-system daily series, alpha-engine-config-I11707)
+# The bound was introduced when this Lambda called Cost Explorer ($0.01 per
+# request, I10389: 185 retries x 2 ticks x 2 calls = $7.40/day). Since
+# alpha-engine-config-I12168 it makes no Cost Explorer call at all, so the
+# bound no longer guards a billed AWS API — it is KEPT because each retry
+# still hits every provider's billing API (Anthropic, OpenRouter, DeepSeek,
+# Neon, GitHub) and a 185-deep retry storm against them is a rate-limit and
+# noise problem with no upside.
 #
 # Two is enough for a genuine transient (the provider adapters are already
-# fenced, so a retry here means the rollup WRITE or the SSM/S3 read failed)
-# and small enough that a sustained failure loop reaches the $6 line's alert
-# rather than the month's budget. A dead collector is caught separately, by
-# aws_spend_monitor.py's staleness clause on `expenses/latest.json`.
-#
-# DECLARED HERE AND GRADED DAILY: `sync_cost_controls.py --check` reads the
-# live schedules and reds if either exceeds this bound, so a console edit or
-# an un-flagged redeploy cannot quietly restore 185.
+# fenced, so a retry here means the rollup WRITE or the SSM/S3 read failed).
+# A dead collector is caught separately, by aws_spend_monitor.py's staleness
+# clause on `expenses/latest.json`.
 SCHED_MAX_RETRIES=2
 SCHED_MAX_EVENT_AGE_SECONDS=3600
 
@@ -213,6 +205,8 @@ echo "Installing runtime deps into ${PKG} (Lambda-safe Docker pip)..."
 bash "${LAMBDAS_DIR}/lambda_pip_install.sh" "${PKG}" "${SCRIPT_DIR}/requirements.txt"
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+# The dependency-free parquet reader for the billing export (I12168).
+cp "${SCRIPT_DIR}/cur_parquet.py" "${PKG}/cur_parquet.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")

@@ -91,8 +91,13 @@ _RECONCILE_CHAIN = [
     # alpha-engine-config-I2722 (2026-07-16): the skip edge used to land on
     # CheckSkipDailySubstrateHealthCheck; that gate + the whole
     # DailySubstrateHealthCheck chain were removed (spun out to a dashboard-box
-    # systemd timer), so this now routes straight to the cost-guard tail.
-    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "StopTradingInstance"),
+    # systemd timer), so this now routes straight to the cost-guard tail --
+    # entered, since alpha-engine-config-I12020, through the bounded
+    # trader-reconcile drain (DrainTraderReconcile) that keeps the box up
+    # until the v2 trader's boot-time reconcile has settled. Since 2026-10-09
+    # the drain is itself entered through CheckBoxOwnedBeforeStop: a box this
+    # execution did not start is neither drained nor stopped.
+    ("CheckSkipEODReconcile", "EODReconcile", "skip_eod_reconcile", "CheckBoxOwnedBeforeStop"),
 ]
 
 _MACHINES = {
@@ -101,7 +106,13 @@ _MACHINES = {
 }
 
 _POSTCLOSE_TAIL = ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+#: alpha-engine-config-I12020: the reconcile machine enters its stop through
+#: the trader-reconcile drain; the drain's happy edge is Success.
+#: 2026-10-09: and the drain through the box-ownership check, whose happy
+#: edge (this execution started the box) is owned == true.
+_RECONCILE_STOP_ENTRY = "CheckBoxOwnedBeforeStop"
 _RECONCILE_TAIL = [
+    "CheckBoxOwnedBeforeStop", "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
     "StopTradingInstance", "ReadExerciseCadence", "CheckExerciseCadence",
     "LaunchWeeklyExerciseRun", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
 ]
@@ -277,10 +288,11 @@ class TestEntryEdgesRouteThroughGates:
     def test_eod_success_enters_stop_trading_instance(self, reconcile):
         # alpha-engine-config-I2722 (2026-07-16): CheckEODStatus's Success edge
         # used to feed CheckSkipDailySubstrateHealthCheck; that gate + chain
-        # are removed, so it now routes directly to the cost-guard tail.
+        # are removed, so it now routes directly to the cost-guard tail
+        # (through the trader-reconcile drain, alpha-engine-config-I12020).
         succ = [c["Next"] for c in reconcile["CheckEODStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["StopTradingInstance"]
+        assert succ == [_RECONCILE_STOP_ENTRY]
 
 
 def _walk(states, chain, skip_flags, pipeline_role="operator-replay"):
@@ -315,7 +327,8 @@ def _walk(states, chain, skip_flags, pipeline_role="operator-replay"):
             # happy edge is ready == true (its first rule), the same shape.
             launched = (
                 [c["Next"] for c in st.get("Choices", []) if _ops(c).get("BooleanEquals") is True]
-                if cur.endswith("SpotLaunched") or cur == "CheckCollectionReadiness" else []
+                if cur.endswith("SpotLaunched")
+                or cur in ("CheckCollectionReadiness", "CheckBoxOwnedBeforeStop") else []
             )
             # alpha-engine-config-I6689: CheckExerciseCadence branches on
             # StringEquals "daily"/"weekly-only"/"off", not "Success" or a
@@ -385,7 +398,7 @@ class TestPaths:
         assert order[:3] == [
             "InitCollectionReadinessPoll", "SeedCollectionReadiness", "WaitForCollectionManifests",
         ]
-        assert order[-7:] == _RECONCILE_TAIL
+        assert order[-len(_RECONCILE_TAIL):] == _RECONCILE_TAIL
 
     def test_skip_refresh_resumes_at_snapshot_in_postclose(self, postclose):
         # alpha-engine-config#5569: resumes at the retry-counter init, then
@@ -405,7 +418,7 @@ class TestPaths:
         assert "WaitForCollectionManifests" not in order
         assert order[0] == "ProbeEODReconcilePrecondition"
         assert order[1] == "EODReconcile"
-        assert order[-7:] == _RECONCILE_TAIL
+        assert order[-len(_RECONCILE_TAIL):] == _RECONCILE_TAIL
 
     def test_happy_path_waits_for_the_collection_before_the_reconcile(self, reconcile):
         # alpha-engine-config-I11269: the reconcile reads what the EOD
@@ -508,22 +521,25 @@ class TestSubstrateHealthCheckChainRemoved:
     def test_check_eod_status_success_rewired_to_stop_trading_instance(self, states):
         succ = [c["Next"] for c in states["CheckEODStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["StopTradingInstance"]
+        assert succ == [_RECONCILE_STOP_ENTRY]
 
     def test_check_skip_eod_reconcile_skip_edge_rewired(self, states):
         skip_choice = states["CheckSkipEODReconcile"]["Choices"][0]
-        assert skip_choice["Next"] == "StopTradingInstance"
+        assert skip_choice["Next"] == _RECONCILE_STOP_ENTRY
 
+    # HealConvergedNotify routes around the stop entry since the 2026-10-08
+    # heal-replay stop race: the replay it follows owns the box
+    # (tests/test_heal_replay_owns_the_trading_box.py).
     @pytest.mark.parametrize(
         "heal_state",
-        ["HealReplayDispatchFailed", "HealConvergedNotify", "HealNonConvergent"],
+        ["HealReplayDispatchFailed", "HealNonConvergent"],
     )
     def test_heal_outcome_notifiers_rewired(self, states, heal_state):
         st = states[heal_state]
-        assert st["Next"] == "StopTradingInstance"
+        assert st["Next"] == _RECONCILE_STOP_ENTRY
         catches = [c for c in st["Catch"] if c["ErrorEquals"] == ["States.ALL"]]
         assert len(catches) == 1
-        assert catches[0]["Next"] == "StopTradingInstance"
+        assert catches[0]["Next"] == _RECONCILE_STOP_ENTRY
 
     @pytest.mark.parametrize("machine", sorted(_MACHINES))
     def test_no_dangling_reference_to_removed_states_anywhere(self, machine):

@@ -1,0 +1,173 @@
+# Unit descriptor — data collector unit D50 (features settled regrade).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE, committed
+# beside the thing it describes and pointing at where its facts ALREADY live.
+# Nothing about the console changes to render this unit.
+#
+# `data_collection_plan_260914.md` §4.1: `data_gate/clauses.py` GENERATES every
+# clause from these descriptors. Nothing is hand-listed (`observability-policy`
+# §2.2).
+#
+# REGISTERED AFTER THE 2026-09-14 AUDIT (alpha-engine-config-I12023, Crucible v2
+# ruling 2026-10-06, comment 6024224623 §2). The audit scored no such unit, so
+# `audit.baseline_date` is this unit's own registration date and the `cells`
+# below are this PR's reading, RED where nothing measures them yet.
+#
+# PUBLIC REPO. This file carries key templates, triggers and consumer paths that
+# are already public in this repository's own code. IAM role names, alarm
+# thresholds and runbook detail stay in `nous-ergon-ops` (plan §5).
+unit_id: D50
+component_id: "data-collector-d50-features-settled-regrade"
+owning_repo: "nousergon-data"
+title: "features settled regrade (features/{D-1} rebuilt from the settled bar)"
+component: 1
+lifecycle: "in-service"
+owner: brian
+code_path: "weekly_collector.py:5852, features/settled_regrade.py:533, features/compute.py:1517"
+trigger:
+  kind: "step-functions"
+  # The LAST workload of the standalone stack's morning machine, after D17
+  # settled staging/daily_closes/{D-1} and the ArcticDB probe ran
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::MorningSchedule).
+  owner: "ne-data-collection-morning"
+  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-morning"
+  successor: "ne-data-collection-morning (alpha-engine-config-I12023); no v1 predecessor — v1 never rebuilt features/{D-1}"
+  schedule: "weekdays 07:30 America/New_York"
+  runs_on: "ec2-spot"
+writes:
+  - "features/{date}/*.parquet"
+  - "features/{date}/settlement.json"
+# Same keys as D31, rewritten the next morning. D31 writes them first (the
+# evening of D, from the provisional bar); D50 rewrites them from the settled
+# bar and leaves the D31 versions readable by the VersionIds its marker names.
+writes_shared_with:
+  - D31
+consumers:
+  - "crucible-research:scoring/factor_scoring.py"
+  - "crucible-dashboard:views/13_Feature_Store.py"
+consumers_reason: >-
+    The same readers as D31's features/{date}/*.parquet: D50 rewrites those
+    keys in place. `settlement.json` is new with this unit and has no reader
+    yet; it is the `backfilled_at` marker DATA_QUALITY_WINDOWS.md requires beside
+    a re-derived prefix, and the evidence the parity adjudication reads to tell a
+    rebuilt snapshot from an original (alpha-engine-config-I12023).
+contract:
+  schema:
+    - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+  producer_test:
+    - tests/test_features_settled_regrade.py
+    - tests/test_schema_contract.py
+  # D31's only body_schema pin is on features/registry.json, which D50 never
+  # writes, so it is not reused here. The parquet readers below have no pinned
+  # contract file of their own (same as D31's parquet half); they render as a
+  # finding until one exists.
+  unpinned_consumers:
+    - "crucible-research:scoring/factor_scoring.py"
+    - "crucible-dashboard:views/13_Feature_Store.py"
+  # The rebuilt bytes come from the SAME serialiser D31 publishes through
+  # (features/writer.py::snapshot_group_frames), so D31's per-column contract
+  # covers them.
+registry_rows:
+  - feature_store_freshness_sentinel
+run_manifest_prefix: data_collection/runs/D50
+detectors:
+  - kind: "sf-execution"
+    via: "ne-data-collection-morning"
+    state: PRESENT
+    note: "verify_units D50: a missing, failed or output-less D50 manifest fails the morning execution, which pages"
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: ABSENT
+    note: "the settlement.json row is an alpha-engine-config ARTIFACT_REGISTRY companion to this PR"
+freshness:
+  family: morning
+  # The morning fire plus every workload's SSM-online budget and declared cap
+  # through features-settled-regrade (data_collection_stack.worst_case_seconds):
+  # 07:30 + 3 x (5 + 120) + (5 + 60) min = 14:50 ET at the outside. The ruling
+  # (comment 6024224623 §2) bounds the rebuild by dates.bar_settlement, which
+  # this meets on the morning of D+1. Still `proposed`.
+  deadline: "14:50 America/New_York"
+  status: proposed
+  ratified_at: "phase-3 exit (plan §2 row 1)"
+completeness:
+  denominator: "the groups D-1's D31 run published"
+  floor: 1.0
+  status: proposed
+  note: >-
+    Enforced IN THE PRODUCER: the rebuild refuses unless it produces every
+    group D31's manifest recorded, so no group is left provisional beside
+    rebuilt ones.
+  rows_out_floor: null
+  rows_out_floor_na_code: "N/A-NOT-IMPL"
+guards:
+  empty_fresh:
+    state: present
+    code:
+      - "weekly_collector.py::_record_mode_lineage"
+    records_as: data_empty_fresh
+    note: >-
+        Whole-mode unit: run_units.MODE_ROWS reads features.tickers_computed, so a
+        zero-row rebuild records `empty_fresh` and an unreported count
+        `unmeasurable`, never a pass. An idempotent repeat records
+        `not_applicable` with reason no_new_data_declared.
+  cardinality:
+    state: present
+    code:
+      - "features/settled_regrade.py::regrade"
+    evaluates: "if not set(d31_groups) <= set(frames):"
+    note: >-
+        The rebuilt group set must contain every group D31 published, or nothing
+        is written. Per-ticker cardinality is D31's own feature code (5% error
+        ceiling in features.compute.build_feature_frame).
+  units:
+    state: present_static
+    note: "as D31: the same writer and its units-suffix contract (features/writer.py)"
+  pit:
+    state: present
+    code:
+      - "features/settled_regrade.py::regrade"
+    evaluates: "facade = SettledInputsS3(client, pins)"
+    note: >-
+        Every S3 input but staging/daily_closes is served at the VersionId D-1's
+        D31 run recorded, so a pointer advanced since (the Saturday
+        latest_weekly.json) cannot reach a Friday rebuild; ArcticDB is read with
+        before = end = D-1.
+  vendor_fallback:
+    state: absent
+    note: >-
+        No vendor fetch: the rebuild reads only what D17 and D31 already wrote.
+        A missing or moved input refuses rather than substituting.
+  success_without_output:
+    state: present
+    note: >-
+        Every refused precondition returns status=error: the manifest files
+        `failed` and the box exits 1. A run with nothing to rebuild says so as
+        not_applicable, never `ok`.
+audit:
+  source: "alpha-engine-config-I12023 (unit added after the 2026-09-14 baseline)"
+  baseline_date: "2026-10-06"
+  cells:
+    identity: PRESENT
+    consumers: PRESENT
+    schema_contract: PRESENT
+    artifact_registry: ABSENT
+    observability_row: ABSENT
+    run_record: PRESENT
+    detector: PRESENT
+    console_entity: UNVERIFIED
+    survives_phase4: PRESENT
+clause_phase:
+  identity: 2
+  consumers: 1
+  schema_contract: 1
+  artifact_registry: 1
+  observability_row: 1
+  run_record: 1
+  detector: 3
+  console_entity: 3
+  survives_phase4: 1
+notes: >-
+    A D50 failure fails the morning execution (and pages), which breaks that
+    execution's reliability streak. It cannot delay trading: the preopen
+    readiness wait reads D17/D18 only (data_collection_stack.READINESS_WAIT_EXCLUSIONS)
+    and the predictor reads ArcticDB, not features/.
