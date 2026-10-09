@@ -268,7 +268,14 @@ def _market_hours_proceed_target(states: dict) -> str:
         c["Next"] for c in choice["Choices"] if c.get("StringEquals") == "PROCEED"
     ]
     assert len(proceed) == 1, proceed
-    return proceed[0]
+    target = proceed[0]
+    # 2026-10-09: the box-stopping machines refuse the pre-session window
+    # [08:00, 09:30) ET after the gate; outside it the chain continues to the
+    # mutex. Pinned in tests/test_sf_pre_session_window_and_box_ownership.py.
+    if target == "StampStartClockUtc":
+        assert states[target]["Next"] == "PreSessionWindowChoice"
+        target = states["PreSessionWindowChoice"]["Default"]
+    return target
 
 
 class TestMutexWiring:

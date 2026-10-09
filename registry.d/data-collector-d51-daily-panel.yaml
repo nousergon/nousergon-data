@@ -11,8 +11,9 @@
 component_id: data-collector-d51-daily-panel
 owning_repo: nousergon-data
 substrate: ec2-spot
-origin: NOT YET SCHEDULED. Operator-run in-region (`python -m builders.daily_panel publish --date <session>`);
-  belongs on ne-data-collection-eod after the universe append.
+origin: NOT YET SCHEDULED. Operator-run in-region (`python weekly_collector.py --daily-panel [--date <session>]`,
+  or `python -m builders.daily_panel publish --date <session>`); belongs on ne-data-collection-eod after
+  the universe append.
 owner: brian
 lifecycle: pending
 lifecycle_owner: brian
