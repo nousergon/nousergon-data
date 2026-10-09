@@ -44,7 +44,20 @@ def _targets(state: dict) -> list[str]:
     return out
 
 
-def _reachable(start: str, blocked: set[str] = frozenset()) -> set[str]:
+#: 2026-10-09 box ownership: these Choices skip the stop when the box was
+#: already running at this execution's start. Their owned edge is the only
+#: one ``_owned_targets`` follows, i.e. the execution that started the box.
+OWNERSHIP_GUARDS = {"CheckBoxOwnedBeforeStop", "CheckBoxOwnedBeforeForceStop"}
+
+
+def _owned_targets(name: str) -> list[str]:
+    st = STATES[name]
+    if name in OWNERSHIP_GUARDS:
+        return [c["Next"] for c in st["Choices"]]
+    return _targets(st)
+
+
+def _reachable(start: str, blocked: set[str] = frozenset(), owned: bool = False) -> set[str]:
     seen: set[str] = set()
     todo = [start]
     while todo:
@@ -52,7 +65,7 @@ def _reachable(start: str, blocked: set[str] = frozenset()) -> set[str]:
         if name in seen or name in blocked:
             continue
         seen.add(name)
-        todo.extend(_targets(STATES[name]))
+        todo.extend(_owned_targets(name) if owned else _targets(STATES[name]))
     return seen
 
 
@@ -93,15 +106,16 @@ def test_after_a_dispatch_the_dispatcher_never_drains_or_stops_the_box():
 def test_no_dispatch_routes_still_drain_and_stop():
     for name in ("HealReplayDispatchFailed", "HealNonConvergent"):
         st = STATES[name]
-        assert st["Next"] == "DrainTraderReconcile", name
-        assert [c["Next"] for c in st["Catch"]] == ["DrainTraderReconcile"], name
-    assert "StopTradingInstance" in _reachable("DrainTraderReconcile")
+        assert st["Next"] == "CheckBoxOwnedBeforeStop", name
+        assert [c["Next"] for c in st["Catch"]] == ["CheckBoxOwnedBeforeStop"], name
+    assert "StopTradingInstance" in _reachable("CheckBoxOwnedBeforeStop", owned=True)
 
 
 def test_every_route_from_the_box_start_to_a_terminal_stops_it_unless_handed_off():
-    """With the stops and the hand-off removed, nothing after StartTradingInstance
-    can reach a terminal. A new route that ends a run with the box up fails here."""
-    leaked = _terminals(_reachable("StartTradingInstance", blocked=STOPS | {HAND_OFF}))
+    """For an execution that started the box (owned edges only), with the stops
+    and the hand-off removed, nothing after StartTradingInstance can reach a
+    terminal. A new route that ends a run with the box up fails here."""
+    leaked = _terminals(_reachable("StartTradingInstance", blocked=STOPS | {HAND_OFF}, owned=True))
     assert leaked == set(), sorted(leaked)
 
 
