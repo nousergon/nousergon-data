@@ -20,9 +20,10 @@ notify path is a no-op stub by default; alert-specific tests monkeypatch
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -88,6 +89,11 @@ class FakeS3:
         self.store[kw["Key"]] = kw["Body"]
         return {}
 
+    def list_objects_v2(self, Bucket, Prefix, ContinuationToken=None):
+        keys = sorted(k for k in self.store if k.startswith(Prefix))
+        return {"Contents": [{"Key": k, "LastModified": CUR_REFRESHED.get(k, NOW - timedelta(hours=2))}
+                             for k in keys], "IsTruncated": False}
+
     def get_paginator(self, name):
         assert name == "list_objects_v2"
         store = self.store
@@ -119,55 +125,92 @@ class FakeSSM:
         }
 
 
-def _daily_by_system_response(kw: dict) -> dict:
-    """A DAILY, GroupBy-TAG response over the requested window: every day
-    splits $2.00 crucible-v2 / $1.00 untagged."""
-    from datetime import date, timedelta
-    start = date.fromisoformat(kw["TimePeriod"]["Start"])
-    end = date.fromisoformat(kw["TimePeriod"]["End"])
-    periods, d = [], start
-    while d < end:
-        periods.append({
-            "TimePeriod": {"Start": d.isoformat(), "End": (d + timedelta(days=1)).isoformat()},
-            "Estimated": d >= end - timedelta(days=2),
-            "Groups": [
-                {"Keys": ["system$crucible-v2"], "Metrics": {"UnblendedCost": {"Amount": "2.00"}}},
-                {"Keys": ["system$"], "Metrics": {"UnblendedCost": {"Amount": "1.00"}}},
-            ],
-        })
-        d += timedelta(days=1)
-    return {"ResultsByTime": periods}
+# ── The AWS billing export, faked (alpha-engine-config-I12168) ─────────────
+#
+# The collector reads AWS spend from the CUR export's parquet files. Decoding
+# parquet is `cur_parquet.py`'s job and `test_cur_parquet.py` pins it against
+# files pyarrow wrote; here each "parquet file" is the JSON of its rows and
+# `cur_parquet.read_rows` is swapped for a JSON reader (autouse fixture below),
+# so these tests exercise everything ABOVE the decoder.
+
+#: Per-key LastModified override for the fake listing (default: NOW - 2h).
+CUR_REFRESHED: dict[str, datetime] = {}
 
 
-def _is_daily_by_system(kw: dict) -> bool:
-    return kw.get("GroupBy") == [{"Type": "TAG", "Key": "system"}]
+def _cur_key(period: str) -> str:
+    return f"{index.CUR_DATA_PREFIX}/BILLING_PERIOD={period}/nous-ergon-fleet-cur-00001.snappy.parquet"
 
 
-class FakeCE:
-    def __init__(self, fail_forecast: bool = False):
-        self.fail_forecast = fail_forecast
+def cur_line(day: str, cost: float, *, product: str = "AmazonEC2",
+             usage: str = "USE1-BoxUsage:t3.small", line_type: str = "Usage",
+             system: str | None = None) -> dict:
+    return {
+        index.CUR_USAGE_START: day,
+        index.CUR_COST: cost,
+        index.CUR_PRODUCT: product,
+        index.CUR_USAGE_TYPE: usage,
+        index.CUR_LINE_TYPE: line_type,
+        index.CUR_SYSTEM_TAG: system,
+    }
 
-    def get_cost_and_usage(self, **kw):
-        if _is_daily_by_system(kw):
-            return _daily_by_system_response(kw)
-        return {"ResultsByTime": [{"Groups": [
-            {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "8.10"}}},
-            {"Keys": ["AmazonS3"], "Metrics": {"UnblendedCost": {"Amount": "4.24"}}},
-        ]}]}
 
-    def get_cost_forecast(self, **kw):
-        if self.fail_forecast:
-            raise RuntimeError("forecast unavailable")
-        # MONTHLY-granularity forecast returns the FULL month-end total (already
-        # includes MTD), NOT the remainder — this is the AWS-console figure.
-        return {"Total": {"Amount": "25.00"}}
+def cur_files(by_period: dict[str, list[dict]], *, drop_columns=()) -> dict[str, bytes]:
+    """Store entries for one fake export file per period. ``drop_columns``
+    models a period written before the export carried those columns."""
+    out = {}
+    for period, lines in by_period.items():
+        rows = [{k: v for k, v in r.items() if k not in drop_columns} for r in lines]
+        out[_cur_key(period)] = json.dumps(rows).encode()
+    return out
+
+
+def _json_read_rows(data: bytes, columns: list[str]) -> list[dict]:
+    rows = json.loads(data)
+    have = set(rows[0]) if rows else set(columns)
+    missing = [c for c in columns if c not in have]
+    if missing:
+        raise KeyError(", ".join(missing))
+    out = []
+    for r in rows:
+        row = {c: r[c] for c in columns}
+        if row.get(index.CUR_USAGE_START):
+            row[index.CUR_USAGE_START] = datetime.fromisoformat(
+                row[index.CUR_USAGE_START]).replace(tzinfo=timezone.utc)
+        out.append(row)
+    return out
+
+
+@pytest.fixture(autouse=True)
+def _fake_parquet(monkeypatch):
+    monkeypatch.setattr(index.cur_parquet, "read_rows", _json_read_rows)
+    CUR_REFRESHED.clear()
+
+
+def july_export() -> dict[str, list[dict]]:
+    """NOW is 2026-07-17 12:00Z. July: EC2 instance hours 8.10 (crucible-v2)
+    + S3 4.24 (untagged) = 12.34, real usage posted through 07-16, and one
+    Savings Plan fee booked IN ADVANCE for 07-25 that must not count. June:
+    the same 12.34, its EC2 day carrying crucible-v2."""
+    july = [cur_line("2026-07-01", 8.10, system="crucible-v2"),
+            cur_line("2026-07-02", 4.24, product="AmazonS3", usage="Requests-Tier1")]
+    july += [cur_line(f"2026-07-{d:02d}", 0.0) for d in range(3, 17)]
+    july.append(cur_line("2026-07-25", 0.36, product="ComputeSavingsPlans",
+                         usage="ComputeSP:1yrNoUpfront", line_type="SavingsPlanRecurringFee"))
+    june = [cur_line("2026-06-01", 8.10, system="crucible-v2"),
+            cur_line("2026-06-02", 4.24, product="AmazonS3", usage="Requests-Tier1")]
+    return {"2026-06": june, "2026-07": july}
 
 
 class FakeBoto3:
-    def __init__(self, s3, ssm, ce):
-        self._by_name = {"s3": s3, "ssm": ssm, "ce": ce}
+    """Asking for a Cost Explorer client FAILS the test: the collector must never construct a
+    Cost Explorer client (alpha-engine-config-I12168)."""
+
+    def __init__(self, s3, ssm):
+        self._by_name = {"s3": s3, "ssm": ssm}
 
     def client(self, name, region_name=None):
+        if name == "ce":
+            raise AssertionError("the expense collector constructed a Cost Explorer client")
         return self._by_name[name]
 
 
@@ -477,6 +520,7 @@ def env(monkeypatch):
             "as_of": {"openrouter_total_usage": "2026-07-01T00:15:00+00:00",
                       "deepseek_neg_balance": "2026-07-01T00:15:00+00:00"},
         }).encode(),
+        **cur_files(july_export()),
     }
     s3 = FakeS3(store)
     ssm = FakeSSM({
@@ -488,7 +532,7 @@ def env(monkeypatch):
         index.SSM_GITHUB_USER_PAT: "ghp-user-xxx",
         # no ANTHROPIC_ADMIN_KEY → client-telemetry fallback path
     })
-    monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+    monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm))
     monkeypatch.setattr(index, "_now_utc", lambda: NOW)
     monkeypatch.setattr(index, "_http_json", http_router({
         "openrouter.ai/api/v1/credits": {
@@ -544,7 +588,9 @@ class TestHandler:
         assert rows["aws"]["projected_month_end_usd"] == pytest.approx(12.34 / 16 * 31, abs=0.01)
         assert rows["aws"]["detail"]["projection_source"] == "mtd_run_rate"
         assert rows["aws"]["pace"] == "under"  # 23.91 < 50 budget
-        assert rows["aws"]["detail"]["top_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
+        assert rows["aws"]["source"] == "billing_export"
+        # Keys are Cost Explorer's SERVICE names, which every budget line uses.
+        assert rows["aws"]["detail"]["top_services_usd"][index.EC2_COMPUTE] == pytest.approx(8.10)
 
         # EVERY service is reported, not just the top 8. Seven budget lines had
         # to be REASONED rather than measured on 2026-09-20 because they fell
@@ -556,7 +602,9 @@ class TestHandler:
             "top_services_usd must be a SUBSET of all_services_usd"
         # 4dp, not 2dp: a $0.004/month service rounds to $0.00 at two decimals,
         # which is indistinguishable from a service that cost nothing at all.
-        assert detail["all_services_usd"]["AmazonEC2"] == pytest.approx(8.10)
+        assert detail["all_services_usd"][index.EC2_COMPUTE] == pytest.approx(8.10)
+        assert detail["all_services_usd"]["Amazon Simple Storage Service"] == pytest.approx(4.24)
+        assert detail["posted_through"] == "2026-07-16"
         # and the published total still reconciles to the per-service sum
         assert sum(detail["all_services_usd"].values()) == pytest.approx(
             rows["aws"]["mtd_cost_usd"], abs=0.01)
@@ -661,15 +709,15 @@ class TestHandler:
         s3, store = env
         monkeypatch.setattr(index, "_http_json",
                             http_router({}))  # every HTTP call unrouted → raises
-        fail_ce = FakeCE()
-        fail_ce.get_cost_and_usage = lambda **kw: (_ for _ in ()).throw(RuntimeError("ce down"))
+        for k in [k for k in store if k.startswith(index.CUR_DATA_PREFIX)]:
+            del store[k]  # no export on day 17 → the AWS row errors
         ssm = FakeSSM({index.SSM_GITHUB_TOKEN: "ghp-xxx", index.SSM_NEON: "n"})
         # No budgets fixed rows either → zero ok rows ⇒ systemic failure raises.
         del store["config/expense_budgets.json"]
         monkeypatch.setattr(
             index, "collect_anthropic",
             lambda *a, **k: (_ for _ in ()).throw(RuntimeError("s3 down")))
-        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, fail_ce))
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm))
         with pytest.raises(RuntimeError, match="all provider adapters failed"):
             index.handler({}, None)
 
@@ -887,16 +935,29 @@ class TestReconciliationRow:
 
 
 class TestReconcileAws:
-    def test_reconciles_full_prior_month(self, monkeypatch):
-        monkeypatch.setattr(index, "boto3", FakeBoto3(FakeS3({}), FakeSSM({}), FakeCE()))
+    def test_reconciles_full_prior_month(self):
         pmw = index._prior_month_window(NOW)
         prior_doc = {"providers": [{"key": "aws", "mtd_cost_usd": 10.0,
                                     "projected_month_end_usd": 20.0}]}
-        row = index.reconcile_aws(pmw, {}, prior_doc)
-        # FakeCE.get_cost_and_usage always returns EC2 8.10 + S3 4.24 = 12.34
+        row = index.reconcile_aws(pmw, {}, prior_doc, FakeS3(cur_files(july_export())))
+        # June's export: EC2 8.10 + S3 4.24
         assert row["actual_final"] == pytest.approx(12.34)
         assert row["accrued_mtd_final"] == 10.0
         assert row["delta_usd"] == pytest.approx(2.34)
+        assert "billing export" in row["note"]
+
+    def test_a_period_written_before_the_service_columns_still_reconciles(self):
+        """2026-09 was exported before the product columns existed; the
+        month's TOTAL needs only cost and date."""
+        pmw = index._prior_month_window(NOW)
+        s3 = FakeS3(cur_files(july_export(), drop_columns=(index.CUR_PRODUCT,
+                                                           index.CUR_LINE_TYPE)))
+        assert index.reconcile_aws(pmw, {}, None, s3)["actual_final"] == pytest.approx(12.34)
+
+    def test_no_export_for_the_month_is_not_available_not_zero(self):
+        row = index.reconcile_aws(index._prior_month_window(NOW), {}, None, FakeS3({}))
+        assert row["status"] == "not_available"
+        assert row["actual_final"] is None
 
 
 class TestReconcileAnthropic:
@@ -1237,11 +1298,12 @@ class TestRunReconciliation:
                 {"counters": {"openrouter_total_usage": 42.5,
                               "deepseek_neg_balance": -15.0}}).encode(),
         }
+        store.update(cur_files(july_export()))
         s3 = FakeS3(store)
         ssm = FakeSSM({})
-        # FakeCE always returns 12.34 for get_cost_and_usage → aws delta vs
-        # prior_doc's 5.0 accrued is large enough to flag past the threshold.
-        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        # June's export totals 12.34 → aws delta vs prior_doc's 5.0 accrued is
+        # large enough to flag past the threshold.
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm))
         monkeypatch.setattr(index, "_http_json", http_router({}))  # anthropic/github → error rows
         result = index.run_reconciliation(s3, NOW, {}, {})
         assert result["period"] == "2026-06"
@@ -1265,15 +1327,15 @@ class TestRunReconciliation:
         ssm = FakeSSM({})
 
         def _boom(*a, **k):
-            raise RuntimeError("CE down")
+            raise RuntimeError("export down")
 
         monkeypatch.setattr(index, "reconcile_aws", _boom)
-        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm))
         monkeypatch.setattr(index, "_http_json", http_router({}))
         index.run_reconciliation(s3, NOW, {}, {})
         doc = json.loads(s3.store["expenses/reconciliation/2026-06.json"])
         assert doc["providers"]["aws"]["status"] == "error"
-        assert "CE down" in doc["providers"]["aws"]["note"]
+        assert "export down" in doc["providers"]["aws"]["note"]
         assert doc["providers"]["neon"]["status"] == "not_configured"
 
 
@@ -1282,7 +1344,7 @@ class TestHandlerReconcileMode:
         monkeypatch.setattr(index, "_now_utc", lambda: NOW)
         s3 = FakeS3({})
         ssm = FakeSSM({})
-        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm, FakeCE()))
+        monkeypatch.setattr(index, "boto3", FakeBoto3(s3, ssm))
         monkeypatch.setattr(index, "_http_json", http_router({}))
         result = index.handler({"mode": "reconcile"}, None)
         assert result["period"] == "2026-06"
@@ -1303,185 +1365,117 @@ class TestHandlerReconcileMode:
 
 
 # ---------------------------------------------------------------------------
-# Cost Explorer call budget (alpha-engine-config-I11201, residual of -I10389)
+# AWS from the billing export, and NEVER from Cost Explorer (I12168)
 # ---------------------------------------------------------------------------
-#
-# `ce:GetCostAndUsage` and `ce:GetCostForecast` are billed PER REQUEST at
-# $0.01. In 2026-09-03..09-06 an unbounded caller issued 44,167 of them for
-# $441.67 -- more than either of the account's two prior FULL months' bills.
-# This Lambda is the only CE caller in the fleet that runs UNATTENDED on a
-# schedule, and until I11201 its call count was bounded only by its cron.
-#
-# These tests exist because the fleet has repeatedly shipped guards that were
-# never shown to fire. Each one therefore asserts on the CLIENT's own request
-# log -- what was actually sent -- not merely that an exception was raised.
 
-class _CountingCE:
-    """A Cost Explorer fake that records every request it is handed.
+class TestNoCostExplorer:
+    """AWS Support processes the I10389 $441.67 credit only once the account
+    makes no Cost Explorer calls (Brian, 2026-10-08). This Lambda was the last
+    machine caller. These fail on any path back."""
 
-    `FakeCE` above answers requests; this one also remembers them, which is
-    the only way to distinguish "the budget raised" from "the budget raised
-    AFTER paying for the call it was supposed to refuse".
-    """
+    def test_the_module_never_constructs_a_cost_explorer_client(self):
+        src = Path(index.__file__).read_text()
+        assert not re.search(r"""client\(\s*["']ce["']""", src)
+        assert "get_cost_and_usage" not in src
+        assert "get_cost_forecast" not in src
 
-    def __init__(self, deny: bool = False):
-        self.calls: list[str] = []
-        self.deny = deny
+    def test_the_role_grants_no_cost_explorer_action(self):
+        policy = json.loads((Path(__file__).parent / "iam-policy.json").read_text())
+        granted = [a for st in policy["Statement"] if st.get("Effect") == "Allow"
+                   for a in ([st["Action"]] if isinstance(st["Action"], str) else st["Action"])]
+        assert not [a for a in granted if a.lower().startswith("ce:") or a == "*"], granted
 
-    def get_cost_and_usage(self, **kw):
-        self.calls.append("get_cost_and_usage")
-        if self.deny:
-            raise RuntimeError("AccessDeniedException")
-        if _is_daily_by_system(kw):
-            return _daily_by_system_response(kw)
-        return {"ResultsByTime": [{"Groups": [
-            {"Keys": ["AmazonEC2"], "Metrics": {"UnblendedCost": {"Amount": "8.10"}}},
-        ]}]}
-
-    def get_cost_forecast(self, **kw):
-        self.calls.append("get_cost_forecast")
-        return {"Total": {"Amount": "25.00"}}
+    def test_the_role_can_read_the_export_it_now_depends_on(self):
+        policy = json.loads((Path(__file__).parent / "iam-policy.json").read_text())
+        resources = json.dumps([st for st in policy["Statement"]
+                                if "s3:GetObject" in st.get("Action", [])])
+        assert f"arn:aws:s3:::{index.CUR_BUCKET}/{index.CUR_DATA_PREFIX.split('/')[0]}/*" in resources
 
 
-class TestAwsProjectionIsThisMonthsRunRate:
-    """Brian 2026-10-02: projected spend comes from actual usage this month,
-    not a forecast over prior months ($317.59 against $0 of October usage)."""
-
+class TestAwsFromTheBillingExport:
     def test_the_projection_is_mtd_over_posted_days(self, monkeypatch):
         monkeypatch.setattr(index, "_now_utc", lambda: NOW)
-        raw = _CountingCE()
-        row = index.collect_aws(index._month_window(NOW), {"aws": 50}, ce=raw)
-        assert "get_cost_forecast" not in raw.calls
-        assert row["projected_month_end_usd"] == pytest.approx(8.10 / 16 * 31, abs=0.01)
+        row = index.collect_aws(index._month_window(NOW), {"aws": 50},
+                                FakeS3(cur_files(july_export())))
+        assert row["mtd_cost_usd"] == pytest.approx(12.34)
+        assert row["projected_month_end_usd"] == pytest.approx(12.34 / 16 * 31, abs=0.01)
         assert row["detail"]["projection_source"] == "mtd_run_rate"
 
-    def test_nothing_posted_yet_is_no_projection_not_zero(self, monkeypatch):
-        class _NothingPosted(_CountingCE):
-            def get_cost_and_usage(self, **kw):
-                if _is_daily_by_system(kw):
-                    return _daily_by_system_response(kw)
-                self.calls.append("get_cost_and_usage")
-                return {"ResultsByTime": [{"Groups": []}]}
+    def test_a_fee_booked_for_a_later_day_is_not_month_to_date(self, monkeypatch):
+        """The export books the Savings Plan fee for every remaining day in
+        advance; counting it would turn a pre-payment into usage."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        row = index.collect_aws(index._month_window(NOW), {},
+                                FakeS3(cur_files(july_export())))
+        assert "Savings Plans for AWS Compute usage" not in row["detail"]["all_services_usd"]
 
+    def test_mtd_stops_at_the_newest_posted_day_not_at_today(self, monkeypatch):
+        """A lagging export must not stretch the projection over days it has
+        not posted: 12.34 over 5 posted days, not 16."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        export = july_export()
+        export["2026-07"] = [r for r in export["2026-07"]
+                             if r[index.CUR_USAGE_START] <= "2026-07-05"
+                             or r[index.CUR_LINE_TYPE] != "Usage"]
+        row = index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(export)))
+        assert row["detail"]["posted_through"] == "2026-07-05"
+        assert row["projected_month_end_usd"] == pytest.approx(12.34 / 5 * 31, abs=0.01)
+
+    def test_nothing_posted_yet_is_no_projection_not_zero(self, monkeypatch):
         day2 = datetime(2026, 10, 2, 12, 15, tzinfo=timezone.utc)
+        CUR_REFRESHED[_cur_key("2026-10")] = day2 - timedelta(hours=3)
         monkeypatch.setattr(index, "_now_utc", lambda: day2)
-        row = index.collect_aws(index._month_window(day2), {}, ce=_NothingPosted())
+        export = {"2026-10": [cur_line("2026-10-05", 0.36, product="ComputeSavingsPlans",
+                                       line_type="SavingsPlanRecurringFee")]}
+        row = index.collect_aws(index._month_window(day2), {}, FakeS3(cur_files(export)))
         assert row["mtd_cost_usd"] == 0
         assert row["projected_month_end_usd"] is None
         assert row["pace"] is None
         assert row["detail"]["projection_source"] == "pending_no_usage_posted"
 
+    def test_the_first_of_the_month_before_the_export_writes_the_period(self, monkeypatch):
+        first = datetime(2026, 7, 1, 0, 16, tzinfo=timezone.utc)
+        monkeypatch.setattr(index, "_now_utc", lambda: first)
+        export = july_export()
+        del export["2026-07"]
+        row = index.collect_aws(index._month_window(first), {}, FakeS3(cur_files(export)))
+        assert row["mtd_cost_usd"] == 0.0
+        assert "month just started" in row["note"]
+        # the closed-month series the gates read on the 1st-3rd is still there
+        series = row["detail"]["daily_by_system"]
+        assert series["days"][-1]["date"] == "2026-06-30"
 
-class TestCostExplorerCallBudget:
-    def test_the_default_budget_has_no_headroom_for_a_loop(self):
-        """A `collect` invocation makes exactly two CE calls. A budget with
-        room to spare cannot tell a loop from normal operation."""
-        assert index.CE_CALL_BUDGET == 2
+    def test_no_period_after_the_first_is_an_error_not_zero(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        with pytest.raises(RuntimeError, match="no files for 2026-07"):
+            index.collect_aws(index._month_window(NOW), {}, FakeS3({}))
 
-    def test_a_normal_collect_fits_the_default_budget_exactly(self):
-        raw = _CountingCE()
-        ce = index._BudgetedCostExplorer(raw, budget=index.CE_CALL_BUDGET)
-        row = index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage", "get_cost_and_usage"]
-        assert ce.calls == 2
-        assert row["mtd_cost_usd"] == pytest.approx(8.10)
-        assert row["detail"]["daily_by_system"]["complete"] is True
+    def test_a_stale_export_fails_the_row_rather_than_republishing_it(self, monkeypatch):
+        """Consumers grade freshness on the rollup's `as_of`, which is fresh
+        every run; a stopped export would hide behind it."""
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        CUR_REFRESHED[_cur_key("2026-07")] = NOW - timedelta(hours=40)
+        with pytest.raises(RuntimeError, match="last refreshed 40.0h ago"):
+            index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(july_export())))
 
-    def test_the_over_budget_call_never_reaches_the_client(self):
-        """The whole point: the request is refused BEFORE it is billed."""
-        raw = _CountingCE()
-        ce = index._BudgetedCostExplorer(raw, budget=1)
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage"], (
-            "the daily-series call was past the budget and must never have been sent"
-        )
+    def test_service_names_are_cost_explorers(self):
+        sf = index.service_for
+        assert sf("AmazonEC2", "USE1-BoxUsage:t3.small", "Usage") == index.EC2_COMPUTE
+        assert sf("AmazonEC2", "USE1-EBS:VolumeUsage.gp3", "Usage") == "EC2 - Other"
+        assert sf("AmazonStates", "StateTransition", "Usage") == "AWS Step Functions"
+        assert sf("AWSDataTransfer", "DataTransfer-Out-Bytes", "Tax") == "Tax"
+        assert sf("ComputeSavingsPlans", "x", "SavingsPlanRecurringFee") == \
+            "Savings Plans for AWS Compute usage"
+        # unknown codes publish raw — the monitor grades them `unbudgeted`
+        assert sf("AmazonNewThing", "x", "Usage") == "AmazonNewThing"
 
-    def test_the_daily_series_call_is_budgeted_too(self):
-        """The daily call is inside the budget, not beside it: a budget of one
-        refuses it before it is sent and fails the collect loudly."""
-        raw = _CountingCE()
-        ce = index._BudgetedCostExplorer(raw, budget=1)
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage"]
-
-    def test_a_budget_of_zero_refuses_the_first_call(self):
-        raw = _CountingCE()
-        ce = index._BudgetedCostExplorer(raw, budget=0)
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == []
-
-    def test_a_denied_read_still_counts_against_the_budget(self):
-        """A denial is billed like any other request, so an unbounded retry on
-        one is exactly the 2026-09 burst's shape."""
-        raw = _CountingCE(deny=True)
-        ce = index._BudgetedCostExplorer(raw, budget=1)
-        with pytest.raises(RuntimeError, match="AccessDenied"):
-            index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert ce.calls == 1
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.collect_aws(index._month_window(NOW), {}, ce=ce)
-        assert raw.calls == ["get_cost_and_usage"]
-
-    def test_an_unbilled_operation_is_not_metered(self):
-        """Only per-request-billed operations count. Metering everything would
-        make the budget a throttle on the client rather than on spend."""
-        class _WithFreeCall(_CountingCE):
-            def get_caller_identity(self, **kw):
-                self.calls.append("get_caller_identity")
-                return {}
-
-        raw = _WithFreeCall()
-        ce = index._BudgetedCostExplorer(raw, budget=0)
-        ce.get_caller_identity()
-        assert ce.calls == 0
-
-    def test_the_module_has_no_unbudgeted_cost_explorer_client(self):
-        """A raw `boto3.client("ce", ...)` anywhere else is an unbudgeted
-        caller, which is the entire defect. The one permitted occurrence is
-        inside `_ce_client`, and the budget it reads is env-overridable."""
-        src = Path(index.__file__).read_text()
-        assert src.count('boto3.client("ce"') == 1
-        factory = src.split("def _ce_client(")[1].split("\ndef ")[0]
-        assert 'boto3.client("ce"' in factory
-        assert 'os.environ.get("EXPENSE_CE_CALL_BUDGET"' in src
-
-    def test_a_breach_fails_the_whole_collect_rather_than_one_row(self, env, monkeypatch):
-        """Every other provider failure degrades one row so the rollup still
-        publishes. A budget breach must NOT: recording it as one row's error
-        field is how the 2026-09 burst ran four days instead of four minutes.
-        """
-        monkeypatch.setattr(index, "CE_CALL_BUDGET", 1)
-        monkeypatch.setattr(index, "_ce_client",
-                            lambda budget=None: index._BudgetedCostExplorer(
-                                _CountingCE(), budget=1))
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.handler({}, None)
-
-    def test_a_breach_fails_the_whole_reconcile_rather_than_one_row(self, env, monkeypatch):
-        monkeypatch.setattr(index, "_ce_client",
-                            lambda budget=None: index._BudgetedCostExplorer(
-                                _CountingCE(), budget=0))
-        with pytest.raises(index.CostExplorerCallBudgetExceeded):
-            index.handler({"mode": "reconcile"}, None)
-
-
-# ── the retry bound is part of the CE safeguard (I11206) ───────────────────
-#
-# Brian's ruling 2026-09-20 exempted this Lambda's role from the Cost Explorer
-# breaker "as long as we have the safeguards in place not to get runaway cost
-# accumulation". There are TWO, and neither substitutes for the other:
-#
-#   per INVOCATION   CE_CALL_BUDGET = 2, tested above
-#   per DAY          how many invocations there can be
-#
-# The second was AWS's default of 185 retries over a 24h event age, never set.
-# Each retry is a fresh invocation with a fresh budget, and the CE calls happen
-# EARLY in the handler, so a failure anywhere after them re-pays for them:
-# 185 x 2 ticks x 2 calls = 740 calls/day = $7.40/day, ~$222/month against a
-# $139 account budget. That is I10389's exact shape one level up.
+    def test_savings_plan_covered_usage_and_its_negation_net_out(self):
+        rows = _json_read_rows(json.dumps([
+            cur_line("2026-07-01", 0.5, line_type="SavingsPlanCoveredUsage"),
+            cur_line("2026-07-01", -0.5, line_type="SavingsPlanNegation"),
+            cur_line("2026-07-01", 1.0)]).encode(), list(cur_line("x", 0)))
+        assert index._unblended_by_service(rows, "2026-07-01", "2026-07-02") == {
+            index.EC2_COMPUTE: 1.0}
 
 
 def _deploy_sh() -> str:
@@ -1489,34 +1483,23 @@ def _deploy_sh() -> str:
 
 
 class TestTheScheduleRetryBoundIsDeclared:
+    """EventBridge Scheduler defaults to 185 retries; each is a fresh run that
+    re-reads every provider (I11206). Kept after I12168 removed Cost Explorer."""
+
     def test_the_retry_bound_is_declared_not_left_to_the_aws_default(self):
         src = _deploy_sh()
         assert "SCHED_MAX_RETRIES=2" in src
         assert "SCHED_MAX_EVENT_AGE_SECONDS=3600" in src
 
     def test_every_schedule_carries_the_bound_on_create_AND_update(self):
-        """A redeploy must not silently restore 185. RetryPolicy is part of the
-        TARGET, which both branches pass, so this asserts the target string
-        carries it and that both branches use that string."""
         src = _deploy_sh()
         assert src.count('"RetryPolicy":{"MaximumRetryAttempts":%s') == 1
         assert src.count('--target "${target}"') == 2, (
             "create-schedule and update-schedule must both pass the same target"
         )
 
-    def test_the_bound_keeps_worst_case_ce_spend_inside_the_line(self):
-        """The arithmetic, pinned. 17 services share a $139 ceiling and Cost
-        Explorer's line is $6; a sustained failure loop must reach that line's
-        ALERT rather than the month's budget."""
-        src = _deploy_sh()
-        retries = int(src.split("SCHED_MAX_RETRIES=")[1].split("\n")[0])
-        invocations_per_day = (retries + 1) * 2  # two schedule ticks
-        calls_per_day = invocations_per_day * index.CE_CALL_BUDGET
-        usd_per_month = calls_per_day * 0.01 * 30
-        assert usd_per_month < 6.00, (
-            f"worst case ${usd_per_month:.2f}/mo exceeds the $6 Cost Explorer "
-            f"line; the breaker exemption (I11206) was granted on this bound"
-        )
+    def test_the_parquet_reader_ships_in_the_package(self):
+        assert 'cp "${SCRIPT_DIR}/cur_parquet.py" "${PKG}/cur_parquet.py"' in _deploy_sh()
 
 
 # --------------------------------------------------------------------------
@@ -1596,7 +1579,6 @@ def test_collect_reports_the_dispatch_outcome_in_its_result():
 
 class TestDailyBySystem:
     def test_window_covers_the_prior_month_and_thirty_one_days(self):
-        from datetime import datetime, timezone
         # Mid-month: the prior month's 1st is the earlier bound.
         assert index._daily_by_system_window(
             datetime(2026, 9, 29, 12, tzinfo=timezone.utc)) == ("2026-08-01", "2026-09-29")
@@ -1604,50 +1586,74 @@ class TestDailyBySystem:
         assert index._daily_by_system_window(
             datetime(2026, 3, 1, 0, 16, tzinfo=timezone.utc)) == ("2026-01-29", "2026-03-01")
 
+    @staticmethod
+    def _three_a_day(start: str, end: str) -> dict[str, list[dict]]:
+        """Every day $2.00 crucible-v2 + $1.00 untagged, as real usage."""
+        from datetime import date
+        out: dict[str, list[dict]] = {}
+        d, stop = date.fromisoformat(start), date.fromisoformat(end)
+        while d < stop:
+            out.setdefault(d.strftime("%Y-%m"), []).extend([
+                cur_line(d.isoformat(), 2.0, system="crucible-v2"),
+                cur_line(d.isoformat(), 1.0, product="AmazonS3", usage="TimedStorage")])
+            d += timedelta(days=1)
+        return out
+
     def test_groups_split_by_system_and_sum_to_the_account_total(self):
-        from datetime import datetime, timezone
+        now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
         out = index.collect_aws_daily_by_system(
-            FakeCE(), datetime(2026, 9, 29, 12, tzinfo=timezone.utc))
+            FakeS3(cur_files(self._three_a_day("2026-08-01", "2026-09-29"))), now)
         assert out["tag_key"] == "system"
+        assert out["source"] == "billing_export"
         assert out["complete"] is True
         assert len(out["days"]) == 59  # 2026-08-01 .. 2026-09-28
         day = out["days"][0]
         assert day["date"] == "2026-08-01"
         assert day["by_system_usd"] == {"(untagged)": 1.0, "crucible-v2": 2.0}
-        assert out["days"][-1]["estimated"] is True
+        assert out["days"][0]["estimated"] is False  # August, closed and final
+        assert out["days"][-1]["estimated"] is True  # the open month
 
-    def test_a_second_page_is_recorded_as_incomplete_not_fetched(self):
-        from datetime import datetime, timezone
-
-        class _Paged(FakeCE):
-            def get_cost_and_usage(self, **kw):
-                return {**_daily_by_system_response(kw), "NextPageToken": "abc"}
-
+    def test_the_prior_month_stays_estimated_through_the_fifth(self):
+        now = datetime(2026, 10, 3, 12, tzinfo=timezone.utc)
         out = index.collect_aws_daily_by_system(
-            _Paged(), datetime(2026, 9, 29, 12, tzinfo=timezone.utc))
+            FakeS3(cur_files(self._three_a_day("2026-09-01", "2026-10-03"))), now)
+        assert {d["estimated"] for d in out["days"]} == {True}
+
+    def test_days_the_export_has_not_posted_are_absent_not_cheap(self):
+        """A lagging export: nothing after 09-20 has posted. Those days must be
+        missing from the series (crucible: UNMEASURABLE), never $0."""
+        now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+        out = index.collect_aws_daily_by_system(
+            FakeS3(cur_files(self._three_a_day("2026-08-01", "2026-09-21"))), now)
+        assert out["posted_through"] == "2026-09-20"
+        assert out["days"][-1]["date"] == "2026-09-20"
+
+    def test_a_period_with_no_export_is_incomplete_and_its_days_absent(self):
+        now = datetime(2026, 9, 29, 12, tzinfo=timezone.utc)
+        out = index.collect_aws_daily_by_system(
+            FakeS3(cur_files(self._three_a_day("2026-09-01", "2026-09-29"))), now)
         assert out["complete"] is False
+        assert out["days"][0]["date"] == "2026-09-01"
 
-    def test_a_failed_series_degrades_only_its_own_field(self):
-        class _DailyDenied(_CountingCE):
-            def get_cost_and_usage(self, **kw):
-                if _is_daily_by_system(kw):
-                    self.calls.append("get_cost_and_usage")
-                    raise RuntimeError("AccessDeniedException")
-                return super().get_cost_and_usage(**kw)
+    def test_a_period_written_before_the_service_columns_still_has_the_series(self):
+        now = datetime(2026, 10, 8, 12, tzinfo=timezone.utc)
+        export = self._three_a_day("2026-09-01", "2026-10-08")
+        files = cur_files({"2026-09": export["2026-09"]},
+                          drop_columns=(index.CUR_PRODUCT, index.CUR_USAGE_TYPE,
+                                        index.CUR_LINE_TYPE))
+        files.update(cur_files({"2026-10": export["2026-10"]}))
+        out = index.collect_aws_daily_by_system(FakeS3(files), now)
+        assert out["complete"] is True
+        assert len(out["days"]) == 37
 
-        row = index.collect_aws(index._month_window(NOW), {}, ce=_DailyDenied())
-        assert row["mtd_cost_usd"] == pytest.approx(8.10)
+    def test_a_failed_series_degrades_only_its_own_field(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+
+        def _denied(*a, **k):
+            raise RuntimeError("AccessDenied")
+
+        monkeypatch.setattr(index, "collect_aws_daily_by_system", _denied)
+        row = index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(july_export())))
+        assert row["mtd_cost_usd"] == pytest.approx(12.34)
         assert "daily_by_system" not in row["detail"]
         assert "AccessDenied" in row["detail"]["daily_by_system_error"]
-
-    def test_the_first_of_the_month_still_publishes_the_series(self, monkeypatch):
-        """The MTD window is empty on the 1st, but the closed-month read the
-        gates take on the 1st through the 3rd needs the series most then."""
-        from datetime import datetime, timezone
-        first = datetime(2026, 10, 1, 0, 16, tzinfo=timezone.utc)
-        monkeypatch.setattr(index, "_now_utc", lambda: first)
-        raw = _CountingCE()
-        row = index.collect_aws(index._month_window(first), {}, ce=raw)
-        assert raw.calls == ["get_cost_and_usage"]
-        series = row["detail"]["daily_by_system"]
-        assert series["start"] == "2026-08-31" and series["end"] == "2026-10-01"
