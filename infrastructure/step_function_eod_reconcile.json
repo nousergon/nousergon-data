@@ -1051,7 +1051,7 @@
     },
     "HealDispatchReplay": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution of THIS machine ($$.StateMachine.Id) with pipeline_role=operator-replay + skip_post_market_data=true. Deliberately a SEPARATE execution rather than looping this one back: the replay's own terminal is the convergence signal, independently observable by name (eod-heal-replay-{run_date}-*). Fire-and-forget (non-.sync). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): skip_capture_snapshot is gone from this Input because CaptureSnapshot is not in this machine \u2014 the post-close pipeline captured the snapshot at the close, and this replay never re-touches live IB. alpha-engine-config-I7586: skip_refresh_executor_deploy stays OUT of this Input \u2014 the parent stops the box (HealConvergedNotify -> StopTradingInstance), the replay's own StartTradingInstance boots it again, and a rebooted box is not on the SHA the parent froze; the replay's own RefreshExecutorDeploy is what makes its EODReconcile drift guard meaningful. skip_post_market_data is correct: the heal loop just re-ran the collection.",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution of THIS machine ($$.StateMachine.Id) with pipeline_role=operator-replay + skip_post_market_data=true. Deliberately a SEPARATE execution rather than looping this one back: the replay's own terminal is the convergence signal, independently observable by name (eod-heal-replay-{run_date}-*). Fire-and-forget (non-.sync). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): skip_capture_snapshot is gone from this Input because CaptureSnapshot is not in this machine \u2014 the post-close pipeline captured the snapshot at the close, and this replay never re-touches live IB. alpha-engine-config-I7586: skip_refresh_executor_deploy stays OUT of this Input \u2014 the replay's own RefreshExecutorDeploy is what makes its EODReconcile drift guard meaningful, and it is cheap on a box already on the frozen SHA. Since the 2026-10-08 heal-replay stop race the parent no longer stops the box after this state (HealConvergedNotify routes around DrainTraderReconcile and StopTradingInstance): the replay inherits the running box and owns its stop. skip_post_market_data is correct: the heal loop just re-ran the collection.",
       "Resource": "arn:aws:states:::states:startExecution",
       "Parameters": {
         "StateMachineArn.$": "$$.StateMachine.Id",
@@ -1103,12 +1103,12 @@
     },
     "HealConvergedNotify": {
       "Type": "Task",
-      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name.",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name. 2026-10-08 heal-replay stop race (eod-reconcile-backstop-2026-10-08-1791512138): both edges go to ReadExerciseCadence, AROUND DrainTraderReconcile and StopTradingInstance. Reaching this state means HealDispatchReplay succeeded, so the trading box now belongs to the replay, which drains and stops it at its own end (or force-stops it on failure). This execution used to drain and stop it anyway: on 2026-10-09 the replay's StartTradingInstance was a no-op on the running box at 03:19:17Z, this execution's StopTradingInstance stopped it at 03:19:30Z, the replay's RefreshExecutorDeploy was sent to a stopping box at 03:19:32Z and ended DeliveryTimedOut, and the replay FAILED at 03:39:42Z with no eod_pnl row for 2026-10-08. HealReplayDispatchFailed and HealNonConvergent still drain and stop: no replay owns the box on those routes.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Self-Heal \u2014 replay dispatched (convergence pending)",
-        "Message.$": "States.Format('EOD self-heal for {} re-ran the standalone EOD collection after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution of ne-postclose-reconcile-pipeline has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
+        "Message.$": "States.Format('EOD self-heal for {} re-ran the standalone EOD collection after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution of ne-postclose-reconcile-pipeline has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome. The replay owns the trading box from here and stops it at its own end.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
       "TimeoutSeconds": 60,
@@ -1118,10 +1118,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "DrainTraderReconcile"
+          "Next": "ReadExerciseCadence"
         }
       ],
-      "Next": "DrainTraderReconcile"
+      "Next": "ReadExerciseCadence"
     },
     "HealNonConvergent": {
       "Type": "Task",

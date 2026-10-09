@@ -478,8 +478,12 @@ class TestHealOutcomeNotifications:
         assert 0 < len(st["Parameters"]["Subject"]) <= 100
         assert "\n" not in st["Parameters"]["Subject"]
 
+    # HealConvergedNotify is not here: after a successful dispatch the replay
+    # owns the box and stops it at its own end, so the parent routes around
+    # the drain and the stop (2026-10-08 heal-replay stop race,
+    # tests/test_heal_replay_owns_the_trading_box.py).
     @pytest.mark.parametrize("state_name", [
-        "HealConvergedNotify", "HealReplayDispatchFailed", "HealNonConvergent",
+        "HealReplayDispatchFailed", "HealNonConvergent",
     ])
     def test_reaches_cost_guard_tail_on_success_and_on_sns_failure(self, states, state_name):
         # alpha-engine-config-I12020: the cost-guard tail is entered through

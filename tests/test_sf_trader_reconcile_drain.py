@@ -65,8 +65,12 @@ def test_every_route_into_the_stop_comes_through_the_drain():
     assert feeders <= set(DRAIN), sorted(feeders - set(DRAIN))
     # And the drain is actually entered from the work paths, not orphaned.
     into_drain = {n for n, st in STATES.items() if "DrainTraderReconcile" in _targets(st)}
-    assert {"CheckEODStatus", "CheckSkipEODReconcile", "HealConvergedNotify",
+    assert {"CheckEODStatus", "CheckSkipEODReconcile",
             "HealReplayDispatchFailed", "HealNonConvergent"} <= into_drain
+    # HealConvergedNotify is deliberately NOT a feeder: after a successful
+    # dispatch the replay owns the box and runs its OWN drain before its own
+    # stop (tests/test_heal_replay_owns_the_trading_box.py).
+    assert "HealConvergedNotify" not in into_drain
 
 
 def test_the_drain_fails_open_toward_the_stop():
