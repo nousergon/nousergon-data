@@ -67,6 +67,9 @@ _SHARED = {
     "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
     "WriteCompletionMarkerDegraded", "DegradedRun",
     "HandleFailure", "ForceStopInstance", "FailExecution", "NormalizeEODFailureContext",
+    # 2026-10-09 in-session box stop: both machines stop the box, so both
+    # refuse the pre-session window [08:00, 09:30) ET after the gate.
+    "StampStartClockUtc", "PreSessionWindowChoice", "NotifyPreSessionBlocked",
 }
 
 _POSTCLOSE_ONLY = {
@@ -108,6 +111,12 @@ _RECONCILE_ONLY = _COLLECTOR_DEPENDENT | {
     "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
     "TraderReconcileDrainWait", "ExtractTraderReconcileDrainStatusError",
     "SetTraderReconcileDrainDegraded", "PublishTraderReconcileDrainUnsettled",
+    # 2026-10-09 in-session box stop: box ownership. This machine stops only a
+    # box it started; the post-close machine's stop is the ruled 16:00 stop of
+    # the box the preopen pipeline started, so it carries no ownership check.
+    "ResolveBoxOwnership", "StampBoxOwned", "StampBoxNotOwned",
+    "CheckBoxOwnedBeforeStop", "NotifyStopSkippedNotBoxOwner",
+    "CheckBoxOwnedBeforeForceStop",
 }
 
 
@@ -239,10 +248,18 @@ def test_the_reconcile_machine_takes_no_snapshot_and_runs_no_drift_gate(reconcil
 
 def test_the_reconcile_machine_still_stops_the_box_on_every_non_failure_path(reconcile):
     """The cost guard the old single machine carried moves with the tail:
-    every route into the Option-A terminals passes StopTradingInstance."""
+    every route into the Option-A terminals passes StopTradingInstance --
+    except the one through HealConvergedNotify, where a replay execution
+    already owns the box and stops it at its own end (2026-10-08 heal-replay
+    stop race, tests/test_heal_replay_owns_the_trading_box.py) and the one
+    through NotifyStopSkippedNotBoxOwner, where the box was already running
+    when this execution started it, so another actor owns it (2026-10-09
+    in-session stop, tests/test_sf_pre_session_window_and_box_ownership.py)."""
     states = reconcile["States"]
     before_stop = _reachable(states, reconcile["StartAt"],
-                             blocked={"StopTradingInstance", "HandleFailure"})
+                             blocked={"StopTradingInstance", "HandleFailure",
+                                      "HealConvergedNotify",
+                                      "NotifyStopSkippedNotBoxOwner"})
     assert not {"CheckDegradedOutcome", "NormalSucceeded", "DegradedRun"} & before_stop
 
 
