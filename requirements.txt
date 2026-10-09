@@ -1,7 +1,11 @@
 boto3>=1.43.109
 pandas>=2.0
 openpyxl>=3.1.5
-pyarrow>=25.0.1
+# <26: pyarrow 26.0.0 (2026-10-09) refuses to import under NumPy 1.x, and every
+# spot box runs `pip install 'numpy<2'` after this file (data-spot-dispatcher,
+# spot_data_weekly.sh, weekly-freshness, arctic-migration). Lift the cap only in
+# the same change that removes those numpy<2 pins.
+pyarrow>=25.0.1,<26
 yfinance>=1.7.0
 requests>=2.34.2
 pyyaml>=6.0.3
