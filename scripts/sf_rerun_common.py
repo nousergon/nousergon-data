@@ -113,10 +113,12 @@ def derive_calendar_date(events: list[dict], start_time: datetime | None) -> tup
     InitializeInput's calendar_date (or its pre-normalizer run_date stamp) >
     date(Execution start time).
 
-    The weekly SF's ``CheckPredictorSkipWeightsFresh`` compares the weights
-    manifest against ``$.calendar_date``, not ``$.run_date`` — a recovery
-    rerun must emit this field or ``InitializeInput`` re-stamps it from the
-    NEW execution's wall clock (alpha-engine-config-I8809).
+    The weekly SF's ``NormalizeRunDates`` derives ``$.run_date`` (the trading
+    day every date-keyed stage reads, ``ValidatePredictorSkipWeightsFresh``'s
+    arena verdict key included) FROM ``$.calendar_date`` — a recovery rerun
+    must emit this field or ``InitializeInput`` re-stamps it from the NEW
+    execution's wall clock and the rerun keys on a different cycle
+    (alpha-engine-config-I8809, I12050).
     """
     orig = execution_input(events)
     if isinstance(orig.get("calendar_date"), str) and orig["calendar_date"]:
