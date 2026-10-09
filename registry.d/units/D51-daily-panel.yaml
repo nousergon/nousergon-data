@@ -1,0 +1,125 @@
+# Unit descriptor — data collector unit D51 (the daily panel, plan P-25).
+#
+# `console-policy` §2.6: onboarding a module is writing THIS FILE. Registered
+# the same PR the producer module lands, because `data.inventory.writers_declared`
+# turns the board red for a write site no descriptor claims — and it should.
+#
+# Plan amendment 1 (foundation rule architecture.d/146): the daily panel is a
+# DATA-COLLECTOR product, a PHASE-3 deliverable. Every column below is graded at
+# phase 3 for that reason (`clause_phase`), beside the adoption clause
+# `data.phase3.daily_panel_adopted` (data_gate/panel.py). Guard clauses are
+# graded at phase 2 by construction (`data_gate/clauses.py::_clause_guard`).
+#
+# PUBLIC REPO. Key templates and code paths only.
+unit_id: D51
+component_id: "data-collector-d51-daily-panel"
+owning_repo: "nousergon-data"
+title: "Daily panel: one long OHLCV panel per session, compiled once from ArcticDB universe"
+component: 1
+lifecycle: pending
+owner: brian
+code_path: "builders/daily_panel.py:174"
+pending_since: "2026-10-06"
+lifecycle_reexam: "2026-10-08"
+lifecycle_reason: >-
+    The producer module, its contract, an operator-run CLI and the collector's
+    whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
+    alpha-engine-config-I10791). Not yet scheduled: naming `daily-panel` in the
+    ne-data-collection-eod schedule waits on the collection-box write grant on
+    data_collection/panel/ (a scheduled run would fail on AccessDenied). Until
+    then the unit writes nothing on a schedule.
+lifecycle_owner: brian
+promotes_when: >-
+    The EOD collection runs `weekly_collector.py --daily-panel` after the
+    ArcticDB append and data_collection/panel/{trading_day}/manifest.json is
+    current for the latest session. Flip lifecycle to in-service and declare the
+    cadence in the same PR.
+trigger:
+  kind: "manual"
+  runs_on: "ec2-spot"
+  detail: >-
+    NOT YET SCHEDULED. Operator-run in-region (`python weekly_collector.py
+    --daily-panel [--date <session>]`, or `python -m builders.daily_panel
+    publish --date <session>`); belongs on ne-data-collection-eod after the
+    universe append.
+writes:
+  - "data_collection/panel/{trading_day}/panel.parquet"
+  - "data_collection/panel/{trading_day}/manifest.json"
+  - "data_collection/panel/{trading_day}/parity.json"
+consumers:
+  - "crucible:crucible/data/sources.py"
+consumers_reason: >-
+    crucible v2 data.daily (D47) reads the published panel through
+    PublishedPanelSource instead of compiling its own from raw ArcticDB
+    (plan amendment 1). The crucible consumer PR lands alongside or after this
+    producer (architecture.d/146 rule 3).
+contract:
+  schema: contracts/daily_panel.schema.json
+  producer_test: tests/test_daily_panel_publisher.py
+  consumer_pins:
+    - repo: "crucible"
+      path: "tests/contracts/daily_panel.schema.json"
+      pins: "body_schema"
+      producer: "contracts/daily_panel.schema.json"
+      read_site: "crucible/data/sources.py::PublishedPanelSource"
+      note: "contracts/daily_panel.py::CONSUMER; pending the crucible consumer PR"
+registry_rows: []
+run_manifest_prefix: data_collection/runs/D51
+detectors:
+  - kind: "crucible-gate"
+    via: "data.phase3.daily_panel_adopted (published leg)"
+    state: ABSENT
+    note: "no freshness-monitor row until the unit is scheduled"
+freshness:
+  status: proposed
+  ratified_at: "alpha-engine-config-I10791 (with the schedule)"
+completeness:
+  denominator: "every symbol in the ArcticDB universe library on the session"
+  floor: 1.0
+  status: proposed
+  note: >-
+    Enforced IN THE PRODUCER: an empty per-ticker frame, a null or non-positive
+    value, or no rows on the session raises before any write
+    (builders/daily_panel.py::frames_to_panel, contracts/daily_panel.py::validate_panel_frame).
+guards:
+  empty_fresh:
+    state: present
+    note: "a panel with no rows on its own session, or an empty per-ticker frame, raises before any write"
+  cardinality:
+    state: present
+    note: "an empty ticker frame is refused, never dropped; symbol counts are on the manifest"
+  units:
+    state: present
+    note: "columns carry the _raw unit suffix; values are copied from ArcticDB unconverted"
+  pit:
+    state: present
+    note: "the manifest records generated_at and the session; the panel is keyed by session and never overwritten in place by a later session"
+  vendor_fallback:
+    state: present
+    note: "one store (ArcticDB universe) and no fallback path: a failed or empty read raises, it is never substituted"
+  success_without_output:
+    state: present
+    note: "the manifest is written only after the parquet, and a manifest naming no parquet reads as an incomplete publish"
+audit:
+  source: "alpha-engine-config-I10791 (unit added after the 2026-09-14 baseline)"
+  baseline_date: "2026-10-06"
+  cells:
+    identity: ABSENT
+    consumers: ABSENT
+    schema_contract: PRESENT
+    artifact_registry: ABSENT
+    observability_row: PRESENT
+    run_record: ABSENT
+    detector: ABSENT
+    console_entity: ABSENT
+    survives_phase4: ABSENT
+clause_phase:
+  identity: 3
+  consumers: 3
+  schema_contract: 3
+  artifact_registry: 3
+  observability_row: 3
+  run_record: 3
+  detector: 3
+  console_entity: 3
+  survives_phase4: 3

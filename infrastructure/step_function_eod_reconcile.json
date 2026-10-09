@@ -57,8 +57,8 @@
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
-          "Comment": "Market closed. Every scheduled or event-driven start of this machine lands here: the collection's terminal event (~19:00-21:00 ET) and the reconcile backstop (02:15 UTC) are both after the 16:00 ET close.",
-          "Next": "CheckMutexRole"
+          "Comment": "Market closed. Every scheduled or event-driven start of this machine lands here: the collection's terminal event (~19:00-21:00 ET) and the reconcile backstop (02:15 UTC) are both after the 16:00 ET close. Then StampStartClockUtc: the Lambda's window opens at 09:30 ET, the pre-session window [08:00, 09:30) ET is refused after it.",
+          "Next": "StampStartClockUtc"
         },
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
@@ -140,7 +140,7 @@
     "MarketHoursBlocked": {
       "Type": "Fail",
       "Error": "MarketHoursBoundary",
-      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}. Also reached from NotifyPreSessionBlocked: a start in the pre-session window [08:00, 09:30) ET, when the preopen pipeline has the box up for the session (2026-10-09 incident); that window has no override."
     },
     "NotifyMarketHoursOverrideMalformed": {
       "Type": "Task",
@@ -188,10 +188,10 @@
           ],
           "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
-          "Next": "CheckMutexRole"
+          "Next": "StampStartClockUtc"
         }
       ],
-      "Next": "CheckMutexRole"
+      "Next": "StampStartClockUtc"
     },
     "SetMarketHoursUnverifiedDegraded": {
       "Type": "Pass",
@@ -203,6 +203,63 @@
       },
       "ResultPath": "$.degraded_summary",
       "Next": "NotifyMarketHoursUnverified"
+    },
+    "StampStartClockUtc": {
+      "Type": "Pass",
+      "Comment": "2026-10-09 in-session box stop (alpha-engine-config-I12020 follow-up): the manual replay eod-heal-replay-2026-10-08-manual-1 started at 13:27:21Z (09:27 ET), passed MarketHoursGate (the gate Lambda only refuses [09:30, 16:00) ET), and its success path EODReconcile -> DrainTraderReconcile -> StopTradingInstance stopped the trading box the preopen pipeline had started at 12:15Z. The box stayed down the whole session: the v2 trader's 10:45 ET session never ran and the v1 intraday daemon never ticked. The gate Lambda's window starts at the 09:30 ET open, but the box is up from the preopen pipeline's start (alpha-engine-weekday, cron(15 5) America/Los_Angeles = 08:15 ET), so a box-stopping execution started between the two stops a box the session is about to trade on. This state stamps the execution's UTC start as HHMM (zero-padded, so Choice string comparison orders it correctly) for PreSessionWindowChoice. Pure arithmetic on $$.Execution.StartTime: it needs no Lambda and no DST table, so it also runs on the gate-unverified route, where the Lambda's own answer is missing.",
+      "Parameters": {
+        "start_time.$": "$$.Execution.StartTime",
+        "hhmm.$": "States.Format('{}{}', States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 1), ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
+      },
+      "ResultPath": "$.start_clock_utc",
+      "Next": "PreSessionWindowChoice"
+    },
+    "PreSessionWindowChoice": {
+      "Type": "Choice",
+      "Comment": "Refuses a box-stopping start in the pre-session window [08:00, 09:30) ET. The window is written in UTC as [12:00, 14:30), the union of that ET window under both offsets: EDT (UTC-4) puts it at [12:00, 13:30)Z and EST (UTC-5) at [13:00, 14:30)Z. The over-coverage is harmless: EDT 09:30-10:30 is already in-session (the gate Lambda refuses it) and EST 07:00-08:00 is before anything starts the box. Nothing legitimate starts this pipeline then: its scheduled and event-driven starts are all after the close (16:00 ET or later, 13:00 ET on an early close = 17:00Z or later). [09:30, close) stays the gate Lambda's, which owns the holiday and early-close calendar, so together the two refuse [08:00, close) ET. No override crosses this window: the market_hours_override the Lambda validates covers the in-session window only, so a deliberate start waits for 09:30 and uses that.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "StringGreaterThanEquals": "1200"
+            },
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "StringLessThan": "1430"
+            }
+          ],
+          "Next": "NotifyPreSessionBlocked"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "NotifyPreSessionBlocked": {
+      "Type": "Task",
+      "Comment": "A refusal is loud (sf-pipeline-policy \u00a72.3), then ends in MarketHoursBlocked, the same Fail the in-session refusal uses, so status watchers keyed on MarketHoursBoundary see it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 REFUSED (start in the pre-session window)",
+        "Message.$": "States.Format('Refused to start a box-stopping trading pipeline in the pre-session window [08:00, 09:30) ET, when the preopen pipeline has the trading box up for the session. Execution: {}. Start (UTC): {}. This window has no override; an authorised start waits for 09:30 ET and carries a market_hours_override. The market-hours gate verdict is in $.market_hours_gate in execution history.', $$.Execution.Id, $.start_clock_utc.start_time)"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.pre_session_blocked_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursBlocked"
+        }
+      ],
+      "Next": "MarketHoursBlocked"
     },
     "CheckMutexRole": {
       "Type": "Choice",
@@ -310,7 +367,7 @@
     },
     "StartTradingInstance": {
       "Type": "Task",
-      "Comment": "Re-runnability guard (2026-06-30 incident). Since 2026-10-01 this is the normal path's box start, not only a guard: ne-postclose-trading-pipeline stops the box as soon as CaptureSnapshot is done (Brian: \"lets just stop it when postclose part 1 completes\"). Its first boot of the evening is also when crucible-executor's Persistent=true post-close timers (trader-reconcile, eod-reconcile-standalone, reference-rate-publish) catch up. It still covers a reconcile-backstop run, an operator rerun or a heal replay landing on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening.",
+      "Comment": "Re-runnability guard (2026-06-30 incident). Since 2026-10-01 this is the normal path's box start, not only a guard: ne-postclose-trading-pipeline stops the box as soon as CaptureSnapshot is done (Brian: \"lets just stop it when postclose part 1 completes\"). Its first boot of the evening is also when crucible-executor's Persistent=true post-close timers (trader-reconcile, eod-reconcile-standalone, reference-rate-publish) catch up. It still covers a reconcile-backstop run, an operator rerun or a heal replay landing on a box that ForceStopInstance or this pipeline's own StopTradingInstance already stopped. ec2:startInstances is a no-op if already running, so this is safe on the normal path and makes the pipeline idempotently re-runnable any time that evening. Its result also decides whether this execution OWNS the box (ResolveBoxOwnership): StartingInstances[0].PreviousState says whether the box was already up before this call.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:startInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -336,6 +393,101 @@
         }
       ],
       "ResultPath": "$.ec2_start_result",
+      "Next": "ResolveBoxOwnership"
+    },
+    "ResolveBoxOwnership": {
+      "Type": "Choice",
+      "Comment": "2026-10-09 in-session box stop (alpha-engine-config-I12020 follow-up): the manual replay eod-heal-replay-2026-10-08-manual-1 started at 13:27:21Z (09:27 ET), passed MarketHoursGate (the gate Lambda only refuses [09:30, 16:00) ET), and its success path EODReconcile -> DrainTraderReconcile -> StopTradingInstance stopped the trading box the preopen pipeline had started at 12:15Z. The box stayed down the whole session: the v2 trader's 10:45 ET session never ran and the v1 intraday daemon never ticked. Box ownership: this execution may stop the trading box only if it started it. ec2:StartInstances reports the state it found (StartingInstances[0].PreviousState.Name), so ownership is read off the start itself, atomically and within the role's existing ec2:StartInstances grant (no ec2:DescribeInstances needed). running/pending = someone else has the box up (the preopen pipeline in-session, an operator, a still-running sibling) and this execution does not own it. Anything else (stopped, stopping) = this execution started it and owns it. A heal replay inherits its dispatcher's ownership: HealDispatchReplay passes box_owned_by_dispatcher, because the dispatcher started the box and hands the stop to the replay (nousergon-data#2127), so the replay's own start always finds it running. Inheritance is honoured only together with pipeline_role=operator-replay. An unreadable PreviousState is NOT owned: wrongly stopping a box is a lost trading session, wrongly leaving one up is bounded by the 22:00 PT alpha-engine-stop-trading schedule.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "IsBoolean": true
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "StampBoxOwned"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.pipeline_role",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.pipeline_role",
+              "StringEquals": "operator-replay"
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "IsBoolean": true
+            },
+            {
+              "Variable": "$.box_owned_by_dispatcher",
+              "BooleanEquals": false
+            }
+          ],
+          "Next": "StampBoxNotOwned"
+        },
+        {
+          "Not": {
+            "Variable": "$.ec2_start_result.StartingInstances[0].PreviousState.Name",
+            "IsPresent": true
+          },
+          "Next": "StampBoxNotOwned"
+        },
+        {
+          "Or": [
+            {
+              "Variable": "$.ec2_start_result.StartingInstances[0].PreviousState.Name",
+              "StringEquals": "running"
+            },
+            {
+              "Variable": "$.ec2_start_result.StartingInstances[0].PreviousState.Name",
+              "StringEquals": "pending"
+            }
+          ],
+          "Next": "StampBoxNotOwned"
+        }
+      ],
+      "Default": "StampBoxOwned"
+    },
+    "StampBoxOwned": {
+      "Type": "Pass",
+      "Comment": "This execution started the box (or inherited it from the dispatcher that did), so it stops it at its end: CheckBoxOwnedBeforeStop and CheckBoxOwnedBeforeForceStop read this.",
+      "Result": {
+        "owned": true
+      },
+      "ResultPath": "$.box_ownership",
+      "Next": "WaitForInstanceReady"
+    },
+    "StampBoxNotOwned": {
+      "Type": "Pass",
+      "Comment": "The box was already up when this execution started it, so another actor owns it and this execution never stops it: both stop routes skip on owned=false.",
+      "Result": {
+        "owned": false
+      },
+      "ResultPath": "$.box_ownership",
       "Next": "WaitForInstanceReady"
     },
     "WaitForInstanceReady": {
@@ -528,7 +680,7 @@
         {
           "Variable": "$.eod_poll.Status",
           "StringEquals": "Success",
-          "Next": "StopTradingInstance"
+          "Next": "CheckBoxOwnedBeforeStop"
         },
         {
           "Variable": "$.eod_poll.Status",
@@ -873,7 +1025,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "StopTradingInstance"
+          "Next": "CheckBoxOwnedBeforeStop"
         },
         {
           "And": [
@@ -1051,7 +1203,7 @@
     },
     "HealDispatchReplay": {
       "Type": "Task",
-      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution of THIS machine ($$.StateMachine.Id) with pipeline_role=operator-replay + skip_post_market_data=true. Deliberately a SEPARATE execution rather than looping this one back: the replay's own terminal is the convergence signal, independently observable by name (eod-heal-replay-{run_date}-*). Fire-and-forget (non-.sync). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): skip_capture_snapshot is gone from this Input because CaptureSnapshot is not in this machine \u2014 the post-close pipeline captured the snapshot at the close, and this replay never re-touches live IB. alpha-engine-config-I7586: skip_refresh_executor_deploy stays OUT of this Input \u2014 the parent stops the box (HealConvergedNotify -> StopTradingInstance), the replay's own StartTradingInstance boots it again, and a rebooted box is not on the SHA the parent froze; the replay's own RefreshExecutorDeploy is what makes its EODReconcile drift guard meaningful. skip_post_market_data is correct: the heal loop just re-ran the collection.",
+      "Comment": "config-I2702 deliverable #3(c): auto-start the reconcile-only replay execution of THIS machine ($$.StateMachine.Id) with pipeline_role=operator-replay + skip_post_market_data=true. Deliberately a SEPARATE execution rather than looping this one back: the replay's own terminal is the convergence signal, independently observable by name (eod-heal-replay-{run_date}-*). Fire-and-forget (non-.sync). alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): skip_capture_snapshot is gone from this Input because CaptureSnapshot is not in this machine \u2014 the post-close pipeline captured the snapshot at the close, and this replay never re-touches live IB. alpha-engine-config-I7586: skip_refresh_executor_deploy stays OUT of this Input \u2014 the replay's own RefreshExecutorDeploy is what makes its EODReconcile drift guard meaningful, and it is cheap on a box already on the frozen SHA. Since the 2026-10-08 heal-replay stop race the parent no longer stops the box after this state (HealConvergedNotify routes around DrainTraderReconcile and StopTradingInstance): the replay inherits the running box and owns its stop. skip_post_market_data is correct: the heal loop just re-ran the collection. box_owned_by_dispatcher hands this execution's box ownership to the replay (ResolveBoxOwnership): the replay's own start finds the box running, and without it the replay would never stop the box this execution started.",
       "Resource": "arn:aws:states:::states:startExecution",
       "Parameters": {
         "StateMachineArn.$": "$$.StateMachine.Id",
@@ -1062,7 +1214,8 @@
           "run_date.$": "$.run_date",
           "triggered_by": "eod-self-heal",
           "pipeline_role": "operator-replay",
-          "skip_post_market_data": true
+          "skip_post_market_data": true,
+          "box_owned_by_dispatcher.$": "$.box_ownership.owned"
         }
       },
       "TimeoutSeconds": 30,
@@ -1096,19 +1249,19 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "CheckBoxOwnedBeforeStop"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "CheckBoxOwnedBeforeStop"
     },
     "HealConvergedNotify": {
       "Type": "Task",
-      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name.",
+      "Comment": "config-I2702 closes-when 'convergence notification': informational (non-paging) \u2014 the self-heal re-dispatched the missing workload(s) and the replay execution named here does the actual EODReconcile. alpha-engine-config-I7586: this used to assert 'No operator action required' on the strength of a DISPATCH. Under the deploy-refresh defect that claim was false in every case this state could be reached, and it is a claim this state structurally cannot make \u2014 the dispatch is fire-and-forget, so the convergence signal belongs to the replay's own terminal, independently observable by execution name. 2026-10-08 heal-replay stop race (eod-reconcile-backstop-2026-10-08-1791512138): both edges go to ReadExerciseCadence, AROUND DrainTraderReconcile and StopTradingInstance. Reaching this state means HealDispatchReplay succeeded, so the trading box now belongs to the replay, which drains and stops it at its own end (or force-stops it on failure). This execution used to drain and stop it anyway: on 2026-10-09 the replay's StartTradingInstance was a no-op on the running box at 03:19:17Z, this execution's StopTradingInstance stopped it at 03:19:30Z, the replay's RefreshExecutorDeploy was sent to a stopping box at 03:19:32Z and ended DeliveryTimedOut, and the replay FAILED at 03:39:42Z with no eod_pnl row for 2026-10-08. HealReplayDispatchFailed and HealNonConvergent still drain and stop: no replay owns the box on those routes.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
         "Subject": "Alpha Engine EOD Self-Heal \u2014 replay dispatched (convergence pending)",
-        "Message.$": "States.Format('EOD self-heal for {} re-ran the standalone EOD collection after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution of ne-postclose-reconcile-pipeline has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
+        "Message.$": "States.Format('EOD self-heal for {} re-ran the standalone EOD collection after {} attempt(s); SPY close is now verified present in ArcticDB and a reconcile-only replay execution of ne-postclose-reconcile-pipeline has been started ({}). The replay\\'s OWN terminal is the convergence signal \u2014 this message reports a dispatch, not an outcome. The replay owns the trading box from here and stops it at its own end.', $.run_date, States.MathAdd($.heal_loop.attempts, 1), States.JsonToString($.heal_replay_dispatch))"
       },
       "ResultPath": "$.heal_converged_notify",
       "TimeoutSeconds": 60,
@@ -1118,10 +1271,10 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "ReadExerciseCadence"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "ReadExerciseCadence"
     },
     "HealNonConvergent": {
       "Type": "Task",
@@ -1140,10 +1293,56 @@
             "States.ALL"
           ],
           "ResultPath": null,
-          "Next": "StopTradingInstance"
+          "Next": "CheckBoxOwnedBeforeStop"
         }
       ],
-      "Next": "StopTradingInstance"
+      "Next": "CheckBoxOwnedBeforeStop"
+    },
+    "CheckBoxOwnedBeforeStop": {
+      "Type": "Choice",
+      "Comment": "Box ownership, success side: every route that used to enter DrainTraderReconcile (EODReconcile succeeded, the skip/data-gap routes, HealReplayDispatchFailed, HealNonConvergent) comes here first. Owned -> drain and stop as before. Not owned (or no record, which no success route can produce) -> NotifyStopSkippedNotBoxOwner and the exercise-cadence tail, with the box left exactly as this execution found it. The drain is skipped too: it exists only to hold the stop back for the v2 trader's reconcile.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.box_ownership.owned",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.box_ownership.owned",
+              "IsBoolean": true
+            },
+            {
+              "Variable": "$.box_ownership.owned",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "DrainTraderReconcile"
+        }
+      ],
+      "Default": "NotifyStopSkippedNotBoxOwner"
+    },
+    "NotifyStopSkippedNotBoxOwner": {
+      "Type": "Task",
+      "Comment": "Informational: this execution finished its work and did NOT stop the trading box, because the box was already running when it started (another actor owns it). Catch continues to the same tail: an SNS failure must not turn into a stop.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Reconcile Pipeline \u2014 trading box left running (not started by this execution)",
+        "Message.$": "States.Format('ne-postclose-reconcile-pipeline ({}) for {} did not stop the trading box: it was already {} when this execution started it, so another actor owns it (box ownership, 2026-10-09 in-session stop). If nothing else stops it, the 22:00 PT alpha-engine-stop-trading schedule does.', $$.Execution.Id, $.run_date, States.JsonToString($.ec2_start_result))"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.stop_skipped_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "ReadExerciseCadence"
+        }
+      ],
+      "Next": "ReadExerciseCadence"
     },
     "StopTradingInstance": {
       "Type": "Task",
@@ -1448,7 +1647,7 @@
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS \u2014 instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance.",
+      "Comment": "Failure alert via SNS \u2014 instance still stops to avoid cost. ARN is hardcoded (not $.sns_topic_arn) so a malformed input field can never block the cost-guard. Catch routes to ForceStopInstance so any SNS-side failure (throttling, IAM drift, transient outage) still stops the instance. The stop is now ownership-gated (CheckBoxOwnedBeforeForceStop): the cost guard stops a box this execution started, never one it found running.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
@@ -1463,15 +1662,39 @@
             "States.ALL"
           ],
           "Comment": "Defense-in-depth: SNS publish failure must NOT block ForceStopInstance. The cost-guard fires regardless of alert delivery (avoids the 2026-05-14 incident where a malformed sns_topic_arn left the trading instance running).",
-          "Next": "ForceStopInstance",
+          "Next": "CheckBoxOwnedBeforeForceStop",
           "ResultPath": "$.failure_notify_error"
         }
       ],
-      "Next": "ForceStopInstance"
+      "Next": "CheckBoxOwnedBeforeForceStop"
+    },
+    "CheckBoxOwnedBeforeForceStop": {
+      "Type": "Choice",
+      "Comment": "Box ownership, failure side. Owned -> ForceStopInstance (the cost guard, unchanged). Not owned, or no ownership record because the failure came before or at StartTradingInstance (the gate's fail-closed default, a failed start) -> FailExecution without stopping: this execution never brought the box up, so stopping it could only take down a box another actor is using. The 22:00 PT alpha-engine-stop-trading schedule still bounds the cost.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.box_ownership.owned",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.box_ownership.owned",
+              "IsBoolean": true
+            },
+            {
+              "Variable": "$.box_ownership.owned",
+              "BooleanEquals": true
+            }
+          ],
+          "Next": "ForceStopInstance"
+        }
+      ],
+      "Default": "FailExecution"
     },
     "ForceStopInstance": {
       "Type": "Task",
-      "Comment": "Always stop trading instance even on failure \u2014 avoid cost overrun",
+      "Comment": "Stop the trading instance on failure to avoid a cost overrun, when this execution owns it (CheckBoxOwnedBeforeForceStop).",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1483,7 +1706,7 @@
     "FailExecution": {
       "Type": "Fail",
       "Error": "EODReconcilePipelineFailure",
-      "Cause": "EOD reconcile pipeline failed \u2014 trading instance stopped, check logs."
+      "Cause": "EOD reconcile pipeline failed \u2014 the trading instance was stopped if this execution started it (left running otherwise), check logs."
     },
     "NormalizeEODFailureContext": {
       "Type": "Pass",
@@ -1706,6 +1929,185 @@
         }
       ],
       "Next": "HealReProbe"
+    },
+    "DrainTraderReconcile": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12020 (2026-10-07 boot race). The box this machine starts is also where crucible-executor's Persistent=true alpha-engine-trader-reconcile timer catches up (see StartTradingInstance): it fires at THIS boot, and nothing in this machine waited for it, so StopTradingInstance (~2 min after StartTradingInstance on 2026-10-07) raced the v2 trader's own reconciliation. That run connected ~58s after the cold boot, before the dockerised IB Gateway had finished logging in, and was filed as an expired session. crucible-trader now waits, bounded (default 300s), for the gateway's API port before it connects; this state is what keeps the box up for that wait. Waits until alpha-engine-trader-reconcile.service is neither queued nor running (systemctl ActiveState not active/activating/reloading AND no pending job), bounded at 1080s in-script (the trader's 300s gateway wait plus its provisioning, venv build and the reconcile itself, with headroom; the unit's own TimeoutStartSec is 30min) under a 1200s executionTimeout. Settles immediately on a box where the run already finished (the 02:15 UTC backstop, an operator rerun, a heal replay) and on a box with no such unit. FAIL-OPEN toward the stop, never toward an idle box: an exhausted budget, a non-Success status or any SSM error routes to SetTraderReconcileDrainDegraded and then StopTradingInstance. The cost guard and the reconcile terminal are this machine's deliverables; the trader reconcile files its own run manifest, and the recording surface for a drain that did not settle is $.trader_reconcile_drain_error plus the degraded terminal.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands": [
+            "set -u",
+            "unit=alpha-engine-trader-reconcile.service",
+            "deadline=$((SECONDS+1080))",
+            "while :; do",
+            "  state=$(systemctl show -p ActiveState --value \"$unit\")",
+            "  queued=$(systemctl list-jobs --no-legend \"$unit\" | wc -l)",
+            "  if [ \"$state\" != activating ] && [ \"$state\" != active ] && [ \"$state\" != reloading ] && [ \"$queued\" -eq 0 ]; then",
+            "    echo \"$unit settled: ActiveState=$state Result=$(systemctl show -p Result --value \"$unit\")\"",
+            "    exit 0",
+            "  fi",
+            "  if [ \"$SECONDS\" -ge \"$deadline\" ]; then",
+            "    echo \"$unit still ActiveState=$state (queued jobs: $queued) after 1080s; stopping the box anyway\" >&2",
+            "    exit 1",
+            "  fi",
+            "  sleep 10",
+            "done"
+          ],
+          "executionTimeout": [
+            "1200"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 1260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open toward the stop: a drain that could not even be sent must never leave the box running.",
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_result",
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "WaitForTraderReconcileDrain": {
+      "Type": "Task",
+      "Comment": "Poll the DrainTraderReconcile invocation. Same retry shape as WaitForRefreshExecutorDeploy; every error fails open to SetTraderReconcileDrainDegraded -> StopTradingInstance. Maps StandardErrorContent only (the drain's unsettled diagnostic is written to stderr); stdout is never mapped into SF state (test_sf_ssm_diagnostics_reach_the_operator.py, the DataLimitExceeded class).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.trader_reconcile_drain_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.trader_reconcile_drain_poll",
+      "Next": "CheckTraderReconcileDrainStatus"
+    },
+    "CheckTraderReconcileDrainStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> StopTradingInstance. InProgress/Pending/Delayed -> keep polling. Anything else (Failed: the in-script budget ran out; TimedOut; Cancelled) -> SetTraderReconcileDrainDegraded, which still stops the box.",
+      "Choices": [
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Success",
+          "Next": "StopTradingInstance"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "TraderReconcileDrainWait"
+        }
+      ],
+      "Default": "ExtractTraderReconcileDrainStatusError"
+    },
+    "TraderReconcileDrainWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "SetTraderReconcileDrainDegraded": {
+      "Type": "Pass",
+      "Comment": "The trader-reconcile drain did not settle (budget exhausted, non-Success status, or an SSM error). Recorded on $.degraded_summary so CheckDegradedOutcome routes to the DegradedRun terminal instead of a plain SUCCEEDED, pages immediately (PublishTraderReconcileDrainUnsettled, sf-pipeline-policy.md \u00a75), then the box is stopped regardless. Same shape as SetMutexAcquireDegradedFlag.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_trader_reconcile_drain_unsettled",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.trader_reconcile_drain_error"
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishTraderReconcileDrainUnsettled"
+    },
+    "ExtractTraderReconcileDrainStatusError": {
+      "Type": "Pass",
+      "Comment": "Copies the terminal non-Success poll (Failed when the in-script budget ran out; TimedOut; Cancelled) into $.trader_reconcile_drain_error, the same field DrainTraderReconcile's and WaitForTraderReconcileDrain's Catch write, so SetTraderReconcileDrainDegraded reads one path on every route into it.",
+      "InputPath": "$.trader_reconcile_drain_poll",
+      "ResultPath": "$.trader_reconcile_drain_error",
+      "Next": "SetTraderReconcileDrainDegraded"
+    },
+    "PublishTraderReconcileDrainUnsettled": {
+      "Type": "Task",
+      "Comment": "Best-effort immediate page that the v2 trader's reconcile was still queued or running when this machine had to stop the box (or that the drain could not be read). Its own Catch routes to StopTradingInstance too, so an SNS failure cannot leave the box running.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine trader reconcile NOT DRAINED (box stopped anyway)",
+        "Message.$": "States.Format('ne-postclose-reconcile-pipeline stopped the trading box for {} while alpha-engine-trader-reconcile.service had not settled (still queued or running past the drain budget, or the drain could not be read). The v2 trader reconcile may have been cut off by the stop; check its run manifest for the day. Detail: {}', $.run_date, States.JsonToString($.trader_reconcile_drain_error))"
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "An alert failure must not block the cost-guard stop.",
+          "Next": "StopTradingInstance",
+          "ResultPath": "$.trader_reconcile_drain_notify_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_notify",
+      "Next": "StopTradingInstance"
     }
   }
 }

@@ -118,6 +118,29 @@ def test_lane_timeout_is_fast_enough_to_actually_run(staging):
     )
 
 
+def test_execution_ceiling_leaves_the_recovery_path_room_to_finish(prod, staging):
+    """After a lane times out, the recovery path runs inside the gap between
+    the lane budget and the execution ceiling. Scaling must not floor that gap
+    below the cold-start floor, or every timeout scenario races the ceiling and
+    grades TIMED_OUT instead of FAILED (alpha-engine-config-I11980: at /720 the
+    gap was 1s and the recovery path took ~1.1s)."""
+    def lane_budget(defn):
+        for state in defn["States"].values():
+            if state.get("Type") == "Map":
+                body = state.get("ItemProcessor") or state.get("Iterator")
+                return body["States"]["LaunchGroomSpot"]["TimeoutSeconds"]
+        raise AssertionError("LaunchGroomSpot not found in the Map body")
+
+    prod_gap = prod["TimeoutSeconds"] - lane_budget(prod)
+    assert prod_gap > 0, "production's execution ceiling no longer exceeds its lane budget"
+    stg_gap = staging["TimeoutSeconds"] - lane_budget(staging)
+    assert stg_gap >= MIN_TIMEOUT_SECONDS, (
+        f"staging ceiling sits {stg_gap}s above the lane budget (production: "
+        f"{prod_gap}s); the recovery path cannot reliably finish in under "
+        f"{MIN_TIMEOUT_SECONDS}s, so lower TIMEOUT_DIVISOR"
+    )
+
+
 def test_builder_refuses_a_definition_it_cannot_make_safe():
     """If either swap finds nothing, FAIL — never emit a half-swapped machine."""
     with pytest.raises(ValueError, match="names no"):

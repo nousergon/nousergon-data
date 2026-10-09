@@ -565,6 +565,7 @@ def _resolve_run_mode(args: argparse.Namespace) -> str:
         "daily_arctic_append",
         "chronic_gap_heal",
         "daily_heal",
+        "daily_panel",
     ):
         if getattr(args, flag, False):
             return flag
@@ -1758,7 +1759,23 @@ def _settled_regrade_keys(result: dict) -> dict[str, int]:
     return keys
 
 
+def _daily_panel_keys(result: dict) -> dict[str, int]:
+    """The two keys D51 published, with their counts: the panel (``rows``) and
+    its manifest (1), which the publisher writes last. Empty unless it wrote."""
+    panel = (result.get("collectors") or {}).get("daily_panel") or {}
+    if panel.get("status") != "ok":
+        return {}
+    return {panel["panel_key"]: int(panel.get("rows") or 0), panel["manifest_key"]: 1}
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "daily_panel": (
+        (
+            lambda r: list(_daily_panel_keys(r)),
+            lambda r: bool(_daily_panel_keys(r)),
+            _daily_panel_keys,
+        ),
+    ),
     "features_settled_regrade": (
         (
             lambda r: list(_settled_regrade_keys(r)),
@@ -1919,6 +1936,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
         return _run_whole_mode_unit(
             "features_settled_regrade", _run_features_settled_regrade, config, args
         )
+
+    if getattr(args, "daily_panel", False):
+        return _run_whole_mode_unit("daily_panel", _run_daily_panel, config, args)
 
     if args.daily:
         return _run_daily(config, args)
@@ -3939,10 +3959,25 @@ def _self_heal_missing_universe_days(
     # ledger-marked) — de-dup against both. Missing days are the more severe
     # gap, so they get healed first; ledger-only days (already outside the
     # window) come last since the window-scan days are the fresher signal.
+    #
+    # Ledger days are held to the same horizon as both window detectors:
+    # strictly before ``target_date``. The ledger is unbounded in the past
+    # (config#2672) but NOT in the future: EOD marks the session it just
+    # wrote the same evening, and that session's own Polygon correction is
+    # the next morning's append, which runs after this heal (05:00 ET). A
+    # ledger day >= target_date is therefore not yet overdue, and admitting
+    # it let the newest entry win the per-run budget every weekday, so an
+    # older entry that really was overdue was deferred indefinitely
+    # (2026-09-30 deferred on 10-05 and 10-06 while the heal re-healed the
+    # day the morning append was about to correct). Its row stays in
+    # ``ledger_days`` for the artifact; it is simply not a candidate yet.
     combined = (
         missing
         + [d for d in fallback_quality if d not in missing]
-        + [d for d in ledger_days if d not in missing and d not in fallback_quality]
+        + [
+            d for d in ledger_days
+            if d < target_date and d not in missing and d not in fallback_quality
+        ]
     )
     if not combined:
         logger.info(
@@ -4638,22 +4673,46 @@ def _augment_with_macro_daily_tickers(tickers: list[str]) -> list[str]:
     return list(dict.fromkeys(tickers + _MACRO_DAILY_TICKERS))
 
 
-def _load_daily_universe_tickers(config: dict) -> list[str]:
+def _load_daily_universe_tickers(config: dict, run_date: str | None = None) -> list[str]:
     """Load the daily universe (S3 constituents → Wikipedia fallback) plus the
     macro daily tickers. Shared by :func:`_run_daily` and
     :func:`_run_daily_arctic_append` so a split EOD run (PostMarketData computes,
     PostMarketArcticAppend appends) feeds daily_append the identical
     expected-ticker scope. Returns ``[]`` when no constituents are resolvable —
-    callers treat that as a hard failure."""
+    callers treat that as a hard failure.
+
+    With ``run_date``, reads the NEWEST dated constituents on or before it —
+    this morning's MorningEnrich refresh — not the Saturday-only
+    ``latest_weekly.json`` pointer, so a mid-week delisting or rename leaves
+    the evening universe the same day it leaves the morning's (2026-10-07:
+    WBD/PSKY, see ``builders._constituents_loader.load_newest_dated_constituents``).
+    The pointer stays the fallback."""
     tickers: list[str] = []
     market_prefix = config.get("market_data", {}).get("s3_prefix", "market_data/")
-    try:
-        existing = constituents.load_from_s3(config["bucket"], market_prefix)
-        if existing:
-            tickers = existing.get("tickers", [])
-            logger.info("Loaded %d tickers from S3 constituents", len(tickers))
-    except Exception as exc:
-        logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
+    if run_date:
+        try:
+            from builders._constituents_loader import load_newest_dated_constituents
+            tickers_set, dated = load_newest_dated_constituents(
+                boto3.client("s3"), config["bucket"], run_date, market_prefix,
+            )
+            tickers = sorted(tickers_set)
+            logger.info(
+                "Loaded %d tickers from S3 constituents (newest dated <= %s: %s)",
+                len(tickers), run_date, dated,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Dated constituents read on or before %s failed (%s) — falling back "
+                "to the latest_weekly.json pointer", run_date, exc,
+            )
+    if not tickers:
+        try:
+            existing = constituents.load_from_s3(config["bucket"], market_prefix)
+            if existing:
+                tickers = existing.get("tickers", [])
+                logger.info("Loaded %d tickers from S3 constituents", len(tickers))
+        except Exception as exc:
+            logger.warning("S3 constituents load failed — will try Wikipedia fallback: %s", exc)
     if not tickers:
         try:
             tickers, _, _, _, _, _, _ = constituents._fetch_constituents()
@@ -4684,7 +4743,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    tickers = _load_daily_universe_tickers(config)
+    tickers = _load_daily_universe_tickers(config, run_date)
     if not tickers:
         logger.error("No tickers available for daily closes")
         results["status"] = "failed"
@@ -5274,7 +5333,7 @@ def _run_daily_arctic_append(config: dict, args: argparse.Namespace) -> dict:
         "collectors": {},
     }
 
-    tickers = _load_daily_universe_tickers(config)
+    tickers = _load_daily_universe_tickers(config, run_date)
     if not tickers:
         logger.error("No tickers available for ArcticDB append")
         results["status"] = "failed"
@@ -5682,6 +5741,14 @@ def _parse_args() -> argparse.Namespace:
              "not_applicable. --date overrides the trading day.",
     )
     parser.add_argument(
+        "--daily-panel", dest="daily_panel", action="store_true",
+        help="D51: compile the session's long OHLCV panel ONCE from the ArcticDB universe "
+             "library and publish data_collection/panel/{trading_day}/panel.parquet, then "
+             "manifest.json (builders/daily_panel.py; alpha-engine-config-I10791, plan P-25). "
+             "Refuses, writing nothing, on an empty ticker frame or a panel off-contract. "
+             "--date overrides the trading day; --dry-run compiles and validates only.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -5732,7 +5799,9 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False):
+        # --daily-panel (D51) reads the ArcticDB universe library and writes
+        # data_collection/panel/ — the same S3 + ArcticDB surface as --daily.
         # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
         # and macro libraries, the same surface D31 reads under --daily.
         # --daily-arctic-append reads the daily_closes PostMarketData wrote +
@@ -5882,6 +5951,39 @@ def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dic
     }
     if status == "skipped":
         result["skip_reason"] = collector.get("skip_reason")
+    if status == "error":
+        result["error"] = collector.get("error")
+    return result
+
+
+def _run_daily_panel(config: dict, args: argparse.Namespace) -> dict:
+    """D51: publish the session's daily panel (`builders.daily_panel.run`).
+
+    Keyed by the last closed session (``--date`` or :func:`default_run_date`),
+    the same day D32 appended. Reads the ArcticDB ``universe`` library once and
+    writes the panel parquet, then its manifest. A refused contract returns
+    ``status: error``, which the wrapper records as ``failed`` and ``main``
+    exits 1 on: an absent panel is a red leg on the phase-3 acceptance clause,
+    never a thin one every consumer reads as fine.
+    """
+    from builders import daily_panel
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = daily_panel.run(
+        config["bucket"],
+        trading_day=datetime.fromisoformat(run_date).date(),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    status = collector.get("status")
+    result = {
+        "mode": "daily_panel",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"daily_panel": collector},
+    }
     if status == "error":
         result["error"] = collector.get("error")
     return result

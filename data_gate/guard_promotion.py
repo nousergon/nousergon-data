@@ -143,13 +143,30 @@ GUARD_PROMOTIONS: tuple[GuardPromotion, ...] = (
         tracked_issue="alpha-engine-config-I10780",
     ),
     GuardPromotion(
-        name="bar_settlement",
-        staging="dates.py::BAR_SETTLEMENT_GUARD",
+        name="data_spine_window",
+        staging="validators/expectations.py::SPINE_WINDOW_GUARD",
         mode="observe",
         risk="moderate",
         blast_radius=(
-            "the D03/D19 daily-close fetches; no ENFORCE raise site exists yet, so promotion "
-            "also writes one — the verdict is recorded on the manifest and read by shadow parity"
+            "the EOD spine's (D20) own run; no ENFORCE raise site exists yet, so promotion also "
+            "writes one — the window verdict is recorded on the manifest and never acted on, today"
+        ),
+        guard_class=None,
+        units=("D20",),
+        clean_verdicts=frozenset({"ok"}),
+        preconditions=(),
+        tracked_issue="alpha-engine-config-I10780",
+    ),
+    GuardPromotion(
+        name="bar_settlement",
+        staging="dates.py::BAR_SETTLEMENT_GUARD",
+        mode="enforce",
+        risk="moderate",
+        blast_radius=(
+            "the D03/D19 daily-close fetches: dates.assert_settled_bar refuses a fetch for day "
+            "D's own bar opened before SETTLED_AFTER_ET, failing that unit's phase before "
+            "anything is written; the verdict is also recorded on the manifest and read by "
+            "shadow parity"
         ),
         guard_class=None,
         units=("D03", "D19"),

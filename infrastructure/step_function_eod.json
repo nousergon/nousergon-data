@@ -57,8 +57,8 @@
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
           "StringEquals": "PROCEED",
-          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it.",
-          "Next": "CheckMutexRole"
+          "Comment": "Market closed. The scheduled trigger of both pipelines lands here every day: preopen at 05:15 PT (pre-open) and postclose at 13:00:0x PT, which is 16:00:0x ET \u2014 the session window is half-open [09:30, 16:00) so the close instant itself is already outside it. Then StampStartClockUtc: the Lambda's window opens at 09:30 ET, the pre-session window [08:00, 09:30) ET is refused after it.",
+          "Next": "StampStartClockUtc"
         },
         {
           "Variable": "$.market_hours_gate.Payload.verdict",
@@ -140,7 +140,7 @@
     "MarketHoursBlocked": {
       "Type": "Fail",
       "Error": "MarketHoursBoundary",
-      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}."
+      "Cause": "alpha-engine-config-I7111: this execution's start time falls inside the NYSE regular session ([09:30, 16:00) ET on a trading day) and carried no market-hours override. Trading pipelines do not start in-session \u2014 the preopen chain boots the trading box and starts the order-placing daemon, and the postclose chain stops the box and reconciles the book; either one, mid-session, acts on a stale plan against a live market. The verdict, the ET clock it was judged against, and the override shape are in $.market_hours_gate and in the SNS alert. To authorise one in-session start, re-run with market_hours_override {reason, authorized_by, expires_at}. Also reached from NotifyPreSessionBlocked: a start in the pre-session window [08:00, 09:30) ET, when the preopen pipeline has the box up for the session (2026-10-09 incident); that window has no override."
     },
     "NotifyMarketHoursOverrideMalformed": {
       "Type": "Task",
@@ -188,10 +188,10 @@
           ],
           "Comment": "SNS delivery is the announcement, not the record \u2014 the gate verdict and the full override document are in $.market_hours_gate in execution history either way. A publish failure must not change what the boundary decided.",
           "ResultPath": "$.market_hours_notify_error",
-          "Next": "CheckMutexRole"
+          "Next": "StampStartClockUtc"
         }
       ],
-      "Next": "CheckMutexRole"
+      "Next": "StampStartClockUtc"
     },
     "SetMarketHoursUnverifiedDegraded": {
       "Type": "Pass",
@@ -203,6 +203,63 @@
       },
       "ResultPath": "$.degraded_summary",
       "Next": "NotifyMarketHoursUnverified"
+    },
+    "StampStartClockUtc": {
+      "Type": "Pass",
+      "Comment": "2026-10-09 in-session box stop (alpha-engine-config-I12020 follow-up): the manual replay eod-heal-replay-2026-10-08-manual-1 started at 13:27:21Z (09:27 ET), passed MarketHoursGate (the gate Lambda only refuses [09:30, 16:00) ET), and its success path EODReconcile -> DrainTraderReconcile -> StopTradingInstance stopped the trading box the preopen pipeline had started at 12:15Z. The box stayed down the whole session: the v2 trader's 10:45 ET session never ran and the v1 intraday daemon never ticked. The gate Lambda's window starts at the 09:30 ET open, but the box is up from the preopen pipeline's start (alpha-engine-weekday, cron(15 5) America/Los_Angeles = 08:15 ET), so a box-stopping execution started between the two stops a box the session is about to trade on. This state stamps the execution's UTC start as HHMM (zero-padded, so Choice string comparison orders it correctly) for PreSessionWindowChoice. Pure arithmetic on $$.Execution.StartTime: it needs no Lambda and no DST table, so it also runs on the gate-unverified route, where the Lambda's own answer is missing.",
+      "Parameters": {
+        "start_time.$": "$$.Execution.StartTime",
+        "hhmm.$": "States.Format('{}{}', States.ArrayGetItem(States.StringSplit(States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, 'T'), 1), ':'), 0), States.ArrayGetItem(States.StringSplit($$.Execution.StartTime, ':'), 1))"
+      },
+      "ResultPath": "$.start_clock_utc",
+      "Next": "PreSessionWindowChoice"
+    },
+    "PreSessionWindowChoice": {
+      "Type": "Choice",
+      "Comment": "Refuses a box-stopping start in the pre-session window [08:00, 09:30) ET. The window is written in UTC as [12:00, 14:30), the union of that ET window under both offsets: EDT (UTC-4) puts it at [12:00, 13:30)Z and EST (UTC-5) at [13:00, 14:30)Z. The over-coverage is harmless: EDT 09:30-10:30 is already in-session (the gate Lambda refuses it) and EST 07:00-08:00 is before anything starts the box. Nothing legitimate starts this pipeline then: its scheduled and event-driven starts are all after the close (16:00 ET or later, 13:00 ET on an early close = 17:00Z or later). [09:30, close) stays the gate Lambda's, which owns the holiday and early-close calendar, so together the two refuse [08:00, close) ET. No override crosses this window: the market_hours_override the Lambda validates covers the in-session window only, so a deliberate start waits for 09:30 and uses that.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "StringGreaterThanEquals": "1200"
+            },
+            {
+              "Variable": "$.start_clock_utc.hhmm",
+              "StringLessThan": "1430"
+            }
+          ],
+          "Next": "NotifyPreSessionBlocked"
+        }
+      ],
+      "Default": "CheckMutexRole"
+    },
+    "NotifyPreSessionBlocked": {
+      "Type": "Task",
+      "Comment": "A refusal is loud (sf-pipeline-policy \u00a72.3), then ends in MarketHoursBlocked, the same Fail the in-session refusal uses, so status watchers keyed on MarketHoursBoundary see it.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD Pipeline \u2014 REFUSED (start in the pre-session window)",
+        "Message.$": "States.Format('Refused to start a box-stopping trading pipeline in the pre-session window [08:00, 09:30) ET, when the preopen pipeline has the trading box up for the session. Execution: {}. Start (UTC): {}. This window has no override; an authorised start waits for 09:30 ET and carries a market_hours_override. The market-hours gate verdict is in $.market_hours_gate in execution history.', $$.Execution.Id, $.start_clock_utc.start_time)"
+      },
+      "TimeoutSeconds": 60,
+      "ResultPath": "$.pre_session_blocked_notify",
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "SNS delivery is the announcement, not the record. A publish failure must not change what the boundary decided.",
+          "ResultPath": "$.market_hours_notify_error",
+          "Next": "MarketHoursBlocked"
+        }
+      ],
+      "Next": "MarketHoursBlocked"
     },
     "CheckMutexRole": {
       "Type": "Choice",

@@ -149,15 +149,25 @@ def test_a_client_created_before_activation_is_still_redirected():
     convention.
     """
     import boto3
+    import botocore.client
 
+    real = botocore.client.BaseClient._make_api_call
     client = boto3.client("s3", region_name="us-east-1", aws_access_key_id="x", aws_secret_access_key="y")
     seen: list[dict] = []
     activate(ROOT)
+    saved = interceptor._ORIGINAL
     try:
         interceptor._ORIGINAL = lambda self, op, params: seen.append({"op": op, **params}) or {}
         client.put_object(Bucket="alpha-engine-research", Key="market_data/technicals/latest.json", Body=b"{}")
     finally:
+        # Put the real original back BEFORE deactivate(): uninstall() restores
+        # whatever `_ORIGINAL` holds onto BaseClient, so leaving the stub there
+        # made every later boto3 call in this xdist worker return `{}` — which
+        # is how tests/test_features_settled_regrade.py failed 21 setups with
+        # KeyError 'VersionId' whenever loadfile put it after this file.
+        interceptor._ORIGINAL = saved
         deactivate()
+    assert botocore.client.BaseClient._make_api_call is real
     assert seen and seen[0]["Key"] == "staging/shadow/2026-09-12/market_data/technicals/latest.json"
 
 

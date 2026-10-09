@@ -158,6 +158,12 @@ _D03_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
     ("failed_vendor_no_data", "vendor_no_data"),
     ("failed_batch_fetch_error", "batch_fetch_error"),
     ("failed_refresh_error", "refresh_error"),
+    # Not a failure (``prices.SKIP_STOPPED_PRINTING``): recorded so the manifest
+    # still names every ticker the run did not write.
+    ("skipped_stopped_printing", "stopped_printing_suspected"),
+    # Not a failure either (``prices.QUARANTINED``): a guard refusal set aside
+    # within the declared bound, still named here so the manifest says so.
+    ("quarantined_guard_refused", "guard_refused_quarantined"),
 )
 
 
@@ -265,6 +271,9 @@ MODE_UNITS: dict[str, str] = {
     # morning rebuild of features/{D-1} from the settled bar
     # (features/settled_regrade.py). Shares D31's feature keys.
     "features_settled_regrade": "D50",
+    # alpha-engine-config-I10791 (plan P-25): the daily panel, compiled once
+    # from the ArcticDB universe library (builders/daily_panel.py).
+    "daily_panel": "D51",
 }
 
 
@@ -318,6 +327,9 @@ MODE_ROWS: dict[str, ModeRows] = {
     # rebuilt snapshot (features.compute.FeatureBuild.n_ok), the same key D31's
     # PhaseUnit reads.
     "features_settled_regrade": ModeRows("features", "tickers_computed", library_ref=None),
+    # D51 publishes two S3 keys and no library; `rows` is the panel's row count
+    # (builders.daily_panel.run), the manifest's `row_count`.
+    "daily_panel": ModeRows("daily_panel", "rows", library_ref=None),
 }
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase
