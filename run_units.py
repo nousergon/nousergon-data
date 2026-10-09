@@ -161,6 +161,9 @@ _D03_REJECTED_KEYS: tuple[tuple[str, str], ...] = (
     # Not a failure (``prices.SKIP_STOPPED_PRINTING``): recorded so the manifest
     # still names every ticker the run did not write.
     ("skipped_stopped_printing", "stopped_printing_suspected"),
+    # Not a failure either (``prices.QUARANTINED``): a guard refusal set aside
+    # within the declared bound, still named here so the manifest says so.
+    ("quarantined_guard_refused", "guard_refused_quarantined"),
 )
 
 

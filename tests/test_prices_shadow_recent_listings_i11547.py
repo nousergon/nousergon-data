@@ -332,6 +332,7 @@ def test_the_refusal_record_says_when_it_is_truncated(monkeypatch):
 def test_d03_declares_its_rejections_by_cause_never_the_bare_total():
     expected = tuple((key, reason) for reason, key in prices.FAILURE_RESULT_KEYS.items()) + (
         (prices.SKIP_STOPPED_PRINTING_RESULT_KEY, prices.SKIP_STOPPED_PRINTING),
+        (prices.QUARANTINED_RESULT_KEY, prices.QUARANTINED),
     )
     for mode in ("daily", "phase1"):
         assert run_units.PHASE_UNITS[(mode, "prices")].rejected_keys == expected
