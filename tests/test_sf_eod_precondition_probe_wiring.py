@@ -478,19 +478,28 @@ class TestHealOutcomeNotifications:
         assert 0 < len(st["Parameters"]["Subject"]) <= 100
         assert "\n" not in st["Parameters"]["Subject"]
 
+    # HealConvergedNotify is not here: after a successful dispatch the replay
+    # owns the box and stops it at its own end, so the parent routes around
+    # the drain and the stop (2026-10-08 heal-replay stop race,
+    # tests/test_heal_replay_owns_the_trading_box.py).
     @pytest.mark.parametrize("state_name", [
-        "HealConvergedNotify", "HealReplayDispatchFailed", "HealNonConvergent",
+        "HealReplayDispatchFailed", "HealNonConvergent",
     ])
     def test_reaches_cost_guard_tail_on_success_and_on_sns_failure(self, states, state_name):
         # alpha-engine-config-I12020: the cost-guard tail is entered through
         # the bounded trader-reconcile drain (DrainTraderReconcile), every
         # edge of which ends at StopTradingInstance
         # (tests/test_sf_trader_reconcile_drain.py).
+        # 2026-10-09: entered through the box-ownership check, whose owned
+        # edge is the drain (tests/test_sf_pre_session_window_and_box_ownership.py).
         st = states[state_name]
-        assert st["Next"] == "DrainTraderReconcile"
+        assert st["Next"] == "CheckBoxOwnedBeforeStop"
         catches = [c for c in st["Catch"] if c["ErrorEquals"] == ["States.ALL"]]
         assert len(catches) == 1
-        assert catches[0]["Next"] == "DrainTraderReconcile"
+        assert catches[0]["Next"] == "CheckBoxOwnedBeforeStop"
+        assert [c["Next"] for c in states["CheckBoxOwnedBeforeStop"]["Choices"]] == [
+            "DrainTraderReconcile"
+        ]
 
     def test_nonconvergent_never_reaches_a_halt_state(self, states):
         _HALT = {"HandleFailure", "FailExecution", "ForceStopInstance"}
@@ -582,11 +591,17 @@ class TestHandleFailureCostGuardHardening:
             "HandleFailure.Catch must include a 'States.ALL' branch — partial "
             "catches leave failure surfaces uncovered."
         )
-        assert all_catch["Next"] == "ForceStopInstance", (
-            f"HandleFailure Catch must route to ForceStopInstance, not "
-            f"{all_catch['Next']!r}. The cost-guard is the load-bearing "
-            "step; alert delivery is best-effort."
+        # 2026-10-09: the force-stop is ownership-gated — it stops a box this
+        # execution started, never one another actor had up. Both HandleFailure
+        # edges go through that check, whose owned edge is ForceStopInstance.
+        assert all_catch["Next"] == "CheckBoxOwnedBeforeForceStop", (
+            f"HandleFailure Catch must route to the ownership-gated "
+            f"ForceStopInstance, not {all_catch['Next']!r}. The cost-guard is "
+            "the load-bearing step; alert delivery is best-effort."
         )
+        assert states["HandleFailure"]["Next"] == "CheckBoxOwnedBeforeForceStop"
+        guard = states["CheckBoxOwnedBeforeForceStop"]
+        assert [c["Next"] for c in guard["Choices"]] == ["ForceStopInstance"]
 
     def test_input_schema_no_longer_requires_sns_topic_arn(self, states):
         """Once the ARN is hardcoded, no state's Parameters or input/output

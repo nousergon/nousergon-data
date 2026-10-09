@@ -130,6 +130,9 @@ TERMINAL_ERROR_HANDLING_STATES: frozenset[str] = frozenset({
     # Excluding only HandleFailure fixes the common path and leaves the
     # market-hours refusals naming the alerter — the same defect, narrower.
     "NotifyMarketHoursBlocked",
+    # 2026-10-09: the pre-session refusal ([08:00, 09:30) ET) on the two
+    # box-stopping post-close machines, also ahead of MarketHoursBlocked.
+    "NotifyPreSessionBlocked",
     "NotifyMarketHoursOverrideMalformed",
     "NotifyMarketHoursUnverified",
     "TradingDayGateFailed",
