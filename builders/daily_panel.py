@@ -21,10 +21,15 @@ panel is either the contract or absent, and an absent panel is a red leg on
 ``data.phase3.daily_panel_adopted`` rather than a thin artifact every
 consumer reads as fine.
 
-**What this slice is not.** No schedule, no stack wiring and no unit
-descriptor: those are the next slice (the ``ne-data-collection-eod`` stage
-after the ArcticDB append, plus the IAM write grant on ``data_collection/panel/``).
-Run by hand, in-region, until then:
+**Entry points.** ``python -m builders.daily_panel publish|parity`` for an
+operator, and :func:`run` for the collector's whole-mode unit D51
+(``python weekly_collector.py --daily-panel``, ``weekly_collector.py::_run_daily_panel``),
+which records a run manifest around it. **Neither is scheduled yet**: naming
+``daily-panel`` in the ``ne-data-collection-eod`` schedule, and the
+``s3:PutObject`` grant on ``data_collection/panel/*`` for the collection box's
+role, are the remaining steps (alpha-engine-config-I10791). Until the grant
+exists a scheduled run would fail on AccessDenied, so the schedule is not
+wired by the slice that adds the mode.
 
     python -m builders.daily_panel publish --date 2026-10-02 [--dry-run]
     python -m builders.daily_panel parity --date 2026-10-02 --consumer-panel s3://.../panel.parquet
@@ -242,6 +247,55 @@ def parity(
         raise PanelCompileError(f"refusing to publish: parity receipt breaks its schema: {problems}")
     put(dp.parity_key(trading_day), json.dumps(receipt, indent=2).encode(), "application/json")
     return receipt
+
+
+def run(
+    bucket: str,
+    *,
+    trading_day: dt.date,
+    lookback_days: int = DEFAULT_LOOKBACK_CALENDAR_DAYS,
+    region: str | None = None,
+    dry_run: bool = False,
+    loader: Loader | None = None,
+    put: Callable[[str, bytes, str], None] | None = None,
+) -> dict:
+    """Compile and publish one session's panel; return a collector-shaped result.
+
+    The collector's entry (``weekly_collector.py --daily-panel``). It never
+    raises on a contract refusal: :class:`PanelCompileError` becomes
+    ``status: error`` with the reason, so the whole-mode wrapper records the
+    unit ``failed`` and ``main`` exits 1 rather than a traceback standing in
+    for a verdict. Nothing is written on that path.
+
+    ``dry_run`` compiles and validates (reads are real) and writes nothing,
+    status ``ok_dry_run``. On success the result names the two keys written and
+    the counts the manifest carries, so the run manifest records the outputs
+    from what was actually published, not from the descriptor.
+    """
+    result: dict[str, Any] = {"status": "error", "trading_day": str(trading_day)}
+    try:
+        panel = compile_panel(
+            bucket, trading_day=trading_day, lookback_days=lookback_days, region=region, loader=loader
+        )
+        result["rows"] = int(len(panel))
+        if dry_run:
+            result["status"] = "ok_dry_run"
+            return result
+        if put is None:
+            _get, put = _s3_io(bucket, None)
+        manifest = publish(panel, trading_day=trading_day, lookback_days=lookback_days, put=put)
+    except PanelCompileError as exc:
+        logger.error("%s", exc)
+        result["error"] = str(exc)
+        return result
+    result.update(
+        status="ok",
+        rows=int(manifest["row_count"]),
+        panel_key=dp.panel_key(trading_day),
+        manifest_key=dp.manifest_key(trading_day),
+        panel_sha256=manifest["panel_sha256"],
+    )
+    return result
 
 
 # -- CLI --------------------------------------------------------------------
