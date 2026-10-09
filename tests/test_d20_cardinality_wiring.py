@@ -78,6 +78,12 @@ def _collect(s3, *, priced):
     )
 
 
+def _cardinality(result: dict) -> list[dict]:
+    """This run's cardinality entries. The collector also files a spine-window
+    reading (`tests/test_spine_window_guard.py`), graded there."""
+    return [g for g in result["guards"] if g["guard"] == expectations.CARDINALITY_GUARD.name]
+
+
 def _metric_docs(s3: FakeS3) -> list[dict]:
     return [b for k, b in s3.puts if k.startswith("data_collection/metrics/eod_completeness/")]
 
@@ -98,9 +104,9 @@ def test_full_coverage_publishes_an_ok_completeness_metric(universe):
     assert doc["value"] == 1.0
 
     # And the SAME reading rides on the result, for the run manifest.
-    assert [g["verdict"] for g in result["guards"]] == ["ok"]
-    assert result["guards"][0]["guard"] == expectations.CARDINALITY_GUARD.name
-    assert result["guards"][0]["mode"] == "observe"
+    assert [g["verdict"] for g in _cardinality(result)] == ["ok"]
+    assert _cardinality(result)[0]["guard"] == expectations.CARDINALITY_GUARD.name
+    assert _cardinality(result)[0]["mode"] == "observe"
 
 
 def test_an_undeclared_miss_is_below_floor_and_names_the_symbol(universe):
@@ -109,8 +115,8 @@ def test_an_undeclared_miss_is_below_floor_and_names_the_symbol(universe):
 
     # OBSERVE mode: the run is still `ok`; the verdict is the finding.
     assert result["status"] == "ok"
-    assert [g["verdict"] for g in result["guards"]] == ["below_floor"]
-    assert "NVDA" in result["guards"][0]["detail"]
+    assert [g["verdict"] for g in _cardinality(result)] == ["below_floor"]
+    assert "NVDA" in _cardinality(result)[0]["detail"]
     assert _metric_docs(s3)[0]["status"] == "RED"
 
 
@@ -127,10 +133,10 @@ def test_a_failed_artifact_write_still_publishes_an_unmeasurable_metric(universe
     docs = _metric_docs(s3)
     assert len(docs) == 1, "a failed EOD run must still leave a completeness document"
     assert docs[0]["status"] == "N/A-MISSING-INPUT"
-    assert [g["verdict"] for g in result["guards"]] == ["unmeasurable"]
+    assert [g["verdict"] for g in _cardinality(result)] == ["unmeasurable"]
     # UNMEASURABLE, not zero coverage: "we published nothing" and "we published
     # none of the universe" are different claims with different owners.
-    assert "not zero coverage" in result["guards"][0]["detail"]
+    assert "not zero coverage" in _cardinality(result)[0]["detail"]
 
 
 def test_a_metric_put_failure_never_fails_the_eod_run(universe, caplog):
@@ -140,7 +146,7 @@ def test_a_metric_put_failure_never_fails_the_eod_run(universe, caplog):
     result = _collect(s3, priced=["AAPL", "MSFT", "NVDA"])
 
     assert result["status"] == "ok"
-    assert [g["verdict"] for g in result["guards"]] == ["ok"]
+    assert [g["verdict"] for g in _cardinality(result)] == ["ok"]
     assert any("completeness metric PUT failed" in r.message for r in caplog.records)
 
 

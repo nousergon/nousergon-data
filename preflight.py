@@ -222,7 +222,12 @@ class DataPreflight(BasePreflight):
         if last_ts.tzinfo is not None:
             last_ts = last_ts.tz_convert("UTC").tz_localize(None)
         last_date = last_ts.normalize().date()
-        today = datetime.now(timezone.utc).date().isoformat()
+        # The NYSE calendar day, never the UTC one: after 00:00Z (20:00 ET) the
+        # UTC date is already tomorrow, so an evening heal/backstop run read
+        # SPY at the prior close as 2 sessions stale and refused to run the
+        # very append that would freshen it (2026-10-08 02:31Z, run_date 10-07).
+        from zoneinfo import ZoneInfo
+        today = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York")).date().isoformat()
         if not is_fresh_in_trading_days(last_date, today, max_stale=max_stale):
             stale = trading_days_stale(last_date, today)
             expected = expected_last_close(today)

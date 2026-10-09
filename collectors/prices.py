@@ -33,6 +33,7 @@ behind) whether ``collect()`` runs weekly (full-universe rebuild) or daily
 
 from __future__ import annotations
 
+import io
 import logging
 import tempfile
 from datetime import date, datetime, timedelta, timezone
@@ -53,6 +54,7 @@ from dates import (
     FutureBarError,
     as_trading_day,
     assert_no_bar_after,
+    assert_settled_bar,
     bar_settlement_guard_entry,
     clip_to_trading_day,
     default_run_date,
@@ -106,6 +108,133 @@ FAIL_BEHIND_FETCH = "behind_fetch_guard_refused"
 FAIL_NO_DATA = "vendor_no_data"
 FAIL_BATCH_ERROR = "batch_fetch_error"
 FAIL_REFRESH_ERROR = "refresh_error"
+
+#: A ticker the short-fetch guard refused AFTER it had already stopped printing:
+#: its cached parquet ends before the session preceding the run's expected last
+#: bar, so the cache missed at least one completed session before this run, and
+#: the run's own canonical closes (``staging/daily_closes/{trading_day}``) carry
+#: no close for it, and the vendor now answers its full-period request with a
+#: stub. That is a delisting or rename (WBD and PSKY after 2026-10-05, measured 2026-10-07: 1
+#: and 49 rows against a 2,512-row cache), not a transient short answer — there
+#: is no newer history to refresh. The guard still refuses the upload and the
+#: cache is preserved; the ticker is reported under its own key and does NOT
+#: degrade ``status``, because until the weekly constituents run drops it, a
+#: failure here hard-failed every weekday EOD collection (and with it the
+#: ArcticDB append and EODReconcile). Not a ``FAIL_*`` cause: those sum to
+#: ``failed``, and this is not a failed refresh.
+SKIP_STOPPED_PRINTING = "stopped_printing_suspected"
+SKIP_STOPPED_PRINTING_RESULT_KEY = "skipped_stopped_printing"
+
+#: A ticker the short-fetch or behind-fetch guard REFUSED, set aside within a
+#: declared bound so one ticker cannot fail the whole stage. Measured
+#: 2026-10-08: TCBI (Texas Capital Bancshares, still listed, closed 92.39 that
+#: day, its close is in that day's ``staging/daily_closes``) got 1 row from
+#: yfinance for a 10y request on all 3 attempts, at 22:23Z and again at 23:35Z,
+#: against a 2,513-row cache ending 2026-10-07. That is not stopped printing
+#: (the cache is current and the ticker closed today), so the guard refused it
+#: as a failure. D03 went ``partial`` and the collector exited 1. The same
+#: thing happened on all three runs (the 22:15Z run and two heals). So the
+#: 10-08 ArcticDB append and EODReconcile never ran, over 1 of 934 tickers.
+#:
+#: The guard's protective half is unchanged: the short or behind answer is
+#: NEVER uploaded, and the existing parquet is preserved. What changes is the
+#: blast radius. Only these refusals qualify, because by construction both
+#: guards act only when an existing cache was there to compare against, so the
+#: ticker keeps its full history, just behind by a session. A run may set aside at
+#: most ``QUARANTINE_MAX_TICKERS``, and no more than ``QUARANTINE_MAX_FRACTION``
+#: of the universe. A ticker also stops qualifying once its preserved cache ends
+#: more than ``QUARANTINE_MAX_SESSIONS_BEHIND`` sessions before the run's
+#: expected last bar, so a persistent gap fails the stage within days instead
+#: of going stale quietly. Past any of these bounds, or alongside any other
+#: kind of failure, every refusal counts as a failure exactly as before: many
+#: refusals at once is a vendor outage, not one bad ticker. The always-download benchmark and macro
+#: symbols (SPY, VIX, VIX3M, ...) are never set aside: every feature reads them,
+#: and the I9256 VIX3M flake must still fail the run.
+#:
+#: A quarantined ticker is not silent. It keeps its keyed ``write_refused``
+#: manifest entry, it is declared in D03's ``rejected_keys`` under its own
+#: reason, it is named in ``quarantined_tickers``, and it is logged at ERROR
+#: (the Flow Doctor alert path) once per run.
+QUARANTINED = "guard_refused_quarantined"
+QUARANTINED_RESULT_KEY = "quarantined_guard_refused"
+QUARANTINE_MAX_TICKERS = 3
+QUARANTINE_MAX_FRACTION = 0.005
+QUARANTINE_MAX_SESSIONS_BEHIND = 3
+#: Only refusals that by construction left a current, preserved cache in place.
+_QUARANTINABLE_REASONS = frozenset({FAIL_SHORT_FETCH, FAIL_BEHIND_FETCH})
+
+
+def quarantine_bound(total_tickers: int) -> int:
+    """Most refused tickers one run may quarantine rather than fail on."""
+    return max(0, min(QUARANTINE_MAX_TICKERS, int(total_tickers * QUARANTINE_MAX_FRACTION)))
+
+
+def oldest_quarantinable_bar(trading_day: "str | date") -> date:
+    """The oldest cached last bar a quarantined ticker may have.
+
+    This is the session ``QUARANTINE_MAX_SESSIONS_BEHIND`` sessions before the
+    run's expected last bar.
+    """
+    d = _expected_last_bar(trading_day)
+    for _ in range(QUARANTINE_MAX_SESSIONS_BEHIND):
+        d = _expected_last_bar(d - timedelta(days=1))
+    return d
+
+
+def select_quarantine(
+    failure_reasons: "dict[str, str]",
+    total_tickers: int,
+    *,
+    cached_last_bar=None,
+    oldest_allowed: "date | None" = None,
+) -> "tuple[dict[str, str], str]":
+    """Pick which failed tickers to quarantine. Returns ``({ticker: reason}, why)``.
+
+    If ``cached_last_bar`` is given, it maps a ticker to its preserved cache's
+    last bar, or None. A ticker only qualifies if that bar is on or after
+    ``oldest_allowed``.
+
+    It is all or nothing. Either every failure qualifies and the set is within
+    the bound, or nothing is quarantined and the run fails exactly as it did
+    before. ``why`` explains a refusal to quarantine. It is empty when nothing
+    failed or when the quarantine was taken.
+    """
+    if not failure_reasons:
+        return {}, ""
+    bound = quarantine_bound(total_tickers)
+    not_eligible = sorted(
+        t for t, r in failure_reasons.items()
+        if r not in _QUARANTINABLE_REASONS or t in _ALWAYS_DOWNLOAD
+    )
+    if not_eligible:
+        return {}, (
+            f"not quarantined: {len(not_eligible)} failure(s) are not a single-ticker guard "
+            f"refusal on a universe ticker (e.g. {', '.join(not_eligible[:5])})"
+        )
+    if len(failure_reasons) > bound:
+        return {}, (
+            f"not quarantined: {len(failure_reasons)} refusals exceed the bound of {bound} "
+            f"(max {QUARANTINE_MAX_TICKERS}, max fraction {QUARANTINE_MAX_FRACTION} of "
+            f"{total_tickers}). Too many at once looks like a vendor outage, not one bad ticker"
+        )
+    if cached_last_bar is not None and oldest_allowed is not None:
+        too_old = {}
+        for t in sorted(failure_reasons):
+            last = cached_last_bar(t)
+            if last is None or last < oldest_allowed:
+                too_old[t] = last.isoformat() if last else "unreadable"
+        if too_old:
+            return {}, (
+                f"not quarantined: {len(too_old)} refused ticker(s) have a cache older than "
+                f"{oldest_allowed.isoformat()} ({QUARANTINE_MAX_SESSIONS_BEHIND} sessions "
+                f"behind): {too_old}. This is a persistent gap, not a one-day miss"
+            )
+    return dict(failure_reasons), ""
+
+
+#: Where ``collectors/daily_closes.py`` publishes the run's canonical closes —
+#: the independent witness that a stopped-printing ticker had no close today.
+_DAILY_CLOSES_PREFIX = "staging/daily_closes/"
 
 #: reason -> the ``collect()`` result key carrying its count. Mirrored as
 #: literals in ``run_units.PHASE_UNITS`` (D03) and in the result dict below;
@@ -245,17 +374,49 @@ def collect(
     # one fetch window and its OPENING edge is the conservative one — a run that
     # starts before the bar settles does not become settled because it ran long.
     fetch_started_at = datetime.now(timezone.utc)
+    # ENFORCE raise site (`dates.BAR_SETTLEMENT_GUARD`): refuse to open a fetch
+    # for day D's own bar before it settles, so nothing provisional is written.
+    assert_settled_bar(fetch_started_at, trading_day, unit="D03")
     short_fetch_retries: dict[str, int] = {}
     failure_reasons: dict[str, str] = {}
+    stopped_printing: dict[str, str] = {}
     refreshed, failed_tickers, written = _refresh_stale(
         s3, bucket, s3_prefix, stale, fetch_period, batch_size,
         trading_day=trading_day, short_fetch_retries=short_fetch_retries,
-        failure_reasons=failure_reasons,
+        failure_reasons=failure_reasons, stopped_printing=stopped_printing,
     )
     # A failed ticker with no observed cause is an error of the refresh, never
     # a guard refusal — so the per-cause counts always sum to `failed`.
     for ticker in failed_tickers:
         failure_reasons.setdefault(ticker, FAIL_REFRESH_ERROR)
+    # Bounded single-ticker quarantine (see QUARANTINED). The refusal already
+    # happened: nothing was uploaded for these tickers. This only decides
+    # whether that refusal fails the whole stage.
+    quarantined, quarantine_refused_because = select_quarantine(
+        failure_reasons, len(all_tickers),
+        cached_last_bar=lambda t: _cached_last_bar_or_none(s3, bucket, s3_prefix, t),
+        oldest_allowed=oldest_quarantinable_bar(trading_day),
+    )
+    refused_record = dict(failure_reasons)
+    if quarantined:
+        for ticker in quarantined:
+            del failure_reasons[ticker]
+            refused_record[ticker] = f"{quarantined[ticker]}; {QUARANTINED}"
+        failed_tickers = [t for t in failed_tickers if t not in quarantined]
+        logger.error(
+            "D03 QUARANTINED %d ticker(s) for trading_day %s: %s. The guard refused each "
+            "one, so nothing was uploaded and each existing parquet is preserved. Each "
+            "keeps its last good history and is retried on the next refresh. The stage "
+            "continues because this is within the declared bound of %d (max %d, max "
+            "fraction %s of %d). This is an alert, not a pass: if a ticker repeats, "
+            "check it for a corporate action or a vendor-side gap.",
+            len(quarantined), trading_day,
+            ", ".join(f"{t} ({r})" for t, r in quarantined.items()),
+            quarantine_bound(len(all_tickers)), QUARANTINE_MAX_TICKERS,
+            QUARANTINE_MAX_FRACTION, len(all_tickers),
+        )
+    elif quarantine_refused_because:
+        logger.warning("D03 %s", quarantine_refused_because)
     failure_counts = {reason: 0 for reason in FAILURE_RESULT_KEYS}
     for reason in failure_reasons.values():
         failure_counts[reason] += 1
@@ -265,7 +426,7 @@ def collect(
     if refreshed > 0:
         try:
             from validators.price_validator import validate_refreshed
-            refreshed_tickers = [t for t in stale if t not in failed_tickers]
+            refreshed_tickers = [t for t in stale if t not in failed_tickers and t not in quarantined]
             validation = validate_refreshed(s3, bucket, s3_prefix, refreshed_tickers)
         except Exception as e:
             logger.warning("Price validation failed (non-fatal): %s", e)
@@ -284,6 +445,12 @@ def collect(
         "failed_vendor_no_data": failure_counts[FAIL_NO_DATA],
         "failed_batch_fetch_error": failure_counts[FAIL_BATCH_ERROR],
         "failed_refresh_error": failure_counts[FAIL_REFRESH_ERROR],
+        # Not part of `failed` (see SKIP_STOPPED_PRINTING): refused and
+        # preserved, but nothing newer exists to refresh.
+        "skipped_stopped_printing": len(stopped_printing),
+        # Not part of `failed` either (see QUARANTINED): refused, preserved,
+        # and set aside within the declared bound.
+        "quarantined_guard_refused": len(quarantined),
         "total": len(all_tickers),
         # alpha-engine-config-I11026: the per-ticker keys + row counts this
         # run actually uploaded — never a copy of `stale` (attempted, not
@@ -292,23 +459,33 @@ def collect(
         # the manifest's `extra_outputs` callable form.
         "written": dict(written),
         # alpha-engine-config-I11354: grade THIS run's bar on the settlement
-        # clock and carry the verdict on D03's manifest. Observe mode — the
-        # reading never moves the exit code; it is what a promotion to enforce
-        # (and Brian's ruling on the 16:45 ET `data-collection-eod` schedule)
-        # will be argued from. `_record_collector_guards` folds this on.
+        # clock and carry the verdict on D03's manifest. The ENFORCE half is
+        # `assert_settled_bar` at the fetch's opening edge above, so a run that
+        # reaches here was settled; the reading stays on the manifest as the
+        # evidence the promotion row reads. `_record_collector_guards` folds
+        # this on.
         "guards": [
             bar_settlement_guard_entry(
                 fetch_started_at, trading_day, key=f"{s3_prefix}*.parquet",
             ),
-            *refused_keys_guard_entries(failure_reasons, s3_prefix),
+            # Quarantined tickers stay listed: the key was still not written.
+            *refused_keys_guard_entries(refused_record, s3_prefix),
         ],
     }
+    if quarantined:
+        result["quarantined_tickers"] = dict(quarantined)
+        result["quarantine_bound"] = quarantine_bound(len(all_tickers))
+    elif quarantine_refused_because:
+        result["quarantine_refused"] = quarantine_refused_because
     if split_forced:
         # alpha-engine-config-I11518: every ticker the split guard pulled into
         # the refresh although it was fresh by age, with the reason (bounded:
         # a split scan failure names the whole fresh set, so cap the sample).
         result["split_forced_refresh"] = len(split_forced)
         result["split_forced_sample"] = dict(list(split_forced.items())[:20])
+    if stopped_printing:
+        # {ticker: cached last bar}, bounded like `failed_tickers`.
+        result["stopped_printing_tickers"] = dict(list(stopped_printing.items())[:20])
     if short_fetch_retries:
         # alpha-engine-config-I11287: never silent — every ticker that
         # entered the short-fetch guard's bounded retry is named here with
@@ -958,6 +1135,19 @@ def _existing_parquet_last_bar(s3, bucket: str, s3_prefix: str, ticker: str) -> 
     return None if df is None else _last_bar_date(df.index)
 
 
+def _cached_last_bar_or_none(s3, bucket: str, s3_prefix: str, ticker: str) -> "date | None":
+    """:func:`_existing_parquet_last_bar`, with an unreadable cache read as None.
+
+    The caller treats None as "no quarantine". A failed read can only make the
+    run fail, never excuse it.
+    """
+    try:
+        return _existing_parquet_last_bar(s3, bucket, s3_prefix, ticker)
+    except Exception:  # noqa: BLE001 - conservative: no evidence, no quarantine
+        logger.warning("Quarantine check: %s cache unreadable; not quarantined", ticker, exc_info=True)
+        return None
+
+
 def _expected_last_bar(trading_day: "str | date") -> date:
     """The newest bar a history fetch serving ``trading_day`` should end on.
 
@@ -1045,6 +1235,7 @@ def _refresh_stale(
     trading_day: "str | date",
     short_fetch_retries: "dict[str, int] | None" = None,
     failure_reasons: "dict[str, str] | None" = None,
+    stopped_printing: "dict[str, str] | None" = None,
 ) -> tuple[int, list[str], list[tuple[str, int]]]:
     """Batch-fetch stale tickers from yfinance and upload to S3.
 
@@ -1118,6 +1309,46 @@ def _refresh_stale(
     def _fail(ticker: str, reason: str) -> None:
         failed_tickers.append(ticker)
         _reasons[ticker] = reason
+
+    _stopped: "dict[str, str]" = stopped_printing if stopped_printing is not None else {}
+    # The session before the expected last bar: a cache ending before it
+    # already missed a completed session before this run (SKIP_STOPPED_PRINTING).
+    prior_session = _expected_last_bar(expected_last - timedelta(days=1))
+
+    _closes: "list[set[str] | None]" = []
+
+    def _closed_today() -> "set[str] | None":
+        # The run's own canonical closes (daily_closes runs before prices).
+        # Unreadable or absent -> None, which never excuses a refusal.
+        if not _closes:
+            key = f"{_DAILY_CLOSES_PREFIX}{as_trading_day(trading_day).isoformat()}.parquet"
+            try:
+                body = s3.get_object(Bucket=bucket, Key=key)["Body"].read()
+                _closes.append({str(t) for t in pd.read_parquet(io.BytesIO(body)).index})
+            except Exception:  # noqa: BLE001 - conservative: no evidence, no excuse
+                logger.warning("Stopped-printing check: %s unreadable; no refusal is excused", key)
+                _closes.append(None)
+        return _closes[0]
+
+    def _stopped_printing(ticker: str, fetched_rows: int, existing_rows: int) -> bool:
+        cached_last = _existing_parquet_last_bar(s3, bucket, s3_prefix, ticker)
+        if cached_last is None or cached_last >= prior_session:
+            return False
+        closed = _closed_today()
+        if closed is None or ticker in closed:
+            return False
+        logger.warning(
+            "Short-fetch refused for %s, and it has STOPPED PRINTING: the cached "
+            "parquet (%d rows) ends %s, before the %s session, today's closes have "
+            "no row for it, and the vendor now returns %d rows — a delisting/rename "
+            "candidate, not a failed refresh. "
+            "Existing history preserved; not counted as a failure (%s).",
+            ticker, existing_rows, cached_last.isoformat(), prior_session.isoformat(),
+            fetched_rows, SKIP_STOPPED_PRINTING,
+        )
+        hole_filler.discard(ticker)
+        _stopped[ticker] = cached_last.isoformat()
+        return True
 
     with tempfile.TemporaryDirectory() as tmpdir:
         local_dir = Path(tmpdir)
@@ -1265,6 +1496,8 @@ def _refresh_stale(
                                     new_df = retried_df
                                 else:
                                     recovered_len = len(retried_df) if retried_df is not None else original_len
+                                    if _stopped_printing(ticker, recovered_len, existing_rows):
+                                        continue
                                     logger.error(
                                         "Short-fetch REFUSED for %s after %d retr%s: "
                                         "yfinance returned %d rows (best of %d/%d attempts) "
@@ -1282,6 +1515,8 @@ def _refresh_stale(
                                     continue
                             else:
                                 _retry_counts[ticker] = 0
+                                if _stopped_printing(ticker, original_len, existing_rows):
+                                    continue
                                 logger.error(
                                     "Short-fetch REFUSED for %s: yfinance returned %d rows "
                                     "for period=%s but the existing price-cache parquet has "

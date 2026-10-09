@@ -36,6 +36,7 @@ from tests.data_gate_support import DeniedStore, EmptyStore, TRADING_DAY
 _STAGINGS = {
     "validators/expectations.py::EMPTY_FRESH_GUARD": expectations.EMPTY_FRESH_GUARD,
     "validators/expectations.py::CARDINALITY_GUARD": expectations.CARDINALITY_GUARD,
+    "validators/expectations.py::SPINE_WINDOW_GUARD": expectations.SPINE_WINDOW_GUARD,
     "dates.py::BAR_SETTLEMENT_GUARD": dates.BAR_SETTLEMENT_GUARD,
 }
 
