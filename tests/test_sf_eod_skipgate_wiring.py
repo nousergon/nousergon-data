@@ -522,9 +522,12 @@ class TestSubstrateHealthCheckChainRemoved:
         skip_choice = states["CheckSkipEODReconcile"]["Choices"][0]
         assert skip_choice["Next"] == _RECONCILE_STOP_ENTRY
 
+    # HealConvergedNotify routes around the stop entry since the 2026-10-08
+    # heal-replay stop race: the replay it follows owns the box
+    # (tests/test_heal_replay_owns_the_trading_box.py).
     @pytest.mark.parametrize(
         "heal_state",
-        ["HealReplayDispatchFailed", "HealConvergedNotify", "HealNonConvergent"],
+        ["HealReplayDispatchFailed", "HealNonConvergent"],
     )
     def test_heal_outcome_notifiers_rewired(self, states, heal_state):
         st = states[heal_state]

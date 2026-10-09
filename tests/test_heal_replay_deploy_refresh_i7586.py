@@ -35,6 +35,15 @@ alpha-engine-config-I11269 (post-close split): the heal loop and its replay now
 live in ne-postclose-reconcile-pipeline (step_function_eod_reconcile.json).
 The reasoning above is unchanged — the parent still stops the box right after
 dispatching — so every pin is kept and re-pointed at that definition.
+
+2026-10-08 heal-replay stop race (eod-reconcile-backstop-2026-10-08-1791512138):
+the parent no longer stops the box after a successful dispatch — the stop
+raced the replay, which inherited a STOPPING box and failed at
+RefreshExecutorDeploy (DeliveryTimedOut). The replay now owns the box
+(tests/test_heal_replay_owns_the_trading_box.py). The refresh is kept anyway:
+the replay still cannot prove the box it lands on is on the parent's frozen
+SHA (an operator stop, a ForceStopInstance or any reboot in between breaks
+it), and a refresh on a box already on that SHA costs one SSM round-trip.
 """
 
 from __future__ import annotations
@@ -55,10 +64,9 @@ REPLAY_INPUT = STATES["HealDispatchReplay"]["Parameters"]["Input"]
 
 def test_the_replay_does_not_skip_the_deploy_refresh():
     assert "skip_refresh_executor_deploy" not in REPLAY_INPUT, (
-        "HealDispatchReplay must not skip RefreshExecutorDeploy: the parent stops "
-        "the box (StopTradingInstance) right after dispatching this replay, so the "
-        "child boots a box that is no longer on the frozen SHA and dies in "
-        "check_deploy_drift. See alpha-engine-config-I7586."
+        "HealDispatchReplay must not skip RefreshExecutorDeploy: the child cannot "
+        "prove the box it lands on is still on the parent's frozen SHA, and when it "
+        "is not, EODReconcile dies in check_deploy_drift. See alpha-engine-config-I7586."
     )
 
 
@@ -84,23 +92,20 @@ def test_a_second_live_ib_capture_is_structurally_impossible():
     assert "skip_capture_snapshot" not in REPLAY_INPUT
 
 
-def test_the_parent_still_stops_the_box_after_dispatching():
-    """The pin on WHY the flag is wrong. If this ordering ever changes, the
-    premise behind the original flag becomes true again and this whole test
-    module should be revisited rather than silently kept.
+def test_the_parent_hands_the_box_to_the_child_after_dispatching():
+    """Revisited on the 2026-10-08 heal-replay stop race, as this pin asked.
+    The parent used to stop the box right after dispatching; it now routes
+    around the drain and the stop, so the child inherits a RUNNING box. That
+    does not make the original flag right (see the module docstring): the
+    refresh stays, and the property pinned here is the hand-off itself.
     """
     assert STATES["HealDispatchReplay"]["Next"] == "HealConvergedNotify"
-    # alpha-engine-config-I12020: the stop is entered through the bounded
-    # trader-reconcile drain, whose every edge still ends at the stop -- so
-    # the parent still stops the box underneath the child.
-    assert STATES["HealConvergedNotify"]["Next"] == "DrainTraderReconcile"
-    assert STATES["CheckTraderReconcileDrainStatus"]["Choices"][0]["Next"] == "StopTradingInstance"
+    assert STATES["HealConvergedNotify"]["Next"] == "ReadExerciseCadence"
 
 
 def test_the_dispatch_is_still_fire_and_forget():
-    """Non-`.sync` startExecution. If it became `.sync` the parent would wait,
-    the box would not be stopped underneath the child, and the reasoning above
-    would change."""
+    """Non-`.sync` startExecution. If it became `.sync` the parent would wait
+    for the child and the hand-off reasoning above would change."""
     assert STATES["HealDispatchReplay"]["Resource"] == "arn:aws:states:::states:startExecution"
 
 
