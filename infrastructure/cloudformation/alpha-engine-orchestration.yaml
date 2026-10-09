@@ -665,29 +665,10 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
-  # alpha-engine-config-I2717 (Brian ruling 2026-07-16): "loud alert whenever
-  # the healer actually does heal-work" — a heal firing (universe-gap day OR
-  # chronic-polygon-gap ticker) is a real data-quality event worth seeing
-  # regardless of where the heal runs. Emitted every --daily-heal run
-  # (weekly_collector._run_daily_heal), including 0, so TreatMissingData=
-  # notBreaching covers the steady "nothing to heal" state (no data point ==
-  # no alarm evaluation window == OK) while a real missed run still shows up
-  # via the dispatcher's own Lambda-error alarms, not this one.
-  DailyHealDaysHealedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: alpha-engine-daily-heal-days-healed
-      AlarmDescription: Standalone daily data-heal (alpha-engine-config-I2717) actually healed something — data-quality event, not a failure
-      Namespace: AlphaEngine/Data
-      MetricName: daily_heal_days_healed
-      Statistic: Maximum
-      Period: 86400  # 1 day — one data point per daily-heal run
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
+  # DailyHealDaysHealedAlarm (alpha-engine-daily-heal-days-healed) RETIRED 2026-10-09
+  # (alpha-engine-config-I11792 Tier 2): it alarmed on a data-quality event, not a
+  # failure; heal FAILURE stays covered by ne-data-collection-daily-heal-failed. The
+  # healer still emits daily_heal_days_healed. Restore from git history.
 
   ResearchRunnerErrors:
     Type: AWS::CloudWatch::Alarm
@@ -843,43 +824,11 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
-  ExecutorDaemonHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: alpha-engine-executor-daemon-no-heartbeat
-      AlarmDescription: Executor daemon did not emit heartbeat
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: executor-daemon
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  ExecutorEodHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: alpha-engine-executor-eod-no-heartbeat
-      AlarmDescription: EOD reconciliation did not emit heartbeat
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: executor-eod
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
+  # ExecutorDaemonHeartbeat / ExecutorEodHeartbeat (alpha-engine-executor-{daemon,eod}-
+  # no-heartbeat) RETIRED 2026-10-09 (alpha-engine-config-I11792 Tier 1): both could never
+  # fire - notBreaching on Heartbeat{executor-daemon,executor-eod}, which had 0 datapoints in
+  # 63 days (the daemon now emits executor-daemon-start). EOD stays covered by
+  # alpha-engine-eod-sf-failed and the postclose deadman. Restore from git history.
 
   PredictorTrainingHeartbeat:
     Type: AWS::CloudWatch::Alarm
@@ -957,34 +906,10 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
-  ResearchAlertsErrors:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: alpha-engine-research-alerts-errors
-      AlarmDescription: Research alerts Lambda errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-research-alerts
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 1
-      Threshold: 3
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
+  # ResearchAlertsErrors (alpha-engine-research-alerts-errors) RETIRED 2026-10-09
+  # (alpha-engine-config-I11792 Tier 1): its trigger alpha-research-alerts is DISABLED
+  # under the automation pause (0 invocations in 14 days). Restore from git history.
 
-  # --------------------------------------------------------------------------
-  # SF execution log groups (CFN-owned) + L274 MutexConflict alarms (config#729)
-  # --------------------------------------------------------------------------
-  # These two LogGroups are the CloudWatch destinations for the two managed SFs'
-  # LoggingConfiguration (above). They MUST be CFN resources (not relied upon as
-  # side-effects of SF logging) so the metric filters below have a guaranteed,
-  # ordered dependency to attach to. Names match the live ne-* state machines.
-  # 30-day retention bounds cost (these are low-frequency pipelines: weekly +
-  # daily, ERROR-level so only failed-execution events are logged).
   WeeklyFreshnessLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:

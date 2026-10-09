@@ -107,9 +107,12 @@ finished` or `rehearsal-finished`). It is not an orphan and nothing alarms on it
 Until 2026-10-04 both reasons shared `spot_orphans_terminated`, so every finished
 weekly run paged an hour after it stopped (2026-10-03: ALARM 13:16Z and 17:16Z).
 
-`AlphaEngine/Infra/orphan_reaper_candidates` and `orphan_reaper_terminated` (Count)
-with a `market` dimension (`spot` / `on-demand`) are emitted on **every** run,
-zeros included, so "nothing matched the filter" is a data point, not an absence.
+Per-market candidates and reaps (`spot` / `on-demand`) are logged on **every** run as
+one `{"event": "orphan_reaper_scan", "candidates": {...}, "terminated": {...}}` JSON
+line, zeros included, so "nothing matched the filter" is a data point, not an
+absence. Until 2026-10-09 these were the CloudWatch series
+`AlphaEngine/Infra/orphan_reaper_{candidates,terminated}`; nothing read them, so
+they moved to the log (alpha-engine-config-I11792 M1).
 
 ## Watch-kind incomplete-reap alert (additive, generalized config#2106)
 

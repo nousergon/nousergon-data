@@ -109,8 +109,12 @@ class _Sweep:
         coverage_established=True,
         deferred=False,
         deferral_reason=None,
+        findings=0,
+        absent=0,
     ):
         self.should_alert = should_alert
+        self.findings = findings
+        self.absent = absent
         self.cycle = cycle
         # alpha-engine-config-I8809: the sweep now reports which date
         # partitions it unioned. The handler threads both onto its result and
@@ -467,3 +471,81 @@ def test_a_sweep_that_could_not_publish_still_reports_the_observer_verdict():
     )
     assert out["outcome"] == index.OUTCOME_UNAVAILABLE
     assert out["observer_did_work"] is False
+
+
+# ---------------------------------------------------------------------------
+# StageCoverageSweepAlarmable — the folded alarm series (alpha-engine-config-I11792)
+# ---------------------------------------------------------------------------
+
+
+class _CW:
+    def __init__(self, raises: Exception | None = None):
+        self.calls: list[dict] = []
+        self.raises = raises
+
+    def put_metric_data(self, **kw):
+        if self.raises:
+            raise self.raises
+        self.calls.append(kw)
+
+
+def _install_with_cw(sweep, cw):
+    index, calls = _install_stubs(sweep=sweep)
+    sys.modules["boto3"].client = lambda *a, **k: cw
+    return index, calls
+
+
+@pytest.mark.parametrize("kw,expected", [
+    ({}, 0.0),
+    ({"findings": 2}, 2.0),
+    ({"absent": 3}, 3.0),
+    ({"findings": 1, "absent": 2}, 3.0),
+    # Deferred: the lib withholds the absent count, so this does too, and the
+    # deferral itself counts once - exactly what -deferred used to page on.
+    ({"deferred": True, "coverage_established": False, "absent": 13}, 1.0),
+    ({"deferred": True, "coverage_established": False, "findings": 1, "absent": 4}, 2.0),
+])
+def test_the_alarmable_point_sums_findings_absent_and_deferred(kw, expected):
+    cw = _CW()
+    index, _ = _install_with_cw(_Sweep(should_alert=bool(expected), **kw), cw)
+    out = index.handler({"run_date": "2026-08-22"}, None)
+    assert out["alarmable_published"] is True
+    (call,) = [c for c in cw.calls if c["MetricData"][0]["MetricName"] == index.ALARMABLE_METRIC]
+    assert call["Namespace"] == "AlphaEngine"
+    point = call["MetricData"][0]
+    assert point["Dimensions"] == [{"Name": "Pipeline", "Value": "ne-weekly-freshness-pipeline"}]
+    assert point["Value"] == expected
+
+
+def test_a_clean_sweep_still_publishes_a_zero():
+    """Published on EVERY sweep, zero included, so the alarm returns to OK on
+    a corrected re-sweep rather than waiting out missing data."""
+    cw = _CW()
+    index, _ = _install_with_cw(_Sweep(should_alert=False), cw)
+    index.handler({"run_date": "2026-08-22"}, None)
+    assert [c["MetricData"][0]["Value"] for c in cw.calls] == [0.0]
+
+
+def test_an_alarmable_publish_failure_never_changes_the_outcome():
+    cw = _CW(raises=RuntimeError("throttled"))
+    index, calls = _install_with_cw(_Sweep(should_alert=True, findings=1), cw)
+    out = index.handler({"run_date": "2026-08-22"}, None)
+    assert out["outcome"] == index.OUTCOME_FINDINGS
+    assert out["alarmable_published"] is False
+    assert calls["alerted"] == 1, "the finding still pages through krepis.alerts"
+
+
+def test_dry_run_publishes_no_alarmable_point():
+    cw = _CW()
+    index, _ = _install_with_cw(_Sweep(should_alert=True, findings=1), cw)
+    index.handler({"run_date": "2026-08-22", "dry_run": True}, None)
+    assert cw.calls == []
+
+
+def test_the_alarm_this_feeds_is_the_one_the_ops_tree_declares():
+    """The metric name is a cross-repo contract with nous-ergon-ops'
+    infrastructure/cloudwatch/alarms/alpha-engine-stage-coverage-findings.json.
+    Pinned literally so a rename here is a red test, not a silent alarm."""
+    index, _ = _install_stubs(sweep=_Sweep(should_alert=False))
+    assert index.ALARMABLE_METRIC == "StageCoverageSweepAlarmable"
+    assert index.ALARMABLE_NAMESPACE == "AlphaEngine"
