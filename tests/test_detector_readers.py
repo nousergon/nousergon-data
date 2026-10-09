@@ -94,7 +94,9 @@ def test_family_receipt_on_another_units_subject_is_never_met(units, unit_id, ki
 
 #: Families whose `via` is prose: the subject must be DECLARED on the entry.
 DECLARED_FAMILIES = [
-    pytest.param("D33", "cloudwatch-alarm", id="cloudwatch-alarm"),
+    # D16, not D33: D33's only detector (alarm alpha-engine-daily-heal-days-healed)
+    # was deleted 2026-10-09 (alpha-engine-config-I11792 Tier 2).
+    pytest.param("D16", "cloudwatch-alarm", id="cloudwatch-alarm"),
     pytest.param("D36", "box-timer-health", id="box-timer-health"),
     pytest.param("D37", "code-refusal", id="code-refusal"),
     pytest.param("D47", "crucible-gate", id="crucible-gate"),
