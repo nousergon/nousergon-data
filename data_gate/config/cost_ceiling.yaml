@@ -1,0 +1,33 @@
+# Monthly cost ceiling that `data.cost.monthly` grades against
+# (alpha-engine-config-I10788; plan data_collection_plan_260914.md section 2
+# objective 8 and R6).
+#
+# BRIAN'S TO RATIFY. Nothing in this repository may fill `ceiling_usd` on its
+# own: it is a limit, and limits are Brian's ruling. While it is null the
+# producer (`data_gate/producers/cost_monthly.py`) publishes the month-to-date
+# figure and its observation maturity with `status: pending_target`, which the
+# clause renders as NOT LIVE (target not ratified), never as MET and never
+# against a guessed number.
+#
+# `proposed_baseline_multiplier` is R6's proposal rule (ceiling = 4-week
+# tagged baseline x 1.2, proposed at phase-1 exit). The producer publishes the
+# resulting `proposed_ceiling_usd` beside the figure ONLY once the 28-day
+# baseline window is fully covered; before that it is null, so no proposal is
+# ever computed from a partial baseline. The proposal is informational: the
+# verdict reads `ceiling_usd` and nothing else.
+
+# Ratified monthly ceiling in USD for spend tagged system=data-collection.
+# null = not ratified yet. Proposed value: the producer's
+# `proposed_ceiling_usd` once days_covered reaches 28 (flagged for Brian).
+ceiling_usd: null
+
+# Who ratified `ceiling_usd`, and where (a decision-card id or issue comment).
+# Must be set in the same change that sets `ceiling_usd`.
+ratified_by: null
+
+# R6 (as amended 2026-09-21): proposal = baseline x 1.2. Flagged for Brian's
+# ruling with the ceiling itself.
+proposed_baseline_multiplier: 1.2
+
+# The baseline window the proposal is computed from (plan phase-1 exit).
+proposed_baseline_days: 28

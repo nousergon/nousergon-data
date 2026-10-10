@@ -34,21 +34,43 @@ REQUIRED with no default and `main()` fails loud, naming the missing export
 and the tracked issue, until an operator provisions it. This is the honest
 "stop and report" the calling issue's dispatch instructions asked for rather
 than a silent fallback to Cost Explorer.
+
+**The same document carries `data.cost.monthly`'s calendar-month verdict**
+(Wednesday 2026-10-07 milestone, audit gap A9: "cost status is undefined on
+the board"). Until 2026-10-06 it carried only the 28-day baseline, so the
+clause read `status ''` and rendered "outside the closed set ... a finding".
+It now also publishes the month-to-date tagged spend (`value`), how much of
+the month the export has measured (`days_observed` of `days_in_month`), and a
+`status` from the closed set the clause reads. The ceiling that status grades
+against is Brian's ratification (R6), declared in
+`data_gate/config/cost_ceiling.yaml`; while it is null, `status` is
+`pending_target`, which renders NOT LIVE with the reason, never MET and never
+against a guessed number.
 """
 
 from __future__ import annotations
 
 import argparse
+import calendar
 import datetime as dt
 import io
 import json
 import logging
 import sys
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 __all__ = [
     "DEFAULT_BUCKET",
+    "DEFAULT_CEILING_CONFIG",
+    "PENDING_TARGET",
+    "CeilingConfig",
+    "MonthToDate",
+    "load_ceiling_config",
+    "month_to_date",
+    "monthly_status",
+    "proposed_ceiling",
     "DEFAULT_KEY",
     "DEFAULT_TAG_KEY",
     "DEFAULT_TAG_VALUE",
@@ -75,6 +97,15 @@ DEFAULT_TAG_VALUE = "data-collection"
 _COST_COLUMN = "line_item_unblended_cost"
 _USAGE_START_COLUMN = "line_item_usage_start_date"
 
+#: Brian's ratification surface for the monthly ceiling (R6). The producer
+#: reads it from the checkout it runs in, so ratifying is a one-line PR here.
+DEFAULT_CEILING_CONFIG = Path(__file__).resolve().parents[1] / "config" / "cost_ceiling.yaml"
+
+#: The status published while no ceiling is ratified. `data_gate.evidence`
+#: renders it as a declared pending state (figure and maturity shown, NOT
+#: LIVE), not as the undefined-status finding.
+PENDING_TARGET = "pending_target"
+
 
 @dataclass(frozen=True)
 class CostWindow:
@@ -86,6 +117,123 @@ class CostWindow:
     objects_read: int = 0
     rows_scanned: int = 0
     rows_matched: int = 0
+    #: The earliest day any row carried the tag inside this window, or None.
+    first_tagged_day: str | None = None
+
+
+@dataclass(frozen=True)
+class CeilingConfig:
+    """`data_gate/config/cost_ceiling.yaml`, validated."""
+
+    ceiling_usd: float | None
+    ratified_by: str | None
+    proposed_baseline_multiplier: float
+    proposed_baseline_days: int
+
+
+@dataclass(frozen=True)
+class MonthToDate:
+    """The calendar month `data.cost.monthly` grades, measured so far."""
+
+    month: str
+    window: CostWindow
+    days_in_month: int
+    status: str
+    ceiling_usd: float | None
+    ratified_by: str | None
+    proposed_ceiling_usd: float | None
+
+
+def load_ceiling_config(path: Path | str = DEFAULT_CEILING_CONFIG) -> CeilingConfig:
+    """Read the ceiling declaration. A ceiling with no `ratified_by` is
+    refused: the value is Brian's ruling, and a number nobody can trace to
+    one is exactly the guessed ceiling A9 rules out."""
+    import yaml  # noqa: PLC0415 - deferred like boto3/pyarrow
+
+    raw = yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {}
+    ceiling = raw.get("ceiling_usd")
+    ratified_by = raw.get("ratified_by")
+    if ceiling is not None:
+        ceiling = float(ceiling)
+        if ceiling <= 0:
+            raise ValueError(f"{path}: ceiling_usd={ceiling} must be a positive USD amount or null")
+        if not ratified_by:
+            raise ValueError(
+                f"{path}: ceiling_usd is set but ratified_by is empty. The monthly ceiling is "
+                "Brian's ruling (R6); record where he ratified it in the same change."
+            )
+    multiplier = float(raw.get("proposed_baseline_multiplier", 1.2))
+    days = int(raw.get("proposed_baseline_days", 28))
+    if multiplier <= 0 or days <= 0:
+        raise ValueError(f"{path}: proposal multiplier and days must be positive")
+    return CeilingConfig(
+        ceiling_usd=ceiling,
+        ratified_by=str(ratified_by) if ratified_by else None,
+        proposed_baseline_multiplier=multiplier,
+        proposed_baseline_days=days,
+    )
+
+
+def monthly_status(month_to_date_cost: float, ceiling_usd: float | None) -> str:
+    """`ok` / `breach` against a ratified ceiling, else :data:`PENDING_TARGET`.
+
+    Month-to-date spend is cumulative, so once it exceeds the ceiling no later
+    day can bring it back: `breach` is final for the month, and `ok` means no
+    day observed so far fails it (the plan's producer contract, section 6.2h).
+    """
+    if ceiling_usd is None:
+        return PENDING_TARGET
+    return "breach" if month_to_date_cost > ceiling_usd else "ok"
+
+
+def proposed_ceiling(baseline: CostWindow, days_in_month: int, config: CeilingConfig) -> float | None:
+    """R6's proposal (baseline x multiplier, scaled to the month's length),
+    or None until the baseline window is fully covered. A proposal from a
+    partial baseline is the guessed ceiling this refuses to publish."""
+    if baseline.days_covered < config.proposed_baseline_days or baseline.days_covered == 0:
+        return None
+    daily = baseline.total_cost / baseline.days_covered
+    return round(daily * days_in_month * config.proposed_baseline_multiplier, 2)
+
+
+def month_to_date(
+    s3: Any,
+    *,
+    cur_bucket: str,
+    cur_prefix: str,
+    tag_key: str,
+    tag_value: str,
+    end: dt.date,
+    baseline: CostWindow,
+    config: CeilingConfig,
+) -> MonthToDate:
+    """Measure `end`'s calendar month from its first day through `end`.
+
+    `end` is yesterday (CUR lags), so on the 1st this grades the month that
+    just closed, complete. The tag's first appearance is carried over from the
+    baseline window, so a month whose first days had no tagged spend still
+    counts them as measured once the tag was already proven earlier.
+    """
+    window = read_cur_window(
+        s3,
+        cur_bucket=cur_bucket,
+        cur_prefix=cur_prefix,
+        tag_key=tag_key,
+        tag_value=tag_value,
+        start=end.replace(day=1),
+        end=end,
+        first_tagged_on=baseline.first_tagged_day,
+    )
+    days_in_month = calendar.monthrange(end.year, end.month)[1]
+    return MonthToDate(
+        month=f"{end:%Y-%m}",
+        window=window,
+        days_in_month=days_in_month,
+        status=monthly_status(window.total_cost, config.ceiling_usd),
+        ceiling_usd=config.ceiling_usd,
+        ratified_by=config.ratified_by,
+        proposed_ceiling_usd=proposed_ceiling(baseline, days_in_month, config),
+    )
 
 
 def iter_billing_periods(start: dt.date, end: dt.date) -> list[str]:
@@ -123,6 +271,7 @@ def read_cur_window(
     tag_value: str,
     start: dt.date,
     end: dt.date,
+    first_tagged_on: str | None = None,
 ) -> CostWindow:
     """Sum `line_item_unblended_cost` for rows tagged `tag_key=tag_value`
     whose `line_item_usage_start_date` falls in `[start, end)`, reading CUR
@@ -219,6 +368,11 @@ def read_cur_window(
     # window ending 2026-10-01 holds three tagged days, not 28. Same
     # discipline as the missing-period gap above.
     first_tagged = min(covered_days) if covered_days else None
+    # A caller that already proved the tag earlier (the month window, handed
+    # the baseline window's first tagged day) may move the proof earlier,
+    # never later.
+    if first_tagged_on is not None and (first_tagged is None or first_tagged_on < first_tagged):
+        first_tagged = first_tagged_on
     for iso in sorted(delivered_days):
         if first_tagged is not None and iso >= first_tagged:
             covered_days.add(iso)
@@ -235,6 +389,7 @@ def read_cur_window(
         objects_read=objects_read,
         rows_scanned=rows_scanned,
         rows_matched=rows_matched,
+        first_tagged_day=first_tagged,
     )
 
 
@@ -246,9 +401,10 @@ def build_metric(
     cur_bucket: str,
     cur_prefix: str,
     as_of: dt.datetime | None = None,
+    month: MonthToDate | None = None,
 ) -> dict:
     as_of = as_of or dt.datetime.now(dt.timezone.utc)
-    return {
+    document = {
         # `baseline` / `days_covered` are the two fields
         # `read_cost_baseline_measured` reads; everything else is provenance.
         "baseline": window.total_cost,
@@ -264,6 +420,24 @@ def build_metric(
         "rows_scanned": window.rows_scanned,
         "rows_matched": window.rows_matched,
     }
+    if month is not None:
+        # `status` / `value` / `days_observed` / `days_in_month` are what
+        # `data.cost.monthly` reads (`evidence.read_windowed_objective`).
+        document.update(
+            {
+                "status": month.status,
+                "value": month.window.total_cost,
+                "month": month.month,
+                "days_observed": month.window.days_covered,
+                "days_in_month": month.days_in_month,
+                "month_uncovered_days": list(month.window.uncovered_days),
+                "target": month.ceiling_usd,
+                "target_ratified_by": month.ratified_by,
+                "target_source": "data_gate/config/cost_ceiling.yaml",
+                "proposed_ceiling_usd": month.proposed_ceiling_usd,
+            }
+        )
+    return document
 
 
 class _S3Reader:
@@ -316,6 +490,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--tag-value", default=DEFAULT_TAG_VALUE)
     ap.add_argument("--region", default=_REGION)
     ap.add_argument("--days", type=int, default=28, help="4-week baseline window (phase-1 exit)")
+    ap.add_argument(
+        "--ceiling-config",
+        default=str(DEFAULT_CEILING_CONFIG),
+        help="the monthly ceiling declaration (Brian's ratification surface, R6)",
+    )
     ap.add_argument("--no-write", action="store_true")
     args = ap.parse_args(argv)
 
@@ -357,12 +536,23 @@ def main(argv: list[str] | None = None) -> int:
             start=start,
             end=end,
         )
+        month = month_to_date(
+            reader,
+            cur_bucket=args.cur_bucket,
+            cur_prefix=cur_path,
+            tag_key=args.tag_key,
+            tag_value=args.tag_value,
+            end=end,
+            baseline=window,
+            config=load_ceiling_config(args.ceiling_config),
+        )
         metric = build_metric(
             window=window,
             tag_key=args.tag_key,
             tag_value=args.tag_value,
             cur_bucket=args.cur_bucket,
             cur_prefix=cur_path,
+            month=month,
         )
         # NEVER the full document (alpha-engine-config-I11274, CodeQL "Clear-
         # text logging of sensitive information" on this exact line): this
@@ -371,7 +561,11 @@ def main(argv: list[str] | None = None) -> int:
         # (`cur_source`) and the cost-attribution tag value — all of it
         # written to S3 already, none of it fit for a public log. Print a
         # fixed, non-sensitive summary only.
-        print(f"{args.key}: days_covered={window.days_covered}, status=ok")
+        print(
+            f"{args.key}: days_covered={window.days_covered}, "
+            f"days_observed={month.window.days_covered}/{month.days_in_month}, "
+            f"month_status={month.status}, status=ok"
+        )
     except Exception as exc:  # RAISE after recording — fail loud, never a silent swallow
         if not args.no_write:
             write_run_record(
@@ -406,6 +600,10 @@ def main(argv: list[str] | None = None) -> int:
                 "baseline": window.total_cost,
                 "days_covered": window.days_covered,
                 "days_requested": window.days_requested,
+                "month": month.month,
+                "month_status": month.status,
+                "days_observed": month.window.days_covered,
+                "days_in_month": month.days_in_month,
             },
         )
 
