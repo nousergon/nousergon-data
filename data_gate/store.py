@@ -88,6 +88,9 @@ class S3Store:
         # `open_store`.
         self.artifact_registry_source = None
         self.github_contents = None
+        # Per-process read memo (alpha-engine-config-I11792). See `get_bytes`.
+        self._listed: dict[str, tuple[str, ...]] = {}
+        self._bodies: dict[str, bytes | None] = {}
 
     @property
     def uri(self) -> str:
@@ -141,6 +144,31 @@ class S3Store:
         return f"{self.prefix}/{key}" if self.prefix else key
 
     def get_bytes(self, key: str) -> bytes:
+        """``key``'s body, read from S3 at most once per store instance.
+
+        **One reading reads one snapshot** (alpha-engine-config-I11792). The
+        clauses of a gate reading each re-derive their evidence, so before this
+        memo a single `python -m data_gate read` process re-LISTed the same
+        `data_collection/runs/<unit>/<date>/` folder tens of times and
+        re-GOT the same manifests as often: measured 2026-10-09 in the
+        `alpha-engine-research` access logs, 55k LISTs and 71k GETs (1.0 GB of
+        internet egress, the runner is not in AWS) a day for ~1,050 distinct
+        prefixes and ~1,250 distinct keys. The memo makes the reading what it
+        was always described as — every clause grading the SAME evidence —
+        rather than a set of reads seconds-to-minutes apart that could
+        disagree with one another.
+
+        Absence is memoised too (as ``None``): it is an answer, and the same
+        process asking again would get the same one. Any OTHER failure is not
+        memoised and re-raises in kind on every call, so an access problem
+        still reaches every reader as UNMEASURABLE. A write through
+        :meth:`put_bytes` drops whatever the memo held for that key.
+        """
+        if key in self._bodies:
+            cached = self._bodies[key]
+            if cached is None:
+                raise FileNotFoundError(key)
+            return cached
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=self._s3_key(key))
         except Exception as exc:  # noqa: BLE001 - classified, then re-raised in kind
@@ -152,11 +180,27 @@ class S3Store:
                 # Absence is an ANSWER, and the engine's reader needs it typed
                 # as one. Everything else keeps its own type and reaches the
                 # reader as an access problem -> UNMEASURABLE.
+                self._bodies[key] = None
                 raise FileNotFoundError(key) from exc
             raise
-        return response["Body"].read()
+        body = response["Body"].read()
+        self._bodies[key] = body
+        return body
 
     def list_keys(self, prefix: str = "") -> Iterator[str]:
+        """Every key under ``prefix``, LISTed at most once per store instance.
+
+        The listing is taken whole before the first key is yielded, so a
+        paginated listing that fails part-way raises without being memoised
+        and the next caller lists again. See :meth:`get_bytes` for why.
+        """
+        listed = self._listed.get(prefix)
+        if listed is None:
+            listed = tuple(self._list_from_s3(prefix))
+            self._listed[prefix] = listed
+        yield from listed
+
+    def _list_from_s3(self, prefix: str) -> Iterator[str]:
         paginator = self.client.get_paginator("list_objects_v2")
         full = self._s3_key(prefix)
         for page in paginator.paginate(Bucket=self.bucket, Prefix=full):
@@ -164,9 +208,15 @@ class S3Store:
                 key = item["Key"]
                 yield key[len(self.prefix) + 1 :] if self.prefix else key
 
+    def _forget(self, key: str) -> None:
+        self._bodies.pop(key, None)
+        for prefix in [p for p in self._listed if key.startswith(p)]:
+            del self._listed[prefix]
+
     def put_bytes(self, key: str, payload: bytes) -> None:
         if self.dry_run:
             raise DryRunWriteRefusedError(key)
+        self._forget(key)
         self.client.put_object(
             Bucket=self.bucket,
             Key=self._s3_key(key),
