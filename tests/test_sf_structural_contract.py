@@ -1426,9 +1426,10 @@ def test_sf_file_set_matches_exemption_registry():
 #                  post-close machine no longer waits on the collection. Its
 #                  worst case is the gates (~3 min), the box boot + SSM poll
 #                  (~4 min), RefreshExecutorDeploy (660 s task + poll) and two
-#                  CaptureSnapshot attempts (120 s executionTimeout each + poll)
-#                  — ~25 min, inside sf-pipeline-policy.md §4's ≤75-min eod
-#                  target; 1h is ~2.4x that.
+#                  CaptureSnapshot attempts (720 s executionTimeout each + poll,
+#                  since alpha-engine-config-I12220's 420 s gateway-readiness
+#                  wait; 120 s before) — ~44 min, inside sf-pipeline-policy.md
+#                  §4's ≤75-min eod target; 1h is ~1.4x that.
 #   eod_reconcile
 #          14400  the collector-dependent half (EODReconcile, heal loop, box
 #                  stop, weekly-exercise chain), started on

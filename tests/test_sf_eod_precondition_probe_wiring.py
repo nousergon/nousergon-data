@@ -426,10 +426,12 @@ class TestHealDispatchReplay:
         inp = states["HealDispatchReplay"]["Parameters"]["Input"]
         assert inp["pipeline_role"] == "operator-replay"
         assert inp["skip_post_market_data"] is True
-        # CaptureSnapshot is not in this machine (I11269 split): the key must
-        # be absent, never silently re-added as a dead input.
+        # No skip_capture_snapshot: since alpha-engine-config-I12220 this
+        # machine's CaptureSnapshot is the missing-snapshot self-heal, which has
+        # no skip gate (it opens no IB session when the snapshot exists), so
+        # the key would still be a dead input.
         assert "skip_capture_snapshot" not in inp
-        assert "CaptureSnapshot" not in states
+        assert "CheckSkipCaptureSnapshot" not in states
         assert inp["run_date.$"] == "$.run_date"
         assert inp["trading_instance_id.$"] == "$.trading_instance_id"
         assert inp["ec2_instance_id.$"] == "$.ec2_instance_id"

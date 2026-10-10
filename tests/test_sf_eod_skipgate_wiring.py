@@ -78,8 +78,14 @@ _POSTCLOSE_CHAIN = [
     ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "StopTradingInstance"),
 ]
 
+#: alpha-engine-config-I12220: the missing-snapshot self-heal runs right after
+#: the deploy refresh, skipped or not. It has no skip gate on purpose: when the
+#: snapshot is already in S3 its command exits before opening an IB session, so
+#: there is nothing to skip, and when it is missing nothing after it can succeed.
+_SNAPSHOT_HEAL = ["CaptureSnapshot", "WaitForCaptureSnapshot", "CheckSnapshotStatus"]
+
 _RECONCILE_CHAIN = [
-    ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CheckSkipPostMarketData"),
+    ("CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy", "skip_refresh_executor_deploy", "CaptureSnapshot"),
     # alpha-engine-config-I11269: CheckSkipPostMarketData's Default enters the
     # readiness wait (InitCollectionReadinessPoll -> ... ->
     # WaitForCollectionManifests) — pinned in test_sf_data_spot_relocation_wiring.py
@@ -239,7 +245,9 @@ class TestEntryEdgesRouteThroughGates:
 
     @pytest.mark.parametrize("machine,first_work_gate", [
         ("postclose", "CheckSkipCaptureSnapshot"),
-        ("reconcile", "CheckSkipPostMarketData"),
+        # alpha-engine-config-I12220: the missing-snapshot self-heal, then
+        # CheckSkipPostMarketData.
+        ("reconcile", "CaptureSnapshot"),
     ])
     def test_refresh_success_enters_first_work_gate(self, machine, first_work_gate):
         # config#1549: after the deploy refresh succeeds, control enters the
@@ -379,8 +387,9 @@ class TestPaths:
         # ProbeEODReconcilePrecondition still runs even on a fully-skipped
         # path (default pipeline_role="operator-replay" here) — same
         # unconditional-probe behavior pinned in
-        # test_operator_replay_still_honors_skips below.
-        assert order == ["ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
+        # test_operator_replay_still_honors_skips below, and so does the
+        # missing-snapshot self-heal (alpha-engine-config-I12220).
+        assert order == [*_SNAPSHOT_HEAL, "ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
 
     def test_postclose_full_skip_reaches_normal_terminal(self, postclose):
         order = _walk(postclose, _POSTCLOSE_CHAIN, skip_flags={c[2] for c in _POSTCLOSE_CHAIN})
@@ -395,7 +404,8 @@ class TestPaths:
         # the spot data phase from config#1767 until then).
         order = _walk(reconcile, _RECONCILE_CHAIN, skip_flags={"skip_refresh_executor_deploy"})
         assert "RefreshExecutorDeploy" not in order
-        assert order[:3] == [
+        assert order[:3] == _SNAPSHOT_HEAL
+        assert order[3:6] == [
             "InitCollectionReadinessPoll", "SeedCollectionReadiness", "WaitForCollectionManifests",
         ]
         assert order[-len(_RECONCILE_TAIL):] == _RECONCILE_TAIL
@@ -416,8 +426,9 @@ class TestPaths:
         order = _walk(reconcile, _RECONCILE_CHAIN,
                       skip_flags={"skip_refresh_executor_deploy", "skip_post_market_data"})
         assert "WaitForCollectionManifests" not in order
-        assert order[0] == "ProbeEODReconcilePrecondition"
-        assert order[1] == "EODReconcile"
+        assert order[:3] == _SNAPSHOT_HEAL
+        assert order[3] == "ProbeEODReconcilePrecondition"
+        assert order[4] == "EODReconcile"
         assert order[-len(_RECONCILE_TAIL):] == _RECONCILE_TAIL
 
     def test_happy_path_waits_for_the_collection_before_the_reconcile(self, reconcile):
@@ -470,8 +481,9 @@ class TestSkipFlagsInertOutsideOperatorReplay:
         # config-I2702: even a fully-skipped operator-replay run still probes
         # the precondition fresh (ProbeEODReconcilePrecondition sits between
         # the CheckSkipPostMarketData skip edge and CheckSkipEODReconcile
-        # unconditionally) before its own skip_eod_reconcile flag takes over.
-        assert order == ["ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
+        # unconditionally) before its own skip_eod_reconcile flag takes over,
+        # and the missing-snapshot self-heal still runs (alpha-engine-config-I12220).
+        assert order == [*_SNAPSHOT_HEAL, "ProbeEODReconcilePrecondition", *_RECONCILE_TAIL]
 
     def test_operator_replay_still_honors_skips_in_postclose(self, postclose):
         order = _walk(

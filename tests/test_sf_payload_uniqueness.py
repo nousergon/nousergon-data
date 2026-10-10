@@ -828,10 +828,12 @@ class TestEODSFTopLevelFieldsClosed:
     # exactly, in both directions, rather than as a union that would let a
     # field drift from one machine to the other unnoticed.
     _POSTCLOSE_ONLY: frozenset[str] = frozenset({
-        # CaptureSnapshot and its bounded retry stay at 16:00.
-        "snapshot_result", "snapshot_poll", "skip_capture_snapshot",
+        # CaptureSnapshot's skip gate and its bounded retry stay at 16:00.
+        # (snapshot_result / snapshot_poll / capture_snapshot_irreversible_notify
+        # are shared since alpha-engine-config-I12220: the reconcile machine's
+        # missing-snapshot self-heal writes the same fields.)
+        "skip_capture_snapshot",
         "capture_snapshot_retry", "capture_snapshot_page_notify",
-        "capture_snapshot_irreversible_notify",
         # DeployDriftCheck is not in the reconcile machine (follow-up: the
         # crucible-predictor probe must declare its sf_name first).
         "drift_result", "drift_error", "deploy_drift_degraded_notify",
