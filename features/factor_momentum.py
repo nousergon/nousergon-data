@@ -295,6 +295,96 @@ def materialize_factor_momentum(
     }
 
 
+def compute_factor_momentum_latest(
+    universe_lib,
+    tickers,
+    as_of_ts,
+    *,
+    loading_cols: list[str] | None = None,
+    window: int = 252,
+    skip: int = 21,
+    quantile: float = 0.3,
+    min_names: int = 20,
+    trailing_days: int | None = None,
+) -> tuple[dict[str, float] | None, dict]:
+    """The READ + COMPUTE half of :func:`update_factor_momentum_latest`.
+
+    Returns ``(fm_by_ticker, result)``. ``fm_by_ticker`` is ``None`` when the
+    pass cannot proceed (the slim read failed, or no ticker was readable), and
+    ``result`` is then the final result dict exactly as the update function
+    has always returned it. Otherwise ``result`` carries the compute-side
+    counts (``tickers_all_nan``, ``read_fail``, ``n_computed``) and the caller
+    owns the write — split out so `features.second_pass` can write this pass
+    and the factor-loading z-score pass in ONE ``update_batch``
+    (alpha-engine-config-I11792).
+    """
+    import pandas as _pd
+    from arcticdb.version_store.library import ReadRequest
+    from arcticdb_ext.exceptions import ArcticException  # noqa: F401  (parity w/ daily_append err handling)
+
+    cols = list(loading_cols) if loading_cols is not None else list(DEFAULT_FACTOR_LOADINGS)
+    if trailing_days is None:
+        trailing_days = int(window) + int(skip) + 40  # factor-return warmup buffer
+    as_of_ts = _pd.Timestamp(as_of_ts)
+    # Calendar span covering ~trailing_days trading days (×1.6 for weekends/holidays).
+    start_ts = as_of_ts - _pd.Timedelta(days=int(trailing_days * 1.6) + 5)
+
+    tickers = list(tickers)
+    slim_cols = ["Close", *cols]
+
+    # ── Pass 1: slim trailing (close + loadings) panel via read_batch ────────
+    try:
+        slim_reqs = [
+            ReadRequest(symbol=t, date_range=(start_ts, as_of_ts), columns=slim_cols)
+            for t in tickers
+        ]
+        slim_results = universe_lib.read_batch(slim_reqs)
+    except Exception as exc:
+        log.warning("factor-momentum daily: slim read_batch failed (skipped): %s", exc)
+        return None, {"status": "read_error", "error": str(exc), "tickers_written": 0}
+
+    frames: list[pd.DataFrame] = []
+    read_fail = 0
+    for t, res in zip(tickers, slim_results):
+        data = getattr(res, "data", None)
+        if data is None:  # DataError / missing symbol
+            read_fail += 1
+            continue
+        if data.empty or "Close" not in data.columns:
+            continue
+        sub = pd.DataFrame({"close": data["Close"].astype(float)})
+        for c in cols:
+            if c in data.columns:
+                sub[c] = data[c].astype(float)
+        sub["ticker"] = t
+        sub["date"] = data.index
+        frames.append(sub.reset_index(drop=True))
+
+    if not frames:
+        log.warning("factor-momentum daily: no readable tickers (read_fail=%d)", read_fail)
+        return None, {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
+
+    panel = pd.concat(frames, ignore_index=True)
+    fm = compute_factor_momentum_feature(
+        panel, loading_cols=cols, window=window, skip=skip,
+        quantile=quantile, min_names=min_names,
+    )
+    panel["factor_momentum_ratio"] = fm.to_numpy()
+
+    # Latest value per ticker AT as_of_ts (the go-forward date just appended).
+    latest = panel[panel["date"] == panel["date"].max()]
+    fm_by_ticker = {
+        t: float(g["factor_momentum_ratio"].iloc[-1]) for t, g in latest.groupby("ticker", sort=False)
+    }
+    n_all_nan = sum(1 for v in fm_by_ticker.values() if not np.isfinite(v))
+    return fm_by_ticker, {
+        "status": "ok",
+        "tickers_all_nan": n_all_nan,
+        "read_fail": read_fail,
+        "n_computed": len(fm_by_ticker),
+    }
+
+
 def update_factor_momentum_latest(
     universe_lib,
     tickers,
@@ -326,65 +416,18 @@ def update_factor_momentum_latest(
     counts logged LOUD (per [[feedback_no_silent_fails]]); never raises into the
     daily pipeline.
     """
-    import pandas as _pd
-    from arcticdb.version_store.library import ReadRequest, UpdatePayload
-    from arcticdb_ext.exceptions import ArcticException  # noqa: F401  (parity w/ daily_append err handling)
+    from features.second_pass import write_latest_values
 
-    cols = list(loading_cols) if loading_cols is not None else list(DEFAULT_FACTOR_LOADINGS)
-    if trailing_days is None:
-        trailing_days = int(window) + int(skip) + 40  # factor-return warmup buffer
-    as_of_ts = _pd.Timestamp(as_of_ts)
-    # Calendar span covering ~trailing_days trading days (×1.6 for weekends/holidays).
-    start_ts = as_of_ts - _pd.Timedelta(days=int(trailing_days * 1.6) + 5)
-
-    tickers = list(tickers)
-    slim_cols = ["Close", *cols]
-
-    # ── Pass 1: slim trailing (close + loadings) panel via read_batch ────────
-    try:
-        slim_reqs = [
-            ReadRequest(symbol=t, date_range=(start_ts, as_of_ts), columns=slim_cols)
-            for t in tickers
-        ]
-        slim_results = universe_lib.read_batch(slim_reqs)
-    except Exception as exc:
-        log.warning("factor-momentum daily: slim read_batch failed (skipped): %s", exc)
-        return {"status": "read_error", "error": str(exc), "tickers_written": 0}
-
-    frames: list[pd.DataFrame] = []
-    read_fail = 0
-    for t, res in zip(tickers, slim_results):
-        data = getattr(res, "data", None)
-        if data is None:  # DataError / missing symbol
-            read_fail += 1
-            continue
-        if data.empty or "Close" not in data.columns:
-            continue
-        sub = pd.DataFrame({"close": data["Close"].astype(float)})
-        for c in cols:
-            if c in data.columns:
-                sub[c] = data[c].astype(float)
-        sub["ticker"] = t
-        sub["date"] = data.index
-        frames.append(sub.reset_index(drop=True))
-
-    if not frames:
-        log.warning("factor-momentum daily: no readable tickers (read_fail=%d)", read_fail)
-        return {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
-
-    panel = pd.concat(frames, ignore_index=True)
-    fm = compute_factor_momentum_feature(
-        panel, loading_cols=cols, window=window, skip=skip,
-        quantile=quantile, min_names=min_names,
+    as_of_ts = pd.Timestamp(as_of_ts)
+    fm_by_ticker, computed = compute_factor_momentum_latest(
+        universe_lib, tickers, as_of_ts,
+        loading_cols=loading_cols, window=window, skip=skip,
+        quantile=quantile, min_names=min_names, trailing_days=trailing_days,
     )
-    panel["factor_momentum_ratio"] = fm.to_numpy()
-
-    # Latest value per ticker AT as_of_ts (the go-forward date just appended).
-    latest = panel[panel["date"] == panel["date"].max()]
-    fm_by_ticker = {
-        t: float(g["factor_momentum_ratio"].iloc[-1]) for t, g in latest.groupby("ticker", sort=False)
-    }
-    n_all_nan = sum(1 for v in fm_by_ticker.values() if not np.isfinite(v))
+    if fm_by_ticker is None:
+        return computed
+    n_all_nan = computed["tickers_all_nan"]
+    read_fail = computed["read_fail"]
     if not write:
         return {"status": "ok", "tickers_written": 0, "tickers_all_nan": n_all_nan,
                 "read_fail": read_fail, "n_computed": len(fm_by_ticker)}
@@ -393,46 +436,37 @@ def update_factor_momentum_latest(
     # A full-row update is required because the lib is static-schema (no
     # column-wise update); today's row already carries factor_momentum_ratio as
     # NaN from daily_append's schema-align, so the descriptor matches.
-    write_tickers = list(fm_by_ticker)
-    try:
-        today_results = universe_lib.read_batch(
-            [ReadRequest(symbol=t, date_range=(as_of_ts, as_of_ts)) for t in write_tickers]
-        )
-    except Exception as exc:
-        log.warning("factor-momentum daily: today read_batch failed (skipped): %s", exc)
-        return {"status": "read_error", "error": str(exc), "tickers_written": 0,
+    written = write_latest_values(
+        universe_lib, as_of_ts,
+        {t: {"factor_momentum_ratio": v} for t, v in fm_by_ticker.items()},
+        canonical_fn=canonical_fn, label="factor-momentum daily",
+    )
+    if written["status"] == "read_error":
+        return {"status": "read_error", "error": written["error"], "tickers_written": 0,
                 "read_fail": read_fail}
+    return finish_factor_momentum_result(
+        computed, as_of_ts,
+        n_written=len(written["written"]), write_fail=len(written["write_fail"]),
+    )
 
-    payloads = []
-    for t, res in zip(write_tickers, today_results):
-        data = getattr(res, "data", None)
-        if data is None or data.empty or as_of_ts not in data.index:
-            continue
-        row = data.copy()
-        row.loc[as_of_ts, "factor_momentum_ratio"] = np.float32(fm_by_ticker[t])
-        out = canonical_fn(row) if canonical_fn is not None else row
-        payloads.append(UpdatePayload(symbol=t, data=out))
 
-    n_written = 0
-    write_fail = 0
-    if payloads:
-        try:
-            universe_lib.update_batch(payloads)
-            n_written = len(payloads)
-        except Exception as exc:
-            log.warning("factor-momentum daily: update_batch failed (skipped): %s", exc)
-            write_fail = len(payloads)
-
+def finish_factor_momentum_result(
+    computed: dict, as_of_ts, *, n_written: int, write_fail: int,
+) -> dict:
+    """The pass's closing log lines and its result dict, given what was written."""
+    n_all_nan = computed["tickers_all_nan"]
+    read_fail = computed["read_fail"]
+    n_computed = computed["n_computed"]
     if n_all_nan:
         log.warning(
             "factor-momentum daily: %d/%d tickers have an all-NaN latest value "
             "(short history / no finite loadings → neutral downstream, not a "
-            "silent zero).", n_all_nan, len(fm_by_ticker),
+            "silent zero).", n_all_nan, n_computed,
         )
     log.info(
         "factor-momentum daily update @ %s: %d written, %d all-NaN, %d read-fail, "
         "%d write-fail (of %d computed)",
-        as_of_ts.date(), n_written, n_all_nan, read_fail, write_fail, len(fm_by_ticker),
+        pd.Timestamp(as_of_ts).date(), n_written, n_all_nan, read_fail, write_fail, n_computed,
     )
     return {
         "status": "ok",
@@ -440,5 +474,5 @@ def update_factor_momentum_latest(
         "tickers_all_nan": n_all_nan,
         "read_fail": read_fail,
         "write_fail": write_fail,
-        "n_computed": len(fm_by_ticker),
+        "n_computed": n_computed,
     }

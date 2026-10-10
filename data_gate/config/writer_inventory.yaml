@@ -193,6 +193,9 @@ shared_writers:
   - path: features/factor_momentum.py
     parent_units: [D12, D31]
     reason: A feature family computed and written by the compute units.
+  - path: features/second_pass.py
+    parent_units: [D18, D32]
+    reason: The daily arctic append's cross-sectional second pass (factor momentum + factor-loading z-scores), written in one update_batch (alpha-engine-config-I11792).
   - path: features/feature_engineer.py
     parent_units: [D12, D31]
     reason: The compute entry point's engineering stage.

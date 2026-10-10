@@ -301,22 +301,20 @@ def materialize_factor_loading_zscores(
     }
 
 
-def update_factor_loading_zscores_latest(
+def compute_factor_loading_zscores_latest(
     universe_lib,
     tickers,
     as_of_ts,
-    *,
-    write: bool = True,
-    canonical_fn=None,
-) -> dict:
-    """Daily go-forward update of C.1 ``*_zscore`` loadings (ArcticDB second pass).
+) -> tuple[dict[str, dict[str, float]] | None, dict]:
+    """The READ + COMPUTE half of :func:`update_factor_loading_zscores_latest`.
 
-    Runs AFTER ``builders/daily_append`` has written today's per-ticker raw
-    loading columns so the cross-section is complete. Reads today's rows,
-    applies :func:`apply_factor_zscores`, and updates ONLY ``as_of_ts`` via
-    ``update_batch``. Best-effort — never raises into the daily pipeline.
+    Returns ``(z_by_ticker, result)`` with the same contract as
+    `features.factor_momentum.compute_factor_momentum_latest`: ``None`` plus
+    the final result dict when the pass cannot proceed, otherwise the values
+    plus the compute-side counts, leaving the write to the caller
+    (alpha-engine-config-I11792).
     """
-    from arcticdb.version_store.library import ReadRequest, UpdatePayload
+    from arcticdb.version_store.library import ReadRequest
 
     src_cols = factor_loading_source_columns()
     dst_cols = factor_loading_columns()
@@ -334,7 +332,7 @@ def update_factor_loading_zscores_latest(
         log.warning(
             "factor-loading-zscores daily: source read_batch failed (skipped): %s", exc,
         )
-        return {"status": "read_error", "error": str(exc), "tickers_written": 0}
+        return None, {"status": "read_error", "error": str(exc), "tickers_written": 0}
 
     for t, res in zip(tickers, src_results):
         data = getattr(res, "data", None)
@@ -351,7 +349,7 @@ def update_factor_loading_zscores_latest(
             "factor-loading-zscores daily: no readable tickers @ %s (read_fail=%d)",
             as_of_ts.date(), read_fail,
         )
-        return {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
+        return None, {"status": "empty", "tickers_written": 0, "read_fail": read_fail}
 
     zscored = apply_factor_zscores(pd.DataFrame(rows))
     z_by_ticker = {
@@ -362,63 +360,78 @@ def update_factor_loading_zscores_latest(
         1 for vals in z_by_ticker.values()
         if not any(np.isfinite(v) for v in vals.values())
     )
+    return z_by_ticker, {
+        "status": "ok",
+        "tickers_all_nan": n_all_nan,
+        "read_fail": read_fail,
+        "n_computed": len(z_by_ticker),
+    }
+
+
+def update_factor_loading_zscores_latest(
+    universe_lib,
+    tickers,
+    as_of_ts,
+    *,
+    write: bool = True,
+    canonical_fn=None,
+) -> dict:
+    """Daily go-forward update of C.1 ``*_zscore`` loadings (ArcticDB second pass).
+
+    Runs AFTER ``builders/daily_append`` has written today's per-ticker raw
+    loading columns so the cross-section is complete. Reads today's rows,
+    applies :func:`apply_factor_zscores`, and updates ONLY ``as_of_ts`` via
+    ``update_batch``. Best-effort — never raises into the daily pipeline.
+    """
+    from features.second_pass import write_latest_values
+
+    as_of_ts = pd.Timestamp(as_of_ts)
+    z_by_ticker, computed = compute_factor_loading_zscores_latest(universe_lib, tickers, as_of_ts)
+    if z_by_ticker is None:
+        return computed
     if not write:
         return {
             "status": "ok",
             "tickers_written": 0,
-            "tickers_all_nan": n_all_nan,
-            "read_fail": read_fail,
+            "tickers_all_nan": computed["tickers_all_nan"],
+            "read_fail": computed["read_fail"],
             "n_computed": len(z_by_ticker),
         }
 
-    write_tickers = list(z_by_ticker)
-    try:
-        today_results = universe_lib.read_batch(
-            [ReadRequest(symbol=t, date_range=(as_of_ts, as_of_ts)) for t in write_tickers]
-        )
-    except Exception as exc:
-        log.warning(
-            "factor-loading-zscores daily: today read_batch failed (skipped): %s", exc,
-        )
+    written = write_latest_values(
+        universe_lib, as_of_ts, z_by_ticker,
+        canonical_fn=canonical_fn, label="factor-loading-zscores daily",
+    )
+    if written["status"] == "read_error":
         return {
             "status": "read_error",
-            "error": str(exc),
+            "error": written["error"],
             "tickers_written": 0,
-            "read_fail": read_fail,
+            "read_fail": computed["read_fail"],
         }
+    return finish_factor_loading_zscores_result(
+        computed, as_of_ts,
+        n_written=len(written["written"]), write_fail=len(written["write_fail"]),
+    )
 
-    payloads = []
-    for t, res in zip(write_tickers, today_results):
-        data = getattr(res, "data", None)
-        if data is None or data.empty or as_of_ts not in data.index:
-            continue
-        row = data.copy()
-        for col in dst_cols:
-            row.loc[as_of_ts, col] = np.float32(z_by_ticker[t][col])
-        out = canonical_fn(row) if canonical_fn is not None else row
-        payloads.append(UpdatePayload(symbol=t, data=out))
 
-    n_written = 0
-    write_fail = 0
-    if payloads:
-        try:
-            universe_lib.update_batch(payloads)
-            n_written = len(payloads)
-        except Exception as exc:
-            log.warning(
-                "factor-loading-zscores daily: update_batch failed (skipped): %s", exc,
-            )
-            write_fail = len(payloads)
-
+def finish_factor_loading_zscores_result(
+    computed: dict, as_of_ts, *, n_written: int, write_fail: int,
+) -> dict:
+    """The pass's closing log lines and its result dict, given what was written."""
+    n_all_nan = computed["tickers_all_nan"]
+    read_fail = computed["read_fail"]
+    n_computed = computed["n_computed"]
+    as_of_ts = pd.Timestamp(as_of_ts)
     if n_all_nan:
         log.warning(
             "factor-loading-zscores daily: %d/%d tickers all-NaN @ %s",
-            n_all_nan, len(z_by_ticker), as_of_ts.date(),
+            n_all_nan, n_computed, as_of_ts.date(),
         )
     log.info(
         "factor-loading-zscores daily update @ %s: %d written, %d all-NaN, "
         "%d read-fail, %d write-fail (of %d computed)",
-        as_of_ts.date(), n_written, n_all_nan, read_fail, write_fail, len(z_by_ticker),
+        as_of_ts.date(), n_written, n_all_nan, read_fail, write_fail, n_computed,
     )
     return {
         "status": "ok",
@@ -426,5 +439,5 @@ def update_factor_loading_zscores_latest(
         "tickers_all_nan": n_all_nan,
         "read_fail": read_fail,
         "write_fail": write_fail,
-        "n_computed": len(z_by_ticker),
+        "n_computed": n_computed,
     }
