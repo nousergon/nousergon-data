@@ -52,7 +52,9 @@ def _ruled(board):
 
 
 def test_the_ruling_covers_every_time_counting_phase_2_3_clause(board, units):
-    """The card's 11 plus I11305's five: 16 clauses, and none left on a calendar.
+    """The card's 11. I11305's five calendar-floored clauses are STANDING
+    instead (`tests/test_calendar_floor_standing.py`), so none is left on a
+    calendar either way.
 
     Named rather than derived from the wrapper type, so dropping a clause from
     the ruling (or adding one) is a visible edit here.
@@ -62,18 +64,14 @@ def test_the_ruling_covers_every_time_counting_phase_2_3_clause(board, units):
         "data.phase2.eod_universe_covered",
         "data.phase2.empty_fresh_free",
         "data.phase2.vendor_divergence_emitted",
-        "data.phase2.executor_collection_writes_zero",
-        "data.cost.monthly",
-        "data.pages.monthly",
-        "data.human_touch.monthly",
-        "data.phase3.sustained_window",
     } | {f"data.slo.freshness.{family}" for family in families}
     ruled = {c.name for c in board if clause_module.is_observation_window(c)}
     assert ruled == expected
     assert {c.name for c in _ruled(board)} == expected
-    # 2026-10-03: eight families, so sixteen clauses — 0 time-counting clauses
-    # left graded strictly.
-    assert len(families) == 8 and len(ruled) == 16
+    # Eight families, so eleven clauses under the 2026-10-03 ruling (was 16
+    # while I11305's five rode the same wrapper); those five are standing.
+    assert len(families) == 8 and len(ruled) == 11
+    assert not ruled & set(clause_module.CALENDAR_FLOOR_STANDING_CLAUSES)
 
 
 def test_the_completeness_slos_are_not_converted(board):
@@ -336,74 +334,3 @@ def test_board_rows_keep_the_window_and_the_strict_answer_visible(board):
         assert window["ruling"] == clause_module.OBSERVATION_WINDOW_RULING
         assert window["complete"] is False
         assert window["required"] > 0 or clause.unmeasurable
-
-
-# --- I11305's five ----------------------------------------------------------
-
-
-def _doc_store(key: str, document: dict) -> EmptyStore:
-    return EmptyStore({key: json.dumps(document).encode()})
-
-
-def test_executor_writes_pass_on_a_partial_clean_window_and_reopen_on_a_write():
-    key = xc.EXECUTOR_WRITES_KEY
-    clause = clause_module._clause_phase2_executor_collection_writes_zero(
-        _doc_store(key, {"collection_writes": 0, "days_covered": 3})
-    )
-    assert clause.met and not clause.window_complete, clause.detail
-    clause = clause_module._clause_phase2_executor_collection_writes_zero(
-        _doc_store(key, {"collection_writes": 5, "days_covered": 7})
-    )
-    assert not clause.met and "REOPENED" in clause.detail
-
-
-@pytest.mark.parametrize(
-    ("fn", "key"),
-    [
-        ("_clause_cost_monthly", "metrics/cost/monthly/latest.json"),
-        ("_clause_pages_monthly", "metrics/pages/monthly/latest.json"),
-        ("_clause_human_touch_monthly", "metrics/human_touch/monthly/latest.json"),
-    ],
-)
-def test_monthly_objectives_pass_mid_month_and_reopen_on_breach(fn, key):
-    build = getattr(clause_module, fn)
-    clause = build(_doc_store(key, {"status": "ok", "days_observed": 4, "days_in_month": 31}))
-    assert clause.met and clause.window_observed == 4 and clause.window_required == 31
-    assert not clause.window_complete
-    clause = build(_doc_store(key, {"status": "breach", "days_observed": 9}))
-    assert not clause.met and "REOPENED" in clause.detail
-    clause = build(_doc_store(key, {"status": ""}))
-    assert not clause.met and "NOT LIVE" in clause.detail
-
-
-def _sustain(statuses_newest_first: list[str | None], saturdays: list[list[str] | None]):
-    """statuses: 'clean' | 'red' | None (no reading)."""
-    from nousergon_lib.trading_calendar import subtract_trading_days  # pyright: ignore[reportAttributeAccessIssue]
-
-    objects: dict[str, bytes] = {}
-    day = TRADING_DAY
-    for status in statuses_newest_first:
-        if status is not None:
-            rows = [{"name": "data.x", "met": status == "clean", "unmeasurable": False}]
-            objects[f"gates/data-phase3/{day.isoformat()}/gate.json"] = json.dumps(
-                {"clauses": rows}
-            ).encode()
-        day = subtract_trading_days(day, 1)
-    weekly = _cycles(saturdays, guard="empty_fresh")
-    return clause_module._clause_phase3_sustained_window(EmptyStore(objects), weekly, trading_day=TRADING_DAY)
-
-
-def test_sustain_passes_on_clean_readings_before_the_window_fills():
-    clause = _sustain(["clean", "clean", None, None], [["ok"], None])
-    assert clause.met, clause.detail
-    assert not clause.window_complete
-
-
-def test_sustain_counts_a_red_reading_inside_the_window():
-    clause = _sustain(["clean", "red", "clean"], [["ok"]])
-    assert not clause.met and "REOPENED" in clause.detail
-
-
-def test_sustain_is_not_live_without_a_complete_saturday():
-    clause = _sustain(["clean"], [None])
-    assert not clause.met and "NOT LIVE" in clause.detail
