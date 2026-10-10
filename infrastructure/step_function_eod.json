@@ -495,7 +495,7 @@
     },
     "CaptureSnapshot": {
       "Type": "Task",
-      "Comment": "Capture live IB state once at the close and persist it to s3://alpha-engine-research/trades/snapshots/{run_date}.json. EODReconcile (now in ne-postclose-reconcile-pipeline) reads that snapshot instead of querying live IB, so the row keyed by run_date=X sources from observations made at time X. alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): this state used to run ~3.5 h after the close, behind the bounded wait on ne-data-collection-eod (18:15 ET = dates.SETTLED_AFTER_ET); it needs nothing from the collector, so it now runs minutes after the daemon-shutdown trigger \u2014 the snapshot records the book AT the close, which is what it was always meant to record.",
+      "Comment": "Capture live IB state once at the close and persist it to s3://alpha-engine-research/trades/snapshots/{run_date}.json. EODReconcile (now in ne-postclose-reconcile-pipeline) reads that snapshot instead of querying live IB, so the row keyed by run_date=X sources from observations made at time X. alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"): this state used to run ~3.5 h after the close, behind the bounded wait on ne-data-collection-eod (18:15 ET = dates.SETTLED_AFTER_ET); it needs nothing from the collector, so it now runs minutes after the daemon-shutdown trigger \u2014 the snapshot records the book AT the close, which is what it was always meant to record. alpha-engine-config-I12220 (2026-10-09 backstop failure): executionTimeout is 720 s, not 120 s, because snapshot_capturer.py now waits up to GATEWAY_READY_TIMEOUT_S (420 s) for IB Gateway to be READY (API port open AND logged in past the paper-trading disclaimer) before it connects. This state runs ~25 s after StartTradingInstance on a cold box; on 2026-10-09 the port opened ~71 s after the start with the login still at the disclaimer, and the old ~30 s connect retry lost both attempts. 720 = the 420 s readiness budget + ~300 s for the capture, fill reconciliation and prior-session sweep. A warm gateway answers the first probe and pays nothing.",
       "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
       "Parameters": {
         "DocumentName": "AWS-RunShellScript",
@@ -503,12 +503,12 @@
         "Parameters": {
           "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $$.Execution.Name, $.run_date))",
           "executionTimeout": [
-            "120"
+            "720"
           ]
         },
         "TimeoutSeconds": 120
       },
-      "TimeoutSeconds": 180,
+      "TimeoutSeconds": 780,
       "Retry": [
         {
           "ErrorEquals": [

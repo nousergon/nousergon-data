@@ -70,6 +70,12 @@ _SHARED = {
     # 2026-10-09 in-session box stop: both machines stop the box, so both
     # refuse the pre-session window [08:00, 09:30) ET after the gate.
     "StampStartClockUtc", "PreSessionWindowChoice", "NotifyPreSessionBlocked",
+    # alpha-engine-config-I12220: the reconcile machine captures a MISSING
+    # snapshot itself (once, no retry budget, presence-gated) instead of
+    # failing on it; the capture/poll/page states carry the same names, and
+    # so the same pipeline-status registry rows, in both machines.
+    "CaptureSnapshot", "WaitForCaptureSnapshot", "CheckSnapshotStatus",
+    "SnapshotStatusError", "SnapshotWait", "PageCaptureSnapshotIrreversibleFailure",
 }
 
 _POSTCLOSE_ONLY = {
@@ -77,12 +83,11 @@ _POSTCLOSE_ONLY = {
     "DeployDriftCheck", "DeployDriftGate", "SetDeployDriftObserveWouldHaltFlag",
     "SetDeployDriftProbeUnreadableFlag", "SetDeployDriftDegradedFlag",
     "PublishDeployDriftDegraded",
-    # CaptureSnapshot and its bounded same-day retry (alpha-engine-config#5569).
-    "CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "CaptureSnapshot",
-    "WaitForCaptureSnapshot", "CheckSnapshotStatus", "SnapshotStatusError", "SnapshotWait",
+    # CaptureSnapshot's skip gate and its bounded same-day retry
+    # (alpha-engine-config#5569).
+    "CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter",
     "CheckCaptureSnapshotRetryBudget", "PageCaptureSnapshotFailureImmediate",
     "IncrementCaptureSnapshotRetry", "CaptureSnapshotRetryExhausted",
-    "PageCaptureSnapshotIrreversibleFailure",
 }
 
 #: Every state that depends on ne-data-collection-eod having run.
@@ -237,12 +242,12 @@ def test_the_box_timers_that_now_run_at_the_evening_boot_are_persistent():
         assert re.search(r"^Persistent=true$", text, re.MULTILINE), stem
 
 
-def test_the_reconcile_machine_takes_no_snapshot_and_runs_no_drift_gate(reconcile):
+def test_the_reconcile_machine_runs_no_drift_gate_and_no_capture_retry_loop(reconcile):
     states = reconcile["States"]
     present = sorted(_POSTCLOSE_ONLY & set(states))
     assert present == [], present
-    # The heal replay targets THIS machine, so a live-IB recapture is
-    # structurally impossible from it (see test_heal_replay_deploy_refresh_i7586).
+    # The heal replay targets THIS machine; its CaptureSnapshot is presence-
+    # gated, so a replay never recaptures (see test_heal_replay_deploy_refresh_i7586).
     assert states["HealDispatchReplay"]["Parameters"]["StateMachineArn.$"] == "$$.StateMachine.Id"
 
 
