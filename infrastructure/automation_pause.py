@@ -46,9 +46,9 @@ a pause (deleting/moving the watched trigger's entry out of ``paused``) makes
 the alarm's justification lapse on the very next ``--check``/``--enforce`` —
 the SAME manifest edit that restores the trigger's schedule, no separate AWS
 CLI command. ``enforce()`` disables actions on a justified-but-armed alarm and
-RE-ENABLES actions on an alarm whose justification has lapsed; alarms are
-silenced with ``disable-alarm-actions``, never deleted, so their history and
-configuration survive for later reconstruction. Re-enabling an alarm is NOT
+RE-ENABLES actions on an alarm whose justification has lapsed; this script
+silences with ``disable-alarm-actions`` and never deletes, so an alarm's history
+and configuration survive for later reconstruction. Re-enabling an alarm is NOT
 the trigger-reenable asymmetry below — it only resumes paging, it starts no
 scheduled work, so it is safe for ``enforce()`` to do unattended.
 
@@ -67,6 +67,28 @@ class read OK at that moment — one of them because another component was
 re-invoking their paused probe — and were therefore never listed, and kept
 paging. A register built from symptoms is an incident log; ``armed_alarms`` is
 what makes this one an audit.
+
+**Retiring instead of silencing (Brian, 2026-10-09, alpha-engine-config-I11792).**
+"Silenced, never deleted" was a rule about PRESERVING an alarm's configuration,
+and it predates the alarm tree that now preserves it: every alarm is a file in
+``nous-ergon-ops/infrastructure/cloudwatch/alarms/``, so a deleted alarm's exact
+configuration survives in git history and comes back by restoring one file. A
+silenced alarm on a paused or retired component still bills $0.10/month while
+it can only report the pause back to us. So an alarm watching a component that
+is retired or paused MAY be deleted, on two conditions: its configuration is
+retained in git history (the entry's ``restore_from`` names the file and the
+commit that still has it), and the deletion is DECLARED — the entry moves from
+``paused_alarms`` to ``retired_alarms`` in the SAME change that deletes the
+alarm file. ``retired_alarms`` is graded in neither silencing direction (there
+is nothing left to silence or re-arm) and counts as a declaration for the
+completeness scans, so the interval between that change merging and an
+operator running the printed CloudWatch alarm-delete command reads green in BOTH
+states: alarm still live and muted, or alarm gone. Whether the operator has run
+the delete is ``nous-ergon-ops``' ``check-drift.py``'s question (a live alarm
+with no file), never this one's. This script still has no delete verb: the
+deletion is an operator step printed by ``cloudwatch-alarm-apply-on-merge.yml``.
+Un-retiring is restoring the file from ``restore_from`` and moving the entry
+back to ``paused_alarms`` or ``armed_alarms``.
 
 **``paused_alarms`` may hold BOTH missing-data treatments; only ``breaching``
 entries are graded for silence (alpha-engine-config-I8712).** The block's
@@ -277,6 +299,91 @@ def alarm_entries(manifest: dict | None = None) -> list[dict]:
             "issue": entry.get("issue", ""),
             "re_exam": entry.get("re_exam", ""),
         })
+    return out
+
+
+def retired_alarm_entries(manifest: dict | None = None) -> list[dict]:
+    """Every declared ``retired_alarms`` entry (alpha-engine-config-I11792).
+
+    An alarm DELETED because the component it watched is retired or paused,
+    with its configuration retained in git history at ``restore_from``. Same
+    ``_``-prefix prose convention as every other block.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    out: list[dict] = []
+    for name, entry in sorted(m.get("retired_alarms", {}).items()):
+        if name.startswith("_"):
+            continue
+        out.append({
+            "name": name,
+            "reason": entry.get("reason", ""),
+            "restore_from": entry.get("restore_from", ""),
+            "issue": entry.get("issue", ""),
+        })
+    return out
+
+
+def retired_alarm_names(manifest: dict | None = None) -> set[str]:
+    return {e["name"] for e in retired_alarm_entries(manifest)}
+
+
+#: ``<repo>@<40-hex sha>:<path to the alarm file>`` — the commit must be one
+#: that still HAS the file (the parent of the deleting commit, or any earlier
+#: one), so ``git show <sha>:<path>`` is the whole restore.
+RESTORE_FROM_RE = re.compile(
+    r"^[a-z0-9-]+@[0-9a-f]{40}:infrastructure/cloudwatch/alarms/[^/]+\.json$")
+
+
+def retirement_findings(manifest: dict | None = None) -> list[dict]:
+    """Is every ``retired_alarms`` entry a declaration that can be acted on?
+
+    Offline, like ``declaration_findings``. The amended rule
+    (alpha-engine-config-I11792) permits deleting an alarm ONLY when its
+    configuration is retained in git history, so an entry that does not say
+    where is the rule's condition unmet, and an entry that also sits in
+    ``paused_alarms`` or ``armed_alarms`` is a contradiction the scans would
+    resolve silently in favour of whichever they read first.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    paused = {e["name"] for e in alarm_entries(m)}
+    armed = armed_alarm_names(m)
+    out: list[dict] = []
+    for entry in retired_alarm_entries(m):
+        name = entry["name"]
+        if not entry["reason"].strip():
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-retirement-unexplained",
+                "detail": "retired_alarms entry carries no reason.",
+            })
+        if not RESTORE_FROM_RE.match(entry["restore_from"]):
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-retirement-unrestorable",
+                "detail": (
+                    f"restore_from={entry['restore_from']!r} is not "
+                    f"'<repo>@<sha>:infrastructure/cloudwatch/alarms/<file>.json'. "
+                    f"Deleting an alarm is permitted only when its configuration "
+                    f"is retained in git history, and this field is where that "
+                    f"history is named."
+                ),
+            })
+        if not DECLARATION_ISSUE_RE.match(entry["issue"]):
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-declaration-unowned",
+                "detail": f"retired_alarms entry carries issue={entry['issue']!r}.",
+            })
+        if name in paused or name in armed:
+            out.append({
+                "trigger": name, "surface": "cloudwatch",
+                "kind": "alarm-declared-twice",
+                "detail": (
+                    "declared retired AND in "
+                    f"{'paused_alarms' if name in paused else 'armed_alarms'} — "
+                    "an alarm is retired, silenced or armed, never two of them."
+                ),
+            })
     return out
 
 
@@ -783,6 +890,7 @@ def declaration_findings(manifest: dict | None = None) -> list[dict]:
                 "kind": "alarm-declaration-undated",
                 "detail": f"re_exam={re_exam!r} is not a real calendar date.",
             })
+    out.extend(retirement_findings(manifest))
     return out
 
 
@@ -798,6 +906,10 @@ def alarm_coverage_findings() -> list[dict]:
     out: list[dict] = []
     declared_paused = {e["name"] for e in alarm_entries()}
     declared_armed = armed_alarm_names()
+    # alpha-engine-config-I11792: a retired alarm is declared too. Until the
+    # operator runs the delete it is still live (and still muted); afterwards
+    # it is gone. Both states are the declaration holding, not a finding.
+    declared_retired = retired_alarm_names()
     live = _live_breaching_alarms()
 
     # ── an UNDECLARED mute, of any alarm (alpha-engine-config-I8047) ────────
@@ -811,7 +923,8 @@ def alarm_coverage_findings() -> list[dict]:
     # they never been declared. Codifying those fourteen as declared,
     # self-expiring suppressions is only half the ruling; this is the half that
     # must not weaken, because a mute nobody declared is still the defect.
-    for name in sorted(_live_silenced_alarms() - declared_paused - declared_armed):
+    for name in sorted(_live_silenced_alarms() - declared_paused - declared_armed
+                       - declared_retired):
         out.append({
             "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared-silence",
             "detail": (
@@ -825,7 +938,7 @@ def alarm_coverage_findings() -> list[dict]:
             ),
         })
 
-    for name in sorted(set(live) - declared_paused - declared_armed):
+    for name in sorted(set(live) - declared_paused - declared_armed - declared_retired):
         out.append({
             "trigger": name, "surface": "cloudwatch", "kind": "alarm-undeclared",
             "detail": (

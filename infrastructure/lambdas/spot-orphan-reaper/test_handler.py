@@ -16,6 +16,7 @@ dispatcher/ci-watch-dispatcher's test files) so this suite stays network-free.
 from __future__ import annotations
 
 import importlib
+import json
 import os
 import sys
 import types
@@ -716,26 +717,35 @@ class TestOnDemandRunBoxes:
 
 
 class TestScanMetrics:
-    def _points(self, cw) -> dict[tuple[str, str], float]:
-        calls = _metric_calls(cw, "orphan_reaper_candidates")
-        assert len(calls) == 1
+    """Per-market scan counts are a LOG line since alpha-engine-config-I11792 M1;
+    no CloudWatch series carries them any more."""
+
+    def _points(self, cw, caplog) -> dict[tuple[str, str], float]:
+        assert not _metric_calls(cw, "orphan_reaper_candidates")
+        assert not _metric_calls(cw, "orphan_reaper_terminated")
+        lines = [json.loads(r.getMessage()) for r in caplog.records
+                 if r.getMessage().startswith("{") and '"orphan_reaper_scan"' in r.getMessage()]
+        assert len(lines) == 1, lines
+        rec = lines[0]
         return {
-            (d["MetricName"], d["Dimensions"][0]["Value"]): d["Value"]
-            for d in calls[0].kwargs["MetricData"]
+            (f"orphan_reaper_{k}", m): float(v)
+            for k in ("candidates", "terminated") for m, v in rec[k].items()
         }
 
-    def test_an_empty_scan_still_emits_zero_candidates(self, index_module):
+    def test_an_empty_scan_still_emits_zero_candidates(self, index_module, caplog):
         # I11108 deliverable 2: "found nothing to look at" must be a data
         # point, not an absence that reads the same as a healthy fleet.
+        caplog.set_level("INFO")
         _out, _ec2, cw = _run_filtered(index_module, [])
-        assert self._points(cw) == {
+        assert self._points(cw, caplog) == {
             ("orphan_reaper_candidates", "spot"): 0.0,
             ("orphan_reaper_terminated", "spot"): 0.0,
             ("orphan_reaper_candidates", "on-demand"): 0.0,
             ("orphan_reaper_terminated", "on-demand"): 0.0,
         }
 
-    def test_candidates_and_reaps_are_split_by_market(self, index_module):
+    def test_candidates_and_reaps_are_split_by_market(self, index_module, caplog):
+        caplog.set_level("INFO")
         past = (datetime.now(timezone.utc) - timedelta(seconds=7200)).isoformat()
         fleet = [
             _box("i-spot", "alpha-engine-backtest-20260925", 600, lifecycle="spot", launch_market="spot"),
@@ -744,7 +754,7 @@ class TestScanMetrics:
         ]
         out, _ec2, cw = _run_filtered(index_module, fleet)
         assert out["scanned_by_market"] == {"spot": 1, "on-demand": 1}
-        points = self._points(cw)
+        points = self._points(cw, caplog)
         assert points[("orphan_reaper_candidates", "spot")] == 1.0
         assert points[("orphan_reaper_terminated", "spot")] == 0.0
         assert points[("orphan_reaper_candidates", "on-demand")] == 1.0

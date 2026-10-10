@@ -70,15 +70,11 @@ contract:
 registry_rows:
   - daily_heal_summary
 run_manifest_prefix: data_collection/runs/D33
-detectors:
-  - kind: "cloudwatch-alarm"
-    via: "alpha-engine-daily-heal-days-healed"
-    state: BROKEN
-    note: an alarm over a producer that NEVER RUNS. A detector that cannot fire is not a detector.
-    # Subject for the detector reader (alpha-engine-config-I10795, A3), verified 2026-10-07.
-    # Live alarm on AlphaEngine/Data daily_heal_days_healed, emitted by
-    # weekly_collector.py's daily heal; codified in alpha-engine-orchestration.yaml.
-    subject: "alpha-engine-daily-heal-days-healed"
+# The one detector this row carried, alarm `alpha-engine-daily-heal-days-healed`
+# (state BROKEN: an alarm on a data-quality event, not a failure), was DELETED
+# 2026-10-09 under alpha-engine-config-I11792 Tier 2. Heal FAILURE is detected by
+# `ne-data-collection-daily-heal-failed`, which is not a per-unit detector here.
+detectors: []
 freshness:
   family: morning
   deadline: "07:30 America/New_York"

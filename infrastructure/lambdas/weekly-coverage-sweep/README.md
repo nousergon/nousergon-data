@@ -9,7 +9,13 @@ Runs `nousergon_lib.pipeline_status`'s stage-coverage sweep over one weekly
 **cycle**, then:
 
 1. writes the sweep artifact to `_stage_coverage/_sweep/<pipeline>/<run_date>.json`
-   and publishes its metric,
+   and publishes its metrics, plus one `AlphaEngine/StageCoverageSweepAlarmable`
+   point (`Pipeline` dimension) = findings + absent (only when coverage is
+   established) + 1 if deferred, zero included. It is the only series
+   `alpha-engine-stage-coverage-findings` alarms on: the former `-absent` and
+   `-deferred` alarms were folded into it on 2026-10-09
+   (`alpha-engine-config-I11792`). A failed put is logged at ERROR and never
+   changes the outcome,
 2. **augments the SF completion marker** at
    `_sf_completion/<pipeline>/<run_date>.json` with the cycle's real shape —
    which executions contributed, what each entered, what the union adds up to,

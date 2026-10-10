@@ -754,6 +754,8 @@ def test_reconcile_monthly_is_paused_not_pending(manifest, module):
 # edit — and the four alarms it was missing were precisely the ones still paging
 # on 2026-08-14. A frozen expected-set turns "the register grew" into a failure
 # and "the register is incomplete" into a pass, which is backwards.
+DRAIN_FLOOR = "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor"
+
 ORIGINAL_ALARM_NAMES = {
     "alpha-engine-watch-plane-alert-drain-liveness-probe-invocations-floor",
     "alpha-engine-watch-plane-canary-replay-liveness-probe-invocations-floor",
@@ -789,11 +791,16 @@ def test_the_original_pause_caused_alarms_are_still_declared(manifest, module):
     I7174 never becomes UNCLASSIFIED — which is exactly what the two blocks
     together express, and what `--check` grades as `alarm-undeclared`.
     """
+    # `retired_alarms` (alpha-engine-config-I11792, 2026-10-09) is the third
+    # block: an alarm DELETED because its component is paused or retired,
+    # with its file's last version named by `restore_from`. Moving there is
+    # a declaration, not a loss of one.
     names = ({e["name"] for e in module.alarm_entries(manifest)}
-             | set(module.armed_alarm_names()))
+             | set(module.armed_alarm_names())
+             | set(module.retired_alarm_names(manifest)))
     assert ORIGINAL_ALARM_NAMES <= names, (
         f"an alarm silenced under I7174 lost its declaration entirely — it is "
-        f"in neither paused_alarms nor armed_alarms: "
+        f"in none of paused_alarms, armed_alarms, retired_alarms: "
         f"{ORIGINAL_ALARM_NAMES - names}"
     )
 
@@ -806,7 +813,8 @@ def test_the_four_alarms_that_paged_on_2026_08_14_are_declared(manifest, module)
     original list was built from what was firing that morning rather than from
     the class.
     """
-    names = {e["name"] for e in module.alarm_entries(manifest)}
+    names = ({e["name"] for e in module.alarm_entries(manifest)}
+             | set(module.retired_alarm_names(manifest)))
     for name in (
         "alpha-engine-watch-plane-overseer-liveness-probe-errors",
         "alpha-engine-watch-plane-overseer-liveness-probe-throttles",
@@ -943,17 +951,17 @@ def test_check_flags_a_stale_disabled_alarm_after_its_pause_lifts(
         module, monkeypatch, classified_world):
     """The failure this issue exists to prevent: pause lifted, alarm never re-armed."""
     lifted = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-0645-daily"]
-    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-1445-daily"]
+    # The sf-watch liveness alarms this used to lift were retired
+    # (alpha-engine-config-I11792); the alert-drain floor is the one
+    # paused_alarms entry left, so it is the worked example.
+    for slot in ("0400", "1000", "1600", "2200"):
+        del lifted["paused"]["scheduler_schedules"][f"alpha-engine-alert-drain-{slot}utc"]
     monkeypatch.setattr(module, "load_manifest", lambda: lifted)
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
     monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
     findings = module.check()
     kinds = {(f["trigger"], f["kind"]) for f in findings}
-    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
-            "alarm-stale-disabled") in kinds, findings
-    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-throttles",
-            "alarm-stale-disabled") in kinds, findings
+    assert (DRAIN_FLOOR, "alarm-stale-disabled") in kinds, findings
 
 
 def test_check_is_silent_on_alarms_whose_state_matches_justification(
@@ -1044,8 +1052,11 @@ def test_enforce_can_both_disable_and_enable_alarm_actions(module, monkeypatch):
     is the mechanism that re-arms an alarm the same run a pause lifts, with no
     separate AWS CLI command."""
     lifted = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-0645-daily"]
-    del lifted["paused"]["scheduler_schedules"]["alpha-engine-sf-watch-liveness-1445-daily"]
+    # The sf-watch liveness alarms this used to lift were retired
+    # (alpha-engine-config-I11792); the alert-drain floor is the one
+    # paused_alarms entry left, so it is the worked example.
+    for slot in ("0400", "1000", "1600", "2200"):
+        del lifted["paused"]["scheduler_schedules"][f"alpha-engine-alert-drain-{slot}utc"]
     monkeypatch.setattr(module, "load_manifest", lambda: lifted)
     monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
     monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: False)
@@ -1055,8 +1066,8 @@ def test_enforce_can_both_disable_and_enable_alarm_actions(module, monkeypatch):
         lambda name, enabled: acted.append((name, enabled)))
     module.enforce(alarms_only=True)
     acted_names = {n for n, _ in acted}
-    assert "alpha-engine-watch-plane-sf-watch-liveness-probe-errors" in acted_names
-    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors", True) in acted, (
+    assert DRAIN_FLOOR in acted_names
+    assert (DRAIN_FLOOR, True) in acted, (
         "the un-paused entry's alarm must be RE-ENABLED, not disabled again"
     )
 
@@ -1081,7 +1092,10 @@ def test_ci_reconciles_alarm_actions_alarms_only(module):
 
 def test_alarms_are_silenced_not_deleted(module):
     # Property 1: history/config survive. The mutation surface must never
-    # contain a delete verb for an alarm.
+    # contain a delete verb for an alarm. Retirement (alpha-engine-config-
+    # I11792) does not change this: a retired alarm is deleted by an operator
+    # running the command nous-ergon-ops' merge job prints, never by this
+    # script, which only DECLARES the retirement.
     import inspect
     src = inspect.getsource(module)
     assert "delete-alarms" not in src, (
@@ -1151,12 +1165,17 @@ def test_the_fourteen_hand_muted_alarms_are_all_declared(manifest, module):
     # as `armed-but-silenced` if the alarm is in fact still muted. A silent
     # shrink still cannot happen; it just is not spelled with a frozen block
     # name any more.
+    #
+    # Since 2026-10-09 (alpha-engine-config-I11792) twelve of these were
+    # DELETED rather than muted and live in `retired_alarms`, which is a
+    # declaration too: it names the reason and the commit to restore from.
     paused = {e["name"] for e in module.alarm_entries(manifest)}
     armed = set(module.armed_alarm_names())
-    undeclared = hand_muted - paused - armed
+    retired = set(module.retired_alarm_names(manifest))
+    undeclared = hand_muted - paused - armed - retired
     assert not undeclared, (
-        f"a hand-muted alarm lost its declaration entirely — in neither "
-        f"paused_alarms nor armed_alarms: {sorted(undeclared)}"
+        f"a hand-muted alarm lost its declaration entirely — in none of "
+        f"paused_alarms, armed_alarms, retired_alarms: {sorted(undeclared)}"
     )
 
 
@@ -1182,7 +1201,7 @@ def test_no_alarm_outside_the_measured_set_was_declared(manifest, module):
 def _mutated(field: str, value):
     """The manifest with one paused_alarms entry's declaration broken."""
     m = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
-    m["paused_alarms"]["alpha-engine-watch-plane-sf-watch-liveness-probe-errors"][field] = value
+    m["paused_alarms"][DRAIN_FLOOR][field] = value
     return m
 
 
@@ -1190,7 +1209,7 @@ def test_a_declaration_with_no_owning_issue_is_a_finding(module):
     """RED proof 1 — an unowned declaration cannot be graded against the
     tracker, so it can never be found stale."""
     findings = module.declaration_findings(_mutated("issue", ""))
-    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+    assert (DRAIN_FLOOR,
             "alarm-declaration-unowned") in {(f["trigger"], f["kind"]) for f in findings}
 
 
@@ -1205,7 +1224,7 @@ def test_a_declaration_with_a_free_text_owner_is_a_finding(module):
 def test_a_declaration_with_no_re_exam_date_is_a_finding(module):
     """RED proof 2 — no date means nothing can ever be past it."""
     findings = module.declaration_findings(_mutated("re_exam", ""))
-    assert ("alpha-engine-watch-plane-sf-watch-liveness-probe-errors",
+    assert (DRAIN_FLOOR,
             "alarm-declaration-undated") in {(f["trigger"], f["kind"]) for f in findings}
 
 
@@ -1597,3 +1616,82 @@ def test_group_qualified_kept_schedule_is_not_a_kept_but_missing_finding(
     assert bad == [], (
         f"a live, ENABLED, group-qualified kept schedule was reported wrong: {bad}"
     )
+
+
+# ── retired_alarms: deleted, not silenced (alpha-engine-config-I11792) ──────
+#
+# Brian's "Full plan" ruling (2026-10-09) amended property 1: an alarm on a
+# retired-or-paused component may be DELETED, provided its configuration is
+# retained in git history. The block must stay green across the window between
+# the nous-ergon-ops merge (file gone) and the operator's `delete-alarms` run
+# (alarm gone), so it is a declaration for completeness and graded in neither
+# silencing direction.
+
+
+def _retired_world(module, *, retired_live: bool):
+    world = {e["name"]: {"enabled": False, "breaching": True}
+             for e in module.alarm_entries()}
+    world.update({n: {"enabled": True, "breaching": True}
+                  for n in module.armed_alarm_names()})
+    if retired_live:
+        world.update({n: {"enabled": False, "breaching": True}
+                      for n in module.retired_alarm_names()})
+    return world
+
+
+@pytest.mark.parametrize("retired_live", [True, False],
+                         ids=["before-operator-delete", "after-operator-delete"])
+def test_retired_alarms_are_green_both_before_and_after_the_delete(
+        module, monkeypatch, retired_live):
+    world = _retired_world(module, retired_live=retired_live)
+    monkeypatch.setattr(module, "_live_alarm_actions", lambda: world)
+    retired = module.retired_alarm_names()
+    assert retired, "the live manifest declares no retired alarms"
+    hits = [f for f in module.alarm_coverage_findings() if f["trigger"] in retired]
+    assert not hits, hits
+
+
+def test_the_live_manifest_retirements_are_well_formed(module):
+    assert module.retirement_findings() == []
+
+
+def _retired_mutated(field: str, value):
+    m = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    name = sorted(k for k in m["retired_alarms"] if not k.startswith("_"))[0]
+    m["retired_alarms"][name][field] = value
+    return name, m
+
+
+@pytest.mark.parametrize("field,value,kind", [
+    ("reason", "  ", "alarm-retirement-unexplained"),
+    ("restore_from", "", "alarm-retirement-unrestorable"),
+    ("restore_from", "nous-ergon-ops@main:infrastructure/cloudwatch/alarms/x.json",
+     "alarm-retirement-unrestorable"),
+    ("issue", "tracked by Brian", "alarm-declaration-unowned"),
+])
+def test_a_malformed_retirement_is_a_finding(module, field, value, kind):
+    """The amended rule's condition is that the config is retained in git
+    history; a retirement that does not say where is that condition unmet."""
+    name, m = _retired_mutated(field, value)
+    kinds = {(f["trigger"], f["kind"]) for f in module.declaration_findings(m)}
+    assert (name, kind) in kinds, kinds
+
+
+def test_an_alarm_retired_and_still_paused_is_a_finding(module):
+    m = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    name = sorted(k for k in m["retired_alarms"] if not k.startswith("_"))[0]
+    m["paused_alarms"][name] = dict(m["paused_alarms"][DRAIN_FLOOR])
+    kinds = {(f["trigger"], f["kind"]) for f in module.retirement_findings(m)}
+    assert (name, "alarm-declared-twice") in kinds, kinds
+
+
+def test_retired_alarms_are_never_enforced(module, monkeypatch):
+    """enforce() must not touch a retired alarm in either direction: it has no
+    `watches` to justify a state, and the alarm may already be gone."""
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: "DISABLED")
+    monkeypatch.setattr(module, "_alarm_actions_enabled", lambda name: True)
+    acted: list = []
+    monkeypatch.setattr(module, "_set_alarm_actions",
+                        lambda name, enabled: acted.append(name))
+    module.enforce(alarms_only=True)
+    assert not (set(acted) & module.retired_alarm_names()), acted
