@@ -34,7 +34,7 @@ own MET/UNMET/UNMEASURABLE), source, as_of and evidence.
 from __future__ import annotations
 
 import datetime as dt
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from nousergon_lib.gates import Clause, clause_member_status, contain_clause_exceptions, unmeasurable
 
@@ -127,26 +127,61 @@ EXIT_CRITERION_CLAUSES: tuple[str, ...] = (
 )
 
 #: The clauses Brian's 2026-10-03 extension of the time-gate ruling covers
-#: (:data:`OBSERVATION_WINDOW_RULING`): EVERY phase-2/3 clause whose
-#: requirement counts elapsed cycles, days or a calendar month — the eleven
-#: the card named and, by the coordinator's follow-up the same night, the five
-#: `alpha-engine-config-I11305` named, so no phase-2/3 clause is graded by a
-#: calendar any more. fnmatch patterns, so the eight per-family freshness SLO
-#: rows are one entry — the family list comes from the descriptors.
+#: (:data:`OBSERVATION_WINDOW_RULING`): the eleven phase-2/3 clauses the card
+#: named whose requirement counts elapsed cycles or days. fnmatch patterns, so
+#: the eight per-family freshness SLO rows are one entry — the family list
+#: comes from the descriptors.
 #:
-#: NOT here, deliberately: `data.slo.completeness.*`, whose requirement
-#: ("every published key met its declared floor") reads ONE document and
-#: counts no elapsed time, so there is no window for the ruling to run behind.
+#: NOT here, deliberately:
+#:
+#: * :data:`CALENDAR_FLOOR_STANDING_CLAUSES` — the five calendar-floored clauses
+#:   `alpha-engine-config-I11305` names. They are STANDING under Brian's
+#:   2026-09-21 ruling (:data:`CALENDAR_FLOOR_STANDING_RULING`): read and
+#:   rendered every day, graded by no data-phase gate.
+#: * `data.slo.completeness.*`, whose requirement ("every published key met its
+#:   declared floor") reads ONE document and counts no elapsed time, so there is
+#:   no window for the ruling to run behind.
 OBSERVATION_WINDOW_CLAUSE_PATTERNS: tuple[str, ...] = (
     "data.phase2.eod_universe_covered",
     "data.phase2.empty_fresh_free",
     "data.phase2.vendor_divergence_emitted",
-    "data.phase2.executor_collection_writes_zero",
     "data.slo.freshness.*",
+)
+
+#: The five clauses `alpha-engine-config-I11305` names: each can become true
+#: only by the calendar advancing (a trailing 7-day CloudTrail window, a
+#: calendar month, a 20-trading-day + 4-Saturday sustain), and none can be made
+#: true sooner by anything its phase builds. STANDING under Brian's 2026-09-21
+#: ruling (:data:`CALENDAR_FLOOR_STANDING_RULING`, :class:`StandingClause`) —
+#: the same treatment `alpha-engine-config-I10793` gave the phase-1 cost
+#: baseline and the three reliability streaks. Each row still reads MET/UNMET
+#: against its ORIGINAL ratified target; absent data renders absent, never
+#: green.
+#:
+#: The executor-profile row's OTHER half — "the migration off the executor
+#: profile has happened" — is not a wait and stays gating: it is the phase-2
+#: per-unit ``identity`` column (`data.D*.identity`, alpha-engine-config-I10756),
+#: which simulates each unit's DECLARED writer role, and
+#: `data_gate/config/writer_identities.yaml` declares a role only once a box has
+#: been observed writing under it.
+CALENDAR_FLOOR_STANDING_CLAUSES: tuple[str, ...] = (
+    "data.phase2.executor_collection_writes_zero",
     "data.cost.monthly",
     "data.pages.monthly",
     "data.human_touch.monthly",
     "data.phase3.sustained_window",
+)
+
+#: Brian's ruling, 2026-09-21 (verbatim, recorded on
+#: `alpha-engine-config-I10793`), applied by `alpha-engine-config-I11305` to the
+#: five calendar-floored clauses its sweep found in phases 2 and 3.
+CALENDAR_FLOOR_STANDING_RULING = (
+    "Brian, 2026-09-21: \"i'm not clear why we need to time gate anything, why not just "
+    "collect the data when it is ready but not block subsequent issues\" and \"the only time "
+    "gate we should have here is for v2 phase 4 deleting the v1 pipelines ... we should be "
+    "able to work up to this point without time gates\" (alpha-engine-config-I10793, applied "
+    "by alpha-engine-config-I11305): this calendar-floored row is read and reported every "
+    "day against its ratified target and gates no data phase."
 )
 
 CUTOVER_READY_ROLES: tuple[str, ...] = (
@@ -975,27 +1010,47 @@ def _clause_slo_freshness(store: ev.GateStore, family: str) -> Clause:
 #: document does not state ``days_in_month`` itself.
 MONTHLY_WINDOW_DAYS = 30
 
-_MONTHLY_RULING_SENTENCE = (
-    " Graded under Brian's 2026-10-03 ruling: MET once the monthly document publishes a real "
-    "verdict and no day observed so far in the month fails it (producer contract: "
-    "status ok/breach, days_observed, days_in_month)"
+_MONTHLY_STANDING_SENTENCE = (
+    " STANDING under Brian's 2026-09-21 ruling (alpha-engine-config-I11305): reported daily "
+    "against this target, gates no data phase (producer contract: status ok/breach, "
+    "days_observed, days_in_month)"
 )
 
 
 def _monthly_clause(store: ev.GateStore, name: str, requirement: str, key: str) -> Clause:
-    """One calendar-month objective under :data:`OBSERVATION_WINDOW_RULING`."""
-    return _observation_window_clause(
+    """One calendar-month objective, STANDING (:data:`CALENDAR_FLOOR_STANDING_RULING`).
+
+    ``met`` is the document's own verdict against the ratified target, carried
+    verbatim; a missing or unreadable document reads UNMET/UNMEASURABLE, never
+    MET.
+    """
+    reading = ev.read_windowed_objective(
+        store,
+        key,
+        required=MONTHLY_WINDOW_DAYS,
+        unit="day(s)",
+        observed_field="days_observed",
+        required_field="days_in_month",
+    )
+    window = reading.window
+    if reading.met and window is not None and not window.complete:
+        # The producer contract's `ok` means "no day observed so far fails";
+        # the ratified target is the WHOLE month, so a partial month is not
+        # rendered MET on a standing row.
+        reading = replace(
+            reading,
+            met=False,
+            detail=(
+                f"{reading.detail} — {window.observed} of {window.required} day(s) of the month "
+                "observed; the ratified target is the full calendar month"
+            ),
+        )
+    return _standing_clause(
         name,
-        requirement + _MONTHLY_RULING_SENTENCE,
-        ev.read_windowed_objective(
-            store,
-            key,
-            required=MONTHLY_WINDOW_DAYS,
-            unit="day(s)",
-            observed_field="days_observed",
-            required_field="days_in_month",
-        ),
+        requirement + _MONTHLY_STANDING_SENTENCE,
+        reading,
         phase=f"data-phase{_OBJECTIVE_PHASE}",
+        ruling=CALENDAR_FLOOR_STANDING_RULING,
     )
 
 
@@ -1868,16 +1923,18 @@ def _clause_vendor_divergence_daily(store: ev.GateStore, *, trading_day: dt.date
 
 
 def _clause_phase2_executor_collection_writes_zero(store: ev.GateStore) -> Clause:
-    return _observation_window_clause(
+    return _standing_clause(
         "data.phase2.executor_collection_writes_zero",
         (
             "the executor profile shows no collection writes over 7 days (plan §6 phase-2 exit) "
-            "— the producer/consumer separation the collector split exists to establish. Graded "
-            "under Brian's 2026-10-03 ruling: MET once the profile is published and shows zero "
-            "writes, however many of the 7 days it covers so far"
+            "— the producer/consumer separation the collector split exists to establish. "
+            "STANDING under Brian's 2026-09-21 ruling (alpha-engine-config-I11305): the 7-day "
+            "window is reported daily and gates no data phase; the migration itself stays "
+            "gating as the phase-2 per-unit identity column (alpha-engine-config-I10756)"
         ),
         xc.read_executor_collection_writes_zero(store),
         phase="data-phase2",
+        ruling=CALENDAR_FLOOR_STANDING_RULING,
     )
 
 
@@ -1885,7 +1942,7 @@ def _clause_phase3_sustained_window(
     store: ev.GateStore, weekly: xc.CycleSet, *, trading_day: dt.date
 ) -> Clause:
     name = "data.phase3.sustained_window"
-    return _observation_window_clause(
+    return _standing_clause(
         name,
         (
             f"every clause MET with 0 UNMEASURABLE and 0 UNREPORTED, SUSTAINED over "
@@ -1893,9 +1950,9 @@ def _clause_phase3_sustained_window(
             "Saturdays (plan §6 phase-3 exit), read from the gate's own dated readings — which "
             "are never overwritten, and are therefore the only record a sustain claim can "
             "honestly be built on. This clause is excluded from the readings it grades, so the "
-            "window is not its own precondition. Graded under Brian's 2026-10-03 ruling: MET "
-            "once a dated reading and a complete Saturday exist and every reading and Saturday "
-            "inside the window since is clean"
+            "window is not its own precondition. STANDING under Brian's 2026-09-21 ruling "
+            "(alpha-engine-config-I11305): a reliability soak, reported daily and gating no "
+            "data phase — phase 3 exits on the board being green on its non-calendar clauses"
         ),
         xc.read_sustained_window(
             store,
@@ -1907,6 +1964,7 @@ def _clause_phase3_sustained_window(
             saturdays=xc.PHASE3_SATURDAYS,
         ),
         phase="data-phase3",
+        ruling=CALENDAR_FLOOR_STANDING_RULING,
     )
 
 

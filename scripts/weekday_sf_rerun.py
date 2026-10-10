@@ -220,7 +220,10 @@ EOD_RECONCILE_STAGES: tuple[Stage, ...] = (
         "CheckSkipEODReconcile", "EODReconcile",
         # alpha-engine-config-I12020: every non-failure route to the stop now
         # enters DrainTraderReconcile first, so it witnesses the same thing.
-        frozenset({"DrainTraderReconcile", "StopTradingInstance"}),
+        # 2026-10-09: and since box ownership, every such route enters
+        # CheckBoxOwnedBeforeStop before the drain (a box this execution did
+        # not start is neither drained nor stopped), so it witnesses it too.
+        frozenset({"CheckBoxOwnedBeforeStop", "DrainTraderReconcile", "StopTradingInstance"}),
         # config-I2702: precondition-probe data-gap route — EODReconcile was
         # bypassed because run_date's SPY close wasn't yet verified-present
         # in ArcticDB, NOT because an operator asked to skip it. The closed
