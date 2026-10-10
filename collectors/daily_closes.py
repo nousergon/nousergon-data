@@ -1743,7 +1743,13 @@ def _collect_window(
         # and the morning collection proceeds (the per-date discrepancy logging,
         # the morning polygon re-fetch, and the blocking Saturday backfill audit
         # all remain in place).
-        if registry is not None and detected_actions:
+        # Declared actions (corporate_actions.declared, alpha-engine-config-I11806)
+        # are not in polygon's feed, so a morning with no polygon split must
+        # still run sync: it is what brings the ArcticDB universe onto a
+        # declared action's basis, evidence-gated and a no-op once it is there.
+        from corporate_actions.declared import declared_tickers
+
+        if registry is not None and (detected_actions or declared_tickers()):
             try:
                 import corporate_actions
 
@@ -1760,6 +1766,10 @@ def _collect_window(
                     tickers=tickers,
                     registry=registry,
                     actions=detected_actions,
+                    # A run entered only for the declared actions keeps the
+                    # polygon budget it had before they existed: no dividend
+                    # scan on a morning with no split.
+                    dividend_actions=None if detected_actions else [],
                 )
                 n_applied = sum(
                     1
