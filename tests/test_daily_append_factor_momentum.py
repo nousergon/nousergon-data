@@ -33,11 +33,14 @@ def test_today_row_aligned_to_stored_schema():
 
 
 def test_factor_momentum_daily_update_invoked_after_write_loop():
-    """update_factor_momentum_latest is imported + called with today_ts and the
-    canonical writer, gated by the FACTOR_MOMENTUM_DAILY_ENABLED env var."""
+    """The factor-momentum pass runs through the one-write second pass
+    (`features.second_pass.update_cross_sectional_latest`, I11792), called with
+    today_ts and the canonical writer, gated by FACTOR_MOMENTUM_DAILY_ENABLED."""
     src = _source()
-    assert "from features.factor_momentum import update_factor_momentum_latest" in src
-    assert "update_factor_momentum_latest(" in src
+    assert "from features.second_pass import update_cross_sectional_latest" in src
+    assert "update_cross_sectional_latest(" in src
     assert "FACTOR_MOMENTUM_DAILY_ENABLED" in src
     # Best-effort: wrapped so it never fails the daily pipeline.
-    assert "Factor-momentum daily update FAILED" in src
+    assert "Cross-sectional second pass FAILED" in src
+    second_pass = (_DAILY_APPEND.parent.parent / "features" / "second_pass.py").read_text()
+    assert "Factor-momentum daily update FAILED" in second_pass
