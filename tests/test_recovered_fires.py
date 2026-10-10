@@ -26,6 +26,8 @@ FIRE = dt.datetime(2026, 10, 3, 9, 0, tzinfo=UTC)
 #: The Monday reading C12 predicted against.
 MONDAY = dt.date(2026, 10, 5)
 MONDAY_READ = dt.datetime(2026, 10, 5, 23, 30, tzinfo=UTC)
+#: Fri 2026-10-09 07:30 America/New_York — the morning fire declared pending a ruling.
+MORNING_FIRE = dt.datetime(2026, 10, 9, 11, 30, tzinfo=UTC)
 #: The next Saturday's fire, which no declaration names.
 NEXT_FIRE = dt.datetime(2026, 10, 10, 9, 0, tzinfo=UTC)
 NEXT_MONDAY = dt.date(2026, 10, 12)
@@ -107,14 +109,25 @@ def _store(root, *executions: dict, morning: list[dict] | None = None):
 # ── the committed declaration ───────────────────────────────────────────────
 
 
-def test_the_committed_file_declares_exactly_the_10_03_weekly_fire():
+def test_the_committed_file_declares_exactly_the_10_03_weekly_and_10_09_morning_fires():
     entries = standalone.load_recovered_fires(standalone.RECOVERED_FIRES_PATH)
-    assert [(e.schedule, e.fire) for e in entries] == [("data-collection-weekly", FIRE)]
+    assert [(e.schedule, e.fire) for e in entries] == [
+        ("data-collection-weekly", FIRE),
+        ("data-collection-morning", MORNING_FIRE),
+    ]
     entry = entries[0]
     assert entry.machine == WEEKLY
     assert entry.fire_execution == "ff6ac0c4-10a8-471f-9905-d73f00012ff5"
     assert entry.recovery_execution == "weekly-recovery-2026-10-02-1"
     assert "#2036" in entry.root_cause_fix and entry.tracker == "alpha-engine-config-I11812"
+    assert entry.ruled
+    morning = entries[1]
+    assert morning.machine == "ne-data-collection-morning"
+    assert morning.fire_execution == "a36ac8d0-38e6-4001-bfa8-174117a47f96"
+    assert morning.recovery_execution == "morning-rerun-2026-10-09-pyarrow-1"
+    assert "#2128" in morning.root_cause_fix and morning.tracker == "alpha-engine-config-I10793"
+    # Inert until Brian rules; a merge alone must not change any reading.
+    assert not morning.ruled
 
 
 # ── the exception, when ruled ───────────────────────────────────────────────
