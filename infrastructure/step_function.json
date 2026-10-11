@@ -625,9 +625,9 @@
       "Retry": [
         {
           "ErrorEquals": [
-            "DynamoDB.ServiceException",
-            "DynamoDB.RequestLimitExceededException",
-            "DynamoDB.TimeoutException"
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
           ],
           "MaxAttempts": 1,
           "IntervalSeconds": 2,
@@ -637,7 +637,7 @@
       "Catch": [
         {
           "ErrorEquals": [
-            "DynamoDB.ConditionalCheckFailedException"
+            "DynamoDb.ConditionalCheckFailedException"
           ],
           "Comment": "Mutex held by another execution of the same run-slot (state-machine + pipeline_role + run_date) \u2014 the duplicate-trigger case we are explicitly protecting against, now at ANY stagger, not just same-minute. Fail loud so the dup is visible in SF execution history + SNS alert.",
           "Next": "MutexConflict",

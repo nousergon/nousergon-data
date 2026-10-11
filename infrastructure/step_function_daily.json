@@ -276,7 +276,7 @@
       "Catch": [
         {
           "ErrorEquals": [
-            "DynamoDB.ConditionalCheckFailedException"
+            "DynamoDb.ConditionalCheckFailedException"
           ],
           "Comment": "Mutex held by another concurrent execution in the same minute bucket — the duplicate-trigger case we are explicitly protecting against. Fail loud so the dup is visible in SF execution history + SNS alert (HandleFailure picks it up via MutexConflict's terminal Fail).",
           "Next": "MutexConflict",
