@@ -330,7 +330,7 @@
       "Catch": [
         {
           "ErrorEquals": [
-            "DynamoDB.ConditionalCheckFailedException"
+            "DynamoDb.ConditionalCheckFailedException"
           ],
           "Comment": "Mutex held by another concurrent execution in the same minute bucket \u2014 the duplicate-trigger case we are explicitly protecting against. Fail loud (EOD has its own ForceStopInstance cost-guard on the failure path, so a MutexConflict still releases the trading instance).",
           "Next": "MutexConflict",
