@@ -146,7 +146,8 @@ case "$1 $2" in
   "show -p")
     if [ "$3" = ActiveState ]; then next states; else echo success; fi ;;
   "list-jobs --no-legend")
-    for _ in $(seq 1 "$(next jobs)"); do echo "1 {UNIT} start waiting"; done ;;
+    count=$(next jobs)
+    for ((i=0; i<count; i++)); do echo "1 {UNIT} start waiting"; done ;;
 esac
 """
     for name, body in (("systemctl", fake), ("sleep", "#!/usr/bin/env bash\nexit 0\n")):
