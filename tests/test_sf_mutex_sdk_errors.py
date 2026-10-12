@@ -31,6 +31,13 @@ def test_sdk_error_routes_to_its_intended_outcome(path, error, target):
         catch["Next"] for catch in task["Catch"]
         if error in catch["ErrorEquals"] or "States.ALL" in catch["ErrorEquals"]
     )
+    if error.endswith("ConditionalCheckFailedException") and "ReadRunSlotHolder" in states:
+        # alpha-engine-config-I12228 (weekly only): a held slot is first
+        # inspected, and taken over only from a terminal-FAILED holder; every
+        # other answer still ends at MutexConflict. The takeover chain itself
+        # is pinned by tests/test_sf_run_slot_takeover_and_release.py.
+        assert route == "ReadRunSlotHolder"
+        route = target
     assert route == target
     if error.endswith("ConditionalCheckFailedException"):
         assert states[route]["Type"] == "Fail"
@@ -38,6 +45,9 @@ def test_sdk_error_routes_to_its_intended_outcome(path, error, target):
 
 @pytest.mark.parametrize("path", DEFINITIONS, ids=lambda p: p.name)
 def test_sdk_retry_and_catch_use_sdk_error_namespace(path):
-    task = json.loads(path.read_text())["States"]["AcquireMutex"]
-    for handler in task.get("Retry", []) + task["Catch"]:
-        assert not any(e.startswith("DynamoDB.") for e in handler["ErrorEquals"])
+    states = json.loads(path.read_text())["States"]
+    for name, task in states.items():
+        if not str(task.get("Resource", "")).startswith("arn:aws:states:::aws-sdk:dynamodb:"):
+            continue
+        for handler in task.get("Retry", []) + task.get("Catch", []):
+            assert not any(e.startswith("DynamoDB.") for e in handler["ErrorEquals"]), name

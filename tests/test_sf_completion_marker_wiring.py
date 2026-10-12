@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 from tests.sf_degraded_summary_helpers import assert_completion_notifier_chain
+from tests.sf_run_slot_release_helpers import through_release
 
 _INFRA = Path(__file__).resolve().parent.parent / "infrastructure"
 
@@ -133,6 +134,6 @@ def test_the_preflight_degraded_edge_ends_in_the_shared_fail_terminal(weekly_sta
     assert choice["Default"] == "ShellRunComplete"
     assert weekly_states["ShellRunComplete"]["Type"] == "Succeed"
     (rule,) = choice["Choices"]
-    assert rule["Next"] == "DegradedRun"
-    assert weekly_states["NotifyShellRunCompleteDegraded"]["Next"] == "DegradedRun"
+    assert through_release(weekly_states, rule["Next"]) == "DegradedRun"
+    assert through_release(weekly_states, weekly_states["NotifyShellRunCompleteDegraded"]["Next"]) == "DegradedRun"
     assert "End" not in weekly_states["NotifyShellRunCompleteDegraded"]

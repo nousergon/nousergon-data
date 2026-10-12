@@ -36,7 +36,7 @@ from features.feature_engineer import (
     MIN_ROWS_FOR_FEATURES,
     compute_features,
 )
-from features.factor_momentum import update_factor_momentum_latest
+from features.second_pass import update_cross_sectional_latest
 from features.cross_sectional import FACTOR_LOADING_SOURCES
 from features.postflight import ALL_NULL_EXPECTED
 from features.compute import (
@@ -113,7 +113,9 @@ log = logging.getLogger(__name__)
 # them to NaN as a schema-align placeholder (see the `_stored_col in
 # FEATURES` block a few hundred lines down), then two SECOND PASSES after
 # the write loop (`update_factor_momentum_latest`,
-# `update_factor_loading_zscores_latest`) fill in the real values over the
+# `update_factor_loading_zscores_latest` — written together in one
+# `update_batch` by `features.second_pass.update_cross_sectional_latest`
+# since alpha-engine-config-I11792) fill in the real values over the
 # freshly-written rows. Counting write-time NaN on these columns toward
 # per-ticker coverage (`n_ok`/`n_partial`) is a category error: the value
 # is EXPECTED to be NaN at that instant and is not yet decidable per
@@ -3259,49 +3261,46 @@ def _daily_append_impl(
         # Best-effort/non-fatal by construction (see function docstring).
         _write_feature_store_freshness_sentinel(s3, bucket, library="universe")
 
-        # ── L4484: factor-momentum daily go-forward second pass ──────────────
-        # factor_momentum_ratio is a cross-sectional-time-series feature that
-        # can't be produced per-ticker in the loop above (it ranks the WHOLE
-        # cross-section + builds factor-return portfolios). Now that today's
-        # OHLCV+loadings rows are written, recompute the latest date's value
-        # over a slim trailing panel and update it in place. Best-effort +
-        # OBSERVE: the function never raises; gate off via the env var if it
-        # ever misbehaves. Skipped on dry_run (no writes happened).
+        # ── L4484 + C.1: the cross-sectional second pass, ONE write ──────────
+        # factor_momentum_ratio (L4484) and the 9 *_zscore Barra loadings (C.1)
+        # are cross-sectional features that can't be produced per-ticker in the
+        # loop above (they rank / z-score the WHOLE cross-section). Now that
+        # today's OHLCV+loadings rows are written, compute both over the
+        # cross-section and update today's row in place. Best-effort: never
+        # raises into the daily pipeline; each half gates off independently
+        # via FACTOR_MOMENTUM_DAILY_ENABLED / FACTOR_LOADING_ZSCORE_DAILY_ENABLED.
+        # Skipped on dry_run (no writes happened).
+        #
+        # alpha-engine-config-I11792: the two passes used to each read today's
+        # rows back and `update_batch` them separately, so every universe
+        # symbol got three ArcticDB versions per burst (this loop's write plus
+        # one per pass). They read only the raw columns the loop above stored
+        # and write disjoint columns, so `features.second_pass` now writes both
+        # in ONE update_batch — two versions per burst, same final row.
         fm_result: dict | None = None
-        if os.environ.get("FACTOR_MOMENTUM_DAILY_ENABLED", "true").lower() != "false":
-            try:
-                fm_result = update_factor_momentum_latest(
-                    universe_lib, stock_tickers, today_ts,
-                    canonical_fn=to_arctic_canonical,
-                )
-                log.info("Factor-momentum daily update: %s", json.dumps(fm_result, default=str))
-            except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
-                log.warning("Factor-momentum daily update FAILED (OBSERVE, non-fatal): %s", exc)
-                fm_result = {"status": "error", "error": str(exc), "tickers_written": 0}
-
-        # ── C.1: factor-loading z-score daily go-forward second pass ─────────
-        # The 9 *_zscore Barra loadings (C.3 / predictor risk_model_persist)
-        # are cross-sectional — same structural gap as factor_momentum_ratio.
-        # S3 feature store already runs apply_factor_zscores in compute.py;
-        # this pass keeps ArcticDB (predictor training + C.2b F+D persistence)
-        # in sync. Best-effort + gated; never fails the daily pipeline.
         flz_result: dict | None = None
-        if os.environ.get("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "true").lower() != "false":
-            try:
-                from features.cross_sectional import update_factor_loading_zscores_latest
-                flz_result = update_factor_loading_zscores_latest(
-                    universe_lib, stock_tickers, today_ts,
-                    canonical_fn=to_arctic_canonical,
-                )
-                log.info(
-                    "Factor-loading z-score daily update: %s",
-                    json.dumps(flz_result, default=str),
-                )
-            except Exception as exc:
-                log.warning(
-                    "Factor-loading z-score daily update FAILED (non-fatal): %s", exc,
-                )
-                flz_result = {"status": "error", "error": str(exc), "tickers_written": 0}
+        try:
+            fm_result, flz_result = update_cross_sectional_latest(
+                universe_lib, stock_tickers, today_ts,
+                factor_momentum=(
+                    os.environ.get("FACTOR_MOMENTUM_DAILY_ENABLED", "true").lower() != "false"
+                ),
+                factor_loading_zscores=(
+                    os.environ.get("FACTOR_LOADING_ZSCORE_DAILY_ENABLED", "true").lower() != "false"
+                ),
+                canonical_fn=to_arctic_canonical,
+            )
+        except Exception as exc:  # belt-and-suspenders — never fail the daily pipeline
+            log.warning("Cross-sectional second pass FAILED (non-fatal): %s", exc)
+            fm_result = {"status": "error", "error": str(exc), "tickers_written": 0}
+            flz_result = {"status": "error", "error": str(exc), "tickers_written": 0}
+        if fm_result is not None:
+            log.info("Factor-momentum daily update: %s", json.dumps(fm_result, default=str))
+        if flz_result is not None:
+            log.info(
+                "Factor-loading z-score daily update: %s",
+                json.dumps(flz_result, default=str),
+            )
 
         # ── I10939: honest cross-sectional coverage, recorded SEPARATELY ─────
         # from n_ok/n_partial rather than folded into them. Neither second

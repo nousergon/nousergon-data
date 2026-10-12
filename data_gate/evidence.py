@@ -2194,13 +2194,15 @@ def read_parity(store: GateStore, *, trading_day: dt.date) -> Reading:
     if not met:
         # alpha-engine-config-I12023: the report's own reading above is never
         # rewritten. A separate, append-only adjudication record citing it may
-        # prove every exception away on independent evidence; only then does
-        # the clause read MET, and the detail still prints the failed reading.
+        # prove every exception away on independent evidence, or carry the
+        # owner's ruling on a record that attributes every breaching path
+        # (Brian, 2026-10-12); only then does the clause read MET, and the
+        # detail still prints the failed reading and every accepted breach.
         adjudication = _read_parity_adjudication(store, key, report_day, document)
         if adjudication is not None:
             evidence_keys = (key, adjudication.record_key)
             detail += " — " + adjudication.summary()
-            if adjudication.cleared:
+            if adjudication.cleared or adjudication.ruled:
                 met = True
     if frozen:
         # No window phrase: freshness is not applied to a frozen reading

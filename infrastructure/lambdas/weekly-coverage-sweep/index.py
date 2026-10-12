@@ -45,6 +45,9 @@ last two are the ones that must not be collapsed into either of the first:
   every would-be-absent stage and the re-sweep command, and
   ``publish_sweep`` emits ``StageCoverageSweepDeferred=1`` on its own metric
   rather than letting the deferral be inferred from another metric's silence.
+  This handler also folds findings + absent + deferred into the single
+  ``StageCoverageSweepAlarmable`` point that ``alpha-engine-stage-coverage-findings``
+  alarms on (alpha-engine-config-I11792).
 - ``unavailable`` — **the sweep did not run.** "Found nothing", "could not
   establish" and "did not run" are three different facts and only the last
   means the reader itself is dead (``principles.md`` §2.7). This handler
@@ -99,6 +102,58 @@ OUTCOME_DEFERRED = "deferred"
 #: ``absent`` is a false positive guaranteed on every run, and it was one of
 #: the 13 on 2026-09-04 (``alpha-engine-config-I10170``).
 SWEEP_STAGE = os.environ.get("SWEEP_STAGE", "WeeklyCoverageSweep")
+
+#: The ONE series ``alpha-engine-stage-coverage-findings`` alarms on
+#: (alpha-engine-config-I11792 Tier 3, 2026-10-09). Before then three alarms
+#: watched three of the lib's series - ``-findings`` on
+#: ``StageCoverageSweepFindings``, ``-absent`` on ``StageCoverageSweepAbsent``,
+#: ``-deferred`` on ``StageCoverageSweepDeferred`` - and every one of them pages
+#: the same topic for the same reader to open the same sweep artifact. This sums
+#: them so one alarm covers all three. The lib keeps publishing its own series
+#: (weekly, so they cost ~nothing); this is an ADDITIONAL point, written here
+#: rather than in nousergon_lib so the fold needs no lib release and pin bump.
+ALARMABLE_METRIC = "StageCoverageSweepAlarmable"
+ALARMABLE_NAMESPACE = "AlphaEngine"
+
+
+def alarmable_count(sweep) -> float:
+    """``findings + absent + deferred``, with the lib's own withholding rule.
+
+    ``absent`` counts only when ``coverage_established`` - the lib WITHHOLDS
+    ``StageCoverageSweepAbsent`` otherwise, because a stage not entered YET is
+    not a stage never entered (alpha-engine-config-I10170). The deferral is
+    what stays loud in that case, as 1, exactly as ``StageCoverageSweepDeferred``
+    does. So this is never more alarming than the three series it replaces,
+    and never less.
+    """
+    absent = sweep.absent if sweep.coverage_established else 0
+    return float(sweep.findings + absent + (1 if sweep.deferred else 0))
+
+
+def publish_alarmable(sweep, *, cloudwatch_client, pipeline: str = PIPELINE) -> bool:
+    """Put the one alarmable point. Never raises; a failure is logged at ERROR.
+
+    Fail-soft for the same reason ``publish_sweep`` is: this state sits
+    downstream of the run's real success terminal. It is not the only voice -
+    a finding or a deferral has ALREADY paged from this handler via
+    ``krepis.alerts`` - and the sweep's liveness is ``StageCoverageSweepRan``'s
+    alarm, not this one's, so a missed point here is not mistaken for health.
+    """
+    try:
+        value = alarmable_count(sweep)
+        cloudwatch_client.put_metric_data(
+            Namespace=ALARMABLE_NAMESPACE,
+            MetricData=[{
+                "MetricName": ALARMABLE_METRIC,
+                "Dimensions": [{"Name": "Pipeline", "Value": pipeline}],
+                "Value": value,
+                "Unit": "Count",
+            }],
+        )
+        return True
+    except Exception:  # noqa: BLE001 — fail-soft, recorded at ERROR
+        logger.error("coverage sweep: FAILED to publish %s", ALARMABLE_METRIC, exc_info=True)
+        return False
 
 
 #: `RunScope`'s own artifact key template (mirrors
@@ -364,18 +419,21 @@ def handler(event, _context):
         }
 
     published = False
+    alarmable_published = False
     augmented = False
     write_error: str | None = None
     try:
         import boto3
 
+        cloudwatch_client = boto3.client("cloudwatch", region_name=region)
         publish_sweep(
             sweep,
             s3_client=s3_client,
-            cloudwatch_client=boto3.client("cloudwatch", region_name=region),
+            cloudwatch_client=cloudwatch_client,
             bucket=BUCKET,
         )
         published = True
+        alarmable_published = publish_alarmable(sweep, cloudwatch_client=cloudwatch_client)
         if sweep.cycle is not None:
             # Both partitions the state machine dual-wrote get the cycle
             # verdict, or a consumer on the legacy family reads UNKNOWN beside
@@ -450,5 +508,6 @@ def handler(event, _context):
         "legacy_partition_rows": sweep.legacy_partition_rows,
         "explanation": explanation,
         "published": published,
+        "alarmable_published": alarmable_published,
         "marker_augmented": augmented,
     }
