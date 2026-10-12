@@ -19,6 +19,12 @@
    "new": "VMRK",
    "effective": "2026-08-18",
    "evidence": "Same instrument under a new symbol: reference/price_cache/VMRK.parquet (read 2026-09-24) carries ten years of history, and its 2,466 closes that overlap EQR.parquet match to within 0.03% (close ratio 0.99973-1.00000, dividend-adjustment drift only). Absent from the reference changes table, which lists AVB's 2026-08-17 removal but no change for EQR or VMRK. alpha-engine-config-I11470."
+  },
+  {
+   "old": "PSKY",
+   "new": "SKYD",
+   "effective": "2026-10-06",
+   "evidence": "Paramount Skydance symbol change; identity preserved, no index change. reference/price_cache/SKYD.parquet (read 2026-10-10) carries ten years of history, and its 2,510 closes that overlap PSKY.parquet (2016-10-10..2026-10-05) match to within 0.0001% (close ratio 0.999999-1.000001). PSKY's last bar is 2026-10-05 and SKYD entered the roster 2026-10-06. Absent from the reference changes table. Without this entry the 2026-10-10 weekly D02 failed _DegradedRun on 'observed removed PSKY / added SKYD not in reference'."
   }
  ]
 }
