@@ -721,7 +721,7 @@
     },
     "CheckSkipRefreshExecutorDeploy": {
       "Type": "Choice",
-      "Comment": "Per-task rerun gate (L4607) for the executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} (operator-replay only) routes past RefreshExecutorDeploy to CheckSkipPostMarketData; missing flag = run as normal. Kept in this machine even though the post-close pipeline refreshed the checkout hours earlier: this pipeline may be the one that BOOTS the box (backstop, rerun, heal replay), and alpha-engine-config-I7586 measured what a booted box does to the frozen pin \u2014 boot-pull moves the checkout, .frozen_executor_sha stays behind, and EODReconcile's ExecutorPreflight drift guard fails. Refreshing here re-freezes the pin to what is actually on the box.",
+      "Comment": "Per-task rerun gate (L4607) for the executor-deploy refresh (config#1549). Input {\"skip_refresh_executor_deploy\": true} (operator-replay only) routes past RefreshExecutorDeploy to CaptureSnapshot (the missing-snapshot self-heal); missing flag = run as normal. Kept in this machine even though the post-close pipeline refreshed the checkout hours earlier: this pipeline may be the one that BOOTS the box (backstop, rerun, heal replay), and alpha-engine-config-I7586 measured what a booted box does to the frozen pin \u2014 boot-pull moves the checkout, .frozen_executor_sha stays behind, and EODReconcile's ExecutorPreflight drift guard fails. Refreshing here re-freezes the pin to what is actually on the box.",
       "Choices": [
         {
           "And": [
@@ -742,7 +742,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "CheckSkipPostMarketData"
+          "Next": "CaptureSnapshot"
         }
       ],
       "Default": "RefreshExecutorDeploy"
@@ -854,7 +854,7 @@
         {
           "Variable": "$.refresh_executor_deploy_poll.Status",
           "StringEquals": "Success",
-          "Next": "CheckSkipPostMarketData"
+          "Next": "CaptureSnapshot"
         },
         {
           "Variable": "$.refresh_executor_deploy_poll.Status",
@@ -891,6 +891,165 @@
         "instance_id.$": "$.refresh_executor_deploy_poll.InstanceId"
       },
       "ResultPath": "$.error",
+      "Next": "HandleFailure"
+    },
+    "CaptureSnapshot": {
+      "Type": "Task",
+      "Comment": "Missing-snapshot SELF-HEAL (alpha-engine-config-I12220; Brian 2026-10-10: \"we should make this failure heal itself\"). EODReconcile reads trades/snapshots/{run_date}.json and has no live-IB fallback, so a day whose post-close CaptureSnapshot failed (2026-10-09: the 22:30Z backstop cold-started the box and its ~30 s connect retry hit IB Gateway before login) used to fail here two hours later. This state runs on the box this execution has just started (or inherited, see ResolveBoxOwnership), right after the deploy refresh and BEFORE the collection wait, the heal loop and EODReconcile, so the capture lands as early in the evening as possible. One SSM command, three steps: (1) the snapshot is already in S3 -> exit 0 and NO capture, no IB session (the normal day); (2) the ET date is no longer run_date -> exit non-zero with the reason on stderr, because a capture is live-only and after ET midnight it would record the wrong session (snapshot_capturer.py refuses it too); (3) otherwise run snapshot_capturer.py, which waits up to 420 s for IB Gateway READINESS (API port open AND logged in past the paper-trading disclaimer) and fails with gateway_not_ready naming the last state if it never comes. Write-once: the capturer's create-only put keeps any snapshot that raced in first. Market hours: this state is downstream of MarketHoursGate and PreSessionWindowChoice (nousergon-data#2129), so it never runs in or just before a session. Box ownership (nousergon-data#2127/#2129): this state starts and stops nothing; a heal replay that inherits the box finds the snapshot present and exits at step (1). Failure is fail-CLOSED: PageCaptureSnapshotIrreversibleFailure -> HandleFailure -> CheckBoxOwnedBeforeForceStop.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands.$": "States.Array('set -o pipefail', 'cd /home/ec2-user/alpha-engine', 'export AWS_REGION=us-east-1 AWS_DEFAULT_REGION=us-east-1', 'export ALPHA_ENGINE_DEPLOYED=1', 'export FLOW_DOCTOR_ENABLED=1', States.Format('if aws s3api head-object --bucket alpha-engine-research --key trades/snapshots/{}.json >/dev/null 2>&1; then echo \"snapshot_self_heal: trades/snapshots/{}.json present, no capture\"; exit 0; fi', $.run_date, $.run_date), States.Format('if [ \"$(TZ=America/New_York date +%F)\" != \"{}\" ]; then echo \"snapshot_self_heal: trades/snapshots/{}.json is MISSING and the ET date is now $(TZ=America/New_York date +%F): past the same-ET-day capture deadline, a live capture would record the wrong session\" >&2; exit 3; fi', $.run_date, $.run_date), States.Format('echo \"snapshot_self_heal: trades/snapshots/{}.json missing, capturing now\"', $.run_date), 'source .venv/bin/activate', States.Format('python -m krepis.ssm_log_capture run --correlation-id {} --slug snapshot --log /var/log/snapshot.log -- python executor/snapshot_capturer.py --date {}', $$.Execution.Name, $.run_date))",
+          "executionTimeout": [
+            "720"
+          ]
+        },
+        "TimeoutSeconds": 120
+      },
+      "TimeoutSeconds": 780,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 30,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "sendCommand itself failed (SSM API, box not registered): fail-CLOSED through the same page as a failed capture.",
+          "Next": "PageCaptureSnapshotIrreversibleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultPath": "$.snapshot_result",
+      "Next": "WaitForCaptureSnapshot"
+    },
+    "WaitForCaptureSnapshot": {
+      "Type": "Task",
+      "Comment": "Polls the self-heal capture. StandardErrorContent is carried (never StandardOutputContent) so a gateway_not_ready or past-deadline reason reaches the failure page and HandleFailure, not just an exit code.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.snapshot_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "PageCaptureSnapshotIrreversibleFailure",
+          "ResultPath": "$.error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "StandardErrorContent.$": "$.StandardErrorContent",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId"
+      },
+      "ResultPath": "$.snapshot_poll",
+      "Next": "CheckSnapshotStatus"
+    },
+    "CheckSnapshotStatus": {
+      "Type": "Choice",
+      "Comment": "Success (snapshot present, or captured now) -> CheckSkipPostMarketData, the pipeline as before. Any terminal non-Success -> SnapshotStatusError, fail-closed.",
+      "Choices": [
+        {
+          "Variable": "$.snapshot_poll.Status",
+          "StringEquals": "Success",
+          "Next": "CheckSkipPostMarketData"
+        },
+        {
+          "Variable": "$.snapshot_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "SnapshotWait"
+        },
+        {
+          "Variable": "$.snapshot_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "SnapshotWait"
+        },
+        {
+          "Variable": "$.snapshot_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "SnapshotWait"
+        }
+      ],
+      "Default": "SnapshotStatusError"
+    },
+    "SnapshotWait": {
+      "Type": "Wait",
+      "Comment": "The readiness wait alone can take 420 s on a cold box; poll every 10 s.",
+      "Seconds": 10,
+      "Next": "WaitForCaptureSnapshot"
+    },
+    "SnapshotStatusError": {
+      "Type": "Pass",
+      "Comment": "Choice Default path: synthesize $.error from the poll (stderr included) for the page and HandleFailure.",
+      "Parameters": {
+        "source": "snapshot_self_heal",
+        "run_date.$": "$.run_date",
+        "status.$": "$.snapshot_poll.Status",
+        "status_details.$": "$.snapshot_poll.StatusDetails",
+        "response_code.$": "$.snapshot_poll.ResponseCode",
+        "stderr.$": "$.snapshot_poll.StandardErrorContent",
+        "command_id.$": "$.snapshot_poll.CommandId",
+        "instance_id.$": "$.snapshot_poll.InstanceId"
+      },
+      "ResultPath": "$.error",
+      "Next": "PageCaptureSnapshotIrreversibleFailure"
+    },
+    "PageCaptureSnapshotIrreversibleFailure": {
+      "Type": "Task",
+      "Comment": "The self-heal could not produce the snapshot: the post-close capture already failed (that is why it was missing) and this same-evening capture failed too, so EODReconcile cannot run for run_date and the window closes at ET midnight. Distinct page from the generic HandleFailure one, carrying the capture's stderr (gateway_not_ready reason or the past-deadline line). Own Catch so an SNS failure cannot block HandleFailure.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject": "Alpha Engine EOD reconcile: snapshot self-heal FAILED, act before ET midnight",
+        "Message.$": "States.Format('trades/snapshots/{}.json is missing and ne-postclose-reconcile-pipeline could not capture it (alpha-engine-config-I12220 self-heal). EODReconcile cannot run for this date without it, and a capture is live-only: it must be taken before ET midnight. Manual capture: start the trading box, then SSM python executor/snapshot_capturer.py --date {} and replay the reconcile. Detail: {}', $.run_date, $.run_date, States.JsonToString($.error))"
+      },
+      "ResultPath": "$.capture_snapshot_irreversible_notify",
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "ResultPath": null,
+          "Next": "HandleFailure"
+        }
+      ],
       "Next": "HandleFailure"
     },
     "CheckSkipPostMarketData": {
