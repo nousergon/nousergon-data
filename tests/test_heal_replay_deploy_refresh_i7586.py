@@ -80,16 +80,21 @@ def test_the_other_skip_flags_are_retained(flag):
     assert REPLAY_INPUT.get(flag) is True
 
 
-def test_a_second_live_ib_capture_is_structurally_impossible():
+def test_a_second_live_ib_capture_cannot_replace_the_days_record():
     """`skip_capture_snapshot` used to be retained here because a second
-    live-IB capture is precisely what it exists to avoid. Since the I11269
-    split the replay targets THIS machine (``$$.StateMachine.Id``), which has
-    no CaptureSnapshot at all — the 16:00 ne-postclose-trading-pipeline owns
-    it — so the protection is structural and the flag would be a dead input.
-    Pinned both ways so neither half can drift back alone."""
+    live-IB capture is precisely what it exists to avoid. Since
+    alpha-engine-config-I12220 this machine has a CaptureSnapshot again, but
+    only as the missing-snapshot self-heal: its command exits before the
+    capturer whenever trades/snapshots/{run_date}.json exists, and the
+    capturer it runs carries no --force, so its create-only put can never
+    replace a snapshot that raced in first. The replay (which targets THIS
+    machine) therefore finds the snapshot present and opens no IB session;
+    the flag would still be a dead input."""
     assert STATES["HealDispatchReplay"]["Parameters"]["StateMachineArn.$"] == "$$.StateMachine.Id"
-    assert "CaptureSnapshot" not in STATES
     assert "skip_capture_snapshot" not in REPLAY_INPUT
+    commands = STATES["CaptureSnapshot"]["Parameters"]["Parameters"]["commands.$"]
+    assert commands.index("s3api head-object") < commands.index("snapshot_capturer.py")
+    assert "--force" not in commands
 
 
 def test_the_parent_hands_the_box_to_the_child_after_dispatching():

@@ -96,7 +96,10 @@ _RECONCILE_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod_reconcile.j
 #: machine -> (definition, the first work gate the refresh must precede).
 _MACHINES = {
     "postclose": (_SF_PATH, "CheckSkipCaptureSnapshot"),
-    "reconcile": (_RECONCILE_PATH, "CheckSkipPostMarketData"),
+    # alpha-engine-config-I12220: the missing-snapshot self-heal is the reconcile
+    # machine's first work step, and it must run refreshed code (its gateway
+    # readiness wait lives in executor/snapshot_capturer.py).
+    "reconcile": (_RECONCILE_PATH, "CaptureSnapshot"),
 }
 
 
@@ -177,7 +180,8 @@ class TestRefreshHoistedToChokepoint:
     def test_refresh_runs_before_any_work_step(self, states, machine):
         # RefreshExecutorDeploy (via its Check…Status Success edge) enters the
         # machine's first work gate (CheckSkipCaptureSnapshot at 16:00,
-        # CheckSkipPostMarketData in the reconcile machine — I11269); and the
+        # CaptureSnapshot, the missing-snapshot self-heal, in the reconcile
+        # machine — I11269, alpha-engine-config-I12220); and the
         # SSM-readiness gate enters the refresh gate first. So the refresh is
         # topologically upstream of every work step.
         succ = [c["Next"] for c in states["CheckRefreshExecutorDeployStatus"]["Choices"]
