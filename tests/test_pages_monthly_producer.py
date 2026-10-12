@@ -266,14 +266,21 @@ def _clause_over(tmp_path, document):
 
 
 def test_the_clause_reads_an_ok_month_as_a_partial_window(tmp_path):
+    # data.pages.monthly is a STANDING row (alpha-engine-config-I11305): the
+    # ratified target is the whole calendar month, so an `ok` document that has
+    # observed 5 of 31 days is reported, not rendered MET.
     clause = _clause_over(tmp_path, m.build_document(_reading_with(1), now=NOW))
-    assert clause.met
-    assert clause.window_observed == 5 and clause.window_required == 31 and not clause.window_complete
+    assert isinstance(clause, clause_module.StandingClause)
+    assert not clause.met and not clause.unmeasurable
+    assert "5 of 31 day(s) of the month observed" in clause.detail
+    assert "full calendar month" in clause.detail
 
 
 def test_the_clause_reads_an_over_budget_month_as_reopened(tmp_path):
     clause = _clause_over(tmp_path, m.build_document(_reading_with(3), now=NOW))
-    assert not clause.met and "REOPENED" in clause.detail
+    # A standing row carries the document's own breach verdict verbatim.
+    assert not clause.met and not clause.unmeasurable
+    assert "status=breach, value=3" in clause.detail
 
 
 def test_closed_previous_month_is_rewritten_early_in_the_month():

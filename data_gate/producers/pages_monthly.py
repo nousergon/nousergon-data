@@ -51,7 +51,8 @@ named in ``unobserved_days`` and is not counted toward ``days_observed``.
 **Verdict.** ``breach`` once the month's page count exceeds
 :data:`MAX_PAGES_PER_MONTH`; otherwise ``ok`` (no day observed so far fails
 the target). The clause reads ``status`` / ``days_observed`` /
-``days_in_month`` under Brian's 2026-10-03 observation-window ruling.
+``days_in_month`` as a STANDING row (Brian's 2026-09-21 ruling,
+alpha-engine-config-I11305): a partial month is reported, not rendered MET.
 
 **Read failures never produce a verdict.** A failed listing, GET or parse
 raises; ``main()`` writes an ``error`` run record and exits non-zero, and the
