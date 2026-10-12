@@ -5,9 +5,9 @@
   "States": {
     "InitializeInput": {
       "Type": "Pass",
-      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer. | 2026-08-20 (alpha-engine-config-I7812): the floor also seeds scanner_resource_kill=false, for the same two reasons the I7282 degraded families are seeded here. (a) HAZARD: BranchAComplete/BranchAFailed hoist it via Parameters.$, which throws States.Runtime on any path that never set it \u2014 and it is set only by ScannerResourceKill, i.e. only on a Scanner resource kill. (b) BOTH POLARITIES (sf-pipeline-policy.md \u00a72.3a rule 3): a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: the one Choice that reads it (CheckScannerResourceKillReason) is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected. | 2026-08-27 (alpha-engine-config-I8809, Brian ruling: dual-write): the floor now stamps THREE date fields, not one. $.calendar_date is date($$.Execution.StartTime) and NEVER changes - it is the execution's own wall-clock day, the right key for anything asking 'when did this fire' (the run-day gate, the mutex slot, an artifact-LastModified freshness comparison). $.run_date starts EQUAL to it and is OVERWRITTEN by NormalizeRunDates with the cycle's TRADING day; it is the right key for anything asking 'which cycle is this' (every artifact prefix, every stage-coverage verdict). $.run_date_family names which of the two $.run_date currently holds, seeded 'calendar_date' here and set to 'trading_day' by NormalizeRunDates - BOTH POLARITIES (sf-pipeline-policy.md 2.3a rule 3): a field that appears only on the normalized path cannot be distinguished from a normalizer that broke. WHY: one weekly cycle was written across TWO S3 partitions - MEASURED on 2026-08-22, 28 _stage_coverage verdicts under 2026-08-21 and 11 under 2026-08-22, same cycle - because this state stamped the CALENDAR date and each consumer then decided for itself whether to normalize. crucible-backtester/infrastructure/_spot_common.sh normalizes; the nousergon-data launchers thread the un-normalized EXECUTION_RUN_DATE (config-I8155). weekly-coverage-sweep reads ONE partition, so its first production firing (2026-08-29) would have reported 28 stages absent. | alpha-engine-config-I11073: the floor seeds research_predictor_degraded_routes={\"routes\":[]} so the ReportCard and Director JSONPaths resolve on EVERY path, including the ones that never enter ResearchPredictorParallel. Nested under a `routes` key because a Pass state's Parameters template must be a JSON object, so SetResearchPredictorDegradedRoutes cannot write a bare array; the payload unwraps it at the contract boundary. | alpha-engine-config-I11106: the floor also seeds model_zoo_unservable=false. Written true ONLY by ModelZooUnservableDeclared (inside ResearchPredictorParallel branch B, on a Success poll whose StandardOutputContent carries the MODEL_ZOO_SELECT_OUTCOME v1 declared-unservable marker) and folded to top scope by SetModelZooUnservable. Deliberately independent of research_predictor_degraded/degraded_summary (sf-pipeline-policy.md \u00a72.3a): the arena correctly refusing to promote is a VERDICT, not a stage failure, and must render as a clean completion. BOTH POLARITIES: seeded here so WriteCompletionMarker/WriteCompletionMarkerDegraded can read it on every path, not only the declared-unservable one.",
+      "Comment": "Layer defaults under the execution input so manual invocations don't have to pass every field. Scheduled EventBridge runs pass sns_topic_arn + ec2_instance_id explicitly; manual runs for partial-execution testing often omit sns_topic_arn, which previously caused HandleFailure/NotifyComplete to error on missing JSONPath. States.JsonMerge with user-input as the second arg lets explicit values win. | 2026-05-17: also stamps run_date = date($$.Execution.StartTime) so every spot stage of one execution keys backtest/{date}/ off ONE date (fixes the Backtester=05-17 vs Evaluator=05-18 UTC-midnight split). User-passed run_date still wins. | 2026-05-18 (shell-run keystone): also seeds the dry-path control vars at their NON-DRY identity values \u2014 preflight_args=\"\" (empty spot-command suffix), research_dry=false, data_phase2_dry=false, regime_action=\"produce\". These exist on EVERY run so the spot States.Format / Lambda Payload .$ references always resolve; on the real Saturday run (no shell_run) they hold these identity values, making every spot command string byte-identical to pre-keystone and every Lambda Payload behaviourally identical (handlers default dry_run_llm/dry_run to false; regime action 'produce' is the pre-keystone hardcoded value). ApplyShellRunDefaults (shell_run=true only) overrides them with the dry values. innermost defaults blob is merged UNDER run_date which is merged UNDER sns_topic_arn which is merged UNDER the user input, so user/ApplyShellRunDefaults values always win. PROVENANCE (config#2281): the sns_topic_arn default in the JsonMerge floor hand-carries the account/region literal (arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts) as a FLOOR ONLY \u2014 $$.Execution.Input wins the merge, so the authoritative source is the CALLER: the EventBridge schedule's Input (CFN alpha-engine-orchestration.yaml should pass sns_topic_arn via !Sub/!Ref so account/region live in ONE place \u2014 that Input change rides the CFN file in alpha-engine-config, not this repo) or an operator StartExecution payload. The floor is retained DELIBERATELY: a bare manual console start with no input must still alert instead of dying in HandleFailure on a missing $.sns_topic_arn. tests/test_sf_sns_arn_single_source.py pins that no publish state hardcodes a TopicArn and no NEW copy of the literal can ship outside the two declared floors (here + NormalizeFailureContext). | 2026-08-13 (alpha-engine-config-I7282, sf-pipeline-policy.md \u00a72.3a rule 3): the floor also seeds the four degraded-flag FAMILIES (gate_degraded / health_check_degraded / parity_degraded / research_predictor_degraded) at false, and both pre-spend gate probe results at {\"Payload\":{\"status\":\"UNKNOWN\"}}. Two reasons, and the second is the load-bearing one. (a) HAZARD: each family is written ONLY by its own degraded Pass state, so on the clean path it is ABSENT, not false \u2014 a bare $.gate_degraded reference in the ReportCard/Director Payload would raise States.Runtime on exactly the runs that are WORKING. Seeding is the same guarded-read convention SetLibPinGateDegradedSummary's Comment documents for stage_error, applied at the floor instead of by omission. (b) BOTH POLARITIES: \u00a72.3a requires the surface to state the verdict on a clean run too \u2014 a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: every Choice reading a family is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected (tests/test_sf_gate_state_wiring.py::test_seeding_does_not_change_the_degraded_notifier_selection pins that). The probe seeds carry status=UNKNOWN and deliberately NO has_drift/has_violation key \u2014 a gate that has not run is not a gate that found nothing (config-I7048/I7277); they are overwritten by the Task's own ResultPath the moment the gate actually runs, and survive only on the skip path and the Catch path, which is precisely when UNKNOWN is the true answer. | 2026-08-20 (alpha-engine-config-I7812): the floor also seeds scanner_resource_kill=false, for the same two reasons the I7282 degraded families are seeded here. (a) HAZARD: BranchAComplete/BranchAFailed hoist it via Parameters.$, which throws States.Runtime on any path that never set it \u2014 and it is set only by ScannerResourceKill, i.e. only on a Scanner resource kill. (b) BOTH POLARITIES (sf-pipeline-policy.md \u00a72.3a rule 3): a field that appears only on the bad path cannot be distinguished from a producer that broke. SAFE against the notifier: the one Choice that reads it (CheckScannerResourceKillReason) is And(IsPresent, BooleanEquals:true), so present-and-false selects exactly what absent selected. | 2026-08-27 (alpha-engine-config-I8809, Brian ruling: dual-write): the floor now stamps THREE date fields, not one. $.calendar_date is date($$.Execution.StartTime) and NEVER changes - it is the execution's own wall-clock day, the right key for anything asking 'when did this fire' (the run-day gate, the mutex slot, an artifact-LastModified freshness comparison). $.run_date starts EQUAL to it and is OVERWRITTEN by NormalizeRunDates with the cycle's TRADING day; it is the right key for anything asking 'which cycle is this' (every artifact prefix, every stage-coverage verdict). $.run_date_family names which of the two $.run_date currently holds, seeded 'calendar_date' here and set to 'trading_day' by NormalizeRunDates - BOTH POLARITIES (sf-pipeline-policy.md 2.3a rule 3): a field that appears only on the normalized path cannot be distinguished from a normalizer that broke. WHY: one weekly cycle was written across TWO S3 partitions - MEASURED on 2026-08-22, 28 _stage_coverage verdicts under 2026-08-21 and 11 under 2026-08-22, same cycle - because this state stamped the CALENDAR date and each consumer then decided for itself whether to normalize. crucible-backtester/infrastructure/_spot_common.sh normalizes; the nousergon-data launchers thread the un-normalized EXECUTION_RUN_DATE (config-I8155). weekly-coverage-sweep reads ONE partition, so its first production firing (2026-08-29) would have reported 28 stages absent. | alpha-engine-config-I11073: the floor seeds research_predictor_degraded_routes={\"routes\":[]} so the ReportCard and Director JSONPaths resolve on EVERY path, including the ones that never enter ResearchPredictorParallel. Nested under a `routes` key because a Pass state's Parameters template must be a JSON object, so SetResearchPredictorDegradedRoutes cannot write a bare array; the payload unwraps it at the contract boundary. | alpha-engine-config-I11106: the floor also seeds model_zoo_unservable=false. Written true ONLY by ModelZooUnservableDeclared (inside ResearchPredictorParallel branch B, on a Success poll whose StandardOutputContent carries the MODEL_ZOO_SELECT_OUTCOME v1 declared-unservable marker) and folded to top scope by SetModelZooUnservable. Deliberately independent of research_predictor_degraded/degraded_summary (sf-pipeline-policy.md \u00a72.3a): the arena correctly refusing to promote is a VERDICT, not a stage failure, and must render as a clean completion. BOTH POLARITIES: seeded here so WriteCompletionMarker/WriteCompletionMarkerDegraded can read it on every path, not only the declared-unservable one. | alpha-engine-config-I12228: also floors collection_not_before = $$.Execution.StartTime, the anchor WaitForCollectionManifests grades collection manifests against. On a scheduled run nothing passes it, so the floor IS the old value and the wait is byte-identical. A rerun passes the failed cycle's ORIGINAL start (scripts/weekly_sf_rerun.py emits it), so it reads the collection manifests of its own cycle - including a data-only rerun that finished before this rerun started - instead of demanding a fresh full collection.",
       "Parameters": {
-        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"parity_verdict_unknown\":false,\"research_predictor_degraded\":false,\"research_predictor_degraded_routes\":{\"routes\":[]},\"model_zoo_unservable\":false,\"director_retro_refused\":false,\"cost_coverage_gap\":false,\"scanner_resource_kill\":false,\"weekly_preflight_blind_spot\":{\"present\":false,\"required_skip_count\":0,\"required_skip_names\":[],\"ran_count\":0,\"skip_count\":0,\"warn_count\":0},\"degraded_summary\":{\"degraded\":false,\"reasons\":{},\"run_date\":null},\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
+        "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"parity_verdict_unknown\":false,\"research_predictor_degraded\":false,\"research_predictor_degraded_routes\":{\"routes\":[]},\"model_zoo_unservable\":false,\"director_retro_refused\":false,\"cost_coverage_gap\":false,\"scanner_resource_kill\":false,\"weekly_preflight_blind_spot\":{\"present\":false,\"required_skip_count\":0,\"required_skip_names\":[],\"ran_count\":0,\"skip_count\":0,\"warn_count\":0},\"degraded_summary\":{\"degraded\":false,\"reasons\":{},\"run_date\":null},\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\",\"collection_not_before\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),$$.Execution.StartTime)),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
@@ -595,7 +595,7 @@
     },
     "AcquireMutex": {
       "Type": "Task",
-      "Comment": "L274 + config#2280 \u2014 DynamoDB conditional PUT on the RUN-SLOT. mutex_key = '{state-machine-name}#{pipeline_role}#{run_date}' ($.run_date is stamped by InitializeInput before any gate). The old key's UTC minute bucket only caught duplicates landing in the SAME minute \u2014 an EventBridge internal retry >60s later, an operator re-paste a minute later, or a re-introduced duplicate rule at minute distance all got fresh keys and ran concurrently (double spot spend + artifact write races on the same run_date prefixes). Keying on run_date makes ANY second cadence execution of the same run-slot lose with ConditionalCheckFailedException \u2192 MutexConflict Fail, regardless of stagger. Staleness: a run-date key has no natural expiry (unlike the minute bucket), so items carry ttl_epoch (~24h, from ComputeMutexTtl) with table TTL enabled as the crashed-holder backstop; the PRIMARY stale-item mechanism is scripts/weekly_sf_rerun.py, which deletes the failed holder's item after verifying the holder execution is terminal (never steals from a RUNNING one). Recovery reruns themselves carry pipeline_role='watch-rerun' (non-cadence) and bypass this state entirely. Redrives resume the SAME execution and never re-enter this state. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. This state runs AFTER NormalizeRunDates, so $.run_date is now the CYCLE's trading day and the run-slot is keyed on the cycle rather than on the calendar day the cron happened to fire. That is the same guarantee, stated better: two cadence executions of the SAME weekly cycle collide, which is what the slot means. NOT a new collision risk - the THU-SAT firings resolve to three DIFFERENT trading days, and the two that are not the run day Succeed-skip at WeeklyRunDayGateChoice before ever reaching this state; the Friday-PM rehearsal carries a different $.pipeline_role, which is already part of the key.",
+      "Comment": "L274 + config#2280 \u2014 DynamoDB conditional PUT on the RUN-SLOT. mutex_key = '{state-machine-name}#{pipeline_role}#{run_date}' ($.run_date is stamped by InitializeInput before any gate). The old key's UTC minute bucket only caught duplicates landing in the SAME minute \u2014 an EventBridge internal retry >60s later, an operator re-paste a minute later, or a re-introduced duplicate rule at minute distance all got fresh keys and ran concurrently (double spot spend + artifact write races on the same run_date prefixes). Keying on run_date makes ANY second cadence execution of the same run-slot lose with ConditionalCheckFailedException \u2192 MutexConflict Fail, regardless of stagger. Staleness: a run-date key has no natural expiry (unlike the minute bucket), so items carry ttl_epoch (~24h, from ComputeMutexTtl) with table TTL enabled as the crashed-holder backstop; the PRIMARY stale-item mechanism is scripts/weekly_sf_rerun.py, which deletes the failed holder's item after verifying the holder execution is terminal (never steals from a RUNNING one). Recovery reruns themselves carry pipeline_role='watch-rerun' (non-cadence) and bypass this state entirely. Redrives resume the SAME execution and never re-enter this state. Item accumulation ~<1000/yr; PAY_PER_REQUEST cost negligible. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. This state runs AFTER NormalizeRunDates, so $.run_date is now the CYCLE's trading day and the run-slot is keyed on the cycle rather than on the calendar day the cron happened to fire. That is the same guarantee, stated better: two cadence executions of the SAME weekly cycle collide, which is what the slot means. NOT a new collision risk - the THU-SAT firings resolve to three DIFFERENT trading days, and the two that are not the run day Succeed-skip at WeeklyRunDayGateChoice before ever reaching this state; the Friday-PM rehearsal carries a different $.pipeline_role, which is already part of the key. | alpha-engine-config-I12228: a ConditionalCheckFailed no longer Fails on sight. It routes through ReadRunSlotHolder -> DescribeRunSlotHolder -> CheckRunSlotHolderTerminal, which takes the slot over ONLY from a holder execution that is terminal-failed (FAILED / TIMED_OUT / ABORTED) - the same steal rule scripts/weekly_sf_rerun.py decide_mutex_action applies, moved into the machine so a role='weekly' rerun of a failed Saturday needs no manual DynamoDB delete. Every other answer (RUNNING, SUCCEEDED, item gone, read or describe error) still ends at MutexConflict. Each Fail terminal (FailExecution / DegradedRun / VacuousRun) now also releases the item this execution holds (ReleaseRunSlotBefore*), so the failed holder normally leaves nothing to take over.",
       "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
       "Parameters": {
         "TableName": "alpha-engine-sf-execution-mutex",
@@ -639,8 +639,8 @@
           "ErrorEquals": [
             "DynamoDb.ConditionalCheckFailedException"
           ],
-          "Comment": "Mutex held by another execution of the same run-slot (state-machine + pipeline_role + run_date) \u2014 the duplicate-trigger case we are explicitly protecting against, now at ANY stagger, not just same-minute. Fail loud so the dup is visible in SF execution history + SNS alert.",
-          "Next": "MutexConflict",
+          "Comment": "Mutex held by another execution of the same run-slot (state-machine + pipeline_role + run_date). alpha-engine-config-I12228: no longer a Fail on sight - the holder may be a run that already ended without releasing (a crash, an abort, or a terminal that predates the release-on-failure states). ReadRunSlotHolder names the holder and CheckRunSlotHolderTerminal decides: a terminal-FAILED holder is taken over (TakeOverRunSlot), anything else - RUNNING, SUCCEEDED, unreadable - still Fails loud at MutexConflict, so the duplicate-trigger protection is unchanged.",
+          "Next": "ReadRunSlotHolder",
           "ResultPath": "$.mutex_conflict"
         },
         {
@@ -687,7 +687,181 @@
     "MutexConflict": {
       "Type": "Fail",
       "Error": "MutexConflict",
-      "Cause": "L274/config#2280: another SF execution with the same state-machine + pipeline_role + run_date already holds the run-slot mutex. Most likely causes: duplicate EventBridge target fan-out or a staggered duplicate trigger (internal retry / operator re-paste). Forensic: DynamoDB GetItem on the mutex_key in $.mutex_conflict names the holder's executionArn. If the holder is TERMINAL and a recovery rerun is intended, use scripts/weekly_sf_rerun.py \u2014 it verifies the holder is terminal, deletes the stale item, and starts a correctly-scoped watch-rerun; never delete the item while the holder is RUNNING."
+      "Cause": "L274/config#2280: another SF execution with the same state-machine + pipeline_role + run_date holds the run-slot mutex and is NOT terminal-failed: it is RUNNING (a duplicate trigger - EventBridge target fan-out, internal retry, operator re-paste), it SUCCEEDED (the slot's work is done), or it could not be read or described. A holder that is FAILED / TIMED_OUT / ABORTED is taken over automatically (alpha-engine-config-I12228), so it never lands here. Forensic: $.mutex_holder names the holder's executionArn and $.mutex_holder_execution its status. If the holder SUCCEEDED and a re-run is truly intended, use scripts/weekly_sf_rerun.py; never delete the item while the holder is RUNNING."
+    },
+    "ReadRunSlotHolder": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: AcquireMutex lost the conditional PUT, so the run-slot item exists. Read it (ConsistentRead) to learn WHICH execution holds it. Read-only. Any error here (AccessDenied before the grant lands, throttling past the retry) routes to MutexConflict: a slot whose holder cannot be named is never taken over, which is exactly the pre-I12228 behaviour. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. Keys the run-slot on $.run_date exactly as AcquireMutex does (this state runs after NormalizeRunDates), so it names the SAME item AcquireMutex wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:getItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Key": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
+          }
+        },
+        "ConsistentRead": true
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Holder unreadable: never take over blind.",
+          "ResultPath": "$.mutex_holder_error",
+          "Next": "MutexConflict"
+        }
+      ],
+      "ResultPath": "$.mutex_holder",
+      "Next": "CheckRunSlotHolderPresent"
+    },
+    "CheckRunSlotHolderPresent": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12228: the item must still exist and name its holder. An item that vanished between the PUT and the read (the holder released it in that window) or carries no execution_arn cannot be proven stale, so it is a conflict - same matrix row as scripts/weekly_sf_rerun.py's 'item present, no holder arn -> ABORT'.",
+      "Choices": [
+        {
+          "Variable": "$.mutex_holder.Item.execution_arn.S",
+          "IsPresent": true,
+          "Next": "DescribeRunSlotHolder"
+        }
+      ],
+      "Default": "MutexConflict"
+    },
+    "DescribeRunSlotHolder": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: is the holder execution terminal? DescribeExecution on the stored execution_arn. The key embeds $$.StateMachine.Name, so the holder is always an execution of THIS state machine. Any error routes to MutexConflict - no terminal proof, no takeover. No ResultSelector on purpose: a ResultSelector path that is absent throws States.Runtime, which no Catch can take, so the status is read in CheckRunSlotHolderTerminal behind an IsPresent guard instead - an unexpected response shape reads as 'not proven terminal' -> MutexConflict.",
+      "Resource": "arn:aws:states:::aws-sdk:sfn:describeExecution",
+      "Parameters": {
+        "ExecutionArn.$": "$.mutex_holder.Item.execution_arn.S"
+      },
+      "TimeoutSeconds": 30,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Holder status unknown: never take over without terminal proof.",
+          "ResultPath": "$.mutex_holder_error",
+          "Next": "MutexConflict"
+        }
+      ],
+      "ResultPath": "$.mutex_holder_execution",
+      "Next": "CheckRunSlotHolderTerminal"
+    },
+    "CheckRunSlotHolderTerminal": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12228: the takeover rule, identical to scripts/weekly_sf_rerun.py::decide_mutex_action. FAILED / TIMED_OUT / ABORTED -> the holder can no longer write artifacts, so this execution takes the slot over and proceeds NOT degraded. RUNNING (or PENDING_REDRIVE) -> a genuine duplicate, MutexConflict. SUCCEEDED -> also MutexConflict: the slot's work completed, and a second cadence run would redo the week (the duplicate-trigger-after-completion shape the run-slot key exists to stop); an intended re-run of a SUCCEEDED slot stays an operator decision.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.mutex_holder_execution.Status",
+              "IsPresent": true
+            },
+            {
+              "Or": [
+                {
+                  "Variable": "$.mutex_holder_execution.Status",
+                  "StringEquals": "FAILED"
+                },
+                {
+                  "Variable": "$.mutex_holder_execution.Status",
+                  "StringEquals": "TIMED_OUT"
+                },
+                {
+                  "Variable": "$.mutex_holder_execution.Status",
+                  "StringEquals": "ABORTED"
+                }
+              ]
+            }
+          ],
+          "Next": "TakeOverRunSlot"
+        }
+      ],
+      "Default": "MutexConflict"
+    },
+    "TakeOverRunSlot": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: replace the terminal holder's item with this execution's, conditioned on the item still naming THAT holder (or being gone). Two executions racing to take over the same stale slot cannot both win: the loser gets ConditionalCheckFailed -> MutexConflict. Writes $.mutex_result exactly as a clean AcquireMutex does, so the ReleaseRunSlotBefore* states release it on a Fail terminal. taken_over_from records the replaced holder for forensics. An infra error is the same class as AcquireMutex's and takes the same fail-open continuation (SetMutexAcquireDegradedFlag). | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. Keys the run-slot on $.run_date exactly as AcquireMutex does (this state runs after NormalizeRunDates), so it names the SAME item AcquireMutex wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:putItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Item": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
+          },
+          "execution_arn": {
+            "S.$": "$$.Execution.Id"
+          },
+          "started_at": {
+            "S.$": "$$.Execution.StartTime"
+          },
+          "state_machine": {
+            "S.$": "$$.StateMachine.Name"
+          },
+          "pipeline_role": {
+            "S.$": "$.pipeline_role"
+          },
+          "ttl_epoch": {
+            "N.$": "$.mutex_ttl_epoch"
+          },
+          "taken_over_from": {
+            "S.$": "$.mutex_holder.Item.execution_arn.S"
+          }
+        },
+        "ConditionExpression": "attribute_not_exists(mutex_key) OR execution_arn = :holder",
+        "ExpressionAttributeValues": {
+          ":holder": {
+            "S.$": "$.mutex_holder.Item.execution_arn.S"
+          }
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ConditionalCheckFailedException"
+          ],
+          "Comment": "Another execution took the slot first: a genuine conflict.",
+          "ResultPath": "$.mutex_conflict",
+          "Next": "MutexConflict"
+        },
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Infra error after terminal proof: same fail-open as AcquireMutex.",
+          "ResultPath": "$.mutex_error",
+          "Next": "SetMutexAcquireDegradedFlag"
+        }
+      ],
+      "ResultPath": "$.mutex_result",
+      "Next": "CheckSpotDispatchNeeded"
     },
     "CheckShellRun": {
       "Type": "Choice",
@@ -7476,7 +7650,7 @@
         "reasons.$": "States.JsonMerge($.degraded_summary.reasons, States.StringToJson('{\"preflight_notify\":\"weekly_preflight_notify_fail_open\"}'), false)"
       },
       "ResultPath": "$.degraded_summary",
-      "Next": "DegradedRun"
+      "Next": "CheckRunSlotHeldBeforeDegradedRun"
     },
     "NotifyComplete": {
       "Type": "Task",
@@ -7628,6 +7802,62 @@
         "Message.$": "States.Format('Saturday{} Pipeline failed. Error: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status  (redrive-execution is a no-op on this pipeline: every Task Catch routes to this shared FailExecution state, so redrive just re-enters FailExecution and re-fails immediately with no retry. To retry MECHANICALLY: from a nousergon-data checkout run  python3 scripts/weekly_sf_rerun.py --dry-run  -- it derives the original run_date + the correct skip_* set from this failed execution and handles the run-slot mutex; review, then rerun with --start. Manual fallback: start a fresh execution with skip_* input flags set true for stages already completed, e.g. skip_morning_enrich / skip_backtester -- see infrastructure/README.md for the full flag list and rationale.)', $.pipeline_label, States.JsonToString($.error))"
       },
       "ResultPath": "$.failure_notify",
+      "Next": "CheckRunSlotHeldBeforeFailExecution"
+    },
+    "CheckRunSlotHeldBeforeFailExecution": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12228: release the run-slot on the way to FailExecution, but only if THIS execution acquired it - $.mutex_result is written only by a successful AcquireMutex or TakeOverRunSlot. Non-cadence roles, the fail-open path and failures before CheckMutexRole skip straight to the terminal, so the release never reads a path that may be absent.",
+      "Choices": [
+        {
+          "Variable": "$.mutex_result",
+          "IsPresent": true,
+          "Next": "ReleaseRunSlotBeforeFailExecution"
+        }
+      ],
+      "Default": "FailExecution"
+    },
+    "ReleaseRunSlotBeforeFailExecution": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: best-effort release before FailExecution. A failed run that keeps its run-slot item blocks the role='weekly' rerun of the same cycle for the 24h TTL (2026-10-10: weekly-rerun-2026-10-10-1 lost AcquireMutex to the 09:00Z run that had FAILED at 10:55Z). Conditional on execution_arn == $$.Execution.Id, so it can only ever delete this execution's own item, never a taker's. Its Catch continues to the SAME terminal: a release failure (AccessDenied, throttle, item already taken over) never masks the real outcome, and the TTL plus TakeOverRunSlot still cover the leftover item. SUCCEEDED terminals deliberately keep the item: a completed slot must still refuse a later duplicate trigger. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. Keys the run-slot on $.run_date exactly as AcquireMutex does (this state runs after NormalizeRunDates), so it names the SAME item AcquireMutex wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Key": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
+          }
+        },
+        "ConditionExpression": "execution_arn = :me",
+        "ExpressionAttributeValues": {
+          ":me": {
+            "S.$": "$$.Execution.Id"
+          }
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort: never mask the terminal outcome.",
+          "ResultPath": "$.run_slot_release_error",
+          "Next": "FailExecution"
+        }
+      ],
+      "ResultPath": "$.run_slot_release",
       "Next": "FailExecution"
     },
     "FailExecution": {
@@ -9276,7 +9506,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "DegradedRun"
+          "Next": "CheckRunSlotHeldBeforeDegradedRun"
         }
       ],
       "Default": "ShellRunComplete"
@@ -9348,10 +9578,66 @@
               "BooleanEquals": false
             }
           ],
-          "Next": "VacuousRun"
+          "Next": "CheckRunSlotHeldBeforeVacuousRun"
         }
       ],
       "Default": "CheckWeeklyCoverageSweepOutcome"
+    },
+    "CheckRunSlotHeldBeforeVacuousRun": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12228: release the run-slot on the way to VacuousRun, but only if THIS execution acquired it - $.mutex_result is written only by a successful AcquireMutex or TakeOverRunSlot. Non-cadence roles, the fail-open path and failures before CheckMutexRole skip straight to the terminal, so the release never reads a path that may be absent.",
+      "Choices": [
+        {
+          "Variable": "$.mutex_result",
+          "IsPresent": true,
+          "Next": "ReleaseRunSlotBeforeVacuousRun"
+        }
+      ],
+      "Default": "VacuousRun"
+    },
+    "ReleaseRunSlotBeforeVacuousRun": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: best-effort release before VacuousRun. A failed run that keeps its run-slot item blocks the role='weekly' rerun of the same cycle for the 24h TTL (2026-10-10: weekly-rerun-2026-10-10-1 lost AcquireMutex to the 09:00Z run that had FAILED at 10:55Z). Conditional on execution_arn == $$.Execution.Id, so it can only ever delete this execution's own item, never a taker's. Its Catch continues to the SAME terminal: a release failure (AccessDenied, throttle, item already taken over) never masks the real outcome, and the TTL plus TakeOverRunSlot still cover the leftover item. SUCCEEDED terminals deliberately keep the item: a completed slot must still refuse a later duplicate trigger. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. Keys the run-slot on $.run_date exactly as AcquireMutex does (this state runs after NormalizeRunDates), so it names the SAME item AcquireMutex wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Key": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
+          }
+        },
+        "ConditionExpression": "execution_arn = :me",
+        "ExpressionAttributeValues": {
+          ":me": {
+            "S.$": "$$.Execution.Id"
+          }
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort: never mask the terminal outcome.",
+          "ResultPath": "$.run_slot_release_error",
+          "Next": "VacuousRun"
+        }
+      ],
+      "ResultPath": "$.run_slot_release",
+      "Next": "VacuousRun"
     },
     "VacuousRun": {
       "Comment": "alpha-engine-config-I9693. Error is a consumer contract, exactly as DegradedRun's is: sf-telegram-notifier keys its rendering off the literal, so a run that did no work reads as 'did no work' and not as a crash. The completion marker for this cycle HAS been written and HAS been augmented with the cycle's real shape by the time this is entered - nousergon_lib.pipeline_status.completion_marker.marker_verdict is the field to read for the CYCLE's verdict; this terminal is the statement about THIS EXECUTION, and it is the one list-executions can see. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. $.run_date is the cycle's trading day from NormalizeRunDates, and this cause names WHICH CYCLE this execution contributed nothing to \u2014 not when it fired.",
@@ -9511,6 +9797,62 @@
         }
       ],
       "Next": "WriteCompletionMarkerDegradedCalendar"
+    },
+    "CheckRunSlotHeldBeforeDegradedRun": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12228: release the run-slot on the way to DegradedRun, but only if THIS execution acquired it - $.mutex_result is written only by a successful AcquireMutex or TakeOverRunSlot. Non-cadence roles, the fail-open path and failures before CheckMutexRole skip straight to the terminal, so the release never reads a path that may be absent.",
+      "Choices": [
+        {
+          "Variable": "$.mutex_result",
+          "IsPresent": true,
+          "Next": "ReleaseRunSlotBeforeDegradedRun"
+        }
+      ],
+      "Default": "DegradedRun"
+    },
+    "ReleaseRunSlotBeforeDegradedRun": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12228: best-effort release before DegradedRun. A failed run that keeps its run-slot item blocks the role='weekly' rerun of the same cycle for the 24h TTL (2026-10-10: weekly-rerun-2026-10-10-1 lost AcquireMutex to the 09:00Z run that had FAILED at 10:55Z). Conditional on execution_arn == $$.Execution.Id, so it can only ever delete this execution's own item, never a taker's. Its Catch continues to the SAME terminal: a release failure (AccessDenied, throttle, item already taken over) never masks the real outcome, and the TTL plus TakeOverRunSlot still cover the leftover item. SUCCEEDED terminals deliberately keep the item: a completed slot must still refuse a later duplicate trigger. | alpha-engine-config-I8809: PARTITION FAMILY = trading_day. Keys the run-slot on $.run_date exactly as AcquireMutex does (this state runs after NormalizeRunDates), so it names the SAME item AcquireMutex wrote.",
+      "Resource": "arn:aws:states:::aws-sdk:dynamodb:deleteItem",
+      "Parameters": {
+        "TableName": "alpha-engine-sf-execution-mutex",
+        "Key": {
+          "mutex_key": {
+            "S.$": "States.Format('{}#{}#{}', $$.StateMachine.Name, $.pipeline_role, $.run_date)"
+          }
+        },
+        "ConditionExpression": "execution_arn = :me",
+        "ExpressionAttributeValues": {
+          ":me": {
+            "S.$": "$$.Execution.Id"
+          }
+        }
+      },
+      "TimeoutSeconds": 30,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "DynamoDb.ServiceException",
+            "DynamoDb.RequestLimitExceededException",
+            "DynamoDb.TimeoutException"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 2,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Best-effort: never mask the terminal outcome.",
+          "ResultPath": "$.run_slot_release_error",
+          "Next": "DegradedRun"
+        }
+      ],
+      "ResultPath": "$.run_slot_release",
+      "Next": "DegradedRun"
     },
     "DegradedRun": {
       "Type": "Fail",
@@ -9973,13 +10315,13 @@
           "Comment": "Transient S3 fault coverage \u2014 mirrors the SendCommand SDK-transient Retry convention used elsewhere in this SF."
         }
       ],
-      "Next": "DegradedRun",
+      "Next": "CheckRunSlotHeldBeforeDegradedRun",
       "Catch": [
         {
           "ErrorEquals": [
             "States.ALL"
           ],
-          "Next": "DegradedRun",
+          "Next": "CheckRunSlotHeldBeforeDegradedRun",
           "ResultPath": "$.completion_marker_calendar_error"
         }
       ]
@@ -10060,7 +10402,7 @@
     },
     "WaitForCollectionManifests": {
       "Type": "Task",
-      "Comment": "alpha-engine-config-I11264 / -I11269: the weekly SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-weekly). It starts at 09:00 UTC Saturday (alpha-engine-saturday), which is the same instant as data-collection-weekly's 05:00 America/New_York under EDT and an hour BEFORE it under EST, so lookback_seconds is 0. The units are the weekly schedule's verify_units MINUS D15/D16/D46, whose v1 owners (DataPhase2, RAGIngestion) are still in this definition and still run inside ResearchPredictorParallel (alpha-engine-config-I10753 is their own cutover). D03, D12 and D34 are not waited because the schedule no longer names them: each legitimately publishes nothing on a Saturday (D03 refreshed by Friday's EOD, D12 already published by D31, D34 has no chronic-gap tickers configured), and naming them settled this wait not-ready on every Saturday (alpha-engine-config-I11812) \u2014 the derivation is pinned by tests/test_v1_collection_readiness_wait.py against each unit's trigger.owner. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim.",
+      "Comment": "alpha-engine-config-I11264 / -I11269: the weekly SF no longer runs its own data stages; the standalone nousergon-data-collection stack does (ne-data-collection-weekly). It starts at 09:00 UTC Saturday (alpha-engine-saturday), which is the same instant as data-collection-weekly's 05:00 America/New_York under EDT and an hour BEFORE it under EST, so lookback_seconds is 0. The units are the weekly schedule's verify_units MINUS D15/D16/D46, whose v1 owners (DataPhase2, RAGIngestion) are still in this definition and still run inside ResearchPredictorParallel (alpha-engine-config-I10753 is their own cutover). D03, D12 and D34 are not waited because the schedule no longer names them: each legitimately publishes nothing on a Saturday (D03 refreshed by Friday's EOD, D12 already published by D31, D34 has no chronic-gap tickers configured), and naming them settled this wait not-ready on every Saturday (alpha-engine-config-I11812) \u2014 the derivation is pinned by tests/test_v1_collection_readiness_wait.py against each unit's trigger.owner. This state asks whether every unit this pipeline reads has published for this cycle, using the SAME run-manifest predicate the producer's own VerifyRunManifests applies (data_gate/run_manifest_predicate.py::_check_unit). It asks through alpha-engine-collection-readiness-probe, a read-only function, and deliberately NOT through the data-spot dispatcher, which launches collector boxes: no v1 definition may invoke the dispatcher (alpha-engine-config-I11266, pinned by tests/test_v1_collection_readiness_wait.py). `units` is pinned against the schedule Input in infrastructure/cloudformation/nousergon-data-collection.yaml by tests/test_v1_collection_readiness_wait.py, so a unit added to the schedule cannot silently fall out of this consumer's predicate. A raised poll (Catch) counts as one not-ready poll: a persistent raise exhausts the bounded budget and degrades loudly, it never proceeds on an unmeasured claim. | alpha-engine-config-I12228: not_before is the CYCLE's anchor $.collection_not_before (floored by InitializeInput to $$.Execution.StartTime), not this execution's own start. Before, a pipeline rerun graded manifests against its own later start, so a data-only rerun that finished first was invisible and every pipeline rerun forced a full data rerun. A rerun now carries the failed cycle's original start. consumer_started lets the probe refuse an anchor older than COLLECTION_ANCHOR_MAX_AGE_SECONDS (data_gate/run_manifest_predicate.py), so a mistyped or carried-over anchor can never reach back far enough to admit the previous week's manifests - that raise counts as a not-ready poll and fails closed.",
       "Resource": "arn:aws:states:::lambda:invoke",
       "Parameters": {
         "FunctionName": "alpha-engine-collection-readiness-probe",
@@ -10080,7 +10422,8 @@
             "D14",
             "D17"
           ],
-          "not_before.$": "$$.Execution.StartTime",
+          "not_before.$": "$.collection_not_before",
+          "consumer_started.$": "$$.Execution.StartTime",
           "lookback_seconds": 0
         }
       },

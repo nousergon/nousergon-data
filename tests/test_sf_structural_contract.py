@@ -324,6 +324,12 @@ _FAILURE_FAMILY: dict[str, frozenset[str]] = {
             "HandleFailure",
             "FailExecution",
             "MutexConflict",
+            # alpha-engine-config-I12228: the run-slot release hop's
+            # best-effort Catch lands on the Fail terminal it guards. Both
+            # are real Fail-type terminals (Error DegradedRun / VacuousRun),
+            # so a route reaching them fails LOUD, same as FailExecution.
+            "DegradedRun",
+            "VacuousRun",
         }
     ),
     # alpha-engine-config-I7111 adds three more real Fail-type terminals to
@@ -431,6 +437,20 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # ── alpha-engine-config-I12228 ─────────────────────────────────
+        "AcquireMutex": (
+            "its ConditionalCheckFailed Catch is not a fail-open: it routes to "
+            "ReadRunSlotHolder, whose every exit except a proven-terminal-"
+            "FAILED holder ends at MutexConflict (a loud Fail), and a takeover "
+            "of a FAILED holder's slot is a clean acquisition, deliberately "
+            "NOT degraded (the run is exactly as protected as one whose "
+            "AcquireMutex succeeded). Its OTHER Catch, States.ALL, is the real "
+            "fail-open and still writes $.gate_degraded via "
+            "SetMutexAcquireDegradedFlag — pinned separately by "
+            "tests/test_sf_mutex_wiring.py::test_acquire_states_all_catch_"
+            "fails_open_to_former_first_state, since this exemption is per "
+            "owning state."
+        ),
         # ── alpha-engine-config-I11264 ─────────────────────────────────
         "WaitForCollectionManifests": (
             "a raising probe is not a verdict either way: the Catch records "
