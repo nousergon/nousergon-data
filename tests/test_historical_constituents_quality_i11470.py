@@ -159,6 +159,20 @@ def test_eqr_to_vmrk_is_a_committed_reticker():
     assert all(r.get("evidence") and r.get("effective") for r in known["retickers"])
 
 
+def test_psky_to_skyd_is_a_committed_reticker_and_never_reaches_polygon():
+    # The 2026-10-10 weekly D02 failed _DegradedRun on this pair: Polygon
+    # does not report the Paramount Skydance symbol change, and SKYD's
+    # 1937 list_date refuses provisional acceptance as a new listing.
+    with patch("corporate_actions.detect_renames") as detect:
+        out = hc.resolve_renames({"2026-10-06": ["PSKY"]}, reference_removed=set())
+    detect.assert_not_called()
+    assert out.renames == {"PSKY": "SKYD"}
+    changes, unresolved = hc.changes_from_snapshots(
+        {"2026-10-05": ["AAPL", "PSKY"], "2026-10-06": ["AAPL", "SKYD"]}, out.renames
+    )
+    assert changes == [] and unresolved == []
+
+
 def test_candidates_the_reference_already_removed_are_not_sent_to_polygon():
     swaps = {"2026-06-22": ["CPB", "POOL"], "2026-08-18": ["EQR"], "2026-09-01": ["MYST"]}
     detection = MagicMock(renames=[], failed_candidates={"MYST"})
