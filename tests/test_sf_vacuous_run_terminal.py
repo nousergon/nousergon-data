@@ -21,6 +21,8 @@ import pathlib
 
 import pytest
 
+from tests.sf_run_slot_release_helpers import through_release
+
 _SF = pathlib.Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json"
 
 #: The flag the Choice reads, as one string, so a rename cannot pass silently.
@@ -78,7 +80,7 @@ def test_the_choice_fires_only_on_an_explicit_boolean_false(states):
     assert choice["Default"] == "CheckWeeklyCoverageSweepOutcome"
     assert len(choice["Choices"]) == 1
     rule = choice["Choices"][0]
-    assert rule["Next"] == "VacuousRun"
+    assert through_release(states, rule["Next"]) == "VacuousRun"
     conjuncts = rule["And"]
     assert {c["Variable"] for c in conjuncts} == {_VARIABLE}
     assert any(c.get("IsPresent") is True for c in conjuncts)
