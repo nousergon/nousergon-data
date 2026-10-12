@@ -565,7 +565,10 @@ def _completion_check(event: dict, s3_client=None) -> dict:
 #     07:30 ET, so a manifest that finished at 08:05 is this cycle's and must
 #     count; the postclose and weekly SFs start BEFORE their producer, so their
 #     lookback is 0. Each v1 definition declares its own lookback and a test
-#     derives it from the two schedules.
+#     derives it from the two schedules. The weekly passes its CYCLE's anchor
+#     as `not_before` instead of its own start (alpha-engine-config-I12228):
+#     equal on the scheduled run, the failed cycle's original start on a
+#     rerun, bounded by `COLLECTION_ANCHOR_MAX_AGE_SECONDS`.
 #   * It never FAILS on a finding — a consumer polling a producer that has not
 #     finished yet is the normal case, not an error. It returns `ready` (no
 #     finding at all) and `settled` (every unit has a manifest for this cycle,
@@ -595,6 +598,17 @@ def _completion_check(event: dict, s3_client=None) -> dict:
 #: module ships in Lambda zips without the ASL;
 #: `tests/test_readiness_awaits_producer_retry.py` derives it from the ASL.
 PRODUCER_ATTEMPTS_PER_WORKLOAD = 2
+
+#: How far behind the consumer's own start a caller-supplied anchor may reach
+#: (alpha-engine-config-I12228). The weekly consumer grades manifests against
+#: its CYCLE's anchor (`$.collection_not_before`) rather than its own start, so
+#: a rerun hours or days after the scheduled run still reads that cycle's
+#: collection. The previous cycle's collection finished about seven days before
+#: this one's started, so an anchor at most six days older than the consumer's
+#: start cannot reach far enough back to admit it, whatever the caller typed.
+#: Only enforced when the caller names `consumer_started`; the morning and EOD
+#: consumers pass their own start as `not_before` and never set it.
+COLLECTION_ANCHOR_MAX_AGE_SECONDS = 6 * 24 * 3600
 
 #: Collections whose v1 consumer waits out the producer's retry before reading
 #: a failed unit as settled. Exactly the collections whose consumer FAILS CLOSED
@@ -678,6 +692,17 @@ def _readiness_check(event: dict, s3_client=None) -> dict:
         ) from exc
     if lookback < 0:
         raise ValueError(f"lookback_seconds={lookback} is negative")
+    if event.get("consumer_started") is not None:
+        consumer_started = _parse_ts(event.get("consumer_started"), where="consumer_started")
+        age = (consumer_started - not_before).total_seconds()
+        if age > COLLECTION_ANCHOR_MAX_AGE_SECONDS:
+            raise ValueError(
+                f"not_before={event.get('not_before')!r} is {age / 86400:.1f} days before "
+                f"consumer_started={event.get('consumer_started')!r}, past the "
+                f"{COLLECTION_ANCHOR_MAX_AGE_SECONDS // 86400}-day bound. An anchor that old "
+                f"can admit the previous cycle's manifests as this cycle's "
+                f"(alpha-engine-config-I12228)."
+            )
     baseline = not_before - timedelta(seconds=lookback)
     collection = str(event.get("collection") or "unknown")
     descriptors = _unit_descriptors()
