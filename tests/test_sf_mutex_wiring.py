@@ -547,9 +547,14 @@ class TestAcquireMutexSemantics:
             f"it, a States.ALL Catch would swallow the duplicate-trigger "
             f"case and fail-open silently (the worst possible behavior)"
         )
-        assert match[0]["Next"] == "MutexConflict", (
+        # alpha-engine-config-I12228: the weekly inspects the holder first and
+        # takes the slot over only from a terminal-FAILED one; every other
+        # answer still ends at MutexConflict (pinned end to end in
+        # tests/test_sf_run_slot_takeover_and_release.py).
+        expected = "ReadRunSlotHolder" if sf_name == "saturday" else "MutexConflict"
+        assert match[0]["Next"] == expected, (
             f"{sf_name} AcquireMutex: Conditional-Check Catch must route to "
-            f"MutexConflict (Fail), not bypass to the workload"
+            f"{expected}, not bypass to the workload"
         )
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))

@@ -253,7 +253,17 @@ def test_the_weekly_lookback_is_zero_because_it_starts_first(day, schedules):
     payload = _definition("step_function.json")["States"]["WaitForCollectionManifests"][
         "Parameters"]["Payload"]
     assert payload["lookback_seconds"] == 0
-    assert payload["not_before.$"] == "$$.Execution.StartTime"
+    # alpha-engine-config-I12228: not_before is the cycle anchor, which
+    # InitializeInput floors to $$.Execution.StartTime - so on the scheduled run
+    # it is still this execution's own start, the instant the derivation above
+    # is about. A rerun carries the failed cycle's original start instead.
+    assert payload["not_before.$"] == "$.collection_not_before"
+    assert payload["consumer_started.$"] == "$$.Execution.StartTime"
+    merged = _definition("step_function.json")["States"]["InitializeInput"]["Parameters"][
+        "merged.$"]
+    # The floor sits in the layer UNDER $$.Execution.Input, so a rerun's value wins.
+    assert '"collection_not_before":"{}"' in merged
+    assert ",$$.Execution.StartTime)),false),$$.Execution.Input,false)" in merged
 
 
 #: The reconcile wait's fixed UTC floor on its run_date. Parsed, not assumed.

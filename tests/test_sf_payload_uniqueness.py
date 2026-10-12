@@ -80,8 +80,10 @@ _READINESS_PROBE_KEYS = frozenset(
 
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I11264: the weekly SF's bounded wait on
-    # ne-data-collection-weekly's run manifests.
-    "WaitForCollectionManifests": _READINESS_PROBE_KEYS,
+    # ne-data-collection-weekly's run manifests. alpha-engine-config-I12228:
+    # the weekly alone also passes consumer_started, so the probe can bound how
+    # far back the cycle anchor it reads as not_before may reach.
+    "WaitForCollectionManifests": _READINESS_PROBE_KEYS | {"consumer_started.$"},
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     # alpha-engine-config-I10172: run_date.$ added — this stage had never

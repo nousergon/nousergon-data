@@ -147,6 +147,10 @@ Resources:
   #   stamps ttl_epoch (~24h) as the crashed-holder BACKSTOP; the PRIMARY
   #   stale-item mechanism is scripts/weekly_sf_rerun.py's verified steal
   #   (delete only after the holder execution is confirmed terminal).
+  #   alpha-engine-config-I12228: the weekly SF now also releases its own
+  #   item on every Fail terminal (conditional DeleteItem) and takes over a
+  #   held slot whose holder is FAILED/TIMED_OUT/ABORTED (GetItem +
+  #   DescribeExecution + conditional PutItem) — same steal rule, in-machine.
   # - WEEKDAY/EOD SFs still key on the minute bucket and write NO ttl_epoch;
   #   items without the attribute never expire (DynamoDB TTL ignores them),
   #   so this TimeToLiveSpecification is a purely ADDITIVE, backward-
