@@ -80,8 +80,10 @@ _READINESS_PROBE_KEYS = frozenset(
 
 _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I11264: the weekly SF's bounded wait on
-    # ne-data-collection-weekly's run manifests.
-    "WaitForCollectionManifests": _READINESS_PROBE_KEYS,
+    # ne-data-collection-weekly's run manifests. alpha-engine-config-I12228:
+    # the weekly alone also passes consumer_started, so the probe can bound how
+    # far back the cycle anchor it reads as not_before may reach.
+    "WaitForCollectionManifests": _READINESS_PROBE_KEYS | {"consumer_started.$"},
     # config#2249: fast pre-dispatch substrate health gate, immediately
     # before MorningEnrich (alpha-engine-substrate-health-gate Lambda).
     # alpha-engine-config-I10172: run_date.$ added — this stage had never
@@ -608,6 +610,13 @@ class TestEODSFTopLevelFieldsClosed:
     # fields. Snapshot from step_function_eod.json on 2026-05-27.
     _EXPECTED_EOD_TOP_LEVEL_FIELDS: frozenset[str] = frozenset(
         {
+            # 2026-10-09 in-session box stop (alpha-engine-config-I12020
+            # follow-up). Both machines: StampStartClockUtc's UTC start clock
+            # and the pre-session refusal's page. Reconcile only: the box
+            # ownership record, the heal replay's inherited ownership input,
+            # and the page for a stop skipped because another actor owns the box.
+            "start_clock_utc", "pre_session_blocked_notify",
+            "box_ownership", "box_owned_by_dispatcher", "stop_skipped_notify",
             # alpha-engine-config-I12020 — DrainTraderReconcile's send/poll
             # results, its fail-open error and its best-effort page.
             "trader_reconcile_drain_result", "trader_reconcile_drain_poll",
@@ -846,6 +855,9 @@ class TestEODSFTopLevelFieldsClosed:
         "exercise_cadence_param", "exercise_cadence_read_error",
         "exercise_cadence_degraded_notify", "exercise_cadence_degraded_notify_error",
         "exercise_cadence_unknown_notify", "exercise_cadence_unknown_notify_error",
+        # Box ownership (2026-10-09): only the reconcile machine skips a stop
+        # on a box it did not start.
+        "box_ownership", "box_owned_by_dispatcher", "stop_skipped_notify",
         # The trader-reconcile drain in front of the box stop (I12020).
         "trader_reconcile_drain_result", "trader_reconcile_drain_poll",
         "trader_reconcile_drain_error", "trader_reconcile_drain_notify",

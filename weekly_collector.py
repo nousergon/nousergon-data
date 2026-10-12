@@ -565,6 +565,7 @@ def _resolve_run_mode(args: argparse.Namespace) -> str:
         "daily_arctic_append",
         "chronic_gap_heal",
         "daily_heal",
+        "daily_panel",
     ):
         if getattr(args, flag, False):
             return flag
@@ -1758,7 +1759,23 @@ def _settled_regrade_keys(result: dict) -> dict[str, int]:
     return keys
 
 
+def _daily_panel_keys(result: dict) -> dict[str, int]:
+    """The two keys D51 published, with their counts: the panel (``rows``) and
+    its manifest (1), which the publisher writes last. Empty unless it wrote."""
+    panel = (result.get("collectors") or {}).get("daily_panel") or {}
+    if panel.get("status") != "ok":
+        return {}
+    return {panel["panel_key"]: int(panel.get("rows") or 0), panel["manifest_key"]: 1}
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "daily_panel": (
+        (
+            lambda r: list(_daily_panel_keys(r)),
+            lambda r: bool(_daily_panel_keys(r)),
+            _daily_panel_keys,
+        ),
+    ),
     "features_settled_regrade": (
         (
             lambda r: list(_settled_regrade_keys(r)),
@@ -1919,6 +1936,9 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
         return _run_whole_mode_unit(
             "features_settled_regrade", _run_features_settled_regrade, config, args
         )
+
+    if getattr(args, "daily_panel", False):
+        return _run_whole_mode_unit("daily_panel", _run_daily_panel, config, args)
 
     if args.daily:
         return _run_daily(config, args)
@@ -5721,6 +5741,14 @@ def _parse_args() -> argparse.Namespace:
              "not_applicable. --date overrides the trading day.",
     )
     parser.add_argument(
+        "--daily-panel", dest="daily_panel", action="store_true",
+        help="D51: compile the session's long OHLCV panel ONCE from the ArcticDB universe "
+             "library and publish data_collection/panel/{trading_day}/panel.parquet, then "
+             "manifest.json (builders/daily_panel.py; alpha-engine-config-I10791, plan P-25). "
+             "Refuses, writing nothing, on an empty ticker frame or a panel off-contract. "
+             "--date overrides the trading day; --dry-run compiles and validates only.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -5771,7 +5799,9 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False):
+        # --daily-panel (D51) reads the ArcticDB universe library and writes
+        # data_collection/panel/ — the same S3 + ArcticDB surface as --daily.
         # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
         # and macro libraries, the same surface D31 reads under --daily.
         # --daily-arctic-append reads the daily_closes PostMarketData wrote +
@@ -5921,6 +5951,39 @@ def _run_features_settled_regrade(config: dict, args: argparse.Namespace) -> dic
     }
     if status == "skipped":
         result["skip_reason"] = collector.get("skip_reason")
+    if status == "error":
+        result["error"] = collector.get("error")
+    return result
+
+
+def _run_daily_panel(config: dict, args: argparse.Namespace) -> dict:
+    """D51: publish the session's daily panel (`builders.daily_panel.run`).
+
+    Keyed by the last closed session (``--date`` or :func:`default_run_date`),
+    the same day D32 appended. Reads the ArcticDB ``universe`` library once and
+    writes the panel parquet, then its manifest. A refused contract returns
+    ``status: error``, which the wrapper records as ``failed`` and ``main``
+    exits 1 on: an absent panel is a red leg on the phase-3 acceptance clause,
+    never a thin one every consumer reads as fine.
+    """
+    from builders import daily_panel
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = daily_panel.run(
+        config["bucket"],
+        trading_day=datetime.fromisoformat(run_date).date(),
+        dry_run=bool(getattr(args, "dry_run", False)),
+    )
+    status = collector.get("status")
+    result = {
+        "mode": "daily_panel",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"daily_panel": collector},
+    }
     if status == "error":
         result["error"] = collector.get("error")
     return result

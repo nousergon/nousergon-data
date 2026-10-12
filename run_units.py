@@ -271,6 +271,9 @@ MODE_UNITS: dict[str, str] = {
     # morning rebuild of features/{D-1} from the settled bar
     # (features/settled_regrade.py). Shares D31's feature keys.
     "features_settled_regrade": "D50",
+    # alpha-engine-config-I10791 (plan P-25): the daily panel, compiled once
+    # from the ArcticDB universe library (builders/daily_panel.py).
+    "daily_panel": "D51",
 }
 
 
@@ -324,6 +327,9 @@ MODE_ROWS: dict[str, ModeRows] = {
     # rebuilt snapshot (features.compute.FeatureBuild.n_ok), the same key D31's
     # PhaseUnit reads.
     "features_settled_regrade": ModeRows("features", "tickers_computed", library_ref=None),
+    # D51 publishes two S3 keys and no library; `rows` is the panel's row count
+    # (builders.daily_panel.run), the manifest's `row_count`.
+    "daily_panel": ModeRows("daily_panel", "rows", library_ref=None),
 }
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase

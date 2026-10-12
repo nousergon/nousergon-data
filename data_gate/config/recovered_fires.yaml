@@ -37,3 +37,20 @@ recovered_fires:
     tracker: alpha-engine-config-I11812
     # Brian ruled "count it" on 2026-10-05 20:14Z (ask 2).
     ruling: https://github.com/nousergon/alpha-engine-config/issues/11812#issuecomment-6002163196
+  - schedule: data-collection-morning
+    fire: "2026-10-09T11:30:00Z"
+    machine: ne-data-collection-morning
+    # Started 11:30:42Z, inside the window. FAILED 11:47Z: PyPI published
+    # pyarrow 26.0.0 at 08:26Z, the box pins numpy<2, and pyarrow 26 will not
+    # import under NumPy 1.x, so D17 morning_enrich failed on its first parquet
+    # read and D18/D50 never ran.
+    fire_execution: a36ac8d0-38e6-4001-bfa8-174117a47f96
+    # Started by hand 13:58Z, after #2128 merged, with the schedule's own input
+    # (verify_units D17, D18, D50); SUCCEEDED 16:07Z. Ok scheduled-trigger
+    # manifests for D17/D18/D50 were written 14:05Z, 15:31Z and 16:06Z, all
+    # inside [fire, fire + COMPLETION_GRACE].
+    recovery_execution: morning-rerun-2026-10-09-pyarrow-1
+    root_cause_fix: nousergon-data#2128 (cap pyarrow below 26 while the box pins numpy<2)
+    tracker: alpha-engine-config-I10793
+    # INERT until Brian rules: replace `pending` with the ruling's URL.
+    ruling: pending

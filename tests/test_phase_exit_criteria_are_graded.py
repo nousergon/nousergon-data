@@ -26,7 +26,7 @@ import fnmatch
 
 import pytest
 
-from data_gate.clauses import EXIT_CRITERION_CLAUSES, generate
+from data_gate.clauses import CALENDAR_FLOOR_STANDING_CLAUSES, EXIT_CRITERION_CLAUSES, generate
 from data_gate.descriptors import load_units
 from data_gate.read import GATES, _phase_number, evaluate, load_phases
 
@@ -197,10 +197,16 @@ def test_the_bijection_check_bites(board, phases):
     """
     generated = {c.name for c in board}
     assert not fnmatch.filter(sorted(generated), "data.phase9.*")
-    assert sum(len(p.exit_criteria) for p in phases) >= 20, (
+    # 23 declared criteria before alpha-engine-config-I11305, 18 after (floor was
+    # 20, now 18): the five calendar-floored criteria left the exit lists for
+    # STANDING rows under Brian's 2026-09-21 ruling. They are still generated
+    # and rendered — asserted below — so nothing the plan names went unmeasured.
+    assert sum(len(p.exit_criteria) for p in phases) >= 18, (
         "the phases file declares fewer criteria than the plan's §6 exits list; a criterion "
         "dropped from the file is a criterion nothing grades"
     )
+    missing = sorted(set(CALENDAR_FLOOR_STANDING_CLAUSES) - generated)
+    assert not missing, f"standing calendar-floor clause(s) gone from the board: {missing}"
 
 
 def test_the_trading_day_fixture_is_a_date():

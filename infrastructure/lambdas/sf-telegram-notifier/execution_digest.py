@@ -130,10 +130,19 @@ TERMINAL_ERROR_HANDLING_STATES: frozenset[str] = frozenset({
     # Excluding only HandleFailure fixes the common path and leaves the
     # market-hours refusals naming the alerter — the same defect, narrower.
     "NotifyMarketHoursBlocked",
+    # 2026-10-09: the pre-session refusal ([08:00, 09:30) ET) on the two
+    # box-stopping post-close machines, also ahead of MarketHoursBlocked.
+    "NotifyPreSessionBlocked",
     "NotifyMarketHoursOverrideMalformed",
     "NotifyMarketHoursUnverified",
     "TradingDayGateFailed",
     "WeeklyRunDayGateFailed",
+    # alpha-engine-config-I12228: the weekly pipeline releases its own run
+    # slot on the way into each failure terminal. Housekeeping, not the
+    # state that broke, so the fallback must look past it like an alerter.
+    "ReleaseRunSlotBeforeFailExecution",
+    "ReleaseRunSlotBeforeDegradedRun",
+    "ReleaseRunSlotBeforeVacuousRun",
 })
 
 # The counterpart set, and the reason the one above can be a literal at all.

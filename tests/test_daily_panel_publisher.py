@@ -195,3 +195,40 @@ def test_the_cli_dry_run_writes_locally_and_never_to_s3(tmp_path, monkeypatch):
     assert put_calls == []
     assert (tmp_path / dp.panel_key(DAY)).is_file()
     assert (tmp_path / dp.manifest_key(DAY)).is_file()
+
+
+# -- run(): the collector's entry (weekly_collector.py --daily-panel, D51) ----
+
+
+def test_run_publishes_and_reports_the_keys_it_wrote():
+    sink = _Sink()
+    result = pub.run("b", trading_day=DAY, lookback_days=LOOKBACK, loader=_loader(_frames()), put=sink.put)
+    assert result["status"] == "ok"
+    assert result["panel_key"] == dp.panel_key(DAY) and result["manifest_key"] == dp.manifest_key(DAY)
+    assert sink.order == [result["panel_key"], result["manifest_key"]]
+    manifest = json.loads(sink.objects[result["manifest_key"]])
+    assert result["rows"] == manifest["row_count"] > 0
+    assert result["panel_sha256"] == manifest["panel_sha256"] == dp.sha256_hex(sink.objects[result["panel_key"]])
+
+
+def test_run_dry_run_compiles_and_validates_but_writes_nothing():
+    sink = _Sink()
+    result = pub.run("b", trading_day=DAY, lookback_days=LOOKBACK, loader=_loader(_frames()), put=sink.put, dry_run=True)
+    assert result["status"] == "ok_dry_run" and result["rows"] > 0
+    assert sink.objects == {} and "panel_key" not in result
+
+
+def test_run_returns_an_error_verdict_not_a_traceback_and_writes_nothing():
+    frames = _frames()
+    frames["MSFT"] = frames["MSFT"].iloc[0:0]
+    sink = _Sink()
+    result = pub.run("b", trading_day=DAY, lookback_days=LOOKBACK, loader=_loader(frames), put=sink.put)
+    assert result["status"] == "error" and "empty frame" in result["error"]
+    assert sink.objects == {} and "panel_key" not in result
+
+
+def test_run_refuses_a_non_session_before_reading():
+    loader = _loader(_frames())
+    result = pub.run("b", trading_day=dt.date(2026, 10, 3), loader=loader, put=_Sink().put)
+    assert result["status"] == "error" and "not an NYSE session" in result["error"]
+    assert loader.calls == []
