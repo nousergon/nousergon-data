@@ -572,9 +572,16 @@ def test_the_published_document_renders_as_a_declared_pending_state_on_the_board
     store = EmptyStore({"metrics/cost/monthly/latest.json": json.dumps(document).encode()})
     clause = clause_module._clause_cost_monthly(store)
     assert not clause.met and not clause.unmeasurable
-    assert "NOT LIVE" in clause.detail
+    # data.cost.monthly is a STANDING row (alpha-engine-config-I11305): it
+    # carries the reading's own detail, not the observation-window "NOT LIVE"
+    # verdict. The declared pending state is stated in that detail.
+    assert "status=pending_target" in clause.detail
     assert "not ratified" in clause.detail
+    assert "no ok/breach verdict to grade" in clause.detail
     assert "5 of 31 day(s) of 2026-10 observed" in clause.detail
     assert "baseline 7 of 28 day(s) covered" in clause.detail
     assert "closed set" not in clause.detail
-    assert clause.window_observed == 5 and clause.window_required == 31
+    # The window counts moved into the standing row's detail (asserted above);
+    # a standing row carries no window_* attributes, so assert the row's kind.
+    assert isinstance(clause, clause_module.StandingClause)
+    assert "STANDING" in clause.requirement

@@ -44,8 +44,8 @@ the month the export has measured (`days_observed` of `days_in_month`), and a
 `status` from the closed set the clause reads. The ceiling that status grades
 against is Brian's ratification (R6), declared in
 `data_gate/config/cost_ceiling.yaml`; while it is null, `status` is
-`pending_target`, which renders NOT LIVE with the reason, never MET and never
-against a guessed number.
+`pending_target`, which the standing row renders as a declared pending state
+with the reason, never MET and never against a guessed number.
 """
 
 from __future__ import annotations

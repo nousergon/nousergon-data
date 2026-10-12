@@ -6,8 +6,8 @@
 # own: it is a limit, and limits are Brian's ruling. While it is null the
 # producer (`data_gate/producers/cost_monthly.py`) publishes the month-to-date
 # figure and its observation maturity with `status: pending_target`, which the
-# clause renders as NOT LIVE (target not ratified), never as MET and never
-# against a guessed number.
+# standing clause renders as a declared pending state (target not ratified),
+# never as MET and never against a guessed number.
 #
 # `proposed_baseline_multiplier` is R6's proposal rule (ceiling = 4-week
 # tagged baseline x 1.2, proposed at phase-1 exit). The producer publishes the
