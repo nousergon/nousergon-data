@@ -19,8 +19,16 @@ component: 1
 lifecycle: pending
 owner: brian
 code_path: "builders/daily_panel.py:174"
-pending_since: "2026-10-06"
-lifecycle_reexam: "2026-10-20"
+# RE-EXAMINED 2026-10-13, re-declared pending with a NEW reason. The blocker
+# the 2026-10-06 declaration named has cleared: nous-ergon-ops-PR1668 merged
+# 2026-10-12 15:45Z granting the collection-box role PutObject/GetObject on
+# data_collection/panel/*, its iam-apply-on-merge `apply` job succeeded, and
+# the live inline policy nousergon-data-collection-box-s3 carries the
+# data_collection/panel/* ARN (read 2026-10-13). What remains is the schedule
+# itself, and the promotion condition is unmet: no object exists under
+# data_collection/panel/ or data_collection/runs/D51/ (aws s3 ls, 2026-10-13).
+pending_since: "2026-10-13"
+lifecycle_reexam: "2026-10-27"
 lifecycle_reason: >-
     The producer module, its contract, an operator-run CLI and the collector's
     whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
@@ -30,8 +38,10 @@ lifecycle_reason: >-
     collection-box write grant on data_collection/panel/ is
     nous-ergon-ops-PR1668, applied 2026-10-12. The unit stays pending until a
     scheduled run has published data_collection/panel/{trading_day}/manifest.json
-    for the latest session (promotes_when). Re-exam 2026-10-20 =
-    pending_since + 14 days, the PENDING_MAX_DAYS ceiling.
+    for the latest session (promotes_when). Re-declared pending 2026-10-13 ->
+    re-exam 2026-10-27 (pending_since + 14 days, the PENDING_MAX_DAYS
+    ceiling); the previous window (2026-10-06 -> 2026-10-20) named the grant
+    as the blocker.
 lifecycle_owner: brian
 promotes_when: >-
     The EOD collection runs `weekly_collector.py --daily-panel` after the

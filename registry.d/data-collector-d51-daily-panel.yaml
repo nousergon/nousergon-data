@@ -15,8 +15,8 @@ origin: ne-data-collection-eod
 owner: brian
 lifecycle: pending
 lifecycle_owner: brian
-lifecycle_reexam: '2026-10-20'
-pending_since: '2026-10-06'
+lifecycle_reexam: '2026-10-27'
+pending_since: '2026-10-13'
 promotes_when: the D51 unit descriptor's own successor (ne-data-collection-eod (alpha-engine-config-I10791);
   no v1 predecessor, because v1 never published a panel) goes live
 lifecycle_reason: 'Generated from registry.d/units/D51-*.yaml (P-08): the unit descriptor itself declares
