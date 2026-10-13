@@ -546,6 +546,8 @@ def check_cardinality(
     class_rules: Sequence[Mapping[str, Any]] | None = None,
     floor: float = 1.0,
     staging: GuardStaging = CARDINALITY_GUARD,
+    miss_remedy: str | None = None,
+    max_named: int | None = None,
 ) -> CardinalityReading:
     """Grade one unit's published coverage against its declared universe.
 
@@ -570,6 +572,18 @@ def check_cardinality(
             explains is named with its class in the detail. ``None`` loads
             the committed contract.
         floor: Minimum acceptable coverage ratio (D20's declared floor is 1.0).
+        miss_remedy: What the detail tells a reader to do about an undeclared
+            miss. ``None`` keeps the EOD spine's wording (declare the symbol in
+            ``unpriced_symbols.yaml`` or fix the fetch). A unit whose
+            denominator is not a priced universe passes its own, because that
+            advice would send its reader to the wrong file (D01's previous
+            roster, D02's previous membership history).
+        max_named: Name at most this many undeclared misses and count the
+            rest. ``None`` names every one (the EOD spine's universe is under a
+            hundred symbols). A unit whose collapse can lose hundreds passes a
+            bound, so the count, the floor and the remedy survive the run
+            manifest's 2,000-character ``detail`` instead of being cut off
+            mid-list.
 
     An empty denominator is `unmeasurable`, never a vacuous pass — a unit that
     cannot even measure its own universe has nothing for this guard to grade,
@@ -632,10 +646,15 @@ def check_cardinality(
     if undeclared_missing:
         detail += (
             f" — {len(undeclared_missing)} UNDECLARED miss(es): "
-            f"{', '.join(undeclared_missing)}. An undeclared missing symbol is a failure, "
-            "never a silent exclusion (plan §2 row 2): add a row (or, for a whole "
-            "never-priced instrument class, a class rule) to "
-            "contracts/exclusions/unpriced_symbols.yaml, or fix the fetch."
+            f"{', '.join(_bounded(undeclared_missing, max_named))}. "
+            + (
+                miss_remedy
+                if miss_remedy is not None
+                else "An undeclared missing symbol is a failure, "
+                "never a silent exclusion (plan §2 row 2): add a row (or, for a whole "
+                "never-priced instrument class, a class rule) to "
+                "contracts/exclusions/unpriced_symbols.yaml, or fix the fetch."
+            )
         )
     else:
         detail += " — zero undeclared misses"
@@ -643,6 +662,13 @@ def check_cardinality(
     if coverage < floor:
         return CardinalityReading("below_floor", detail, value=coverage, baseline=float(floor))
     return CardinalityReading("ok", detail, value=coverage, baseline=float(floor))
+
+
+def _bounded(names: list[str], limit: int | None) -> list[str]:
+    """``names``, or its first ``limit`` with the rest counted, never dropped."""
+    if limit is None or len(names) <= limit:
+        return names
+    return [*names[:limit], f"... and {len(names) - limit} more"]
 
 
 def cardinality_metric(unit_id: str, reading: CardinalityReading, *, source_path: str) -> MetricRecord:

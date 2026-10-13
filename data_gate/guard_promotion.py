@@ -133,8 +133,10 @@ GUARD_PROMOTIONS: tuple[GuardPromotion, ...] = (
         mode="observe",
         risk="moderate",
         blast_radius=(
-            "the EOD spine's (D20) own run; no ENFORCE raise site exists yet, so promotion also "
-            "writes one — the verdict is recorded and published, never acted on, today"
+            "the EOD spine's (D20) own run, and the weekly constituents (D01, which also runs "
+            "pre-MorningEnrich every trading day) and historical constituents (D02) runs; no "
+            "ENFORCE raise site exists yet, so promotion also writes one — the verdict is "
+            "recorded and published, never acted on, today"
         ),
         guard_class="cardinality",
         units=(),

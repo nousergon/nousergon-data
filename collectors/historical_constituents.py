@@ -89,6 +89,8 @@ import boto3
 import pandas as pd
 import requests
 
+from validators import expectations
+
 logger = logging.getLogger(__name__)
 
 #: First date with a dated roster snapshot at
@@ -1431,6 +1433,121 @@ def load_prior_rename_checks(
     return prior, None
 
 
+#: PROPOSED, not ratified — threshold values are Brian's (alpha-engine-config-I10785).
+#: The share of the names the PREVIOUSLY published history holds that this build
+#: must still hold (``data.D02.guard.cardinality``). History is append-only in
+#: intent, so a build that knows fewer names than the last one lost frozen
+#: changes, roster snapshots or part of today's roster. 0.99 rather than 1.0
+#: because a reticker newly committed to ``sp500_known_retickers.json`` folds
+#: one name into another (PSKY -> SKYD, nousergon-data#2133), and that is a
+#: correction, not a loss. Measured 2026-10-13 over the 11 builds published
+#: 2026-09-12..2026-10-10 (each against the one before it, membership lists
+#: only): worst 0.9959 (5 names, 2026-09-24), PSKY alone on 2026-10-10 at
+#: 0.9992. The 2026-10-10 build holds 1,228 names, so the floor allows 12.
+D02_HISTORY_RETENTION_FLOOR = 0.99
+
+
+def load_prior_membership_names(
+    bucket: str, s3_prefix: str = "market_data/", s3=None,
+) -> tuple[set[str] | None, str | None]:
+    """Every name the previously published ``membership`` map holds, or ``None``.
+
+    Returns ``(names, error)``. Read BEFORE this build's PUT overwrites the
+    key. A missing, unreadable or empty previous map is not a failure of this
+    build; it means the cardinality reading has no baseline, which
+    :func:`_grade_cardinality` records as ``unmeasurable`` (red, never
+    a pass).
+    """
+    s3 = s3 or boto3.client("s3")
+    key = f"{s3_prefix}historical_constituents.json"
+    try:
+        body = json.loads(s3.get_object(Bucket=bucket, Key=key)["Body"].read())
+        membership = body.get("membership")
+        if not isinstance(membership, dict) or not membership:
+            raise ValueError("membership is missing or empty")
+        names: set[str] = set()
+        for members in membership.values():
+            names.update(str(t) for t in members)
+    except Exception as exc:  # noqa: BLE001 — returned and graded unmeasurable by the caller
+        return None, f"{type(exc).__name__}: {exc}"
+    return names, None
+
+
+def _grade_cardinality(
+    prior_names: set[str] | None,
+    prior_error: str | None,
+    membership: dict[str, list[str]],
+    current_tickers: list[str],
+    *,
+    key: str,
+) -> dict:
+    """D02's cardinality reading, as one run-manifest guard entry.
+
+    ``validators/expectations.py::check_cardinality`` with the previous
+    build's names as the denominator and this build's names (every membership
+    list plus today's roster) as the covered set, at
+    :data:`D02_HISTORY_RETENTION_FLOOR`. Every name the previous build had
+    and this one lost is named in the detail.
+
+    OBSERVE mode (`sf-pipeline-policy` §7a), staged on
+    ``expectations.CARDINALITY_GUARD``: the verdict is logged (ERROR when not
+    clean) and rides on the manifest; it never changes what is published or
+    the exit code. It also never raises: a grading fault is recorded as
+    ``unmeasurable`` with the exception named, because this collector failing
+    stops the weekly pipeline at CollectionReadiness.
+    """
+    try:
+        if prior_names is None:
+            reading = expectations.CardinalityReading(
+                "unmeasurable",
+                "D02: no previous membership history to grade against "
+                f"({prior_error or 'not read'}). UNMEASURABLE, not a pass.",
+                key=key,
+                baseline=D02_HISTORY_RETENTION_FLOOR,
+            )
+        else:
+            covered = set(current_tickers)
+            for members in membership.values():
+                covered.update(members)
+            graded = expectations.check_cardinality(
+                unit_id="D02",
+                denominator_symbols=prior_names,
+                covered_symbols=covered,
+                exclusions={},
+                suffix_map={},
+                class_rules=[],
+                max_named=60,
+                floor=D02_HISTORY_RETENTION_FLOOR,
+                miss_remedy=(
+                    "Each is a name the previous published history held and this build "
+                    "does not: lost frozen changes, lost roster snapshots or a short "
+                    "current roster lose names; a newly committed reticker folds one."
+                ),
+            )
+            reading = expectations.CardinalityReading(
+                graded.verdict, graded.detail, key=key,
+                value=graded.value, baseline=graded.baseline,
+            )
+    except Exception as exc:  # noqa: BLE001 — recorded as unmeasurable; see docstring
+        reading = expectations.CardinalityReading(
+            "unmeasurable",
+            f"D02: cardinality grading failed ({type(exc).__name__}: {exc}). "
+            "UNMEASURABLE, not a pass.",
+            key=key,
+            baseline=D02_HISTORY_RETENTION_FLOOR,
+        )
+    expectations.report(reading, unit_id="D02", staging=expectations.CARDINALITY_GUARD, log=logger)
+    return {
+        "guard": expectations.CARDINALITY_GUARD.name,
+        "mode": expectations.CARDINALITY_GUARD.mode.value,
+        "verdict": reading.verdict,
+        "detail": reading.detail[:2000],
+        "key": reading.key,
+        "value": reading.value,
+        "baseline": reading.baseline,
+    }
+
+
 def collect(
     bucket: str,
     current_tickers: list[str],
@@ -1501,6 +1618,8 @@ def collect(
     # about. Verdicts Polygon already gave are carried from the previous
     # build (alpha-engine-config-I11525; see resolve_renames).
     prior, prior_error = load_prior_rename_checks(bucket, s3_prefix)
+    # Read before this build's PUT overwrites it: the cardinality baseline.
+    prior_names, prior_names_error = load_prior_membership_names(bucket, s3_prefix)
     if prior_error:
         logger.warning(
             "historical_constituents: previous rename verdicts unreadable (%s) — "
@@ -1691,6 +1810,11 @@ def collect(
         "built_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    key = f"{s3_prefix}historical_constituents.json"
+    cardinality = _grade_cardinality(
+        prior_names, prior_names_error, pit, current_tickers, key=key,
+    )
+
     if dry_run:
         logger.info(
             "[dry-run] historical_constituents: %d changes (%d frozen + %d "
@@ -1703,10 +1827,10 @@ def collect(
         return {
             "status": "ok_dry_run", "n_changes": len(changes),
             "n_snapshots": len(pit), "verdict": status, **quality,
+            "guards": [cardinality],
         }
 
     s3 = boto3.client("s3")
-    key = f"{s3_prefix}historical_constituents.json"
     s3.put_object(
         Bucket=bucket,
         Key=key,
@@ -1722,9 +1846,10 @@ def collect(
     out = {
         "status": status, "n_changes": len(changes), "n_snapshots": len(pit),
         **quality,
+        "guards": [cardinality],
     }
     if provisional.accepted:
-        out["guards"] = provisional_addition_guards(provisional.accepted, key=key)
+        out["guards"] += provisional_addition_guards(provisional.accepted, key=key)
     if detail:
         out["detail"] = detail
     return out

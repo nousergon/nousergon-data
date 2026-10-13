@@ -218,7 +218,9 @@ def test_collect_passes_vylr_provisionally_and_publishes_it_everywhere():
     assert written["attestation"]["provisional_additions"] == [entry]
     assert written["quality"]["provisional_additions"] == [entry]
 
-    [guard] = out["guards"]
+    # The cardinality reading rides every build (data_cardinality); this
+    # test is about the provisional one.
+    [guard] = [g for g in out["guards"] if g["guard"] == hc.PROVISIONAL_ADDITION_GUARD]
     assert guard["guard"] == hc.PROVISIONAL_ADDITION_GUARD
     assert guard["key"] == "market_data/historical_constituents.json"
     assert "ticker=VYLR" in guard["detail"] and entry["deadline"] in guard["detail"]
@@ -231,7 +233,7 @@ def test_collect_with_two_additions_is_degraded():
                             ["A", "B", "VYLR", "ZZZ"])
     assert out["status"] == "degraded"
     assert out["n_provisional_additions"] == 0
-    assert "guards" not in out
+    assert [g["guard"] for g in out["guards"]] == ["data_cardinality"]
     assert "at most 1" in out["detail"]
     assert written["attestation"]["provisional_additions"] == []
 
