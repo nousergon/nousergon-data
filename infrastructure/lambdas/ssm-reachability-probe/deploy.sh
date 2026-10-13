@@ -100,6 +100,9 @@ package() {
 # nousergon-data/tests/test_no_imperative_alarm_authorship.py fails the build
 # if it reappears. To apply immediately from nous-ergon-ops:
 #   infrastructure/cloudwatch/apply.py --prefix alpha-engine-ssm-reachability-probe-
+# Both files were DELETED 2026-10-09 (alpha-engine-config-I11792) while this
+# probe is paused; restore them from automation_pause.json :: retired_alarms
+# `restore_from` before un-pausing it.
 apply_alarms() {
   echo "  (no-op: alarms for ${FUNCTION_NAME} are applied from nous-ergon-ops, alpha-engine-config-I7359)"
 }

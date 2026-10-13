@@ -88,6 +88,15 @@ item and applies the decision matrix (``decide_mutex_action``):
                                   the unsafe case; recording surface = loud
                                   stderr WARN + the printed manual command.
 
+Since alpha-engine-config-I12228 the weekly SF applies the same matrix
+itself: every Fail terminal releases the execution's own item, and AcquireMutex
+takes over a slot whose holder is terminal-failed (CheckRunSlotHolderTerminal).
+This script's steal remains the path for holders that predate that change, and
+the source of truth both are pinned against
+(tests/test_sf_run_slot_takeover_and_release.py). It also emits the failed
+cycle's ``collection_not_before`` (``cycle_collection_anchor``), so the rerun's
+collection readiness wait reads the collection its cycle already ran.
+
 Independently of DynamoDB, ``--start`` ABORTS if ANY execution of the state
 machine is currently RUNNING with the same effective run_date (that is the
 actual double-writer hazard, and it needs no DDB permissions).
@@ -116,6 +125,7 @@ from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
     entered_states,
     execution_input,
     fetch_history,
+    initialize_input_output,
     list_all_executions,
     verify_skip_flags_live,
     _walk_states,  # noqa: F401 — re-exported: tests/test_weekly_sf_rerun.py calls mod._walk_states directly
@@ -275,6 +285,11 @@ TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
     # a run that already ended, and re-running a stage on the strength of it
     # would re-run the whole pipeline. Deleted at the 2026-09-05 cutover.
     "WriteCompletionMarkerDegradedCalendar",
+    # alpha-engine-config-I12228: the run-slot release hop in front of the
+    # terminal. It releases this execution's own mutex item on the way out and
+    # records nothing about any stage.
+    "CheckRunSlotHeldBeforeDegradedRun",
+    "ReleaseRunSlotBeforeDegradedRun",
     "DegradedRun",
 })
 
@@ -1176,6 +1191,12 @@ class RerunPlan:
     # why" without anyone having to find the terminal that launched it.
     accept_vacuous_reason: str = ""
 
+    # alpha-engine-config-I12228: the cycle's collection-readiness anchor (an
+    # RFC3339 instant), emitted as ``collection_not_before``. See
+    # ``cycle_collection_anchor``. Empty = not derivable; the key is then left
+    # out and the SF's InitializeInput floor (the rerun's own start) applies.
+    collection_not_before: str = ""
+
     def rerun_input(self) -> dict:
         """The emitted StartExecution input.
 
@@ -1240,6 +1261,8 @@ class RerunPlan:
         out.update(self.skip_flags)
         if self.accept_vacuous_reason:
             out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
+        if self.collection_not_before:
+            out["collection_not_before"] = self.collection_not_before
         return out
 
 
@@ -1380,6 +1403,62 @@ def resolve_chain(links: list) -> tuple:
     return outcome, witness
 
 
+def _parse_anchor(value) -> datetime | None:
+    """An aware datetime from a datetime or an RFC3339 string, else None."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    try:
+        parsed = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _execution_start(events: list[dict]) -> datetime | None:
+    """The ExecutionStarted event's timestamp (boto3 hands a datetime; a
+    recorded fixture an RFC3339 string)."""
+    for e in events:
+        if e.get("type") == "ExecutionStarted" and e.get("timestamp") is not None:
+            return _parse_anchor(e["timestamp"])
+    return None
+
+
+def cycle_collection_anchor(
+    histories: list[list[dict]], start_time: datetime | None = None
+) -> str:
+    """The instant this cycle's collection manifests are graded from.
+
+    alpha-engine-config-I12228. The weekly SF's WaitForCollectionManifests
+    grades manifests against ``$.collection_not_before``, which InitializeInput
+    floors to the execution's OWN start. On a rerun that floor is wrong: it is
+    hours after the cycle's collection ran, so a data-only rerun that finished
+    first is invisible and the pipeline rerun demands a fresh full collection.
+    The right anchor is the cycle's ORIGINAL start - the earliest execution of
+    the chain (all of them share this run_date) - read from each execution's
+    InitializeInput output when it has one (that carries an anchor an earlier
+    rerun already inherited), else its own start. ``start_time`` is the
+    source's start, used only when no history carries a timestamp. Returns ""
+    when nothing is derivable. The probe refuses an anchor more than
+    COLLECTION_ANCHOR_MAX_AGE_SECONDS before the rerun's start, so this can
+    never admit the previous cycle's manifests.
+    """
+    anchors: list[datetime] = []
+    for events in histories:
+        merged = initialize_input_output(events) or {}
+        anchor = _parse_anchor(merged["collection_not_before"]) if merged.get(
+            "collection_not_before") else None
+        if anchor is None:
+            anchor = _execution_start(events)
+        if anchor is not None:
+            anchors.append(anchor)
+    if not anchors and start_time is not None:
+        anchors.append(_parse_anchor(start_time))
+    if not anchors:
+        return ""
+    earliest = min(anchors).astimezone(timezone.utc)
+    return earliest.isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def derive_plan(
     events: list[dict],
     start_time: datetime | None = None,
@@ -1410,6 +1489,9 @@ def derive_plan(
     plan.chain = [label for label, _ in links]
     entered_by_label = dict(links)
     outcome, plan.witnessed_by = resolve_chain(links)
+    plan.collection_not_before = cycle_collection_anchor(
+        [evs for _label, evs in (prior_histories or [])] + [events], start_time
+    )
 
     for stage in STAGES:
         verdict = outcome.get(stage.name)
@@ -1676,6 +1758,20 @@ def decide_mutex_action(
             holder_arn=holder_arn,
             holder_status=holder_status,
             manual_cmd=_manual_delete_cmd(key),
+        )
+    if holder_status not in TERMINAL_STATUSES:
+        # alpha-engine-config-I12228: PENDING_REDRIVE (or any status AWS adds
+        # later) is not terminal. A redrive resumes that SAME execution, which
+        # would then write beside the rerun - the RUNNING hazard by another
+        # name. Only a status this script KNOWS is terminal is stolen from; the
+        # weekly SF's CheckRunSlotHolderTerminal applies the identical rule.
+        return MutexDecision(
+            "abort",
+            f"holder execution {holder_arn} is {holder_status}, which is not "
+            "terminal — never steal from an execution that can still resume.",
+            key=key,
+            holder_arn=holder_arn,
+            holder_status=holder_status,
         )
     # FAILED / TIMED_OUT / ABORTED
     return MutexDecision(
@@ -2104,6 +2200,7 @@ def _print_plan(plan: RerunPlan, source_arn: str, source_status: str, name: str,
     print(f"chain            : {' -> '.join(plan.chain)}")
     print(f"rerun name       : {name}")
     print(f"pipeline_role    : {EMITTED_ROLE}")
+    print(f"collection anchor: {plan.collection_not_before or '(none - the rerun grades from its own start)'}")
     print(f"completed stages : {', '.join(plan.completed) or '(none)'}")
     print(f"degraded stages  : {', '.join(plan.degraded) or '(none)'}")
     print(f"failed stages    : {', '.join(plan.failed) or '(none identified)'}")

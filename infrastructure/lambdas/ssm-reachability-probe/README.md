@@ -51,15 +51,22 @@ scan — a false green, which is worse than no probe at all.
 
 ## Alarms
 
+**None live** since 2026-10-09 (alpha-engine-config-I11792 Tier 1). Both alarms
+below were DELETED while the probe's `...-5min` trigger is disabled under the
+automation pause; they are declared in `infrastructure/automation_pause.json ::
+retired_alarms`, whose `restore_from` names the nous-ergon-ops commit that still
+has each file. Un-pausing the probe means restoring them from there.
+
 - `alpha-engine-ssm-reachability-probe-unreachable` — `> 0` for two
-  consecutive 5-minute periods, missing data **breaching**.
+  consecutive 5-minute periods.
 - `alpha-engine-ssm-reachability-probe-dead` — heartbeat `< 1` over three
   consecutive periods (15 minutes), missing data **breaching**.
 
 ## Deploy
 
-Both **alarms** are applied on every merge by
-`.github/workflows/deploy-ssm-reachability-probe.yml` (`--apply-alarms`), and
+`--apply-alarms` is a no-op here (alarms live in nous-ergon-ops, and this
+probe's were retired — see above); it still runs on every merge from
+`.github/workflows/deploy-ssm-reachability-probe.yml`, and
 **code** deploys on every merge once the function exists.
 
 First-time creation of the IAM role, function and EventBridge rule is
@@ -69,7 +76,8 @@ incidents). This is `pull-request-policy.md` §4.2 **form 3**: the merge emits
 the exact command, and `alpha-engine-ssm-reachability-probe-dead` sits RED from
 the moment the alarms land until the command has actually run. Alarm creation
 is deliberately NOT part of `--bootstrap` — that would make the detector for
-"bootstrap has not run" not exist until bootstrap ran.
+"bootstrap has not run" not exist until bootstrap ran. (That detector is the
+retired `-dead` alarm: a re-bootstrap after un-pausing restores it first.)
 
 ```
 AWS_PROFILE=ne-admin bash infrastructure/lambdas/ssm-reachability-probe/deploy.sh --bootstrap
