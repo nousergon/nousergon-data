@@ -48,7 +48,10 @@ name: Data-collection gate (read-only)
 # THREE RULES CARRIED VERBATIM FROM THE PLAN (§4.1), for EACH read:
 #   1. A gate READS; it never runs. This workflow launches no collection —
 #      its role (`github-actions-data-gate-read`, nous-ergon-ops) holds no
-#      write capability outside `data_collection/gates/*` and no Step
+#      write capability outside `data_collection/gates/*` and
+#      `data_collection/parity_adjudication/*/evidence/*` (byte-identical
+#      server-side copies of the versions a graded parity breach cites — never
+#      an adjudication record, whose keys never match that prefix) and no Step
 #      Functions/Scheduler/Lambda invoke authority at all.
 #   2. A clause is MET, UNMET or UNMEASURABLE, and UNMEASURABLE is never MET.
 #   3. The gate's job succeeds when the MEASUREMENT succeeds, whatever the
@@ -357,6 +360,25 @@ jobs:
             --trading-day "$GATE_TRADING_DAY" \
             --trigger "$GATE_TRIGGER" \
             $FAIL_ON_UNMET_FLAG
+
+      # alpha-engine-config-I12023 follow-up: the parity clause graded above
+      # cites object VERSIONS (v1's compared write, the shadow object, every
+      # adjudication input's source_key@source_version_id) that the bucket's
+      # 30-day noncurrent-version purge and 7-day staging expiry delete. This
+      # step copies each one server-side to
+      # `data_collection/parity_adjudication/{report_day}/evidence/` and records
+      # `_manifest.json` there — idempotent, so a day with nothing new writes
+      # nothing (`data_gate/parity_evidence.py`). LAST on purpose: every reading
+      # above is already published when it runs, so a failure here can never
+      # cost a reading. NOT continue-on-error: a version that cannot be copied
+      # exits 2 and turns this job red, naming the version, because evidence
+      # that silently expired is the failure this step exists to prevent.
+      - name: Preserve the graded parity breach's evidence
+        id: parity_evidence
+        run: |
+          python -m data_gate preserve-parity-evidence \
+            --store "$STORE_URI" \
+            --trading-day "$GATE_TRADING_DAY"
 
   # ── FAILURE ALERTING ─────────────────────────────────────────────────────
   # Simplified under I10906: with the verdict no longer coupled to the job's
