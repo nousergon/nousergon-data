@@ -160,27 +160,21 @@ def test_the_eod_unit_writers_carry_declared_caps(stack):
     default, overrides, ssm = stack.dispatcher_runtime_caps()
     assert (default, ssm) == (7200, 300)
     writers = set(stack.UNIT_WRITERS["data-collection-eod"].values())
-    # daily-panel (D51, alpha-engine-config-I10791) is declared too: no
-    # scheduled run has been measured yet, so its 3600 s is sized like D50's,
-    # and it keeps the whole EOD chain inside the machine's ceiling.
-    assert writers == {"post-market-data", "post-market-arctic-append", "daily-panel"}
+    assert writers == {"post-market-data", "post-market-arctic-append"}
     assert {w: overrides[w] for w in writers} == {
-        "post-market-data": 5400, "post-market-arctic-append": 3600, "daily-panel": 3600,
+        "post-market-data": 5400, "post-market-arctic-append": 3600,
     }
 
 
 def test_the_eod_ordering_chain_is_derived_from_the_template(stack, tpl):
     """alpha-engine-config-I11363. From the EOD cron, the last minute any EOD
-    verify_unit a reader waits on can still be written is the cron plus
-    (SSM-online budget + cap) of each workload up to the last unit writer:
-    18:15 + 95 + 65 = 20:55 ET. D51 (the daily panel, alpha-engine-config-I10791)
-    runs after that and is a declared readiness exclusion, so it does not move
-    the bound. Every number comes from the template or the dispatcher source."""
+    verify_unit can still be written is the cron plus (SSM-online budget + cap)
+    of each workload up to the last unit writer: 18:15 + 95 + 65 = 20:55 ET.
+    Every number comes from the template or the dispatcher source."""
     by_name = {s["name"]: s for s in stack.schedules(tpl)}
     eod = by_name["data-collection-eod"]
     h, m = _cron_hour_minute(eod["expression"])
-    assert stack.waited_units(eod) == [u for u in eod["input"]["verify_units"] if u != "D51"]
-    worst = stack.worst_case_through_units(eod, stack.waited_units(eod))
+    worst = stack.worst_case_through_units(eod, eod["input"]["verify_units"])
     default, overrides, ssm = stack.dispatcher_runtime_caps()
     assert worst == sum(
         ssm + overrides.get(w, default) for w in ("post-market-data", "post-market-arctic-append")
@@ -306,16 +300,15 @@ def test_eod_verifies_every_unit_its_workloads_run(stack, tpl):
     # alpha-engine-config-I11269: edgar-pit-fundamentals-daily joins at the
     # tail (it was the v1 postclose SF's LaunchEdgarPitFundamentalsDailySpot
     # leg). It has no unit descriptor, so verify_units is unchanged.
-    # alpha-engine-config-I10791: daily-panel (D51) runs last and is verified.
     assert eod["workloads"] == [
         "post-market-data", "post-market-arctic-append", "arctic-probe",
-        "edgar-pit-fundamentals-daily", "daily-panel",
+        "edgar-pit-fundamentals-daily",
     ]
     assert eod["require_trading_day"] is True
     assert "verify_keys" not in eod
     assert set(eod["verify_units"]) == {
         "D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25",
-        "D26", "D27", "D28", "D29", "D30", "D31", "D32", "D51",
+        "D26", "D27", "D28", "D29", "D30", "D31", "D32",
     }
 
 
@@ -369,9 +362,8 @@ def test_lint_refuses_an_undeclared_or_empty_verify_units(stack, monkeypatch):
 #: none of it, so the probe still describes the day's final ArcticDB state.
 #: edgar-pit-fundamentals-daily reads the `universe` library for split-adjusted
 #: closes (collectors/edgar_pit_fundamentals.py::ArcticPriceReader) and writes
-#: S3 objects only. daily-panel (D51) reads the `universe` library once and
-#: writes data_collection/panel/ only (builders/daily_panel.py).
-_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade", "daily-panel"}
+#: S3 objects only.
+_NON_ARCTIC_WRITERS = {"edgar-pit-fundamentals-daily", "features-settled-regrade"}
 
 
 def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
@@ -390,7 +382,7 @@ def test_eod_and_morning_probe_arcticdb_after_its_last_writer(stack, tpl):
     assert set(after_morning) <= _NON_ARCTIC_WRITERS
     eod = by_name["data-collection-eod"]["input"]["workloads"]
     after = eod[eod.index("arctic-probe") + 1:]
-    assert after == ["edgar-pit-fundamentals-daily", "daily-panel"]
+    assert after == ["edgar-pit-fundamentals-daily"]
     assert set(after) <= _NON_ARCTIC_WRITERS
 
 
@@ -409,25 +401,6 @@ def test_the_morning_regrade_follows_the_settle_and_is_verified(stack, tpl):
 
     ceiling = _json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
     assert stack.worst_case_seconds(morning["workloads"], through="features-settled-regrade") <= ceiling
-
-
-def test_the_daily_panel_follows_the_append_and_is_verified(stack, tpl):
-    """alpha-engine-config-I10791: D51 compiles the session's panel from the
-    ArcticDB `universe` library, so it runs after the D32 append in the same
-    strictly ordered Map. It runs last, after edgar, so a refused panel cannot
-    stop edgar from running. Its run manifest is part of the EOD completion
-    claim. The whole EOD chain, D51 included, still fits the machine's
-    ceiling."""
-    eod = {s["name"]: s for s in stack.schedules(tpl)}["data-collection-eod"]["input"]
-    workloads = eod["workloads"]
-    assert workloads[-1] == "daily-panel"
-    assert workloads.index("post-market-arctic-append") < workloads.index("daily-panel")
-    assert eod["verify_units"][-1] == "D51"
-    assert stack.UNIT_WRITERS["data-collection-eod"]["D51"] == "daily-panel"
-    import json as _json
-
-    ceiling = _json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
-    assert stack.worst_case_seconds(workloads, through="daily-panel") <= ceiling
 
 
 def test_weekly_mirrors_the_v1_order(stack, tpl):
@@ -887,3 +860,91 @@ def test_daily_heal_runs_on_trading_days_only(stack, tpl):
     assert heal["require_trading_day"] is True
     assert heal["workloads"] == ["daily-heal"]
     assert heal["verify_units"] == ["D33"]
+
+
+# ── D51 daily panel: after the EOD collection, never inside it ──────────────
+#
+# alpha-engine-config-I10791. ne-postclose-reconcile-pipeline (the eod_pnl
+# reconcile) is started by alpha-engine-eod-backstop on ne-data-collection-eod's
+# terminal status change (eod-backstop/deploy.sh, COLLECTION_TERMINAL_PATTERN).
+# Any workload inside that machine delays the reconcile by its runtime, and a
+# failed one turns the collection FAILED. The panel therefore runs on its own
+# machine, started by a rule on the EOD machine's SUCCEEDED, which fires only
+# after the reconcile's trigger already has.
+
+_EOD_BACKSTOP_DEPLOY = REPO / "infrastructure" / "lambdas" / "eod-backstop" / "deploy.sh"
+_EOD_RECONCILE_SF = REPO / "infrastructure" / "step_function_eod_reconcile.json"
+
+
+def _machine_names(tpl) -> dict[str, str]:
+    return {
+        logical: res["Properties"]["StateMachineName"]
+        for logical, res in tpl["Resources"].items()
+        if res["Type"] == "AWS::StepFunctions::StateMachine"
+    }
+
+
+def test_the_reconcile_trigger_chain_cannot_include_the_panel(stack, tpl):
+    names = _machine_names(tpl)
+    # 1. The reconcile's trigger keys on exactly one machine: ne-data-collection-eod.
+    text = _EOD_BACKSTOP_DEPLOY.read_text(encoding="utf-8")
+    pattern = re.search(r"COLLECTION_TERMINAL_PATTERN=\$\(cat <<EOF\n(.*?)\nEOF", text, re.S)
+    assert pattern, "reconcile trigger pattern not found in eod-backstop/deploy.sh"
+    watched = re.findall(r"stateMachine:([A-Za-z0-9-]+)", pattern.group(1))
+    assert watched == ["ne-data-collection-eod"]
+    # 2. Nothing that machine runs, scheduled or healed, is the panel.
+    eod_machine = next(k for k, v in names.items() if v == "ne-data-collection-eod")
+    for s in stack.schedules(tpl):
+        if s["target_ref"] == eod_machine:
+            assert "daily-panel" not in s["input"]["workloads"], s["name"]
+            assert "D51" not in s["input"]["verify_units"], s["name"]
+    heal = json.loads(_EOD_RECONCILE_SF.read_text(encoding="utf-8"))["States"]["HealStartCollection"]
+    assert "daily-panel" not in heal["Parameters"]["Input"]["workloads"]
+    assert "D51" not in heal["Parameters"]["Input"]["verify_units"]
+    # 3. The panel runs only where its outcome cannot reach that trigger: on its
+    #    own machine, started by the EOD machine's SUCCEEDED and nothing else.
+    panel_runners = [
+        r for r in stack.event_rules(tpl) if "daily-panel" in r["input"]["workloads"]
+    ] + [s for s in stack.schedules(tpl) if "daily-panel" in s["input"].get("workloads", [])]
+    assert [r["name"] for r in panel_runners] == ["ne-data-collection-panel-on-eod"]
+    rule = panel_runners[0]
+    assert names[rule["target_ref"]] == "ne-data-collection-panel"
+    assert rule["target_ref"] != eod_machine
+    assert stack.rule_source_machines(rule) == [eod_machine]
+    assert rule["pattern"]["detail"]["status"] == ["SUCCEEDED"]
+    assert rule["input"]["workloads"] == ["daily-panel"]
+    assert rule["input"]["verify_units"] == ["D51"]
+    assert rule["declared_state"] == "ENABLED"
+
+
+def test_the_panel_machine_fits_its_ceiling(stack, tpl):
+    rule = next(r for r in stack.event_rules(tpl) if r["name"] == "ne-data-collection-panel-on-eod")
+    ceiling = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
+    assert stack.worst_case_seconds(rule["input"]["workloads"], through="daily-panel") <= ceiling
+    _default, overrides, _ssm = stack.dispatcher_runtime_caps()
+    assert overrides["daily-panel"] == 3600
+
+
+def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
+    real_loader = stack.load_template
+
+    def _mutate(fn):
+        base = real_loader()
+        fn(base["Resources"]["PanelOnEodSucceededRule"]["Properties"])
+        return base
+
+    def _bad_workload(p):
+        payload = json.loads(p["Targets"][0]["Input"])
+        payload["workloads"] = ["no-such-workload"]
+        p["Targets"][0]["Input"] = json.dumps(payload)
+
+    def _self_start(p):
+        p["Targets"][0]["Arn"] = {"Ref": "EodStateMachine"}
+
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(_bad_workload))
+    assert any("no-such-workload" in p for p in stack.lint())
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(_self_start))
+    assert any("may not start itself" in p for p in stack.lint())
+    assert stack.rule_pause_problems(
+        [{"name": "x-rule", "declared_state": "ENABLED"}], {"not_paused": {}}
+    ) == ["rule x-rule: declared ENABLED but not in automation_pause.json not_paused"]

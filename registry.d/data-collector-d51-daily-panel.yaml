@@ -11,13 +11,13 @@
 component_id: data-collector-d51-daily-panel
 owning_repo: nousergon-data
 substrate: step-functions
-origin: ne-data-collection-eod
+origin: ne-data-collection-panel
 owner: brian
 lifecycle: pending
 lifecycle_owner: brian
 lifecycle_reexam: '2026-10-27'
 pending_since: '2026-10-13'
-promotes_when: the D51 unit descriptor's own successor (ne-data-collection-eod (alpha-engine-config-I10791);
+promotes_when: the D51 unit descriptor's own successor (ne-data-collection-panel (alpha-engine-config-I10791);
   no v1 predecessor, because v1 never published a panel) goes live
 lifecycle_reason: 'Generated from registry.d/units/D51-*.yaml (P-08): the unit descriptor itself declares
   lifecycle: pending.'
@@ -49,7 +49,7 @@ signals:
 log_location: s3:alpha-engine-research/data_collection/logs/{workload}/{trading_day}/{instance_id}.log
 log_location_reason: The unit's spot box ships its WHOLE run log to this key on exit and every 60s while
   running (alpha-engine-config-I11353), and each of the unit's run manifests records the exact object
-  under `log_location`. Owning pipeline 'ne-data-collection-eod' (plan §4.4). The `_ssm_logs/data-spot/`
+  under `log_location`. Owning pipeline 'ne-data-collection-panel' (plan §4.4). The `_ssm_logs/data-spot/`
   path this row used to name was retired with that change; CloudWatch remains a capped live tail, never
   the record.
 alert_channel: sns:alpha-engine-alerts, via the owning pipeline's NotifyFailure state

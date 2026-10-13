@@ -33,8 +33,10 @@ lifecycle_reason: >-
     The producer module, its contract, an operator-run CLI and the collector's
     whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
     alpha-engine-config-I10791). SCHEDULED by alpha-engine-config-I10791's
-    schedule step: `daily-panel` is the last workload of the
-    ne-data-collection-eod schedule and D51 is one of its verify_units. The
+    schedule step: `daily-panel` runs on its own machine,
+    ne-data-collection-panel, which the rule ne-data-collection-panel-on-eod
+    starts when ne-data-collection-eod SUCCEEDS. D51 is that machine's only
+    verify_unit. The
     collection-box write grant on data_collection/panel/ is
     nous-ergon-ops-PR1668, applied 2026-10-12. The unit stays pending until a
     scheduled run has published data_collection/panel/{trading_day}/manifest.json
@@ -51,14 +53,23 @@ promotes_when: >-
     pending dates.
 trigger:
   kind: "step-functions"
-  # The LAST workload of the standalone stack's EOD machine, after the D32
-  # ArcticDB append it reads and after edgar, so a refused panel cannot stop
-  # edgar from running
-  # (infrastructure/cloudformation/nousergon-data-collection.yaml::EodSchedule).
-  owner: "ne-data-collection-eod"
-  started_by: "eventbridge-scheduler:nousergon-data-collection/data-collection-eod"
-  successor: "ne-data-collection-eod (alpha-engine-config-I10791); no v1 predecessor, because v1 never published a panel"
-  schedule: "weekdays 18:15 America/New_York"
+  # Its own machine, ne-data-collection-panel, started by the EventBridge rule
+  # ne-data-collection-panel-on-eod when ne-data-collection-eod SUCCEEDS
+  # (scheduled run or heal), so it runs after the D32 ArcticDB append it reads
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::PanelOnEodSucceededRule).
+  # It is deliberately NOT a workload of the EOD machine. The eod_pnl reconcile
+  # starts on that machine's terminal event, and the panel must neither delay
+  # nor gate it.
+  owner: "ne-data-collection-panel"
+  started_by: "eventbridge-rule:ne-data-collection-panel-on-eod"
+  successor: "ne-data-collection-panel (alpha-engine-config-I10791); no v1 predecessor, because v1 never published a panel"
+  # No `schedule:`. The machine is event-started, not cron-started, so
+  # data_gate/trigger_reconcile.py has no fire time to reconcile it against.
+  # In practice it starts when the weekday 18:15 America/New_York EOD
+  # collection, or a heal of it, SUCCEEDS. `on_demand: true` is the cadence
+  # shape data_gate/cadence.py offers an event-started unit. A missing day
+  # still surfaces through data.phase3.daily_panel_adopted.
+  on_demand: true
   runs_on: "ec2-spot"
 writes:
   - "data_collection/panel/{trading_day}/panel.parquet"
@@ -85,9 +96,9 @@ registry_rows: []
 run_manifest_prefix: data_collection/runs/D51
 detectors:
   - kind: "sf-execution"
-    via: "ne-data-collection-eod"
+    via: "ne-data-collection-panel"
     state: PRESENT
-    note: "verify_units D51: a missing, failed or output-less D51 manifest fails the EOD execution, which pages"
+    note: "verify_units D51: a missing, failed or output-less D51 manifest fails the panel execution, which pages"
   - kind: "crucible-gate"
     via: "data.phase3.daily_panel_adopted (published leg)"
     state: ABSENT

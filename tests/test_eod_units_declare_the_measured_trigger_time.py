@@ -55,9 +55,8 @@ MEASURED_SCHEDULE = "weekdays 18:15 America/New_York"
 
 #: The units the EOD machine owns: D19-D32, plus D03 (prices), which is in its
 #: verify_units and, since nousergon-data-PR2016 dropped it from the weekly
-#: check, graded only there (alpha-engine-config-I11832), plus D51 (the daily
-#: panel), the machine's last workload since alpha-engine-config-I10791.
-EOD_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03", "D51"}
+#: check, graded only there (alpha-engine-config-I11832).
+EOD_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03"}
 
 #: The family whose `freshness.deadline` is the EOD fire plus its writers' caps.
 #: D03 keeps its own `weekly` freshness family: that axis is the freshness SLO's
@@ -70,7 +69,7 @@ def _eod_units():
 
 
 def test_the_eod_units_are_owned_by_the_standalone_machine():
-    """Non-vacuity guard and the owner pin in one: exactly D19-D32, D03 and D51."""
+    """Non-vacuity guard and the owner pin in one: exactly D19-D32 and D03."""
     assert {u.unit_id for u in _eod_units()} == EOD_UNITS
 
 
@@ -134,7 +133,7 @@ def test_the_eod_spine_deadline_is_the_derived_worst_case_write_bound():
     match = re.match(r"cron\((\d+) (\d+) ", eod["expression"])
     assert match, eod["expression"]
     fire = int(match.group(2)) * 60 + int(match.group(1))
-    worst = stack.worst_case_through_units(eod, stack.waited_units(eod))
+    worst = stack.worst_case_through_units(eod, eod["input"]["verify_units"])
     bound = fire + -(-worst // 60)
     expected = f"{bound // 60:02d}:{bound % 60:02d} America/New_York"
 

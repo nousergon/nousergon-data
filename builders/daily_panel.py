@@ -24,12 +24,12 @@ consumer reads as fine.
 **Entry points.** ``python -m builders.daily_panel publish|parity`` for an
 operator, and :func:`run` for the collector's whole-mode unit D51
 (``python weekly_collector.py --daily-panel``, ``weekly_collector.py::_run_daily_panel``),
-which records a run manifest around it. The collector entry is scheduled:
-``daily-panel`` is the last workload of the ``ne-data-collection-eod``
-schedule, and D51 is one of its verify_units (alpha-engine-config-I10791). The
-collection box's ``s3:PutObject`` grant on ``data_collection/panel/*`` is
-nous-ergon-ops-PR1668. The operator CLI below stays for replays and for the
-parity receipt.
+which records a run manifest around it. The collector entry runs on
+``ne-data-collection-panel``, started when ``ne-data-collection-eod`` SUCCEEDS
+(alpha-engine-config-I10791), never inside the EOD machine whose terminal
+event starts the eod_pnl reconcile. The box's ``data_collection/panel/*``
+write grant is nous-ergon-ops-PR1668. The operator CLI below stays for
+replays and for the parity receipt.
 
     python -m builders.daily_panel publish --date 2026-10-02 [--dry-run]
     python -m builders.daily_panel parity --date 2026-10-02 --consumer-panel s3://.../panel.parquet
