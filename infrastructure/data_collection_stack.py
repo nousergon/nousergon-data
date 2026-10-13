@@ -245,6 +245,7 @@ UNIT_WRITERS: dict[str, dict[str, str]] = {
             "D28", "D29", "D30", "D31",
         )},
         "D32": "post-market-arctic-append",
+        "D51": "daily-panel",
     },
     "data-collection-morning": {
         "D17": "morning-enrich",
@@ -267,6 +268,16 @@ UNIT_WRITERS: dict[str, dict[str, str]] = {
 #: are otherwise derived as exactly the schedule's verify_units, and
 #: tests/test_v1_collection_readiness_wait.py asserts this table both ways.
 READINESS_WAIT_EXCLUSIONS: dict[str, dict[str, str]] = {
+    "data-collection-eod": {
+        "D51": (
+            "daily panel, data_collection/panel/{trading_day}/ (alpha-engine-config-I10791). "
+            "ne-postclose-reconcile-pipeline reads the D03..D32 manifests and the SPY "
+            "close in ArcticDB, not the panel. Waiting on D51 would hold the reconcile "
+            "on an artifact it does not read. For the same reason, its HealStartCollection "
+            "runs only the two writers of what it reads and does not verify D51. The "
+            "EOD SF's own VerifyRunManifests grades D51."
+        ),
+    },
     "data-collection-morning": {
         "D50": (
             "features/{D-1} settled rebuild (alpha-engine-config-I12023). The preopen "
@@ -287,6 +298,19 @@ def worst_case_through_units(schedule: dict, units: list[str], *, path: Path = D
     return worst_case_seconds(workloads, through=last, path=path)
 
 
+def waited_units(schedule: dict) -> list[str]:
+    """``schedule``'s verify_units minus its declared readiness exclusions.
+
+    These are the units a downstream reader waits on, so they are the ones the
+    reader's time bounds are derived through. D51, the daily panel, runs last
+    on the EOD schedule. Nothing downstream on that evening waits on it, so it
+    is graded only by the collection's own VerifyRunManifests. Counting it
+    here would move every reader's bound to the end of the whole chain.
+    """
+    excluded = READINESS_WAIT_EXCLUSIONS.get(schedule["name"], {})
+    return [u for u in schedule["input"]["verify_units"] if u not in excluded]
+
+
 def _cron_minutes(expression: str) -> int | None:
     """``cron(M H ? * MON-FRI *)`` -> minutes after local midnight."""
     m = re.fullmatch(r"cron\((\d+) (\d+) \?.*\)", expression)
@@ -299,8 +323,10 @@ def sameday_ordering_problems(sched: list[dict], *, path: Path = DISPATCHER) -> 
 
     Refused when BOTH are ENABLED and the shadow's cron does not clear the EOD
     cron plus the declared caps of every workload up to the last one writing an
-    EOD verify_unit. Both crons are same-day America/New_York weekday times
-    (checked by lint), so the comparison is in local minutes.
+    EOD verify_unit the shadow could compare (:func:`waited_units`; D51's
+    data_collection/panel/ keys have no v1 counterpart to compare). Both crons
+    are same-day America/New_York weekday times (checked by lint), so the
+    comparison is in local minutes.
     """
     by_name = {s["name"]: s for s in sched}
     eod = by_name.get("data-collection-eod")
@@ -312,7 +338,7 @@ def sameday_ordering_problems(sched: list[dict], *, path: Path = DISPATCHER) -> 
     eod_start, shadow_start = _cron_minutes(eod["expression"]), _cron_minutes(shadow["expression"])
     if eod_start is None or shadow_start is None:
         return ["sameday ordering: unparseable cron on data-collection-eod or -shadow-sameday"]
-    bound = eod_start + -(-worst_case_through_units(eod, eod["input"]["verify_units"], path=path) // 60)
+    bound = eod_start + -(-worst_case_through_units(eod, waited_units(eod), path=path) // 60)
     if shadow_start < bound:
         return [
             f"sameday ordering: data-collection-shadow-sameday fires at minute {shadow_start} "

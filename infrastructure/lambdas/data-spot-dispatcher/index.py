@@ -247,6 +247,14 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # rather than inherited because it extends the morning schedule's worst
     # case (`data_collection_stack.worst_case_seconds`).
     "features-settled-regrade": 3600,
+    # D51 (alpha-engine-config-I10791, plan P-25): one read of the ArcticDB
+    # universe library over a 600-day window and one parquet + manifest PUT,
+    # no fetch. No scheduled run has been measured yet, so it is sized like
+    # D50 beside it (a single compile plus box boot and the venv build) and
+    # declared rather than inherited: the 7200 s default would push the EOD
+    # chain's worst case past the collection machine's 28800 s ceiling
+    # (tests/test_data_collection_stack.py pins the fit).
+    "daily-panel": 3600,
 }
 
 
@@ -444,6 +452,13 @@ _WORKLOADS: dict[str, str] = {
     # LAST, after `arctic-probe`: it writes S3 keys only and no ArcticDB, so
     # the probe still describes the morning's final library state.
     "features-settled-regrade": "python weekly_collector.py --features-settled-regrade",
+    # alpha-engine-config-I10791 (plan P-25): D51, the daily panel
+    # (`builders/daily_panel.py`). It compiles the session's long OHLCV panel
+    # once from the ArcticDB `universe` library and publishes it under
+    # data_collection/panel/{trading_day}/. The EOD schedule runs it LAST,
+    # after the D32 append it reads; it writes S3 keys only and no ArcticDB,
+    # so `arctic-probe` still describes the evening's final library state.
+    "daily-panel": "python weekly_collector.py --daily-panel",
     # alpha-engine-config-I10753: the five weekly units with no standalone
     # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
     # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no

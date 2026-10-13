@@ -256,6 +256,20 @@ Resources:
   # completion claim covers every key each of them publishes, not the two Metron
   # reads most (alpha-engine-config-I10787). `arctic-probe` is absent because it
   # writes no run manifest — a gap named in the P-20 report, not a silent skip.
+  #
+  # `daily-panel` (D51, alpha-engine-config-I10791, plan P-25) runs LAST. It
+  # compiles the session's long OHLCV panel from the ArcticDB `universe`
+  # library, so it must follow the D32 append. It writes S3 keys only
+  # (data_collection/panel/{trading_day}/) and no ArcticDB, so it may follow
+  # arctic-probe. It runs after edgar so that a refused panel cannot stop edgar
+  # from running. D51 is a verify_unit: a missing, failed or output-less D51
+  # manifest fails this execution and pages. Its write grant is
+  # nous-ergon-ops-PR1668. The v1 reconcile pipeline does not read the panel,
+  # so D51 is a declared exclusion from that pipeline's readiness wait and from
+  # its heal (data_collection_stack.READINESS_WAIT_EXCLUSIONS). The reconcile
+  # backstop's worst case is still derived through D32. With D51's declared
+  # 3600 s cap, the whole chain is 28500 s worst case, inside the machine's
+  # 28800 s TimeoutSeconds.
   EodSchedule:
     Type: AWS::Scheduler::Schedule
     Properties:
@@ -276,7 +290,7 @@ Resources:
         RetryPolicy:
           MaximumRetryAttempts: 3
           MaximumEventAgeInSeconds: 3600
-        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe", "edgar-pit-fundamentals-daily"], "require_trading_day": true, "verify_units": ["D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31", "D32"]}'
+        Input: '{"collection": "eod", "workloads": ["post-market-data", "post-market-arctic-append", "arctic-probe", "edgar-pit-fundamentals-daily", "daily-panel"], "require_trading_day": true, "verify_units": ["D03", "D19", "D20", "D21", "D22", "D23", "D24", "D25", "D26", "D27", "D28", "D29", "D30", "D31", "D32", "D51"]}'
 
   # Weekday pre-open ArcticDB enrich + append. Replaces ne-preopen-trading-
   # pipeline's LaunchMorningEnrichSpot + LaunchMorningArcticAppendSpot. 07:30 ET

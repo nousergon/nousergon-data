@@ -473,7 +473,14 @@ def test_the_heal_starts_the_standalone_eod_machine_with_its_own_units(schedules
     assert eod["target_ref"] and "eod" in eod["target_ref"].lower()
     heal_input = heal["Parameters"]["Input"]
     assert heal_input["collection"] == "eod"
-    assert heal_input["verify_units"] == eod["input"]["verify_units"]
+    # The heal verifies what the reconcile reads: the schedule's verify_units
+    # minus the units the reconcile declared it does not wait on (D51, the
+    # daily panel, alpha-engine-config-I10791). The heal does not run that
+    # unit's writer, so verifying it there would fail every heal.
+    excluded = stack.READINESS_WAIT_EXCLUSIONS.get("data-collection-eod", {})
+    assert heal_input["verify_units"] == [
+        u for u in eod["input"]["verify_units"] if u not in excluded
+    ]
     assert set(heal_input["workloads"]) <= set(eod["input"]["workloads"])
     # The heal is for the precondition's data: the two writers of the verify_units.
     assert heal_input["workloads"] == ["post-market-data", "post-market-arctic-append"]

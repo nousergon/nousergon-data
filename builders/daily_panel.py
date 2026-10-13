@@ -24,12 +24,12 @@ consumer reads as fine.
 **Entry points.** ``python -m builders.daily_panel publish|parity`` for an
 operator, and :func:`run` for the collector's whole-mode unit D51
 (``python weekly_collector.py --daily-panel``, ``weekly_collector.py::_run_daily_panel``),
-which records a run manifest around it. **Neither is scheduled yet**: naming
-``daily-panel`` in the ``ne-data-collection-eod`` schedule, and the
-``s3:PutObject`` grant on ``data_collection/panel/*`` for the collection box's
-role, are the remaining steps (alpha-engine-config-I10791). Until the grant
-exists a scheduled run would fail on AccessDenied, so the schedule is not
-wired by the slice that adds the mode.
+which records a run manifest around it. The collector entry is scheduled:
+``daily-panel`` is the last workload of the ``ne-data-collection-eod``
+schedule, and D51 is one of its verify_units (alpha-engine-config-I10791). The
+collection box's ``s3:PutObject`` grant on ``data_collection/panel/*`` is
+nous-ergon-ops-PR1668. The operator CLI below stays for replays and for the
+parity receipt.
 
     python -m builders.daily_panel publish --date 2026-10-02 [--dry-run]
     python -m builders.daily_panel parity --date 2026-10-02 --consumer-panel s3://.../panel.parquet
