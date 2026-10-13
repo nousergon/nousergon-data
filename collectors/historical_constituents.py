@@ -82,7 +82,7 @@ import logging
 import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from io import StringIO
+from io import BytesIO, StringIO
 from pathlib import Path
 
 import boto3
@@ -362,6 +362,153 @@ def same_date_swaps(snapshots: dict[str, list[str]]) -> dict[str, list[str]]:
         if left and joined:
             out[date] = left
     return out
+
+
+def same_date_swap_pairs(
+    snapshots: dict[str, list[str]],
+) -> dict[str, tuple[list[str], list[str]]]:
+    """``{date: (left, joined)}`` for every date where both sides are non-empty.
+
+    :func:`same_date_swaps` with the joining side kept, so
+    :func:`infer_price_identity_renames` can test each departure against the
+    names that appeared on the same date.
+    """
+    out: dict[str, tuple[list[str], list[str]]] = {}
+    dates = sorted(snapshots)
+    for prev_date, date in zip(dates, dates[1:]):
+        before, after = set(snapshots[prev_date]), set(snapshots[date])
+        left, joined = sorted(before - after), sorted(after - before)
+        if left and joined:
+            out[date] = (left, joined)
+    return out
+
+
+#: Price-identity reticker inference. A reticker is the same instrument under a
+#: new symbol, so the new symbol's price history carries the old one's closes.
+#: Every committed reticker was proven exactly this way by hand: EQR -> VMRK
+#: matched to 0.03% (dividend-adjustment drift) over 2,466 closes, PSKY -> SKYD
+#: to 1e-6 over 2,510. Two different companies do not trade within 0.1% of each
+#: other for a year of sessions. PSKY -> SKYD failed the 2026-10-10 weekly D02
+#: because nothing ran that check (alpha-engine-config-I12023 arc).
+PRICE_IDENTITY_MIN_OVERLAP = 250
+PRICE_IDENTITY_MAX_DEVIATION = 0.001
+PRICE_CACHE_PREFIX = "reference/price_cache/"
+
+
+def price_identity_match(
+    old: pd.Series, new: pd.Series, swap_date: str,
+) -> dict | None:
+    """Evidence that ``new`` is ``old`` under a new symbol, or ``None``.
+
+    Both are close series indexed by session date. The old symbol must have
+    stopped trading before ``swap_date`` (a symbol still printing after it is a
+    second listing, not a rename), and the two must share at least
+    ``PRICE_IDENTITY_MIN_OVERLAP`` sessions whose closes all agree within
+    ``PRICE_IDENTITY_MAX_DEVIATION``.
+    """
+    old = old.dropna()
+    new = new.dropna()
+    if old.empty or new.empty:
+        return None
+    if pd.Timestamp(old.index.max()) >= pd.Timestamp(swap_date):
+        return None
+    joined = pd.concat([old, new], axis=1, join="inner").dropna()
+    joined = joined[(joined.iloc[:, 0] > 0) & (joined.iloc[:, 1] > 0)]
+    if len(joined) < PRICE_IDENTITY_MIN_OVERLAP:
+        return None
+    deviation = float((joined.iloc[:, 0] / joined.iloc[:, 1] - 1.0).abs().max())
+    if deviation > PRICE_IDENTITY_MAX_DEVIATION:
+        return None
+    return {
+        "overlap_sessions": int(len(joined)),
+        "max_close_deviation": round(deviation, 8),
+        "old_last_bar": pd.Timestamp(old.index.max()).strftime("%Y-%m-%d"),
+    }
+
+
+def infer_price_identity_renames(
+    resolution: "RenameResolution",
+    pairs: dict[str, tuple[list[str], list[str]]],
+    closes,
+) -> None:
+    """Resolve, in place, swaps Polygon did not classify by price identity.
+
+    Polygon reports some retickers as nothing at all (BK -> BNY, PSKY -> SKYD),
+    so the committed ``sp500_known_retickers.json`` used to be the only other
+    path, and each new reticker failed one weekly before somebody wrote it
+    down. This runs the same measurement that justified every entry in that
+    file. ``closes(ticker)`` returns that symbol's close series or ``None``.
+
+    Only candidates still unresolved are tested: never one the committed file,
+    Polygon or an earlier run already called a rename, and never one the
+    reference lists as an index removal. A departure is inferred only when
+    exactly one same-date arrival matches; two would be ambiguous and are left
+    to fail loudly as before. Inferred renames join ``resolution.renames`` (so
+    the next run reuses them through ``settled()``) and are named in
+    ``resolution.inferred`` with their evidence, for a human to commit.
+    """
+    confirmed = set(resolution.confirmed_by_reference)
+    for date, (left, joined) in sorted(pairs.items()):
+        arrivals = [t for t in joined if t not in resolution.renames.values()]
+        for old_ticker in left:
+            if old_ticker in resolution.renames or old_ticker in confirmed:
+                continue
+            old_closes = closes(old_ticker)
+            if old_closes is None:
+                continue
+            matches = []
+            for new_ticker in arrivals:
+                new_closes = closes(new_ticker)
+                if new_closes is None:
+                    continue
+                evidence = price_identity_match(old_closes, new_closes, date)
+                if evidence is not None:
+                    matches.append((new_ticker, evidence))
+            if len(matches) != 1:
+                continue
+            new_ticker, evidence = matches[0]
+            resolution.renames[old_ticker] = new_ticker
+            resolution.inferred[old_ticker] = {
+                "new": new_ticker, "effective": date, **evidence,
+            }
+            resolution.not_renamed = [t for t in resolution.not_renamed if t != old_ticker]
+            resolution.deferred = [t for t in resolution.deferred if t != old_ticker]
+            arrivals.remove(new_ticker)
+    if resolution.inferred:
+        logger.warning(
+            "historical_constituents: %d reticker(s) INFERRED from price identity "
+            "and excluded from membership changes; commit each to %s: %s",
+            len(resolution.inferred), _KNOWN_RETICKERS_PATH.name, resolution.inferred,
+        )
+
+
+def price_cache_closes(bucket: str, s3=None):
+    """``closes(ticker)`` over ``reference/price_cache/<ticker>.parquet``.
+
+    A missing or unreadable parquet is ``None``: the inference then has no
+    evidence for that symbol and leaves the swap unresolved, as before.
+    """
+    s3 = s3 or boto3.client("s3")
+
+    def closes(ticker: str) -> pd.Series | None:
+        try:
+            body = s3.get_object(
+                Bucket=bucket, Key=f"{PRICE_CACHE_PREFIX}{ticker}.parquet",
+            )["Body"].read()
+            frame = pd.read_parquet(BytesIO(body))
+        except Exception as exc:  # noqa: BLE001 — no evidence is a non-match
+            logger.info(
+                "historical_constituents: no price cache for %s (%s)", ticker, exc,
+            )
+            return None
+        column = next((c for c in frame.columns if str(c).lower() == "close"), None)
+        if column is None:
+            return None
+        series = frame[column]
+        series.index = pd.to_datetime(series.index)
+        return series
+
+    return closes
 
 
 def changes_from_snapshots(
@@ -1092,6 +1239,9 @@ class RenameResolution:
     #: Candidates not asked about because an earlier run's Polygon answer
     #: for them is carried in ``prior`` (alpha-engine-config-I11525).
     settled_by_prior_run: list[str] = field(default_factory=list)
+    #: Retickers resolved by price identity (:func:`infer_price_identity_renames`),
+    #: ``{old: {new, effective, overlap_sessions, max_close_deviation, old_last_bar}}``.
+    inferred: dict[str, dict] = field(default_factory=dict)
 
     def settled(self) -> dict:
         """The verdicts Polygon gave, in the shape :func:`resolve_renames`
@@ -1359,6 +1509,9 @@ def collect(
     resolution = resolve_renames(
         same_date_swaps(universe), reference_removed=reference_removed, prior=prior,
     )
+    infer_price_identity_renames(
+        resolution, same_date_swap_pairs(universe), price_cache_closes(bucket),
+    )
     renames = resolution.renames
 
     # Membership: the S&P 500+400 diff.
@@ -1524,6 +1677,9 @@ def collect(
         "n_changes_observed_sp500": len(observed_sp500),
         "n_roster_snapshots": len(universe),
         "renames_excluded": renames,
+        # Retickers resolved by price identity this run, with their evidence:
+        # each should be committed to sp500_known_retickers.json.
+        "renames_inferred": resolution.inferred,
         # Polygon's answers, reused by the next build (see resolve_renames).
         "rename_checks": resolution.settled(),
         "unresolved_swaps": unresolved,

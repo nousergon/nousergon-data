@@ -19,6 +19,12 @@ from pathlib import Path
 
 import pytest
 
+from tests.sf_run_slot_release_helpers import (
+    assert_release_hop,
+    release_gate,
+    release_task,
+)
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 SF_JSON = REPO_ROOT / "infrastructure" / "step_function.json"
 
@@ -84,7 +90,16 @@ class TestReadingErrorAtTheFailStateIsSafe:
     preconditions that guarantee ``$.error`` is present."""
 
     def test_fail_execution_has_exactly_one_inbound_edge(self, states):
-        assert _inbound_edges(states, "FailExecution") == ["HandleFailure"]
+        # alpha-engine-config-I12228: the run-slot release hop sits between
+        # HandleFailure and FailExecution. It reads nothing from $.error and
+        # hands $ on untouched (assert_release_hop), so the property is the
+        # same one stated one hop further out: HandleFailure is still the only
+        # way in.
+        gate, task = release_gate("FailExecution"), release_task("FailExecution")
+        assert_release_hop(states, "FailExecution")
+        assert sorted(set(_inbound_edges(states, "FailExecution"))) == sorted([gate, task])
+        assert _inbound_edges(states, gate) == ["HandleFailure"]
+        assert _inbound_edges(states, task) == [gate]
 
     def test_normalization_dominates_every_path_to_handle_failure(self, states):
         """NormalizeFailureContext (config#1819) is what guarantees $.error, so
