@@ -137,6 +137,12 @@ TERMINAL_ERROR_HANDLING_STATES: frozenset[str] = frozenset({
     "NotifyMarketHoursUnverified",
     "TradingDayGateFailed",
     "WeeklyRunDayGateFailed",
+    # alpha-engine-config-I12228: the weekly pipeline releases its own run
+    # slot on the way into each failure terminal. Housekeeping, not the
+    # state that broke, so the fallback must look past it like an alerter.
+    "ReleaseRunSlotBeforeFailExecution",
+    "ReleaseRunSlotBeforeDegradedRun",
+    "ReleaseRunSlotBeforeVacuousRun",
 })
 
 # The counterpart set, and the reason the one above can be a literal at all.

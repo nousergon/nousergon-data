@@ -17,6 +17,8 @@ def _source() -> str:
 
 def test_factor_loading_zscore_daily_update_invoked_after_write_loop():
     src = _source()
-    assert "update_factor_loading_zscores_latest" in src
+    assert "update_cross_sectional_latest(" in src
     assert "FACTOR_LOADING_ZSCORE_DAILY_ENABLED" in src
-    assert "Factor-loading z-score daily update FAILED" in src
+    second_pass = (_DAILY_APPEND.parent.parent / "features" / "second_pass.py").read_text()
+    assert "compute_factor_loading_zscores_latest" in second_pass
+    assert "Factor-loading z-score daily update FAILED" in second_pass

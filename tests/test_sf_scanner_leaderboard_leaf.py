@@ -30,6 +30,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.sf_run_slot_release_helpers import through_release
+
 _DEF = Path(__file__).resolve().parents[1] / "infrastructure" / "step_function.json"
 
 
@@ -189,7 +191,7 @@ def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
     # marker sits between it and DegradedRun for the migration window; it is
     # fail-soft. Deleted at the 2026-09-05 cutover.
     assert states["WriteCompletionMarkerDegraded"]["Next"] == "WriteCompletionMarkerDegradedCalendar"
-    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "DegradedRun"
+    assert through_release(states, states["WriteCompletionMarkerDegradedCalendar"]["Next"]) == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
 
 

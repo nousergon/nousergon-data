@@ -54,6 +54,8 @@ import re
 
 import pytest
 
+from tests.sf_run_slot_release_helpers import through_release
+
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
 
@@ -272,7 +274,7 @@ def test_timed_out_true_execution_history_reaches_the_hard_fail_terminal(states,
     # FailExecution is the SAME shared chokepoint every other genuine SF
     # failure already uses — asserted directly by name (config#1819).
     assert states["NormalizeFailureContext"]["Next"] == "NormalizeFailureContextRepin"
-    assert states["HandleFailure"]["Next"] == "FailExecution"
+    assert through_release(states, states["HandleFailure"]["Next"]) == "FailExecution"
     assert states["FailExecution"]["Type"] == "Fail"
 
 
@@ -413,7 +415,7 @@ def test_pit_parity_compare_resource_kill_routes_directly_to_hard_fail(states):
     # FailExecution is the SAME shared chokepoint every other genuine SF
     # failure already uses — asserted directly by name (config#1819).
     assert states["NormalizeFailureContext"]["Next"] == "NormalizeFailureContextRepin"
-    assert states["HandleFailure"]["Next"] == "FailExecution"
+    assert through_release(states, states["HandleFailure"]["Next"]) == "FailExecution"
 
 
 # ---------------------------------------------------------------------------

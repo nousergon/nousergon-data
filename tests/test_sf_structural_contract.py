@@ -324,6 +324,12 @@ _FAILURE_FAMILY: dict[str, frozenset[str]] = {
             "HandleFailure",
             "FailExecution",
             "MutexConflict",
+            # alpha-engine-config-I12228: the run-slot release hop's
+            # best-effort Catch lands on the Fail terminal it guards. Both
+            # are real Fail-type terminals (Error DegradedRun / VacuousRun),
+            # so a route reaching them fails LOUD, same as FailExecution.
+            "DegradedRun",
+            "VacuousRun",
         }
     ),
     # alpha-engine-config-I7111 adds three more real Fail-type terminals to
@@ -431,6 +437,20 @@ _NOTIFY_RESOURCE = "arn:aws:states:::sns:publish"
 #     needing its own tracker issue, not a leftover.
 _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
     "step_function.json": {
+        # ── alpha-engine-config-I12228 ─────────────────────────────────
+        "AcquireMutex": (
+            "its ConditionalCheckFailed Catch is not a fail-open: it routes to "
+            "ReadRunSlotHolder, whose every exit except a proven-terminal-"
+            "FAILED holder ends at MutexConflict (a loud Fail), and a takeover "
+            "of a FAILED holder's slot is a clean acquisition, deliberately "
+            "NOT degraded (the run is exactly as protected as one whose "
+            "AcquireMutex succeeded). Its OTHER Catch, States.ALL, is the real "
+            "fail-open and still writes $.gate_degraded via "
+            "SetMutexAcquireDegradedFlag — pinned separately by "
+            "tests/test_sf_mutex_wiring.py::test_acquire_states_all_catch_"
+            "fails_open_to_former_first_state, since this exemption is per "
+            "owning state."
+        ),
         # ── alpha-engine-config-I11264 ─────────────────────────────────
         "WaitForCollectionManifests": (
             "a raising probe is not a verdict either way: the Catch records "
@@ -1426,9 +1446,10 @@ def test_sf_file_set_matches_exemption_registry():
 #                  post-close machine no longer waits on the collection. Its
 #                  worst case is the gates (~3 min), the box boot + SSM poll
 #                  (~4 min), RefreshExecutorDeploy (660 s task + poll) and two
-#                  CaptureSnapshot attempts (120 s executionTimeout each + poll)
-#                  — ~25 min, inside sf-pipeline-policy.md §4's ≤75-min eod
-#                  target; 1h is ~2.4x that.
+#                  CaptureSnapshot attempts (720 s executionTimeout each + poll,
+#                  since alpha-engine-config-I12220's 420 s gateway-readiness
+#                  wait; 120 s before) — ~44 min, inside sf-pipeline-policy.md
+#                  §4's ≤75-min eod target; 1h is ~1.4x that.
 #   eod_reconcile
 #          14400  the collector-dependent half (EODReconcile, heal loop, box
 #                  stop, weekly-exercise chain), started on

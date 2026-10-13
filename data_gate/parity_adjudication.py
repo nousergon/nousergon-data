@@ -93,6 +93,28 @@ report are in until the in-region FRED ALFRED / Polygon reads land.
 Anything else — a missing field, an unknown source kind, a vendor read with no
 retrieval time — is ``invalid`` and red. There is no waiver verdict: this
 module has no vocabulary for "accepted without evidence".
+
+**An owner's ruling on a fully attributed record** (``ruling``, Brian's ruling
+of 2026-10-12 on `alpha-engine-config-I12023`, issuecomment-6127891583). The
+frozen report can never be re-measured, so an exception that is fully
+attributed and still BREACH has exactly two futures: red forever, or the
+owner's explicit acceptance. A record may carry ONE ruling with disposition
+``attributed_not_met``. It makes the clause read MET — ``ruled``, never
+``cleared`` — only when ALL of these hold:
+
+* every exception the report carries is graded ``cleared`` or ``breach``:
+  nothing ``pending``, ``invalid``, ``missing``, ``unattributed`` or
+  ``precision_limited`` — a ruling accepts measured differences, it never
+  stands in for a measurement that was not made;
+* every path of every breaching exception is attributed to a declared input;
+* ``covers`` names EXACTLY the exceptions that are not cleared — a ruling
+  cannot reach a key nobody showed the owner, and a breach it does not name
+  stays red;
+* ``by``, ``at`` and an https ``ref`` to the written ruling are present.
+
+A ruling that fails any of these is ignored and named in the detail; the
+record's own per-exception grades print beside it either way, so the breaches
+it accepts stay visible on every reading.
 """
 
 from __future__ import annotations
@@ -194,6 +216,12 @@ PRECISION_LIMITED = "precision_limited"
 QUANTIZED_EQUAL = "quantized_equal"
 INVALID = "invalid"
 MISSING = "missing"
+
+#: The one owner-ruling disposition (module docstring): every exception fully
+#: attributed, the remaining breaches accepted as attributed, not met.
+RULING_ATTRIBUTED_NOT_MET = "attributed_not_met"
+#: Verdicts a ruling may stand on. Everything else is a measurement not made.
+_RULABLE = frozenset({CLEARED, BREACH})
 
 #: The only run trigger whose regrade counts: the collector's own scheduled
 #: regrade path. A manual or backfill rewrite is not the value the contract
@@ -309,6 +337,11 @@ class Adjudication:
     cleared: bool
     grades: list[ExceptionGrade] = field(default_factory=list)
     problem: str = ""
+    #: The record's owner ruling held (module docstring). Never set with ``cleared``.
+    ruled: bool = False
+    ruling: Mapping[str, Any] | None = None
+    #: Why a ruling the record carries was NOT applied; empty when none or when it held.
+    ruling_problem: str = ""
 
     def summary(self) -> str:
         if self.problem:
@@ -317,7 +350,17 @@ class Adjudication:
         for grade in self.grades:
             counts[grade.verdict] = counts.get(grade.verdict, 0) + 1
         tally = ", ".join(f"{name}={counts[name]}" for name in sorted(counts))
-        head = "ADJUDICATED — every frozen exception cleared on independent evidence" if self.cleared else "adjudication open"
+        if self.cleared:
+            head = "ADJUDICATED — every frozen exception cleared on independent evidence"
+        elif self.ruled and self.ruling is not None:
+            head = (
+                f"RULED {RULING_ATTRIBUTED_NOT_MET} by {self.ruling.get('by')} at {self.ruling.get('at')} "
+                f"({self.ruling.get('ref')}) — every path attributed, the breaches below accepted, not cleared"
+            )
+        elif self.ruling_problem:
+            head = f"adjudication open (ruling NOT applied: {self.ruling_problem})"
+        else:
+            head = "adjudication open"
         open_items = "; ".join(
             f"{g.key}: {g.verdict} ({g.detail})" for g in self.grades if g.verdict != CLEARED
         )
@@ -1079,8 +1122,46 @@ def grade_record(
             grades.append(ExceptionGrade(key, kind, INVALID, f"record says kind {entry.get('kind')!r}, report says {kind!r}"))
             continue
         grades.append(_grade_exception(entry, kind, counts.get(key), cut, rel, absolute, fetch_bytes))
+    cleared = bool(grades) and all(g.verdict == CLEARED for g in grades)
+    ruling = record.get("ruling")
+    ruling_problem = "" if ruling is None or cleared else _ruling_problem(ruling, grades)
     return Adjudication(
         record_key=record_key,
-        cleared=bool(grades) and all(g.verdict == CLEARED for g in grades),
+        cleared=cleared,
         grades=grades,
+        ruled=ruling is not None and not cleared and not ruling_problem,
+        ruling=ruling if isinstance(ruling, Mapping) else None,
+        ruling_problem=ruling_problem,
     )
+
+
+def _ruling_problem(ruling: Any, grades: list[ExceptionGrade]) -> str:
+    """Why ``ruling`` cannot apply to ``grades`` — empty when it holds (module docstring)."""
+    if not isinstance(ruling, Mapping):
+        return "ruling is not an object"
+    if ruling.get("disposition") != RULING_ATTRIBUTED_NOT_MET:
+        return f"disposition {ruling.get('disposition')!r} is not {RULING_ATTRIBUTED_NOT_MET!r}"
+    for name in ("by", "at", "ref"):
+        if not isinstance(ruling.get(name), str) or not ruling.get(name):
+            return f"ruling.{name} is required"
+    try:
+        _parse_utc(ruling["at"], "ruling.at")
+    except ValueError as exc:
+        return str(exc)
+    if not ruling["ref"].startswith("https://"):
+        return "ruling.ref must be an https link to the written ruling"
+    covers = ruling.get("covers")
+    if not isinstance(covers, list) or not all(isinstance(k, str) for k in covers):
+        return "ruling.covers must list the exception keys it accepts"
+    unrulable = [f"{g.key} ({g.verdict})" for g in grades if g.verdict not in _RULABLE]
+    if unrulable:
+        return "a ruling accepts measured breaches only; not measured: " + ", ".join(unrulable)
+    partial = [f"{g.key} ({g.attributed}/{g.paths} attributed, {g.pending} pending)"
+               for g in grades if g.verdict == BREACH and (g.paths <= 0 or g.attributed != g.paths or g.pending)]
+    if partial:
+        return "every breaching path must be attributed: " + ", ".join(partial)
+    breaching = {g.key for g in grades if g.verdict == BREACH}
+    if set(covers) != breaching or len(covers) != len(set(covers)):
+        return (f"ruling.covers {sorted(covers)} must name exactly the breaching exceptions "
+                f"{sorted(breaching)}")
+    return ""

@@ -205,9 +205,12 @@ EOD_STAGES: tuple[Stage, ...] = (
 )
 
 EOD_RECONCILE_STAGES: tuple[Stage, ...] = (
+    # alpha-engine-config-I12220: the refresh (done or skipped) now enters the
+    # missing-snapshot self-heal, CaptureSnapshot, which has no skip gate: it
+    # opens no IB session when the snapshot is already in S3.
     Stage("refresh_executor_deploy", "skip_refresh_executor_deploy",
           "CheckSkipRefreshExecutorDeploy", "RefreshExecutorDeploy",
-          frozenset({"CheckSkipPostMarketData"})),
+          frozenset({"CaptureSnapshot"})),
     # alpha-engine-config-I11269: same repoint as morning_enrich above — the
     # post-market spot legs left for ne-data-collection-eod; the stage is the
     # bounded readiness grade on its manifests. Not-ready is a DEGRADED bypass.
