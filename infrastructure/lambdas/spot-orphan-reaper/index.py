@@ -38,10 +38,11 @@ instance, plus every on-demand instance the launcher tagged
 ``LaunchMarket=on-demand``; see ``_SCAN_SCOPES``) and terminates any older than
 its effective threshold. Emits CloudWatch custom metric
 ``AlphaEngine/Infra/spot_orphans_terminated`` (sum) with a ``name`` dimension
-(the box's Name tag), and on every run ``orphan_reaper_candidates`` /
-``orphan_reaper_terminated`` with a ``market`` dimension, zeros included, so a
-scan that stops matching is visible. All purely for observability, NOT feeding
-the reap decision.
+(the box's Name tag). On every run it also LOGS one ``orphan_reaper_scan``
+JSON line with per-market candidates and reaps, zeros included, so a scan that
+stops matching is visible (a log line since 2026-10-09; it was an always-on
+CloudWatch series nothing read - alpha-engine-config-I11792 M1). All purely for
+observability, NOT feeding the reap decision.
 
 WATCH-KIND INCOMPLETE-REAP ALERT (additive, generalized config#2106): for a
 small, explicit set of "watch" workloads (Fleet CI Watch, Fleet-SF Watch,
@@ -60,6 +61,7 @@ is untouched.
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -404,29 +406,27 @@ def _emit_metric(cw, name: str, count: int, metric_name: str = ORPHAN_METRIC) ->
         logger.warning("CloudWatch put_metric_data failed for %s: %s", name, exc)
 
 
-def _emit_scan_metrics(cw, scanned: dict[str, int], terminated: dict[str, int]) -> None:
-    """Per-market candidates and reaps, emitted on EVERY run, zeros included
+SCAN_LOG_EVENT = "orphan_reaper_scan"
+
+
+def _log_scan_counts(scanned: dict[str, int], terminated: dict[str, int]) -> None:
+    """Per-market candidates and reaps, logged on EVERY run, zeros included
     (alpha-engine-config-I11108 deliverable 2). ``spot_orphans_terminated``
     above only emits on a reap, so a scan that stopped matching anything read
-    exactly like a healthy fleet. A candidates series is a line that drops to
-    zero when the filter goes blind. Separate metric names, so the existing
-    ``name``-dimensioned series and any alarm on it are unchanged."""
-    data = []
-    for market in (MARKET_SPOT, MARKET_ON_DEMAND):
-        for metric, counts in (
-            ("orphan_reaper_candidates", scanned),
-            ("orphan_reaper_terminated", terminated),
-        ):
-            data.append({
-                "MetricName": metric,
-                "Dimensions": [{"Name": "market", "Value": market}],
-                "Value": float(counts.get(market, 0)),
-                "Unit": "Count",
-            })
-    try:
-        cw.put_metric_data(Namespace="AlphaEngine/Infra", MetricData=data)
-    except Exception as exc:
-        logger.warning("CloudWatch put_metric_data failed for scan metrics: %s", exc)
+    exactly like a healthy fleet; a candidates count is a line that drops to
+    zero when the filter goes blind.
+
+    One structured log line, not CloudWatch metrics (alpha-engine-config-I11792
+    M1, 2026-10-09). Until then these were four always-on custom series
+    (``orphan_reaper_{candidates,terminated}`` x ``market={spot,on-demand}``,
+    $0.30/month each) that no alarm, dashboard or reader consumed. The zeros
+    are still recorded - in the log, where Logs Insights can chart them - so the
+    "blind filter" signal is not lost, only the bill for it."""
+    logger.info(json.dumps({
+        "event": SCAN_LOG_EVENT,
+        "candidates": {m: int(scanned.get(m, 0)) for m in (MARKET_SPOT, MARKET_ON_DEMAND)},
+        "terminated": {m: int(terminated.get(m, 0)) for m in (MARKET_SPOT, MARKET_ON_DEMAND)},
+    }, sort_keys=True))
 
 
 def handler(event: dict, context) -> dict:
@@ -545,7 +545,7 @@ def handler(event: dict, context) -> dict:
         _emit_metric(cw, name, count)
     for name, count in per_name_finished.items():
         _emit_metric(cw, name, count, FINISHED_BOX_METRIC)
-    _emit_scan_metrics(cw, scanned_by_market, terminated_by_market)
+    _log_scan_counts(scanned_by_market, terminated_by_market)
 
     return {
         "scanned": len(instances),

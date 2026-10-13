@@ -42,6 +42,8 @@ import re
 
 import pytest
 
+from tests.sf_run_slot_release_helpers import through_release
+
 _REPO_ROOT = pathlib.Path(__file__).parent.parent
 _WEEKLY = _REPO_ROOT / "infrastructure" / "step_function.json"
 _DAILY = _REPO_ROOT / "infrastructure" / "step_function_daily.json"
@@ -420,7 +422,7 @@ class TestSuccessPathNotifiersAreNonFatal:
             "the DegradedRun terminal dereferences $.degraded_summary.reason "
             "unguarded on this path"
         )
-        assert degraded["Next"] in ("CheckDegradedOutcome", "DegradedRun"), (
+        assert through_release(weekly_states, degraded["Next"]) in ("CheckDegradedOutcome", "DegradedRun"), (
             f"{degraded_next} must reach an honest terminal. The property "
             "config#1819 bought is that the pipeline is never ABORTED by a "
             "notify failure — every workload state still ran, and the run is "

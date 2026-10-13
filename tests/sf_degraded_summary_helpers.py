@@ -19,6 +19,8 @@ dereferences unguarded.
 """
 from __future__ import annotations
 
+from tests.sf_run_slot_release_helpers import through_release
+
 
 def summary_state_name(setter: str) -> str:
     """The sibling summary Pass for a degraded-flag setter.
@@ -147,7 +149,8 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
     # marker sits between it and DegradedRun for the migration window; it is
     # fail-soft and its Next is DegradedRun. Deleted at the 2026-09-05 cutover.
     assert degraded_marker["Next"] == "WriteCompletionMarkerDegradedCalendar"
-    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "DegradedRun"
+    # alpha-engine-config-I12228: through the run-slot release hop.
+    assert through_release(states, states["WriteCompletionMarkerDegradedCalendar"]["Next"]) == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
     assert states["DegradedRun"]["Error"] == "DegradedRun", (
         "the error string is a consumer contract: sf-telegram-notifier keys its "
@@ -217,7 +220,7 @@ def assert_observe_only_tail(states: dict, entry: str) -> None:
             # fire only on an explicit boolean false.
             gate = states[declared_fail_gate]
             assert gate["Type"] == "Choice"
-            rules = [r for r in gate["Choices"] if r["Next"] == declared_fail]
+            rules = [r for r in gate["Choices"] if through_release(states, r["Next"]) == declared_fail]
             assert len(rules) == 1
             conjuncts = rules[0]["And"]
             assert any(c.get("BooleanEquals") is False for c in conjuncts)
