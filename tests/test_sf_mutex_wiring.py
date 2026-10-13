@@ -10,7 +10,7 @@ conditional-PUT mutex.
 
 Design:
 - Allowlist all unattended cadence roles (``daily`` / ``weekly`` / ``eod`` / ``shell-run`` / ``exercise``)
-  acquire the mutex via ``DynamoDB.PutItem`` with
+  acquire the mutex via ``DynamoDb.PutItem`` with
   ``ConditionExpression: attribute_not_exists(mutex_key)``.
 - Operator-initiated runs (any other ``pipeline_role`` value, including
   absent and the recovery role ``watch-rerun``) bypass entirely — they
@@ -60,7 +60,7 @@ This test pins:
   ``CheckMutexRole.Default`` → former-first-state;
   ``AcquireMutex.Next`` → former-first-state.
 - ``CheckMutexRole`` gates on ``$.pipeline_role`` in the cadence allowlist.
-- ``AcquireMutex`` catches ``DynamoDB.ConditionalCheckFailedException`` →
+- ``AcquireMutex`` catches ``DynamoDb.ConditionalCheckFailedException`` →
   ``MutexConflict``; catches ``States.ALL`` → fail-open to former-first-state.
 - Weekly ``mutex_key`` Format references ``$$.StateMachine.Name``,
   ``$.pipeline_role``, and ``$.run_date`` (run-slot); weekday/eod keep the
@@ -539,17 +539,22 @@ class TestAcquireMutexSemantics:
         match = [
             c
             for c in catches
-            if "DynamoDB.ConditionalCheckFailedException" in c.get("ErrorEquals", [])
+            if "DynamoDb.ConditionalCheckFailedException" in c.get("ErrorEquals", [])
         ]
         assert len(match) == 1, (
             f"{sf_name} AcquireMutex must Catch "
-            f"DynamoDB.ConditionalCheckFailedException explicitly — without "
+            f"DynamoDb.ConditionalCheckFailedException explicitly — without "
             f"it, a States.ALL Catch would swallow the duplicate-trigger "
             f"case and fail-open silently (the worst possible behavior)"
         )
-        assert match[0]["Next"] == "MutexConflict", (
+        # alpha-engine-config-I12228: the weekly inspects the holder first and
+        # takes the slot over only from a terminal-FAILED one; every other
+        # answer still ends at MutexConflict (pinned end to end in
+        # tests/test_sf_run_slot_takeover_and_release.py).
+        expected = "ReadRunSlotHolder" if sf_name == "saturday" else "MutexConflict"
+        assert match[0]["Next"] == expected, (
             f"{sf_name} AcquireMutex: Conditional-Check Catch must route to "
-            f"MutexConflict (Fail), not bypass to the workload"
+            f"{expected}, not bypass to the workload"
         )
 
     @pytest.mark.parametrize("sf_name", list(FORMER_FIRST_STATE_BY_SF))
