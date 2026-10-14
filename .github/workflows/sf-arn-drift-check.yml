@@ -339,10 +339,33 @@ jobs:
       - name: Install boto3 for the floor-calibration check
         run: pip install --quiet boto3
 
+      # alpha-engine-config-I11792. The check samples every SUCCEEDED
+      # execution, and re-reading all of their full histories cost ~1,000
+      # GetExecutionHistory calls (billed Step Functions egress) on EVERY run.
+      # A SUCCEEDED execution's history never changes, so the per-execution
+      # numbers are cached across runs and only executions new since the last
+      # run are read. Restore by prefix (newest wins), save under a fresh
+      # run-scoped key because a cache key is immutable once written. A cache
+      # miss is a full re-read, never a different verdict. The file lives
+      # under the workspace because hashFiles() cannot see outside it.
+      - name: Restore the floor-calibration sample cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .floor-calibration-cache/samples.json
+          key: floor-calibration-samples-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: floor-calibration-samples-
+
       - name: Duration-floor calibration drift (STATE_DURATION_FLOORS_SEC vs live SF history)
         id: floor_calibration_drift
         continue-on-error: true
-        run: python3 infrastructure/lambdas/sf-telegram-notifier/floor_calibration.py --check
+        run: python3 infrastructure/lambdas/sf-telegram-notifier/floor_calibration.py --check --cache .floor-calibration-cache/samples.json
+
+      - name: Save the floor-calibration sample cache
+        if: always() && hashFiles('.floor-calibration-cache/samples.json') != ''
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: .floor-calibration-cache/samples.json
+          key: floor-calibration-samples-${{ github.run_id }}-${{ github.run_attempt }}
 
       # ── THE GATE ────────────────────────────────────────────────────────────
       # alpha-engine-config-I9121. Every check above is INDEPENDENT — a

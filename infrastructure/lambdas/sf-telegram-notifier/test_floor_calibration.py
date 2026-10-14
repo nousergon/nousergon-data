@@ -549,3 +549,175 @@ def test_run_check_wires_every_state_machine():
     expected_machines = set(STATE_TO_STATE_MACHINE.values())
     called_machines = {arn.rsplit(":", 1)[-1] for arn in called_arns}
     assert called_machines == expected_machines
+
+
+# ── per-execution sample cache (alpha-engine-config-I11792) ─────────────
+
+
+_PREOPEN_ARN = (
+    "arn:aws:states:us-east-1:711398986525:stateMachine:ne-preopen-trading-pipeline"
+)
+
+
+def _scanner_events(seconds):
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+    return [
+        _entered("Scanner", base),
+        _exited("Scanner", base + timedelta(seconds=seconds), {}),
+    ]
+
+
+def _sf_listing(n):
+    sf_client = MagicMock()
+    sf_client.get_paginator.return_value.paginate.return_value = [
+        {
+            "executions": [
+                {
+                    "executionArn": (
+                        "arn:aws:states:us-east-1:711398986525:execution:"
+                        f"ne-preopen-trading-pipeline:exec-{i}"
+                    ),
+                    "name": f"exec-{i}",
+                }
+                for i in range(n)
+            ]
+        }
+    ]
+    return sf_client
+
+
+def test_cache_makes_a_second_run_read_no_history_and_yield_identical_samples():
+    """The leak: every run re-read every SUCCEEDED execution's full history.
+    A SUCCEEDED history is immutable, so a warm cache must cost zero
+    GetExecutionHistory calls and change nothing about the samples."""
+    calls = []
+
+    def fetch(_client, arn):
+        calls.append(arn)
+        return _scanner_events(100 + len(calls)), False
+
+    sf_client = _sf_listing(5)
+    cache = {}
+    first = collect_state_duration_samples(
+        sf_client, _PREOPEN_ARN, ["Scanner"], fetch_history=fetch, cache=cache
+    )
+    assert len(calls) == 5 and len(cache) == 5
+
+    second = collect_state_duration_samples(
+        sf_client, _PREOPEN_ARN, ["Scanner"], fetch_history=fetch, cache=cache
+    )
+    assert len(calls) == 5, "a cached execution's history was re-read"
+    assert second == first
+
+    uncached = collect_state_duration_samples(
+        sf_client,
+        _PREOPEN_ARN,
+        ["Scanner"],
+        fetch_history=lambda c, a: _scanner_events(101 + int(a.rsplit("-", 1)[-1])),
+    )
+    assert uncached == first
+
+
+def test_cache_reads_only_executions_new_since_the_last_run():
+    calls = []
+
+    def fetch(_client, arn):
+        calls.append(arn)
+        return _scanner_events(120), False
+
+    cache = {}
+    collect_state_duration_samples(
+        _sf_listing(3), _PREOPEN_ARN, ["Scanner"], fetch_history=fetch, cache=cache
+    )
+    calls.clear()
+    collect_state_duration_samples(
+        _sf_listing(4), _PREOPEN_ARN, ["Scanner"], fetch_history=fetch, cache=cache
+    )
+    assert calls == [
+        "arn:aws:states:us-east-1:711398986525:execution:ne-preopen-trading-pipeline:exec-3"
+    ]
+
+
+def test_truncated_history_is_sampled_but_never_cached():
+    cache = {}
+    samples = collect_state_duration_samples(
+        _sf_listing(1),
+        _PREOPEN_ARN,
+        ["Scanner"],
+        fetch_history=lambda c, a: (_scanner_events(90), True),
+        cache=cache,
+    )
+    assert samples["Scanner"][0]["duration_sec"] == 90
+    assert cache == {}
+
+
+def test_cache_keys_carry_no_account_id():
+    cache = {}
+    collect_state_duration_samples(
+        _sf_listing(2),
+        _PREOPEN_ARN,
+        ["Scanner"],
+        fetch_history=lambda c, a: (_scanner_events(60), False),
+        cache=cache,
+    )
+    assert set(cache) == {
+        "ne-preopen-trading-pipeline:exec-0",
+        "ne-preopen-trading-pipeline:exec-1",
+    }
+    assert "711398986525" not in _json.dumps(cache)
+
+
+def test_cached_poll_status_matches_an_uncached_read():
+    from datetime import datetime, timedelta, timezone
+
+    base = datetime(2026, 7, 5, 12, 0, 0, tzinfo=timezone.utc)
+    events = [
+        _entered("PollMorningArcticAppendSpot", base),
+        _exited(
+            "PollMorningArcticAppendSpot",
+            base + timedelta(seconds=930),
+            {"arctic_append_poll": {"Status": "Failed"}},
+        ),
+    ]
+    cache = {}
+    for _ in range(2):
+        samples = collect_state_duration_samples(
+            _sf_listing(1),
+            _PREOPEN_ARN,
+            ["PollMorningArcticAppendSpot"],
+            fetch_history=lambda c, a: (events, False),
+            cache=cache,
+        )
+        assert samples["PollMorningArcticAppendSpot"][0]["poll_status"] == "Failed"
+
+
+def test_cache_file_round_trip_and_version_invalidation(tmp_path, monkeypatch):
+    path = str(tmp_path / "sub" / "samples.json")
+    assert fc.load_sample_cache(path) == {}
+    entries = {"m:e": {"durations": {"Scanner": 5}, "poll_status": {}}}
+    fc.save_sample_cache(path, entries)
+    assert fc.load_sample_cache(path) == entries
+
+    # Declaring a new poll key changes what an entry must hold: old entries
+    # must not be served.
+    monkeypatch.setattr(
+        fc, "KNOWN_POLL_STATUS_KEYS", {**fc.KNOWN_POLL_STATUS_KEYS, "Scanner": "scan_poll"}
+    )
+    assert fc.load_sample_cache(path) == {}
+
+
+def test_unreadable_cache_is_a_full_reread_not_an_error(tmp_path):
+    path = tmp_path / "samples.json"
+    path.write_text("{not json")
+    assert fc.load_sample_cache(str(path)) == {}
+
+
+def test_default_fetch_asks_for_the_largest_history_page():
+    sf_client = MagicMock()
+    sf_client.get_execution_history.return_value = {"events": []}
+    events, truncated = fc._default_fetch_history(sf_client, "arn:exec")
+    assert events == [] and truncated is False
+    assert sf_client.get_execution_history.call_args.kwargs["maxResults"] == 1000
+    assert sf_client.get_execution_history.call_args.kwargs["includeExecutionData"] is False
