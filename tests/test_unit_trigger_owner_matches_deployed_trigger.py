@@ -56,7 +56,15 @@ def deployed() -> dict:
     for sched in stack.schedules(tpl):
         if sched["target_kind"] != "state_machine":
             continue
-        by_machine.setdefault(names[sched["target_ref"]], []).append(sched)
+        entry = {**sched, "started_by": f"eventbridge-scheduler:{sched['qualified_name']}"}
+        by_machine.setdefault(names[sched["target_ref"]], []).append(entry)
+    # An EventBridge rule that starts a machine is that machine's trigger too:
+    # ne-data-collection-panel, on ne-data-collection-eod SUCCEEDED
+    # (alpha-engine-config-I10791). A rule has no cron, so its units declare no
+    # trigger.schedule to compare.
+    for rule in stack.event_rules(tpl):
+        entry = {**rule, "started_by": f"eventbridge-rule:{rule['name']}"}
+        by_machine.setdefault(names[rule["target_ref"]], []).append(entry)
     return by_machine
 
 
@@ -85,12 +93,12 @@ def owner_problems(units: list[Unit], deployed: dict) -> list[str]:
             problems.append(f"{unit.unit_id}: owner {owner!r} is not a state machine in the template")
             continue
         if in_stack:
-            entries = {f"eventbridge-scheduler:{s['qualified_name']}": s for s in deployed[owner]}
+            entries = {s["started_by"]: s for s in deployed[owner]}
             sched = entries.get(trigger.get("started_by"))
             if sched is None:
                 problems.append(
                     f"{unit.unit_id}: started_by {trigger.get('started_by')!r} is not a Scheduler "
-                    f"entry targeting {owner!r} (have {sorted(entries)})"
+                    f"entry or rule targeting {owner!r} (have {sorted(entries)})"
                 )
                 continue
             if unit.unit_id not in sched["input"].get("verify_units", []):
@@ -98,7 +106,13 @@ def owner_problems(units: list[Unit], deployed: dict) -> list[str]:
                     f"{unit.unit_id}: owner {owner!r} does not verify it "
                     f"(not in {sched['name']}'s verify_units)"
                 )
-            if trigger.get("schedule") != _declared_schedule(sched):
+            if "expression" not in sched:
+                if trigger.get("schedule"):
+                    problems.append(
+                        f"{unit.unit_id}: declares schedule {trigger.get('schedule')!r} but is "
+                        f"started by rule {sched['name']}, which has no cron"
+                    )
+            elif trigger.get("schedule") != _declared_schedule(sched):
                 problems.append(
                     f"{unit.unit_id}: schedule {trigger.get('schedule')!r} is not "
                     f"{sched['name']}'s {_declared_schedule(sched)!r}"

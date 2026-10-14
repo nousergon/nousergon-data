@@ -1,5 +1,6 @@
 """`python -m data_gate read --gate data-phase<N> --store <uri> [--dry-run]`
-and `python -m data_gate report --store <uri> [--dry-run]`.
+and `python -m data_gate report --store <uri> [--dry-run]`
+and `python -m data_gate preserve-parity-evidence --store <uri> [--dry-run]`.
 
 Exit codes are the contract, not a detail:
 
@@ -139,6 +140,25 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="render and deliver nothing, write nothing at all",
     )
+    preserver = sub.add_parser(
+        "preserve-parity-evidence",
+        help="copy every object version the graded parity breach names to the retained prefix",
+    )
+    preserver.add_argument(
+        "--store",
+        required=True,
+        help="s3://alpha-engine-research/data_collection (object versions exist only in S3)",
+    )
+    preserver.add_argument(
+        "--trading-day",
+        default=None,
+        help="the gate trading day whose parity reading is preserved; same literals as `read`",
+    )
+    preserver.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="resolve and print the plan, copy and write nothing",
+    )
     reader.add_argument(
         "--fail-on-unmet",
         action="store_true",
@@ -265,10 +285,45 @@ def _report_command(args) -> int:
     return EXIT_MET
 
 
+def _preserve_command(args) -> int:
+    """Preserve the graded parity breach's evidence. 0 = every referenced version
+    is retained (or nothing breached); 2 = at least one is not, named on stderr.
+
+    There is no verdict to encode here and no third code: evidence that was not
+    preserved is a failure of this step, never a reading
+    (`data_gate.parity_evidence`, alpha-engine-config-I12023).
+    """
+    from data_gate import parity_evidence  # noqa: PLC0415 - only this subcommand needs it
+
+    trading_day = resolve_trading_day(
+        args.trading_day, today=dt.datetime.now(dt.timezone.utc).date()
+    )
+    store = open_store(args.store, dry_run=args.dry_run)
+    try:
+        result = parity_evidence.preserve_graded_parity(store, trading_day=trading_day)
+    except parity_evidence.EvidencePreservationError as exc:
+        if exc.result is not None:
+            print(exc.result.summary())
+        print(f"data_gate: parity evidence NOT preserved: {exc}", file=sys.stderr)
+        for failure in exc.failures:
+            print(f"::error::parity evidence not preserved: {failure}", file=sys.stderr)
+        return EXIT_UNMEASURED
+    except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
+        print(f"data_gate: parity evidence preservation failed: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return EXIT_UNMEASURED
+    if result is None:
+        print("data_gate: the graded parity reading names no breach evidence; nothing to preserve")
+    else:
+        print(result.summary())
+    return EXIT_MET
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.command == "report":
         return _report_command(args)
+    if args.command == "preserve-parity-evidence":
+        return _preserve_command(args)
     return _read_command(args)
 
 

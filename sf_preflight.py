@@ -2556,15 +2556,29 @@ def summarize_results(results: "list[CheckResult]") -> dict:
     }
 
 
-def _previous_trading_day_str() -> str:
-    """Resolve the prior trading day. Avoids importing weekly_collector
+def _previous_trading_day_str(now: "datetime | None" = None) -> str:
+    """Resolve the prior trading day: the most recent NYSE trading day
+    strictly before TODAY IN NEW YORK. Avoids importing weekly_collector
     (which transitively imports boto3 + every collector module) so
     ArcticDB's bundled AWS SDK doesn't conflict with system boto3 — the
     conflict crashes on macOS, see CHECKS docstring.
+
+    "Today" is the ET calendar date, not the UTC one, because that is the
+    day Polygon's plan refuses: rehearsal-2026-10-13-1 ran this at 02:19Z
+    (22:19 EDT on 10-13), the UTC date 10-14 made 10-13 the "prior" day,
+    and Polygon answered 403 "Attempted to request today's data before end
+    of day" — failing polygon_grouped_coverage on a correct environment.
+    The scheduled 09:00Z runs see the same date either way, so production
+    is unchanged; only a launch between UTC midnight and ET midnight moves.
+    Deliberately NOT ``last_closed_trading_day``: at 22:15 ET that is the
+    same day Polygon still refuses.
     """
     from datetime import timedelta
+    from zoneinfo import ZoneInfo
     from nousergon_lib.trading_calendar import is_trading_day
-    today = datetime.now(timezone.utc).date()
+    if now is None:
+        now = datetime.now(timezone.utc)
+    today = now.astimezone(ZoneInfo("America/New_York")).date()
     candidate = today - timedelta(days=1)
     for _ in range(10):
         if is_trading_day(candidate):

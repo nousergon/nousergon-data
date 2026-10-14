@@ -566,6 +566,8 @@ def _resolve_run_mode(args: argparse.Namespace) -> str:
         "chronic_gap_heal",
         "daily_heal",
         "daily_panel",
+        "index_contributions",
+        "nasdaq100_constituents",
     ):
         if getattr(args, flag, False):
             return flag
@@ -1720,6 +1722,10 @@ _MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
     # D50 carries D17's settlement onto every key it rebuilt, row by row for
     # the tickers D17 carried provisional (features/settled_regrade.py).
     "features_settled_regrade": ("features",),
+    # D48 records a DECLARED skip of an index leg whose weight producer has
+    # never published (alpha-engine-config-I11306), so the skip and its reason
+    # are on the manifest rather than only in a log.
+    "index_contributions": ("index_contributions",),
 }
 
 #: mode -> the nested collectors whose recorded READS (``input_refs``,
@@ -1768,7 +1774,40 @@ def _daily_panel_keys(result: dict) -> dict[str, int]:
     return {panel["panel_key"]: int(panel.get("rows") or 0), panel["manifest_key"]: 1}
 
 
+def _index_contributions_keys(result: dict) -> dict[str, int]:
+    """Every key D48 wrote this run (``paths_written``): a dated file and
+    ``latest.json`` per index it published, each counted as one file. Empty
+    when it wrote nothing; a ``partial`` run still records the index it did
+    publish."""
+    collector = (result.get("collectors") or {}).get("index_contributions") or {}
+    return {key: 1 for key in collector.get("paths_written") or ()}
+
+
+def _nasdaq100_keys(result: dict) -> dict[str, int]:
+    """The two keys D49 wrote (latest and the dated snapshot), each carrying
+    the membership count. Empty unless it wrote."""
+    collector = (result.get("collectors") or {}).get("nasdaq100_constituents") or {}
+    if collector.get("status") != "ok":
+        return {}
+    count = int(collector.get("count") or 0)
+    return {collector["s3_key"]: count, collector["dated_s3_key"]: count}
+
+
 _MODE_EXTRA_OUTPUTS: dict[str, tuple[tuple[object, object, object], ...]] = {
+    "index_contributions": (
+        (
+            lambda r: list(_index_contributions_keys(r)),
+            lambda r: bool(_index_contributions_keys(r)),
+            _index_contributions_keys,
+        ),
+    ),
+    "nasdaq100_constituents": (
+        (
+            lambda r: list(_nasdaq100_keys(r)),
+            lambda r: bool(_nasdaq100_keys(r)),
+            _nasdaq100_keys,
+        ),
+    ),
     "daily_panel": (
         (
             lambda r: list(_daily_panel_keys(r)),
@@ -1939,6 +1978,16 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
 
     if getattr(args, "daily_panel", False):
         return _run_whole_mode_unit("daily_panel", _run_daily_panel, config, args)
+
+    if getattr(args, "index_contributions", False):
+        return _run_whole_mode_unit(
+            "index_contributions", _run_index_contributions, config, args
+        )
+
+    if getattr(args, "nasdaq100_constituents", False):
+        return _run_whole_mode_unit(
+            "nasdaq100_constituents", _run_nasdaq100_constituents, config, args
+        )
 
     if args.daily:
         return _run_daily(config, args)
@@ -5749,6 +5798,21 @@ def _parse_args() -> argparse.Namespace:
              "--date overrides the trading day; --dry-run compiles and validates only.",
     )
     parser.add_argument(
+        "--index-contributions", dest="index_contributions", action="store_true",
+        help="D48: publish the per-constituent contribution to each index's move "
+             "(market_data/index_contributions/{SPX,NDX}/{date}.json and latest.json; "
+             "collectors/index_contributions.py, alpha-engine-config-I11306). Reads the "
+             "ArcticDB universe library, so in-region only. --date bounds the session; "
+             "--dry-run computes and writes nothing.",
+    )
+    parser.add_argument(
+        "--nasdaq100-constituents", dest="nasdaq100_constituents", action="store_true",
+        help="D49: publish Nasdaq-100 membership and weights "
+             "(market_data/index_constituents/NDX.json and market_data/weekly/{date}/NDX.json; "
+             "collectors/nasdaq100.py, alpha-engine-config-I11306). --date overrides the "
+             "snapshot date; --dry-run fetches and writes nothing.",
+    )
+    parser.add_argument(
         "--phase", type=int, choices=[1, 2], default=None,
         help="Phase 1: pre-research data. Phase 2: post-research alternative data.",
     )
@@ -5799,7 +5863,10 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False) or getattr(args, "index_contributions", False) or getattr(args, "nasdaq100_constituents", False):
+        # --index-contributions (D48) reads S3 and the ArcticDB universe library
+        # and writes market_data/; --nasdaq100-constituents (D49) reads S3 and
+        # writes market_data/. Both are covered by the S3 + ArcticDB surface.
         # --daily-panel (D51) reads the ArcticDB universe library and writes
         # data_collection/panel/ — the same S3 + ArcticDB surface as --daily.
         # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
@@ -5983,6 +6050,85 @@ def _run_daily_panel(config: dict, args: argparse.Namespace) -> dict:
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "status": "ok" if status == "ok_dry_run" else status,
         "collectors": {"daily_panel": collector},
+    }
+    if status == "error":
+        result["error"] = collector.get("error")
+    return result
+
+
+def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
+    """D48: publish the per-constituent index contribution
+    (`collectors.index_contributions.collect`, alpha-engine-config-I11306).
+
+    Keyed by the last closed session (``--date`` or :func:`default_run_date`);
+    the producer reads the actual session off the proxy's own series.
+
+    * An index whose weight producer has NEVER published (D49 before its first
+      weekly run) is a declared skip: the run stays ``ok`` and does not page,
+      and the manifest carries a ``not_applicable`` cardinality reading naming
+      the leg and the reason.
+    * An index whose weights are missing after a publish, stale, or otherwise
+      unavailable is a ``partial`` run. The wrapper files it ``failed``, and it
+      pages, while the other index's files stay published.
+    * No index publishable raises from the producer, also filed ``failed``.
+    """
+    from collectors import index_contributions
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = index_contributions.collect(
+        config["bucket"], run_date=run_date, dry_run=bool(getattr(args, "dry_run", False))
+    )
+    # A leg skipped because its weight producer has never published (D49
+    # before its first weekly run) is a declared, expected state: the run stays
+    # `ok` and does not page, and the manifest says which leg and why. A leg
+    # that FAILED is in `errors` instead, the run is `partial`, and it pages.
+    collector["guards"] = [
+        {
+            "guard": expectations.CARDINALITY_GUARD.name,
+            "mode": expectations.CARDINALITY_GUARD.mode.value,
+            "verdict": "not_applicable",
+            "detail": f"{index} leg skipped (declared): {reason}",
+            "key": f"market_data/index_contributions/{index}/",
+        }
+        for index, reason in sorted((collector.get("skipped") or {}).items())
+    ]
+    status = collector.get("status")
+    result = {
+        "mode": "index_contributions",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"index_contributions": collector},
+    }
+    if collector.get("errors"):
+        result["error"] = collector["errors"]
+    return result
+
+
+def _run_nasdaq100_constituents(config: dict, args: argparse.Namespace) -> dict:
+    """D49: publish Nasdaq-100 membership and weights
+    (`collectors.nasdaq100.collect`, alpha-engine-config-I11306).
+
+    Keyed by the last closed session (``--date`` or :func:`default_run_date`),
+    the same date the weekly collection keys ``market_data/weekly/{date}/``.
+    """
+    from collectors import nasdaq100
+
+    run_date = getattr(args, "date", None) or default_run_date()
+    started_at = datetime.now(timezone.utc).isoformat()
+    collector = nasdaq100.collect(
+        config["bucket"], run_date=run_date, dry_run=bool(getattr(args, "dry_run", False))
+    )
+    status = collector.get("status")
+    result = {
+        "mode": "nasdaq100_constituents",
+        "date": run_date,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "status": "ok" if status == "ok_dry_run" else status,
+        "collectors": {"nasdaq100_constituents": collector},
     }
     if status == "error":
         result["error"] = collector.get("error")

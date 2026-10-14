@@ -200,6 +200,34 @@ Resources:
         - Key: system
           Value: data-collection
 
+  # The D51 daily panel's own machine (alpha-engine-config-I10791, plan P-25).
+  # It uses the same definition as the four above. It is started by the three
+  # rules below, never by a schedule: PanelOnEodSucceededRule (D51),
+  # IndexContributionsOnEodSucceededRule (D48) and
+  # NdxConstituentsOnWeeklySucceededRule (D49). Each rule starts its own
+  # execution with its own Input, so one unit's failure never hides another's.
+  PanelStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-panel
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: system
+          Value: data-collection
+
   CollectionScheduleGroup:
     Type: AWS::Scheduler::ScheduleGroup
     Properties:
@@ -557,6 +585,151 @@ Resources:
   # dimension is the state machine ARN, which is fixed by StateMachineName
   # above, so the alarm files need nothing from this stack.
 
+  # D51 daily panel, run AFTER the EOD collection and outside it
+  # (alpha-engine-config-I10791). The panel compiles the session's long OHLCV
+  # panel from the ArcticDB `universe` library, so it needs the D32 append.
+  # A SUCCEEDED ne-data-collection-eod execution is one whose D32 manifest that
+  # machine has already verified. That is the same event
+  # crucible-v2-data-daily-on-collection keys on, and it covers a heal's
+  # SUCCEEDED too.
+  #
+  # It is deliberately NOT a workload of data-collection-eod.
+  # ne-postclose-reconcile-pipeline (the eod_pnl reconcile) is started by
+  # alpha-engine-eod-backstop on that machine's terminal status change. A panel
+  # inside the machine would delay the reconcile by the panel's runtime (up to
+  # its 3600 s cap plus a box boot). It could also push the chain past the
+  # 22:00 PT cost guard, and a failed panel would mark the collection FAILED.
+  # Here the panel starts only after that event has already fired, so it can
+  # neither delay nor gate the reconcile.
+  # tests/test_data_collection_stack.py::test_the_reconcile_trigger_chain_cannot_include_the_panel
+  # pins this.
+  #
+  # require_trading_day is false on purpose. The rule fires only on an EOD
+  # execution that itself ran for a trading day, and a heal can succeed after
+  # midnight ET, when today's calendar check would skip a valid session. The
+  # panel keys the last closed session itself (weekly_collector.py::default_run_date).
+  # Its state follows CollectionState. It is declared KEPT in
+  # automation_pause.json.
+  PanelOnEodSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ne-data-collection-panel-on-eod
+      Description: >-
+        ne-data-collection-eod SUCCEEDED (scheduled run or heal) ->
+        ne-data-collection-panel, the D51 daily panel
+        (alpha-engine-config-I10791). Outside the EOD machine, so the
+        panel cannot delay or gate the eod_pnl reconcile.
+      State: !Ref CollectionState
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - Step Functions Execution Status Change
+        detail:
+          status:
+            - SUCCEEDED
+          stateMachineArn:
+            - !Ref EodStateMachine
+      Targets:
+        - Id: ne-data-collection-panel
+          Arn: !Ref PanelStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+          Input: '{"collection": "panel", "workloads": ["daily-panel"], "require_trading_day": false, "verify_units": ["D51"]}'
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+            MaximumEventAgeInSeconds: 3600
+      Tags:
+        - Key: system
+          Value: data-collection
+
+  # D48, the per-constituent index contribution (alpha-engine-config-I11306).
+  # It joins each index member's prior-close weight with that session's return
+  # from the ArcticDB `universe` library, so it is only meaningful once the
+  # day's closes are appended (D32). A SUCCEEDED ne-data-collection-eod
+  # execution is one whose D32 manifest that machine has already verified, the
+  # same event PanelOnEodSucceededRule keys on.
+  #
+  # Its own execution on the panel machine, not a second workload of the D51
+  # execution: a D48 failure (a below-floor coverage refusal, or NDX weights
+  # not yet published) must page as D48 and must not withhold or fail the
+  # panel. It is outside the EOD machine for the same reason the panel is: the
+  # eod_pnl reconcile starts on that machine's terminal event.
+  #
+  # require_trading_day is false for the panel's reason: the rule fires only on
+  # an EOD run that was itself for a trading day, and a heal can succeed after
+  # midnight ET. The producer reads the session off the proxy's own series.
+  # Declared KEPT in automation_pause.json.
+  IndexContributionsOnEodSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ne-data-collection-index-contributions-on-eod
+      Description: >-
+        ne-data-collection-eod SUCCEEDED (scheduled run or heal) ->
+        ne-data-collection-panel running D48, the per-constituent index
+        contribution (alpha-engine-config-I11306). Outside the EOD machine,
+        so it cannot delay or gate the eod_pnl reconcile.
+      State: !Ref CollectionState
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - Step Functions Execution Status Change
+        detail:
+          status:
+            - SUCCEEDED
+          stateMachineArn:
+            - !Ref EodStateMachine
+      Targets:
+        - Id: ne-data-collection-panel-d48
+          Arn: !Ref PanelStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+          Input: '{"collection": "index-contributions", "workloads": ["index-contributions"], "require_trading_day": false, "verify_units": ["D48"]}'
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+            MaximumEventAgeInSeconds: 3600
+      Tags:
+        - Key: system
+          Value: data-collection
+
+  # D49, Nasdaq-100 membership and weights (alpha-engine-config-I11306), D48's
+  # NDX weight source. A weekly membership unit, like D01 beside it. Its
+  # weights read the latest archive/fundamentals/{date}.json, which D10 writes
+  # in the weekly collection, so it runs after that machine SUCCEEDS (scheduled
+  # run or a rerun) rather than on a timer of its own. Its own execution on the
+  # panel machine, so a D49 failure (Nasdaq's endpoint refusing the box) pages
+  # as D49 and never fails the weekly collection.
+  # Declared KEPT in automation_pause.json.
+  NdxConstituentsOnWeeklySucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ne-data-collection-ndx-constituents-on-weekly
+      Description: >-
+        ne-data-collection-weekly SUCCEEDED (scheduled run or rerun) ->
+        ne-data-collection-panel running D49, Nasdaq-100 membership and
+        weights (alpha-engine-config-I11306).
+      State: !Ref CollectionState
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - Step Functions Execution Status Change
+        detail:
+          status:
+            - SUCCEEDED
+          stateMachineArn:
+            - !Ref WeeklyStateMachine
+      Targets:
+        - Id: ne-data-collection-panel-d49
+          Arn: !Ref PanelStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+          Input: '{"collection": "ndx-constituents", "workloads": ["ndx-constituents"], "require_trading_day": false, "verify_units": ["D49"]}'
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+            MaximumEventAgeInSeconds: 3600
+      Tags:
+        - Key: system
+          Value: data-collection
+
 Outputs:
   EodStateMachineArn:
     Value: !Ref EodStateMachine
@@ -566,3 +739,5 @@ Outputs:
     Value: !Ref WeeklyStateMachine
   DailyHealStateMachineArn:
     Value: !Ref DailyHealStateMachine
+  PanelStateMachineArn:
+    Value: !Ref PanelStateMachine
