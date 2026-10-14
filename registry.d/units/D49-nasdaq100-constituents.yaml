@@ -34,38 +34,50 @@ component: 1
 lifecycle: pending
 owner: brian
 code_path: "collectors/nasdaq100.py:328"
-# RE-EXAMINED 2026-10-06: first declared pending 2026-09-21 with a 2026-10-05
-# re-exam. On the re-exam nothing runs it yet: the scheduling work,
-# alpha-engine-config-I11306, is still open. Re-declared pending for one more
-# 14-day window (the ops ceiling, PENDING_MAX_DAYS), not promoted and not
-# removed. The date is Brian's call; a second extension needs a new reason.
-pending_since: "2026-10-06"
-lifecycle_reexam: "2026-10-20"
+# RE-EXAMINED 2026-10-14 on a CHANGED reason: the trigger is in this change.
+# History: declared pending 2026-09-21 (re-exam 2026-10-05); re-declared
+# 2026-10-06 (re-exam 2026-10-20) because nothing scheduled it. This window
+# no longer waits on scheduling. It waits on the first scheduled run's
+# artifact, which promotes_when names. pending_since + 14 days is the ops
+# ceiling (PENDING_MAX_DAYS); the window spans two Saturday weekly runs.
+pending_since: "2026-10-14"
+lifecycle_reexam: "2026-10-28"
 lifecycle_reason: >-
-    Producer module merged without a trigger. It is a weekly-cadence membership
-    producer like D01, and the natural home is the existing weekly collector
-    run rather than a new timer; that wiring is operational assembly and is
-    tracked with the sibling contribution producer's scheduling work in
-    alpha-engine-config-I11306. Until it lands the unit writes nothing.
+    SCHEDULED by alpha-engine-config-I11306: `weekly_collector.py
+    --nasdaq100-constituents` (run-manifest-wrapped) runs on
+    ne-data-collection-panel, started by the rule
+    ne-data-collection-ndx-constituents-on-weekly when
+    ne-data-collection-weekly SUCCEEDS, after D10 has written the
+    fundamentals archive its weights read. D49 is that execution's only
+    verify_unit. The unit stays pending until a scheduled run has published
+    market_data/index_constituents/NDX.json with a current date
+    (promotes_when).
 lifecycle_owner: brian
 promotes_when: >-
-    The weekly run invokes collectors.nasdaq100.collect and
-    market_data/index_constituents/NDX.json exists with a current as_of. Flip
-    lifecycle to in-service and declare the cadence in the same PR.
+    A scheduled ne-data-collection-panel execution has filed an ok D49 run
+    manifest, and market_data/index_constituents/NDX.json exists with a current
+    `date`. The cadence is already declared (trigger below), so the promotion
+    PR flips lifecycle to in-service, drops the pending dates, and clears the
+    two registry rows' declared-off block (see registry_rows below).
 trigger:
-  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
-  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
-  # only way it runs today. There is no "none" kind, and inventing one would
-  # be a fallback guess where the generator deliberately refuses to make one.
-  kind: "manual"
+  kind: "step-functions"
+  # Its own execution on ne-data-collection-panel, started by the EventBridge
+  # rule ne-data-collection-ndx-constituents-on-weekly when
+  # ne-data-collection-weekly SUCCEEDS (scheduled run or rerun)
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::NdxConstituentsOnWeeklySucceededRule).
+  # The weekly membership cadence beside D01, after D10's fundamentals archive.
+  # Not a workload of the weekly machine, so a D49 failure (Nasdaq's endpoint
+  # refusing the box) pages as D49 and never fails the weekly collection.
+  owner: "ne-data-collection-panel"
+  started_by: "eventbridge-rule:ne-data-collection-ndx-constituents-on-weekly"
+  successor: "ne-data-collection-panel (alpha-engine-config-I11306); no v1 predecessor, because v1 never published NDX membership"
+  # No `schedule:`. The machine is event-started, so
+  # data_gate/trigger_reconcile.py has no fire time to reconcile it against.
+  # In practice it starts when the Saturday 05:00 America/New_York weekly
+  # collection, or a rerun of it, SUCCEEDS. `on_demand: true` is the cadence
+  # shape data_gate/cadence.py offers an event-started unit.
+  on_demand: true
   runs_on: "ec2-spot"
-  detail: >-
-    NOT YET SCHEDULED. Belongs on the weekly membership cadence beside D01
-    (constituents), which sources S&P membership from the SSGA holdings files
-    the same way this unit sources Nasdaq-100 membership.
-  # No `schedule` key: a `pending` row may not declare a cadence, and
-  # data_gate/cadence.py would otherwise grade this unit against a cadence
-  # nothing honours.
 writes:
   # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
   # templated key against a contract's x-key-pattern, and a bare `*` resolves
@@ -100,6 +112,10 @@ registry_rows:
 # parked, so the promotion PR has to clear them.
 run_manifest_prefix: data_collection/runs/D49
 detectors:
+  - kind: "sf-execution"
+    via: "ne-data-collection-panel"
+    state: PRESENT
+    note: "verify_units D49: a missing, failed or output-less D49 manifest fails its execution, which pages"
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
     state: ABSENT

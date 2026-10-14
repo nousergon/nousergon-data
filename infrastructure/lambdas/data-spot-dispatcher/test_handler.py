@@ -557,6 +557,12 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload == "features-settled-regrade":
             # D50 (alpha-engine-config-I12023): one D31 compute, ~24 min.
             expected = 3600
+        elif workload == "daily-panel":
+            # D51 (alpha-engine-config-I10791): one ArcticDB read + one PUT.
+            expected = 3600
+        elif workload in ("index-contributions", "ndx-constituents"):
+            # D48 / D49 (alpha-engine-config-I11306), sized like D51.
+            expected = 3600
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
@@ -575,6 +581,36 @@ def test_features_settled_regrade_runs_d50_with_no_trading_day(monkeypatch):
     resolved, cmd = index._resolve_workload({"workload": "features-settled-regrade"})
     assert resolved == "features-settled-regrade"
     assert cmd == "python weekly_collector.py --features-settled-regrade"
+
+
+def test_daily_panel_runs_d51_with_no_trading_day(monkeypatch):
+    """alpha-engine-config-I10791: the D51 daily panel resolves to its own
+    weekly_collector mode. It needs no ``trading_day``: it keys the last closed
+    session on the box (``default_run_date``), the same day D32 appended."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert "daily-panel" not in index._WORKLOADS_REQUIRING_TRADING_DAY
+    resolved, cmd = index._resolve_workload({"workload": "daily-panel"})
+    assert resolved == "daily-panel"
+    assert cmd == "python weekly_collector.py --daily-panel"
+
+
+@pytest.mark.parametrize(
+    "workload, flag",
+    [
+        ("index-contributions", "--index-contributions"),
+        ("ndx-constituents", "--nasdaq100-constituents"),
+    ],
+)
+def test_d48_d49_run_their_own_modes_with_no_trading_day(monkeypatch, workload, flag):
+    """alpha-engine-config-I11306: D48 and D49 resolve to their own
+    weekly_collector modes. Each is started by a rule with a static Input, so
+    neither takes a ``trading_day``; the box keys the last closed session
+    (``default_run_date``)."""
+    index, _ssm, _ec2 = _load(monkeypatch, launch_impl=lambda t, s, **kw: "i-x")
+    assert workload not in index._WORKLOADS_REQUIRING_TRADING_DAY
+    resolved, cmd = index._resolve_workload({"workload": workload})
+    assert resolved == workload
+    assert cmd == f"python weekly_collector.py {flag}"
 
 
 def test_shadow_weekday_parity_window_is_a_declared_non_requirement(monkeypatch):

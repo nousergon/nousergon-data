@@ -381,6 +381,7 @@ def test_an_sf_only_unit_the_stack_does_not_cover_is_unmet(units):
         u for u in units.values()
         if not u.retired and (u.raw.get("trigger") or {}).get("kind") == "step-functions"
         and not standalone.covering_schedules(u.unit_id)
+        and not standalone.covering_rules(u.unit_id)
     ]
     for unit in uncovered:
         reading = standalone.read_survives_phase4(EmptyStore(), unit, trading_day=TUESDAY, now=WEDNESDAY_NOON)
@@ -429,3 +430,46 @@ def test_a_partial_exclusion_column_is_graded_explicitly_not_inherited(units):
     reading = standalone.read_survives_phase4(EmptyStore(), units["D47"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
     assert reading.met is True and not reading.unmeasurable
     assert "not applicable: N/A-NOT-IMPL" in reading.detail
+
+
+# ── survives_phase4: rule-started units (D48, D49, D51) ─────────────────────
+
+
+def test_rule_started_units_are_covered_by_a_stack_rule_not_a_schedule():
+    for uid, rule in (("D51", "ne-data-collection-panel-on-eod"),
+                      ("D48", "ne-data-collection-index-contributions-on-eod"),
+                      ("D49", "ne-data-collection-ndx-constituents-on-weekly")):
+        assert standalone.covering_schedules(uid) == []
+        assert [r["name"] for r in standalone.covering_rules(uid)] == [rule]
+
+
+@pytest.mark.parametrize("uid", ["D48", "D49", "D51"])
+def test_a_rule_started_unit_survives_phase4_while_its_upstream_schedule_is_enabled(tmp_path, units, uid):
+    """Was UNMET as "the v1 Step Functions pipeline 'ne-data-collection-panel', which v2
+    phase 4 tears down": that machine and its rule are resources of the data-collection
+    stack, which phase 4 keeps."""
+    store = _live_store(tmp_path, _Scheduler(state="ENABLED"), _Sfn({}))
+    reading = standalone.read_survives_phase4(store, units[uid], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is True and reading.unmeasurable is False, reading.detail
+    assert "tears down" not in reading.detail
+
+
+@pytest.mark.parametrize("uid", ["D48", "D49", "D51"])
+def test_a_rule_started_unit_is_unmet_while_its_upstream_schedule_is_disabled(tmp_path, units, uid):
+    store = _live_store(tmp_path, _Scheduler(state="DISABLED"), _Sfn({}))
+    reading = standalone.read_survives_phase4(store, units[uid], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is False and reading.unmeasurable is False and "DISABLED" in reading.detail
+
+
+def test_a_rule_started_unit_is_unmeasurable_on_a_denied_or_absent_schedule_read(tmp_path, units):
+    denied = _live_store(tmp_path, _Scheduler(deny=True), _Sfn({}))
+    assert standalone.read_survives_phase4(denied, units["D51"], trading_day=TUESDAY, now=WEDNESDAY_NOON).unmeasurable
+    assert standalone.read_survives_phase4(EmptyStore(), units["D51"], trading_day=TUESDAY, now=WEDNESDAY_NOON).unmeasurable
+
+
+def test_a_rule_sharing_no_state_parameter_with_its_upstream_schedule_is_unmet(tmp_path, units, monkeypatch):
+    rules = [dict(r, state_parameter=None) for r in standalone.covering_rules("D51")]
+    monkeypatch.setattr(standalone, "covering_rules", lambda uid: rules)
+    store = _live_store(tmp_path, _Scheduler(state="ENABLED"), _Sfn({}))
+    reading = standalone.read_survives_phase4(store, units["D51"], trading_day=TUESDAY, now=WEDNESDAY_NOON)
+    assert reading.met is False and reading.unmeasurable is False and "cannot be attested" in reading.detail
