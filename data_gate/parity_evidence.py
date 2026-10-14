@@ -139,10 +139,18 @@ def manifest_key(report_day: dt.date) -> str:
     return f"{retained_prefix(report_day)}{MANIFEST_NAME}"
 
 
+#: Prefixes that name an ArcticDB library or symbol, not an S3 object. A parity
+#: report row spells it `arcticdb/<library>`; an adjudication record's input
+#: spells it `arcticdb:<library>/<symbol>` with the symbol's ArcticDB version as
+#: its `source_version_id` (the 09-28 record cites `arcticdb:macro/HYOAS@31`), and
+#: `features/input_record.py` uses `arcticdb://`. ArcticDB never overwrites a
+#: version, so none of them has an S3 version to preserve, and the gate-read role
+#: is (correctly) not granted on `arcticdb/*`.
+_ARCTICDB_PREFIXES = ("arcticdb/", "arcticdb:")
+
+
 def _is_s3_object_key(key: Any) -> bool:
-    # `arcticdb/<library>` rows name an ArcticDB library, not an S3 object:
-    # ArcticDB never overwrites a version key, so it has nothing to preserve here.
-    return isinstance(key, str) and bool(key) and not key.startswith("arcticdb/")
+    return isinstance(key, str) and bool(key) and not key.startswith(_ARCTICDB_PREFIXES)
 
 
 def report_references(report: Mapping[str, Any], report_key: str) -> list[Reference]:
