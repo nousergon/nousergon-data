@@ -39,6 +39,11 @@ has to fire: a fire with no execution of its own is UNMET as before.
 UNMET with the reason otherwise; UNMEASURABLE only when a read was denied or
 failed (or the store carries no AWS clients at all — every test fixture).
 
+A unit no schedule covers but a stack EventBridge rule starts (D48, D49 and
+D51 on ``ne-data-collection-panel``) is outside the teardown too: MET while the
+schedule whose state parameter the rule shares is ENABLED live
+(``_grade_rule_started``).
+
 A unit the stack does NOT cover is graded by what its trigger is:
 
 * a Step Functions trigger (the v1 pipelines phase 4 tears down) with no
@@ -73,6 +78,7 @@ __all__ = [
     "PARTIAL_RUN_WINDOW",
     "RECOVERED_FIRES_PATH",
     "RecoveredFire",
+    "covering_rules",
     "covering_schedules",
     "load_recovered_fires",
     "stack_schedules",
@@ -121,13 +127,26 @@ _SOURCE_DECLARED = "infrastructure/data_collection_stack.py (verify_units) + reg
 
 
 @lru_cache(maxsize=1)
-def _stack_schedules() -> tuple[dict, ...]:
+def _stack_helper():  # noqa: ANN202 — a module loaded by path
     # A standalone script, not a package: loaded by path, the same way its own
     # tests load it, so the gate and the deploy tool share one parser.
     spec = importlib.util.spec_from_file_location("data_collection_stack", _STACK_HELPER)
     module = importlib.util.module_from_spec(spec)  # type: ignore[arg-type]
     spec.loader.exec_module(module)  # type: ignore[union-attr]
+    return module
+
+
+@lru_cache(maxsize=1)
+def _stack_schedules() -> tuple[dict, ...]:
+    module = _stack_helper()
     return tuple(module.schedules(module.load_template()))
+
+
+@lru_cache(maxsize=1)
+def _stack_rules() -> tuple[dict, ...]:
+    """Every EventBridge rule target the committed stack declares (`event_rules`)."""
+    module = _stack_helper()
+    return tuple(module.event_rules(module.load_template()))
 
 
 def stack_schedules() -> tuple[dict, ...]:
@@ -249,6 +268,16 @@ def _recovery_for(schedule: dict, fire: dt.datetime) -> RecoveredFire | None:
 def covering_schedules(unit_id: str) -> list[dict]:
     """Every standalone schedule whose ``verify_units`` names this unit."""
     return [s for s in _stack_schedules() if unit_id in (s["input"].get("verify_units") or [])]
+
+
+def covering_rules(unit_id: str) -> list[dict]:
+    """Every stack EventBridge rule target whose ``verify_units`` names this unit.
+
+    D48, D49 and D51 run on ``ne-data-collection-panel``, which no schedule
+    starts: a rule in the same stack starts it when ``ne-data-collection-eod``
+    or ``-weekly`` SUCCEEDS (alpha-engine-config-I10791 / -I11306).
+    """
+    return [r for r in _stack_rules() if unit_id in (r["input"].get("verify_units") or [])]
 
 
 def _error_code(exc: Exception) -> str:
@@ -629,6 +658,9 @@ def read_survives_phase4(
     descriptor = unit.path.relative_to(REPO_ROOT).as_posix()
 
     if not schedules:
+        rules = covering_rules(unit.unit_id)
+        if rules:
+            return _grade_rule_started(store, unit, rules, descriptor)
         cadence = unit_cadence(unit.raw)
         if kind == "step-functions":
             return Reading(
@@ -741,6 +773,83 @@ def read_survives_phase4(
         evidence=evidence,
         source=_SOURCE_LIVE,
         as_of=max(str(r.as_of or "") for r in readings),
+    )
+
+
+def _grade_rule_started(store: GateStore, unit: Unit, rules: list[dict], descriptor: str) -> Reading:
+    """A unit started by a stack EventBridge rule on an upstream stack machine's SUCCEEDED.
+
+    The rule, the machine it starts and the upstream machine are all resources
+    of the ``nousergon-data-collection`` stack, which v2 phase 4 does not tear
+    down, so the question is whether the chain is live. The rule's state is
+    not read directly: the gate role holds no ``events:*`` read. A rule whose
+    ``State`` is the SAME stack parameter as the schedule that starts its
+    upstream machine is on exactly when that schedule is, so that schedule's
+    live state is read in its place. A rule that shares no state parameter
+    with such a schedule cannot be attested this way and reads UNMET.
+    """
+    module = _stack_helper()
+    evidence: tuple[str, ...] = (descriptor, "infrastructure/cloudformation/nousergon-data-collection.yaml")
+    upstream: dict[str, dict] = {}
+    for rule in rules:
+        sources = set(module.rule_source_machines(rule))
+        param = rule.get("state_parameter")
+        feeding = [s for s in _stack_schedules() if s.get("target_ref") in sources]
+        sharing = [s for s in feeding if param and s.get("state_parameter") == param]
+        if not sharing:
+            return Reading(
+                met=False,
+                detail=(
+                    f"{unit.unit_id} is started by stack rule {rule['name']!r} on {sorted(sources)}, but no "
+                    f"stack schedule starting that machine shares its state parameter {param!r}, so its "
+                    "live state cannot be attested by this gate's grants"
+                ),
+                evidence=evidence + (f"rule:{rule['name']}",),
+                source="registry.d/units + stack definition",
+            )
+        for s in sharing:
+            upstream[s["qualified_name"]] = s
+    evidence = evidence + tuple(f"rule:{r['name']}" for r in rules) + tuple(f"scheduler:{n}" for n in upstream)
+    scheduler = getattr(store, "scheduler_client", None)
+    if scheduler is None:
+        return _unmeasurable(
+            f"this store backend supplies no Scheduler client (only a live S3Store does); {unit.unit_id} is "
+            f"started by {[r['name'] for r in rules]} behind {sorted(upstream)}",
+            evidence,
+        )
+    states: dict[str, str] = {}
+    for name, schedule in sorted(upstream.items()):
+        try:
+            states[name] = str(scheduler.get_schedule(GroupName=schedule["group"], Name=schedule["name"]).get("State"))
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if _error_code(exc) == "ResourceNotFoundException":
+                return Reading(
+                    met=False,
+                    detail=f"schedule {name} does not exist live: the nousergon-data-collection stack is not applied",
+                    evidence=evidence,
+                    source=_SOURCE_LIVE,
+                )
+            return _unmeasurable(f"could not read schedule {name}: {type(exc).__name__}: {exc}", evidence)
+    disabled = sorted(n for n, st in states.items() if st != "ENABLED")
+    if disabled:
+        return Reading(
+            met=False,
+            detail=(
+                f"{unit.unit_id}'s rule(s) {[r['name'] for r in rules]} share their state parameter with "
+                f"{disabled}, which are {sorted({states[n] for n in disabled})} in live state"
+            ),
+            evidence=evidence,
+            source=_SOURCE_LIVE,
+        )
+    return Reading(
+        met=True,
+        detail=(
+            f"{unit.unit_id} is started by stack rule(s) {[r['name'] for r in rules]} on SUCCEEDED of a stack "
+            f"machine, outside the phase-4 teardown; they share their state parameter with {sorted(states)}, "
+            "ENABLED in live state (rule state itself not read: no events:* grant)"
+        ),
+        evidence=evidence,
+        source=_SOURCE_LIVE,
     )
 
 
