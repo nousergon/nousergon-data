@@ -71,12 +71,16 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
 INDEX_CONTRIBUTIONS_PREFIX = "market_data/index_contributions/"
+
+# D49's latest NDX weights (collectors/nasdaq100.py), the NDX leg's weight source.
+NDX_WEIGHTS_KEY = "market_data/index_constituents/NDX.json"
 
 # Fraction of index weight that must have a usable return before the
 # decomposition is publishable. Not 1.0: a handful of members legitimately
@@ -96,18 +100,53 @@ class IndexContributionsUnavailable(RuntimeError):
     """
 
 
+class IndexLegNotYetProduced(IndexContributionsUnavailable):
+    """An index's weight producer has NEVER published, so its leg is skipped.
+
+    alpha-engine-config-I11306. D48 runs after every EOD collection and D49
+    (the NDX weights) after the weekly one, so from the day both are scheduled
+    until D49's first weekly run there is no NDX.json at all. That is a
+    declared, expected state, not an outage: :func:`collect` records the leg
+    under ``skipped`` with this reason and the run stays ``ok``.
+
+    Raised ONLY on evidence that no publish ever happened (no D49 ok run
+    manifest and no dated NDX snapshot). Once one exists, a missing or stale
+    NDX.json is :class:`IndexContributionsUnavailable` again, the run is
+    ``partial``, and it pages, because that is a real D49 outage.
+    """
+
+
 @dataclass(frozen=True)
 class IndexSpec:
-    """An index, its tradeable proxy, and the label a consumer displays."""
+    """An index, its tradeable proxy, and the label a consumer displays.
+
+    ``max_weights_age_sessions`` refuses weights more than that many NYSE
+    sessions behind ``run_date`` (``None``: not checked here).
+    """
 
     index: str
     label: str
     proxy_symbol: str
+    max_weights_age_sessions: int | None = None
 
+
+# NDX weights are D49's weekly snapshot, keyed to the week's last session, and
+# D48 runs every session after it. At the next week's last session they are 5
+# sessions behind (holiday-aware: a Thursday-keyed snapshot before a closed
+# Friday is still 5 at the next Friday). 6 or more means the current week's
+# snapshot is missing: the weekly run, or D49 after it, did not publish.
+# Measured with nousergon_lib.dates.trading_days_stale: Fri 2026-10-09 vs
+# Fri 2026-10-16 = 5, vs Mon 2026-10-19 = 6; Thu 2026-04-02 vs Fri 2026-04-10 = 5.
+NDX_MAX_WEIGHTS_AGE_SESSIONS = 5
 
 INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(index="SPX", label="S&P 500", proxy_symbol="SPY"),
-    IndexSpec(index="NDX", label="Nasdaq 100", proxy_symbol="QQQ"),
+    IndexSpec(
+        index="NDX",
+        label="Nasdaq 100",
+        proxy_symbol="QQQ",
+        max_weights_age_sessions=NDX_MAX_WEIGHTS_AGE_SESSIONS,
+    ),
 )
 
 
@@ -265,10 +304,12 @@ def collect(
 
     results: dict[str, dict] = {}
     errors: dict[str, str] = {}
+    skipped: dict[str, str] = {}
 
     for spec in indexes:
         try:
             weights = weights_source(spec.index)
+            _refuse_stale_weights(spec, weights, run_date)
             if not weights.weight_map:
                 raise IndexContributionsUnavailable(
                     f"{spec.index}: no weights available (method={weights.method!r}). "
@@ -282,6 +323,12 @@ def collect(
             results[spec.index] = compute_contributions(
                 spec, weights, closes, proxy_series
             )
+        except IndexLegNotYetProduced as exc:
+            # Declared, expected, and not an error: the weight producer has
+            # never published (see IndexLegNotYetProduced). Recorded with its
+            # reason, never silently dropped, and the run stays `ok`.
+            logger.warning("index_contributions %s skipped: %s", spec.index, exc)
+            skipped[spec.index] = str(exc)
         except IndexContributionsUnavailable as exc:
             # Per-index soft-fail is deliberate and narrow: one index's weight
             # producer being down must not withhold the other index's honest
@@ -292,7 +339,8 @@ def collect(
 
     if not results:
         raise IndexContributionsUnavailable(
-            f"no index produced a publishable decomposition for {run_date}: {errors}"
+            f"no index produced a publishable decomposition for {run_date}: "
+            f"errors={errors} skipped={skipped}"
         )
 
     if dry_run:
@@ -309,6 +357,7 @@ def collect(
             "status": "ok_dry_run",
             "indexes": sorted(results),
             "errors": errors,
+            "skipped": skipped,
         }
 
     s3 = boto3.client("s3")
@@ -335,7 +384,69 @@ def collect(
         "paths_written": written,
         "rows_out": sum(len(p["constituents"]) for p in results.values()),
         "errors": errors,
+        "skipped": skipped,
     }
+
+
+def _refuse_stale_weights(spec: IndexSpec, weights: Weights, run_date: str) -> None:
+    """Raise when ``spec`` bounds its weights' age and these are past it, or
+    carry no date to check. Stale weights are an outage of their producer, so
+    this is :class:`IndexContributionsUnavailable` (``partial``, pages), never
+    :class:`IndexLegNotYetProduced`."""
+    if spec.max_weights_age_sessions is None:
+        return
+    if not weights.as_of:
+        raise IndexContributionsUnavailable(
+            f"{spec.index}: weights carry no date, so their age against "
+            f"{run_date} cannot be checked"
+        )
+    from nousergon_lib.dates import trading_days_stale
+
+    age = trading_days_stale(
+        datetime.fromisoformat(str(weights.as_of)[:10]).date(), run_date[:10]
+    )
+    if age > spec.max_weights_age_sessions:
+        raise IndexContributionsUnavailable(
+            f"{spec.index}: weights dated {weights.as_of} are {age} sessions behind "
+            f"{run_date}, over the {spec.max_weights_age_sessions}-session bound; the "
+            f"current week's snapshot was not published"
+        )
+
+
+# Where D49's run manifests live (nousergon_lib.run_manifest's default prefix,
+# registry.d/units/D49-*.yaml run_manifest_prefix) and its dated snapshots
+# (collectors/nasdaq100.py).
+D49_RUN_MANIFEST_PREFIX = "data_collection/runs/D49/"
+WEEKLY_PREFIX = "market_data/weekly/"
+
+
+def ndx_weights_ever_published(bucket: str, s3) -> bool:
+    """Whether D49 has EVER published NDX weights: any ``ok`` D49 run manifest,
+    or any dated ``market_data/weekly/{date}/NDX.json`` snapshot.
+
+    Evidence, not a date: the answer flips the first time D49 publishes and
+    never flips back, so once it is True a missing NDX.json is an outage.
+    An S3 error here propagates. It never reads as "never published", because
+    that answer is the one that suppresses a page.
+    """
+    paginator = s3.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=bucket, Prefix=D49_RUN_MANIFEST_PREFIX):
+        for obj in page.get("Contents", []):
+            if not obj["Key"].endswith(".json"):
+                continue
+            body = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read()
+            if json.loads(body).get("status") == "ok":
+                return True
+    for page in paginator.paginate(Bucket=bucket, Prefix=WEEKLY_PREFIX, Delimiter="/"):
+        for prefix in page.get("CommonPrefixes", []):
+            key = f"{prefix['Prefix']}NDX.json"
+            try:
+                s3.head_object(Bucket=bucket, Key=key)
+                return True
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404", "NotFound"):
+                    raise
+    return False
 
 
 def _default_weights_source(bucket: str) -> WeightsSource:
@@ -359,9 +470,30 @@ def _default_weights_source(bucket: str) -> WeightsSource:
             )
         if index == "NDX":
             s3 = boto3.client("s3")
-            obj = s3.get_object(
-                Bucket=bucket, Key="market_data/index_constituents/NDX.json"
-            )
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=NDX_WEIGHTS_KEY)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                    raise
+                # No NDX.json. Any other S3 failure is NOT this case and
+                # propagates (the re-raise above). Which of two states this is
+                # is decided by evidence, not a date:
+                #   * D49 has NEVER published: a declared skip of the NDX leg.
+                #     SPX still publishes and the run stays `ok`.
+                #   * D49 published before and the file is gone: an outage.
+                #     The run is `partial` and pages.
+                if not ndx_weights_ever_published(bucket, s3):
+                    raise IndexLegNotYetProduced(
+                        f"NDX: D49 (collectors/nasdaq100.py) has never published "
+                        f"weights (no s3://{bucket}/{NDX_WEIGHTS_KEY}, no ok "
+                        f"{D49_RUN_MANIFEST_PREFIX} manifest, no dated "
+                        f"{WEEKLY_PREFIX}*/NDX.json); NDX leg skipped until its "
+                        f"first weekly run (alpha-engine-config-I11306)"
+                    ) from exc
+                raise IndexContributionsUnavailable(
+                    f"NDX: no weights at s3://{bucket}/{NDX_WEIGHTS_KEY}, but D49 "
+                    f"has published before; the file is missing"
+                ) from exc
             payload = json.loads(obj["Body"].read())
             # `date`, not `as_of`: contracts/ndx_constituents.schema.json is
             # closed and names the snapshot date `date`, the same field the

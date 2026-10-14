@@ -149,6 +149,43 @@ def schedules(tpl: dict) -> list[dict]:
     return sorted(out, key=lambda s: s["name"])
 
 
+def event_rules(tpl: dict) -> list[dict]:
+    """Every EventBridge rule, flattened like :func:`schedules`.
+
+    alpha-engine-config-I10791 adds the first: ``ne-data-collection-panel-on-eod``,
+    which starts the D51 daily panel machine when ``ne-data-collection-eod``
+    SUCCEEDS. A rule targets a state machine in this stack with the same
+    collection/workloads/verify_units Input every schedule carries, so
+    :func:`lint` holds it to the same contract.
+    """
+    defaults = parameter_defaults(tpl)
+    out = []
+    for logical, res in resources_of_type(tpl, "AWS::Events::Rule").items():
+        p = res["Properties"]
+        state = p["State"]
+        state_param = state["Ref"] if isinstance(state, dict) else None
+        for target in p.get("Targets", []):
+            arn = target.get("Arn") or {}
+            out.append(
+                {
+                    "logical_id": logical,
+                    "name": p["Name"],
+                    "state_parameter": state_param,
+                    "declared_state": defaults.get(state_param) if state_param else state,
+                    "pattern": p.get("EventPattern") or {},
+                    "target_ref": arn.get("Ref") if isinstance(arn, dict) else None,
+                    "input": json.loads(target["Input"]),
+                }
+            )
+    return sorted(out, key=lambda r: r["name"])
+
+
+def rule_source_machines(rule: dict) -> list[str]:
+    """Logical ids of this stack's state machines whose status change ``rule`` matches."""
+    arns = ((rule["pattern"].get("detail") or {}).get("stateMachineArn")) or []
+    return [a["Ref"] for a in arns if isinstance(a, dict) and "Ref" in a]
+
+
 # ── digests and deploy arguments ─────────────────────────────────────────────
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -389,6 +426,23 @@ def pause_manifest_problems(sched: list[dict], manifest: dict) -> list[str]:
     return problems
 
 
+def rule_pause_problems(rules: list[dict], manifest: dict) -> list[str]:
+    """An ENABLED rule must be declared KEPT (`not_paused`), or the pause
+    reconcile reports it as an undeclared trigger. A DISABLED one must be
+    `pending` or paused. The same two-way rule as the schedules."""
+    pending = {k for k in manifest.get("pending", {}) if not k.startswith("_")}
+    paused = set(manifest.get("paused", {}).get("events_rules", {}))
+    kept = {k for k in manifest.get("not_paused", {}) if not k.startswith("_")}
+    problems = []
+    for r in rules:
+        n = r["name"]
+        if r["declared_state"] == "ENABLED" and n not in kept:
+            problems.append(f"rule {n}: declared ENABLED but not in automation_pause.json not_paused")
+        if r["declared_state"] == "DISABLED" and n not in pending | paused:
+            problems.append(f"rule {n}: declared DISABLED but not in automation_pause.json pending/paused")
+    return problems
+
+
 def lint() -> list[str]:
     problems: list[str] = []
     try:
@@ -462,9 +516,30 @@ def lint() -> list[str]:
                 "units' run manifests (alpha-engine-config-I10787); an empty list is a "
                 "machine whose only completion claim is an SSM exit code"
             )
-    problems += pause_manifest_problems(
-        schedules(tpl), json.loads(PAUSE_MANIFEST.read_text(encoding="utf-8"))
-    )
+    for r in event_rules(tpl):
+        where = f"rule {r['name']}"
+        if r["state_parameter"] not in STATE_PARAMETERS:
+            problems.append(f"{where}: State must Ref one of {STATE_PARAMETERS}")
+        if r["target_ref"] not in machines:
+            problems.append(f"{where}: target is not a state machine in this stack")
+        sources = rule_source_machines(r)
+        if not sources or any(src not in machines for src in sources):
+            problems.append(f"{where}: EventPattern must name this stack's state machines by Ref")
+        if r["target_ref"] in sources:
+            problems.append(f"{where}: a machine may not start itself")
+        if set(r["input"]) != STATE_MACHINE_INPUT_FIELDS:
+            problems.append(
+                f"{where}: Input fields {sorted(r['input'])} != {sorted(STATE_MACHINE_INPUT_FIELDS)}"
+            )
+        unknown = [w for w in r["input"].get("workloads", []) if w not in workloads]
+        if unknown or not r["input"].get("workloads"):
+            problems.append(f"{where}: workloads {unknown or '[]'} not in the dispatcher's _WORKLOADS")
+        verify_units = r["input"].get("verify_units", [])
+        if not verify_units or [u for u in verify_units if u not in units]:
+            problems.append(f"{where}: verify_units must be non-empty and every unit declared")
+    manifest = json.loads(PAUSE_MANIFEST.read_text(encoding="utf-8"))
+    problems += pause_manifest_problems(schedules(tpl), manifest)
+    problems += rule_pause_problems(event_rules(tpl), manifest)
     problems += sameday_ordering_problems(schedules(tpl))
     return problems
 
