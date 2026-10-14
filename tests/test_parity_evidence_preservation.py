@@ -239,6 +239,26 @@ def test_passing_rows_settled_prior_days_and_arcticdb_rows_are_not_evidence():
     assert not any("alternative" in s or s.startswith("arcticdb/") for s in sources)
 
 
+def test_a_record_input_read_from_arcticdb_is_not_an_s3_object():
+    """The 09-28 adjudication record cites `arcticdb:macro/HYOAS` at ArcticDB
+    version 31. Treating it as an S3 key made every gate run HeadObject a key
+    that does not exist and fail the step (data-gate, 2026-10-13 22:43Z on)."""
+    record = _record()
+    record["exceptions"][0]["inputs"].append({
+        "id": "HYOAS", "kind": "macro",
+        "source_key": "arcticdb:macro/HYOAS", "source_version_id": "31",
+        "settled": {"source_kind": adj.SETTLED_SOURCE_V1_LATER,
+                    "source_key": "arcticdb://alpha-engine-research/macro", "source_version_id": "32"},
+    })
+    refs = pe.record_references(record, RECORD_KEY)
+    assert not any(r.source_key.startswith("arcticdb") for r in refs)
+    vault = _vault()
+    store = _Store({REPORT_KEY: _report(), RECORD_KEY: record})
+    result = _run(vault, store)
+    assert {(src, vid) for src, vid, _ in vault.copies} == EXPECTED
+    assert len(result.copied) == len(EXPECTED)
+
+
 def test_a_second_run_copies_nothing_and_writes_nothing():
     vault = _vault()
     _run(vault)

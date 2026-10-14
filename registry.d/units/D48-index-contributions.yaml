@@ -37,41 +37,59 @@ component: 1
 lifecycle: pending
 owner: brian
 code_path: "collectors/index_contributions.py:1"
-# RE-EXAMINED 2026-10-06: first declared pending 2026-09-21 with a 2026-10-05
-# re-exam. On the re-exam nothing runs it yet: the scheduling work,
-# alpha-engine-config-I11306, is still open. Re-declared pending for one more
-# 14-day window (the ops ceiling, PENDING_MAX_DAYS), not promoted and not
-# removed. The date is Brian's call; a second extension needs a new reason.
-pending_since: "2026-10-06"
-lifecycle_reexam: "2026-10-20"
+# RE-EXAMINED 2026-10-14 on a CHANGED reason: the trigger is in this change.
+# History: declared pending 2026-09-21 (re-exam 2026-10-05); re-declared
+# 2026-10-06 (re-exam 2026-10-20) because nothing scheduled it. This window
+# no longer waits on scheduling. It waits on the first scheduled run's
+# artifacts, which promotes_when names. pending_since + 14 days is the ops
+# ceiling (PENDING_MAX_DAYS).
+pending_since: "2026-10-14"
+lifecycle_reexam: "2026-10-28"
 lifecycle_reason: >-
-    Producer module merged without a trigger. Scheduling and the ops-side
-    observability/authority rows are operational assembly and belong in the ops
-    repos, tracked as alpha-engine-config-I11306. Until that lands the unit
-    writes nothing, which I11306 states plainly rather than leaving to be
-    discovered.
+    SCHEDULED by alpha-engine-config-I11306: `weekly_collector.py
+    --index-contributions` (run-manifest-wrapped) runs on
+    ne-data-collection-panel, started by the rule
+    ne-data-collection-index-contributions-on-eod when ne-data-collection-eod
+    SUCCEEDS, so that day's closes are already in ArcticDB. D48 is that
+    execution's only verify_unit. The unit stays pending until a scheduled run
+    has published market_data/index_contributions/{SPX,NDX}/latest.json for
+    the latest session (promotes_when). Until D49 has EVER published (no ok
+    D49 manifest, no dated NDX snapshot), the NDX leg is a declared skip: SPX
+    publishes, the run files ok with a not_applicable cardinality reading
+    naming the leg, and nothing pages. After that, a missing NDX.json, or one
+    more than 5 NYSE sessions old, makes the run `partial`, filed failed, and
+    it pages.
 lifecycle_owner: brian
 promotes_when: >-
-    alpha-engine-config-I11306 has landed the post-close trigger and the
-    `observability.d/` row reads in-service, and at least one trading day's
-    market_data/index_contributions/{SPX,NDX}/latest.json exists with that day's
-    trading_day. Flip lifecycle to in-service and declare the cadence in the same PR.
+    A scheduled ne-data-collection-panel execution has filed an ok D48 run
+    manifest, and market_data/index_contributions/{SPX,NDX}/latest.json exists
+    with that session's trading_day. The cadence is already declared (trigger
+    below), so the promotion PR flips lifecycle to in-service, drops the pending
+    dates, and clears the two registry rows' declared-off block (see
+    registry_rows below).
 trigger:
-  # `manual` is the honest value from the closed SUBSTRATE_BY_TRIGGER_KIND
-  # vocabulary: nothing schedules this unit, so an ad-hoc invocation is the
-  # only way it runs today. There is no "none" kind, and inventing one would
-  # be a fallback guess where the generator deliberately refuses to make one.
-  kind: "manual"
+  kind: "step-functions"
+  # Its own execution on ne-data-collection-panel, started by the EventBridge
+  # rule ne-data-collection-index-contributions-on-eod when
+  # ne-data-collection-eod SUCCEEDS (scheduled run or heal), so it runs after
+  # the D32 ArcticDB append it reads
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::IndexContributionsOnEodSucceededRule).
+  # Not a workload of the EOD machine, whose terminal event starts the eod_pnl
+  # reconcile, and not a second workload of the D51 execution, so a D48
+  # failure pages as D48 alone. IN-REGION on a data-spot box: the job reads the
+  # close archive, and a read that size from outside the bucket's region is
+  # dominated by S3 round-trip latency (measured 2026-07-15: a 20-40 minute
+  # in-region job took 3+ hours locally).
+  owner: "ne-data-collection-panel"
+  started_by: "eventbridge-rule:ne-data-collection-index-contributions-on-eod"
+  successor: "ne-data-collection-panel (alpha-engine-config-I11306); no v1 predecessor, because v1 never published the decomposition"
+  # No `schedule:`. The machine is event-started, so
+  # data_gate/trigger_reconcile.py has no fire time to reconcile it against.
+  # In practice it starts when the weekday 18:15 America/New_York EOD
+  # collection, or a heal of it, SUCCEEDS. `on_demand: true` is the cadence
+  # shape data_gate/cadence.py offers an event-started unit.
+  on_demand: true
   runs_on: "ec2-spot"
-  detail: >-
-    NOT YET SCHEDULED — alpha-engine-config-I11306. Must run post-close on
-    trading days, chained after the day's closes reach ArcticDB, and IN-REGION:
-    the job reads the ~900-ticker close archive, and a read that size from
-    outside the bucket's region is dominated by S3 round-trip latency (measured
-    2026-07-15: a 20-40 minute in-region job took 3+ hours locally).
-  # No `schedule` key: a `pending` row may not declare a cadence, and
-  # data_gate/cadence.py would otherwise grade this unit against a cadence
-  # nothing honours.
 writes:
   # Key TEMPLATES, not globs: shadow.parity.resolve_contract matches a
   # templated key against a contract's x-key-pattern, and a bare `*` resolves
@@ -113,6 +131,10 @@ registry_rows:
 # promotion PR has to clear them.
 run_manifest_prefix: data_collection/runs/D48
 detectors:
+  - kind: "sf-execution"
+    via: "ne-data-collection-panel"
+    state: PRESENT
+    note: "verify_units D48: a missing, failed or output-less D48 manifest fails its execution, which pages"
   - kind: "freshness-monitor"
     via: "artifact-registry-row"
     state: ABSENT
