@@ -71,12 +71,16 @@ from datetime import datetime, timezone
 from typing import Callable, Mapping, Sequence
 
 import boto3
+from botocore.exceptions import ClientError
 
 logger = logging.getLogger(__name__)
 
 SCHEMA_VERSION = 1
 
 INDEX_CONTRIBUTIONS_PREFIX = "market_data/index_contributions/"
+
+# D49's latest NDX weights (collectors/nasdaq100.py), the NDX leg's weight source.
+NDX_WEIGHTS_KEY = "market_data/index_constituents/NDX.json"
 
 # Fraction of index weight that must have a usable return before the
 # decomposition is publishable. Not 1.0: a handful of members legitimately
@@ -359,9 +363,20 @@ def _default_weights_source(bucket: str) -> WeightsSource:
             )
         if index == "NDX":
             s3 = boto3.client("s3")
-            obj = s3.get_object(
-                Bucket=bucket, Key="market_data/index_constituents/NDX.json"
-            )
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=NDX_WEIGHTS_KEY)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                    raise
+                # D49 has not published yet. That is one index's weight
+                # producer being absent, the case the per-index soft-fail in
+                # collect() exists for: SPX still publishes, the run reports
+                # `partial`, and the error names the missing key. Any other S3
+                # failure is NOT this case and propagates (the re-raise above).
+                raise IndexContributionsUnavailable(
+                    f"NDX: no weights at s3://{bucket}/{NDX_WEIGHTS_KEY}; D49 "
+                    f"(collectors/nasdaq100.py) has not published it"
+                ) from exc
             payload = json.loads(obj["Body"].read())
             # `date`, not `as_of`: contracts/ndx_constituents.schema.json is
             # closed and names the snapshot date `date`, the same field the

@@ -318,3 +318,36 @@ def test_the_units_identity_holds_exactly() -> None:
     assert app["contribution_pp"] / 100.0 == pytest.approx(
         app["weight_prior_close"] * (app["return_pct"] / 100.0)
     )
+
+
+def test_ndx_weights_not_yet_published_soft_fails_the_ndx_leg_only() -> None:
+    """alpha-engine-config-I11306: D48 is scheduled daily and D49 weekly, so
+    the first D48 runs can precede the first NDX.json. A missing NDX.json is
+    one index's weight producer being absent, the case the per-index soft-fail
+    exists for: it must raise IndexContributionsUnavailable (SPX still
+    publishes, status `partial`), not a raw ClientError that withholds SPX."""
+    from botocore.exceptions import ClientError
+
+    class _NoNdx:
+        def get_object(self, Bucket, Key):  # noqa: N803
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+    with patch.object(ic.boto3, "client", return_value=_NoNdx()):
+        source = ic._default_weights_source("any")
+        with pytest.raises(ic.IndexContributionsUnavailable, match="D49"):
+            source("NDX")
+
+
+def test_ndx_weights_any_other_s3_failure_propagates() -> None:
+    """Only the not-yet-published case is converted. AccessDenied or a
+    throttle is not 'D49 has not run' and must not read as it."""
+    from botocore.exceptions import ClientError
+
+    class _Denied:
+        def get_object(self, Bucket, Key):  # noqa: N803
+            raise ClientError({"Error": {"Code": "AccessDenied", "Message": "x"}}, "GetObject")
+
+    with patch.object(ic.boto3, "client", return_value=_Denied()):
+        source = ic._default_weights_source("any")
+        with pytest.raises(ClientError):
+            source("NDX")
