@@ -49,7 +49,7 @@ from data_gate.evidence import (
     empty_fresh_runs,
     manifests_since,
 )
-from data_gate.standalone import stack_schedules
+from data_gate.standalone import PARTIAL_RUN_SCHEDULES, PARTIAL_RUN_WINDOW, stack_schedules
 
 __all__ = [
     "CYCLE_COUNTS",
@@ -221,6 +221,10 @@ def _parse_utc(stamp: object) -> dt.datetime | None:
     return parsed.astimezone(dt.timezone.utc)
 
 
+def _hours(delta: dt.timedelta) -> str:
+    return f"{int(delta.total_seconds() // 3600)}h"
+
+
 def due_fires(cadence: Cadence, *, as_of: dt.datetime, count: int) -> list[dt.datetime]:
     """The ``count`` most recent fires whose runs should be finished, newest first."""
     fires: list[dt.datetime] = []
@@ -243,10 +247,36 @@ class Cycle:
 
     fire: dt.datetime
     manifests: dict[str, list[tuple[str, dict]]] = field(default_factory=dict)
+    #: Whether the schedule's partial-run rule widened this cycle past
+    #: ``fire + COMPLETION_GRACE`` (see `collect_cycles`).
+    partial_runs: bool = False
+    #: Whether the fire's OWN run is evidenced: some unit recorded a
+    #: ``scheduled`` manifest inside ``[fire, fire + COMPLETION_GRACE]``.
+    #: Always True for a cycle the partial-run rule does not cover.
+    fired: bool = True
 
     @property
     def label(self) -> str:
         return self.fire.strftime("%Y-%m-%dT%H:%MZ")
+
+    def late_units(self) -> set[str]:
+        """Units whose only ok scheduled manifests started after the fire's grace.
+
+        Non-empty only on a cycle the partial-run rule covers: the units a
+        rerun of the week produced rather than the fire's own execution.
+        """
+        deadline = self.fire + COMPLETION_GRACE
+        late: set[str] = set()
+        for unit_id, docs in self.manifests.items():
+            starts = [
+                _parse_utc(d.get("started"))
+                for _, d in docs
+                if d.get("trigger") == "scheduled" and d.get("status") == "ok"
+            ]
+            starts = [s for s in starts if s is not None]
+            if starts and min(starts) > deadline:
+                late.add(unit_id)
+        return late
 
     def ok_units(self) -> set[str]:
         return {
@@ -301,6 +331,19 @@ def collect_cycles(
 ) -> CycleSet:
     """The last ``count`` due fires of ``schedule_name``, with each unit's manifests.
 
+    A manifest belongs to a fire when it started inside ``[fire, fire +
+    COMPLETION_GRACE]``. For a schedule in
+    :data:`~data_gate.standalone.PARTIAL_RUN_SCHEDULES` the window is ``[fire,
+    fire + PARTIAL_RUN_WINDOW)`` instead — Brian's 2026-10-06 ruling on
+    alpha-engine-config-I11812, "count weekly sf as success if it runs
+    successfully even if it is made up of partial runs", the same rule
+    `standalone._grade_partial_runs` applies to ``survives_phase4``. Without it
+    the cycle counters graded the same week as incomplete that
+    ``survives_phase4`` graded as survived, in one reading. The trigger still
+    has to fire: when no unit recorded a scheduled manifest inside the fire's
+    own grace, the reruns do not stand in for it and the cycle keeps only what
+    started inside the grace (``Cycle.fired`` is False).
+
     A listing or read failure is recorded on the set and renders every clause
     over it UNMEASURABLE — never an empty window, which would read as "the
     schedule never fired" and file the finding against the collector instead of
@@ -343,7 +386,8 @@ def collect_cycles(
             f"lookback of {as_of.isoformat()}"
         )
         return result
-    result.cycles = [Cycle(fire=fire) for fire in fires]
+    partial = schedule["name"] in PARTIAL_RUN_SCHEDULES
+    result.cycles = [Cycle(fire=fire, partial_runs=partial) for fire in fires]
     # ONE listing pass per unit over the WHOLE window, then bucketed by fire.
     # Listing per (fire, unit) instead would re-list the same day folders once
     # per fire — the same answer at five times the S3 calls, on a reader that
@@ -371,10 +415,44 @@ def collect_cycles(
                 result.problems.append(f"{key}: `started` does not parse ({doc.get('started')!r})")
                 continue
             for cycle in result.cycles:
-                if cycle.fire <= started <= cycle.fire + COMPLETION_GRACE:
+                in_grace = cycle.fire <= started <= cycle.fire + COMPLETION_GRACE
+                # PARTIAL_RUN_WINDOW is shorter than the gap between two
+                # fires, so no manifest can belong to two cycles.
+                in_partial = partial and cycle.fire <= started < cycle.fire + PARTIAL_RUN_WINDOW
+                if in_grace or in_partial:
                     cycle.manifests[unit.unit_id].append((key, doc))
                     break
+    if partial:
+        for cycle in result.cycles:
+            _require_own_fire(cycle)
     return result
+
+
+def _require_own_fire(cycle: Cycle) -> None:
+    """Drop a partial-run cycle's late manifests when its fire never ran.
+
+    The partial-run rule counts a week the machine FINISHED by reruns; it never
+    counts a week whose scheduled fire produced nothing at all — the same line
+    `standalone._grade_partial_runs` holds with "a fire with no execution of its
+    own is UNMET as before". Read from the manifests alone, so the fire's own
+    run is evidenced by any ``scheduled`` manifest inside its grace, whatever
+    its status.
+    """
+    deadline = cycle.fire + COMPLETION_GRACE
+    cycle.fired = any(
+        d.get("trigger") == "scheduled"
+        and (started := _parse_utc(d.get("started"))) is not None
+        and started <= deadline
+        for d in cycle.all_manifests()
+    )
+    if cycle.fired:
+        return
+    for unit_id, docs in cycle.manifests.items():
+        cycle.manifests[unit_id] = [
+            (key, d)
+            for key, d in docs
+            if (started := _parse_utc(d.get("started"))) is not None and started <= deadline
+        ]
 
 
 def _cycle_verdict(cycles: CycleSet) -> list[tuple[Cycle, set[str], list[str]]]:
@@ -425,19 +503,33 @@ def read_consecutive_cycles(cycles: CycleSet, *, required: int) -> Reading:
     rows = _cycle_verdict(cycles)
     streak = 0
     first_gap = ""
+    rerun_completed: list[str] = []
     for cycle, _ok, missing in rows:
         if missing:
             first_gap = (
                 f"the {cycle.label} cycle is incomplete: no ok scheduled-trigger manifest for "
                 f"{missing[:8]}"
             )
+            if not cycle.fired:
+                first_gap += (
+                    " (its fire recorded no scheduled manifest inside the "
+                    f"{_hours(COMPLETION_GRACE)} grace, so reruns of that week do not count for it)"
+                )
             break
         streak += 1
+        late = sorted(cycle.late_units() & set(cycles.unit_ids))
+        if late:
+            rerun_completed.append(f"{cycle.label} ({late[:8]} by rerun)")
     detail = (
         f"{streak} consecutive complete cycle(s) of {cycles.schedule} ending at the latest due "
         f"fire, against the {required} the plan's exit names, over {len(rows)} cycle(s) examined "
         f"and {len(cycles.unit_ids)} verified unit(s)"
     )
+    if rerun_completed:
+        detail += (
+            f"; completed across partial runs within {PARTIAL_RUN_WINDOW.days} days of the fire "
+            f"(partial-run rule, Brian 2026-10-06, alpha-engine-config-I11812): {rerun_completed}"
+        )
     if first_gap:
         detail += f"; {first_gap}"
     return Reading(

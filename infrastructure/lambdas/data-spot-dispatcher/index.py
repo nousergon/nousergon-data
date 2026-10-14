@@ -247,6 +247,21 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # rather than inherited because it extends the morning schedule's worst
     # case (`data_collection_stack.worst_case_seconds`).
     "features-settled-regrade": 3600,
+    # D51 (alpha-engine-config-I10791, plan P-25): one read of the ArcticDB
+    # universe library over a 600-day window and one parquet + manifest PUT,
+    # no fetch. No scheduled run has been measured yet, so it is sized like
+    # D50 beside it (a single compile plus the box boot and the venv build).
+    # It is declared rather than inherited so that the panel machine
+    # (ne-data-collection-panel, started on the EOD collection's SUCCEEDED)
+    # pages within about an hour rather than two.
+    "daily-panel": 3600,
+    # D48 / D49 (alpha-engine-config-I11306). No scheduled run has been
+    # measured yet. D48 is one batched ArcticDB read of the ~600 index members
+    # and four small PUTs; D49 is one HTTP fetch, one fundamentals-archive read
+    # and two PUTs. Both are sized like D51 beside them on the same machine, so
+    # a hung run pages within about an hour rather than two.
+    "index-contributions": 3600,
+    "ndx-constituents": 3600,
 }
 
 
@@ -444,6 +459,28 @@ _WORKLOADS: dict[str, str] = {
     # LAST, after `arctic-probe`: it writes S3 keys only and no ArcticDB, so
     # the probe still describes the morning's final library state.
     "features-settled-regrade": "python weekly_collector.py --features-settled-regrade",
+    # alpha-engine-config-I10791 (plan P-25): D51, the daily panel
+    # (`builders/daily_panel.py`). It compiles the session's long OHLCV panel
+    # once from the ArcticDB `universe` library and publishes it under
+    # data_collection/panel/{trading_day}/. It runs on its own machine,
+    # ne-data-collection-panel, which is started when ne-data-collection-eod
+    # SUCCEEDS. It is never a workload of the EOD machine, whose terminal event
+    # starts the eod_pnl reconcile.
+    "daily-panel": "python weekly_collector.py --daily-panel",
+    # alpha-engine-config-I11306: D48, the per-constituent index contribution
+    # (`collectors/index_contributions.py`). It reads the ArcticDB universe
+    # library, so it runs in-region only. It runs on ne-data-collection-panel,
+    # started by the rule ne-data-collection-index-contributions-on-eod when
+    # ne-data-collection-eod SUCCEEDS, so that day's closes are already
+    # appended. Never a workload of the EOD machine.
+    "index-contributions": "python weekly_collector.py --index-contributions",
+    # alpha-engine-config-I11306: D49, Nasdaq-100 membership and weights
+    # (`collectors/nasdaq100.py`), D48's NDX weight source. It runs on
+    # ne-data-collection-panel, started by the rule
+    # ne-data-collection-ndx-constituents-on-weekly when
+    # ne-data-collection-weekly SUCCEEDS, after D10 has written the
+    # fundamentals archive its weights read.
+    "ndx-constituents": "python weekly_collector.py --nasdaq100-constituents",
     # alpha-engine-config-I10753: the five weekly units with no standalone
     # successor (D15, D16, D40, D41, D46). D40/D41 (analyst snapshotter /
     # analyst_revisions) are RETIRED by Brian ruling 2026-09-14 R7 — no

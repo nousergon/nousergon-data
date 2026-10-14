@@ -1404,12 +1404,12 @@ def read_completeness_metric(
     )
 
 
-def read_objective(store: GateStore, key: str) -> Reading:
+def read_objective(store: GateStore, key: str, *, now: dt.datetime | None = None) -> Reading:
     """One objective/SLO metric document, or the reason there is none yet."""
-    return _objective_reading(key, read_store_document(store, key))
+    return _objective_reading(key, read_store_document(store, key), now=now)
 
 
-def _objective_reading(key: str, read: DocumentRead) -> Reading:
+def _objective_reading(key: str, read: DocumentRead, *, now: dt.datetime | None = None) -> Reading:
     if read.problem is not None:
         return Reading(
             met=False,
@@ -1430,6 +1430,24 @@ def _objective_reading(key: str, read: DocumentRead) -> Reading:
         )
     document = read.document or {}
     status = str(document.get("status") or "")
+    if status == PENDING_TARGET:
+        # A DECLARED state, not the undefined-status finding below: the
+        # producer measured its number but the target it grades against is
+        # not ratified yet (`data.cost.monthly` before Brian rules R6's
+        # ceiling). Shows the figure and how much of the window is measured;
+        # never MET, because there is nothing to be within.
+        return Reading(
+            met=False,
+            detail=(
+                f"{key}: status={PENDING_TARGET}, value={document.get('value')}, "
+                f"{_maturity(document)}; target not ratified yet "
+                f"(target={document.get('target')}, proposed={document.get('proposed_ceiling_usd')}), "
+                "so there is no ok/breach verdict to grade"
+            ),
+            evidence=(key,),
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
     if status not in {"ok", "breach"}:
         return Reading(
             met=False,
@@ -1443,13 +1461,75 @@ def _objective_reading(key: str, read: DocumentRead) -> Reading:
         )
     value = document.get("value")
     baseline = document.get("baseline")
+    # A document may declare when it stops being evidence (`data_gate/producers
+    # /slo.py`, alpha-engine-config-I10789). Past that instant the emitter has
+    # stopped, and its last answer — green or red — is no longer a reading:
+    # UNMEASURABLE, never the stale verdict. Opt-in, so a producer that does
+    # not declare it is graded exactly as before.
+    stale_after = _parse_stamp(document.get("stale_after_utc"))
+    if document.get("stale_after_utc") is not None and stale_after is None:
+        return Reading(
+            met=False,
+            detail=f"{key} carries stale_after_utc {document.get('stale_after_utc')!r}, which does not parse",
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
+    if stale_after is not None and (now or dt.datetime.now(dt.timezone.utc)) > stale_after:
+        return Reading(
+            met=False,
+            detail=(
+                f"{key} is stale: generated {document.get('generated_utc')}, no longer evidence after "
+                f"{document.get('stale_after_utc')}. Its emitter has stopped; the last answer was "
+                f"status={status}, value={value}."
+            ),
+            evidence=(key,),
+            unmeasurable=True,
+            source="data_collection store",
+            as_of=str(document.get("as_of") or ""),
+        )
+    summary = " ".join(str(document.get("summary") or "").split())
     return Reading(
         met=status == "ok",
-        detail=f"{key}: status={status}, value={value}, baseline={baseline}",
+        detail=f"{key}: status={status}, value={value}, baseline={baseline}" + (f" — {summary}" if summary else ""),
         evidence=(key,),
         source="data_collection store",
         as_of=str(document.get("as_of") or ""),
     )
+
+
+#: The one non-verdict status an objective document may declare: measured,
+#: target not ratified. Published by `data_gate/producers/cost_monthly.py`.
+PENDING_TARGET = "pending_target"
+
+
+def _maturity(document: dict) -> str:
+    """How much of its window an objective document has measured."""
+    parts = []
+    if "days_observed" in document:
+        parts.append(
+            f"{document.get('days_observed')} of {document.get('days_in_month', '?')} day(s) of "
+            f"{document.get('month', 'the month')} observed"
+        )
+    if "days_covered" in document:
+        parts.append(
+            f"baseline {document.get('days_covered')} of {document.get('days_requested', '?')} day(s) covered"
+        )
+    return "; ".join(parts) or "no observation counts published"
+
+
+def _parse_stamp(stamp: object) -> dt.datetime | None:
+    """An ISO-8601 instant as aware UTC, or ``None`` when absent or unparseable."""
+    if not isinstance(stamp, str) or not stamp:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
 
 
 def read_windowed_objective(
@@ -1460,6 +1540,7 @@ def read_windowed_objective(
     unit: str,
     observed_field: str = "cycles_observed",
     required_field: str | None = None,
+    now: dt.datetime | None = None,
 ) -> Reading:
     """:func:`read_objective` for an objective whose target counts a WINDOW.
 
@@ -1475,7 +1556,7 @@ def read_windowed_objective(
     ``required_field``.
     """
     read = read_store_document(store, key)
-    reading = _objective_reading(key, read)
+    reading = _objective_reading(key, read, now=now)
     document: dict = {}
     if read.problem is None and not read.absent:
         document = read.document or {}
@@ -1502,7 +1583,12 @@ def read_windowed_objective(
             observed=observed,
             required=required,
             failures=(f"{key}: status=breach, value={document.get('value')}",) if status == "breach" else (),
-            not_live=f"{key} carries no ok/breach verdict yet — nothing publishes this number",
+            not_live=(
+                f"{key} publishes its number ({_maturity(document)}) but its target is not "
+                "ratified yet, so there is no ok/breach verdict"
+                if status == PENDING_TARGET
+                else f"{key} carries no ok/breach verdict yet — nothing publishes this number"
+            ),
             unit=unit,
             current=_objective_current(document) if live else None,
         ),
