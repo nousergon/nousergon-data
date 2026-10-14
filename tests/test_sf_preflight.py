@@ -1807,3 +1807,52 @@ def test_cli_never_renders_a_blocked_only_run_as_pass():
     text = sfp._format_human(results)
     assert "PASS" not in text
     assert "INCOMPLETE" in text
+
+
+# ── _previous_trading_day_str: "today" is the ET date Polygon refuses ─────────
+#
+# rehearsal-2026-10-13-1 launched 22:15 EDT on 10-13 = 02:15Z on 10-14. With a
+# UTC "today" the prior day was 10-13, which Polygon's plan still treats as
+# "today" (403 "Attempted to request today's data before end of day"), so
+# polygon_grouped_coverage failed and predicted_missing_from_closes was blocked.
+
+from datetime import datetime as _dt, timezone as _tz
+
+
+@pytest.mark.parametrize("now_utc, expected", [
+    # The failing launch: evening ET, past UTC midnight -> the day BEFORE 10-13.
+    (_dt(2026, 10, 14, 2, 15, tzinfo=_tz.utc), "2026-10-12"),
+    # Last instant of ET 10-13 (EDT, UTC-4): still 10-13 in New York.
+    (_dt(2026, 10, 14, 3, 59, 59, tzinfo=_tz.utc), "2026-10-12"),
+    # ET midnight has passed: 10-13 is now a completed, servable day.
+    (_dt(2026, 10, 14, 4, 0, tzinfo=_tz.utc), "2026-10-13"),
+    # Scheduled production instant (09:00Z, Saturday): unchanged -> Friday.
+    (_dt(2026, 10, 17, 9, 0, tzinfo=_tz.utc), "2026-10-16"),
+    # Thursday/Friday holiday-week slot at 09:00Z: unchanged.
+    (_dt(2026, 10, 15, 9, 0, tzinfo=_tz.utc), "2026-10-14"),
+    # EST regime (UTC-5): 04:30Z on 12-02 is still 12-01 in New York.
+    (_dt(2026, 12, 2, 4, 30, tzinfo=_tz.utc), "2026-11-30"),
+])
+def test_previous_trading_day_uses_the_new_york_date(now_utc, expected):
+    assert sfp._previous_trading_day_str(now_utc) == expected
+
+
+def test_previous_trading_day_matches_utc_whenever_the_dates_agree():
+    """Every instant where the UTC and ET calendar dates agree resolves exactly
+    as before the fix — only the UTC-midnight..ET-midnight gap moves."""
+    from datetime import timedelta
+    from zoneinfo import ZoneInfo
+    from nousergon_lib.trading_calendar import is_trading_day
+
+    compared = 0
+    for day in range(12, 19):  # Mon 10-12 .. Sun 10-18
+        for hour in range(24):
+            now = _dt(2026, 10, day, hour, 0, tzinfo=_tz.utc)
+            if now.astimezone(ZoneInfo("America/New_York")).date() != now.date():
+                continue
+            d = now.date() - timedelta(days=1)
+            while not is_trading_day(d):
+                d -= timedelta(days=1)
+            assert sfp._previous_trading_day_str(now) == d.isoformat(), now
+            compared += 1
+    assert compared == 7 * 20  # EDT: 20 of 24 UTC hours share the ET date

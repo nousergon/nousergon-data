@@ -394,7 +394,7 @@ def load_registry_with_recovery(
     s3_client: Any, bucket: str, key: str
 ) -> tuple[list[ArtifactSpec], dict[str, dict], dict[str, list[str]],
            dict[str, bool], dict[str, str], dict[str, str],
-           dict[str, Any]]:
+           dict[str, Any], dict[str, str]]:
     """Like :func:`load_registry`, but also returns the per-artifact
     ``recovery:`` spec map (config#1240), the
     ``critical_while_champion_arm`` map (config-I3086), the
@@ -404,7 +404,9 @@ def load_registry_with_recovery(
     and the ``declared_off`` input (config-I8719): the well-formed
     ``declared_off:`` blocks plus the publisher's ``declared_off_resolution``
     block, which :func:`resolve_declared_off` turns into a suppression map
-    once ``now`` is known.
+    once ``now`` is known — and, last, the ``run_evidence_prefix`` map
+    (alpha-engine-config-I6831), which :func:`apply_run_evidence` uses to
+    lift a producer suppression when the producer demonstrably RAN.
 
     ``deadline_local`` (alpha-engine-config-I10805) is NOT a parallel map
     here as of I10829 phase 2: it is a native ``ArtifactSpec`` field on the
@@ -435,6 +437,7 @@ def load_registry_with_recovery(
     escalate_to_issue_by_id: dict[str, bool] = {}
     remediation_by_id: dict[str, str] = {}
     producer_trigger_by_id: dict[str, str] = {}
+    run_evidence_prefix_by_id: dict[str, str] = {}
     for entry in data["artifacts"]:
         merged = {**defaults, **entry}
         merged["created_at"] = _coerce_date(merged["created_at"])
@@ -482,6 +485,30 @@ def load_registry_with_recovery(
                     "row on fewer producers than it declares",
                     spec.artifact_id, producer_trigger,
                 )
+        # alpha-engine-config-I6831 — where the producer leaves evidence that
+        # it RAN, independent of whether it produced. Carried only alongside a
+        # producer_trigger: it exists to LIFT a suppression, so a row with no
+        # trigger has nothing for it to act on. A malformed value is dropped
+        # with a warning — the row keeps today's behaviour, and the PR-time
+        # validator in alpha-engine-config is the chokepoint for the typo.
+        run_evidence_prefix = merged.get("run_evidence_prefix")
+        if run_evidence_prefix is not None:
+            if (
+                isinstance(run_evidence_prefix, str)
+                and run_evidence_prefix.strip()
+                and "{" not in run_evidence_prefix
+            ):
+                run_evidence_prefix_by_id[spec.artifact_id] = (
+                    run_evidence_prefix.strip()
+                )
+            else:
+                logger.warning(
+                    "registry row %s carries a malformed run_evidence_prefix "
+                    "%r — expected a fixed, non-empty S3 key prefix; the "
+                    "row's producer suppression cannot be lifted by run "
+                    "evidence until it is fixed",
+                    spec.artifact_id, run_evidence_prefix,
+                )
     # config-I8719 — the declared-off input. Both halves come from THIS file:
     # the per-row declarations and the publisher's resolution of their clearing
     # milestones, so a declaration can never be read against a resolution from
@@ -492,7 +519,7 @@ def load_registry_with_recovery(
     }
     return (specs, recovery_by_id, critical_arms_by_id,
             escalate_to_issue_by_id, remediation_by_id, producer_trigger_by_id,
-            declared_off_input)
+            declared_off_input, run_evidence_prefix_by_id)
 
 
 # ── Dynamic severity (config-I3086) ─────────────────────────────────────────
@@ -1256,6 +1283,168 @@ def apply_producer_suppression(
     return out
 
 
+# ── Run evidence lifts producer suppression (alpha-engine-config-I6831) ─────
+#
+# Producer suppression reasons ONLY from the trigger's state: "the rule that
+# runs this producer is DISABLED, so its artifact going stale is the pause, not
+# a failure". That is right when nothing ran. It is wrong when something ELSE
+# ran the producer and the producer failed — and for nous-ergon-ops-I570 that
+# is what happened: the Think Tank challenger arm wrote no challenger selection
+# for ten days while its daily rule was DISABLED, and nothing paged, although
+# a run manifest landed under `thinktank/runs/` on every one of those days.
+# A producer that ran and did not produce is a producer incident, not a pause.
+#
+# So a row may declare `run_evidence_prefix`: where the producer leaves a trace
+# of having RUN regardless of outcome. When a row would be suppressed and an
+# object under that prefix is newer than the artifact itself (by more than
+# RUN_EVIDENCE_GRACE_MINUTES), the suppression is lifted and the row pages
+# with the evidence named on the page and in check_results.json.
+#
+# The grace exists because a HEALTHY run writes its own evidence a moment
+# after the artifact: measured 2026-10-12, `challenger_selection/latest.json`
+# at 14:40:28Z and the same run's manifest at 14:40:29Z. Without it, the last
+# good run before a deliberate pause would read as "ran without producing"
+# and page on the pause — exactly the noise suppression exists to remove.
+#
+# Fail direction: an unreadable or over-large evidence prefix LIFTS the
+# suppression. This field can only ever add a page, and the module's rule for
+# every suppression input is that an input it cannot read must not silence a
+# row (see `resolve_disabled_producers`).
+RUN_EVIDENCE_GRACE_MINUTES = int(
+    os.environ.get("RUN_EVIDENCE_GRACE_MINUTES", "60")
+)
+_RUN_EVIDENCE_SCAN_PAGES = int(os.environ.get("RUN_EVIDENCE_SCAN_PAGES", "5"))
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+
+
+def newest_run_evidence(
+    s3_client: Any, bucket: str, prefix: str,
+) -> tuple[dict[str, Any] | None, bool]:
+    """Newest object under ``prefix``: ``({"key", "last_modified"} | None,
+    complete)``. ``complete`` is False when the scan hit
+    :data:`_RUN_EVIDENCE_SCAN_PAGES` — the answer is then a lower bound on the
+    newest object, never a claim that nothing newer exists. Raises on an S3
+    error; the caller decides the fail direction."""
+    newest: dict[str, Any] | None = None
+    token = None
+    for _ in range(_RUN_EVIDENCE_SCAN_PAGES):
+        kwargs: dict[str, Any] = {"Bucket": bucket, "Prefix": prefix, "MaxKeys": 1000}
+        if token:
+            kwargs["ContinuationToken"] = token
+        resp = s3_client.list_objects_v2(**kwargs)
+        for obj in resp.get("Contents") or []:
+            modified = obj.get("LastModified")
+            if not isinstance(modified, datetime):
+                continue
+            modified = _as_utc(modified)
+            if newest is None or modified > newest["last_modified"]:
+                newest = {"key": str(obj.get("Key", "")), "last_modified": modified}
+        if not resp.get("IsTruncated"):
+            return newest, True
+        token = resp.get("NextContinuationToken")
+        if not token:
+            return newest, True
+    return newest, False
+
+
+def apply_run_evidence(
+    s3_client: Any,
+    bucket: str,
+    artifact_id: str,
+    suppression: dict[str, Any] | None,
+    run_evidence_prefix: str | None,
+    artifact_last_modified: datetime | None,
+) -> dict[str, Any] | None:
+    """Lift ``suppression`` when the producer demonstrably RAN after the
+    artifact was last written (alpha-engine-config-I6831).
+
+    Returns ``suppression`` unchanged when there is nothing to decide (no
+    suppression, not currently suppressing, or no declared prefix). Otherwise
+    returns a COPY carrying a ``run_evidence`` block whose ``verdict`` is one
+    of:
+
+    - ``ran_without_artifact`` — evidence newer than the artifact by more than
+      :data:`RUN_EVIDENCE_GRACE_MINUTES`; ``suppressed`` becomes False.
+    - ``unreadable`` / ``scan_capped`` — the question could not be answered;
+      ``suppressed`` becomes False (fail toward paging).
+    - ``no_newer_run`` — nothing ran since the artifact; suppression stands.
+
+    A row whose artifact has never been seen (``artifact_last_modified`` is
+    None) is anchored on the day the trigger was first observed disabled: a
+    run inside the pause is still a run.
+
+    Run evidence outranks a pause OWNER too (config-I7509 holds a suppression
+    past the clock when an open item owns the pause). An owned pause is a
+    decision that the producer does not run; evidence that it ran anyway is a
+    fact that decision does not cover.
+    """
+    if not suppression or not suppression.get("suppressed") or not run_evidence_prefix:
+        return suppression
+    if artifact_last_modified is not None:
+        anchor: datetime | None = _as_utc(artifact_last_modified)
+    else:
+        try:
+            anchor = datetime.combine(
+                date.fromisoformat(str(suppression.get("disabled_since"))),
+                datetime.min.time(), tzinfo=timezone.utc,
+            )
+        except ValueError:
+            anchor = None
+    threshold = (
+        anchor + timedelta(minutes=RUN_EVIDENCE_GRACE_MINUTES)
+        if anchor is not None else None
+    )
+    evidence: dict[str, Any] = {
+        "prefix": run_evidence_prefix,
+        "artifact_last_modified": anchor.isoformat() if anchor else None,
+        "grace_minutes": RUN_EVIDENCE_GRACE_MINUTES,
+        "newest_key": None,
+        "newest_at": None,
+    }
+    try:
+        newest, complete = newest_run_evidence(s3_client, bucket, run_evidence_prefix)
+    except Exception as exc:  # noqa: BLE001 — an unreadable input must not silence
+        logger.warning(
+            "run evidence for %s unreadable at s3://%s/%s (%s: %s) — NOT "
+            "suppressing: a producer that may have run and failed must not be "
+            "read as paused (config-I6831)",
+            artifact_id, bucket, run_evidence_prefix, type(exc).__name__, exc,
+        )
+        evidence["verdict"] = "unreadable"
+        evidence["error"] = f"{type(exc).__name__}: {exc}"
+        return {**suppression, "suppressed": False, "run_evidence": evidence}
+
+    if newest is not None:
+        evidence["newest_key"] = newest["key"]
+        evidence["newest_at"] = newest["last_modified"].isoformat()
+    if newest is not None and (threshold is None or newest["last_modified"] > threshold):
+        logger.warning(
+            "producer-suppression LIFTED for %s: trigger %s is disabled but the "
+            "producer RAN — %s (%s) is newer than the artifact (%s) by more "
+            "than %d min. A run that produced nothing is a producer incident, "
+            "not a pause (config-I6831)",
+            artifact_id, suppression.get("trigger"), newest["key"],
+            evidence["newest_at"], evidence["artifact_last_modified"],
+            RUN_EVIDENCE_GRACE_MINUTES,
+        )
+        evidence["verdict"] = "ran_without_artifact"
+        return {**suppression, "suppressed": False, "run_evidence": evidence}
+    if not complete:
+        logger.warning(
+            "run evidence for %s: scan of s3://%s/%s hit %d pages without "
+            "proving a newer run — NOT suppressing on an unanswered question "
+            "(config-I6831)",
+            artifact_id, bucket, run_evidence_prefix, _RUN_EVIDENCE_SCAN_PAGES,
+        )
+        evidence["verdict"] = "scan_capped"
+        return {**suppression, "suppressed": False, "run_evidence": evidence}
+    evidence["verdict"] = "no_newer_run"
+    return {**suppression, "run_evidence": evidence}
+
+
 def enumerate_disabled_schedules(
     events_client: Any = None,
     scheduler_client: Any = None,
@@ -1721,6 +1910,22 @@ def _check_one(
 # ── Aggregation + S3 emission ───────────────────────────────────────────────
 
 
+def _producer_suppression_verdict(suppression: dict[str, Any] | None) -> str | None:
+    """Closed vocabulary for WHY a disabled-producer row is quiet or paging
+    (alpha-engine-config-I6831 deliverable 3). ``None`` means no declared
+    producer of this row is disabled."""
+    if not suppression:
+        return None
+    verdict = (suppression.get("run_evidence") or {}).get("verdict")
+    if verdict == "ran_without_artifact":
+        return "paging_producer_ran_without_artifact"
+    if verdict in ("unreadable", "scan_capped"):
+        return "paging_run_evidence_unanswered"
+    if suppression.get("suppressed"):
+        return "suppressed_producer_paused"
+    return "paging_suppression_lapsed"
+
+
 def suppression_coverage(
     pairs: list[tuple[Any, Any]],
     producer_trigger_by_id: dict[str, str | list],
@@ -1881,6 +2086,22 @@ def _serialize_check_results(
                 "producer_disabled": suppression is not None,
                 "producer_disabled_since": (
                     suppression["disabled_since"] if suppression else None
+                ),
+                # alpha-engine-config-I6831 — the two reasons a disabled
+                # producer's row is or is not quiet must never render alike:
+                # "suppressed (producer paused)" vs "paging (producer RAN and
+                # left no artifact)". `run_evidence` carries the object that
+                # proves the run, or the verdict that no run was found.
+                "producer_suppression_verdict": _producer_suppression_verdict(
+                    suppression
+                ),
+                "producer_ran_without_artifact": bool(
+                    suppression
+                    and (suppression.get("run_evidence") or {}).get("verdict")
+                    == "ran_without_artifact"
+                ),
+                "run_evidence": (
+                    suppression.get("run_evidence") if suppression else None
                 ),
                 "alert_suppressed": bool(
                     (suppression and suppression["suppressed"])
@@ -3409,6 +3630,14 @@ def _alert_decision(spec: ArtifactSpec, result: CheckResult, now: datetime,
             f" escalated_from=warning escalation_basis={escalation_basis}"
             f" after_consecutive_miss_runs={consecutive_miss_runs}"
         )
+    # alpha-engine-config-I6831 — the producer's trigger is disabled, yet it
+    # ran: say so on the page, so it is never read as a paused producer.
+    run_evidence = (producer_suppression or {}).get("run_evidence") or {}
+    if run_evidence.get("verdict") == "ran_without_artifact":
+        line += (
+            f" producer_trigger_disabled_but_ran="
+            f"{run_evidence.get('newest_key')}@{run_evidence.get('newest_at')}"
+        )
     line += " " + _owning_item_body_fragment(owning)
 
     return {
@@ -4211,7 +4440,8 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     )
 
     (specs, recovery_by_id, critical_arms_by_id, _escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input,
+     run_evidence_prefix_by_id) = (
         load_registry_with_recovery(s3_client, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     specs, _coerced = apply_dynamic_severity(s3_client, specs, critical_arms_by_id)
@@ -4255,6 +4485,7 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
         # with the pass. The intraday rule probes two rows, so it gains little;
         # it is threaded so there is exactly one way check_freshness is called.
         list_cache=_new_list_cache(),
+        run_evidence_prefix_by_id=run_evidence_prefix_by_id,
     )
 
     duration_seconds = round(time.time() - started_at, 2)
@@ -4290,6 +4521,7 @@ def _run_probe_pass(
     prev_issue_filed: dict[str, str] | None = None,
     prev_episode_state: dict[str, dict[str, str]] | None = None,
     list_cache: dict | None = None,
+    run_evidence_prefix_by_id: dict[str, str] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -4325,6 +4557,13 @@ def _run_probe_pass(
     ``miss_counts`` is this sweep's updated map (persisted into
     check_results.json by the daily caller — the intraday mini-rule
     passes None and gets all-zero counters, so it never escalates).
+
+    ``run_evidence_prefix_by_id`` (alpha-engine-config-I6831): for a not-fresh
+    row that is producer-suppressed and declares a run-evidence prefix, the
+    pass REPLACES that row's entry in ``suppression_by_id`` with the result of
+    :func:`apply_run_evidence`. It mutates the caller's map on purpose: the
+    page decision here and the check_results.json row the caller serializes
+    afterwards must read the same verdict.
     """
     pairs: list[tuple[ArtifactSpec, CheckResult]] = []
     alerted = 0
@@ -4372,6 +4611,23 @@ def _run_probe_pass(
                 "per-spec exception for %s: %s", spec.artifact_id, exc,
             )
         pairs.append((spec, result))
+
+        # alpha-engine-config-I6831 — a suppressed row whose producer left
+        # evidence of RUNNING since its artifact was written is a producer
+        # incident, not a pause. Only a not-fresh row can page, so only a
+        # not-fresh row pays for the LIST.
+        evidence_prefix = (run_evidence_prefix_by_id or {}).get(spec.artifact_id)
+        if (
+            evidence_prefix
+            and suppression_by_id
+            and spec.artifact_id in suppression_by_id
+            and result.state in ("missing", "stale")
+        ):
+            suppression_by_id[spec.artifact_id] = apply_run_evidence(
+                s3_client, spec.s3_bucket, spec.artifact_id,
+                suppression_by_id[spec.artifact_id], evidence_prefix,
+                result.last_modified,
+            )
 
         # config-I9336 — driver attribution (closed set) on EVERY row, and
         # this row's open-episode identity (None when not alerting). Both
@@ -4649,7 +4905,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # Load registry. If THIS fails, we want the Lambda to error out
     # so the CW alarm fires — a broken registry must not be silent.
     (specs, recovery_by_id, critical_arms_by_id, escalate_to_issue_by_id,
-     remediation_by_id, producer_trigger_by_id, declared_off_input) = (
+     remediation_by_id, producer_trigger_by_id, declared_off_input,
+     run_evidence_prefix_by_id) = (
         load_registry_with_recovery(s3, REGISTRY_BUCKET, REGISTRY_KEY)
     )
     # config-I9206 — wall-clock phase marks. The 2026-09-01 timeout was
@@ -4743,6 +5000,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         # config-I9206 — ONE cache for this invocation, owned by the handler
         # and discarded with it.
         list_cache=list_cache,
+        # config-I6831 — lifts a suppression where the producer RAN.
+        run_evidence_prefix_by_id=run_evidence_prefix_by_id,
     )
     t_spec_loop_done = time.time()
     owning_by_id = pass_telemetry["owning_by_id"]
