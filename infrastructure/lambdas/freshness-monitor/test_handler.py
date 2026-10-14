@@ -1883,7 +1883,7 @@ def test_load_registry_with_recovery_parses_block(monkeypatch, fake_s3):
     artifact_id; artifacts without a block are absent from the map."""
     fake_s3._registry_body = _RECOVERY_REGISTRY
     import index
-    specs, recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
+    specs, recovery, critical_arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert len(specs) == 2
     assert set(recovery) == {"closes_recoverable"}
@@ -1938,7 +1938,7 @@ def _keyed_get_object(fake_s3, extra: dict[str, bytes]) -> None:
 def test_load_registry_parses_critical_while_champion_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    _specs, _recovery, critical_arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(
+    _specs, _recovery, critical_arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert critical_arms == {"champion_feed": ["scanner_predictor_direct"]}
 
@@ -1946,7 +1946,7 @@ def test_load_registry_parses_critical_while_champion_arm(fake_s3):
 def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY:
             b'{"schema_version": 1, "champion": "scanner_predictor_direct"}',
@@ -1962,7 +1962,7 @@ def test_dynamic_severity_coerces_when_champion_arm_matches(fake_s3):
 def test_dynamic_severity_not_coerced_for_other_arm(fake_s3):
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {
         index.CHAMPION_POINTER_KEY: b'{"schema_version": 1, "champion": "think_tank"}',
     })
@@ -1977,7 +1977,7 @@ def test_dynamic_severity_pointer_read_failure_fails_toward_critical(fake_s3):
     fail toward paging, never toward silence."""
     fake_s3._registry_body = _CHAMPION_ARM_REGISTRY
     import index
-    specs, _r, arms, _esc, _rem, _pt, _do = index.load_registry_with_recovery(fake_s3, "b", "k")
+    specs, _r, arms, _esc, _rem, _pt, _do, _rev = index.load_registry_with_recovery(fake_s3, "b", "k")
     _keyed_get_object(fake_s3, {index.CHAMPION_POINTER_KEY: None})
     coerced_specs, coerced_ids = index.apply_dynamic_severity(
         fake_s3, specs, arms)
@@ -2196,7 +2196,7 @@ artifacts:
     created_at: 2025-01-01
 """
     import index
-    _specs, _recovery, _arms, escalate, _rem, _pt, _do = index.load_registry_with_recovery(
+    _specs, _recovery, _arms, escalate, _rem, _pt, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k")
     assert escalate == {"config_scoring_weights": True}
 
@@ -2540,7 +2540,7 @@ def test_load_registry_parses_remediation_map(monkeypatch, fake_s3):
     undeclared rows are simply absent."""
     import index
     fake_s3._registry_body = _DRAIN_REGISTRY
-    _s, _r, _a, _e, remediation, _pt, _do = index.load_registry_with_recovery(
+    _s, _r, _a, _e, remediation, _pt, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert remediation == {
@@ -2738,7 +2738,7 @@ def test_loader_parses_producer_trigger_and_drops_malformed(fake_s3):
     today's alerting behaviour instead of taking the registry down."""
     import index
     fake_s3._registry_body = _PRODUCER_REGISTRY
-    specs, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
+    specs, _r, _a, _e, _rem, producer, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert {s.artifact_id for s in specs} == {
@@ -4098,7 +4098,7 @@ def test_partially_malformed_trigger_list_is_dropped_whole(fake_s3, caplog):
         b"      - scheduler:good\n"
         b"      - not-a-trigger\n"
     )
-    _s, _r, _a, _e, _rem, producer, _do = index.load_registry_with_recovery(
+    _s, _r, _a, _e, _rem, producer, _do, _rev = index.load_registry_with_recovery(
         fake_s3, "b", "k"
     )
     assert producer == {}
@@ -5822,7 +5822,7 @@ _PREOPEN_KEYS = (
 def _preopen_specs(index_mod, fake_s3):
     fake_s3._registry_body = _PREOPEN_REGISTRY
     (specs, recovery, _arms, _esc, remediation, _pt,
-     _do) = index_mod.load_registry_with_recovery(fake_s3, "b", "k")
+     _do, _rev) = index_mod.load_registry_with_recovery(fake_s3, "b", "k")
     return specs, recovery, remediation
 
 
@@ -6113,3 +6113,293 @@ def test_deadline_local_is_threaded_into_the_spec_constructor():
     closes."""
     import index
     assert "deadline_local" in index._SPEC_FIELDS
+
+
+# ── Run evidence lifts producer suppression (alpha-engine-config-I6831) ──────
+#
+# nous-ergon-ops-I570: the Think Tank challenger arm wrote no challenger
+# selection for ten days while its daily rule was DISABLED, and nothing paged,
+# though a run manifest landed under `thinktank/runs/` on every one of those
+# days. A producer that RAN and did not produce is an incident, not a pause.
+
+_RUN_EVIDENCE_REGISTRY = b"""\
+schema_version: 1
+defaults:
+  s3_bucket: alpha-engine-research
+  grace_period_cycles: 2
+  calendar_aware: true
+  severity: warning
+artifacts:
+  - artifact_id: with_evidence
+    s3_key_template: "thinktank/challenger_selection/latest.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 720
+    severity: critical
+    producer_trigger: "events:alpha-research-thinktank-daily"
+    run_evidence_prefix: "thinktank/runs/"
+    owner_repo: crucible-research
+    created_at: 2025-01-01
+  - artifact_id: templated_evidence
+    s3_key_template: "x/latest.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 720
+    producer_trigger: "events:r"
+    run_evidence_prefix: "x/runs/{date}/"
+    owner_repo: nousergon-data
+    created_at: 2025-01-01
+  - artifact_id: empty_evidence
+    s3_key_template: "y/latest.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 720
+    producer_trigger: "events:r"
+    run_evidence_prefix: "  "
+    owner_repo: nousergon-data
+    created_at: 2025-01-01
+  - artifact_id: no_evidence
+    s3_key_template: "z/latest.json"
+    cadence: continuous
+    interval_minutes: 1440
+    sla_minutes_after_cron: 720
+    producer_trigger: "events:r"
+    owner_repo: nousergon-data
+    created_at: 2025-01-01
+"""
+
+_ARTIFACT_AT = datetime(2026, 8, 1, 15, 19, 21, tzinfo=timezone.utc)
+
+
+def _evidence_s3(objects, *, truncated=False, raises=None):
+    """S3 fake whose list_objects_v2 returns ``objects`` = [(key, LastModified)]."""
+    client = mock.Mock()
+    client.calls = []
+
+    def _list(**kw):
+        client.calls.append(kw)
+        if raises is not None:
+            raise raises
+        contents = [
+            {"Key": k, "LastModified": lm} for k, lm in objects
+            if k.startswith(kw["Prefix"])
+        ]
+        out = {"Contents": contents, "IsTruncated": truncated}
+        if truncated:
+            out["NextContinuationToken"] = "t"
+        return out
+
+    client.list_objects_v2.side_effect = _list
+    return client
+
+
+def _suppressed(**extra):
+    return {
+        "trigger": "events:alpha-research-thinktank-daily",
+        "reason": "EventBridge rule alpha-research-thinktank-daily is DISABLED",
+        "disabled_since": "2026-07-28", "days_disabled": 3, "suppressed": True,
+        "pause_owner": None, "pause_owner_url": None, **extra,
+    }
+
+
+def test_loader_carries_run_evidence_prefix_and_drops_malformed(fake_s3):
+    import index
+    fake_s3._registry_body = _RUN_EVIDENCE_REGISTRY
+    (_s, _r, _a, _e, _rem, producer, _do,
+     run_evidence) = index.load_registry_with_recovery(fake_s3, "b", "k")
+    # A templated prefix cannot be listed as one prefix, and a blank one names
+    # nothing: both are dropped, and the row keeps today's suppression.
+    assert run_evidence == {"with_evidence": "thinktank/runs/"}
+    assert set(producer) == {
+        "with_evidence", "templated_evidence", "empty_evidence", "no_evidence",
+    }
+
+
+def test_disabled_trigger_plus_newer_run_evidence_is_not_suppressed():
+    """The I570 shape: artifact frozen 08-01, manifests 08-03..08-10."""
+    import index
+    s3 = _evidence_s3([
+        ("thinktank/runs/2026-07-31/manifest_a.json", _ARTIFACT_AT),
+        ("thinktank/runs/2026-08-10/manifest_b150c317eeef.json",
+         datetime(2026, 8, 10, 14, 40, tzinfo=timezone.utc)),
+    ])
+    out = index.apply_run_evidence(
+        s3, "alpha-engine-research", "with_evidence", _suppressed(),
+        "thinktank/runs/", _ARTIFACT_AT,
+    )
+    assert out["suppressed"] is False
+    assert out["run_evidence"]["verdict"] == "ran_without_artifact"
+    assert out["run_evidence"]["newest_key"].endswith("manifest_b150c317eeef.json")
+    # The trigger facts are kept: the row is still a disabled-producer row,
+    # it just stopped being a quiet one.
+    assert out["trigger"] == "events:alpha-research-thinktank-daily"
+
+
+def test_disabled_trigger_without_newer_run_evidence_stays_suppressed():
+    """A healthy run writes its manifest a second AFTER the artifact
+    (measured 2026-10-12: 14:40:28Z vs 14:40:29Z). That is the last good run
+    before a pause, not a run that failed — the grace keeps it quiet."""
+    import index
+    s3 = _evidence_s3([
+        ("thinktank/runs/2026-07-31/manifest_a.json",
+         _ARTIFACT_AT + timedelta(seconds=1)),
+    ])
+    out = index.apply_run_evidence(
+        s3, "alpha-engine-research", "with_evidence", _suppressed(),
+        "thinktank/runs/", _ARTIFACT_AT,
+    )
+    assert out["suppressed"] is True
+    assert out["run_evidence"]["verdict"] == "no_newer_run"
+
+
+def test_enabled_trigger_is_never_suppressed_whatever_the_evidence(fixed_now):
+    """Any producer ENABLED ⇒ no suppression entry exists, and run evidence
+    has nothing to act on — it can only ever ADD a page."""
+    import index
+    s3 = _keyed_s3({})
+    suppression = index.apply_producer_suppression(
+        s3, {"with_evidence": ("events:alpha-research-thinktank-daily",)},
+        fixed_now, events_client=_events("ENABLED"),
+    )
+    assert suppression == {}
+    evidence_s3 = _evidence_s3([])
+    assert index.apply_run_evidence(
+        evidence_s3, "b", "with_evidence", suppression.get("with_evidence"),
+        "thinktank/runs/", _ARTIFACT_AT,
+    ) is None
+    assert evidence_s3.calls == []      # and it costs no LIST
+
+
+def test_unreadable_or_capped_run_evidence_does_not_suppress(monkeypatch):
+    import index
+    out = index.apply_run_evidence(
+        _evidence_s3([], raises=RuntimeError("AccessDenied")), "b",
+        "with_evidence", _suppressed(), "thinktank/runs/", _ARTIFACT_AT,
+    )
+    assert out["suppressed"] is False
+    assert out["run_evidence"]["verdict"] == "unreadable"
+
+    monkeypatch.setattr(index, "_RUN_EVIDENCE_SCAN_PAGES", 2)
+    out = index.apply_run_evidence(
+        _evidence_s3([("thinktank/runs/old.json", _ARTIFACT_AT)], truncated=True),
+        "b", "with_evidence", _suppressed(), "thinktank/runs/", _ARTIFACT_AT,
+    )
+    assert out["suppressed"] is False
+    assert out["run_evidence"]["verdict"] == "scan_capped"
+
+
+def test_missing_artifact_is_anchored_on_the_pause_start():
+    import index
+    in_pause = _evidence_s3([
+        ("thinktank/runs/2026-08-03/m.json",
+         datetime(2026, 8, 3, 14, 40, tzinfo=timezone.utc)),
+    ])
+    out = index.apply_run_evidence(
+        in_pause, "b", "with_evidence", _suppressed(disabled_since="2026-08-01"),
+        "thinktank/runs/", None,
+    )
+    assert out["suppressed"] is False
+    before_pause = _evidence_s3([
+        ("thinktank/runs/2026-07-20/m.json",
+         datetime(2026, 7, 20, 14, 40, tzinfo=timezone.utc)),
+    ])
+    out = index.apply_run_evidence(
+        before_pause, "b", "with_evidence", _suppressed(disabled_since="2026-08-01"),
+        "thinktank/runs/", None,
+    )
+    assert out["suppressed"] is True
+
+
+def test_run_evidence_outranks_a_pause_owner():
+    """An owned pause is a decision that the producer does not run. Evidence
+    that it ran anyway is a fact the decision does not cover."""
+    import index
+    s3 = _evidence_s3([
+        ("thinktank/runs/2026-08-10/m.json",
+         datetime(2026, 8, 10, 14, 40, tzinfo=timezone.utc)),
+    ])
+    out = index.apply_run_evidence(
+        s3, "b", "with_evidence",
+        _suppressed(days_disabled=40, pause_owner="alpha-engine-config-I6617"),
+        "thinktank/runs/", _ARTIFACT_AT,
+    )
+    assert out["suppressed"] is False
+
+
+def test_lifted_suppression_pages_and_says_why(monkeypatch, fixed_now):
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    import importlib
+    import index
+    importlib.reload(index)
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="with_evidence", s3_bucket="b",
+        s3_key_template="thinktank/challenger_selection/latest.json",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="crucible-research",
+        created_at=date(2025, 1, 1),
+    )
+    result = CheckResult(state="stale", sla_violated_by_minutes=999)
+    lifted = index.apply_run_evidence(
+        _evidence_s3([("thinktank/runs/2026-08-10/m.json",
+                       datetime(2026, 8, 10, 14, 40, tzinfo=timezone.utc))]),
+        "b", "with_evidence", _suppressed(), "thinktank/runs/", _ARTIFACT_AT,
+    )
+    decision = index._alert_decision(
+        spec, result, fixed_now, producer_suppression=lifted,
+    )
+    assert decision is not None
+    assert "producer_trigger_disabled_but_ran=thinktank/runs/2026-08-10/m.json" in (
+        decision["line"]
+    )
+
+    payload = index._serialize_check_results(
+        [(spec, result)], fixed_now, suppression_by_id={"with_evidence": lifted},
+    )
+    row = payload["results"][0]
+    assert row["alert_suppressed"] is False
+    assert row["producer_disabled"] is True
+    assert row["producer_ran_without_artifact"] is True
+    assert row["producer_suppression_verdict"] == (
+        "paging_producer_ran_without_artifact"
+    )
+    # ...and a genuinely paused row renders differently.
+    paused = index._serialize_check_results(
+        [(spec, result)], fixed_now, suppression_by_id={"with_evidence": _suppressed()},
+    )["results"][0]
+    assert paused["producer_suppression_verdict"] == "suppressed_producer_paused"
+    assert paused["producer_ran_without_artifact"] is False
+
+
+def test_probe_pass_replaces_the_suppression_the_serializer_reads(
+    monkeypatch, fixed_now,
+):
+    """The page decision and the check_results row must read ONE verdict, so
+    the pass writes the lifted suppression back into the caller's map."""
+    import index
+    from nousergon_lib.artifact_freshness import ArtifactSpec, CheckResult
+
+    spec = ArtifactSpec(
+        artifact_id="with_evidence", s3_bucket="b",
+        s3_key_template="thinktank/challenger_selection/latest.json",
+        cadence="saturday_sf", sla_minutes_after_cron=60,
+        severity="critical", owner_repo="crucible-research",
+        created_at=date(2025, 1, 1),
+    )
+    stale = CheckResult(state="stale", sla_violated_by_minutes=999,
+                        last_modified=_ARTIFACT_AT)
+    monkeypatch.setattr(index, "_check_one", lambda *a, **kw: (stale, None))
+    monkeypatch.setattr(index, "_publish_digest", mock.Mock())
+    s3 = _evidence_s3([("thinktank/runs/2026-08-10/m.json",
+                        datetime(2026, 8, 10, 14, 40, tzinfo=timezone.utc))])
+    suppression_by_id = {"with_evidence": _suppressed()}
+    index._run_probe_pass(
+        s3, [spec], {}, fixed_now,
+        suppression_by_id=suppression_by_id,
+        run_evidence_prefix_by_id={"with_evidence": "thinktank/runs/"},
+    )
+    assert suppression_by_id["with_evidence"]["suppressed"] is False
+    assert suppression_by_id["with_evidence"]["run_evidence"]["verdict"] == (
+        "ran_without_artifact"
+    )
