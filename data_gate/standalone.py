@@ -291,20 +291,70 @@ def _unmeasurable(detail: str, evidence: tuple[str, ...]) -> Reading:
     return Reading(met=False, detail=detail, evidence=evidence, unmeasurable=True, source=_SOURCE_LIVE)
 
 
-def _executions_since(sfn, machine_arn: str, since: dt.datetime) -> list[dict]:
+class _ExecutionListing:
+    """One machine's executions, newest-first, fetched lazily and at most once.
+
+    alpha-engine-config-I12307: every unit x schedule pair graded below used to
+    re-issue its own ``states:ListExecutions`` from the newest page, so one
+    ``python -m data_gate read`` re-listed ``ne-data-collection-weekly`` /
+    ``-eod`` / ``-morning`` ~100 times and the data-gate workflow (six reads a
+    run) made ~580 calls a run. Step Functions bills the response bytes as
+    egress. Pages are now fetched once per (store, client, machine) and every
+    reader walks the same newest-first sequence, fetching a further page only
+    when a reader walks past the last one fetched. A failed fetch caches
+    nothing, so the next reader retries exactly as it did before.
+    """
+
+    def __init__(self, sfn, machine_arn: str) -> None:
+        self._sfn = sfn
+        self._arn = machine_arn
+        self._rows: list[dict] = []
+        self._token: str | None = None
+        self._exhausted = False
+
+    def _fetch_page(self) -> None:
+        kwargs: dict = {"stateMachineArn": self._arn, "maxResults": 100}
+        if self._token:
+            kwargs["nextToken"] = self._token
+        page = self._sfn.list_executions(**kwargs)
+        self._rows.extend(page.get("executions", []))
+        self._token = page.get("nextToken") or None
+        self._exhausted = self._token is None
+
+    def __iter__(self):
+        i = 0
+        while True:
+            while i < len(self._rows):
+                yield self._rows[i]
+                i += 1
+            if self._exhausted:
+                return
+            self._fetch_page()
+
+
+_LISTINGS_ATTR = "_standalone_execution_listings"
+
+
+def _listing(store: GateStore, machine_arn: str) -> _ExecutionListing:
+    """The run's one listing of ``machine_arn`` — scoped to this store and its client."""
+    sfn = store.sfn_client  # type: ignore[attr-defined]
+    cache = store.__dict__.setdefault(_LISTINGS_ATTR, {})
+    key = (id(sfn), machine_arn)
+    entry = cache.get(key)
+    if entry is None or entry[0] is not sfn:
+        entry = (sfn, _ExecutionListing(sfn, machine_arn))
+        cache[key] = entry
+    return entry[1]
+
+
+def _executions_since(store: GateStore, machine_arn: str, since: dt.datetime) -> list[dict]:
     """Every execution of the machine that started at or after ``since``."""
-    kwargs = {"stateMachineArn": machine_arn, "maxResults": 100}
     found: list[dict] = []
-    while True:
-        page = sfn.list_executions(**kwargs)
-        for execution in page.get("executions", []):
-            if execution["startDate"].astimezone(dt.timezone.utc) < since:
-                return found
-            found.append(execution)
-        token = page.get("nextToken")
-        if not token:
+    for execution in _listing(store, machine_arn):
+        if execution["startDate"].astimezone(dt.timezone.utc) < since:
             return found
-        kwargs["nextToken"] = token
+        found.append(execution)
+    return found
 
 
 def _parse_started(stamp: object) -> dt.datetime | None:
@@ -350,7 +400,7 @@ def _grade_recovered_fire(
         )
     window_end = recovery.fire + COMPLETION_GRACE
     try:
-        candidates = _executions_since(store.sfn_client, machine, recovery.fire)  # type: ignore[attr-defined]
+        candidates = _executions_since(store, machine, recovery.fire)
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
         return _unmeasurable(f"could not list executions of {machine}: {type(exc).__name__}: {exc}", evidence)
     rec = next((e for e in candidates if recovery.names(e, "recovery_execution")), None)
@@ -449,7 +499,7 @@ def _grade_partial_runs(
     try:
         runs = [
             e
-            for e in _executions_since(store.sfn_client, machine, fire)  # type: ignore[attr-defined]
+            for e in _executions_since(store, machine, fire)
             if e["startDate"].astimezone(dt.timezone.utc) < window_end
         ]
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
@@ -524,21 +574,15 @@ def _grade_partial_runs(
     )
 
 
-def _execution_for(sfn, machine_arn: str, fire: dt.datetime) -> dict | None:
+def _execution_for(store: GateStore, machine_arn: str, fire: dt.datetime) -> dict | None:
     """The execution that started for ``fire``, newest-first, stopping once past it."""
-    kwargs = {"stateMachineArn": machine_arn, "maxResults": 100}
-    while True:
-        page = sfn.list_executions(**kwargs)
-        for execution in page.get("executions", []):
-            started = execution["startDate"].astimezone(dt.timezone.utc)
-            if fire <= started <= fire + EXECUTION_START_WINDOW:
-                return execution
-            if started < fire:
-                return None
-        token = page.get("nextToken")
-        if not token:
+    for execution in _listing(store, machine_arn):
+        started = execution["startDate"].astimezone(dt.timezone.utc)
+        if fire <= started <= fire + EXECUTION_START_WINDOW:
+            return execution
+        if started < fire:
             return None
-        kwargs["nextToken"] = token
+    return None
 
 
 def _grade_schedule(store: GateStore, unit: Unit, schedule: dict, live: dict, as_of: dt.datetime) -> Reading:
@@ -557,7 +601,7 @@ def _grade_schedule(store: GateStore, unit: Unit, schedule: dict, live: dict, as
             met=False, detail=f"{name} is ENABLED but live state names no target", evidence=evidence, source=_SOURCE_LIVE
         )
     try:
-        execution = _execution_for(store.sfn_client, machine, fire)  # type: ignore[attr-defined]
+        execution = _execution_for(store, machine, fire)
     except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
         # The failure mode is a denied/throttled ListExecutions; the rest of
         # the board survives; the recording surface is this UNMEASURABLE row.
