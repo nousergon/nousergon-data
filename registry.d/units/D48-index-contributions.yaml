@@ -53,9 +53,12 @@ lifecycle_reason: >-
     SUCCEEDS, so that day's closes are already in ArcticDB. D48 is that
     execution's only verify_unit. The unit stays pending until a scheduled run
     has published market_data/index_contributions/{SPX,NDX}/latest.json for
-    the latest session (promotes_when). Until D49 has published NDX.json once,
-    the NDX leg is unavailable, the run is `partial` and files failed, and SPX
-    still publishes.
+    the latest session (promotes_when). Until D49 has EVER published (no ok
+    D49 manifest, no dated NDX snapshot), the NDX leg is a declared skip: SPX
+    publishes, the run files ok with a not_applicable cardinality reading
+    naming the leg, and nothing pages. After that, a missing NDX.json, or one
+    more than 5 NYSE sessions old, makes the run `partial`, filed failed, and
+    it pages.
 lifecycle_owner: brian
 promotes_when: >-
     A scheduled ne-data-collection-panel execution has filed an ok D48 run

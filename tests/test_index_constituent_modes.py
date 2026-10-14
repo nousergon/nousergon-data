@@ -83,7 +83,7 @@ _SERIES = {
 }
 
 
-def _d48_sources(monkeypatch, ndx_weights: bool = True):
+def _d48_sources(monkeypatch, ndx_weights: bool = True, ndx_never_published: bool = False):
     def closes(bucket):
         return lambda symbols, through, limit: {
             s: v for s, v in _SERIES.items() if s in set(symbols)
@@ -91,8 +91,12 @@ def _d48_sources(monkeypatch, ndx_weights: bool = True):
 
     def weights(bucket):
         def source(index):
+            if index == "NDX" and ndx_never_published:
+                raise ic.IndexLegNotYetProduced("NDX: D49 has never published weights")
             if index == "NDX" and not ndx_weights:
-                raise ic.IndexContributionsUnavailable("NDX: D49 has not published it")
+                raise ic.IndexContributionsUnavailable(
+                    "NDX: no weights, but D49 has published before; the file is missing"
+                )
             return ic.Weights(weight_map={"AAPL": 1.0}, method="test", as_of="2026-10-10")
 
         return source
@@ -125,15 +129,37 @@ def test_d48_publishing_both_indexes_files_ok_with_its_four_keys(s3, monkeypatch
     }
 
 
-def test_d48_missing_ndx_weights_publishes_spx_and_files_failed(s3, monkeypatch):
-    """Before D49's first run: SPX is published, the run is `partial`, and the
-    manifest says failed so the execution pages. Never `ok`."""
+def test_d48_ndx_never_published_is_a_declared_skip_that_files_ok(s3, monkeypatch):
+    """Before D49's FIRST run: SPX is published and the manifest is `ok`, so the
+    execution does not page. The skip is on the manifest, with its reason, as a
+    `not_applicable` cardinality reading for the NDX leg."""
+    _d48_sources(monkeypatch, ndx_never_published=True)
+    result = weekly_collector._run_whole_mode_unit(
+        "index_contributions", weekly_collector._run_index_contributions, {"bucket": BUCKET}, _Args()
+    )
+    assert result["status"] == "ok"
+    doc = _manifest(s3, "D48")
+    assert doc["status"] == "ok"
+    assert {o["key"] for o in doc["outputs"]} == {
+        f"market_data/index_contributions/SPX/{DAY}.json",
+        "market_data/index_contributions/SPX/latest.json",
+    }
+    (skip,) = [g for g in doc["guards"] if g["key"] == "market_data/index_contributions/NDX/"]
+    assert skip["guard"] == "data_cardinality" and skip["verdict"] == "not_applicable"
+    assert "NDX leg skipped (declared)" in skip["detail"] and "never published" in skip["detail"]
+
+
+def test_d48_ndx_missing_after_a_publish_publishes_spx_and_files_failed(s3, monkeypatch):
+    """A real D49 outage (NDX.json existed before, now missing or stale): SPX
+    is published, the run is `partial`, and the manifest says failed so the
+    execution pages. Never `ok`, and never recorded as a declared skip."""
     _d48_sources(monkeypatch, ndx_weights=False)
     result = weekly_collector._run_whole_mode_unit(
         "index_contributions", weekly_collector._run_index_contributions, {"bucket": BUCKET}, _Args()
     )
     assert result["status"] == "partial"
     assert "NDX" in result["error"]
+    assert result["collectors"]["index_contributions"]["guards"] == []
     assert _manifest(s3, "D48")["status"] == "failed"
     assert f"market_data/index_contributions/SPX/{DAY}.json" in s3.objects
     assert not any(k.startswith("market_data/index_contributions/NDX/") for k in s3.objects)

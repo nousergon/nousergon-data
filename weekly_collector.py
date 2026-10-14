@@ -1722,6 +1722,10 @@ _MODE_GUARD_COLLECTORS: dict[str, tuple[str, ...]] = {
     # D50 carries D17's settlement onto every key it rebuilt, row by row for
     # the tickers D17 carried provisional (features/settled_regrade.py).
     "features_settled_regrade": ("features",),
+    # D48 records a DECLARED skip of an index leg whose weight producer has
+    # never published (alpha-engine-config-I11306), so the skip and its reason
+    # are on the manifest rather than only in a log.
+    "index_contributions": ("index_contributions",),
 }
 
 #: mode -> the nested collectors whose recorded READS (``input_refs``,
@@ -6057,11 +6061,16 @@ def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
     (`collectors.index_contributions.collect`, alpha-engine-config-I11306).
 
     Keyed by the last closed session (``--date`` or :func:`default_run_date`);
-    the producer reads the actual session off the proxy's own series. One
-    index whose weights are unavailable is a ``partial`` run, which the wrapper
-    files ``failed`` while the other index's files stay published. No index
-    publishable raises from the producer, which the wrapper also files
-    ``failed``.
+    the producer reads the actual session off the proxy's own series.
+
+    * An index whose weight producer has NEVER published (D49 before its first
+      weekly run) is a declared skip: the run stays ``ok`` and does not page,
+      and the manifest carries a ``not_applicable`` cardinality reading naming
+      the leg and the reason.
+    * An index whose weights are missing after a publish, stale, or otherwise
+      unavailable is a ``partial`` run. The wrapper files it ``failed``, and it
+      pages, while the other index's files stay published.
+    * No index publishable raises from the producer, also filed ``failed``.
     """
     from collectors import index_contributions
 
@@ -6070,6 +6079,20 @@ def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
     collector = index_contributions.collect(
         config["bucket"], run_date=run_date, dry_run=bool(getattr(args, "dry_run", False))
     )
+    # A leg skipped because its weight producer has never published (D49
+    # before its first weekly run) is a declared, expected state: the run stays
+    # `ok` and does not page, and the manifest says which leg and why. A leg
+    # that FAILED is in `errors` instead, the run is `partial`, and it pages.
+    collector["guards"] = [
+        {
+            "guard": expectations.CARDINALITY_GUARD.name,
+            "mode": expectations.CARDINALITY_GUARD.mode.value,
+            "verdict": "not_applicable",
+            "detail": f"{index} leg skipped (declared): {reason}",
+            "key": f"market_data/index_contributions/{index}/",
+        }
+        for index, reason in sorted((collector.get("skipped") or {}).items())
+    ]
     status = collector.get("status")
     result = {
         "mode": "index_contributions",

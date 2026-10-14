@@ -320,22 +320,151 @@ def test_the_units_identity_holds_exactly() -> None:
     )
 
 
-def test_ndx_weights_not_yet_published_soft_fails_the_ndx_leg_only() -> None:
-    """alpha-engine-config-I11306: D48 is scheduled daily and D49 weekly, so
-    the first D48 runs can precede the first NDX.json. A missing NDX.json is
-    one index's weight producer being absent, the case the per-index soft-fail
-    exists for: it must raise IndexContributionsUnavailable (SPX still
-    publishes, status `partial`), not a raw ClientError that withholds SPX."""
+
+class _NdxS3:
+    """S3 for the NDX weights leg: objects by key, listings, paginated LIST."""
+
+    def __init__(self, objects: dict[str, bytes] | None = None, list_error: str | None = None):
+        self.objects = dict(objects or {})
+        self.list_error = list_error
+
+    @staticmethod
+    def _missing(op):
+        from botocore.exceptions import ClientError
+
+        return ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, op)
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        if Key not in self.objects:
+            raise self._missing("GetObject")
+        body = self.objects[Key]
+        return {"Body": type("B", (), {"read": lambda self_: body})()}
+
+    def head_object(self, Bucket, Key):  # noqa: N803
+        if Key not in self.objects:
+            from botocore.exceptions import ClientError
+
+            raise ClientError({"Error": {"Code": "404", "Message": "x"}}, "HeadObject")
+        return {}
+
+    def get_paginator(self, name):
+        outer = self
+
+        class _P:
+            def paginate(self, Bucket, Prefix, Delimiter=None):  # noqa: N803
+                if outer.list_error:
+                    from botocore.exceptions import ClientError
+
+                    raise ClientError({"Error": {"Code": outer.list_error, "Message": "x"}}, "ListObjectsV2")
+                keys = sorted(k for k in outer.objects if k.startswith(Prefix))
+                if Delimiter:
+                    prefixes = sorted({Prefix + k[len(Prefix):].split(Delimiter)[0] + Delimiter
+                                       for k in keys if Delimiter in k[len(Prefix):]})
+                    yield {"CommonPrefixes": [{"Prefix": p} for p in prefixes]}
+                else:
+                    yield {"Contents": [{"Key": k} for k in keys]}
+
+        return _P()
+
+
+def _ndx_source(s3):
+    with patch.object(ic.boto3, "client", return_value=s3):
+        return ic._default_weights_source("any")
+
+
+def test_ndx_never_published_is_a_declared_skip_not_an_error() -> None:
+    """alpha-engine-config-I11306. D48 is scheduled daily and D49 weekly, so
+    the first D48 runs can precede the first NDX.json. With NO evidence D49
+    ever published (no ok D49 manifest, no dated NDX snapshot), the NDX leg
+    raises IndexLegNotYetProduced: a declared skip, not an outage."""
+    s3 = _NdxS3({
+        # A FAILED D49 run is not a publish.
+        "data_collection/runs/D49/2026-10-16/r1.json": json.dumps({"status": "failed"}).encode(),
+        # Other weekly snapshots exist; none of them is NDX.
+        "market_data/weekly/2026-10-09/constituents.json": b"{}",
+    })
+    with patch.object(ic.boto3, "client", return_value=s3):
+        source = ic._default_weights_source("any")
+        with pytest.raises(ic.IndexLegNotYetProduced, match="never published"):
+            source("NDX")
+
+
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"data_collection/runs/D49/2026-10-16/r1.json": json.dumps({"status": "ok"}).encode()},
+        {"market_data/weekly/2026-10-16/NDX.json": b"{}"},
+    ],
+    ids=["ok-d49-manifest", "dated-ndx-snapshot"],
+)
+def test_ndx_missing_after_a_publish_is_an_outage(evidence) -> None:
+    """Once D49 has published (either form of evidence), a missing NDX.json is
+    an outage: IndexContributionsUnavailable, NOT the declared skip."""
+    with patch.object(ic.boto3, "client", return_value=_NdxS3(evidence)):
+        source = ic._default_weights_source("any")
+        with pytest.raises(ic.IndexContributionsUnavailable) as raised:
+            source("NDX")
+    assert not isinstance(raised.value, ic.IndexLegNotYetProduced)
+    assert "has published before" in str(raised.value)
+
+
+def test_ndx_evidence_lookup_failing_is_never_read_as_never_published() -> None:
+    """The 'never published' answer is the one that suppresses a page, so an S3
+    error while looking for evidence propagates instead of defaulting to it."""
     from botocore.exceptions import ClientError
 
-    class _NoNdx:
-        def get_object(self, Bucket, Key):  # noqa: N803
-            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
-
-    with patch.object(ic.boto3, "client", return_value=_NoNdx()):
+    with patch.object(ic.boto3, "client", return_value=_NdxS3(list_error="AccessDenied")):
         source = ic._default_weights_source("any")
-        with pytest.raises(ic.IndexContributionsUnavailable, match="D49"):
+        with pytest.raises(ClientError):
             source("NDX")
+
+
+def _ndx_closes(symbols, through, limit):
+    series = {
+        "AAPL": [("2026-10-13", 102.0), ("2026-10-10", 100.0)],
+        "SPY": [("2026-10-13", 102.0), ("2026-10-10", 100.0)],
+        "QQQ": [("2026-10-13", 102.0), ("2026-10-10", 100.0)],
+    }
+    return {s: v for s, v in series.items() if s in set(symbols)}
+
+
+def test_collect_keeps_a_declared_skip_ok_and_records_it() -> None:
+    def weights(index):
+        if index == "NDX":
+            raise ic.IndexLegNotYetProduced("NDX: D49 has never published weights")
+        return _weights({"AAPL": 1.0})
+
+    result = ic.collect(
+        bucket="any", run_date="2026-10-13", dry_run=True,
+        weights_source=weights, closes_source=_ndx_closes,
+    )
+    assert result["status"] == "ok_dry_run"
+    assert result["indexes"] == ["SPX"]
+    assert result["errors"] == {}
+    assert "never published" in result["skipped"]["NDX"]
+
+
+@pytest.mark.parametrize("as_of, outcome", [("2026-10-05", "stale"), ("2026-10-06", "fresh"), (None, "stale")])
+def test_stale_ndx_weights_are_an_outage_not_a_skip(as_of, outcome) -> None:
+    """NDX weights more than NDX_MAX_WEIGHTS_AGE_SESSIONS (5) NYSE sessions
+    behind run_date (Mon 2026-10-05 is 6 behind Tue 2026-10-13, Tue 10-06 is 5)
+    mean the current week's snapshot is missing: an error (partial, pages), never a skip.
+    Undated weights cannot be checked and are refused the same way."""
+
+    def weights(index):
+        return ic.Weights(weight_map={"AAPL": 1.0}, method="m", as_of=as_of)
+
+    result = ic.collect(
+        bucket="any", run_date="2026-10-13", dry_run=True,
+        weights_source=weights, closes_source=_ndx_closes,
+    )
+    assert result["skipped"] == {}
+    if outcome == "stale":
+        assert result["indexes"] == ["SPX"]
+        assert "NDX" in result["errors"]
+    else:
+        assert result["indexes"] == ["NDX", "SPX"]
+        assert result["errors"] == {}
 
 
 def test_ndx_weights_any_other_s3_failure_propagates() -> None:
