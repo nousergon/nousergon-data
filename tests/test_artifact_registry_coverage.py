@@ -69,6 +69,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
     # the `data_collection/gates/` grandfathered prefix (per-date readings).
     "data_gate/store.py": 1,
+    # alpha-engine-config-I12023 follow-up — `python -m data_gate
+    # preserve-parity-evidence` (data-gate.yml's last step): ONE put_object
+    # site, the evidence manifest
+    # data_collection/parity_adjudication/{report_day}/evidence/_manifest.json,
+    # written only when its content changes. (The retained evidence copies
+    # beside it are `copy_object`, which this scan does not count.) Not a
+    # freshness artifact — it moves only when a parity breach cites a new
+    # version — so it needs a `data_collection/parity_adjudication/`
+    # grandfathered_paths entry in ARTIFACT_REGISTRY.yaml, not a registered row.
+    "data_gate/parity_evidence.py": 1,
     # alpha-engine-config-I11035 / -I11036, SCHEDULED as of -I11058 — the two
     # phase-exit metric producers, one metric-document PUT each:
     #   metrics/v1_data_stage/executions_since_cutover.json
