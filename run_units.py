@@ -274,6 +274,12 @@ MODE_UNITS: dict[str, str] = {
     # alpha-engine-config-I10791 (plan P-25): the daily panel, compiled once
     # from the ArcticDB universe library (builders/daily_panel.py).
     "daily_panel": "D51",
+    # alpha-engine-config-I11306: the per-constituent index contribution
+    # (collectors/index_contributions.py), run after the EOD collection.
+    "index_contributions": "D48",
+    # alpha-engine-config-I11306: Nasdaq-100 membership + weights
+    # (collectors/nasdaq100.py), run after the weekly collection.
+    "nasdaq100_constituents": "D49",
 }
 
 
@@ -330,6 +336,12 @@ MODE_ROWS: dict[str, ModeRows] = {
     # D51 publishes two S3 keys and no library; `rows` is the panel's row count
     # (builders.daily_panel.run), the manifest's `row_count`.
     "daily_panel": ModeRows("daily_panel", "rows", library_ref=None),
+    # D48 publishes S3 keys only; `rows_out` is the constituent count summed
+    # over the indexes it published (collectors.index_contributions.collect).
+    "index_contributions": ModeRows("index_contributions", "rows_out", library_ref=None),
+    # D49 publishes two S3 keys only; `count` is the membership count
+    # (collectors.nasdaq100.collect).
+    "nasdaq100_constituents": ModeRows("nasdaq100_constituents", "count", library_ref=None),
 }
 
 #: The :data:`NOT_APPLICABLE_REASONS` members this repo's whole-mode/phase
