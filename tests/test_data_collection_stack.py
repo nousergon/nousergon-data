@@ -925,6 +925,38 @@ def test_the_panel_machine_fits_its_ceiling(stack, tpl):
     assert overrides["daily-panel"] == 3600
 
 
+@pytest.mark.parametrize(
+    "rule_name, source, workload, unit",
+    [
+        ("ne-data-collection-index-contributions-on-eod", "ne-data-collection-eod", "index-contributions", "D48"),
+        ("ne-data-collection-ndx-constituents-on-weekly", "ne-data-collection-weekly", "ndx-constituents", "D49"),
+    ],
+)
+def test_d48_d49_run_in_their_own_executions_after_their_source_succeeds(
+    stack, tpl, rule_name, source, workload, unit
+):
+    """alpha-engine-config-I11306. D48 needs that day's closes in ArcticDB, so
+    it follows the EOD collection's SUCCEEDED; D49 needs D10's fundamentals
+    archive, so it follows the weekly collection's. Each is its OWN execution
+    on the panel machine, so its failure pages as that unit and never fails the
+    collection it follows, the D51 panel, or the eod_pnl reconcile's trigger."""
+    names = _machine_names(tpl)
+    runners = [r for r in stack.event_rules(tpl) if workload in r["input"]["workloads"]] + [
+        s for s in stack.schedules(tpl) if workload in s["input"].get("workloads", [])
+    ]
+    assert [r["name"] for r in runners] == [rule_name]
+    rule = runners[0]
+    assert names[rule["target_ref"]] == "ne-data-collection-panel"
+    assert [names[m] for m in stack.rule_source_machines(rule)] == [source]
+    assert rule["pattern"]["detail"]["status"] == ["SUCCEEDED"]
+    assert rule["input"]["workloads"] == [workload]
+    assert rule["input"]["verify_units"] == [unit]
+    assert rule["input"]["require_trading_day"] is False
+    assert rule["declared_state"] == "ENABLED"
+    ceiling = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
+    assert stack.worst_case_seconds(rule["input"]["workloads"], through=workload) <= ceiling
+
+
 def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
     real_loader = stack.load_template
 
