@@ -90,7 +90,10 @@ execution population, if any, is undocumented and out of scope here.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
 import logging
+import os
 import re
 import statistics
 import sys
@@ -175,6 +178,91 @@ DRIFT_TOLERANCE = 0.20
 #: for human review; no recommendation is computed from it.
 DEGENERATE_SPREAD_RATIO = 1.02
 
+#: GetExecutionHistory page size for the calibration walk. The API maximum;
+#: the service default of 100 cost ~9 calls per ne-preopen-trading-pipeline
+#: execution (alpha-engine-config-I11792).
+HISTORY_PAGE_SIZE = 1000
+
+
+# ── Per-execution sample cache (alpha-engine-config-I11792) ─────────────────
+#
+# WHY. Every `--check` used to list EVERY SUCCEEDED execution of each machine
+# and re-read each one's FULL history: ~110 preopen + ~50 weekly executions,
+# ~1,000 GetExecutionHistory calls per run, on every push-to-main touching the
+# workflow's paths plus the daily schedule (measured in CloudTrail 2026-10-14:
+# 1,002 calls in run 38581892203, 1,029 / 1,036 / 1,088 in earlier runs). Step
+# Functions DataTransfer-Out is billed per byte once the free tier is spent,
+# so re-downloading the same immutable histories every run is a cost leak,
+# not just noise.
+#
+# WHY A CACHE IS EXACT, NOT AN APPROXIMATION. Only SUCCEEDED executions are
+# sampled, and a terminal execution's history never changes. So the per-state
+# numbers this module derives from one execution are a pure function of its
+# ARN: computing them once and reusing them yields the identical sample
+# population, the identical min/percentiles and the identical verdict. The
+# cache stores only those derived numbers (span per Task state, companion
+# poll status) — never the raw events.
+#
+# Keyed by "<state machine>:<execution name>", not the full ARN, so the file
+# carries no account id. The version embeds a digest of KNOWN_POLL_STATUS_KEYS:
+# declaring a new poll key changes what an entry must contain, so it
+# invalidates the whole cache rather than serving entries computed without it.
+# A truncated history is never cached — it is re-read next run.
+_CACHE_SCHEMA = 1
+
+
+def _cache_version() -> str:
+    digest = hashlib.sha256(
+        json.dumps(sorted(KNOWN_POLL_STATUS_KEYS.items())).encode()
+    ).hexdigest()[:12]
+    return f"{_CACHE_SCHEMA}:{digest}"
+
+
+def _cache_key(execution_arn: str) -> str:
+    # arn:aws:states:<region>:<acct>:execution:<machine>:<name>
+    parts = execution_arn.split(":")
+    return ":".join(parts[-2:]) if len(parts) >= 2 else execution_arn
+
+
+def load_sample_cache(path: Optional[str]) -> Dict[str, Any]:
+    """Return the ``{key: entry}`` map from ``path``, or ``{}`` when the file
+    is absent, unreadable, or written under another cache version. A bad
+    cache costs one full re-read, never a wrong number."""
+    if not path or not os.path.exists(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError) as exc:
+        logger.warning("ignoring unreadable floor-calibration cache %s: %s", path, exc)
+        return {}
+    if not isinstance(data, dict) or data.get("version") != _cache_version():
+        return {}
+    entries = data.get("executions")
+    return entries if isinstance(entries, dict) else {}
+
+
+def save_sample_cache(path: str, entries: Mapping[str, Any]) -> None:
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    tmp = f"{path}.tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump({"version": _cache_version(), "executions": dict(entries)}, fh, sort_keys=True)
+    os.replace(tmp, path)
+
+
+def _derive_execution_entry(events: Sequence[dict]) -> Dict[str, Any]:
+    """The only facts collect_state_duration_samples reads from one
+    execution's events: every Task state's span, and the companion poll
+    status of every state with a declared poll key."""
+    durations = parse_task_state_durations(events)
+    last_outputs = _last_task_outputs(events, list(KNOWN_POLL_STATUS_KEYS))
+    poll_status: Dict[str, Optional[str]] = {}
+    for name, poll_key in KNOWN_POLL_STATUS_KEYS.items():
+        output = last_outputs.get(name)
+        if isinstance(output, dict):
+            poll_status[name] = (output.get(poll_key) or {}).get("Status")
+    return {"durations": dict(durations), "poll_status": poll_status}
+
 
 @dataclass(frozen=True)
 class FloorRecommendation:
@@ -216,6 +304,7 @@ def collect_state_duration_samples(
     state_names: Sequence[str],
     *,
     fetch_history: Any,
+    cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, List[Dict[str, Any]]]:
     """Per-state list of ``{"duration_sec": float, "poll_status": Optional[str],
     "exclusion_reason": Optional[str]}`` samples across every SUCCEEDED
@@ -237,6 +326,12 @@ def collect_state_duration_samples(
     exclusion (state has a ``KNOWN_POLL_STATUS_KEYS`` entry) is layered on
     top by ``compute_recommendation``, which is the only place that already
     special-cases it.
+
+    ``cache`` (alpha-engine-config-I11792), when given, is a mutable
+    ``{key: entry}`` map: an execution already in it is NOT re-read, and every
+    execution read this call is added to it. ``fetch_history`` may return
+    ``(events, truncated)``; a truncated execution is sampled but not cached.
+    The returned samples are identical with and without the cache.
     """
     machine_name = state_machine_arn.rsplit(":", 1)[-1]
     canonical_only = machine_name in _CANONICAL_NAME_SCOPED_MACHINES
@@ -250,19 +345,23 @@ def collect_state_duration_samples(
     for execution in executions:
         exec_name = execution.get("name") or ""
         non_canonical = canonical_only and not _CANONICAL_EXECUTION_NAME_RE.match(exec_name)
-        events = fetch_history(sf_client, execution["executionArn"])
-        durations = parse_task_state_durations(events)
-        last_outputs = _last_task_outputs(events, state_names)
+        key = _cache_key(execution["executionArn"])
+        entry = cache.get(key) if cache is not None else None
+        if not isinstance(entry, dict):
+            fetched = fetch_history(sf_client, execution["executionArn"])
+            truncated = False
+            if isinstance(fetched, tuple):
+                fetched, truncated = fetched
+            entry = _derive_execution_entry(fetched)
+            if cache is not None and not truncated:
+                cache[key] = entry
+        durations = entry.get("durations") or {}
+        poll_statuses = entry.get("poll_status") or {}
         for name in state_names:
             if name not in durations:
                 continue
             duration = durations[name]
-            poll_status = None
-            poll_key = KNOWN_POLL_STATUS_KEYS.get(name)
-            if poll_key:
-                output = last_outputs.get(name)
-                if isinstance(output, dict):
-                    poll_status = (output.get(poll_key) or {}).get("Status")
+            poll_status = poll_statuses.get(name) if name in KNOWN_POLL_STATUS_KEYS else None
             exclusion_reason: Optional[str] = None
             if duration <= 0:
                 exclusion_reason = (
@@ -506,13 +605,21 @@ def _default_fetch_history(sf_client: Any, execution_arn: str) -> List[dict]:
     # in execution_digest.build_execution_digest.
     from execution_digest import fetch_execution_history
 
-    events, _truncated = fetch_execution_history(sf_client, execution_arn)
-    return events
+    # Returns (events, truncated) so collect_state_duration_samples can keep a
+    # truncated history out of the cache (alpha-engine-config-I11792).
+    return fetch_execution_history(
+        sf_client, execution_arn, page_size=HISTORY_PAGE_SIZE
+    )
 
 
-def run_check(sf_client: Any) -> List[FloorRecommendation]:
+def run_check(
+    sf_client: Any, cache: Optional[Dict[str, Any]] = None
+) -> List[FloorRecommendation]:
     """Pull live samples for every state machine referenced in
-    STATE_TO_STATE_MACHINE and return the full recommendation set."""
+    STATE_TO_STATE_MACHINE and return the full recommendation set.
+
+    ``cache`` is passed through to ``collect_state_duration_samples``; see
+    "Per-execution sample cache" above."""
     states_by_machine: Dict[str, List[str]] = {}
     for state_name, machine in STATE_TO_STATE_MACHINE.items():
         states_by_machine.setdefault(machine, []).append(state_name)
@@ -521,7 +628,11 @@ def run_check(sf_client: Any) -> List[FloorRecommendation]:
     for machine, state_names in states_by_machine.items():
         arn = f"arn:aws:states:{REGION}:{ACCOUNT_ID}:stateMachine:{machine}"
         collected = collect_state_duration_samples(
-            sf_client, arn, state_names, fetch_history=_default_fetch_history
+            sf_client,
+            arn,
+            state_names,
+            fetch_history=_default_fetch_history,
+            cache=cache,
         )
         samples_by_state.update(collected)
 
@@ -540,12 +651,33 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         action="store_true",
         help="Print the full recommendation table (CSV) and exit 0.",
     )
+    parser.add_argument(
+        "--cache",
+        metavar="PATH",
+        help=(
+            "JSON file of per-execution samples already derived from earlier "
+            "runs. Terminal executions found there are not re-read; the file "
+            "is rewritten with this run's set (alpha-engine-config-I11792)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     import boto3
 
     sf_client = boto3.client("stepfunctions", region_name=REGION)
-    recommendations = run_check(sf_client)
+    cache: Optional[Dict[str, Any]] = None
+    if args.cache:
+        cache = load_sample_cache(args.cache)
+        cached_before = set(cache)
+        print(f"floor-calibration cache: {len(cached_before)} execution(s) loaded", file=sys.stderr)
+    recommendations = run_check(sf_client, cache=cache)
+    if args.cache and cache is not None:
+        save_sample_cache(args.cache, cache)
+        print(
+            f"floor-calibration cache: {len(set(cache) - cached_before)} execution(s) read "
+            f"from Step Functions this run, {len(cache)} cached",
+            file=sys.stderr,
+        )
     report = render_report(recommendations)
     print(report)
 
