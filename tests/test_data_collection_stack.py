@@ -860,3 +860,91 @@ def test_daily_heal_runs_on_trading_days_only(stack, tpl):
     assert heal["require_trading_day"] is True
     assert heal["workloads"] == ["daily-heal"]
     assert heal["verify_units"] == ["D33"]
+
+
+# ── D51 daily panel: after the EOD collection, never inside it ──────────────
+#
+# alpha-engine-config-I10791. ne-postclose-reconcile-pipeline (the eod_pnl
+# reconcile) is started by alpha-engine-eod-backstop on ne-data-collection-eod's
+# terminal status change (eod-backstop/deploy.sh, COLLECTION_TERMINAL_PATTERN).
+# Any workload inside that machine delays the reconcile by its runtime, and a
+# failed one turns the collection FAILED. The panel therefore runs on its own
+# machine, started by a rule on the EOD machine's SUCCEEDED, which fires only
+# after the reconcile's trigger already has.
+
+_EOD_BACKSTOP_DEPLOY = REPO / "infrastructure" / "lambdas" / "eod-backstop" / "deploy.sh"
+_EOD_RECONCILE_SF = REPO / "infrastructure" / "step_function_eod_reconcile.json"
+
+
+def _machine_names(tpl) -> dict[str, str]:
+    return {
+        logical: res["Properties"]["StateMachineName"]
+        for logical, res in tpl["Resources"].items()
+        if res["Type"] == "AWS::StepFunctions::StateMachine"
+    }
+
+
+def test_the_reconcile_trigger_chain_cannot_include_the_panel(stack, tpl):
+    names = _machine_names(tpl)
+    # 1. The reconcile's trigger keys on exactly one machine: ne-data-collection-eod.
+    text = _EOD_BACKSTOP_DEPLOY.read_text(encoding="utf-8")
+    pattern = re.search(r"COLLECTION_TERMINAL_PATTERN=\$\(cat <<EOF\n(.*?)\nEOF", text, re.S)
+    assert pattern, "reconcile trigger pattern not found in eod-backstop/deploy.sh"
+    watched = re.findall(r"stateMachine:([A-Za-z0-9-]+)", pattern.group(1))
+    assert watched == ["ne-data-collection-eod"]
+    # 2. Nothing that machine runs, scheduled or healed, is the panel.
+    eod_machine = next(k for k, v in names.items() if v == "ne-data-collection-eod")
+    for s in stack.schedules(tpl):
+        if s["target_ref"] == eod_machine:
+            assert "daily-panel" not in s["input"]["workloads"], s["name"]
+            assert "D51" not in s["input"]["verify_units"], s["name"]
+    heal = json.loads(_EOD_RECONCILE_SF.read_text(encoding="utf-8"))["States"]["HealStartCollection"]
+    assert "daily-panel" not in heal["Parameters"]["Input"]["workloads"]
+    assert "D51" not in heal["Parameters"]["Input"]["verify_units"]
+    # 3. The panel runs only where its outcome cannot reach that trigger: on its
+    #    own machine, started by the EOD machine's SUCCEEDED and nothing else.
+    panel_runners = [
+        r for r in stack.event_rules(tpl) if "daily-panel" in r["input"]["workloads"]
+    ] + [s for s in stack.schedules(tpl) if "daily-panel" in s["input"].get("workloads", [])]
+    assert [r["name"] for r in panel_runners] == ["ne-data-collection-panel-on-eod"]
+    rule = panel_runners[0]
+    assert names[rule["target_ref"]] == "ne-data-collection-panel"
+    assert rule["target_ref"] != eod_machine
+    assert stack.rule_source_machines(rule) == [eod_machine]
+    assert rule["pattern"]["detail"]["status"] == ["SUCCEEDED"]
+    assert rule["input"]["workloads"] == ["daily-panel"]
+    assert rule["input"]["verify_units"] == ["D51"]
+    assert rule["declared_state"] == "ENABLED"
+
+
+def test_the_panel_machine_fits_its_ceiling(stack, tpl):
+    rule = next(r for r in stack.event_rules(tpl) if r["name"] == "ne-data-collection-panel-on-eod")
+    ceiling = json.loads(stack.DEFINITION.read_text(encoding="utf-8"))["TimeoutSeconds"]
+    assert stack.worst_case_seconds(rule["input"]["workloads"], through="daily-panel") <= ceiling
+    _default, overrides, _ssm = stack.dispatcher_runtime_caps()
+    assert overrides["daily-panel"] == 3600
+
+
+def test_lint_holds_rules_to_the_schedule_contract(stack, monkeypatch):
+    real_loader = stack.load_template
+
+    def _mutate(fn):
+        base = real_loader()
+        fn(base["Resources"]["PanelOnEodSucceededRule"]["Properties"])
+        return base
+
+    def _bad_workload(p):
+        payload = json.loads(p["Targets"][0]["Input"])
+        payload["workloads"] = ["no-such-workload"]
+        p["Targets"][0]["Input"] = json.dumps(payload)
+
+    def _self_start(p):
+        p["Targets"][0]["Arn"] = {"Ref": "EodStateMachine"}
+
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(_bad_workload))
+    assert any("no-such-workload" in p for p in stack.lint())
+    monkeypatch.setattr(stack, "load_template", lambda *a, **k: _mutate(_self_start))
+    assert any("may not start itself" in p for p in stack.lint())
+    assert stack.rule_pause_problems(
+        [{"name": "x-rule", "declared_state": "ENABLED"}], {"not_paused": {}}
+    ) == ["rule x-rule: declared ENABLED but not in automation_pause.json not_paused"]
