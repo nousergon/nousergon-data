@@ -200,6 +200,31 @@ Resources:
         - Key: system
           Value: data-collection
 
+  # The D51 daily panel's own machine (alpha-engine-config-I10791, plan P-25).
+  # It uses the same definition as the four above. It is started by
+  # PanelOnEodSucceededRule below, never by a schedule.
+  PanelStateMachine:
+    Type: AWS::StepFunctions::StateMachine
+    Properties:
+      StateMachineName: ne-data-collection-panel
+      StateMachineType: STANDARD
+      RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${StateMachineRoleName}
+      DefinitionS3Location:
+        Bucket: !Ref DefinitionS3Bucket
+        Key: !Ref DefinitionS3Key
+      DefinitionSubstitutions:
+        DispatcherFunctionArn: !Sub arn:aws:lambda:${AWS::Region}:${AWS::AccountId}:function:${DispatcherFunctionName}
+        AlertsTopicArn: !Sub arn:aws:sns:${AWS::Region}:${AWS::AccountId}:${AlertsTopicName}
+      LoggingConfiguration:
+        Level: ERROR
+        IncludeExecutionData: true
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt CollectionLogGroup.Arn
+      Tags:
+        - Key: system
+          Value: data-collection
+
   CollectionScheduleGroup:
     Type: AWS::Scheduler::ScheduleGroup
     Properties:
@@ -557,6 +582,63 @@ Resources:
   # dimension is the state machine ARN, which is fixed by StateMachineName
   # above, so the alarm files need nothing from this stack.
 
+  # D51 daily panel, run AFTER the EOD collection and outside it
+  # (alpha-engine-config-I10791). The panel compiles the session's long OHLCV
+  # panel from the ArcticDB `universe` library, so it needs the D32 append.
+  # A SUCCEEDED ne-data-collection-eod execution is one whose D32 manifest that
+  # machine has already verified. That is the same event
+  # crucible-v2-data-daily-on-collection keys on, and it covers a heal's
+  # SUCCEEDED too.
+  #
+  # It is deliberately NOT a workload of data-collection-eod.
+  # ne-postclose-reconcile-pipeline (the eod_pnl reconcile) is started by
+  # alpha-engine-eod-backstop on that machine's terminal status change. A panel
+  # inside the machine would delay the reconcile by the panel's runtime (up to
+  # its 3600 s cap plus a box boot). It could also push the chain past the
+  # 22:00 PT cost guard, and a failed panel would mark the collection FAILED.
+  # Here the panel starts only after that event has already fired, so it can
+  # neither delay nor gate the reconcile.
+  # tests/test_data_collection_stack.py::test_the_reconcile_trigger_chain_cannot_include_the_panel
+  # pins this.
+  #
+  # require_trading_day is false on purpose. The rule fires only on an EOD
+  # execution that itself ran for a trading day, and a heal can succeed after
+  # midnight ET, when today's calendar check would skip a valid session. The
+  # panel keys the last closed session itself (weekly_collector.py::default_run_date).
+  # Its state follows CollectionState. It is declared KEPT in
+  # automation_pause.json.
+  PanelOnEodSucceededRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: ne-data-collection-panel-on-eod
+      Description: >-
+        ne-data-collection-eod SUCCEEDED (scheduled run or heal) ->
+        ne-data-collection-panel, the D51 daily panel
+        (alpha-engine-config-I10791). Outside the EOD machine, so the
+        panel cannot delay or gate the eod_pnl reconcile.
+      State: !Ref CollectionState
+      EventPattern:
+        source:
+          - aws.states
+        detail-type:
+          - Step Functions Execution Status Change
+        detail:
+          status:
+            - SUCCEEDED
+          stateMachineArn:
+            - !Ref EodStateMachine
+      Targets:
+        - Id: ne-data-collection-panel
+          Arn: !Ref PanelStateMachine
+          RoleArn: !Sub arn:aws:iam::${AWS::AccountId}:role/${SchedulerRoleName}
+          Input: '{"collection": "panel", "workloads": ["daily-panel"], "require_trading_day": false, "verify_units": ["D51"]}'
+          RetryPolicy:
+            MaximumRetryAttempts: 10
+            MaximumEventAgeInSeconds: 3600
+      Tags:
+        - Key: system
+          Value: data-collection
+
 Outputs:
   EodStateMachineArn:
     Value: !Ref EodStateMachine
@@ -566,3 +648,5 @@ Outputs:
     Value: !Ref WeeklyStateMachine
   DailyHealStateMachineArn:
     Value: !Ref DailyHealStateMachine
+  PanelStateMachineArn:
+    Value: !Ref PanelStateMachine
