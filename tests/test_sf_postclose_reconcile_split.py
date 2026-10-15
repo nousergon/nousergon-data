@@ -116,6 +116,8 @@ _RECONCILE_ONLY = _COLLECTOR_DEPENDENT | {
     "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
     "TraderReconcileDrainWait", "ExtractTraderReconcileDrainStatusError",
     "SetTraderReconcileDrainDegraded", "PublishTraderReconcileDrainUnsettled",
+    # alpha-engine-config-I12292: the drain's unit settled, but failed.
+    "SetTraderReconcileUnitFailedDegraded",
     # 2026-10-09 in-session box stop: box ownership. This machine stops only a
     # box it started; the post-close machine's stop is the ruled 16:00 stop of
     # the box the preopen pipeline started, so it carries no ownership check.
