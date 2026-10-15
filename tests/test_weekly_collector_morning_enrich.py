@@ -75,10 +75,85 @@ def test_previous_trading_day_strict_inequality():
 def test_previous_trading_day_raises_on_runaway():
     """Defensive: if is_trading_day returns False for 10 days straight, raise."""
     with patch("nousergon_lib.trading_calendar.is_trading_day", return_value=False):
-        with pytest.raises(RuntimeError, match="trading_calendar.is_trading_day appears broken"):
+        with pytest.raises(RuntimeError, match="Could not find a trading day"):
             weekly_collector._previous_trading_day(
                 reference=datetime(2026, 4, 23, 13, 0, 0, tzinfo=timezone.utc)
             )
+
+
+# ── _previous_trading_day: "today" is the New York date (I12294) ────────────
+#
+# Same semantics as sf_preflight._previous_trading_day_str (nousergon-data#2146):
+# the most recent NYSE trading day strictly before the ET calendar date. The
+# UTC date is a day AHEAD between UTC midnight and ET midnight (Polygon 403s
+# "today's data before end of day"); the Pacific date the call sites used to
+# pass is a day BEHIND between ET midnight and PT midnight.
+
+
+@pytest.mark.parametrize("now_utc, expected", [
+    # Saturday 00:00-03:59Z (EDT, UTC-4) is still FRIDAY 10-16 in New York, so
+    # the prior session is Thursday 10-15 — not Friday, which Polygon refuses.
+    (datetime(2026, 10, 17, 0, 0, tzinfo=timezone.utc), "2026-10-15"),
+    (datetime(2026, 10, 17, 2, 15, tzinfo=timezone.utc), "2026-10-15"),
+    (datetime(2026, 10, 17, 3, 59, 59, tzinfo=timezone.utc), "2026-10-15"),
+    # Saturday 04:00-04:59Z: ET midnight has passed, Friday is servable.
+    (datetime(2026, 10, 17, 4, 0, tzinfo=timezone.utc), "2026-10-16"),
+    (datetime(2026, 10, 17, 4, 59, 59, tzinfo=timezone.utc), "2026-10-16"),
+    # Scheduled production instant (Saturday 09:00Z): unchanged -> Friday.
+    (datetime(2026, 10, 17, 9, 0, tzinfo=timezone.utc), "2026-10-16"),
+    # EST regime (UTC-5): all of Saturday 00:00-04:59Z is still Friday 11-13.
+    (datetime(2026, 11, 14, 0, 0, tzinfo=timezone.utc), "2026-11-12"),
+    (datetime(2026, 11, 14, 4, 59, 59, tzinfo=timezone.utc), "2026-11-12"),
+    (datetime(2026, 11, 14, 5, 0, tzinfo=timezone.utc), "2026-11-13"),
+    # The issue's case: 22:15 EDT Tue 10-13 = 02:15Z Wed -> Monday 10-12.
+    (datetime(2026, 10, 14, 2, 15, tzinfo=timezone.utc), "2026-10-12"),
+])
+def test_previous_trading_day_uses_the_new_york_date(now_utc, expected):
+    assert weekly_collector._previous_trading_day(reference=now_utc) == expected
+
+
+def test_previous_trading_day_ignores_the_zone_of_the_reference():
+    """The instant decides, not its zone: Fri 21:30 PDT is Sat 00:30 EDT, so
+    the prior session is Friday. The old ``reference.date()`` read the Pacific
+    date (Friday) and targeted Thursday."""
+    instant = datetime(2026, 10, 16, 21, 30, tzinfo=_PT)
+    expected = "2026-10-16"
+    assert weekly_collector._previous_trading_day(reference=instant) == expected
+    assert weekly_collector._previous_trading_day(
+        reference=instant.astimezone(timezone.utc)
+    ) == expected
+
+
+def test_previous_trading_day_default_is_now_in_new_york():
+    """No reference -> the current instant, resolved through the shared helper."""
+    import sf_preflight
+
+    assert weekly_collector._previous_trading_day() == sf_preflight._previous_trading_day_str()
+
+
+def test_previous_trading_day_is_the_one_shared_resolver():
+    """One New-York-date resolver, not two: weekly_collector delegates to
+    sf_preflight's, passing the reference instant through unchanged."""
+    instant = datetime(2026, 10, 17, 9, 0, tzinfo=timezone.utc)
+    with patch("sf_preflight._previous_trading_day_str", return_value="sentinel") as shared:
+        assert weekly_collector._previous_trading_day(reference=instant) == "sentinel"
+    shared.assert_called_once_with(instant)
+
+
+def test_previous_trading_day_matches_utc_at_the_daily_9am_slot():
+    """Production runs at 09:00Z, where the UTC and ET dates agree: across a
+    full week (and a holiday week) the result is exactly the old UTC answer."""
+    from datetime import timedelta
+    from nousergon_lib.trading_calendar import is_trading_day
+
+    for start in (datetime(2026, 10, 12, 9, 0, tzinfo=timezone.utc),
+                  datetime(2026, 11, 23, 9, 0, tzinfo=timezone.utc)):  # Thanksgiving wk
+        for offset in range(7):
+            now = start + timedelta(days=offset)
+            d = now.date() - timedelta(days=1)
+            while not is_trading_day(d):
+                d -= timedelta(days=1)
+            assert weekly_collector._previous_trading_day(reference=now) == d.isoformat(), now
 
 
 # ── _run_morning_enrich orchestration ───────────────────────────────────────
@@ -625,7 +700,7 @@ def test_morning_enrich_explicit_date_overrides_skip_guard():
 
 
 def test_morning_enrich_skips_when_arctic_already_has_newer_row():
-    """End-to-end: Wed-PM manual rerun. _previous_trading_day(PT-aware) yields
+    """End-to-end: Wed-PM manual rerun. _previous_trading_day (ET date) yields
     Tue, ArcticDB SPY already has Wed (from Wed EOD yfinance). Skip fires with
     stale_overwrite reason; no polygon, no daily_append, no health stamp."""
     from datetime import date
