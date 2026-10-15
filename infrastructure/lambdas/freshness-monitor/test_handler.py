@@ -278,6 +278,16 @@ def test_notify_via_flow_doctor_sets_source_across_primary_flow_doctor_path(monk
 # ── Fixtures ────────────────────────────────────────────────────────────────
 
 
+@pytest.fixture(autouse=True)
+def _unregistered_envelope_sweep_off(monkeypatch):
+    """The daily handler appends one synthetic row for the
+    unregistered-envelope sweep (alpha-engine-config-I11840). This file's
+    tests pin the registry rows they seed, row counts included, so the sweep
+    is off here. ``test_unregistered_envelopes.py`` covers it, including
+    through ``handler``."""
+    monkeypatch.setenv("UNREGISTERED_ENVELOPE_SWEEP_ENABLED", "false")
+
+
 @pytest.fixture
 def yaml_registry_body() -> bytes:
     """A small but representative registry — three rows covering the

@@ -107,6 +107,7 @@ from nousergon_lib.trading_calendar import (
     previous_trading_day,
 )
 from flow_doctor_telegram import notify_via_flow_doctor
+import unregistered_envelopes
 from nousergon_lib.flow_doctor_fleet import FleetTelegramTopic
 
 logger = logging.getLogger()
@@ -4522,6 +4523,7 @@ def _run_probe_pass(
     prev_episode_state: dict[str, dict[str, str]] | None = None,
     list_cache: dict | None = None,
     run_evidence_prefix_by_id: dict[str, str] | None = None,
+    precomputed_results: dict[str, CheckResult] | None = None,
 ) -> tuple[
     list[tuple[ArtifactSpec, CheckResult]], int, int, int, dict[str, int],
     dict[str, Any],
@@ -4604,7 +4606,13 @@ def _run_probe_pass(
         # itself, so every downstream consumer (driver attribution, episode
         # identity, `_alert_decision`, `check_results.json`, the digest)
         # sees the ONE resulting verdict with no second re-grade step here.
-        result, exc = _check_one(s3_client, spec, now, list_cache=list_cache)
+        # alpha-engine-config-I11840 — a synthetic row (the unregistered-envelope
+        # sweep) arrives already graded; every row after this line, synthetic
+        # or not, takes the same page, dedup and escalation path.
+        if precomputed_results and spec.artifact_id in precomputed_results:
+            result, exc = precomputed_results[spec.artifact_id], None
+        else:
+            result, exc = _check_one(s3_client, spec, now, list_cache=list_cache)
         if exc is not None:
             per_spec_exceptions += 1
             logger.warning(
@@ -4867,6 +4875,58 @@ def _run_probe_pass(
     )
 
 
+def _unregistered_sweep_enabled() -> bool:
+    """Read at call time, so a test (or an operator env flip) needs no reload."""
+    return os.environ.get(
+        "UNREGISTERED_ENVELOPE_SWEEP_ENABLED", "true",
+    ).lower() == "true"
+
+
+def _with_unregistered_envelope_sweep(
+    s3_client: Any, specs: list[ArtifactSpec], now: datetime,
+) -> tuple[list[ArtifactSpec], dict[str, CheckResult]]:
+    """Run the alpha-engine-config-I11840 sweep and append its synthetic row.
+
+    Returns ``(specs, precomputed_results)``. The original ``specs`` come back
+    unchanged when the sweep is disabled, or when the registry already
+    carries a row under the sweep's id (a real row always wins over the
+    synthetic one). A sweep that raises becomes a ``probe_failed`` row, so it
+    pages rather than sinking the pass. The report write is trapped
+    like every secondary surface: the row's verdict reaches the page and
+    check_results.json even if the report is lost.
+    """
+    if not _unregistered_sweep_enabled():
+        logger.info("unregistered-envelope sweep disabled by env")
+        return specs, {}
+    sweep_id = unregistered_envelopes.SWEEP_ARTIFACT_ID
+    if any(s.artifact_id == sweep_id for s in specs):
+        logger.warning(
+            "registry carries a %s row; the synthetic sweep row is skipped",
+            sweep_id,
+        )
+        return specs, {}
+    try:
+        spec, result, report = unregistered_envelopes.run_sweep(
+            s3_client, REGISTRY_BUCKET, specs, now,
+        )
+    except Exception as exc:  # noqa: BLE001 — a sweep defect is a probe failure that pages, never a sunk pass
+        logger.error("unregistered-envelope sweep raised: %s", exc, exc_info=True)
+        spec = unregistered_envelopes.sweep_spec(REGISTRY_BUCKET)
+        reason = f"sweep raised: {type(exc).__name__}: {exc}"
+        result = CheckResult(state="probe_failed", reason=reason,
+                             canonical_key=unregistered_envelopes.REPORT_KEY)
+        report = {"schema_version": 1, "run_at": now.isoformat(),
+                  "state": "probe_failed", "summary": reason, "grades": []}
+    try:
+        _put_json(s3_client, REGISTRY_BUCKET, unregistered_envelopes.REPORT_KEY, report)
+    except Exception as exc:  # noqa: BLE001 — secondary surface; the verdict still travels in the pass
+        logger.error(
+            "unregistered-envelope report write failed (non-fatal): %s", exc,
+            exc_info=True,
+        )
+    return [*specs, spec], {sweep_id: result}
+
+
 # ── Main handler ────────────────────────────────────────────────────────────
 
 
@@ -4989,6 +5049,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # listing.
     list_cache = _new_list_cache()
 
+    # alpha-engine-config-I11840 / Brian's ruling #25 (2026-10-14) — grade the
+    # ops/checks envelopes NO registry row names, and carry the verdict into
+    # the pass as one synthetic row. See unregistered_envelopes.py.
+    specs, precomputed_results = _with_unregistered_envelope_sweep(s3, specs, now)
+
     (pairs, alerted, dispatched, per_spec_exceptions, miss_counts,
      pass_telemetry) = _run_probe_pass(
         s3, specs, recovery_by_id, now, prev_miss_counts,
@@ -5002,6 +5067,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         list_cache=list_cache,
         # config-I6831 — lifts a suppression where the producer RAN.
         run_evidence_prefix_by_id=run_evidence_prefix_by_id,
+        precomputed_results=precomputed_results,
     )
     t_spec_loop_done = time.time()
     owning_by_id = pass_telemetry["owning_by_id"]
