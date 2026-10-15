@@ -6,7 +6,7 @@ Producer owns the consumer contract. Every downstream freshness/shape check
 (research's ``PriceFetchError`` / ``MacroFetchError``, predictor's
 ``_verify_arctic_fresh``, backtester's ArcticDB reads) must have a matching
 producer-side postflight that fails FIRST. This eliminates blast-radius
-fan-out — one ``alpha-engine-saturday-sf-failed`` alarm at DataPhase1 instead
+fan-out — one weekly-SF FAILED page at DataPhase1 instead
 of 3× downstream cold-starts each reporting the same root cause — and avoids
 compute waste on downstream Lambda invocations / spot-EC2 bootstraps doomed
 to fail at preflight.
