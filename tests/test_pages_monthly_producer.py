@@ -276,6 +276,28 @@ def test_the_clause_reads_an_ok_month_as_a_partial_window(tmp_path):
     assert "full calendar month" in clause.detail
 
 
+def test_the_clause_reads_a_complete_ok_month_as_met(tmp_path):
+    # The positive half of the standing contract: once every day of the month
+    # is observed and the producer says `ok`, the row turns green. Without this
+    # a guard that withholds MET from every `ok` month (not only partial ones)
+    # would pass the partial-window and breach tests above and read UNMET forever.
+    reading = m.MonthReading(
+        month="2026-10",
+        days_in_month=31,
+        days_read=31,
+        observed_days=[f"2026-10-{d:02d}" for d in range(1, 32)],
+        pages=[m.PageEvent("2026-10-01T01:00:00Z", "execution_failed_alarm", "s", "e0")],
+        complete=True,
+    )
+    document = m.build_document(reading, now=dt.datetime(2026, 11, 1, 22, 0, tzinfo=UTC))
+    assert document["status"] == "ok"
+    assert document["days_observed"] == 31 and document["days_in_month"] == 31
+    clause = _clause_over(tmp_path, document)
+    assert isinstance(clause, clause_module.StandingClause)
+    assert clause.met and not clause.unmeasurable
+    assert "full calendar month" not in clause.detail
+
+
 def test_the_clause_reads_an_over_budget_month_as_reopened(tmp_path):
     clause = _clause_over(tmp_path, m.build_document(_reading_with(3), now=NOW))
     # A standing row carries the document's own breach verdict verbatim.
