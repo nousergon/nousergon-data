@@ -105,8 +105,20 @@ name: Data-collection gate (read-only)
 # CADENCE. Daily 23:30 UTC — after the EOD spine's 18:15 ET / ~22:15-23:15
 # UTC deadline (plan §2 row 1) so the daily reading reflects a completed
 # cycle — plus Saturday 18:00 UTC for the weekly family's Sat 13:00 ET
-# deadline, on push to the clause/descriptor sources so a topology change is
-# re-read immediately, and on-demand.
+# deadline, on push to the gate's own code, and on-demand.
+#
+# NOT ON `registry.d/**` PUSHES (alpha-engine-config-I11792). The push trigger
+# used to include the descriptor tree "so a topology change is re-read
+# immediately". It drove 28 of October's first 65 push runs (21 of them
+# touched nothing else), each ~10k S3 LISTs and ~0.45 GB of egress, and bought
+# only latency: a descriptor change does change the clause list, but the next
+# scheduled read takes it from the same checkout of `main`, and the largest
+# gap between scheduled reads (Sat 23:30 -> Sun 23:30 UTC) is 24h, inside
+# `data.gate.ladder_fresh`'s 26h ceiling. A descriptor that would break the
+# reader is caught before merge: `tests/test_data_gate.py` and siblings
+# generate the whole board from the committed `registry.d/units/`. A push to
+# `data_gate/**` still reads at once, because a code change is the one thing
+# that can break the reader against live data, which no PR test sees.
 #
 # WHICH GATES. `data-phase0` (phase 0 is what this repo is building toward,
 # per the plan's phase table) and `data-cutover-ready` (PR1716's sub-gate of
@@ -163,7 +175,6 @@ on:
     branches: [main]
     paths:
       - 'data_gate/**'
-      - 'registry.d/**'
       - '.github/workflows/data-gate.yml'
   workflow_dispatch:
     inputs:
@@ -213,7 +224,8 @@ jobs:
   read-gate:
     name: data-gate-read
     runs-on: ubuntu-latest
-    # Six sequential reads. Each took ~2 min on 2026-09-22 and 3.2-4.0 min from
+    # Six sequential readings (one process since alpha-engine-config-I11792,
+    # which removes most of each one's S3 wait). Each took ~2 min on 2026-09-22 and 3.2-4.0 min from
     # 2026-09-23 on, so 15 minutes cancelled every read from 01:30Z that day
     # partway through data-phase2/phase3 (runs 35806797260, 35825495053,
     # 35894773097, 35895185107), before the reliability gate ever ran. A
@@ -283,79 +295,42 @@ jobs:
       # data_gate read` exits 0 on MET or UNMET and only exits non-zero (2)
       # when the measurement itself failed, so this step — and therefore
       # this job — fails only on a genuine reader break.
-      - name: Read the data-phase0 gate
+      #
+      # SIX READINGS, ONE PROCESS (alpha-engine-config-I11792). These used to
+      # be six steps, one `python -m data_gate` process per gate. Each process
+      # evaluated the whole board (see BOTH READS, ONE BOARD above), so each
+      # re-LISTed the same ~2k `data_collection/` prefixes and re-downloaded
+      # the same objects, the 33.5 MB parity adjudication record among them —
+      # six times a run, because `S3Store`'s read memo lives for one process.
+      # Repeating `--gate` takes the same six readings, in the same order, each
+      # publishing its own dated key and then the ladder and board, over ONE
+      # store, so the memo covers the whole run. `data_gate/__main__.py::
+      # _read_command` carries the equivalence argument; the order below is
+      # the order the steps ran in, and it matters (a later reading reads the
+      # ladder and dated keys an earlier one published).
+      #
+      # Why each gate is read at all: each `--gate` is the only way to get
+      # THAT gate's own dated `gates/<gate>/{date}/gate.json`.
+      #   * `data-phase0` — what this repo is building toward.
+      #   * `data-cutover-ready` — PR1716's sub-gate of phase 1.
+      #   * `data-phase1`/`2`/`3` — registered in `data_gate/read.py::GATES`;
+      #     `data.phase3.sustained_window` reads `data-phase3`'s dated key
+      #     (`alpha-engine-config-I10795`).
+      #   * `data-collection-reliability` — `alpha-engine-config-I10793`/
+      #     `-I10788`, Brian's 2026-09-21 ruling: the three reliability-streak
+      #     STANDING clauses as their own dated artifact. Crucible v2 phase 4
+      #     gates its irreversible v1-pipeline deletion
+      #     (`alpha-engine-config-I10655`) on THIS gate's own `met`.
+      - name: Read every gate
         id: gate_read
         run: |
-          python -m data_gate read --gate data-phase0 \
-            --store "$STORE_URI" \
-            --trading-day "$GATE_TRADING_DAY" \
-            --trigger "$GATE_TRIGGER" \
-            $FAIL_ON_UNMET_FLAG
-
-      # Second invocation, same contract, `data-cutover-ready`'s own exit
-      # code. See "BOTH READS, ONE BOARD" at the top of this file for why
-      # running it a second time writes an equivalent, not a conflicting,
-      # `ladder.json`/`board/latest.json`.
-      - name: Read the data-cutover-ready gate
-        id: gate_read_cutover
-        run: |
-          python -m data_gate read --gate data-cutover-ready \
-            --store "$STORE_URI" \
-            --trading-day "$GATE_TRADING_DAY" \
-            --trigger "$GATE_TRIGGER" \
-            $FAIL_ON_UNMET_FLAG
-
-      # Three more invocations, same contract, same "BOTH READS, ONE BOARD"
-      # argument above — `data-phase1`/`2`/`3` are already registered in
-      # `data_gate/read.py::GATES` (ceilings 1/2/3) and already graded on the
-      # console's board, but until now only `data-phase0` and
-      # `data-cutover-ready` were ever passed as `--gate`, and only the
-      # `--gate` argument gets a DATED artifact written
-      # (`gates/<gate>/{date}/gate.json`). `data.phase3.sustained_window`
-      # reads that dated key for `data-phase3` and had never seen one —
-      # `alpha-engine-config-I10795`. Each of these writes only its OWN never-
-      # before-written dated key; none can clobber a better reading (see this
-      # PR's body).
-      - name: Read the data-phase1 gate
-        id: gate_read_phase1
-        run: |
-          python -m data_gate read --gate data-phase1 \
-            --store "$STORE_URI" \
-            --trading-day "$GATE_TRADING_DAY" \
-            --trigger "$GATE_TRIGGER" \
-            $FAIL_ON_UNMET_FLAG
-
-      - name: Read the data-phase2 gate
-        id: gate_read_phase2
-        run: |
-          python -m data_gate read --gate data-phase2 \
-            --store "$STORE_URI" \
-            --trading-day "$GATE_TRADING_DAY" \
-            --trigger "$GATE_TRIGGER" \
-            $FAIL_ON_UNMET_FLAG
-
-      - name: Read the data-phase3 gate
-        id: gate_read_phase3
-        run: |
-          python -m data_gate read --gate data-phase3 \
-            --store "$STORE_URI" \
-            --trading-day "$GATE_TRADING_DAY" \
-            --trigger "$GATE_TRIGGER" \
-            $FAIL_ON_UNMET_FLAG
-
-      # `alpha-engine-config-I10793`/`-I10788`, Brian's 2026-09-21 ruling: a
-      # sixth invocation, same contract, publishing the three reliability-
-      # streak STANDING clauses (never counted in phase1/2/3 above) as their
-      # own dated artifact — `data_collection/gates/data-collection-reliability/
-      # {date}/gate.json` and `.../latest.json` — the SAME shape
-      # `data-cutover-ready` already publishes for the cutover itself.
-      # Crucible v2 phase 4 gates its irreversible v1-pipeline deletion
-      # (`alpha-engine-config-I10655`) on THIS gate's own `met`, never on a
-      # numbered data-phase gate.
-      - name: Read the data-collection-reliability gate
-        id: gate_read_reliability
-        run: |
-          python -m data_gate read --gate data-collection-reliability \
+          python -m data_gate read \
+            --gate data-phase0 \
+            --gate data-cutover-ready \
+            --gate data-phase1 \
+            --gate data-phase2 \
+            --gate data-phase3 \
+            --gate data-collection-reliability \
             --store "$STORE_URI" \
             --trading-day "$GATE_TRADING_DAY" \
             --trigger "$GATE_TRIGGER" \
