@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import io
 import logging
+import math
 import random
 import re
 import time
@@ -49,6 +50,7 @@ from datetime import datetime, time as dtime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 import boto3
+import numpy as np
 import pandas as pd
 import requests
 
@@ -96,6 +98,31 @@ _NYSE_TZ = ZoneInfo("America/New_York")
 
 _YFINANCE_BATCH_SIZE = 100
 _YFINANCE_BATCH_DELAY = 2  # seconds between batches
+
+
+def _yf_price(value) -> float:
+    """A yfinance price as the vendor's decimal print, rounded to 4 places.
+
+    yfinance hands back prices quantised to float32 upstream, so ``1255.69``
+    arrives as ``1255.68994140625`` (measured in the 2026-09-28 D19 output). ``round(x, 4)`` alone undoes that only while the
+    float32 half-ULP stays under the 5e-5 rounding radius, i.e. below 1024:
+    from 1024 up it is 6.1e-5 or more, and the artefact survives the round
+    (GWW 1255.69 -> 1255.6899, NVR 6267.89 -> 6267.8901 on 2026-09-28).
+    That ~1e-4 then propagates into every Close-derived loading and its
+    cross-sectional z-score, which no longer reproduce from the vendor's
+    settled close (alpha-engine-config-I12246).
+
+    A value that is exactly float32-representable is read back through its
+    shortest float32 decimal, which is the decimal the vendor quantised. A
+    value that is not float32-exact did not come through float32 and is only
+    rounded, so a genuine float64 price is never moved.
+    """
+    x = float(value)
+    if math.isfinite(x):
+        f32 = np.float32(x)
+        if float(f32) == x:
+            x = float(str(f32))
+    return round(x, 4)
 
 _FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
 _FRED_TIMEOUT = 15
@@ -1743,7 +1770,13 @@ def _collect_window(
         # and the morning collection proceeds (the per-date discrepancy logging,
         # the morning polygon re-fetch, and the blocking Saturday backfill audit
         # all remain in place).
-        if registry is not None and detected_actions:
+        # Declared actions (corporate_actions.declared, alpha-engine-config-I11806)
+        # are not in polygon's feed, so a morning with no polygon split must
+        # still run sync: it is what brings the ArcticDB universe onto a
+        # declared action's basis, evidence-gated and a no-op once it is there.
+        from corporate_actions.declared import declared_tickers
+
+        if registry is not None and (detected_actions or declared_tickers()):
             try:
                 import corporate_actions
 
@@ -1760,6 +1793,10 @@ def _collect_window(
                     tickers=tickers,
                     registry=registry,
                     actions=detected_actions,
+                    # A run entered only for the declared actions keeps the
+                    # polygon budget it had before they existed: no dividend
+                    # scan on a morning with no split.
+                    dividend_actions=None if detected_actions else [],
                 )
                 n_applied = sum(
                     1
@@ -2623,10 +2660,10 @@ def _fetch_yfinance_closes(
 
                     last = df.iloc[-1]
                     store_ticker = ticker.lstrip("^")
-                    adj_close = float(last["Adj Close"]) if "Adj Close" in df.columns else float(last["Close"])
-                    high = float(last["High"])
-                    low = float(last["Low"])
-                    close = float(last["Close"])
+                    adj_close = _yf_price(last["Adj Close"] if "Adj Close" in df.columns else last["Close"])
+                    high = _yf_price(last["High"])
+                    low = _yf_price(last["Low"])
+                    close = _yf_price(last["Close"])
                     # VWAP is None on yfinance fallback. yfinance does not expose
                     # true volume-weighted VWAP; the previous (H+L+C)/3 proxy
                     # misrepresented proxy values as VWAP and contaminated the
@@ -2638,11 +2675,11 @@ def _fetch_yfinance_closes(
                     records.append({
                         "ticker": store_ticker,
                         "date": date_str,
-                        "Open": round(float(last["Open"]), 4),
-                        "High": round(high, 4),
-                        "Low": round(low, 4),
-                        "Close": round(close, 4),
-                        "Adj_Close": round(adj_close, 4),
+                        "Open": _yf_price(last["Open"]),
+                        "High": high,
+                        "Low": low,
+                        "Close": close,
+                        "Adj_Close": adj_close,
                         "Volume": int(last["Volume"]) if pd.notna(last.get("Volume")) else 0,
                         "VWAP": None,
                         "source": "yfinance",

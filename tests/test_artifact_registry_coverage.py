@@ -69,6 +69,16 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # `data_collection_gate_ladder` ARTIFACT_REGISTRY row (critical, 26 h) and
     # the `data_collection/gates/` grandfathered prefix (per-date readings).
     "data_gate/store.py": 1,
+    # alpha-engine-config-I12023 follow-up — `python -m data_gate
+    # preserve-parity-evidence` (data-gate.yml's last step): ONE put_object
+    # site, the evidence manifest
+    # data_collection/parity_adjudication/{report_day}/evidence/_manifest.json,
+    # written only when its content changes. (The retained evidence copies
+    # beside it are `copy_object`, which this scan does not count.) Not a
+    # freshness artifact — it moves only when a parity breach cites a new
+    # version — so it needs a `data_collection/parity_adjudication/`
+    # grandfathered_paths entry in ARTIFACT_REGISTRY.yaml, not a registered row.
+    "data_gate/parity_evidence.py": 1,
     # alpha-engine-config-I11035 / -I11036, SCHEDULED as of -I11058 — the two
     # phase-exit metric producers, one metric-document PUT each:
     #   metrics/v1_data_stage/executions_since_cutover.json
@@ -129,6 +139,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # in alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml before it is
     # scheduled, like trigger_observation.py; REGISTERED once a run first writes.
     "data_gate/producers/pages_monthly.py": 1,
+    # alpha-engine-config-I10789 (P-22) — the SLO emitter: ONE `put_bytes`
+    # site (the PUT is routed through `data_gate.store`, so the run record via
+    # `_StoreS3Adapter.put_object` is not a direct boto3 site) writing the
+    # sixteen data_collection/metrics/slo/{freshness,completeness}/<family>/
+    # latest.json documents the data.slo.* clauses read. GRANDFATHERED in
+    # alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml
+    # (`data_collection/metrics/slo/`, alpha-engine-config-PR11962) until its
+    # IAM grant and scheduled job land — the trigger_observation posture.
+    "data_gate/producers/slo.py": 1,
     # alpha-engine-config-I10795 (A3 part 2, the receipt WRITER) — one PUT
     # site, the per-unit console reachability receipt
     # data_collection/console_entity/<unit_id>/latest.json read by the 42

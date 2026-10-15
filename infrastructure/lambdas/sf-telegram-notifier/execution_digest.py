@@ -495,6 +495,7 @@ def fetch_execution_history(
     execution_arn: str,
     *,
     max_pages: Optional[int] = None,
+    page_size: Optional[int] = None,
 ) -> Tuple[List[dict], bool]:
     """Returns ``(events, truncated)``. ``truncated`` is True only when
     ``max_pages`` was exhausted with a ``nextToken`` still outstanding —
@@ -505,6 +506,11 @@ def fetch_execution_history(
     resolved at CALL time rather than bound as a literal default — so tests
     (and any future recalibration) can override the module constant without
     also having to pass it through every call site.
+
+    ``page_size`` sets ``maxResults`` (the API caps it at 1000). ``None``
+    leaves the service default (100), which is what the live notifier has
+    always used; the batch floor calibration passes 1000 so a ~900-event
+    execution is one call instead of nine (alpha-engine-config-I11792).
     """
     if max_pages is None:
         max_pages = _MAX_HISTORY_PAGES
@@ -516,6 +522,8 @@ def fetch_execution_history(
             "executionArn": execution_arn,
             "includeExecutionData": False,
         }
+        if page_size:
+            kwargs["maxResults"] = page_size
         if token:
             kwargs["nextToken"] = token
         resp = sf_client.get_execution_history(**kwargs)

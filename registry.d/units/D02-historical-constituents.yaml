@@ -94,11 +94,22 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: present
+    code:
+      - "collectors/historical_constituents.py::_grade_cardinality"
+    records_as: data_cardinality
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        collect() grades every build before the PUT through _grade_cardinality:
+        validators/expectations.py::check_cardinality with the names the previously published
+        membership map holds (load_prior_membership_names, read before the overwrite) as the
+        denominator and this build's names (every membership list plus today's roster) as
+        covered, at D02_HISTORY_RETENTION_FLOOR (0.99; a newly committed reticker folds one
+        name). Every lost name is named; no readable previous map is `unmeasurable`. Filed on
+        the manifest as guard `data_cardinality`. OBSERVE mode, staged on
+        validators/expectations.py::CARDINALITY_GUARD: logged at ERROR when not clean, never
+        changes the published map or the exit code, and a grading fault is recorded rather
+        than raised. Not in service until commissioned by an induced fault (P-19,
+        alpha-engine-config-I10786).
   units:
     state: absent
     note: >-

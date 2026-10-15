@@ -73,6 +73,8 @@ import boto3
 import pandas as pd
 import requests
 
+from validators import expectations
+
 logger = logging.getLogger(__name__)
 
 
@@ -317,6 +319,89 @@ _SECTOR_OVERRIDES: dict[str, tuple[tuple[str, str, str, str], ...]] = {
 _YF_FALLBACK_DELAY_SECS = 0.4
 
 
+#: PROPOSED, not ratified — threshold values are Brian's (alpha-engine-config-I10785).
+#: D01's declared completeness floor (``registry.d/units/D01-constituents.yaml``:
+#: "week-over-week membership change <= 5%", plan §2 row 2), as the share of the
+#: names in either roster that are in both. Graded against the newest earlier
+#: snapshot, which is usually the previous trading day's (this collector also
+#: runs pre-MorningEnrich), so the bound is tighter than weekly, never looser.
+#: Measured 2026-10-13 over the 38 snapshots 2026-08-17..2026-10-09: worst 0.9934
+#: (6 names, the 2026-09-21 rebalance). An S&P 500+400 roster that changes by
+#: more than 5% is a fetch that lost a fund's holdings file, not an index.
+D01_MEMBERSHIP_STABILITY_FLOOR = 0.95
+
+
+def _grade_cardinality(previous: dict | None, tickers: list[str], *, key: str) -> dict:
+    """D01's cardinality reading, as one run-manifest guard entry.
+
+    ``validators/expectations.py::check_cardinality`` over the union of the
+    previous snapshot's roster and this one, with the names in BOTH as the
+    covered set, at :data:`D01_MEMBERSHIP_STABILITY_FLOOR`. So the ratio is
+    ``1 - changed / union`` and every name that joined or left is named in
+    the detail, in either direction. The previous snapshot is the one
+    :func:`_load_previous_snapshot` already read for the sector carry-forward;
+    none readable is ``unmeasurable`` (red, never a pass).
+
+    OBSERVE mode (`sf-pipeline-policy` §7a), staged on
+    ``expectations.CARDINALITY_GUARD``: the verdict is logged (ERROR when not
+    clean) and returned for the run manifest. It never changes the published
+    roster or the exit code, and it never raises: a grading fault is recorded
+    as ``unmeasurable`` with the exception named. This collector also runs
+    pre-MorningEnrich on every trading day, so a raise here would stop the
+    daily collection the trader's inputs come from.
+    """
+    try:
+        prior = (previous or {}).get("tickers") if isinstance(previous, dict) else None
+        if not prior:
+            reading = expectations.CardinalityReading(
+                "unmeasurable",
+                "D01: no earlier constituents snapshot was readable, so the change in "
+                "membership cannot be measured. UNMEASURABLE, not a pass.",
+                key=key,
+                baseline=D01_MEMBERSHIP_STABILITY_FLOOR,
+            )
+        else:
+            prior_set = {str(t) for t in prior}
+            current = {str(t) for t in tickers}
+            graded = expectations.check_cardinality(
+                unit_id="D01",
+                denominator_symbols=prior_set | current,
+                covered_symbols=prior_set & current,
+                exclusions={},
+                suffix_map={},
+                class_rules=[],
+                max_named=60,
+                floor=D01_MEMBERSHIP_STABILITY_FLOOR,
+                miss_remedy=(
+                    f"Each joined or left the roster since the {previous.get('date')} "
+                    "snapshot. A change this large is a lost or truncated SPY/MDY "
+                    "holdings file until S&P DJI's announcements say otherwise."
+                ),
+            )
+            reading = expectations.CardinalityReading(
+                graded.verdict, graded.detail, key=key,
+                value=graded.value, baseline=graded.baseline,
+            )
+    except Exception as exc:  # noqa: BLE001 — recorded as unmeasurable; see docstring
+        reading = expectations.CardinalityReading(
+            "unmeasurable",
+            f"D01: cardinality grading failed ({type(exc).__name__}: {exc}). "
+            "UNMEASURABLE, not a pass.",
+            key=key,
+            baseline=D01_MEMBERSHIP_STABILITY_FLOOR,
+        )
+    expectations.report(reading, unit_id="D01", staging=expectations.CARDINALITY_GUARD, log=logger)
+    return {
+        "guard": expectations.CARDINALITY_GUARD.name,
+        "mode": expectations.CARDINALITY_GUARD.mode.value,
+        "verdict": reading.verdict,
+        "detail": reading.detail[:2000],
+        "key": reading.key,
+        "value": reading.value,
+        "baseline": reading.baseline,
+    }
+
+
 def collect(
     bucket: str,
     s3_prefix: str = "market_data/",
@@ -451,6 +536,9 @@ def collect(
         "fetched_at": datetime.now(timezone.utc).isoformat(),
     }
 
+    key = f"{s3_prefix}weekly/{run_date}/constituents.json"
+    cardinality = _grade_cardinality(previous, tickers, key=key)
+
     if dry_run:
         logger.info(
             "[dry-run] constituents: %d tickers (%d S&P500, %d S&P400), "
@@ -462,11 +550,11 @@ def collect(
             "status": "ok_dry_run",
             "count": len(tickers),
             "tickers": tickers,
+            "guards": [cardinality],
         }
 
     # Write to S3
     s3 = boto3.client("s3")
-    key = f"{s3_prefix}weekly/{run_date}/constituents.json"
     s3.put_object(
         Bucket=bucket,
         Key=key,
@@ -557,6 +645,7 @@ def collect(
         "sub_sector_etf_map_count": len(sub_sector_etf_map),
         "weight_map_count": len(weights.weight_map),
         "weight_method": weights.method,
+        "guards": [cardinality],
     }
 
 

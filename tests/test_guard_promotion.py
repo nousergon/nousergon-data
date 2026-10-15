@@ -93,7 +93,7 @@ def test_the_ruling_is_dated_and_cites_its_record():
 
 
 def test_the_required_units_come_from_the_descriptors_records_as(units):
-    assert gp.required_units(_by_name("data_cardinality"), units) == ["D20"]
+    assert gp.required_units(_by_name("data_cardinality"), units) == ["D01", "D02", "D20"]
     empty_fresh = gp.required_units(_by_name("data_empty_fresh"), units)
     assert len(empty_fresh) >= 20
     assert gp.required_units(_by_name("bar_settlement"), units) == ["D03", "D19"]
@@ -152,20 +152,32 @@ def _commissioned(unit_id: str, guard_class: str) -> dict[str, bytes]:
     }
 
 
+def _commissioned_all(promotion, units) -> dict[str, bytes]:
+    """A commissioning record for every unit the promotion requires."""
+    out: dict[str, bytes] = {}
+    for unit_id in gp.required_units(promotion, units):
+        out.update(_commissioned(unit_id, promotion.guard_class))
+    return out
+
+
 def _read(promotion, store, units, verdicts):
-    sets = [_cycle_set("D20", verdicts, guard=promotion.name, units=units)]
+    """The same latest-cycle verdicts for every unit the promotion requires."""
+    sets = [
+        _cycle_set(unit_id, verdicts, guard=promotion.name, units=units)
+        for unit_id in gp.required_units(promotion, units)
+    ]
     return gp.read_promotion(store, promotion, units, sets, trading_day=TRADING_DAY)
 
 
 def test_ready_but_observing_reads_unmet_and_says_ready(units):
     promotion = _by_name("data_cardinality")
-    reading = _read(promotion, EmptyStore(_commissioned("D20", "cardinality")), units, ["ok"])
+    reading = _read(promotion, EmptyStore(_commissioned_all(promotion, units)), units, ["ok"])
     assert not reading.met and reading.detail.startswith("READY TO PROMOTE")
 
 
 def test_promoted_on_evidence_is_met(units):
     promotion = dataclasses.replace(_by_name("data_cardinality"), mode="enforce")
-    reading = _read(promotion, EmptyStore(_commissioned("D20", "cardinality")), units, ["ok"])
+    reading = _read(promotion, EmptyStore(_commissioned_all(promotion, units)), units, ["ok"])
     assert reading.met and reading.detail.startswith("PROMOTED")
 
 

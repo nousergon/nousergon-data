@@ -32,28 +32,45 @@ lifecycle_reexam: "2026-10-27"
 lifecycle_reason: >-
     The producer module, its contract, an operator-run CLI and the collector's
     whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
-    alpha-engine-config-I10791). Not yet scheduled: `daily-panel` is not yet a
-    workload on the ne-data-collection-eod schedule, so the unit writes nothing
-    on a schedule. The write grant this waited on (collection-box role,
-    data_collection/panel/*) landed live 2026-10-12 via nous-ergon-ops-PR1668,
-    so the remaining gap is the schedule entry alone. Re-declared pending
-    2026-10-13 -> re-exam 2026-10-27 (pending_since + 14 days, the
-    PENDING_MAX_DAYS ceiling) on that changed reason; the previous window
-    (2026-10-06 -> 2026-10-20) named the grant as the blocker.
+    alpha-engine-config-I10791). SCHEDULED by alpha-engine-config-I10791's
+    schedule step: `daily-panel` runs on its own machine,
+    ne-data-collection-panel, which the rule ne-data-collection-panel-on-eod
+    starts when ne-data-collection-eod SUCCEEDS. D51 is that machine's only
+    verify_unit. The
+    collection-box write grant on data_collection/panel/ is
+    nous-ergon-ops-PR1668, applied 2026-10-12. The unit stays pending until a
+    scheduled run has published data_collection/panel/{trading_day}/manifest.json
+    for the latest session (promotes_when). Re-declared pending 2026-10-13 ->
+    re-exam 2026-10-27 (pending_since + 14 days, the PENDING_MAX_DAYS
+    ceiling); the previous window (2026-10-06 -> 2026-10-20) named the grant
+    as the blocker.
 lifecycle_owner: brian
 promotes_when: >-
     The EOD collection runs `weekly_collector.py --daily-panel` after the
     ArcticDB append and data_collection/panel/{trading_day}/manifest.json is
-    current for the latest session. Flip lifecycle to in-service and declare the
-    cadence in the same PR.
+    current for the latest session. The cadence is already declared (trigger
+    below), so the promotion PR flips lifecycle to in-service and drops the
+    pending dates.
 trigger:
-  kind: "manual"
+  kind: "step-functions"
+  # Its own machine, ne-data-collection-panel, started by the EventBridge rule
+  # ne-data-collection-panel-on-eod when ne-data-collection-eod SUCCEEDS
+  # (scheduled run or heal), so it runs after the D32 ArcticDB append it reads
+  # (infrastructure/cloudformation/nousergon-data-collection.yaml::PanelOnEodSucceededRule).
+  # It is deliberately NOT a workload of the EOD machine. The eod_pnl reconcile
+  # starts on that machine's terminal event, and the panel must neither delay
+  # nor gate it.
+  owner: "ne-data-collection-panel"
+  started_by: "eventbridge-rule:ne-data-collection-panel-on-eod"
+  successor: "ne-data-collection-panel (alpha-engine-config-I10791); no v1 predecessor, because v1 never published a panel"
+  # No `schedule:`. The machine is event-started, not cron-started, so
+  # data_gate/trigger_reconcile.py has no fire time to reconcile it against.
+  # In practice it starts when the weekday 18:15 America/New_York EOD
+  # collection, or a heal of it, SUCCEEDS. `on_demand: true` is the cadence
+  # shape data_gate/cadence.py offers an event-started unit. A missing day
+  # still surfaces through data.phase3.daily_panel_adopted.
+  on_demand: true
   runs_on: "ec2-spot"
-  detail: >-
-    NOT YET SCHEDULED. Operator-run in-region (`python weekly_collector.py
-    --daily-panel [--date <session>]`, or `python -m builders.daily_panel
-    publish --date <session>`); belongs on ne-data-collection-eod after the
-    universe append.
 writes:
   - "data_collection/panel/{trading_day}/panel.parquet"
   - "data_collection/panel/{trading_day}/manifest.json"
@@ -78,10 +95,14 @@ contract:
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D51
 detectors:
+  - kind: "sf-execution"
+    via: "ne-data-collection-panel"
+    state: PRESENT
+    note: "verify_units D51: a missing, failed or output-less D51 manifest fails the panel execution, which pages"
   - kind: "crucible-gate"
     via: "data.phase3.daily_panel_adopted (published leg)"
     state: ABSENT
-    note: "no freshness-monitor row until the unit is scheduled"
+    note: "no freshness-monitor row yet; the ARTIFACT_REGISTRY row is an alpha-engine-config companion"
 freshness:
   status: proposed
   ratified_at: "alpha-engine-config-I10791 (with the schedule)"
@@ -89,6 +110,14 @@ completeness:
   denominator: "every symbol in the ArcticDB universe library on the session"
   floor: 1.0
   status: proposed
+  # The parity receipt is written by the operator CLI
+  # (`python -m builders.daily_panel parity --consumer-panel ...`), never by the
+  # scheduled run, which publishes panel.parquet + manifest.json only. Without
+  # this the completion check failed every scheduled panel run with
+  # output_missing (first run, 2026-10-14). The receipt is graded by
+  # data.phase3.daily_panel_adopted's parity leg (data_gate/panel.py).
+  operator_writes:
+    - "data_collection/panel/{trading_day}/parity.json"
   note: >-
     Enforced IN THE PRODUCER: an empty per-ticker frame, a null or non-positive
     value, or no rows on the session raises before any write

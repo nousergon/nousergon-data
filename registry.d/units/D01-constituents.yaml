@@ -114,8 +114,21 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
-    note: "no floor against the prior week's ~900 (audit §4.1)"
+    state: present
+    code:
+      - "collectors/constituents.py::_grade_cardinality"
+    records_as: data_cardinality
+    note: >-
+        collect() grades every run before the PUT through _grade_cardinality:
+        validators/expectations.py::check_cardinality over the union of the previous snapshot's
+        roster (_load_previous_snapshot) and this one, the names in both as covered, at
+        D01_MEMBERSHIP_STABILITY_FLOOR (0.95, the declared week-over-week change <= 5%). Every
+        name that joined or left is named; no readable earlier snapshot is `unmeasurable`.
+        Filed on the manifest as guard `data_cardinality`. OBSERVE mode, staged on
+        validators/expectations.py::CARDINALITY_GUARD: logged at ERROR when not clean, never
+        changes the published roster or the exit code, and a grading fault is recorded rather
+        than raised (the same collect() runs pre-MorningEnrich every trading day). Not in
+        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: present
     code:
