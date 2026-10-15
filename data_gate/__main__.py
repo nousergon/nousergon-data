@@ -1,4 +1,4 @@
-"""`python -m data_gate read --gate data-phase<N> --store <uri> [--dry-run]`
+"""`python -m data_gate read --gate data-phase<N> [--gate <name> ...] --store <uri> [--dry-run]`
 and `python -m data_gate report --store <uri> [--dry-run]`
 and `python -m data_gate preserve-parity-evidence --store <uri> [--dry-run]`.
 
@@ -53,7 +53,21 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="data_gate", description=__doc__)
     sub = parser.add_subparsers(dest="command", required=True)
     reader = sub.add_parser("read", help="read a gate and publish the ladder")
-    reader.add_argument("--gate", required=True, choices=sorted(read_module.GATES))
+    reader.add_argument(
+        "--gate",
+        required=True,
+        action="append",
+        choices=sorted(read_module.GATES),
+        help=(
+            "the gate whose reading this invocation files and exits on. Repeatable: "
+            "`--gate A --gate B` reads A then B in ONE process over ONE store, so "
+            "every S3 object and listing both readings share is fetched once "
+            "(alpha-engine-config-I11792). Each reading is taken and published "
+            "exactly as a separate `--gate` invocation would take it, in the order "
+            "given, and the sequence stops at the first that a separate step would "
+            "have stopped the workflow on."
+        ),
+    )
     reader.add_argument(
         "--store",
         required=True,
@@ -191,7 +205,49 @@ def resolve_trading_day(value: "str | None", *, today: dt.date) -> dt.date:
     return dt.date.fromisoformat(value)
 
 
+def _gates(args) -> list[str]:
+    """``--gate`` as a list, in the order given; a repeated name is refused.
+
+    A string (one ``--gate`` built by hand, as some callers construct the
+    namespace) is one gate.
+    """
+    gates = [args.gate] if isinstance(args.gate, str) else list(args.gate)
+    repeated = sorted({g for g in gates if gates.count(g) > 1})
+    if repeated:
+        raise SystemExit(
+            f"data_gate: --gate {repeated} given more than once; each gate's reading is filed once"
+        )
+    return gates
+
+
 def _read_command(args) -> int:
+    """Read every ``--gate``, in order, in this one process.
+
+    **One process, one store, every reading** (alpha-engine-config-I11792).
+    `data-gate.yml` used to start six processes, one per gate. Every one of
+    them evaluated the WHOLE board (`read.run` builds every gate's reading
+    from one clause list), so each re-LISTed the same ~2k prefixes and
+    re-downloaded the same objects, including the 33.5 MB parity adjudication
+    record: six times per run. `S3Store`'s memo is per instance, so sharing
+    one store across the readings is what makes "each object once" hold for
+    the whole run rather than for each sixth of it.
+
+    The readings themselves are unchanged. Each gate still gets its own
+    `read.run` — a fresh clause generation, its own dated `gate.json`, the
+    ladder and board rewritten after it — in the order the separate steps ran.
+    A reading that follows a write still sees that write: `S3Store.put_bytes`
+    drops the memo entry for the key and every memoised listing covering it,
+    so `data.gate.ladder_fresh` reads the ladder the previous reading just
+    published and `data.phase3.sustained_window` reads `data-phase3`'s dated
+    key as published, exactly as the next process used to.
+
+    The exit code is what the LAST step to run would have produced: a reading
+    that could not be taken exits 2 and stops the sequence (a failed step
+    skipped every later one), and so does an UNMET reading under
+    `--fail-on-unmet` (exit 1). Every reading taken before the stop is
+    already published, as it was.
+    """
+    gates = _gates(args)
     trading_day = resolve_trading_day(
         args.trading_day, today=dt.datetime.now(dt.timezone.utc).date()
     )
@@ -201,25 +257,29 @@ def _read_command(args) -> int:
         artifact_registry=args.artifact_registry,
         github_token=os.environ.get(GITHUB_TOKEN_ENV) or None,
     )
-    try:
-        result, _ladder, board = read_module.run(
-            store,
-            gate=args.gate,
-            trading_day=trading_day,
-            dry_run=args.dry_run,
-            trigger=getattr(args, "trigger", "manual"),
-        )
-    except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
-        # Deliberate, and narrow in effect: the failure mode is "the measurement
-        # could not be taken at all"; nothing is published, so no reader can
-        # mistake this for a reading; and the recording surface is stderr plus
-        # exit code 2, which is distinct from the gate saying no.
-        print(f"data_gate: the measurement failed: {type(exc).__name__}: {exc}", file=sys.stderr)
-        return EXIT_UNMEASURED
-    print(read_module.render(result, board, dry_run=args.dry_run))
-    if result.met:
-        return EXIT_MET
-    return EXIT_NOT_MET if args.fail_on_unmet else EXIT_MET
+    for gate in gates:
+        try:
+            result, _ladder, board = read_module.run(
+                store,
+                gate=gate,
+                trading_day=trading_day,
+                dry_run=args.dry_run,
+                trigger=getattr(args, "trigger", "manual"),
+            )
+        except Exception as exc:  # noqa: BLE001 - classified into exit 2, never swallowed
+            # Deliberate, and narrow in effect: the failure mode is "the measurement
+            # could not be taken at all"; nothing is published for THIS gate, so no
+            # reader can mistake this for a reading; and the recording surface is
+            # stderr plus exit code 2, which is distinct from the gate saying no.
+            print(
+                f"data_gate: the measurement failed ({gate}): {type(exc).__name__}: {exc}",
+                file=sys.stderr,
+            )
+            return EXIT_UNMEASURED
+        print(read_module.render(result, board, dry_run=args.dry_run))
+        if not result.met and args.fail_on_unmet:
+            return EXIT_NOT_MET
+    return EXIT_MET
 
 
 def _report_command(args) -> int:
