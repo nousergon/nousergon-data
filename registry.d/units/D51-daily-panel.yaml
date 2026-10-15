@@ -110,6 +110,14 @@ completeness:
   denominator: "every symbol in the ArcticDB universe library on the session"
   floor: 1.0
   status: proposed
+  # The parity receipt is written by the operator CLI
+  # (`python -m builders.daily_panel parity --consumer-panel ...`), never by the
+  # scheduled run, which publishes panel.parquet + manifest.json only. Without
+  # this the completion check failed every scheduled panel run with
+  # output_missing (first run, 2026-10-14). The receipt is graded by
+  # data.phase3.daily_panel_adopted's parity leg (data_gate/panel.py).
+  operator_writes:
+    - "data_collection/panel/{trading_day}/parity.json"
   note: >-
     Enforced IN THE PRODUCER: an empty per-ticker frame, a null or non-positive
     value, or no rows on the session raises before any write
