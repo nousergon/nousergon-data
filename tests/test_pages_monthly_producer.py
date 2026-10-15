@@ -258,6 +258,15 @@ def test_budget_is_the_plans_two_pages(pages, status):
     assert doc["vendor_outage_exclusions"]["excluded_pages"] == 0
 
 
+def _fresh_document(reading: m.MonthReading) -> dict:
+    # The clause reads `stale_after_utc` against the WALL clock (evidence.py's
+    # opt-in staleness rule, alpha-engine-config-I10789): a document built at a
+    # fixed past instant reads UNMEASURABLE once its 50 h horizon passes. Build
+    # the documents the clause tests read as of now, so they test the verdict,
+    # not the calendar.
+    return m.build_document(reading, now=dt.datetime.now(UTC))
+
+
 def _clause_over(tmp_path, document):
     target = tmp_path / "metrics" / "pages" / "monthly" / "latest.json"
     target.parent.mkdir(parents=True)
@@ -269,7 +278,7 @@ def test_the_clause_reads_an_ok_month_as_a_partial_window(tmp_path):
     # data.pages.monthly is a STANDING row (alpha-engine-config-I11305): the
     # ratified target is the whole calendar month, so an `ok` document that has
     # observed 5 of 31 days is reported, not rendered MET.
-    clause = _clause_over(tmp_path, m.build_document(_reading_with(1), now=NOW))
+    clause = _clause_over(tmp_path, _fresh_document(_reading_with(1)))
     assert isinstance(clause, clause_module.StandingClause)
     assert not clause.met and not clause.unmeasurable
     assert "5 of 31 day(s) of the month observed" in clause.detail
@@ -289,7 +298,7 @@ def test_the_clause_reads_a_complete_ok_month_as_met(tmp_path):
         pages=[m.PageEvent("2026-10-01T01:00:00Z", "execution_failed_alarm", "s", "e0")],
         complete=True,
     )
-    document = m.build_document(reading, now=dt.datetime(2026, 11, 1, 22, 0, tzinfo=UTC))
+    document = _fresh_document(reading)
     assert document["status"] == "ok"
     assert document["days_observed"] == 31 and document["days_in_month"] == 31
     clause = _clause_over(tmp_path, document)
@@ -299,7 +308,7 @@ def test_the_clause_reads_a_complete_ok_month_as_met(tmp_path):
 
 
 def test_the_clause_reads_an_over_budget_month_as_reopened(tmp_path):
-    clause = _clause_over(tmp_path, m.build_document(_reading_with(3), now=NOW))
+    clause = _clause_over(tmp_path, _fresh_document(_reading_with(3)))
     # A standing row carries the document's own breach verdict verbatim.
     assert not clause.met and not clause.unmeasurable
     assert "status=breach, value=3" in clause.detail
