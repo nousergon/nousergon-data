@@ -59,11 +59,13 @@ import json
 import logging
 import pathlib
 import re
+import types
 from dataclasses import dataclass
 
 import pandas as pd
 import pytest
 from botocore.exceptions import ClientError
+from nousergon_lib import run_manifest
 from nousergon_lib.guard_mode import GuardMode, GuardStaging
 
 import run_units
@@ -84,11 +86,39 @@ GUARD_CLASS = "empty_fresh"
 WORKLOAD = "post-market-data"
 BUCKET = "alpha-engine-research"
 
-#: The trading day is TODAY (UTC) rather than a fixed date: the completion
-#: check lists manifests from ``started_at - MANIFEST_LOOKBACK_DAYS`` onward and
-#: requires ``finished >= started_at``, both against wall-clock stamps the
-#: wrapper writes. A fixed past date would grade an empty window.
-TRADING_DAY = dt.datetime.now(dt.timezone.utc).date().isoformat()
+#: When the harness's first execution starts: the EOD schedule's 18:15 ET
+#: trigger on a trading day. Every stamp the record is graded on comes from
+#: :class:`HarnessClock`, never the wall clock, so the record reads the same on
+#: any day and at any hour it is taken.
+EOD_START = dt.datetime(2026, 10, 15, 22, 15, tzinfo=dt.timezone.utc)
+TRADING_DAY = EOD_START.date().isoformat()
+
+
+class HarnessClock:
+    """The one clock every run manifest and execution start in this file reads.
+
+    The completion check takes the lexically greatest manifest key as a unit's
+    newest run, and that key is a ULID: a millisecond timestamp, then 80 random
+    bits. Read off the wall clock, the faulted retry and the recovery run started
+    1-2 ms apart on a CI-class box, and on a faster one in the SAME millisecond,
+    where the random bits decided which was "newest". When they picked the
+    retry, the recovery graded the refused run (`run_not_ok`) and failed — a
+    random subset of units on each run (alpha-engine-config-I10786, 2026-10-15).
+    In production the two are separate box launches minutes apart.
+
+    Each read advances one second, so every run starts strictly after the last
+    one finished, and the manifest's whole-second ``finished`` stamp never
+    reads earlier than the execution start it is graded against.
+    """
+
+    STEP = dt.timedelta(seconds=1)
+
+    def __init__(self, start: dt.datetime) -> None:
+        self._now = start
+
+    def now(self) -> dt.datetime:
+        self._now += self.STEP
+        return self._now
 
 
 @dataclass(frozen=True)
@@ -276,6 +306,22 @@ def _environment(monkeypatch):
     completion.reset_unit_cache()
 
 
+@pytest.fixture(autouse=True)
+def clock(monkeypatch) -> HarnessClock:
+    """Stamp every run manifest from :class:`HarnessClock` (the wrapper's only clock reads)."""
+    harness_clock = HarnessClock(EOD_START)
+
+    class _HarnessDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return harness_clock.now().astimezone(tz) if tz else harness_clock.now()
+
+    monkeypatch.setattr(
+        run_manifest, "dt", types.SimpleNamespace(datetime=_HarnessDatetime, timezone=dt.timezone)
+    )
+    return harness_clock
+
+
 @pytest.fixture
 def s3(monkeypatch) -> InMemoryS3:
     store = InMemoryS3()
@@ -429,7 +475,8 @@ class Execution:
         self.attempts: list[dict] = []
         self.pages: list[str] = []
         self.path: list[str] = []
-        self.started_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        # The same clock the manifests are stamped by (the `clock` fixture).
+        self.started_at = run_manifest.dt.datetime.now(dt.timezone.utc)
 
     def tasks(self, name: str, state: dict, data: dict):
         resource = state["Resource"]
@@ -518,7 +565,9 @@ def test_the_fault_record_empty_frame_fails_pages_once_and_stands_down(case, s3,
     assert recovered.path[-1] == "CollectionSucceeded"
     assert recovered.pages == []
     assert recovered.completion["ok"] is True
-    assert s3.manifests(case)[-1]["status"] == "ok"
+    # Keys list in run order (HarnessClock), so the completion check's
+    # "newest" is the recovery run, not whichever ULID drew higher random bits.
+    assert [m["status"] for m in s3.manifests(case)] == ["failed", "failed", "ok"]
     assert s3.marker(case)["status"] == "ok"
 
     _print_record(case, faulted, recovered, s3, marker_after_fault)
