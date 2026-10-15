@@ -131,6 +131,14 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # applied and a scheduled run first writes the key — the same posture
     # cost_monthly.py took — then re-evaluated for a REGISTERED row.
     "data_gate/producers/trigger_observation.py": 1,
+    # alpha-engine-config-I10788 A9 (plan P-22) - the data.pages.monthly
+    # producer: one PUT call site writing data_collection/metrics/pages/monthly/
+    # latest.json (plus, on days 1-3 of a month, the closed previous month as
+    # {YYYY-MM}.json under the same prefix), plus the shared _run_record.py PUT.
+    # Needs a grandfathered_paths row for data_collection/metrics/pages/monthly/
+    # in alpha-engine-config/private-docs/ARTIFACT_REGISTRY.yaml before it is
+    # scheduled, like trigger_observation.py; REGISTERED once a run first writes.
+    "data_gate/producers/pages_monthly.py": 1,
     # alpha-engine-config-I10789 (P-22) — the SLO emitter: ONE `put_bytes`
     # site (the PUT is routed through `data_gate.store`, so the run record via
     # `_StoreS3Adapter.put_object` is not a direct boto3 site) writing the
