@@ -363,7 +363,7 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
     prefix = str(raw["run_manifest_prefix"])
     row = {"unit": unit_id, "manifest": None, "status": None, "keys_checked": 0,
            "unverifiable": [], "auto_skipped": False, "floor": None, "conditional_skipped": [],
-           "carried_forward_from": None}
+           "operator_skipped": [], "carried_forward_from": None}
     key, doc = _newest_manifest(s3, prefix, started_at)
     if doc is not None and _is_same_date_noop(doc):
         real_key, real_doc = _carry_forward_same_date_noop(s3, prefix, key, doc)
@@ -436,6 +436,21 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
         g.get("guard") == EMPTY_FRESH_GUARD_RECORDED_NAME and g.get("verdict") == "empty_fresh"
         for g in (doc.get("guards") or [])
     )
+    # `completeness.operator_writes` (D51 parity receipt): a `writes:` template
+    # an operator-run CLI publishes, which the scheduled run NEVER writes. It
+    # stays under `writes:` so the key is declared and owned, but a per-run
+    # completion check that required it fails (and pages) every scheduled run.
+    # The receipt is graded where it is consumed (D51: data_gate/panel.py
+    # parity leg), not here. An entry that is not also under `writes:` is a
+    # descriptor error, never a silent no-op.
+    operator = {str(w) for w in (raw.get("completeness") or {}).get("operator_writes") or []}
+    stray = operator - {str(w) for w in raw.get("writes") or []}
+    if stray:
+        raise ValueError(
+            f"{unit_id}: completeness.operator_writes names {sorted(stray)}, which are not "
+            f"under writes:. An exemption for a key the unit does not declare exempts nothing "
+            f"and hides a typo."
+        )
 
     findings: list[dict] = []
     for template in raw.get("writes") or []:
@@ -446,6 +461,9 @@ def _check_unit(s3, unit_id: str, raw: dict, started_at) -> tuple[list[dict], di
         row["keys_checked"] += 1
         matched = [o for o in outputs if pattern.match(str(o.get("key") or ""))]
         if not matched:
+            if str(template) in operator:
+                row["operator_skipped"].append(str(template))
+                continue
             if auto_skipped:
                 continue
             if str(template) in conditional and measured_zero:
