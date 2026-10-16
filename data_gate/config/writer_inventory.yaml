@@ -214,6 +214,12 @@ shared_writers:
   - path: features/gen_schema_md.py
     parent_units: [D12]
     reason: Regenerates SCHEMA.md from CATALOG; a build tool for the contract, not a unit.
+  - path: features/gen_parquet_contract.py
+    parent_units: [D31]
+    reason: >-
+      Regenerates contracts/features_parquet.schema.json from CATALOG
+      (alpha-engine-config-I10793); a build tool for the contract D31/D50
+      publish under, not a unit. Its one write is the committed local file.
   - path: builders/_price_cache_writeboth.py
     parent_units: [D03]
     reason: The price-cache dual-write helper.

@@ -54,19 +54,29 @@ consumers_reason: >-
 contract:
   schema:
     - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+    - "contracts/features_parquet.schema.json"
   producer_test:
     - tests/test_features_settled_regrade.py
     - tests/test_schema_contract.py
-  # D31's only body_schema pin is on features/registry.json, which D50 never
-  # writes, so it is not reused here. The parquet readers below have no pinned
-  # contract file of their own (same as D31's parquet half); they render as a
-  # finding until one exists.
-  unpinned_consumers:
-    - "crucible-research:scoring/factor_scoring.py"
-    - "crucible-dashboard:views/13_Feature_Store.py"
+    - tests/test_features_parquet_contract.py
   # The rebuilt bytes come from the SAME serialiser D31 publishes through
-  # (features/writer.py::snapshot_group_frames), so D31's per-column contract
-  # covers them.
+  # (features/writer.py::snapshot_group_frames), so D31's per-column contract,
+  # contracts/features_parquet.schema.json (generated from CATALOG,
+  # alpha-engine-config-I10793), covers them, and both parquet readers pin a
+  # copy of it. D31's other pin, on features/registry.json, is not reused:
+  # D50 never writes that file (features/settled_regrade.py
+  # FORBIDDEN_WRITE_SUFFIXES).
+  consumer_pins:
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/features_parquet.schema.json"
+      pins: "body_schema"
+      producer: "contracts/features_parquet.schema.json"
+      read_site: "views/13_Feature_Store.py::_load_parquet"
+    - repo: "crucible-research"
+      path: "tests/contracts/features_parquet.schema.json"
+      pins: "body_schema"
+      producer: "contracts/features_parquet.schema.json"
+      read_site: "scoring/factor_scoring.py::_resolve_group_snapshot"
 registry_rows:
   - feature_store_freshness_sentinel
 run_manifest_prefix: data_collection/runs/D50
