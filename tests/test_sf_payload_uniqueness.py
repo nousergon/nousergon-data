@@ -115,6 +115,18 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "observer_execution_arn.$",
         }
     ),
+    # alpha-engine-config-I11111: the same Lambda, called from the degraded
+    # terminal path. The payload is byte-identical to the clean path's, so the
+    # Lambda needs no change and no deploy.
+    "WeeklyCoverageSweepDegraded": frozenset(
+        {
+            "run_date.$",
+            "calendar_date.$",
+            "dry_run.$",
+            "state_machine_arn.$",
+            "observer_execution_arn.$",
+        }
+    ),
     # alpha-engine-config-I8809: the weekly graph's ONE date normalization —
     # calendar date in, cycle trading day out. Reuses alpha-engine-weekly-preflight
     # rather than adding a function, because a new Lambda needs an IAM role
