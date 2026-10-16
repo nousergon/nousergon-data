@@ -291,7 +291,12 @@ class TestMutexWiring:
         # workload gate; its skip-default + gate-default converge on
         # CheckMutexRole — the mutex still sits between entry and the
         # former-first-state, one gate further down.
-        assert saturday_sf["States"]["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # alpha-engine-config-I12351: the rehearsal-marker hop sits between
+        # InitializeInput and the run-day gate; both namespace branches rejoin it.
+        assert saturday_sf["States"]["InitializeInput"]["Next"] == "ReadRehearsalMarker"
+        assert saturday_sf["States"]["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
+        for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
+            assert saturday_sf["States"][_ns]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
         # gate and CheckRunMode — the graph's ONE date normalization, on every path

@@ -312,7 +312,10 @@ class TestSkipEvalJudge:
         assert choice["Next"] != "SaturdayHealthCheck"
 
     def test_default_runs_eval(self, states):
-        assert states["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
+        # alpha-engine-config-I12351: via the rehearsal date pin, whose
+        # Default is ComputeEvalCadence for every non-rehearsal execution.
+        assert states["CheckSkipEvalJudge"]["Default"] == "CheckEvalCadenceRehearsal"
+        assert states["CheckEvalCadenceRehearsal"]["Default"] == "ComputeEvalCadence"
 
 
 # ── Cadence computation ───────────────────────────────────────────────────

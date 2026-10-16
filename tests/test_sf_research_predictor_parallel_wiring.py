@@ -102,6 +102,8 @@ _BRANCH_A_STATES = {
     "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
     "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
     "ComputeEvalCadence", "CheckMonthlyCadence",
+    # alpha-engine-config-I12351: rehearsal-only eval-date pin.
+    "CheckEvalCadenceRehearsal", "ComputeEvalCadenceRehearsal",
     "EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly",
     # alpha-engine-config-I9329: the four EvalJudgePoll* states were deleted
     # with the provider batch API they existed to drive, and EvalJudgeProcess
@@ -327,7 +329,9 @@ class TestBranchAContents:
         ]
         assert len(success_arm) == 1
         assert success_arm[0]["Next"] == "CheckSkipEvalJudge"
-        assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
+        # alpha-engine-config-I12351: through the rehearsal date pin.
+        assert branch_a["CheckSkipEvalJudge"]["Default"] == "CheckEvalCadenceRehearsal"
+        assert branch_a["CheckEvalCadenceRehearsal"]["Default"] == "ComputeEvalCadence"
 
     def test_data_phase2_poll_loop_is_bounded(self, branch_a):
         """alpha-engine-config-I5687: a poll loop added AFTER that finding

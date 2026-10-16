@@ -701,7 +701,12 @@ class TestStrictSuperset:
         # IsPresent branch / Default both still ultimately reach CheckShellRun
         # (immediately, or after the dispatch+bootstrap-poll chain), so the
         # strict-superset property is preserved one gate further down.
-        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # alpha-engine-config-I12351: the rehearsal-marker hop sits between
+        # InitializeInput and the run-day gate; both namespace branches rejoin it.
+        assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
+        assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
+        for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
+            assert states[_ns]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         # alpha-engine-config-I8809: NormalizeRunDates (+ ApplyNormalizedRunDate)
         # sit between the run-day gate and CheckRunMode — the graph's ONE date
@@ -1511,6 +1516,11 @@ class TestHappyPathTraversal:
         # poll-budget seed).
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            # alpha-engine-config-I12351: the rehearsal-marker hop; a
+            # production execution name takes the empty-namespace branch.
+            "ReadRehearsalMarker",
+            "CheckRehearsalMarker",
+            "ApplyProductionNamespace",
             "CheckWeeklyRunDayGate",
             # alpha-engine-config-I8809: the graph's ONE date normalization.
             "NormalizeRunDates",

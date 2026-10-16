@@ -51,7 +51,12 @@ class TestCronSchedule:
 
 class TestGateRouting:
     def test_initialize_input_routes_to_gate_choice(self, states):
-        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # alpha-engine-config-I12351: the rehearsal-marker hop sits between
+        # InitializeInput and the run-day gate; both namespace branches rejoin it.
+        assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
+        assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
+        for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
+            assert states[_ns]["Next"] == "CheckWeeklyRunDayGate"
 
     def test_skip_flag_defaulted_false(self, states):
         merged = states["InitializeInput"]["Parameters"]["merged.$"]

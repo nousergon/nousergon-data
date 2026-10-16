@@ -138,12 +138,14 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
-    "Scanner": frozenset({"dry_run_llm.$", "run_date.$"}),
+    # alpha-engine-config-I12351: execution_name.$ carries the rehearsal marker
+    # (execution-name prefix) into the Lambdas that write live pointers.
+    "Scanner": frozenset({"dry_run_llm.$", "run_date.$", "execution_name.$"}),
     # alpha-engine-config-I7813: the same scanner Lambda, invoked as a
     # post-Director leaf with an explicit `mode` so it builds ONLY the
     # observe-only scanner/leaderboard board. The literal `mode` is what
     # keeps this payload distinct from Scanner's above.
-    "ScannerLeaderboard": frozenset({"dry_run_llm.$", "run_date.$", "mode"}),
+    "ScannerLeaderboard": frozenset({"dry_run_llm.$", "run_date.$", "mode", "execution_name.$"}),
     "RegimeSubstrate": frozenset({"action.$", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     "RegimeRetrospectiveEval": frozenset({"action.$", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     # alpha-engine-config-I2515 Phase B: replaces the removed multi-agent
@@ -153,7 +155,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # fallback-staleness guard to a WARN (the dry Scanner leaves the dated board
     # absent every Friday). DISTINCT from dry_run_llm — the read/build/write
     # path still runs; only the expected-stale-fallback bound is relaxed.
-    "SignalsEnvelope": frozenset({"run_date.$", "target", "preflight.$"}),
+    "SignalsEnvelope": frozenset({"run_date.$", "target", "preflight.$", "execution_name.$"}),
     # alpha-engine-config-I2515 Phase B: keeps the no_agent champion-baseline
     # shadow alive for the producer leaderboard post graph-runner removal.
     "ChallengerShadow": frozenset({"mode", "date.$"}),
