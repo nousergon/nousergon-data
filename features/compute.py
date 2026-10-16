@@ -2021,6 +2021,7 @@ def compute_and_write(
             )
 
     supplemental_written: dict[str, int] = {}
+    registry_written = 0
     if dry_run:
         log.info(
             "[dry-run] Would write feature snapshot: %d tickers, %d features, date=%s",
@@ -2037,7 +2038,7 @@ def compute_and_write(
             date_str, features_df, bucket,
             prefix=FEATURE_STORE_PREFIX,
         )
-        upload_registry(bucket, prefix=FEATURE_STORE_PREFIX)
+        registry_written = upload_registry(bucket, prefix=FEATURE_STORE_PREFIX)
 
         # Write schema version alongside snapshot for training consistency checks
         _schema_content = json.dumps({"features": FEATURES, "config": FEATURE_CFG}, sort_keys=True)
@@ -2115,6 +2116,10 @@ def compute_and_write(
         # (compute/write failure) — the caller's only truthful source of
         # whether `features/metron_supplemental/` was actually written this run.
         "metron_supplemental_written": supplemental_written,
+        # alpha-engine-config-I10793: catalog entries in the features/registry.json
+        # this run uploaded (0 on a dry run). The caller records the key in the
+        # run manifest's outputs[] from this, never from the descriptor.
+        "registry_written": registry_written,
         "load_seconds": round(t_load, 1),
         "compute_seconds": round(t_compute, 1),
         # alpha-engine-config-I11203: folded onto the run manifest's `inputs`

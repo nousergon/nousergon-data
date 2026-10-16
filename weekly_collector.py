@@ -668,6 +668,23 @@ def _feature_group_extra_outputs(run_date: str) -> tuple[tuple[str, object, obje
     )
 
 
+def _feature_registry_extra_output() -> tuple[str, object, object]:
+    """``features/registry.json``, recorded only when this run uploaded it.
+
+    alpha-engine-config-I10793: ``features/compute.py::compute_and_write`` has
+    always uploaded the catalog registry on every non-dry run, but the manifest
+    never listed it, so D31/D12 could not declare the key and its contract
+    (``contracts/feature_registry.schema.json``) was unreachable from any key
+    they write. Read from the result's own ``registry_written`` (the catalog
+    entry count ``upload_registry`` returns), never assumed from the descriptor.
+    """
+    return (
+        "features/registry.json",
+        lambda r: bool(r.get("registry_written")),
+        lambda r: r.get("registry_written") or 0,
+    )
+
+
 def _prices_extra_outputs(s3_prefix: str) -> tuple[tuple[object, object, object], ...]:
     """The per-ticker price-cache parquet keys ``collectors/prices.py::collect``
     actually uploaded THIS run, each with its own row count
@@ -2454,7 +2471,7 @@ def _run_phase1(config: dict, args: argparse.Namespace) -> dict:
             # alpha-engine-config-I10855: D12 declares 5 real parquet keys under
             # `features/{date}/` (D12 does not declare the metron_supplemental
             # prefix — that is D31's daily call below).
-            extra_outputs=_feature_group_extra_outputs(run_date),
+            extra_outputs=_feature_group_extra_outputs(run_date) + (_feature_registry_extra_output(),),
         )
 
     # ── 8. ArcticDB universe rebuild ─────────────────────────────────────────
@@ -5106,6 +5123,7 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
         # one group parquet or a non-empty sectors map (`{"sectors": 0}` alone
         # is that early-return sentinel, never a real write).
         extra_outputs=_feature_group_extra_outputs(run_date) + (
+            _feature_registry_extra_output(),
             (
                 f"features/metron_supplemental/{run_date}/sectors.json",
                 lambda r: bool(

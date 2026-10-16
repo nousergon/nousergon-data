@@ -250,6 +250,15 @@ def validate_feature_registry(data: dict) -> list[str]:
     return _validate(data, "feature_registry")
 
 
+def validate_features_parquet(data: dict) -> list[str]:
+    """Validate one day's feature snapshot, as ``{group: [row, ...]}`` built from
+    features/{date}/{group}.parquet (features/writer.py::snapshot_group_frames,
+    D31/D50). Generated from CATALOG by features/gen_parquet_contract.py.
+    Consumers: crucible-research scoring/factor_scoring.py and crucible-dashboard
+    views/13_Feature_Store.py, each pinning a copy (alpha-engine-config-I10793)."""
+    return _validate(data, "features_parquet")
+
+
 def validate_fundamentals_snapshot(data: dict) -> list[str]:
     """Validate archive/fundamentals/{date}.json (collectors/fundamentals.py::collect,
     D10). Consumer: crucible-dashboard health_checker.py (`archive/fundamentals/`
