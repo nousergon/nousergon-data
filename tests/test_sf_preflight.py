@@ -1570,6 +1570,12 @@ def test_bypass_rules_match_the_sf_rule_for_rule():
     for rule in rules:
         if rule["Next"] != "PredictorTrainingSkipped":
             continue
+        if "$.rehearsal_marker." in json.dumps(rule):
+            # alpha-engine-config-I12351: the rehearsal-only rule keys on the
+            # execution-name marker, not on any input flag, so there is no
+            # skip claim for the preflight to grade (a rehearsal input never
+            # carries skip_predictor_training) and production never matches it.
+            continue
         cond = _sf_choice_conditions(rule)
         assert cond.pop("skip_predictor_training") is True
         sf_bypasses.add(frozenset(cond.items()))

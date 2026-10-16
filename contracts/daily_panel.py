@@ -114,8 +114,9 @@ class PanelConsumer:
     * ``read_site`` — ``path::Symbol`` of the class that reads the published
       panel; it must exist on the consumer's default branch.
     * ``entrypoint`` — ``path::function`` of the job whose direct compile the
-      panel replaces. After the switch its body references ``read_site``'s
-      symbol and NONE of ``direct_compile_names``: the old path is removed, not
+      panel replaces. After the switch its module references ``read_site``'s
+      symbol, and neither its body nor any module-level function it reaches
+      references ANY of ``direct_compile_names``: the old path is removed, not
       left beside the new one as a silent second implementation.
     """
 
