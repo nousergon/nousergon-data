@@ -63,9 +63,20 @@ contract:
       pins: "body_schema"
       producer: "contracts/metron_fx_history.schema.json"
       read_site: "api/services/prices.py"
-registry_rows: []
+registry_rows:
+  - metron_close_history_consolidated
 run_manifest_prefix: data_collection/runs/D21
-detectors: []
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        metron_close_history_consolidated (eod_sf, the consolidated.json this unit writes)
+        is a live, un-parked row on the published registry the freshness monitor enforces;
+        declared here so the monthly threshold-tightening drill
+        (data_gate/producers/freshness_commissioning.py, alpha-engine-config-I10795)
+        commissions it. The per-symbol close_history/fx_history keys have no row of their
+        own. UNVERIFIED until that drill writes the receipt.
 freshness:
   family: "eod-spine"
   # The family's worst-case write bound, by the same rule the weekly family

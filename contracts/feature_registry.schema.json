@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "nousergon-data/contracts/feature_registry.schema.json",
   "title": "Feature catalog registry (features/registry.json, D12)",
-  "description": "Producer: features/registry.py::generate_registry_json/upload_registry, a serialization of CATALOG (list[FeatureEntry]). Consumer: crucible-dashboard views/13_Feature_Store.py::_load_registry (data-collector plan P-07, alpha-engine-config-I10870, D12). The per-COLUMN contract for features/{date}/*.parquet remains features/registry.py::CATALOG <-> features/SCHEMA.md \u00a73 (tests/test_schema_contract.py) \u2014 this schema covers only the SEPARATE S3-published registry.json artifact the dashboard actually GETs, which had no versioned JSON Schema of its own before this PR.",
+  "description": "Producer: features/registry.py::generate_registry_json/upload_registry, a serialization of CATALOG (list[FeatureEntry]), written by D31 (and retired D12) on every non-dry run. Consumer: crucible-dashboard views/13_Feature_Store.py::_load_registry (data-collector plan P-07, alpha-engine-config-I10870, D12). This schema covers ONLY the S3-published registry.json artifact. The per-COLUMN contract for features/{date}/*.parquet is contracts/features_parquet.schema.json, generated from the same CATALOG (alpha-engine-config-I10793), which also carries the parquet keys' x-key-pattern and x-settling-bar.",
   "type": "object",
   "additionalProperties": true,
   "required": [
@@ -64,17 +64,5 @@
       }
     }
   },
-  "x-settling-bar": {
-    "basis": "key_date",
-    "rationale": "Ticker-indexed and dated by the path segment, same shape as staging/daily_closes: every indicator in features/{date}/*.parquet reads the last bar, so on a same-day run the whole file is a derivation of the unsettled session (24,961 technical / 3,328 interaction / 508 alternative / 4 macro breaches measured on 2026-09-21). Graded as settling only when the key names the report's trading_day — features/metron_supplemental/ carries no date and is never settling (alpha-engine-config-I11351)."
-  },
-  "x-key-pattern": [
-    "features/{date}/technical.parquet",
-    "features/{date}/fundamental.parquet",
-    "features/{date}/interaction.parquet",
-    "features/{date}/macro.parquet",
-    "features/{date}/alternative.parquet",
-    "features/{date}/*.parquet",
-    "features/metron_supplemental/"
-  ]
+  "x-key-pattern": "features/registry.json"
 }

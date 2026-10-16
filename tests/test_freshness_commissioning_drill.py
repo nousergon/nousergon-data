@@ -252,6 +252,58 @@ def test_not_due_touches_no_aws(monkeypatch, capsys):
     assert "not due" in capsys.readouterr().out
 
 
+def _utc(*args):
+    return dt.datetime(*args, tzinfo=dt.timezone.utc)
+
+
+def test_schedule_hour_matches_the_workflow_cron():
+    cron = yaml.safe_load(WORKFLOW.read_text())[True]["schedule"][0]["cron"]
+    minute, hour, *_rest = cron.split()
+    assert (minute, int(hour)) == ("0", drill.SCHEDULE_UTC_HOUR)
+
+
+@pytest.mark.parametrize(
+    "started, session",
+    [
+        (_utc(2026, 11, 2, 22, 0), dt.date(2026, 11, 2)),  # on time
+        (_utc(2026, 11, 2, 23, 59), dt.date(2026, 11, 2)),  # late, same UTC day
+        (_utc(2026, 11, 3, 0, 7), dt.date(2026, 11, 2)),  # past 00:00Z (10-16 start)
+        (_utc(2026, 11, 3, 2, 53), dt.date(2026, 11, 2)),  # 10-13 start
+        (_utc(2026, 11, 3, 5, 0), dt.date(2026, 11, 2)),  # 5h late
+        (_utc(2026, 11, 3, 21, 59), dt.date(2026, 11, 2)),  # ~24h late is still that fire
+        (_utc(2026, 11, 3, 22, 0), dt.date(2026, 11, 3)),  # next fire
+    ],
+)
+def test_late_start_keeps_its_scheduled_date(started, session):
+    assert drill.scheduled_session_date(started) == session
+
+
+def _run_only_if_due(monkeypatch, capsys, started):
+    monkeypatch.setattr(drill, "_now", lambda: started)
+    monkeypatch.setitem(sys.modules, "boto3", None)  # past the gate, boto3 import raises
+    try:
+        code = drill.main(["--only-if-due"])
+    except ImportError:
+        return "due", capsys.readouterr().out
+    return ("skipped" if code == 0 else f"exit {code}"), capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "started, verdict",
+    [
+        (_utc(2026, 11, 2, 22, 0), "due"),
+        (_utc(2026, 11, 3, 0, 7), "due"),  # the delayed-past-midnight case
+        (_utc(2026, 11, 3, 4, 59), "due"),
+        (_utc(2026, 11, 2, 0, 30), "skipped"),  # Nov 1 (Sunday) fire, started late
+        (_utc(2026, 11, 3, 22, 5), "skipped"),  # second session's fire
+        (_utc(2026, 11, 4, 1, 0), "skipped"),  # second session's fire, late
+        (_utc(2026, 12, 2, 1, 0), "due"),  # Dec 1 (Tuesday) fire, started past midnight
+    ],
+)
+def test_only_if_due_judges_the_scheduled_day_not_the_start_day(monkeypatch, capsys, started, verdict):
+    assert _run_only_if_due(monkeypatch, capsys, started)[0] == verdict
+
+
 def test_the_drill_rides_an_existing_scheduled_job():
     """No new workflow (fleet GHA-minutes cap): one step on the daily
     `trigger_observation` job, gated to the drill day by the script itself,
@@ -262,3 +314,38 @@ def test_the_drill_rides_an_existing_scheduled_job():
     assert "--only-if-due" in step["run"]
     assert step.get("if") == "${{ !cancelled() }}"
     assert steps.index(step) == len(steps) - 1
+
+
+#: Units whose live, un-parked ARTIFACT_REGISTRY row was declared in
+#: ``registry_rows`` alongside a ``freshness-monitor`` detector so the monthly
+#: drill commissions them (alpha-engine-config-I10795). Each key is a fixed key
+#: under ``market_data/``, which the drill role's
+#: ``FreshnessDrillProbeTheDrilledRows`` grant already reads (nous-ergon-ops-PR1697).
+NEWLY_DRILLED = {
+    "D02": ("historical_constituents", "market_data/historical_constituents.json", "saturday_sf"),
+    "D21": ("metron_close_history_consolidated", "market_data/close_history/consolidated.json", "eod_sf"),
+    "D29": ("metron_analyst", "market_data/analyst/latest.json", "eod_sf"),
+    "D30": ("metron_sentiment", "market_data/sentiment/latest.json", "eod_sf"),
+}
+
+
+@pytest.mark.parametrize("unit_id", sorted(NEWLY_DRILLED))
+def test_a_declared_registry_row_is_drilled_and_reads_met(units, unit_id):
+    artifact_id, key, cadence = NEWLY_DRILLED[unit_id]
+    unit = units[unit_id]
+    assert [r for r in unit.raw["registry_rows"]] == [artifact_id]
+    assert "registry_rows_broken" not in unit.raw  # the rows were unparked (I10776)
+    assert key in unit.raw["writes"]
+    assert key.startswith("market_data/") and "{" not in key
+    specs, broken = drill.build_specs(_registry(artifact_id=artifact_id, s3_key_template=key, cadence=cadence))
+    assert not broken
+    s3 = _FakeS3({key: DRILL_INSTANT - dt.timedelta(hours=1)})
+    receipt, rows, why = drill.drill_unit(
+        unit, _detector(unit), specs, s3=s3, clock=_Clock(DRILL_INSTANT), run_ref="t"
+    )
+    assert why is None and receipt is not None
+    assert receipt["outcome"] == "induced", receipt
+    assert receipt["fired"]["subject"] == artifact_id
+    assert rows[0]["states"] == {"baseline": "fresh", "induced": "stale", "cleared": "fresh"}
+    assert s3.calls == [("head", key)] * 3
+    assert _read(units, unit_id, receipt).met

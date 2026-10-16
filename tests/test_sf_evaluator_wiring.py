@@ -36,6 +36,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -114,7 +115,7 @@ class TestSkipEvaluator:
         assert choice["Next"] == "CheckSkipPostEval"
 
     def test_default_runs_the_diagnostics_half_first(self, states):
-        assert states["CheckSkipEvaluator"]["Default"] == "EvaluatorDiagnostics"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipEvaluator"]["Default"]) == "EvaluatorDiagnostics"
 
 
 class TestSkipBacktesterRoutesThroughEvaluatorGate:

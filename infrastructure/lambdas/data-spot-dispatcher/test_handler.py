@@ -946,6 +946,8 @@ def test_a_unit_whose_collector_reports_no_count_is_graded_on_presence(monkeypat
     doc = _manifest(unit_id="D31", outputs=[
         {"key": "features/2026-09-14/technical.parquet", "rows_out": 0},
         {"key": "features/metron_supplemental/2026-09-14.parquet", "rows_out": 0},
+        # alpha-engine-config-I10793: the catalog upload D31 now declares.
+        {"key": "features/registry.json", "rows_out": 0},
     ])
     result, _ = _check(index, {"data_collection/runs/D31/2026-09-14/01K5AA.json": doc},
                        units=("D31",))
@@ -953,7 +955,7 @@ def test_a_unit_whose_collector_reports_no_count_is_graded_on_presence(monkeypat
     assert completion["ok"] is True
     assert completion["units"][0]["floor"] == "not_applicable (N/A-NOT-IMPL)"
     # `features/metron_supplemental/` is a declared PREFIX and matches by prefix.
-    assert completion["units"][0]["keys_checked"] == 2
+    assert completion["units"][0]["keys_checked"] == 3
 
 
 # ── precedence, unverifiable writes, and the loud refusals ───────────────────
@@ -1085,6 +1087,8 @@ _MULTI_KEY_UNIT_OUTPUTS: dict[str, list[dict]] = {
         {"key": "features/2026-09-14/interaction.parquet", "rows_out": 903},
         {"key": "features/2026-09-14/macro.parquet", "rows_out": 1},
         {"key": "features/2026-09-14/alternative.parquet", "rows_out": 903},
+        # alpha-engine-config-I10793: the shared producer's catalog upload.
+        {"key": "features/registry.json", "rows_out": 91},
     ],
     "D15": [
         {"key": "market_data/weekly/2026-09-14/alternative/manifest.json", "rows_out": 903},

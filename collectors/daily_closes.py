@@ -1159,6 +1159,22 @@ def collect(
                             preserved = {"ticker": str(t)}
                             preserved.update(row.to_dict())
                             existing_rows_for_merge.append(preserved)
+                        elif row_source == "fred" and pd.notna(row_close):
+                            # A FRED row is part of the merge base but NOT
+                            # of the yfinance skip set: Step 2 re-fetches
+                            # every FRED series in every mode, so the fresh
+                            # row must meet its prior one in the coalesce.
+                            # Leaving it out made every EOD window rewrite
+                            # land as ``new_only`` — revision reset to 1
+                            # (2026-10-15 22:18Z: 10-13 and 10-14 macro rows
+                            # went 2 -> 1) — and let a yfinance macro
+                            # backstop replace a prior FRED value that
+                            # VENDOR_PRECEDENCE ranks above it, which
+                            # ``polygon_only`` (whole-file merge base)
+                            # already refuses (alpha-engine-config-I10783).
+                            preserved = {"ticker": str(t)}
+                            preserved.update(row.to_dict())
+                            existing_rows_for_merge.append(preserved)
                 logger.info(
                     "[skip_if_canonical] %s: %d existing canonical "
                     "tickers will be preserved; yfinance fetch reduced "

@@ -113,7 +113,7 @@ def test_a_normal_phase_writes_one_ok_manifest_with_its_output():
         }
     ]
     assert m["rows_out"] == 896
-    assert [g["verdict"] for g in m["guards"]] == ["ok"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["ok"]
 
 
 def test_the_manifest_key_is_addressed_by_unit_and_trading_day():
@@ -390,7 +390,7 @@ def test_a_broken_extra_output_is_the_one_the_board_metric_reports():
     )
     assert result["status"] == "ok", "observe mode must not move the exit code"
     m = _manifests(s3)[0]
-    by_key = {g["key"]: g["verdict"] for g in m["guards"] if g["key"]}
+    by_key = {g["key"]: g["verdict"] for g in m["guards"] if g["key"] and g["guard"] != "data_pit"}
     assert by_key["research.db"] == "ok"
     assert by_key["backups/research_2026-09-14.db"] == "empty_fresh"
     assert m["metrics"][0]["status"] == "RED", "the broken key must win the single board row"

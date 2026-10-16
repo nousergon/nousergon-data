@@ -936,72 +936,17 @@ Resources:
       RetentionInDays: 30
 
   # The SF MutualExclusionGuard (L274) fails a duplicate-trigger execution with a
-  # terminal `MutexConflict` Fail — visible today only in SF execution history +
-  # the SNS HandleFailure email. These metric-filters + alarms add a CloudWatch
-  # signal on the RATE of MutexConflict Fails per SF; the first non-zero count
-  # pages the operator to investigate the duplicate-trigger source (CFN drift, EB
-  # internal retry, operator double-paste, cross-region replay).
-  #
-  # The filters key on the MutexConflict Cause text in the SF FailedEvent (logged
-  # at level=ERROR + includeExecutionData=true via the LoggingConfiguration
-  # above). DependsOn the log group so CFN creates the destination before the
-  # filter.
-  #
-  # Per-SF attribution is via a DISTINCT MetricName per filter — NOT a Dimension.
-  # AWS::Logs::MetricFilter only permits dimensions whose VALUE is a token
-  # extracted from the filter pattern (e.g. `$.field`); a literal dimension value
-  # is rejected at create with "filter pattern does not support dimensions". Our
-  # pattern is a plain text match, so we give each SF its own metric name and
-  # point its alarm at that name. (DefaultValue is also omitted — it is mutually
-  # exclusive with dimensions and unnecessary here: the alarm's
-  # TreatMissingData=notBreaching covers the zero-conflict steady state, where no
-  # match -> no data point -> alarm OK.)
-  #
-  # EOD (ne-postclose-trading-pipeline) is now covered too — see the
-  # PostcloseTradingMutexConflict* resources below (config#1416). It is still
-  # script-managed (update_eod_pipeline_sf.sh + deploy-infrastructure.sh), so
-  # unlike the two SFs above, its log group is deliberately NOT a CFN
-  # resource — see the comment on that section for why.
-  WeeklyFreshnessMutexConflictMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    DependsOn: WeeklyFreshnessLogGroup
-    Properties:
-      LogGroupName: /aws/stepfunctions/ne-weekly-freshness-pipeline
-      FilterPattern: '"MutexConflict"'
-      MetricTransformations:
-        - MetricNamespace: AlphaEngine/StepFunctions
-          MetricName: WeeklyFreshnessMutexConflictFails
-          MetricValue: '1'
-
-  PreopenTradingMutexConflictMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    DependsOn: PreopenTradingLogGroup
-    Properties:
-      LogGroupName: /aws/stepfunctions/ne-preopen-trading-pipeline
-      FilterPattern: '"MutexConflict"'
-      MetricTransformations:
-        - MetricNamespace: AlphaEngine/StepFunctions
-          MetricName: PreopenTradingMutexConflictFails
-          MetricValue: '1'
-
-  WeeklyFreshnessMutexConflictAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: ne-weekly-freshness-mutex-conflict
-      AlarmDescription: >-
-        L274 MutexConflict Fail on the weekly-freshness (Saturday) pipeline
-        (duplicate-trigger guard fired). First occurrence = investigate the
-        duplicate-trigger source.
-      Namespace: AlphaEngine/StepFunctions
-      MetricName: WeeklyFreshnessMutexConflictFails
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
+  # terminal `MutexConflict` Fail. Until 2026-10-15 three log metric filters
+  # (one per machine, matching "MutexConflict") and three alarms (`ne-{weekly-freshness,preopen-
+  # trading,postclose-trading}-mutex-conflict`) paged on it. RETIRED by Brian's
+  # "Cut redundant" ruling (alpha-engine-config-I11792): a MutexConflict is a Fail
+  # state, so the execution ends FAILED and `alpha-engine-sf-status-change` ->
+  # alpha-engine-sf-telegram-notifier already pages it, Cause line included, on
+  # all three machines, alongside the SF's own HandleFailure email. Removing the
+  # resources here is what deletes the live alarms: the stack update calls
+  # DeleteAlarms via `InfraDeployCfnOnlyDelete` (aws:CalledVia=cloudformation).
+  # Their codified copies leave nous-ergon-ops/infrastructure/cloudwatch/alarms/
+  # in the same arc.
 
   # config#1819 (2026-07-06/07): SNS-publish TaskFailed alarm on the weekly
   # SF. Motivating incident (2026-06-12): NotifyComplete (a SUCCESS-path
@@ -1027,8 +972,8 @@ Resources:
   # Catch (so a failure already fails the execution -> the existing
   # HandleFailure email path) or is itself a best-effort early-signal alert
   # inside ResearchPredictorParallel whose branch still ends up visible via
-  # CheckBranchOutcomes). Same string-match-precision trade the existing
-  # MutexConflict filters above already accept.
+  # CheckBranchOutcomes). Same string-match-precision trade the retired
+  # MutexConflict filters (above) accepted.
   SnsPublishFailedMetricFilter:
     Type: AWS::Logs::MetricFilter
     DependsOn: WeeklyFreshnessLogGroup
@@ -1055,67 +1000,6 @@ Resources:
         this fired alongside the existing HandleFailure email.
       Namespace: AlphaEngine/StepFunctions
       MetricName: WeeklyFreshnessSnsPublishFails
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  PreopenTradingMutexConflictAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: ne-preopen-trading-mutex-conflict
-      AlarmDescription: >-
-        L274 MutexConflict Fail on the pre-open-trading (weekday) pipeline
-        (duplicate-trigger guard fired). First occurrence = investigate the
-        duplicate-trigger source.
-      Namespace: AlphaEngine/StepFunctions
-      MetricName: PreopenTradingMutexConflictFails
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # --------------------------------------------------------------------------
-  # EOD (ne-postclose-trading-pipeline) MutexConflict alarm (config#1416)
-  # --------------------------------------------------------------------------
-  # EOD is script-managed (infrastructure/update_eod_pipeline_sf.sh +
-  # deploy-infrastructure.sh's update_or_create()), not a CFN
-  # AWS::StepFunctions::StateMachine resource, so — unlike the weekly/preopen
-  # pair above — its log group is NOT a CFN resource: the scripts create it
-  # idempotently (create-log-group + put-retention-policy) before setting
-  # LoggingConfiguration on the state machine. CFN owns only the filter +
-  # alarm below, which read the log group by its literal name. This ordering
-  # is deliberate: the scripts' state-machine update (deploy-infrastructure.sh
-  # step 3) runs BEFORE this stack's deploy (step 4), so a CFN-owned log group
-  # would not exist yet on first deploy.
-  PostcloseTradingMutexConflictMetricFilter:
-    Type: AWS::Logs::MetricFilter
-    Properties:
-      LogGroupName: /aws/stepfunctions/ne-postclose-trading-pipeline
-      FilterPattern: '"MutexConflict"'
-      MetricTransformations:
-        - MetricNamespace: AlphaEngine/StepFunctions
-          MetricName: PostcloseTradingMutexConflictFails
-          MetricValue: '1'
-
-  PostcloseTradingMutexConflictAlarm:
-    Type: AWS::CloudWatch::Alarm
-    Properties:
-      AlarmName: ne-postclose-trading-mutex-conflict
-      AlarmDescription: >-
-        L274 MutexConflict Fail on the post-close (EOD) pipeline
-        (duplicate-trigger guard fired). First occurrence = investigate the
-        duplicate-trigger source.
-      Namespace: AlphaEngine/StepFunctions
-      MetricName: PostcloseTradingMutexConflictFails
       Statistic: Sum
       Period: 86400
       EvaluationPeriods: 1

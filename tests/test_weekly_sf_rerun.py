@@ -671,7 +671,12 @@ class TestStageTableLockstep:
         # through the additive CheckSkipBacktesterStageOnly gate before
         # Backtester, rather than landing on Backtester directly.
         assert all_states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
-        assert all_states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
+        # alpha-engine-config-I12351 (B): the rehearsal deadline checkpoint
+        # (a clock Pass + a rehearsal-only Choice) sits on that edge; its
+        # Default is Backtester, so the RUN path is unchanged.
+        assert all_states["CheckSkipBacktesterStageOnly"]["Default"] == "RehearsalClockBeforeBacktester"
+        assert all_states["RehearsalClockBeforeBacktester"]["Next"] == "CheckRehearsalDeadlineBeforeBacktester"
+        assert all_states["CheckRehearsalDeadlineBeforeBacktester"]["Default"] == "Backtester"
 
     def test_every_degraded_state_is_mapped(self, mod, all_states):
         """Completeness (alpha-engine-config-I6055): a NEW *Degraded /
@@ -1408,8 +1413,14 @@ class TestPredictorSkipVacuousRuleMatchesTheSf:
     def _flags(rule):
         return {c["Variable"].removeprefix("$.") for c in rule["And"]}
 
+    @staticmethod
+    def _operator_rules(gate):
+        """The operator-flag rules, without alpha-engine-config-I12351's
+        rehearsal-only rule (rule 0; production never matches it)."""
+        return [c for c in gate["Choices"] if "rehearsal_marker" not in json.dumps(c)]
+
     def test_rule_order_preset_then_vacuous_then_validate(self, gate):
-        preset, vacuous, validate = gate["Choices"]
+        preset, vacuous, validate = self._operator_rules(gate)
         assert "mode" in self._flags(preset)
         assert preset["Next"] == "PredictorTrainingSkipped"
         assert vacuous["Next"] == "PredictorTrainingSkipped"
@@ -1417,7 +1428,7 @@ class TestPredictorSkipVacuousRuleMatchesTheSf:
         assert self._flags(validate) == {"skip_predictor_training"}
 
     def test_vacuous_rule_names_exactly_the_declared_consumers(self, mod, gate):
-        vacuous = gate["Choices"][1]
+        vacuous = self._operator_rules(gate)[1]
         assert self._flags(vacuous) == (
             {"skip_predictor_training"} | set(mod.PREDICTOR_WEIGHTS_CONSUMER_SKIPS)
         )

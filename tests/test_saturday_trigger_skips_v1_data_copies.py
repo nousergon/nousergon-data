@@ -31,6 +31,7 @@ import re
 from pathlib import Path
 
 import pytest
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _ORCH = _REPO_ROOT / "infrastructure" / "cloudformation" / "alpha-engine-orchestration.yaml"
@@ -130,16 +131,22 @@ def test_the_flag_alone_keeps_the_stage_from_running(flag: str) -> None:
         )
     ]
     assert taken == [skip_target], f"{gate} must route {flag}=true to {skip_target}"
-    assert gate_state["Default"] == stage
+    first_hop = gate_state["Default"]
+    assert past_rehearsal_checkpoint(states, first_hop) == stage
 
     # The only edges INTO the stage are the gate's Default and its own
-    # retry loop, so a true flag leaves no path that runs it.
+    # retry loop, so a true flag leaves no path that runs it. Since
+    # alpha-engine-config-I12351 (B) the Default reaches the stage through a
+    # rehearsal deadline checkpoint, which is entered from the gate alone.
     own_loop = _reachable(states, stage) - _reachable(states, skip_target)
     entries = {
         name for name, st in states.items()
         if stage in _successors(st) and name not in own_loop
     }
-    assert entries == {gate}, f"{stage} is entered from {sorted(entries)}, not only {gate}"
+    entry = gate if first_hop == stage else f"CheckRehearsalDeadlineBefore{stage}"
+    assert entries == {entry}, f"{stage} is entered from {sorted(entries)}, not only {entry}"
+    if first_hop != stage:
+        assert {n for n, st in states.items() if first_hop in _successors(st)} == {gate}
 
 
 @pytest.mark.parametrize("flag", sorted(_SKIPS))
