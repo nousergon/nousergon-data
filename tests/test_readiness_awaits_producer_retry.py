@@ -298,6 +298,11 @@ def test_the_weekly_budget_still_routes_a_never_retried_failure_to_fail_closed()
     definition = json.loads((REPO / "infrastructure" / "step_function.json").read_text())
     states = definition["States"]
     budget = states["CheckCollectionReadinessBudget"]
-    exhausted = [c for c in budget["Choices"] if "shell_run" not in json.dumps(c)]
+    # shell_run and (alpha-engine-config-I12351) rehearsal rules never match a
+    # production execution; the exhausted-budget rule is the one after them.
+    exhausted = [
+        c for c in budget["Choices"]
+        if "shell_run" not in json.dumps(c) and "rehearsal_marker" not in json.dumps(c)
+    ]
     assert exhausted and exhausted[0]["Next"] == "ExtractCollectionNotReadyError"
     assert states["ExtractCollectionNotReadyError"]["Next"] == "NormalizeFailureContext"

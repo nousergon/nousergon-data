@@ -228,6 +228,44 @@ def test_enabled_trigger_silent_target_skips_an_sf_invoked_target(mod):
     assert findings == []
 
 
+def test_enabled_trigger_silent_target_skips_an_event_driven_rule(mod):
+    """An EventPattern rule fires only when its event occurs, so a silent
+    target is the expected reading, not a finding. Regression: 2026-10-15,
+    `alpha-engine-vcpu-runaway-responder-alarm-state` (alarm-state pattern)
+    went red once its responder's last invocation aged out of the window.
+    The exclusion is recorded in `noted`, never silent."""
+    noted: list[dict] = []
+    findings = mod.reconcile(
+        manifest=_manifest(),
+        rows={"on-alarm": _row("on-alarm"),
+              "responder": _row("responder", "in-service", substrate="lambda")},
+        triggers=[{"surface": "events", "name": "on-alarm", "state": "ENABLED",
+                   "event_driven": True}],
+        targets_of=lambda t: ["arn:aws:lambda:us-east-1:1:function:responder"],
+        sf_invoked=set(), invocations_of=lambda cid: 0,
+        alarm_breaching_of=lambda name: True, noted=noted,
+    )
+    assert findings == []
+    assert [(n["kind"], n["id"]) for n in noted] == \
+        [("event-driven-trigger", "events:on-alarm")]
+
+
+def test_live_triggers_marks_pattern_only_rules_event_driven(mod, monkeypatch):
+    """`event_driven` is True only for an EventPattern rule with no
+    ScheduleExpression; a scheduled rule keeps direction E's grading."""
+    def _fake(cmd, key):
+        if cmd[0] == "events":
+            return iter([
+                {"Name": "on-alarm", "State": "ENABLED", "EventPattern": "{}"},
+                {"Name": "daily", "State": "ENABLED", "ScheduleExpression": "rate(1 day)"},
+            ])
+        return iter([])
+    monkeypatch.setattr(mod, "_paginate", _fake)
+    by_name = {t["name"]: t for t in mod.live_triggers()}
+    assert by_name["on-alarm"]["event_driven"] is True
+    assert by_name["daily"]["event_driven"] is False
+
+
 def test_enabled_trigger_silent_target_skips_a_paused_trigger(mod):
     """A trigger the manifest declares paused but that is live ENABLED is
     direction A's `running-while-declared-off` — not duplicated here."""
