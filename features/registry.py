@@ -339,8 +339,13 @@ def generate_registry_json() -> str:
     )
 
 
-def upload_registry(bucket: str, prefix: str = "features/") -> None:
-    """Write registry.json to S3."""
+def upload_registry(bucket: str, prefix: str = "features/") -> int:
+    """Write registry.json to S3 and return the number of catalog entries it holds.
+
+    The count is what the caller records as the key's ``rows_out`` in the run
+    manifest (alpha-engine-config-I10793: ``features/registry.json`` is a declared
+    D31 write, so a run that uploaded it says so in ``outputs[]``).
+    """
     import boto3
 
     s3 = boto3.client("s3")
@@ -348,3 +353,4 @@ def upload_registry(bucket: str, prefix: str = "features/") -> None:
     key = f"{prefix}registry.json"
     s3.put_object(Bucket=bucket, Key=key, Body=body.encode(), ContentType="application/json")
     logger.info("Feature registry uploaded to s3://%s/%s (%d features)", bucket, key, len(CATALOG))
+    return len(CATALOG)

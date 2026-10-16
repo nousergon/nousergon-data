@@ -151,7 +151,7 @@ def test_one_commissioned_detector_is_enough_and_the_other_is_still_named(units)
 
 
 def test_a_unit_declaring_no_detector_is_unmet(units):
-    reading = detector_readers.read_detector(EmptyStore(), units["D02"])
+    reading = detector_readers.read_detector(EmptyStore(), units["D08"])
     assert not reading.met and not reading.unmeasurable
     assert "declares no detector" in reading.detail
 

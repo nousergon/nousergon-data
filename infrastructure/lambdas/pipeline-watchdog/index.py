@@ -182,7 +182,11 @@ from zoneinfo import ZoneInfo
 import boto3
 
 from nousergon_lib import alerts
-from nousergon_lib.pipeline_status.completion_marker import read_marker
+from nousergon_lib.pipeline_status.completion_marker import (
+    VERDICT_UNKNOWN,
+    marker_verdict,
+    read_marker,
+)
 from nousergon_lib.trading_calendar import (
     is_trading_day,
     last_closed_trading_day,
@@ -1270,6 +1274,11 @@ class FailedDayCheckResult:
     executions_on_day: Optional[int] = None
     succeeded_on_day: Optional[int] = None
     marker_status: Optional[str] = None  # None = not consulted
+    #: alpha-engine-config-I11092: the CYCLE verdict read off the augmented
+    #: completion marker for a weekly cycle that had a SUCCEEDED execution.
+    #: ``None`` = not consulted (non-weekly cadence, or no SUCCEEDED execution).
+    cycle_verdict: Optional[str] = None
+    cycle_marker_key: Optional[str] = None
     alert_emitted: bool = False
     alert_detail: Optional[str] = None
 
@@ -1452,6 +1461,159 @@ def _weekly_real_statuses_for_day(client: object, target_date: date) -> "dict[st
     return counts
 
 
+# ── Weekly SUCCEEDED-but-hollow check (alpha-engine-config-I11092) ──────────
+#
+# ``_check_failed_day`` above answers "did every execution of the cycle fail".
+# Its ``succeeded > 0`` branch then CLEARS, and that is the hole the weekly
+# SF's silent no-op lives in: a ``watch-rerun`` that skips 19 stages reports
+# SUCCEEDED (measured 2026-10-04, ``HOLLOW-SUSPECT``), and so does a cycle whose
+# real run FAILED and whose only SUCCEEDED execution entered 0 of the spine
+# (``vacuous_success``, measured 2026-09-11: cycle ``incomplete``,
+# ``partial_cycle``, 15/17, missing PitParityCompare, while the watchdog
+# found a SUCCEEDED execution and said nothing). An execution status cannot
+# tell a full run from a recovery tail; the augmented completion marker's
+# ``cycle_verdict`` can (nousergon_lib.pipeline_status.completion_marker,
+# written by weekly-coverage-sweep from the whole cycle's execution history).
+#
+# This check is independent of the SF on purpose: it is a post-run read of
+# S3 from a different Lambda on a different schedule, so it needs no change to
+# the state machine and survives that definition being wrong (rehearsal-path
+# guard: the SF definition is not touched by this check).
+#
+# KEY. The cycle verdict lives on the TRADING-DAY partition (``cycle_key`` =
+# the run_date NormalizeRunDates resolves, i.e. the last session before the
+# weekly day, Friday for a Saturday cycle). The calendar-partition twin that
+# the SF still writes beside it (``WriteCompletionMarkerCalendar``) is never
+# augmented and always reads ``unknown`` — measured on every marker 2026-09-05
+# onward (e.g. ``2026-10-03.json`` unknown beside ``2026-10-02.json``
+# completed). ``_completion_marker_status`` keys by the weekly day, which is
+# fine for ``status`` (both copies agree) and wrong for the verdict, so this
+# resolves the trading-day key first.
+
+#: Cycle verdicts that need no page. Everything else is reported.
+_CYCLE_OK_VERDICTS = frozenset({"completed"})
+
+#: Verdicts that say the cycle's work did NOT happen. These page at ``error``.
+#: ``unknown`` / ``in_flight`` / an unreadable or absent marker mean the
+#: verdict could not be established, which is UNKNOWN, not a pass
+#: (sf-pipeline-policy §2.3a) — reported at ``warning`` so a lagging sweep is
+#: visible without paging as though the cycle were known-bad.
+_CYCLE_DEFECT_VERDICTS = frozenset({"incomplete", "skipped"})
+
+
+def _cycle_marker(
+    s3_client: object, pipeline_name: str, target_date: date
+) -> "tuple[Optional[dict], Optional[str], Optional[str]]":
+    """``(marker, key, read_error)`` for the weekly CYCLE ``target_date``.
+
+    Tries the trading-day partition first (the one the coverage sweep
+    augments), then the weekly day itself. ``marker`` is ``None`` when neither
+    exists; ``read_error`` is set (and ``marker`` ``None``) when a read failed
+    for any reason other than absence — never folded into "absent".
+    """
+    candidates: "list[date]" = []
+    try:
+        candidates.append(previous_trading_day(target_date))
+    except Exception as exc:  # noqa: BLE001 — falls through to the weekly day
+        logger.warning(
+            "weekly cycle verdict: previous_trading_day(%s) failed (%s: %s); "
+            "trying the weekly-day key only", target_date, type(exc).__name__, exc,
+        )
+    if target_date not in candidates:
+        candidates.append(target_date)
+    first_key: Optional[str] = None
+    for day in candidates:
+        key = f"_sf_completion/{pipeline_name}/{day.isoformat()}.json"
+        first_key = first_key or key
+        try:
+            marker = read_marker(s3_client, bucket=MARKER_BUCKET, key=key)
+        except Exception as exc:  # noqa: BLE001 — classified, never a pass
+            logger.warning(
+                "weekly cycle verdict: marker s3://%s/%s unreadable (%s: %s)",
+                MARKER_BUCKET, key, type(exc).__name__, exc,
+            )
+            return None, key, f"{type(exc).__name__}: {exc}"
+        if marker is not None:
+            return marker, key, None
+    return None, first_key, None
+
+
+def _check_weekly_cycle_verdict(
+    *,
+    sf_label: str,
+    sf_arn: str,
+    pipeline_name: str,
+    target_date: date,
+    counts: "dict[str, int]",
+    s3_client: Optional[object],
+) -> FailedDayCheckResult:
+    """The weekly cycle had a SUCCEEDED real execution: confirm the CYCLE did
+    the work, page when the augmented marker says it did not.
+
+    Called only from ``_check_failed_day``'s ``cadence == "weekly"`` branch
+    with ``succeeded > 0`` — the branch that used to clear unconditionally.
+    """
+    if s3_client is None:  # pragma: no cover — production path
+        s3_client = boto3.client("s3", region_name=REGION)
+    total = sum(counts.values())
+    succeeded = counts.get("SUCCEEDED", 0)
+    marker, key, read_error = _cycle_marker(s3_client, pipeline_name, target_date)
+    verdict = VERDICT_UNKNOWN if marker is None else marker_verdict(marker)
+    base = dict(
+        sf_label=sf_label,
+        checked=True,
+        target_trading_day=target_date.isoformat(),
+        executions_on_day=total,
+        succeeded_on_day=succeeded,
+        cycle_verdict=verdict,
+        cycle_marker_key=key,
+    )
+    if verdict in _CYCLE_OK_VERDICTS:
+        return FailedDayCheckResult(**base)
+
+    cycle = marker.get("cycle") if isinstance(marker, dict) else None
+    cycle = cycle if isinstance(cycle, dict) else {}
+    reason = cycle.get("reason")
+    explain = cycle.get("explain")
+    if read_error is not None:
+        evidence = f"the completion marker s3://{MARKER_BUCKET}/{key} could not be read ({read_error})"
+    elif marker is None:
+        evidence = f"no completion marker exists at s3://{MARKER_BUCKET}/{key}"
+    elif explain:
+        evidence = str(explain)
+    else:
+        evidence = f"cycle_verdict={verdict!r}" + (f" reason={reason!r}" if reason else "")
+    defect = verdict in _CYCLE_DEFECT_VERDICTS
+    severity = "error" if defect else "warning"
+    headline = (
+        "SUCCEEDED but the CYCLE did NOT do the work"
+        if defect
+        else "SUCCEEDED but the cycle verdict could not be established (UNKNOWN is not a pass)"
+    )
+    message = (
+        f"{sf_label} ({pipeline_name}) {headline} for cycle day {target_date}: "
+        f"{succeeded} of {total} real execution(s) SUCCEEDED, but the augmented "
+        f"completion marker's cycle verdict is {verdict!r}. {evidence}. "
+        f"An execution status cannot tell a full run from a recovery tail that "
+        f"skipped its stages; the cycle verdict can "
+        f"(alpha-engine-config-I11092, the silent weekly SF no-op class). "
+        f"Do not trust this cycle's report card until it is resolved. "
+        f"Inspect: `aws s3 cp s3://{MARKER_BUCKET}/{key} - | jq` and "
+        f"`aws stepfunctions list-executions --state-machine-arn {sf_arn} "
+        f"--max-results 10`."
+    )
+    dedup_key = f"pipeline-watchdog-weekly-cycle-verdict-{pipeline_name}-{target_date.isoformat()}-{verdict}"
+    alert_detail = _publish_watchdog_alert(
+        message,
+        severity=severity,
+        dedup_key=dedup_key,
+        context={"sf_label": sf_label, "sf_arn": sf_arn,
+                 "target_trading_day": target_date.isoformat(),
+                 "cycle_verdict": verdict, "cycle_marker_key": key},
+    )
+    return FailedDayCheckResult(**base, alert_emitted=True, alert_detail=alert_detail)
+
+
 def _check_failed_day(
     *,
     sf_label: str,
@@ -1501,6 +1663,17 @@ def _check_failed_day(
             ),
         )
     if succeeded > 0:
+        if cadence == "weekly":
+            # alpha-engine-config-I11092: a SUCCEEDED execution is not a
+            # completed CYCLE. Confirm against the augmented marker.
+            return _check_weekly_cycle_verdict(
+                sf_label=sf_label,
+                sf_arn=sf_arn,
+                pipeline_name=pipeline_name,
+                target_date=target_date,
+                counts=counts,
+                s3_client=s3_client,
+            )
         return FailedDayCheckResult(
             sf_label=sf_label,
             checked=True,
@@ -1977,6 +2150,8 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
                 "executions_on_day": c.executions_on_day,
                 "succeeded_on_day": c.succeeded_on_day,
                 "marker_status": c.marker_status,
+                "cycle_verdict": c.cycle_verdict,
+                "cycle_marker_key": c.cycle_marker_key,
                 "alert_emitted": c.alert_emitted,
                 "alert_detail": c.alert_detail,
             }

@@ -338,6 +338,23 @@ jobs:
       - name: Run trigger_observation producer
         run: python -m data_gate.producers.trigger_observation
 
+      # alpha-engine-config-I10795 (ruling 2026-10-14): the monthly
+      # freshness-monitor threshold-tightening drill. A STEP on this daily
+      # job, not a new workflow or job, so it costs no runner minutes on the
+      # days it does not run (fleet GHA cap): `--only-if-due` returns before
+      # any AWS call except on the month's first NYSE trading day, judged by
+      # the date the cron fire was SCHEDULED for (a fire started hours late,
+      # past 00:00Z, still counts as its own day). A manual
+      # `workflow_dispatch` runs it unconditionally. `!cancelled()` so a
+      # failed trigger_observation read above cannot skip the month's drill.
+      # It reads the published registry and the drilled rows' S3 metadata,
+      # writes only data_collection/commissioning/<unit>/freshness-monitor/
+      # latest.json and its run record, and exits 1 (paging through
+      # notify-main-failure) when any unit's drill is inconclusive.
+      - name: Monthly freshness-monitor commissioning drill
+        if: ${{ !cancelled() }}
+        run: python -m data_gate.producers.freshness_commissioning ${{ github.event_name == 'schedule' && '--only-if-due' || '' }}
+
   # Required of every scheduled workflow in this repo by
   # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
   # naming every other job and an `if` gated to the default branch.

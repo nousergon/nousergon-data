@@ -211,14 +211,27 @@ def test_the_two_post_publish_crons_exist_alongside_the_backstop():
     assert {"30 23 * * *", "0 18 * * 6"} <= crons
 
 
+def _gates_read(step: dict) -> list[str]:
+    import re
+
+    return re.findall(r"--gate\s+([\w-]+)", step.get("run") or "")
+
+
 def test_every_gate_read_passes_the_trigger_and_the_trading_day():
-    """Six reads, one wiring. A read that forgot either would publish a
+    """Six readings, one wiring. A read that forgot either would publish a
     reading filed under the wrong day, or with no trigger to tell a
-    pre-publish reading from a post-publish one."""
+    pre-publish reading from a post-publish one.
+
+    Since alpha-engine-config-I11792 the six are ONE process (repeated
+    `--gate`), so the S3 read memo covers all of them; every registered gate
+    is still read, each once."""
     doc = _workflow()
     steps = doc["jobs"]["read-gate"]["steps"]
     reads = [s for s in steps if "python -m data_gate read" in (s.get("run") or "")]
-    assert len(reads) == 6
+    assert len(reads) == 1, "the readings share one process, or each re-reads S3 from cold"
+    gates = [g for step in reads for g in _gates_read(step)]
+    assert sorted(gates) == sorted(read_module.GATES)
+    assert len(gates) == len(set(gates))
     for step in reads:
         assert '--trigger "$GATE_TRIGGER"' in step["run"], step.get("name")
         assert '--trading-day "$GATE_TRADING_DAY"' in step["run"], step.get("name")
@@ -255,9 +268,11 @@ def test_the_job_timeout_covers_six_reads_at_the_measured_duration():
     pages nothing. Keep headroom above the measured worst case."""
     job = _workflow()["jobs"]["read-gate"]
     reads = [s for s in job["steps"] if "python -m data_gate read" in (s.get("run") or "")]
+    readings = sum(len(_gates_read(step)) for step in reads)
     measured_worst_read_minutes = 4.0
     install_minutes = 1.0
-    assert job["timeout-minutes"] >= len(reads) * measured_worst_read_minutes + install_minutes
+    assert readings == len(read_module.GATES)
+    assert job["timeout-minutes"] >= readings * measured_worst_read_minutes + install_minutes
 
 
 # ---------------------------------------------------------------------------

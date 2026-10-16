@@ -63,9 +63,19 @@ contract:
   schema: null
   producer_test: null
   consumer_pins: []
-registry_rows: []
+registry_rows:
+  - historical_constituents
 run_manifest_prefix: data_collection/runs/D02
-detectors: []
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        historical_constituents (saturday_sf) is a live, un-parked row on the published
+        registry the freshness monitor enforces; declared here so the monthly
+        threshold-tightening drill (data_gate/producers/freshness_commissioning.py,
+        alpha-engine-config-I10795) commissions it. UNVERIFIED until that drill writes the
+        receipt.
 freshness:
   family: weekly
   deadline: "Sat 13:00 America/New_York"

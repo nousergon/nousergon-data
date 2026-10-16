@@ -72,8 +72,12 @@ registry_rows:
 run_manifest_prefix: data_collection/runs/D33
 # The one detector this row carried, alarm `alpha-engine-daily-heal-days-healed`
 # (state BROKEN: an alarm on a data-quality event, not a failure), was DELETED
-# 2026-10-09 under alpha-engine-config-I11792 Tier 2. Heal FAILURE is detected by
-# `ne-data-collection-daily-heal-failed`, which is not a per-unit detector here.
+# 2026-10-09 under alpha-engine-config-I11792 Tier 2. Heal FAILURE is announced by
+# the machine itself: every Fail path publishes NotifyFailure /
+# NotifyCompletionFindings to alpha-engine-alerts first. The
+# `ne-data-collection-daily-heal-failed` alarm that re-paged the same topic was
+# retired 2026-10-15 (same issue, "Cut redundant" ruling). Neither is a per-unit
+# detector here.
 detectors: []
 freshness:
   family: morning

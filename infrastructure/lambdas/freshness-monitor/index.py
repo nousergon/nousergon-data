@@ -1449,6 +1449,7 @@ def apply_run_evidence(
 def enumerate_disabled_schedules(
     events_client: Any = None,
     scheduler_client: Any = None,
+    existing: set[str] | None = None,
 ) -> list[dict[str, str]]:
     """Every DISABLED EventBridge rule and EventBridge Scheduler schedule.
 
@@ -1462,6 +1463,13 @@ def enumerate_disabled_schedules(
     than omitted. Silence here would reproduce the defect this exists to
     close — an empty inventory must mean "nothing is disabled", never
     "the walk failed".
+
+    ``existing``, when passed, is filled with the trigger string of EVERY
+    rule and schedule the walk saw, enabled or not (alpha-engine-config-I12296).
+    The walk already lists the whole account; collecting the names costs no
+    extra call, and it is what lets :func:`dangling_producer_triggers` tell a
+    registry trigger that names nothing on its surface from one that is merely
+    enabled.
     """
     out: list[dict[str, str]] = []
     try:
@@ -1469,6 +1477,8 @@ def enumerate_disabled_schedules(
         paginator = client.get_paginator("list_rules")
         for page in paginator.paginate():
             for rule in page.get("Rules", []):
+                if existing is not None:
+                    existing.add(f"events:{rule['Name']}")
                 if rule.get("State") == "DISABLED":
                     out.append({
                         "trigger": f"events:{rule['Name']}",
@@ -1488,6 +1498,8 @@ def enumerate_disabled_schedules(
         paginator = client.get_paginator("list_schedules")
         for page in paginator.paginate():
             for sch in page.get("Schedules", []):
+                if existing is not None:
+                    existing.add(schedule_trigger(sch.get("GroupName"), sch["Name"]))
                 if sch.get("State") == "DISABLED":
                     # Group-qualified outside `default` (I12058): ListSchedules
                     # walks every group, and a bare name here would never
@@ -1510,6 +1522,48 @@ def enumerate_disabled_schedules(
     return out
 
 
+def dangling_producer_triggers(
+    referenced_triggers: set[str], existing: set[str],
+) -> list[dict[str, str]]:
+    """Registry triggers that name no live rule or schedule on their surface.
+
+    alpha-engine-config-I12296: four ARTIFACT_REGISTRY rows declared
+    ``scheduler:alpha-engine-saturday``, which is an EventBridge RULE. The
+    lookup in :func:`resolve_disabled_producers` raised, was logged as a
+    warning, and the trigger was treated as enabled. That is the safe direction
+    for paging, but those rows could never be suppressed during a declared
+    pause, and nothing outside a log line said so. This makes that class a
+    counted, published fact.
+
+    Only ``events:`` and ``scheduler:`` triggers are judged; ``gha:`` has its
+    own inventory. Each row carries ``exists_on`` naming the OTHER surface when
+    a rule or schedule of that name exists there, which is the wrong-surface
+    case and its one-word fix. Callers must pass a COMPLETE ``existing`` set:
+    against a partial walk every unseen trigger would read as dangling.
+    """
+    other = {"events": "scheduler", "scheduler": "events"}
+    out: list[dict[str, str]] = []
+    for trigger in sorted(referenced_triggers):
+        parsed = parse_producer_trigger(trigger)
+        if parsed is None or parsed[0] not in other or trigger in existing:
+            continue
+        surface, name = parsed
+        if surface == "scheduler":
+            # `scheduler:default/x` and `scheduler:x` are one schedule.
+            group, bare = split_schedule_name(name)  # parse checked it
+            if schedule_trigger(group, bare) in existing:
+                continue
+            flipped = f"events:{bare}" if group == DEFAULT_SCHEDULE_GROUP else ""
+        else:
+            flipped = schedule_trigger(DEFAULT_SCHEDULE_GROUP, name)
+        out.append({
+            "trigger": trigger,
+            "surface": surface,
+            "exists_on": other[surface] if flipped and flipped in existing else "",
+        })
+    return out
+
+
 def write_disabled_producer_inventory(
     s3_client: Any,
     now: datetime,
@@ -1529,9 +1583,23 @@ def write_disabled_producer_inventory(
     must not take down a sweep whose alerting already ran.
     """
     today = now.date().isoformat()
-    rows = enumerate_disabled_schedules(events_client, scheduler_client)
+    existing: set[str] = set()
+    rows = enumerate_disabled_schedules(events_client, scheduler_client, existing)
     since = _load_producer_disabled_since(s3_client)
     incomplete = any(r.get("error") for r in rows)
+    # A partial walk cannot prove absence, so it reports none (I12296).
+    dangling = (
+        [] if incomplete
+        else dangling_producer_triggers(referenced_triggers, existing)
+    )
+    for d in dangling:
+        logger.error(
+            "DANGLING_PRODUCER_TRIGGER %s names no live %s%s — its rows can "
+            "never be suppressed by a pause (alpha-engine-config-I12296)",
+            d["trigger"],
+            "EventBridge rule" if d["surface"] == "events" else "Scheduler schedule",
+            f"; a {d['exists_on']} trigger of that name exists" if d["exists_on"] else "",
+        )
     for row in rows:
         if row.get("error"):
             continue
@@ -1553,6 +1621,8 @@ def write_disabled_producer_inventory(
              if not r.get("error") and not r.get("referenced_by_registry")]
         ),
         "rows": rows,
+        "dangling_trigger_count": len(dangling),
+        "dangling_triggers": dangling,
     }
     try:
         s3_client.put_object(
@@ -1983,6 +2053,12 @@ def suppression_coverage(
             [r for r in disabled_rows if not r.get("referenced_by_registry")]
         ),
         "inventory_complete": bool((inventory or {}).get("complete")),
+        # alpha-engine-config-I12296: declared triggers that name nothing on
+        # their surface. Such a row is declared, so it is not in
+        # undeclared_not_fresh, yet no pause can ever suppress it.
+        "dangling_producer_triggers": int(
+            (inventory or {}).get("dangling_trigger_count") or 0
+        ),
     }
 
 
@@ -2006,6 +2082,9 @@ def _emit_suppression_coverage_metrics(
              "Unit": "Count"},
             {"MetricName": "DisabledProducersUnreferenced",
              "Value": float(coverage["disabled_producers_unreferenced"]),
+             "Unit": "Count"},
+            {"MetricName": "DanglingProducerTriggers",
+             "Value": float(coverage.get("dangling_producer_triggers", 0)),
              "Unit": "Count"},
         ],
     )

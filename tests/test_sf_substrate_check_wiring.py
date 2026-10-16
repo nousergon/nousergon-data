@@ -25,6 +25,7 @@ import pytest
 
 from tests.sf_command_utils import extract_commands
 from tests.sf_degraded_summary_helpers import assert_degraded_continuation
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -178,7 +179,7 @@ class TestChainOrdering:
         # routes into the tail pass through it.
         assert success["Next"] == "RunScope"
         assert states["RunScope"]["Next"] == "CheckSkipReportCard"
-        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipReportCard"]["Default"]) == "ReportCard"
 
 
 class TestCatchSemantics:
@@ -218,7 +219,7 @@ class TestCatchSemantics:
             states, "SubstrateHealthCheckDegraded", "RunScope",
         )
         assert states["RunScope"]["Next"] == "CheckSkipReportCard"
-        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipReportCard"]["Default"]) == "ReportCard"
 
 
 class TestCommandShape:

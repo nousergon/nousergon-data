@@ -64,6 +64,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function.json"
@@ -102,6 +103,8 @@ _BRANCH_A_STATES = {
     "CheckSkipRegimeRetrospectiveEval", "RegimeRetrospectiveEval",
     "CheckSkipDataPhase2", "DataPhase2", "CheckSkipEvalJudge",
     "ComputeEvalCadence", "CheckMonthlyCadence",
+    # alpha-engine-config-I12351: rehearsal-only eval-date pin.
+    "CheckEvalCadenceRehearsal", "ComputeEvalCadenceRehearsal",
     "EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly",
     # alpha-engine-config-I9329: the four EvalJudgePoll* states were deleted
     # with the provider batch API they existed to drive, and EvalJudgeProcess
@@ -314,7 +317,7 @@ class TestBranchAContents:
         # regime chain and DataPhase2. RegimeRetrospectiveEval's success
         # path now goes straight to CheckSkipDataPhase2 → DataPhase2.
         assert branch_a["RegimeRetrospectiveEval"]["Next"] == "CheckSkipDataPhase2"
-        assert branch_a["CheckSkipDataPhase2"]["Default"] == "DataPhase2"
+        assert past_rehearsal_checkpoint(branch_a, branch_a["CheckSkipDataPhase2"]["Default"]) == "DataPhase2"
 
     def test_eval_chain_after_dataphase2_in_branch_a(self, branch_a):
         # alpha-engine-config-I5759: DataPhase2 dispatches to spot, so its
@@ -327,7 +330,9 @@ class TestBranchAContents:
         ]
         assert len(success_arm) == 1
         assert success_arm[0]["Next"] == "CheckSkipEvalJudge"
-        assert branch_a["CheckSkipEvalJudge"]["Default"] == "ComputeEvalCadence"
+        # alpha-engine-config-I12351: through the rehearsal date pin.
+        assert branch_a["CheckSkipEvalJudge"]["Default"] == "CheckEvalCadenceRehearsal"
+        assert branch_a["CheckEvalCadenceRehearsal"]["Default"] == "ComputeEvalCadence"
 
     def test_data_phase2_poll_loop_is_bounded(self, branch_a):
         """alpha-engine-config-I5687: a poll loop added AFTER that finding
@@ -428,8 +433,13 @@ class TestBranchBContents:
         Absent flag still defaults to PredictorTraining (scheduled runs
         unaffected)."""
         gate = branch_b["CheckSkipPredictorTraining"]
-        assert len(gate["Choices"]) == 3
-        preset_rule, vacuous_rule, plain_rule = gate["Choices"]
+        # alpha-engine-config-I12351: rule 0 is the rehearsal-only skip (a
+        # rehearsal never trains or selects); production never matches it, so
+        # the three operator rules below keep their order and meaning.
+        assert len(gate["Choices"]) == 4
+        rehearsal_rule, preset_rule, vacuous_rule, plain_rule = gate["Choices"]
+        assert {c["Variable"] for c in rehearsal_rule["And"]} == {"$.rehearsal_marker.is_rehearsal"}
+        assert rehearsal_rule["Next"] == "PredictorTrainingSkipped"
         vacuous_vars = {cond["Variable"] for cond in vacuous_rule["And"]}
         assert "$.skip_predictor_training" in vacuous_vars
         assert "$.mode" not in vacuous_vars
@@ -1348,7 +1358,7 @@ class TestInboundRewireAndDownstreamUnchanged:
         # through the additive CheckSkipBacktesterStageOnly gate before
         # Backtester.
         assert states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
-        assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipBacktesterStageOnly"]["Default"]) == "Backtester"
 
     def test_backtester_after_parallel_join_and_reachable(self, sf):
         """Walk the top-level happy path (Parallel as a single node);

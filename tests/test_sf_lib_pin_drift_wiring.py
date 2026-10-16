@@ -45,7 +45,13 @@ def test_runs_first_off_initialize_input(sf, states):
     # this gate; CheckRunMode.Default → CheckSkipLibPinDriftCheck, so the lib-pin
     # gate still runs first for any non-preset input.
     assert sf["StartAt"] == "InitializeInput"
-    assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+    # alpha-engine-config-I12351: the rehearsal-marker hop sits between
+    # InitializeInput and the run-day gate; both namespace branches rejoin it.
+    assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
+    assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
+    assert states["ApplyProductionNamespace"]["Next"] == "CheckWeeklyRunDayGate"
+    assert states["ApplyRehearsalNamespace"]["Next"] == "ApplyRehearsalChampionSkips"
+    assert states["ApplyRehearsalChampionSkips"]["Next"] == "CheckWeeklyRunDayGate"
     # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
     # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
     # gate and CheckRunMode — the graph's ONE date normalization, on every path

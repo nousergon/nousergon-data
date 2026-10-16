@@ -3139,6 +3139,78 @@ def test_a_failed_write_does_not_take_down_the_sweep():
     assert payload["disabled_count"] == 0
 
 
+def test_a_trigger_on_the_wrong_surface_is_counted_and_names_the_fix(monkeypatch):
+    """alpha-engine-config-I12296, the measured case: four registry rows said
+    `scheduler:alpha-engine-saturday`, an EventBridge RULE. The state lookup
+    raised, logged a warning, and treated the trigger as enabled, so those
+    rows could never be suppressed in a pause and nothing counted it."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+    events = _FakeEvents([
+        {"Name": "alpha-engine-saturday", "State": "ENABLED"},
+        {"Name": "alpha-research-thinktank-daily", "State": "DISABLED"},
+    ])
+    scheduler = _FakeScheduler([
+        {"Name": "alpha-engine-weekday", "State": "ENABLED", "GroupName": "default"},
+        {"Name": "data-collection-daily-heal", "State": "ENABLED",
+         "GroupName": "nousergon-data-collection"},
+    ])
+
+    class _S3:
+        def put_object(self, **kw):
+            self.put = kw
+
+    payload = index.write_disabled_producer_inventory(
+        _S3(), datetime(2026, 10, 16, tzinfo=timezone.utc),
+        {
+            "scheduler:alpha-engine-saturday",           # wrong surface
+            "events:alpha-engine-weekday",               # wrong surface
+            "events:alpha-engine-gone",                  # exists nowhere
+            "events:alpha-engine-saturday",              # correct, enabled
+            "events:alpha-research-thinktank-daily",     # correct, disabled
+            "scheduler:default/alpha-engine-weekday",    # explicit default group
+            "scheduler:nousergon-data-collection/data-collection-daily-heal",
+            "gha:nousergon/alpha-engine-config/x.yml",   # not this check's surface
+        },
+        events, scheduler,
+    )
+    assert payload["dangling_triggers"] == [
+        {"trigger": "events:alpha-engine-gone", "surface": "events",
+         "exists_on": ""},
+        {"trigger": "events:alpha-engine-weekday", "surface": "events",
+         "exists_on": "scheduler"},
+        {"trigger": "scheduler:alpha-engine-saturday", "surface": "scheduler",
+         "exists_on": "events"},
+    ]
+    assert payload["dangling_trigger_count"] == 3
+    cov = index.suppression_coverage([], {}, {}, payload)
+    assert cov["dangling_producer_triggers"] == 3
+
+
+def test_a_partial_walk_reports_no_dangling_triggers(monkeypatch):
+    """Absence is only provable against a complete walk. A failed rule
+    enumeration must not turn every `events:` trigger into a finding."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+
+    class _S3:
+        def put_object(self, **kw):
+            pass
+
+    payload = index.write_disabled_producer_inventory(
+        _S3(), datetime(2026, 10, 16, tzinfo=timezone.utc),
+        {"events:alpha-engine-saturday"},
+        _FakeEvents([], raises=True), _FakeScheduler(),
+    )
+    assert payload["complete"] is False
+    assert payload["dangling_triggers"] == []
+    assert payload["dangling_trigger_count"] == 0
+
+
 # ── §7.4a: a page names the item that owns it (I7326) ───────────────────────
 #
 # The measured instance these pin: 2026-08-14 08:00 UTC, `[CRITICAL]
@@ -4249,6 +4321,7 @@ def test_coverage_metrics_emit_zeros_rather_than_nothing():
     assert names["UndeclaredNotFreshRows"] == 0.0
     assert names["RowsDeclaringProducerTrigger"] == 0.0
     assert names["DisabledProducersUnreferenced"] == 0.0
+    assert names["DanglingProducerTriggers"] == 0.0
 
 
 # ── config-I7713: one page per sweep, grouped by cause ──────────────────────

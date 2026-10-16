@@ -370,6 +370,12 @@ STAGES: tuple[Stage, ...] = (
         # still reads as THIS stage failing, so a rerun of such a history
         # waits on the collector rather than skipping past missing data.
         historical_work=frozenset({"MorningEnrich", "DataPhase1"}),
+        # alpha-engine-config-I12351: a REHEARSAL whose one readiness probe
+        # said not-ready / not-ok (or raised) records the refusal and
+        # continues to ResearchPredictorParallel through this Pass. The wait
+        # ran but did not succeed, so a rerun must wait again rather than
+        # skip past it on the strength of the witness.
+        degraded_witness=frozenset({"RehearsalCollectionNotReadyDegraded"}),
     ),
     # --- ResearchPredictorParallel branch A -------------------------------
     # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and
