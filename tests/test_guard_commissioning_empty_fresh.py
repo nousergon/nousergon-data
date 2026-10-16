@@ -59,15 +59,21 @@ import json
 import logging
 import pathlib
 import re
+import types
+from dataclasses import dataclass
 
 import pandas as pd
 import pytest
 from botocore.exceptions import ClientError
+from nousergon_lib import run_manifest
 from nousergon_lib.guard_mode import GuardMode, GuardStaging
 
+import run_units
 import weekly_collector
+from collectors import metron_market_data, technical_rating_ledger
 from data_gate import descriptors, evidence
 from data_gate import run_manifest_predicate as completion
+from data_gate.guard_commissioning import record_document, record_key
 from data_gate.store import LocalStore
 from shadow.run_state import RunStatePhaseRegistry
 from validators import expectations
@@ -76,18 +82,127 @@ REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 ASL_PATH = REPO_ROOT / "infrastructure" / "step-functions" / "data-collection.asl.json"
 STACK_PATH = REPO_ROOT / "infrastructure" / "cloudformation" / "nousergon-data-collection.yaml"
 
-UNIT = "D19"
 GUARD_CLASS = "empty_fresh"
-PHASE = "daily_closes"
 WORKLOAD = "post-market-data"
 BUCKET = "alpha-engine-research"
 
-#: The trading day is TODAY (UTC) rather than a fixed date: the completion
-#: check lists manifests from ``started_at - MANIFEST_LOOKBACK_DAYS`` onward and
-#: requires ``finished >= started_at``, both against wall-clock stamps the
-#: wrapper writes. A fixed past date would grade an empty window.
-TRADING_DAY = dt.datetime.now(dt.timezone.utc).date().isoformat()
-KEY = f"staging/daily_closes/{TRADING_DAY}.parquet"
+#: When the harness's first execution starts: the EOD schedule's 18:15 ET
+#: trigger on a trading day. Every stamp the record is graded on comes from
+#: :class:`HarnessClock`, never the wall clock, so the record reads the same on
+#: any day and at any hour it is taken.
+EOD_START = dt.datetime(2026, 10, 15, 22, 15, tzinfo=dt.timezone.utc)
+TRADING_DAY = EOD_START.date().isoformat()
+
+
+class HarnessClock:
+    """The one clock every run manifest and execution start in this file reads.
+
+    The completion check takes the lexically greatest manifest key as a unit's
+    newest run, and that key is a ULID: a millisecond timestamp, then 80 random
+    bits. Read off the wall clock, the faulted retry and the recovery run started
+    1-2 ms apart on a CI-class box, and on a faster one in the SAME millisecond,
+    where the random bits decided which was "newest". When they picked the
+    retry, the recovery graded the refused run (`run_not_ok`) and failed — a
+    random subset of units on each run (alpha-engine-config-I10786, 2026-10-15).
+    In production the two are separate box launches minutes apart.
+
+    Each read advances one second, so every run starts strictly after the last
+    one finished, and the manifest's whole-second ``finished`` stamp never
+    reads earlier than the execution start it is graded against.
+    """
+
+    STEP = dt.timedelta(seconds=1)
+
+    def __init__(self, start: dt.datetime) -> None:
+        self._now = start
+
+    def now(self) -> dt.datetime:
+        self._now += self.STEP
+        return self._now
+
+
+@dataclass(frozen=True)
+class Case:
+    """One unit's induced fault: the phase it runs as and the key it publishes.
+
+    ``key`` is the unit's PRIMARY ``artifact_key`` exactly as the daily mode's
+    ``_phase_collect`` call site builds it in ``weekly_collector.py`` (from the
+    same collector-module constants), so the guard grades the key production
+    publishes. ``fault`` is the induced-fault sentence the record carries.
+    """
+
+    unit: str
+    phase: str
+    key: str
+    fault: str
+    #: D19's call site alone passes ``verify_artifact_exists=True, bucket=...``
+    #: (config-I2702); the metron call sites pass neither. Mirrored, not tidied.
+    verify_artifact_exists: bool = False
+    #: ``(key, result count key)`` for every ``extra_outputs`` entry the call
+    #: site declares (alpha-engine-config-I10855) — D20 and D22 publish more
+    #: than one key, and the completion check reads ``output_missing`` on a
+    #: recovery run that published only the primary one.
+    extra: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def keys(self) -> tuple[str, ...]:
+        return (self.key, *(k for k, _ in self.extra))
+
+    @property
+    def rows_key(self) -> str:
+        return run_units.PHASE_UNITS[("daily", self.phase)].rows_key
+
+
+def _json_case(unit: str, phase: str, key: str, extra: tuple[tuple[str, str], ...] = ()) -> Case:
+    return Case(
+        unit, phase, key,
+        f"empty payload: a zero-record JSON document PUT to {key} under status ok, "
+        "reporting a row count of 0" + (" (and every co-published key empty too)" if extra else ""),
+        extra=extra,
+    )
+
+
+_M = metron_market_data
+#: Every daily-mode ``_phase_collect`` unit on the EOD machine's
+#: ``post-market-data`` workload that publishes through a primary
+#: ``artifact_key``. D19 is the first record (nousergon-data#2069); the metron
+#: units ride the identical call path (`_phase_collect` ->
+#: `_record_phase_lineage` -> `check_empty_fresh`) on the same workload and the
+#: same deployed ASL, and each gets its own record because the gate grades
+#: commissioning per unit (`faults/<unit>/<guard>/latest.json`).
+#:
+#: Not here, and why: D03/D31/D32 run on the same machine and are left to a
+#: later slice (this one adds the metron family only); D21 and D26 publish only
+#: per-symbol / ledger keys through ``extra_outputs`` with no primary
+#: ``artifact_key``, so their fault needs the extra-output shape, not this one.
+CASES: tuple[Case, ...] = (
+    Case(
+        "D19", "daily_closes", f"staging/daily_closes/{TRADING_DAY}.parquet",
+        "empty frame: a zero-row parquet PUT to the contracted key under status ok",
+        verify_artifact_exists=True,
+    ),
+    _json_case(
+        "D20", "metron_market_data", f"{_M.CLOSES_PREFIX}{TRADING_DAY}.json",
+        extra=(
+            (f"{_M.CLOSES_PREFIX}latest.json", "closes"),
+            (f"{_M.FX_PREFIX}{TRADING_DAY}.json", "fx"),
+            (f"{_M.FX_PREFIX}latest.json", "fx"),
+        ),
+    ),
+    _json_case(
+        "D22", "metron_reference_data", f"{_M.SECTORS_PREFIX}latest.json",
+        extra=((f"{_M.EARNINGS_PREFIX}latest.json", "earnings"),),
+    ),
+    _json_case("D23", "metron_macro_data", f"{_M.MACRO_PREFIX}latest.json"),
+    _json_case("D24", "metron_fundamentals_data", f"{_M.FUNDAMENTALS_PREFIX}latest.json"),
+    _json_case("D25", "metron_technicals_data", f"{_M.TECHNICALS_PREFIX}latest.json"),
+    _json_case("D27", "metron_rating_performance", technical_rating_ledger.RATING_PERFORMANCE_KEY),
+    _json_case("D28", "metron_security_performance_data", f"{_M.SECURITY_PERFORMANCE_PREFIX}latest.json"),
+    _json_case("D29", "metron_analyst_data", f"{_M.ANALYST_PREFIX}latest.json"),
+    _json_case("D30", "metron_sentiment_data", f"{_M.SENTIMENT_PREFIX}latest.json"),
+)
+CASE_IDS = [c.unit for c in CASES]
+D19 = CASES[0]
 
 
 # ---------------------------------------------------------------------------
@@ -119,12 +234,12 @@ class InMemoryS3:
         keys = sorted(k for k in self.objects if k.startswith(Prefix) and k > StartAfter)
         return {"Contents": [{"Key": k} for k in keys], "IsTruncated": False}
 
-    def manifests(self) -> list[dict]:
-        prefix = f"data_collection/runs/{UNIT}/{TRADING_DAY}/"
+    def manifests(self, case: Case) -> list[dict]:
+        prefix = f"data_collection/runs/{case.unit}/{TRADING_DAY}/"
         return [json.loads(self.objects[k]) for k in sorted(self.objects) if k.startswith(prefix)]
 
-    def marker(self) -> dict:
-        return json.loads(self.objects[f"data/{TRADING_DAY}/.phases/{PHASE}.json"])
+    def marker(self, case: Case) -> dict:
+        return json.loads(self.objects[f"data/{TRADING_DAY}/.phases/{case.phase}.json"])
 
 
 def _parquet(rows: int) -> bytes:
@@ -134,22 +249,46 @@ def _parquet(rows: int) -> bytes:
     return buf.getvalue()
 
 
-def _collector(s3: InMemoryS3, rows: int):
-    """D19's collector body, reduced to its publish: PUT a frame, report it."""
+def _body(case: Case, rows: int) -> bytes:
+    if case.key.endswith(".parquet"):
+        return _parquet(rows)
+    return json.dumps({"records": [{"symbol": f"T{i}"} for i in range(rows)]}).encode("utf-8")
+
+
+def _collector(s3: InMemoryS3, case: Case, rows: int):
+    """The unit's collector body, reduced to its publish: PUT the key, report its count."""
 
     def run() -> dict:
-        s3.put_object(Bucket=BUCKET, Key=KEY, Body=_parquet(rows))
-        return {"status": "ok", "tickers_captured": rows}
+        result = {"status": "ok", case.rows_key: rows}
+        for key in case.keys:
+            s3.put_object(Bucket=BUCKET, Key=key, Body=_body(case, rows))
+        for _, count_key in case.extra:
+            result[count_key] = rows
+        return result
 
     return run
 
 
-def _run_phase(s3: InMemoryS3, rows: int) -> dict:
-    """One process attempt of the D19 phase, exactly as the daily mode calls it."""
+def _extra_outputs(case: Case) -> tuple:
+    """The call site's ``extra_outputs``, in its own shape: written on ``ok``, counted by key."""
+    return tuple(
+        (key, lambda r: r.get("status") == "ok", lambda r, c=count_key: r.get(c) or 0)
+        for key, count_key in case.extra
+    )
+
+
+def _run_phase(s3: InMemoryS3, case: Case, rows: int) -> dict:
+    """One process attempt of the unit's phase, exactly as the daily mode calls it."""
     reg = RunStatePhaseRegistry(date=TRADING_DAY, bucket=BUCKET, marker_prefix="data", s3_client=s3)
     reg.data_mode = "daily"
+    if case.verify_artifact_exists:
+        return weekly_collector._phase_collect(
+            reg, case.phase, _collector(s3, case, rows), artifact_key=case.key,
+            verify_artifact_exists=True, bucket=BUCKET,
+        )
     return weekly_collector._phase_collect(
-        reg, PHASE, _collector(s3, rows), artifact_key=KEY, verify_artifact_exists=True, bucket=BUCKET,
+        reg, case.phase, _collector(s3, case, rows), artifact_key=case.key,
+        extra_outputs=_extra_outputs(case),
     )
 
 
@@ -165,6 +304,22 @@ def _environment(monkeypatch):
     monkeypatch.setenv("NE_DATA_TRIGGER", "scheduled")
     monkeypatch.delenv("RUN_TOKEN", raising=False)
     completion.reset_unit_cache()
+
+
+@pytest.fixture(autouse=True)
+def clock(monkeypatch) -> HarnessClock:
+    """Stamp every run manifest from :class:`HarnessClock` (the wrapper's only clock reads)."""
+    harness_clock = HarnessClock(EOD_START)
+
+    class _HarnessDatetime(dt.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return harness_clock.now().astimezone(tz) if tz else harness_clock.now()
+
+    monkeypatch.setattr(
+        run_manifest, "dt", types.SimpleNamespace(datetime=_HarnessDatetime, timezone=dt.timezone)
+    )
+    return harness_clock
 
 
 @pytest.fixture
@@ -311,15 +466,17 @@ def _walk(states: dict, start: str, data: dict, tasks, path: list[str], context:
 
 
 class Execution:
-    """One execution of the deployed EOD machine, with D19's phase run for real."""
+    """One execution of the deployed EOD machine, with the case's phase run for real."""
 
-    def __init__(self, s3: InMemoryS3, rows_per_attempt):
+    def __init__(self, s3: InMemoryS3, case: Case, rows_per_attempt):
         self.s3 = s3
+        self.case = case
         self.rows_per_attempt = rows_per_attempt
         self.attempts: list[dict] = []
         self.pages: list[str] = []
         self.path: list[str] = []
-        self.started_at = dt.datetime.now(dt.timezone.utc) - dt.timedelta(seconds=1)
+        # The same clock the manifests are stamped by (the `clock` fixture).
+        self.started_at = run_manifest.dt.datetime.now(dt.timezone.utc)
 
     def tasks(self, name: str, state: dict, data: dict):
         resource = state["Resource"]
@@ -334,7 +491,7 @@ class Execution:
             if data["workload"] != WORKLOAD:
                 return {"Status": "Success", "StatusDetails": "Success"}
             rows = self.rows_per_attempt[len(self.attempts)]
-            result = _run_phase(self.s3, rows)
+            result = _run_phase(self.s3, self.case, rows)
             self.attempts.append(result)
             status = _process_status(result)
             return {"Status": status, "StatusDetails": status}
@@ -343,7 +500,7 @@ class Execution:
             out = completion._completion_check(
                 {
                     "collection": data["collection"],
-                    "units": [UNIT],
+                    "units": [self.case.unit],
                     "started_at": data["started_at"],
                 },
                 s3_client=self.s3,
@@ -367,48 +524,53 @@ class Execution:
 # ---------------------------------------------------------------------------
 
 
-def test_the_fault_record_empty_frame_fails_pages_once_and_stands_down(s3, enforcing, caplog):
-    """The commissioning record for ``empty_fresh``, under the promoted guard."""
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_the_fault_record_empty_frame_fails_pages_once_and_stands_down(case, s3, enforcing, caplog):
+    """The commissioning record for ``empty_fresh``, under the promoted guard, per unit."""
     caplog.set_level(logging.ERROR, logger=weekly_collector.logger.name)
 
-    # Induce: the empty frame, on the attempt AND on the on-demand retry (the
-    # fault is in the data, so the retry meets it again).
-    faulted = Execution(s3, rows_per_attempt=[0, 0])
+    # Induce: the empty publish, on the attempt AND on the on-demand retry
+    # (the fault is in the data, so the retry meets it again).
+    faulted = Execution(s3, case, rows_per_attempt=[0, 0])
     terminal = faulted.run()
 
     # 1. A `failed` manifest, carrying the guard's verdict under `enforce`.
-    manifests = s3.manifests()
+    manifests = s3.manifests(case)
     assert [m["status"] for m in manifests] == ["failed", "failed"], manifests
     for m in manifests:
         assert "empty_fresh guard" in m["reason"]
         guard = next(g for g in m["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name)
         assert (guard["verdict"], guard["mode"]) == ("empty_fresh", "enforce")
-        assert [(o["key"], o["rows_out"]) for o in m["outputs"]] == [(KEY, 0)]
+        assert sorted((o["key"], o["rows_out"]) for o in m["outputs"]) == sorted((k, 0) for k in case.keys)
 
     # 2. Exactly one page — not zero, not one per attempt.
     assert faulted.pages == ["NotifyFailure"], faulted.path
     guard_errors = [r for r in caplog.records if "guard=data_empty_fresh" in r.getMessage()]
-    assert len(guard_errors) == len(faulted.attempts) == 2  # one ERROR verdict line per attempt
+    # One ERROR verdict line per graded key per attempt (every published PUT is graded).
+    assert len(faulted.attempts) == 2
+    assert len(guard_errors) == len(faulted.attempts) * len(case.keys)
 
     # 3. Stand-down: terminal Fail, the retry RECOMPUTED (never auto-skipped
     # the refused artifact), and the marker is not left `ok`.
     assert terminal == "Fail" and faulted.path[-1] == "CollectionFailed"
     assert faulted.path.count("RetryOnDemand") == 1
     assert not any(a.get("auto_skipped") for a in faulted.attempts)
-    marker_after_fault = s3.marker()
+    marker_after_fault = s3.marker(case)
     assert marker_after_fault["status"] == "error"
     assert "enforcing empty_fresh guard rejected this publish" in marker_after_fault["error"]
 
     # ...and once the fault is gone, the next run is clean end to end.
-    recovered = Execution(s3, rows_per_attempt=[896])
+    recovered = Execution(s3, case, rows_per_attempt=[896])
     assert recovered.run() == "Succeed", recovered.path
     assert recovered.path[-1] == "CollectionSucceeded"
     assert recovered.pages == []
     assert recovered.completion["ok"] is True
-    assert s3.manifests()[-1]["status"] == "ok"
-    assert s3.marker()["status"] == "ok"
+    # Keys list in run order (HarnessClock), so the completion check's
+    # "newest" is the recovery run, not whichever ULID drew higher random bits.
+    assert [m["status"] for m in s3.manifests(case)] == ["failed", "failed", "ok"]
+    assert s3.marker(case)["status"] == "ok"
 
-    _print_record(faulted, recovered, s3, marker_after_fault)
+    _print_record(case, faulted, recovered, s3, marker_after_fault)
 
 
 def test_the_same_fault_under_the_shipped_observe_mode_pages_once_through_the_completion_check(s3):
@@ -421,9 +583,9 @@ def test_the_same_fault_under_the_shipped_observe_mode_pages_once_through_the_co
     check. That is why this is not the commissioning record: the guard's own
     consequence is only reachable once it enforces.
     """
-    observed = Execution(s3, rows_per_attempt=[0])
+    observed = Execution(s3, D19, rows_per_attempt=[0])
     assert observed.run() == "Fail"
-    m = s3.manifests()[-1]
+    m = s3.manifests(D19)[-1]
     assert m["status"] == "ok"
     guard = next(g for g in m["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name)
     assert (guard["verdict"], guard["mode"]) == ("empty_fresh", "observe")
@@ -434,56 +596,68 @@ def test_the_same_fault_under_the_shipped_observe_mode_pages_once_through_the_co
 
 def test_observe_mode_never_withholds_the_marker(s3):
     """The marker fix is gated on ENFORCE: in observe, behaviour is unchanged."""
-    _run_phase(s3, 0)
-    assert s3.marker()["status"] == "ok"
+    _run_phase(s3, D19, 0)
+    assert s3.marker(D19)["status"] == "ok"
 
 
-def test_the_record_shape_is_what_the_phase_two_gate_reads(tmp_path):
+def test_every_case_is_a_daily_phase_unit_on_the_post_market_data_workload():
+    """A case is commissioned only on the machine and workload it actually runs on.
+
+    The record's page and stand-down are walked on the deployed EOD machine,
+    whose ``verify_units`` must name the unit (else the completion check grades
+    nothing for it) and whose ``post-market-data`` workload is the daily mode
+    that runs these phases.
+    """
+    eod = _deployed_eod_input()
+    assert WORKLOAD in eod["workloads"]
+    for case in CASES:
+        assert run_units.PHASE_UNITS[("daily", case.phase)].unit_id == case.unit
+        assert case.unit in eod["verify_units"], case.unit
+        unit = next(u for u in descriptors.load_units() if u.unit_id == case.unit)
+        assert unit.guards[GUARD_CLASS]["state"] == "present", case.unit
+
+
+@pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
+def test_the_record_shape_is_what_the_phase_two_gate_reads(case, tmp_path):
     """``faults/<unit>/<guard>/latest.json`` with ``outcome: induced`` reads MET.
 
-    The gate reader exists (`data_gate.evidence.read_guard_commissioning`);
-    what does not exist yet is anything that writes the record to the data
-    collection store — that is a production write and is parked on I10786.
+    The gate reader is `data_gate.evidence.read_guard_commissioning`. The
+    document is built by the same function the publisher
+    (`scripts/publish_guard_commissioning.py`) writes, so what this asserts is
+    what lands in the store.
     """
-    unit = next(u for u in descriptors.load_units() if u.unit_id == UNIT)
+    unit = next(u for u in descriptors.load_units() if u.unit_id == case.unit)
     store = LocalStore(tmp_path)
     day = dt.date.fromisoformat(TRADING_DAY)
     before = evidence.read_guard_commissioning(store, unit, GUARD_CLASS, trading_day=day)
     assert before.met is False and "no induced-fault record" in before.detail
 
-    key = tmp_path / "faults" / UNIT / GUARD_CLASS / "latest.json"
-    key.parent.mkdir(parents=True)
-    key.write_text(json.dumps(_record_document()))
+    document = record_document(case.unit, GUARD_CLASS, fault=case.fault, test=nodeid(case), code_sha="c" * 40)
+    store.put_bytes(record_key(case.unit, GUARD_CLASS), json.dumps(document).encode("utf-8"))
     after = evidence.read_guard_commissioning(store, unit, GUARD_CLASS, trading_day=day)
     assert after.met is True, after.detail
 
 
-def _record_document() -> dict:
-    return {
-        "unit": UNIT,
-        "guard": GUARD_CLASS,
-        "outcome": "induced",
-        "fault": "empty frame: a zero-row parquet PUT to the contracted key under status ok",
-        "test": "tests/test_guard_commissioning_empty_fresh.py::"
-        "test_the_fault_record_empty_frame_fails_pages_once_and_stands_down",
-        "as_of": dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-    }
+def nodeid(case: Case) -> str:
+    return (
+        "tests/test_guard_commissioning_empty_fresh.py::"
+        f"test_the_fault_record_empty_frame_fails_pages_once_and_stands_down[{case.unit}]"
+    )
 
 
-def _print_record(faulted: Execution, recovered: Execution, s3: InMemoryS3, marker: dict) -> None:
+def _print_record(case: Case, faulted: Execution, recovered: Execution, s3: InMemoryS3, marker: dict) -> None:
     """The fault record, printed for the PR body (`pytest -s`)."""
-    first = s3.manifests()[0]
+    first = s3.manifests(case)[0]
     guard = next(g for g in first["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name)
     lines = [
-        f"FAULT RECORD guard={GUARD_CLASS} unit={UNIT} phase={PHASE} workload={WORKLOAD}",
-        "  fault:      zero-row parquet frame PUT to " + KEY + " under status=ok",
+        f"FAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={WORKLOAD}",
+        f"  fault:      {case.fault}",
         "  attempts:   " + ", ".join(f"{a['status']}" for a in faulted.attempts),
-        "  manifests:  " + ", ".join(m["status"] for m in s3.manifests()[: len(faulted.attempts)]),
+        "  manifests:  " + ", ".join(m["status"] for m in s3.manifests(case)[: len(faulted.attempts)]),
         f"  verdict:    {guard['verdict']} mode={guard['mode']}: {guard['detail']}",
         f"  pages:      {len(faulted.pages)} {faulted.pages}",
         "  path:       " + " > ".join(faulted.path),
         f"  marker:     {marker['status']} ({marker['error'][:90]}...)",
         "  recovery:   " + " > ".join(recovered.path) + f" (pages={len(recovered.pages)})",
-        "  record:     " + json.dumps({k: v for k, v in _record_document().items() if k != "as_of"}),
     ]
     print("\n" + "\n".join(lines))

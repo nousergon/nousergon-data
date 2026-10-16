@@ -19,6 +19,13 @@ The failure mode is silent in both directions and neither direction is visible
 from this repo alone — the alarms are created in `nous-ergon-ops`. So the
 pairing is pinned here: for every split pair, the breaching half MUST be
 declared and the notBreaching half MUST NOT be.
+
+FOLDED PAIRS (alpha-engine-config-I11792, Brian's "Cut redundant" ruling
+2026-10-15). The two exposure-probe pairs were folded back into one alarm each:
+the `-violation` count is published on every tick, so `-violation` became
+``breaching`` and carries silence itself, and `-dead` was deleted. For those the
+rule inverts: the `-violation` half MUST be declared armed and the `-dead` half
+MUST sit in ``retired_alarms`` (never ``armed_alarms``), naming its restore point.
 """
 
 from __future__ import annotations
@@ -38,16 +45,21 @@ MANIFEST_PATH = REPO / "infrastructure" / "automation_pause.json"
 #: AlarmDescription states the same split in prose.
 I8118_PAIRS = [
     (
+        "alpha-engine-director-plan-no-datapoint",
+        "alpha-engine-director-plan-latency",
+    ),
+]
+
+#: ``(retired silence half, folded alarm now breaching and armed)`` — see the
+#: module docstring's FOLDED PAIRS paragraph.
+FOLDED_PAIRS = [
+    (
         "alpha-engine-console-exposure-probe-dead",
         "alpha-engine-console-exposure-probe-violation",
     ),
     (
         "alpha-engine-router-exposure-probe-dead",
         "alpha-engine-router-exposure-probe-violation",
-    ),
-    (
-        "alpha-engine-director-plan-no-datapoint",
-        "alpha-engine-director-plan-latency",
     ),
 ]
 
@@ -91,6 +103,18 @@ def classification_findings(manifest: dict, module) -> list[str]:
     for name in STANDALONE_BREACHING:
         if name not in declared:
             findings.append(f"{name} is breaching live and is not classified")
+    retired = set(module.retired_alarm_names(manifest))
+    for dead, folded in FOLDED_PAIRS:
+        if folded not in declared:
+            findings.append(
+                f"{folded} carries silence since the 2026-10-15 fold "
+                "(TreatMissingData=breaching) and is not declared armed"
+            )
+        if dead in declared or dead not in retired:
+            findings.append(
+                f"{dead} was folded into {folded} and deleted; it belongs in "
+                "retired_alarms, never armed_alarms"
+            )
     return findings
 
 

@@ -2643,26 +2643,30 @@ def _write_alternative_scope_baseline(
 
 
 def _previous_trading_day(reference: datetime | None = None) -> str:
-    """Find the most recent trading day strictly before ``reference`` (UTC).
+    """Find the most recent NYSE trading day strictly before TODAY IN NEW YORK
+    at ``reference`` (an aware instant; defaults to now).
 
-    Used by --morning-enrich to determine which date polygon's grouped-daily
-    should be fetched for. Free tier won't serve today's data, so we always
-    enrich the prior session. Walks back at most 10 calendar days as a
-    runaway guard against a broken trading-calendar implementation.
+    Used by --morning-enrich (and the append/heal paths that follow it) to
+    determine which date polygon's grouped-daily should be fetched for. Free
+    tier won't serve today's data, so we always enrich the prior session.
+
+    Delegates to ``sf_preflight._previous_trading_day_str`` so the fleet has
+    ONE New-York-date prior-day resolver, not two (alpha-engine-config-I12294,
+    the sibling of nousergon-data#2146 / I12286). "Today" used to be
+    ``reference.date()`` in whatever zone the caller passed: UTC by default
+    (between UTC midnight and ET midnight that is a day ahead, so the "prior"
+    day is the current ET day and Polygon answers 403 "Attempted to request
+    today's data before end of day"), and Pacific at the four call sites (a
+    day BEHIND New York from 00:00 to 03:00 ET, so a launch just after ET
+    midnight targeted the session before last). The instant is what matters;
+    its zone no longer does. Walks back at most 10 calendar days as a runaway
+    guard against a broken trading-calendar implementation.
     """
-    from nousergon_lib.trading_calendar import is_trading_day
-    from datetime import timedelta
+    # sf_preflight's module scope is stdlib-only, so this import is cheap and
+    # cannot cycle (sf_preflight deliberately never imports this module).
+    from sf_preflight import _previous_trading_day_str
 
-    ref = reference or datetime.now(timezone.utc)
-    d = ref.date() - timedelta(days=1)
-    for _ in range(10):
-        if is_trading_day(d):
-            return d.strftime("%Y-%m-%d")
-        d -= timedelta(days=1)
-    raise RuntimeError(
-        f"Could not find a trading day in the 10 calendar days before {ref.date()} — "
-        f"trading_calendar.is_trading_day appears broken or NYSE has been closed for >1 week."
-    )
+    return _previous_trading_day_str(reference)
 
 
 def _arctic_spy_last_date(bucket: str) -> "date | None":
@@ -3400,14 +3404,12 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Compute target_date PT-aware so a Wed-evening manual rerun (UTC rolled
-    # past midnight) doesn't resolve "previous trading day" to today PT — that
-    # was the original 403 trap the wall-clock guard worked around.
+    # target_date is the trading day before TODAY IN NEW YORK, so a
+    # Wed-evening manual rerun (UTC rolled past midnight) doesn't resolve
+    # "previous trading day" to today ET — the original 403 trap the
+    # wall-clock guard worked around (I12294).
     if args.date is None:
-        from zoneinfo import ZoneInfo
-        target_date = _previous_trading_day(
-            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
-        )
+        target_date = _previous_trading_day()
     else:
         target_date = args.date
 
@@ -4224,13 +4226,10 @@ def _run_daily_heal(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Same PT-aware target-date resolution as MorningEnrich/MorningArcticAppend
+    # Same New-York-date target-date resolution as MorningEnrich/MorningArcticAppend
     # (the day being healed is the prior trading day relative to this run).
     if args.date is None:
-        from zoneinfo import ZoneInfo
-        target_date = _previous_trading_day(
-            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
-        )
+        target_date = _previous_trading_day()
     else:
         target_date = args.date
 
@@ -4380,13 +4379,10 @@ def _run_morning_arctic_append(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Same PT-aware target-date resolution as MorningEnrich, so the append
+    # Same New-York-date target-date resolution as MorningEnrich, so the append
     # targets the prior trading day MorningEnrich just fetched.
     if args.date is None:
-        from zoneinfo import ZoneInfo
-        target_date = _previous_trading_day(
-            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
-        )
+        target_date = _previous_trading_day()
     else:
         target_date = args.date
 
@@ -4551,13 +4547,10 @@ def _run_chronic_gap_heal(config: dict, args: argparse.Namespace) -> dict:
     bucket = config["bucket"]
     started_at = datetime.now(timezone.utc).isoformat()
 
-    # Mirror _run_morning_enrich's PT-aware target-date resolution so the heal
+    # Mirror _run_morning_enrich's New-York-date target-date resolution so the heal
     # targets the same trading day the enrich just wrote.
     if args.date is None:
-        from zoneinfo import ZoneInfo
-        target_date = _previous_trading_day(
-            reference=datetime.now(ZoneInfo("America/Los_Angeles"))
-        )
+        target_date = _previous_trading_day()
     else:
         target_date = args.date
 
