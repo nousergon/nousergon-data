@@ -86,6 +86,32 @@ def test_isolated_lambda_stages_receive_the_execution_name():
         assert ALL[n]["Parameters"]["Payload"]["execution_arn.$"] == "$$.Execution.Id", n
 
 
+def test_report_card_receives_the_execution_name_additively():
+    """rehearsal-2026-10-16-1: ReportCard read live signals/ and raised
+    StaleInputArtifactError, because its Payload named nothing that said
+    "rehearsal". It now carries the same marker the isolated Lambda stages do
+    (crucible-evaluator grading/rehearsal.py keys on it).
+
+    ADDITIVE, and asserted as such: every key the Payload carried before is
+    still there with the same value, so production's invocation differs only by
+    one field that a pre-existing handler ignores and the new one treats as
+    production for any name that is not ``rehearsal-*``."""
+    payload = ALL["ReportCard"]["Parameters"]["Payload"]
+    assert payload["execution_name.$"] == "$$.Execution.Name"
+    assert ALL["ReportCard"]["Parameters"]["FunctionName"] == "alpha-engine-evaluator:live"
+    assert {k: v for k, v in payload.items() if k != "gate_state"} == {
+        "date.$": "$.run_date",
+        "dry_run.$": "$.research_dry",
+        "snapshot": True,
+        "execution_name.$": "$$.Execution.Name",
+        "run_scope.$": "$.run_scope_result.Payload",
+    }
+    # Not $.rehearsal_marker.*: the context object is present on every path
+    # that reaches ReportCard, so the reference cannot throw States.Runtime on
+    # a valid path the way an unseeded state-input path can.
+    assert "rehearsal_marker" not in json.dumps(payload)
+
+
 def test_every_completion_marker_is_namespaced_and_unchanged_in_production():
     markers = {
         n: s["Parameters"]["Key.$"]

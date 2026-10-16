@@ -350,7 +350,9 @@ def test_a_recorded_entry_that_published_something_is_untouched(monkeypatch):
     )
     (manifest,) = written.values()
     assert manifest["status"] == "ok"
-    assert [g["guard"] for g in manifest.get("guards", [])] == []
+    # No empty-production verdict; the one guard is the point-in-time stamp
+    # every recorded output now carries (alpha-engine-config-I10782).
+    assert [g["guard"] for g in manifest.get("guards", [])] == ["data_pit"]
 
 
 # ---------------------------------------------------------------------------

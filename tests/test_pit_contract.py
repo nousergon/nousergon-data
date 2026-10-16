@@ -316,3 +316,141 @@ def test_a_collector_returned_stamp_reaches_the_gate_through_the_generic_hook(tm
     manifest = json.loads(next((tmp_path / "data_collection" / "runs" / "D01").rglob("*.json")).read_text())
     assert [g["guard"] for g in manifest["guards"]] == [pit.PIT_GUARD_NAME]
     assert dataclasses.asdict(pit.read_pit_entry(manifest["guards"][0]))["verdict"] == "ok"
+
+
+# ── stage 2, writer half: the shared wrappers stamp every recorded output ──
+#
+# 2026-10-13's phase-2 read named every published key of 33 units as carrying
+# NO `data_pit` stamp, because `pit_guard_entry` had no production caller. The
+# fix is ONE shared call (`run_units.record_pit_stamps`) from every wrapper
+# that records outputs, so a unit cannot publish unstamped by being added in a
+# hurry.
+
+import run_units  # noqa: E402 - grouped with the section that needs it
+
+SATURDAY_RUN = dt.datetime(2026, 9, 12, 10, 5, tzinfo=UTC)
+
+
+def _ctx(trading_day: str = FRIDAY) -> run_manifest.UnitRun:
+    return run_manifest.UnitRun(
+        run_id="RUN1",
+        unit_id="D01",
+        trading_day=trading_day,
+        calendar_date="2026-09-12",
+        trigger="scheduled",
+        started=dt.datetime(2026, 9, 12, 10, 0, tzinfo=UTC),
+        code_sha="a" * 40,
+        log_location="local://test",
+    )
+
+
+def _pit_entries(guards) -> dict[str, dict]:
+    return {g["key"]: g for g in guards if g["guard"] == pit.PIT_GUARD_NAME}
+
+
+def test_the_writer_stamps_every_output_with_the_runs_trading_day_and_the_moment_it_recorded():
+    ctx = _ctx()
+    other = f"market_data/weekly/{FRIDAY}/sector_map.json"
+    ctx.record_output(KEY, rows_out=503)
+    ctx.record_output(other, rows_out=11)
+
+    assert run_units.record_pit_stamps(ctx, now=SATURDAY_RUN) == 2
+
+    entries = _pit_entries(ctx.guards)
+    assert set(entries) == {KEY, other}
+    for entry in entries.values():
+        assert entry["verdict"] == "ok" and entry["mode"] == pit.PIT_GUARD_MODE
+        assert entry["value"] == SATURDAY_RUN.timestamp()
+        assert entry["baseline"] == pit.as_of_floor(dt.date(2026, 9, 11)).timestamp()
+        assert f"as_of={FRIDAY} available_at=2026-09-12T10:05:00Z" in entry["detail"]
+
+
+def test_a_producers_own_stamp_stands_and_the_writer_does_not_restamp_it():
+    ctx = _ctx()
+    ctx.record_output(KEY, rows_out=1)
+    own = pit.pit_guard_entry(KEY, _stamped(available_at="2026-09-12T10:01:00Z"))
+    weekly_collector._record_collector_guards(ctx, {"guards": [own]})
+
+    assert run_units.record_pit_stamps(ctx, now=SATURDAY_RUN) == 0
+    assert [g for g in ctx.guards if g["guard"] == pit.PIT_GUARD_NAME] == [own]
+
+
+def test_an_arcticdb_ref_is_filed_exempt_and_a_repeated_key_is_stamped_once():
+    ctx = _ctx()
+    ctx.record_output("arcticdb/universe", rows_out=900)
+    ctx.record_output(KEY, rows_out=1)
+    ctx.record_output(KEY, rows_out=1)
+
+    assert run_units.record_pit_stamps(ctx, now=SATURDAY_RUN) == 2
+    entries = _pit_entries(ctx.guards)
+    assert entries["arcticdb/universe"]["verdict"] == "not_applicable"
+    assert entries[KEY]["verdict"] == "ok"
+
+
+def test_a_trading_day_that_has_not_begun_is_recorded_unmeasurable_not_ok():
+    """The writer never papers over a contradiction: a run keyed on a day that
+    starts AFTER the moment it recorded cannot have known that day's record."""
+    ctx = _ctx(trading_day="2026-09-14")
+    ctx.record_output(KEY, rows_out=1)
+
+    run_units.record_pit_stamps(ctx, now=SATURDAY_RUN)
+
+    assert _pit_entries(ctx.guards)[KEY]["verdict"] == "unmeasurable"
+
+
+def test_recorded_entry_stamps_every_output_and_the_gate_reads_it_met(tmp_path, units, monkeypatch):
+    """End to end through the wrapper metron, daily_news, inst_ownership and
+    the Lambdas use: the body records outputs and nothing else, and the gate's
+    `guard.pit` reader grades N/N stamped."""
+    monkeypatch.setenv("NE_DATA_LOG_LOCATION", "local://test")
+    monkeypatch.setattr(run_units, "manifest_sink", lambda bucket, s3=None: run_manifest.LocalDirManifestSink(str(tmp_path)))
+    # The Saturday fire's start, so the cadence reader selects this run; the
+    # stamp and `finished` both read the wall clock, which is later still.
+    real_run_unit = run_manifest.run_unit
+    monkeypatch.setattr(
+        run_units.run_manifest,
+        "run_unit",
+        lambda *a, **k: real_run_unit(*a, now=dt.datetime(2026, 9, 12, 10, 0, tzinfo=UTC), **k),
+    )
+
+    def body(ctx):
+        ctx.record_output(KEY, rows_out=503)
+
+    run_units.recorded_entry("D01", body, trigger="scheduled", trading_day=FRIDAY, code_sha="a" * 40)
+
+    manifest = json.loads(next((tmp_path / "data_collection" / "runs" / "D01").rglob("*.json")).read_text())
+    assert _pit_entries(manifest["guards"])[KEY]["verdict"] == "ok"
+    reading = evidence.read_pit(
+        LocalStore(tmp_path / "data_collection"), units["D01"], trading_day=TUESDAY, now=WEDNESDAY_NOON
+    )
+    assert reading.met is True, reading.detail
+    assert "1/1 published key(s) stamped" in reading.detail
+
+
+def test_recorded_entry_stamps_what_a_failed_body_published(tmp_path, monkeypatch):
+    monkeypatch.setenv("NE_DATA_LOG_LOCATION", "local://test")
+    monkeypatch.setattr(run_units, "manifest_sink", lambda bucket, s3=None: run_manifest.LocalDirManifestSink(str(tmp_path)))
+
+    def body(ctx):
+        ctx.record_output(KEY, rows_out=503)
+        raise run_units.EntryRunFailed("second write failed", value="sentinel")
+
+    assert run_units.recorded_entry("D01", body, trigger="scheduled", trading_day=FRIDAY, code_sha="a" * 40) == "sentinel"
+    manifest = json.loads(next((tmp_path / "data_collection" / "runs" / "D01").rglob("*.json")).read_text())
+    assert manifest["status"] == "failed"
+    assert set(_pit_entries(manifest["guards"])) == {KEY}
+
+
+def test_every_shared_writer_calls_the_stamp():
+    """The writer half is only as complete as its call sites. Every wrapper in
+    this repo that records a unit's outputs on a manifest stamps them; a new
+    wrapper that does not is the 2026-10-13 defect again, one level up."""
+    import inspect
+
+    for fn in (
+        weekly_collector._record_phase_lineage,
+        weekly_collector._run_whole_mode_unit,
+        run_units.recorded_entry,
+        run_units.manual_run,
+    ):
+        assert "record_pit_stamps(" in inspect.getsource(fn), fn.__qualname__
