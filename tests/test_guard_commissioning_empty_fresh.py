@@ -60,6 +60,7 @@ import logging
 import pathlib
 import re
 import types
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import pandas as pd
@@ -70,7 +71,7 @@ from nousergon_lib.guard_mode import GuardMode, GuardStaging
 
 import run_units
 import weekly_collector
-from collectors import metron_market_data, technical_rating_ledger
+from collectors import metron_market_data, prices, technical_rating_ledger
 from data_gate import descriptors, evidence
 from data_gate import run_manifest_predicate as completion
 from data_gate.guard_commissioning import record_document, record_key
@@ -122,18 +123,46 @@ class HarnessClock:
 
 
 @dataclass(frozen=True)
+class Shape:
+    """A unit whose published keys are not one primary key plus a literal list.
+
+    D03 (one parquet per ticker), D21 (a consolidated artifact plus one FX file
+    per currency), D26 (a ledger manifest written only when the run wrote) and
+    D31 (feature groups present only when computed) declare their outputs
+    through ``extra_outputs`` entries whose key and count come out of the
+    collector's own result. The harness does not re-derive those: the
+    ``extra_outputs`` here is the CALL SITE'S (``weekly_collector`` helpers
+    where it has one, a mirror of the inline tuple where it does not), and
+    ``result`` is the dict the collector would return, so the real
+    ``_extra_writes`` reads it back exactly as production does.
+    """
+
+    #: ``rows -> the collector's result dict`` (``status``, the unit's ``rows_key``,
+    #: and whatever the call site's ``extra_outputs`` read).
+    result: Callable[[int], dict]
+    #: ``rows -> {key: rows recorded for it}`` for every key that run PUTs. The
+    #: assertion on the failed manifest's ``outputs`` is made against this.
+    written: Callable[[int], dict[str, int]]
+    #: The call site's ``extra_outputs`` tuple.
+    extra_outputs: Callable[[], tuple]
+    #: The call site's ``supports_auto_skip``.
+    auto_skip: bool = True
+
+
+@dataclass(frozen=True)
 class Case:
     """One unit's induced fault: the phase it runs as and the key it publishes.
 
     ``key`` is the unit's PRIMARY ``artifact_key`` exactly as the daily mode's
     ``_phase_collect`` call site builds it in ``weekly_collector.py`` (from the
     same collector-module constants), so the guard grades the key production
-    publishes. ``fault`` is the induced-fault sentence the record carries.
+    publishes; ``None`` for a unit whose call site passes none. ``fault`` is the
+    induced-fault sentence the record carries.
     """
 
     unit: str
     phase: str
-    key: str
+    key: str | None
     fault: str
     #: D19's call site alone passes ``verify_artifact_exists=True, bucket=...``
     #: (config-I2702); the metron call sites pass neither. Mirrored, not tidied.
@@ -143,10 +172,21 @@ class Case:
     #: than one key, and the completion check reads ``output_missing`` on a
     #: recovery run that published only the primary one.
     extra: tuple[tuple[str, str], ...] = ()
+    #: Set for the units whose outputs are shaped by their own result (see
+    #: :class:`Shape`); ``extra`` is then unused.
+    shape: Shape | None = None
+
+    def written(self, rows: int) -> dict[str, int]:
+        """Every key a run at ``rows`` PUTs, with the count its manifest records."""
+        if self.shape is not None:
+            return self.shape.written(rows)
+        return {k: rows for k in self.keys}
 
     @property
     def keys(self) -> tuple[str, ...]:
-        return (self.key, *(k for k, _ in self.extra))
+        if self.shape is not None:
+            return tuple(self.shape.written(0))
+        return (*([self.key] if self.key else []), *(k for k, _ in self.extra))
 
     @property
     def rows_key(self) -> str:
@@ -163,18 +203,139 @@ def _json_case(unit: str, phase: str, key: str, extra: tuple[tuple[str, str], ..
 
 
 _M = metron_market_data
+
+#: ``price_cfg.get("s3_prefix", ...)`` at the D03 daily call site.
+_PRICE_CACHE_PREFIX = "predictor/price_cache/"
+_PRICE_TICKERS = ("AAA", "BBB")
+
+
+def _d03_shape() -> Shape:
+    """D03 (prices): no primary key; one parquet per ticker the run actually wrote.
+
+    The call site's ``extra_outputs`` is ``weekly_collector._prices_extra_outputs``
+    itself, reading ``result["written"]`` through ``prices.written_keys``.
+    """
+    return Shape(
+        result=lambda rows: {
+            "status": "ok", "refreshed": rows, "written": {t: rows for t in _PRICE_TICKERS},
+        },
+        written=lambda rows: prices.written_keys(
+            {"written": {t: rows for t in _PRICE_TICKERS}}, _PRICE_CACHE_PREFIX
+        ),
+        extra_outputs=lambda: weekly_collector._prices_extra_outputs(_PRICE_CACHE_PREFIX),
+        auto_skip=False,
+    )
+
+
+_D21_FX_KEY = f"{_M.FX_HISTORY_PREFIX}EUR.json"
+
+
+def _d21_shape() -> Shape:
+    """D21 (close/fx history): no primary key; the consolidated close history and
+    one FX file per currency written. The fault empties the close history; the FX
+    file is a real one-rate document, so the guard has to pick the empty key out.
+
+    The call site's ``extra_outputs`` is inline in ``weekly_collector.py``
+    (``metron_market_data_history``), so it is mirrored here, not tidied.
+    """
+    return Shape(
+        result=lambda rows: {"status": "ok", "close_series": rows, "fx_currencies": ["EUR"]},
+        written=lambda rows: {_M.CONSOLIDATED_CLOSE_HISTORY_KEY: rows, _D21_FX_KEY: 1},
+        extra_outputs=lambda: (
+            (
+                _M.CONSOLIDATED_CLOSE_HISTORY_KEY,
+                lambda r: r.get("status") == "ok",
+                lambda r: r.get("close_series") or 0,
+            ),
+            (
+                lambda r: [f"{_M.FX_HISTORY_PREFIX}{ccy}.json" for ccy in (r.get("fx_currencies") or [])],
+                lambda r: r.get("status") == "ok" and bool(r.get("fx_currencies")),
+                lambda r: 1,
+            ),
+        ),
+        auto_skip=False,
+    )
+
+
+def _d26_shape() -> Shape:
+    """D26 (rating ledger): no primary key; the ledger manifest, recorded only when
+    the run wrote (``backfill_written or live_written``), counted as ``total_dates``.
+    Mirrors the inline ``extra_outputs`` of ``metron_rating_ledger``'s call site.
+    """
+    manifest = technical_rating_ledger.RATING_LEDGER_MANIFEST_KEY
+    return Shape(
+        result=lambda rows: {"status": "ok", "total_dates": rows, "live_written": True},
+        written=lambda rows: {manifest: rows},
+        extra_outputs=lambda: (
+            (
+                manifest,
+                lambda r: bool(r.get("backfill_written") or r.get("live_written")),
+                lambda r: r.get("total_dates") or 0,
+            ),
+        ),
+        auto_skip=False,
+    )
+
+
+#: What D31 reports for the parts of its write that are not the fault: the catalog
+#: entry count ``upload_registry`` returns and the sectors the metron_supplemental
+#: sidecar carries. Both are real, non-empty writes.
+_D31_REGISTRY_ENTRIES = 120
+_D31_SECTORS = 85
+
+
+def _d31_shape() -> Shape:
+    """D31 (daily features): the primary ``schema_version.json``, one parquet per
+    feature group computed, the catalog registry and the metron_supplemental sidecar.
+
+    The group and registry entries are ``weekly_collector``'s own helpers; the
+    sidecar entry is inline at the call site and mirrored. The fault is a snapshot
+    of zero rows in every group, with the registry and sidecar written as normal.
+    """
+    sidecar = f"features/metron_supplemental/{TRADING_DAY}/sectors.json"
+    groups = weekly_collector._FEATURE_GROUPS
+    return Shape(
+        result=lambda rows: {
+            "status": "ok",
+            "tickers_computed": rows,
+            "groups_written": {g: rows for g in groups},
+            "registry_written": _D31_REGISTRY_ENTRIES,
+            "metron_supplemental_written": {"sectors": _D31_SECTORS},
+        },
+        written=lambda rows: {
+            f"features/{TRADING_DAY}/schema_version.json": rows,
+            **{f"features/{TRADING_DAY}/{g}.parquet": rows for g in groups},
+            "features/registry.json": _D31_REGISTRY_ENTRIES,
+            sidecar: _D31_SECTORS,
+        },
+        extra_outputs=lambda: weekly_collector._feature_group_extra_outputs(TRADING_DAY) + (
+            weekly_collector._feature_registry_extra_output(),
+            (
+                sidecar,
+                lambda r: bool(
+                    {k: v for k, v in (r.get("metron_supplemental_written") or {}).items() if k != "sectors"}
+                ) or ((r.get("metron_supplemental_written") or {}).get("sectors") or 0) > 0,
+                lambda r: (r.get("metron_supplemental_written") or {}).get("sectors") or 0,
+            ),
+        ),
+    )
+
+
 #: Every daily-mode ``_phase_collect`` unit on the EOD machine's
-#: ``post-market-data`` workload that publishes through a primary
-#: ``artifact_key``. D19 is the first record (nousergon-data#2069); the metron
-#: units ride the identical call path (`_phase_collect` ->
-#: `_record_phase_lineage` -> `check_empty_fresh`) on the same workload and the
-#: same deployed ASL, and each gets its own record because the gate grades
-#: commissioning per unit (`faults/<unit>/<guard>/latest.json`).
+#: ``post-market-data`` workload that the trading path does not read. D19 is the
+#: first record (nousergon-data#2069); the metron units ride the identical call
+#: path (`_phase_collect` -> `_record_phase_lineage` -> `check_empty_fresh`) on the
+#: same workload and the same deployed ASL, and each gets its own record because
+#: the gate grades commissioning per unit (`faults/<unit>/<guard>/latest.json`).
+#: A unit with a primary ``artifact_key`` takes the literal-list shape
+#: (:func:`_json_case`); D03, D21, D26 and D31 publish through result-shaped
+#: ``extra_outputs`` and carry a :class:`Shape`.
 #:
-#: Not here, and why: D03/D31/D32 run on the same machine and are left to a
-#: later slice (this one adds the metron family only); D21 and D26 publish only
-#: per-symbol / ledger keys through ``extra_outputs`` with no primary
-#: ``artifact_key``, so their fault needs the extra-output shape, not this one.
+#: Not here, and why: D32 runs on the OTHER workload (``post-market-arctic-append``)
+#: and its call site declares no ``artifact_key`` and no ``extra_outputs``, so
+#: the guard grades nothing there (`not_applicable`) and there is no fault to
+#: induce through this path. D19's `staging/daily_closes` is read by
+#: crucible-executor (trading path) and is held with D01/D02.
 CASES: tuple[Case, ...] = (
     Case(
         "D19", "daily_closes", f"staging/daily_closes/{TRADING_DAY}.parquet",
@@ -200,6 +361,30 @@ CASES: tuple[Case, ...] = (
     _json_case("D28", "metron_security_performance_data", f"{_M.SECURITY_PERFORMANCE_PREFIX}latest.json"),
     _json_case("D29", "metron_analyst_data", f"{_M.ANALYST_PREFIX}latest.json"),
     _json_case("D30", "metron_sentiment_data", f"{_M.SENTIMENT_PREFIX}latest.json"),
+    Case(
+        "D03", "prices", None,
+        "empty frame: every per-ticker price-cache parquet PUT with zero rows under status ok, "
+        "reporting refreshed 0",
+        shape=_d03_shape(),
+    ),
+    Case(
+        "D21", "metron_market_data_history", None,
+        f"empty payload: a zero-series JSON document PUT to {_M.CONSOLIDATED_CLOSE_HISTORY_KEY} "
+        "under status ok, reporting a close_series count of 0",
+        shape=_d21_shape(),
+    ),
+    Case(
+        "D26", "metron_rating_ledger", None,
+        "empty ledger: a zero-date rating-history manifest PUT under status ok, reporting "
+        "total_dates 0",
+        shape=_d26_shape(),
+    ),
+    Case(
+        "D31", "features", f"features/{TRADING_DAY}/schema_version.json",
+        "empty snapshot: the schema marker and every feature-group parquet PUT with zero rows "
+        "under status ok, reporting tickers_computed 0",
+        shape=_d31_shape(),
+    ),
 )
 CASE_IDS = [c.unit for c in CASES]
 D19 = CASES[0]
@@ -249,21 +434,24 @@ def _parquet(rows: int) -> bytes:
     return buf.getvalue()
 
 
-def _body(case: Case, rows: int) -> bytes:
-    if case.key.endswith(".parquet"):
+def _body(key: str, rows: int) -> bytes:
+    if key.endswith(".parquet"):
         return _parquet(rows)
     return json.dumps({"records": [{"symbol": f"T{i}"} for i in range(rows)]}).encode("utf-8")
 
 
 def _collector(s3: InMemoryS3, case: Case, rows: int):
-    """The unit's collector body, reduced to its publish: PUT the key, report its count."""
+    """The unit's collector body, reduced to its publish: PUT the keys, report its counts."""
 
     def run() -> dict:
-        result = {"status": "ok", case.rows_key: rows}
-        for key in case.keys:
-            s3.put_object(Bucket=BUCKET, Key=key, Body=_body(case, rows))
-        for _, count_key in case.extra:
-            result[count_key] = rows
+        if case.shape is not None:
+            result = case.shape.result(rows)
+        else:
+            result = {"status": "ok", case.rows_key: rows}
+            for _, count_key in case.extra:
+                result[count_key] = rows
+        for key, recorded in case.written(rows).items():
+            s3.put_object(Bucket=BUCKET, Key=key, Body=_body(key, recorded))
         return result
 
     return run
@@ -271,6 +459,8 @@ def _collector(s3: InMemoryS3, case: Case, rows: int):
 
 def _extra_outputs(case: Case) -> tuple:
     """The call site's ``extra_outputs``, in its own shape: written on ``ok``, counted by key."""
+    if case.shape is not None:
+        return case.shape.extra_outputs()
     return tuple(
         (key, lambda r: r.get("status") == "ok", lambda r, c=count_key: r.get(c) or 0)
         for key, count_key in case.extra
@@ -289,6 +479,7 @@ def _run_phase(s3: InMemoryS3, case: Case, rows: int) -> dict:
     return weekly_collector._phase_collect(
         reg, case.phase, _collector(s3, case, rows), artifact_key=case.key,
         extra_outputs=_extra_outputs(case),
+        supports_auto_skip=case.shape.auto_skip if case.shape is not None else True,
     )
 
 
@@ -539,16 +730,20 @@ def test_the_fault_record_empty_frame_fails_pages_once_and_stands_down(case, s3,
     assert [m["status"] for m in manifests] == ["failed", "failed"], manifests
     for m in manifests:
         assert "empty_fresh guard" in m["reason"]
-        guard = next(g for g in m["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name)
+        guard = _worst_guard(m)
         assert (guard["verdict"], guard["mode"]) == ("empty_fresh", "enforce")
-        assert sorted((o["key"], o["rows_out"]) for o in m["outputs"]) == sorted((k, 0) for k in case.keys)
+        assert sorted((o["key"], o["rows_out"]) for o in m["outputs"]) == sorted(case.written(0).items())
 
     # 2. Exactly one page — not zero, not one per attempt.
     assert faulted.pages == ["NotifyFailure"], faulted.path
     guard_errors = [r for r in caplog.records if "guard=data_empty_fresh" in r.getMessage()]
-    # One ERROR verdict line per graded key per attempt (every published PUT is graded).
+    # One ERROR verdict line per EMPTY key per attempt: every published PUT is
+    # graded, and a key the run wrote with rows (D21's FX file, D31's registry)
+    # is graded `ok` and logs nothing.
     assert len(faulted.attempts) == 2
-    assert len(guard_errors) == len(faulted.attempts) * len(case.keys)
+    empty_keys = [k for k, n in case.written(0).items() if n == 0]
+    assert empty_keys, "a case with no empty key induces no fault"
+    assert len(guard_errors) == len(faulted.attempts) * len(empty_keys)
 
     # 3. Stand-down: terminal Fail, the retry RECOMPUTED (never auto-skipped
     # the refused artifact), and the marker is not left `ok`.
@@ -638,6 +833,22 @@ def test_the_record_shape_is_what_the_phase_two_gate_reads(case, tmp_path):
     assert after.met is True, after.detail
 
 
+def _worst_guard(manifest: dict) -> dict:
+    """The manifest's ``data_empty_fresh`` reading that carries the verdict.
+
+    A unit with no primary key (D03, D21, D26) files a ``not_applicable`` reading
+    for that absent key BEFORE it files the readings for the keys it did publish,
+    so the first entry is not the verdict. The guard's own rule is the worst
+    reading wins (``weekly_collector._worst_reading``); the same rule picks it here.
+    """
+    readings = [g for g in manifest["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name]
+    assert readings, manifest["guards"]
+    return max(
+        readings,
+        key=lambda g: weekly_collector._EMPTY_FRESH_SEVERITY.get(g["verdict"], 2),
+    )
+
+
 def nodeid(case: Case) -> str:
     return (
         "tests/test_guard_commissioning_empty_fresh.py::"
@@ -648,7 +859,7 @@ def nodeid(case: Case) -> str:
 def _print_record(case: Case, faulted: Execution, recovered: Execution, s3: InMemoryS3, marker: dict) -> None:
     """The fault record, printed for the PR body (`pytest -s`)."""
     first = s3.manifests(case)[0]
-    guard = next(g for g in first["guards"] if g["guard"] == expectations.EMPTY_FRESH_GUARD.name)
+    guard = _worst_guard(first)
     lines = [
         f"FAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={WORKLOAD}",
         f"  fault:      {case.fault}",
