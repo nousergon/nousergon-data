@@ -98,6 +98,38 @@ pages "DEGRADED: cannot read …" naming the exact command — **UNKNOWN, never
 healthy**. `nous-ergon-ops/infrastructure/iam/check-drift.py --lambdas-root`
 (daily, 09:35 UTC) is the second, automatic detector for the same gap.
 
+## Weekly SUCCEEDED-but-hollow check (alpha-engine-config-I11092)
+
+The prior-day failed-run check used to **clear** the weekly SF whenever one
+real execution of the cycle SUCCEEDED. That is the silent no-op: a
+`watch-rerun` that skips most of the spine reports SUCCEEDED
+(`HOLLOW-SUSPECT`, 2026-10-04), and cycle 2026-09-11 had a SUCCEEDED execution
+while the cycle itself read `incomplete (partial_cycle)`, 15/17 stages, with
+nothing paging.
+
+Now, for the weekly cadence only, a SUCCEEDED day is confirmed against the
+completion marker's **cycle verdict** (`nousergon_lib.pipeline_status.
+completion_marker.marker_verdict`, written by `weekly-coverage-sweep` from the
+whole cycle's execution history). It is a post-run read of S3 from this Lambda,
+independent of the state machine, so it needs no change to the SF definition.
+
+| cycle verdict on the marker | action |
+|---|---|
+| `completed` | quiet |
+| `incomplete`, `skipped` | page `error`: the execution succeeded, the cycle did not do the work |
+| `unknown`, `in_flight`, marker absent or unreadable | page `warning`: UNKNOWN is not a pass (sf-pipeline-policy section 2.3a) |
+
+**Key.** The verdict lives on the **trading-day** partition (the last session
+before the weekly day: Friday for a Saturday cycle). The calendar-partition
+twin the SF still writes beside it is never augmented and always reads
+`unknown`, so the check reads `previous_trading_day(weekly day)` first.
+
+**When.** The weekly target is the last fully-due weekly day, so the Sat
+09:00Z cycle is evaluated at Sun 14:00Z (and again each following day while
+it stays non-clean, deduped at 12h). Replayed read-only against the live
+markers: 2026-09-18 and 2026-10-02 quiet, 2026-09-11 `error`, and the stale
+`in_flight` markers of 2026-08-28 and 2026-09-04 `warning`.
+
 ## Why this exists (vs. a dumb CW alarm)
 
 Per Phase 0 Q2 SOTA-lock, a naive `AWS/States ExecutionsStarted` alarm with
