@@ -60,6 +60,11 @@ _CALENDAR_SITES = {
     # The converter itself — calendar_date IN, trading_day OUT. The only site
     # in the graph that legitimately touches both.
     "NormalizeRunDates",
+    # alpha-engine-config-I12351: the rehearsal twin of ComputeEvalCadence,
+    # which keys the eval-judge date and the first-Saturday test off the
+    # wall-clock StartTime. A rehearsal substitutes its pinned $.calendar_date
+    # for that same firing day, so it stays in the calendar family.
+    "ComputeEvalCadenceRehearsal",
 }
 
 
