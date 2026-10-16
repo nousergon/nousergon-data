@@ -235,6 +235,7 @@ run_handler_tests "${SCRIPT_DIR}" -r "${SCRIPT_DIR}/requirements.txt"
 # ----- 1c. Copy handler + zip Lambda package -------------------------------
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
+cp "${SCRIPT_DIR}/unregistered_envelopes.py" "${PKG}/unregistered_envelopes.py"
 cp "${SCRIPT_DIR}/../flow_doctor_telegram.py" "${PKG}/flow_doctor_telegram.py"
 ZIP="${PKG}/function.zip"
 (cd "${PKG}" && zip -qr "function.zip" . -x "function.zip")
