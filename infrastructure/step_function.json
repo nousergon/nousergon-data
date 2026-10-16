@@ -3019,7 +3019,7 @@
             },
             "ComputeEvalCadenceRehearsal": {
               "Type": "Pass",
-              "Comment": "alpha-engine-config-I12351: ComputeEvalCadence with the pinned $.calendar_date in place of the StartTime date. submit_iso stays the wall clock: it stamps when the batch was submitted, not which cycle it grades.",
+              "Comment": "alpha-engine-config-I12351: ComputeEvalCadence with the pinned $.calendar_date in place of the StartTime date. submit_iso stays the wall clock: it stamps when the batch was submitted, not which cycle it grades. alpha-engine-config-I8809: PARTITION FAMILY = calendar_date, mirroring ComputeEvalCadence: production reads the firing day off $$.Execution.StartTime, and a rehearsal's pinned $.calendar_date is the stand-in for that same firing day (NormalizeRunDates still derives the trading-day $.run_date from it), so the eval-judge date and the first-Saturday day_of_month stay in the calendar family.",
               "Parameters": {
                 "day_of_month.$": "States.ArrayGetItem(States.StringSplit($.calendar_date, '-'), 2)",
                 "eval_date.$": "$.calendar_date",
