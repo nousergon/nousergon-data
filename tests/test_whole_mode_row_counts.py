@@ -112,7 +112,7 @@ def test_an_arctic_append_records_its_measured_ticker_count(monkeypatch):
         "append_error": 2,
         "quality_gate_blocked": 5,
     }
-    assert [g["verdict"] for g in m["guards"]] == ["ok"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["ok"]
 
 
 def test_a_heal_unit_counts_the_length_of_what_it_healed(monkeypatch):
@@ -147,7 +147,7 @@ def test_a_heal_unit_counts_the_length_of_what_it_healed(monkeypatch):
         "staging/daily_closes/2026-09-12.parquet": 2,
         "arcticdb/universe": 2,
     }
-    assert [g["verdict"] for g in m["guards"]] == ["ok"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["ok"]
 
 
 def test_morning_enrich_records_its_daily_closes_write_even_without_an_arctic_append(
@@ -175,7 +175,7 @@ def test_morning_enrich_records_its_daily_closes_write_even_without_an_arctic_ap
     assert keys == {"staging/daily_closes/2026-09-14.parquet": 903}
     # The arctic row measurement is genuinely absent this run — unmeasurable,
     # never silently 0 — and the S3 write above is recorded regardless.
-    assert [g["verdict"] for g in m["guards"]] == ["unmeasurable"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["unmeasurable"]
 
 
 def test_chronic_gap_heal_records_one_price_cache_key_per_healed_ticker(monkeypatch):
@@ -208,7 +208,7 @@ def test_chronic_gap_heal_records_one_price_cache_key_per_healed_ticker(monkeypa
         "reference/price_cache/BF-B.parquet": 8,
         "arcticdb/universe": 2,
     }
-    assert [g["verdict"] for g in m["guards"]] == ["ok"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["ok"]
 
 
 def test_a_real_zero_is_empty_fresh_not_a_pass(monkeypatch):
@@ -220,7 +220,7 @@ def test_a_real_zero_is_empty_fresh_not_a_pass(monkeypatch):
         {"status": "ok", "collectors": {"arcticdb": {"status": "ok", "tickers_published": 0}}},
     )
     assert m["rows_out"] == 0
-    assert [g["verdict"] for g in m["guards"]] == ["empty_fresh"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["empty_fresh"]
 
 
 # ── A missing count is `unmeasurable`, never 0 ───────────────────────────────
@@ -240,7 +240,7 @@ def test_a_mode_whose_declared_step_reported_no_count_is_unmeasurable(monkeypatc
     # wrapper, so the mode's own return value and the exit code are unchanged.
     assert m["status"] == "failed"
     assert m["reason"].startswith("EmptyProduction")
-    assert [g["verdict"] for g in m["guards"]] == ["unmeasurable", "empty_fresh"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["unmeasurable", "empty_fresh"]
     assert "arcticdb.tickers_published" in m["guards"][0]["detail"]
 
 
@@ -329,7 +329,7 @@ def test_a_stale_overwrite_skip_writes_no_new_data_declared(monkeypatch):
     )
     assert m["status"] == "not_applicable"
     assert m["reason"] == run_units.NOT_RUN_NO_NEW_DATA_DECLARED
-    assert [g["verdict"] for g in m["guards"]] == ["not_applicable"]
+    assert [g["verdict"] for g in m["guards"] if g["guard"] != "data_pit"] == ["not_applicable"]
     # The caller's contract is the mode's own dict — `run_unit` returns
     # `value=None` on the not-applicable path, and returning that would turn an
     # honest non-run into an AttributeError upstream.

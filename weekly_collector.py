@@ -1102,6 +1102,7 @@ def _record_phase_lineage(
             value=reading.value,
             baseline=reading.baseline,
         )
+    run_units.record_pit_stamps(run_ctx)  # after the collector's own stamps, which stand (I10782)
 
     # The board's `data.<unit>.guard.empty_fresh` clause reads ONE MetricRecord
     # per run (`data_gate/clauses.py`, sibling-owned) — every graded key rides
@@ -1641,6 +1642,7 @@ def _run_whole_mode_unit(mode: str, fn, config: dict, args: argparse.Namespace) 
             )
             raise run_manifest.NotApplicable(run_units.NOT_RUN_NO_NEW_DATA_DECLARED, detail)
         _record_mode_lineage(run_ctx, mode, unit_id, result or {})
+        run_units.record_pit_stamps(run_ctx)  # alpha-engine-config-I10782: as_of/available_at per output
         # `alpha-engine-config-I11011`: same rule as `_phase_collect`, at the
         # other dispatch. A whole-mode unit that finished having recorded no
         # output at all — including one whose declared row source reported no

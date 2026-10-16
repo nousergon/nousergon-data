@@ -72,6 +72,7 @@ __all__ = [
     "manifest_sink",
     "manual_run",
     "record_empty_production",
+    "record_pit_stamps",
     "require_in_region",
     "resolve_log_location",
     "recorded_entry",
@@ -571,6 +572,72 @@ def is_empty_success(manifest: Mapping[str, Any]) -> bool:
     return not (manifest.get("outputs") or []) and not int(manifest.get("rows_out") or 0)
 
 
+def record_pit_stamps(run_ctx, *, now: dt.datetime | None = None) -> int:
+    """File one ``data_pit`` stamp for every output this run recorded and did not stamp itself.
+
+    `alpha-engine-config-I10782` (plan item P-15), stage 2's writer half. Stage 1
+    (nousergon-data#2072) defined the stamp and the ``data.<unit>.guard.pit``
+    reader, but nothing in production ever called
+    ``contracts/pit.py::pit_guard_entry`` — so the phase-2 read of 2026-10-13
+    named every published key of 33 units as having NO stamp (D03 0/1860, D37
+    0/162). This is the shared call: every wrapper that records outputs calls it
+    once, after the outputs are on ``run_ctx``.
+
+    What the writer can state honestly, and nothing more:
+
+    * ``as_of`` is the manifest's own ``trading_day`` — the session the run is
+      keyed on (for the scheduled collectors ``dates.default_run_date``, the
+      last CLOSED NYSE session: the Saturday run files under Friday). It is the
+      same claim the manifest already makes about every output on it, now in
+      the field the reader grades. A day that has not begun yet is filed
+      ``unmeasurable`` by ``pit_guard_entry``, never ``ok``.
+    * ``available_at`` is NOW, taken after the collector returned and its
+      outputs were recorded: the moment the record had certainly been written.
+      That is an UPPER bound on when it first became knowable, never a lower
+      one — a consumer that trusts it can only ever wait longer than it had to,
+      never read a record before it existed. It precedes the manifest's
+      ``finished`` by construction (`run_unit` stamps that after the body).
+
+    A producer that knows better — it read its source at a time it recorded —
+    returns its own ``pit_guard_entry`` in its result's ``guards``, and that
+    stamp stands: a key that already carries a ``data_pit`` entry is skipped
+    here. ArcticDB library refs are filed ``not_applicable`` with
+    ``contracts/pit.py``'s exemption reason, exactly as a producer's own call
+    would file them.
+
+    OBSERVE mode (`sf-pipeline-policy` §7a): this records, it never raises and
+    never changes a run's status. Returns the number of stamps filed.
+    """
+    from contracts import pit  # local: keeps the contracts package off CLIs that never publish
+
+    stamped = {
+        str(g.get("key"))
+        for g in run_ctx.guards
+        if g.get("guard") == pit.PIT_GUARD_NAME and g.get("key")
+    }
+    moment = pit.format_available_at(now or dt.datetime.now(dt.timezone.utc))
+    filed = 0
+    for output in list(run_ctx.outputs):
+        key = str(output.get("key") or "")
+        if not key or key in stamped:
+            continue
+        entry = pit.pit_guard_entry(
+            key, {pit.AS_OF: run_ctx.trading_day, pit.AVAILABLE_AT: moment}
+        )
+        run_ctx.record_guard(
+            entry["guard"],
+            mode=entry["mode"],
+            verdict=entry["verdict"],
+            detail=entry["detail"],
+            key=entry["key"],
+            value=entry["value"],
+            baseline=entry["baseline"],
+        )
+        stamped.add(key)
+        filed += 1
+    return filed
+
+
 def record_empty_production(run_ctx, unit_id: str, *, detail: str) -> None:
     """Record the terminal state of a run that published nothing. NEVER returns.
 
@@ -825,7 +892,10 @@ def manual_run(
     from dates import default_run_date  # local: keeps `dates` off the import path of CLIs that do not need it
 
     def _body(ctx):
-        value = fn(ctx)
+        try:
+            value = fn(ctx)
+        finally:  # a repair that failed halfway still stamps what it did write (I10782)
+            record_pit_stamps(ctx)
         if write and not ctx.outputs and not int(ctx.rows_out or 0):
             # `alpha-engine-config-I11011`. A repair run that wrote nothing is
             # the one this matters most for: it is invoked BECAUSE something is
@@ -1174,7 +1244,10 @@ def recorded_entry(
     captured: dict[str, Any] = {}
 
     def _checked(ctx) -> Any:
-        captured["value"] = value = body(ctx)
+        try:
+            captured["value"] = value = body(ctx)
+        finally:  # EntryRunFailed still published what it recorded; stamp it (I10782)
+            record_pit_stamps(ctx)
         if write and not ctx.outputs and not int(ctx.rows_out or 0):
             # `alpha-engine-config-I11011`: `rows_out: 0` with an empty
             # `outputs` array is not `ok`. Raised from INSIDE the wrapper so the
