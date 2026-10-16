@@ -628,7 +628,12 @@ _SUBMIT = {
     "weekly": "EvalJudgeSubmitWeekly",
     "first_saturday": "EvalJudgeSubmitFirstSaturday",
 }
-_INTO_JUDGE = ["CheckSkipEvalJudge", "ComputeEvalCadence", "CheckMonthlyCadence"]
+# alpha-engine-config-I12351: CheckEvalCadenceRehearsal sits between the gate
+# and ComputeEvalCadence; a non-rehearsal run takes its Default.
+_INTO_JUDGE = [
+    "CheckSkipEvalJudge", "CheckEvalCadenceRehearsal",
+    "ComputeEvalCadence", "CheckMonthlyCadence",
+]
 _POLL_ONCE = [
     "WaitForEvalJudgeProcess", "CheckEvalJudgeProcessStatus",
     "EvalJudgeProcessWait", "EvalJudgeProcessPollWait",
@@ -721,8 +726,13 @@ def test_every_clean_judge_branch_is_completed(repo_definition, cadence, shape):
         "stages"]["EvalJudge"]
     assert row["disposition"] == ENABLED_COMPLETED, row["reason"]
     assert row["entry_state"] == _SUBMIT[cadence]
-    assert row["entry_route"][0]["taken"] == _SUBMIT[cadence]
-    assert row["entry_route"][0]["source"] == "execution_history"
+    # alpha-engine-config-I12351: two routing Choices are crossed now, the
+    # rehearsal check (Default taken on a non-rehearsal run) and the cadence.
+    assert [(h["choice"], h["taken"]) for h in row["entry_route"]] == [
+        ("CheckEvalCadenceRehearsal", "ComputeEvalCadence"),
+        ("CheckMonthlyCadence", _SUBMIT[cadence]),
+    ]
+    assert all(h["source"] == "execution_history" for h in row["entry_route"])
     assert row["completion_witness"]["rejoined_at"] == "CheckSkipRationaleClustering"
 
 
