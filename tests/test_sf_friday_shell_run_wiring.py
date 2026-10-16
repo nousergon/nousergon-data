@@ -73,6 +73,7 @@ from tests.sf_degraded_summary_helpers import (
     assert_completion_notifier_chain,
     assert_degraded_continuation,
 )
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -701,7 +702,13 @@ class TestStrictSuperset:
         # IsPresent branch / Default both still ultimately reach CheckShellRun
         # (immediately, or after the dispatch+bootstrap-poll chain), so the
         # strict-superset property is preserved one gate further down.
-        assert states["InitializeInput"]["Next"] == "CheckWeeklyRunDayGate"
+        # alpha-engine-config-I12351: the rehearsal-marker hop sits between
+        # InitializeInput and the run-day gate; both namespace branches rejoin it.
+        assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
+        assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
+        assert states["ApplyProductionNamespace"]["Next"] == "CheckWeeklyRunDayGate"
+        assert states["ApplyRehearsalNamespace"]["Next"] == "ApplyRehearsalChampionSkips"
+        assert states["ApplyRehearsalChampionSkips"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         # alpha-engine-config-I8809: NormalizeRunDates (+ ApplyNormalizedRunDate)
         # sit between the run-day gate and CheckRunMode — the graph's ONE date
@@ -1140,7 +1147,7 @@ class TestConsolidatedNotify:
         # routes — now passes through that gate first.
         assert substrate_success["Next"] == "RunScope"
         assert states["RunScope"]["Next"] == "CheckSkipReportCard"
-        assert states["CheckSkipReportCard"]["Default"] == "ReportCard"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipReportCard"]["Default"]) == "ReportCard"
         report_card = states["ReportCard"]
         assert report_card["Next"] == "CheckSkipDirector"
         assert all(c["Next"] == "ReportCardDegraded" for c in report_card["Catch"])
@@ -1511,6 +1518,11 @@ class TestHappyPathTraversal:
         # poll-budget seed).
         assert order[: order.index("CheckSkipMorningEnrich") + 2] == [
             "InitializeInput",
+            # alpha-engine-config-I12351: the rehearsal-marker hop; a
+            # production execution name takes the empty-namespace branch.
+            "ReadRehearsalMarker",
+            "CheckRehearsalMarker",
+            "ApplyProductionNamespace",
             "CheckWeeklyRunDayGate",
             # alpha-engine-config-I8809: the graph's ONE date normalization.
             "NormalizeRunDates",
