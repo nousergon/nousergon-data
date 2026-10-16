@@ -10,7 +10,7 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"substrate_relaunch_attempts\":0,\"preflight_args\":\"\",\"skip_weekly_run_day_gate\":false,\"research_dry\":false,\"data_phase2_dry\":false,\"regime_action\":\"produce\",\"pipeline_label\":\"\",\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\",\"gate_degraded\":false,\"health_check_degraded\":false,\"parity_degraded\":false,\"parity_verdict_unknown\":false,\"research_predictor_degraded\":false,\"research_predictor_degraded_routes\":{\"routes\":[]},\"model_zoo_unservable\":false,\"director_retro_refused\":false,\"cost_coverage_gap\":false,\"scanner_resource_kill\":false,\"weekly_preflight_blind_spot\":{\"present\":false,\"required_skip_count\":0,\"required_skip_names\":[],\"ran_count\":0,\"skip_count\":0,\"warn_count\":0},\"degraded_summary\":{\"degraded\":false,\"reasons\":{},\"run_date\":null},\"libpin_drift_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"pipeline_contract_result\":{\"Payload\":{\"status\":\"UNKNOWN\",\"reason\":\"gate_did_not_run\"}},\"mutex_ttl_epoch\":0,\"health_check_error\":{\"status\":\"not_set\"},\"health_check_poll\":{\"status\":\"not_set\"},\"substrate_check_error\":{\"status\":\"not_set\"},\"substrate_check_poll\":{\"status\":\"not_set\"},\"parity_error\":{\"status\":\"not_set\"},\"parity_poll\":{\"status\":\"not_set\"},\"parity_branch_outcomes\":{\"status\":\"not_set\"},\"parity_replay_poll\":{\"status\":\"not_set\"},\"pit_parity_lookahead_poll\":{\"status\":\"not_set\"},\"pit_parity_walkforward_poll\":{\"status\":\"not_set\"},\"pit_parity_compare_error\":{\"status\":\"not_set\"},\"pit_parity_compare_poll\":{\"status\":\"not_set\"},\"run_scope_result\":{\"Payload\":{\"degraded\":true,\"degraded_reason\":\"the RunScope stage did not run on this execution path\",\"stages\":{}}},\"report_card_error\":{\"status\":\"not_set\"},\"scanner_leaderboard_error\":{\"status\":\"not_set\"}}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\",\"calendar_date\":\"{}\",\"run_date_family\":\"calendar_date\",\"collection_not_before\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0),$$.Execution.StartTime)),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
-      "Next": "CheckWeeklyRunDayGate"
+      "Next": "ReadRehearsalMarker"
     },
     "CheckWeeklyRunDayGate": {
       "Type": "Choice",
@@ -957,7 +957,8 @@
                 "FunctionName": "alpha-engine-research-scanner:live",
                 "Payload": {
                   "run_date.$": "$.run_date",
-                  "dry_run_llm.$": "$.research_dry"
+                  "dry_run_llm.$": "$.research_dry",
+                  "execution_name.$": "$$.Execution.Name"
                 }
               },
               "TimeoutSeconds": 440,
@@ -1026,7 +1027,7 @@
               "Resource": "arn:aws:states:::aws-sdk:s3:headObject",
               "Parameters": {
                 "Bucket": "alpha-engine-research",
-                "Key": "universe_membership/latest.json"
+                "Key.$": "States.Format('{}universe_membership/latest.json', $.rehearsal_marker.ns_prefix)"
               },
               "TimeoutSeconds": 30,
               "ResultSelector": {
@@ -1207,7 +1208,8 @@
                 "Payload": {
                   "run_date.$": "$.run_date",
                   "target": "production",
-                  "preflight.$": "$.research_dry"
+                  "preflight.$": "$.research_dry",
+                  "execution_name.$": "$$.Execution.Name"
                 }
               },
               "TimeoutSeconds": 300,
@@ -1953,7 +1955,7 @@
                   "Next": "CheckSkipRationaleClustering"
                 }
               ],
-              "Default": "ComputeEvalCadence"
+              "Default": "CheckEvalCadenceRehearsal"
             },
             "ComputeEvalCadence": {
               "Type": "Pass",
@@ -2994,6 +2996,37 @@
               },
               "ResultPath": "$.eval_judge_error",
               "Next": "MarkEvalJudgeDegraded"
+            },
+            "CheckEvalCadenceRehearsal": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I12351: a REHEARSAL keys the eval-judge date off its pinned cycle ($.calendar_date, which the rehearsal door sets to the last completed session whose data exists), never the wall clock. ComputeEvalCadence (production and every non-rehearsal run) is unchanged.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Next": "ComputeEvalCadenceRehearsal"
+                }
+              ],
+              "Default": "ComputeEvalCadence"
+            },
+            "ComputeEvalCadenceRehearsal": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I12351: ComputeEvalCadence with the pinned $.calendar_date in place of the StartTime date. submit_iso stays the wall clock: it stamps when the batch was submitted, not which cycle it grades.",
+              "Parameters": {
+                "day_of_month.$": "States.ArrayGetItem(States.StringSplit($.calendar_date, '-'), 2)",
+                "eval_date.$": "$.calendar_date",
+                "submit_iso.$": "$$.Execution.StartTime"
+              },
+              "ResultPath": "$.eval_cadence",
+              "Next": "CheckMonthlyCadence"
             }
           }
         },
@@ -7598,7 +7631,7 @@
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
-        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
+        "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.run_date)",
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
@@ -8900,7 +8933,8 @@
         "Payload": {
           "run_date.$": "$.run_date",
           "dry_run_llm.$": "$.research_dry",
-          "mode": "scanner_leaderboard"
+          "mode": "scanner_leaderboard",
+          "execution_name.$": "$$.Execution.Name"
         }
       },
       "TimeoutSeconds": 440,
@@ -9779,7 +9813,7 @@
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
-        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)",
+        "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.run_date)",
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
@@ -10264,7 +10298,7 @@
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
-        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.calendar_date)",
+        "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.calendar_date)",
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"SUCCEEDED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"substrate_relaunches\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, $.substrate_relaunch_attempts, States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
@@ -10298,7 +10332,7 @@
       "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
       "Parameters": {
         "Bucket": "alpha-engine-research",
-        "Key.$": "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.calendar_date)",
+        "Key.$": "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.rehearsal_marker.ns_prefix, $.calendar_date)",
         "ContentType": "application/json",
         "Body.$": "States.Format('\\{\"sf\":\"ne-weekly-freshness-pipeline\",\"execution_arn\":\"{}\",\"status\":\"DEGRADED\",\"claim\":\"sf_execution_terminal\",\"cycle_verdict\":\"unknown\",\"started_at\":\"{}\",\"completed_at\":\"{}\",\"cycle_key\":\"{}\",\"degraded_summary\":{},\"model_zoo_unservable\":{},\"director_retro_refused\":{},\"cost_coverage_gap\":{},\"weekly_preflight_blind_spot\":{}\\}', $$.Execution.Id, $$.Execution.StartTime, $$.State.EnteredTime, $.run_date, States.JsonToString($.degraded_summary), States.JsonToString($.model_zoo_unservable), States.JsonToString($.director_retro_refused), States.JsonToString($.cost_coverage_gap), States.JsonToString($.weekly_preflight_blind_spot))"
       },
@@ -10497,6 +10531,20 @@
         {
           "And": [
             {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I12351: a REHEARSAL runs on whatever data exists (Brian, 2026-10-16: 'it should be able to run on stale data if it's a rehearsal'). One probe ran and its verdict is recorded; a not-ready or not-ok collection degrades and the rehearsal continues instead of polling 62 x 300 s and failing. Production never matches this rule (is_rehearsal is false) and keeps every refusal below.",
+          "Next": "RehearsalCollectionNotReadyDegraded"
+        },
+        {
+          "And": [
+            {
               "Variable": "$.collection_readiness.settled",
               "IsPresent": true
             },
@@ -10527,6 +10575,20 @@
           ],
           "Comment": "shell_run: reachable only when the one dry probe RAISED (WaitForCollectionManifests' Catch). A probe that cannot run on Friday will not run on Saturday either, so the preflight fails loud now instead of polling for 62 x 300 s.",
           "Next": "ExtractCollectionNotReadyError"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            }
+          ],
+          "Comment": "alpha-engine-config-I12351: reachable on a REHEARSAL only when the one probe RAISED. Degrade and continue (recorded), as CheckCollectionReadiness does for a not-ready verdict; production keeps the budget and the refusal.",
+          "Next": "RehearsalCollectionNotReadyDegraded"
         },
         {
           "And": [
@@ -10853,6 +10915,73 @@
       },
       "ResultPath": "$.error",
       "Next": "NormalizeFailureContext"
+    },
+    "ReadRehearsalMarker": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351: the rehearsal marker is the EXECUTION NAME, never an input field: the rehearsal door (nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py) names every rehearsal `rehearsal-<date>-<n>`, and crucible-backtester#790 keys its live-config guard on the same prefix. Reads the name's first '-'-separated token so CheckRehearsalMarker can branch on it. Overwrites $.rehearsal_marker unconditionally, so no caller can pass a marker in the input.",
+      "Parameters": {
+        "head.$": "States.ArrayGetItem(States.StringSplit($$.Execution.Name, '-'), 0)"
+      },
+      "ResultPath": "$.rehearsal_marker",
+      "Next": "CheckRehearsalMarker"
+    },
+    "CheckRehearsalMarker": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351: a rehearsal gets a namespace prefix (rehearsal/<execution name>/) that the SF's own S3 writes and probes use; every other execution gets the empty prefix, which leaves each key byte-identical to before.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.head",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.head",
+              "StringEquals": "rehearsal"
+            }
+          ],
+          "Next": "ApplyRehearsalNamespace"
+        }
+      ],
+      "Default": "ApplyProductionNamespace"
+    },
+    "ApplyRehearsalNamespace": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351: REHEARSAL. The Lambda stages isolate themselves from the execution name (Scanner/ScannerLeaderboard/SignalsEnvelope get it as execution_name, the regime stages from execution_arn) and re-key every S3 write under this same prefix. ns_prefix is used by the SF's own writes (WriteCompletionMarker*) and by ProbeUniverseMembershipPointer, so a rehearsal never writes a production _sf_completion marker and its scanner-kill probe reads the rehearsal's own membership pointer, not production's.",
+      "Parameters": {
+        "head": "rehearsal",
+        "is_rehearsal": true,
+        "execution_name.$": "$$.Execution.Name",
+        "ns_prefix.$": "States.Format('rehearsal/{}/', $$.Execution.Name)"
+      },
+      "ResultPath": "$.rehearsal_marker",
+      "Next": "CheckWeeklyRunDayGate"
+    },
+    "ApplyProductionNamespace": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351: not a rehearsal. The empty prefix keeps every key the SF writes or probes exactly as it was.",
+      "Parameters": {
+        "head.$": "$.rehearsal_marker.head",
+        "is_rehearsal": false,
+        "execution_name.$": "$$.Execution.Name",
+        "ns_prefix": ""
+      },
+      "ResultPath": "$.rehearsal_marker",
+      "Next": "CheckWeeklyRunDayGate"
+    },
+    "RehearsalCollectionNotReadyDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351: records the degraded collection-readiness refusal on the run output ($.rehearsal_degradations.collection_readiness) and continues to the consumers. Rehearsal only.",
+      "Parameters": {
+        "collection_readiness": {
+          "degraded": true,
+          "refusal": "weekly collection manifests not ready / not ok; a production run would wait the budget and fail here",
+          "readiness.$": "$.collection_readiness",
+          "poll.$": "$.collection_readiness_poll"
+        }
+      },
+      "ResultPath": "$.rehearsal_degradations",
+      "Next": "ResearchPredictorParallel"
     }
   }
 }
