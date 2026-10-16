@@ -252,6 +252,58 @@ def test_not_due_touches_no_aws(monkeypatch, capsys):
     assert "not due" in capsys.readouterr().out
 
 
+def _utc(*args):
+    return dt.datetime(*args, tzinfo=dt.timezone.utc)
+
+
+def test_schedule_hour_matches_the_workflow_cron():
+    cron = yaml.safe_load(WORKFLOW.read_text())[True]["schedule"][0]["cron"]
+    minute, hour, *_rest = cron.split()
+    assert (minute, int(hour)) == ("0", drill.SCHEDULE_UTC_HOUR)
+
+
+@pytest.mark.parametrize(
+    "started, session",
+    [
+        (_utc(2026, 11, 2, 22, 0), dt.date(2026, 11, 2)),  # on time
+        (_utc(2026, 11, 2, 23, 59), dt.date(2026, 11, 2)),  # late, same UTC day
+        (_utc(2026, 11, 3, 0, 7), dt.date(2026, 11, 2)),  # past 00:00Z (10-16 start)
+        (_utc(2026, 11, 3, 2, 53), dt.date(2026, 11, 2)),  # 10-13 start
+        (_utc(2026, 11, 3, 5, 0), dt.date(2026, 11, 2)),  # 5h late
+        (_utc(2026, 11, 3, 21, 59), dt.date(2026, 11, 2)),  # ~24h late is still that fire
+        (_utc(2026, 11, 3, 22, 0), dt.date(2026, 11, 3)),  # next fire
+    ],
+)
+def test_late_start_keeps_its_scheduled_date(started, session):
+    assert drill.scheduled_session_date(started) == session
+
+
+def _run_only_if_due(monkeypatch, capsys, started):
+    monkeypatch.setattr(drill, "_now", lambda: started)
+    monkeypatch.setitem(sys.modules, "boto3", None)  # past the gate, boto3 import raises
+    try:
+        code = drill.main(["--only-if-due"])
+    except ImportError:
+        return "due", capsys.readouterr().out
+    return ("skipped" if code == 0 else f"exit {code}"), capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "started, verdict",
+    [
+        (_utc(2026, 11, 2, 22, 0), "due"),
+        (_utc(2026, 11, 3, 0, 7), "due"),  # the delayed-past-midnight case
+        (_utc(2026, 11, 3, 4, 59), "due"),
+        (_utc(2026, 11, 2, 0, 30), "skipped"),  # Nov 1 (Sunday) fire, started late
+        (_utc(2026, 11, 3, 22, 5), "skipped"),  # second session's fire
+        (_utc(2026, 11, 4, 1, 0), "skipped"),  # second session's fire, late
+        (_utc(2026, 12, 2, 1, 0), "due"),  # Dec 1 (Tuesday) fire, started past midnight
+    ],
+)
+def test_only_if_due_judges_the_scheduled_day_not_the_start_day(monkeypatch, capsys, started, verdict):
+    assert _run_only_if_due(monkeypatch, capsys, started)[0] == verdict
+
+
 def test_the_drill_rides_an_existing_scheduled_job():
     """No new workflow (fleet GHA-minutes cap): one step on the daily
     `trigger_observation` job, gated to the drill day by the script itself,
