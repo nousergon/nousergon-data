@@ -52,11 +52,19 @@ contract:
       pins: "body_schema"
       producer: "contracts/metron_sentiment.schema.json"
       read_site: "api/services/sentiment.py::load_sentiment"
-registry_rows: []
-registry_rows_broken:
-  - "metron_sentiment — PARKED while written daily. P-09 unparks it."
+registry_rows:
+  - metron_sentiment
 run_manifest_prefix: data_collection/runs/D30
-detectors: []
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        metron_sentiment (eod_sf) was unparked on the published registry 2026-09-14
+        (P-09, alpha-engine-config-I10776); declared here so the monthly
+        threshold-tightening drill (data_gate/producers/freshness_commissioning.py,
+        alpha-engine-config-I10795) commissions it. UNVERIFIED until that drill writes the
+        receipt.
 freshness:
   family: "eod-spine"
   # The family's worst-case write bound, by the same rule the weekly family

@@ -85,6 +85,7 @@ from pathlib import Path
 
 import pytest
 from tests.sf_degraded_summary_helpers import assert_degraded_continuation
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -222,7 +223,7 @@ class TestChainOrdering:
         # through the additive CheckSkipBacktesterStageOnly gate before
         # Backtester (still runs Backtester on a scheduled/normal run).
         assert states["CheckSkipBacktester"]["Default"] == "CheckSkipBacktesterStageOnly"
-        assert states["CheckSkipBacktesterStageOnly"]["Default"] == "Backtester"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipBacktesterStageOnly"]["Default"]) == "Backtester"
 
     def test_skip_backtester_whole_pair_routes_to_evaluator_skipgate(self, states):
         """{"skip_backtester": true} keeps its original whole-pair semantics:
@@ -305,7 +306,7 @@ class TestChainOrdering:
             "predictor+Phase4 in its own state so a fresh simulate never "
             "carries the post-sweep stack into one SSM execution timeout."
         )
-        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest", (
+        assert past_rehearsal_checkpoint(states, states["CheckSkipPredictorBacktest"]["Default"]) == "PredictorBacktest", (
             "CheckSkipPredictorBacktest must default to running PredictorBacktest "
             "so a normal Saturday run is unaffected by the config#830 skip-gate."
         )
@@ -850,9 +851,9 @@ class TestL4472PhaseSplit:
                 if c.get("StringEquals") == "Success"
             ]
         assert success("CheckBacktesterStatus") == ["CheckSkipPredictorBacktest"]
-        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipPredictorBacktest"]["Default"]) == "PredictorBacktest"
         assert success("CheckPredictorBacktestStatus") == ["CheckSkipPortfolioOptimizerBacktest"]
-        assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipPortfolioOptimizerBacktest"]["Default"]) == "PortfolioOptimizerBacktest"
         assert success("CheckPortfolioOptimizerBacktestStatus") == ["CheckSkipParity"]
 
     def test_predictor_backtest_invokes_predictor_mode(self, states):

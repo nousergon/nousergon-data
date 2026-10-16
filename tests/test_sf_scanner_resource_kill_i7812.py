@@ -133,7 +133,9 @@ def test_the_probe_reads_the_membership_pointer_not_a_date_derived_key(branch_a)
     assert probe["Resource"] == "arn:aws:states:::aws-sdk:s3:headObject"
     assert probe["Parameters"] == {
         "Bucket": "alpha-engine-research",
-        "Key": "universe_membership/latest.json",
+        # alpha-engine-config-I12351: the run's own namespace; ns_prefix is ""
+        # in production, so the production key is unchanged.
+        "Key.$": "States.Format('{}universe_membership/latest.json', $.rehearsal_marker.ns_prefix)",
     }
     assert probe["ResultSelector"] == {
         "pointer_last_modified_date.$": (
