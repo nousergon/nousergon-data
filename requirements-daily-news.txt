@@ -22,7 +22,7 @@
 # alpha-engine-config#6063).
 boto3>=1.43.109
 pandas>=2.0
-pyarrow>=26.0.0
+pyarrow>=25.0.1
 numpy>=2.4.6
 requests>=2.34.2
 feedparser>=6.0.14
