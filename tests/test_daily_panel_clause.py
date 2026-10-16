@@ -42,6 +42,32 @@ def handle_data_daily(args):
     return run_daily(source=source)
 '''
 
+# crucible main after crucible#398 (alpha-engine-config-I12020): the compile
+# moved out of the entrypoint into a helper it calls, where it still runs. The
+# module NAMES the read site, so a read of the entrypoint's own body alone
+# graded this MET (alpha-engine-config-I10791).
+TRACK_A_COMPILE_IN_HELPER = '''
+from crucible.data.sources import PublishedPanelSource
+
+def _source(args, config):
+    return ArcticPriceSource(config.arctic_bucket)
+
+def _panel(args):
+    return PublishedPanelSource(config.arctic_bucket, trading_day=args.trading_day)
+
+def handle_data_daily(args):
+    with _daily_chain_lease(args):
+        code = _data_daily_body(args)
+    return code
+
+def _daily_chain_lease(args):
+    return lock(args)
+
+def _data_daily_body(args):
+    source = _source(args, config)
+    return run_daily(source=source)
+'''
+
 SOURCES = "class PublishedPanelSource(PriceSource):\n    name = 'published-panel'\n"
 
 
@@ -230,7 +256,7 @@ def test_a_panel_two_sessions_old_is_a_stopped_publisher():
         (lambda: _store(github=FakeGitHub(_consumer_files(**{"crucible/data/sources.py": b"class Other: pass"}))),
          "consumer_pin", "defines no class"),
         (lambda: _store(github=FakeGitHub(_consumer_files(**{dp.CONSUMER.entrypoint_path: TRACK_A_BEFORE.encode()}))),
-         "direct_compile_removed", "still references"),
+         "direct_compile_removed", "still reaches"),
         (lambda: _store(github=FakeGitHub(_consumer_files(
             **{dp.CONSUMER.entrypoint_path: b"def handle_data_daily(args):\n    return run_daily(read())\n"}))),
          "direct_compile_removed", "undeclared"),
@@ -247,6 +273,48 @@ def test_one_broken_leg_turns_the_clause_red(store, leg, phrase):
     assert not reading.unmeasurable, "a definite finding is UNMET, not UNMEASURABLE"
     assert _leg(reading, leg) == "UNMET", reading.detail
     assert phrase in reading.detail
+
+
+def _direct_compile_reading(track_a: str):
+    return _read(_store(github=FakeGitHub(_consumer_files(**{dp.CONSUMER.entrypoint_path: track_a.encode()}))))
+
+
+def test_a_compile_moved_into_a_helper_the_entrypoint_calls_is_not_removed():
+    """Regression for alpha-engine-config-I10791: crucible#398's shape read MET."""
+    reading = _direct_compile_reading(TRACK_A_COMPILE_IN_HELPER)
+    assert not reading.met
+    assert _leg(reading, "direct_compile_removed") == "UNMET", reading.detail
+    assert "handle_data_daily -> _data_daily_body" in reading.detail
+
+
+def test_the_compile_is_found_however_deep_and_however_it_is_reached():
+    deeper = TRACK_A_COMPILE_IN_HELPER.replace(
+        "def _data_daily_body(args):\n    source = _source(args, config)\n    return run_daily(source=source)",
+        "def _data_daily_body(args):\n    return run_job(_compile, args)\n\n"
+        "def _compile(args):\n    return run_daily(source=_build(args))\n\n"
+        "def _build(args):\n    return ArcticPriceSource(config.arctic_bucket)",
+    )
+    assert deeper != TRACK_A_COMPILE_IN_HELPER
+    reading = _direct_compile_reading(deeper)
+    assert _leg(reading, "direct_compile_removed") == "UNMET", reading.detail
+    assert "_data_daily_body -> _compile -> _build" in reading.detail
+
+
+def test_a_compile_only_other_entrypoints_reach_does_not_block():
+    """``data.weekly``/``data.heal`` keeping the direct compile is not ``data.daily`` keeping it."""
+    track_a = TRACK_A_AFTER + (
+        "\ndef _source(args, config):\n    return ArcticPriceSource(config.arctic_bucket)\n"
+        "\ndef handle_data_weekly(args):\n    return run_weekly(source=_source(args, config))\n"
+    )
+    reading = _direct_compile_reading(track_a)
+    assert _leg(reading, "direct_compile_removed") == "MET", reading.detail
+
+
+def test_a_recursive_helper_terminates():
+    track_a = TRACK_A_AFTER + "\ndef _again(args):\n    return _again(args)\n"
+    track_a = track_a.replace("return run_daily(source=source)", "return _again(run_daily(source=source))")
+    reading = _direct_compile_reading(track_a)
+    assert _leg(reading, "direct_compile_removed") == "MET", reading.detail
 
 
 def test_no_github_reader_is_unmeasurable_never_met():

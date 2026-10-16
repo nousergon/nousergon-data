@@ -19,8 +19,9 @@ lands, and the clause is their conjunction:
    :data:`contracts.daily_panel.PARITY_TOLERANCE`, both sides end on the
    receipt's own trading day, and its producer side is the panel actually
    published for that day (same sha256).
-5. ``direct_compile_removed`` — the consumer's ``data.daily`` entrypoint no
-   longer references the direct-ArcticDB compile. Not a flag somebody sets:
+5. ``direct_compile_removed`` — the consumer's ``data.daily`` entrypoint, and
+   every module-level function it reaches in that file, no longer references
+   the direct-ArcticDB compile. Not a flag somebody sets:
    read from the consumer's code on its default branch, so restoring the old
    path turns the clause red again.
 
@@ -300,19 +301,56 @@ def _leg_parity(store: GateStore) -> _Leg:
     )
 
 
-def _function_names(source: str, function: str) -> set[str] | None:
-    """Every Name id and Attribute attr referenced in ``function``'s body, or ``None``."""
+def _referenced_names(node: ast.AST) -> set[str]:
+    """Every Name id and Attribute attr referenced anywhere under ``node``."""
+    names: set[str] = set()
+    for inner in ast.walk(node):
+        if isinstance(inner, ast.Name):
+            names.add(inner.id)
+        elif isinstance(inner, ast.Attribute):
+            names.add(inner.attr)
+    return names
+
+
+def _reachable_names(source: str, function: str) -> dict[str, tuple[str, ...]] | None:
+    """Names referenced by ``function`` and every module function it can reach, or ``None``.
+
+    Maps each referenced name to the call path (entrypoint first) of the
+    function that references it. The walk follows any reference to a
+    MODULE-LEVEL function of the same file, called or passed as a callback,
+    transitively. Reading the entrypoint's own body alone was the
+    alpha-engine-config-I10791 defect: crucible#398 moved the direct compile
+    from ``handle_data_daily`` into ``_data_daily_body``, where it still runs,
+    and a single-body read would have called it removed. Following the graph
+    rather than naming the helper means the next extraction is caught too.
+    """
     tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function:
-            names: set[str] = set()
-            for inner in ast.walk(node):
-                if isinstance(inner, ast.Name):
-                    names.add(inner.id)
-                elif isinstance(inner, ast.Attribute):
-                    names.add(inner.attr)
-            return names
-    return None
+    module_functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    entry = module_functions.get(function) or next(
+        (
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == function
+        ),
+        None,
+    )
+    if entry is None:
+        return None
+    found: dict[str, tuple[str, ...]] = {}
+    seen = {function}
+    queue: list[tuple[ast.AST, tuple[str, ...]]] = [(entry, (function,))]
+    while queue:
+        node, path = queue.pop(0)
+        for name in sorted(_referenced_names(node)):
+            found.setdefault(name, path)
+            if name in module_functions and name not in seen:
+                seen.add(name)
+                queue.append((module_functions[name], (*path, name)))
+    return found
 
 
 def _leg_direct_compile_removed(store: GateStore) -> _Leg:
@@ -323,7 +361,7 @@ def _leg_direct_compile_removed(store: GateStore) -> _Leg:
         return _Leg("direct_compile_removed", _UNMEASURABLE if unmeasurable else _UNMET, finding, evidence)
     source = (content or b"").decode("utf-8", "replace")
     try:
-        names = _function_names(source, consumer.entrypoint_function)
+        names = _reachable_names(source, consumer.entrypoint_function)
     except SyntaxError as exc:
         return _Leg("direct_compile_removed", _UNMET, f"{consumer.entrypoint_path} does not parse: {exc}", evidence)
     if names is None:
@@ -333,12 +371,13 @@ def _leg_direct_compile_removed(store: GateStore) -> _Leg:
             f"{consumer.entrypoint_path} defines no {consumer.entrypoint_function}",
             evidence,
         )
-    still = sorted(set(consumer.direct_compile_names) & names)
+    still = sorted(set(consumer.direct_compile_names) & names.keys())
     if still:
+        paths = sorted({" -> ".join(names[name]) for name in still})
         return _Leg(
             "direct_compile_removed",
             _UNMET,
-            f"{consumer.entrypoint} still references the direct-ArcticDB compile ({still})",
+            f"{consumer.entrypoint} still reaches the direct-ArcticDB compile ({still}) via {paths}",
             evidence,
         )
     if consumer.read_site_symbol not in source:
@@ -352,7 +391,8 @@ def _leg_direct_compile_removed(store: GateStore) -> _Leg:
     return _Leg(
         "direct_compile_removed",
         _MET,
-        f"{consumer.entrypoint} references none of {list(consumer.direct_compile_names)} and its module "
+        f"{consumer.entrypoint} and the module functions it reaches reference none of "
+        f"{list(consumer.direct_compile_names)} and its module "
         f"reads {consumer.read_site_symbol}",
         evidence,
     )
