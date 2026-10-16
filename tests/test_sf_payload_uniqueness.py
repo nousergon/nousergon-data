@@ -243,8 +243,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # rehearsal is forbidden to write, since the RunScope Lambda skips its
     # put_object on dry_run. Consumer: crucible-evaluator
     # grading/artifacts.py::_read_run_scope (in-band first, S3 as the fallback).
+    # alpha-engine-config-I12351: +execution_name.$, the rehearsal marker the
+    # evaluator's grading/rehearsal.py isolates on (as Scanner/SignalsEnvelope).
     "ReportCard": frozenset({
         "date.$", "dry_run.$", "snapshot", "gate_state", "run_scope.$",
+        "execution_name.$",
     }),
     # Director: no longer a Lambda Payload (alpha-engine-config-I11936) — it runs
     # on the weekly box over SSM; its date / dry_run / gate_state ride the SSM
