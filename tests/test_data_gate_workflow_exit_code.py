@@ -93,3 +93,47 @@ def test_no_step_re_derives_the_gate_verdict_into_the_job_result():
             "to re-derive the job's own pass/fail from the gate verdict — that is "
             "exactly the coupling alpha-engine-config-I10906 removed."
         )
+
+
+def test_a_registry_d_push_does_not_trigger_a_read():
+    """alpha-engine-config-I11792: a `registry.d/**` push bought only latency
+    (the next scheduled read is at most 24h away, inside the 26h ladder
+    ceiling) at ~10k LISTs and ~0.45 GB a run. The gate's own code and this
+    workflow still trigger a read on push."""
+    loaded = _load_workflow()
+    on_block = loaded["doc"].get("on") or loaded["doc"].get(True)
+    paths = on_block["push"]["paths"]
+    assert not any(p.startswith("registry.d") for p in paths), paths
+    assert "data_gate/**" in paths
+    assert ".github/workflows/data-gate.yml" in paths
+
+
+def test_the_scheduled_reads_stay_inside_the_ladder_freshness_ceiling():
+    """With no push read after a descriptor change, the schedule alone must
+    re-read inside `data.gate.ladder_fresh`'s 26h ceiling. Walk two weeks of
+    the four crons and assert the largest gap between fires is under 26h."""
+    import datetime as dt
+
+    loaded = _load_workflow()
+    on_block = loaded["doc"].get("on") or loaded["doc"].get(True)
+
+    def _days(field: str) -> set[int]:  # cron day-of-week, 0 = Sunday
+        if field == "*":
+            return set(range(7))
+        out: set[int] = set()
+        for part in field.split(","):
+            lo, _, hi = part.partition("-")
+            out |= set(range(int(lo), int(hi or lo) + 1))
+        return out
+
+    start = dt.datetime(2026, 10, 4)  # a Sunday
+    fires = []
+    for entry in on_block["schedule"]:
+        minute, hour, _dom, _mon, dow = entry["cron"].split()
+        for d in range(14):
+            day = start + dt.timedelta(days=d)
+            if (day.isoweekday() % 7) in _days(dow):
+                fires.append(day.replace(hour=int(hour), minute=int(minute)))
+    fires.sort()
+    gap = max(b - a for a, b in zip(fires, fires[1:]))
+    assert gap < dt.timedelta(hours=26), gap
