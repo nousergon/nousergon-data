@@ -8,6 +8,7 @@ Builds subject/body/HTML and delegates the SMTP+SES dispatch to
 from __future__ import annotations
 
 import logging
+import os
 from datetime import datetime, timezone
 
 from nousergon_lib.email_sender import send_email
@@ -15,13 +16,47 @@ from nousergon_lib.email_sender import send_email
 log = logging.getLogger(__name__)
 
 
+#: The env var carrying the Step Functions execution name down to the box.
+#: ``krepis.ssm_log_capture`` exports it to the launcher, and the spot
+#: launchers forward it into the workload they run over SSM.
+RUN_TOKEN_ENV = "RUN_TOKEN"
+
+#: The weekly-SF rehearsal marker: the rehearsal door names every run
+#: ``rehearsal-<date>-<n>`` (alpha-engine-config-I12351), the same prefix the
+#: SF's own rehearsal isolation and crucible-evaluator key on.
+REHEARSAL_PREFIX = "rehearsal-"
+
+
+def rehearsal_execution(env: dict | None = None) -> str | None:
+    """The rehearsal's execution name when this process runs under one, else ``None``."""
+    token = ((os.environ if env is None else env).get(RUN_TOKEN_ENV) or "").strip()
+    return token if token.startswith(REHEARSAL_PREFIX) else None
+
+
 def send_step_email(step_name: str, results: dict, date_str: str) -> bool:
-    """Send a completion email for a pipeline step. Never raises."""
+    """Send a completion email for a pipeline step. Never raises.
+
+    Under a weekly-SF rehearsal the email is NOT sent. A rehearsal publishes
+    its SNS alerts to the muted topic, but this email goes straight to the
+    operator over SMTP/SES, so nothing the SF's ``sns_topic_arn`` says ever
+    reached it: rehearsal-2026-10-16-2 put a "RAG Ingestion | DEGRADED" email
+    in the operator's inbox. The would-be email is written to the run log
+    instead (which ``ssm_log_capture`` ships to S3), and the call returns
+    ``True`` because nothing failed.
+    """
     try:
         subject, html_body, plain_body = _build_email(step_name, results, date_str)
     except Exception as exc:
         log.warning("Failed to build step email: %s", exc)
         return False
+    rehearsal = rehearsal_execution()
+    if rehearsal:
+        log.warning(
+            "Step email suppressed: %s is a weekly-SF rehearsal, and a rehearsal "
+            "does not reach the operator's inbox. Subject: %r\n%s",
+            rehearsal, subject, plain_body,
+        )
+        return True
     return send_email(subject, plain_body, html=html_body)
 
 

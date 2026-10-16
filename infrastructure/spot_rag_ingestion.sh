@@ -198,6 +198,9 @@ fi
 run_ssm "rag-ingestion" "$(cat <<WORKLOAD
 set -eo pipefail
 ${_ENV_SOURCE}
+# The SF execution name, so the completion email knows a rehearsal from a
+# production run (emailer.py; set by _spot_common.sh).
+${_RUN_TOKEN_EXPORT}
 cd /home/ec2-user/data
 
 # Fetch RAG secrets from SSM
