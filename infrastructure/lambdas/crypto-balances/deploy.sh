@@ -113,6 +113,13 @@ cp "${REPO_ROOT}/collectors/crypto_balances.py" "${PKG}/crypto_balances.py"
 # the record idiom across the timers, the workflows and this handler.
 cp "${REPO_ROOT}/run_units.py" "${PKG}/run_units.py"
 cp "${REPO_ROOT}/dates.py" "${PKG}/dates.py"
+# run_units.record_pit_stamps files the point-in-time stamp on every output the
+# run records (alpha-engine-config-I10782) and imports `contracts.pit` to do it.
+# Both files import only the standard library at module load; the rest of the
+# `contracts` package is not needed here and is not shipped.
+mkdir -p "${PKG}/contracts"
+cp "${REPO_ROOT}/contracts/__init__.py" "${PKG}/contracts/__init__.py"
+cp "${REPO_ROOT}/contracts/pit.py" "${PKG}/contracts/pit.py"
 
 # The sha of the tree this package was built from. A Lambda has no git checkout,
 # so `run_manifest.resolve_code_sha()` cannot measure one — and a sha carried in
