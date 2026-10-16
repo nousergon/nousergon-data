@@ -1403,6 +1403,48 @@
                   "Next": "CheckSkipRegimeRetrospectiveEval"
                 }
               ],
+              "Default": "RehearsalClockBeforeRAGIngestion"
+            },
+            "RehearsalClockBeforeRAGIngestion": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before RAGIngestion so CheckRehearsalDeadlineBeforeRAGIngestion can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+              "Parameters": {
+                "now.$": "$$.State.EnteredTime"
+              },
+              "ResultPath": "$.rehearsal_clock",
+              "Next": "CheckRehearsalDeadlineBeforeRAGIngestion"
+            },
+            "CheckRehearsalDeadlineBeforeRAGIngestion": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start RAGIngestion; it takes the same edge as the operator skip (CheckSkipRegimeRetrospectiveEval) and the branch carries on to its end. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "BooleanEquals": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_deadline",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_deadline",
+                      "IsTimestamp": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_clock.now",
+                      "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+                    }
+                  ],
+                  "Comment": "rehearsal past its deadline -> CheckSkipRegimeRetrospectiveEval",
+                  "Next": "CheckSkipRegimeRetrospectiveEval"
+                }
+              ],
               "Default": "RAGIngestion"
             },
             "RAGIngestion": {
@@ -1700,6 +1742,48 @@
                       "BooleanEquals": true
                     }
                   ],
+                  "Next": "CheckSkipEvalJudge"
+                }
+              ],
+              "Default": "RehearsalClockBeforeDataPhase2"
+            },
+            "RehearsalClockBeforeDataPhase2": {
+              "Type": "Pass",
+              "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before DataPhase2 so CheckRehearsalDeadlineBeforeDataPhase2 can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+              "Parameters": {
+                "now.$": "$$.State.EnteredTime"
+              },
+              "ResultPath": "$.rehearsal_clock",
+              "Next": "CheckRehearsalDeadlineBeforeDataPhase2"
+            },
+            "CheckRehearsalDeadlineBeforeDataPhase2": {
+              "Type": "Choice",
+              "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start DataPhase2; it takes the same edge as the operator skip (CheckSkipEvalJudge) and the branch carries on to its end. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+              "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "BooleanEquals": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_deadline",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_deadline",
+                      "IsTimestamp": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_clock.now",
+                      "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+                    }
+                  ],
+                  "Comment": "rehearsal past its deadline -> CheckSkipEvalJudge",
                   "Next": "CheckSkipEvalJudge"
                 }
               ],
@@ -3047,6 +3131,20 @@
               "Type": "Choice",
               "Comment": "Skip-gate (config#2253 validated-skip upgrade). {\"skip_predictor_training\": true} bypasses GBM retrain (and, per config#902, the bundled drift step riding the same spot) AND the config#1083 model-zoo fan-out \u2014 but the skip claim is VALIDATED first: ValidatePredictorSkipWeightsFresh reads arena/model/{run_date}.verdict -- the one-word decision.status that ModelZooSelect writes for THIS trading day on every cycle that trained and selected, whatever it decided -- and CheckPredictorSkipWeightsFresh requires a known status word. No verdict for this run_date \u2192 BranchBFailed (fail loud: silently honoring a false training-already-ran claim would hand Backtester weights this cycle never selected AND swallow the very re-training the pipeline owed). alpha-engine-config-I12050: this used to HeadObject the LIVE weights manifest (predictor/weights/meta/manifest.json) and require LastModified >= calendar_date, on the premise that every non-dry training run rewrote it. That premise has been false since alpha-engine-config-I9018: training writes only predictor/weights/meta_staging/{date}/{model_version}/, and the live manifest moves only when promote_to_champion promotes. So every recovery after a cycle that trained but did not promote failed this gate (live manifest 2026-09-12 against four straight unservable verdicts, 2026-09-18 to 2026-10-02), and scripts/weekly_sf_rerun.py had to clamp calendar_date back to the manifest date to get through, which is how watch-rerun-2026-09-25-1 regraded 2026-09-11. EXCEPTION (first Choice rule): mode=backtest-eval (config#830 replay preset, which force-seeds this flag) routes straight to PredictorTrainingSkipped with NO freshness validation \u2014 that preset's contract is 'replay Backtester+Evaluator against existing artifacts, whatever their vintage', so a mid-week replay must not demand this cycle's verdict. No cross-UTC-midnight correction is needed any more: the verdict key is the trading day NormalizeRunDates derives, the same on Saturday as on the Sunday a recovery may launch. | alpha-engine-config-I11655: SECOND Choice rule = the VACUOUS skip. The freshness validation below exists to protect the stages that CONSUME the predictor weights; the claim it tests (this cycle's training completed) matters only if one of them runs. The consumers, read from crucible-backtester: Backtester (its preflight HEADs predictor/weights/meta/momentum_model.txt, and this gate's own rationale names it), PredictorBacktest (download_gbm_model, GBM inference), PortfolioOptimizerBacktest (re-runs predictor_pipeline), the parity family's PitParityLookahead/PitParityWalkforward (GBM inference, gated as a family by skip_parity) and EvaluatorDiagnostics/EvaluatorOptimize (evaluate.py's contribution_lift predictor_ensemble reads the manifest's L2 combination rule). When skip_predictor_training AND all five of skip_backtester / skip_predictor_backtest / skip_portfolio_optimizer_backtest / skip_parity / skip_evaluator are present and true, no stage this run can enter loads the weights, so the branch ends at PredictorTrainingSkipped without the verdict read. The SF proves the claim is vacuous from flags it already honours: no new flag, and no skip_* flag on its own, can route around this gate (alpha-engine-config-I11268). NOT consumers: ReportCard, Director and the health checks read the manifest to GRADE it and report its age; a stale manifest is the fact they report, not an input they compute with. The per-branch parity flags deliberately do NOT satisfy this rule: that is stricter than necessary, and a stricter rule can only send a run to the validation it already had. WHY: before this rule the only way a Director-only rerun got through was scripts/weekly_sf_rerun.py clamping calendar_date down to the manifest date, and NormalizeRunDates re-derives run_date FROM calendar_date, so watch-rerun-2026-09-25-1 (clamped 2026-09-26 to 2026-09-12) ran every downstream stage, the Director included, for trading day 2026-09-11. The script declares the same five flags (PREDICTOR_WEIGHTS_CONSUMER_SKIPS) and tests/test_weekly_sf_rerun.py pins the two together.",
               "Choices": [
+                {
+                  "And": [
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "IsPresent": true
+                    },
+                    {
+                      "Variable": "$.rehearsal_marker.is_rehearsal",
+                      "BooleanEquals": true
+                    }
+                  ],
+                  "Comment": "alpha-engine-config-I12351 (A): a REHEARSAL never trains or selects. PredictorTraining writes predictor/weights and the training summary the daily inference Lambda serves from; the model-zoo chain writes predictor/model_zoo/leaderboard, the arena/model verdict and latest pointer, and auto-promotes the champion. All of it is skipped (branch B ends OK + skipped, same terminal as an operator skip) with no weights-freshness probe: the rehearsal reads whatever the live champion is and changes none of it. Production never matches (is_rehearsal is false).",
+                  "Next": "PredictorTrainingSkipped"
+                },
                 {
                   "And": [
                     {
@@ -4560,6 +4658,48 @@
           "Next": "CheckSkipPredictorBacktest"
         }
       ],
+      "Default": "RehearsalClockBeforeBacktester"
+    },
+    "RehearsalClockBeforeBacktester": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before Backtester so CheckRehearsalDeadlineBeforeBacktester can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+      "Parameters": {
+        "now.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.rehearsal_clock",
+      "Next": "CheckRehearsalDeadlineBeforeBacktester"
+    },
+    "CheckRehearsalDeadlineBeforeBacktester": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start Backtester; the execution ends at RehearsalDeadlineStop. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsTimestamp": true
+            },
+            {
+              "Variable": "$.rehearsal_clock.now",
+              "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+            }
+          ],
+          "Comment": "rehearsal past its deadline -> RecordRehearsalDeadlineStop",
+          "Next": "RecordRehearsalDeadlineStop"
+        }
+      ],
       "Default": "Backtester"
     },
     "Backtester": {
@@ -4725,6 +4865,48 @@
           "Next": "CheckSkipPortfolioOptimizerBacktest"
         }
       ],
+      "Default": "RehearsalClockBeforePredictorBacktest"
+    },
+    "RehearsalClockBeforePredictorBacktest": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before PredictorBacktest so CheckRehearsalDeadlineBeforePredictorBacktest can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+      "Parameters": {
+        "now.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.rehearsal_clock",
+      "Next": "CheckRehearsalDeadlineBeforePredictorBacktest"
+    },
+    "CheckRehearsalDeadlineBeforePredictorBacktest": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start PredictorBacktest; the execution ends at RehearsalDeadlineStop. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsTimestamp": true
+            },
+            {
+              "Variable": "$.rehearsal_clock.now",
+              "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+            }
+          ],
+          "Comment": "rehearsal past its deadline -> RecordRehearsalDeadlineStop",
+          "Next": "RecordRehearsalDeadlineStop"
+        }
+      ],
       "Default": "PredictorBacktest"
     },
     "PredictorBacktest": {
@@ -4888,6 +5070,48 @@
             }
           ],
           "Next": "CheckSkipParity"
+        }
+      ],
+      "Default": "RehearsalClockBeforePortfolioOptimizerBacktest"
+    },
+    "RehearsalClockBeforePortfolioOptimizerBacktest": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before PortfolioOptimizerBacktest so CheckRehearsalDeadlineBeforePortfolioOptimizerBacktest can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+      "Parameters": {
+        "now.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.rehearsal_clock",
+      "Next": "CheckRehearsalDeadlineBeforePortfolioOptimizerBacktest"
+    },
+    "CheckRehearsalDeadlineBeforePortfolioOptimizerBacktest": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start PortfolioOptimizerBacktest; the execution ends at RehearsalDeadlineStop. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsTimestamp": true
+            },
+            {
+              "Variable": "$.rehearsal_clock.now",
+              "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+            }
+          ],
+          "Comment": "rehearsal past its deadline -> RecordRehearsalDeadlineStop",
+          "Next": "RecordRehearsalDeadlineStop"
         }
       ],
       "Default": "PortfolioOptimizerBacktest"
@@ -6276,6 +6500,48 @@
             }
           ],
           "Next": "CheckSkipPostEval"
+        }
+      ],
+      "Default": "RehearsalClockBeforeEvaluatorDiagnostics"
+    },
+    "RehearsalClockBeforeEvaluatorDiagnostics": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before EvaluatorDiagnostics so CheckRehearsalDeadlineBeforeEvaluatorDiagnostics can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+      "Parameters": {
+        "now.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.rehearsal_clock",
+      "Next": "CheckRehearsalDeadlineBeforeEvaluatorDiagnostics"
+    },
+    "CheckRehearsalDeadlineBeforeEvaluatorDiagnostics": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start EvaluatorDiagnostics; the execution ends at RehearsalDeadlineStop. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsTimestamp": true
+            },
+            {
+              "Variable": "$.rehearsal_clock.now",
+              "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+            }
+          ],
+          "Comment": "rehearsal past its deadline -> RecordRehearsalDeadlineStop",
+          "Next": "RecordRehearsalDeadlineStop"
         }
       ],
       "Default": "EvaluatorDiagnostics"
@@ -8882,6 +9148,48 @@
           "Next": "CheckSkipDirector"
         }
       ],
+      "Default": "RehearsalClockBeforeReportCard"
+    },
+    "RehearsalClockBeforeReportCard": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B), rehearsal deadline stop: reads the clock before ReportCard so CheckRehearsalDeadlineBeforeReportCard can compare it with $.rehearsal_deadline (production slot - 2 h, stamped by nous-ergon-ops scripts/weekly_sf_rehearsal_guard.py). A no-op for production: the Choice after it only fires when is_rehearsal is true.",
+      "Parameters": {
+        "now.$": "$$.State.EnteredTime"
+      },
+      "ResultPath": "$.rehearsal_clock",
+      "Next": "CheckRehearsalDeadlineBeforeReportCard"
+    },
+    "CheckRehearsalDeadlineBeforeReportCard": {
+      "Type": "Choice",
+      "Comment": "alpha-engine-config-I12351 (B): a REHEARSAL past its deadline does not start ReportCard; the execution ends at RehearsalDeadlineStop. Production never matches (is_rehearsal false), and a rehearsal launched without a deadline is unaffected.",
+      "Choices": [
+        {
+          "And": [
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_marker.is_rehearsal",
+              "BooleanEquals": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsPresent": true
+            },
+            {
+              "Variable": "$.rehearsal_deadline",
+              "IsTimestamp": true
+            },
+            {
+              "Variable": "$.rehearsal_clock.now",
+              "TimestampGreaterThanEqualsPath": "$.rehearsal_deadline"
+            }
+          ],
+          "Comment": "rehearsal past its deadline -> RecordRehearsalDeadlineStop",
+          "Next": "RecordRehearsalDeadlineStop"
+        }
+      ],
       "Default": "ReportCard"
     },
     "CheckSkipDirector": {
@@ -10952,9 +11260,27 @@
         "head": "rehearsal",
         "is_rehearsal": true,
         "execution_name.$": "$$.Execution.Name",
-        "ns_prefix.$": "States.Format('rehearsal/{}/', $$.Execution.Name)"
+        "ns_prefix.$": "States.Format('rehearsal/{}/', $$.Execution.Name)",
+        "champion_skips": [
+          "ChallengerShadow",
+          "ThinkTankCoverage",
+          "EvalJudge",
+          "EvalRollingMean",
+          "PredictorTraining",
+          "ModelZoo",
+          "Director"
+        ]
       },
       "ResultPath": "$.rehearsal_marker",
+      "Next": "ApplyRehearsalChampionSkips"
+    },
+    "ApplyRehearsalChampionSkips": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (A), champion-risk isolation. REHEARSAL ONLY (reached solely from ApplyRehearsalNamespace). A rehearsal must never change the live champion or add an arena week to a champion-challenger compare, so it forces the existing, already-tested operator skips for every stage whose live write feeds the trading path or a promotion decision: skip_challenger_shadow (ChallengerShadow: signals_shadow/no_agent/, scored by the producer leaderboard), skip_thinktank_coverage (ThinkTankCoverage: thinktank/challenger_selection/latest.json, read by crucible-executor executor/champion.py when the Think Tank arm serves, and the thinktank_20 shadow the research arena scores), skip_eval_judge (EvalJudge + EvalRollingMean: the latter writes arena/research/{date}.json, latest.json and register.json, the research slot's champion-challenger record), skip_director (Director: director/carryover_ledger.json, read by crucible-executor executor/derisk_gate.py as a sizing multiplier). PredictorTraining and the model zoo (predictor weights, predictor/model_zoo/leaderboard, arena/model verdicts, auto-promote) are skipped by CheckSkipPredictorTraining's own rehearsal rule. Merged LAST (JsonMerge, the literal wins), so a rehearsal's input cannot opt back in. Production never reaches this state: ApplyProductionNamespace goes straight to CheckWeeklyRunDayGate and no Choice on the production path changes.",
+      "Parameters": {
+        "merged.$": "States.JsonMerge($, States.StringToJson('{\"skip_challenger_shadow\":true,\"skip_thinktank_coverage\":true,\"skip_eval_judge\":true,\"skip_director\":true}'), false)"
+      },
+      "OutputPath": "$.merged",
       "Next": "CheckWeeklyRunDayGate"
     },
     "ApplyProductionNamespace": {
@@ -10982,6 +11308,22 @@
       },
       "ResultPath": "$.rehearsal_degradations",
       "Next": "ResearchPredictorParallel"
+    },
+    "RecordRehearsalDeadlineStop": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12351 (B): records why a rehearsal ended early. Reached only from a CheckRehearsalDeadlineBefore* Choice, which only fires for a rehearsal whose clock has passed $.rehearsal_deadline (production slot - 2 h). Nothing after this point runs, so the rehearsal holds no box, LLM or substrate time when production starts; its spot box is reclaimed by the spot-orphan reaper, and everything it wrote is already under rehearsal/<execution name>/.",
+      "Parameters": {
+        "stopped": true,
+        "reason": "rehearsal deadline (production slot - 2 h) reached",
+        "deadline.$": "$.rehearsal_deadline",
+        "at.$": "$.rehearsal_clock.now"
+      },
+      "ResultPath": "$.rehearsal_deadline_stop",
+      "Next": "RehearsalDeadlineStop"
+    },
+    "RehearsalDeadlineStop": {
+      "Type": "Succeed",
+      "Comment": "alpha-engine-config-I12351 (B): the clean end of a rehearsal stopped by its deadline. Succeed, not Fail: stopping on schedule is the designed outcome, and a Fail would page through the weekly pipeline's failure alarms for a rehearsal that did what it should."
     }
   }
 }

@@ -49,8 +49,9 @@ def test_runs_first_off_initialize_input(sf, states):
     # InitializeInput and the run-day gate; both namespace branches rejoin it.
     assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
     assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
-    for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
-        assert states[_ns]["Next"] == "CheckWeeklyRunDayGate"
+    assert states["ApplyProductionNamespace"]["Next"] == "CheckWeeklyRunDayGate"
+    assert states["ApplyRehearsalNamespace"]["Next"] == "ApplyRehearsalChampionSkips"
+    assert states["ApplyRehearsalChampionSkips"]["Next"] == "CheckWeeklyRunDayGate"
     # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
     # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
     # gate and CheckRunMode — the graph's ONE date normalization, on every path

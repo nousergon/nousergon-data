@@ -295,8 +295,9 @@ class TestMutexWiring:
         # InitializeInput and the run-day gate; both namespace branches rejoin it.
         assert saturday_sf["States"]["InitializeInput"]["Next"] == "ReadRehearsalMarker"
         assert saturday_sf["States"]["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
-        for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
-            assert saturday_sf["States"][_ns]["Next"] == "CheckWeeklyRunDayGate"
+        assert saturday_sf["States"]["ApplyProductionNamespace"]["Next"] == "CheckWeeklyRunDayGate"
+        assert saturday_sf["States"]["ApplyRehearsalNamespace"]["Next"] == "ApplyRehearsalChampionSkips"
+        assert saturday_sf["States"]["ApplyRehearsalChampionSkips"]["Next"] == "CheckWeeklyRunDayGate"
         # config#1824: run-day gate precedes CheckRunMode; bypass Default keeps chain.
         # alpha-engine-config-I8809: NormalizeRunDates now sits between the run-day
         # gate and CheckRunMode — the graph's ONE date normalization, on every path

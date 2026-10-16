@@ -55,8 +55,9 @@ class TestGateRouting:
         # InitializeInput and the run-day gate; both namespace branches rejoin it.
         assert states["InitializeInput"]["Next"] == "ReadRehearsalMarker"
         assert states["ReadRehearsalMarker"]["Next"] == "CheckRehearsalMarker"
-        for _ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
-            assert states[_ns]["Next"] == "CheckWeeklyRunDayGate"
+        assert states["ApplyProductionNamespace"]["Next"] == "CheckWeeklyRunDayGate"
+        assert states["ApplyRehearsalNamespace"]["Next"] == "ApplyRehearsalChampionSkips"
+        assert states["ApplyRehearsalChampionSkips"]["Next"] == "CheckWeeklyRunDayGate"
 
     def test_skip_flag_defaulted_false(self, states):
         merged = states["InitializeInput"]["Parameters"]["merged.$"]

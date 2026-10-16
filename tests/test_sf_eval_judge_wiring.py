@@ -24,6 +24,7 @@ import json
 from pathlib import Path
 
 import pytest
+from tests.sf_rehearsal_checkpoint import past_rehearsal_checkpoint
 
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -183,7 +184,7 @@ class TestBacktesterTransition:
             c for c in bt["Choices"] if c.get("StringEquals") == "Success"
         )
         assert success_choice["Next"] == "CheckSkipPredictorBacktest"
-        assert states["CheckSkipPredictorBacktest"]["Default"] == "PredictorBacktest"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipPredictorBacktest"]["Default"]) == "PredictorBacktest"
 
         def _success(check):
             return next(
@@ -194,7 +195,7 @@ class TestBacktesterTransition:
         # Walk the L4472 split chain (through the config#830 skip-gates) to the
         # parity skip-gate.
         assert _success("CheckPredictorBacktestStatus") == "CheckSkipPortfolioOptimizerBacktest"
-        assert states["CheckSkipPortfolioOptimizerBacktest"]["Default"] == "PortfolioOptimizerBacktest"
+        assert past_rehearsal_checkpoint(states, states["CheckSkipPortfolioOptimizerBacktest"]["Default"]) == "PortfolioOptimizerBacktest"
         assert _success("CheckPortfolioOptimizerBacktestStatus") == "CheckSkipParity"
 
         # skip_parity short-circuit reaches the Evaluator gate via
@@ -274,7 +275,7 @@ class TestSkipBacktesterPreservesEvalJudge:
         gate = states["CheckSkipEvaluator"]
         skip_choice = gate["Choices"][0]
         assert skip_choice["Next"] == "CheckSkipPostEval"
-        assert gate["Default"] == "EvaluatorDiagnostics"
+        assert past_rehearsal_checkpoint(states, gate["Default"]) == "EvaluatorDiagnostics"
         # Run path success also exits to the tail gate (judge already ran upstream).
         assert (
             states["CheckEvaluatorOptimizeStatus"]["Choices"][0]["Next"]
