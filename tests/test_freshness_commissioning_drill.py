@@ -314,3 +314,38 @@ def test_the_drill_rides_an_existing_scheduled_job():
     assert "--only-if-due" in step["run"]
     assert step.get("if") == "${{ !cancelled() }}"
     assert steps.index(step) == len(steps) - 1
+
+
+#: Units whose live, un-parked ARTIFACT_REGISTRY row was declared in
+#: ``registry_rows`` alongside a ``freshness-monitor`` detector so the monthly
+#: drill commissions them (alpha-engine-config-I10795). Each key is a fixed key
+#: under ``market_data/``, which the drill role's
+#: ``FreshnessDrillProbeTheDrilledRows`` grant already reads (nous-ergon-ops-PR1697).
+NEWLY_DRILLED = {
+    "D02": ("historical_constituents", "market_data/historical_constituents.json", "saturday_sf"),
+    "D21": ("metron_close_history_consolidated", "market_data/close_history/consolidated.json", "eod_sf"),
+    "D29": ("metron_analyst", "market_data/analyst/latest.json", "eod_sf"),
+    "D30": ("metron_sentiment", "market_data/sentiment/latest.json", "eod_sf"),
+}
+
+
+@pytest.mark.parametrize("unit_id", sorted(NEWLY_DRILLED))
+def test_a_declared_registry_row_is_drilled_and_reads_met(units, unit_id):
+    artifact_id, key, cadence = NEWLY_DRILLED[unit_id]
+    unit = units[unit_id]
+    assert [r for r in unit.raw["registry_rows"]] == [artifact_id]
+    assert "registry_rows_broken" not in unit.raw  # the rows were unparked (I10776)
+    assert key in unit.raw["writes"]
+    assert key.startswith("market_data/") and "{" not in key
+    specs, broken = drill.build_specs(_registry(artifact_id=artifact_id, s3_key_template=key, cadence=cadence))
+    assert not broken
+    s3 = _FakeS3({key: DRILL_INSTANT - dt.timedelta(hours=1)})
+    receipt, rows, why = drill.drill_unit(
+        unit, _detector(unit), specs, s3=s3, clock=_Clock(DRILL_INSTANT), run_ref="t"
+    )
+    assert why is None and receipt is not None
+    assert receipt["outcome"] == "induced", receipt
+    assert receipt["fired"]["subject"] == artifact_id
+    assert rows[0]["states"] == {"baseline": "fresh", "induced": "stale", "cleared": "fresh"}
+    assert s3.calls == [("head", key)] * 3
+    assert _read(units, unit_id, receipt).met
