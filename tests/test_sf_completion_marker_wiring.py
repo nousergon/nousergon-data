@@ -57,8 +57,12 @@ def test_marker_state_shape(weekly_states):
     assert st["Type"] == "Task"
     assert st["Resource"] == "arn:aws:states:::aws-sdk:s3:putObject"
     assert st["Parameters"]["Bucket"] == "alpha-engine-research"
+    # alpha-engine-config-I12351: prefixed with the rehearsal namespace, which
+    # is "" on every non-rehearsal execution, so the production key is
+    # unchanged (tests/test_sf_rehearsal_isolation_wiring.py evaluates both).
     assert st["Parameters"]["Key.$"] == (
-        "States.Format('_sf_completion/ne-weekly-freshness-pipeline/{}.json', $.run_date)"
+        "States.Format('{}_sf_completion/ne-weekly-freshness-pipeline/{}.json', "
+        "$.rehearsal_marker.ns_prefix, $.run_date)"
     )
     body = st["Parameters"]["Body.$"]
     assert "ne-weekly-freshness-pipeline" in body

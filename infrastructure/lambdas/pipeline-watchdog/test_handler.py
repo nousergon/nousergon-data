@@ -1917,22 +1917,69 @@ def _rerun_success():
     }
 
 
-def test_weekly_cycle_recovered_by_a_watch_rerun_does_not_page():
-    """THE regression. The cycle failed on the cron and succeeded on a rerun
-    the next UTC day — the exact live shape of 2026-08-15/16. Before the
-    fix this paged with 'none SUCCEEDED'."""
-    client = _make_weekly_cycle_client([_cron_failure(), _rerun_success()])
+def _weekday_only_previous_trading_day(d: date) -> date:
+    prv = d - timedelta(days=1)
+    while prv.weekday() >= 5:
+        prv -= timedelta(days=1)
+    return prv
+
+
+# alpha-engine-config-I11092: the augmented cycle verdict lives on the
+# TRADING-DAY partition (Fri 2026-08-14 for the Sat 2026-08-15 cycle). The
+# calendar-partition twin at the weekly day is never augmented.
+_CYCLE_TD_KEY = "_sf_completion/ne-weekly-freshness-pipeline/2026-08-14.json"
+_CYCLE_CAL_KEY = "_sf_completion/ne-weekly-freshness-pipeline/2026-08-15.json"
+
+
+def _make_s3_marker_by_key(markers: dict, *, errors: dict | None = None) -> MagicMock:
+    """Key-aware S3 stand-in, double-encoded exactly as the SF writes it.
+    A key in neither dict raises NoSuchKey (absence)."""
+    errors = errors or {}
     s3 = MagicMock()
-    result = index._check_failed_day(
+
+    def _get_object(Bucket, Key):  # noqa: N803 — boto3 signature
+        if Key in errors:
+            raise errors[Key]
+        if Key not in markers:
+            raise _FakeNoSuchKey()
+        body = MagicMock()
+        body.read.return_value = _json.dumps(_json.dumps(markers[Key])).encode()
+        return {"Body": body}
+
+    s3.get_object.side_effect = _get_object
+    return s3
+
+
+def _augmented(verdict: str, **cycle) -> dict:
+    return {
+        "status": "SUCCEEDED", "claim": "sf_execution_terminal",
+        "cycle_verdict": verdict, "cycle_key": "2026-08-14",
+        "cycle": {"verdict": verdict, **cycle},
+    }
+
+
+def _weekly_succeeded_check(s3):
+    _tc_mod.previous_trading_day.side_effect = _weekday_only_previous_trading_day
+    client = _make_weekly_cycle_client([_cron_failure(), _rerun_success()])
+    return index._check_failed_day(
         sf_label="Weekly SF", sf_arn=SAT_ARN,
         pipeline_name="ne-weekly-freshness-pipeline",
         target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
     )
+
+
+def test_weekly_cycle_recovered_by_a_watch_rerun_does_not_page():
+    """THE regression. The cycle failed on the cron and succeeded on a rerun
+    the next UTC day — the exact live shape of 2026-08-15/16. Before the
+    fix this paged with 'none SUCCEEDED'."""
+    s3 = _make_s3_marker_by_key({_CYCLE_TD_KEY: _augmented("completed")})
+    result = _weekly_succeeded_check(s3)
     assert result.alert_emitted is False
     assert result.succeeded_on_day == 1
     assert result.executions_on_day == 2
-    # A cleared day must never spend an S3 read on the marker.
-    s3.get_object.assert_not_called()
+    # I11092: a SUCCEEDED day now spends ONE read, on the cycle's verdict.
+    assert result.cycle_verdict == "completed"
+    assert result.cycle_marker_key == _CYCLE_TD_KEY
     _alerts_mod.publish.assert_not_called()
 
 
@@ -1941,11 +1988,13 @@ def test_weekly_cycle_counts_the_recovery_role_too():
     WEEKLY_CADENCE_ROLES and must count exactly like watch-rerun — a cycle
     rescued from a spot reclaim is a cycle that succeeded."""
     recovery = dict(_rerun_success(), role="recovery")
+    _tc_mod.previous_trading_day.side_effect = _weekday_only_previous_trading_day
     client = _make_weekly_cycle_client([_cron_failure(), recovery])
     result = index._check_failed_day(
         sf_label="Weekly SF", sf_arn=SAT_ARN,
         pipeline_name="ne-weekly-freshness-pipeline",
-        target_date=_CYCLE, cadence="weekly", client=client, s3_client=MagicMock(),
+        target_date=_CYCLE, cadence="weekly", client=client,
+        s3_client=_make_s3_marker_by_key({_CYCLE_TD_KEY: _augmented("completed")}),
     )
     assert result.alert_emitted is False
     assert result.succeeded_on_day == 1
@@ -2039,6 +2088,118 @@ def test_succeeded_marker_clears_instead_of_paging():
     assert result.alert_emitted is False
     assert result.marker_status == "SUCCEEDED"
     _alerts_mod.publish.assert_not_called()
+
+
+# ── alpha-engine-config-I11092: SUCCEEDED is not a completed CYCLE ─────────
+
+
+def test_succeeded_execution_with_incomplete_cycle_pages_at_error():
+    """THE silent no-op. A SUCCEEDED execution exists (a watch-rerun that
+    entered none of the spine), the cron run FAILED, and the augmented marker
+    says the CYCLE is incomplete — the live 2026-09-11 shape (partial_cycle,
+    15/17). The old branch cleared this on `succeeded > 0` and said nothing."""
+    explain = ("ne-weekly-freshness-pipeline cycle 2026-09-11: incomplete "
+               "(partial_cycle), stages 15/17 across 3 executions, missing PitParityCompare")
+    s3 = _make_s3_marker_by_key({
+        _CYCLE_TD_KEY: _augmented("incomplete", reason="partial_cycle", explain=explain),
+    })
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert result.succeeded_on_day == 1
+    assert result.cycle_verdict == "incomplete"
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "error"
+    assert "did NOT do the work" in kwargs["message"]
+    assert "missing PitParityCompare" in kwargs["message"]
+    assert "I11092" in kwargs["message"]
+    assert kwargs["dedup_key"] == (
+        "pipeline-watchdog-weekly-cycle-verdict-ne-weekly-freshness-pipeline-2026-08-15-incomplete"
+    )
+
+
+def test_cycle_verdict_is_read_from_the_trading_day_key_not_the_calendar_twin():
+    """The calendar-partition twin the SF still writes beside the real marker
+    is never augmented (measured: 2026-10-03.json unknown beside
+    2026-10-02.json completed). Reading the weekly-day key alone would page
+    `unknown` on every healthy cycle."""
+    s3 = _make_s3_marker_by_key({
+        _CYCLE_TD_KEY: _augmented("completed"),
+        _CYCLE_CAL_KEY: {"status": "SUCCEEDED", "cycle_verdict": "unknown"},
+    })
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is False
+    assert result.cycle_verdict == "completed"
+    keys = [c.kwargs["Key"] for c in s3.get_object.call_args_list]
+    assert keys == [_CYCLE_TD_KEY]
+    _alerts_mod.publish.assert_not_called()
+
+
+def test_unaugmented_marker_is_unknown_and_warns_never_passes():
+    """A SUCCEEDED day whose marker carries no cycle block resolves to UNKNOWN
+    (sf-pipeline-policy §2.3a), reported at warning — the sweep not
+    augmenting is itself a fault, but not a known-bad cycle."""
+    s3 = _make_s3_marker_by_key({_CYCLE_TD_KEY: {"status": "SUCCEEDED", "cycle_verdict": "unknown"}})
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert result.cycle_verdict == "unknown"
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "warning"
+    assert "could not be established" in kwargs["message"]
+
+
+def test_absent_cycle_marker_after_a_succeeded_execution_warns():
+    s3 = _make_s3_marker_by_key({})
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert result.cycle_verdict == "unknown"
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "warning"
+    assert "no completion marker exists" in kwargs["message"]
+
+
+def test_in_flight_cycle_verdict_is_not_a_pass():
+    """A marker augmented while an execution was still running (measured
+    2026-08-28 / 09-04) carries `in_flight`. By the time the watchdog reads it
+    a stale in_flight is an unestablished verdict, not a completed cycle."""
+    s3 = _make_s3_marker_by_key({_CYCLE_TD_KEY: _augmented("in_flight", reason="still_running")})
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+
+
+def test_unreadable_cycle_marker_is_reported_not_swallowed():
+    s3 = _make_s3_marker_by_key({}, errors={_CYCLE_TD_KEY: RuntimeError("AccessDenied")})
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert result.cycle_verdict == "unknown"
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "warning"
+    assert "could not be read" in kwargs["message"]
+    assert "AccessDenied" in kwargs["message"]
+
+
+def test_declared_skip_cycle_verdict_pages_at_error():
+    """A real (non-gate-noop) SUCCEEDED execution on a due weekly day whose
+    cycle reads `skipped` means no work was done on a day work was due."""
+    s3 = _make_s3_marker_by_key({_CYCLE_TD_KEY: _augmented("skipped", reason="declared_skip")})
+    result = _weekly_succeeded_check(s3)
+    assert result.alert_emitted is True
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "error"
+
+
+def test_non_weekly_succeeded_day_never_reads_the_cycle_marker():
+    """The verdict check is weekly-only: a SUCCEEDED weekday/EOD day still
+    clears on status without an S3 read."""
+    client = _make_status_aware_sfn_client({"SUCCEEDED": [{"startDate": _TARGET_START}]})
+    s3 = MagicMock()
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is False
+    assert result.cycle_verdict is None
+    s3.get_object.assert_not_called()
 
 
 def test_normalize_role_preserves_the_recovery_vocabulary():

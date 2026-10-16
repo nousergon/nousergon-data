@@ -51,6 +51,12 @@ receipt the reader cannot check would turn an UNMET row UNMEASURABLE.
 **Cadence.** ``--only-if-due`` makes the step a no-op (no AWS call at all)
 except on the first NYSE trading day of the calendar month, so it rides an
 existing daily job in ``phase-exit-metrics.yml`` instead of a new workflow.
+
+The day is the one the cron fire was SCHEDULED for, not the wall-clock UTC
+date at process start: GitHub starts the ``0 22 * * *`` fire 2-5 hours late
+(measured 2026-10-12..16, every start after 00:00Z), so a start-date test
+would see the next UTC day and miss the due day. See
+:func:`scheduled_session_date`.
 """
 
 from __future__ import annotations
@@ -80,6 +86,7 @@ __all__ = [
     "is_drill_day",
     "main",
     "run_drill",
+    "scheduled_session_date",
     "tightened_threshold",
 ]
 
@@ -133,6 +140,24 @@ _CLEARED_STATE = "fresh"
 # ---------------------------------------------------------------------------
 # Cadence.
 # ---------------------------------------------------------------------------
+
+
+#: UTC hour of the ``phase-exit-metrics.yml`` cron (``0 22 * * *``). Mirrored,
+#: not parsed at runtime; ``tests/test_freshness_commissioning_drill.py``
+#: asserts it equals the workflow's cron hour.
+SCHEDULE_UTC_HOUR = 22
+
+
+def scheduled_session_date(started_at: dt.datetime) -> dt.date:
+    """The calendar date the scheduled fire containing ``started_at`` was FOR.
+
+    Each fire is owned by the 24h window beginning at its cron instant, so a
+    start up to 24h late still maps to the date it was scheduled on (a 22:00Z
+    fire started at 02:00Z the next UTC day is still that session's fire).
+    Exactly one fire per date, so a late start can neither miss the due day
+    nor run the drill twice for it.
+    """
+    return (started_at - dt.timedelta(hours=SCHEDULE_UTC_HOUR)).date()
 
 
 def is_drill_day(today: dt.date) -> bool:
@@ -432,6 +457,10 @@ def _load_registry(uri: str, s3: Any) -> dict[str, Any]:
     return yaml.safe_load(body)
 
 
+def _now() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
 def main(argv: list[str] | None = None) -> int:
     logging.basicConfig(level="INFO")
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n", 1)[0])
@@ -441,14 +470,21 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--only-if-due",
         action="store_true",
-        help="exit 0 without touching AWS unless today (UTC) is the month's first NYSE trading day",
+        help=(
+            "exit 0 without touching AWS unless the fire's scheduled date "
+            "(see scheduled_session_date) is the month's first NYSE trading day"
+        ),
     )
     ap.add_argument("--no-write", action="store_true", help="print the receipts instead of writing them")
     args = ap.parse_args(argv)
 
-    started_at = dt.datetime.now(dt.timezone.utc)
-    if args.only_if_due and not is_drill_day(started_at.date()):
-        print(f"{PRODUCER}: not due on {started_at.date()} (runs on the month's first NYSE trading day)")
+    started_at = _now()
+    session_date = scheduled_session_date(started_at)
+    if args.only_if_due and not is_drill_day(session_date):
+        print(
+            f"{PRODUCER}: not due on {session_date} (scheduled date of this fire, started "
+            f"{started_at:%Y-%m-%dT%H:%MZ}; runs on the month's first NYSE trading day)"
+        )
         return 0
 
     import boto3  # noqa: PLC0415 - deferred so the module imports without AWS

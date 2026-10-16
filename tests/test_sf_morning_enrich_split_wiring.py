@@ -59,6 +59,8 @@ _WAIT_BLOCK = {
     "WaitForCollectionManifests", "CheckCollectionReadiness",
     "CheckCollectionReadinessBudget", "CollectionReadinessPollWait",
     "IncrementCollectionReadinessPoll", "ExtractCollectionNotReadyError",
+    # alpha-engine-config-I12351: rehearsal-only degrade-and-continue edge.
+    "RehearsalCollectionNotReadyDegraded",
 }
 
 
@@ -224,7 +226,7 @@ class TestChainOrdering:
         into_research = sorted(
             n for n in seen if "ResearchPredictorParallel" in _targets(states[n])
         )
-        assert into_research == ["CheckCollectionReadiness"]
+        assert into_research == ["CheckCollectionReadiness", "RehearsalCollectionNotReadyDegraded"]
 
 
 class TestWeeklyWaitFailsClosed:
@@ -268,12 +270,15 @@ class TestShellRunRunsTheWaitDry:
         order = [
             "ready" if c["And"][0]["Variable"] == "$.collection_readiness.ready"
             else "shell_run" if self._is_shell_run(c)
+            else "rehearsal" if "rehearsal_marker" in json.dumps(c)
             else "settled"
             for c in choices
         ]
         # ready first (a green probe is a green probe), then the dry exit
         # BEFORE the settled-not-ok halt: a Friday verdict never halts.
-        assert order == ["ready", "shell_run", "settled"]
+        # alpha-engine-config-I12351: the rehearsal degrade-and-continue rule
+        # also precedes the halt; production never matches it.
+        assert order == ["ready", "shell_run", "rehearsal", "settled"]
         assert choices[1]["Next"] == "ResearchPredictorParallel"
 
     def test_a_raising_dry_probe_fails_the_preflight_now(self, states):

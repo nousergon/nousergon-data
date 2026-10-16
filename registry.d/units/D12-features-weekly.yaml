@@ -60,6 +60,10 @@ trigger:
   schedule: "Sat 05:00 America/New_York"
   runs_on: "ec2-spot"
 writes:
+  # alpha-engine-config-I10793: the shared producer (features/compute.py ->
+  # upload_registry) writes features/registry.json on every non-dry run, and
+  # this unit's contract list names its schema, so the key is declared here too.
+  - "features/registry.json"
   - "features/{date}/technical.parquet"
   - "features/{date}/fundamental.parquet"
   - "features/{date}/interaction.parquet"
@@ -85,7 +89,12 @@ consumers_reason: >-
 contract:
   schema:
     - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+    - "contracts/features_parquet.schema.json"
     - "contracts/feature_registry.schema.json"
+  # alpha-engine-config-I10793: the parquet keys now resolve to the generated
+  # per-column contract (contracts/features_parquet.schema.json); registry.json
+  # keeps its own. Consumer pins for the parquet contract are declared on D31,
+  # the in-service producer of the same keys; this unit is retired.
   # LIST value (two schemas): the pre-existing per-COLUMN parquet contract
   # (unchanged) plus a new versioned JSON Schema for the SEPARATE
   # features/registry.json artifact — see below. data_gate/evidence.py only reads a
@@ -93,6 +102,7 @@ contract:
   # is extending it to lists.
   producer_test:
     - tests/test_schema_contract.py
+    - tests/test_features_parquet_contract.py
     - tests/test_feature_registry_contract.py
   consumer_pins:
     - repo: "crucible-dashboard"
