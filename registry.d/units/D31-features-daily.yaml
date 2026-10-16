@@ -42,6 +42,12 @@ trigger:
 writes:
   - "features/{date}/*.parquet"
   - features/metron_supplemental/
+  # alpha-engine-config-I10793: uploaded on every non-dry run by
+  # features/compute.py -> features/registry.py::upload_registry and recorded in
+  # the run manifest's outputs[] (weekly_collector._feature_registry_extra_output).
+  # Declared so contracts/feature_registry.schema.json is reachable from a key
+  # this unit writes, now that the parquet keys resolve to their own contract.
+  - "features/registry.json"
 consumers:
   - "crucible-research:scoring/factor_scoring.py"
   - "crucible-dashboard:views/13_Feature_Store.py"
@@ -58,14 +64,22 @@ consumers_reason: >-
 contract:
   schema:
     - "features/registry.py::CATALOG <-> SCHEMA.md §3"
+    - "contracts/features_parquet.schema.json"
     - "contracts/feature_registry.schema.json"
-  # LIST value, mirrors D12 (PR1750): the pre-existing per-column parquet contract
-  # plus the SEPARATE features/registry.json artifact. D31 (daily) and D12 (weekly)
-  # run through the SAME shared code path (features/compute.py -> upload_registry,
-  # compute.py:1456) — one producer, one registry.json, one contract, whichever
-  # trigger last ran.
+  # Two artifacts, two contracts (alpha-engine-config-I10793, Brian's ruling
+  # 2026-10-14, option (a)):
+  #   * features/{date}/{group}.parquet -> contracts/features_parquet.schema.json,
+  #     the per-COLUMN contract GENERATED from CATALOG by
+  #     features/gen_parquet_contract.py (tests/test_features_parquet_contract.py
+  #     fails CI when the committed file is stale). It carries the parquet keys'
+  #     x-key-pattern and x-settling-bar, so parity grades them as before.
+  #   * features/registry.json -> contracts/feature_registry.schema.json, the
+  #     CATALOG serialisation the dashboard GETs. D31 and D12 run the SAME code
+  #     path (features/compute.py -> upload_registry), so one producer, one
+  #     registry.json, one contract whichever trigger last ran.
   producer_test:
     - tests/test_schema_contract.py
+    - tests/test_features_parquet_contract.py
     - tests/test_feature_registry_contract.py
   consumer_pins:
     - repo: "crucible-dashboard"
@@ -73,15 +87,23 @@ contract:
       pins: "body_schema"
       producer: "contracts/feature_registry.schema.json"
       read_site: "views/13_Feature_Store.py::_load_registry"
-  # P-07 (alpha-engine-config-I10873): reuses the ALREADY-MERGED crucible-dashboard
-  # pin from D12 (crucible-dashboard-PR862, merged 2026-09-15T17:04:36Z) — verified
-  # live on crucible-dashboard origin/main this session. It is the same artifact
-  # (features/registry.json) produced by the same code path regardless of whether
-  # the weekly (D12) or daily (D31) trigger last ran, so the existing pin covers
-  # both units honestly; no new companion PR needed for this part of the contract.
-  # The per-column parquet contract (CATALOG <-> SCHEMA.md §3) has no separate pin
-  # of its own — same as D12, the registry.json pin is what makes `consumer_pins`
-  # non-empty.
+    - repo: "crucible-dashboard"
+      path: "tests/contracts/features_parquet.schema.json"
+      pins: "body_schema"
+      producer: "contracts/features_parquet.schema.json"
+      read_site: "views/13_Feature_Store.py::_load_parquet"
+    - repo: "crucible-research"
+      path: "tests/contracts/features_parquet.schema.json"
+      pins: "body_schema"
+      producer: "contracts/features_parquet.schema.json"
+      read_site: "scoring/factor_scoring.py::_resolve_group_snapshot"
+  # P-07 (alpha-engine-config-I10873): the registry.json pin reuses the
+  # crucible-dashboard pin from D12 (crucible-dashboard-PR862). The two
+  # features_parquet pins are alpha-engine-config-I10793's consumer PRs; each
+  # pinned copy must keep the producer's validation SHAPE (data_gate.consumer_pins
+  # strips descriptions and x-* annotations before comparing), so a CATALOG
+  # column change re-generates the producer file and stales both copies until
+  # they are re-pinned — which is the drift a pin exists to surface.
 registry_rows:
   - feature_store_freshness_sentinel
 run_manifest_prefix: data_collection/runs/D31
