@@ -142,6 +142,7 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
     "D11": (("market_data/valuation_medians/latest.json",), (), ()),
     "D12": (
         (
+            "features/registry.json",
             "features/{date}/alternative.parquet",
             "features/{date}/fundamental.parquet",
             "features/{date}/interaction.parquet",
@@ -215,7 +216,11 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
     "D28": (("market_data/security_performance/latest.json",), (), ()),
     "D29": (("market_data/analyst/latest.json",), (), ()),
     "D30": (("market_data/sentiment/latest.json",), (), ()),
-    "D31": (("features/metron_supplemental/", "features/{date}/*.parquet"), (), ()),
+    # alpha-engine-config-I10793: `features/registry.json` was always uploaded by
+    # this producer (features/compute.py -> upload_registry) and is now declared,
+    # so its own contract is reachable from a key the unit writes. Covered by the
+    # grandfathered `features/` path_prefix in ARTIFACT_REGISTRY: no new row.
+    "D31": (("features/metron_supplemental/", "features/registry.json", "features/{date}/*.parquet"), (), ()),
     "D32": ((), ("universe",), ()),
     "D33": (("data/heal/daily/{date}.json", "staging/daily_closes/*"), ("universe",), ()),
     "D34": (("reference/price_cache/*",), ("universe",), ()),
