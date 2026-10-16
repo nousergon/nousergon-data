@@ -315,6 +315,8 @@ excluded_paths:
     reason: Step Functions rerun tooling — the ops plane.
   - glob: "scripts/weekly_sf_rerun.py"
     reason: Step Functions rerun tooling — the ops plane.
+  - glob: "scripts/pit_parity_proof_input.py"
+    reason: Print-only Step Functions input builder (alpha-engine-config-I7309); writes nothing.
   - glob: "scripts/weekly_sf_recovery_metric.py"
     reason: An ops metric about the pipeline, not a published data key.
   - glob: "scripts/weekly_sf_silence_deadman.py"
