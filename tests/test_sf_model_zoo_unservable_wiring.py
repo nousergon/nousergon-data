@@ -352,16 +352,15 @@ def test_unservable_notice_tells_the_operator_the_truth(branch_b):
     veto refuses, and the live model stays UNCHANGED (predictor-model-zoo log,
     2026-10-17 run f4b49786: "the champion-arch refresh was refused
     (behavioral_veto) — the live model is UNCHANGED"). It also omitted that the
-    condition is standing and has a recorded disposition, so the operator read
-    a five-week-old ruled condition as a fresh break."""
+    condition is standing, so the operator read a month-old condition as a
+    fresh break."""
     msg = branch_b["PublishModelZooUnservableNotice"]["Parameters"]["Message.$"]
     assert "trained+promoted" not in msg, (
         "the notice must not claim a promotion happened on a cycle where "
         "nothing was promoted"
     )
     assert "UNCHANGED" in msg
-    # The standing disposition and where its cause is tracked.
-    assert "alpha-engine-config-I11480" in msg
+    # Where the cause and its repair are tracked.
     assert "alpha-engine-config-I11106" in msg
     # Placeholders and arguments agree, or States.Format raises at runtime.
     assert msg.count("{}") == msg.count("$.run_date")
