@@ -4232,7 +4232,7 @@
               "Parameters": {
                 "TopicArn.$": "$.sns_topic_arn",
                 "Subject.$": "States.Format('Alpha Engine Saturday{} \u2014 M slot UNSERVABLE (verdict, not a failure)', $.pipeline_label)",
-                "Message.$": "States.Format('The model-zoo rotation for cycle {} concluded UNSERVABLE: the M slot arena correctly found no challenger clearing the promotion bar this run. This is a VERDICT, not a stage failure \u2014 the base champion-arch retrain already trained+promoted; nothing about what may be promoted changes. Durable source of truth: arena/model/{}.json::decision.status (alpha-engine-config-I11101 deliverable 4 moves the SF Choice onto that structured read instead of the current stdout-marker match). Review predictor-model-zoo-select.log on the spot for the arena cycle detail.', $.run_date, $.run_date)"
+                "Message.$": "States.Format('The model-zoo rotation for cycle {} concluded UNSERVABLE: every M arm, INCLUDING the champion-arch refresh, failed a hard serving precondition, so NOTHING was promoted and the live model is UNCHANGED \u2014 the previously served champion keeps serving. This is a VERDICT, not a stage failure. Check whether it is STANDING before treating it as new: the M slot has been unservable on every weekly cycle since 2026-09-18, because every retrained arm is scale-collapsed below the behavioral-veto floor. Root cause and repair are tracked on alpha-engine-config-I11106 and -I11123. Per-arm reasons: arena/model/{}.json::decision.ineligible. Verdict history: arena/model/<date>.verdict.', $.run_date, $.run_date)"
               },
               "ResultPath": null,
               "Next": "BranchBComplete",
