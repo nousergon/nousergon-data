@@ -54,7 +54,13 @@ import numpy as np
 import pandas as pd
 import requests
 
-from dates import SETTLED_AFTER_ET, assert_settled_bar, bar_settlement_guard_entry
+from dates import (
+    BAR_PROVISIONAL,
+    SETTLED_AFTER_ET,
+    assert_settled_bar,
+    bar_settlement,
+    bar_settlement_guard_entry,
+)
 from nousergon_lib.secrets import get_secret
 from nousergon_lib.yfinance_quiet import log_yf_coverage, yf_quiet
 
@@ -1490,10 +1496,38 @@ def collect(
     explained_actions: list = []
     unexplained_discrepancies: list = []
     if existing_close_for_discrepancy and polygon_count > 0:
+        refused_tickers: list[str] = []
         explained_actions, unexplained_discrepancies = _log_close_discrepancies(
             closes_df, existing_close_for_discrepancy, run_date, registry=registry,
             defer_unexplained=_defer_unexplained_errors,
+            close_loader=(
+                _archive_close_loader(s3, bucket, s3_prefix)
+                if registry is not None else None
+            ),
+            refused=refused_tickers,
         )
+        # alpha-engine-config-I12359: a vendor restatement that matched a
+        # registered split with NO price evidence is not written — the ticker
+        # keeps the prior row (which is then that object's row, so it is
+        # carried for settlement like any other retained row).
+        if refused_tickers:
+            prior_rows = {
+                str(r["ticker"]): r for r in existing_rows_for_merge if r.get("ticker")
+            }
+            kept = [t for t in refused_tickers if t in prior_rows]
+            if kept:
+                kept_set = set(kept)
+                records = [
+                    prior_rows[str(r["ticker"])] if str(r["ticker"]) in kept_set else r
+                    for r in records
+                ]
+                closes_df = pd.DataFrame(records).set_index("ticker")
+                carried_tickers.extend(t for t in kept if t not in carried_tickers)
+                logger.warning(
+                    "polygon_only %s: kept the prior row for %d ticker(s) whose "
+                    "vendor restatement matched an unevidenced registry split: %s",
+                    run_date, len(kept), sorted(kept),
+                )
 
     # ── Vendor-divergence MetricRecord (alpha-engine-config-I10783) ──────────
     # polygon_only (D17, morning-enrich) is the run that has both this run's
@@ -2166,6 +2200,70 @@ def _split_ratio_hint(prior: float, new: float) -> str:
     return ""
 
 
+# Price-evidence verdicts (``corporate_actions.price_evidence_orientation``)
+# under which a registry-matched split counts as REAL: the raw tape prints the
+# factor at the ex-date boundary, in the stated or the inverted orientation
+# (the inverted HON/DD feed records restate by the true factor, so their
+# overwrite is still that action's). ``ambiguous``/``none``/``uncovered`` are
+# not evidence — the same verdicts on which ``corporate_actions.apply``
+# refuses to restate (alpha-engine-config-I12359).
+_EVIDENCED_VERDICTS = frozenset({"direct", "inverse"})
+
+
+def _now_utc() -> datetime:
+    """Wall clock for :func:`_ex_date_unsettled` (patched in tests)."""
+    return datetime.now(timezone.utc)
+
+
+def _ex_date_unsettled(action) -> bool:
+    """Has ``action``'s ex-date session NOT yet settled?
+
+    Then the tape cannot show the split yet: a vendor that pre-adjusts on the
+    ex-date morning (Polygon did for SKYD at 12:04Z on 2026-10-14) restates
+    history before the first post-split bar exists. The overwrite is still
+    refused, but at WARN — the next run, with the ex-date bar archived, gives
+    the real verdict and pages if the split is absent (I12359).
+    """
+    try:
+        return bar_settlement(_now_utc(), action.ex_date) == BAR_PROVISIONAL
+    except Exception:  # noqa: BLE001 - unparseable ex_date: treat as settled (page)
+        return False
+
+
+def _archive_close_loader(s3, bucket: str, s3_prefix: str):
+    """``close_loader`` for ``CorporateActionRegistry.classify_discrepancy``:
+    the ticker's stored closes in the ``staging/daily_closes`` archive for
+    every business day within the price-evidence window of the action's
+    ex-date (alpha-engine-config-I12359).
+
+    Those closes are the raw tape the vendor's adjusted restatement is
+    measured against: a date on/after the ex-date is never pre-adjusted, and a
+    pre-ex date that still disagrees with the vendor by the split factor is,
+    by construction, still on the unadjusted basis. A missing or unreadable
+    parquet just narrows the window; too narrow a window reads ``uncovered``
+    and refuses.
+    """
+    from corporate_actions import (
+        _PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS,
+        _read_archive_parquet,
+    )
+
+    def _load(action):
+        ex = pd.Timestamp(action.ex_date).normalize()
+        span = pd.Timedelta(days=_PRICE_EVIDENCE_EX_DATE_WINDOW_DAYS)
+        closes: dict = {}
+        for day in pd.bdate_range(ex - span, ex + span):
+            df = _read_archive_parquet(s3, bucket, s3_prefix, day.strftime("%Y-%m-%d"))
+            if df is None or "Close" not in df.columns or action.ticker not in df.index:
+                continue
+            value = df.at[action.ticker, "Close"]
+            if pd.notna(value):
+                closes[day] = float(value)
+        return pd.Series(closes, dtype="float64")
+
+    return _load
+
+
 # Two window dates' unexplained overwrite ratios "agree" (same corporate-action
 # restatement) when they differ by less than this relative tolerance.
 _UNIFORM_RATIO_REL_TOL = 0.02
@@ -2193,6 +2291,41 @@ def _emit_window_unexplained_discrepancies(rows: list, target_date: str) -> None
             abs(r - mean_ratio) <= _UNIFORM_RATIO_REL_TOL * mean_ratio
             for r in ratios
         )
+        refused_ids = sorted({
+            g["refused_action_id"] for g in group if g.get("refused_action_id")
+        })
+        if refused_ids:
+            # alpha-engine-config-I12359: the vendor's restatement matched a
+            # registered split the raw tape does not show, and was NOT written.
+            refused_rows = [g for g in group if g.get("refused_action_id")]
+            dates = ", ".join(sorted(g["date"] for g in refused_rows))
+            evidence = ", ".join(sorted({str(g.get("evidence")) for g in refused_rows}))
+            all_pending = all(g.get("pending") for g in refused_rows)
+            refused_ratio = sum(g["ratio"] for g in refused_rows) / len(refused_rows)
+            (logger.warning if all_pending else logger.error)(
+                "polygon_only OVERWRITE REFUSED %s: ×%.4f vendor restatement "
+                "across %d window date(s) [%s] matches registry split(s) %s, "
+                "but the raw close shows no such split around the ex-date "
+                "(price evidence=%s) — prior rows KEPT. %s "
+                "(alpha-engine-config-I12359)",
+                ticker, refused_ratio, len(refused_rows), dates,
+                ", ".join(refused_ids), evidence,
+                "The ex-date session has not settled yet; the next run "
+                "re-checks against the ex-date bar"
+                if all_pending else
+                "Suspected phantom vendor split: confirm against the trade "
+                "tape before anything restates this ticker",
+            )
+            # Any non-refused rows for the same ticker still page on their own.
+            group = [g for g in group if not g.get("refused_action_id")]
+            if not group:
+                continue
+            ratios = [g["ratio"] for g in group]
+            mean_ratio = sum(ratios) / len(ratios)
+            uniform = len(group) >= 2 and all(
+                abs(r - mean_ratio) <= _UNIFORM_RATIO_REL_TOL * mean_ratio
+                for r in ratios
+            )
         if uniform:
             dates = ", ".join(sorted(g["date"] for g in group))
             logger.error(
@@ -2224,6 +2357,8 @@ def _log_close_discrepancies(
     *,
     registry=None,
     defer_unexplained: bool = False,
+    close_loader=None,
+    refused: "list | None" = None,
 ) -> "tuple[list, list]":
     """Log per-ticker Close discrepancy when polygon overwrites yfinance.
 
@@ -2263,8 +2398,21 @@ def _log_close_discrepancies(
     each row (``feedback_no_silent_fails`` — the surface stays, severity moves
     to the aggregate).
 
+    alpha-engine-config-I12359 (phantom SKYD/PSKY 2:1): a registry match is
+    NOT on its own enough to call a jump explained. The matched action must
+    also have PRICE EVIDENCE on the raw tape around its ex-date
+    (``registry.classify_discrepancy`` → ``price_evidence_orientation``, read
+    through ``close_loader``). A factor match whose verdict is
+    ``ambiguous``/``none``/``uncovered`` is an UNEVIDENCED split: the row is
+    returned as unexplained (so it pages) carrying ``refused_action_id`` and
+    ``evidence``, and its ticker is appended to ``refused`` so the caller keeps
+    the prior row instead of writing the vendor's restatement. With no
+    ``close_loader`` there is no evidence, so every registry match is refused —
+    the guard is on unless a caller can show the tape.
+
     Returns ``(explained_actions, unexplained_rows)`` where each unexplained
-    row is ``{"ticker", "date", "prior", "new", "ratio"}``.
+    row is ``{"ticker", "date", "prior", "new", "ratio"}`` (plus
+    ``refused_action_id`` / ``evidence`` for an unevidenced registry match).
     """
     n_compared = 0
     n_warn = 0
@@ -2282,6 +2430,14 @@ def _log_close_discrepancies(
         n_compared += 1
         is_fred_index = str(ticker).lstrip("^") in _FRED_INDEX_MAP
         pct_diff = abs(float(new_close) - prior) / prior
+        # (action, evidence verdict) for a >5% equity jump the registry can
+        # attribute to a registered split; (None, None) otherwise.
+        action, verdict = None, None
+        if pct_diff > _DISCREPANCY_ERROR_PCT and not is_fred_index and registry is not None:
+            action, verdict = registry.classify_discrepancy(
+                str(ticker), run_date, prior, float(new_close),
+                close_loader=close_loader,
+            )
         if pct_diff > _DISCREPANCY_ERROR_PCT and is_fred_index:
             # FRED-index restatement toward the authoritative value — expected
             # self-heal, NOT an equity data-quality anomaly. WARN, not ERROR.
@@ -2291,19 +2447,46 @@ def _log_close_discrepancies(
                 ticker, run_date, prior, float(new_close), pct_diff * 100,
             )
             n_restatement += 1
-        elif (
-            pct_diff > _DISCREPANCY_ERROR_PCT
-            and registry is not None
-            and (
-                action := registry.explains_discrepancy(
-                    str(ticker), run_date, prior, float(new_close)
-                )
+        elif action is not None and verdict not in _EVIDENCED_VERDICTS:
+            # alpha-engine-config-I12359: the registry has a split at this
+            # factor and ex-date, but the raw tape does not show it. Refuse the
+            # overwrite (the caller keeps the prior row) and page — at WARN
+            # only while the ex-date session has not settled.
+            pending = _ex_date_unsettled(action)
+            unexplained_rows.append({
+                "ticker": str(ticker),
+                "date": run_date,
+                "prior": float(prior),
+                "new": float(new_close),
+                "ratio": float(new_close) / float(prior),
+                "refused_action_id": action.action_id,
+                "evidence": verdict,
+                "pending": pending,
+            })
+            if refused is not None:
+                refused.append(str(ticker))
+            _log = logger.warning if (defer_unexplained or pending) else logger.error
+            _log(
+                "polygon_only OVERWRITE REFUSED %s @ %s: Close %.4f → %.4f "
+                "(%.2f%% diff vs prior parquet) matches registry %s (%s, ex %s) "
+                "but the raw close shows no such split around its ex-date "
+                "(price evidence=%s%s) — keeping the prior row; a vendor split "
+                "with no market evidence is not a restatement "
+                "(alpha-engine-config-I12359)%s",
+                ticker, run_date, prior, float(new_close), pct_diff * 100,
+                action.action_id, action.human(), action.ex_date, verdict,
+                "; ex-date session not settled yet, re-checked next run"
+                if pending else "",
+                " — deferred to the window-level unexplained-discrepancy "
+                "aggregation" if defer_unexplained else "",
             )
-            is not None
-        ):
-            # config#1431: confirmed corporate-action restatement (the registry
-            # is AUTHORITATIVE) — expected adjusted-history restatement, WARN not
-            # ERROR, excluded from the flow-doctor ERROR filter.
+            if not pending:
+                n_error += 1
+        elif action is not None:
+            # config#1431: confirmed corporate-action restatement — a registry
+            # match WITH price evidence (I12359) — expected adjusted-history
+            # restatement, WARN not ERROR, excluded from the flow-doctor ERROR
+            # filter.
             logger.warning(
                 "corporate_action_restatement %s @ %s: Close %.4f → %.4f "
                 "(%.2f%% diff vs prior parquet) — confirmed %s (registry %s), "
