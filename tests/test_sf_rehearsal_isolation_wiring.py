@@ -203,7 +203,16 @@ FORCED_SKIPS = {
     "skip_thinktank_coverage": True,
     "skip_eval_judge": True,
     "skip_director": True,
+    # C30: DataPhase2 writes D15's production keys and the data registry's
+    # shared completion marker; production's Saturday run skips it too.
+    "skip_data_phase2": True,
 }
+#: Task states that write PRODUCTION data keys with no rehearsal namespace
+#: (alpha-engine-config-I12351 C30). Not champion risk, but a live write all
+#: the same: rehearsal-2026-10-16-2's DataPhase2 left
+#: data/2026-10-16/.phases/alternative.json status=ok, which v2's
+#: alternative-phase-two would have auto-skipped on.
+PRODUCTION_DATA_TASKS = {"DataPhase2"}
 
 
 def _leaf(cond: dict, known: dict):
@@ -306,6 +315,7 @@ def test_each_forced_skip_is_one_the_graph_honours():
         (branch_a["CheckSkipThinkTankCoverage"], "skip_thinktank_coverage", "ThinkTankCoverage"),
         (branch_a["CheckSkipEvalJudge"], "skip_eval_judge", "CheckEvalCadenceRehearsal"),
         (TOP["CheckSkipDirector"], "skip_director", "PrepareDirectorOnSpot"),
+        (branch_a["CheckSkipDataPhase2"], "skip_data_phase2", "RehearsalClockBeforeDataPhase2"),
     ):
         (rule,) = [c for c in choice["Choices"] if f"$.{flag}" in json.dumps(c)]
         assert rule["Next"] != skipped
@@ -341,6 +351,13 @@ def test_a_rehearsal_reaches_no_champion_risk_writer():
     assert reached & CHAMPION_RISK_TASKS == set(), sorted(reached & CHAMPION_RISK_TASKS)
 
 
+def test_a_rehearsal_reaches_no_production_data_writer():
+    """C30: a rehearsal reaches no stage that writes a live data key."""
+    reached = _reachable("ApplyRehearsalNamespace", TOP, _rehearsal_known())
+    assert "CheckSkipDataPhase2" in reached
+    assert reached & PRODUCTION_DATA_TASKS == set(), sorted(reached & PRODUCTION_DATA_TASKS)
+
+
 def test_production_still_reaches_every_champion_writer():
     """The same walk for a production execution: every one of those writers
     stays reachable, so production behaviour is unchanged."""
@@ -353,6 +370,7 @@ def test_production_still_reaches_every_champion_writer():
     reached = _reachable("ApplyProductionNamespace", TOP, known)
     assert "ApplyRehearsalChampionSkips" not in reached
     assert CHAMPION_RISK_TASKS <= reached, sorted(CHAMPION_RISK_TASKS - reached)
+    assert PRODUCTION_DATA_TASKS <= reached, sorted(PRODUCTION_DATA_TASKS - reached)
 
 
 # ── (B) deadline stop ───────────────────────────────────────────────────────
