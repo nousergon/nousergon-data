@@ -560,6 +560,10 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload == "daily-panel":
             # D51 (alpha-engine-config-I10791): one ArcticDB read + one PUT.
             expected = 3600
+        elif workload == "panel-history-export":
+            # D51's one-off frozen export (alpha-engine-config-I12399): one
+            # read of both libraries to 2022-03-31 + two PUTs, sized like D51.
+            expected = 3600
         elif workload in ("index-contributions", "ndx-constituents"):
             # D48 / D49 (alpha-engine-config-I11306), sized like D51.
             expected = 3600
