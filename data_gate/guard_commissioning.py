@@ -40,19 +40,63 @@ import sys
 import tempfile
 import xml.etree.ElementTree as ET
 
-__all__ = ["HARNESSES", "Harness", "main", "record_document", "record_key"]
+__all__ = [
+    "EMPTY_FRESH_OBSERVED",
+    "HARNESSES",
+    "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
+    "Harness",
+    "main",
+    "record_document",
+    "record_key",
+]
 
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 DEFAULT_STORE = "s3://alpha-engine-research/data_collection"
 
 
+#: What the ``empty_fresh`` harness observes. A guard that RAISES (manifest
+#: ``failed``, process exit 1) is retried on demand and pages through
+#: ``NotifyFailure``.
+EMPTY_FRESH_OBSERVED: tuple[str, ...] = (
+    "manifest status failed on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL",
+    "stand-down: terminal CollectionFailed, phase marker error (not ok)",
+    "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
+)
+
+#: What the ``success_without_output`` harness observes. That guard does not move
+#: the exit code (`run_units.record_empty_production`): the process reports
+#: success, so nothing retries, and the page comes from the completion check
+#: reading the ``failed`` manifest (``run_not_ok``), not from ``NotifyFailure``.
+SUCCESS_WITHOUT_OUTPUT_OBSERVED: tuple[str, ...] = (
+    "manifest status failed (EmptyProduction) while the collector reported status ok",
+    "exactly one page (NotifyCompletionFindings, failure_mode run_not_ok) on the deployed "
+    "data-collection ASL; the process exited 0, so no on-demand retry",
+    "stand-down: terminal RunNotOk; a same-date rerun that still publishes nothing files "
+    "failed again (never carried forward to ok)",
+    "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
+)
+
+
 class Harness:
     """Where a guard class's induced-fault record is taken, and what it induces."""
 
-    def __init__(self, test_file: str, test_name: str, mode_under_test: str) -> None:
+    def __init__(
+        self,
+        test_file: str,
+        test_name: str,
+        mode_under_test: str,
+        *,
+        cases_module: str,
+        observed: tuple[str, ...],
+    ) -> None:
         self.test_file = test_file
         self.test_name = test_name
         self.mode_under_test = mode_under_test
+        #: The ``tests`` module whose ``CASES`` declare each unit's induced fault.
+        self.cases_module = cases_module
+        #: What the harness asserts, carried onto the record verbatim.
+        self.observed = observed
 
     def nodeid(self, unit: str) -> str:
         return f"{self.test_file}::{self.test_name}[{unit}]"
@@ -67,6 +111,18 @@ HARNESSES: dict[str, Harness] = {
         "tests/test_guard_commissioning_empty_fresh.py",
         "test_the_fault_record_empty_frame_fails_pages_once_and_stands_down",
         mode_under_test="enforce",
+        cases_module="test_guard_commissioning_empty_fresh",
+        observed=EMPTY_FRESH_OBSERVED,
+    ),
+    # `data_success_without_output` ships ENFORCING (`run_units.record_empty_production`
+    # files `failed`); there is no staged mode flip, so the record is taken against
+    # the code exactly as shipped.
+    "success_without_output": Harness(
+        "tests/test_guard_commissioning_success_without_output.py",
+        "test_the_fault_record_ok_with_no_output_fails_pages_once_and_stands_down",
+        mode_under_test="enforce",
+        cases_module="test_guard_commissioning_success_without_output",
+        observed=SUCCESS_WITHOUT_OUTPUT_OBSERVED,
     ),
 }
 
@@ -85,6 +141,7 @@ def record_document(
     code_sha: str,
     mode_under_test: str = "enforce",
     as_of: str | None = None,
+    observed: tuple[str, ...] | None = None,
 ) -> dict:
     """The document the phase-2 gate grades. ``outcome: induced`` is what reads MET."""
     return {
@@ -93,18 +150,20 @@ def record_document(
         "guard": guard,
         "outcome": "induced",
         "fault": fault,
-        "observed": [
-            "manifest status failed on the attempt and on the on-demand retry",
-            "exactly one page (NotifyFailure) on the deployed data-collection ASL",
-            "stand-down: terminal CollectionFailed, phase marker error (not ok)",
-            "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
-        ],
+        "observed": list(observed if observed is not None else _observed_for(guard)),
         "mode_under_test": mode_under_test,
         "test": test,
         "code_sha": code_sha,
         "as_of": as_of or dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "tracked_issue": "alpha-engine-config-I10786",
     }
+
+
+def _observed_for(guard: str) -> tuple[str, ...]:
+    harness = HARNESSES.get(guard)
+    if harness is None:
+        raise ValueError(f"{guard!r} has no induced-fault harness; there is nothing it observed")
+    return harness.observed
 
 
 def _git(*args: str) -> str:
@@ -145,9 +204,11 @@ def _run_harness(nodeids: list[str]) -> dict[str, str]:
 
 def _fault_for(unit: str, guard: str) -> str:
     """The induced-fault sentence the harness declares for this unit."""
-    if guard == "empty_fresh":
+    if guard in HARNESSES:
+        import importlib
+
         sys.path.insert(0, str(REPO_ROOT))
-        from tests import test_guard_commissioning_empty_fresh as harness
+        harness = importlib.import_module(f"tests.{HARNESSES[guard].cases_module}")
 
         for case in harness.CASES:
             if case.unit == unit:
@@ -194,7 +255,7 @@ def main(argv: list[str] | None = None) -> int:
     for unit in units:
         document = record_document(
             unit, args.guard, fault=faults[unit], test=harness.nodeid(unit), code_sha=code_sha,
-            mode_under_test=harness.mode_under_test, as_of=as_of,
+            mode_under_test=harness.mode_under_test, as_of=as_of, observed=harness.observed,
         )
         key = record_key(unit, args.guard)
         if args.write:
