@@ -91,6 +91,46 @@ while [ $# -gt 0 ]; do
     shift
 done
 
+# ── Rehearsal isolation (alpha-engine-config-I12375) ─────────────────────────
+# A weekly-SF rehearsal (execution name `rehearsal-<date>-<n>`, carried here as
+# $RUN_TOKEN by krepis.ssm_log_capture → infrastructure/_spot_common.sh) must
+# never write live data. Before this, it ran the full ingestion against the
+# production pgvector corpus: rehearsal-2026-10-16-1 stored 15 documents
+# (2 10-Qs, 11 8-Ks, 2 13F summaries), and both 10-16 rehearsals overwrote
+# data/insider_transactions/latest.json, the analyst snapshot series,
+# rag/manifest/latest.json and rag/filing_changes/latest.json. Because corpus
+# dedup is by (ticker, doc_type, filed_date, source), every document a
+# rehearsal stores is one Saturday's production run then finds "already held".
+#
+# The corpus is one shared database, so it cannot be namespaced the way the
+# SF's S3 keys are (`rehearsal/<execution>/`). A rehearsal therefore takes
+# this script's existing, already-tested --dry-run — the same shape as the
+# SF's ApplyRehearsalChampionSkips: the rehearsal is FORCED onto a skip that
+# production already uses, and nothing a caller passes can opt back out. Under
+# --dry-run every step still resolves its scope and discovers what is new
+# (EDGAR searches, corpus dedup reads), but no document, chunk, embedding,
+# parquet, snapshot, manifest or freshness verdict is written. What a
+# rehearsal still writes goes under its own namespace: progress telemetry and
+# the source-yield records, at s3://alpha-engine-research/rehearsal/<execution>/.
+#
+# The prefix is emailer.REHEARSAL_PREFIX; tests/test_rag_rehearsal_isolation.py
+# holds the two in lockstep.
+REHEARSAL_EXECUTION=""
+case "${RUN_TOKEN:-}" in
+    rehearsal-*) REHEARSAL_EXECUTION="$RUN_TOKEN" ;;
+esac
+RAG_NS_PREFIX=""
+if [ -n "$REHEARSAL_EXECUTION" ]; then
+    if ! [[ "$REHEARSAL_EXECUTION" =~ ^rehearsal-[A-Za-z0-9._-]+$ ]]; then
+        echo "ERROR: RUN_TOKEN '$REHEARSAL_EXECUTION' looks like a rehearsal but is not a safe S3 path segment" >&2
+        exit 2
+    fi
+    DRY_RUN="--dry-run"
+    RAG_NS_PREFIX="rehearsal/${REHEARSAL_EXECUTION}/"
+    echo "REHEARSAL: $REHEARSAL_EXECUTION — forcing --dry-run: NO corpus, parquet, snapshot or manifest write (alpha-engine-config-I12375)."
+    echo "REHEARSAL: progress telemetry and source-yield records go under s3://alpha-engine-research/${RAG_NS_PREFIX}"
+fi
+
 # Activate venv
 if [ -d ".venv" ]; then
     source .venv/bin/activate
@@ -173,7 +213,7 @@ emit_progress() {
     local step="$1" of="$2" label="$3"
     $PYTHON_BIN -m rag.pipelines.emit_progress \
         --run-date "$RUN_DATE" --step "$step" --of "$of" --label "$label" \
-        --started-at "$START_TIME" \
+        --started-at "$START_TIME" --key-prefix "$RAG_NS_PREFIX" \
         || echo "WARN: rag_ingestion_progress PUT failed for step $step/$of ($label) — telemetry only, continuing"
 }
 
@@ -318,6 +358,16 @@ echo ""
 echo "==> Source-yield verdict..."
 $PYTHON_BIN -m rag.pipelines.source_yield --report
 
+# A rehearsal keeps its record of what it found — the per-source yields and the
+# verdict — in its own namespace, never beside production's (I12375). Fail-soft
+# like the progress ticks: it is a record ABOUT the rehearsal, not its output.
+if [ -n "$REHEARSAL_EXECUTION" ]; then
+    aws s3 cp --recursive --only-show-errors "$RAG_SOURCE_YIELD_DIR" \
+        "s3://alpha-engine-research/${RAG_NS_PREFIX}rag/source_yield/${RUN_DATE}/" \
+        && echo "REHEARSAL: source-yield records -> s3://alpha-engine-research/${RAG_NS_PREFIX}rag/source_yield/${RUN_DATE}/" \
+        || echo "WARN: rehearsal source-yield upload failed — record only, continuing"
+fi
+
 echo ""
 echo "========================================"
 echo "RAG Weekly Ingestion Complete — $(date -u '+%Y-%m-%d %H:%M UTC')"
@@ -325,13 +375,19 @@ echo "========================================"
 
 # Emit CloudWatch heartbeat on successful completion. No `|| echo` swallow
 # — a broken heartbeat emission is a real signal worth escalating.
-aws cloudwatch put-metric-data \
-  --namespace "AlphaEngine" \
-  --metric-name "Heartbeat" \
-  --dimensions "Process=rag-ingestion" \
-  --value 1 --unit "Count" \
-  --region "${AWS_REGION:-us-east-1}"
-echo "Heartbeat emitted: rag-ingestion"
+# Not under a rehearsal: Process=rag-ingestion is production's liveness
+# signal, and a rehearsal's tick would stand in for a production run (I12375).
+if [ -n "$REHEARSAL_EXECUTION" ]; then
+    echo "REHEARSAL: production heartbeat (Process=rag-ingestion) not emitted"
+else
+    aws cloudwatch put-metric-data \
+      --namespace "AlphaEngine" \
+      --metric-name "Heartbeat" \
+      --dimensions "Process=rag-ingestion" \
+      --value 1 --unit "Count" \
+      --region "${AWS_REGION:-us-east-1}"
+    echo "Heartbeat emitted: rag-ingestion"
+fi
 
 # Send completion email. With `set -euo pipefail` active, reaching this
 # point means all 8 pipelines EXITED 0 — which is not the same as every source
