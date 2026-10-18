@@ -999,6 +999,109 @@ alert_classes:
     # DECLARED: an empty-filter finding for an operator to act on, not a
     # failure — mirrors backtester_empty_param_sweep's tracked-only tier.
     tier: tracked-only
+  # Spot-launcher EXIT-trap notices (alpha-engine-config-I12385). Every
+  # crucible-backtester spot stage script sources infrastructure/_spot_common.sh,
+  # whose `cleanup` trap publishes ONE ops alert on a non-zero exit with
+  # source='alpha-engine-backtester/${SPOT_STAGE_NAME}'. spot_backtest.sh
+  # carries its own copy of that trap with a fixed source. Severity is
+  # `warning` when the trap is about to relaunch (spot reclaim, or a
+  # launch-time capacity/quota refusal with attempts left; will_relaunch=1)
+  # and `error` when it gives up or the stage itself failed (will_relaunch=0).
+  # The source is interpolated inside a shell-embedded python -c string, so
+  # alert_class_registry_drift.py's static scan cannot see it; until these
+  # rows existed every such notice resolved as undeclared and PAGED
+  # (krepis.alert_tiers.resolve_tier's no-row branch). One row per
+  # SPOT_STAGE_NAME rather than an `alpha-engine-backtester/*` wildcard: a
+  # wildcard would silently claim every future undeclared backtester source.
+  # A stage script added to crucible-backtester needs its row here.
+  - class: backtester_spot_exit_backtester
+    source: "alpha-engine-backtester/backtester"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: &backtester_spot_exit_reason >-
+      A spot stage's own EXIT-trap notice. `warning` means the trap is
+      relaunching (spot reclaim, or a launch-time capacity/quota refusal with
+      attempts left) and the stage heals itself. `error` means the trap gave up
+      or the stage itself failed. Either way the safe state is reached without
+      a human: the Step Functions task that launched the stage fails with it,
+      so the failure also surfaces on that pipeline's own watch. drain-queue
+      T0-T3 triage is the closed loop for the `error` case, and no human
+      action is waiting on this notice.
+  - class: backtester_spot_exit_evaluator
+    source: "alpha-engine-backtester/evaluator"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_parity
+    source: "alpha-engine-backtester/parity"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_parity_compare
+    source: "alpha-engine-backtester/parity-compare"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_parity_replay
+    source: "alpha-engine-backtester/parity-replay"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_pit_lookahead
+    source: "alpha-engine-backtester/pit-lookahead"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_pit_walkforward
+    source: "alpha-engine-backtester/pit-walkforward"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_portfolio_optimizer
+    source: "alpha-engine-backtester/portfolio-optimizer"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_predictor_backtest
+    source: "alpha-engine-backtester/predictor-backtest"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
+  - class: backtester_spot_exit_spot_backtest
+    source: "alpha-engine-backtester/spot_backtest.sh"
+    severities: [warning, error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: *backtester_spot_exit_reason
 
   # ── predictor (crucible-predictor) ──
   - class: predictor_risk_model_persist
