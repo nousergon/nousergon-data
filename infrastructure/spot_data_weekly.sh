@@ -1239,6 +1239,10 @@ if [ "$RUN_MODE" = "phase2-only" ]; then
     run_ssm "phase2-only" "$PHASE2_ONLY_WORKLOAD_TIMEOUT_SECONDS" <<PHASE2_ONLY
 set -eo pipefail
 ${ENV_SOURCE}
+# The SF execution name (krepis.ssm_log_capture exports it to this launcher),
+# so weekly_collector's completion email knows a rehearsal from a production
+# run and does not email the operator from one (emailer.py).
+export RUN_TOKEN=$(printf '%q' "${RUN_TOKEN:-}")
 cd /home/ec2-user/alpha-engine-data
 
 # Spot-side log capture — same rationale as the rag-only block: SSM caps

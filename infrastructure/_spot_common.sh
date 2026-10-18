@@ -141,9 +141,14 @@ _INSTANCE_ID=""
 _S3_STAGING_PREFIX=""
 _S3_STAGING=""
 
-# krepis RUN_TOKEN forwarding
+# krepis RUN_TOKEN forwarding. RUN_TOKEN is the SF execution name
+# (krepis.ssm_log_capture exports it to this launcher), and the workload runs
+# on ANOTHER host over SSM where it does not exist unless a launcher expands
+# this line into the workload script. emailer.py reads it there: a
+# `rehearsal-*` execution must not email the operator (rehearsal-2026-10-16-2's
+# RAG Ingestion email reached the live inbox).
 if [ -n "${RUN_TOKEN:-}" ]; then
-  _RUN_TOKEN_EXPORT="export RUN_TOKEN=${RUN_TOKEN}"$'\n'
+  _RUN_TOKEN_EXPORT="export RUN_TOKEN=$(printf '%q' "$RUN_TOKEN")"$'\n'
 else
   _RUN_TOKEN_EXPORT="export RUN_TOKEN=spot-data-weekly-$(date -u +%Y%m%d)"$'\n'
 fi

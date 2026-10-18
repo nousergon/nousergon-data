@@ -549,3 +549,57 @@ def test_the_alarm_this_feeds_is_the_one_the_ops_tree_declares():
     index, _ = _install_stubs(sweep=_Sweep(should_alert=False))
     assert index.ALARMABLE_METRIC == "StageCoverageSweepAlarmable"
     assert index.ALARMABLE_NAMESPACE == "AlphaEngine"
+
+
+# ── C30: a rehearsal never publishes (alpha-engine-config-I12351) ─────────────
+
+_REHEARSAL_ARN = (
+    "arn:aws:states:us-east-1:711398986525:execution:"
+    "ne-weekly-freshness-pipeline:rehearsal-2026-10-16-2"
+)
+_PRODUCTION_ARN = (
+    "arn:aws:states:us-east-1:711398986525:execution:"
+    "ne-weekly-freshness-pipeline:eb30d967-fa2f-fbce-4264-24e54b54c5fb"
+)
+
+
+def test_a_rehearsal_sweep_writes_pages_and_alarms_nothing():
+    """rehearsal-2026-10-16-2 swept the 2026-10-15 partition with dry_run false,
+    published, and paged alpha-engine-stage-coverage-findings at 23:42Z."""
+    cw = _CW()
+    index, calls = _install_with_cw(_Sweep(should_alert=True, findings=8, absent=5), cw)
+    out = index.handler(
+        {"run_date": "2026-10-15", "dry_run": False, "observer_execution_arn": _REHEARSAL_ARN},
+        None,
+    )
+    assert out["outcome"] == index.OUTCOME_FINDINGS, "the verdict is still the real one"
+    assert out["dry_run"] is True
+    assert out["rehearsal"] == "rehearsal-2026-10-16-2"
+    assert calls.get("published") is None, "no _stage_coverage/_sweep artifact"
+    assert calls.get("augmented") is None, "no production _sf_completion marker"
+    assert calls.get("alerted") is None, "no page"
+    assert cw.calls == [], "no StageCoverageSweepAlarmable point"
+    assert "observer_did_work" in out, "CheckExecutionDidWork still has its field"
+
+
+def test_a_production_sweep_still_publishes_and_pages():
+    cw = _CW()
+    index, calls = _install_with_cw(_Sweep(should_alert=True, findings=1), cw)
+    out = index.handler(
+        {"run_date": "2026-10-17", "observer_execution_arn": _PRODUCTION_ARN}, None
+    )
+    assert out["outcome"] == index.OUTCOME_FINDINGS
+    assert "dry_run" not in out
+    assert calls["published"] == 1 and calls["alerted"] == 1
+    assert len(cw.calls) == 1
+
+
+def test_rehearsal_is_read_from_the_execution_name_only():
+    index, _ = _install_stubs(sweep=_Sweep(should_alert=False))
+    assert index.rehearsal_execution(_REHEARSAL_ARN) == "rehearsal-2026-10-16-2"
+    assert index.rehearsal_execution(_PRODUCTION_ARN) is None
+    assert index.rehearsal_execution("") is None
+    # A prefix elsewhere in the ARN is not a rehearsal; only the name counts.
+    assert index.rehearsal_execution(
+        "arn:aws:states:us-east-1:1:execution:rehearsal-pipeline:weekly-rerun-1"
+    ) is None

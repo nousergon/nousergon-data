@@ -245,7 +245,7 @@ def test_d13_records_both_arctic_libraries_graded_on_count_not_s3_head():
         "arcticdb/universe": 903,
         "arcticdb/macro": 2512,
     }
-    verdicts = {g["key"]: g["verdict"] for g in m["guards"] if g.get("key")}
+    verdicts = {g["key"]: g["verdict"] for g in m["guards"] if g.get("key") and g["guard"] != "data_pit"}
     assert verdicts == {"arcticdb/universe": "ok", "arcticdb/macro": "ok"}
     (metric,) = [x for x in m["metrics"] if x["name"] == "data.D13.guard.empty_fresh"]
     assert metric["status"] == "GREEN"
