@@ -289,3 +289,108 @@ def test_a_filing_with_no_sections_is_counted_not_silent(monkeypatch, _stub_rag)
     assert ingest_sec_filings.ingest_ticker("TSM", stats=stats) == 0
     assert stats.failures == {"no_sections": 1}
     assert stats.discovered == 1 and stats.ingested == 0
+
+
+# ── 40-F: the AIF and MD&A are EX-99 exhibits (alpha-engine-config-I11528) ──
+#
+# Measured on the weekly runs of 2026-09-26, 2026-10-03 and 2026-10-10: BN's
+# two 40-F primary documents (bn-20251231.htm, bn-20241231.htm) yielded no
+# sections every week, so every run's source-yield verdict read DEGRADED with
+# no_sections=2. An MJDS 40-F's primary document is a cover wrapper; its
+# Annual Information Form and MD&A are filed as EX-99.x exhibits, which the
+# filing index lists by Type. The index fixture below has the shape of
+# EDGAR's "Document Format Files" table (Seq, Description, Document, Type,
+# Size), including the ``/ix?doc=`` link EDGAR gives an inline-XBRL document.
+
+_ACC = "0001046179-26-000000"  # what _edgar() assigns the first filing
+
+_INDEX_40F = f"""
+<html><body>
+<div id="formDiv"><p>Filing index for {_ACC}. {'Header padding. ' * 60}</p></div>
+<table class="tableFile" summary="Document Format Files">
+  <tr><th>Seq</th><th>Description</th><th>Document</th><th>Type</th><th>Size</th></tr>
+  <tr><td>1</td><td>40-F</td>
+      <td><a href="/ix?doc=/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-40f.htm">bn-40f.htm</a></td>
+      <td>40-F</td><td>90000</td></tr>
+  <tr><td>2</td><td>ANNUAL INFORMATION FORM</td>
+      <td><a href="/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-ex99_1.htm">bn-ex99_1.htm</a></td>
+      <td>EX-99.1</td><td>900000</td></tr>
+  <tr><td>3</td><td>FINANCIAL STATEMENTS</td>
+      <td><a href="/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-ex99_2.pdf">bn-ex99_2.pdf</a></td>
+      <td>EX-99.2</td><td>500000</td></tr>
+  <tr><td>4</td><td>MD&amp;A</td>
+      <td><a href="/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-ex99_3.htm">bn-ex99_3.htm</a></td>
+      <td>EX-99.3</td><td>700000</td></tr>
+  <tr><td>5</td><td>CONSENT</td>
+      <td><a href="/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-ex23.htm">bn-ex23.htm</a></td>
+      <td>EX-23.1</td><td>3000</td></tr>
+</table>
+</body></html>
+"""
+
+_WRAPPER_40F = (
+    "<html><body><p>FORM 40-F</p>"
+    + _para("the incorporation by reference of the annual information form", 20)
+    + "</body></html>"
+)
+
+_AIF = (
+    "<html><body><p>ANNUAL INFORMATION FORM</p>"
+    "<p>DESCRIPTION OF THE BUSINESS</p>" + _para("the asset management business", 10)
+    + "<p>RISK FACTORS</p>" + _para("the risks the company faces", 10)
+    + "<p>DIVIDENDS</p>" + _para("the dividend record", 3)
+    + "</body></html>"
+)
+
+_MDA_EXHIBIT = (
+    "<html><body>"
+    "<p>MANAGEMENT'S DISCUSSION AND ANALYSIS OF FINANCIAL RESULTS FOR THE YEAR ENDED DECEMBER 31, 2025</p>"
+    + _para("operating results and liquidity", 12)
+    + "</body></html>"
+)
+
+
+def test_the_filing_index_yields_only_html_ex99_exhibits(monkeypatch, _stub_rag):
+    _edgar(monkeypatch, forms=[("40-F", "bn-40f.htm")], docs={f"{_ACC}-index.htm": _INDEX_40F})
+
+    exhibits = ingest_sec_filings._list_exhibits({"cik": "1046179", "accession_number": _ACC})
+
+    assert [e["exhibit_type"] for e in exhibits] == ["EX-99.1", "EX-99.3"]
+    assert exhibits[0]["url"] == (
+        f"https://www.sec.gov/Archives/edgar/data/1046179/{_ACC.replace('-', '')}/bn-ex99_1.htm"
+    )
+
+
+def test_a_40f_takes_its_sections_from_its_exhibits(monkeypatch, _stub_rag):
+    _edgar(monkeypatch, forms=[("40-F", "bn-40f.htm")], docs={
+        "bn-40f.htm": _WRAPPER_40F,
+        f"{_ACC}-index.htm": _INDEX_40F,
+        "bn-ex99_1.htm": _AIF,
+        "bn-ex99_3.htm": _MDA_EXHIBIT,
+    })
+    stats = SourceYield(source="sec_filings", scope=1)
+
+    assert ingest_sec_filings.ingest_ticker("TSM", stats=stats) == 1  # _edgar() knows one filer
+
+    assert stats.failures == {}
+    _, kwargs = _stub_rag.ingest_document.call_args
+    assert kwargs["doc_type"] == "40-F"
+    assert kwargs["url"].endswith("/bn-40f.htm")  # the document key is still the 40-F
+    labels = {c["section_label"] for c in kwargs["chunks"]}
+    assert labels == {BUSINESS, RISK, MDA}
+
+
+def test_a_40f_with_an_unreadable_index_still_counts_its_failure(monkeypatch, _stub_rag):
+    _edgar(monkeypatch, forms=[("40-F", "bn-40f.htm")], docs={"bn-40f.htm": _WRAPPER_40F})
+    stats = SourceYield(source="sec_filings", scope=1)
+
+    assert ingest_sec_filings.ingest_ticker("TSM", stats=stats) == 0  # _edgar() knows one filer
+    assert stats.failures == {"no_sections": 1}
+
+
+def test_a_10k_does_not_read_its_filing_index(monkeypatch, _stub_rag):
+    _edgar(monkeypatch, forms=[("10-K", "a-10k.htm")], docs={"a-10k.htm": _TEN_K})
+
+    assert ingest_sec_filings.ingest_ticker("TSM") == 1
+    urls = [c.args[0] for c in ingest_sec_filings.requests.get.call_args_list]
+    assert not any(u.endswith("-index.htm") for u in urls)

@@ -5560,7 +5560,18 @@ def _finalize(
 
 
 def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -> None:
-    """Write manifest.json and update latest_weekly.json pointer."""
+    """Write manifest.json; a Phase 1 run also advances ``latest_weekly.json``.
+
+    The pointer is D01's output (alpha-engine-config-I10855): it names the
+    ``weekly/{date}/`` prefix whose ``constituents.json`` every pointer reader
+    resolves (``constituents.load_from_s3``, the prune, D48's SPX weights).
+    Only Phase 1 writes that file, so only Phase 1 may move the pointer. A
+    Phase 2 run used to advance it too, which is harmless on a Saturday (same
+    ``run_date``) but not on any other day: on 2026-10-16 two weekday
+    rehearsals' DataPhase2 moved it to ``2026-10-15`` and then to
+    ``2026-10-16``, a prefix with no ``constituents.json``, and D48 failed
+    that night on SPX ``weight_method='unavailable'``.
+    """
     s3 = boto3.client("s3")
 
     # Manifest
@@ -5571,6 +5582,13 @@ def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -
         Body=json.dumps(results, indent=2, default=str),
         ContentType="application/json",
     )
+
+    if results.get("phase") != 1:
+        logger.info(
+            "Wrote manifest for %s; latest_weekly.json left alone (phase %s "
+            "does not write constituents.json)", run_date, results.get("phase"),
+        )
+        return
 
     # Latest pointer
     pointer = {"date": run_date, "s3_prefix": f"{s3_prefix}weekly/{run_date}/"}
