@@ -115,6 +115,32 @@ SWEEP_STAGE = os.environ.get("SWEEP_STAGE", "WeeklyCoverageSweep")
 ALARMABLE_METRIC = "StageCoverageSweepAlarmable"
 ALARMABLE_NAMESPACE = "AlphaEngine"
 
+#: SF execution names that start with this are rehearsals of the weekly run
+#: (the rehearsal door, nous-ergon-ops ``scripts/weekly_sf_rehearsal_guard.py``,
+#: names every one ``rehearsal-<date>-<n>``; the state machine's
+#: ``ReadRehearsalMarker`` keys on the same prefix).
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+
+
+def rehearsal_execution(observer_execution_arn: str) -> str | None:
+    """The rehearsal's execution name when the OBSERVER is a rehearsal, else None.
+
+    ``alpha-engine-config-I12351`` (C30). A rehearsal's sweep published to the
+    PRODUCTION surfaces - ``_stage_coverage/_sweep/<pipeline>/<run_date>.json``,
+    the ``StageCoverageSweepAlarmable`` point on the production dimension, the
+    production ``_sf_completion`` marker's cycle block, and a
+    ``krepis.alerts`` page. Measured 2026-10-16 23:41Z:
+    ``rehearsal-2026-10-16-2`` swept the 2026-10-15 partition, published, and
+    ``alpha-engine-stage-coverage-findings`` went to ALARM at 23:42Z. A
+    rehearsal must neither page nor write production state, so it gets the
+    dry-run contract: the real verdict, no writes, no page, no metric.
+
+    Read from the execution ARN the SF passes as ``$$.Execution.Id``, never
+    from an input flag, so no caller can opt a rehearsal back into publishing.
+    """
+    name = (observer_execution_arn or "").rsplit(":", 1)[-1]
+    return name if name.startswith(REHEARSAL_EXECUTION_PREFIX) else None
+
 
 def alarmable_count(sweep) -> float:
     """``findings + absent + deferred``, with the lib's own withholding rule.
@@ -331,7 +357,9 @@ def handler(event, _context):
     # Naming the observer lets nousergon_lib count its entered states (real
     # work) without letting its status make its own cycle non-terminal.
     observer_execution_arn = (event or {}).get("observer_execution_arn") or ""
-    dry_run = bool((event or {}).get("dry_run"))
+    rehearsal = rehearsal_execution(observer_execution_arn)
+    # C30: a rehearsal is always dry - see `rehearsal_execution`.
+    dry_run = bool((event or {}).get("dry_run")) or rehearsal is not None
 
     if not run_date:
         # No cycle key means no cycle to sweep. Unobserved, not clean.
@@ -408,9 +436,16 @@ def handler(event, _context):
         # detect. What ``dry_run`` withholds is the WRITES and the page, never
         # the verdict.
         observer = _observer_contribution(sweep, observer_execution_arn)
+        if rehearsal is not None:
+            logger.info(
+                "coverage sweep %s: observer %s is a rehearsal, so nothing is "
+                "published, augmented or paged (alpha-engine-config-I12351)",
+                run_date, rehearsal,
+            )
         return {
             "outcome": _outcome_for(sweep),
             "dry_run": True,
+            "rehearsal": rehearsal,
             "run_date": run_date,
             "partitions_read": list(sweep.partitions_read),
             "explanation": explanation,
