@@ -36,7 +36,9 @@ on Lambda's 900s hard ceiling under spot-capacity/LLM-latency variance):
 DETERMINISTIC run_token (the key divergence from ci-watch-dispatcher's
 random uuid4): the SCHEDULED path derives `sched-{isoyear}w{isoweek:02d}`
 from the current UTC date, and the PR path derives
-`pr-{repo-with-slash-flattened}-{pr_number}-{sha[:12]}` from the event —
+`pr-{repo-with-slash-flattened}-{pr_number}-{sha[:12]}` from the event
+(plus `-a{run_attempt}` when the caller's GHA run attempt is > 1, so a
+re-run launches its own box instead of re-reading attempt 1's marker) —
 both WITHOUT any IPC. This lets `canary-replay-liveness-probe` (the
 Thursday-path watchdog) independently compute the SAME S3 completion-marker
 key it needs to poll, with no coupling to this Lambda beyond the shared
@@ -158,6 +160,9 @@ _REPO_RE = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _SHA_RE = re.compile(r"^[0-9a-f]{7,40}$")
 _PR_NUMBER_RE = re.compile(r"^[0-9]+$")
 _MODE_RE = re.compile(r"^(scheduled|pr)$")
+# GitHub Actions `github.run_attempt`: 1 on the first run, incremented on every
+# re-run of the same workflow run. Bounded so it stays a short token suffix.
+_RUN_ATTEMPT_RE = re.compile(r"^[1-9][0-9]{0,3}$")
 
 
 class _InvalidEvent(ValueError):
@@ -188,11 +193,26 @@ def _scheduled_run_token(now: datetime) -> str:
     return f"sched-{iso_year}w{iso_week:02d}"
 
 
-def _pr_run_token(repo: str, pr_number: str, sha: str) -> str:
-    """Deterministic per-(repo, PR, sha) token — see module docstring. A
-    re-pushed commit gets a fresh token (new sha); re-running CI on the SAME
-    commit (e.g. a manual re-run) overwrites the same marker key."""
-    return f"pr-{repo.replace('/', '-')}-{pr_number}-{sha[:12]}"
+def _pr_run_token(repo: str, pr_number: str, sha: str, run_attempt: str = "1") -> str:
+    """Deterministic per-(repo, PR, sha, run attempt) token — see module
+    docstring. A re-pushed commit gets a fresh token (new sha).
+
+    A RE-RUN of the same workflow run on the SAME commit gets a fresh token
+    too, via ``run_attempt`` (alpha-engine-config-I11083 / I11579). Keyed on
+    sha alone, a re-run collided with the previous attempt's box and marker:
+    measured 2026-10-16 on nousergon-data#2183 (run 38880701852, job
+    116909685238) — attempt 1's box had written its FAIL marker and was still
+    shutting down, so the re-run's dispatch got ``concurrent_skip`` (no
+    ``dispatched_at``, freshness floor 0) and the poller re-reported attempt
+    1's verdict in 2s without probing anything. A re-run that cannot re-probe
+    is not a re-run. Attempt 1 keeps the bare token, so the first dispatch's
+    key is unchanged and a caller that sends no ``run_attempt`` is unaffected;
+    duplicate deliveries of the SAME attempt still share a token and still
+    dedupe."""
+    token = f"pr-{repo.replace('/', '-')}-{pr_number}-{sha[:12]}"
+    if run_attempt != "1":
+        token = f"{token}-a{run_attempt}"
+    return token
 
 
 def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
@@ -214,7 +234,8 @@ def _resolve_event_fields(event: dict) -> tuple[str, str, str, str]:
     repo = _require(event, "repo", _REPO_RE)
     pr_number = _require(event, "pr_number", _PR_NUMBER_RE)
     sha = _require(event, "sha", _SHA_RE)
-    run_token = _pr_run_token(repo, pr_number, sha)
+    run_attempt = _optional(event, "run_attempt", _RUN_ATTEMPT_RE, default="1")
+    run_token = _pr_run_token(repo, pr_number, sha, run_attempt)
     return mode, research_ref, data_ref, run_token
 
 
