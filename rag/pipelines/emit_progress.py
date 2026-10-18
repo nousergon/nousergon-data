@@ -36,12 +36,29 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import re
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
 _BUCKET = "alpha-engine-research"
 _KEY_TEMPLATE = "health/rag_ingestion_progress/{run_date}.json"
+
+# A weekly-SF rehearsal writes its ticks under its own namespace,
+# ``rehearsal/<execution name>/`` — the same ``ns_prefix`` the SF applies to
+# its own keys — so a rehearsal never overwrites the dated key production's
+# run is read under (alpha-engine-config-I12375). Anything else is refused: a
+# prefix becomes part of an S3 key.
+_KEY_PREFIX_RE = re.compile(r"(rehearsal/rehearsal-[A-Za-z0-9._-]+/)?")
+
+
+def progress_key(run_date: str, key_prefix: str = "") -> str:
+    """The S3 key one tick is written to. ``key_prefix`` is ``""`` in production."""
+    if not _KEY_PREFIX_RE.fullmatch(key_prefix):
+        raise ValueError(
+            f"key_prefix {key_prefix!r} is neither empty nor rehearsal/<rehearsal-execution>/"
+        )
+    return key_prefix + _KEY_TEMPLATE.format(run_date=run_date)
 
 
 def emit_progress(
@@ -52,6 +69,7 @@ def emit_progress(
     label: str,
     started_at: str,
     bucket: str = _BUCKET,
+    key_prefix: str = "",
 ) -> bool:
     """Write one progress tick. Returns True on success, False on any
     failure — the caller (main(), and transitively the shell script) treats
@@ -64,7 +82,13 @@ def emit_progress(
         "started_at": started_at,
         "updated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
     }
-    key = _KEY_TEMPLATE.format(run_date=run_date)
+    try:
+        key = progress_key(run_date, key_prefix)
+    except ValueError as exc:
+        # Fail-soft like the PUT (module docstring), but write NOTHING: a key
+        # this module cannot vouch for is never guessed at.
+        logger.warning("rag_ingestion_progress not written: %s", exc)
+        return False
     try:
         import boto3
 
@@ -100,6 +124,10 @@ def main() -> None:
     parser.add_argument("--label", required=True)
     parser.add_argument("--started-at", required=True, help="ISO8601 UTC timestamp the pipeline run itself started")
     parser.add_argument("--bucket", default=_BUCKET)
+    parser.add_argument(
+        "--key-prefix", default="",
+        help="Rehearsal namespace, rehearsal/<execution>/; empty in production (alpha-engine-config-I12375)",
+    )
     args = parser.parse_args()
 
     # Never raise out of main() — a bad CLI invocation from the shell script
@@ -114,6 +142,7 @@ def main() -> None:
         label=args.label,
         started_at=args.started_at,
         bucket=args.bucket,
+        key_prefix=args.key_prefix,
     )
     if not ok:
         # Exit 0 regardless — see module docstring. The WARN is already
