@@ -188,10 +188,14 @@ def publish_alarmable(sweep, *, cloudwatch_client, pipeline: str = PIPELINE) -> 
 #: (`disposition: DISABLED`, e.g. `skip_parity: true`), versus which it
 #: simply never reached.
 RUN_SCOPE_KEY_TEMPLATE = "backtest/{run_date}/run_scope.json"
+#: A rehearsal's own scope (mirrors `weekly-run-scope/index.py::REHEARSAL_KEY_TEMPLATE`,
+#: alpha-engine-config-I12351): a rehearsal observer grades ITS run, not the
+#: live cycle's scope another execution wrote.
+REHEARSAL_RUN_SCOPE_KEY_TEMPLATE = "backtest/{run_date}/.rehearsal/{execution}/run_scope.json"
 
 
 def _declared_skip_stage_spine(
-    *, pipeline: str, run_date: str, bucket: str, s3_client
+    *, pipeline: str, run_date: str, bucket: str, s3_client, rehearsal: str | None = None
 ) -> tuple[tuple[str, ...] | None, tuple[str, ...]]:
     """The declared spine for THIS cycle, minus any stage RunScope recorded
     as ``DISABLED`` — and which stages were excluded, for the caller to log.
@@ -221,7 +225,11 @@ def _declared_skip_stage_spine(
         if not full_spine:
             return None, ()
 
-        key = RUN_SCOPE_KEY_TEMPLATE.format(run_date=run_date)
+        key = (
+            REHEARSAL_RUN_SCOPE_KEY_TEMPLATE.format(run_date=run_date, execution=rehearsal)
+            if rehearsal
+            else RUN_SCOPE_KEY_TEMPLATE.format(run_date=run_date)
+        )
         body = s3_client.get_object(Bucket=bucket, Key=key)["Body"].read()
         import json as _json
 
@@ -387,6 +395,7 @@ def handler(event, _context):
         # docstring for the fail-open contract.
         stage_spine, excluded_stages = _declared_skip_stage_spine(
             pipeline=PIPELINE, run_date=run_date, bucket=BUCKET, s3_client=s3_client,
+            rehearsal=rehearsal,
         )
         if excluded_stages:
             logger.info(

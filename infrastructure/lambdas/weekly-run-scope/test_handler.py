@@ -1489,3 +1489,61 @@ def test_the_merged_statement_is_recomputed_not_carried():
         "2 of 3 gated stages ran and are graded; 1 disabled by operator flag."
     )
     assert merged["graded_stages"] == ["A", "B"]
+
+
+# ---------------------------------------------------------------------------
+# alpha-engine-config-I12351: a rehearsal's scope never lands on the live key
+# ---------------------------------------------------------------------------
+
+_REHEARSAL_ARN = (
+    "arn:aws:states:us-east-1:111111111111:execution:"
+    "ne-weekly-freshness-pipeline:rehearsal-2026-10-16-2"
+)
+
+
+def test_a_rehearsal_writes_its_own_scope_and_merges_with_nothing(
+    monkeypatch, definition, real_run_history
+):
+    """rehearsal-2026-10-16-2 wrote the live backtest/2026-10-15/run_scope.json
+    and MERGED onto rehearsal-2026-10-16-1's, so its contributing_executions
+    named the other rehearsal and the coverage sweep graded the merged scope."""
+    live = "backtest/2026-08-14/run_scope.json"
+    s3 = _FakeS3({live: {"stages": {}, "contributing_executions": ["arn:prod"]}})
+    monkeypatch.delenv("RUN_TOKEN", raising=False)
+    index, written = _index(
+        monkeypatch, definition=definition, history=real_run_history, s3=s3
+    )
+    index.handler(
+        {
+            "run_date": "2026-08-15",
+            "execution_arn": _REHEARSAL_ARN,
+            "state_machine_arn": "arn:y",
+            "execution_input": {},
+        },
+        None,
+    )
+    assert written["Key"] == (
+        "backtest/2026-08-14/.rehearsal/rehearsal-2026-10-16-2/run_scope.json"
+    )
+    assert s3.store[live] == {"stages": {}, "contributing_executions": ["arn:prod"]}
+    # The RUN_TOKEN set for the stage-coverage call is not left in the container.
+    import os  # noqa: PLC0415
+
+    assert "RUN_TOKEN" not in os.environ
+
+
+def test_a_production_execution_keeps_the_live_key(monkeypatch):
+    import sys  # noqa: PLC0415
+    import types  # noqa: PLC0415
+
+    monkeypatch.setitem(sys.modules, "boto3", types.SimpleNamespace(client=None))
+    sys.modules.pop("index", None)
+    import index  # noqa: PLC0415
+
+    assert index.rehearsal_execution(_REHEARSAL_ARN) == "rehearsal-2026-10-16-2"
+    for arn in ("", "arn:x", "arn:aws:states:us-east-1:1:execution:p:f4b49786-4d8b",
+                "arn:aws:states:us-east-1:1:execution:p:weekly-rerun-2026-10-10-1"):
+        assert index.rehearsal_execution(arn) is None
+        assert index.scope_key("2026-10-15", index.rehearsal_execution(arn)) == (
+            "backtest/2026-10-15/run_scope.json"
+        )

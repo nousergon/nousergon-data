@@ -565,6 +565,15 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # the weekly SF's RunScope stage). Only with --apply, conditional on the
     # ETag it read; it creates no new artifact.
     "scripts/sweep_run_scope_rows.py": 1,
+    # alpha-engine-config-I12359 — the operator-run PSKY phantom-split
+    # restatement (red line 4, Brian runs it with --apply). Two PUTs, both only
+    # with --apply: (1) rewrites an existing staging/daily_closes/{date}.parquet
+    # (7-day lifecycle staging, ETag-conditional, PSKY row only), so no new
+    # artifact; (2) one write-once provenance record
+    # data_collection/restatements/{run_date}/{restatement_id}.json. That is an
+    # audit record, not a freshness artifact: it is written once per manual
+    # restatement and never on a cadence, so it needs no SLA row.
+    "scripts/restate_psky_phantom_split.py": 2,
 }
 
 

@@ -178,7 +178,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         {"mode", "dry_run_llm.$", "execution_id.$", "run_date.$", "pipeline_role"}
     ),
     # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
-    "ResearchSelfTest": frozenset({"mode", "date.$"}),
+    # alpha-engine-config-I12351 (C3): execution_name.$ carries the rehearsal
+    # marker into the three research stages that isolate themselves.
+    "ResearchSelfTest": frozenset({"mode", "date.$", "execution_name.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
          "run_date.$"}
@@ -211,7 +213,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # merge first.
     "EvalRollingMean": frozenset({"end_time_iso.$", "run_date.$"}),
     "RationaleClustering": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "run_date.$"}
+        {"dry_run_llm.$", "end_time_iso.$", "run_date.$", "execution_name.$"}
     ),
     # ReplayConcordance LEFT this table under alpha-engine-config-I10539
     # (Brian ruling 2026-09-16, option b) with the state itself — an entry
@@ -226,7 +228,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # the denominator is a SET per stage — the defect it detects (every record
     # in the prefix coming from one producer that is no longer in this
     # pipeline) is invisible to any count.
-    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$", "coverage"}),
+    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$", "coverage", "execution_name.$"}),
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
     # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
