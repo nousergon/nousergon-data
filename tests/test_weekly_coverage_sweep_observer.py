@@ -240,7 +240,46 @@ def test_declared_skip_degrades_to_the_full_spine_on_any_read_failure(handler_mo
     assert excluded == ()
 
 
+def test_a_rehearsal_reads_its_own_run_scope(handler_module) -> None:
+    """alpha-engine-config-I12351: a rehearsal's RunScope writes
+    ``backtest/<D>/.rehearsal/<execution>/run_scope.json``, so its observer
+    reads that scope and never the live cycle's."""
+    seen: list[str] = []
+    inner = _FakeS3RunScope(
+        {"Parity": {"disposition": "DISABLED", "entry_state": "ParityParallel"}}
+    )
+
+    class _Recording:
+        def get_object(self, *, Bucket: str, Key: str):  # noqa: N803 — boto3 shape
+            seen.append(Key)
+            return inner.get_object(Bucket=Bucket, Key=Key)
+
+    _, excluded = handler_module._declared_skip_stage_spine(
+        pipeline="ne-weekly-freshness-pipeline",
+        run_date="2026-10-15",
+        bucket="alpha-engine-research",
+        s3_client=_Recording(),
+        rehearsal="rehearsal-2026-10-16-2",
+    )
+    assert seen == ["backtest/2026-10-15/.rehearsal/rehearsal-2026-10-16-2/run_scope.json"]
+    assert excluded == ("ParityParallel",)
+
+
 def _default_spine() -> tuple[str, ...]:
     from nousergon_lib.pipeline_status.registry import stage_order_for
 
     return stage_order_for("ne-weekly-freshness-pipeline")
+
+
+def test_the_rehearsal_scope_key_matches_the_writer(handler_module) -> None:
+    """The observer's rehearsal scope key is the one RunScope writes."""
+    import pathlib
+
+    writer = (
+        pathlib.Path(__file__).resolve().parents[1]
+        / "infrastructure/lambdas/weekly-run-scope/index.py"
+    ).read_text()
+    assert (
+        f'REHEARSAL_KEY_TEMPLATE = "{handler_module.REHEARSAL_RUN_SCOPE_KEY_TEMPLATE}"'
+        in writer
+    )

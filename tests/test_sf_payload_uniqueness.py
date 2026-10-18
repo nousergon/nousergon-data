@@ -115,6 +115,18 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
             "observer_execution_arn.$",
         }
     ),
+    # alpha-engine-config-I11111: the same Lambda, called from the degraded
+    # terminal path. The payload is byte-identical to the clean path's, so the
+    # Lambda needs no change and no deploy.
+    "WeeklyCoverageSweepDegraded": frozenset(
+        {
+            "run_date.$",
+            "calendar_date.$",
+            "dry_run.$",
+            "state_machine_arn.$",
+            "observer_execution_arn.$",
+        }
+    ),
     # alpha-engine-config-I8809: the weekly graph's ONE date normalization —
     # calendar date in, cycle trading day out. Reuses alpha-engine-weekly-preflight
     # rather than adding a function, because a new Lambda needs an IAM role
@@ -166,7 +178,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         {"mode", "dry_run_llm.$", "execution_id.$", "run_date.$", "pipeline_role"}
     ),
     # alpha-engine-config-I7726 — same research-runner Lambda, different mode.
-    "ResearchSelfTest": frozenset({"mode", "date.$"}),
+    # alpha-engine-config-I12351 (C3): execution_name.$ carries the rehearsal
+    # marker into the three research stages that isolate themselves.
+    "ResearchSelfTest": frozenset({"mode", "date.$", "execution_name.$"}),
     "EvalJudgeSubmitFirstSaturday": frozenset(
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
          "run_date.$"}
@@ -199,7 +213,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # merge first.
     "EvalRollingMean": frozenset({"end_time_iso.$", "run_date.$"}),
     "RationaleClustering": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "run_date.$"}
+        {"dry_run_llm.$", "end_time_iso.$", "run_date.$", "execution_name.$"}
     ),
     # ReplayConcordance LEFT this table under alpha-engine-config-I10539
     # (Brian ruling 2026-09-16, option b) with the state itself — an entry
@@ -214,7 +228,7 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # the denominator is a SET per stage — the defect it detects (every record
     # in the prefix coming from one producer that is no longer in this
     # pipeline) is invisible to any count.
-    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$", "coverage"}),
+    "AggregateCosts": frozenset({"date.$", "dry_run_llm.$", "coverage", "execution_name.$"}),
     # Evaluator Report Card v2 (Layer B) — alpha-engine-evaluator:live. Builds
     # evaluator/{date}/report_card.json; non-fatal (own Catch → notify gate).
     # dry_run.$=$.research_dry → no-write on the Friday preflight (ROADMAP L4504).
@@ -243,8 +257,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # rehearsal is forbidden to write, since the RunScope Lambda skips its
     # put_object on dry_run. Consumer: crucible-evaluator
     # grading/artifacts.py::_read_run_scope (in-band first, S3 as the fallback).
+    # alpha-engine-config-I12351: +execution_name.$, the rehearsal marker the
+    # evaluator's grading/rehearsal.py isolates on (as Scanner/SignalsEnvelope).
     "ReportCard": frozenset({
         "date.$", "dry_run.$", "snapshot", "gate_state", "run_scope.$",
+        "execution_name.$",
     }),
     # Director: no longer a Lambda Payload (alpha-engine-config-I11936) — it runs
     # on the weekly box over SSM; its date / dry_run / gate_state ride the SSM

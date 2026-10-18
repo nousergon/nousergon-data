@@ -11,13 +11,18 @@ properties an operator relies on when pasting the printed command:
    parity family run: no training, no backtest, no Evaluator, no tail.
 3. ``skip_backtester`` is false. Its skip route jumps past the parity family,
    so flipping it would silently turn this into a run that proves nothing.
-4. The run_date can never be a weekly cycle's (Monday to Wednesday only), so
-   the proof's pit_parity.json cannot become a cycle's contamination verdict.
+4. The run_date can never be a weekly cycle's (Monday to Wednesday only, and
+   an NYSE session so NormalizeRunDates cannot re-date it), so the proof's
+   pit_parity.json cannot become a cycle's contamination verdict.
+5. The input reaches ValidatePredictorSkipWeightsFresh, so the command is
+   printed only for a run_date whose arena/model verdict the gate accepts
+   (alpha-engine-config-I7309 comment, 2026-10-17).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import re
 import sys
@@ -141,14 +146,118 @@ def test_name_is_never_a_rerun_or_rehearsal_name():
         mod.execution_name("2026-10-20", "A B")
 
 
-def test_main_prints_the_command_and_starts_nothing(capsys, monkeypatch):
+class _NoSuchKey(Exception):
+    pass
+
+
+class _FakeS3:
+    """GetObject only: anything else the script called would AttributeError."""
+
+    def __init__(self, objects: dict):
+        self.objects = objects
+        self.calls: list = []
+
+    def get_object(self, Bucket, Key):
+        self.calls.append((Bucket, Key))
+        if (Bucket, Key) not in self.objects:
+            raise _NoSuchKey(Key)
+        return {"Body": io.BytesIO(self.objects[(Bucket, Key)].encode())}
+
+
+def _s3_with(run_date: str, body: str) -> _FakeS3:
+    return _FakeS3({("alpha-engine-research", f"arena/model/{run_date}.verdict"): body})
+
+
+def _flat(sm: dict) -> dict:
+    return rerun._flat_states(sm)
+
+
+def test_the_proof_input_reaches_the_verdict_gate():
+    """skip_predictor_training is validated, not honoured blind, on this input:
+    the production route through CheckSkipPredictorTraining is the verdict
+    gate, so the verdict pre-check cannot be dropped silently."""
+    from run_scope import evaluate_rule
+
+    sm = json.loads(SF_PATH.read_text())
+    payload = mod.build_proof_input("2026-10-20")
+    assert payload["skip_predictor_training"] is True
+    assert rerun.predictor_skip_needs_freshness(payload)
+    assert "ValidatePredictorSkipWeightsFresh" in rerun._reachable_from(
+        sm, sm["StartAt"], payload
+    )
+    gate = _flat(sm)["CheckSkipPredictorTraining"]
+    production = dict(payload, rehearsal_marker={"is_rehearsal": False})
+    for rule in gate["Choices"]:
+        verdict = evaluate_rule(rule, production, set())
+        assert verdict in (True, False), rule
+        if verdict:
+            assert rule["Next"] == "ValidatePredictorSkipWeightsFresh"
+            break
+    else:
+        raise AssertionError("no rule matched; Default is not the verdict gate")
+
+
+def test_the_gate_reads_the_key_the_script_checks():
+    states = _flat(json.loads(SF_PATH.read_text()))
+    params = states["ValidatePredictorSkipWeightsFresh"]["Parameters"]
+    assert params["Bucket"] == rerun.PREDICTOR_SKIP_VERDICT_BUCKET
+    assert params["Key.$"] == "States.Format('arena/model/{}.verdict', $.run_date)"
+    assert mod.verdict_key("2026-10-14") == "arena/model/2026-10-14.verdict"
+
+
+def test_a_monday_holiday_is_refused():
+    # Labor Day 2026: NormalizeRunDates would re-date it to Friday 2026-09-04.
+    with pytest.raises(mod.ProofInputError, match="2026-09-04"):
+        mod.build_proof_input("2026-09-07")
+
+
+@pytest.mark.parametrize("word", ["decided", "held", "unmeasurable", "unservable", "bootstrap"])
+def test_every_status_word_is_accepted(word):
+    payload = mod.build_proof_input("2026-10-14")
+    assert mod.check_proof_verdict(_s3_with("2026-10-14", word), "2026-10-14", payload) == word
+
+
+def test_main_prints_the_precondition_and_the_command_and_starts_nothing(capsys, monkeypatch):
     monkeypatch.setitem(sys.modules, "boto3", None)  # any AWS import would raise
-    assert mod.main(["--run-date", "2026-10-20"]) == 0
+    s3 = _s3_with("2026-10-14", "unservable")
+    assert mod.main(["--run-date", "2026-10-14"], s3=s3) == 0
+    assert s3.calls == [("alpha-engine-research", "arena/model/2026-10-14.verdict")]
     out = capsys.readouterr().out
-    assert "aws stepfunctions start-execution" in out
-    assert "--name pit-parity-proof-2026-10-20-1" in out
+    pre = out.index(
+        "aws s3api get-object --bucket alpha-engine-research "
+        "--key arena/model/2026-10-14.verdict /dev/stdout"
+    )
+    start = out.index("aws stepfunctions start-execution")
+    assert pre < start
+    assert "reads 'unservable'" in out
+    assert "--name pit-parity-proof-2026-10-14-1" in out
 
 
-def test_main_refuses_a_friday(capsys):
-    assert mod.main(["--run-date", "2026-10-23"]) == 1
+def test_main_refuses_a_run_date_with_no_verdict(capsys):
+    """The 2026-10-20 command the first version printed: no ModelZooSelect
+    ran that day, so the run would end at PredictorSkipWeightsStale."""
+    assert mod.main(["--run-date", "2026-10-20"], s3=_FakeS3({})) == 1
+    captured = capsys.readouterr()
+    assert "REFUSED" in captured.err
+    assert "ValidatePredictorSkipWeightsFresh" in captured.err
+    assert "start-execution" not in captured.out
+
+
+def test_main_refuses_an_unknown_verdict_body(capsys):
+    assert mod.main(["--run-date", "2026-10-14"], s3=_s3_with("2026-10-14", "decided\n")) == 1
+    captured = capsys.readouterr()
+    assert "REFUSED" in captured.err
+    assert "start-execution" not in captured.out
+
+
+def test_main_fails_closed_without_boto3(capsys, monkeypatch):
+    monkeypatch.setitem(sys.modules, "boto3", None)
+    assert mod.main(["--run-date", "2026-10-14"]) == 1
     assert "REFUSED" in capsys.readouterr().err
+
+
+def test_main_refuses_a_friday_before_reading_anything(capsys):
+    s3 = _FakeS3({})
+    assert mod.main(["--run-date", "2026-10-23"], s3=s3) == 1
+    assert "REFUSED" in capsys.readouterr().err
+    assert s3.calls == []

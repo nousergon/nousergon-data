@@ -72,6 +72,35 @@ logger.setLevel(logging.INFO)
 BUCKET = os.environ.get("RESEARCH_BUCKET", "alpha-engine-research")
 KEY_TEMPLATE = "backtest/{run_date}/run_scope.json"
 
+#: SF execution names that start with this are weekly-SF rehearsals (the
+#: rehearsal door names every one ``rehearsal-<date>-<n>``; the state machine's
+#: ``ReadRehearsalMarker`` keys on the same prefix).
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+#: Where a rehearsal's own scope lives, inside the same cycle partition and
+#: under the role's existing ``backtest/*/run_scope.json`` grant.
+REHEARSAL_KEY_TEMPLATE = "backtest/{run_date}/.rehearsal/{execution}/run_scope.json"
+
+
+def rehearsal_execution(execution_arn: str) -> str | None:
+    """The rehearsal's execution name when this execution is one, else None.
+
+    alpha-engine-config-I12351. ``backtest/{run_date}/run_scope.json`` is the
+    cycle's live record of which stages ran, and ``_persist`` MERGES every
+    execution's scope into it. ``rehearsal-2026-10-16-2`` therefore wrote the
+    live 2026-10-15 scope and merged onto ``rehearsal-2026-10-16-1``'s, and the
+    weekly coverage sweep then graded that merged scope. A rehearsal gets its
+    own key and merges with nothing; a production execution's key is unchanged.
+    """
+    name = (execution_arn or "").rsplit(":", 1)[-1]
+    return name if name.startswith(REHEARSAL_EXECUTION_PREFIX) else None
+
+
+def scope_key(run_date: str, rehearsal: str | None = None) -> str:
+    """The key this execution's scope is read from and written to."""
+    if rehearsal:
+        return REHEARSAL_KEY_TEMPLATE.format(run_date=run_date, execution=rehearsal)
+    return KEY_TEMPLATE.format(run_date=run_date)
+
 
 class EmptyRunDateError(ValueError):
     """Raised when the SF handed no ``run_date`` at all.
@@ -279,7 +308,9 @@ def _persist(scope: dict, key: str) -> dict:
     )
 
 
-def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:
+def _assert_stage_coverage(
+    stage: str, started: datetime, run_date: str | None, rehearsal: str | None = None
+) -> dict:
     """Record this stage's own output verdict (alpha-engine-config-I10172).
 
     `RunScope` declares `output: registered` / `artifacts: [weekly_run_scope]`
@@ -309,7 +340,21 @@ def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) 
     except ImportError as exc:
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
-    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    if not rehearsal:
+        return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    # alpha-engine-config-I12351: krepis keeps a rehearsal's verdict out of the
+    # live `_stage_coverage/<run_date>/` partition when `$RUN_TOKEN` names a
+    # rehearsal (krepis-PR252). A Lambda has no RUN_TOKEN of its own, so it is
+    # set for this one call and restored, never left behind in a warm container.
+    previous = os.environ.get("RUN_TOKEN")
+    os.environ["RUN_TOKEN"] = rehearsal
+    try:
+        return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    finally:
+        if previous is None:
+            os.environ.pop("RUN_TOKEN", None)
+        else:
+            os.environ["RUN_TOKEN"] = previous
 
 
 def handler(event, _context):
@@ -318,6 +363,7 @@ def handler(event, _context):
     _stage_coverage_started = datetime.now(timezone.utc)
     calendar_run_date = event.get("run_date") or ""
     execution_arn = event.get("execution_arn") or ""
+    rehearsal = rehearsal_execution(execution_arn)
     state_machine_arn = event.get("state_machine_arn") or ""
     dry_run = bool(event.get("dry_run"))
     flags = {
@@ -398,7 +444,7 @@ def handler(event, _context):
         scope["dry_run"] = True
         if run_date:
             _, _, read_ok, note = _read_incumbent(
-                boto3.client("s3"), KEY_TEMPLATE.format(run_date=run_date)
+                boto3.client("s3"), scope_key(run_date, rehearsal)
             )
             scope["incumbent_read"] = {"ok": read_ok, "note": note}
         return scope
@@ -417,12 +463,12 @@ def handler(event, _context):
             "execution (calendar_run_date=%r)", calendar_run_date,
         )
         scope["stage_coverage"] = _assert_stage_coverage(
-            "RunScope", _stage_coverage_started, None
+            "RunScope", _stage_coverage_started, None, rehearsal
         )
         return scope
 
-    written = _persist(scope, KEY_TEMPLATE.format(run_date=run_date))
+    written = _persist(scope, scope_key(run_date, rehearsal))
     written["stage_coverage"] = _assert_stage_coverage(
-        "RunScope", _stage_coverage_started, run_date
+        "RunScope", _stage_coverage_started, run_date, rehearsal
     )
     return written

@@ -27,7 +27,7 @@ entries:
     expires: "2027-03-10"
     tracking: alpha-engine-config-I10226
   - path: emailer.py
-    line: 44
+    line: 79
     reason: >-
       (a) failure mode swallowed: results["started_at"]/["completed_at"]
       missing or unparseable. (c) no recording surface — this only formats a

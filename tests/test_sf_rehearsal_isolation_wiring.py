@@ -86,6 +86,32 @@ def test_isolated_lambda_stages_receive_the_execution_name():
         assert ALL[n]["Parameters"]["Payload"]["execution_arn.$"] == "$$.Execution.Id", n
 
 
+def test_report_card_receives_the_execution_name_additively():
+    """rehearsal-2026-10-16-1: ReportCard read live signals/ and raised
+    StaleInputArtifactError, because its Payload named nothing that said
+    "rehearsal". It now carries the same marker the isolated Lambda stages do
+    (crucible-evaluator grading/rehearsal.py keys on it).
+
+    ADDITIVE, and asserted as such: every key the Payload carried before is
+    still there with the same value, so production's invocation differs only by
+    one field that a pre-existing handler ignores and the new one treats as
+    production for any name that is not ``rehearsal-*``."""
+    payload = ALL["ReportCard"]["Parameters"]["Payload"]
+    assert payload["execution_name.$"] == "$$.Execution.Name"
+    assert ALL["ReportCard"]["Parameters"]["FunctionName"] == "alpha-engine-evaluator:live"
+    assert {k: v for k, v in payload.items() if k != "gate_state"} == {
+        "date.$": "$.run_date",
+        "dry_run.$": "$.research_dry",
+        "snapshot": True,
+        "execution_name.$": "$$.Execution.Name",
+        "run_scope.$": "$.run_scope_result.Payload",
+    }
+    # Not $.rehearsal_marker.*: the context object is present on every path
+    # that reaches ReportCard, so the reference cannot throw States.Runtime on
+    # a valid path the way an unseeded state-input path can.
+    assert "rehearsal_marker" not in json.dumps(payload)
+
+
 def test_every_completion_marker_is_namespaced_and_unchanged_in_production():
     markers = {
         n: s["Parameters"]["Key.$"]
@@ -177,7 +203,20 @@ FORCED_SKIPS = {
     "skip_thinktank_coverage": True,
     "skip_eval_judge": True,
     "skip_director": True,
+    # C30: DataPhase2 writes D15's production keys and the data registry's
+    # shared completion marker; production's Saturday run skips it too.
+    "skip_data_phase2": True,
 }
+#: Non-skip fields the rehearsal literal also forces (alpha-engine-config-I12351).
+#: pipeline_role: CheckMutexRole acquires production's DynamoDB run-slot only for
+#: the unattended cadence roles, so a rehearsal is pinned to a role outside them.
+FORCED_FIELDS = {"pipeline_role": "watch-rerun"}
+#: Task states that write PRODUCTION data keys with no rehearsal namespace
+#: (alpha-engine-config-I12351 C30). Not champion risk, but a live write all
+#: the same: rehearsal-2026-10-16-2's DataPhase2 left
+#: data/2026-10-16/.phases/alternative.json status=ok, which v2's
+#: alternative-phase-two would have auto-skipped on.
+PRODUCTION_DATA_TASKS = {"DataPhase2"}
 
 
 def _leaf(cond: dict, known: dict):
@@ -263,7 +302,7 @@ def test_champion_skips_are_forced_only_on_the_rehearsal_branch():
     m = re.fullmatch(r"States\.JsonMerge\(\$, States\.StringToJson\('(.*)'\), false\)", expr)
     assert m, expr
     # The literal is the SECOND argument, so it wins over anything the input says.
-    assert json.loads(m.group(1)) == FORCED_SKIPS
+    assert json.loads(m.group(1)) == {**FORCED_SKIPS, **FORCED_FIELDS}
     into = [n for n, s in ALL.items() if s.get("Next") == "ApplyRehearsalChampionSkips"
             or s.get("Default") == "ApplyRehearsalChampionSkips"
             or any(c.get("Next") == "ApplyRehearsalChampionSkips" for c in s.get("Choices", []))]
@@ -280,6 +319,7 @@ def test_each_forced_skip_is_one_the_graph_honours():
         (branch_a["CheckSkipThinkTankCoverage"], "skip_thinktank_coverage", "ThinkTankCoverage"),
         (branch_a["CheckSkipEvalJudge"], "skip_eval_judge", "CheckEvalCadenceRehearsal"),
         (TOP["CheckSkipDirector"], "skip_director", "PrepareDirectorOnSpot"),
+        (branch_a["CheckSkipDataPhase2"], "skip_data_phase2", "RehearsalClockBeforeDataPhase2"),
     ):
         (rule,) = [c for c in choice["Choices"] if f"$.{flag}" in json.dumps(c)]
         assert rule["Next"] != skipped
@@ -315,6 +355,13 @@ def test_a_rehearsal_reaches_no_champion_risk_writer():
     assert reached & CHAMPION_RISK_TASKS == set(), sorted(reached & CHAMPION_RISK_TASKS)
 
 
+def test_a_rehearsal_reaches_no_production_data_writer():
+    """C30: a rehearsal reaches no stage that writes a live data key."""
+    reached = _reachable("ApplyRehearsalNamespace", TOP, _rehearsal_known())
+    assert "CheckSkipDataPhase2" in reached
+    assert reached & PRODUCTION_DATA_TASKS == set(), sorted(reached & PRODUCTION_DATA_TASKS)
+
+
 def test_production_still_reaches_every_champion_writer():
     """The same walk for a production execution: every one of those writers
     stays reachable, so production behaviour is unchanged."""
@@ -327,6 +374,7 @@ def test_production_still_reaches_every_champion_writer():
     reached = _reachable("ApplyProductionNamespace", TOP, known)
     assert "ApplyRehearsalChampionSkips" not in reached
     assert CHAMPION_RISK_TASKS <= reached, sorted(CHAMPION_RISK_TASKS - reached)
+    assert PRODUCTION_DATA_TASKS <= reached, sorted(PRODUCTION_DATA_TASKS - reached)
 
 
 # ── (B) deadline stop ───────────────────────────────────────────────────────
@@ -410,3 +458,49 @@ def test_production_never_matches_a_deadline_rule():
     for gate, stage in {**TOP_CHECKPOINTS}.items():
         check = TOP[f"CheckRehearsalDeadlineBefore{stage}"]
         assert _leaf(check["Choices"][0], known) is False
+
+
+def _mutex_roles() -> set[str]:
+    """The pipeline_role values CheckMutexRole sends to the run-slot mutex."""
+    roles: set[str] = set()
+
+    def walk(rule):
+        if isinstance(rule, dict):
+            if rule.get("Variable") == "$.pipeline_role" and "StringEquals" in rule:
+                roles.add(rule["StringEquals"])
+            for v in rule.values():
+                walk(v)
+        elif isinstance(rule, list):
+            for v in rule:
+                walk(v)
+
+    for choice in TOP["CheckMutexRole"]["Choices"]:
+        if choice.get("Next") == "ComputeMutexTtl":
+            walk(choice)
+    return roles
+
+
+def test_a_rehearsal_can_never_take_the_run_slot_mutex():
+    """alpha-engine-config-I12351 (run-slot). rehearsal-2026-10-16-2 bypassed the
+    mutex only because the rehearsal door passed pipeline_role=watch-rerun. The
+    rehearsal literal now forces it, and it must stay outside the roles that
+    acquire production's run-slot, or a hand-started rehearsal-* with
+    pipeline_role=weekly could hold Saturday's slot."""
+    roles = _mutex_roles()
+    assert {"daily", "weekly", "eod"} <= roles, roles
+    assert FORCED_FIELDS["pipeline_role"] not in roles
+    assert TOP["CheckMutexRole"]["Default"] != "ComputeMutexTtl"
+    # The forced role must reach CheckMutexRole: nothing may overwrite it.
+    for name, st in ALL.items():
+        assert st.get("ResultPath") != "$.pipeline_role", name
+
+
+def test_the_lambda_stages_that_isolate_themselves_get_the_execution_name():
+    """ResearchSelfTest, AggregateCosts and RationaleClustering wrote live keys in
+    rehearsal-2026-10-16-2 (research/<date>/self_test.json, nine
+    decision_artifacts/_cost/<date>/cost.parquet, the console row). Their
+    handlers isolate on execution_name, like Scanner and SignalsEnvelope."""
+    for name in ("ResearchSelfTest", "AggregateCosts", "RationaleClustering",
+                 "Scanner", "SignalsEnvelope", "ScannerLeaderboard", "ReportCard"):
+        payload = ALL[name]["Parameters"]["Payload"]
+        assert payload.get("execution_name.$") == "$$.Execution.Name", name

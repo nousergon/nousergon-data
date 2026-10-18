@@ -138,6 +138,11 @@
       "substrate": "nousergon-data infrastructure/lambdas/weekly-coverage-sweep",
       "reason": "Rolls up stage-coverage verdicts. no paid-model call site in the substrate."
     },
+    "WeeklyCoverageSweepDegraded": {
+      "disposition": "exempt",
+      "substrate": "nousergon-data infrastructure/lambdas/weekly-coverage-sweep",
+      "reason": "The degraded-path caller of the same Lambda as WeeklyCoverageSweep (alpha-engine-config-I11111). Rolls up stage-coverage verdicts. no paid-model call site in the substrate."
+    },
     "SubstrateHealthGate": {
       "disposition": "exempt",
       "substrate": "Lambda alpha-engine-substrate-health-gate",

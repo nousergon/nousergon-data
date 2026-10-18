@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Emit the StartExecution input for ONE pit_parity proof run (alpha-engine-config-I7309).
 
-Print-only. This script calls no AWS API and starts nothing; it prints the
-input and the exact ``start-execution`` command for the operator who has been
-authorised to run it.
+Read-only. This script starts nothing. It makes one S3 GetObject (the
+verdict pre-check below) and prints the input and the exact
+``start-execution`` command for the operator who has been authorised to run
+it.
 
 Why it exists
 -------------
@@ -50,6 +51,29 @@ parity family, to run, so no stage relies on a default. Two non-obvious flags:
 definition using ``weekly_sf_rerun._simulate_reachable_works``: exactly
 LibPinDriftCheck and the parity family run.
 
+Why the run_date must already have an arena/model verdict
+----------------------------------------------------------
+``skip_predictor_training: true`` is a validated skip
+(alpha-engine-config-I12050). Branch B routes through
+``ValidatePredictorSkipWeightsFresh``, which reads
+``s3://alpha-engine-research/arena/model/{run_date}.verdict`` and requires its
+whole body to be one of the ``decision.status`` words. A missing object, or any
+other body, ends in ``PredictorSkipWeightsStale`` -> ``BranchBFailed`` ->
+``HandleFailure``, and ``ParityParallel`` is never reached. The spot boots, the
+gates pass, and the run fails at ``ResearchPredictorParallel`` with no verdict.
+
+Only ModelZooSelect writes that object, and only for a date it ran on, so a
+proof's run_date must be a Monday-to-Wednesday session that ALREADY has one.
+This script reads the object before printing anything and refuses a run_date
+without a known status word, with the same predicate the SF uses
+(``weekly_sf_rerun.PREDICTOR_SKIP_VERDICT_WORDS``). It also prints the same
+read as a precondition to re-run immediately before ``start-execution``.
+
+The run_date must also be an NYSE session. ``NormalizeRunDates`` overwrites
+``$.run_date`` with ``resolve_trading_day(calendar_date)``, so a Monday holiday
+would be re-dated to the Friday before it: a weekly cycle's run_date, which
+the rule above exists to keep the proof off.
+
 Why the run_date must be Monday to Wednesday
 --------------------------------------------
 ``backtest/{run_date}/pit_parity.json`` is the contamination half of that
@@ -69,7 +93,9 @@ that date must already exist.
 
 Usage
 -----
-    python3 scripts/pit_parity_proof_input.py --run-date 2026-10-20 [--suffix 1]
+    python3 scripts/pit_parity_proof_input.py --run-date <Mon-Wed session with a verdict> [--suffix 1]
+
+Needs read access to ``alpha-engine-research/arena/model/``.
 """
 
 from __future__ import annotations
@@ -82,6 +108,7 @@ import shlex
 import sys
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 _HERE = Path(__file__).resolve().parent
 
@@ -164,7 +191,57 @@ def check_run_date(run_date: str) -> date:
             "run_date, and its pit_parity.json would become that cycle's "
             "contamination verdict (see this script's docstring)."
         )
+    session = _rerun.resolve_trading_day(run_date)
+    if session != run_date:
+        raise ProofInputError(
+            f"run_date {run_date} is not an NYSE session. NormalizeRunDates "
+            f"would re-date the run to {session}, which can be a weekly "
+            "cycle's run_date (see this script's docstring)."
+        )
     return d
+
+
+def verdict_key(run_date: str) -> str:
+    return _rerun.PREDICTOR_SKIP_VERDICT_KEY.format(trading_day=run_date)
+
+
+def check_proof_verdict(s3: Any, run_date: str, payload: dict) -> str:
+    """Refuse a run_date the SF's ValidatePredictorSkipWeightsFresh would fail.
+
+    One read-only GetObject on ``arena/model/{run_date}.verdict``, through
+    ``weekly_sf_rerun``'s reader and its status-word set (which
+    tests/test_weekly_sf_rerun.py pins to CheckPredictorSkipWeightsFresh), so
+    the two tools and the SF share one predicate. Returns the verdict word.
+    """
+    if not _rerun.predictor_skip_needs_freshness(payload):
+        raise ProofInputError(
+            "the proof input no longer reaches ValidatePredictorSkipWeightsFresh; "
+            "re-check this script against the definition before using it"
+        )
+    refusal = (
+        f"run_date {run_date} has no usable arena/model verdict, so the run "
+        "would fail at ValidatePredictorSkipWeightsFresh before ParityParallel. "
+        "Pick a Monday-to-Wednesday session that has one."
+    )
+    try:
+        body = _rerun._predictor_cycle_verdict(s3, run_date)
+    except _rerun.SkipCoherenceError as exc:
+        raise ProofInputError(f"{refusal} Detail: {exc}") from exc
+    if body not in _rerun.PREDICTOR_SKIP_VERDICT_WORDS:
+        raise ProofInputError(
+            f"{refusal} s3://{_rerun.PREDICTOR_SKIP_VERDICT_BUCKET}/"
+            f"{verdict_key(run_date)} holds {body[:40]!r}, not one of "
+            f"{', '.join(_rerun.PREDICTOR_SKIP_VERDICT_WORDS)}."
+        )
+    return body
+
+
+def _default_s3_client() -> Any:
+    try:
+        import boto3  # deferred: build_proof_input stays import-light for tests
+    except ImportError as exc:
+        raise ProofInputError(f"boto3 is needed for the verdict pre-check ({exc})") from exc
+    return boto3.client("s3", region_name=_ACCOUNT_REGION[0])
 
 
 def build_proof_input(run_date: str) -> dict:
@@ -184,19 +261,34 @@ def execution_name(run_date: str, suffix: str) -> str:
     return f"{NAME_PREFIX}{run_date}-{suffix}"
 
 
-def main(argv: list | None = None) -> int:
+def main(argv: list | None = None, s3: Any = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
-    ap.add_argument("--run-date", required=True, help="closed NYSE session, Monday-Wednesday")
+    ap.add_argument(
+        "--run-date", required=True,
+        help="closed NYSE session, Monday-Wednesday, with an arena/model verdict",
+    )
     ap.add_argument("--suffix", default="1")
     args = ap.parse_args(argv)
     try:
         payload = build_proof_input(args.run_date)
         name = execution_name(args.run_date, args.suffix)
+        verdict = check_proof_verdict(
+            s3 if s3 is not None else _default_s3_client(), args.run_date, payload
+        )
     except ProofInputError as exc:
         print(f"REFUSED: {exc}", file=sys.stderr)
         return 1
     body = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    bucket = _rerun.PREDICTOR_SKIP_VERDICT_BUCKET
+    words = "|".join(_rerun.PREDICTOR_SKIP_VERDICT_WORDS)
     print(json.dumps(payload, sort_keys=True, indent=2))
+    print(f"\n# Verdict pre-check: s3://{bucket}/{verdict_key(args.run_date)} reads {verdict!r}.")
+    print("# Precondition, re-run immediately before start-execution; it must print")
+    print(f"# exactly one of {words}, or the run fails at ValidatePredictorSkipWeightsFresh:")
+    print(
+        f"aws s3api get-object --bucket {bucket} "
+        f"--key {verdict_key(args.run_date)} /dev/stdout"
+    )
     print("\n# Operator only (AWS_PROFILE=ne-admin), on a weekday evening ET after")
     print("# the post-close reconcile has SUCCEEDED, with no weekly execution RUNNING:")
     print(
