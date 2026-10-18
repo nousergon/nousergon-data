@@ -64,6 +64,15 @@ Parameters:
     Type: String
     Default: arn:aws:iam::711398986525:role/alpha-engine-eventbridge-role
 
+  # alpha-engine-config-I12323 (C41): the Firehose delivery role for the alert
+  # log below. Codified and bootstrapped in nous-ergon-ops
+  # (infrastructure/iam/nousergon-alert-log-firehose-role/), not here. This
+  # repo is public and this stack holds no IAM, the same as every role
+  # parameter above.
+  AlertLogFirehoseRoleArn:
+    Type: String
+    Default: arn:aws:iam::711398986525:role/nousergon-alert-log-firehose-role
+
   AlertEmail:
     Type: String
     Default: cipher813@gmail.com
@@ -1097,6 +1106,83 @@ Resources:
       AlarmActions:
         - !Ref AlertsTopic
 
+  # --------------------------------------------------------------------------
+  # Durable alert log (alpha-engine-config-I12323, Director plan C41)
+  # --------------------------------------------------------------------------
+  # Every `nousergon.alert.v1` event on the `nousergon-alerts` bus is kept in
+  # two stores, because each answers a question the other cannot:
+  #
+  #   READ   AlertLogDeliveryStream -> s3://alpha-engine-research/ops/alerts/v1/
+  #          dt=YYYY-MM-DD/<firehose object>. Each object is JSON Lines, one
+  #          whole EventBridge envelope per line ({version, id, detail-type,
+  #          source, account, time, region, resources, detail}). This is what
+  #          the console's /planner alert views read (C42).
+  #   REPLAY AlertBusArchive: the native EventBridge archive, 90 days. It can
+  #          re-drive past events back onto the bus (for example into the
+  #          Overseer intake after an intake outage), but it CANNOT be read
+  #          in place. That is why it is not the console's store.
+  #
+  # The bus itself (and the Overseer intake rule on it) is still provisioned by
+  # infrastructure/setup_overseer_intake.sh. Both resources here only REFER to
+  # the bus by name. The pattern is detail-type only, so it covers every
+  # emitter: krepis (`nousergon.krepis`), the SNS forwarder
+  # (`nousergon.sns-forwarder`), the console milestone journal and any later
+  # source that keeps the contract.
+  AlertBusArchive:
+    Type: AWS::Events::Archive
+    Properties:
+      ArchiveName: nousergon-alerts-alert-v1
+      Description: Every nousergon.alert.v1 event on nousergon-alerts, for replay (alpha-engine-config-I12323)
+      SourceArn: !Sub 'arn:aws:events:${AWS::Region}:${AWS::AccountId}:event-bus/nousergon-alerts'
+      EventPattern:
+        detail-type:
+          - nousergon.alert.v1
+      RetentionDays: 90
+
+  # Buffering: 60 s / 1 MB. The bus carries ~65 events/day (~1 KB each, 4.8 KB
+  # max, measured 14 days to 2026-10-15), so the interval, not the size,
+  # flushes. That gives /planner one-minute freshness and at most one object
+  # per minute that has alerts. AppendDelimiterToRecord makes the object JSON
+  # Lines. Without it Firehose concatenates the envelopes with no separator.
+  # Uncompressed: at this volume gzip saves nothing worth a decode step in
+  # every reader.
+  AlertLogDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: nousergon-alert-log
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: arn:aws:s3:::alpha-engine-research
+        RoleARN: !Ref AlertLogFirehoseRoleArn
+        Prefix: 'ops/alerts/v1/dt=!{timestamp:yyyy-MM-dd}/'
+        ErrorOutputPrefix: 'ops/alerts/v1-errors/!{firehose:error-output-type}/dt=!{timestamp:yyyy-MM-dd}/'
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 1
+        CompressionFormat: UNCOMPRESSED
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: AppendDelimiterToRecord
+              Parameters:
+                - ParameterName: Delimiter
+                  ParameterValue: '\n'
+
+  AlertLogRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: nousergon-alert-log
+      Description: Every nousergon.alert.v1 event -> Firehose nousergon-alert-log -> s3 ops/alerts/v1/ (alpha-engine-config-I12323)
+      EventBusName: nousergon-alerts
+      EventPattern:
+        detail-type:
+          - nousergon.alert.v1
+      State: ENABLED
+      Targets:
+        - Id: nousergon-alert-log
+          Arn: !GetAtt AlertLogDeliveryStream.Arn
+          RoleArn: !Ref EventBridgeSfnRoleArn
+
 Outputs:
   AlertsTopicArn:
     Value: !Ref AlertsTopic
@@ -1113,3 +1199,7 @@ Outputs:
   ExecutionMutexTableName:
     Value: !Ref ExecutionMutexTable
     Description: DynamoDB table name for SF execution mutex (L274)
+
+  AlertLogPrefix:
+    Value: s3://alpha-engine-research/ops/alerts/v1/
+    Description: Durable nousergon.alert.v1 log, JSON Lines under dt=YYYY-MM-DD/ (alpha-engine-config-I12323)
