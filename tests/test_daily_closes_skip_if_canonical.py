@@ -684,3 +684,113 @@ class TestFetchRecentSplitDates:
 
     def test_empty_window_returns_empty(self):
         assert daily_closes._fetch_recent_split_dates([]) == set()
+
+
+# ── FRED rows on the yfinance/auto merge base (alpha-engine-config-I10783) ──
+
+
+def _existing_parquet_with_revisions(rows: dict[str, dict]) -> MagicMock:
+    """Like ``_existing_parquet_with_sources`` but every row carries a
+    ``revision`` cell, as every object written since I10783 does."""
+    s3 = MagicMock()
+    s3.head_object.return_value = {
+        "LastModified": datetime(2026, 10, 15, 11, 36, 25, tzinfo=timezone.utc),
+        "ContentLength": 12345,
+        "ContentType": "application/octet-stream",
+    }
+    df = pd.DataFrame(
+        [{
+            "Open": f["Close"], "High": f["Close"], "Low": f["Close"],
+            "Close": f["Close"], "Adj_Close": f["Close"],
+            "Volume": f.get("Volume", 0), "VWAP": f.get("VWAP"),
+            "source": f["source"], "revision": f["revision"],
+        } for f in rows.values()],
+        index=pd.Index(list(rows.keys()), name="ticker"),
+    )
+    buf = io.BytesIO()
+    df.to_parquet(buf, engine="pyarrow", compression="snappy", index=True)
+    body_bytes = buf.getvalue()
+    s3.get_object.side_effect = lambda *a, **k: {
+        "Body": MagicMock(read=lambda: body_bytes),
+    }
+    s3.put_object.return_value = {"ETag": '"abc"'}
+    return s3
+
+
+def _written(s3: MagicMock) -> pd.DataFrame:
+    body = s3.put_object.call_args.kwargs["Body"]
+    return pd.read_parquet(io.BytesIO(body), engine="pyarrow")
+
+
+class TestFredRowsOnTheEodMergeBase:
+    """The EOD ``yfinance_only`` + ``skip_if_canonical`` window re-fetches
+    FRED for every window date (Step 2 runs in every mode). Measured
+    2026-10-15 22:18Z: the 10-13 and 10-14 macro rows were rewritten with
+    ``revision`` 1 where their prior was 2, because FRED rows were left out
+    of the merge base and every rewrite landed as ``new_only``."""
+
+    _EXISTING = {
+        "AAPL": {"Close": 150.0, "source": "polygon", "revision": 2},
+        "TNX": {"Close": 5.21, "source": "fred", "revision": 2},
+    }
+
+    def _collect(self, s3, fred_side, yf_side):
+        with patch("collectors.daily_closes.boto3.client", return_value=s3):
+            with patch.object(
+                daily_closes, "_fetch_polygon_closes", return_value=0
+            ), patch.object(
+                daily_closes, "_fetch_yfinance_closes", side_effect=yf_side,
+            ), patch.object(
+                daily_closes, "_fetch_fred_closes", side_effect=fred_side,
+            ):
+                return daily_closes.collect(
+                    bucket="b", tickers=["AAPL", "^TNX"],
+                    run_date="2026-10-14",
+                    source="yfinance_only", skip_if_canonical=True,
+                )
+
+    def test_a_fred_rewrite_bumps_the_prior_revision(self):
+        s3 = _existing_parquet_with_revisions(self._EXISTING)
+
+        def _fred_side(tickers, run_date, records, window_cache=None):
+            for t in tickers:
+                records.append(
+                    daily_closes._fred_record(t.lstrip("^"), run_date, 5.19)
+                )
+            return len(tickers)
+
+        self._collect(s3, _fred_side, lambda missing, run_date, records: 0)
+        out = _written(s3)
+        assert out.loc["TNX", "Close"] == 5.19
+        assert out.loc["TNX", "source"] == "fred"
+        assert out.loc["TNX", "revision"] == 3  # was reset to 1 before the fix
+        # The canonical equity row is carried untouched.
+        assert out.loc["AAPL", "Close"] == 150.0
+        assert out.loc["AAPL", "revision"] == 2
+
+    def test_a_yfinance_backstop_does_not_replace_a_prior_fred_row(self):
+        """FRED returns nothing for the date: the macro yfinance backstop
+        still runs (FRED rows are not in the skip set), but its value ranks
+        below the prior FRED row, which is kept with its revision."""
+        s3 = _existing_parquet_with_revisions(self._EXISTING)
+        asked: list[str] = []
+
+        def _yf_side(missing, run_date, records):
+            asked.extend(missing)
+            for t in missing:
+                records.append({
+                    "ticker": t.lstrip("^"), "date": run_date,
+                    "Open": 9.99, "High": 9.99, "Low": 9.99, "Close": 9.99,
+                    "Adj_Close": 9.99, "Volume": 0, "VWAP": None,
+                    "source": "yfinance",
+                })
+            return len(missing)
+
+        self._collect(
+            s3, lambda tickers, run_date, records, window_cache=None: 0, _yf_side,
+        )
+        assert asked == ["^TNX"]  # AAPL skipped as canonical; TNX not
+        out = _written(s3)
+        assert out.loc["TNX", "Close"] == 5.21
+        assert out.loc["TNX", "source"] == "fred"
+        assert out.loc["TNX", "revision"] == 2

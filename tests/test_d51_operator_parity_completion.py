@@ -68,7 +68,10 @@ def test_a_scheduled_run_without_the_parity_receipt_passes():
     completion = _run([PANEL, MANIFEST])
     assert completion["ok"] is True, completion["summary"]
     (row,) = completion["units"]
-    assert row["operator_skipped"] == ["data_collection/panel/{trading_day}/parity.json"]
+    assert row["operator_skipped"] == [
+        "data_collection/panel/{trading_day}/parity.json",
+        "data_collection/panel/history/",
+    ]
 
 
 def test_a_run_missing_the_panel_is_still_output_missing():

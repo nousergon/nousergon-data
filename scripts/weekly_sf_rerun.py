@@ -285,6 +285,12 @@ TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
     # a run that already ended, and re-running a stage on the strength of it
     # would re-run the whole pipeline. Deleted at the 2026-09-05 cutover.
     "WriteCompletionMarkerDegradedCalendar",
+    # alpha-engine-config-I11111: the stage-coverage sweep of a cycle that
+    # already ended degraded. Observe-only and fail-soft (its Next and Catch
+    # both land on the release gate below), it grades the cycle rather than
+    # being a stage of it, so re-running a stage on the strength of it would
+    # be the same arbitrary re-run the rest of this family excludes.
+    "WeeklyCoverageSweepDegraded",
     # alpha-engine-config-I12228: the run-slot release hop in front of the
     # terminal. It releases this execution's own mutex item on the way out and
     # records nothing about any stage.
@@ -370,6 +376,12 @@ STAGES: tuple[Stage, ...] = (
         # still reads as THIS stage failing, so a rerun of such a history
         # waits on the collector rather than skipping past missing data.
         historical_work=frozenset({"MorningEnrich", "DataPhase1"}),
+        # alpha-engine-config-I12351: a REHEARSAL whose one readiness probe
+        # said not-ready / not-ok (or raised) records the refusal and
+        # continues to ResearchPredictorParallel through this Pass. The wait
+        # ran but did not succeed, so a rerun must wait again rather than
+        # skip past it on the strength of the witness.
+        degraded_witness=frozenset({"RehearsalCollectionNotReadyDegraded"}),
     ),
     # --- ResearchPredictorParallel branch A -------------------------------
     # config#3134: Scanner, SignalsEnvelope, ChallengerShadow, and

@@ -168,8 +168,13 @@ def live_triggers() -> list[dict]:
     """
     out: list[dict] = []
     for page in _paginate(["events", "list-rules"], "Rules"):
+        # `event_driven`: a rule with an EventPattern and no ScheduleExpression
+        # fires only when its event occurs, so its target's silence is not
+        # evidence of anything (direction E below skips it).
         out.append({"surface": "events", "name": page["Name"],
-                    "state": page.get("State")})
+                    "state": page.get("State"),
+                    "event_driven": bool(page.get("EventPattern"))
+                    and not page.get("ScheduleExpression")})
     for page in _paginate(["scheduler", "list-schedules"], "Schedules"):
         out.append({"surface": "scheduler", "name": page["Name"],
                     "state": page.get("State"),
@@ -753,6 +758,24 @@ def reconcile(
         if name in paused:
             continue  # a manual-invocation-only trigger left enabled by mistake
             # is direction A's "running-while-declared-off", not this one.
+        if t.get("event_driven"):
+            # An EventPattern rule (no ScheduleExpression) fires only when its
+            # event happens, so "the trigger is firing" — this direction's
+            # premise — does not hold, and zero target invocations is the
+            # expected reading on every quiet window. Measured 2026-10-15:
+            # `alpha-engine-vcpu-runaway-responder-alarm-state` matches only an
+            # ALARM transition on the two vCPU-runaway alarms; its responder's
+            # last invocation (2026-10-01T20:00Z) aged out of the 14-day window
+            # and the next run reported `enabled-trigger-silent-target` for a
+            # fleet with no vCPU runaway. Noted, never silently excluded.
+            noted.append({
+                "id": f"{t['surface']}:{name}", "kind": "event-driven-trigger",
+                "detail": ("live State=ENABLED with an EventPattern and no "
+                           "ScheduleExpression — it fires only when its event "
+                           "occurs, so its target's invocation count is not "
+                           "graded by direction E."),
+            })
+            continue
         for arn in targets_of(t):
             for row in _rows_for_target(reg, arn):
                 cid = row["component_id"]
