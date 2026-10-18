@@ -593,6 +593,25 @@ class TestSplitSource:
         assert merged["CMG"] == [(_o("2024-06-26"), 0.02)]
         assert stats["vendor_added"] == 1 and stats["duplicates"] == 1
 
+    def test_distributions_in_the_splits_feed_are_not_share_splits(self) -> None:
+        stats: dict[str, int] = {}
+        vendor = e.vendor_split_events(
+            _rows(
+                ("MMM", "2024-04-01", 1000, 1196),  # spin-off style record
+                ("VZ", "2022-01-03", 1, 1.0155),  # fractional distribution
+                ("CBSH", "2023-12-01", 20, 21),  # 5% stock dividend: a real share change
+                ("WRB", "2024-06-25", 2, 3),  # 3-for-2
+                ("SIRI", "2024-09-10", 10, 1),  # 1-for-10 reverse
+                ("ODFL", "2024-03-28", 1, 2.0),  # 2-for-1 written as a float
+                ("APG", "2024-08-01", 1, 1.5),  # 3-for-2 written unreduced
+                ("NRWRF", "2026-06-01", 20.625, 21.625),  # fractional distribution
+            ),
+            stats,
+        )
+        assert sorted(vendor) == ["APG", "CBSH", "ODFL", "SIRI", "WRB"]
+        assert stats["vendor_not_share_split"] == 3
+        assert vendor["SIRI"] == [(_o("2024-09-10"), 10.0)]
+
     def test_tickers_are_normalized_and_bad_ratios_dropped(self) -> None:
         vendor = e.vendor_split_events(_rows(("BRK.B", "2010-01-21", 1, 50), ("ZZZ", "2020-01-02", 0, 1)))
         assert list(vendor) == ["BRK-B"]
