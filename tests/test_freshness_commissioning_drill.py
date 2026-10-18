@@ -349,3 +349,48 @@ def test_a_declared_registry_row_is_drilled_and_reads_met(units, unit_id):
     assert rows[0]["states"] == {"baseline": "fresh", "induced": "stale", "cleared": "fresh"}
     assert s3.calls == [("head", key)] * 3
     assert _read(units, unit_id, receipt).met
+
+
+class _ListingS3(_FakeS3):
+    """Adds the ``list_objects_v2`` paginator a date-templated row is probed with."""
+
+    def get_paginator(self, name: str):
+        assert name == "list_objects_v2"
+        outer = self
+
+        class _Paginator:
+            def paginate(self, *, Bucket: str, Prefix: str):  # noqa: N803 - boto3 shape
+                outer.calls.append(("list", Prefix))
+                yield {
+                    "Contents": [
+                        {"Key": k, "LastModified": lm} for k, lm in sorted(outer.objects.items()) if k.startswith(Prefix)
+                    ]
+                }
+
+        return _Paginator()
+
+
+def test_d19_drills_its_own_daily_closes_row_and_reads_met(units):
+    """D19 writes the same ``staging/daily_closes/{date}.parquet`` as D17
+    (``writes_shared_with``), so its freshness-monitor detector names the same
+    row D17's does. The row is date-templated: the drill LISTs the prefix the
+    drill role's ``FreshnessDrillListTheDrilledPrefixes`` grant already covers."""
+    unit = units["D19"]
+    assert unit.raw["registry_rows"] == ["daily_closes_parquet"]
+    assert "staging/daily_closes/{date}.parquet" in unit.raw["writes"]
+    assert units["D17"].raw["registry_rows"] == ["daily_closes_parquet"]
+    template = "staging/daily_closes/{trading_day}.parquet"
+    specs, broken = drill.build_specs(
+        _registry(artifact_id="daily_closes_parquet", s3_key_template=template, cadence="weekday_sf")
+    )
+    assert not broken
+    key = f"staging/daily_closes/{DRILL_INSTANT:%Y-%m-%d}.parquet"
+    s3 = _ListingS3({key: DRILL_INSTANT - dt.timedelta(hours=1)})
+    receipt, rows, why = drill.drill_unit(unit, _detector(unit), specs, s3=s3, clock=_Clock(DRILL_INSTANT), run_ref="t")
+    assert why is None and receipt is not None
+    assert receipt["outcome"] == "induced", receipt
+    assert receipt["fired"]["subject"] == "daily_closes_parquet"
+    assert rows[0]["states"] == {"baseline": "fresh", "induced": "stale", "cleared": "fresh"}
+    assert {c[0] for c in s3.calls} == {"list"}
+    assert all(prefix.startswith("staging/daily_closes/") for _, prefix in s3.calls)
+    assert _read(units, "D19", receipt).met
