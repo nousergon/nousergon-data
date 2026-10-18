@@ -109,6 +109,17 @@ def _registry_with_hon_reverse_split():
     return reg
 
 
+def _hon_tape(_action):
+    """HON's raw closes around the 2026-06-27 ex-date: the tape doubles at the
+    boundary, so the 1-for-2 reverse split has price evidence (I12359)."""
+    return pd.Series(
+        [229.0, 229.49, 230.1, 460.2, 461.0],
+        index=pd.to_datetime(
+            ["2026-06-24", "2026-06-25", "2026-06-26", "2026-06-29", "2026-06-30"]
+        ),
+    )
+
+
 class TestRegistryReclassifiesConfirmedSplit:
     def test_explained_split_logs_warning_not_error(self, caplog):
         # HON 1-for-2 reverse split restated 229.49 -> 458.98 (factor 2.0).
@@ -116,7 +127,8 @@ class TestRegistryReclassifiesConfirmedSplit:
         reg = _registry_with_hon_reverse_split()
         with caplog.at_level(logging.DEBUG):
             explained, _unexplained = daily_closes._log_close_discrepancies(
-                new_df, {"HON": 229.49}, "2026-06-25", registry=reg
+                new_df, {"HON": 229.49}, "2026-06-25", registry=reg,
+                close_loader=_hon_tape,
             )
         errors = [r for r in caplog.records if r.levelno == logging.ERROR]
         warns = [r for r in caplog.records if r.levelno == logging.WARNING]
