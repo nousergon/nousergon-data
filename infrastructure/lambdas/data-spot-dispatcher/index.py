@@ -255,6 +255,7 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # (ne-data-collection-panel, started on the EOD collection's SUCCEEDED)
     # pages within about an hour rather than two.
     "daily-panel": 3600,
+    "panel-history-export": 3600,
     # D48 / D49 (alpha-engine-config-I11306). No scheduled run has been
     # measured yet. D48 is one batched ArcticDB read of the ~600 index members
     # and four small PUTs; D49 is one HTTP fetch, one fundamentals-archive read
@@ -474,6 +475,16 @@ _WORKLOADS: dict[str, str] = {
     # ne-data-collection-eod SUCCEEDS, so that day's closes are already
     # appended. Never a workload of the EOD machine.
     "index-contributions": "python weekly_collector.py --index-contributions",
+    # alpha-engine-config-I12399: the one-off frozen history export under D51
+    # (`builders/daily_panel.py history`). Reads `universe` and
+    # `delisted_history` read-only, up to 2022-03-31, and writes one parquet
+    # plus its manifest under data_collection/panel/history/. Operator-started
+    # with `aws lambda invoke`, never scheduled; re-running overwrites the same
+    # two keys with the same window.
+    "panel-history-export": (
+        "python -m builders.daily_panel history --name m-slot-2016-2022q1 "
+        "--start 2000-01-01 --end 2022-03-31"
+    ),
     # alpha-engine-config-I11306: D49, Nasdaq-100 membership and weights
     # (`collectors/nasdaq100.py`), D48's NDX weight source. It runs on
     # ne-data-collection-panel, started by the rule

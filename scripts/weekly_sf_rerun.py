@@ -285,6 +285,12 @@ TERMINAL_DEGRADED_FAMILY: frozenset[str] = frozenset({
     # a run that already ended, and re-running a stage on the strength of it
     # would re-run the whole pipeline. Deleted at the 2026-09-05 cutover.
     "WriteCompletionMarkerDegradedCalendar",
+    # alpha-engine-config-I11111: the stage-coverage sweep of a cycle that
+    # already ended degraded. Observe-only and fail-soft (its Next and Catch
+    # both land on the release gate below), it grades the cycle rather than
+    # being a stage of it, so re-running a stage on the strength of it would
+    # be the same arbitrary re-run the rest of this family excludes.
+    "WeeklyCoverageSweepDegraded",
     # alpha-engine-config-I12228: the run-slot release hop in front of the
     # terminal. It releases this execution's own mutex item on the way out and
     # records nothing about any stage.

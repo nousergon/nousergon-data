@@ -543,6 +543,7 @@ _DEGRADED_FLAG_EXEMPT: dict[str, dict[str, str]] = {
         # WeeklyCoverageSweepUnobserved — which says the coverage SURFACE, not
         # the run, is the thing without a verdict.
         "WeeklyCoverageSweep": "observe-only tail downstream of the success terminal — pages via its own SNS state; a degraded flag would have no reader, the run's outcome being already written",
+        "WeeklyCoverageSweepDegraded": "alpha-engine-config-I11111: observe-only, on a path that has ALREADY set its degraded flag (that is what routed it here) and terminates DegradedRun regardless of the sweep; a second flag would have no reader, and the Catch must not change the terminal",
 
         "RunScope": (
             "alpha-engine-config-I7620. The fail-open is VISIBLE on the "
