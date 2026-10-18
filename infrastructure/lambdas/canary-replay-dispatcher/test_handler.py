@@ -147,6 +147,86 @@ class TestEventValidation:
         assert result["research_ref"] == "feat/some-branch"
         assert result["data_ref"] == "main"
 
+    def test_first_run_attempt_keeps_the_bare_token(self):
+        # Attempt 1 (and a caller that sends no run_attempt) keeps the key it
+        # always had — only a RE-RUN changes it.
+        _install_stubs()
+        index = _reload_index()
+        base = {
+            "mode": "pr",
+            "repo": "nousergon/nousergon-data",
+            "pr_number": "2183",
+            "sha": "540fe891966eb7dab93438613fce8c913433149c",
+        }
+        assert index.handler(base, None)["run_token"] == (
+            "pr-nousergon-nousergon-data-2183-540fe891966e"
+        )
+        assert index.handler({**base, "run_attempt": "1"}, None)["run_token"] == (
+            "pr-nousergon-nousergon-data-2183-540fe891966e"
+        )
+
+    def test_rerun_attempt_gets_its_own_token_and_marker(self):
+        # alpha-engine-config-I11083 / I11579: a re-run keyed on sha alone hit
+        # concurrent_skip against attempt 1's still-terminating box and
+        # re-read attempt 1's marker (nousergon-data#2183, job 116909685238).
+        _install_stubs()
+        index = _reload_index()
+        result = index.handler(
+            {
+                "mode": "pr",
+                "repo": "nousergon/nousergon-data",
+                "pr_number": "2183",
+                "sha": "540fe891966eb7dab93438613fce8c913433149c",
+                "run_attempt": "2",
+            },
+            None,
+        )
+        assert result["launched"] is True
+        assert result["run_token"] == "pr-nousergon-nousergon-data-2183-540fe891966e-a2"
+        assert result["marker_key"] == (
+            "tmp/canary/pr-nousergon-nousergon-data-2183-540fe891966e-a2.json"
+        )
+
+    def test_rerun_attempt_does_not_dedupe_against_the_previous_attempts_box(self):
+        seen_tokens: list[str] = []
+
+        def _running(*a, **kw):
+            seen_tokens.append(str(a) + str(kw))
+            # Attempt 1's box is still alive under the BARE token only.
+            return ["i-attempt1"] if "540fe891966e-a2" not in str(a) + str(kw) else []
+
+        _install_stubs(running_instance_ids_impl=_running)
+        index = _reload_index()
+        result = index.handler(
+            {
+                "mode": "pr",
+                "repo": "nousergon/nousergon-data",
+                "pr_number": "2183",
+                "sha": "540fe891966eb7dab93438613fce8c913433149c",
+                "run_attempt": "2",
+            },
+            None,
+        )
+        assert result["launched"] is True
+        assert "dispatched_at" in result
+
+    @pytest.mark.parametrize("bad", ["0", "-1", "a2", "12345", "2; rm -rf /"])
+    def test_malformed_run_attempt_rejected(self, bad):
+        _install_stubs()
+        index = _reload_index()
+        result = index.handler(
+            {
+                "mode": "pr",
+                "repo": "nousergon/nousergon-data",
+                "pr_number": "2183",
+                "sha": "540fe891966eb7dab93438613fce8c913433149c",
+                "run_attempt": bad,
+            },
+            None,
+        )
+        assert result["launched"] is False
+        assert result["reason"] == "invalid_event"
+
     def test_invalid_mode_returns_clean_launched_false(self):
         _install_stubs()
         index = _reload_index()
