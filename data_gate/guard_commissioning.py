@@ -41,6 +41,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 __all__ = [
+    "CARDINALITY_OBSERVED",
     "EMPTY_FRESH_OBSERVED",
     "HARNESSES",
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
@@ -74,6 +75,23 @@ SUCCESS_WITHOUT_OUTPUT_OBSERVED: tuple[str, ...] = (
     "data-collection ASL; the process exited 0, so no on-demand retry",
     "stand-down: terminal RunNotOk; a same-date rerun that still publishes nothing files "
     "failed again (never carried forward to ok)",
+    "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
+)
+
+#: What the ``cardinality`` harness observes. No shared chokepoint enforces this
+#: class (`validators/expectations.py::CARDINALITY_GUARD` is staged OBSERVE with
+#: no raise site), so the record is taken on each unit's OWN coverage check, the
+#: one its descriptor's ``guards.cardinality.code`` names, run for real over a
+#: vendor that answers for a truncated universe. A raise (``status: error``) or a
+#: ``partial`` result both exit 1, so the retry runs and the page is
+#: ``NotifyFailure``.
+CARDINALITY_OBSERVED: tuple[str, ...] = (
+    "manifest status failed naming the truncated universe, on the attempt and on the "
+    "on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL; the process "
+    "exited 1 on both attempts",
+    "stand-down: terminal CollectionFailed; the retry recomputed, and the truncated answer "
+    "overwrote none of the previously published keys it did not cover",
     "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
 )
 
@@ -123,6 +141,15 @@ HARNESSES: dict[str, Harness] = {
         mode_under_test="enforce",
         cases_module="test_guard_commissioning_success_without_output",
         observed=SUCCESS_WITHOUT_OUTPUT_OBSERVED,
+    ),
+    # No staged mode flip either: each unit's own coverage check raises (or
+    # files `partial`) as shipped, and that is the check the record is taken on.
+    "cardinality": Harness(
+        "tests/test_guard_commissioning_cardinality.py",
+        "test_the_fault_record_truncated_universe_fails_pages_once_and_stands_down",
+        mode_under_test="enforce",
+        cases_module="test_guard_commissioning_cardinality",
+        observed=CARDINALITY_OBSERVED,
     ),
 }
 
