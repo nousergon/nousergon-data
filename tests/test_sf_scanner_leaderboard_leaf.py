@@ -191,7 +191,11 @@ def test_a_leaf_failure_degrades_the_run_loudly_and_never_silently(states):
     # marker sits between it and DegradedRun for the migration window; it is
     # fail-soft. Deleted at the 2026-09-05 cutover.
     assert states["WriteCompletionMarkerDegraded"]["Next"] == "WriteCompletionMarkerDegradedCalendar"
-    assert through_release(states, states["WriteCompletionMarkerDegradedCalendar"]["Next"]) == "DegradedRun"
+    # alpha-engine-config-I11111: the degraded cycle is swept before the
+    # terminal; the sweep is fail-soft (Next and Catch land on the same gate),
+    # so the marker still reaches DegradedRun through it.
+    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "WeeklyCoverageSweepDegraded"
+    assert through_release(states, states["WeeklyCoverageSweepDegraded"]["Next"]) == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
 
 
