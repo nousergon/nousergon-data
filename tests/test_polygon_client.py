@@ -242,6 +242,42 @@ def test_get_recent_splits_forbidden_returns_empty():
         assert client.get_recent_splits("2026-05-01", "2026-05-15") == []
 
 
+# ── get_all_splits_between (alpha-engine-config-I12418: full split history) ──
+
+
+def test_get_all_splits_between_follows_every_page():
+    client = _make_client()
+    pages = [
+        {
+            "results": [{"ticker": "NVDA", "execution_date": "2024-06-10", "split_from": 1, "split_to": 10}],
+            "next_url": "https://api.polygon.io/v3/reference/splits?cursor=abc&apiKey=secret",
+        },
+        {"results": [{"ticker": "AAPL", "execution_date": "2020-08-31", "split_from": 1, "split_to": 4}]},
+    ]
+    with patch.object(client, "_get", side_effect=pages) as mock_get:
+        out = client.get_all_splits_between("2015-01-01", "2026-10-16")
+    assert mock_get.call_count == 2
+    second_path, second_kwargs = mock_get.call_args_list[1][0][0], mock_get.call_args_list[1][1]
+    assert second_path == "/v3/reference/splits"
+    assert second_kwargs["params"] == {"cursor": "abc"}
+    assert [r["ticker"] for r in out] == ["AAPL", "NVDA"]
+
+
+def test_get_all_splits_between_raises_on_forbidden():
+    client = _make_client()
+    with patch.object(client, "_get", side_effect=PolygonForbiddenError("403")), pytest.raises(
+        PolygonForbiddenError
+    ):
+        client.get_all_splits_between("2015-01-01", "2026-10-16")
+
+
+def test_get_all_splits_between_refuses_a_runaway_cursor():
+    client = _make_client()
+    page = {"results": [], "next_url": "https://api.polygon.io/v3/reference/splits?cursor=x"}
+    with patch.object(client, "_get", return_value=page), pytest.raises(RuntimeError, match="pages"):
+        client.get_all_splits_between("2015-01-01", "2026-10-16", max_pages=3)
+
+
 # ── get_ticker_events (corporate-actions PR6: ticker-rename detection) ─────────
 
 
