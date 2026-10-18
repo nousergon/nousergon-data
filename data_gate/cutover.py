@@ -48,6 +48,7 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 __all__ = [
+    "ACKNOWLEDGED_V1_DATA_STAGE_EXECUTIONS",
     "CUTOVER_STATUS",
     "CUTOVER_UTC",
     "V1_STATE_MACHINE_NAMES",
@@ -71,6 +72,33 @@ V1_STATE_MACHINE_NAMES: tuple[str, ...] = (
     "ne-weekly-freshness-pipeline",
     "ne-preopen-trading-pipeline",
     "ne-postclose-trading-pipeline",
+)
+
+#: v1 data-stage executions since ``CUTOVER_UTC`` that ``data.phase1.v1_data_stage_quiet``
+#: reports as ACKNOWLEDGED rather than counting against the phase-1 exit. A NAMED,
+#: CLOSED list (Brian's ruling 2026-10-18 14:44Z, "1-9 proceed as recommended",
+#: option 1 on alpha-engine-config-I10793): each entry is ``(state machine, execution
+#: name, citation)``, never an ARN (this repo is public and an ARN embeds the account).
+#:
+#: Both entries are the 2026-10-16 weekday rehearsals that entered v1 ``DataPhase2``
+#: (D15) and wrote production keys (alpha-engine-config-I12351 / I12377). The leak was
+#: closed by nousergon-data-PR2196 (``ApplyRehearsalChampionSkips`` forces
+#: ``skip_data_phase2``), deployed at ``60121707``. Any OTHER v1 data-stage execution
+#: still fails the clause; the window and ``CUTOVER_UTC`` are unchanged.
+#:
+#: Adding an entry relaxes a phase-exit guard and needs its own cited ruling.
+#: ``tests/test_v1_data_stage_acknowledged.py`` pins this list's exact contents.
+ACKNOWLEDGED_V1_DATA_STAGE_EXECUTIONS: tuple[tuple[str, str, str], ...] = (
+    (
+        "ne-weekly-freshness-pipeline",
+        "rehearsal-2026-10-16-1",
+        "alpha-engine-config-I10793 option 1 (Brian 2026-10-18); leak I12351/I12377, fix PR2196",
+    ),
+    (
+        "ne-weekly-freshness-pipeline",
+        "rehearsal-2026-10-16-2",
+        "alpha-engine-config-I10793 option 1 (Brian 2026-10-18); leak I12351/I12377, fix PR2196",
+    ),
 )
 
 _ET = ZoneInfo("America/New_York")

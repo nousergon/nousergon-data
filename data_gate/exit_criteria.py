@@ -1222,7 +1222,12 @@ def read_v1_data_stage_quiet(store: GateStore) -> Reading:
     The detail renders the per-machine breakdown, so a non-zero reading names its
     pipeline (I11265 deliverable 4).
     """
-    from data_gate.cutover import CUTOVER_UTC, V1_STATE_MACHINE_NAMES, cutover_instant
+    from data_gate.cutover import (
+        ACKNOWLEDGED_V1_DATA_STAGE_EXECUTIONS,
+        CUTOVER_UTC,
+        V1_STATE_MACHINE_NAMES,
+        cutover_instant,
+    )
 
     read = read_store_document(store, V1_DATA_STAGE_KEY)
     if read.problem is not None:
@@ -1299,12 +1304,35 @@ def read_v1_data_stage_quiet(store: GateStore) -> Reading:
             f"reports a total of {executions} but its per-machine counts {counts} sum to "
             f"{sum(counts.values())}; a document that disagrees with itself is not a reading."
         )
+    # alpha-engine-config-I10793 option 1: subtract only the NAMED, CLOSED list in
+    # data_gate.cutover, and only when the document's own ARN list carries the entry.
+    # A document without ARNs acknowledges nothing, so this fails closed.
+    arns = document.get("data_stage_execution_arns")
+    arn_set = {str(a) for a in arns} if isinstance(arns, list) else set()
+    acknowledged: list[str] = []
+    for machine, execution, _citation in ACKNOWLEDGED_V1_DATA_STAGE_EXECUTIONS:
+        suffix = f":execution:{machine}:{execution}"
+        if machine in counts and any(a.endswith(suffix) for a in arn_set):
+            counts[machine] -= 1
+            acknowledged.append(f"{machine}:{execution}")
+    if any(n < 0 for n in counts.values()):
+        return _refuse(
+            f"acknowledges {acknowledged} but its per-machine counts go negative; a document "
+            "that lists more executions than it counts is not a reading."
+        )
+    residual = executions - len(acknowledged)
     breakdown = ", ".join(f"{name}={n}" for name, n in counts.items())
+    ack_note = (
+        f"; {len(acknowledged)} acknowledged by ruling and not counted ({', '.join(acknowledged)}, "
+        "alpha-engine-config-I10793 option 1)"
+        if acknowledged
+        else ""
+    )
     return Reading(
-        met=executions == 0,
+        met=residual == 0,
         detail=(
-            f"{V1_DATA_STAGE_KEY}: {executions} v1 data-stage execution(s) since the cutover at "
-            f"{declared} ({breakdown}); the exit requires 0"
+            f"{V1_DATA_STAGE_KEY}: {residual} v1 data-stage execution(s) since the cutover at "
+            f"{declared} ({breakdown}){ack_note}; the exit requires 0"
         ),
         evidence=(V1_DATA_STAGE_KEY,),
         source=_SOURCE_STORE,
