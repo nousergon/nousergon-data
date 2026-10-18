@@ -207,6 +207,42 @@ REGISTRY_KEY = "_freshness_monitor/ARTIFACT_REGISTRY.yaml"
 # read as a pipeline with nothing to report.
 VERDICT_KEY_TEMPLATE = "_stage_outputs/{pipeline}/{run_date}.json"
 
+#: alpha-engine-config-I12351: SF execution names that start with this are
+#: weekly-SF rehearsals (the state machine's ``ReadRehearsalMarker`` keys on the
+#: same prefix). A rehearsal's verdict goes under its own namespace, inside the
+#: ``_stage_outputs/`` prefix every writer of the live verdict is granted.
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+REHEARSAL_VERDICT_KEY_TEMPLATE = (
+    "_stage_outputs/.rehearsal/{execution}/{pipeline}/{run_date}.json"
+)
+
+
+def rehearsal_execution(
+    execution_arn: str | None, env: Optional[dict] = None
+) -> str | None:
+    """The rehearsal's execution name when this sweep observes one, else None.
+
+    ``rehearsal-2026-10-16-2``'s WeeklySubstrateHealthCheck wrote the live
+    ``_stage_outputs/ne-weekly-freshness-pipeline/2026-10-15.json``. The
+    execution ARN decides when the launcher passed one; otherwise
+    ``$RUN_TOKEN`` (exported by ``krepis.ssm_log_capture``) does.
+    """
+    import os  # noqa: PLC0415
+
+    name = (execution_arn or "").rsplit(":", 1)[-1].strip()
+    if not name:
+        name = ((os.environ if env is None else env).get("RUN_TOKEN") or "").strip()
+    return name if name.startswith(REHEARSAL_EXECUTION_PREFIX) else None
+
+
+def verdict_key(pipeline: str, run_date: str, rehearsal: str | None = None) -> str:
+    """Where this sweep's verdict document is written."""
+    if rehearsal:
+        return REHEARSAL_VERDICT_KEY_TEMPLATE.format(
+            execution=rehearsal, pipeline=pipeline, run_date=run_date
+        )
+    return VERDICT_KEY_TEMPLATE.format(pipeline=pipeline, run_date=run_date)
+
 UNRESOLVED_PRODUCER_STAGE = "UNRESOLVED"
 
 # Verdicts. Ordered worst-first for reporting; the ordering is not a severity
@@ -1195,8 +1231,20 @@ def sweep(
             len(summary["gated"]), _describe(summary["gated"]),
         )
 
+    # alpha-engine-config-I12351: a rehearsal's sweep keeps its real verdict
+    # and exit code, but records it in its own namespace, publishes no metric
+    # (the metric has no execution dimension) and never alerts above
+    # tracked-only, whatever its run_mode resolved to.
+    rehearsal = rehearsal_execution(execution_arn)
+    if rehearsal is not None:
+        logger.info(
+            "Stage-output sweep observes rehearsal %s: verdict recorded under "
+            "its own namespace, no metric, alerts tracked-only", rehearsal,
+        )
+        emit_metrics = False
+
     if publish:
-        _publish_verdict(s3_client, bucket, document)
+        _publish_verdict(s3_client, bucket, document, rehearsal=rehearsal)
 
     # I7392 item E — best-effort, independently trapped (matches
     # freshness-monitor's split-trap convention): a PutMetricData grant
@@ -1213,7 +1261,7 @@ def sweep(
             )
 
     if alert and summary["status"] != "ok":
-        if _alert_at_full_severity(document):
+        if rehearsal is None and _alert_at_full_severity(document):
             _alert(document)
         else:
             logger.warning(
@@ -1293,7 +1341,9 @@ def _emit_metrics(cloudwatch_client: Any, document: dict) -> None:
     )
 
 
-def _publish_verdict(s3_client: Any, bucket: str, document: dict) -> None:
+def _publish_verdict(
+    s3_client: Any, bucket: str, document: dict, *, rehearsal: str | None = None
+) -> None:
     """Write the verdict artifact.
 
     Failure to publish is logged and swallowed rather than raised — (a) the
@@ -1305,9 +1355,7 @@ def _publish_verdict(s3_client: Any, bucket: str, document: dict) -> None:
     convert a reporting fault into a pipeline failure — the reporter destroying
     the thing it reports, a class this fleet has already shipped twice.
     """
-    key = VERDICT_KEY_TEMPLATE.format(
-        pipeline=document["pipeline"], run_date=document["run_date"]
-    )
+    key = verdict_key(document["pipeline"], document["run_date"], rehearsal)
     try:
         s3_client.put_object(
             Bucket=bucket,

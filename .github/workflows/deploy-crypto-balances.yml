@@ -26,6 +26,11 @@ on:
       - 'collectors/crypto_balances.py'
       - 'run_units.py'
       - 'dates.py'
+      # deploy.sh vendors these since nousergon-data#2180: run_units imports
+      # contracts.pit to stamp every output (alpha-engine-config-I10782).
+      # Held to deploy.sh by tests/test_lambda_deploy_paths_cover_vendored_files.py.
+      - 'contracts/__init__.py'
+      - 'contracts/pit.py'
       - 'infrastructure/automation_pause.json'
       - '.github/workflows/deploy-crypto-balances.yml'
   workflow_dispatch:

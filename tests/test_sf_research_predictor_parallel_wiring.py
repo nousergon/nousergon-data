@@ -61,6 +61,7 @@ This test catches regressions like:
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 
 import pytest
@@ -796,6 +797,30 @@ class TestBranchBContents:
         # The Map state's own Catch is a best-effort backstop, never BranchBFailed.
         assert all(c["Next"] != "BranchBFailed" for c in m["Catch"])
         assert m["Next"] == "ModelZooSelect"
+
+    def test_model_zoo_spec_log_is_per_spec(self, branch_b):
+        """alpha-engine-config-I11489: every Map iteration runs on the SAME
+        dispatcher box, and krepis.ssm_log_capture opens ``--log`` with "wb"
+        then ships the whole file. One shared path meant each shipped
+        ``_ssm_logs/predictor-model-zoo-spec/`` object carried the OTHER
+        spec's banner and instance id. The log path must carry the item's
+        spec id, and the ``{}`` placeholders must bind in order: correlation
+        id, log-path spec id, ``--spec-id`` spec id, preflight args."""
+        proc = branch_b["ModelZooTrainMap"]["ItemProcessor"]["States"]
+        dcmd = proc["TrainSpecDispatch"]["Parameters"]["Parameters"]["commands.$"]
+        m = re.search(
+            r"States\.Format\('([^']*ssm_log_capture[^']*)',([^)]*)\)", dcmd
+        )
+        assert m, f"no ssm_log_capture States.Format in {dcmd!r}"
+        template, args = m.group(1), [a.strip() for a in m.group(2).split(",")]
+        assert "--log /var/log/predictor-model-zoo-spec-{}.log" in template
+        # The S3 slug stays shared: the rss check and _ssm_logs/ readers key
+        # on it. Only the box-local file is split.
+        assert "--slug predictor-model-zoo-spec " in template
+        assert template.count("{}") == len(args) == 4
+        assert args == [
+            "$$.Execution.Name", "$.spec_id", "$.spec_id", "$.preflight_args",
+        ]
 
     def test_model_zoo_select_is_best_effort(self, branch_b):
         """config#1083: ModelZooSelect runs the selection on ONE spot after the
