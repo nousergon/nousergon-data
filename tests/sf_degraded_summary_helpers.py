@@ -149,8 +149,13 @@ def assert_completion_notifier_chain(states: dict, notifier: str) -> None:
     # marker sits between it and DegradedRun for the migration window; it is
     # fail-soft and its Next is DegradedRun. Deleted at the 2026-09-05 cutover.
     assert degraded_marker["Next"] == "WriteCompletionMarkerDegradedCalendar"
-    # alpha-engine-config-I12228: through the run-slot release hop.
-    assert through_release(states, states["WriteCompletionMarkerDegradedCalendar"]["Next"]) == "DegradedRun"
+    # alpha-engine-config-I11111: the degraded cycle is swept before the
+    # terminal. The sweep is fail-soft (Next and Catch both land on the same
+    # gate), so the property this line always stood for - the marker's Next
+    # reaches DegradedRun, through the run-slot release hop of
+    # alpha-engine-config-I12228 - holds through it.
+    assert states["WriteCompletionMarkerDegradedCalendar"]["Next"] == "WeeklyCoverageSweepDegraded"
+    assert through_release(states, states["WeeklyCoverageSweepDegraded"]["Next"]) == "DegradedRun"
     assert states["DegradedRun"]["Type"] == "Fail"
     assert states["DegradedRun"]["Error"] == "DegradedRun", (
         "the error string is a consumer contract: sf-telegram-notifier keys its "
