@@ -92,6 +92,21 @@ detectors:
     # rag/pipelines/run_weekly_ingestion.sh on success; codified in
     # infrastructure/cloudformation/alpha-engine-orchestration.yaml.
     subject: "alpha-engine-rag-ingestion-no-heartbeat"
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        rag_corpus_freshness (saturday_sf, rag/corpus_freshness/latest.json) is this
+        unit's own write (run_weekly_ingestion.sh step 4, assert_corpus_freshness.py;
+        dropped from `writes` above only because it has no external reader, see
+        `notes`) and a live, un-parked row on the published registry the freshness
+        monitor enforces. Declared so the monthly threshold-tightening drill
+        (data_gate/producers/freshness_commissioning.py, alpha-engine-config-I10795)
+        commissions it. The drill role's GetObject on this exact key is the
+        nous-ergon-ops-PR1732 grant (Brian approved 2026-10-18); until it applies the drill
+        reads probe_failed and records D16 inconclusive. UNVERIFIED until that drill
+        writes the receipt. If step 4's publish is ever trimmed, this detector and
+        the registry row go with it.
 freshness:
   family: weekly
   deadline: "Sat 13:00 America/New_York"
