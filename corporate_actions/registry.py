@@ -75,6 +75,13 @@ class CorporateActionRegistry:
         # adjusted-close jumps needs only the session set — NEVER a full S3 list
         # (which would also be O(all-time-actions) on every comparison).
         self._session_actions: dict = {}
+        # Per-instance memo of :meth:`price_evidence` verdicts, by action_id
+        # (alpha-engine-config-I12359). The registry is built ONCE per window
+        # run and threaded through every per-date collect(), so the memo pins
+        # each action's verdict to the stores AS THEY STOOD when it was first
+        # asked — before this run's own overwrites of the boundary dates could
+        # flatten (or fabricate) the boundary the verdict is read from.
+        self._evidence_verdicts: dict = {}
 
     # ── key helpers ──────────────────────────────────────────────────────
     def _action_key(self, action_id: str) -> str:
@@ -332,6 +339,74 @@ class CorporateActionRegistry:
         # Evaluate by ex_date ascending so the earliest plausible action wins.
         out.sort(key=lambda a: a.ex_date)
         return out
+
+    # ── price evidence for a matched action (alpha-engine-config-I12359) ─
+    def price_evidence(self, action, close_loader) -> str:
+        """What the RAW tape says about ``action``, memoized per action_id.
+
+        ``close_loader(action)`` returns the raw close series for
+        ``action.ticker`` around its ex-date (or ``None`` when it has none);
+        the verdict is :func:`corporate_actions.price_evidence_orientation`'s
+        (``direct`` / ``inverse`` / ``ambiguous`` / ``none`` / ``uncovered``).
+        A loader that raises reads as ``uncovered`` — no evidence, never a
+        pass. ``close_loader=None`` is also ``uncovered``.
+        """
+        from corporate_actions import price_evidence_orientation
+
+        if action.action_id in self._evidence_verdicts:
+            return self._evidence_verdicts[action.action_id]
+        close = None
+        if close_loader is not None:
+            try:
+                close = close_loader(action)
+            except Exception as exc:  # noqa: BLE001 - no evidence, never a pass
+                log.warning(
+                    "corporate_actions registry: price-evidence load failed for "
+                    "%s %s (%s) — treating as uncovered",
+                    action.ticker, action.action_id, type(exc).__name__,
+                )
+                close = None
+        try:
+            verdict = price_evidence_orientation(close, action)
+        except Exception as exc:  # noqa: BLE001 - malformed action: no evidence
+            log.warning(
+                "corporate_actions registry: price-evidence check failed for "
+                "%s %s (%s) — treating as uncovered",
+                action.ticker, action.action_id, type(exc).__name__,
+            )
+            verdict = "uncovered"
+        self._evidence_verdicts[action.action_id] = verdict
+        return verdict
+
+    def classify_discrepancy(
+        self, ticker: str, date, prior: float, new: float, *, close_loader=None,
+    ):
+        """:meth:`explains_discrepancy` with the price-evidence precondition.
+
+        Returns ``(action, verdict)``:
+
+          * ``(None, None)`` — no registered split matches the factor and the
+            ex-date window: an UNEXPLAINED discrepancy, exactly as before.
+          * ``(action, "direct" | "inverse")`` — a registered split matches AND
+            the raw tape around its ex-date shows the split (in the stated or
+            the inverted orientation): the overwrite is that action's expected
+            restatement.
+          * ``(action, "ambiguous" | "none" | "uncovered")`` — a registered
+            split matches the factor but the tape does NOT show it. The
+            registry record alone is not evidence: the vendor may have
+            published a split that never happened (Polygon's 2:1 SKYD/PSKY
+            records, 2026-10-05 and 2026-10-14). The caller must not treat this
+            as explained.
+
+        ``corporate_actions.apply`` and ``sync`` already refuse to restate on
+        the same verdicts; this makes the overwrite path ask the same question,
+        so the weaker test no longer decides what reaches
+        ``staging/daily_closes``.
+        """
+        action = self.explains_discrepancy(ticker, date, prior, new)
+        if action is None:
+            return None, None
+        return action, self.price_evidence(action, close_loader)
 
     # ── the authoritative discrepancy classifier ─────────────────────────
     def explains_discrepancy(self, ticker: str, date, prior: float, new: float):
