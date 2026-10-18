@@ -207,6 +207,10 @@ FORCED_SKIPS = {
     # shared completion marker; production's Saturday run skips it too.
     "skip_data_phase2": True,
 }
+#: Non-skip fields the rehearsal literal also forces (alpha-engine-config-I12351).
+#: pipeline_role: CheckMutexRole acquires production's DynamoDB run-slot only for
+#: the unattended cadence roles, so a rehearsal is pinned to a role outside them.
+FORCED_FIELDS = {"pipeline_role": "watch-rerun"}
 #: Task states that write PRODUCTION data keys with no rehearsal namespace
 #: (alpha-engine-config-I12351 C30). Not champion risk, but a live write all
 #: the same: rehearsal-2026-10-16-2's DataPhase2 left
@@ -298,7 +302,7 @@ def test_champion_skips_are_forced_only_on_the_rehearsal_branch():
     m = re.fullmatch(r"States\.JsonMerge\(\$, States\.StringToJson\('(.*)'\), false\)", expr)
     assert m, expr
     # The literal is the SECOND argument, so it wins over anything the input says.
-    assert json.loads(m.group(1)) == FORCED_SKIPS
+    assert json.loads(m.group(1)) == {**FORCED_SKIPS, **FORCED_FIELDS}
     into = [n for n, s in ALL.items() if s.get("Next") == "ApplyRehearsalChampionSkips"
             or s.get("Default") == "ApplyRehearsalChampionSkips"
             or any(c.get("Next") == "ApplyRehearsalChampionSkips" for c in s.get("Choices", []))]
@@ -454,3 +458,49 @@ def test_production_never_matches_a_deadline_rule():
     for gate, stage in {**TOP_CHECKPOINTS}.items():
         check = TOP[f"CheckRehearsalDeadlineBefore{stage}"]
         assert _leaf(check["Choices"][0], known) is False
+
+
+def _mutex_roles() -> set[str]:
+    """The pipeline_role values CheckMutexRole sends to the run-slot mutex."""
+    roles: set[str] = set()
+
+    def walk(rule):
+        if isinstance(rule, dict):
+            if rule.get("Variable") == "$.pipeline_role" and "StringEquals" in rule:
+                roles.add(rule["StringEquals"])
+            for v in rule.values():
+                walk(v)
+        elif isinstance(rule, list):
+            for v in rule:
+                walk(v)
+
+    for choice in TOP["CheckMutexRole"]["Choices"]:
+        if choice.get("Next") == "ComputeMutexTtl":
+            walk(choice)
+    return roles
+
+
+def test_a_rehearsal_can_never_take_the_run_slot_mutex():
+    """alpha-engine-config-I12351 (run-slot). rehearsal-2026-10-16-2 bypassed the
+    mutex only because the rehearsal door passed pipeline_role=watch-rerun. The
+    rehearsal literal now forces it, and it must stay outside the roles that
+    acquire production's run-slot, or a hand-started rehearsal-* with
+    pipeline_role=weekly could hold Saturday's slot."""
+    roles = _mutex_roles()
+    assert {"daily", "weekly", "eod"} <= roles, roles
+    assert FORCED_FIELDS["pipeline_role"] not in roles
+    assert TOP["CheckMutexRole"]["Default"] != "ComputeMutexTtl"
+    # The forced role must reach CheckMutexRole: nothing may overwrite it.
+    for name, st in ALL.items():
+        assert st.get("ResultPath") != "$.pipeline_role", name
+
+
+def test_the_lambda_stages_that_isolate_themselves_get_the_execution_name():
+    """ResearchSelfTest, AggregateCosts and RationaleClustering wrote live keys in
+    rehearsal-2026-10-16-2 (research/<date>/self_test.json, nine
+    decision_artifacts/_cost/<date>/cost.parquet, the console row). Their
+    handlers isolate on execution_name, like Scanner and SignalsEnvelope."""
+    for name in ("ResearchSelfTest", "AggregateCosts", "RationaleClustering",
+                 "Scanner", "SignalsEnvelope", "ScannerLeaderboard", "ReportCard"):
+        payload = ALL[name]["Parameters"]["Payload"]
+        assert payload.get("execution_name.$") == "$$.Execution.Name", name

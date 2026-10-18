@@ -822,6 +822,63 @@ class TestSweepRunModeIntegration:
         assert alerted[0][1] == {"tracked_only": True}
 
 
+class TestRehearsalIsolation:
+    """alpha-engine-config-I12351: rehearsal-2026-10-16-2's
+    WeeklySubstrateHealthCheck wrote the LIVE
+    ``_stage_outputs/ne-weekly-freshness-pipeline/2026-10-15.json``. A
+    rehearsal's sweep keeps its real verdict, but records it in its own
+    namespace, publishes no metric and never alerts above tracked-only."""
+
+    TOKEN = "rehearsal-2026-10-16-2"
+
+    @pytest.mark.parametrize(
+        ("arn", "env", "want"),
+        [
+            (f"arn:aws:states:us-east-1:1:execution:p:{TOKEN}", {}, TOKEN),
+            (None, {"RUN_TOKEN": TOKEN}, TOKEN),
+            ("arn:aws:states:us-east-1:1:execution:p:f4b49786", {"RUN_TOKEN": TOKEN}, None),
+            (None, {"RUN_TOKEN": "f4b49786-4d8b"}, None),
+            (None, {}, None),
+        ],
+    )
+    def test_rehearsal_execution(self, arn, env, want):
+        assert sos.rehearsal_execution(arn, env=env) == want
+
+    def test_a_rehearsal_verdict_never_lands_at_the_live_key(
+        self, registry_file, monkeypatch
+    ):
+        alerted = []
+        monkeypatch.setattr(sos, "_alert", lambda doc, **kw: alerted.append(kw))
+        monkeypatch.setattr(
+            sos, "_emit_metrics",
+            lambda *a, **k: pytest.fail("a rehearsal must publish no metric"),
+        )
+        monkeypatch.setenv("RUN_TOKEN", self.TOKEN)
+        s3 = _FakeS3({f"good/{RUN_DATE}.json": EXEC_START + timedelta(hours=1)})
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3, run_mode="weekly",
+            emit_metrics=True, cloudwatch_client=object(),
+        )
+        assert doc["status"] == "stage_output_missing"
+        assert [p["Key"] for p in s3.puts] == [
+            f"_stage_outputs/.rehearsal/{self.TOKEN}/{PIPELINE}/{RUN_DATE}.json"
+        ]
+        assert alerted == [{"tracked_only": True}]
+
+    def test_production_keeps_the_live_key(self, registry_file, monkeypatch):
+        monkeypatch.delenv("RUN_TOKEN", raising=False)
+        monkeypatch.setattr(sos, "_alert", lambda doc, **kw: None)
+        s3 = _FakeS3()
+        sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, execution_start=EXEC_START,
+            registry_path=registry_file, s3_client=s3,
+        )
+        assert [p["Key"] for p in s3.puts] == [
+            f"_stage_outputs/{PIPELINE}/{RUN_DATE}.json"
+        ]
+
+
 class TestEnteredStages:
     def test_stage_not_entered_is_skipped_when_the_set_is_known(self):
         decls = sos.declared_outputs([_row("a", "b/{date}.json", "Backtester")], pipeline=PIPELINE)
