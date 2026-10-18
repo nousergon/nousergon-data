@@ -71,6 +71,17 @@ detectors:
   - kind: "sf-execution"
     via: "ne-postclose-trading-pipeline"
     state: PRESENT
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        daily_closes_parquet (weekday_sf, staging/daily_closes/{trading_day}.parquet) is
+        this unit's own write (shared with D17, which already declares the same detector
+        on the same row) and a live, un-parked row on the published registry the
+        freshness monitor enforces. Declared so the monthly threshold-tightening drill
+        (data_gate/producers/freshness_commissioning.py, alpha-engine-config-I10795)
+        commissions it; the drill role already lists and reads staging/daily_closes/*
+        (nous-ergon-ops-PR1697). UNVERIFIED until that drill writes the receipt.
 freshness:
   family: "eod-spine"
   # The family's worst-case write bound, by the same rule the weekly family
