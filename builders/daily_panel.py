@@ -33,6 +33,7 @@ replays and for the parity receipt.
 
     python -m builders.daily_panel publish --date 2026-10-02 [--dry-run]
     python -m builders.daily_panel parity --date 2026-10-02 --consumer-panel s3://.../panel.parquet
+    python -m builders.daily_panel history --name m-slot-2016-2022q1 --start 2000-01-01 --end 2022-03-31
 """
 
 from __future__ import annotations
@@ -298,6 +299,209 @@ def run(
     return result
 
 
+# -- frozen history export ---------------------------------------------------
+#
+# A one-off, operator-started read of everything ArcticDB holds up to a cutoff,
+# frozen to one parquet so a backtest can hold out a window the live libraries
+# will later drop: `universe` is a rolling ten-year window the weekly rebuild
+# slides forward (builders/backfill.py), so its oldest sessions disappear every
+# Saturday. First use: the model zoo's M-slot confirmation window, 2016 to
+# 2021 (alpha-engine-config-I12399). Never a scheduled output, so D51 declares
+# the key under `completeness.operator_writes`.
+
+HISTORY_KEY_PREFIX = f"{dp.KEY_PREFIX}history/"
+HISTORY_SCHEMA_VERSION = "panel_history_export.v1"
+DELISTED_HISTORY_LIB = "delisted_history"
+CLASSIFICATION_KEY = "market_data/universe_classification/latest.json"
+_HISTORY_EXTRA_COLUMNS = {"VWAP": "vwap_raw", "source": "source"}
+HISTORY_COLUMNS: tuple[str, ...] = (
+    "trading_day",
+    "ticker",
+    *_OHLCV_RENAME.values(),
+    "vwap_raw",
+    "source",
+    "library",
+    "delisted",
+    "sector",
+)
+
+
+def history_key(name: str, leaf: str) -> str:
+    if not name or "/" in name or name.startswith("."):
+        raise PanelCompileError(f"history export name {name!r} must be one plain path segment")
+    return f"{HISTORY_KEY_PREFIX}{name}/{leaf}"
+
+
+def frames_to_history(
+    frames: dict[str, Any],
+    *,
+    library: str,
+    start: dt.date,
+    end: dt.date,
+    sectors: dict[str, str | None],
+) -> tuple[pd.DataFrame, dict[str, str]]:
+    """``{ticker: frame}`` -> long history rows in ``[start, end]``, plus ``{ticker: why}`` skips.
+
+    Unlike the daily panel this does not refuse the whole export on one bad
+    symbol: a delisted name backfilled from a free source can lack a column,
+    and the export says so per ticker in its manifest instead of either
+    dropping it silently or publishing nothing.
+    """
+    skipped: dict[str, str] = {}
+    blocks: list[pd.DataFrame] = []
+    for ticker, frame in sorted(frames.items()):
+        if frame is None or len(frame) == 0:
+            skipped[ticker] = "read failed or empty frame"
+            continue
+        missing = [c for c in _OHLCV_RENAME if c not in frame.columns]
+        if missing:
+            skipped[ticker] = f"lacks {missing}"
+            continue
+        block = frame[list(_OHLCV_RENAME)].rename(columns=_OHLCV_RENAME)
+        for column, out in _HISTORY_EXTRA_COLUMNS.items():
+            block[out] = frame[column] if column in frame.columns else None
+        index = pd.to_datetime(frame.index)
+        try:
+            index = index.tz_localize(None)
+        except TypeError:
+            index = index.tz_convert(None)
+        block = block.assign(
+            trading_day=index.date,
+            ticker=ticker,
+            library=library,
+            delisted=library == DELISTED_HISTORY_LIB,
+            sector=sectors.get(ticker),
+        ).reset_index(drop=True)
+        block = block[(block["trading_day"] >= start) & (block["trading_day"] <= end)]
+        if block.empty:
+            skipped[ticker] = f"no rows in {start}..{end}"
+            continue
+        blocks.append(block[list(HISTORY_COLUMNS)])
+    if not blocks:
+        return pd.DataFrame(columns=list(HISTORY_COLUMNS)), skipped
+    history = pd.concat(blocks, ignore_index=True)
+    history = history.drop_duplicates(subset=["trading_day", "ticker", "library"], keep="last")
+    for column in (*_OHLCV_RENAME.values(), "vwap_raw"):
+        history[column] = history[column].astype("float64")
+    history["source"] = history["source"].astype("string")
+    history["sector"] = history["sector"].astype("string")
+    return history, skipped
+
+
+def _coverage(history: pd.DataFrame) -> dict[str, Any]:
+    if history.empty:
+        return {"rows": 0, "symbols": 0, "first_day": None, "last_day": None}
+    return {
+        "rows": int(len(history)),
+        "symbols": int(history["ticker"].nunique()),
+        "first_day": str(history["trading_day"].min()),
+        "last_day": str(history["trading_day"].max()),
+    }
+
+
+def export_history(
+    *,
+    name: str,
+    start: dt.date,
+    end: dt.date,
+    load: Callable[[str], dict[str, Any]],
+    sectors: dict[str, str | None],
+    put: Callable[[str, bytes, str], None],
+    code_sha: str | None = None,
+    now: dt.datetime | None = None,
+) -> dict:
+    """Read both libraries through ``load(library)``, write the parquet, then the manifest.
+
+    Refuses (writes nothing) when either library returns no symbols or no row
+    falls in the window: an empty library is an outage, not an empty history.
+    """
+    if start > end:
+        raise PanelCompileError(f"history export start {start} is after end {end}")
+    parts: list[pd.DataFrame] = []
+    libraries: dict[str, Any] = {}
+    for library in ("universe", DELISTED_HISTORY_LIB):
+        frames = load(library)
+        if not frames:
+            raise PanelCompileError(f"the {library!r} library returned zero symbols; refusing a partial export")
+        part, skipped = frames_to_history(frames, library=library, start=start, end=end, sectors=sectors)
+        libraries[library] = {
+            **_coverage(part),
+            "symbols_listed": len(frames),
+            "skipped": skipped,
+            "per_ticker": {
+                str(t): [str(g.min()), str(g.max())]
+                for t, g in part.groupby("ticker")["trading_day"]
+            },
+        }
+        parts.append(part)
+    history = pd.concat(parts, ignore_index=True).sort_values(["trading_day", "library", "ticker"])
+    history = history.reset_index(drop=True)
+    if history.empty:
+        raise PanelCompileError(f"no row in either library falls in {start}..{end}")
+    payload = serialize(history)
+    manifest = {
+        "schema_version": HISTORY_SCHEMA_VERSION,
+        "name": name,
+        "window": {"start": str(start), "end": str(end)},
+        "parquet_key": history_key(name, "history.parquet"),
+        "parquet_sha256": dp.sha256_hex(payload),
+        "columns": list(HISTORY_COLUMNS),
+        **_coverage(history),
+        "libraries": libraries,
+        "sector_source": f"{CLASSIFICATION_KEY} (current classification, not point-in-time)",
+        "notes": [
+            "Prices are the *_raw ArcticDB columns, copied unconverted; dollar volume is close_raw * volume_raw.",
+            "universe is a rolling ten-year window; its first_day is where that window stood at export time.",
+            "delisted_history holds only the names the pruner retained or the backfill recovered; it is not "
+            "a complete survivorship-free set.",
+        ],
+        "module": MODULE,
+        "code_sha": code_sha or _repo_code_sha(),
+        "generated_at": (now or dt.datetime.now(dt.timezone.utc)).isoformat(),
+    }
+    put(history_key(name, "history.parquet"), payload, "application/vnd.apache.parquet")
+    put(history_key(name, "manifest.json"), json.dumps(manifest, indent=2).encode(), "application/json")
+    return manifest
+
+
+def _arctic_history_loader(bucket: str, *, start: dt.date, end: dt.date, region: str | None):
+    """``load(library)`` over the live libraries, read-only (never creates a library)."""
+    from nousergon_lib import arcticdb as nl_adb
+
+    lookback_days = (end - start).days + 1
+
+    full = [*_OHLCV_RENAME, *_HISTORY_EXTRA_COLUMNS]
+
+    def load(library: str) -> dict[str, Any]:
+        """Every listed symbol, mapped to its frame or to None when no read succeeded.
+
+        Narrow columns first (universe frames also carry ~100 feature
+        columns), then OHLCV only for a symbol whose frame lacks VWAP or
+        source. A symbol that fails both stays in the map as None, so the
+        export names it as skipped instead of losing it.
+        """
+        lib = nl_adb.open_arctic(bucket, region=region).get_library(library, create_if_missing=False)
+        listed = sorted(lib.list_symbols())
+
+        def read(symbols: list[str], columns: list[str]) -> dict[str, Any]:
+            if not symbols:
+                return {}
+            return nl_adb._load_arctic_frames(  # noqa: SLF001 - the shared read core both public readers use
+                lib, symbols, lookback_days=lookback_days, end=str(end), columns=columns, label=library
+            )
+
+        frames = read(listed, full)
+        frames.update(read([t for t in listed if t not in frames], list(_OHLCV_RENAME)))
+        return {t: frames.get(t) for t in listed}
+
+    return load
+
+
+def _sectors(get: Callable[[str], bytes]) -> dict[str, str | None]:
+    doc = json.loads(get(CLASSIFICATION_KEY))
+    return {str(t): (row or {}).get("sector") for t, row in (doc.get("data") or {}).items()}
+
+
 # -- CLI --------------------------------------------------------------------
 
 
@@ -354,12 +558,33 @@ def main(argv: list[str] | None = None) -> int:
     sub.choices["parity"].add_argument(
         "--consumer-panel", required=True, help="s3:// URI or path of the consumer's directly compiled panel"
     )
+    history = sub.add_parser("history", help="one-off frozen export of both libraries up to --end")
+    history.add_argument("--name", required=True, help="export name, one path segment")
+    history.add_argument("--start", required=True, type=dt.date.fromisoformat)
+    history.add_argument("--end", required=True, type=dt.date.fromisoformat)
+    history.add_argument("--bucket", default=DEFAULT_BUCKET)
+    history.add_argument("--region", default=None)
+    history.add_argument("--dry-run", metavar="DIR", nargs="?", const="daily_panel_dry_run", default=None)
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s: %(message)s")
     dry_run_dir = Path(args.dry_run) if args.dry_run else None
     get, put = _s3_io(args.bucket, dry_run_dir)
     try:
-        if args.command == "publish":
+        if args.command == "history":
+            manifest = export_history(
+                name=args.name,
+                start=args.start,
+                end=args.end,
+                load=_arctic_history_loader(args.bucket, start=args.start, end=args.end, region=args.region),
+                sectors=_sectors(get),
+                put=put,
+            )
+            result = {k: v for k, v in manifest.items() if k not in ("libraries", "notes", "columns")}
+            result["libraries"] = {
+                lib: {k: v for k, v in meta.items() if k != "per_ticker"}
+                for lib, meta in manifest["libraries"].items()
+            }
+        elif args.command == "publish":
             panel = compile_panel(
                 args.bucket, trading_day=args.date, lookback_days=args.lookback_days, region=args.region
             )

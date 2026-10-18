@@ -75,6 +75,7 @@ writes:
   - "data_collection/panel/{trading_day}/panel.parquet"
   - "data_collection/panel/{trading_day}/manifest.json"
   - "data_collection/panel/{trading_day}/parity.json"
+  - "data_collection/panel/history/"
 consumers:
   - "crucible:crucible/data/sources.py"
 consumers_reason: >-
@@ -118,6 +119,9 @@ completeness:
   # data.phase3.daily_panel_adopted's parity leg (data_gate/panel.py).
   operator_writes:
     - "data_collection/panel/{trading_day}/parity.json"
+    # The one-off frozen history export (`builders.daily_panel history`,
+    # dispatcher workload `panel-history-export`, alpha-engine-config-I12399).
+    - "data_collection/panel/history/"
   note: >-
     Enforced IN THE PRODUCER: an empty per-ticker frame, a null or non-positive
     value, or no rows on the session raises before any write

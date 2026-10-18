@@ -340,3 +340,30 @@ def test_set_model_zoo_unservable_is_the_sole_writer_of_the_top_level_flag(doc):
         if isinstance(st, dict) and st.get("ResultPath") == "$.model_zoo_unservable"
     ]
     assert writers == ["SetModelZooUnservable"]
+
+
+def test_unservable_notice_tells_the_operator_the_truth(branch_b):
+    """The notice is the ONLY thing most readers see of an unservable cycle,
+    so it must not contradict the arena it reports on.
+
+    Until 2026-10-17 it said "the base champion-arch retrain already
+    trained+promoted". That has been false on every unservable cycle since
+    2026-09-18: the champion-arch refresh is one of the arms the behavioral
+    veto refuses, and the live model stays UNCHANGED (predictor-model-zoo log,
+    2026-10-17 run f4b49786: "the champion-arch refresh was refused
+    (behavioral_veto) — the live model is UNCHANGED"). It also omitted that the
+    condition is standing, so the operator read a month-old condition as a
+    fresh break."""
+    msg = branch_b["PublishModelZooUnservableNotice"]["Parameters"]["Message.$"]
+    assert "trained+promoted" not in msg, (
+        "the notice must not claim a promotion happened on a cycle where "
+        "nothing was promoted"
+    )
+    assert "UNCHANGED" in msg
+    # Where the cause and its repair are tracked.
+    assert "alpha-engine-config-I11106" in msg
+    # Placeholders and arguments agree, or States.Format raises at runtime.
+    assert msg.count("{}") == msg.count("$.run_date")
+    # No unescaped intrinsic-function specials inside the template body.
+    body = msg.split("States.Format('", 1)[1].rsplit("',", 1)[0]
+    assert "'" not in body and "\\" not in body

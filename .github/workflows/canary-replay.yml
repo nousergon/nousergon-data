@@ -170,6 +170,15 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_SHA: ${{ github.event.pull_request.head.sha }}
           PR_DATA_REF: ${{ github.event.pull_request.head.ref }}
+          # A re-run of this job must PROBE AGAIN, not re-read attempt 1's
+          # verdict (alpha-engine-config-I11083 / I11579). Keyed on the sha
+          # alone, a re-run dispatched while attempt 1's box was still
+          # shutting down got concurrent_skip with no dispatched_at, and the
+          # poller accepted attempt 1's marker in 2s (nousergon-data#2183, run
+          # 38880701852, job 116909685238). The dispatcher suffixes the
+          # run_token (and so the marker key and the box's dedupe tag) with
+          # the attempt number when it is > 1.
+          RUN_ATTEMPT: ${{ github.run_attempt }}
         run: |
           PAYLOAD=$(jq -n \
             --arg mode "pr" \
@@ -177,7 +186,8 @@ jobs:
             --arg pr_number "$PR_NUMBER" \
             --arg sha "$PR_SHA" \
             --arg data_ref "$PR_DATA_REF" \
-            '{mode: $mode, repo: $repo, pr_number: $pr_number, sha: $sha, data_ref: $data_ref}')
+            --arg run_attempt "$RUN_ATTEMPT" \
+            '{mode: $mode, repo: $repo, pr_number: $pr_number, sha: $sha, data_ref: $data_ref, run_attempt: $run_attempt}')
 
           RESP=$(mktemp)
           aws lambda invoke --function-name alpha-engine-canary-replay-dispatcher \
@@ -200,6 +210,15 @@ jobs:
               echo "::error::canary-replay-dispatcher declined to launch: $(cat "$RESP")"
               exit 1
             fi
+          fi
+          RUN_TOKEN=$(jq -r '.run_token // empty' "$RESP")
+          if [ "$RUN_ATTEMPT" != "1" ] && [ "${RUN_TOKEN%"-a${RUN_ATTEMPT}"}" = "$RUN_TOKEN" ]; then
+            # A dispatcher that does not key on run_attempt (not yet
+            # redeployed) hands a re-run attempt 1's token, and the poller
+            # below would re-report attempt 1's verdict. Fail in seconds and
+            # say why, rather than fail WRONG with a stale verdict.
+            echo "::error::canary-replay-dispatcher returned run_token=${RUN_TOKEN} for run attempt ${RUN_ATTEMPT} — it did not key the token on run_attempt, so this re-run would read the previous attempt's marker instead of probing: $(cat "$RESP")"
+            exit 1
           fi
           MARKER_KEY=$(jq -r '.marker_key // empty' "$RESP")
           if [ -z "$MARKER_KEY" ]; then
