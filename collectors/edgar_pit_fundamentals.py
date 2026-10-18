@@ -86,13 +86,19 @@ Price basis
 Market cap = ArcticDB `universe` Close on session L (split-adjusted to the
 current share basis, `features/SCHEMA.md` §2a) x shares outstanding reported at
 date d / (product of split factors with execution date after d). The split
-factors come from the corporate-action registry that restated Close, so price
-and shares sit on one basis by construction. Diluted EPS for the growth CAGR is
-put on the same basis from its filing date.
+factors are the corporate-action registry (the record that restated Close)
+merged with polygon's split history back to `SPLIT_LOOKBACK_YEARS` before the
+first session, so price and shares sit on one basis. The registry alone holds
+only splits the daily sync saw (2026 onward), and every earlier split was missing
+until alpha-engine-config-I12418. Diluted EPS for the growth CAGR is put on the
+same basis from its filing date.
 
 Gates (the run refuses to write when one fails)
 ===============================================
 
+* Split source: each `SPLIT_SOURCE_CANARIES` name in the universe has its known
+  split in the merged set, and a polygon error stops the run rather than
+  degrading to no splits.
 * Coverage: the newest session covers at least `COVERAGE_FLOOR_RATIO` of the
   eligible universe, the same floor the crucible consumer applies.
 * Cross-check: on the newest v1 fundamentals snapshot at or before the newest
@@ -1206,6 +1212,130 @@ def registry_split_events(s3_client: Any, bucket: str) -> dict[str, list[tuple[i
     return {ticker: sorted(events) for ticker, events in out.items()}
 
 
+#: How far before the first session the vendor split history must reach. A fact
+#: the run uses can be filed this long before a session: the 3-year diluted-EPS
+#: CAGR reaches four fiscal years back, plus filing lag and
+#: `MAX_PERIOD_AGE_DAYS`. Seven years covers that with margin.
+SPLIT_LOOKBACK_YEARS = 7
+
+#: Splits that are public record, one per name. When one of these names is in the
+#: universe and its date is inside the fetched window, the merged split set must
+#: hold an event within `_SPLIT_DATE_TOLERANCE_DAYS` of it, or the run refuses.
+#: The registry alone held only 2026 splits, and nothing noticed: NVDA's P/E was
+#: about 10x off and CMG's about 50x off before their 2024 splits
+#: (alpha-engine-config-I12418).
+SPLIT_SOURCE_CANARIES: Mapping[str, str] = {
+    "NVDA": "2024-06-10",
+    "CMG": "2024-06-26",
+    "AVGO": "2024-07-15",
+    "AAPL": "2020-08-31",
+}
+_SPLIT_DATE_TOLERANCE_DAYS = 3
+
+
+def vendor_split_events(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[tuple[int, float]]]:
+    """Polygon `/v3/reference/splits` rows -> {ticker: [(ordinal, factor)]}."""
+    out: dict[str, list[tuple[int, float]]] = defaultdict(list)
+    for row in rows:
+        split_from, split_to = float(row["split_from"]), float(row["split_to"])
+        if split_from <= 0 or split_to <= 0:
+            continue
+        out[normalize_ticker(str(row["ticker"]))].append(
+            (_ordinal(str(row["execution_date"])[:10]), split_from / split_to)
+        )
+    return {ticker: sorted(events) for ticker, events in out.items()}
+
+
+def merge_split_events(
+    registry: Mapping[str, SplitEvents], vendor: Mapping[str, SplitEvents]
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, int]]:
+    """Union of the registry and the vendor history, one event per split.
+
+    A vendor event within `_SPLIT_DATE_TOLERANCE_DAYS` of an event already kept
+    (registry, or an earlier vendor row) is the same split. The registry's copy
+    wins, because that is the factor that restated `Close`. When the two disagree on the factor it is counted as a
+    conflict and the registry is still kept.
+    """
+    merged: dict[str, list[tuple[int, float]]] = {t: list(ev) for t, ev in registry.items()}
+    stats = {"registry": 0, "vendor_added": 0, "duplicates": 0, "factor_conflicts": 0}
+    stats["registry"] = sum(len(ev) for ev in registry.values())
+    for ticker, events in vendor.items():
+        known = merged.setdefault(ticker, [])
+        for ordinal, factor in events:
+            # Against everything kept so far, so a vendor row repeated in the
+            # feed is not applied twice either.
+            match = next(
+                (r for r in known if abs(r[0] - ordinal) <= _SPLIT_DATE_TOLERANCE_DAYS), None
+            )
+            if match is None:
+                known.append((ordinal, factor))
+                stats["vendor_added"] += 1
+            elif math.isclose(match[1], factor, rel_tol=1e-6):
+                stats["duplicates"] += 1
+            else:
+                stats["factor_conflicts"] += 1
+    return {t: sorted(ev) for t, ev in merged.items() if ev}, stats
+
+
+def check_split_canaries(
+    splits: Mapping[str, SplitEvents], universe: Iterable[str], *, window_start: dt.date
+) -> list[str]:
+    """The canaries that should have a split in `splits` and do; raises when one is missing."""
+    names = {normalize_ticker(t) for t in universe}
+    checked: list[str] = []
+    for ticker, date_text in SPLIT_SOURCE_CANARIES.items():
+        ordinal = _ordinal(date_text)
+        if ticker not in names or ordinal < window_start.toordinal():
+            continue
+        if not any(
+            abs(executed - ordinal) <= _SPLIT_DATE_TOLERANCE_DAYS for executed, _ in splits.get(ticker, ())
+        ):
+            raise GateFailed(
+                f"split source is incomplete: no split for {ticker} near {date_text}. "
+                "Per-share fields and market cap would sit on the pre-split basis "
+                "(alpha-engine-config-I12418)."
+            )
+        checked.append(ticker)
+    return checked
+
+
+def resolve_split_events(
+    s3_client: Any,
+    bucket: str,
+    *,
+    universe: Sequence[str],
+    start: dt.date,
+    end: dt.date,
+    fetch_vendor: Any = None,
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, Any]]:
+    """Registry splits plus the vendor's split history back to `SPLIT_LOOKBACK_YEARS` before `start`.
+
+    `fetch_vendor(start_iso, end_iso)` returns polygon split rows. Any error it
+    raises stops the run: an empty or partial history is the defect this exists
+    to prevent.
+    """
+    window_start = dt.date(max(start.year - SPLIT_LOOKBACK_YEARS, 2000), 1, 1)
+    if fetch_vendor is None:
+        from polygon_client import polygon_client
+
+        fetch_vendor = polygon_client().get_all_splits_between
+    rows = fetch_vendor(window_start.isoformat(), end.isoformat())
+    merged, stats = merge_split_events(
+        registry_split_events(s3_client, bucket), vendor_split_events(rows)
+    )
+    canaries = check_split_canaries(merged, universe, window_start=window_start)
+    # Counts only: the rows are licensed vendor data and this repo's logs are public.
+    summary = {
+        "window_start": window_start.isoformat(),
+        "vendor_rows": len(rows),
+        **stats,
+        "tickers_with_splits": len(merged),
+        "canaries_checked": len(canaries),
+    }
+    logger.info("split events: %s", json.dumps(summary, sort_keys=True))
+    return merged, summary
+
+
 # ── the build ───────────────────────────────────────────────────────────────
 
 
@@ -1534,13 +1664,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         facts_source = ApiCompanyFacts(client)
 
+    splits, split_summary = resolve_split_events(
+        s3, bucket, universe=universe, start=start, end=end
+    )
     summary = run(
         store=store,
         tickers=universe,
         cik_map=cik_map,
         facts_source=facts_source,
         closes=closes,
-        splits=registry_split_events(s3, bucket),
+        splits=splits,
         start=start,
         end=end,
         eligible=eligible,
@@ -1550,6 +1683,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         work_dir=work_dir,
     )
     summary["sec_requests"] = client.request_count
+    summary["splits"] = split_summary
     print(json.dumps(summary, indent=2, sort_keys=True, default=str))
     return 0
 
