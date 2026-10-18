@@ -151,6 +151,7 @@ import zipfile
 from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from fractions import Fraction
 from typing import Any, Protocol
 
 import pandas as pd
@@ -1233,12 +1234,39 @@ SPLIT_SOURCE_CANARIES: Mapping[str, str] = {
 _SPLIT_DATE_TOLERANCE_DAYS = 3
 
 
-def vendor_split_events(rows: Iterable[Mapping[str, Any]]) -> dict[str, list[tuple[int, float]]]:
-    """Polygon `/v3/reference/splits` rows -> {ticker: [(ordinal, factor)]}."""
+#: The smaller side of a share split's ratio is at most this. A forward N-for-1,
+#: a reverse 1-for-N, a 3-for-2 and a 5% stock dividend (20:21) all pass.
+#: Polygon also publishes spin-offs and other distributions in the splits feed,
+#: as ratios like 1000:1061 or 1:1.0517. Those do not change the parent's share
+#: count, and the ArcticDB `Close` is not restated for them, so applying one put
+#: market cap and per-share fields off by the distribution's size. Measured on
+#: the 2026-10-18 rebuild: MMM 1.196, GE 1.25, FTV 1.33, VZ 0.985
+#: (alpha-engine-config-I12418).
+_SPLIT_RATIO_MAX_SMALL_SIDE = 25
+
+
+def is_share_split(split_from: float, split_to: float) -> bool:
+    """True when the ratio is a share split or stock dividend, not a distribution."""
+    if split_from <= 0 or split_to <= 0 or split_from == split_to:
+        return False
+    # Reduce the ratio first, so 1:1.5 reads as the 2:3 it is.
+    ratio = split_to / split_from
+    reduced = Fraction(ratio).limit_denominator(_SPLIT_RATIO_MAX_SMALL_SIDE)
+    if not math.isclose(float(reduced), ratio, rel_tol=1e-6):
+        return False
+    return min(reduced.numerator, reduced.denominator) <= _SPLIT_RATIO_MAX_SMALL_SIDE
+
+
+def vendor_split_events(
+    rows: Iterable[Mapping[str, Any]], stats: dict[str, int] | None = None
+) -> dict[str, list[tuple[int, float]]]:
+    """Polygon `/v3/reference/splits` rows -> {ticker: [(ordinal, factor)]}, share splits only."""
     out: dict[str, list[tuple[int, float]]] = defaultdict(list)
     for row in rows:
         split_from, split_to = float(row["split_from"]), float(row["split_to"])
-        if split_from <= 0 or split_to <= 0:
+        if not is_share_split(split_from, split_to):
+            if stats is not None:
+                stats["vendor_not_share_split"] = stats.get("vendor_not_share_split", 0) + 1
             continue
         out[normalize_ticker(str(row["ticker"]))].append(
             (_ordinal(str(row["execution_date"])[:10]), split_from / split_to)
@@ -1320,14 +1348,16 @@ def resolve_split_events(
 
         fetch_vendor = polygon_client().get_all_splits_between
     rows = fetch_vendor(window_start.isoformat(), end.isoformat())
+    shape: dict[str, int] = {"vendor_not_share_split": 0}
     merged, stats = merge_split_events(
-        registry_split_events(s3_client, bucket), vendor_split_events(rows)
+        registry_split_events(s3_client, bucket), vendor_split_events(rows, shape)
     )
     canaries = check_split_canaries(merged, universe, window_start=window_start)
     # Counts only: the rows are licensed vendor data and this repo's logs are public.
     summary = {
         "window_start": window_start.isoformat(),
         "vendor_rows": len(rows),
+        **shape,
         **stats,
         "tickers_with_splits": len(merged),
         "canaries_checked": len(canaries),
