@@ -109,6 +109,9 @@ EXPECTED_WRITE_TARGETS: dict[str, tuple[tuple[str, ...], tuple[str, ...], tuple[
     # red at phase 3, which is the honest state.
     "D51": (
         (
+            # The one-off frozen history export (alpha-engine-config-I12399);
+            # grandfathered in ARTIFACT_REGISTRY.yaml as operator-only, no SLA.
+            "data_collection/panel/history/",
             "data_collection/panel/{trading_day}/manifest.json",
             "data_collection/panel/{trading_day}/panel.parquet",
             "data_collection/panel/{trading_day}/parity.json",
