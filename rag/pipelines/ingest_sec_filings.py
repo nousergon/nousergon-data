@@ -87,15 +87,32 @@ _SECTION_TITLES: dict[str, dict[str, tuple[str, ...]]] = {
         _MARKET_RISK: (_TITLE_MARKET_RISK,),
     },
     # 40-F (MJDS): the Annual Information Form and the MD&A are usually
-    # EXHIBITS to the 40-F rather than its primary document, so only what the
-    # primary document itself carries can be extracted here.
+    # EXHIBITS to the 40-F (EX-99.x) rather than its primary document, so the
+    # same map is applied to the primary document AND to each EX-99 exhibit
+    # (:func:`_exhibit_sections`, alpha-engine-config-I11528 item 1). An MD&A
+    # exhibit is headed by its own title line, which often runs on ("...
+    # Analysis of Financial Results for the Year Ended ..."), so the title may
+    # carry an "of"/"for" tail on that line.
     "40-F": {
         _RISK: (_TITLE_RISK,),
-        _MDA: (_TITLE_MDA,),
+        _MDA: (_TITLE_MDA + r"(?:[ \t]+(?:of|for)\b[^\n]{0,100})?",),
         _BUSINESS: (r"description\s+of\s+(?:the\s+)?business", r"business\b"),
         _MARKET_RISK: (_TITLE_MARKET_RISK,),
     },
 }
+
+# Forms whose narrative sections live in EX-99 exhibits, not the primary
+# document (alpha-engine-config-I11528 item 1). Measured on the weekly runs of
+# 2026-09-26, 2026-10-03 and 2026-10-10: BN's two 40-F primary documents
+# yielded no sections at all, every week, so the source-yield verdict read
+# DEGRADED (``no_sections=2``) on each run; CCJ and HELP 40-Fs yielded only a
+# thin wrapper (3 and 10 chunks, against ~80 for a 10-K).
+_EXHIBIT_SECTION_FORMS = frozenset({"40-F"})
+# Bound on exhibit downloads per filing. An MJDS 40-F carries the AIF, the
+# audited statements and the MD&A as three EX-99s; the rest are consents and
+# certifications, which carry no target section.
+_MAX_EXHIBITS = 6
+_EDGAR_ROOT = "https://www.sec.gov"
 
 # Kept for callers that read the label list; the per-form map above is the
 # source of truth.
@@ -219,6 +236,66 @@ def _download_filing_html(url: str) -> str | None:
     except Exception as e:
         logger.warning("Failed to download filing from %s: %s", url, e)
         return None
+
+
+def _list_exhibits(filing: dict) -> list[dict]:
+    """The EX-99 documents of one filing, read off its EDGAR filing index.
+
+    The index page (``{accession}-index.htm``) lists every document of the
+    submission in its "Document Format Files" table: Seq, Description,
+    Document, Type, Size. The Type column carries the exhibit number
+    (``EX-99.1``), which a document's file name does not reliably carry. Only
+    HTML exhibits are returned, at most :data:`_MAX_EXHIBITS`, in index order.
+    An index that cannot be read yields ``[]`` — the primary document is still
+    extracted, and an unread index is logged, never silent.
+    """
+    cik = filing.get("cik", "")
+    accession = filing.get("accession_number", "")
+    if not cik or not accession:
+        return []
+    index_url = (
+        f"{_EDGAR_ROOT}/Archives/edgar/data/{cik}/{accession.replace('-', '')}/{accession}-index.htm"
+    )
+    html = _download_filing_html(index_url)
+    if not html:
+        logger.warning("Could not read the filing index %s", index_url)
+        return []
+
+    soup = parse_filing_markup(html)
+    table = soup.find("table", class_="tableFile") or soup.find("table")
+    exhibits: list[dict] = []
+    for row in table.find_all("tr") if table else []:
+        cells = row.find_all("td")
+        link = row.find("a", href=True)
+        if len(cells) < 4 or link is None:
+            continue
+        doc_type = cells[3].get_text(strip=True).upper()
+        href = link["href"]
+        if href.startswith("/ix?doc="):
+            href = href[len("/ix?doc="):]
+        if not doc_type.startswith("EX-99") or not href.lower().endswith((".htm", ".html")):
+            continue
+        exhibits.append({
+            "exhibit_type": doc_type,
+            "url": href if href.startswith("http") else _EDGAR_ROOT + href,
+        })
+        if len(exhibits) >= _MAX_EXHIBITS:
+            break
+    return exhibits
+
+
+def _exhibit_sections(filing: dict, form_type: str) -> dict[str, str]:
+    """Sections extracted from a filing's EX-99 exhibits, longest per label."""
+    sections: dict[str, str] = {}
+    for exhibit in _list_exhibits(filing):
+        html = _download_filing_html(exhibit["url"])
+        if not html:
+            logger.warning("Could not download %s exhibit %s", exhibit["exhibit_type"], exhibit["url"])
+            continue
+        for label, text in _extract_sections(html, form_type=form_type).items():
+            if len(text) > len(sections.get(label, "")):
+                sections[label] = text
+    return sections
 
 
 # Text normalisation before any heading match: filings set headings with
@@ -446,6 +523,13 @@ def ingest_ticker(
             continue
 
         sections = _extract_sections(html, form_type=form_type)
+        if form_type in _EXHIBIT_SECTION_FORMS:
+            # The primary document of a 40-F is a wrapper; its AIF and MD&A
+            # are exhibits. Keep the longer text per label, so a wrapper's
+            # cross-reference never displaces the exhibit's real section.
+            for label, text in _exhibit_sections(filing, form_type).items():
+                if len(text) > len(sections.get(label, "")):
+                    sections[label] = text
         if not sections:
             logger.warning(
                 "No sections extracted from %s %s %s (%s)",
