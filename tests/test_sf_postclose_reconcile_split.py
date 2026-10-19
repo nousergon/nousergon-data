@@ -80,8 +80,8 @@ _SHARED = {
 
 _POSTCLOSE_ONLY = {
     # alpha-engine-config-I8102: the deploy-drift gate.
-    "DeployDriftCheck", "DeployDriftGate", "SetDeployDriftObserveWouldHaltFlag",
-    "SetDeployDriftProbeUnreadableFlag", "SetDeployDriftDegradedFlag",
+    "DeployDriftCheck", "DeployDriftGate", "SetDeployDriftHaltError",
+    "SetDeployDriftDegradedFlag",
     "PublishDeployDriftDegraded",
     # CaptureSnapshot's skip gate and its bounded same-day retry
     # (alpha-engine-config#5569).

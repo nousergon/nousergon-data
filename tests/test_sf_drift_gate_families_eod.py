@@ -19,37 +19,32 @@ edit is likely to get wrong:
 So ``sf_drift`` is a HALT family here too, and this file asserts it is routed
 as one.
 
-**It is not halting yet, and that is also asserted.** sf-pipeline-policy §7a:
-a check newly added to a scheduled pipeline path whose verdict can fail a run
-observes before it enforces. §1.3 is why the observe stage is not ceremony
-here — every trading day must terminate with a postclose completion marker and
-an ``eod_pnl`` row, *including* days nothing traded, so a false halt does not
-merely lose a run, it leaves a hole in NAV continuity. §7a.2's precedent is an
-EOD gap of precisely this shape.
+**It halts, as of ``alpha-engine-config-I8141``.** The gate shipped in
+sf-pipeline-policy §7a observe mode (``alpha-engine-config-I8102``) and was
+promoted once its written criterion was met: the three HALT-family branches and
+``DeployDriftCheck``'s Catch route to ``HandleFailure`` (the Choice branches via
+``SetDeployDriftHaltError``, which writes the shared ``$.error`` that
+``HandleFailure`` formats — a Choice cannot write state). ``cf_drift`` and
+``deploy_stamp_stale`` stay permanently non-halting.
 
-The tests below therefore pin BOTH halves:
+The tests below pin:
 
   1-3. The three HALT-family branches (``sf_drift`` true, ``sf_drift`` absent,
-       ``cf_drift`` absent) exist, in that order, ahead of the degrade family.
+       ``cf_drift`` absent) exist, in that order, ahead of the degrade family,
+       and route to ``HandleFailure`` via ``SetDeployDriftHaltError``.
   4-5. ``cf_drift=true`` and ``deploy_stamp_stale=true`` route to the
        permanently non-halting degrade path.
   6.   A clean payload reaches ``StartTradingInstance`` via ``Default`` — the
        gate costs a clean day nothing.
-  7.   During observe mode the halt family routes to a Pass that still marks
-       the run DEGRADED, so the verdict is loud (§7a obligation 3) rather than
-       suppressed.
-  8.   The probe's own failure (Catch) is an unmeasured verdict, carried on its
-       own path because ``$.drift_result.Payload`` does not exist there.
-  9.   The single notify state cannot raise ``States.Format`` on any path that
+  7.   The probe's own failure (Catch) is an unmeasured verdict and halts via
+       ``HandleFailure`` with ``ResultPath`` ``$.error``.
+  8.   The single notify state cannot raise ``States.Format`` on any path that
        reaches it, and fails open to ``StartTradingInstance``.
- 10.   The promotion criterion is written down, in the states it governs
-       (§7a obligation 2 — a guard parked in observe mode indefinitely is the
-       failure the rule exists to prevent).
- 11.   The gate is sited before the pipeline spends anything, and every route
-       into ``StartTradingInstance`` from the mutex now passes through it —
+  9.   The gate is sited before the pipeline spends anything, and every route
+       into ``StartTradingInstance`` from the mutex passes through it —
        the leak this test exists to catch is a fourth caller added later that
        jumps the gate.
- 12.   ``sf_name`` is explicit. Without it the probe answers about the PREOPEN
+ 10.   ``sf_name`` is explicit. Without it the probe answers about the PREOPEN
        state machine, and this gate would read a confident verdict about a
        pipeline that is not itself.
 """
@@ -63,7 +58,8 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _SF_PATH = _REPO_ROOT / "infrastructure" / "step_function_eod.json"
 
-_HALT_FAMILY_OBSERVE_TARGET = "SetDeployDriftObserveWouldHaltFlag"
+_HALT_TARGET = "SetDeployDriftHaltError"
+_HANDLE_FAILURE = "HandleFailure"
 _DEGRADE_TARGET = "SetDeployDriftDegradedFlag"
 _CLEAN_NEXT = "StartTradingInstance"
 
@@ -96,7 +92,7 @@ def test_sf_drift_true_is_the_first_branch_and_is_halt_family(gate):
     }
     assert comparison["Variable"] == "$.drift_result.Payload.sf_drift"
     assert comparison["BooleanEquals"] is True
-    assert gate["Choices"][0]["Next"] == _HALT_FAMILY_OBSERVE_TARGET
+    assert gate["Choices"][0]["Next"] == _HALT_TARGET
 
 
 def test_sf_drift_absent_is_halt_family(gate):
@@ -105,7 +101,7 @@ def test_sf_drift_absent_is_halt_family(gate):
     assert c["Not"] == {
         "Variable": "$.drift_result.Payload.sf_drift", "IsPresent": True,
     }
-    assert c["Next"] == _HALT_FAMILY_OBSERVE_TARGET
+    assert c["Next"] == _HALT_TARGET
 
 
 def test_cf_drift_absent_is_halt_family(gate):
@@ -113,7 +109,7 @@ def test_cf_drift_absent_is_halt_family(gate):
     assert c["Not"] == {
         "Variable": "$.drift_result.Payload.cf_drift", "IsPresent": True,
     }
-    assert c["Next"] == _HALT_FAMILY_OBSERVE_TARGET
+    assert c["Next"] == _HALT_TARGET
 
 
 def test_cf_drift_true_degrades_permanently(gate):
@@ -139,50 +135,44 @@ def test_halt_family_and_degrade_family_are_disjoint(gate):
     reverse.
     """
     targets = [c["Next"] for c in gate["Choices"]]
-    assert targets == [_HALT_FAMILY_OBSERVE_TARGET] * 3 + [_DEGRADE_TARGET] * 2
+    assert targets == [_HALT_TARGET] * 3 + [_DEGRADE_TARGET] * 2
 
 
-def test_observe_mode_still_marks_the_run_degraded(states):
-    """§7a obligation 3: observe mode is not silent.
-
-    The halt-family verdict must reach BOTH surfaces — an SNS page and a
-    terminal that is not a plain success — or it is a suppression wearing an
-    observation's name.
-    """
-    flag = states[_HALT_FAMILY_OBSERVE_TARGET]
-    assert flag["Type"] == "Pass"
-    assert flag["Parameters"]["degraded"] is True
-    assert flag["Parameters"]["reason"] == "eod_deploy_drift_observe_would_halt"
-    assert flag["Parameters"]["stage_error.$"] == "$.drift_result.Payload"
-    assert flag["ResultPath"] == "$.degraded_summary"
-    assert flag["Next"] == "PublishDeployDriftDegraded"
-
-    # $.degraded_summary is exactly what CheckDegradedOutcome reads, so the
-    # execution terminates DegradedRun rather than a plain SUCCEEDED marker.
-    outcome = states["CheckDegradedOutcome"]
-    assert outcome["Choices"][0]["Next"] == "WriteCompletionMarkerDegraded"
 
 
-def test_probe_failure_has_its_own_path_and_never_dereferences_a_missing_payload(states):
-    """The Catch cannot route to the would-halt Pass: on that path there is no
-    ``$.drift_result.Payload`` and the Pass's own Parameters would raise
-    ``States.Runtime`` — turning an unmeasured verdict into a crash whose
-    handler is somewhere else entirely."""
-    check = states["DeployDriftCheck"]
-    catch = check["Catch"][0]
+def test_probe_failure_halts_via_handle_failure_with_the_shared_error_path(states):
+    """The probe could not answer: an UNMEASURED verdict is never a pass
+    (§2.3a rule 2). Routed exactly as every other Catch that reaches
+    ``HandleFailure``, which reads ``$.error``."""
+    catch = states["DeployDriftCheck"]["Catch"][0]
     assert catch["ErrorEquals"] == ["States.ALL"]
-    assert catch["ResultPath"] == "$.drift_error"
-    assert catch["Next"] == "SetDeployDriftProbeUnreadableFlag"
+    assert catch["ResultPath"] == "$.error"
+    assert catch["Next"] == _HANDLE_FAILURE
 
-    flag = states["SetDeployDriftProbeUnreadableFlag"]
-    assert flag["Parameters"]["stage_error.$"] == "$.drift_error"
-    assert flag["Parameters"]["reason"] == "eod_deploy_drift_observe_probe_unreadable"
-    assert flag["ResultPath"] == "$.degraded_summary"
-    assert flag["Next"] == "PublishDeployDriftDegraded"
+
+def test_halt_family_writes_the_shared_error_before_handle_failure(states):
+    """A Choice cannot write state and ``HandleFailure`` formats ``$.error``;
+    routing a halt branch straight there would raise ``States.Runtime`` inside
+    the failure alert (``tests/test_sf_field_reachability.py`` catches this)."""
+    flag = states[_HALT_TARGET]
+    assert flag["Type"] == "Pass"
+    assert flag["ResultPath"] == "$.error"
+    assert flag["Parameters"]["Error"] == "DeployDriftHalt"
+    # Whole $.drift_result, never .Payload: cannot itself raise.
+    assert flag["Parameters"]["Cause.$"] == "States.JsonToString($.drift_result)"
+    assert flag["Next"] == _HANDLE_FAILURE
+
+
+def test_observe_mode_states_are_gone(states):
+    for name in (
+        "SetDeployDriftObserveWouldHaltFlag",
+        "SetDeployDriftProbeUnreadableFlag",
+    ):
+        assert name not in states, name
 
 
 def test_notify_interpolates_only_fields_every_inbound_path_writes(states):
-    """Every ``States.Format`` argument must resolve on all three inbound paths.
+    """Every ``States.Format`` argument must resolve on the inbound path.
 
     A ``States.Format`` on an absent path raises ``States.Runtime``, which this
     state's own Catch would swallow into ``StartTradingInstance`` — losing the
@@ -205,30 +195,10 @@ def test_notify_interpolates_only_fields_every_inbound_path_writes(states):
     assert notify["Parameters"]["TopicArn"].startswith("arn:aws:sns:")
     assert "TopicArn.$" not in notify["Parameters"]
 
-    inbound = [
-        _HALT_FAMILY_OBSERVE_TARGET,
-        "SetDeployDriftProbeUnreadableFlag",
-        _DEGRADE_TARGET,
-    ]
-    for name in inbound:
-        params = states[name]["Parameters"]
-        assert params["reason"], name
-        assert states[name]["ResultPath"] == "$.degraded_summary", name
+    params = states[_DEGRADE_TARGET]["Parameters"]
+    assert params["reason"]
+    assert states[_DEGRADE_TARGET]["ResultPath"] == "$.degraded_summary"
 
-
-def test_promotion_criterion_is_written_in_the_states_it_governs():
-    """§7a obligation 2 — the criterion lives in the guard, not in a PR body.
-
-    Asserted on the raw text rather than the parsed doc so that deleting the
-    observe-mode states without also deleting this test is impossible: at
-    promotion, the criterion text goes with them and this test is removed in
-    the same diff.
-    """
-    text = _SF_PATH.read_text()
-    assert "OBSERVE MODE" in text
-    assert "PROMOTION CRITERION" in text
-    assert "HandleFailure" in text
-    assert "2026-09-08" in text
 
 
 def test_gate_sits_between_the_mutex_and_the_first_spend(states):
