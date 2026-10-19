@@ -89,7 +89,9 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # alpha-engine-config-I10172: run_date.$ added — this stage had never
     # once written a _stage_coverage verdict (the I8228 "never wired" class);
     # its Payload carried no execution identity at all to key one by.
-    "SubstrateHealthGate": frozenset({"instance_id.$", "run_date.$"}),
+    # alpha-engine-config-I12351: execution_name.$ lets the handler's krepis
+    # stage-coverage verdict land in the rehearsal namespace under a rehearsal.
+    "SubstrateHealthGate": frozenset({"instance_id.$", "run_date.$", "execution_name.$"}),
     # alpha-engine-config-I8214: the stage-coverage sweep at the tail of the
     # run. Deliberately NOT threading execution_arn: the sweep reads the whole
     # CYCLE (every contributing execution for this run_date), not this one
@@ -146,8 +148,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # directly after PipelineContractGate's pass-through. Two separate Lambda
     # invokes (grading, then director) — each checks its OWN :live alias's
     # baked GIT_SHA against origin/main independently.
-    "EvaluatorDeployDriftCheck": frozenset({"action"}),
-    "EvaluatorDirectorDeployDriftCheck": frozenset({"action"}),
+    # alpha-engine-config-I12351: execution_name.$ lets the handler's krepis
+    # stage-coverage verdict land in the rehearsal namespace under a rehearsal.
+    "EvaluatorDeployDriftCheck": frozenset({"action", "execution_name.$"}),
+    "EvaluatorDirectorDeployDriftCheck": frozenset({"action", "execution_name.$"}),
     # config#1824 weekly run-day gate (pure calendar; mirrors LibPinDriftCheck shape).
     "WeeklyRunDayGate": frozenset({"action", "run_date.$", "execution_arn.$"}),  # +run_date.$ (I8155), +execution_arn.$ (I9247)
     # alpha-engine-config-I12351: execution_name.$ carries the rehearsal marker
@@ -219,8 +223,10 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
     # (Brian ruling 2026-09-16, option b) with the state itself — an entry
     # naming a state this walk cannot reach exempts nothing while reading
     # as coverage.
+    # alpha-engine-config-I12351: execution_name.$ lets the handler's krepis
+    # stage-coverage verdict land in the rehearsal namespace under a rehearsal.
     "Counterfactual": frozenset(
-        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days", "run_date.$"}
+        {"dry_run_llm.$", "end_time_iso.$", "max_depth", "window_days", "run_date.$", "execution_name.$"}
     ),
     # `coverage` (config-I7179) is the fan-in declaration: which stages must
     # have produced a cost record by the time the aggregator reads

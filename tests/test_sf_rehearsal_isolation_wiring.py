@@ -504,3 +504,51 @@ def test_the_lambda_stages_that_isolate_themselves_get_the_execution_name():
                  "Scanner", "SignalsEnvelope", "ScannerLeaderboard", "ReportCard"):
         payload = ALL[name]["Parameters"]["Payload"]
         assert payload.get("execution_name.$") == "$$.Execution.Name", name
+
+
+# The eight Lambda-backed stages whose krepis stage-coverage verdicts
+# rehearsal-2026-10-16-2 wrote at live _stage_coverage/<date>/<Stage>.json keys
+# (two of them into production's 2026-10-16 partition), measured from the
+# bucket's S3 access logs. krepis-PR252 (0.59.78) routes a verdict into
+# _stage_coverage/.rehearsal/<exec>/ when the handler passes the execution name
+# or ARN; each of these must therefore receive one. Payload key -> context path.
+_COVERAGE_EXECUTION_IDENTITY = {
+    "LibPinDriftCheck": ("execution_arn.$", "$$.Execution.Id"),
+    "PipelineContractCheck": ("execution_arn.$", "$$.Execution.Id"),
+    "EvaluatorDeployDriftCheck": ("execution_name.$", "$$.Execution.Name"),
+    "EvaluatorDirectorDeployDriftCheck": ("execution_name.$", "$$.Execution.Name"),
+    "SubstrateHealthGate": ("execution_name.$", "$$.Execution.Name"),
+    "DispatchWeeklyFreshnessSpot": ("execution_id.$", "$$.Execution.Id"),
+    "Counterfactual": ("execution_name.$", "$$.Execution.Name"),
+}
+
+
+def test_lambda_coverage_stages_receive_their_execution_identity():
+    """alpha-engine-config-I12351: without an execution identity a Lambda's
+    krepis verdict cannot tell a rehearsal from production and keys live."""
+    for name, (key, path) in _COVERAGE_EXECUTION_IDENTITY.items():
+        payload = ALL[name]["Parameters"]["Payload"]
+        assert payload.get(key) == path, name
+
+
+def test_weekly_preflight_reads_the_rehearsal_marker_from_its_whole_state_input():
+    """WeeklyPreflight is the eighth: it takes ``Payload.$ = "$"``, so its
+    handler reads ``$.rehearsal_marker.execution_name``. That holds only while
+    the whole state input is passed and the marker is set on every path to it."""
+    assert ALL["WeeklyPreflight"]["Parameters"]["Payload.$"] == "$"
+    for ns in ("ApplyRehearsalNamespace", "ApplyProductionNamespace"):
+        st = TOP[ns]
+        assert st["ResultPath"] == "$.rehearsal_marker", ns
+        assert st["Parameters"]["execution_name.$"] == "$$.Execution.Name", ns
+    blocked = {"ApplyRehearsalNamespace", "ApplyProductionNamespace"}
+    seen: set[str] = set()
+    todo = [SF["StartAt"]]
+    while todo:
+        n = todo.pop()
+        if n in seen or n in blocked or n not in TOP:
+            continue
+        seen.add(n)
+        st = TOP[n]
+        todo += [st[k] for k in ("Next", "Default") if k in st]
+        todo += [c["Next"] for c in st.get("Choices", []) + st.get("Catch", [])]
+    assert "WeeklyPreflight" not in seen
