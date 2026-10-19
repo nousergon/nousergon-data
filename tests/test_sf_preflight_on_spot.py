@@ -27,6 +27,21 @@ _GROUP = {
 _CHECKOUT = {"price_cards_cover_all_models", "recursion_budget_for_response_format", "tool_contracts"}
 
 
+@pytest.fixture(autouse=True)
+def _no_live_stage_coverage(monkeypatch):
+    """main() records a krepis stage-coverage verdict; never let a test reach
+    the real S3/CloudWatch for it. Tests that exercise the recording install
+    their own fake over this one."""
+    import sys
+    import types
+
+    # Only the submodule is replaced: the real `krepis` package stays, so
+    # nothing else this module imports from krepis is shadowed.
+    mod = types.ModuleType("krepis.stage_coverage")
+    mod.assert_stage_coverage = lambda stage, **_k: {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", mod)
+
+
 def _names(fns):
     return {fn.__name__.replace("check_", "") for fn in fns}
 
@@ -326,8 +341,114 @@ def test_aws_clients_work_with_no_region_in_the_environment(monkeypatch, tmp_pat
     monkeypatch.setattr(boto3, "DEFAULT_SESSION", None)
     monkeypatch.setattr(boto3, "client", _client)
     monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "enforce", "verdict": "OK"})
+    # This test pins THIS module's two clients. The stage-coverage verdict's
+    # clients belong to krepis (which resolves its own region) and are covered
+    # by the _record_stage_coverage tests below.
+    monkeypatch.setattr(spot, "_record_stage_coverage", lambda *a: None)
     assert spot.main(["--run-date", "2026-09-25", "--execution-name", "exec-1"]) == 0
     line = json.loads(capsys.readouterr().out.strip())
     assert "metric_error" not in line, line
     assert "artifact_error" not in line, line
     assert sorted(built) == [("cloudwatch", "us-east-1"), ("s3", "us-east-1")]
+
+
+# ── Stage-coverage verdict (alpha-engine-config-I12351, C3 2026-10-18) ──────
+
+
+class _FakeKrepis:
+    """Stands in for krepis.stage_coverage; records each call."""
+
+    def __init__(self, *, takes_execution_name: bool, raises: bool = False):
+        self.calls: list = []
+        self.raises = raises
+        if takes_execution_name:
+            def assert_stage_coverage(stage, *, run_date, window_start=None,
+                                      execution_name=None):
+                return self._record(stage, run_date=run_date,
+                                    window_start=window_start,
+                                    execution_name=execution_name)
+        else:
+            def assert_stage_coverage(stage, *, run_date, window_start=None):
+                return self._record(stage, run_date=run_date,
+                                    window_start=window_start)
+        self.assert_stage_coverage = assert_stage_coverage
+
+    def _record(self, stage, **kwargs):
+        if self.raises:
+            raise RuntimeError("registry unreadable")
+        self.calls.append((stage, kwargs))
+        return {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+
+
+def _install_krepis(monkeypatch, fake):
+    import sys
+    import types
+
+    mod = types.ModuleType("krepis.stage_coverage")
+    mod.assert_stage_coverage = fake.assert_stage_coverage
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", mod)
+
+
+def _started():
+    from datetime import datetime, timezone
+    return datetime(2026, 10, 17, 9, 4, tzinfo=timezone.utc)
+
+
+def test_records_the_stage_verdict_under_the_execution_run_date(monkeypatch):
+    fake = _FakeKrepis(takes_execution_name=True)
+    _install_krepis(monkeypatch, fake)
+    err = spot._record_stage_coverage("2026-10-16", "f4b49786-exec", _started())
+    assert err is None
+    (stage, kwargs), = fake.calls
+    assert stage == "WeeklyPreflightOnSpot" == spot.STAGE
+    assert kwargs["run_date"] == "2026-10-16"
+    assert kwargs["execution_name"] == "f4b49786-exec"
+    assert kwargs["window_start"] == _started()
+
+
+def test_a_rehearsal_on_an_old_krepis_records_nothing_live(monkeypatch):
+    fake = _FakeKrepis(takes_execution_name=False)
+    _install_krepis(monkeypatch, fake)
+    err = spot._record_stage_coverage("2026-10-16", "rehearsal-2026-10-16-2", _started())
+    assert err == "rehearsal without krepis namespacing"
+    assert fake.calls == []
+
+
+def test_a_production_run_on_an_old_krepis_still_records(monkeypatch):
+    fake = _FakeKrepis(takes_execution_name=False)
+    _install_krepis(monkeypatch, fake)
+    assert spot._record_stage_coverage("2026-10-16", "f4b49786-exec", _started()) is None
+    (stage, kwargs), = fake.calls
+    assert "execution_name" not in kwargs
+
+
+def test_no_run_date_records_nothing_and_says_so(monkeypatch):
+    fake = _FakeKrepis(takes_execution_name=True)
+    _install_krepis(monkeypatch, fake)
+    assert spot._record_stage_coverage(None, "x", _started()) == "no run_date"
+    assert fake.calls == []
+
+
+def test_a_recording_failure_never_changes_the_exit_code(monkeypatch, capsys):
+    fake = _FakeKrepis(takes_execution_name=True, raises=True)
+    _install_krepis(monkeypatch, fake)
+    monkeypatch.setattr(spot, "observe", lambda b, d: {"mode": "enforce", "verdict": "OK"})
+    monkeypatch.setattr(spot, "_write_artifact", lambda b, k, r: None)
+    monkeypatch.setattr(spot, "_emit_metrics", lambda r: None)
+    rc = spot.main(["--run-date", "2026-10-16", "--execution-name", "f4b49786-exec"])
+    assert rc == 0
+    line = json.loads(capsys.readouterr().out.strip())
+    assert line["stage_coverage_error"].startswith("RuntimeError")
+
+
+def test_main_records_the_verdict_on_every_verdict(monkeypatch, capsys):
+    fake = _FakeKrepis(takes_execution_name=True)
+    _install_krepis(monkeypatch, fake)
+    monkeypatch.setattr(spot, "observe", lambda b, d: {
+        "mode": "enforce", "verdict": "FAIL", "fail_names": ["x"]})
+    monkeypatch.setattr(spot, "_write_artifact", lambda b, k, r: None)
+    monkeypatch.setattr(spot, "_emit_metrics", lambda r: None)
+    rc = spot.main(["--run-date", "2026-10-16", "--execution-name", "f4b49786-exec"])
+    assert rc == spot.OBSERVED_FAIL_EXIT_CODE
+    assert [c[0] for c in fake.calls] == ["WeeklyPreflightOnSpot"]
+    assert "stage_coverage_error" not in json.loads(capsys.readouterr().out.strip())
