@@ -300,6 +300,6 @@ def test_the_dispatcher_exposes_the_backfill_workload() -> None:
     ).read_text()
     assert '"insider-transactions-pit-backfill"' in source
     assert (
-        "python -m collectors.insider_transactions_pit backfill --start 2018q1"
+        "python -m collectors.insider_transactions_pit backfill --start 2014q1"
         in source
     )

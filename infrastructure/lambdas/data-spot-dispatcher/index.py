@@ -453,10 +453,11 @@ _WORKLOADS: dict[str, str] = {
     ),
     # alpha-engine-config-I12461: point-in-time Form 4 insider transactions from
     # SEC's quarterly Form 3/4/5 data sets (`collectors/insider_transactions_pit.py`),
-    # 2018 onward for the model zoo's W4 family. One SEC request per quarter;
+    # 2014 onward (three years of owner history before the 2018 scoring window)
+    # for the model zoo's W4 family. One SEC request per quarter;
     # write-if-absent. Not scheduled by this change.
     "insider-transactions-pit-backfill": (
-        "python -m collectors.insider_transactions_pit backfill --start 2018q1"
+        "python -m collectors.insider_transactions_pit backfill --start 2014q1"
     ),
     # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
     # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
