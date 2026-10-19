@@ -682,3 +682,110 @@ class TestRunMode:
         assert a == mod._user_data("tok123", "gap_fill")
         assert a != mod._user_data("tok123")
         assert len(a.encode()) < 16 * 1024
+
+
+# ── ThinkTankCoverage stage-coverage verdict (alpha-engine-config-I12351) ────
+
+
+class _FakeCoverage:
+    def __init__(self, *, takes_execution_name: bool = True, raises: bool = False):
+        self.calls: list = []
+        self.raises = raises
+        if takes_execution_name:
+            def assert_stage_coverage(stage, *, run_date, window_start=None, execution_name=None):
+                return self._rec(stage, run_date=run_date, window_start=window_start,
+                                 execution_name=execution_name)
+        else:
+            def assert_stage_coverage(stage, *, run_date, window_start=None):
+                return self._rec(stage, run_date=run_date, window_start=window_start)
+        self.fn = assert_stage_coverage
+
+    def _rec(self, stage, **kw):
+        if self.raises:
+            raise RuntimeError("boom")
+        self.calls.append((stage, kw))
+        return {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+
+
+def _install_coverage(monkeypatch, fake):
+    import types
+
+    mod = types.ModuleType("krepis.stage_coverage")
+    mod.assert_stage_coverage = fake.fn
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", mod)
+
+
+_SF_EXEC = "arn:aws:states:us-east-1:711398986525:execution:ne-weekly-freshness-pipeline:f4b49786-x"
+
+
+class TestThinkTankCoverageVerdict:
+    def _launch(self, monkeypatch, event):
+        mod = _load()
+        monkeypatch.setattr(mod, "_already_running", lambda: [])
+        monkeypatch.setattr(
+            mod, "_launch_instance",
+            lambda *a, **k: mod.ec2_spot.SelfStartingLaunch("i-abc", "spot", False, False),
+        )
+        return mod, mod.handler(event, _Ctx())
+
+    def test_a_gap_fill_launch_records_the_stage_under_the_cycle_run_date(self, monkeypatch):
+        fake = _FakeCoverage()
+        _install_coverage(monkeypatch, fake)
+        mod, out = self._launch(monkeypatch, {
+            "mode": "gap_fill", "run_date": "2026-10-16", "execution_id": _SF_EXEC})
+        (stage, kw), = fake.calls
+        assert stage == "ThinkTankCoverage" == mod.STAGE_COVERAGE_STAGE
+        assert kw["run_date"] == "2026-10-16"
+        assert kw["execution_name"] == "f4b49786-x"
+        assert out["stage_coverage"]["status"] == "COVERED_NO_OUTPUT"
+
+    def test_the_daily_pass_records_nothing(self, monkeypatch):
+        fake = _FakeCoverage()
+        _install_coverage(monkeypatch, fake)
+        _, out = self._launch(monkeypatch, {"run_date": "2026-10-16"})
+        assert fake.calls == [] and "stage_coverage" not in out
+
+    def test_a_rehearsal_on_an_old_krepis_records_nothing_live(self, monkeypatch):
+        fake = _FakeCoverage(takes_execution_name=False)
+        _install_coverage(monkeypatch, fake)
+        _, out = self._launch(monkeypatch, {
+            "mode": "gap_fill", "run_date": "2026-10-16",
+            "execution_id": _SF_EXEC.replace("f4b49786-x", "rehearsal-2026-10-16-2")})
+        assert fake.calls == []
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+
+    def test_a_recording_failure_never_fails_the_dispatch(self, monkeypatch):
+        _install_coverage(monkeypatch, _FakeCoverage(raises=True))
+        _, out = self._launch(monkeypatch, {
+            "mode": "gap_fill", "run_date": "2026-10-16", "execution_id": _SF_EXEC})
+        assert out["launched"] is True
+        assert out["stage_coverage"]["status"] == "UNMEASURED"
+
+    def test_no_run_date_is_unmeasured_not_a_call(self, monkeypatch):
+        fake = _FakeCoverage()
+        _install_coverage(monkeypatch, fake)
+        _, out = self._launch(monkeypatch, {"mode": "gap_fill"})
+        assert fake.calls == [] and out["stage_coverage"]["status"] == "UNMEASURED"
+
+
+class TestStageCoverageGrant:
+    """The verdict write is scoped to this stage's own key, never the prefix."""
+
+    def _statements(self):
+        import json
+
+        with open(os.path.join(_HERE, "iam-policy.json")) as fh:
+            return {s.get("Sid"): s for s in json.load(fh)["Statement"]}
+
+    def test_put_is_scoped_to_the_thinktank_coverage_verdict(self):
+        s = self._statements()["WriteThinkTankCoverageVerdict"]
+        assert s["Action"] == "s3:PutObject"
+        assert s["Resource"] == (
+            "arn:aws:s3:::alpha-engine-research/_stage_coverage/*/ThinkTankCoverage.json"
+        )
+
+    def test_registry_read_is_the_one_key(self):
+        s = self._statements()["ReadStageCoverageRegistry"]
+        assert s["Resource"] == (
+            "arn:aws:s3:::alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml"
+        )
