@@ -499,11 +499,15 @@ def price_evidence_orientation(
     DIRECTION around its ``ex_date``.
 
     A corporate-action FEED can report a split that never happened (config#1455
-    phantom class) — or, observed live 2026-07-01/02, report a REAL split with
-    the ``split_from``/``split_to`` ratio INVERTED (polygon published HON's
-    forward 1:2 as ``2:1`` — then deleted the record upstream — and DD's
-    forward 1:3 as ``3:1``; blindly applying the stated factor multiplied both
-    tickers' full pre-ex histories instead of dividing them). The market's own
+    phantom class), or a REAL split with the ``split_from``/``split_to`` ratio
+    INVERTED. The two cases this was written for (2026-07-01/02) were NOT
+    inverted: HON 2026-06-29 (``2:1``) and DD 2026-06-24 (``3:1``) are 1-for-2
+    and 1-for-3 REVERSE splits, so polygon's records were right and the
+    operator corrections 8b2a092f2a0c743e / d33c1022d713f6ad that flipped them
+    are wrong. HON's raw boundary showed no x2 because its HONA spin-off the
+    same day cancelled the reverse split on price (config#12434, config#12436).
+    A boundary move is evidence of the factor a price series carries, not of
+    the share count. The market's own
     boundary move is ground truth for the DIRECTION polygon's adjusted
     aggregates actually applied, so the factor we fold into a price store must
     be corroborated against it, not trusted from the feed's field ordering.
@@ -845,10 +849,10 @@ def apply(
     # restate. ``effective_factor`` is the MARKET-CORROBORATED multiplier for
     # pre-ex rows — equal to the feed's ``expected_factor`` when the market
     # confirms the stated orientation, and its inverse when the market shows
-    # the feed record is inverted (observed live 2026-07-01/02: polygon
-    # published HON's forward 1:2 as ``2:1`` and DD's forward 1:3 as ``3:1``,
-    # which — applied as stated — multiplied both full histories instead of
-    # dividing them).
+    # the feed record is inverted. (The HON ``2:1`` and DD ``3:1`` records once
+    # cited here as inverted were right: both are reverse splits, and the
+    # 2026-07-02 operator corrections that flipped them are wrong; see
+    # config#12436.)
     events_to_apply: list[tuple[CorporateAction, float, bool]] = []
     for a in split_actions:
         factor = expected_factor(a)  # == split_from / split_to (as stated by feed)
