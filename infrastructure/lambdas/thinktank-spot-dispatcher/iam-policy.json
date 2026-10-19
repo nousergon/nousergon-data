@@ -124,6 +124,42 @@
           "ec2:ResourceTag/Name": "alpha-engine-thinktank-spot"
         }
       }
+    },
+    {
+      "Sid": "ReadStageCoverageRegistry",
+      "Effect": "Allow",
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_freshness_monitor/ARTIFACT_REGISTRY.yaml"
+    },
+    {
+      "Sid": "ReadStageCoverageRegistryList",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "_freshness_monitor/*"
+          ]
+        }
+      }
+    },
+    {
+      "Sid": "WriteThinkTankCoverageVerdict",
+      "Effect": "Allow",
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::alpha-engine-research/_stage_coverage/*/ThinkTankCoverage.json"
+    },
+    {
+      "Sid": "PutStageCoverageMetric",
+      "Effect": "Allow",
+      "Action": "cloudwatch:PutMetricData",
+      "Resource": "*",
+      "Condition": {
+        "StringEquals": {
+          "cloudwatch:namespace": "AlphaEngine"
+        }
+      }
     }
   ]
 }

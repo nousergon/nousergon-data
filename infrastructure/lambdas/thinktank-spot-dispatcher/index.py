@@ -456,6 +456,59 @@ def _already_running() -> list[str]:
     return spot_dispatch.running_instance_ids(INSTANCE_TAG_NAME, {}, region=REGION)
 
 
+#: The weekly SF state that invokes this dispatcher with ``mode=gap_fill``.
+#: The daily EventBridge pass is not a pipeline stage and records nothing.
+STAGE_COVERAGE_STAGE = "ThinkTankCoverage"
+#: SF execution names that start with this are weekly-SF rehearsals (the same
+#: literal as ``krepis.rehearsal`` and the coverage sweep).
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+
+
+def _assert_stage_coverage(
+    started: datetime.datetime, run_date: str | None, execution_id: str | None
+) -> dict:
+    """Record ``ThinkTankCoverage``'s own verdict (alpha-engine-config-I12351).
+
+    The stage declares ``output: none`` in ``ARTIFACT_REGISTRY.yaml``'s
+    ``pipeline_stages`` (the box writes the daily Think Tank's own keys), so
+    the verdict is ``COVERED_NO_OUTPUT``. Measured 2026-10-19: the stage had
+    never written a ``_stage_coverage`` verdict, and the 2026-10-16 weekly
+    sweep paged it ``absent`` — one of six rows holding
+    ``alpha-engine-stage-coverage-findings`` in ALARM (the I8228 "never wired"
+    class). Mirrors ``eval-judge-spot-dispatcher/index.py::_assert_stage_coverage``.
+
+    Never alters the handler's outcome. A rehearsal's verdict goes only to its
+    own namespace; on a krepis that cannot take ``execution_name`` a rehearsal
+    records nothing rather than write the live key.
+    """
+    stage = STAGE_COVERAGE_STAGE
+    if not run_date:
+        logger.error("stage-coverage assertion has no run_date for %s", stage)
+        return {"stage": stage, "status": "UNMEASURED", "reason": "no run_date on state input"}
+    try:
+        import inspect
+
+        from krepis.stage_coverage import assert_stage_coverage
+    except ImportError as exc:
+        logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
+    execution_name = (execution_id or "").rsplit(":", 1)[-1] or None
+    kwargs: dict = {"window_start": started, "run_date": run_date}
+    if "execution_name" in inspect.signature(assert_stage_coverage).parameters:
+        kwargs["execution_name"] = execution_name
+    elif (execution_name or "").startswith(REHEARSAL_EXECUTION_PREFIX):
+        logger.info(
+            "stage-coverage: %s is a rehearsal and this krepis cannot namespace "
+            "its verdict; %s not recorded", execution_name, stage,
+        )
+        return {"stage": stage, "status": "UNMEASURED", "reason": "rehearsal; not recorded live"}
+    try:
+        return assert_stage_coverage(stage, **kwargs)
+    except Exception as exc:  # noqa: BLE001 — observe mode: never fail the dispatch
+        logger.error("stage-coverage assertion failed for %s: %s", stage, exc)
+        return {"stage": stage, "status": "UNMEASURED", "reason": f"{type(exc).__name__}: {exc}"}
+
+
 def handler(event: dict, context) -> dict:
     """EventBridge handler — launch the daily Think Tank box.
 
@@ -474,6 +527,7 @@ def handler(event: dict, context) -> dict:
     duplicated.
     """
     event = event or {}
+    started = datetime.datetime.now(datetime.timezone.utc)
     force_on_demand = bool(event.get("force_on_demand", False))
     mode = _run_mode(event)
 
@@ -572,7 +626,7 @@ def handler(event: dict, context) -> dict:
         idempotency_key,
     )
 
-    return {
+    response = {
         "launched": True,
         "mode": mode,
         "replayed": result.replayed,
@@ -583,3 +637,11 @@ def handler(event: dict, context) -> dict:
         "dedupe_degraded": dedupe_degraded,
         "idempotency_probe_degraded": result.probe_degraded,
     }
+    if mode == "gap_fill":
+        # Only the weekly SF's ThinkTankCoverage state sends gap_fill, and it
+        # threads run_date + execution_id. Recorded after a launch only: a
+        # refused or failed dispatch raises above and stays `absent`.
+        response["stage_coverage"] = _assert_stage_coverage(
+            started, event.get("run_date"), event.get("execution_id"),
+        )
+    return response
