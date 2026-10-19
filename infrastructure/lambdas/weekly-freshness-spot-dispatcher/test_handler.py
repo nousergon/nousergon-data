@@ -251,3 +251,43 @@ class TestRenderedBootstrap:
         index.handler({}, None)
         cmd = sd.send_async_command.call_args.args[1]
         assert "ec2-spot-watchdog" in cmd
+
+
+class TestRehearsalStageCoverage:
+    """alpha-engine-config-I12351: rehearsal-2026-10-16-2 wrote this stage's
+    verdict at the live `_stage_coverage/<run_date>/` key. The SF's
+    `execution_id` (the execution ARN) reaches krepis, which records a
+    rehearsal's verdict in its own namespace with no StageCoverage metric."""
+
+    def _calls(self, index_mod, monkeypatch, event):
+        index, _ = index_mod
+        calls = []
+        fake = types.ModuleType("krepis.stage_coverage")
+
+        def assert_stage_coverage(stage, **kw):
+            calls.append({"stage": stage, **kw})
+            return {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+
+        fake.assert_stage_coverage = assert_stage_coverage
+        monkeypatch.setitem(sys.modules, "krepis.stage_coverage", fake)
+        index.handler(event, None)
+        assert len(calls) == 1
+        return calls[0]
+
+    def test_execution_arn_reaches_the_coverage_assertion(self, index_mod, monkeypatch):
+        arn = (
+            "arn:aws:states:us-east-1:711398986525:execution:"
+            "ne-weekly-freshness-pipeline:rehearsal-2026-10-16-2"
+        )
+        call = self._calls(
+            index_mod,
+            monkeypatch,
+            {"execution_id": arn, "run_date": "2026-10-15", "sf_stage": "DispatchWeeklyFreshnessSpot"},
+        )
+        assert call["stage"] == "DispatchWeeklyFreshnessSpot"
+        assert call["run_date"] == "2026-10-15"
+        assert call["execution_name"] == arn
+
+    def test_an_off_cycle_invocation_passes_no_execution(self, index_mod, monkeypatch):
+        call = self._calls(index_mod, monkeypatch, {"run_date": "2026-10-16"})
+        assert call["execution_name"] is None

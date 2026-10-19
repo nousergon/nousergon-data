@@ -264,6 +264,15 @@ def handler(event: dict, context) -> dict:
     # a failure: this gate must not start halting the pipeline over a payload
     # shape it previously ignored.
     run_date = event.get("run_date")
+    # alpha-engine-config-I12351: `Payload.$="$"` hands this handler the whole
+    # state input, which carries `$.rehearsal_marker` (set by
+    # ApplyRehearsalNamespace / ApplyProductionNamespace before any state that
+    # reaches here). Its execution_name routes a rehearsal's coverage verdict
+    # into the rehearsal namespace; absent, the verdict keys live as before.
+    _marker = event.get("rehearsal_marker")
+    execution_name = event.get("execution_name") or (
+        _marker.get("execution_name") if isinstance(_marker, dict) else None
+    )
     # alpha-engine-config-I8809: $.run_date is the cycle's TRADING day past
     # NormalizeRunDates; check_skip_flag_artifact_coherence compares an S3
     # LastModified and needs the wall-clock day instead.
@@ -395,7 +404,9 @@ def handler(event: dict, context) -> dict:
             "required_skip_count": required_skip_count,
             "required_skip_names": required_skip_names,
             "results": result_dicts,
-            "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date),
+            "stage_coverage": _assert_stage_coverage(
+                "WeeklyPreflight", started, run_date, execution_name
+            ),
         }
 
     metrics = _metrics("OK")
@@ -410,11 +421,16 @@ def handler(event: dict, context) -> dict:
         "required_skip_count": 0,
         "required_skip_names": [],
         "results": result_dicts,
-        "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date),
+        "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date, execution_name),
     }
 
 
-def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:
+def _assert_stage_coverage(
+    stage: str,
+    started: datetime,
+    run_date: str | None,
+    execution_name: str | None = None,
+) -> dict:
     """Record this stage's own output verdict (alpha-engine-config-I7214).
 
     `WeeklyPreflight` is an INFRASTRUCTURE/GATE stage: it positively declares
@@ -438,6 +454,14 @@ def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) 
     exists to catch (alpha-engine-config-I8155 — EXECUTION_RUN_DATE is
     deliberately the ONLY carrier, never $RUN_DATE, which other launchers in
     the fleet reassign to the trading day).
+
+    ``execution_name`` is the orchestrator execution this stage belongs to (a
+    bare name or an execution ARN). A weekly-SF rehearsal's verdict is then
+    recorded under ``_stage_coverage/.rehearsal/<exec>/`` with no
+    ``StageCoverage`` metric, never at the live key production's verdict for
+    the same run_date holds (krepis.stage_coverage.record_verdict,
+    alpha-engine-config-I12351). Absent, krepis falls back to ``$RUN_TOKEN``,
+    which a Lambda never has, so the live key: the production behaviour.
     """
     if not run_date:
         print(f"ERROR: stage-coverage assertion has no run_date for {stage} — event carried none")
@@ -447,4 +471,6 @@ def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) 
     except ImportError as exc:
         print(f"ERROR: stage-coverage assertion unavailable for {stage}: {exc}")
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
-    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    return assert_stage_coverage(
+        stage, window_start=started, run_date=run_date, execution_name=execution_name
+    )

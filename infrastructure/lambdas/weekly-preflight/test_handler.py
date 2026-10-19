@@ -213,6 +213,60 @@ class WeeklyPreflightHandlerTests(unittest.TestCase):
         )
         self.assertIn("stage_coverage", out, "DEGRADED still records stage coverage, like OK")
 
+    def _coverage_calls(self, event):
+        calls = []
+        fake = types.ModuleType("krepis.stage_coverage")
+
+        def assert_stage_coverage(stage, **kw):
+            calls.append({"stage": stage, **kw})
+            return {"stage": stage, "status": "COVERED_NO_OUTPUT"}
+
+        fake.assert_stage_coverage = assert_stage_coverage
+        saved = sys.modules.get("krepis.stage_coverage")
+        sys.modules["krepis.stage_coverage"] = fake
+        try:
+            _install_stub([_Result("sf_iam_reachability", "ok")])
+            out = self._handler()(event, None)
+        finally:
+            if saved is None:
+                sys.modules.pop("krepis.stage_coverage", None)
+            else:
+                sys.modules["krepis.stage_coverage"] = saved
+        self.assertEqual(out["status"], "OK")
+        self.assertEqual(len(calls), 1)
+        return calls[0]
+
+    def test_rehearsal_marker_routes_the_coverage_verdict(self):
+        """alpha-engine-config-I12351: rehearsal-2026-10-16-2 wrote this
+        stage's verdict at the live `_stage_coverage/<run_date>/` key. The
+        state input's `rehearsal_marker.execution_name` reaches krepis, which
+        then records a rehearsal's verdict in its own namespace."""
+        call = self._coverage_calls(
+            {
+                "run_date": "2026-10-15",
+                "rehearsal_marker": {
+                    "is_rehearsal": True,
+                    "execution_name": "rehearsal-2026-10-16-2",
+                },
+            }
+        )
+        self.assertEqual(call["stage"], "WeeklyPreflight")
+        self.assertEqual(call["run_date"], "2026-10-15")
+        self.assertEqual(call["execution_name"], "rehearsal-2026-10-16-2")
+
+    def test_production_execution_name_is_forwarded_unchanged(self):
+        call = self._coverage_calls(
+            {
+                "run_date": "2026-10-16",
+                "rehearsal_marker": {"is_rehearsal": False, "execution_name": "weekly-2026-10-17"},
+            }
+        )
+        self.assertEqual(call["execution_name"], "weekly-2026-10-17")
+
+    def test_no_marker_leaves_execution_name_unset(self):
+        call = self._coverage_calls({"run_date": "2026-10-16"})
+        self.assertIsNone(call["execution_name"])
+
     def test_optional_skip_stays_ok(self):
         """A skip declared optional (CHECK_REQUIRED[...] = False) never
         escalates the aggregate status — only a REQUIRED skip does."""
