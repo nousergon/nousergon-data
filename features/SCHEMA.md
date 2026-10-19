@@ -182,7 +182,7 @@ version is kept in `fundamentals_pit/edgar/v1/facts/{run_date}/{run_id}.parquet`
 | `payout_ratio` | ratio, clip [0, 2] | dividends paid TTM / net income TTM; 0.0 when cash flow was reported and no dividend tagged | crucible `payout_ratio` |
 | `close_raw` | USD | ArcticDB `universe` `Close` on L (current split basis) | audit |
 | `market_cap_raw` | USD | `close_raw` x `shares_outstanding_raw` | audit |
-| `shares_outstanding_raw` | shares, current split basis | reported shares / product of registry split factors after the report date | audit |
+| `shares_outstanding_raw` | shares, current split basis | reported shares / product of split factors after the cover-page date (dei) or the filing date (us-gaap, restated by its filing); a count a whole power of ten from the last accepted one, or under 100,000, is refused | audit |
 | `net_income_ttm_raw`, `revenue_ttm_raw`, `gross_profit_ttm_raw`, `fcf_ttm_raw`, `dividends_ttm_raw` | USD | trailing twelve months (see below) | audit |
 | `equity_raw`, `total_debt_raw`, `assets_current_raw`, `liabilities_current_raw`, `assets_total_raw`, `liabilities_total_raw` | USD | newest balance sheet | audit |
 
@@ -216,6 +216,12 @@ quarters, Q2-Q4 derived from year-to-date cumulatives (6M - 3M, 9M - 6M, FY - 9M
 | dividends_paid | duration | USD | `PaymentsOfDividendsCommonStock`, `PaymentsOfDividends`, `PaymentsOfOrdinaryDividends` |
 | shares_outstanding | instant | shares | `EntityCommonStockSharesOutstanding` (dei), `CommonStockSharesOutstanding` |
 | diluted_weighted_shares | duration | shares | `WeightedAverageNumberOfDilutedSharesOutstanding` (used only when no share count is tagged) |
+
+Share counts are screened before use (alpha-engine-config-I12426): a fact a whole power of ten from the
+last accepted count is a units error and is refused unless another share tag in the same filing agrees
+with it, and a count under 100,000 is a pre-listing shell's. The run refuses to write when any ticker's
+share count moves more than 3x between adjacent sessions with no split between them, unless that jump
+is declared with a reason in `SHARE_COUNT_JUMPS_DECLARED`.
 
 Total debt = the combined figure when tagged; else long-term (total, or noncurrent + current portion)
 plus short-term borrowings and commercial paper. With no long-term or combined tag it is null: JPM,
