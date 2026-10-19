@@ -222,6 +222,12 @@ class TestTrailingTwelveMonths:
 # -- fields and v1 normalisation ------------------------------------------------
 
 
+#: Shares in the synthetic filings are in millions, so they clear the placeholder
+#: floor (`MIN_SHARE_COUNT`); closes are divided by the same factor, keeping every
+#: market cap in the units the asserts read.
+_M = 1_000_000
+
+
 def _balance_sheet_event(**overrides: float) -> dict:
     facts = [
         _fact("net_income", "2023-01-01", "2023-12-31", overrides.get("income", 100), "2024-02-01"),
@@ -234,7 +240,7 @@ def _balance_sheet_event(**overrides: float) -> dict:
         _fact("liabilities_total", None, "2023-12-31", 1500, "2024-02-01"),
         _fact("operating_cash_flow", "2023-01-01", "2023-12-31", 150, "2024-02-01"),
         _fact("capex", "2023-01-01", "2023-12-31", 50, "2024-02-01"),
-        _fact("shares_outstanding", None, "2024-01-20", 100, "2024-02-01", unit="shares"),
+        _fact("shares_outstanding", None, "2024-01-20", 100 * _M, "2024-02-01", unit="shares"),
     ]
     if "long_term_debt" in overrides:
         facts.append(
@@ -252,7 +258,7 @@ def _balance_sheet_event(**overrides: float) -> dict:
 class TestFields:
     def test_v1_normalisations_and_the_price_fields(self) -> None:
         event = _balance_sheet_event(long_term_debt=400, short_term=100)["event"]
-        row = e.session_row(ticker="T", cik=1, label=dt.date(2024, 3, 1), event=event, close=30.0)
+        row = e.session_row(ticker="T", cik=1, label=dt.date(2024, 3, 1), event=event, close=30.0 / _M)
         assert row["roe"] == pytest.approx(0.2)
         assert row["debt_to_equity"] == pytest.approx((500 / 500) / 2)
         assert row["gross_margin"] == pytest.approx(0.4)
@@ -273,7 +279,7 @@ class TestFields:
 
     def test_the_v1_clips_bound_every_field(self) -> None:
         event = _balance_sheet_event(income=100_000, long_term_debt=400)["event"]
-        row = e.session_row(ticker="T", cik=1, label=dt.date(2024, 3, 1), event=event, close=0.001)
+        row = e.session_row(ticker="T", cik=1, label=dt.date(2024, 3, 1), event=event, close=0.001 / _M)
         assert row["roe"] == 1.0
         assert -3.0 <= row["pe_ratio"] <= 3.0
 
@@ -288,9 +294,9 @@ class TestFields:
     def test_market_cap_puts_reported_shares_on_the_close_basis(self) -> None:
         """Shares reported 2024-01-20; a 2-for-1 split executes 2024-06-01; Close is current basis."""
         built = _balance_sheet_event(long_term_debt=400, split=True)
-        assert built["event"].shares_current_basis == pytest.approx(200)
+        assert built["event"].shares_current_basis == pytest.approx(200 * _M)
         row = e.session_row(
-            ticker="T", cik=1, label=dt.date(2024, 3, 1), event=built["event"], close=15.0
+            ticker="T", cik=1, label=dt.date(2024, 3, 1), event=built["event"], close=15.0 / _M
         )
         assert row["market_cap_raw"] == pytest.approx(3000.0)
 
@@ -345,6 +351,223 @@ class TestGates:
         v1 = pd.DataFrame({"ticker": tickers, "pe_ratio": [0.5] * 20})
         with pytest.raises(e.GateFailed, match="under the 100-name minimum"):
             e.crosscheck_against_v1(_frame(tickers, [15.0] * 20), v1)
+
+
+# -- share counts (alpha-engine-config-I12426) --------------------------------------
+#
+# Each failure shape below is the one measured in companyfacts for the named
+# ticker, with the real reported values and filing dates.
+
+_DEI = ("dei", "EntityCommonStockSharesOutstanding", 0)
+_CSO = ("us-gaap", "CommonStockSharesOutstanding", 1)
+_WAD = ("us-gaap", "WeightedAverageNumberOfDilutedSharesOutstanding", 0)
+
+
+def _share(tag: tuple[str, str, int], end: str, value: float, filed: str, *, start: str | None = None) -> e.Fact:
+    taxonomy, concept, priority = tag
+    return e.Fact(
+        quantity="diluted_weighted_shares" if tag is _WAD else "shares_outstanding",
+        priority=priority,
+        start=_o(start) if start else None,
+        end=_o(end),
+        value=float(value),
+        filed=_o(filed),
+        accession=f"acc-{filed}",
+        taxonomy=taxonomy,
+        concept=concept,
+        unit="shares",
+        form="10-Q",
+    )
+
+
+def _shares_by_filing(facts: list[e.Fact], splits=()) -> tuple[dict[str, float | None], list]:
+    rejected: list = []
+    ordered = sorted(facts, key=lambda f: (f.filed, f.accession))
+    events = e.filing_events(ordered, splits=splits, evaluate_from=0, share_rejections=rejected)
+    return {dt.date.fromordinal(ev.filed).isoformat(): ev.shares_current_basis for ev in events}, rejected
+
+
+class TestShareCounts:
+    def test_hxl_a_cover_count_a_million_times_too_large_is_refused_twice(self) -> None:
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_DEI, "2024-04-19", 83_114_360, "2024-04-22"),
+                _share(_DEI, "2024-07-15", 81_748_036_000_000, "2024-07-18"),
+                _share(_DEI, "2024-10-18", 81_002_128_000_000, "2024-10-21"),
+                _share(_DEI, "2025-01-31", 81_131_630, "2025-02-05"),
+            ]
+        )
+        assert shares["2024-07-18"] == shares["2024-10-21"] == 83_114_360
+        assert shares["2025-02-05"] == 81_131_630
+        assert [(r.shift, r.reason) for r in rejected] == [(6, "scale"), (6, "scale")]
+
+    def test_hl_a_cover_count_in_thousands_is_refused_on_consecutive_filings(self) -> None:
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_DEI, "2024-02-09", 625_117_775, "2024-02-15"),
+                _share(_DEI, "2024-05-03", 626_290_204_000, "2024-05-09"),
+                _share(_DEI, "2024-08-02", 629_715_867_000, "2024-08-07"),
+                _share(_DEI, "2024-11-01", 637_015_400, "2024-11-07"),
+            ]
+        )
+        assert shares["2024-05-09"] == shares["2024-08-07"] == 625_117_775
+        assert shares["2024-11-07"] == 637_015_400
+        assert {r.shift for r in rejected} == {3}
+
+    def test_ntap_a_cover_count_a_tenth_too_small_falls_to_the_balance_sheet(self) -> None:
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_DEI, "2023-11-28", 206_031_047, "2023-11-30"),
+                _share(_CSO, "2024-01-26", 206_000_000, "2024-02-29"),
+                _share(_DEI, "2024-02-23", 20_637_666, "2024-02-29"),
+            ]
+        )
+        assert shares["2024-02-29"] == 206_000_000
+        assert [(r.concept, r.shift) for r in rejected] == [("EntityCommonStockSharesOutstanding", -1)]
+
+    def test_echo_a_weighted_average_in_thousands_is_refused_and_a_merger_is_not(self) -> None:
+        """EchoStar tags no undimensioned cover count, so the weighted average is its only
+        share tag. The DISH merger more than tripled it, which is a real change; the 10-Qs
+        from 2024-05 carry it a thousand times too small, which is not."""
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_WAD, "2023-09-30", 83_850_000, "2023-11-06", start="2023-07-01"),
+                _share(_WAD, "2023-12-31", 270_842_000, "2024-02-29", start="2023-01-01"),
+                _share(_WAD, "2023-03-31", 307_410, "2024-05-08", start="2023-01-01"),
+                _share(_WAD, "2024-03-31", 271_519, "2024-05-08", start="2024-01-01"),
+                _share(_WAD, "2024-06-30", 271_592, "2024-08-09", start="2024-04-01"),
+                _share(_WAD, "2024-12-31", 274_079_000, "2025-02-27", start="2024-01-01"),
+            ]
+        )
+        assert shares["2024-02-29"] == 270_842_000
+        assert shares["2024-05-08"] == shares["2024-08-09"] == 270_842_000
+        assert shares["2025-02-27"] == 274_079_000
+        assert len(rejected) == 3 and {r.shift for r in rejected} == {-3}
+
+    def test_ahr_an_offering_that_doubles_the_count_is_kept(self) -> None:
+        """AHR's February 2024 listing doubled its shares. Not a decimal shift: kept, and
+        under the continuity gate's 3x. Its first post-listing cover count (2024-03-22)
+        is half the later ones, which no periodic filing at that date can contradict."""
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_WAD, "2023-09-30", 66_048_991, "2023-11-13", start="2023-07-01"),
+                _share(_DEI, "2024-03-15", 65_372_222, "2024-03-22"),
+                _share(_DEI, "2024-08-07", 131_647_015, "2024-08-09"),
+            ]
+        )
+        assert shares == {"2023-11-13": 66_048_991, "2024-03-22": 65_372_222, "2024-08-09": 131_647_015}
+        assert rejected == []
+
+    def test_a_shell_s_founder_shares_are_not_a_share_count(self) -> None:
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_DEI, "2023-05-11", 1000, "2023-05-16"),
+                _share(_DEI, "2023-08-03", 56_566_214, "2023-08-08"),
+            ]
+        )
+        assert shares == {"2023-05-16": None, "2023-08-08": 56_566_214}
+        assert [r.reason for r in rejected] == ["placeholder"]
+
+    def test_a_level_change_both_tags_report_is_kept(self) -> None:
+        """A 10-for-1 the split set does not know: the cover count and the weighted
+        average move together, which a mis-scaled tag never does."""
+        shares, rejected = _shares_by_filing(
+            [
+                _share(_DEI, "2024-04-20", 50_000_000, "2024-04-25"),
+                _share(_DEI, "2024-07-20", 500_000_000, "2024-07-25"),
+                _share(_WAD, "2024-06-30", 498_000_000, "2024-07-25", start="2024-04-01"),
+            ]
+        )
+        assert shares["2024-07-25"] == 500_000_000
+        assert rejected == []
+
+    def test_a_restated_weighted_average_is_not_rebased_twice(self) -> None:
+        """GOOG: the 10-Q filed after the 2022-07-18 20-for-1 split reports Q2's weighted
+        average already restated; rebasing it from the 06-30 period end made it 20x."""
+        split = [(_o("2022-07-18"), 1 / 20)]
+        shares, _ = _shares_by_filing(
+            [
+                _share(_WAD, "2022-03-31", 664_000_000, "2022-04-27", start="2022-01-01"),
+                _share(_WAD, "2022-06-30", 13_078_000_000, "2022-07-27", start="2022-04-01"),
+            ],
+            splits=split,
+        )
+        assert shares["2022-04-27"] == pytest.approx(13_280_000_000)
+        assert shares["2022-07-27"] == pytest.approx(13_078_000_000)
+
+    def test_a_cover_count_dated_before_a_split_takes_it(self) -> None:
+        split = [(_o("2024-06-10"), 0.1)]
+        shares, _ = _shares_by_filing(
+            [_share(_DEI, "2024-06-05", 2_460_000_000, "2024-06-12")], splits=split
+        )
+        assert shares["2024-06-12"] == pytest.approx(24_600_000_000)
+
+    def test_the_scale_shift_reading(self) -> None:
+        assert e.scale_shift(1000.0, 1.0) == 3
+        assert e.scale_shift(0.1, 1.0) == -1
+        assert e.scale_shift(3.23, 1.0) == 0
+        assert e.scale_shift(50.0, 1.0) == 0
+        assert e.scale_shift(1.0, 0.0) == 0
+
+
+def _session(rows: list[tuple[str, float | None, str]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "ticker": [t for t, _, _ in rows],
+            "shares_outstanding_raw": [s for _, s, _ in rows],
+            "market_cap_raw": [None if s is None else s * 10.0 for _, s, _ in rows],
+            "latest_filed": [f for _, _, f in rows],
+        }
+    )
+
+
+class TestShareCountContinuity:
+    def test_a_jump_in_any_historical_session_refuses_the_run(self) -> None:
+        sessions = {
+            dt.date(2024, 7, 17): _session([("HXL", 83e6, "2024-04-22"), ("A", 1e8, "2024-06-01")]),
+            dt.date(2024, 7, 18): _session([("HXL", 8.17e13, "2024-07-18"), ("A", 1e8, "2024-06-01")]),
+            dt.date(2026, 10, 16): _session([("HXL", 76e6, "2026-07-29"), ("A", 1e8, "2024-06-01")]),
+        }
+        with pytest.raises(e.GateFailed, match="share-count jump") as caught:
+            e.assert_share_count_continuity(sessions, {})
+        assert "'HXL'" in str(caught.value) and "2024-07-18" in str(caught.value)
+
+    def test_a_split_between_the_sessions_exempts_the_pair(self) -> None:
+        sessions = {
+            dt.date(2024, 6, 7): _session([("NVDA", 2.46e9, "2024-05-29")]),
+            dt.date(2024, 6, 10): _session([("NVDA", 24.6e9, "2024-05-29")]),
+        }
+        reading = e.assert_share_count_continuity(sessions, {"NVDA": [(_o("2024-06-10"), 0.1)]})
+        assert reading["split_exempt"] == 1 and reading["violations"] == 0
+
+    def test_a_declared_jump_passes_and_is_reported(self) -> None:
+        sessions = {
+            dt.date(2024, 2, 28): _session([("ECHO", 83.85e6, "2023-11-06")]),
+            dt.date(2024, 2, 29): _session([("ECHO", 270.842e6, "2024-02-29")]),
+        }
+        reading = e.assert_share_count_continuity(sessions, {})
+        assert [j["ticker"] for j in reading["declared"]] == ["ECHO"]
+
+    def test_a_name_with_no_market_cap_is_not_compared(self) -> None:
+        sessions = {
+            dt.date(2024, 2, 6): _session([("AHR", 66e6, "2023-11-13")]).assign(market_cap_raw=None),
+            dt.date(2024, 2, 7): _session([("AHR", 200e6, "2023-11-13")]),
+        }
+        assert e.assert_share_count_continuity(sessions, {})["adjacent_pairs"] == 0
+
+
+class TestCrosscheckHistory:
+    def test_every_comparable_snapshot_is_checked_and_a_flat_one_is_counted(self) -> None:
+        tickers = [f"T{i}" for i in range(150)]
+        pe = [5.0 + 0.5 * i % 60 for i in range(150)]
+        good = pd.DataFrame({"ticker": tickers, "pe_ratio": [p / 30.0 for p in pe]})
+        flat = pd.DataFrame({"ticker": tickers, "pe_ratio": [0.0] * 150})
+        sessions = {dt.date(2026, 4, 1): _frame(tickers, pe), dt.date(2026, 6, 1): _frame(tickers, pe)}
+        reading = e.crosscheck_history(sessions, {dt.date(2026, 4, 1): flat, dt.date(2026, 6, 1): good})
+        assert reading["snapshots_compared"] == 1 and reading["snapshots_not_comparable"] == 1
+        sessions[dt.date(2026, 6, 1)] = _frame(tickers, [p / 2.0 for p in pe])
+        with pytest.raises(e.GateFailed, match="v1 snapshot 2026-06-01"):
+            e.crosscheck_history(sessions, {dt.date(2026, 6, 1): good})
 
 
 # -- the run ----------------------------------------------------------------------
