@@ -380,10 +380,12 @@ def _share(tag: tuple[str, str, int], end: str, value: float, filed: str, *, sta
     )
 
 
-def _shares_by_filing(facts: list[e.Fact], splits=()) -> tuple[dict[str, float | None], list]:
+def _shares_by_filing(
+    facts: list[e.Fact], splits=(), cik: int | None = None
+) -> tuple[dict[str, float | None], list]:
     rejected: list = []
     ordered = sorted(facts, key=lambda f: (f.filed, f.accession))
-    events = e.filing_events(ordered, splits=splits, evaluate_from=0, share_rejections=rejected)
+    events = e.filing_events(ordered, splits=splits, evaluate_from=0, share_rejections=rejected, cik=cik)
     return {dt.date.fromordinal(ev.filed).isoformat(): ev.shares_current_basis for ev in events}, rejected
 
 
@@ -467,6 +469,24 @@ class TestShareCounts:
         )
         assert shares == {"2023-05-16": None, "2023-08-08": 56_566_214}
         assert [r.reason for r in rejected] == ["placeholder"]
+
+    def test_four_a_weighted_average_that_is_not_its_share_count_is_refused(self) -> None:
+        """Shift4 (CIK 1794669) tags no undimensioned cover count until its FY2025 10-K, and
+        its weighted average is about 2% of its share count: not a decimal shift, so only the
+        declaration refuses it. Market cap is empty in between instead of 50x low
+        (alpha-engine-config-I12433)."""
+        facts = [
+            _share(_CSO, "2021-09-30", 82_921_152, "2021-11-12"),
+            _share(_WAD, "2024-12-31", 1_668_826, "2025-02-19", start="2024-01-01"),
+            _share(_WAD, "2025-12-31", 1_333_686, "2026-02-27", start="2025-01-01"),
+            _share(_DEI, "2026-02-19", 81_239_315, "2026-02-27"),
+        ]
+        shares, rejected = _shares_by_filing(facts, cik=1794669)
+        assert shares == {"2021-11-12": 82_921_152, "2025-02-19": None, "2026-02-27": 81_239_315}
+        assert [r.reason for r in rejected] == ["declared", "declared"]
+        # Another filer's weighted average of the same size is not touched.
+        shares, rejected = _shares_by_filing(facts, cik=1)
+        assert shares["2025-02-19"] == 1_668_826 and rejected == []
 
     def test_a_level_change_both_tags_report_is_kept(self) -> None:
         """A 10-for-1 the split set does not know: the cover count and the weighted
@@ -847,6 +867,34 @@ class TestSplitSource:
         vendor = e.vendor_split_events(_rows(("BRK.B", "2010-01-21", 1, 50), ("ZZZ", "2020-01-02", 0, 1)))
         assert list(vendor) == ["BRK-B"]
 
+    def test_dd_a_correction_that_cancels_its_split_is_replaced_by_the_declared_factor(self) -> None:
+        """The registry holds polygon's DD 3:1 and an operator correction to 1:3; applied
+        together they multiply to 1.0 and DD's pre-split counts stayed 3x high
+        (alpha-engine-config-I12434)."""
+        registry = {"DD": [(_o("2026-06-24"), 3.0), (_o("2026-06-24"), 1 / 3)]}
+        assert e.split_factor_after(registry["DD"], _o("2026-05-01")) == pytest.approx(1.0)
+        with pytest.raises(e.GateFailed, match="DD"):
+            e.check_cancelling_splits(registry, ["DD"])
+        declared, applied = e.apply_declared_split_factors(registry)
+        assert declared["DD"] == [(_o("2026-06-24"), 3.0)]
+        assert "DD 2026-06-24" in applied
+        e.check_cancelling_splits(declared, ["DD"])
+        # The 2026-05-01 cover count of 409,921,306 lands on the post-split basis.
+        shares, _ = _shares_by_filing(
+            [_share(_DEI, "2026-05-01", 409_921_306, "2026-05-05")], splits=declared["DD"]
+        )
+        assert shares["2026-05-05"] == pytest.approx(136_640_435.33)
+
+    def test_hon_a_declared_factor_of_one_removes_the_pair(self) -> None:
+        registry = {"HON": [(_o("2026-06-29"), 2.0), (_o("2026-06-29"), 0.5)], "AAPL": [(_o("2020-08-31"), 0.25)]}
+        declared, _ = e.apply_declared_split_factors(registry)
+        assert "HON" not in declared and declared["AAPL"] == [(_o("2020-08-31"), 0.25)]
+
+    def test_a_cancelling_pair_outside_the_universe_is_not_checked(self) -> None:
+        e.check_cancelling_splits({"ZZZ": [(_o("2026-01-05"), 2.0), (_o("2026-01-06"), 0.5)]}, ["AAPL"])
+        with pytest.raises(e.GateFailed, match="ZZZ"):
+            e.check_cancelling_splits({"ZZZ": [(_o("2026-01-05"), 2.0), (_o("2026-01-06"), 0.5)]}, ["ZZZ"])
+
     def test_a_missing_canary_split_refuses_the_run(self) -> None:
         with pytest.raises(e.GateFailed, match="NVDA"):
             e.check_split_canaries({"NVDA": [(_o("2026-03-02"), 0.5)]}, ["NVDA"], window_start=dt.date(2015, 1, 1))
@@ -871,6 +919,7 @@ class TestSplitSource:
         assert seen == [("2015-01-01", "2026-10-16")]
         assert merged["NVDA"] == [(_o("2024-06-10"), 0.1)]
         assert summary["vendor_added"] == 1 and summary["canaries_checked"] == 1
+        assert "DD 2026-06-24" in summary["declared_factors"]
 
         def broken(start: str, end: str) -> list[dict]:
             raise RuntimeError("polygon 403")

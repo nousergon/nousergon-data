@@ -221,7 +221,11 @@ Share counts are screened before use (alpha-engine-config-I12426): a fact a whol
 last accepted count is a units error and is refused unless another share tag in the same filing agrees
 with it, and a count under 100,000 is a pre-listing shell's. The run refuses to write when any ticker's
 share count moves more than 3x between adjacent sessions with no split between them, unless that jump
-is declared with a reason in `SHARE_COUNT_JUMPS_DECLARED`.
+is declared with a reason in `SHARE_COUNT_JUMPS_DECLARED`. A share concept a filer tags with something
+other than its share count is refused per CIK in `SHARE_FACTS_REFUSED` (Shift4's weighted average,
+alpha-engine-config-I12433). A split held together with its own inverse on one date, which cancels it,
+refuses the run unless `SPLIT_FACTORS_DECLARED` fixes that date's factor (DD and HON,
+alpha-engine-config-I12434).
 
 Total debt = the combined figure when tagged; else long-term (total, or noncurrent + current portion)
 plus short-term borrowings and commercial paper. With no long-term or combined tag it is null: JPM,
