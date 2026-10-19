@@ -80,3 +80,65 @@ def test_the_harness_runner_reads_real_pytest_outcomes():
     """End to end once, with no monkeypatching: one real node, run and read back."""
     node = gc.HARNESSES["empty_fresh"].nodeid("D23")
     assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_success_without_output_publishes_its_own_observed_lines(tmp_path, monkeypatch, clean_tree):
+    """The second harness (`tests/test_guard_commissioning_success_without_output.py`).
+
+    Its record carries what THAT harness asserts (one completion-check page, no
+    retry), never the `empty_fresh` record's NotifyFailure lines.
+    """
+    monkeypatch.setattr(gc, "_run_harness", _passed)
+    argv = ["--guard", "success_without_output", "--unit", "D26", "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    document = json.loads((tmp_path / "faults/D26/success_without_output/latest.json").read_text())
+    assert document["outcome"] == "induced"
+    assert document["observed"] == list(gc.SUCCESS_WITHOUT_OUTPUT_OBSERVED)
+    assert document["test"] == gc.HARNESSES["success_without_output"].nodeid("D26")
+    unit = next(u for u in descriptors.load_units() if u.unit_id == "D26")
+    reading = evidence.read_guard_commissioning(
+        LocalStore(tmp_path), unit, "success_without_output", trading_day=dt.date(2026, 10, 15)
+    )
+    assert reading.met is True, reading.detail
+
+
+def test_success_without_output_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
+    """D23 has an `empty_fresh` case but no `success_without_output` one: nothing to publish."""
+    with pytest.raises(SystemExit, match="no induced-fault case"):
+        gc.main(["--guard", "success_without_output", "--unit", "D23", "--store", str(tmp_path)])
+
+
+def test_the_harness_runner_reads_a_real_success_without_output_outcome():
+    node = gc.HARNESSES["success_without_output"].nodeid("D03")
+    assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_cardinality_publishes_its_own_observed_lines(tmp_path, monkeypatch, clean_tree):
+    """The third harness (`tests/test_guard_commissioning_cardinality.py`).
+
+    Its record carries what THAT harness asserts (a truncated universe refused by
+    the unit's own coverage check), never another class's lines.
+    """
+    monkeypatch.setattr(gc, "_run_harness", _passed)
+    argv = ["--guard", "cardinality", "--unit", "D29", "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    document = json.loads((tmp_path / "faults/D29/cardinality/latest.json").read_text())
+    assert document["outcome"] == "induced"
+    assert document["observed"] == list(gc.CARDINALITY_OBSERVED)
+    assert document["test"] == gc.HARNESSES["cardinality"].nodeid("D29")
+    unit = next(u for u in descriptors.load_units() if u.unit_id == "D29")
+    reading = evidence.read_guard_commissioning(
+        LocalStore(tmp_path), unit, "cardinality", trading_day=dt.date(2026, 10, 15)
+    )
+    assert reading.met is True, reading.detail
+
+
+def test_cardinality_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
+    """D20's cardinality guard is the observe-only shared reading: no case, nothing to publish."""
+    with pytest.raises(SystemExit, match="no induced-fault case"):
+        gc.main(["--guard", "cardinality", "--unit", "D20", "--store", str(tmp_path)])
+
+
+def test_the_harness_runner_reads_a_real_cardinality_outcome():
+    node = gc.HARNESSES["cardinality"].nodeid("D22")
+    assert gc._run_harness([node]) == {node: "passed"}

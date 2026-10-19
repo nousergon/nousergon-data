@@ -445,6 +445,12 @@ _WORKLOADS: dict[str, str] = {
     "edgar-pit-fundamentals-daily": (
         "python -m collectors.edgar_pit_fundamentals incremental --lookback-sessions 15"
     ),
+    # alpha-engine-config-I12418: re-materialize every session from 2022 on the
+    # corrected split basis. The plain backfill is write-if-absent, so it would
+    # keep the sessions built while the registry held only 2026 splits.
+    "edgar-pit-fundamentals-rebuild": (
+        "python -m collectors.edgar_pit_fundamentals backfill --start 2022-01-03 --overwrite"
+    ),
     # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
     # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
     # workload of both the eod and morning schedule inputs

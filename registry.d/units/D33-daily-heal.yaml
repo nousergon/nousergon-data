@@ -78,7 +78,20 @@ run_manifest_prefix: data_collection/runs/D33
 # `ne-data-collection-daily-heal-failed` alarm that re-paged the same topic was
 # retired 2026-10-15 (same issue, "Cut redundant" ruling). Neither is a per-unit
 # detector here.
-detectors: []
+detectors:
+  - kind: "freshness-monitor"
+    via: "artifact-registry-row"
+    state: UNVERIFIED
+    note: >-
+        daily_heal_summary (weekday_sf, data/heal/daily/{trading_day}.json) is this
+        unit's own write and a live, un-parked row on the published registry the
+        freshness monitor enforces. Declared so the monthly threshold-tightening drill
+        (data_gate/producers/freshness_commissioning.py, alpha-engine-config-I10795)
+        commissions it. The row is date-templated, so the drill LISTs data/heal/daily/
+        and reads the newest key: the drill role's GetObject on data/heal/daily/* and
+        its s3:prefix-scoped ListBucket on the same prefix are the nous-ergon-ops-PR1732
+        grant (Brian approved 2026-10-18); until it applies the drill reads probe_failed and
+        records D33 inconclusive. UNVERIFIED until that drill writes the receipt.
 freshness:
   family: morning
   deadline: "07:30 America/New_York"

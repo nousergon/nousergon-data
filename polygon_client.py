@@ -453,6 +453,49 @@ class PolygonClient:
         results.sort(key=lambda r: r["execution_date"])
         return results
 
+    def get_all_splits_between(
+        self, start_date: str, end_date: str, *, max_pages: int = 200
+    ) -> list[dict]:
+        """Every split in ``[start_date, end_date]``, across all pages.
+
+        Unlike :meth:`get_recent_splits`, which reads only the first page and
+        returns ``[]`` on a 403, this one follows ``next_url`` to the end and
+        lets every error raise (``PolygonForbiddenError`` included). A caller
+        that puts per-share history on one basis cannot tell an empty answer
+        from a broken one, so it must never receive a silent ``[]``
+        (alpha-engine-config-I12418). Rows have the same shape as
+        :meth:`get_recent_splits`.
+        """
+        from urllib.parse import parse_qsl, urlsplit
+
+        path = "/v3/reference/splits"
+        params: dict = {
+            "execution_date.gte": start_date,
+            "execution_date.lte": end_date,
+            "limit": 1000,
+            "order": "asc",
+            "sort": "execution_date",
+        }
+        results: list[dict] = []
+        for _ in range(max_pages):
+            data = self._get(path, params=params)
+            for r in data.get("results", []) or []:
+                row = _parse_split_row(r, require_ticker=True)
+                if row is not None:
+                    results.append(row)
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            parts = urlsplit(next_url)
+            path = parts.path
+            params = {k: v for k, v in parse_qsl(parts.query) if k.lower() != "apikey"}
+        else:
+            raise RuntimeError(
+                f"polygon splits {start_date}..{end_date}: more than {max_pages} pages"
+            )
+        results.sort(key=lambda r: (r["execution_date"], r["ticker"]))
+        return results
+
     def get_dividends(self, ticker: str) -> list[dict]:
         """Fetch the cash-dividend history for one ticker (authoritative).
 

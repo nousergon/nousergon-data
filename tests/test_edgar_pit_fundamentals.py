@@ -551,3 +551,106 @@ def test_the_session_key_shape_is_literal() -> None:
     assert (
         e.session_key(dt.date(2026, 9, 11)) == "fundamentals_pit/edgar/v1/sessions/2026-09-11.parquet"
     )
+
+
+# ── split source (alpha-engine-config-I12418) ────────────────────────────────
+
+
+
+
+def _rows(*items: tuple[str, str, float, float]) -> list[dict]:
+    return [
+        {"ticker": t, "execution_date": d, "split_from": f, "split_to": to} for t, d, f, to in items
+    ]
+
+
+class TestSplitSource:
+    def test_vendor_history_fills_the_splits_the_registry_never_saw(self) -> None:
+        registry = {"NVDA": [(_o("2026-03-02"), 0.5)]}
+        vendor = e.vendor_split_events(
+            _rows(("NVDA", "2024-06-10", 1, 10), ("NVDA", "2021-07-20", 1, 4), ("CMG", "2024-06-26", 1, 50))
+        )
+        merged, stats = e.merge_split_events(registry, vendor)
+        assert merged["NVDA"] == [(_o("2021-07-20"), 0.25), (_o("2024-06-10"), 0.1), (_o("2026-03-02"), 0.5)]
+        assert merged["CMG"] == [(_o("2024-06-26"), 0.02)]
+        assert stats["vendor_added"] == 3
+        # The basis error the issue measured: shares reported before CMG's split
+        # are now divided by 0.02, i.e. multiplied by 50.
+        assert e.split_factor_after(merged["CMG"], _o("2024-03-01")) == pytest.approx(0.02)
+
+    def test_the_registry_copy_of_a_split_wins_and_a_disagreement_is_counted(self) -> None:
+        registry = {"AAA": [(_o("2026-02-02"), 0.5)], "BBB": [(_o("2026-02-02"), 0.5)]}
+        vendor = e.vendor_split_events(
+            _rows(("AAA", "2026-02-03", 1, 2), ("BBB", "2026-02-02", 2, 1))
+        )
+        merged, stats = e.merge_split_events(registry, vendor)
+        assert merged == registry
+        assert stats["duplicates"] == 1 and stats["factor_conflicts"] == 1
+
+    def test_a_split_repeated_in_the_vendor_feed_is_applied_once(self) -> None:
+        vendor = e.vendor_split_events(_rows(("CMG", "2024-06-26", 1, 50), ("CMG", "2024-06-26", 1, 50)))
+        merged, stats = e.merge_split_events({}, vendor)
+        assert merged["CMG"] == [(_o("2024-06-26"), 0.02)]
+        assert stats["vendor_added"] == 1 and stats["duplicates"] == 1
+
+    def test_distributions_in_the_splits_feed_are_not_share_splits(self) -> None:
+        stats: dict[str, int] = {}
+        vendor = e.vendor_split_events(
+            _rows(
+                ("MMM", "2024-04-01", 1000, 1196),  # spin-off style record
+                ("VZ", "2022-01-03", 1, 1.0155),  # fractional distribution
+                ("CBSH", "2023-12-01", 20, 21),  # 5% stock dividend: a real share change
+                ("WRB", "2024-06-25", 2, 3),  # 3-for-2
+                ("SIRI", "2024-09-10", 10, 1),  # 1-for-10 reverse
+                ("ODFL", "2024-03-28", 1, 2.0),  # 2-for-1 written as a float
+                ("APG", "2024-08-01", 1, 1.5),  # 3-for-2 written unreduced
+                ("NRWRF", "2026-06-01", 20.625, 21.625),  # fractional distribution
+            ),
+            stats,
+        )
+        assert sorted(vendor) == ["APG", "CBSH", "ODFL", "SIRI", "WRB"]
+        assert stats["vendor_not_share_split"] == 3
+        assert vendor["SIRI"] == [(_o("2024-09-10"), 10.0)]
+
+    def test_tickers_are_normalized_and_bad_ratios_dropped(self) -> None:
+        vendor = e.vendor_split_events(_rows(("BRK.B", "2010-01-21", 1, 50), ("ZZZ", "2020-01-02", 0, 1)))
+        assert list(vendor) == ["BRK-B"]
+
+    def test_a_missing_canary_split_refuses_the_run(self) -> None:
+        with pytest.raises(e.GateFailed, match="NVDA"):
+            e.check_split_canaries({"NVDA": [(_o("2026-03-02"), 0.5)]}, ["NVDA"], window_start=dt.date(2015, 1, 1))
+
+    def test_canaries_outside_the_universe_or_window_are_not_checked(self) -> None:
+        assert e.check_split_canaries({}, ["JPM"], window_start=dt.date(2015, 1, 1)) == []
+        assert e.check_split_canaries({}, ["AAPL"], window_start=dt.date(2021, 1, 1)) == []
+        found = {"AAPL": [(_o("2020-08-31"), 0.25)]}
+        assert e.check_split_canaries(found, ["AAPL"], window_start=dt.date(2015, 1, 1)) == ["AAPL"]
+
+    def test_resolve_reaches_back_and_lets_a_vendor_error_stop_the_run(self, monkeypatch) -> None:
+        monkeypatch.setattr(e, "registry_split_events", lambda s3, bucket: {})
+        seen: list[tuple[str, str]] = []
+
+        def fetch(start: str, end: str) -> list[dict]:
+            seen.append((start, end))
+            return _rows(("NVDA", "2024-06-10", 1, 10))
+
+        merged, summary = e.resolve_split_events(
+            None, "b", universe=["NVDA"], start=dt.date(2022, 1, 3), end=dt.date(2026, 10, 16), fetch_vendor=fetch
+        )
+        assert seen == [("2015-01-01", "2026-10-16")]
+        assert merged["NVDA"] == [(_o("2024-06-10"), 0.1)]
+        assert summary["vendor_added"] == 1 and summary["canaries_checked"] == 1
+
+        def broken(start: str, end: str) -> list[dict]:
+            raise RuntimeError("polygon 403")
+
+        with pytest.raises(RuntimeError, match="403"):
+            e.resolve_split_events(
+                None, "b", universe=["NVDA"], start=dt.date(2022, 1, 3), end=dt.date(2026, 10, 16), fetch_vendor=broken
+            )
+
+
+def test_the_rebuild_workload_overwrites_from_2022() -> None:
+    source = (_REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py").read_text()
+    assert '"edgar-pit-fundamentals-rebuild"' in source
+    assert "python -m collectors.edgar_pit_fundamentals backfill --start 2022-01-03 --overwrite" in source
