@@ -79,6 +79,10 @@ def test_data_venv_carries_the_released_krepis_stage_coverage_contract():
     pinned = _version(_requirements_krepis_pin())
     assert pinned >= (0, 59, 31), "pre-I8155 StageVerdict contract"
     assert pinned >= (0, 59, 67), "pre-unpriced_live_primaries krepis"
+    # alpha-engine-config-I12351: 0.59.78 (krepis-PR252) is the first krepis whose
+    # stage-coverage verdicts and RSS rows stay in a rehearsal's namespace when the
+    # spot stage runs under a rehearsal RUN_TOKEN.
+    assert pinned >= (0, 59, 78), "pre-rehearsal-namespace krepis"
 
 
 def test_nothing_overrides_the_data_venvs_own_krepis_pin():

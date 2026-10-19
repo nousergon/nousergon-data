@@ -166,7 +166,12 @@ def _parse_disk_used_percent(stdout: str) -> int | None:
     return int(match.group(1))
 
 
-def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:
+def _assert_stage_coverage(
+    stage: str,
+    started: datetime,
+    run_date: str | None,
+    execution_name: str | None = None,
+) -> dict:
     """Record this stage's own output verdict (alpha-engine-config-I10172).
 
     `SubstrateHealthGate` is an INFRASTRUCTURE/GATE stage: it positively
@@ -184,6 +189,14 @@ def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) 
     Mirrors `weekly-preflight/index.py::_assert_stage_coverage` and
     `weekly-freshness-spot-dispatcher/index.py::_assert_stage_coverage`
     (`policy-shared-code` — third adoption of the same shape in this repo).
+
+    ``execution_name`` is the orchestrator execution this stage belongs to (a
+    bare name or an execution ARN). A weekly-SF rehearsal's verdict is then
+    recorded under ``_stage_coverage/.rehearsal/<exec>/`` with no
+    ``StageCoverage`` metric, never at the live key production's verdict for
+    the same run_date holds (krepis.stage_coverage.record_verdict,
+    alpha-engine-config-I12351). Absent, krepis falls back to ``$RUN_TOKEN``,
+    which a Lambda never has, so the live key: the production behaviour.
     """
     if not run_date:
         logger.error(
@@ -196,7 +209,9 @@ def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) 
     except ImportError as exc:
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
-    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    return assert_stage_coverage(
+        stage, window_start=started, run_date=run_date, execution_name=execution_name
+    )
 
 
 def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG001
@@ -207,6 +222,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
     # follows.
     started = datetime.now(timezone.utc)
     run_date = str(event.get("run_date", "")).strip() or None
+    # alpha-engine-config-I12351: the SF passes `$$.Execution.Name`, so a
+    # weekly-SF rehearsal's coverage verdict lands in the rehearsal namespace.
+    execution_name = str(event.get("execution_name", "")).strip() or None
 
     command_id = _send_probe(instance_id)
     outcome = _poll_to_terminal(command_id, instance_id)
@@ -229,7 +247,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"agent process is dead."
         )
         logger.warning(result["message"])
-        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
+        result["stage_coverage"] = _assert_stage_coverage(
+            "SubstrateHealthGate", started, run_date, execution_name
+        )
         return result
 
     if outcome["status"] != "Success":
@@ -245,7 +265,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"or under severe resource pressure."
         )
         logger.warning(result["message"])
-        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
+        result["stage_coverage"] = _assert_stage_coverage(
+            "SubstrateHealthGate", started, run_date, execution_name
+        )
         return result
 
     used_percent = _parse_disk_used_percent(outcome["stdout"])
@@ -264,7 +286,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"substrate signal failure rather than assuming healthy."
         )
         logger.warning(result["message"])
-        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
+        result["stage_coverage"] = _assert_stage_coverage(
+            "SubstrateHealthGate", started, run_date, execution_name
+        )
         return result
 
     if used_percent >= DISK_WARN_PERCENT:
@@ -277,7 +301,9 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
             f"partial output."
         )
         logger.warning(result["message"])
-        result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
+        result["stage_coverage"] = _assert_stage_coverage(
+            "SubstrateHealthGate", started, run_date, execution_name
+        )
         return result
 
     result["verdict"] = "HEALTHY"
@@ -286,5 +312,7 @@ def handler(event: dict[str, Any], context: Any) -> dict[str, Any]:  # noqa: ARG
         f"agent responsive."
     )
     logger.info(result["message"])
-    result["stage_coverage"] = _assert_stage_coverage("SubstrateHealthGate", started, run_date)
+    result["stage_coverage"] = _assert_stage_coverage(
+        "SubstrateHealthGate", started, run_date, execution_name
+    )
     return result

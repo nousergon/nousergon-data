@@ -268,7 +268,9 @@ def test_the_multimode_launcher_asserts_only_the_phase2_stage() -> None:
 def test_weekly_preflight_records_its_no_output_declaration() -> None:
     body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
     assert "from krepis.stage_coverage import assert_stage_coverage" in body
-    assert '_assert_stage_coverage("WeeklyPreflight", started, run_date)' in body
+    # alpha-engine-config-I12351: execution_name rides along so a rehearsal's
+    # verdict lands in krepis' rehearsal namespace.
+    assert '_assert_stage_coverage("WeeklyPreflight", started, run_date, execution_name)' in body
     assert '"stage_coverage"' in body
 
 
@@ -313,15 +315,21 @@ def test_weekly_preflight_threads_the_event_run_date() -> None:
     Payload change needed, only wiring it into the assertion call."""
     body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
     assert 'run_date = event.get("run_date")' in body
-    assert "def _assert_stage_coverage(stage: str, started: datetime, run_date: str | None) -> dict:" in body
-    assert "assert_stage_coverage(stage, window_start=started, run_date=run_date)" in body
+    assert (
+        "def _assert_stage_coverage(\n    stage: str,\n    started: datetime,\n"
+        "    run_date: str | None,\n    execution_name: str | None = None,\n) -> dict:"
+    ) in body
+    assert (
+        "assert_stage_coverage(\n        stage, window_start=started, run_date=run_date, "
+        "execution_name=execution_name\n    )"
+    ) in body
 
 
 def test_weekly_preflight_never_fabricates_a_run_date() -> None:
     """A missing run_date on the event must report UNMEASURED, never invent a
     date — that is exactly the defect alpha-engine-config-I8155 fixes."""
     body = (INFRA / "lambdas" / "weekly-preflight" / "index.py").read_text()
-    fn = body[body.index("def _assert_stage_coverage(stage: str, started: datetime, run_date"):]
+    fn = body[body.index("def _assert_stage_coverage(\n    stage: str,\n    started: datetime,"):]
     assert "if not run_date:" in fn
     guard = fn[: fn.index("try:\n        from krepis.stage_coverage")]
     assert '"status": "UNMEASURED"' in guard
@@ -346,15 +354,21 @@ def test_the_spot_dispatcher_threads_the_event_run_date() -> None:
         INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
     ).read_text()
     assert 'str(event.get("run_date", "")).strip() or None' in body
-    assert "def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str | None) -> dict:" in body
-    assert "assert_stage_coverage(stage, window_start=started, run_date=run_date)" in body
+    assert (
+        "def _assert_stage_coverage(\n    stage: str,\n    started: datetime.datetime,\n"
+        "    run_date: str | None,\n    execution_name: str | None = None,\n) -> dict:"
+    ) in body
+    assert (
+        "assert_stage_coverage(\n        stage, window_start=started, run_date=run_date, "
+        "execution_name=execution_name\n    )"
+    ) in body
 
 
 def test_the_spot_dispatcher_never_fabricates_a_run_date() -> None:
     body = (
         INFRA / "lambdas" / "weekly-freshness-spot-dispatcher" / "index.py"
     ).read_text()
-    fn = body[body.index("def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date"):]
+    fn = body[body.index("def _assert_stage_coverage(\n    stage: str,\n    started: datetime.datetime,"):]
     assert "if not run_date:" in fn
     guard = fn[: fn.index("try:\n        from krepis.stage_coverage")]
     assert '"status": "UNMEASURED"' in guard

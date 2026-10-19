@@ -643,11 +643,19 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
             or ("RelaunchWeeklyFreshnessSpot" if force_on_demand else "DispatchWeeklyFreshnessSpot"),
             started,
             str(event.get("run_date", "")).strip() or None,
+            # alpha-engine-config-I12351: the execution ARN routes a weekly-SF
+            # rehearsal's verdict into the rehearsal namespace.
+            str(event.get("execution_id", "")).strip() or None,
         ),
     }
 
 
-def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str | None) -> dict:
+def _assert_stage_coverage(
+    stage: str,
+    started: datetime.datetime,
+    run_date: str | None,
+    execution_name: str | None = None,
+) -> dict:
     """Record this stage's own output verdict (alpha-engine-config-I7214).
 
     Both stages this Lambda backs are INFRASTRUCTURE/GATE stages: they
@@ -668,6 +676,14 @@ def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str
     run_date since I7214 shipped). Never fabricated: a missing/blank
     run_date is reported UNMEASURED rather than defaulting to any derived
     date — inventing one here is exactly the defect I8155 fixes.
+
+    ``execution_name`` is the orchestrator execution this stage belongs to (a
+    bare name or an execution ARN). A weekly-SF rehearsal's verdict is then
+    recorded under ``_stage_coverage/.rehearsal/<exec>/`` with no
+    ``StageCoverage`` metric, never at the live key production's verdict for
+    the same run_date holds (krepis.stage_coverage.record_verdict,
+    alpha-engine-config-I12351). Absent, krepis falls back to ``$RUN_TOKEN``,
+    which a Lambda never has, so the live key: the production behaviour.
     """
     if not run_date:
         logger.error("stage-coverage assertion has no run_date for %s — event carried none", stage)
@@ -677,4 +693,6 @@ def _assert_stage_coverage(stage: str, started: datetime.datetime, run_date: str
     except ImportError as exc:
         logger.error("stage-coverage assertion unavailable for %s: %s", stage, exc)
         return {"stage": stage, "status": "UNMEASURED", "reason": str(exc)}
-    return assert_stage_coverage(stage, window_start=started, run_date=run_date)
+    return assert_stage_coverage(
+        stage, window_start=started, run_date=run_date, execution_name=execution_name
+    )

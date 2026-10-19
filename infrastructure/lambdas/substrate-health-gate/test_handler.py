@@ -225,6 +225,52 @@ def test_real_krepis_records_covered_no_output_to_the_trading_day_partition(
     assert json.loads(put["Body"])["status"] == "COVERED_NO_OUTPUT"
 
 
+def test_rehearsal_verdict_goes_to_the_rehearsal_namespace_with_no_metric(monkeypatch, tmp_path):
+    """alpha-engine-config-I12351: rehearsal-2026-10-16-2 wrote this stage's
+    verdict at the live `_stage_coverage/<run_date>/` key. With the SF's
+    `execution_name` a rehearsal's verdict lands under
+    `_stage_coverage/.rehearsal/<exec>/` and publishes no StageCoverage metric
+    (krepis >= 0.59.78); production's key is unchanged (the test above)."""
+    real = pytest.importorskip("krepis.stage_coverage")
+    if "execution_name" not in real.record_verdict.__code__.co_varnames:
+        pytest.skip("installed krepis predates the rehearsal namespace (0.59.78)")
+    registry = tmp_path / "registry.yaml"
+    registry.write_text(
+        "pipeline_stages:\n"
+        "  - stage: SubstrateHealthGate\n"
+        "    stage_class: infrastructure\n"
+        "    output: none\n"
+        "    reason: constructs only an SSM client and sends one disk probe\n"
+    )
+    s3 = mock.Mock()
+    cloudwatch = mock.Mock()
+    wrapper = types.ModuleType("krepis.stage_coverage")
+    wrapper.assert_stage_coverage = lambda stage, **kw: real.assert_stage_coverage(
+        stage,
+        s3_client=s3,
+        cloudwatch_client=cloudwatch,
+        registry_local_path=str(registry),
+        **kw,
+    )
+    monkeypatch.setitem(sys.modules, "krepis.stage_coverage", wrapper)
+    ssm = _ssm_stub(invocation_sequence=[_df_success(10)])
+    with (
+        mock.patch.object(index, "_ssm", ssm),
+        mock.patch.object(time, "sleep"),
+        mock.patch.object(time, "monotonic", _clock_that_never_expires()),
+    ):
+        out = index.handler(
+            _event(run_date="2026-10-15", execution_name="rehearsal-2026-10-16-2"), None
+        )
+
+    assert out["stage_coverage"]["status"] == "COVERED_NO_OUTPUT"
+    s3.put_object.assert_called_once()
+    assert s3.put_object.call_args.kwargs["Key"] == (
+        "_stage_coverage/.rehearsal/rehearsal-2026-10-16-2/2026-10-15/SubstrateHealthGate.json"
+    )
+    cloudwatch.put_metric_data.assert_not_called()
+
+
 def test_stage_coverage_assertion_is_import_guarded_and_loud():
     """The nousergon-lib/krepis pin may predate the module; an inert
     assertion must stay distinguishable from a covered stage and must not
