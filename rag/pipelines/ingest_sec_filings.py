@@ -405,7 +405,9 @@ def _pick_section(
     return text[best[0]:best[1]].strip()
 
 
-def _extract_sections(html: str, form_type: str = "10-K") -> dict[str, str]:
+def _extract_sections(
+    html: str, form_type: str = "10-K", *, max_chars: int | None = _MAX_SECTION_CHARS
+) -> dict[str, str]:
     """Extract the target sections of one filing, keyed by section label.
 
     For every target section, every line-start heading for it is a candidate:
@@ -414,6 +416,9 @@ def _extract_sections(html: str, form_type: str = "10-K") -> dict[str, str]:
     line that IS the section title ("Risk Factors" on its own line, as filers
     that use a cross-reference index and 20-F sub-items like "D. Risk Factors"
     set it). :func:`_pick_section` chooses among them.
+
+    ``max_chars`` caps each section for the RAG chunker; ``None`` keeps the
+    whole section (``collectors.filing_text_pit``, which compares filings).
     """
     titles_by_label = _SECTION_TITLES.get(form_type.upper(), _SECTION_TITLES["10-K"])
     text = _html_to_text(html)
@@ -445,7 +450,7 @@ def _extract_sections(html: str, form_type: str = "10-K") -> dict[str, str]:
             best = _pick_section(text, starts, bare_boundaries)
 
         if len(best) > _MIN_SECTION_CHARS:
-            sections[label] = best[:_MAX_SECTION_CHARS]
+            sections[label] = best if max_chars is None else best[:max_chars]
 
     return sections
 

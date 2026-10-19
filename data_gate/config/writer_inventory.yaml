@@ -144,6 +144,13 @@ shared_writers:
       built from SEC's quarterly data sets for 2018 onward (alpha-engine-config-I12461).
       On-demand dispatcher backfill only; it earns a unit of its own when a schedule
       runs it.
+  - path: collectors/filing_text_pit.py
+    parent_units: [D16]
+    reason: >-
+      The point-in-time history of the filings D16 ingests for RAG (10-K / 10-Q
+      text), kept whole per filing for the model zoo's W3 family
+      (alpha-engine-config-I12463). On-demand dispatcher backfill only; it earns
+      a unit of its own when a schedule runs it.
   - path: collectors/news_aggregator.py
     parent_units: [D36]
     reason: Audit §2 folds it into daily-news.
