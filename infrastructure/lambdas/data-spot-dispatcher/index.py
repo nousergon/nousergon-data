@@ -459,6 +459,12 @@ _WORKLOADS: dict[str, str] = {
     "insider-transactions-pit-backfill": (
         "python -m collectors.insider_transactions_pit backfill --start 2014q1"
     ),
+    # alpha-engine-config-I12463: point-in-time 10-K / 10-Q text per issuer
+    # (`collectors/filing_text_pit.py`), 2016 onward for the model zoo's W3
+    # family. Write-if-absent per issuer, so a rerun resumes. Not scheduled.
+    "filing-text-pit-backfill": (
+        "python -m collectors.filing_text_pit backfill"
+    ),
     # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
     # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
     # workload of both the eod and morning schedule inputs
