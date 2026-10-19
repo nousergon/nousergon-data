@@ -885,10 +885,11 @@ class TestSplitSource:
         )
         assert shares["2026-05-05"] == pytest.approx(136_640_435.33)
 
-    def test_hon_a_declared_factor_of_one_removes_the_pair(self) -> None:
+    def test_hon_the_declared_share_factor_replaces_the_pair(self) -> None:
         registry = {"HON": [(_o("2026-06-29"), 2.0), (_o("2026-06-29"), 0.5)], "AAPL": [(_o("2020-08-31"), 0.25)]}
         declared, _ = e.apply_declared_split_factors(registry)
-        assert "HON" not in declared and declared["AAPL"] == [(_o("2020-08-31"), 0.25)]
+        assert declared["HON"] == [(_o("2026-06-29"), 2.0)]
+        assert declared["AAPL"] == [(_o("2020-08-31"), 0.25)]
 
     def test_a_cancelling_pair_outside_the_universe_is_not_checked(self) -> None:
         e.check_cancelling_splits({"ZZZ": [(_o("2026-01-05"), 2.0), (_o("2026-01-06"), 0.5)]}, ["AAPL"])
@@ -928,6 +929,159 @@ class TestSplitSource:
             e.resolve_split_events(
                 None, "b", universe=["NVDA"], start=dt.date(2022, 1, 3), end=dt.date(2026, 10, 16), fetch_vendor=broken
             )
+
+
+def _one_close_series(ticker: str, values: dict[str, float]) -> pd.DataFrame:
+    frame = pd.DataFrame({ticker: list(values.values())}, index=pd.DatetimeIndex(list(values)))
+    return frame.sort_index()
+
+
+def _caps(frames: dict[dt.date, pd.DataFrame], ticker: str) -> dict[str, float]:
+    out = {}
+    for label, frame in frames.items():
+        row = frame[frame["ticker"] == ticker].iloc[0]
+        assert row["market_cap_raw"] == pytest.approx(row["close_raw"] * row["shares_outstanding_raw"])
+        out[label.isoformat()] = float(row["market_cap_raw"])
+    return out
+
+
+class TestPriceFactors:
+    """A share factor and the factor the price store applied to `Close` can differ
+    (alpha-engine-config-I12436). Every number is measured: closes are the stored
+    ArcticDB `Close` (`close_raw` in the 2026-10-19 sessions), share counts are the
+    filers' cover-page counts, and the independent reference is a raw close (the
+    predictor price cache written 2026-06-19, or polygon's daily-closes archive) times
+    the 10-Q share count."""
+
+    _HON_STORED = {
+        "2026-06-15": 237.78677368164062,
+        "2026-06-26": 242.80580139160156,
+        "2026-06-29": 227.1185302734375,
+        "2026-07-22": 232.29299926757812,
+        "2026-07-23": 245.5332794189453,
+    }
+
+    def _hon(self) -> tuple[dict, dict, dict[str, float]]:
+        registry = {"HON": [(_o("2026-06-29"), 2.0), (_o("2026-06-29"), 0.5)]}
+        splits, _ = e.apply_declared_split_factors(registry)
+        prices, summary = e.price_factor_events(splits, through=dt.date(2026, 10, 16))
+        assert prices["HON"] == [(_o("2026-06-29"), 1.04563)]
+        assert summary["price_factor_overrides"] == ["HON 2026-06-29"]
+        facts = [
+            _share(_DEI, "2026-03-31", 633_653_119, "2026-04-23"),
+            _share(_DEI, "2026-06-30", 316_940_010, "2026-07-23"),
+        ]
+        events = e.filing_events(facts, splits=splits["HON"], evaluate_from=0)
+        closes = _one_close_series("HON", self._HON_STORED)
+        frames = e.materialize_sessions(
+            {"HON": (773840, events)},
+            closes,
+            [dt.date.fromisoformat(d) for d in self._HON_STORED],
+            splits=splits,
+            price_factors=prices,
+        )
+        return splits, prices, _caps(frames, "HON")
+
+    def test_hon_market_cap_is_raw_close_times_the_reported_count_on_both_sides(self) -> None:
+        _, _, caps = self._hon()
+        # Before the event: raw close (price cache, 06-15: 227.41) x the 10-Q cover count.
+        assert caps["2026-06-15"] == pytest.approx(227.41 * 633_653_119, rel=1e-5)
+        assert caps["2026-06-26"] == pytest.approx(242.80580139160156 / 1.04563 * 633_653_119, rel=1e-9)
+        # The window until the 10-Q: Close is raw from 06-29, on the post-split count.
+        assert caps["2026-06-29"] == pytest.approx(227.1185302734375 * 633_653_119 / 2, rel=1e-9)
+        assert caps["2026-07-22"] == pytest.approx(232.29299926757812 * 316_826_559.5, rel=1e-9)
+        assert caps["2026-06-29"] / 1e9 == pytest.approx(71.96, abs=0.01)  # was 143.91, 2x high
+        # After the 10-Q: unchanged (77.82B stored).
+        assert caps["2026-07-23"] == pytest.approx(245.5332794189453 * 316_940_010, rel=1e-9)
+
+    def test_hon_one_shared_factor_could_not_have_fixed_both_sides(self) -> None:
+        splits, _, _ = self._hon()
+        events = e.filing_events(
+            [_share(_DEI, "2026-03-31", 633_653_119, "2026-04-23")], splits=splits["HON"], evaluate_from=0
+        )
+        closes = _one_close_series("HON", {"2026-06-15": self._HON_STORED["2026-06-15"]})
+        frames = e.materialize_sessions({"HON": (773840, events)}, closes, [dt.date(2026, 6, 15)])
+        # Price store taken to apply the share factor 2.0: about half the true market cap.
+        assert _caps(frames, "HON")["2026-06-15"] == pytest.approx(
+            227.41 * 633_653_119 * 1.04563 / 2, rel=1e-5
+        )
+
+    def _ctva(self, through: dt.date) -> tuple[dict, dict[str, float]]:
+        prices, summary = e.price_factor_events({}, through=through)
+        events = e.filing_events(
+            [_share(_DEI, "2026-07-24", 667_196_000, "2026-07-31")], splits=(), evaluate_from=0
+        )
+        stored = {"2026-09-30": 12.075473215390325, "2026-10-01": 12.57}
+        frames = e.materialize_sessions(
+            {"CTVA": (1755672, events)},
+            _one_close_series("CTVA", stored),
+            [dt.date(2026, 9, 30), dt.date(2026, 10, 1)],
+            splits={},
+            price_factors=prices,
+        )
+        return {"prices": prices, "summary": summary, "frames": frames}, _caps(frames, "CTVA")
+
+    def test_ctva_declared_spin_off_feeds_the_price_factors(self) -> None:
+        built, caps = self._ctva(dt.date(2026, 10, 16))
+        assert built["summary"]["declared_spinoffs"] == ["CTVA 2026-10-01"]
+        assert built["prices"]["CTVA"][0][1] == pytest.approx(12.57 / (12.57 + 68.26))
+        # 09-30: raw close 77.65 (polygon daily closes) x the 10-Q count, not 8.06B.
+        assert caps["2026-09-30"] == pytest.approx(77.65 * 667_196_000, rel=1e-5)
+        assert caps["2026-10-01"] == pytest.approx(12.57 * 667_196_000, rel=1e-12)
+
+    def test_a_spin_off_after_the_run_has_restated_nothing_it_reads(self) -> None:
+        built, caps = self._ctva(dt.date(2026, 9, 30))
+        assert "CTVA" not in built["prices"] and built["summary"]["declared_spinoffs"] == []
+        assert caps["2026-09-30"] == pytest.approx(12.075473215390325 * 667_196_000)
+
+    def test_the_continuity_gate_exempts_a_price_factor_boundary(self) -> None:
+        built, _ = self._ctva(dt.date(2026, 10, 16))
+        with pytest.raises(e.GateFailed, match="CTVA"):
+            e.assert_share_count_continuity(built["frames"], {})
+        reading = e.assert_share_count_continuity(built["frames"], built["prices"])
+        assert reading["split_exempt"] == 1
+
+    def test_ordinary_splits_leave_market_cap_unchanged(self) -> None:
+        prices, _ = e.price_factor_events(_SPLITS, through=dt.date(2026, 10, 16))
+        for ticker in ("AAPL", "NVDA"):
+            assert prices[ticker] == _SPLITS[ticker]
+            for day in ("2019-06-03", "2021-01-04", "2024-06-07", "2026-01-02"):
+                assert e.close_basis(_SPLITS[ticker], prices[ticker], _o(day)) == 1.0
+
+    def test_dd_and_four_are_unchanged(self) -> None:
+        registry = {"DD": [(_o("2026-06-24"), 3.0), (_o("2026-06-24"), 1 / 3)]}
+        splits, _ = e.apply_declared_split_factors(registry)
+        prices, _ = e.price_factor_events(splits, through=dt.date(2026, 10, 16))
+        assert prices["DD"] == splits["DD"] == [(_o("2026-06-24"), 3.0)]
+        assert "FOUR" not in prices
+        dd = e.filing_events(
+            [
+                _share(_DEI, "2026-05-01", 409_921_306, "2026-05-05"),
+                _share(_DEI, "2026-07-31", 135_042_975, "2026-08-04"),
+            ],
+            splits=splits["DD"],
+            evaluate_from=0,
+        )
+        four = e.filing_events(
+            [_share(_DEI, "2026-08-01", 78_960_120, "2026-08-06")], splits=(), evaluate_from=0
+        )
+        closes = pd.DataFrame(
+            {"DD": [136.6189422607422, 129.89], "FOUR": [36.5, 36.17]},
+            index=pd.DatetimeIndex(["2026-06-26", "2026-09-30"]),
+        )
+        frames = e.materialize_sessions(
+            {"DD": (1666700, dd), "FOUR": (1794669, four)},
+            closes,
+            [dt.date(2026, 6, 26), dt.date(2026, 9, 30)],
+            splits=splits,
+            price_factors=prices,
+        )
+        dd_caps = _caps(frames, "DD")
+        assert dd_caps["2026-06-26"] == pytest.approx(136.6189422607422 * 409_921_306 / 3)
+        assert dd_caps["2026-09-30"] == pytest.approx(129.89 * 135_042_975)  # 17.54B stored
+        assert _caps({dt.date(2026, 9, 30): frames[dt.date(2026, 9, 30)]}, "FOUR")["2026-09-30"] == (
+            pytest.approx(36.17 * 78_960_120)
+        )
 
 
 def test_the_rebuild_workload_overwrites_from_2022() -> None:
