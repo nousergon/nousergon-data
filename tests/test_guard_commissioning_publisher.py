@@ -142,3 +142,29 @@ def test_cardinality_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
 def test_the_harness_runner_reads_a_real_cardinality_outcome():
     node = gc.HARNESSES["cardinality"].nodeid("D22")
     assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_units_publishes_its_own_observed_lines(tmp_path, monkeypatch, clean_tree):
+    """The fourth harness (`tests/test_guard_commissioning_units.py`), on D01's own detection."""
+    monkeypatch.setattr(gc, "_run_harness", _passed)
+    argv = ["--guard", "units", "--unit", "D01", "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    document = json.loads((tmp_path / "faults/D01/units/latest.json").read_text())
+    assert document["observed"] == list(gc.UNITS_OBSERVED)
+    assert document["test"] == gc.HARNESSES["units"].nodeid("D01")
+    unit = next(u for u in descriptors.load_units() if u.unit_id == "D01")
+    reading = evidence.read_guard_commissioning(
+        LocalStore(tmp_path), unit, "units", trading_day=dt.date(2026, 10, 15)
+    )
+    assert reading.met is True, reading.detail
+
+
+def test_units_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
+    """D02 declares no units check: no case, nothing to publish."""
+    with pytest.raises(SystemExit, match="no induced-fault case"):
+        gc.main(["--guard", "units", "--unit", "D02", "--store", str(tmp_path)])
+
+
+def test_the_harness_runner_reads_a_real_units_outcome():
+    node = gc.HARNESSES["units"].nodeid("D01")
+    assert gc._run_harness([node]) == {node: "passed"}

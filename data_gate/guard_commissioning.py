@@ -45,6 +45,7 @@ __all__ = [
     "EMPTY_FRESH_OBSERVED",
     "HARNESSES",
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
+    "UNITS_OBSERVED",
     "Harness",
     "main",
     "record_document",
@@ -93,6 +94,25 @@ CARDINALITY_OBSERVED: tuple[str, ...] = (
     "stand-down: terminal CollectionFailed; the retry recomputed, and the truncated answer "
     "overwrote none of the previously published keys it did not cover",
     "recovery: the next clean run reaches CollectionSucceeded with 0 pages",
+)
+
+
+#: What the ``units`` harness observes. No shared chokepoint and no staged mode:
+#: the record is taken on the unit's OWN units detection, the check its
+#: descriptor's ``guards.units.code`` / ``evaluates`` names, as shipped. The
+#: refusal's consequence depends on the box-local roster cache, so both are
+#: observed. The weekly phase-one run is not walked, so no page count is claimed.
+UNITS_OBSERVED: tuple[str, ...] = (
+    "the unit's own units detection refused a weight column in neither declared band "
+    "and raised inside the fetch",
+    "cold box (no roster cache, the deployed weekly spot): manifest status failed naming "
+    "the refusal, phase marker error, none of the unit's published keys written, the "
+    "previous snapshot untouched",
+    "warm box (roster cache present): the refused weights were never published; the cached "
+    "roster was served with weight_method cache_no_weights and an empty weight_map, and the "
+    "downstream weight consumer refused that empty map",
+    "recovery: the next correctly scaled file publishes ok with every weight normalised to "
+    "1.0 within its index",
 )
 
 
@@ -150,6 +170,16 @@ HARNESSES: dict[str, Harness] = {
         mode_under_test="enforce",
         cases_module="test_guard_commissioning_cardinality",
         observed=CARDINALITY_OBSERVED,
+    ),
+    # No staged mode flip: the unit's own units detection refuses as shipped. D01's is
+    # not the observe-only `data_cardinality`/`data_empty_fresh` staging the trader-feed
+    # ruling covers (nousergon-data#2145), so its record names the live behaviour.
+    "units": Harness(
+        "tests/test_guard_commissioning_units.py",
+        "test_the_fault_record_unit_scaled_column_is_refused_and_never_published",
+        mode_under_test="enforce",
+        cases_module="test_guard_commissioning_units",
+        observed=UNITS_OBSERVED,
     ),
 }
 
