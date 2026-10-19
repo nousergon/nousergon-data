@@ -180,9 +180,9 @@ version is kept in `fundamentals_pit/edgar/v1/facts/{run_date}/{run_id}.parquet`
 | `eps_growth_3y` | CAGR, clip [-1, 2] | annual diluted EPS on the current split basis, 3 fiscal years | crucible `eps_growth_3y_ratio` |
 | `capex_growth_5y` | CAGR, clip [-1, 2] | annual capex, 5 fiscal years | crucible `capex_growth_5y_ratio` |
 | `payout_ratio` | ratio, clip [0, 2] | dividends paid TTM / net income TTM; 0.0 when cash flow was reported and no dividend tagged | crucible `payout_ratio` |
-| `close_raw` | USD | ArcticDB `universe` `Close` on L (current split basis) | audit |
+| `close_raw` | USD | ArcticDB `universe` `Close` on L (current basis: every split and declared spin-off after L applied) | audit |
 | `market_cap_raw` | USD | `close_raw` x `shares_outstanding_raw` | audit |
-| `shares_outstanding_raw` | shares, current split basis | reported shares / product of split factors after the cover-page date (dei) or the filing date (us-gaap, restated by its filing); a count a whole power of ten from the last accepted one, or under 100,000, is refused | audit |
+| `shares_outstanding_raw` | shares, on `close_raw`'s basis | reported shares / product of share factors after the cover-page date (dei) or the filing date (us-gaap, restated by its filing), x share factors after L / price factors after L; the last term is 1 unless the price store applied a factor other than the split's (a spin-off, or HON 2026-06-29), config#12436; a count a whole power of ten from the last accepted one, or under 100,000, is refused | audit |
 | `net_income_ttm_raw`, `revenue_ttm_raw`, `gross_profit_ttm_raw`, `fcf_ttm_raw`, `dividends_ttm_raw` | USD | trailing twelve months (see below) | audit |
 | `equity_raw`, `total_debt_raw`, `assets_current_raw`, `liabilities_current_raw`, `assets_total_raw`, `liabilities_total_raw` | USD | newest balance sheet | audit |
 

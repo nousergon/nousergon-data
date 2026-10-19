@@ -83,9 +83,10 @@ not used (a filer that stopped filing is not frozen onto later sessions).
 Price basis
 ===========
 
-Market cap = ArcticDB `universe` Close on session L (split-adjusted to the
-current share basis, `features/SCHEMA.md` §2a) x shares outstanding reported at
-date d / (product of split factors with execution date after d). The split
+Market cap = ArcticDB `universe` Close on session L (adjusted to the current
+basis, `features/SCHEMA.md` §2a) x shares outstanding reported at date d /
+(product of split factors with execution date after d), when every factor that
+restated Close is a share split (otherwise see below). The split
 factors are the corporate-action registry (the record that restated Close)
 merged with polygon's split history back to `SPLIT_LOOKBACK_YEARS` before the
 first session, so price and shares sit on one basis. The registry alone holds
@@ -96,6 +97,22 @@ replaces whatever the two sources hold there, and a split the merged set holds
 together with its own inverse on one date refuses the run: the pair multiplies
 to 1.0, which erases the split without anything noticing (DD, HON,
 alpha-engine-config-I12434).
+
+Those are SHARE factors. The price store does not always restate `Close` by the
+same number: on HON 2026-06-29 it applied 1.04563 (a 1-for-2 reverse split times
+yfinance's spin-off adjustment) while the share count halved, and on CTVA
+2026-10-01 it applied the declared spin-off factor 0.1555 while the share count
+did not move. `price_factor_events` builds the factors `Close` actually carries:
+the share splits, a declaration's own `price_factor` where it has one, and every
+`corporate_actions.declared.DECLARED_SPINOFFS` entry. Each session then puts the
+current-basis share count onto the basis of its own `Close`:
+
+    shares_on_close_basis(L) = shares(d) / S_after(d) x S_after(L) / P_after(L)
+    market_cap(L)            = Close(L) x shares_on_close_basis(L)
+
+with S and P the products of the share and price factors executed after the
+date. For every ordinary split S equals P and this is the formula above; it
+differs only where the two lists do (alpha-engine-config-I12436).
 
 Share counts are put on that basis by what they are: a dei cover-page count is
 dated and takes the splits after its own date; a us-gaap balance-sheet count
@@ -159,6 +176,16 @@ Known residuals, measured or declared
   half until the 2024-08-09 10-Q. A genuine 7x-14x (times a power of ten) change
   reported by one tag only would be refused as a scale error; the one measured
   (Chesapeake's 2021 emergence, EXE) predates the first session.
+* A vendor spin-off adjustment nothing declares sits in `Close` unseen: the
+  price factors are the splits, the declarations and `DECLARED_SPINOFFS` only.
+  Measured 2026-10-19 against the predictor price cache (yfinance, written
+  2026-06-19): HON's stored Close is the cache's x 1.04563 on both sides of the
+  2025-10-30 Solstice spin-off, and the cache moves only -0.3% across that date, so
+  if yfinance adjusted for Solstice (about 6%) both carry it and HON's market cap
+  before 2025-10-30 reads that much low; unresolved without an independent raw
+  close. CTVA's stored Close before 2026-06-19 is the cache's x 0.14972, not
+  x 0.1555, so CTVA's June 2026 market cap still reads about 3.7% low
+  (alpha-engine-config-I12436).
 * Coverage measured 2026-09-14: 903 of 903 universe tickers map to a CIK; 40 of
   40 sampled file us-gaap facts; 38 of 40 have net income filed on or before 2019.
 """
@@ -182,7 +209,7 @@ from collections import defaultdict
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from fractions import Fraction
-from typing import Any, Protocol
+from typing import Any, NamedTuple, Protocol
 
 import pandas as pd
 
@@ -1216,12 +1243,30 @@ def filing_events(
 
 
 def session_row(
-    *, ticker: str, cik: int, label: dt.date, event: FilingEvent, close: float | None
+    *,
+    ticker: str,
+    cik: int,
+    label: dt.date,
+    event: FilingEvent,
+    close: float | None,
+    close_basis: float = 1.0,
 ) -> dict[str, Any]:
+    """One session's row. ``close_basis`` is the ticker's `close_basis` on ``label``: the
+    multiplier that moves its current-basis share count onto ``close``'s basis.
+
+    Market cap is ``close`` times the share count on ``close``'s basis, not on the
+    current split basis: the two differ wherever the price store applied a factor
+    other than the share split's (alpha-engine-config-I12436).
+    """
     raw = event.raw
+    shares = (
+        event.shares_current_basis * close_basis
+        if event.shares_current_basis is not None
+        else None
+    )
     market_cap = (
-        close * event.shares_current_basis
-        if close is not None and close > 0 and event.shares_current_basis is not None
+        close * shares
+        if close is not None and close > 0 and shares is not None
         else None
     )
     row: dict[str, Any] = {
@@ -1248,7 +1293,7 @@ def session_row(
     )
     row["close_raw"] = close
     row["market_cap_raw"] = market_cap
-    row["shares_outstanding_raw"] = event.shares_current_basis
+    row["shares_outstanding_raw"] = shares
     for name in RAW_FIELDS:
         row.setdefault(name, raw.get(name))
     return row
@@ -1269,8 +1314,17 @@ def materialize_sessions(
     events_by_ticker: Mapping[str, tuple[int, Sequence[FilingEvent]]],
     closes: pd.DataFrame,
     sessions: Sequence[dt.date],
+    *,
+    splits: Mapping[str, SplitEvents] | None = None,
+    price_factors: Mapping[str, SplitEvents] | None = None,
 ) -> dict[dt.date, pd.DataFrame]:
-    """{session label: frame}; a ticker appears once it has a filing on or before the label."""
+    """{session label: frame}; a ticker appears once it has a filing on or before the label.
+
+    ``price_factors`` (from `price_factor_events`) puts each share count on the basis
+    of that session's `Close`; without it the price store is taken to have applied
+    exactly ``splits``.
+    """
+    splits = splits or {}
     out: dict[dt.date, pd.DataFrame] = {}
     close_index = {d: i for i, d in enumerate(pd.DatetimeIndex(closes.index).date)}
     for label in sessions:
@@ -1286,7 +1340,20 @@ def materialize_sessions(
             if position is not None and ticker in closes.columns:
                 value = closes.iloc[position][ticker]
                 close = float(value) if pd.notna(value) and value > 0 else None
-            rows.append(session_row(ticker=ticker, cik=cik, label=label, event=events[at], close=close))
+            key = normalize_ticker(ticker)
+            basis = 1.0
+            if price_factors is not None:
+                basis = close_basis(splits.get(key, ()), price_factors.get(key, ()), ordinal)
+            rows.append(
+                session_row(
+                    ticker=ticker,
+                    cik=cik,
+                    label=label,
+                    event=events[at],
+                    close=close,
+                    close_basis=basis,
+                )
+            )
         out[label] = session_frame(rows)
     return out
 
@@ -1660,31 +1727,53 @@ def merge_split_events(
     return {t: sorted(ev) for t, ev in merged.items() if ev}, stats
 
 
-#: Split factors fixed by review, keyed by (ticker, execution date): (factor, reason).
-#: Each replaces every registry and vendor event for that ticker within
-#: `_SPLIT_DATE_TOLERANCE_DAYS` of the date; a factor of 1.0 removes them. The factor
-#: is the one that puts a share count on the basis of the stored `Close`, which is
-#: what market cap multiplies. Add an entry only with evidence a reader can check.
-SPLIT_FACTORS_DECLARED: Mapping[tuple[str, str], tuple[float, str]] = {
-    ("DD", "2026-06-24"): (
+class DeclaredFactor(NamedTuple):
+    """A corporate action's factors fixed by review.
+
+    ``share_factor`` is the real change in the share count (split_from / split_to), which
+    rebases reported share counts and per-share values. ``price_factor`` is the factor the
+    price store actually applied to `Close` at that date; ``None`` means the same as
+    ``share_factor``, which is true of every ordinary split. They differ when a vendor
+    folded something else into the same boundary (alpha-engine-config-I12436).
+    """
+
+    share_factor: float
+    reason: str
+    price_factor: float | None = None
+
+
+#: Factors fixed by review, keyed by (ticker, execution date). Each replaces every
+#: registry and vendor event for that ticker within `_SPLIT_DATE_TOLERANCE_DAYS` of the
+#: date, in the share-factor list and in the price-factor list; a factor of 1.0 removes
+#: it from that list. Add an entry only with evidence a reader can check.
+#:
+#: The registry's operator corrections 8b2a092f2a0c743e (HON 2026-06-29, 1:2) and
+#: d33c1022d713f6ad (DD 2026-06-24, 1:3) are KNOWN WRONG: both flip polygon records that
+#: were correctly oriented reverse splits. The registry is write-once evidence, so they
+#: stay there and these declarations override both dates (alpha-engine-config-I12436).
+SPLIT_FACTORS_DECLARED: Mapping[tuple[str, str], DeclaredFactor] = {
+    ("DD", "2026-06-24"): DeclaredFactor(
         3.0,
         "DuPont's 1-for-3 reverse split, effective 12:01 a.m. 2026-06-24 (8-K "
         "0001666700-26-000034; the 10-Q of 2026-08-04 restates Q2 2025's diluted weighted "
         "average from 419.7M to 139.9M). Polygon's record (3:1) is right; the registry's "
-        "operator correction d33c1022d713f6ad flipped it to 1:3, and applied together the "
-        "two multiply to 1.0, so DD's share counts before 2026-08-04 read 3x high against "
-        "a Close already on the post-split basis (alpha-engine-config-I12434).",
+        "operator correction d33c1022d713f6ad flipped it to 1:3 and is wrong. Applied "
+        "together the two multiply to 1.0, so DD's share counts before 2026-08-04 read 3x "
+        "high against a Close already on the post-split basis (alpha-engine-config-I12434).",
     ),
-    ("HON", "2026-06-29"): (
-        1.0,
-        "Honeywell's Aerospace spin-off (one HONA per two HON) and its 1-for-2 reverse split "
-        "both took effect 2026-06-29. The stored Close carries neither: it is continuous "
-        "across the date, with the spin-off halving the price and the reverse split "
-        "doubling it. Share counts are therefore not rebased, which keeps P/E with v1's "
-        "before the date (2026-06-15: 1.22 against 1.03; rebased by 2 it would be 0.61). "
-        "Sessions 2026-06-29 to 2026-07-22 still read the pre-split count, about 2x high, "
-        "until the 10-Q of 2026-07-23. The registry holds polygon's 2:1 and an inverse "
-        "operator correction (alpha-engine-config-I12434).",
+    ("HON", "2026-06-29"): DeclaredFactor(
+        2.0,
+        "Honeywell's 1-for-2 reverse split and its Aerospace (HONA) spin-off both took "
+        "effect 2026-06-29. Share factor 2.0: the 10-Q of 2026-07-23 (0000773840-26-000124) "
+        "restates CommonStockSharesOutstanding at 2025-06-30 from 634.9M to 317.5M and Q2 "
+        "2025's diluted weighted average from 640.9M to 320.5M, which a spin-off alone "
+        "never does. Price factor 1.04563: the stored Close (yfinance, rebuilt 2026-07-02) "
+        "is the raw close x 1.04563 before the date, the reverse split (x2) times "
+        "yfinance's spin-off adjustment (about x0.523); measured against the raw "
+        "predictor price cache written 2026-06-19 (06-15: 237.79 / 227.41; 06-18: 239.46 "
+        "/ 229.01). Polygon's record (2:1) is right; the registry's operator correction "
+        "8b2a092f2a0c743e flipped it to 1:2 and is wrong (alpha-engine-config-I12436).",
+        price_factor=1.04563,
     ),
 }
 
@@ -1692,10 +1781,17 @@ SPLIT_FACTORS_DECLARED: Mapping[tuple[str, str], tuple[float, str]] = {
 def apply_declared_split_factors(
     splits: Mapping[str, SplitEvents],
 ) -> tuple[dict[str, list[tuple[int, float]]], list[str]]:
-    """``splits`` with every `SPLIT_FACTORS_DECLARED` entry in place of what was there."""
-    out: dict[str, list[tuple[int, float]]] = {t: list(ev) for t, ev in splits.items()}
+    """``splits`` with every `SPLIT_FACTORS_DECLARED` share factor in place of what was there."""
+    return _replace_declared(splits, lambda declared: declared.share_factor)
+
+
+def _replace_declared(
+    events: Mapping[str, SplitEvents], factor_of: Any
+) -> tuple[dict[str, list[tuple[int, float]]], list[str]]:
+    out: dict[str, list[tuple[int, float]]] = {t: list(ev) for t, ev in events.items()}
     applied: list[str] = []
-    for (ticker, date_text), (factor, _reason) in SPLIT_FACTORS_DECLARED.items():
+    for (ticker, date_text), declared in SPLIT_FACTORS_DECLARED.items():
+        factor = factor_of(declared)
         ordinal = _ordinal(date_text)
         kept = [ev for ev in out.get(ticker, []) if abs(ev[0] - ordinal) > _SPLIT_DATE_TOLERANCE_DAYS]
         if not math.isclose(factor, 1.0):
@@ -1703,6 +1799,55 @@ def apply_declared_split_factors(
         out[ticker] = sorted(kept)
         applied.append(f"{ticker} {date_text}")
     return {t: ev for t, ev in out.items() if ev}, applied
+
+
+def price_factor_events(
+    splits: Mapping[str, SplitEvents], *, through: dt.date
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, Any]]:
+    """The factors the price store applied to `Close`, per ticker.
+
+    Every share split restated `Close` by its own factor, so the list starts from
+    ``splits`` (after `SPLIT_FACTORS_DECLARED`). A declaration with its own
+    ``price_factor`` then replaces the split's factor at its date, and every
+    `corporate_actions.declared.DECLARED_SPINOFFS` entry executed on or before
+    ``through`` is added: a spin-off restates the parent's pre-ex `Close` by its CRSP
+    factor and leaves the share count alone (CTVA 0.1555, alpha-engine-config-I12436).
+    One a later run has not reached yet has not restated anything the run reads.
+    """
+    from corporate_actions.declared import DECLARED_SPINOFFS
+
+    out, _ = _replace_declared(
+        splits,
+        lambda declared: declared.share_factor
+        if declared.price_factor is None
+        else declared.price_factor,
+    )
+    overridden = [
+        f"{ticker} {date_text}"
+        for (ticker, date_text), declared in SPLIT_FACTORS_DECLARED.items()
+        if declared.price_factor is not None
+    ]
+    spinoffs: list[str] = []
+    for spinoff in DECLARED_SPINOFFS:
+        if dt.date.fromisoformat(spinoff.ex_date) > through:
+            continue
+        ticker = normalize_ticker(spinoff.ticker)
+        out.setdefault(ticker, []).append((_ordinal(spinoff.ex_date), spinoff.price_factor))
+        out[ticker].sort()
+        spinoffs.append(f"{ticker} {spinoff.ex_date}")
+    return out, {"price_factor_overrides": overridden, "declared_spinoffs": spinoffs}
+
+
+def close_basis(splits: SplitEvents, price_factors: SplitEvents, ordinal: int) -> float:
+    """The multiplier that moves a current-basis share count onto `Close`'s basis at ``ordinal``.
+
+    `Close` on a session is the raw close times every price factor executed after it;
+    a current-basis share count is the count on that session's date divided by every
+    share factor executed after it. Their product is the market cap only when the two
+    lists are equal, which is every ordinary split; this ratio corrects the rest
+    (HON 2026-06-29, CTVA 2026-10-01, alpha-engine-config-I12436).
+    """
+    return split_factor_after(splits, ordinal) / split_factor_after(price_factors, ordinal)
 
 
 def check_cancelling_splits(splits: Mapping[str, SplitEvents], universe: Iterable[str]) -> None:
@@ -1830,6 +1975,7 @@ def build(
     start: dt.date,
     end: dt.date,
     facts_path: str | None = None,
+    price_factors: Mapping[str, SplitEvents] | None = None,
 ) -> BuildResult:
     """Resolve every ticker's filing events and materialize the sessions in [start, end]."""
     stats = ExtractStats()
@@ -1874,7 +2020,9 @@ def build(
     sessions = [
         d for d in sorted(set(pd.DatetimeIndex(closes.index).date)) if start <= d <= end
     ]
-    frames = materialize_sessions(events_by_ticker, closes, sessions)
+    frames = materialize_sessions(
+        events_by_ticker, closes, sessions, splits=splits, price_factors=price_factors
+    )
     summary = {
         "tickers_requested": len(set(tickers)),
         "tickers_with_events": len(events_by_ticker),
@@ -1983,6 +2131,7 @@ def run(
     run_date: dt.date | None = None,
     run_id: str | None = None,
     work_dir: str | None = None,
+    price_factors: Mapping[str, SplitEvents] | None = None,
 ) -> dict[str, Any]:
     """Build, gate, then write. A failed gate raises before any object is written."""
     run_date = run_date or dt.datetime.now(dt.UTC).date()
@@ -1999,6 +2148,7 @@ def run(
         start=start,
         end=end,
         facts_path=local_facts,
+        price_factors=price_factors,
     )
     if not result.sessions:
         raise GateFailed(f"no price sessions fall in [{start}, {end}]; nothing to materialize")
@@ -2022,7 +2172,12 @@ def run(
         "median": float(pd.Series(ratios).median()),
         "max": max(ratios),
     }
-    summary["share_count_continuity"] = assert_share_count_continuity(result.sessions, splits)
+    # Shares sit on each session's Close basis, so a price factor moves them too.
+    boundaries = {
+        ticker: [*splits.get(ticker, ()), *(price_factors or {}).get(ticker, ())]
+        for ticker in {*splits, *(price_factors or {})}
+    }
+    summary["share_count_continuity"] = assert_share_count_continuity(result.sessions, boundaries)
     if crosscheck_disabled_reason:
         summary["crosscheck"] = {"disabled": crosscheck_disabled_reason}
     else:
@@ -2171,6 +2326,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     splits, split_summary = resolve_split_events(
         s3, bucket, universe=universe, start=start, end=end
     )
+    price_factors, price_summary = price_factor_events(splits, through=end)
+    split_summary.update(price_summary)
     summary = run(
         store=store,
         tickers=universe,
@@ -2185,6 +2342,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         dry_run=args.dry_run,
         crosscheck_disabled_reason=args.no_crosscheck,
         work_dir=work_dir,
+        price_factors=price_factors,
     )
     summary["sec_requests"] = client.request_count
     summary["splits"] = split_summary
