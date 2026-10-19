@@ -230,6 +230,8 @@ def _balance_sheet_event(**overrides: float) -> dict:
         _fact("equity", None, "2023-12-31", overrides.get("equity", 500), "2024-02-01"),
         _fact("assets_current", None, "2023-12-31", 300, "2024-02-01"),
         _fact("liabilities_current", None, "2023-12-31", 100, "2024-02-01"),
+        _fact("assets_total", None, "2023-12-31", 2000, "2024-02-01"),
+        _fact("liabilities_total", None, "2023-12-31", 1500, "2024-02-01"),
         _fact("operating_cash_flow", "2023-01-01", "2023-12-31", 150, "2024-02-01"),
         _fact("capex", "2023-01-01", "2023-12-31", 50, "2024-02-01"),
         _fact("shares_outstanding", None, "2024-01-20", 100, "2024-02-01", unit="shares"),
@@ -262,6 +264,12 @@ class TestFields:
         assert row["payout_ratio"] == 0.0, (
             "operating cash flow was reported and no dividend was tagged: paid nothing"
         )
+
+    def test_total_assets_and_liabilities_ride_the_newest_balance_sheet(self) -> None:
+        event = _balance_sheet_event()["event"]
+        row = e.session_row(ticker="T", cik=1, label=dt.date(2024, 3, 1), event=event, close=30.0)
+        assert row["assets_total_raw"] == pytest.approx(2000.0)
+        assert row["liabilities_total_raw"] == pytest.approx(1500.0)
 
     def test_the_v1_clips_bound_every_field(self) -> None:
         event = _balance_sheet_event(income=100_000, long_term_debt=400)["event"]

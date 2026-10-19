@@ -11,7 +11,7 @@
     "revenue_growth_3y", "eps_growth_3y", "capex_growth_5y", "payout_ratio",
     "close_raw", "market_cap_raw", "shares_outstanding_raw", "net_income_ttm_raw", "revenue_ttm_raw",
     "gross_profit_ttm_raw", "equity_raw", "total_debt_raw", "assets_current_raw",
-    "liabilities_current_raw", "fcf_ttm_raw", "dividends_ttm_raw"
+    "liabilities_current_raw", "assets_total_raw", "liabilities_total_raw", "fcf_ttm_raw", "dividends_ttm_raw"
   ],
   "properties": {
     "ticker": {"type": "string", "minLength": 1},
@@ -41,6 +41,8 @@
     "total_debt_raw": {"type": ["number", "null"], "description": "USD"},
     "assets_current_raw": {"type": ["number", "null"], "description": "USD"},
     "liabilities_current_raw": {"type": ["number", "null"], "description": "USD"},
+    "assets_total_raw": {"type": ["number", "null"], "description": "USD"},
+    "liabilities_total_raw": {"type": ["number", "null"], "description": "USD"},
     "fcf_ttm_raw": {"type": ["number", "null"], "description": "USD"},
     "dividends_ttm_raw": {"type": ["number", "null"], "description": "USD"}
   }

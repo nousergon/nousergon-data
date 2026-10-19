@@ -426,6 +426,8 @@ TAG_MAP: tuple[Quantity, ...] = (
             (_G, "StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest"),
         ),
     ),
+    Quantity("assets_total", "instant", "USD", ((_G, "Assets"),)),
+    Quantity("liabilities_total", "instant", "USD", ((_G, "Liabilities"),)),
     Quantity("assets_current", "instant", "USD", ((_G, "AssetsCurrent"),)),
     Quantity("liabilities_current", "instant", "USD", ((_G, "LiabilitiesCurrent"),)),
     Quantity(
@@ -828,6 +830,8 @@ RAW_FIELDS = (
     "total_debt_raw",
     "assets_current_raw",
     "liabilities_current_raw",
+    "assets_total_raw",
+    "liabilities_total_raw",
     "fcf_ttm_raw",
     "dividends_ttm_raw",
 )
@@ -856,6 +860,8 @@ def resolve_event(state: AsOfState, *, as_of: int, splits: SplitEvents) -> dict[
     equity = latest_instant(state.resolved("equity"), as_of=as_of)
     assets = latest_instant(state.resolved("assets_current"), as_of=as_of)
     liabilities = latest_instant(state.resolved("liabilities_current"), as_of=as_of)
+    assets_total = latest_instant(state.resolved("assets_total"), as_of=as_of)
+    liabilities_total = latest_instant(state.resolved("liabilities_total"), as_of=as_of)
 
     revenue_value = revenue[0] if revenue else None
     if gross is not None and revenue is not None and gross[1] == revenue[1]:
@@ -891,6 +897,8 @@ def resolve_event(state: AsOfState, *, as_of: int, splits: SplitEvents) -> dict[
         "total_debt_raw": debt,
         "assets_current_raw": assets[0] if assets else None,
         "liabilities_current_raw": liabilities[0] if liabilities else None,
+        "assets_total_raw": assets_total[0] if assets_total else None,
+        "liabilities_total_raw": liabilities_total[0] if liabilities_total else None,
         "fcf_ttm_raw": fcf_value,
         "dividends_ttm_raw": dividends_value,
     }
