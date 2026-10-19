@@ -399,6 +399,21 @@ class TestEvalJudgeSubmitContract:
         "state_name",
         ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
     )
+    def test_payload_threads_the_cycle_trading_day_for_stage_coverage(
+        self, states, state_name,
+    ):
+        # alpha-engine-config-I10171 / I12351: the submit Lambda keys its
+        # _stage_coverage verdict on event["run_date"] and falls back to the
+        # CALENDAR `date` only when it is absent. EvalJudgeSubmitWeekly did not
+        # carry it, so its verdict landed under _stage_coverage/2026-10-17/
+        # while the sweep read 2026-10-16/ and paged it `absent`.
+        payload = states[state_name]["Parameters"]["Payload"]
+        assert payload["run_date.$"] == "$.run_date"
+
+    @pytest.mark.parametrize(
+        "state_name",
+        ["EvalJudgeSubmitFirstSaturday", "EvalJudgeSubmitWeekly"],
+    )
     def test_invokes_submit_lambda_live_alias(self, states, state_name):
         params = states[state_name]["Parameters"]
         assert (
