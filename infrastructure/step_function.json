@@ -2105,12 +2105,13 @@
             },
             "EvalJudgeSubmitWeekly": {
               "Type": "Task",
-              "Comment": "Submit phase, weekly cadence. Plans one cheap-tier entry per mapped artifact; the escalation tail runs inside EvalJudgeProcess. STAYS A LAMBDA for the reasons on EvalJudgeSubmitFirstSaturday (alpha-engine-config-I9329).",
+              "Comment": "Submit phase, weekly cadence. Plans one cheap-tier entry per mapped artifact; the escalation tail runs inside EvalJudgeProcess. STAYS A LAMBDA for the reasons on EvalJudgeSubmitFirstSaturday (alpha-engine-config-I9329). | alpha-engine-config-I8809: PARTITION FAMILY = trading_day - $.run_date is the cycle's trading day from NormalizeRunDates, carried for one purpose: the handler files its krepis.stage_coverage verdict under the CYCLE (alpha-engine-config-I10171). Without it the handler fell back to the calendar `date` and wrote _stage_coverage/2026-10-17/ while the sweep read 2026-10-16/, paging this stage absent on a run it covered (alpha-engine-config-I12351). `date` stays the eval window's calendar anchor, unchanged.",
               "Resource": "arn:aws:states:::lambda:invoke",
               "Parameters": {
                 "FunctionName": "alpha-engine-research-eval-judge-submit:live",
                 "Payload": {
                   "force_sonnet_pass": false,
+                  "run_date.$": "$.run_date",
                   "date.$": "$.eval_cadence.eval_date",
                   "dry_run_llm.$": "$.research_dry",
                   "capture_lookback_days": 6

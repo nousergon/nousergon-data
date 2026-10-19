@@ -184,7 +184,7 @@ version is kept in `fundamentals_pit/edgar/v1/facts/{run_date}/{run_id}.parquet`
 | `market_cap_raw` | USD | `close_raw` x `shares_outstanding_raw` | audit |
 | `shares_outstanding_raw` | shares, current split basis | reported shares / product of registry split factors after the report date | audit |
 | `net_income_ttm_raw`, `revenue_ttm_raw`, `gross_profit_ttm_raw`, `fcf_ttm_raw`, `dividends_ttm_raw` | USD | trailing twelve months (see below) | audit |
-| `equity_raw`, `total_debt_raw`, `assets_current_raw`, `liabilities_current_raw` | USD | newest balance sheet | audit |
+| `equity_raw`, `total_debt_raw`, `assets_current_raw`, `liabilities_current_raw`, `assets_total_raw`, `liabilities_total_raw` | USD | newest balance sheet | audit |
 
 **TTM:** the fiscal-year value when the newest period is a fiscal year, else the four newest discrete
 quarters, Q2-Q4 derived from year-to-date cumulatives (6M - 3M, 9M - 6M, FY - 9M). Periods older than
@@ -200,6 +200,8 @@ quarters, Q2-Q4 derived from year-to-date cumulatives (6M - 3M, 9M - 6M, FY - 9M
 | net_income | duration | USD | `NetIncomeLoss`, `NetIncomeLossAvailableToCommonStockholdersBasic`, `ProfitLoss` |
 | eps_diluted | duration | USD/shares | `EarningsPerShareDiluted`, `EarningsPerShareBasicAndDiluted`, `EarningsPerShareBasic` |
 | equity | instant | USD | `StockholdersEquity`, `StockholdersEquityIncludingPortionAttributableToNoncontrollingInterest` |
+| assets_total | instant | USD | `Assets` |
+| liabilities_total | instant | USD | `Liabilities` |
 | assets_current | instant | USD | `AssetsCurrent` |
 | liabilities_current | instant | USD | `LiabilitiesCurrent` |
 | debt_combined | instant | USD | `DebtLongtermAndShorttermCombinedAmount`, `DebtAndCapitalLeaseObligations` |

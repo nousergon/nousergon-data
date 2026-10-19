@@ -189,8 +189,11 @@ _SATURDAY_PAYLOAD_KEYS: dict[str, frozenset[str]] = {
         {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
          "run_date.$"}
     ),
+    # alpha-engine-config-I12351: run_date.$ threaded so the verdict lands in
+    # the cycle's partition, matching EvalJudgeSubmitFirstSaturday above.
     "EvalJudgeSubmitWeekly": frozenset(
-        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days"}
+        {"date.$", "dry_run_llm.$", "force_sonnet_pass", "capture_lookback_days",
+         "run_date.$"}
     ),
     # alpha-engine-config-I9329: EvalJudgePoll and EvalJudgeProcess both left
     # this registry, for different reasons. Poll was DELETED with the provider

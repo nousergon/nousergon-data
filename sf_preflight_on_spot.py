@@ -307,6 +307,58 @@ def _emit_metrics(record: dict) -> "str | None":
         return f"{type(exc).__name__}: {exc}"
 
 
+#: The registry stage this pass runs as (``ARTIFACT_REGISTRY.yaml``
+#: ``pipeline_stages``: ``WeeklyPreflightOnSpot``, ``output: variable_cardinality``).
+STAGE = "WeeklyPreflightOnSpot"
+#: SF execution names that start with this are weekly-SF rehearsals (the same
+#: literal as ``krepis.rehearsal`` and the coverage sweep's prefix).
+REHEARSAL_EXECUTION_PREFIX = "rehearsal-"
+
+
+def _record_stage_coverage(
+    run_date: "str | None", execution_name: "str | None", started: datetime,
+) -> "str | None":
+    """Record this stage's ``_stage_coverage`` verdict. Never raises.
+
+    ``alpha-engine-config-I12351`` / C3 nightly 2026-10-18: the weekly
+    coverage sweep counts a stage that ENTERED and wrote no verdict as
+    ``absent``, and ``WeeklyPreflightOnSpot`` had never written one in any
+    partition — absent on the 2026-10-02, 10-15 and 10-16 sweeps, one of the
+    six rows holding ``alpha-engine-stage-coverage-findings`` in ALARM. The SF
+    state only launches this script over SSM, so the script is the one place
+    that knows the stage ran: the I8228 "never wired" class, closed the way
+    ``spot_rag_ingestion.sh`` and the spot dispatchers close it.
+
+    Observe mode only: a recording failure is logged and returned, never
+    allowed to change this pass's exit code (the state machine reads that).
+    A rehearsal records only under its own namespace; on a krepis that cannot
+    take ``execution_name`` it records nothing rather than write a live key.
+    """
+    if not run_date:
+        log.error("stage-coverage: no --run-date, %s verdict not recorded", STAGE)
+        return "no run_date"
+    try:
+        import inspect
+
+        from krepis.stage_coverage import assert_stage_coverage
+
+        kwargs: dict = {"window_start": started, "run_date": run_date}
+        if "execution_name" in inspect.signature(assert_stage_coverage).parameters:
+            kwargs["execution_name"] = execution_name
+        elif (execution_name or "").startswith(REHEARSAL_EXECUTION_PREFIX):
+            log.warning(
+                "stage-coverage: %s is a rehearsal and this krepis cannot "
+                "namespace its verdict; %s verdict not recorded",
+                execution_name, STAGE,
+            )
+            return "rehearsal without krepis namespacing"
+        verdict = assert_stage_coverage(STAGE, **kwargs)
+        return None if isinstance(verdict, dict) else "no verdict returned"
+    except Exception as exc:  # noqa: BLE001 - observe mode, recorded on the verdict line
+        log.error("stage-coverage: %s verdict not recorded: %s", STAGE, exc)
+        return f"{type(exc).__name__}: {exc}"
+
+
 def verdict_line(record: dict, artifact_uri: str) -> str:
     """The compact stdout summary the state machine stores as a string.
     Bounded well under SSM's 24,000-character StandardOutputContent cap."""
@@ -315,7 +367,7 @@ def verdict_line(record: dict, artifact_uri: str) -> str:
         "group_required_skip_count", "group_required_skip_names", "fail_names",
         "blocked_names",
         "expected_skip_names", "error", "timed_out", "artifact_error",
-        "metric_error", "elapsed_seconds",
+        "metric_error", "stage_coverage_error", "elapsed_seconds",
     )
     line = {k: record[k] for k in keys if k in record}
     line["artifact"] = artifact_uri
@@ -334,6 +386,7 @@ def main(argv: "list[str] | None" = None) -> int:
         format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     )
 
+    started = datetime.now(timezone.utc)
     record = observe(args.bucket, args.run_date)
     record.update({
         "run_date": args.run_date,
@@ -348,6 +401,9 @@ def main(argv: "list[str] | None" = None) -> int:
     metric_error = _emit_metrics(record)
     if metric_error:
         record["metric_error"] = metric_error
+    coverage_error = _record_stage_coverage(args.run_date, args.execution_name, started)
+    if coverage_error:
+        record["stage_coverage_error"] = coverage_error
 
     if record["verdict"] == "FAIL":
         # sf-pipeline-policy §7a obligation 3: a real ERROR on a real surface,
