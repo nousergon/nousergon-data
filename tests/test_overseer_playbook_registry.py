@@ -419,6 +419,39 @@ def test_known_bus_sources_have_rows():
         assert known in sources, f"known emitter {known!r} has no alert-class row"
 
 
+# crucible-backtester's spot EXIT trap (infrastructure/_spot_common.sh::cleanup)
+# publishes source='alpha-engine-backtester/${SPOT_STAGE_NAME}' from inside a
+# shell-embedded `python -c` string, which the static drift scan cannot read.
+# These are the SPOT_STAGE_NAME values its stage scripts set, plus
+# spot_backtest.sh's own fixed-source copy of the trap.
+BACKTESTER_SPOT_EXIT_SOURCES = (
+    "alpha-engine-backtester/backtester",
+    "alpha-engine-backtester/evaluator",
+    "alpha-engine-backtester/parity",
+    "alpha-engine-backtester/parity-compare",
+    "alpha-engine-backtester/parity-replay",
+    "alpha-engine-backtester/pit-lookahead",
+    "alpha-engine-backtester/pit-walkforward",
+    "alpha-engine-backtester/portfolio-optimizer",
+    "alpha-engine-backtester/predictor-backtest",
+    "alpha-engine-backtester/spot_backtest.sh",
+)
+
+
+@pytest.mark.parametrize("source", BACKTESTER_SPOT_EXIT_SOURCES)
+def test_backtester_spot_exit_sources_are_declared(source):
+    """alpha-engine-config-I12385: a spot reclaim on the portfolio-optimizer
+    stage reached intake with no row, and an undeclared source PAGES
+    (krepis.alert_tiers.resolve_tier). Each stage's source has its own exact
+    row, never a backtester-wide wildcard that would hide the next one."""
+    rows = [r for r in REGISTRY["alert_classes"] if r["source"] == source]
+    assert len(rows) == 1, f"{source!r}: expected exactly one alert-class row, got {len(rows)}"
+    row = rows[0]
+    assert row["severities"] == ["warning", "error"]
+    assert row["intake"] == "bus" and row["response"] == "drain-queue"
+    assert row["tier"] == "notify-silent"
+
+
 def test_registry_model_passes_its_executor_validator():
     """LOCKSTEP: every routed playbook's declared `model` must actually be
     accepted by the executor Lambda that receives it.
