@@ -1,6 +1,11 @@
 """2026-07-02 inverted-feed-record incident class — regression coverage.
 
-The incident (Honeywell separation + DuPont split, 2026-06/07):
+The incident (Honeywell separation + DuPont split, 2026-06/07), as it was
+understood at the time. Corrected by config#12436: HON (``2:1``) and DD
+(``3:1``) were 1-for-2 and 1-for-3 REVERSE splits, so polygon's records were
+right and the 2026-07-02 operator corrections that flipped them are wrong. The
+mechanics below (an inverted record must be caught) are still what the tests
+cover:
 
   * polygon published BOTH mega-cap June 2026 split records with the
     ``split_from``/``split_to`` ratio INVERTED (HON's forward 1:2 as ``2:1``

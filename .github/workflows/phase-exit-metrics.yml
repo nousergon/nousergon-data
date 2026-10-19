@@ -88,7 +88,20 @@ name: Data-collection phase-exit metrics
 on:
   schedule:
     - cron: '0 22 * * *'
+  # `drill_only` (alpha-engine-config-I10795): a manual run of ONLY the
+  # freshness-monitor commissioning drill. Without it a dispatch re-runs all
+  # five producers just to write the drill's receipts, which is why the
+  # drill's receipts otherwise wait for its first due day. Off by default,
+  # and absent on a `schedule` event (`inputs.drill_only` is null there, so
+  # `!inputs.drill_only` is true and every job runs exactly as before). It
+  # changes WHEN the drill can run, never what it checks or what the reader
+  # accepts: the receipts are the same induced -> fired -> cleared records.
   workflow_dispatch:
+    inputs:
+      drill_only:
+        description: 'Run only the freshness-monitor commissioning drill (skip the other producers)'
+        type: boolean
+        default: false
 
 permissions: {}
 
@@ -104,6 +117,7 @@ env:
 jobs:
   v1_data_stage:
     name: v1_data_stage phase-exit metric
+    if: ${{ !inputs.drill_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -145,6 +159,7 @@ jobs:
 
   executor_profile:
     name: executor_profile phase-exit metric
+    if: ${{ !inputs.drill_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -186,6 +201,7 @@ jobs:
 
   cloudtrail_evidence:
     name: bounded CloudTrail evidence
+    if: ${{ !inputs.drill_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -229,6 +245,7 @@ jobs:
 
   cost_monthly:
     name: cost_monthly metric (4-week baseline)
+    if: ${{ !inputs.drill_only }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -336,6 +353,7 @@ jobs:
           case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}."; exit 1 ;; esac
 
       - name: Run trigger_observation producer
+        if: ${{ !inputs.drill_only }}
         run: python -m data_gate.producers.trigger_observation
 
       # alpha-engine-config-I10795 (ruling 2026-10-14): the monthly
@@ -345,7 +363,8 @@ jobs:
       # any AWS call except on the month's first NYSE trading day, judged by
       # the date the cron fire was SCHEDULED for (a fire started hours late,
       # past 00:00Z, still counts as its own day). A manual
-      # `workflow_dispatch` runs it unconditionally. `!cancelled()` so a
+      # `workflow_dispatch` runs it unconditionally; with `drill_only` it is
+      # the only producer that runs. `!cancelled()` so a
       # failed trigger_observation read above cannot skip the month's drill.
       # It reads the published registry and the drilled rows' S3 metadata,
       # writes only data_collection/commissioning/<unit>/freshness-monitor/

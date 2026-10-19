@@ -690,14 +690,13 @@ class TestEODSFTopLevelFieldsClosed:
             "market_hours_override_notify",
             "market_hours_unverified_notify",
             # alpha-engine-config-I8102 — the DeployDriftCheck namespace.
-            # $.drift_result is the probe payload DeployDriftGate keys on;
-            # $.drift_error is the Catch path's, kept SEPARATE because on that
-            # path there is no Payload and a Pass reading $.drift_result.Payload
-            # would raise States.Runtime. $.deploy_drift_degraded_notify is the
+            # $.drift_result is the probe payload DeployDriftGate keys on.
+            # DeployDriftCheck's Catch now writes the shared $.error that
+            # HandleFailure reads (alpha-engine-config-I8141), so no separate
+            # drift_error field remains. $.deploy_drift_degraded_notify is the
             # sns:publish result, named to be read by nothing (same convention
             # as degraded_marker_result above).
             "drift_result",
-            "drift_error",
             "deploy_drift_degraded_notify",
             "ec2_instance_id",
             "eod_poll",
@@ -866,7 +865,7 @@ class TestEODSFTopLevelFieldsClosed:
         "capture_snapshot_retry", "capture_snapshot_page_notify",
         # DeployDriftCheck is not in the reconcile machine (follow-up: the
         # crucible-predictor probe must declare its sf_name first).
-        "drift_result", "drift_error", "deploy_drift_degraded_notify",
+        "drift_result", "deploy_drift_degraded_notify",
     })
     _RECONCILE_ONLY: frozenset[str] = frozenset({
         # The readiness wait and its fail-open normalizer.

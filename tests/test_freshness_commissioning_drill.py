@@ -316,6 +316,47 @@ def test_the_drill_rides_an_existing_scheduled_job():
     assert steps.index(step) == len(steps) - 1
 
 
+#: The four producers that are not the drill's host job.
+_OTHER_PRODUCER_JOBS = ("v1_data_stage", "executor_profile", "cloudtrail_evidence", "cost_monthly")
+
+
+def test_a_drill_only_dispatch_runs_the_drill_and_nothing_else():
+    """`drill_only` (alpha-engine-config-I10795) lets the receipts be written
+    without re-running the other producers. Off by default; every other
+    producer and trigger_observation's own read are skipped under it, the
+    drill step itself is NOT gated on it, and it never adds `--only-if-due`
+    to a dispatch (the run is unconditional either way)."""
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    # PyYAML reads the bare `on:` key as boolean True.
+    dispatch = workflow[True]["workflow_dispatch"]
+    flag = dispatch["inputs"]["drill_only"]
+    assert flag["type"] == "boolean"
+    assert flag["default"] is False
+
+    gate = "${{ !inputs.drill_only }}"
+    for name in _OTHER_PRODUCER_JOBS:
+        assert workflow["jobs"][name].get("if") == gate, name
+    host = workflow["jobs"]["trigger_observation"]
+    assert "if" not in host, "the drill's host job must run on a drill_only dispatch"
+    producer = next(s for s in host["steps"] if "producers.trigger_observation" in str(s.get("run", "")))
+    assert producer.get("if") == gate
+    drill = next(s for s in host["steps"] if "freshness_commissioning" in str(s.get("run", "")))
+    assert "drill_only" not in str(drill)
+    # Every producer job is either gated off by the flag or is the drill's host,
+    # so a new producer job cannot silently ride a drill_only run.
+    producers = {n for n in workflow["jobs"] if n != "notify-main-failure"}
+    assert producers == set(_OTHER_PRODUCER_JOBS) | {"trigger_observation"}
+
+
+def test_a_schedule_event_still_runs_every_producer():
+    """`inputs.drill_only` is null on a `schedule` event; the gate must read
+    that as run, not skip. GitHub's `!null` is true, so the gate is a plain
+    negation and never a comparison against `false`."""
+    workflow = yaml.safe_load(WORKFLOW.read_text())
+    for name in _OTHER_PRODUCER_JOBS:
+        assert workflow["jobs"][name]["if"].replace(" ", "") == "${{!inputs.drill_only}}", name
+
+
 #: Units whose live, un-parked ARTIFACT_REGISTRY row was declared in
 #: ``registry_rows`` alongside a ``freshness-monitor`` detector so the monthly
 #: drill commissions them (alpha-engine-config-I10795). Each key is a fixed key

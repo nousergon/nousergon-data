@@ -5571,11 +5571,39 @@ def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -
     rehearsals' DataPhase2 moved it to ``2026-10-15`` and then to
     ``2026-10-16``, a prefix with no ``constituents.json``, and D48 failed
     that night on SPX ``weight_method='unavailable'``.
+
+    Even a Phase 1 run advances it only when the constituents collector
+    reported ``ok`` AND ``weekly/{date}/constituents.json`` is on S3
+    (alpha-engine-config-I12410). A Phase 1 run whose constituents collector
+    failed used to move the pointer to a prefix with no ``constituents.json``,
+    and every reader then failed on ``NoSuchKey`` instead of resolving last
+    week's universe. A refused advance is recorded in the manifest under
+    ``latest_weekly_pointer``, logged at ERROR naming both keys, and fails the
+    run (``status="failed"``) if nothing else already had — so ``main()``
+    exits 1 and the Step Function sees it, never a silent stale pointer.
+    The pointer is left on its previous (last good) target, never deleted.
     """
     s3 = boto3.client("s3")
+    pointer_key = f"{s3_prefix}latest_weekly.json"
+    target_prefix = f"{s3_prefix}weekly/{run_date}/"
+
+    refusal = None
+    if results.get("phase") == 1:
+        refusal = _latest_weekly_refusal(bucket, target_prefix, results)
+        results["latest_weekly_pointer"] = {
+            "key": pointer_key,
+            "target": f"{target_prefix}constituents.json",
+            "advanced": refusal is None,
+            **({"reason": refusal} if refusal else {}),
+        }
+        # A refused advance always ends the run non-zero. `partial`/`failed`
+        # already do; anything else (`ok`, `degraded`) would exit 0 on a
+        # pointer this run was supposed to move and did not.
+        if refusal and results.get("status") not in ("partial", "failed"):
+            results["status"] = "failed"
 
     # Manifest
-    manifest_key = f"{s3_prefix}weekly/{run_date}/manifest.json"
+    manifest_key = f"{target_prefix}manifest.json"
     s3.put_object(
         Bucket=bucket,
         Key=manifest_key,
@@ -5590,15 +5618,45 @@ def _write_manifest(bucket: str, s3_prefix: str, run_date: str, results: dict) -
         )
         return
 
+    if refusal:
+        logger.error(
+            "latest_weekly.json NOT advanced: s3://%s/%s stays on its previous "
+            "target because s3://%s/%sconstituents.json is not a valid target "
+            "(%s). Readers keep resolving the last good week's universe.",
+            bucket, pointer_key, bucket, target_prefix, refusal,
+        )
+        return
+
     # Latest pointer
-    pointer = {"date": run_date, "s3_prefix": f"{s3_prefix}weekly/{run_date}/"}
+    pointer = {"date": run_date, "s3_prefix": target_prefix}
     s3.put_object(
         Bucket=bucket,
-        Key=f"{s3_prefix}latest_weekly.json",
+        Key=pointer_key,
         Body=json.dumps(pointer, indent=2),
         ContentType="application/json",
     )
     logger.info("Wrote manifest + latest pointer for %s", run_date)
+
+
+def _latest_weekly_refusal(bucket: str, target_prefix: str, results: dict) -> str | None:
+    """Why ``latest_weekly.json`` may not advance to ``target_prefix``, or ``None``.
+
+    The pointer summarises exactly one collector — D01's ``constituents`` —
+    so that is the one it is gated on: its own reported status, then the
+    artifact it names. Both are checked because each alone has let a bad
+    pointer through: a collector ``status`` says the write did not raise, not
+    that the object is there, and an object from an earlier attempt says
+    nothing about this run. A HEAD that cannot be answered (IAM, throttling)
+    raises out of ``_s3_object_exists``: the pointer is then not written and
+    the run fails loud, never a guess either way.
+    """
+    status = (results.get("collectors", {}).get("constituents") or {}).get("status")
+    if status != "ok":
+        return f"constituents collector status={status!r}"
+    target = f"{target_prefix}constituents.json"
+    if not _s3_object_exists(bucket, target):
+        return f"constituents collector reported ok but {target} does not exist"
+    return None
 
 
 def _write_validation_json(

@@ -147,11 +147,21 @@ class TestAllEntryPathsEnsureRunning:
         assert failopen == ["SetMutexAcquireDegradedFlag"]
         assert states["SetMutexAcquireDegradedFlag"]["Next"] == "DeployDriftCheck"
         assert states["DeployDriftCheck"]["Next"] == "DeployDriftGate"
+        # alpha-engine-config-I8141: the halt-family routes and the probe's
+        # Catch now go to HandleFailure (the gate is enforcing); those are
+        # halts, not entries to the run, and are asserted separately.
         drift_exits = {states["DeployDriftGate"]["Default"]}
-        for choice in states["DeployDriftGate"]["Choices"]:
-            drift_exits.add(states[choice["Next"]]["Next"])
-        for catch in states["DeployDriftCheck"]["Catch"]:
-            drift_exits.add(states[catch["Next"]]["Next"])
+        halts = set()
+        gate_targets = [c["Next"] for c in states["DeployDriftGate"]["Choices"]]
+        gate_targets += [c["Next"] for c in states["DeployDriftCheck"]["Catch"]]
+        for target in gate_targets:
+            if target == "HandleFailure":
+                halts.add(target)
+            elif target == "SetDeployDriftHaltError":
+                halts.add(states[target]["Next"])
+            else:
+                drift_exits.add(states[target]["Next"])
+        assert halts == {"HandleFailure"}, halts
         # Every non-Default route lands on the single notify state, which then
         # continues to StartTradingInstance (and its own Catch does too).
         resolved = set()
