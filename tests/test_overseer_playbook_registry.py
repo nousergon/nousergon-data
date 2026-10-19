@@ -596,8 +596,12 @@ def test_the_auto_verify_entry_is_reauthorized_by_the_ruling_issue():
     carryover ledger in S3 — that is what makes overseer-policy.md §6's
     'a reviewed issue authorizing it' an actual mechanism."""
     entry = _t1("freshness-critical-auto-verify")
-    assert entry["reauthorized_at"] == "2026-08-26"
-    assert entry["reauthorized_by"] == "alpha-engine-config-I8686"
+    # Re-authorized again 2026-10-19 (Brian, Option A on alpha-engine-config-I12413)
+    # after the 2026-10-18 demotion — it must postdate that demoted_at for
+    # STEP 5a to void it.
+    assert entry["reauthorized_at"] == "2026-10-19"
+    assert entry["reauthorized_by"] == "alpha-engine-config-I12413"
+    assert entry["reauthorized_at"] >= "2026-10-18"
 
 
 def test_reauthorized_at_and_reauthorized_by_are_required_together():
@@ -621,3 +625,45 @@ def test_the_auto_verify_entry_excludes_declared_off_rows():
     desc = _t1("freshness-critical-auto-verify")["description"]
     assert "declared_off" in desc
     assert "alpha-engine-config-I8719" in desc
+
+
+# ── The freshness monitor's synthetic sweep row (alpha-engine-config-I12413) ──
+
+_SWEEP_SRC = (REPO_ROOT / "infrastructure" / "lambdas" / "freshness-monitor"
+              / "unregistered_envelopes.py")
+
+
+def _sweep_constant(name):
+    """Read a constant from the sweep module's SOURCE — importing it would pull
+    in nousergon_lib, and the registry tests must not depend on that."""
+    m = re.search(rf'^{name}\s*=\s*"([^"]+)"', _SWEEP_SRC.read_text(encoding="utf-8"),
+                  re.MULTILINE)
+    assert m, f"{name} not found in {_SWEEP_SRC}"
+    return m.group(1)
+
+
+def test_the_auto_verify_entry_resolves_the_synthetic_sweep_row():
+    """Demoted 2026-10-18 on two runs that could not EVALUATE: the synthetic
+    `unregistered_envelope_staleness` row has no ARTIFACT_REGISTRY row by
+    design, so a step that only reads the registry could never resolve it.
+    The steps must name the row and its report by the module's own spellings,
+    so a rename in the monitor fails here rather than in a drain run."""
+    steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
+    assert _sweep_constant("SWEEP_ARTIFACT_ID") in steps
+    assert _sweep_constant("REPORT_KEY") in steps
+    assert _sweep_constant("CHECKS_PREFIX") + "<check_id>/" + _sweep_constant("ENVELOPE_NAME") in steps
+    assert "threshold_minutes" in steps
+
+
+def test_the_sweep_row_is_never_verified_on_its_report_mtime():
+    """The report is rewritten on every sweep, so HEADing it would `verify`
+    genuinely stale envelopes. The step has to say so, not just omit it."""
+    steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
+    assert "do NOT HEAD its canonical key" in steps
+
+
+def test_a_missing_registry_row_stays_failed_outside_the_sweep_row():
+    """The exception is one named row, not a general licence: any other
+    artifact_id with no registry row is a registry gap and stays `failed`."""
+    steps = " ".join(_t1("freshness-critical-auto-verify")["remediation_steps"])
+    assert "any OTHER artifact_id with no registry row is `failed`" in steps
