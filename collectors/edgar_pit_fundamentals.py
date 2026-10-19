@@ -91,7 +91,11 @@ merged with polygon's split history back to `SPLIT_LOOKBACK_YEARS` before the
 first session, so price and shares sit on one basis. The registry alone holds
 only splits the daily sync saw (2026 onward), and every earlier split was missing
 until alpha-engine-config-I12418. Diluted EPS for the growth CAGR is put on the
-same basis from its filing date.
+same basis from its filing date. A (ticker, date) in `SPLIT_FACTORS_DECLARED`
+replaces whatever the two sources hold there, and a split the merged set holds
+together with its own inverse on one date refuses the run: the pair multiplies
+to 1.0, which erases the split without anything noticing (DD, HON,
+alpha-engine-config-I12434).
 
 Share counts are put on that basis by what they are: a dei cover-page count is
 dated and takes the splits after its own date; a us-gaap balance-sheet count
@@ -99,8 +103,10 @@ or weighted average is restated by its filing for earlier splits, so it takes
 the splits after its filing date. `ShareCountScreen` then refuses a share fact
 a whole power of ten from the last accepted count (a units or `decimals`
 error) unless another tag in the same filing agrees with it, and any count
-under `MIN_SHARE_COUNT` (a pre-listing shell's founder shares). Refusals are
-counted in the run summary (alpha-engine-config-I12426).
+under `MIN_SHARE_COUNT` (a pre-listing shell's founder shares). A concept a
+filer is known to tag with something other than its share count is refused
+outright through `SHARE_FACTS_REFUSED` (alpha-engine-config-I12433). Refusals
+are counted in the run summary (alpha-engine-config-I12426).
 
 Gates (the run refuses to write when one fails)
 ===============================================
@@ -670,6 +676,31 @@ _SHARE_AGREEMENT_RATIO = 3.0
 #: millions.
 MIN_SHARE_COUNT = 100_000
 
+#: Share concepts a filer tags with something that is not its share count, keyed by
+#: (CIK, concept). The screen cannot catch these: the value is not a power of ten off,
+#: and the filer has no other undimensioned share tag to compare it with. Refusing it
+#: leaves market cap empty for the filings it would have set, which is honest; using
+#: it is not. Add an entry only with the measured values and a reason a reader can
+#: check.
+SHARE_FACTS_REFUSED: Mapping[tuple[int, str], str] = {
+    (1794669, "WeightedAverageNumberOfDilutedSharesOutstanding"): (
+        "Shift4 (FOUR) tags its cover-page count by share class only, so this is its sole "
+        "undimensioned share tag from 2022 to 2025. Its 10-Ks of 2025-02-19 and 2026-02-27 "
+        "carry 3,864,579 (FY2022), 1,942,054 (FY2023), 1,668,826 (FY2024) and 1,333,686 "
+        "(FY2025) against 82.9M shares in its 2021 10-Q and an 81.2M cover count in the "
+        "2026-02-27 10-K: about 2% of the share count, not a decimal shift. Used, it put "
+        "market cap about 50x low from 2025-02-19 to 2026-02-26 "
+        "(alpha-engine-config-I12433)."
+    ),
+}
+
+
+def refused_share_concepts(cik: int | None) -> frozenset[str]:
+    """The concepts `SHARE_FACTS_REFUSED` refuses for ``cik``."""
+    if cik is None:
+        return frozenset()
+    return frozenset(concept for (key, concept) in SHARE_FACTS_REFUSED if key == int(cik))
+
 
 def scale_shift(value: float, reference: float) -> int:
     """The power of ten ``value`` sits from ``reference``; 0 when it is not a decimal shift.
@@ -717,8 +748,9 @@ class ShareCountScreen:
     refused every time, because the reference only moves on accepted facts.
     """
 
-    def __init__(self, splits: SplitEvents) -> None:
+    def __init__(self, splits: SplitEvents, refused: frozenset[str] = frozenset()) -> None:
         self._splits = splits
+        self._refused = refused
         self._reference: tuple[int, float] | None = None
         self.rejections: list[ShareRejection] = []
 
@@ -733,7 +765,8 @@ class ShareCountScreen:
             reference = None
         dropped: set[int] = set()
         for i, fact, value in shares:
-            if 0 < value < MIN_SHARE_COUNT:
+            declared = fact.concept in self._refused
+            if declared or 0 < value < MIN_SHARE_COUNT:
                 dropped.add(i)
                 self.rejections.append(
                     ShareRejection(
@@ -744,7 +777,7 @@ class ShareCountScreen:
                         value=fact.value,
                         reference=None,
                         shift=0,
-                        reason="placeholder",
+                        reason="declared" if declared else "placeholder",
                     )
                 )
         placeholders = set(dropped)
@@ -1131,20 +1164,22 @@ def filing_events(
     splits: SplitEvents,
     evaluate_from: int,
     share_rejections: list[ShareRejection] | None = None,
+    cik: int | None = None,
 ) -> list[FilingEvent]:
     """One event per distinct filing date, resolved from every fact filed on or before it.
 
     Events before ``evaluate_from`` are folded into the state but not resolved,
     except the last one before it, which a session at the start of the range reads.
     Share-count facts `ShareCountScreen` refuses never enter the state; they are
-    appended to ``share_rejections`` when it is given.
+    appended to ``share_rejections`` when it is given. ``cik`` selects the
+    `SHARE_FACTS_REFUSED` entries that apply.
     """
     state = AsOfState()
     events: list[FilingEvent] = []
     dates = sorted({f.filed for f in facts})
     last_before = max((d for d in dates if d < evaluate_from), default=None)
     index = 0
-    screen = ShareCountScreen(splits)
+    screen = ShareCountScreen(splits, refused_share_concepts(cik))
     for filed in dates:
         accession = ""
         batch: list[Fact] = []
@@ -1353,19 +1388,6 @@ SHARE_COUNT_JUMPS_DECLARED: Mapping[tuple[str, str], str] = {
         "EchoStar's DISH Network acquisition closed 2023-12-31; the FY2023 10-K reports "
         "270.8M diluted weighted shares against 83.9M in Q3 2023, prior years restated "
         "on the combined basis (common-control accounting)."
-    ),
-    ("FOUR", "2026-02-27"): (
-        "Recovery, not the error: Shift4 tags its cover-page count by class only, and its "
-        "FY2024 10-K (filed 2025-02-19) carries a diluted weighted average of 1,668,826 "
-        "against ~88M shares outstanding. Market cap reads about 50x low from 2025-02-19 "
-        "to 2026-02-26; the FY2025 10-K brings a cover count of 81.2M. Residual on "
-        "alpha-engine-config-I12426."
-    ),
-    ("DD", "2026-08-04"): (
-        "DuPont's 2026-08-04 10-Q reports 135.0M shares against 409.9M in the 2026-05-05 "
-        "10-Q while Close is continuous, the shape of a reverse split that restated Close "
-        "but is in neither the registry nor polygon's feed. Market cap before 2026-08-04 "
-        "reads about 3x high. Residual on alpha-engine-config-I12426."
     ),
 }
 
@@ -1638,6 +1660,76 @@ def merge_split_events(
     return {t: sorted(ev) for t, ev in merged.items() if ev}, stats
 
 
+#: Split factors fixed by review, keyed by (ticker, execution date): (factor, reason).
+#: Each replaces every registry and vendor event for that ticker within
+#: `_SPLIT_DATE_TOLERANCE_DAYS` of the date; a factor of 1.0 removes them. The factor
+#: is the one that puts a share count on the basis of the stored `Close`, which is
+#: what market cap multiplies. Add an entry only with evidence a reader can check.
+SPLIT_FACTORS_DECLARED: Mapping[tuple[str, str], tuple[float, str]] = {
+    ("DD", "2026-06-24"): (
+        3.0,
+        "DuPont's 1-for-3 reverse split, effective 12:01 a.m. 2026-06-24 (8-K "
+        "0001666700-26-000034; the 10-Q of 2026-08-04 restates Q2 2025's diluted weighted "
+        "average from 419.7M to 139.9M). Polygon's record (3:1) is right; the registry's "
+        "operator correction d33c1022d713f6ad flipped it to 1:3, and applied together the "
+        "two multiply to 1.0, so DD's share counts before 2026-08-04 read 3x high against "
+        "a Close already on the post-split basis (alpha-engine-config-I12434).",
+    ),
+    ("HON", "2026-06-29"): (
+        1.0,
+        "Honeywell's Aerospace spin-off (one HONA per two HON) and its 1-for-2 reverse split "
+        "both took effect 2026-06-29. The stored Close carries neither: it is continuous "
+        "across the date, with the spin-off halving the price and the reverse split "
+        "doubling it. Share counts are therefore not rebased, which keeps P/E with v1's "
+        "before the date (2026-06-15: 1.22 against 1.03; rebased by 2 it would be 0.61). "
+        "Sessions 2026-06-29 to 2026-07-22 still read the pre-split count, about 2x high, "
+        "until the 10-Q of 2026-07-23. The registry holds polygon's 2:1 and an inverse "
+        "operator correction (alpha-engine-config-I12434).",
+    ),
+}
+
+
+def apply_declared_split_factors(
+    splits: Mapping[str, SplitEvents],
+) -> tuple[dict[str, list[tuple[int, float]]], list[str]]:
+    """``splits`` with every `SPLIT_FACTORS_DECLARED` entry in place of what was there."""
+    out: dict[str, list[tuple[int, float]]] = {t: list(ev) for t, ev in splits.items()}
+    applied: list[str] = []
+    for (ticker, date_text), (factor, _reason) in SPLIT_FACTORS_DECLARED.items():
+        ordinal = _ordinal(date_text)
+        kept = [ev for ev in out.get(ticker, []) if abs(ev[0] - ordinal) > _SPLIT_DATE_TOLERANCE_DAYS]
+        if not math.isclose(factor, 1.0):
+            kept.append((ordinal, factor))
+        out[ticker] = sorted(kept)
+        applied.append(f"{ticker} {date_text}")
+    return {t: ev for t, ev in out.items() if ev}, applied
+
+
+def check_cancelling_splits(splits: Mapping[str, SplitEvents], universe: Iterable[str]) -> None:
+    """Raise when a universe name holds a split and its inverse on one date.
+
+    The registry keeps a correction beside the record it corrects, so both reach
+    this module, and the two factors multiply to 1.0: the split disappears and no
+    gate sees it. Only one of the two can be right, and which one is a fact about
+    the filing, so it goes in `SPLIT_FACTORS_DECLARED` (alpha-engine-config-I12434).
+    """
+    for ticker in sorted({normalize_ticker(t) for t in universe}):
+        events = list(splits.get(ticker, ()))
+        for i, (first, first_factor) in enumerate(events):
+            for second, second_factor in events[i + 1 :]:
+                if (
+                    abs(first - second) <= _SPLIT_DATE_TOLERANCE_DAYS
+                    and not math.isclose(first_factor, 1.0)
+                    and math.isclose(first_factor * second_factor, 1.0, rel_tol=1e-6)
+                ):
+                    raise GateFailed(
+                        f"split source holds {ticker}'s split on "
+                        f"{dt.date.fromordinal(first).isoformat()} together with its inverse "
+                        f"({first_factor:g} and {second_factor:g}), which cancel. Declare the "
+                        "right factor in SPLIT_FACTORS_DECLARED (alpha-engine-config-I12434)."
+                    )
+
+
 def check_split_canaries(
     splits: Mapping[str, SplitEvents], universe: Iterable[str], *, window_start: dt.date
 ) -> list[str]:
@@ -1685,6 +1777,8 @@ def resolve_split_events(
     merged, stats = merge_split_events(
         registry_split_events(s3_client, bucket), vendor_split_events(rows, shape)
     )
+    merged, declared = apply_declared_split_factors(merged)
+    check_cancelling_splits(merged, universe)
     canaries = check_split_canaries(merged, universe, window_start=window_start)
     # Counts only: the rows are licensed vendor data and this repo's logs are public.
     summary = {
@@ -1693,6 +1787,7 @@ def resolve_split_events(
         **shape,
         **stats,
         "tickers_with_splits": len(merged),
+        "declared_factors": declared,
         "canaries_checked": len(canaries),
     }
     logger.info("split events: %s", json.dumps(summary, sort_keys=True))
@@ -1766,6 +1861,7 @@ def build(
                 splits=splits.get(ticker, ()),
                 evaluate_from=evaluate_from,
                 share_rejections=rejected,
+                cik=cik,
             )
             events_by_ticker[raw_ticker] = (cik, events)
             if rejected:
@@ -1808,7 +1904,7 @@ def _share_rejection_summary(
             {
                 f"{dt.date.fromordinal(r.filed).isoformat()} {r.concept} 10^{r.shift}"
                 if r.reason == "scale"
-                else f"{dt.date.fromordinal(r.filed).isoformat()} {r.concept} placeholder"
+                else f"{dt.date.fromordinal(r.filed).isoformat()} {r.concept} {r.reason}"
                 for r in items
                 if r.filed >= since and r.end >= since - MAX_PERIOD_AGE_DAYS
             }
