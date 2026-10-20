@@ -155,18 +155,22 @@ guards:
         phase-2 work; the clause is UNMET until it exists and is commissioned by an
         induced fault (P-19).
   success_without_output:
-    state: present
-    code:
-      - "run_units.py::record_empty_production"
-    records_as: data_success_without_output
+    state: not_applicable
+    na_code: "N/A-NOT-IMPL"
+    ruled_by: Brian
+    ruled_on: "2026-10-20"
+    ruling: "alpha-engine-config-I10794 (Director decision card, 2026-10-20 14:24Z)"
+    reexam: "2026-11-09"
     note: >-
-        run_units.py::record_empty_production runs on every completed run that recorded no
-        output and no rows: the manifest is filed `failed` (EmptyProduction) with guard
-        `data_success_without_output` verdict `empty_fresh`, unless the descriptor declares
-        `empty_is_valid` (then `not_applicable` with its closed-list reason). Never `ok`. The
-        process exit code is unchanged; the record is the consequence. Reached through
-        weekly_collector.py::_phase_collect -> _record_phase_lineage. Not in service until
-        commissioned by an induced fault (P-19, alpha-engine-config-I10786).
+        Not applicable by ruling (alpha-engine-config-I10794, Brian 2026-10-20): no path on
+        this unit's wiring can reach run_units.py::record_empty_production. Its only call site
+        passes a primary `artifact_key` to weekly_collector.py::_phase_collect, and
+        _record_phase_lineage records that key unconditionally unless the run is auto-skipped
+        or dry, so a collector returning no rows files `ok` with rows_out 0 rather than
+        EmptyProduction (probed 2026-10-20). An empty publish here is the `empty_fresh`
+        class, graded on its own row. The trader feed's path is deliberately not changed.
+        Re-exam 2026-11-09, after Crucible v2's phase-4 exit check (2026-11-06); reinstate
+        `present` if the call site gains a reachable empty-production path.
 audit:
   source: "alpha-engine-config/private-docs/data_collection_audit_260914.md §3"
   baseline_date: "2026-09-14"
