@@ -263,6 +263,15 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # a hung run pages within about an hour rather than two.
     "index-contributions": 3600,
     "ndx-constituents": 3600,
+    # alpha-engine-config-I12463: the one-time 10-K/10-Q text backfill.
+    # MEASURED on its first dispatch, 2026-10-20 (box i-0acffbe0c17495c05):
+    # 745 filings across 18 issuers in 20.6 min, about 1.7 s per filing, nearly
+    # all of it HTML parsing. The 7200 s default would stop it after about 105
+    # of 901 issuers. Parsing is now done once per filing instead of twice,
+    # which halves that. The ~800 issuers left at ~41 filings each then take
+    # about 7.5 h, so 12 h is about 1.6x. The run skips issuers already
+    # written, so a spot interruption only means a re-dispatch.
+    "filing-text-pit-backfill": 43200,
 }
 
 

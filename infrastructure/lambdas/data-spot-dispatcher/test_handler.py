@@ -567,6 +567,11 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload in ("index-contributions", "ndx-constituents"):
             # D48 / D49 (alpha-engine-config-I11306), sized like D51.
             expected = 3600
+        elif workload == "filing-text-pit-backfill":
+            # alpha-engine-config-I12463: the one-time 10-K/10-Q text backfill,
+            # measured at ~1.7 s per filing on its first dispatch (2026-10-20),
+            # ~7.5 h for what remains once each filing is parsed once.
+            expected = 43200
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected

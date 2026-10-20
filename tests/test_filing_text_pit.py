@@ -216,3 +216,24 @@ def test_the_dispatcher_exposes_the_backfill_workload() -> None:
     ).read_text()
     assert '"filing-text-pit-backfill"' in source
     assert "python -m collectors.filing_text_pit backfill" in source
+
+
+def test_each_filing_is_parsed_once(monkeypatch) -> None:
+    """Parsing the HTML is nearly all of the backfill's time, so do it once."""
+    from rag.pipelines import ingest_sec_filings as rag
+
+    calls = []
+    real = rag._html_to_text
+    monkeypatch.setattr(
+        rag, "_html_to_text", lambda html: calls.append(1) or real(html)
+    )
+    row = m.filing_row(m.Filing(1, "a", "10-K", _END, None, "x.htm"), "T", _TEN_K)
+    assert len(calls) == 1
+    assert row["risk_factors_text"] and row["mdna_text"]
+
+
+def test_the_backfill_declares_a_runtime_cap_that_fits_it() -> None:
+    source = (
+        _REPO / "infrastructure" / "lambdas" / "data-spot-dispatcher" / "index.py"
+    ).read_text()
+    assert '"filing-text-pit-backfill": 43200,' in source
