@@ -406,7 +406,11 @@ def _pick_section(
 
 
 def _extract_sections(
-    html: str, form_type: str = "10-K", *, max_chars: int | None = _MAX_SECTION_CHARS
+    html: str,
+    form_type: str = "10-K",
+    *,
+    max_chars: int | None = _MAX_SECTION_CHARS,
+    text: str | None = None,
 ) -> dict[str, str]:
     """Extract the target sections of one filing, keyed by section label.
 
@@ -419,9 +423,13 @@ def _extract_sections(
 
     ``max_chars`` caps each section for the RAG chunker; ``None`` keeps the
     whole section (``collectors.filing_text_pit``, which compares filings).
+
+    ``text`` is ``_html_to_text(html)`` when the caller already has it. Parsing
+    the HTML is most of the cost, so passing it skips a second parse.
     """
     titles_by_label = _SECTION_TITLES.get(form_type.upper(), _SECTION_TITLES["10-K"])
-    text = _html_to_text(html)
+    if text is None:
+        text = _html_to_text(html)
 
     item_boundaries = [(m.start(), m.group(1).upper()) for m in _ANY_ITEM_HEADING.finditer(text)]
     all_titles = "|".join(t for titles in titles_by_label.values() for t in titles)

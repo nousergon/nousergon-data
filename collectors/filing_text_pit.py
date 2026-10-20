@@ -214,7 +214,7 @@ def filing_row(filing: Filing, ticker: str, html: str) -> dict[str, Any]:
         raise FilingTextError(
             f"{filing.accession}: primary document is {len(text)} chars, under {MIN_DOCUMENT_CHARS}"
         )
-    sections = _extract_sections(html, form_type=filing.form, max_chars=None)
+    sections = _extract_sections(html, form_type=filing.form, max_chars=None, text=text)
     row: dict[str, Any] = {
         "cik": filing.cik,
         "ticker": ticker,
