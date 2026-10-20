@@ -179,8 +179,8 @@ class _Sec:
         return _Response(self.payloads[url])
 
 
-def _url(year: int, quarter: int) -> str:
-    return m.DATASET_URL.format(year=year, quarter=quarter)
+def _url(year: int, quarter: int, template: int = 0) -> str:
+    return m.DATASET_URLS[template].format(year=year, quarter=quarter)
 
 
 class TestQuarters:
@@ -292,6 +292,56 @@ class TestRun:
                 overwrite=True,
                 newest_may_be_unpublished=True,
             )
+
+
+class TestDatasetUrls:
+    def test_the_url_names_sec_s_insider_transactions_data_sets_path(self) -> None:
+        # The 2026-10-20 backfill 404'd on `form-345-data-sets`, a path SEC
+        # never served; the zip lives under `insider-transactions-data-sets`.
+        assert _url(2014, 1) == (
+            "https://www.sec.gov/files/structureddata/data/"
+            "insider-transactions-data-sets/2014q1_form345.zip"
+        )
+        assert all("form-345-data-sets" not in u for u in m.DATASET_URLS)
+
+    def test_a_404_falls_through_to_the_next_template(self) -> None:
+        store = _Store()
+        sec = _Sec({_url(2024, 1, template=1): _zip()})
+        summary = m.run(
+            store,
+            sec,
+            [(2024, 1)],
+            run_date=dt.date(2026, 10, 19),
+            overwrite=False,
+            newest_may_be_unpublished=False,
+        )
+        assert sec.urls == [_url(2024, 1, 0), _url(2024, 1, 1)]
+        assert summary["quarters"]["2024q1"]["source_url"] == _url(2024, 1, 1)
+        assert m.quarter_key(2024, 1) in store.objects
+
+    def test_a_non_404_failure_does_not_fall_through(self) -> None:
+        class _Down(_Sec):
+            def get(self, url: str, *, timeout: float = 0) -> _Response:
+                self.urls.append(url)
+                raise SecFetchError(f"GET {url} -> HTTP 503", status=503)
+
+        sec = _Down({})
+        with pytest.raises(SecFetchError) as raised:
+            m.fetch_dataset(sec, 2024, 1)
+        assert raised.value.status == 503 and sec.urls == [_url(2024, 1, 0)]
+
+    def test_a_quarter_missing_everywhere_mid_range_is_fatal(self) -> None:
+        sec = _Sec({_url(2024, 1): _zip(), _url(2024, 3): _zip()})
+        with pytest.raises(SecFetchError) as raised:
+            m.run(
+                _Store(),
+                sec,
+                [(2024, 1), (2024, 2), (2024, 3)],
+                run_date=dt.date(2026, 10, 19),
+                overwrite=True,
+                newest_may_be_unpublished=True,
+            )
+        assert raised.value.status == 404 and "2024q2" in str(raised.value)
 
 
 def test_the_dispatcher_exposes_the_backfill_workload() -> None:

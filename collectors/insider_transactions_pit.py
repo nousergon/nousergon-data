@@ -59,7 +59,18 @@ RUNS_PREFIX = f"{DATASET_PREFIX}/runs/"
 RUN_LATEST_KEY = f"{RUNS_PREFIX}latest.json"
 DEFAULT_BUCKET = "alpha-engine-research"
 
-DATASET_URL = "https://www.sec.gov/files/structureddata/data/form-345-data-sets/{year}q{quarter}_form345.zip"
+#: Where SEC serves a quarter's zip, tried in order; a 404 falls through to
+#: the next template, any other failure stops the run. SEC's path segment is
+#: `insider-transactions-data-sets` (data.gov catalog; the 2026-10-20 backfill
+#: died on `form-345-data-sets`, which never existed). Quarters from 2026q2 on
+#: are reported to live under `datastandardsinnovation/` with the old path
+#: 404ing for them -- one third-party report, not live-verified, hence the
+#: fallback rather than a cut-over. The verified path goes first: it serves
+#: every quarter from 2006q1 through 2026q1.
+DATASET_URLS: tuple[str, ...] = (
+    "https://www.sec.gov/files/structureddata/data/insider-transactions-data-sets/{year}q{quarter}_form345.zip",
+    "https://www.sec.gov/files/datastandardsinnovation/data/insider-transactions-data-sets/{year}q{quarter}_form345.zip",
+)
 
 #: Forms whose Table I rows are admitted.
 FORMS = frozenset({"4", "4/A"})
@@ -350,6 +361,29 @@ def check_quarter_bounds(frame: pd.DataFrame, year: int, quarter: int) -> None:
 # -- run ---------------------------------------------------------------------------
 
 
+def fetch_dataset(sec: Any, year: int, quarter: int) -> tuple[str, bytes]:
+    """(serving URL, zip bytes) from the first template that does not 404.
+
+    A quarter every template 404s raises the LAST template's error with
+    status 404, so the caller's newest-quarter leniency still applies and a
+    gap anywhere else stays fatal.
+    """
+    missing: SecFetchError | None = None
+    for template in DATASET_URLS:
+        url = template.format(year=year, quarter=quarter)
+        try:
+            return url, sec.get(url, timeout=900.0).content
+        except SecFetchError as error:
+            if error.status != 404:
+                raise
+            missing = error
+    assert missing is not None
+    raise SecFetchError(
+        f"{quarter_label(year, quarter)}: HTTP 404 from every data set URL ({missing})",
+        status=404,
+    ) from missing
+
+
 def _to_parquet(frame: pd.DataFrame) -> bytes:
     buffer = io.BytesIO()
     frame.to_parquet(buffer, index=False)
@@ -385,9 +419,8 @@ def run(
         if key in existing and not overwrite:
             summary["quarters_skipped_existing"] += 1
             continue
-        url = DATASET_URL.format(year=year, quarter=quarter)
         try:
-            payload = sec.get(url, timeout=900.0).content
+            url, payload = fetch_dataset(sec, year, quarter)
         except SecFetchError as error:
             if (
                 newest_may_be_unpublished
@@ -399,6 +432,7 @@ def run(
                 continue
             raise
         frame, stats = parse_dataset(payload)
+        stats["source_url"] = url
         check_quarter_bounds(frame, year, quarter)
         store.put_bytes(key, _to_parquet(frame), "application/octet-stream")
         summary["quarters"][label] = stats
