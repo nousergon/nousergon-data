@@ -151,6 +151,18 @@ shared_writers:
       text), kept whole per filing for the model zoo's W3 family
       (alpha-engine-config-I12463). On-demand dispatcher backfill only; it earns
       a unit of its own when a schedule runs it.
+  - path: collectors/short_volume_pit.py
+    parent_units: [D06]
+    reason: >-
+      Daily short-sale VOLUME from FINRA's Reg SHO files, the free short-side history
+      D06's short interest cannot give before 2021-06 (model zoo W7). On-demand
+      dispatcher backfill only; it earns a unit of its own when a schedule runs it.
+  - path: collectors/fails_to_deliver_pit.py
+    parent_units: [D06]
+    reason: >-
+      SEC fails-to-deliver per half month, the second free short-side history next
+      to short_volume_pit (model zoo W7). On-demand dispatcher backfill only; it
+      earns a unit of its own when a schedule runs it.
   - path: collectors/news_aggregator.py
     parent_units: [D36]
     reason: Audit §2 folds it into daily-news.
