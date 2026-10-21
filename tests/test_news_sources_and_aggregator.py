@@ -237,7 +237,10 @@ class TestGdeltNewsAdapter:
         assert len(out) == 1
         assert out[0].source == "gdelt"
         assert out[0].url == "https://reuters.com/x"
-        assert "reuters.com" in out[0].tags
+        # Exact tag match (tags is a tuple of whole values), not a hostname
+        # substring test (CodeQL py/incomplete-url-substring-sanitization,
+        # alpha-engine-config-I3042).
+        assert out[0].tags.count("reuters.com") == 1
 
     def test_query_includes_ticker_and_company_name(self):
         q = _build_query("AAPL", "Apple Inc")
