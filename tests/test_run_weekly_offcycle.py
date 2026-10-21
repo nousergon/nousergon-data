@@ -254,7 +254,14 @@ def test_full_suppresses_then_starts_safely(runner_text: str) -> None:
 def test_reenable_role_scoped_to_saturday_rule(runner_text: str) -> None:
     """The scheduler role grants events:EnableRule on the Saturday rule ONLY."""
     assert "events:EnableRule" in runner_text
-    assert "scheduler.amazonaws.com" in runner_text
+    # Parse the role's trust policy and compare the principal exactly, rather
+    # than substring-matching a hostname in the script text (CodeQL
+    # py/incomplete-url-substring-sanitization, alpha-engine-config-I3042).
+    m = re.search(r"trust='(\{.*?\})'", runner_text)
+    assert m, "run_weekly_offcycle.sh must declare the re-enable role's trust policy"
+    trust = json.loads(m.group(1))
+    services = [stmt["Principal"]["Service"] for stmt in trust["Statement"]]
+    assert services == ["scheduler.amazonaws.com"]
     # The inline policy Resource is the single Saturday rule ARN.
     assert "rule/${SATURDAY_RULE}" in runner_text or "SATURDAY_RULE_ARN" in runner_text
 
