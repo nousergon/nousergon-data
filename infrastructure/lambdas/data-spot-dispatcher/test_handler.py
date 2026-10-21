@@ -641,6 +641,9 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
             # measured at ~1.7 s per filing on its first dispatch (2026-10-20),
             # ~7.5 h for what remains once each filing is parsed once.
             expected = 43200
+        elif workload == "institutional-holdings-pit-backfill":
+            # The one-time 13F backfill, ~40 archives at an estimated ~5 min each.
+            expected = 21600
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected

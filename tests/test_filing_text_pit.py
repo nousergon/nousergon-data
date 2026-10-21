@@ -192,6 +192,29 @@ class TestRun:
         )
         assert summary["issuers_skipped_existing"] == 1 and sec.urls == []
 
+    def test_a_cover_page_filing_is_skipped_and_the_issuer_still_written(self) -> None:
+        class _CoverSec(_Sec):
+            def get(self, url: str, **kw):
+                if url.endswith("aapl-q3.htm"):
+                    self.urls.append(url)
+                    return _Response("<html><body><p>See Exhibit 13.</p></body></html>")
+                return super().get(url, **kw)
+
+        store = _Store()
+        summary = m.run(
+            store,
+            _CoverSec(),
+            [("AAPL", 320193)],
+            start=_START,
+            end=_END,
+            run_date=_END,
+            overwrite=False,
+        )
+        assert summary["issuers_written"] == 1 and summary["filings_written"] == 2
+        skipped = summary["filings_skipped_short"]
+        assert len(skipped) == 1 and skipped[0].startswith("AAPL:")
+        assert summary["issuers_failed"] == []
+
     def test_a_cover_page_is_not_a_report(self) -> None:
         filing = m.Filing(1, "a", "10-K", _END, None, "x.htm")
         with pytest.raises(m.FilingTextError, match="chars"):

@@ -163,6 +163,24 @@ shared_writers:
       SEC fails-to-deliver per half month, the second free short-side history next
       to short_volume_pit (model zoo W7). On-demand dispatcher backfill only; it
       earns a unit of its own when a schedule runs it.
+  - path: collectors/holdings_13f_pit.py
+    parent_units: [D39]
+    reason: >-
+      The point-in-time history behind D39's institutional ownership: SEC Form 13F
+      data sets from 2016 (model zoo free-data request). On-demand dispatcher
+      backfill only; it earns a unit of its own when a schedule runs it.
+  - path: collectors/filing_8k_items_pit.py
+    parent_units: [D16]
+    reason: >-
+      8-K item codes per filing from EDGAR's submissions API, the event-type side of
+      the filings D16 ingests (model zoo free-data request). On-demand dispatcher
+      backfill only; it earns a unit of its own when a schedule runs it.
+  - path: collectors/wiki_pageviews_pit.py
+    parent_units: [D15]
+    reason: >-
+      Daily English Wikipedia pageviews per issuer, an alternative-data attention
+      series beside D15's (model zoo free-data request). On-demand dispatcher
+      backfill only; it earns a unit of its own when a schedule runs it.
   - path: collectors/news_aggregator.py
     parent_units: [D36]
     reason: Audit §2 folds it into daily-news.
