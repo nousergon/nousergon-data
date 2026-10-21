@@ -736,3 +736,75 @@ def test_the_headline_carries_the_count():
         _inputs_with_logs([row]), now=NOW, update_url="https://example/u"
     )
     assert "1 failed run(s) whose log does not resolve" in message
+
+
+# ── one message per market close (Brian 2026-10-21) ──────────────────────────
+
+
+def _delivered_saturday(store: FakeStore) -> None:
+    store.written["runs/report.daily/2026-09-18/2026-09-19/run.json"] = json.dumps(
+        {"status": "ok", "delivered": True}
+    ).encode("utf-8")
+
+
+@pytest.mark.parametrize("source", ["relay", "schedule"])
+def test_a_close_already_delivered_is_not_sent_again(monkeypatch, source):
+    """Sunday and Monday mornings carry Friday's close, which Saturday already
+    sent. The run files an `ok` manifest saying why and sends nothing."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("DATA_REPORT_SOURCE", source)
+    tracker = _RecordingTracker()
+    monkeypatch.setattr(report_module, "_tracker", lambda: tracker)
+    sent = []
+    monkeypatch.setattr(report_module, "deliver", lambda *a, **k: sent.append(a))
+    store = _live_shaped_store()
+    _delivered_saturday(store)
+
+    manifest = report_module.run_report(
+        store, trading_day=dt.date(2026, 9, 18), calendar_date=dt.date(2026, 9, 21), now=NOW
+    )
+
+    assert sent == [] and tracker.comments == []
+    assert manifest["status"] == "ok" and manifest["delivered"] is False
+    assert "2026-09-19" in manifest["not_delivered_because"]
+    assert "runs/report.daily/2026-09-18/2026-09-21/run.json" in store.written
+
+
+def test_a_manual_run_always_delivers_even_for_a_reported_close(monkeypatch):
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "workflow_dispatch")
+    monkeypatch.setenv("DATA_REPORT_SOURCE", "manual")
+    monkeypatch.setattr(report_module, "_tracker", _RecordingTracker)
+    sent = []
+    monkeypatch.setattr(report_module, "deliver", lambda *a, **k: sent.append(a))
+    store = _live_shaped_store()
+    _delivered_saturday(store)
+
+    manifest = report_module.run_report(
+        store, trading_day=dt.date(2026, 9, 18), calendar_date=dt.date(2026, 9, 21), now=NOW
+    )
+
+    assert len(sent) == 1 and manifest["delivered"] is True
+
+
+def test_a_failed_earlier_delivery_does_not_count(monkeypatch):
+    """Saturday's run failed, so Sunday's sends the close."""
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    monkeypatch.setenv("DATA_REPORT_SOURCE", "schedule")
+    monkeypatch.setattr(report_module, "_tracker", _RecordingTracker)
+    sent = []
+    monkeypatch.setattr(report_module, "deliver", lambda *a, **k: sent.append(a))
+    store = _live_shaped_store()
+    store.written["runs/report.daily/2026-09-18/2026-09-19/run.json"] = json.dumps(
+        {"status": "failed", "reason": "the transport refused it"}
+    ).encode("utf-8")
+
+    manifest = report_module.run_report(
+        store, trading_day=dt.date(2026, 9, 18), calendar_date=dt.date(2026, 9, 20), now=NOW
+    )
+
+    assert len(sent) == 1 and manifest["delivered"] is True
+
+
+def test_the_workflow_states_who_started_the_run():
+    text = (pathlib.Path(__file__).resolve().parents[1] / ".github/workflows/data-report.yml").read_text()
+    assert "DATA_REPORT_SOURCE: ${{ inputs.source || github.event_name }}" in text

@@ -313,6 +313,9 @@ jobs:
           # Forces `krepis.secrets` to resolve from the environment instead of
           # reaching SSM, which this role is deliberately not granted.
           ALPHA_ENGINE_SECRETS_SOURCE: env
+          # relay | schedule send one message per market close (Brian
+          # 2026-10-21); manual always sends. `data_gate.report.REPORT_SOURCE_VAR`.
+          DATA_REPORT_SOURCE: ${{ inputs.source || github.event_name }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         # No `--fail-on-unmet` equivalent exists on this subcommand: `report`
