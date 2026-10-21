@@ -244,11 +244,80 @@ def test_cost_tag_survives_alongside_per_run_identity_tags(monkeypatch):
     )
 
     assert result["data_spot"]["launched"] is True
-    assert seen_extra_tags[-1] == {
+    tags = dict(seen_extra_tags[-1])
+    assert tags.pop("watchdog-deadline")
+    assert tags == {
         "execution-id": "exec-1",
         "run-date": "2026-09-21",
         "system": "data-collection",
     }
+
+
+# ── watchdog-deadline tag (alpha-engine-config-I12463) ──────────────────────
+# The orphan reaper reaps an UNTAGGED box at 6 h + 30 min. On 2026-10-21 it
+# killed the 12 h filing-text backfill at age 24632 s because this launcher
+# never stamped the box's own budget.
+
+_REAPER_UNTAGGED_REAP_AFTER_SECONDS = 21600 + 1800  # spot-orphan-reaper defaults
+
+
+def _capture_tags(monkeypatch, workload):
+    index, ssm, ec2 = _load(monkeypatch, launch_impl=lambda *a, **kw: "i-tagged")
+    seen = []
+    real_launch = sys.modules["nousergon_lib.ec2_spot"].launch
+
+    def wrapped(types_, subnets, *, extra_tags=None, **kw):
+        seen.append(extra_tags)
+        return real_launch(types_, subnets, extra_tags=extra_tags, **kw)
+
+    sys.modules["nousergon_lib.ec2_spot"].launch = wrapped
+    import datetime as _dt
+
+    before = _dt.datetime.now(_dt.timezone.utc)
+    result = index.handler({"workload": workload}, None)
+    assert result["data_spot"]["launched"] is True
+    return index, seen[-1], before
+
+
+def test_handler_stamps_the_filing_text_box_past_its_own_12h_cap(monkeypatch):
+    import datetime as _dt
+
+    index, tags, before = _capture_tags(monkeypatch, "filing-text-pit-backfill")
+    deadline = _dt.datetime.fromisoformat(tags["watchdog-deadline"])
+    budget = (deadline - before).total_seconds()
+    assert budget >= index._max_runtime_seconds("filing-text-pit-backfill") == 43200
+    assert budget > _REAPER_UNTAGGED_REAP_AFTER_SECONDS
+    # The ISO form the reaper parses (datetime.fromisoformat, tz-aware).
+    assert deadline.tzinfo is not None
+
+
+def test_handler_stamps_a_deadline_without_sf_identity_tags(monkeypatch):
+    """An operator re-drive carries no execution_id/run_date — the reaper
+    still needs the deadline, so the tag must not depend on them."""
+    _, tags, _ = _capture_tags(monkeypatch, "morning-enrich")
+    assert set(tags) == {"watchdog-deadline", "system"}
+
+
+@pytest.mark.parametrize("cap", [3600, 7200, 18000, 43200])
+def test_watchdog_deadline_covers_the_cap_and_the_launch_to_timer_wait(monkeypatch, cap):
+    import datetime as _dt
+
+    index, _, _ = _load(monkeypatch, launch_impl=lambda *a, **kw: "i-x")
+    monkeypatch.setitem(index._WORKLOAD_MAX_RUNTIME_SECONDS, "w", cap)
+    now = _dt.datetime(2026, 10, 20, 23, 24, tzinfo=_dt.timezone.utc)
+    deadline = _dt.datetime.fromisoformat(index._watchdog_deadline("w", now=now))
+    expected = cap + index._INSTANCE_RUNNING_WAIT_SEC + index.SSM_ONLINE_BUDGET_SEC
+    assert (deadline - now).total_seconds() == expected
+
+
+def test_every_declared_cap_gets_a_deadline_at_least_that_long(monkeypatch):
+    import datetime as _dt
+
+    index, _, _ = _load(monkeypatch, launch_impl=lambda *a, **kw: "i-x")
+    now = _dt.datetime(2026, 10, 21, tzinfo=_dt.timezone.utc)
+    for workload, cap in index._WORKLOAD_MAX_RUNTIME_SECONDS.items():
+        deadline = _dt.datetime.fromisoformat(index._watchdog_deadline(workload, now=now))
+        assert (deadline - now).total_seconds() >= cap, workload
 
 
 def test_handler_happy_path_dispatches_bootstrap(monkeypatch):
