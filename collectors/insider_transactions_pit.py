@@ -21,7 +21,18 @@ Output, one parquet per quarter, rewritten whole (a quarter's data set is
 final once published; SEC re-publishes only to correct):
 
     fundamentals_pit/insider/v1/quarters/{YYYY}q{N}.parquet
+    fundamentals_pit/insider/v1/quarantine/{YYYY}q{N}.json     (only when rows were quarantined)
     fundamentals_pit/insider/v1/runs/{run_date}/{run_id}.json  (+ runs/latest.json)
+
+Malformed dates (alpha-engine-config-I12461): SEC's bulk files carry the odd
+hand-typed date no parser can read -- the 2026-10-20 23:24Z backfill died on
+ONE unparseable TRANS_DATE in 2014q3 and wrote nothing after it. A row whose
+FILING_DATE, PERIOD_OF_REPORT or TRANS_DATE does not parse is QUARANTINED:
+left out of the quarter's parquet, written whole (accession, transaction key,
+column, raw value) to the quarter's quarantine record before the parquet, and
+counted in the run manifest. It is never dropped silently and never guessed.
+A quarter whose quarantined fraction exceeds `QUARANTINE_MAX_FRACTION` still
+stops the run: that is a format change, not a typo.
 
 Rows are non-derivative transactions (Table I) from Form 4 and 4/A only --
 open-market buys and sells, grants, exercises, tax withholding all carry their
@@ -57,6 +68,21 @@ DATASET_PREFIX = "fundamentals_pit/insider/v1"
 QUARTERS_PREFIX = f"{DATASET_PREFIX}/quarters/"
 RUNS_PREFIX = f"{DATASET_PREFIX}/runs/"
 RUN_LATEST_KEY = f"{RUNS_PREFIX}latest.json"
+QUARANTINE_PREFIX = f"{DATASET_PREFIX}/quarantine/"
+
+#: The share of a quarter's Form 4 Table I rows that may be quarantined for an
+#: unparseable date before the quarter is refused as a source-format change.
+#: 2014q3 had one bad TRANS_DATE in ~10^5 rows; a changed date format makes
+#: (nearly) every row unparseable. 0.1% sits orders of magnitude from both.
+QUARANTINE_MAX_FRACTION = 0.001
+
+#: The date columns a row must parse to be written, mapped to their output
+#: names. FILING_DATE is the knowledge time, so it is never optional.
+DATE_COLUMNS: dict[str, str] = {
+    "FILING_DATE": "filing_date",
+    "PERIOD_OF_REPORT": "period_of_report",
+    "TRANS_DATE": "trans_date",
+}
 DEFAULT_BUCKET = "alpha-engine-research"
 
 #: Where SEC serves a quarter's zip, tried in order; a 404 falls through to
@@ -179,6 +205,10 @@ def quarter_key(year: int, quarter: int) -> str:
     return f"{QUARTERS_PREFIX}{quarter_label(year, quarter)}.parquet"
 
 
+def quarantine_key(year: int, quarter: int) -> str:
+    return f"{QUARANTINE_PREFIX}{quarter_label(year, quarter)}.json"
+
+
 # -- parsing -----------------------------------------------------------------------
 
 
@@ -203,19 +233,71 @@ def _read_member(archive: zipfile.ZipFile, name: str) -> pd.DataFrame:
     return frame
 
 
-def _parse_sec_dates(values: pd.Series, *, column: str) -> pd.Series:
-    """SEC writes `DD-MON-YYYY` (e.g. 05-JAN-2024); ISO is accepted too."""
+def _parse_sec_dates(values: pd.Series) -> tuple[pd.Series, pd.Series]:
+    """(dates, unparseable mask). SEC writes `DD-MON-YYYY` (e.g. 05-JAN-2024);
+    ISO is accepted too. A blank stays a blank and is not counted as bad; a
+    present value neither format reads is flagged for the caller to
+    quarantine -- this helper never raises and never guesses."""
     text = values.astype("string").str.strip()
+    text = text.replace("", pd.NA)
     parsed = pd.to_datetime(text, format="%d-%b-%Y", errors="coerce")
     iso = parsed.isna() & text.notna()
     if iso.any():
         parsed = parsed.where(
             ~iso, pd.to_datetime(text.where(iso), format="%Y-%m-%d", errors="coerce")
         )
-    bad = parsed.isna() & text.notna()
-    if bad.any():
-        raise SourceFormatError(f"{int(bad.sum())} unparseable {column} value(s)")
-    return parsed.dt.date
+    bad = (parsed.isna() & text.notna()).fillna(False).astype(bool)
+    return parsed.dt.date, bad
+
+
+def _quarantine_dates(
+    rows: pd.DataFrame,
+) -> tuple[dict[str, pd.Series], pd.Series, pd.DataFrame, dict[str, int]]:
+    """Parse every `DATE_COLUMNS` column of the merged rows.
+
+    Returns (parsed dates by output name, mask of rows with any bad date,
+    one quarantine record per bad (row, column) pair, bad-row count per
+    source column). Raises when the
+    quarantined share of rows exceeds `QUARANTINE_MAX_FRACTION`.
+    """
+    parsed: dict[str, pd.Series] = {}
+    records: list[pd.DataFrame] = []
+    by_column: dict[str, int] = {}
+    any_bad = pd.Series(False, index=rows.index)
+    for column, name in DATE_COLUMNS.items():
+        dates, bad = _parse_sec_dates(rows[column])
+        parsed[name] = dates
+        by_column[column] = int(bad.sum())
+        if bad.any():
+            any_bad |= bad
+            records.append(
+                pd.DataFrame(
+                    {
+                        "accession": rows.loc[bad, "ACCESSION_NUMBER"].astype(str),
+                        "transaction_sk": rows.loc[bad, "NONDERIV_TRANS_SK"].astype(
+                            str
+                        ),
+                        "column": column,
+                        "raw_value": rows.loc[bad, column].astype(str),
+                    }
+                )
+            )
+    quarantined = (
+        pd.concat(records, ignore_index=True)
+        if records
+        else pd.DataFrame(
+            columns=["accession", "transaction_sk", "column", "raw_value"]
+        )
+    )
+    total, bad_rows = len(rows), int(any_bad.sum())
+    if total and bad_rows / total > QUARANTINE_MAX_FRACTION:
+        detail = ", ".join(f"{c}={n}" for c, n in by_column.items() if n)
+        raise SourceFormatError(
+            f"{bad_rows} of {total} row(s) carry an unparseable date ({detail}), "
+            f"above the {QUARANTINE_MAX_FRACTION:.2%} quarantine ceiling; "
+            "treating it as a source-format change"
+        )
+    return parsed, any_bad, quarantined, by_column
 
 
 def _owner_flags(owners: pd.DataFrame) -> pd.DataFrame:
@@ -251,8 +333,14 @@ def _owner_flags(owners: pd.DataFrame) -> pd.DataFrame:
     ).reset_index()
 
 
-def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
-    """One quarterly zip -> (Table I rows from Form 4 / 4/A, counts)."""
+def parse_dataset(
+    payload: bytes,
+) -> tuple[pd.DataFrame, dict[str, Any], pd.DataFrame]:
+    """One quarterly zip -> (Table I rows from Form 4 / 4/A, counts, quarantine).
+
+    The quarantine frame holds one record per (row, date column) that did not
+    parse; those rows are absent from the first frame.
+    """
     with zipfile.ZipFile(io.BytesIO(payload)) as archive:
         submissions = _read_member(archive, "SUBMISSION.tsv")
         owners = _read_member(archive, "REPORTINGOWNER.tsv")
@@ -272,6 +360,9 @@ def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
     )
     rows = rows.merge(_owner_flags(owners), on="ACCESSION_NUMBER", how="left")
     stats["rows_without_owner"] = int(rows["owner_ciks"].isna().sum())
+    dates, bad, quarantined, bad_by_column = _quarantine_dates(rows)
+    stats["rows_quarantined"] = int(bad.sum())
+    stats["quarantined_by_column"] = bad_by_column
 
     out = pd.DataFrame(
         {
@@ -279,10 +370,8 @@ def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
             "transaction_sk": pd.to_numeric(
                 rows["NONDERIV_TRANS_SK"], errors="raise"
             ).astype("int64"),
-            "filing_date": _parse_sec_dates(rows["FILING_DATE"], column="FILING_DATE"),
-            "period_of_report": _parse_sec_dates(
-                rows["PERIOD_OF_REPORT"], column="PERIOD_OF_REPORT"
-            ),
+            "filing_date": dates["filing_date"],
+            "period_of_report": dates["period_of_report"],
             "form": rows["DOCUMENT_TYPE"].str.strip().str.upper().astype("string"),
             "issuer_cik": pd.to_numeric(rows["ISSUERCIK"], errors="raise").astype(
                 "int64"
@@ -302,7 +391,7 @@ def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
             "is_other": rows["is_other"].fillna(False).astype(bool),
             "owner_titles": rows["owner_titles"].fillna("").astype("string"),
             "security_title": rows["SECURITY_TITLE"].fillna("").astype("string"),
-            "trans_date": _parse_sec_dates(rows["TRANS_DATE"], column="TRANS_DATE"),
+            "trans_date": dates["trans_date"],
             "trans_code": rows["TRANS_CODE"]
             .fillna("")
             .str.strip()
@@ -330,6 +419,7 @@ def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
             "schema_version": SCHEMA_VERSION,
         }
     )
+    out = out[~bad.to_numpy()]
     if out["filing_date"].isna().any():
         raise SourceFormatError(
             "a Form 4 row has no FILING_DATE; its knowledge time is unknown"
@@ -338,7 +428,7 @@ def parse_dataset(payload: bytes) -> tuple[pd.DataFrame, dict[str, int]]:
         drop=True
     )
     stats["rows"] = len(out)
-    return out[list(ROW_COLUMNS)], stats
+    return out[list(ROW_COLUMNS)], stats, quarantined
 
 
 def check_quarter_bounds(frame: pd.DataFrame, year: int, quarter: int) -> None:
@@ -413,6 +503,7 @@ def run(
         "quarters_skipped_existing": 0,
         "quarters_unpublished": [],
         "rows_written": 0,
+        "rows_quarantined": 0,
     }
     for year, quarter in quarters:
         label, key = quarter_label(year, quarter), quarter_key(year, quarter)
@@ -431,13 +522,41 @@ def run(
                 summary["quarters_unpublished"].append(label)
                 continue
             raise
-        frame, stats = parse_dataset(payload)
+        frame, stats, quarantined = parse_dataset(payload)
         stats["source_url"] = url
         check_quarter_bounds(frame, year, quarter)
+        if not quarantined.empty:
+            # Before the parquet: a resumed run skips any quarter whose parquet
+            # exists, so a parquet written first could outlive its record.
+            qkey = quarantine_key(year, quarter)
+            record = {
+                "quarter": label,
+                "schema_version": SCHEMA_VERSION,
+                "source_url": url,
+                "run_id": run_id,
+                "rows_quarantined": stats["rows_quarantined"],
+                "rows_written": stats["rows"],
+                "max_fraction": QUARANTINE_MAX_FRACTION,
+                "quarantined_by_column": stats["quarantined_by_column"],
+                "records": quarantined.to_dict(orient="records"),
+            }
+            store.put_bytes(
+                qkey,
+                json.dumps(record, indent=2, sort_keys=True).encode(),
+                "application/json",
+            )
+            stats["quarantine_key"] = qkey
+            logger.warning(
+                "%s: %d row(s) quarantined for an unparseable date (%s)",
+                label,
+                stats["rows_quarantined"],
+                qkey,
+            )
         store.put_bytes(key, _to_parquet(frame), "application/octet-stream")
         summary["quarters"][label] = stats
         summary["quarters_written"] += 1
         summary["rows_written"] += stats["rows"]
+        summary["rows_quarantined"] += stats["rows_quarantined"]
         logger.info(
             "%s: %d rows written (%d Form 4 filings)",
             label,
@@ -500,12 +619,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         newest_may_be_unpublished=lenient,
     )
     logger.info(
-        "run %s: %d quarter(s) written, %d skipped, %d unpublished, %d rows",
+        "run %s: %d quarter(s) written, %d skipped, %d unpublished, %d rows, "
+        "%d quarantined",
         summary["run_id"],
         summary["quarters_written"],
         summary["quarters_skipped_existing"],
         len(summary["quarters_unpublished"]),
         summary["rows_written"],
+        summary["rows_quarantined"],
     )
     return 0
 
