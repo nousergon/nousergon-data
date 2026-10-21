@@ -56,7 +56,9 @@ def test_the_report_and_the_board_agree_on_every_calendar_day():
     while day <= end:
         report_day = report_module.previous_trading_day(day)
         assert report_day == latest_trading_day_on_or_before(day - dt.timedelta(days=1)), day
-        assert report_day == resolve_trading_day("yesterday", today=day), day
+        assert report_day == resolve_trading_day(
+            "yesterday", now=dt.datetime.combine(day, dt.time(1, 30), tzinfo=dt.timezone.utc)
+        ), day
         day += dt.timedelta(days=1)
 
 
