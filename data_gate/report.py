@@ -53,6 +53,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import os
 from dataclasses import dataclass
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -950,6 +951,45 @@ def _history_rows(store: Any) -> list[tuple[str, dict | None, str | None]]:
     return rows
 
 
+#: Who started this run, as the workflow states it: `relay` (the on-time
+#: 12:15Z dispatch), `schedule` (the GitHub cron backstop) or `manual` (a
+#: person). Set by `.github/workflows/data-report.yml` from `inputs.source`
+#: or the event name. Unset means a person ran the CLI, and it delivers.
+REPORT_SOURCE_VAR = "DATA_REPORT_SOURCE"
+
+#: The starters that send at most ONE message per market close. Brian's
+#: 2026-10-21 ruling: one ping per close, sent the morning after (Tue-Sat).
+#: `trading_day` collapses Saturday, Sunday and Monday onto Friday, so without
+#: this the Sunday and Monday mornings repeat Friday's reading. A manual run
+#: always delivers: a person asking for the report gets it.
+ONCE_PER_CLOSE_SOURCES = frozenset({"relay", "schedule"})
+
+
+def earlier_delivery(store: Any, *, trading_day: str, calendar_date: str) -> str | None:
+    """The calendar date that already delivered this close, or None.
+
+    Only a manifest that says `delivered: true` counts, so a morning whose
+    delivery failed is retried on the next one. Anything unreadable counts as
+    not delivered: a duplicate costs one message, a skipped close costs the
+    reading.
+    """
+    try:
+        keys = sorted(store.list_keys(f"{RUNS_PREFIX}/{trading_day}/"))
+    except Exception:  # noqa: BLE001 - fail toward delivering
+        return None
+    for key in keys:
+        parts = key.split("/")
+        if not key.endswith("/run.json") or len(parts) < 2 or parts[-2] == calendar_date:
+            continue
+        try:
+            doc = json.loads(store.get_bytes(key))
+        except Exception:  # noqa: BLE001 - fail toward delivering
+            continue
+        if doc.get("status") == "ok" and doc.get("delivered") is True:
+            return parts[-2]
+    return None
+
+
 def run_report(
     store: Any,
     *,
@@ -998,6 +1038,22 @@ def run_report(
         # this deliverable asks whether `trigger.schedule` exists, and a field
         # inside a document cannot be asserted by a key listing.
         _put(store, manifest_key(f"trigger.{trigger}", day, cal), trigger)
+
+    source = os.environ.get(REPORT_SOURCE_VAR, "").strip()
+    manifest["source"] = source or "unset"
+    if source in ONCE_PER_CLOSE_SOURCES:
+        earlier = earlier_delivery(store, trading_day=day, calendar_date=cal)
+        if earlier is not None:
+            # One message per close. The manifest is still filed `ok`, so this
+            # morning is visibly a run that chose not to send, never an absence.
+            manifest["delivered"] = False
+            manifest["not_delivered_because"] = (
+                f"the {day} close was already delivered on {earlier}; one message per close"
+            )
+            manifest["status"] = "ok"
+            manifest["reason"] = ""
+            _file_manifest()
+            return manifest
 
     try:
         inputs = read_inputs(
