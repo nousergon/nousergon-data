@@ -183,6 +183,22 @@ def _url(year: int, quarter: int, template: int = 0) -> str:
     return m.DATASET_URLS[template].format(year=year, quarter=quarter)
 
 
+def _bulk_trans(n: int, *, accession: str = "0001-24-000001", bad=None) -> list:
+    """`n` Table I rows on one filing; `bad` maps a row index to the
+    (column, raw value) that replaces its well-formed value."""
+    header = _TRANS[0]
+    rows = [header]
+    for i in range(n):
+        row = dict(zip(header, _TRANS[1]))
+        row["ACCESSION_NUMBER"] = accession
+        row["NONDERIV_TRANS_SK"] = str(1000 + i)
+        if bad and i in bad:
+            column, value = bad[i]
+            row[column] = value
+        rows.append(tuple(row[c] for c in header))
+    return rows
+
+
 class TestQuarters:
     def test_range_and_last_complete(self) -> None:
         assert m.quarters_between((2018, 3), (2019, 2)) == [
@@ -200,7 +216,8 @@ class TestQuarters:
 
 class TestParse:
     def test_keeps_form4_table_i_rows_with_owner_roles(self) -> None:
-        frame, stats = m.parse_dataset(_zip())
+        frame, stats, quarantined = m.parse_dataset(_zip())
+        assert quarantined.empty and stats["rows_quarantined"] == 0
         assert tuple(frame.columns) == m.ROW_COLUMNS
         assert stats["form4_submissions"] == 2
         assert list(frame["transaction_sk"]) == [10, 11, 20], (
@@ -228,14 +245,70 @@ class TestParse:
         with pytest.raises(m.SourceFormatError, match="DIRECT_INDIRECT_OWNERSHIP"):
             m.parse_dataset(_zip(trans=trans))
 
-    def test_an_unparseable_filing_date_stops_the_run(self) -> None:
+    def test_an_unparseable_filing_date_above_the_ceiling_stops_the_run(
+        self,
+    ) -> None:
+        # 2 of 3 rows is far above QUARANTINE_MAX_FRACTION: a format change.
         submission = list(_SUBMISSION)
         submission[1] = ("0001-24-000001", "2024/02/05", *submission[1][2:])
-        with pytest.raises(m.SourceFormatError, match="FILING_DATE"):
+        with pytest.raises(m.SourceFormatError, match="FILING_DATE=2"):
             m.parse_dataset(_zip(submission=submission))
 
+    def test_one_bad_trans_date_in_a_large_quarter_is_quarantined(self) -> None:
+        # alpha-engine-config-I12461: 2014q3 carried ONE unparseable TRANS_DATE
+        # and the strict parser aborted ~50 quarters of backfill on it.
+        trans = _bulk_trans(2000, bad={7: ("TRANS_DATE", "31-JUN-2O24")})
+        frame, stats, quarantined = m.parse_dataset(_zip(trans=trans))
+        assert len(frame) == 1999 and 1007 not in set(frame["transaction_sk"])
+        assert stats["rows_quarantined"] == 1
+        assert stats["quarantined_by_column"] == {
+            "FILING_DATE": 0,
+            "PERIOD_OF_REPORT": 0,
+            "TRANS_DATE": 1,
+        }
+        assert quarantined.to_dict(orient="records") == [
+            {
+                "accession": "0001-24-000001",
+                "transaction_sk": "1007",
+                "column": "TRANS_DATE",
+                "raw_value": "31-JUN-2O24",
+            }
+        ]
+        assert frame["trans_date"].notna().all()
+
+    def test_a_bad_period_of_report_is_quarantined_like_trans_date(self) -> None:
+        submission = list(_SUBMISSION)
+        submission[1] = (*submission[1][:2], "1-FEBR-2024", *submission[1][3:])
+        trans = _bulk_trans(2000, accession="0001-24-000002")
+        trans.append(_TRANS[1])
+        frame, stats, quarantined = m.parse_dataset(
+            _zip(submission=submission, trans=trans)
+        )
+        assert stats["rows_quarantined"] == 1 and len(frame) == 2000
+        assert list(quarantined["column"]) == ["PERIOD_OF_REPORT"]
+        assert "0001-24-000001" not in set(frame["accession"])
+
+    def test_a_whole_unparseable_column_still_stops_the_run(self) -> None:
+        bad = {i: ("TRANS_DATE", "2024.02.01") for i in range(2000)}
+        with pytest.raises(m.SourceFormatError, match="TRANS_DATE=2000"):
+            m.parse_dataset(_zip(trans=_bulk_trans(2000, bad=bad)))
+
+    def test_just_above_the_ceiling_stops_the_run(self) -> None:
+        # 3 of 2000 = 0.15% > 0.1%; 2 of 2000 = 0.1% is allowed.
+        bad = {i: ("TRANS_DATE", "??") for i in range(3)}
+        with pytest.raises(m.SourceFormatError, match="quarantine ceiling"):
+            m.parse_dataset(_zip(trans=_bulk_trans(2000, bad=bad)))
+        bad = {i: ("TRANS_DATE", "??") for i in range(2)}
+        _, stats, _ = m.parse_dataset(_zip(trans=_bulk_trans(2000, bad=bad)))
+        assert stats["rows_quarantined"] == 2
+
+    def test_a_blank_trans_date_is_not_quarantined(self) -> None:
+        bad = {0: ("TRANS_DATE", " ")}
+        frame, stats, _ = m.parse_dataset(_zip(trans=_bulk_trans(10, bad=bad)))
+        assert stats["rows_quarantined"] == 0 and len(frame) == 10
+
     def test_rows_filed_outside_the_quarter_are_refused(self) -> None:
-        frame, _ = m.parse_dataset(_zip())
+        frame, _, _ = m.parse_dataset(_zip())
         m.check_quarter_bounds(frame, 2024, 1)
         with pytest.raises(m.SourceFormatError, match="outside"):
             m.check_quarter_bounds(frame, 2024, 2)
@@ -258,6 +331,60 @@ class TestRun:
         assert len(frame) == 3
         assert json.loads(store.objects[m.RUN_LATEST_KEY])["run_id"] == "r1"
         assert m.RUNS_PREFIX + "2026-10-19/r1.json" in store.objects
+
+    def test_quarantine_is_written_before_the_parquet_and_counted(self) -> None:
+        trans = _bulk_trans(2000, bad={3: ("TRANS_DATE", "00-JAN-2024")})
+        store, sec = _Store(), _Sec({_url(2024, 1): _zip(trans=trans)})
+        writes: list[str] = []
+        put = store.put_bytes
+        store.put_bytes = lambda k, b, c: (writes.append(k), put(k, b, c))
+        summary = m.run(
+            store,
+            sec,
+            [(2024, 1)],
+            run_date=dt.date(2026, 10, 21),
+            overwrite=False,
+            newest_may_be_unpublished=False,
+            run_id="r2",
+        )
+        qkey = m.quarantine_key(2024, 1)
+        assert writes.index(qkey) < writes.index(m.quarter_key(2024, 1))
+        record = json.loads(store.objects[qkey])
+        assert record["rows_quarantined"] == 1 and record["rows_written"] == 1999
+        assert record["records"][0]["raw_value"] == "00-JAN-2024"
+        assert summary["rows_quarantined"] == 1 and summary["rows_written"] == 1999
+        latest = json.loads(store.objects[m.RUN_LATEST_KEY])
+        assert latest["quarters"]["2024q1"]["quarantine_key"] == qkey
+
+    def test_a_clean_quarter_writes_no_quarantine_record(self) -> None:
+        store = _Store()
+        m.run(
+            store,
+            _Sec({_url(2024, 1): _zip()}),
+            [(2024, 1)],
+            run_date=dt.date(2026, 10, 21),
+            overwrite=False,
+            newest_may_be_unpublished=False,
+        )
+        assert store.list_keys(m.QUARANTINE_PREFIX) == []
+        assert json.loads(store.objects[m.RUN_LATEST_KEY])["rows_quarantined"] == 0
+
+    def test_a_rerun_resumes_past_quarters_already_written(self) -> None:
+        # The 10-20 23:24Z run left 2014q1/q2 and no manifest; a rerun without
+        # --overwrite must skip what exists and carry on from the next quarter.
+        store = _Store([m.quarter_key(2023, 4)])
+        sec = _Sec({_url(2024, 1): _zip()})
+        summary = m.run(
+            store,
+            sec,
+            [(2023, 4), (2024, 1)],
+            run_date=dt.date(2026, 10, 21),
+            overwrite=False,
+            newest_may_be_unpublished=False,
+        )
+        assert sec.urls == [_url(2024, 1)]
+        assert summary["quarters_skipped_existing"] == 1
+        assert summary["quarters_written"] == 1
 
     def test_existing_quarters_are_skipped_unless_overwriting(self) -> None:
         store = _Store([m.quarter_key(2024, 1)])

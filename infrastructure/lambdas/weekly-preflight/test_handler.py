@@ -65,7 +65,21 @@ def _install_boto3_stub():
     return cw
 
 
-def _install_stub(results, n_fail=None, raises=None, required=None):
+_UNSET = object()
+
+# The real sf_preflight.on_spot_check_names() today (alpha-engine-config-I12481):
+# the ten checks whose capabilities exceed LAMBDA_CAPABILITIES. Pinned against
+# the real module by tests/test_sf_weekly_preflight_blind_spot_reconcile.py.
+_SPOT_NAMES = frozenset({
+    "arctic_connectivity", "constituents_fetch", "universe_drift",
+    "universe_sample_freshness", "polygon_grouped_coverage",
+    "predicted_missing_from_closes", "backfill_source_freshness",
+    "price_cards_cover_all_models", "recursion_budget_for_response_format",
+    "tool_contracts",
+})
+
+
+def _install_stub(results, n_fail=None, raises=None, required=None, spot_names=_UNSET):
     """Install a stub sf_preflight module and return the recorded call kwargs.
 
     ``required`` is the set of bare check names (e.g. "arctic_connectivity")
@@ -138,6 +152,12 @@ def _install_stub(results, n_fail=None, raises=None, required=None):
 
     stub.run_preflight = run_preflight
     stub.summarize_results = summarize_results
+    # alpha-engine-config-I12481. spot_names=None models a sf_preflight that
+    # predates on_spot_check_names (the attribute is absent).
+    if spot_names is _UNSET:
+        spot_names = _SPOT_NAMES
+    if spot_names is not None:
+        stub.on_spot_check_names = lambda: frozenset(spot_names)
     sys.modules["sf_preflight"] = stub
     return recorded
 
@@ -212,6 +232,70 @@ class WeeklyPreflightHandlerTests(unittest.TestCase):
             ["arctic_connectivity", "constituents_fetch"],
         )
         self.assertIn("stage_coverage", out, "DEGRADED still records stage coverage, like OK")
+
+    # ── alpha-engine-config-I12481: which unobserved checks the box re-runs ──
+
+    def _eight_by_design(self, **kw):
+        """The 2026-10-16 cadence shape: 5 AWS checks ran, the 8 required
+        capability-gated checks skipped by design."""
+        eight = [
+            "arctic_connectivity", "constituents_fetch", "universe_drift",
+            "universe_sample_freshness", "polygon_grouped_coverage",
+            "predicted_missing_from_closes", "backfill_source_freshness",
+            "tool_contracts",
+        ]
+        _install_stub(
+            [_Result("sf_iam_reachability", "ok")]
+            + [_Result(n, "skip", "Not run: capability") for n in eight],
+            **kw,
+        )
+        return eight
+
+    def test_capability_skips_are_declared_covered_on_spot(self):
+        eight = self._eight_by_design()
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "DEGRADED", "the Lambda's own verdict is unchanged")
+        self.assertEqual(out["required_skip_names"], eight)
+        self.assertEqual(out["required_skips_on_spot"], eight)
+        self.assertEqual(out["required_skips_off_spot"], [])
+        self.assertEqual(out["required_skips_on_spot_coverage"], "ALL")
+
+    def test_a_skip_the_box_does_not_run_keeps_the_blind_spot_open(self):
+        """An AWS-only check is never re-run on the box, so its skip is
+        covered by nothing and must not be retired."""
+        _install_stub([
+            _Result("sf_iam_reachability", "ok"),
+            _Result("arctic_connectivity", "skip", "Not run: arctic"),
+            _Result("lambda_memory_headroom", "skip", "no lambdas"),
+        ])
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "DEGRADED")
+        self.assertEqual(out["required_skips_on_spot"], ["arctic_connectivity"])
+        self.assertEqual(out["required_skips_off_spot"], ["lambda_memory_headroom"])
+        self.assertEqual(out["required_skips_on_spot_coverage"], "PARTIAL")
+
+    def test_blocked_checks_count_toward_on_spot_coverage(self):
+        _install_stub([
+            _Result("sf_iam_reachability", "ok"),
+            _Result("definition_input_coherence", "blocked", "Blocked"),
+        ])
+        out = self._handler()({}, None)
+        self.assertEqual(out["required_skips_off_spot"], ["definition_input_coherence"])
+        self.assertEqual(out["required_skips_on_spot_coverage"], "NONE")
+
+    def test_older_sf_preflight_fails_closed(self):
+        """A packaged sf_preflight without on_spot_check_names must keep the
+        blind spot open, never retire it on a guess."""
+        eight = self._eight_by_design(spot_names=None)
+        out = self._handler()({}, None)
+        self.assertEqual(out["required_skips_off_spot"], eight)
+        self.assertEqual(out["required_skips_on_spot_coverage"], "NONE")
+
+    def test_clean_run_carries_no_coverage_claim(self):
+        _install_stub([_Result("sf_iam_reachability", "ok")])
+        out = self._handler()({}, None)
+        self.assertEqual(out["status"], "OK")
+        self.assertNotIn("required_skips_on_spot_coverage", out)
 
     def _coverage_calls(self, event):
         calls = []

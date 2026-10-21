@@ -197,7 +197,10 @@ class TestChainOrdering:
             "on-spot preflight pass to CheckShellRun (and from there through "
             "the skip chain into MorningEnrich)"
         )
-        assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
+        # alpha-engine-config-I12481: via the blind-spot reconcile Choice,
+        # whose Default (and its one covered arm) is CheckShellRun.
+        assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "ReconcileWeeklyPreflightBlindSpot"
+        assert states["ReconcileWeeklyPreflightBlindSpot"]["Default"] == "CheckShellRun"
         assert states["CheckSubstrateHealthGate"]["Default"] == "ExtractSubstrateHealthGateError"
 
     def test_skip_morning_enrich_default_enters_the_wait(self, states):

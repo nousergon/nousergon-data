@@ -81,7 +81,18 @@ INFRA = Path(__file__).resolve().parent
 
 #: Safety bound on the path-sensitive walk. Exceeding it is a loud failure, never
 #: a silently truncated analysis (fail-loud: a partial sweep reads as a clean one).
-_MAX_CONTEXTS = 200_000
+#:
+#: Raised from 200,000 (alpha-engine-config-I12481). Measured 2026-10-21: the weekly
+#: graph on main already walked 199,046 contexts, 99.5% of the old bound, with
+#: ~1,936 contexts on every state of the cadence path between spot bootstrap and
+#: CheckShellRun. Any one new state on that path costs about that many, so the
+#: weekly SF could no longer gain a state without failing this check, even one
+#: that adds no boolean fact (I12481 adds two and lands at 202,918). The
+#: walk is linear in this number, so the bound is a runaway guard for a
+#: combinatorial blow-up, which is still loud. It does not budget legitimate
+#: growth. Doubling it leaves room for that growth and still catches the 10s
+#: blow-up the liveness pass was written to stop.
+_MAX_CONTEXTS = 400_000
 
 #: ``$.foo`` / ``$.foo.bar``, never ``$$.Map.Item.Value`` and never a bare ``$``.
 _REF = re.compile(r"(?<!\$)\$\.([A-Za-z_][A-Za-z0-9_]*)")

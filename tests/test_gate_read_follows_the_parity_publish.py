@@ -152,16 +152,55 @@ def test_no_report_at_all_is_still_unmet_not_unmeasurable():
     ],
 )
 def test_yesterday_resolves_to_the_session_a_post_midnight_read_is_about(today, expected):
-    assert resolve_trading_day("yesterday", today=today) == expected
+    # Both post-publish crons, at their scheduled minute and five hours late:
+    # `yesterday` is the UTC day before the one the run starts on.
+    for hour, minute in ((1, 30), (6, 30), (12, 30), (17, 30)):
+        now = dt.datetime.combine(today, dt.time(hour, minute), tzinfo=dt.timezone.utc)
+        assert resolve_trading_day("yesterday", now=now) == expected, now
 
 
-def test_today_and_an_explicit_date_are_unchanged():
+def test_today_and_an_explicit_date_are_unchanged_for_an_on_time_read():
     from data_gate.cadence import latest_trading_day_on_or_before
 
     today = dt.date(2026, 9, 22)
-    assert resolve_trading_day(None, today=today) == latest_trading_day_on_or_before(today)
-    assert resolve_trading_day("today", today=today) == latest_trading_day_on_or_before(today)
-    assert resolve_trading_day("2026-09-18", today=today) == dt.date(2026, 9, 18)
+    on_time = dt.datetime(2026, 9, 22, 23, 30, tzinfo=dt.timezone.utc)
+    assert resolve_trading_day(None, now=on_time) == latest_trading_day_on_or_before(today)
+    assert resolve_trading_day("today", now=on_time) == latest_trading_day_on_or_before(today)
+    assert resolve_trading_day("2026-09-18", now=on_time) == dt.date(2026, 9, 18)
+
+
+@pytest.mark.parametrize(
+    "now, expected",
+    [
+        # alpha-engine-config-I10793, measured: the 23:30 UTC cron started at
+        # 01:56Z on 10-20 and 01:44Z on 10-21 and filed both readings under the
+        # UTC date, a session that had not opened, so D36 daily-news read "no
+        # run manifest for this trading day, under runs/D36/2026-10-21/" while
+        # its 10-20 run had been on S3 since 11:25Z.
+        (dt.datetime(2026, 10, 20, 1, 56, tzinfo=dt.timezone.utc), dt.date(2026, 10, 19)),
+        (dt.datetime(2026, 10, 21, 1, 44, tzinfo=dt.timezone.utc), dt.date(2026, 10, 20)),
+        # Just before midnight ET (EDT) is still the New York day ...
+        (dt.datetime(2026, 10, 21, 3, 59, tzinfo=dt.timezone.utc), dt.date(2026, 10, 20)),
+        # ... and from midnight ET on it is the next one.
+        (dt.datetime(2026, 10, 21, 4, 0, tzinfo=dt.timezone.utc), dt.date(2026, 10, 21)),
+        # Under EST the boundary is 05:00 UTC.
+        (dt.datetime(2026, 12, 2, 4, 30, tzinfo=dt.timezone.utc), dt.date(2026, 12, 1)),
+        (dt.datetime(2026, 12, 2, 5, 0, tzinfo=dt.timezone.utc), dt.date(2026, 12, 2)),
+        # A late Friday-evening read that crosses into Saturday UTC is FRIDAY,
+        # not "the latest trading day on or before Saturday" by luck.
+        (dt.datetime(2026, 10, 17, 1, 30, tzinfo=dt.timezone.utc), dt.date(2026, 10, 16)),
+        # A late Sunday read is still about Friday; Monday UTC 02:00 is Sunday ET.
+        (dt.datetime(2026, 10, 19, 2, 0, tzinfo=dt.timezone.utc), dt.date(2026, 10, 16)),
+    ],
+)
+def test_today_is_the_new_york_session_when_the_cron_starts_after_midnight_utc(now, expected):
+    assert resolve_trading_day("today", now=now) == expected
+    assert resolve_trading_day(None, now=now) == expected
+
+
+def test_a_naive_clock_is_refused_rather_than_guessed():
+    with pytest.raises(ValueError):
+        resolve_trading_day("today", now=dt.datetime(2026, 10, 21, 1, 44))
 
 
 # ---------------------------------------------------------------------------
