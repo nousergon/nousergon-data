@@ -1587,6 +1587,21 @@ alert_classes:
     tier: notify-silent
 
   # ── data plane (nousergon-data) ──
+  - class: data_collection_daily_report
+    # alpha-engine-config-I12473. data_gate/report.py::deliver publishes the
+    # daily data-collection update with source=DELIVERY_SOURCE
+    # ("data-collection/report.daily"), severity info, silent=False. Until
+    # 2026-10-21 it had no row, so every daily update PAGED as registry
+    # drift (fail-upward default). Same disposition as
+    # crucible_v2_morning_report: the report must arrive and buzz
+    # (alpha-engine-config-I9916), and it is a lifecycle notice, not an
+    # incident, so notify-silent rather than page or tracked-only.
+    source: "data-collection/report.daily"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    tier: notify-silent
+
   - class: weekly_cost_coverage_gap
     # alpha-engine-config-I11298, Brian ruling 2026-09-21 ("proceed with rec
     # b"): a cost fan-in coverage gap no longer FAILS the weekly run, so this
