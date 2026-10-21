@@ -38,6 +38,7 @@ import argparse
 import datetime as dt
 import os
 import sys
+from zoneinfo import ZoneInfo
 
 from data_gate import read as read_module
 from data_gate.cadence import latest_trading_day_on_or_before
@@ -78,8 +79,10 @@ def _parser() -> argparse.ArgumentParser:
         default=None,
         help=(
             "ISO date the reading is filed under, or one of the two literals below; "
-            "defaults to `today`. `today` = the latest trading day on or before today "
-            "UTC. `yesterday` = the latest trading day on or before YESTERDAY UTC, which "
+            "defaults to `today`. `today` = the latest trading day on or before today's "
+            "America/New_York date (alpha-engine-config-I10793: the 23:30 UTC cron routinely "
+            "starts after 00:00 UTC, when the UTC date is a session that has not opened). "
+            "`yesterday` = the latest trading day on or before YESTERDAY UTC, which "
             "is the session a read taken after midnight UTC is actually about "
             "(alpha-engine-config-I11355): the same-day parity for session D publishes at "
             "~23:43 UTC on D and the morning dispatch rewrites it at 11:45 UTC on D+1, so "
@@ -189,19 +192,43 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_trading_day(value: "str | None", *, today: dt.date) -> dt.date:
-    """The trading day a reading is filed under, from the flag and today's date.
+#: The exchange's calendar zone: a session's date is a New York date.
+_SESSION_TZ = ZoneInfo("America/New_York")
+
+
+def resolve_trading_day(value: "str | None", *, now: dt.datetime) -> dt.date:
+    """The trading day a reading is filed under, from the flag and the clock.
 
     `alpha-engine-config-I11355`. Two literals plus an explicit ISO date; the
     literals exist so the calendar rule lives in Python with a test on it
     rather than in a shell expression inside a workflow, where a Saturday
     01:30 UTC read (about FRIDAY) is exactly the case a naive
     `previous_trading_day` gets wrong.
+
+    **`today` is the New York date, not the UTC date**
+    (`alpha-engine-config-I10793`). The default read is the 23:30 UTC cron,
+    and GitHub starts scheduled runs late: measured 2026-10-20 01:56Z and
+    2026-10-21 01:44Z, both `trigger: schedule`. Snapping the UTC date filed
+    each reading under a session that had not opened yet (21:44 ET on 10-20
+    was graded as trading day 10-21), so every unit graded by its day
+    partition read UNMET — D36 daily-news, whose 04:00 PT run for 10-20 was
+    on S3 since 11:25Z, read "no run manifest for this trading day, under
+    runs/D36/2026-10-21/" and dropped phase 1 to 247/251. The New York date
+    is the same day for every read from 04:00/05:00 UTC through midnight ET,
+    so on-time reads are unchanged; only a read taken between midnight UTC
+    and midnight ET moves, onto the session that has actually happened.
+
+    `yesterday` keeps its UTC definition: its two crons (01:30 and 12:30 UTC)
+    are named for the UTC day they run on, and the rule above is exactly
+    what they encode.
     """
+    if now.tzinfo is None:
+        raise ValueError("resolve_trading_day needs an aware `now`; a naive clock has no date")
     if not value or value == "today":
-        return latest_trading_day_on_or_before(today)
+        return latest_trading_day_on_or_before(now.astimezone(_SESSION_TZ).date())
     if value == "yesterday":
-        return latest_trading_day_on_or_before(today - dt.timedelta(days=1))
+        utc_today = now.astimezone(dt.timezone.utc).date()
+        return latest_trading_day_on_or_before(utc_today - dt.timedelta(days=1))
     return dt.date.fromisoformat(value)
 
 
@@ -248,9 +275,7 @@ def _read_command(args) -> int:
     already published, as it was.
     """
     gates = _gates(args)
-    trading_day = resolve_trading_day(
-        args.trading_day, today=dt.datetime.now(dt.timezone.utc).date()
-    )
+    trading_day = resolve_trading_day(args.trading_day, now=dt.datetime.now(dt.timezone.utc))
     store = open_store(
         args.store,
         dry_run=args.dry_run,
@@ -355,9 +380,7 @@ def _preserve_command(args) -> int:
     """
     from data_gate import parity_evidence  # noqa: PLC0415 - only this subcommand needs it
 
-    trading_day = resolve_trading_day(
-        args.trading_day, today=dt.datetime.now(dt.timezone.utc).date()
-    )
+    trading_day = resolve_trading_day(args.trading_day, now=dt.datetime.now(dt.timezone.utc))
     store = open_store(args.store, dry_run=args.dry_run)
     try:
         result = parity_evidence.preserve_graded_parity(store, trading_day=trading_day)
