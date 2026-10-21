@@ -504,6 +504,18 @@ _WORKLOADS: dict[str, str] = {
     "filing-text-pit-backfill": (
         "python -m collectors.filing_text_pit backfill"
     ),
+    # Model zoo free-data request (2026-10-21, W7 short-side family; FINRA's
+    # free short-interest history starts 2021-06): FINRA Reg SHO daily
+    # short-sale volume (`collectors/short_volume_pit.py`) and SEC
+    # fails-to-deliver (`collectors/fails_to_deliver_pit.py`), both from 2016
+    # (the NYSE calendar's first covered year). Write-if-absent per month /
+    # half month, so a rerun resumes. Not scheduled.
+    "short-volume-pit-backfill": (
+        "python -m collectors.short_volume_pit backfill --start 2016-01"
+    ),
+    "fails-to-deliver-pit-backfill": (
+        "python -m collectors.fails_to_deliver_pit backfill --start 201601a"
+    ),
     # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
     # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
     # workload of both the eod and morning schedule inputs
