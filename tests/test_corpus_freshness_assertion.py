@@ -20,16 +20,18 @@ NOW = datetime(2026, 8, 1, 12, 0, tzinfo=timezone.utc)
 SCOPE = ["AAA", "BBB", "CCC", "DDD", "EEE"]
 
 
-def _s3(marks: dict):
+def _s3(marks: dict, *, generated_at: str | None = None, scope: list | None = None):
+    scope = SCOPE if scope is None else scope
     s3 = MagicMock()
     payloads = {
         "universe_membership/latest.json": {
             "run_date": "2026-07-31",
+            "generated_at": generated_at,
             "predictor_universe_cut": "attractiveness_top_20",
             # config-I6630: the attractiveness RANK cut, not the gate cut.
             "cuts": {
-                "attractiveness_top_60": {"size": len(SCOPE), "tickers": SCOPE},
-                "attractiveness_top_20": {"size": 1, "tickers": SCOPE[:1]},
+                "attractiveness_top_60": {"size": len(scope), "tickers": scope},
+                "attractiveness_top_20": {"size": 1, "tickers": scope[:1]},
             },
         },
         "metron/holdings_universe.json": {"as_of": "2026-07-31", "tickers": []},
@@ -150,3 +152,117 @@ def test_verdict_carries_the_thresholds_it_was_judged_against():
     )
     assert v["max_age_hours"] == 12 and v["min_coverage"] == 0.5
     assert v["scope"] == 5 and "checked_at" in v
+
+
+# ── naming and cause (alpha-engine-config-I12468) ────────────────────────
+#
+# The 2026-10-17 verdict said "8 of 108 stale" and nothing else; working out
+# which 8, and why, took a by-hand rebuild of the scope from S3 object
+# versions. The answer then was: the scanner published a new cut at 10:55Z,
+# the check graded it at 11:00Z, and the eight names that had just entered the
+# cut were fetched by the daily ingest at 11:26Z. No feed was dead. These tests
+# pin the verdict to saying that on its own.
+
+
+def _iso_ago(h: float) -> str:
+    return (NOW - timedelta(hours=h)).isoformat().replace("+00:00", "Z")
+
+
+def test_stale_and_missing_tickers_are_named_not_just_counted():
+    marks = _marks(AAA=1, BBB=200, CCC=900)
+    v = acf.assess(bucket="b", s3_client=_s3(marks), now=NOW)
+    assert v["stale"] == 2 and v["missing"] == 2
+    # Oldest first, each with the mark it was judged on.
+    assert [d["ticker"] for d in v["stale_tickers"]] == ["CCC", "BBB"]
+    assert v["stale_tickers"][0]["last_ingested_at"] == _iso_ago(900)
+    assert v["stale_tickers"][0]["age_hours"] == 900.0
+    assert v["missing_tickers"] == ["DDD", "EEE"]
+    assert v["stale_tickers_truncated"] == 0 and v["missing_tickers_truncated"] == 0
+
+
+def test_scope_published_after_the_last_ingest_is_named_as_the_cause():
+    # The 2026-10-17 shape: the ingest last ran 23.5h ago (fresh), the scope
+    # was published 5 minutes ago, and two names that just entered it were
+    # last fetched weeks back.
+    marks = _marks(AAA=23.5, BBB=23.5, CCC=23.5, DDD=1438, EEE=575)
+    v = acf.assess(
+        bucket="b", s3_client=_s3(marks, generated_at=_iso_ago(5 / 60)), now=NOW,
+    )
+    assert v["degraded"] is True
+    assert v["not_fresh_cause"] == acf.CAUSE_SCOPE_CHANGED_AFTER_LAST_INGEST
+    assert v["last_ingest_at"] == _iso_ago(23.5)
+    assert v["last_ingest_age_hours"] == 23.5
+    assert v["scope_generated_at"] == _iso_ago(5 / 60)
+    assert [d["ticker"] for d in v["stale_tickers"]] == ["DDD", "EEE"]
+    assert any(acf.CAUSE_SCOPE_CHANGED_AFTER_LAST_INGEST in r
+               for r in v["degraded_reasons"])
+
+
+def test_ingest_that_ran_after_the_scope_and_skipped_names_is_a_fetch_set_divergence():
+    # Same marks, but the scope is OLDER than the last ingest: the ingest had
+    # its chance and still did not fetch these names. That is a different
+    # defect (its fetch set differs from this scope) and must not be reported
+    # as the benign "scope just changed".
+    marks = _marks(AAA=2, BBB=2, CCC=2, DDD=300)
+    v = acf.assess(
+        bucket="b", s3_client=_s3(marks, generated_at=_iso_ago(48)), now=NOW,
+    )
+    assert v["not_fresh_cause"] == acf.CAUSE_OUTSIDE_LAST_FETCH_SET
+    assert v["missing_tickers"] == ["EEE"]
+
+
+def test_an_ingest_that_stopped_is_named_as_such():
+    marks = _marks(**{t: 200 for t in SCOPE})
+    v = acf.assess(
+        bucket="b", s3_client=_s3(marks, generated_at=_iso_ago(1)), now=NOW,
+    )
+    assert v["not_fresh_cause"] == acf.CAUSE_INGEST_STALE
+
+
+def test_an_empty_store_is_named_as_no_ingest_recorded():
+    v = acf.assess(bucket="b", s3_client=_s3({}), now=NOW)
+    assert v["missing"] == 5
+    assert v["not_fresh_cause"] == acf.CAUSE_NO_INGEST_RECORDED
+    assert v["last_ingest_at"] is None and v["last_ingest_age_hours"] is None
+
+
+def test_the_cause_never_changes_the_degraded_verdict():
+    # Naming a cause is reporting, not grading: a newcomer that entered the
+    # scope minutes ago is still a name the run reads no fresh news for, so
+    # the flag stays up. And a warm corpus carries no cause at all.
+    warm = acf.assess(
+        bucket="b",
+        s3_client=_s3(_marks(**{t: 6 for t in SCOPE}), generated_at=_iso_ago(0.1)),
+        now=NOW,
+    )
+    assert warm["degraded"] is False and warm["not_fresh_cause"] is None
+    assert warm["degraded_reasons"] == []
+    assert warm["stale_tickers"] == [] and warm["missing_tickers"] == []
+
+    churned = acf.assess(
+        bucket="b",
+        s3_client=_s3(_marks(AAA=6, BBB=6, CCC=6, DDD=6, EEE=1438),
+                      generated_at=_iso_ago(0.1)),
+        now=NOW,
+    )
+    assert churned["degraded"] is True and churned["stale"] == 1
+
+
+def test_last_ingest_reads_the_whole_store_not_just_the_scope():
+    # A name outside this scope that the ingest fetched an hour ago still
+    # proves the ingest is running.
+    marks = {**_marks(**{t: 300 for t in SCOPE}), **_marks(ZZZ=1)}
+    v = acf.assess(
+        bucket="b", s3_client=_s3(marks, generated_at=_iso_ago(48)), now=NOW,
+    )
+    assert v["last_ingest_age_hours"] == 1.0
+    assert v["not_fresh_cause"] == acf.CAUSE_OUTSIDE_LAST_FETCH_SET
+
+
+def test_named_lists_are_capped_and_the_cap_is_recorded(monkeypatch):
+    monkeypatch.setattr(acf, "MAX_NAMED_TICKERS", 2)
+    v = acf.assess(
+        bucket="b", s3_client=_s3(_marks(**{t: 200 for t in SCOPE})), now=NOW,
+    )
+    assert len(v["stale_tickers"]) == 2 and v["stale_tickers_truncated"] == 3
+    assert v["stale"] == 5
