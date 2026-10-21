@@ -50,6 +50,7 @@ new states.
 
 from __future__ import annotations
 
+import datetime
 import json
 import logging
 import os
@@ -322,6 +323,35 @@ def _max_runtime_seconds(workload: "str | None") -> int:
     """
     declared = _WORKLOAD_MAX_RUNTIME_SECONDS.get(workload or "")
     return MAX_RUNTIME_SECONDS if declared is None else declared
+
+
+#: Launch-to-timer allowance for the ``watchdog-deadline`` tag: the box's
+#: hard-stop timer starts when the bootstrap command starts, which is after
+#: the ``instance_running`` waiter (60 x 5 s) and the SSM-online wait
+#: (:data:`SSM_ONLINE_BUDGET_SEC`, defined below and read at call time).
+_INSTANCE_RUNNING_WAIT_SEC = 300
+
+
+def _watchdog_deadline(workload: "str | None", now: "datetime.datetime | None" = None) -> str:
+    """The ``watchdog-deadline`` tag value for a box running ``workload``.
+
+    alpha-engine-config-I12463: the orphan reaper
+    (``spot-orphan-reaper/index.py``) reaps an UNTAGGED box at its fleet-wide
+    cap, ``MAX_SPOT_BUDGET_SECONDS + GRACE_SECONDS`` (6 h + 30 min). This
+    launcher never stamped the tag, so any workload declared above that cap
+    was killed mid-run by the reaper instead of by its own timer: on
+    2026-10-21 the reaper terminated the 12 h ``filing-text-pit-backfill`` box
+    ``i-09cb956e40a7f90bc`` at 06:15:28Z, age 24632 s, ``reason=deadline``,
+    with no outcome record and no run manifest. Stamping the box's own budget
+    makes the reaper wait for the box's timer, as every other launcher that
+    knows its budget already does (config#5695).
+
+    Launch time + the declared cap + the launch-to-timer allowance; the reaper
+    adds its own grace on top.
+    """
+    now = now or datetime.datetime.now(datetime.timezone.utc)
+    seconds = _max_runtime_seconds(workload) + _INSTANCE_RUNNING_WAIT_SEC + SSM_ONLINE_BUDGET_SEC
+    return (now + datetime.timedelta(seconds=seconds)).strftime("%Y-%m-%dT%H:%M:%S+00:00")
 
 
 # gitleaks pin for the DLP boot gate. It moves in LOCKSTEP with
@@ -1708,6 +1738,9 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         val = str(event.get(key, "")).strip()
         if val:
             extra_tags[tag_name] = val
+    # The box's own budget, so the orphan reaper never cuts a run its own
+    # timer would let finish (alpha-engine-config-I12463).
+    extra_tags["watchdog-deadline"] = _watchdog_deadline(workload)
 
     if not DISPATCH_ENABLED:
         logger.warning("DATA_SPOT_DISPATCH_ENABLED=false — data spot NOT launched")
@@ -1719,7 +1752,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
     # same string, and a reader never has to guess which partition a failed
     # run's log landed in (alpha-engine-config-I11353).
     run_log_day = _run_log_trading_day(str(event.get("trading_day") or "").strip() or None)
-    instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags or None)
+    instance_id, market = _launch_instance(force_on_demand=force_on_demand, extra_tags=extra_tags)
     logger.info("launched data-spot box %s (%s) for %s", instance_id, market, workload)
     # Once the box is up, ANY failure before the bootstrap command is delivered
     # would orphan it (no watchdog/trap yet). Terminate-on-error so a slow
