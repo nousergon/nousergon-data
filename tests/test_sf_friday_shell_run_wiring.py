@@ -1573,6 +1573,9 @@ class TestHappyPathTraversal:
             "WaitForWeeklyPreflightOnSpot",
             "CheckWeeklyPreflightOnSpotStatus",
             "RecordWeeklyPreflightOnSpot",
+            # alpha-engine-config-I12481: the blind-spot reconcile Choice (no
+            # status edge, so a green trace takes its Default).
+            "ReconcileWeeklyPreflightBlindSpot",
             "CheckShellRun",
             "CheckSkipMorningEnrich",
             # alpha-engine-config-I11269: the readiness wait's first seed, where
