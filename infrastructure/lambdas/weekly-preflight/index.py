@@ -390,6 +390,7 @@ def handler(event: dict, context) -> dict:
     # every check that ran passed.
     if required_skip_count > 0 or blocked_count > 0:
         metrics = _metrics("DEGRADED")
+        on_spot = _on_spot_coverage(sfp, list(required_skip_names) + list(blocked_names))
         return {
             "status": "DEGRADED",
             "metrics": metrics,
@@ -403,6 +404,16 @@ def handler(event: dict, context) -> dict:
             "ran_count": ran_count,
             "required_skip_count": required_skip_count,
             "required_skip_names": required_skip_names,
+            # alpha-engine-config-I12481: which of the unobserved checks the
+            # later WeeklyPreflightOnSpot pass re-runs in this same execution.
+            # The state machine retires the blind spot only when the coverage
+            # is "ALL" AND that pass reports verdict OK. A check off the
+            # on-spot profile keeps it open. It is a string, not a bool, so the
+            # ASL can test it with StringEquals (see
+            # ReconcileWeeklyPreflightBlindSpot's comment).
+            "required_skips_on_spot": on_spot["on_spot"],
+            "required_skips_off_spot": on_spot["off_spot"],
+            "required_skips_on_spot_coverage": on_spot["coverage"],
             "results": result_dicts,
             "stage_coverage": _assert_stage_coverage(
                 "WeeklyPreflight", started, run_date, execution_name
@@ -423,6 +434,36 @@ def handler(event: dict, context) -> dict:
         "results": result_dicts,
         "stage_coverage": _assert_stage_coverage("WeeklyPreflight", started, run_date, execution_name),
     }
+
+
+def _on_spot_coverage(sfp, names: list) -> dict:
+    """Split this pass's unobserved required checks by whether
+    ``WeeklyPreflightOnSpot`` re-runs them (alpha-engine-config-I12481).
+
+    The Lambda skips the arctic/repo_modules/polygon/checkout checks BY
+    DESIGN (``LAMBDA_CAPABILITIES`` = {aws}); the weekly box runs exactly
+    those, later in the same execution. Before I12481 nothing joined the two
+    passes, so every completion marker recorded ``weekly_preflight_blind_spot
+    .present: true`` with eight "unreachable" checks the box had just run OK.
+
+    Fails CLOSED: a ``sf_preflight`` that predates ``on_spot_check_names``,
+    or one that raises, lists every name as off-spot, so the blind spot stays
+    recorded. Never retire a gap on a guess.
+    """
+    try:
+        spot_names = frozenset(sfp.on_spot_check_names())
+    except Exception as exc:  # noqa: BLE001 - see "Fails CLOSED" above
+        print(f"ERROR: on-spot coverage unavailable, blind spot kept open: {exc}")
+        spot_names = frozenset()
+    on_spot = [n for n in names if n in spot_names]
+    off_spot = [n for n in names if n not in spot_names]
+    if names and not off_spot:
+        coverage = "ALL"
+    elif on_spot:
+        coverage = "PARTIAL"
+    else:
+        coverage = "NONE"
+    return {"on_spot": on_spot, "off_spot": off_spot, "coverage": coverage}
 
 
 def _assert_stage_coverage(

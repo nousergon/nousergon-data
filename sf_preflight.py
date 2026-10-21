@@ -2513,6 +2513,35 @@ CHECK_REQUIRED: "dict[str, bool]" = {
 }
 
 
+def needs_beyond_lambda(fn_name: str) -> bool:
+    """True when ``fn_name``'s declared capabilities exceed the Lambda's.
+
+    The ONE predicate that splits ``CHECKS`` between the two weekly passes:
+    ``WeeklyPreflight`` (the Lambda) can only run checks for which this is
+    False, and ``WeeklyPreflightOnSpot`` (``sf_preflight_on_spot._spot_checks``)
+    runs exactly the ones for which it is True. An undeclared check resolves
+    to ``FULL_CAPABILITIES`` — beyond the Lambda, so the on-spot pass owns it.
+    """
+    return not CHECK_CAPABILITIES.get(fn_name, FULL_CAPABILITIES) <= LAMBDA_CAPABILITIES
+
+
+def on_spot_check_names() -> "frozenset[str]":
+    """Bare names (``check_`` stripped, as ``CheckResult.name`` carries them)
+    of the checks the weekly box's on-spot pass runs.
+
+    alpha-engine-config-I12481: the Lambda's handler reads this to say which
+    of its REQUIRED skips the later on-spot pass re-runs in the same
+    execution, so the state machine can retire a blind spot the second pass
+    actually closed instead of recording it as open on every completion
+    marker. A skip whose check is NOT in this set is covered by nothing.
+    """
+    return frozenset(
+        fn.__name__[len("check_"):]
+        for fn in CHECKS
+        if needs_beyond_lambda(fn.__name__)
+    )
+
+
 def summarize_results(results: "list[CheckResult]") -> dict:
     """Single source of truth for the run/skip/warn/fail/required-skip
     counts every caller (the Lambda handler, the CLI) keys its aggregate

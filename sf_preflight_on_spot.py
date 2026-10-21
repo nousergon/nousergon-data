@@ -177,11 +177,10 @@ def _spot_checks() -> list:
     """The checks the Lambda profile cannot reach, in CHECKS order."""
     import sf_preflight as sp
 
-    return [
-        fn for fn in sp.CHECKS
-        if not sp.CHECK_CAPABILITIES.get(fn.__name__, sp.FULL_CAPABILITIES)
-        <= sp.LAMBDA_CAPABILITIES
-    ]
+    # sf_preflight.needs_beyond_lambda is the shared predicate: the Lambda's
+    # handler uses the same one (on_spot_check_names) to say which of its
+    # required skips THIS pass re-runs (alpha-engine-config-I12481).
+    return [fn for fn in sp.CHECKS if sp.needs_beyond_lambda(fn.__name__)]
 
 
 def classify(results: list) -> dict:
