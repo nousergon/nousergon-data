@@ -337,6 +337,11 @@ def load_rag_scope(
             "rejected_foreign_listing": len(foreign_held),
         },
         "run_date": membership.get("run_date"),
+        # When the scanner published this cut. A freshness check that grades
+        # the corpus against this scope needs it to tell "the ingest stopped"
+        # apart from "the scope changed after the last ingest ran"
+        # (alpha-engine-config-I12468).
+        "generated_at": membership.get("generated_at"),
         "source": cut.get("source") or key,
     }
 
