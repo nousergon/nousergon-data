@@ -111,6 +111,12 @@ class FilingTextError(RuntimeError):
     pass
 
 
+class ShortDocumentError(FilingTextError):
+    """A filing's primary document is too short to be the report (a cover page or
+    wrapper whose body sits in an exhibit). The filing is skipped and recorded;
+    the issuer's other filings are still written."""
+
+
 @dataclass(frozen=True)
 class Filing:
     cik: int
@@ -211,7 +217,7 @@ def filing_row(filing: Filing, ticker: str, html: str) -> dict[str, Any]:
 
     text = _html_to_text(html)
     if len(text) < MIN_DOCUMENT_CHARS:
-        raise FilingTextError(
+        raise ShortDocumentError(
             f"{filing.accession}: primary document is {len(text)} chars, under {MIN_DOCUMENT_CHARS}"
         )
     sections = _extract_sections(html, form_type=filing.form, max_chars=None, text=text)
@@ -277,6 +283,7 @@ def run(
         "issuers_without_filings": 0,
         "issuers_failed": [],
         "filings_written": 0,
+        "filings_skipped_short": [],
         "sections_found": dict.fromkeys(SECTION_COLUMNS.values(), 0),
     }
     for ticker, cik in issuers:
@@ -285,7 +292,14 @@ def run(
             continue
         try:
             filings = discover(sec, cik, start=start, end=end)
-            rows = [filing_row(f, ticker, sec.get(f.url).text) for f in filings]
+            rows = []
+            for filing in filings:
+                try:
+                    rows.append(filing_row(filing, ticker, sec.get(filing.url).text))
+                except ShortDocumentError:
+                    summary["filings_skipped_short"].append(
+                        f"{ticker}:{filing.accession}"
+                    )
         except (SecFetchError, FilingTextError) as error:
             logger.warning(
                 "%s (CIK %d) not written: %s", ticker, cik, type(error).__name__

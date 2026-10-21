@@ -273,6 +273,12 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # about 7.5 h, so 12 h is about 1.6x. The run skips issuers already
     # written, so a spot interruption only means a re-dispatch.
     "filing-text-pit-backfill": 43200,
+    # The one-time 13F backfill: ~40 quarterly archives of ~50-100 MB each,
+    # each downloaded at SEC's paced rate and joined across three TSVs of a
+    # few million rows. Not yet measured; at ~5 min per archive it is ~3.5 h,
+    # so 6 h is about 1.7x. Archives already written are skipped, so a spot
+    # interruption only means a re-dispatch.
+    "institutional-holdings-pit-backfill": 21600,
 }
 
 
@@ -515,6 +521,21 @@ _WORKLOADS: dict[str, str] = {
     ),
     "fails-to-deliver-pit-backfill": (
         "python -m collectors.fails_to_deliver_pit backfill --start 201601a"
+    ),
+    # Same request, items 3-5: SEC Form 13F holdings data sets
+    # (`collectors/holdings_13f_pit.py`), 8-K item codes per filing from the
+    # submissions API (`collectors/filing_8k_items_pit.py`), and daily English
+    # Wikipedia pageviews per issuer (`collectors/wiki_pageviews_pit.py`, from
+    # the API's 2015-07 start). Not scheduled. The keys spell out "13F" and
+    # "8-K" because _WORKLOAD_RE admits no digits.
+    "institutional-holdings-pit-backfill": (
+        "python -m collectors.holdings_13f_pit backfill --start 2016-01-01"
+    ),
+    "filing-event-items-pit-backfill": (
+        "python -m collectors.filing_8k_items_pit --start 2016-01-01"
+    ),
+    "wiki-pageviews-pit-backfill": (
+        "python -m collectors.wiki_pageviews_pit backfill --start 2015-07"
     ),
     # data-collector plan P-05 (alpha-engine-config-I10748): the in-region
     # ArcticDB probe (`collectors/arctic_probe.py`). Wired as the FINAL
