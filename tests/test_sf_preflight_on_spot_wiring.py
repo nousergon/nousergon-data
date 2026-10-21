@@ -33,6 +33,10 @@ CHAIN = {
     "WeeklyPreflightOnSpotUnobserved",
     "PublishWeeklyPreflightOnSpotNotice",
 }
+# Deliberately OUTSIDE the chain: ReconcileWeeklyPreflightBlindSpot and
+# WeeklyPreflightBlindSpotCoveredOnSpot (alpha-engine-config-I12481) write
+# $.weekly_preflight_blind_spot, not this pass's own result paths. They are
+# pinned by tests/test_sf_weekly_preflight_blind_spot_reconcile.py.
 
 
 def _states() -> dict:
@@ -65,7 +69,12 @@ def test_only_entry_is_the_substrate_gate_healthy_edge():
 def test_clean_and_unobserved_exit_to_check_shell_run():
     """OK and unobserved still converge on CheckShellRun; FAIL halts."""
     states = _states()
-    assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "CheckShellRun"
+    # alpha-engine-config-I12481: the OK arm passes through the blind-spot
+    # reconcile, whose every exit is CheckShellRun.
+    assert states["RecordWeeklyPreflightOnSpot"]["Next"] == "ReconcileWeeklyPreflightBlindSpot"
+    reconcile = states["ReconcileWeeklyPreflightBlindSpot"]
+    assert reconcile["Default"] == "CheckShellRun"
+    assert states["WeeklyPreflightBlindSpotCoveredOnSpot"]["Next"] == "CheckShellRun"
     assert states["PublishWeeklyPreflightOnSpotNotice"]["Next"] == "CheckShellRun"
     assert states["WeeklyPreflightOnSpotUnobserved"]["Next"] == "PublishWeeklyPreflightOnSpotNotice"
     assert states["RecordWeeklyPreflightOnSpotFail"]["Next"] == "ExtractWeeklyPreflightOnSpotFail"
