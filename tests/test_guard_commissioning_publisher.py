@@ -168,3 +168,31 @@ def test_units_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
 def test_the_harness_runner_reads_a_real_units_outcome():
     node = gc.HARNESSES["units"].nodeid("D01")
     assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_pit_publishes_its_own_observed_lines(tmp_path, monkeypatch, clean_tree):
+    """The fifth harness (`tests/test_guard_commissioning_pit.py`), on the shared append-time scan."""
+    monkeypatch.setattr(gc, "_run_harness", _passed)
+    argv = ["--guard", "pit", "--unit", "D13", "--unit", "D18", "--unit", "D32",
+            "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    for unit_id in ("D13", "D18", "D32"):
+        document = json.loads((tmp_path / f"faults/{unit_id}/pit/latest.json").read_text())
+        assert document["observed"] == list(gc.PIT_OBSERVED)
+        assert document["test"] == gc.HARNESSES["pit"].nodeid(unit_id)
+        unit = next(u for u in descriptors.load_units() if u.unit_id == unit_id)
+        reading = evidence.read_guard_commissioning(
+            LocalStore(tmp_path), unit, "pit", trading_day=dt.date(2026, 10, 15)
+        )
+        assert reading.met is True, reading.detail
+
+
+def test_pit_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
+    """D25 declares a different pit check (a minimum-history refusal): no case here."""
+    with pytest.raises(SystemExit, match="no induced-fault case"):
+        gc.main(["--guard", "pit", "--unit", "D25", "--store", str(tmp_path)])
+
+
+def test_the_harness_runner_reads_a_real_pit_outcome():
+    node = gc.HARNESSES["pit"].nodeid("D32")
+    assert gc._run_harness([node]) == {node: "passed"}
