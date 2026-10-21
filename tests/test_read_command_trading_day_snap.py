@@ -107,5 +107,5 @@ def test_the_read_command_uses_the_snap_and_not_the_bare_calendar_date():
     # And the behaviour, not only the spelling: a Sunday still resolves to the
     # Friday, which is the measured defect this file exists for.
     assert main_module.resolve_trading_day(
-        None, today=dt.date(2026, 9, 20)
+        None, now=dt.datetime(2026, 9, 20, 23, 30, tzinfo=dt.timezone.utc)
     ) == dt.date(2026, 9, 18)

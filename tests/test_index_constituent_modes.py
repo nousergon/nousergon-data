@@ -102,6 +102,9 @@ def _d48_sources(monkeypatch, ndx_weights: bool = True, ndx_never_published: boo
         return source
 
     monkeypatch.setattr(ic, "_default_closes_source", closes)
+    # QQQ is not in ArcticDB `universe`; the NDX leg reads its proxy from the
+    # close_history spine (alpha-engine-config-I12478).
+    monkeypatch.setattr(ic, "_default_close_history_source", closes)
     monkeypatch.setattr(ic, "_default_weights_source", weights)
 
 

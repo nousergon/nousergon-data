@@ -44,6 +44,7 @@ __all__ = [
     "CARDINALITY_OBSERVED",
     "EMPTY_FRESH_OBSERVED",
     "HARNESSES",
+    "PIT_OBSERVED",
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
     "UNITS_OBSERVED",
     "Harness",
@@ -115,6 +116,23 @@ UNITS_OBSERVED: tuple[str, ...] = (
     "1.0 within its index",
 )
 
+#: What the ``pit`` harness observes. The guard is the append-time freshness scan
+#: ``builders/daily_append.py::_scan_universe_and_emit_freshness_receipt``
+#: (``UniverseFreshnessViolation``), shared by D13, D18 and D32 and run as shipped;
+#: no staged mode. Each unit's write half is modelled; the guard and the runner are real.
+PIT_OBSERVED: tuple[str, ...] = (
+    "the append-time freshness scan refused a universe member whose last row is past the "
+    "UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS ceiling (UniverseFreshnessViolation)",
+    "manifest status failed naming the stale symbol, on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL, walked on the "
+    "unit's own schedule input; the process exited 1 on both attempts",
+    "stand-down: terminal CollectionFailed, phase marker error; neither "
+    "health/universe_freshness.json nor the run-date sentinel was advanced",
+    "recovery: once the missing bars land, the next run reaches CollectionSucceeded with 0 "
+    "pages and an all-fresh receipt",
+)
+
+
 
 class Harness:
     """Where a guard class's induced-fault record is taken, and what it induces."""
@@ -180,6 +198,15 @@ HARNESSES: dict[str, Harness] = {
         mode_under_test="enforce",
         cases_module="test_guard_commissioning_units",
         observed=UNITS_OBSERVED,
+    ),
+    # No staged mode flip: the shared append-time freshness scan raises as shipped,
+    # at the tail of D13's rebuild and of D18/D32's appends.
+    "pit": Harness(
+        "tests/test_guard_commissioning_pit.py",
+        "test_the_fault_record_stale_as_of_fails_pages_once_and_stands_down",
+        mode_under_test="enforce",
+        cases_module="test_guard_commissioning_pit",
+        observed=PIT_OBSERVED,
     ),
 }
 
