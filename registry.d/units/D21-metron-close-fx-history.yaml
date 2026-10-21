@@ -47,6 +47,7 @@ consumers:
   - "metron:portfolio_analytics/prices/spine_source.py"
   - "metron:api/services/prices.py"
   - "crucible-evaluator:grading/attribution.py"
+  - "nousergon-data:collectors/index_contributions.py (D48 NDX proxy, close_history/QQQ.json)"
 contract:
   schema:
     - contracts/metron_close_history.schema.json

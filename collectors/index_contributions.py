@@ -16,7 +16,10 @@ joined:
     ``market_data/index_constituents/NDX.json`` (Nasdaq-100,
     alpha-engine-config-I11296).
   * **returns** — the ArcticDB ``universe`` library, fed daily by
-    ``collectors/daily_closes.py`` for the whole tracked roster.
+    ``collectors/daily_closes.py`` for the whole tracked roster. The index
+    PROXY's closes come from wherever its ``IndexSpec.proxy_source`` declares:
+    SPY from ``universe``; QQQ, which ``universe`` does not hold, from D21's
+    ``market_data/close_history/QQQ.json`` (see ``NDX_PROXY_SOURCE``).
 
 WHO READS THIS. Metron (``metron-ops-I346``) shows the holdings-vs-benchmark
 return gap — "you +1.8%, Nasdaq-100 +2.0%" — and cannot explain it, because
@@ -122,12 +125,20 @@ class IndexSpec:
 
     ``max_weights_age_sessions`` refuses weights more than that many NYSE
     sessions behind ``run_date`` (``None``: not checked here).
+
+    ``proxy_source`` names where the proxy's closes are read, DECLARED per
+    index rather than discovered by falling through a chain:
+    ``PROXY_SOURCE_UNIVERSE`` (the ArcticDB ``universe`` library, the same read
+    as the members) or ``PROXY_SOURCE_CLOSE_HISTORY`` (the
+    ``market_data/close_history/{sym}.json`` spine D21 publishes in the same EOD
+    run). See ``NDX_PROXY_SOURCE`` for why the two differ.
     """
 
     index: str
     label: str
     proxy_symbol: str
     max_weights_age_sessions: int | None = None
+    proxy_source: str = "universe"
 
 
 # NDX weights are D49's weekly snapshot, keyed to the week's last session, and
@@ -139,6 +150,22 @@ class IndexSpec:
 # Fri 2026-10-16 = 5, vs Mon 2026-10-19 = 6; Thu 2026-04-02 vs Fri 2026-04-10 = 5.
 NDX_MAX_WEIGHTS_AGE_SESSIONS = 5
 
+PROXY_SOURCE_UNIVERSE = "universe"
+PROXY_SOURCE_CLOSE_HISTORY = "close_history"
+
+# QQQ IS NOT IN THE ArcticDB `universe` LIBRARY, nor in `macro`. `universe`
+# admits exactly the stocks plus features.compute.UNIVERSE_BENCHMARK_PROXIES
+# (SPY and the attribution proxies), and declaring QQQ there is not a free
+# edit: daily_append's freshness scan raises UniverseFreshnessViolation on any
+# declared proxy absent from the library, so the EOD append would fail until an
+# in-region D35 backfill ran. Measured 2026-10-21: the D48 runs for 2026-10-19
+# and 2026-10-20, the first two after D49 first published NDX.json, both filed
+# `partial` with "proxy QQQ has 0 close(s) in the window" while the SPX leg
+# published. QQQ's daily close IS already published every EOD run, by D21, as
+# market_data/close_history/QQQ.json (collectors/metron_market_data.py
+# INDEX_PROXY_SYMBOLS), so the NDX leg reads its proxy there.
+NDX_PROXY_SOURCE = PROXY_SOURCE_CLOSE_HISTORY
+
 INDEXES: tuple[IndexSpec, ...] = (
     IndexSpec(index="SPX", label="S&P 500", proxy_symbol="SPY"),
     IndexSpec(
@@ -146,6 +173,7 @@ INDEXES: tuple[IndexSpec, ...] = (
         label="Nasdaq 100",
         proxy_symbol="QQQ",
         max_weights_age_sessions=NDX_MAX_WEIGHTS_AGE_SESSIONS,
+        proxy_source=NDX_PROXY_SOURCE,
     ),
 )
 
@@ -283,6 +311,7 @@ def collect(
     weights_source: WeightsSource | None = None,
     closes_source: ClosesSource | None = None,
     indexes: Sequence[IndexSpec] = INDEXES,
+    proxy_closes_source: ClosesSource | None = None,
 ) -> dict:
     """Publish one contribution artifact per index for the latest session.
 
@@ -294,11 +323,21 @@ def collect(
     ``run_date`` bounds the window; the actual ``trading_day`` is whatever the proxy
     last traded on at or before it, so a run on a holiday or a weekend
     publishes the prior session rather than failing or inventing a day.
+
+    ``proxy_closes_source`` answers proxies whose spec declares
+    ``PROXY_SOURCE_CLOSE_HISTORY``. Left ``None`` it is the close_history spine,
+    unless ``closes_source`` was injected, in which case the injected source
+    answers every read (the test seam stays one function).
     """
     if run_date is None:
         run_date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     if weights_source is None:
         weights_source = _default_weights_source(bucket)
+    if proxy_closes_source is None:
+        proxy_closes_source = (
+            closes_source if closes_source is not None
+            else _default_close_history_source(bucket)
+        )
     if closes_source is None:
         closes_source = _default_closes_source(bucket)
 
@@ -317,9 +356,18 @@ def collect(
                     f"constituents run declares cache_no_weights precisely so this "
                     f"is refused rather than published as an index that moved 0%."
                 )
-            symbols = [*weights.weight_map, spec.proxy_symbol]
-            closes = closes_source(symbols, run_date, 2)
-            proxy_series = list(closes.get(spec.proxy_symbol, []))
+            if spec.proxy_source == PROXY_SOURCE_CLOSE_HISTORY:
+                closes = closes_source(list(weights.weight_map), run_date, 2)
+                proxy_series = list(
+                    proxy_closes_source([spec.proxy_symbol], run_date, 2).get(
+                        spec.proxy_symbol, []
+                    )
+                )
+                _refuse_proxy_behind_members(spec, proxy_series, closes)
+            else:
+                symbols = [*weights.weight_map, spec.proxy_symbol]
+                closes = closes_source(symbols, run_date, 2)
+                proxy_series = list(closes.get(spec.proxy_symbol, []))
             results[spec.index] = compute_contributions(
                 spec, weights, closes, proxy_series
             )
@@ -386,6 +434,32 @@ def collect(
         "errors": errors,
         "skipped": skipped,
     }
+
+
+def _refuse_proxy_behind_members(
+    spec: IndexSpec,
+    proxy_series: list[tuple[str, float]],
+    closes: Mapping[str, list[tuple[str, float]]],
+) -> None:
+    """Raise when a proxy read from a SECOND source ends before the members do.
+
+    The proxy's two latest dates are the trading-day pair. Read from the same
+    library as the members, both move together; read from the close_history
+    spine, a D21 run that did not refresh QQQ would leave the pair one session
+    behind, and every member would then "miss" the older date and trip the
+    coverage floor with a message about members, not about the proxy. Named
+    here instead. A proxy with fewer than two closes is left to
+    :func:`_proxy_date_pair`, which already says so.
+    """
+    if not proxy_series:
+        return
+    members_head = max((s[0][0] for s in closes.values() if s), default=None)
+    if members_head is not None and proxy_series[0][0] < members_head:
+        raise IndexContributionsUnavailable(
+            f"{spec.index}: proxy {spec.proxy_symbol} ({spec.proxy_source}) ends at "
+            f"{proxy_series[0][0]} but the members' closes reach {members_head}; the "
+            f"proxy source was not refreshed for the latest session"
+        )
 
 
 def _refuse_stale_weights(spec: IndexSpec, weights: Weights, run_date: str) -> None:
@@ -505,6 +579,51 @@ def _default_weights_source(bucket: str) -> WeightsSource:
                 as_of=payload.get("date"),
             )
         raise IndexContributionsUnavailable(f"no weights producer for index {index!r}")
+
+    return source
+
+
+def _default_close_history_source(bucket: str) -> ClosesSource:
+    """Dividend-adjusted closes from D21's ``market_data/close_history/{sym}.json``.
+
+    Same shape as :func:`_default_closes_source`, most recent first. The basis
+    is CHECKED, not assumed: the members' ``universe`` closes are
+    dividend-adjusted, and a proxy on a different basis would put an ex-dividend
+    day's payout into ``index_return_pct`` and the residual. A missing key is
+    an empty series, which :func:`_proxy_date_pair` refuses by name; any other
+    S3 failure propagates.
+    """
+
+    def source(
+        symbols: Sequence[str], through: str, limit: int
+    ) -> Mapping[str, list[tuple[str, float]]]:
+        from collectors.metron_market_data import CLOSE_HISTORY_PREFIX
+
+        s3 = boto3.client("s3")
+        out: dict[str, list[tuple[str, float]]] = {}
+        for symbol in dict.fromkeys(symbols):
+            key = f"{CLOSE_HISTORY_PREFIX}{symbol}.json"
+            try:
+                obj = s3.get_object(Bucket=bucket, Key=key)
+            except ClientError as exc:
+                if exc.response.get("Error", {}).get("Code") not in ("NoSuchKey", "404"):
+                    raise
+                continue
+            payload = json.loads(obj["Body"].read())
+            basis = payload.get("adjustment_basis")
+            if basis != "dividend_adjusted":
+                raise IndexContributionsUnavailable(
+                    f"s3://{bucket}/{key}: adjustment_basis={basis!r}, but the members' "
+                    f"closes are dividend-adjusted; refusing to mix bases"
+                )
+            rows = [
+                (str(d)[:10], float(c))
+                for d, c in (payload.get("closes") or [])
+                if c is not None and str(d)[:10] <= through
+            ]
+            rows.sort(key=lambda r: r[0])
+            out[symbol] = list(reversed(rows[-limit:]))
+        return out
 
     return source
 

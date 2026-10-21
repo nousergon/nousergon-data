@@ -480,3 +480,102 @@ def test_ndx_weights_any_other_s3_failure_propagates() -> None:
         source = ic._default_weights_source("any")
         with pytest.raises(ClientError):
             source("NDX")
+
+
+# ── NDX proxy source (QQQ is not in the ArcticDB `universe` library) ─────────
+# Measured 2026-10-21: the D48 runs for 2026-10-19 and 2026-10-20 filed
+# `partial` with "proxy QQQ has 0 close(s) in the window" because QQQ is in
+# neither `universe` nor `macro`. QQQ's close is published every EOD run by D21
+# as market_data/close_history/QQQ.json, and NDX declares that as its source.
+
+
+def test_ndx_declares_close_history_as_its_proxy_source() -> None:
+    by_index = {spec.index: spec for spec in ic.INDEXES}
+    assert by_index["NDX"].proxy_source == ic.PROXY_SOURCE_CLOSE_HISTORY
+    assert by_index["SPX"].proxy_source == ic.PROXY_SOURCE_UNIVERSE
+
+
+def _universe_without_qqq(symbols, through, limit):
+    """The production `universe` shape: SPY and members, no QQQ."""
+    series = {
+        "AAPL": [("2026-10-20", 102.0), ("2026-10-19", 100.0)],
+        "SPY": [("2026-10-20", 102.0), ("2026-10-19", 100.0)],
+    }
+    return {s: v for s, v in series.items() if s in set(symbols)}
+
+
+def test_ndx_reads_its_proxy_from_the_declared_source_not_universe() -> None:
+    asked: list[list[str]] = []
+
+    def proxy_closes(symbols, through, limit):
+        asked.append(list(symbols))
+        return {"QQQ": [("2026-10-20", 101.0), ("2026-10-19", 100.0)]}
+
+    result = ic.collect(
+        bucket="any", run_date="2026-10-20", dry_run=True,
+        weights_source=lambda index: ic.Weights({"AAPL": 1.0}, "m", "2026-10-16"),
+        closes_source=_universe_without_qqq,
+        proxy_closes_source=proxy_closes,
+    )
+    assert result["indexes"] == ["NDX", "SPX"]
+    assert result["errors"] == {}
+    assert asked == [["QQQ"]]
+
+
+def test_a_proxy_source_behind_the_members_is_named_not_a_coverage_failure() -> None:
+    def proxy_closes(symbols, through, limit):
+        return {"QQQ": [("2026-10-19", 100.0), ("2026-10-16", 99.0)]}
+
+    result = ic.collect(
+        bucket="any", run_date="2026-10-20", dry_run=True,
+        weights_source=lambda index: ic.Weights({"AAPL": 1.0}, "m", "2026-10-16"),
+        closes_source=_universe_without_qqq,
+        proxy_closes_source=proxy_closes,
+    )
+    assert result["indexes"] == ["SPX"]
+    assert "proxy QQQ (close_history) ends at 2026-10-19" in result["errors"]["NDX"]
+
+
+class _CloseHistoryS3:
+    def __init__(self, objects: dict[str, dict]):
+        self.objects = objects
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        from botocore.exceptions import ClientError
+
+        if Key not in self.objects:
+            raise ClientError({"Error": {"Code": "NoSuchKey", "Message": "x"}}, "GetObject")
+
+        class _Body:
+            def __init__(self, raw):
+                self.raw = raw
+
+            def read(self):
+                return self.raw
+
+        return {"Body": _Body(json.dumps(self.objects[Key]).encode())}
+
+
+def test_close_history_source_returns_the_latest_two_on_or_before_through() -> None:
+    s3 = _CloseHistoryS3({
+        "market_data/close_history/QQQ.json": {
+            "adjustment_basis": "dividend_adjusted",
+            "closes": [["2026-10-16", 99.0], ["2026-10-19", 100.0],
+                       ["2026-10-20", 101.0], ["2026-10-21", 102.0]],
+        },
+    })
+    with patch.object(ic.boto3, "client", return_value=s3):
+        out = ic._default_close_history_source("any")(["QQQ", "ONEQ"], "2026-10-20", 2)
+    assert out == {"QQQ": [("2026-10-20", 101.0), ("2026-10-19", 100.0)]}
+
+
+def test_close_history_source_refuses_a_different_adjustment_basis() -> None:
+    s3 = _CloseHistoryS3({
+        "market_data/close_history/QQQ.json": {
+            "adjustment_basis": "split_only",
+            "closes": [["2026-10-19", 100.0], ["2026-10-20", 101.0]],
+        },
+    })
+    with patch.object(ic.boto3, "client", return_value=s3):
+        with pytest.raises(ic.IndexContributionsUnavailable, match="adjustment_basis"):
+            ic._default_close_history_source("any")(["QQQ"], "2026-10-20", 2)
