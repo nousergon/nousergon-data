@@ -178,9 +178,12 @@ guards:
   vendor_fallback:
     state: absent
     note: >-
-        Single path: weights from the weight producers, returns from ArcticDB. There is
-        no second vendor to fall back to, and the honest response to a missing input is
-        the refusal above rather than a substitute.
+        Single path per input: weights from the weight producers, member returns from
+        ArcticDB, and each index proxy from the ONE source its IndexSpec.proxy_source
+        declares (SPY: ArcticDB universe; QQQ: D21's market_data/close_history/QQQ.json,
+        because universe does not hold QQQ). Nothing falls through to a second source,
+        and the honest response to a missing input is the refusal above rather than a
+        substitute.
   success_without_output:
     state: present
     note: >-
