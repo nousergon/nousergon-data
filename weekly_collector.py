@@ -6001,7 +6001,15 @@ def main() -> None:
         # _run_morning_enrich hits polygon — so a drifted key failed
         # 28min into the spot run instead of in <1s at the entry.
         mode = "morning_enrich"
-    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False) or getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False) or getattr(args, "index_contributions", False) or getattr(args, "nasdaq100_constituents", False):
+    elif args.daily or getattr(args, "daily_arctic_append", False) or getattr(args, "daily_heal", False):
+        # The weekday PRODUCERS of ArcticDB freshness: --daily (post-market
+        # data), --daily-arctic-append (D32) and --daily-heal (D33). Same
+        # S3 + ArcticDB surface as "daily" below, but a stale macro.SPY is
+        # logged, not fatal — these runs are what freshen it, so gating them
+        # on it stalled the whole daily path after one missed append
+        # (2026-10-22, alpha-engine-config-I12547).
+        mode = "daily_write"
+    elif getattr(args, "features_settled_regrade", False) or getattr(args, "daily_panel", False) or getattr(args, "index_contributions", False) or getattr(args, "nasdaq100_constituents", False):
         # --index-contributions (D48) reads S3 and the ArcticDB universe library
         # and writes market_data/; --nasdaq100-constituents (D49) reads S3 and
         # writes market_data/. Both are covered by the S3 + ArcticDB surface.
@@ -6009,14 +6017,7 @@ def main() -> None:
         # data_collection/panel/ — the same S3 + ArcticDB surface as --daily.
         # --features-settled-regrade (D50) reads S3 and the ArcticDB universe
         # and macro libraries, the same surface D31 reads under --daily.
-        # --daily-arctic-append reads the daily_closes PostMarketData wrote +
-        # the ArcticDB universe libraries — same preflight surface as --daily.
-        # --daily-heal (alpha-engine-config-I2717) reads the same two surfaces
-        # (staging/daily_closes parquet for the chronic-gap drift check +
-        # detect_*_universe_days' ArcticDB reads, and writes both via
-        # daily_append) — no dedicated preflight mode needed, "daily" already
-        # covers S3 + ArcticDB reachability, which is what this mode's
-        # fail-loud posture depends on catching before any heal work starts.
+        # These CONSUME the libraries, so a stale macro.SPY stays fatal here.
         mode = "daily"
     else:
         mode = f"phase{args.phase or 1}"

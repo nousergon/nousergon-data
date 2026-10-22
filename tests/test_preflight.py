@@ -40,7 +40,7 @@ class TestModeValidation:
             DataPreflight(bucket=BUCKET, mode="bogus")
 
     def test_known_modes_accepted(self):
-        for mode in ("phase1", "phase2", "daily", "morning_enrich"):
+        for mode in ("phase1", "phase2", "daily", "daily_write", "morning_enrich"):
             DataPreflight(bucket=BUCKET, mode=mode)  # no exception
 
 
@@ -441,6 +441,59 @@ class TestRunEndToEnd:
             "preflight.datetime", _Clock, create=True
         ), patch("datetime.datetime", _Clock):
             pf._check_macro_spy_fresh_trading_days(max_stale=1)
+
+    def _stale_spy_arctic(self, libraries=("universe", "macro")):
+        """SPY last at the 2026-10-20 close, read at 09:02Z on 10-22: two
+        sessions stale (the 2026-10-22 daily-heal refusal)."""
+        import pandas as pd
+
+        mock_arctic_obj = MagicMock()
+        mock_arctic_obj.list_libraries.return_value = list(libraries)
+        mock_lib = MagicMock()
+        mock_lib.read.return_value = MagicMock(
+            data=pd.DataFrame({"Close": [1.0]}, index=pd.DatetimeIndex([pd.Timestamp("2026-10-20")]))
+        )
+        mock_arctic_obj.get_library.return_value = mock_lib
+        return mock_arctic_obj
+
+    def _run_at_1022_0902z(self, pf, mock_arctic_obj):
+        from datetime import datetime, timezone
+
+        class _Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return datetime(2026, 10, 22, 9, 2, tzinfo=timezone.utc)
+
+        mock_s3 = MagicMock()
+        mock_s3.head_bucket.return_value = {}
+        with patch.dict(
+            "os.environ", {"AWS_REGION": "us-east-1"}, clear=False
+        ), patch("boto3.client", return_value=mock_s3), patch(
+            "arcticdb.Arctic", return_value=mock_arctic_obj
+        ), patch("datetime.datetime", _Clock):
+            pf.run()
+
+    def test_daily_consumer_refuses_stale_spy(self):
+        """Consumers (D48-D51) keep the fatal gate."""
+        with pytest.raises(RuntimeError, match="2 trading-day"):
+            self._run_at_1022_0902z(_make("daily"), self._stale_spy_arctic())
+
+    def test_daily_write_producer_runs_on_stale_spy(self, caplog):
+        """alpha-engine-config-I12547: --daily / --daily-arctic-append /
+        --daily-heal are what freshen SPY. Refusing them at SPY two sessions
+        stale turned one missed append into a stall; they log and run."""
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger="preflight"):
+            self._run_at_1022_0902z(_make("daily_write"), self._stale_spy_arctic())
+        assert any("daily_write" in r.getMessage() for r in caplog.records)
+
+    def test_daily_write_still_requires_the_libraries(self):
+        """A missing library is a deploy fault no producer run can fill."""
+        with pytest.raises(RuntimeError, match="macro"):
+            self._run_at_1022_0902z(
+                _make("daily_write"), self._stale_spy_arctic(libraries=("universe",))
+            )
 
     def test_phase2_requires_fmp_stable(self):
         pf = _make("phase2")
