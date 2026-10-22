@@ -1,7 +1,7 @@
 {
   "Comment": "Alpha Engine post-close pipeline \u2014 the half of the day's close-out that needs only the close: market-hours gate, mutex, deploy-drift check, trading-box start + SSM readiness, executor-checkout refresh, and the live-IB CaptureSnapshot (trades/snapshots/{run_date}.json) with its bounded same-day retry, then the completion marker. Everything that depends on the standalone EOD collection (ne-data-collection-eod, 18:15 ET) \u2014 the collection readiness wait, the reconcile precondition probe, EODReconcile and its self-heal loop, the trading-box stop and the weekly-exercise chain \u2014 runs in ne-postclose-reconcile-pipeline (infrastructure/step_function_eod_reconcile.json), started when that collection reaches a terminal state. alpha-engine-config-I11269 follow-up (Brian, 2026-09-30: \"run all steps in the post close sf that can run immediately after close and just set up the part that relies on the collector as a separate sf\"). Triggered by daemon shutdown on the trading EC2 (~16:00 ET); alpha-engine-eod-backstop is the same-day backstop. Leaves the trading box RUNNING on success \u2014 see CheckDegradedOutcome.",
   "StartAt": "MarketHoursGate",
-  "TimeoutSeconds": 3600,
+  "TimeoutSeconds": 5400,
   "States": {
     "MarketHoursGate": {
       "Type": "Task",
@@ -582,12 +582,12 @@
     },
     "CheckSnapshotStatus": {
       "Type": "Choice",
-      "Comment": "Success -> CheckDegradedOutcome (this pipeline's deliverable, the S3 snapshot, now exists). Default routes to SnapshotStatusError -> the bounded same-day retry so any unexpected SSM status is surfaced, not silently swallowed.",
+      "Comment": "Success -> DrainTraderReconcile (alpha-engine-config-I12376) -> StopTradingInstance -> CheckDegradedOutcome (this pipeline's deliverable, the S3 snapshot, now exists). Default routes to SnapshotStatusError -> the bounded same-day retry so any unexpected SSM status is surfaced, not silently swallowed.",
       "Choices": [
         {
           "Variable": "$.snapshot_poll.Status",
           "StringEquals": "Success",
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         },
         {
           "Variable": "$.snapshot_poll.Status",
@@ -900,7 +900,7 @@
               "BooleanEquals": true
             }
           ],
-          "Next": "StopTradingInstance"
+          "Next": "DrainTraderReconcile"
         }
       ],
       "Default": "InitCaptureSnapshotRetryCounter"
@@ -916,7 +916,7 @@
     },
     "StopTradingInstance": {
       "Type": "Task",
-      "Comment": "Brian, 2026-10-01: \"lets just stop it when postclose part 1 completes\". Stops the trading box as soon as the close-time work (CaptureSnapshot) is done, on both the normal and the operator-replay skip path. Nothing else needs the box until ne-postclose-reconcile-pipeline, which starts it again itself (StartTradingInstance + SSM readiness) once ne-data-collection-eod (18:15 ET) finishes. crucible-executor's post-close timers (alpha-engine-trader-reconcile 16:45 America/New_York, alpha-engine-eod-reconcile-standalone 21:05 UTC, alpha-engine-reference-rate-publish 21:15 UTC) are all Persistent=true and documented to run late on the next boot for the same day, idempotently, so they now run at that evening boot instead of on a box this pipeline used to leave idling. Same task shape as the reconcile pipeline's StopTradingInstance; a hard failure routes to HandleFailure -> ForceStopInstance, and the 22:00 PT alpha-engine-stop-trading schedule remains the backstop.",
+      "Comment": "Brian, 2026-10-01: \"lets just stop it when postclose part 1 completes\". Stops the trading box as soon as the close-time work (CaptureSnapshot) is done, on both the normal and the operator-replay skip path. Nothing else needs the box until ne-postclose-reconcile-pipeline, which starts it again itself (StartTradingInstance + SSM readiness) once ne-data-collection-eod (18:15 ET) finishes. The v2 trader's reconcile (alpha-engine-trader-reconcile, 16:45 America/New_York) is no longer left to that boot: DrainTraderReconcile runs it and waits for it before this stop (alpha-engine-config-I12376), because at a boot after 00:00Z IB no longer returns the session's executions. crucible-executor's other post-close timers (alpha-engine-eod-reconcile-standalone 21:05 UTC, alpha-engine-reference-rate-publish 21:15 UTC) are Persistent=true and documented to run late on the next boot for the same day, idempotently, so they now run at that evening boot instead of on a box this pipeline used to leave idling. Same task shape as the reconcile pipeline's StopTradingInstance; a hard failure routes to HandleFailure -> ForceStopInstance, and the 22:00 PT alpha-engine-stop-trading schedule remains the backstop.",
       "Resource": "arn:aws:states:::aws-sdk:ec2:stopInstances",
       "Parameters": {
         "InstanceIds.$": "$.trading_instance_id"
@@ -1216,6 +1216,201 @@
       },
       "OutputPath": "$.merged",
       "Next": "HandleFailure"
+    },
+    "DrainTraderReconcile": {
+      "Type": "Task",
+      "Comment": "alpha-engine-config-I12376 (Phase 4 PR-H). RUNS the v2 trader's own reconcile, alpha-engine-trader-reconcile.service, and waits for it before StopTradingInstance. Its 16:45 America/New_York timer never fires on time: this machine stops the box at ~20:01Z, so the reconcile used to run only at ne-postclose-reconcile-pipeline's evening boot, and when that boot landed after 00:00Z IB returned none of the session's executions (10-19 and 10-20 DegradedRun: every share and cash delta traced to a v1 fill). Here the gateway has been up and logged in since the morning and it is still the session's UTC day. The unit is STARTED only when run_date is the current day in both UTC and New York and New York is past 13:00 (the earliest close): then the trader's last-closed-session binding is run_date and IB still returns its executions. Any other time (an operator replay after UTC midnight or for another day) the state only drains, exactly like the reconcile machine's copy, so a late replay can never re-file a session with its fills missing. Before starting it waits for alpha-engine-trader-session and alpha-engine-trader-pin-smoke (the trader's other gateway clients) to be neither queued nor running, within the same budget, so it never overlaps them (both are morning/noon oneshots capped at 30 min and long gone by the close). Then the same settle loop as the reconcile machine: bounded at 1080s in-script under a 1200s executionTimeout, and a unit that settled failed exits 3, which CheckTraderReconcileDrainStatus routes to SetTraderReconcileUnitFailedDegraded (reason eod_trader_reconcile_unit_failed, immediate page, DegradedRun): a failed reconcile stays failed. FAIL-OPEN toward the stop, never toward an idle box: an exhausted budget, a refused start, a non-Success status or any SSM error routes to SetTraderReconcileDrainDegraded and then StopTradingInstance. Same state names as the reconcile machine's drain, so the same pipeline-status rows.",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:sendCommand",
+      "Parameters": {
+        "DocumentName": "AWS-RunShellScript",
+        "InstanceIds.$": "$.trading_instance_id",
+        "Parameters": {
+          "commands.$": "States.Array('set -u -o pipefail', 'unit=alpha-engine-trader-reconcile.service', States.Format('run_date={}', $.run_date), 'deadline=$((SECONDS+1080))', 'utc_day=$(date -u +%F)', 'et_day=$(TZ=America/New_York date +%F)', 'et_hhmm=$(TZ=America/New_York date +%H%M)', 'if [ \"$utc_day\" = \"$run_date\" ] && [ \"$et_day\" = \"$run_date\" ] && [ \"$et_hhmm\" -ge 1300 ]; then', '  for peer in alpha-engine-trader-session.service alpha-engine-trader-pin-smoke.service; do', '    while :; do', '      pstate=$(systemctl show -p ActiveState --value \"$peer\")', '      pqueued=$(systemctl list-jobs --no-legend \"$peer\" | wc -l)', '      if [ \"$pstate\" != activating ] && [ \"$pstate\" != active ] && [ \"$pstate\" != reloading ] && [ \"$pqueued\" -eq 0 ]; then break; fi', '      if [ \"$SECONDS\" -ge \"$deadline\" ]; then', '        echo \"$peer still ActiveState=$pstate (queued jobs: $pqueued) after 1080s so $unit was NOT started; stopping the box anyway\" >&2', '        exit 1', '      fi', '      sleep 10', '    done', '  done', '  if ! systemctl start --no-block \"$unit\"; then', '    echo \"systemctl start --no-block $unit failed; stopping the box anyway\" >&2', '    exit 1', '  fi', '  echo \"$unit started for run_date $run_date (UTC day $utc_day; New York $et_day $et_hhmm)\"', 'else', '  echo \"$unit NOT started: run_date $run_date is not the current day in both UTC ($utc_day) and New York ($et_day $et_hhmm; start needs 13:00 or later) so IB would not return the executions of that session or the trader would bind to another session; drain only\"', 'fi', 'while :; do', '  state=$(systemctl show -p ActiveState --value \"$unit\")', '  queued=$(systemctl list-jobs --no-legend \"$unit\" | wc -l)', '  if [ \"$state\" != activating ] && [ \"$state\" != active ] && [ \"$state\" != reloading ] && [ \"$queued\" -eq 0 ]; then', '    result=$(systemctl show -p Result --value \"$unit\")', '    if [ \"$state\" = failed ] || [ \"$result\" != success ]; then', '      echo \"$unit settled FAILED: ActiveState=$state Result=$result\" >&2', '      journalctl -b -u \"$unit\" -n 12 --no-pager -o cat 2>&1 | tail -n 12 >&2', '      exit 3', '    fi', '    echo \"$unit settled: ActiveState=$state Result=$result\"', '    exit 0', '  fi', '  if [ \"$SECONDS\" -ge \"$deadline\" ]; then', '    echo \"$unit still ActiveState=$state (queued jobs: $queued) after 1080s; stopping the box anyway\" >&2', '    exit 1', '  fi', '  sleep 10', 'done')",
+          "executionTimeout": [
+            "1200"
+          ]
+        },
+        "TimeoutSeconds": 600
+      },
+      "TimeoutSeconds": 1260,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "States.TaskFailed"
+          ],
+          "MaxAttempts": 1,
+          "IntervalSeconds": 15,
+          "BackoffRate": 1.0
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "Fail-open toward the stop: a drain that could not even be sent must never leave the box running.",
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_result",
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "WaitForTraderReconcileDrain": {
+      "Type": "Task",
+      "Comment": "Poll the DrainTraderReconcile invocation. Same retry shape as WaitForRefreshExecutorDeploy; every error fails open to SetTraderReconcileDrainDegraded -> StopTradingInstance. Maps StandardErrorContent only (the drain's unsettled diagnostic is written to stderr); stdout is never mapped into SF state (test_sf_ssm_diagnostics_reach_the_operator.py, the DataLimitExceeded class).",
+      "Resource": "arn:aws:states:::aws-sdk:ssm:getCommandInvocation",
+      "Parameters": {
+        "CommandId.$": "$.trader_reconcile_drain_result.Command.CommandId",
+        "InstanceId.$": "$.trading_instance_id[0]"
+      },
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": [
+            "Ssm.InvocationDoesNotExistException",
+            "Ssm.InvocationDoesNotExist"
+          ],
+          "MaxAttempts": 10,
+          "IntervalSeconds": 10,
+          "BackoffRate": 1.5
+        },
+        {
+          "ErrorEquals": [
+            "Ssm.SdkClientException",
+            "States.Timeout"
+          ],
+          "MaxAttempts": 2,
+          "IntervalSeconds": 5,
+          "BackoffRate": 1.5
+        }
+      ],
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Next": "SetTraderReconcileDrainDegraded",
+          "ResultPath": "$.trader_reconcile_drain_error"
+        }
+      ],
+      "ResultSelector": {
+        "Status.$": "$.Status",
+        "ResponseCode.$": "$.ResponseCode",
+        "StatusDetails.$": "$.StatusDetails",
+        "CommandId.$": "$.CommandId",
+        "InstanceId.$": "$.InstanceId",
+        "StandardErrorContent.$": "$.StandardErrorContent"
+      },
+      "ResultPath": "$.trader_reconcile_drain_poll",
+      "Next": "CheckTraderReconcileDrainStatus"
+    },
+    "CheckTraderReconcileDrainStatus": {
+      "Type": "Choice",
+      "Comment": "Success -> StopTradingInstance (the unit settled AND succeeded). Failed with ResponseCode 3 -> SetTraderReconcileUnitFailedDegraded: the unit settled but FAILED (alpha-engine-config-I12292), a degraded run with its own reason. InProgress/Pending/Delayed -> keep polling. Anything else (Failed with exit 1: the in-script budget ran out; TimedOut; Cancelled) -> SetTraderReconcileDrainDegraded, which still stops the box.",
+      "Choices": [
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Success",
+          "Next": "StopTradingInstance"
+        },
+        {
+          "And": [
+            {
+              "Variable": "$.trader_reconcile_drain_poll.Status",
+              "StringEquals": "Failed"
+            },
+            {
+              "Variable": "$.trader_reconcile_drain_poll.ResponseCode",
+              "IsNumeric": true
+            },
+            {
+              "Variable": "$.trader_reconcile_drain_poll.ResponseCode",
+              "NumericEquals": 3
+            }
+          ],
+          "Next": "SetTraderReconcileUnitFailedDegraded"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "InProgress",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Pending",
+          "Next": "TraderReconcileDrainWait"
+        },
+        {
+          "Variable": "$.trader_reconcile_drain_poll.Status",
+          "StringEquals": "Delayed",
+          "Next": "TraderReconcileDrainWait"
+        }
+      ],
+      "Default": "ExtractTraderReconcileDrainStatusError"
+    },
+    "TraderReconcileDrainWait": {
+      "Type": "Wait",
+      "Seconds": 15,
+      "Next": "WaitForTraderReconcileDrain"
+    },
+    "ExtractTraderReconcileDrainStatusError": {
+      "Type": "Pass",
+      "Comment": "Copies the terminal non-Success poll (Failed when the in-script budget ran out; TimedOut; Cancelled -- a Failed poll with ResponseCode 3 is the settled-but-failed unit and goes to SetTraderReconcileUnitFailedDegraded instead) into $.trader_reconcile_drain_error, the same field DrainTraderReconcile's and WaitForTraderReconcileDrain's Catch write, so SetTraderReconcileDrainDegraded reads one path on every route into it.",
+      "InputPath": "$.trader_reconcile_drain_poll",
+      "ResultPath": "$.trader_reconcile_drain_error",
+      "Next": "SetTraderReconcileDrainDegraded"
+    },
+    "SetTraderReconcileDrainDegraded": {
+      "Type": "Pass",
+      "Comment": "The trader-reconcile drain did not settle (budget exhausted, non-Success status, or an SSM error). Recorded on $.degraded_summary so CheckDegradedOutcome routes to the DegradedRun terminal instead of a plain SUCCEEDED, pages immediately (PublishTraderReconcileDrainUnsettled, sf-pipeline-policy.md \u00a75), then the box is stopped regardless. Same shape as SetMutexAcquireDegradedFlag.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_trader_reconcile_drain_unsettled",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.trader_reconcile_drain_error",
+        "page_subject": "Alpha Engine trader reconcile NOT DRAINED (box stopped anyway)",
+        "page_detail": "ne-postclose-trading-pipeline stopped the trading box while alpha-engine-trader-reconcile.service had not settled (not started because another trader unit was still running, still queued or running past the drain budget, or the drain could not be read). The v2 trader reconcile may not have run or may have been cut off by the stop; check its run manifest for the day."
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishTraderReconcileDrainUnsettled"
+    },
+    "PublishTraderReconcileDrainUnsettled": {
+      "Type": "Task",
+      "Comment": "Best-effort immediate page for BOTH degraded outcomes of the trader-reconcile drain, before the box stop: the unit had not settled (SetTraderReconcileDrainDegraded, alpha-engine-config-I12020), or it settled FAILED (SetTraderReconcileUnitFailedDegraded, alpha-engine-config-I12292). Subject and Message are read from $.degraded_summary.page_subject / page_detail, which each setter writes, so one publish state serves both without a second substantive Task (the console registry keys on state names). Its own Catch routes to StopTradingInstance too, so an SNS failure cannot leave the box running.",
+      "Resource": "arn:aws:states:::sns:publish",
+      "Parameters": {
+        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "Subject.$": "$.degraded_summary.page_subject",
+        "Message.$": "States.Format('{} Run date {}. Detail: {}', $.degraded_summary.page_detail, $.run_date, States.JsonToString($.degraded_summary.stage_error))"
+      },
+      "TimeoutSeconds": 60,
+      "Catch": [
+        {
+          "ErrorEquals": [
+            "States.ALL"
+          ],
+          "Comment": "An alert failure must not block the cost-guard stop.",
+          "Next": "StopTradingInstance",
+          "ResultPath": "$.trader_reconcile_drain_notify_error"
+        }
+      ],
+      "ResultPath": "$.trader_reconcile_drain_notify",
+      "Next": "StopTradingInstance"
+    },
+    "SetTraderReconcileUnitFailedDegraded": {
+      "Type": "Pass",
+      "Comment": "alpha-engine-config-I12292 (Brian's ruling, 2026-10-14): a failed v2 trader reconcile must not read as success. The drain's poll came back Failed with ResponseCode 3: alpha-engine-trader-reconcile.service SETTLED, but with ActiveState=failed or a Result other than success. The drain did its job, so the box stops as on any settled drain, but the unit it waited for failed: recorded on $.degraded_summary with its own named reason (stage_error is the poll, whose StandardErrorContent carries the settled state and the unit's last journal lines from this boot), so CheckDegradedOutcome routes to the DegradedRun terminal instead of NormalSucceeded. Pages at once (sf-pipeline-policy.md \u00a75) through the drain's own publish, PublishTraderReconcileDrainUnsettled, whose Subject and Message come from page_subject / page_detail here, then stops the box. Distinct from eod_trader_reconcile_drain_unsettled, which means the drain never saw the unit settle.",
+      "Parameters": {
+        "degraded": true,
+        "reason": "eod_trader_reconcile_unit_failed",
+        "run_date.$": "$.run_date",
+        "stage_error.$": "$.trader_reconcile_drain_poll",
+        "page_subject": "Alpha Engine trader reconcile FAILED (box stopped)",
+        "page_detail": "alpha-engine-trader-reconcile.service settled FAILED on the trading box (ActiveState=failed or a Result other than success), so the v2 trader reconcile did not succeed and ne-postclose-trading-pipeline ends DegradedRun (reason eod_trader_reconcile_unit_failed); the box is stopped as usual. Check runs/trader.reconcile/<run_date>/run.json: if it is absent the unit failed before the reconcile job ran (provisioning, pin or venv). The detail carries the settled state and the unit's journal tail."
+      },
+      "ResultPath": "$.degraded_summary",
+      "Next": "PublishTraderReconcileDrainUnsettled"
     }
   }
 }
