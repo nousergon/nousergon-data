@@ -66,6 +66,16 @@ jobs:
       - name: Validate ssm_log_capture invocations in SF definitions
         run: python3 validators/ssm_log_capture_contract.py
 
+      # S-46 (alpha-engine-config-I12533): SF states call declared entrypoints
+      # only, with no business logic in ASL. OBSERVE mode: reports NEW and STALE
+      # findings against validators/sf_entrypoint_baseline.json as warnings and
+      # in the job summary, and never blocks. Stdlib only, well under 1 s, no
+      # new job. Removed a finding? Lower the ceiling:
+      # python3 validators/sf_entrypoint_lint.py --update
+      - name: SF states call declared entrypoints (observe, S-46)
+        continue-on-error: true
+        run: python3 validators/sf_entrypoint_lint.py
+
   # config#2878: S3 returns 403 AccessDenied instead of 404 NoSuchKey for
   # GetObject on a nonexistent key when the caller lacks s3:ListBucket. Every
   # lambda iam-policy.json that grants GetObject must also grant a matching
