@@ -1264,6 +1264,55 @@ def _yfinance_intraday(yf_symbols: list[str]) -> dict[str, dict]:
     return out
 
 
+#: Cap on the error-body prefix a non-JSON FRED response may log
+#: (alpha-engine-config-I12547). This repo is public: a prefix is printed only
+#: for an HTML or plain-text body (a vendor error page), never for a body that
+#: could carry series data, and never with the API key in it.
+FRED_ERROR_BODY_PREFIX_CHARS = 200
+_FRED_PREFIX_CONTENT_TYPES = ("text/html", "text/plain")
+
+
+class FredNonJsonResponse(ValueError):
+    """A FRED endpoint answered with a body that does not decode as JSON."""
+
+
+def _fred_response_diagnostics(resp: Any, raw: bytes, api_key: str) -> str:
+    """Status, content-type, length and (for an error page only) a short,
+    key-redacted body prefix — what the operator needs to tell an outage page
+    from a throttle from a truncated payload. Never the request URL."""
+    import re
+
+    status = getattr(resp, "status", None)
+    if status is None and callable(getattr(resp, "getcode", None)):
+        status = resp.getcode()
+    headers = getattr(resp, "headers", None)
+    content_type = (headers.get("Content-Type") if headers is not None else None) or ""
+    detail = f"status={status} content-type={content_type or 'unknown'!r} length={len(raw)}"
+    if content_type.split(";")[0].strip().lower() not in _FRED_PREFIX_CONTENT_TYPES:
+        # JSON-, XML- or untyped: a partial body could be vendor data, so
+        # nothing of its content is logged.
+        return detail
+    text = raw[: FRED_ERROR_BODY_PREFIX_CHARS * 4].decode("utf-8", errors="replace")
+    if api_key:
+        text = text.replace(api_key, "<redacted>")
+    text = re.sub(r"(api_key=)[^&\s\"'<>]+", r"\1<redacted>", text, flags=re.IGNORECASE)
+    text = " ".join(text.split())[:FRED_ERROR_BODY_PREFIX_CHARS]
+    return f"{detail} body_prefix={text!r}"
+
+
+def _fred_json(resp: Any, api_key: str) -> dict:
+    """Decode a FRED response body; a non-JSON body raises
+    :class:`FredNonJsonResponse` carrying :func:`_fred_response_diagnostics`
+    instead of a bare ``Expecting value: line 1 column 1 (char 0)``."""
+    raw = resp.read()
+    try:
+        return json.loads(raw.decode())
+    except (UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise FredNonJsonResponse(
+            f"non-JSON response ({e}): {_fred_response_diagnostics(resp, raw, api_key)}"
+        ) from e
+
+
 def _fred_series_history(series_ids: list[str], as_of: date, api_key: str, *, lookback_years: int = 2) -> dict[str, list[tuple[str, float]]]:
     """~``lookback_years`` of daily/monthly observations per FRED series id →
     ``{series_id: [(date, value), …]}`` ascending. stdlib urllib; fail-soft per series."""
@@ -1289,7 +1338,7 @@ def _fred_series_history(series_ids: list[str], as_of: date, api_key: str, *, lo
                                          "sort_order": "asc", "observation_start": start})
         try:
             with urllib.request.urlopen(f"https://api.stlouisfed.org/fred/series/observations?{params}", timeout=15) as resp:
-                payload = json.loads(resp.read().decode())
+                payload = _fred_json(resp, api_key)
         except Exception as e:
             logger.warning("[metron_market_data] FRED fetch failed for %s: %s", sid, e)
             continue
@@ -2038,7 +2087,7 @@ def _fred_publication_evidence(
     def _get(endpoint: str, params: dict) -> dict:
         query = urllib.parse.urlencode({**params, "api_key": api_key, "file_type": "json"})
         with urllib.request.urlopen(f"https://api.stlouisfed.org/fred/{endpoint}?{query}", timeout=15) as resp:
-            return json.loads(resp.read().decode())
+            return _fred_json(resp, api_key)
 
     out: dict[str, dict] = {}
     for sid, observations in series.items():
