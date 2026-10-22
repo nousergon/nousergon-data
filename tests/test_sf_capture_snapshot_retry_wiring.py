@@ -82,7 +82,8 @@ class TestRetryCounterInitialization:
         # bypass of the whole retry machinery, and still gated on
         # operator-replay.
         st = eod["CheckSkipCaptureSnapshot"]
-        assert st["Choices"][0]["Next"] == "StopTradingInstance"
+        # alpha-engine-config-I12376: via the trader-reconcile run-and-drain.
+        assert st["Choices"][0]["Next"] == "DrainTraderReconcile"
         assert st["Default"] == "InitCaptureSnapshotRetryCounter"
         retry_states = {
             "InitCaptureSnapshotRetryCounter", "CaptureSnapshot", "WaitForCaptureSnapshot",

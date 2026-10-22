@@ -1443,14 +1443,18 @@ def test_sf_file_set_matches_exemption_registry():
 #                  recovery a standing rule, and an 11h ceiling let one hung
 #                  execution hold the mutex past the close and take the
 #                  recovery with it.
-#   eod      3600  alpha-engine-config-I11269 follow-up (Brian, 2026-09-30): the
+#   eod      5400  alpha-engine-config-I11269 follow-up (Brian, 2026-09-30): the
 #                  post-close machine no longer waits on the collection. Its
 #                  worst case is the gates (~3 min), the box boot + SSM poll
 #                  (~4 min), RefreshExecutorDeploy (660 s task + poll) and two
 #                  CaptureSnapshot attempts (720 s executionTimeout each + poll,
 #                  since alpha-engine-config-I12220's 420 s gateway-readiness
-#                  wait; 120 s before) — ~44 min, inside sf-pipeline-policy.md
-#                  §4's ≤75-min eod target; 1h is ~1.4x that.
+#                  wait; 120 s before) — ~44 min — plus, since
+#                  alpha-engine-config-I12376, the trader-reconcile run and
+#                  drain before the box stop (1200 s executionTimeout under a
+#                  1260 s state timeout, + poll) — ~65 min, inside
+#                  sf-pipeline-policy.md §4's ≤75-min eod target; 5400 (1.5h)
+#                  is ~1.4x that, the same margin the 3600 it replaces kept.
 #   eod_reconcile
 #          14400  the collector-dependent half (EODReconcile, heal loop, box
 #                  stop, weekly-exercise chain), started on
@@ -1479,7 +1483,7 @@ def test_sf_file_set_matches_exemption_registry():
 _TOP_LEVEL_TIMEOUT_CEILING = {
     "step_function.json": 43200,
     "step_function_daily.json": 7200,
-    "step_function_eod.json": 3600,
+    "step_function_eod.json": 5400,
     "step_function_eod_reconcile.json": 14400,
     "step_function_groom.json": 15000,
 }
