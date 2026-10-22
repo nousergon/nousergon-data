@@ -203,6 +203,16 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
     # reference disagrees with it on a change nothing explains, a recent roster
     # snapshot could not be read, or (I11525) the map does not reproduce a
     # roster snapshot. The collector's own `detail` names each one.
+    # alpha-engine-config-I12547: a non-halting phase (`_EOD_NON_HALTING_PHASES`)
+    # that did not finish ok. Its `reason` (FRED unreachable, key unset) is
+    # carried in the collector's own detail.
+    "metron_macro_data": {
+        "tracked_issue": "alpha-engine-config-I12547",
+        "clears_when": (
+            "the next EOD run's metron_macro_data phase is ok "
+            "(FRED reachable; market_data/macro/latest.json rewritten for that date)"
+        ),
+    },
     "historical_constituents": {
         "tracked_issue": "alpha-engine-config-I11470",
         "clears_when": (
@@ -213,6 +223,51 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
         ),
     },
 }
+
+
+#: EOD daily phases whose failure must NOT halt the price-append / reconcile
+#: path (alpha-engine-config-I12547). Closed list, add-by-PR-only: a phase
+#: belongs here only when nothing the EOD Step Function runs after this
+#: process -- the ArcticDB append (D32), EODReconcile, the trader reconcile --
+#: reads its output. Its failure makes the run ``degraded`` (exit 0, ERROR
+#: log, DEGRADED page naming the tracked issue), never ``ok``; the phase's own
+#: run manifest still records ``failed``. Every phase NOT listed here keeps the
+#: hard-fail posture unchanged.
+#:
+#: metron_macro_data (D23): its only source is FRED and its only consumer is
+#: Metron's Macro page (registry.d/units/D23-metron-macro.yaml). On 2026-10-21
+#: a FRED outage made it ``skipped``, the run ``failed``, and the EOD SF never
+#: appended the day's bars to ArcticDB.
+_EOD_NON_HALTING_PHASES: frozenset[str] = frozenset({"metron_macro_data"})
+
+
+def _aggregate_daily_status(collectors: dict) -> tuple[str, list[str]]:
+    """The EOD daily run's status from its per-collector results.
+
+    Returns ``(status, degraded_collectors)``:
+
+    * ``ok`` -- every phase ``ok``/``ok_dry_run``.
+    * ``degraded`` -- every phase is ok or ``degraded`` (I7572), or is a
+      ``_EOD_NON_HALTING_PHASES`` member in any other state (I12547). The
+      list names each such phase.
+    * ``failed`` -- anything else; the caller exits 1 and halts the SF.
+    """
+    ok = ("ok", "ok_dry_run")
+    degraded: list[str] = []
+    failed = False
+    for name, result in collectors.items():
+        status = (result or {}).get("status", "unknown")
+        if status in ok:
+            continue
+        if status == "degraded" or name in _EOD_NON_HALTING_PHASES:
+            degraded.append(name)
+        else:
+            failed = True
+    if failed:
+        return "failed", []
+    if degraded:
+        return "degraded", sorted(degraded)
+    return "ok", []
 
 
 def _write_guard_skip_record(path: str, results: dict) -> None:
@@ -270,8 +325,9 @@ def _describe_degraded_defects(results: dict) -> str:
         # own `detail` (alpha-engine-config-I11470: historical_constituents
         # names each disagreement and skipped snapshot). `columns=?` alone
         # told the reader nothing.
+        detail = info.get("detail") or info.get("reason")
         what = f"columns={cols}" if cols else (
-            f"detail={info['detail']}" if info.get("detail") else "columns=?"
+            f"detail={detail}" if detail else "columns=?"
         )
         if reg:
             lines.append(
@@ -5193,17 +5249,10 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
     # compute_and_write, the phase status is `degraded` in the per-collector map
     # printed below, the run's own status is `degraded`, and the health marker
     # records it. `ok` is still reserved for a genuinely clean run.
-    statuses = [r.get("status", "unknown") for r in results["collectors"].values()]
-    if all(s in ("ok", "ok_dry_run") for s in statuses):
-        results["status"] = "ok"
-    elif all(s in ("ok", "ok_dry_run", "degraded") for s in statuses):
-        results["status"] = "degraded"
-        results["degraded_collectors"] = sorted(
-            k for k, v in results["collectors"].items()
-            if v.get("status") == "degraded"
-        )
-    else:
-        results["status"] = "failed"
+    status, degraded = _aggregate_daily_status(results["collectors"])
+    results["status"] = status
+    if degraded:
+        results["degraded_collectors"] = degraded
 
     # Health marker. Written on degraded too, carrying the degraded status —
     # previously only an `ok` run wrote one, so a degraded day left the marker
@@ -6029,16 +6078,19 @@ def main() -> None:
     # today's grouped-daily). Treated as success so spot_data_weekly.sh's
     # ``if ! ... exit 1`` check does not trip.
     # `degraded` joins ok/skipped as a non-halting outcome (alpha-engine-config-
-    # I7572). It is emitted ONLY by the EOD daily path, ONLY for the feature
-    # store's zero-variance postflight, and it is loud at every layer: ERROR log
+    # I7572). It is emitted ONLY by the EOD daily path -- for a phase reporting
+    # `degraded` itself (the feature store's zero-variance postflight, the PIT
+    # constituents check) or a declared `_EOD_NON_HALTING_PHASES` member that did
+    # not finish ok (alpha-engine-config-I12547) -- and it is loud at every layer: ERROR log
     # naming the offending columns, `degraded` in the per-collector status map,
     # `degraded` on the run, and a health marker recording it. The hard-fail
     # posture for every genuine data failure is unchanged — see the comment
     # above, which still governs `failed`.
     if results["status"] == "degraded":
         logger.error(
-            "Collection finished DEGRADED — the artifact was produced and the "
-            "pipeline continues, but %s reported a known defect. Exiting 0 so "
+            "Collection finished DEGRADED — the pipeline continues, but %s "
+            "reported a known defect or is a non-halting phase that did not "
+            "finish ok. Exiting 0 so "
             "the EOD SF still runs the ArcticDB append and EODReconcile. "
             "Defect detail: %s. Per-collector statuses: %s",
             ", ".join(results.get("degraded_collectors", [])) or "a collector",
