@@ -42,6 +42,13 @@ the one collector this record faults.
    once the fault is gone the next run files ``ok``, passes the completion
    check and pages nobody.
 
+**The weekly cases** (`alpha-engine-config-I10794`): D04-D08, D10 and D11 on the
+``weekly-phase-one`` workload (mode ``phase1``) and D15 on
+``alternative-phase-two`` (mode ``phase2``) ride the same ``_phase_collect`` path,
+so each is walked on the ``weekly`` schedule's own deployed input with only its
+own workload faulted (:data:`WEEKLY_CASES`, which also says which weekly units
+are not here and why).
+
 **What the first run of this record found** (fixed in the same change): the
 enforce branch raised AFTER the phase marker had been written ``ok``, so the
 Step Function's on-demand retry auto-skipped the very artifact the guard had
@@ -53,6 +60,7 @@ through ``degraded``; ``weekly_collector._GuardRejectedPublish`` closes it.
 
 from __future__ import annotations
 
+import dataclasses
 import datetime as dt
 import io
 import json
@@ -71,7 +79,7 @@ from nousergon_lib.guard_mode import GuardMode, GuardStaging
 
 import run_units
 import weekly_collector
-from collectors import metron_market_data, prices, technical_rating_ledger
+from collectors import fred_history, metron_market_data, prices, technical_rating_ledger
 from data_gate import descriptors, evidence
 from data_gate import run_manifest_predicate as completion
 from data_gate.guard_commissioning import record_document, record_key
@@ -175,6 +183,13 @@ class Case:
     #: Set for the units whose outputs are shaped by their own result (see
     #: :class:`Shape`); ``extra`` is then unused.
     shape: Shape | None = None
+    #: The run mode the call site runs under (``reg.data_mode``, the
+    #: ``run_units.PHASE_UNITS`` key), the deployed workload that runs it, and the
+    #: schedule whose execution input names that workload. The EOD defaults are
+    #: the original cases'; the weekly ones are :data:`_PHASE_ONE` / :data:`_PHASE_TWO`.
+    mode: str = "daily"
+    workload: str = WORKLOAD
+    collection: str = "eod"
 
     def written(self, rows: int) -> dict[str, int]:
         """Every key a run at ``rows`` PUTs, with the count its manifest records."""
@@ -190,7 +205,7 @@ class Case:
 
     @property
     def rows_key(self) -> str:
-        return run_units.PHASE_UNITS[("daily", self.phase)].rows_key
+        return run_units.PHASE_UNITS[(self.mode, self.phase)].rows_key
 
 
 def _json_case(unit: str, phase: str, key: str, extra: tuple[tuple[str, str], ...] = ()) -> Case:
@@ -336,7 +351,7 @@ def _d31_shape() -> Shape:
 #: the guard grades nothing there (`not_applicable`) and there is no fault to
 #: induce through this path. D19's `staging/daily_closes` is read by
 #: crucible-executor (trading path) and is held with D01/D02.
-CASES: tuple[Case, ...] = (
+EOD_CASES: tuple[Case, ...] = (
     Case(
         "D19", "daily_closes", f"staging/daily_closes/{TRADING_DAY}.parquet",
         "empty frame: a zero-row parquet PUT to the contracted key under status ok",
@@ -386,6 +401,187 @@ CASES: tuple[Case, ...] = (
         shape=_d31_shape(),
     ),
 )
+
+# ---------------------------------------------------------------------------
+# The weekly cases: the same guard on the Saturday schedule's own workloads
+# ---------------------------------------------------------------------------
+
+#: The weekly schedule's ``weekly-phase-one`` workload (``_run_phase1``) and its
+#: ``alternative-phase-two`` workload (``_run_phase2``). Both run their units
+#: through the same ``_phase_collect`` -> ``_record_phase_lineage`` ->
+#: ``check_empty_fresh`` path the EOD cases do, under ``reg.data_mode`` ``phase1``
+#: / ``phase2``, on the same deployed ASL, started by the ``weekly`` schedule's
+#: input (whose ``verify_units`` names each of them).
+_PHASE_ONE = {"mode": "phase1", "workload": "weekly-phase-one", "collection": "weekly"}
+_PHASE_TWO = {"mode": "phase2", "workload": "alternative-phase-two", "collection": "weekly"}
+
+#: ``config.get("market_data", {}).get("s3_prefix", "market_data/")`` at the
+#: weekly call sites (the deployed config sets no other prefix).
+_MARKET_PREFIX = "market_data/"
+#: The series the D04 call site passes ``fred_history.backfill_to_s3`` explicitly.
+_FRED_SERIES = ("TWO", "HYOAS", "BAA10Y")
+
+
+def _weekly_json_case(
+    unit: str, phase: str, key: str, extra: tuple[tuple[str, str], ...] = (), *, schedule=None,
+) -> Case:
+    return dataclasses.replace(_json_case(unit, phase, key, extra), **(schedule or _PHASE_ONE))
+
+
+def _d04_result(rows: int) -> dict:
+    """``fred_history.backfill_to_s3``'s own result shape, every series uploaded."""
+    return {
+        "status": "ok", "refreshed": len(_FRED_SERIES), "total": len(_FRED_SERIES),
+        "per_ticker": {t: {"status": "ok", "rows": rows} for t in _FRED_SERIES},
+        "dry_run": False,
+    }
+
+
+def _d04_shape() -> Shape:
+    """D04 (FRED macro history): no primary key; one price-cache parquet per series
+    the run uploaded, each with its own row count. The call site's ``extra_outputs``
+    is ``weekly_collector._fred_history_extra_outputs`` itself, reading
+    ``per_ticker`` through ``fred_history.written_keys``.
+    """
+    return Shape(
+        result=_d04_result,
+        written=lambda rows: fred_history.written_keys(_d04_result(rows), _PRICE_CACHE_PREFIX),
+        extra_outputs=lambda: weekly_collector._fred_history_extra_outputs(_PRICE_CACHE_PREFIX),
+        auto_skip=False,
+    )
+
+
+#: What D05's two secondary writes report when they are not the fault.
+_D05_HISTORY_ROWS = 52
+_D05_CALENDAR_ROWS = 12
+
+
+def _d05_shape() -> Shape:
+    """D05 (macro): the primary ``weekly/{date}/macro.json`` plus the two secondary
+    parquets ``macro.collect`` writes beside it, each recorded only when its own
+    status is ``ok``. The fault empties macro.json; both secondaries are real
+    writes, so the guard has to pick the empty key out. The ``extra_outputs`` is
+    inline at the call site, so it is mirrored here, not tidied.
+    """
+    history = f"{_MARKET_PREFIX}macro_history.parquet"
+    calendar = f"{_MARKET_PREFIX}macro_release_calendar.parquet"
+    return Shape(
+        result=lambda rows: {
+            "status": "ok", "fields": rows, "rows": rows,
+            "macro_history": {"status": "ok", "rows": _D05_HISTORY_ROWS},
+            "release_calendar": {"status": "ok", "rows": _D05_CALENDAR_ROWS},
+        },
+        written=lambda rows: {
+            f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/macro.json": rows,
+            history: _D05_HISTORY_ROWS,
+            calendar: _D05_CALENDAR_ROWS,
+        },
+        extra_outputs=lambda: (
+            (
+                history,
+                lambda r: (r.get("macro_history") or {}).get("status") == "ok",
+                lambda r: (r.get("macro_history") or {}).get("rows") or 0,
+            ),
+            (
+                calendar,
+                lambda r: (r.get("release_calendar") or {}).get("status") == "ok",
+                lambda r: (r.get("release_calendar") or {}).get("rows") or 0,
+            ),
+        ),
+    )
+
+
+def _d08_shape() -> Shape:
+    """D08 (universe returns): no primary key; the ``research.db`` pointer and its
+    dated backup, each recorded when the writer's own ``db_upload`` names it and
+    counted as ``rows_inserted``. Mirrors the call site's inline ``extra_outputs``.
+    """
+    backup = f"backups/research_{TRADING_DAY}.db"
+    return Shape(
+        result=lambda rows: {
+            "status": "ok", "rows_inserted": rows,
+            "db_upload": {"pointer_key": "research.db", "backup_key": backup},
+        },
+        written=lambda rows: {"research.db": rows, backup: rows},
+        extra_outputs=lambda: (
+            (
+                "research.db",
+                lambda r: bool((r.get("db_upload") or {}).get("pointer_key")),
+                lambda r: r.get("rows_inserted") or 0,
+            ),
+            (
+                backup,
+                lambda r: bool((r.get("db_upload") or {}).get("backup_key")),
+                lambda r: r.get("rows_inserted") or 0,
+            ),
+        ),
+        auto_skip=False,
+    )
+
+
+#: The resolved universe size D15's scope baseline records when it is not the fault.
+_D15_SCOPE_TICKERS = 900
+
+
+def _d15_shape() -> Shape:
+    """D15 (alternative, phase 2): the primary ``alternative/manifest.json`` plus the
+    ``scope.json`` baseline the phase body writes before its first vendor call,
+    always recorded with the resolved universe size. The fault is a manifest
+    covering zero tickers over a real scope baseline.
+    """
+    base = f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/alternative/"
+    return Shape(
+        result=lambda rows: {"status": "ok", "tickers_processed": rows},
+        written=lambda rows: {f"{base}manifest.json": rows, f"{base}scope.json": _D15_SCOPE_TICKERS},
+        extra_outputs=lambda: ((f"{base}scope.json", lambda r: True, lambda r: _D15_SCOPE_TICKERS),),
+    )
+
+
+#: Every weekly ``_phase_collect`` unit whose guard can fire through this path and
+#: that the trading path does not read. Each walks the deployed ASL on the
+#: ``weekly`` schedule's input, with only its own workload faulted.
+#:
+#: Not here, and why: D01/D02 (the trader's feed, held by the observe-only ruling,
+#: nousergon-data#2145). D13 (``arcticdb``) records each ArcticDB library only
+#: when its measured count is above 0 (``_arcticdb_backfill_extra_outputs``), so
+#: an empty rebuild records no output, the guard grades ``not_applicable`` and
+#: there is no fault to induce through this path. D09 (``signal_returns``) and
+#: D12 (weekly ``features``) declare no ``empty_fresh: present`` clause.
+WEEKLY_CASES: tuple[Case, ...] = (
+    Case(
+        "D04", "fred_macro_history", None,
+        "empty frame: every FRED-history price-cache parquet PUT with zero rows under status ok, "
+        "each series reporting rows 0",
+        shape=_d04_shape(), **_PHASE_ONE,
+    ),
+    Case(
+        "D05", "macro", f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/macro.json",
+        f"empty payload: a zero-field macro.json PUT to {_MARKET_PREFIX}weekly/{TRADING_DAY}/"
+        "macro.json under status ok, reporting rows 0, beside two real secondary parquets",
+        shape=_d05_shape(), **_PHASE_ONE,
+    ),
+    _weekly_json_case("D06", "short_interest", f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/short_interest.json"),
+    _weekly_json_case(
+        "D07", "universe_classification", f"{_MARKET_PREFIX}universe_classification/{TRADING_DAY}.json",
+        extra=((f"{_MARKET_PREFIX}universe_classification/latest.json", "ok_count"),),
+    ),
+    Case(
+        "D08", "universe_returns", None,
+        "empty write: research.db and its dated backup uploaded under status ok, reporting "
+        "rows_inserted 0",
+        shape=_d08_shape(), **_PHASE_ONE,
+    ),
+    _weekly_json_case("D10", "fundamentals", f"archive/fundamentals/{TRADING_DAY}.json"),
+    _weekly_json_case("D11", "metron_valuation_medians", f"{_M.VALUATION_MEDIANS_PREFIX}latest.json"),
+    Case(
+        "D15", "alternative", f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/alternative/manifest.json",
+        "empty payload: an alternative-data manifest covering zero tickers PUT under status ok, "
+        "reporting tickers_processed 0, beside a real scope baseline",
+        shape=_d15_shape(), **_PHASE_TWO,
+    ),
+)
+
+CASES: tuple[Case, ...] = EOD_CASES + WEEKLY_CASES
 CASE_IDS = [c.unit for c in CASES]
 D19 = CASES[0]
 
@@ -470,7 +666,7 @@ def _extra_outputs(case: Case) -> tuple:
 def _run_phase(s3: InMemoryS3, case: Case, rows: int) -> dict:
     """One process attempt of the unit's phase, exactly as the daily mode calls it."""
     reg = RunStatePhaseRegistry(date=TRADING_DAY, bucket=BUCKET, marker_prefix="data", s3_client=s3)
-    reg.data_mode = "daily"
+    reg.data_mode = case.mode
     if case.verify_artifact_exists:
         return weekly_collector._phase_collect(
             reg, case.phase, _collector(s3, case, rows), artifact_key=case.key,
@@ -548,11 +744,18 @@ def enforcing(monkeypatch) -> GuardStaging:
 # ---------------------------------------------------------------------------
 
 
+def _deployed_input(collection: str) -> dict:
+    """A schedule's execution input, read from the deployed template."""
+    match = re.search(
+        rf"Input: '(\{{\"collection\": \"{collection}\".*?\}})'", STACK_PATH.read_text()
+    )
+    assert match, f"the {collection} schedule's Input could not be found in the collection stack template"
+    return json.loads(match.group(1))
+
+
 def _deployed_eod_input() -> dict:
     """The EOD schedule's execution input, read from the deployed template."""
-    match = re.search(r"Input: '(\{\"collection\": \"eod\".*?\})'", STACK_PATH.read_text())
-    assert match, "the EOD schedule's Input could not be found in the collection stack template"
-    return json.loads(match.group(1))
+    return _deployed_input("eod")
 
 
 def _get(data: dict, path: str):
@@ -657,7 +860,8 @@ def _walk(states: dict, start: str, data: dict, tasks, path: list[str], context:
 
 
 class Execution:
-    """One execution of the deployed EOD machine, with the case's phase run for real."""
+    """One execution of the deployed data-collection machine, on the case's own
+    schedule input (EOD unless the case says otherwise), with its phase run for real."""
 
     def __init__(self, s3: InMemoryS3, case: Case, rows_per_attempt):
         self.s3 = s3
@@ -679,7 +883,8 @@ class Execution:
         if name == "LaunchWorkload":
             return {"data_spot": {"launched": True, "command_id": "cmd", "instance_id": "i-0"}}
         if name == "PollWorkload":
-            if data["workload"] != WORKLOAD:
+            # A sibling harness's own case type may carry no workload: those walk EOD.
+            if data["workload"] != getattr(self.case, "workload", WORKLOAD):
                 return {"Status": "Success", "StatusDetails": "Success"}
             rows = self.rows_per_attempt[len(self.attempts)]
             result = _run_phase(self.s3, self.case, rows)
@@ -702,7 +907,7 @@ class Execution:
 
     def run(self) -> str:
         asl = json.loads(ASL_PATH.read_text())
-        data = _deployed_eod_input()
+        data = _deployed_input(getattr(self.case, "collection", "eod"))
         context = {
             "$$.Execution.Id": "arn:aws:states:::execution:commissioning",
             "$$.Execution.StartTime": self.started_at.isoformat().replace("+00:00", "Z"),
@@ -795,21 +1000,59 @@ def test_observe_mode_never_withholds_the_marker(s3):
     assert s3.marker(D19)["status"] == "ok"
 
 
-def test_every_case_is_a_daily_phase_unit_on_the_post_market_data_workload():
-    """A case is commissioned only on the machine and workload it actually runs on.
+def test_every_case_is_a_phase_unit_on_the_workload_and_schedule_it_runs_on():
+    """A case is commissioned only on the machine, schedule and workload it actually runs on.
 
-    The record's page and stand-down are walked on the deployed EOD machine,
-    whose ``verify_units`` must name the unit (else the completion check grades
-    nothing for it) and whose ``post-market-data`` workload is the daily mode
-    that runs these phases.
+    The record's page and stand-down are walked on the deployed data-collection
+    machine, started by the case's own schedule input, whose ``verify_units``
+    must name the unit (else the completion check grades nothing for it) and
+    whose ``workloads`` must carry the workload that runs the case's mode: EOD
+    ``post-market-data`` for ``daily``, weekly ``weekly-phase-one`` for
+    ``phase1`` and ``alternative-phase-two`` for ``phase2``.
     """
-    eod = _deployed_eod_input()
-    assert WORKLOAD in eod["workloads"]
+    mode_workload = {"daily": WORKLOAD, "phase1": "weekly-phase-one", "phase2": "alternative-phase-two"}
     for case in CASES:
-        assert run_units.PHASE_UNITS[("daily", case.phase)].unit_id == case.unit
-        assert case.unit in eod["verify_units"], case.unit
+        schedule = _deployed_input(case.collection)
+        assert case.workload == mode_workload[case.mode], case.unit
+        assert case.workload in schedule["workloads"], case.unit
+        assert run_units.PHASE_UNITS[(case.mode, case.phase)].unit_id == case.unit
+        assert case.unit in schedule["verify_units"], case.unit
         unit = next(u for u in descriptors.load_units() if u.unit_id == case.unit)
         assert unit.guards[GUARD_CLASS]["state"] == "present", case.unit
+
+
+def test_no_case_is_on_the_trading_path():
+    """D01, D02 and D19 are held for every guard class (the trader's feed and the executor's)."""
+    assert not {"D01", "D02", "D19"} & {c.unit for c in WEEKLY_CASES}
+    assert [c.unit for c in CASES].count("D19") == 1 and D19 is EOD_CASES[0]
+
+
+def test_the_weekly_call_sites_are_what_the_cases_call():
+    """Each weekly case's primary key is the literal its call site passes.
+
+    The cases build their keys from constants, so a call site that moved its key
+    would leave a record graded on a key production no longer publishes. Pin the
+    source text of each call site's ``artifact_key`` (and the extra-output helpers
+    D04 and D13 hand ``_phase_collect``) against the case.
+    """
+    source = (REPO_ROOT / "weekly_collector.py").read_text()
+    for literal in (
+        'artifact_key=f"{market_prefix}weekly/{run_date}/macro.json"',
+        'artifact_key=f"{market_prefix}weekly/{run_date}/short_interest.json"',
+        'artifact_key=f"{market_prefix}universe_classification/{run_date}.json"',
+        'f"{market_prefix}universe_classification/latest.json"',
+        'artifact_key=f"archive/fundamentals/{run_date}.json"',
+        'artifact_key=f"{metron_market_data.VALUATION_MEDIANS_PREFIX}latest.json"',
+        'artifact_key=f"{market_prefix}weekly/{run_date}/alternative/manifest.json"',
+        'scope_key = f"{market_prefix}weekly/{run_date}/alternative/scope.json"',
+        'f"{market_prefix}macro_history.parquet"',
+        'f"{market_prefix}macro_release_calendar.parquet"',
+        'f"backups/research_{run_date}.db"',
+        'tickers=["TWO", "HYOAS", "BAA10Y"]',
+        "extra_outputs=_fred_history_extra_outputs(",
+        "extra_outputs=_arcticdb_backfill_extra_outputs(),",
+    ):
+        assert literal in source, literal
 
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
@@ -861,7 +1104,7 @@ def _print_record(case: Case, faulted: Execution, recovered: Execution, s3: InMe
     first = s3.manifests(case)[0]
     guard = _worst_guard(first)
     lines = [
-        f"FAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={WORKLOAD}",
+        f"FAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={case.workload}",
         f"  fault:      {case.fault}",
         "  attempts:   " + ", ".join(f"{a['status']}" for a in faulted.attempts),
         "  manifests:  " + ", ".join(m["status"] for m in s3.manifests(case)[: len(faulted.attempts)]),
