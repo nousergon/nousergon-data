@@ -74,8 +74,10 @@ _POSTCLOSE_CHAIN = [
     # for CaptureSnapshot's irreversible per-day deadline) before CaptureSnapshot
     # itself — pinned separately in test_sf_capture_snapshot_retry_wiring.py.
     # alpha-engine-config-I11269: CaptureSnapshot is the LAST work task of the
-    # post-close machine, so its skip edge lands on the degraded-outcome tail.
-    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "StopTradingInstance"),
+    # post-close machine, so its skip edge lands on the degraded-outcome tail --
+    # entered, since alpha-engine-config-I12376, through the trader-reconcile
+    # run-and-drain in front of the box stop.
+    ("CheckSkipCaptureSnapshot", "InitCaptureSnapshotRetryCounter", "skip_capture_snapshot", "DrainTraderReconcile"),
 ]
 
 #: alpha-engine-config-I12220: the missing-snapshot self-heal runs right after
@@ -111,7 +113,12 @@ _MACHINES = {
     "reconcile": (_RECONCILE_PATH, _RECONCILE_CHAIN),
 }
 
-_POSTCLOSE_TAIL = ["StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded"]
+#: alpha-engine-config-I12376: the post-close machine runs and drains the v2
+#: trader's reconcile before its stop; the drain's happy edge is Success.
+_POSTCLOSE_TAIL = [
+    "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
+    "StopTradingInstance", "CheckDegradedOutcome", "WriteCompletionMarkerNormal", "NormalSucceeded",
+]
 #: alpha-engine-config-I12020: the reconcile machine enters its stop through
 #: the trader-reconcile drain; the drain's happy edge is Success.
 #: 2026-10-09: and the drain through the box-ownership check, whose happy
@@ -295,7 +302,9 @@ class TestEntryEdgesRouteThroughGates:
         # to the reconcile machine, pinned below).
         succ = [c["Next"] for c in postclose["CheckSnapshotStatus"]["Choices"]
                 if c.get("StringEquals") == "Success"]
-        assert succ == ["StopTradingInstance"]
+        # alpha-engine-config-I12376: through the trader-reconcile run-and-
+        # drain first (tests/test_sf_postclose_trader_reconcile_run.py).
+        assert succ == ["DrainTraderReconcile"]
         assert postclose["StopTradingInstance"]["Next"] == "CheckDegradedOutcome"
 
     def test_precondition_probe_feeds_reconcile_gate(self, reconcile):

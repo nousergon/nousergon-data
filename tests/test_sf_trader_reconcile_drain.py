@@ -132,7 +132,10 @@ def test_the_unit_it_drains_is_the_trader_reconcile_unit():
     if not systemd.is_dir():
         pytest.skip("crucible-executor checkout not present")
     assert (systemd / UNIT).is_file()
-    assert "Persistent=true" in (systemd / UNIT.replace(".service", ".timer")).read_text()
+    # Persistent is deliberately not pinned here any more: since
+    # alpha-engine-config-I12376 ne-postclose-trading-pipeline runs this unit
+    # at the close, and a boot-time catch-up after 00:00Z would re-file the
+    # session with none of its executions.
 
 
 # ── the script itself, against a fake systemctl ──────────────────────────────

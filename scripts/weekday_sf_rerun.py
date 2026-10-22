@@ -198,10 +198,11 @@ EOD_STAGES: tuple[Stage, ...] = (
           frozenset({"CheckSkipCaptureSnapshot"})),
     # StopTradingInstance (and then CheckDegradedOutcome) is entered iff
     # CaptureSnapshot succeeded (or was skipped): the exhausted-retry route
-    # goes to HandleFailure instead.
+    # goes to HandleFailure instead. alpha-engine-config-I12376: both of those
+    # routes now enter DrainTraderReconcile first, so it witnesses the same.
     Stage("capture_snapshot", "skip_capture_snapshot",
           "CheckSkipCaptureSnapshot", "CaptureSnapshot",
-          frozenset({"StopTradingInstance", "CheckDegradedOutcome"})),
+          frozenset({"DrainTraderReconcile", "StopTradingInstance", "CheckDegradedOutcome"})),
 )
 
 EOD_RECONCILE_STAGES: tuple[Stage, ...] = (

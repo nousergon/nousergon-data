@@ -887,10 +887,10 @@ class TestEODSFTopLevelFieldsClosed:
         # Box ownership (2026-10-09): only the reconcile machine skips a stop
         # on a box it did not start.
         "box_ownership", "box_owned_by_dispatcher", "stop_skipped_notify",
-        # The trader-reconcile drain in front of the box stop (I12020).
-        "trader_reconcile_drain_result", "trader_reconcile_drain_poll",
-        "trader_reconcile_drain_error", "trader_reconcile_drain_notify",
-        "trader_reconcile_drain_notify_error",
+        # The trader-reconcile drain in front of the box stop (I12020) is no
+        # longer reconcile-only: since alpha-engine-config-I12376 the
+        # post-close machine runs the same drain (it starts the unit there),
+        # so its five fields are in both machines.
     })
 
     def _expected(self, path: Path) -> frozenset[str]:

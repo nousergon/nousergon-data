@@ -76,6 +76,14 @@ _SHARED = {
     # so the same pipeline-status registry rows, in both machines.
     "CaptureSnapshot", "WaitForCaptureSnapshot", "CheckSnapshotStatus",
     "SnapshotStatusError", "SnapshotWait", "PageCaptureSnapshotIrreversibleFailure",
+    # alpha-engine-config-I12020 / -I12292: the bounded trader-reconcile drain
+    # in front of the box stop. alpha-engine-config-I12376: the post-close
+    # machine carries it too, and there it STARTS the unit (same names, so the
+    # same pipeline-status rows; tests/test_sf_postclose_trader_reconcile_run.py).
+    "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
+    "TraderReconcileDrainWait", "ExtractTraderReconcileDrainStatusError",
+    "SetTraderReconcileDrainDegraded", "PublishTraderReconcileDrainUnsettled",
+    "SetTraderReconcileUnitFailedDegraded",
 }
 
 _POSTCLOSE_ONLY = {
@@ -111,13 +119,6 @@ _RECONCILE_ONLY = _COLLECTOR_DEPENDENT | {
     "PublishCadenceReadDegraded", "CheckExerciseCadence", "SetCadenceUnknownValueDegraded",
     "PublishCadenceUnknownValueDegraded", "LaunchWeeklyExerciseRun",
     "SetWeeklyExerciseDegradedFlag", "WeeklyExerciseLaunchFailed",
-    # alpha-engine-config-I12020: the bounded drain in front of the box stop
-    # that keeps the box up for the v2 trader's boot-time reconcile.
-    "DrainTraderReconcile", "WaitForTraderReconcileDrain", "CheckTraderReconcileDrainStatus",
-    "TraderReconcileDrainWait", "ExtractTraderReconcileDrainStatusError",
-    "SetTraderReconcileDrainDegraded", "PublishTraderReconcileDrainUnsettled",
-    # alpha-engine-config-I12292: the drain's unit settled, but failed.
-    "SetTraderReconcileUnitFailedDegraded",
     # 2026-10-09 in-session box stop: box ownership. This machine stops only a
     # box it started; the post-close machine's stop is the ruled 16:00 stop of
     # the box the preopen pipeline started, so it carries no ownership check.
@@ -238,7 +239,10 @@ def test_the_box_timers_that_now_run_at_the_evening_boot_are_persistent():
     systemd = REPO.parent / "crucible-executor" / "infrastructure" / "systemd"
     if not systemd.is_dir():
         pytest.skip("crucible-executor checkout not present")
-    for stem in ("alpha-engine-trader-reconcile", "alpha-engine-eod-reconcile-standalone",
+    # alpha-engine-config-I12376: alpha-engine-trader-reconcile is no longer
+    # one of them -- this machine runs it before the stop (DrainTraderReconcile),
+    # because a catch-up after 00:00Z sees none of the session's executions.
+    for stem in ("alpha-engine-eod-reconcile-standalone",
                  "alpha-engine-reference-rate-publish"):
         text = (systemd / f"{stem}.timer").read_text(encoding="utf-8")
         assert re.search(r"^Persistent=true$", text, re.MULTILINE), stem
@@ -276,7 +280,7 @@ def test_the_reconcile_machine_still_stops_the_box_on_every_non_failure_path(rec
 def test_the_ceilings(postclose, reconcile):
     # Derivations: tests/test_sf_structural_contract.py and
     # tests/test_v1_collection_readiness_wait.py.
-    assert postclose["TimeoutSeconds"] == 3600
+    assert postclose["TimeoutSeconds"] == 5400  # alpha-engine-config-I12376: + the trader-reconcile drain
     assert reconcile["TimeoutSeconds"] == 14400
 
 
