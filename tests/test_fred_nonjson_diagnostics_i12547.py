@@ -19,7 +19,9 @@ import pytest
 
 from collectors import metron_market_data as mmd
 
-KEY = "abcdef0123456789abcdef0123456789"
+# Deliberately low-entropy and not key-shaped: a literal 32-hex value here
+# trips gitleaks' generic-api-key rule on this public repo (I12547 fixture).
+KEY = "not-a-real-fred-key-" + "x" * 12
 
 
 class _Headers(dict):
