@@ -3471,6 +3471,12 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
     else:
         target_date = args.date
 
+    # Corporate-action scan manifest (alpha-engine-config-I11076): its own
+    # best-effort write, run before the skip guard and kept out of
+    # results["collectors"] so a vendor miss never fails the enrich.
+    from corporate_actions.scan_manifest import morning_scan as _ca_morning_scan
+    _ca_scan = _ca_morning_scan(bucket, target_date, dry_run=args.dry_run)
+
     # Skip guard: data-staleness check. If polygon's target_date is older than
     # what's already in ArcticDB (yfinance EOD already landed today's row),
     # skip so we don't overwrite newer data with older. See
@@ -3489,6 +3495,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
                 "status": "skipped",
                 "skip_reason": reason,
                 "would_have_targeted": target_date,
+                "corporate_action_scan": _ca_scan,
                 "started_at": started_at,
                 "completed_at": datetime.now(timezone.utc).isoformat(),
                 "collectors": {},
@@ -3504,6 +3511,7 @@ def _run_morning_enrich(config: dict, args: argparse.Namespace) -> dict:
         "date": target_date,
         "started_at": started_at,
         "collectors": {},
+        "corporate_action_scan": _ca_scan,
     }
 
     # ── Pre-flight: refresh constituents + prune ArcticDB stragglers ─────────
