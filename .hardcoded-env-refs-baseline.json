@@ -1,0 +1,1727 @@
+{
+  "schema_version": 1,
+  "guard": "hardcoded-env-refs",
+  "tracker": "alpha-engine-config-I12492",
+  "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
+  "totals": {
+    "account_hits": 791,
+    "account_files": 204,
+    "bucket_hits": 950,
+    "bucket_files": 430,
+    "files": 539
+  },
+  "files": {
+    ".github/workflows/alert-class-pr-guard.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/data-gate.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/deploy-collection-readiness-probe.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-eod-backstop.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-eod-snapshot-existence-check.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-pipeline-watchdog.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-preopen-deploy-readiness-probe.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-sf-telegram-notifier.yml": {
+      "account": 1
+    },
+    ".github/workflows/deploy-substrate-health-gate.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/inst-ownership-weekly.yml": {
+      "account": 1
+    },
+    ".github/workflows/live-arcticdb-smoke.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/pause-reconcile.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/phase-exit-metrics.yml": {
+      "bucket": 1
+    },
+    ".github/workflows/sync-alert-tier-registry.yml": {
+      "bucket": 1
+    },
+    "builders/_price_cache_writeboth.py": {
+      "bucket": 1
+    },
+    "builders/backfill.py": {
+      "bucket": 1
+    },
+    "builders/backfill_delisted_history.py": {
+      "bucket": 1
+    },
+    "builders/daily_append.py": {
+      "bucket": 1
+    },
+    "builders/daily_panel.py": {
+      "bucket": 1
+    },
+    "builders/purge_phantom_day.py": {
+      "bucket": 1
+    },
+    "collectors/arctic_probe.py": {
+      "bucket": 2
+    },
+    "collectors/crypto_balances.py": {
+      "bucket": 1
+    },
+    "collectors/daily_closes_fred_repair.py": {
+      "bucket": 4
+    },
+    "collectors/daily_news.py": {
+      "bucket": 1
+    },
+    "collectors/edgar_pit_fundamentals.py": {
+      "bucket": 1
+    },
+    "collectors/fails_to_deliver_pit.py": {
+      "bucket": 1
+    },
+    "collectors/filing_8k_items_pit.py": {
+      "bucket": 1
+    },
+    "collectors/filing_text_pit.py": {
+      "bucket": 1
+    },
+    "collectors/fred_history.py": {
+      "bucket": 4
+    },
+    "collectors/fundamentals.py": {
+      "bucket": 1
+    },
+    "collectors/holdings_13f_pit.py": {
+      "bucket": 1
+    },
+    "collectors/insider_transactions_pit.py": {
+      "bucket": 1
+    },
+    "collectors/macro.py": {
+      "bucket": 1
+    },
+    "collectors/metron_market_data.py": {
+      "bucket": 1
+    },
+    "collectors/news_sources/__init__.py": {
+      "bucket": 1
+    },
+    "collectors/nlp/loughran_mcdonald.py": {
+      "bucket": 1
+    },
+    "collectors/nlp/rule_based_event_extraction.py": {
+      "bucket": 1
+    },
+    "collectors/short_interest.py": {
+      "bucket": 1
+    },
+    "collectors/short_volume_pit.py": {
+      "bucket": 1
+    },
+    "collectors/signal_returns.py": {
+      "bucket": 8
+    },
+    "collectors/technical_rating_ledger.py": {
+      "bucket": 1
+    },
+    "collectors/universe_classification.py": {
+      "bucket": 1
+    },
+    "collectors/wiki_pageviews_pit.py": {
+      "bucket": 1
+    },
+    "config.yaml.example": {
+      "bucket": 1
+    },
+    "contracts/pit_stats_pass.consumer.json": {
+      "bucket": 1
+    },
+    "corporate_actions/declared.py": {
+      "bucket": 2
+    },
+    "data/cache.py": {
+      "bucket": 1
+    },
+    "data/derived/__init__.py": {
+      "bucket": 2
+    },
+    "data/derived/analyst_revisions.py": {
+      "bucket": 2
+    },
+    "data/derived/inst_ownership.py": {
+      "bucket": 4
+    },
+    "data/derived/news_aggregates.py": {
+      "bucket": 1
+    },
+    "data/derived/news_articles.py": {
+      "bucket": 1
+    },
+    "data/derived/news_digest.py": {
+      "bucket": 1
+    },
+    "data/snapshotter/analyst_daily.py": {
+      "bucket": 2
+    },
+    "data_gate/__main__.py": {
+      "bucket": 3
+    },
+    "data_gate/config/simulate_roles.generated.json": {
+      "account": 5
+    },
+    "data_gate/config/writer_identities.yaml": {
+      "account": 1,
+      "bucket": 1
+    },
+    "data_gate/console_entity_readers.py": {
+      "bucket": 1
+    },
+    "data_gate/detector_readers.py": {
+      "bucket": 1
+    },
+    "data_gate/evidence.py": {
+      "bucket": 3
+    },
+    "data_gate/guard_commissioning.py": {
+      "bucket": 1
+    },
+    "data_gate/producers/_run_record.py": {
+      "bucket": 1
+    },
+    "data_gate/producers/console_entity.py": {
+      "bucket": 2
+    },
+    "data_gate/producers/cost_monthly.py": {
+      "bucket": 2
+    },
+    "data_gate/producers/executor_profile.py": {
+      "account": 1,
+      "bucket": 4
+    },
+    "data_gate/producers/freshness_commissioning.py": {
+      "bucket": 2
+    },
+    "data_gate/producers/pages_monthly.py": {
+      "bucket": 3
+    },
+    "data_gate/producers/slo.py": {
+      "bucket": 2
+    },
+    "data_gate/producers/trigger_observation.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "data_gate/producers/v1_data_stage.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "data_gate/run_manifest_predicate.py": {
+      "bucket": 1
+    },
+    "data_gate/sources.py": {
+      "bucket": 3
+    },
+    "data_gate/store.py": {
+      "bucket": 1
+    },
+    "data_gate/trigger_reconcile.py": {
+      "bucket": 1
+    },
+    "data_gate/unit_readers.py": {
+      "bucket": 2
+    },
+    "data_quality/windows.py": {
+      "bucket": 1
+    },
+    "dates.py": {
+      "bucket": 1
+    },
+    "features/compute.py": {
+      "bucket": 3
+    },
+    "features/feature_engineer.py": {
+      "bucket": 1
+    },
+    "features/postflight.py": {
+      "bucket": 1
+    },
+    "features/second_pass.py": {
+      "bucket": 1
+    },
+    "flow-doctor.yaml": {
+      "bucket": 2
+    },
+    "infrastructure/apply_s3_lifecycle.sh": {
+      "bucket": 1
+    },
+    "infrastructure/apply_sf_correlation_id_fix.py": {
+      "account": 1
+    },
+    "infrastructure/cloudformation/alpha-engine-orchestration.yaml": {
+      "account": 11,
+      "bucket": 6
+    },
+    "infrastructure/cloudformation/nousergon-data-collection.yaml": {
+      "bucket": 2
+    },
+    "infrastructure/codebuild-runners/deploy_codebuild_runner.sh": {
+      "account": 2
+    },
+    "infrastructure/contracts/sf_definition_s3.consumer.json": {
+      "bucket": 2
+    },
+    "infrastructure/data_collection_stack.py": {
+      "bucket": 2
+    },
+    "infrastructure/deploy-infrastructure.sh": {
+      "bucket": 2
+    },
+    "infrastructure/deploy_step_function.sh": {
+      "bucket": 2
+    },
+    "infrastructure/eventbridge/check-drift.py": {
+      "account": 2
+    },
+    "infrastructure/exec_code_pin.sh": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/_shared/vocab.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/alert-drain-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/alert-drain-dispatcher/iam-policy.json": {
+      "account": 16
+    },
+    "infrastructure/lambdas/alert-drain-liveness-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/alert-drain-liveness-probe/iam-policy.json": {
+      "account": 8,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/alert-drain-liveness-probe/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/alpha-engine-alerts-forwarder/iam-policy.json": {
+      "account": 1
+    },
+    "infrastructure/lambdas/alpha-engine-alerts-forwarder/index.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/alpha-engine-alerts-forwarder/test_handler.py": {
+      "account": 4
+    },
+    "infrastructure/lambdas/arctic-migration-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/arctic-migration-dispatcher/iam-policy.json": {
+      "account": 16,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/arctic-migration-dispatcher/index.py": {
+      "bucket": 3
+    },
+    "infrastructure/lambdas/arctic-migration-dispatcher/test_handler.py": {
+      "account": 2
+    },
+    "infrastructure/lambdas/backstop-telegram-notifier/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/backstop-telegram-notifier/iam-policy.json": {
+      "account": 4
+    },
+    "infrastructure/lambdas/canary-replay-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/canary-replay-dispatcher/iam-policy.json": {
+      "account": 16,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/canary-replay-dispatcher/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/canary-replay-dispatcher/test_handler.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/canary-replay-liveness-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/canary-replay-liveness-probe/iam-policy.json": {
+      "account": 5,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/canary-replay-liveness-probe/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/changelog-cloudwatch-mirror/deploy.sh": {
+      "account": 1,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/changelog-cloudwatch-mirror/iam-policy.json": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/changelog-cloudwatch-mirror/index.py": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/changelog-cloudwatch-mirror/test_handler.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/changelog-incident-mirror/deploy.sh": {
+      "account": 1,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/changelog-incident-mirror/iam-policy.json": {
+      "bucket": 3
+    },
+    "infrastructure/lambdas/changelog-incident-mirror/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/changelog-incident-mirror/reclassify_history.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/changelog-incident-mirror/test_handler.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/ci-watch-dispatcher/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/ci-watch-dispatcher/iam-policy.json": {
+      "account": 16,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/ci-watch-dispatcher/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/collection-readiness-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/collection-readiness-probe/iam-policy.json": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/crypto-balances/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/crypto-balances/iam-policy.json": {
+      "account": 1,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/crypto-balances/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/data-spot-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/data-spot-dispatcher/iam-policy.json": {
+      "account": 16,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/data-spot-dispatcher/index.py": {
+      "bucket": 10
+    },
+    "infrastructure/lambdas/data-spot-dispatcher/sf-execution-iam-policy.json": {
+      "account": 2
+    },
+    "infrastructure/lambdas/data-spot-dispatcher/test_handler.py": {
+      "bucket": 7
+    },
+    "infrastructure/lambdas/eod-backstop/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/eod-backstop/iam-policy.json": {
+      "account": 4,
+      "bucket": 5
+    },
+    "infrastructure/lambdas/eod-backstop/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/eod-backstop/test_handler.py": {
+      "account": 4,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/eod-precondition-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/eod-precondition-probe/iam-policy.json": {
+      "account": 1,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/eod-precondition-probe/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/eod-snapshot-existence-check/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/eod-snapshot-existence-check/iam-policy.json": {
+      "account": 2,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/eod-snapshot-existence-check/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/eod-success-friday-shell-trigger/deploy.sh": {
+      "account": 3
+    },
+    "infrastructure/lambdas/eod-success-friday-shell-trigger/iam-policy.json": {
+      "account": 2
+    },
+    "infrastructure/lambdas/eod-success-friday-shell-trigger/index.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/eod-success-friday-shell-trigger/test_handler.py": {
+      "account": 5
+    },
+    "infrastructure/lambdas/eod_artifact_verification.py": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/eval-judge-spot-dispatcher/deploy.sh": {
+      "account": 2
+    },
+    "infrastructure/lambdas/eval-judge-spot-dispatcher/iam-policy.json": {
+      "account": 12,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/eval-judge-spot-dispatcher/index.py": {
+      "account": 1,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/eval-judge-spot-dispatcher/test_handler.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/expense-collector/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/expense-collector/expense_budgets.seed.json": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/expense-collector/iam-policy.json": {
+      "account": 13,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/expense-collector/index.py": {
+      "bucket": 3
+    },
+    "infrastructure/lambdas/freshness-monitor/deploy.sh": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/freshness-monitor/iam-policy.json": {
+      "account": 15,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/freshness-monitor/index.py": {
+      "bucket": 3
+    },
+    "infrastructure/lambdas/freshness-monitor/test_handler.py": {
+      "account": 1,
+      "bucket": 33
+    },
+    "infrastructure/lambdas/freshness-monitor/test_unregistered_envelopes.py": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/friday-shell-run-report/deploy.sh": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/friday-shell-run-report/iam-policy.json": {
+      "account": 3,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/friday-shell-run-report/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/friday-shell-run-report/test_handler.py": {
+      "account": 3
+    },
+    "infrastructure/lambdas/groom-inject-mock/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/groom-inject-mock/iam-policy.json": {
+      "account": 1
+    },
+    "infrastructure/lambdas/overseer-backstop-responder/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/overseer-backstop-responder/iam-policy.json": {
+      "account": 5,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/overseer-backstop-responder/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/overseer-dispatcher/deploy.sh": {
+      "account": 1,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/overseer-dispatcher/iam-policy.json": {
+      "account": 9,
+      "bucket": 5
+    },
+    "infrastructure/lambdas/overseer-dispatcher/index.py": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/overseer-liveness-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/overseer-liveness-probe/iam-policy.json": {
+      "account": 34,
+      "bucket": 10
+    },
+    "infrastructure/lambdas/overseer-liveness-probe/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/overseer-liveness-probe/test_handler.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/pipeline-watchdog/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/pipeline-watchdog/iam-policy.json": {
+      "account": 18,
+      "bucket": 6
+    },
+    "infrastructure/lambdas/pipeline-watchdog/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/pipeline-watchdog/test_handler.py": {
+      "account": 2,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/preflight-sweep-dispatcher/deploy.sh": {
+      "account": 2
+    },
+    "infrastructure/lambdas/preflight-sweep-dispatcher/iam-policy.json": {
+      "account": 5,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/preflight-sweep-dispatcher/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/preopen-deploy-readiness-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/preopen-deploy-readiness-probe/iam-policy.json": {
+      "account": 5,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/preopen-deploy-readiness-probe/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/saturday-integrity-sentinel/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/saturday-integrity-sentinel/iam-policy.json": {
+      "account": 7,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/saturday-integrity-sentinel/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/saturday-sf-watch-dispatcher/deploy.sh": {
+      "account": 3,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/saturday-sf-watch-dispatcher/iam-policy.json": {
+      "account": 16,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/saturday-sf-watch-dispatcher/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/saturday-sf-watch-dispatcher/test_handler.py": {
+      "account": 6,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/scheduled-groom-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/scheduled-groom-dispatcher/iam-policy.json": {
+      "account": 25,
+      "bucket": 7
+    },
+    "infrastructure/lambdas/scheduled-groom-dispatcher/index.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/scheduled-groom-dispatcher/sf-execution-iam-policy.json": {
+      "account": 2,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/scheduled-groom-dispatcher/test_handler.py": {
+      "account": 2
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/deploy.sh": {
+      "account": 3
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/execution_digest.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/floor_calibration.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/iam-policy.json": {
+      "account": 10,
+      "bucket": 8
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/test_execution_digest.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/test_floor_calibration.py": {
+      "account": 10
+    },
+    "infrastructure/lambdas/sf-telegram-notifier/test_handler.py": {
+      "account": 7
+    },
+    "infrastructure/lambdas/sf-watch-spot-dispatcher/deploy.sh": {
+      "account": 3
+    },
+    "infrastructure/lambdas/sf-watch-spot-dispatcher/iam-policy.json": {
+      "account": 20
+    },
+    "infrastructure/lambdas/sf-watch-spot-dispatcher/test_handler.py": {
+      "account": 22
+    },
+    "infrastructure/lambdas/spot-interruption-recorder/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/spot-interruption-recorder/iam-policy.json": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/spot-interruption-recorder/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/spot-orphan-reaper/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/spot-orphan-reaper/iam-policy.json": {
+      "account": 5,
+      "bucket": 5
+    },
+    "infrastructure/lambdas/spot-orphan-reaper/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/spot-orphan-reaper/test_handler.py": {
+      "account": 3,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/ssm-liveness-poller/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/ssm-liveness-poller/iam-policy.json": {
+      "account": 1
+    },
+    "infrastructure/lambdas/ssm-liveness-poller/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/ssm-reachability-probe/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/ssm-reachability-probe/iam-policy.json": {
+      "account": 1
+    },
+    "infrastructure/lambdas/substrate-health-gate/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/substrate-health-gate/iam-policy.json": {
+      "account": 4,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/substrate-health-gate/test_handler.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/sweep-artifact-monitor/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/sweep-artifact-monitor/iam-policy.json": {
+      "account": 3,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/sweep-artifact-monitor/index.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/lambdas/sweep-artifact-monitor/test_handler.py": {
+      "account": 3
+    },
+    "infrastructure/lambdas/thinktank-spot-dispatcher/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/thinktank-spot-dispatcher/iam-policy.json": {
+      "account": 12,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/thinktank-spot-dispatcher/index.py": {
+      "bucket": 3
+    },
+    "infrastructure/lambdas/thinktank-spot-dispatcher/test_handler.py": {
+      "account": 1,
+      "bucket": 4
+    },
+    "infrastructure/lambdas/weekly-coverage-sweep/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/weekly-coverage-sweep/iam-policy.json": {
+      "account": 4,
+      "bucket": 8
+    },
+    "infrastructure/lambdas/weekly-coverage-sweep/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/weekly-coverage-sweep/test_handler.py": {
+      "account": 2
+    },
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/deploy.sh": {
+      "account": 1
+    },
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/iam-policy.json": {
+      "account": 13,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/index.py": {
+      "bucket": 2
+    },
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/sf-execution-iam-policy.json": {
+      "account": 1
+    },
+    "infrastructure/lambdas/weekly-freshness-spot-dispatcher/test_handler.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/weekly-preflight/deploy.sh": {
+      "account": 2,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/weekly-preflight/iam-policy.json": {
+      "account": 2,
+      "bucket": 3
+    },
+    "infrastructure/lambdas/weekly-preflight/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/lambdas/weekly-preflight/test_handler.py": {
+      "account": 1
+    },
+    "infrastructure/lambdas/weekly-run-scope/deploy.sh": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/lambdas/weekly-run-scope/fixtures/definition_2026-08-18.json": {
+      "account": 3,
+      "bucket": 5
+    },
+    "infrastructure/lambdas/weekly-run-scope/iam-policy.json": {
+      "account": 3,
+      "bucket": 5
+    },
+    "infrastructure/lambdas/weekly-run-scope/index.py": {
+      "bucket": 1
+    },
+    "infrastructure/overseer/alert_class_registry_drift.py": {
+      "bucket": 1
+    },
+    "infrastructure/overseer/alert_message_lint.py": {
+      "bucket": 1
+    },
+    "infrastructure/overseer/playbooks.yaml": {
+      "account": 2,
+      "bucket": 1
+    },
+    "infrastructure/overseer/publish_alert_tier_registry.py": {
+      "bucket": 2
+    },
+    "infrastructure/pause_reconcile.py": {
+      "bucket": 2
+    },
+    "infrastructure/preflight_sweep.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "infrastructure/preflight_sweep.sh": {
+      "account": 1
+    },
+    "infrastructure/preflight_sweep_manifest.json": {
+      "bucket": 2
+    },
+    "infrastructure/preflight_sweep_stages.py": {
+      "bucket": 1
+    },
+    "infrastructure/revert_sf_correlation_id.py": {
+      "account": 1
+    },
+    "infrastructure/run_weekly_offcycle.sh": {
+      "account": 1
+    },
+    "infrastructure/setup_overseer_intake.sh": {
+      "bucket": 1
+    },
+    "infrastructure/spot_data_weekly.sh": {
+      "bucket": 1
+    },
+    "infrastructure/step-functions/check-definition-drift.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "infrastructure/step-functions/check-drift.py": {
+      "account": 1
+    },
+    "infrastructure/step-functions/check-lambda-existence.py": {
+      "account": 1
+    },
+    "infrastructure/step-functions/data-collection.asl.json": {
+      "bucket": 1
+    },
+    "infrastructure/step_function.json": {
+      "account": 6,
+      "bucket": 35
+    },
+    "infrastructure/step_function_daily.json": {
+      "account": 5,
+      "bucket": 3
+    },
+    "infrastructure/step_function_eod.json": {
+      "account": 10,
+      "bucket": 3
+    },
+    "infrastructure/step_function_eod_reconcile.json": {
+      "account": 20,
+      "bucket": 3
+    },
+    "infrastructure/step_function_groom.json": {
+      "account": 4
+    },
+    "infrastructure/weekly_cadence_drift.py": {
+      "account": 1
+    },
+    "preflight.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/_rag_scope.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/_watermarks.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/assert_corpus_freshness.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/emit_manifest.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/emit_progress.py": {
+      "bucket": 2
+    },
+    "rag/pipelines/filing_change_detection.py": {
+      "bucket": 2
+    },
+    "rag/pipelines/ingest_13f.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/ingest_form4.py": {
+      "bucket": 2
+    },
+    "rag/pipelines/ingest_theses.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/run_analyst_pipeline.py": {
+      "bucket": 1
+    },
+    "rag/pipelines/run_news_pipeline.py": {
+      "bucket": 2
+    },
+    "rag/pipelines/run_weekly_ingestion.sh": {
+      "bucket": 6
+    },
+    "rag/pipelines/run_weekly_ingestion_recorded.py": {
+      "bucket": 1
+    },
+    "rag/preflight.py": {
+      "bucket": 2
+    },
+    "registry.d/ae-preflight-sweep.yaml": {
+      "bucket": 5
+    },
+    "registry.d/data-collector-d01-constituents.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d02-historical-constituents.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d03-prices.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d04-fred-macro-history.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d05-macro.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d06-short-interest.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d07-universe-classification.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d08-universe-returns.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d09-signal-returns.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d10-fundamentals.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d11-metron-valuation-medians.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d12-features-weekly.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d13-arcticdb-backfill.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d14-prune-delisted-tickers.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d15-alternative.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d16-rag-weekly-ingestion.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d17-morning-enrich.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d18-morning-arctic-append.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d19-post-market-data.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d20-metron-eod-closes-fx.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d21-metron-close-fx-history.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d22-metron-reference.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d23-metron-macro.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d24-metron-fundamentals.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d25-metron-technicals.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d26-technical-rating-ledger.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d27-technical-rating-performance.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d28-metron-security-performance.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d29-metron-analyst.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d30-metron-sentiment.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d31-features-daily.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d32-post-market-arctic-append.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d33-daily-heal.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d34-chronic-gap-heal.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d35-benchmark-proxy-backfill.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d40-analyst-snapshotter.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d41-analyst-revisions.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d46-insider-transactions.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d48-index-contributions.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d49-nasdaq100-constituents.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d50-features-settled-regrade.yaml": {
+      "bucket": 1
+    },
+    "registry.d/data-collector-d51-daily-panel.yaml": {
+      "bucket": 1
+    },
+    "registry.d/units/D15L-collector-lambda.yaml": {
+      "bucket": 2
+    },
+    "registry.d/units/D36-daily-news.yaml": {
+      "bucket": 1
+    },
+    "registry.d/units/D37-metron-intraday.yaml": {
+      "bucket": 1
+    },
+    "run_units.py": {
+      "bucket": 3
+    },
+    "scripts/backfill_benchmark_proxies.py": {
+      "bucket": 1
+    },
+    "scripts/download_lm_dict.py": {
+      "bucket": 1
+    },
+    "scripts/fault_injection_run.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "scripts/gen_observability_rows.py": {
+      "bucket": 1
+    },
+    "scripts/pit_parity_proof_input.py": {
+      "bucket": 2
+    },
+    "scripts/restate_psky_phantom_split.py": {
+      "bucket": 5
+    },
+    "scripts/restore_heal_prune_261007.py": {
+      "bucket": 2
+    },
+    "scripts/run_arctic_migrations.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "scripts/run_daily_news_standalone.sh": {
+      "bucket": 1
+    },
+    "scripts/sweep_run_scope_rows.py": {
+      "bucket": 1
+    },
+    "scripts/weekday_sf_rerun.py": {
+      "account": 1
+    },
+    "scripts/weekly_sf_recovery_metric.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "scripts/weekly_sf_rerun.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "scripts/weekly_sf_silence_deadman.py": {
+      "account": 1
+    },
+    "sf_preflight.py": {
+      "account": 2,
+      "bucket": 8
+    },
+    "sf_preflight_on_spot.py": {
+      "bucket": 2
+    },
+    "shadow/__main__.py": {
+      "bucket": 4
+    },
+    "shadow/arctic_parity.py": {
+      "bucket": 3
+    },
+    "shadow/parity.py": {
+      "bucket": 2
+    },
+    "shadow/recompute_lineage.py": {
+      "bucket": 1
+    },
+    "store/arctic_store.py": {
+      "bucket": 1
+    },
+    "tests/fixtures/constituents_guards/d01_rosters.json": {
+      "bucket": 1
+    },
+    "tests/fixtures/constituents_guards/d02_builds.json": {
+      "bucket": 1
+    },
+    "tests/fixtures/sf_history_preopen_2026-09-01_e888a3a4.json": {
+      "account": 88
+    },
+    "tests/fixtures/sf_prekeystone_spot_commands.json": {
+      "bucket": 4
+    },
+    "tests/fixtures/vendor_divergence/daily_closes_2026-10-02_slice.json": {
+      "bucket": 2
+    },
+    "tests/fixtures/vendor_divergence/metric_records_2026-09-21_2026-10-02.json": {
+      "bucket": 1
+    },
+    "tests/fixtures/weekday_sf_rerun/daily_early_failure.json": {
+      "account": 2
+    },
+    "tests/fixtures/weekday_sf_rerun/daily_mid_failure.json": {
+      "account": 2
+    },
+    "tests/fixtures/weekday_sf_rerun/eod_degraded.json": {
+      "account": 1
+    },
+    "tests/fixtures/weekday_sf_rerun/eod_mid_failure.json": {
+      "account": 1
+    },
+    "tests/fixtures/weekly_completion_2026-10-03/manifests.json": {
+      "bucket": 1
+    },
+    "tests/fixtures/weekly_sf_rerun/director_degraded.json": {
+      "account": 3
+    },
+    "tests/fixtures/weekly_sf_rerun/early_failure.json": {
+      "account": 2
+    },
+    "tests/fixtures/weekly_sf_rerun/parallel_branch_failure.json": {
+      "account": 2
+    },
+    "tests/fixtures/weekly_sf_rerun/tail_stage_failure.json": {
+      "account": 2
+    },
+    "tests/test_alert_class_registry_drift.py": {
+      "bucket": 4
+    },
+    "tests/test_alert_message_lint.py": {
+      "bucket": 1
+    },
+    "tests/test_alert_tier_registry.py": {
+      "bucket": 1
+    },
+    "tests/test_alt_data_read_coverage.py": {
+      "bucket": 7
+    },
+    "tests/test_alt_data_scope_resolution.py": {
+      "bucket": 14
+    },
+    "tests/test_alternative_predictor_options_mirror.py": {
+      "bucket": 4
+    },
+    "tests/test_analyst_substrate.py": {
+      "bucket": 5
+    },
+    "tests/test_arctic_parity.py": {
+      "bucket": 4
+    },
+    "tests/test_arcticdb_smoke_assumes_its_own_role.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "tests/test_artifact_registry_coverage.py": {
+      "bucket": 8
+    },
+    "tests/test_backfill_no_regression.py": {
+      "bucket": 2
+    },
+    "tests/test_backfill_s3_pool_sized_to_workers.py": {
+      "bucket": 1
+    },
+    "tests/test_benchmark_proxies_i10704.py": {
+      "bucket": 3
+    },
+    "tests/test_cfn_sf_stack_deploy_role_consumers.py": {
+      "account": 1
+    },
+    "tests/test_console_entity_producer.py": {
+      "bucket": 2
+    },
+    "tests/test_constituents_drift_check.py": {
+      "bucket": 2
+    },
+    "tests/test_constituents_loader_shared.py": {
+      "bucket": 7
+    },
+    "tests/test_corporate_actions.py": {
+      "bucket": 1
+    },
+    "tests/test_corporate_actions_declared.py": {
+      "bucket": 8
+    },
+    "tests/test_corporate_actions_dividends.py": {
+      "bucket": 1
+    },
+    "tests/test_corporate_actions_registry.py": {
+      "bucket": 1
+    },
+    "tests/test_corporate_actions_renames.py": {
+      "bucket": 1
+    },
+    "tests/test_corporate_actions_sync.py": {
+      "bucket": 1
+    },
+    "tests/test_d17_bar_settlement_stamp.py": {
+      "bucket": 1
+    },
+    "tests/test_d20_cardinality_wiring.py": {
+      "bucket": 2
+    },
+    "tests/test_d33_noop_heal_completion.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_append_parquet_warmup.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_append_schema_drift.py": {
+      "bucket": 3
+    },
+    "tests/test_daily_append_writer_lock.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_closes_delta_vwap_i7569.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_closes_split_hint.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_heal_summary_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_panel_mode.py": {
+      "bucket": 1
+    },
+    "tests/test_daily_universe_newest_dated.py": {
+      "bucket": 1
+    },
+    "tests/test_data_gate.py": {
+      "bucket": 3
+    },
+    "tests/test_data_gate_one_process_reads.py": {
+      "bucket": 1
+    },
+    "tests/test_data_gate_s3_read_memo.py": {
+      "bucket": 1
+    },
+    "tests/test_data_report.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "tests/test_dlq_redrive.py": {
+      "account": 4
+    },
+    "tests/test_emit_progress.py": {
+      "bucket": 1
+    },
+    "tests/test_empty_fresh_guard_reads_declared_floor.py": {
+      "bucket": 1
+    },
+    "tests/test_eventbridge_check_drift.py": {
+      "account": 3
+    },
+    "tests/test_executor_profile_producer.py": {
+      "account": 18,
+      "bucket": 5
+    },
+    "tests/test_expectations_cardinality.py": {
+      "bucket": 2
+    },
+    "tests/test_expectations_empty_fresh.py": {
+      "bucket": 1
+    },
+    "tests/test_failure_staging_is_retained.py": {
+      "bucket": 1
+    },
+    "tests/test_fault_injection_staging.py": {
+      "account": 1
+    },
+    "tests/test_features_settled_regrade.py": {
+      "bucket": 1
+    },
+    "tests/test_freshness_commissioning_drill.py": {
+      "bucket": 1
+    },
+    "tests/test_grade_published_outputs.py": {
+      "bucket": 1
+    },
+    "tests/test_groom_dispatcher_engagement_iam_grants.py": {
+      "bucket": 1
+    },
+    "tests/test_groom_sf_iam_lambda_grants.py": {
+      "account": 1
+    },
+    "tests/test_guard_commissioning_empty_fresh.py": {
+      "bucket": 1
+    },
+    "tests/test_iam_actions_exist.py": {
+      "bucket": 1
+    },
+    "tests/test_iam_auto_apply_code_only_path.py": {
+      "account": 2,
+      "bucket": 1
+    },
+    "tests/test_index_constituent_modes.py": {
+      "bucket": 1
+    },
+    "tests/test_ingest_form4.py": {
+      "bucket": 4
+    },
+    "tests/test_inst_ownership_filing_cutoff.py": {
+      "bucket": 19
+    },
+    "tests/test_inst_ownership_reader.py": {
+      "bucket": 1
+    },
+    "tests/test_lambda_run_manifest_grants.py": {
+      "bucket": 3
+    },
+    "tests/test_macro_breadth.py": {
+      "bucket": 1
+    },
+    "tests/test_macro_history_truncation_guard.py": {
+      "bucket": 3
+    },
+    "tests/test_news_aggregates.py": {
+      "bucket": 2
+    },
+    "tests/test_news_articles.py": {
+      "bucket": 2
+    },
+    "tests/test_news_digest.py": {
+      "bucket": 4
+    },
+    "tests/test_parity_evidence_preservation.py": {
+      "bucket": 4
+    },
+    "tests/test_parity_gate_dispatch.py": {
+      "bucket": 1
+    },
+    "tests/test_parity_legs_group.py": {
+      "bucket": 2
+    },
+    "tests/test_parity_row_v1_cause.py": {
+      "bucket": 1
+    },
+    "tests/test_partial_status_manifest_i11230.py": {
+      "bucket": 3
+    },
+    "tests/test_phantom_split_evidence_gate.py": {
+      "bucket": 1
+    },
+    "tests/test_phase2_dry_run_zero_processed_i7041.py": {
+      "bucket": 3
+    },
+    "tests/test_phase_collect_run_manifest.py": {
+      "bucket": 2
+    },
+    "tests/test_phase_manifest_no_third_state.py": {
+      "bucket": 4
+    },
+    "tests/test_phase_outputs_d04_d09_d13_i11469.py": {
+      "bucket": 1
+    },
+    "tests/test_pipeline_watchdog_weekly_failed_day.py": {
+      "account": 1,
+      "bucket": 1
+    },
+    "tests/test_pit_parity_proof_input.py": {
+      "bucket": 3
+    },
+    "tests/test_pit_stats_consumer_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_preflight_sweep.py": {
+      "bucket": 3
+    },
+    "tests/test_price_cache_writeboth.py": {
+      "bucket": 1
+    },
+    "tests/test_prices_behind_fetch_guard_i11467.py": {
+      "bucket": 1
+    },
+    "tests/test_prices_caret_fred_routing.py": {
+      "bucket": 4
+    },
+    "tests/test_prices_holefill_short_fetch_i11576.py": {
+      "bucket": 1
+    },
+    "tests/test_prices_interior_session_hole_i11553.py": {
+      "bucket": 1
+    },
+    "tests/test_prices_manifest_outputs_i11026.py": {
+      "bucket": 2
+    },
+    "tests/test_prices_shadow_recent_listings_i11547.py": {
+      "bucket": 2
+    },
+    "tests/test_prices_short_fetch_guard.py": {
+      "bucket": 11
+    },
+    "tests/test_prune_delisted_tickers.py": {
+      "bucket": 2
+    },
+    "tests/test_rag_rehearsal_isolation.py": {
+      "bucket": 1
+    },
+    "tests/test_rating_ledger_pinned_replay.py": {
+      "bucket": 1
+    },
+    "tests/test_reactivate_paused_lane.py": {
+      "account": 5
+    },
+    "tests/test_recompute_lineage.py": {
+      "bucket": 2
+    },
+    "tests/test_reference_map_raises_i10923.py": {
+      "bucket": 2
+    },
+    "tests/test_research_db_dated_backup.py": {
+      "bucket": 3
+    },
+    "tests/test_run_arctic_migrations.py": {
+      "bucket": 2
+    },
+    "tests/test_run_log_shipping_i11353.py": {
+      "bucket": 2
+    },
+    "tests/test_run_record.py": {
+      "bucket": 5
+    },
+    "tests/test_run_units.py": {
+      "bucket": 1
+    },
+    "tests/test_run_weekly_offcycle.py": {
+      "account": 1
+    },
+    "tests/test_schema_roundtrip.py": {
+      "bucket": 1
+    },
+    "tests/test_second_pass_one_write.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_aggregate_costs_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_completion_marker_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_completion_marker_wiring_daily.py": {
+      "bucket": 2
+    },
+    "tests/test_sf_completion_marker_wiring_eod.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_definition_s3_consumer_contract.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_degraded_summary_accumulates.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_eod_precondition_probe_wiring.py": {
+      "account": 1
+    },
+    "tests/test_sf_eval_judge_wiring.py": {
+      "bucket": 2
+    },
+    "tests/test_sf_exec_code_pin_i11570.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_friday_shell_run_wiring.py": {
+      "bucket": 2
+    },
+    "tests/test_sf_lambda_existence_check.py": {
+      "account": 2
+    },
+    "tests/test_sf_lambda_timeout_ordering.py": {
+      "account": 2
+    },
+    "tests/test_sf_logging_config_check_drift.py": {
+      "account": 4
+    },
+    "tests/test_sf_market_hours_gate_wiring.py": {
+      "account": 1
+    },
+    "tests/test_sf_model_zoo_unservable_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_mutex_wiring.py": {
+      "account": 1
+    },
+    "tests/test_sf_notifier_totality_wiring.py": {
+      "account": 2
+    },
+    "tests/test_sf_payload_uniqueness.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_postclose_reconcile_split.py": {
+      "account": 2
+    },
+    "tests/test_sf_preflight.py": {
+      "account": 2,
+      "bucket": 8
+    },
+    "tests/test_sf_preflight_on_spot.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_reconcile_snapshot_self_heal.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_research_predictor_parallel_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_scanner_resource_kill_i7812.py": {
+      "bucket": 2
+    },
+    "tests/test_sf_sns_arn_single_source.py": {
+      "account": 1
+    },
+    "tests/test_sf_ssm_pipefail_wiring.py": {
+      "bucket": 1
+    },
+    "tests/test_sf_weekly_cadence_wiring.py": {
+      "account": 1
+    },
+    "tests/test_sf_weekly_exercise_chain_wiring.py": {
+      "account": 1
+    },
+    "tests/test_shadow_morning_arctic_parity_i11546.py": {
+      "bucket": 2
+    },
+    "tests/test_shadow_own_state.py": {
+      "bucket": 1
+    },
+    "tests/test_shadow_parity.py": {
+      "bucket": 22
+    },
+    "tests/test_spine_window_guard.py": {
+      "bucket": 1
+    },
+    "tests/test_splice_rebase.py": {
+      "bucket": 1
+    },
+    "tests/test_split_restatement.py": {
+      "bucket": 1
+    },
+    "tests/test_stage_coverage_assertions.py": {
+      "bucket": 1
+    },
+    "tests/test_stage_coverage_writers_read_the_registry.py": {
+      "bucket": 2
+    },
+    "tests/test_stage_output_sweep.py": {
+      "bucket": 4
+    },
+    "tests/test_stage_window_first_entry.py": {
+      "bucket": 2
+    },
+    "tests/test_staging_prefix_migration.py": {
+      "bucket": 1
+    },
+    "tests/test_thinktank_deploy_uses_shared_helpers.py": {
+      "account": 3
+    },
+    "tests/test_unit_manifests.py": {
+      "bucket": 1
+    },
+    "tests/test_unit_readers.py": {
+      "account": 1,
+      "bucket": 5
+    },
+    "tests/test_universe_returns_units_i7936.py": {
+      "bucket": 1
+    },
+    "tests/test_vendor_crosscheck_emission.py": {
+      "bucket": 1
+    },
+    "tests/test_vendor_divergence_metric.py": {
+      "bucket": 3
+    },
+    "tests/test_vwap_and_factor_momentum_i7572_still_dead.py": {
+      "bucket": 1
+    },
+    "tests/test_weekday_sf_rerun.py": {
+      "account": 5
+    },
+    "tests/test_weekly_collector_heartbeat_wiring.py": {
+      "bucket": 5
+    },
+    "tests/test_weekly_collector_phase_registry.py": {
+      "bucket": 6
+    },
+    "tests/test_weekly_completion_replay_2026_10_03.py": {
+      "bucket": 1
+    },
+    "tests/test_weekly_coverage_sweep_observer.py": {
+      "bucket": 4
+    },
+    "tests/test_weekly_retry_marker_and_manifest_i11812.py": {
+      "bucket": 1
+    },
+    "tests/test_weekly_sf_recovery_metric.py": {
+      "bucket": 2
+    },
+    "tests/test_weekly_sf_rerun.py": {
+      "account": 2
+    },
+    "tests/test_weekly_sf_rerun_vacuity.py": {
+      "account": 1
+    },
+    "tests/test_weekly_sf_silence_deadman.py": {
+      "account": 4
+    },
+    "tests/test_whole_mode_row_counts.py": {
+      "bucket": 1
+    },
+    "tests/test_workflow_account_id_literal_guard.py": {
+      "account": 1,
+      "bucket": 2
+    },
+    "tests/test_write_targets_pinned.py": {
+      "bucket": 1
+    },
+    "tests/test_yf_closes_label_and_shadow_holefill_i11577.py": {
+      "bucket": 1
+    },
+    "validators/constituents_drift_check.py": {
+      "bucket": 2
+    },
+    "validators/phase_marker_sweep.py": {
+      "bucket": 3
+    },
+    "validators/stage_output_sweep.py": {
+      "bucket": 2
+    },
+    "weekly_collector.py": {
+      "bucket": 4
+    }
+  }
+}
