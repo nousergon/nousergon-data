@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "tracker": "alpha-engine-config-I12533",
+  "note": "Declared Step Functions entrypoints (plan S-46). A Task may invoke only a Lambda function or state machine named here; validators/sf_entrypoint_lint.py reports any other. Seeded 2026-10-22 from every target the definitions already invoke. Adding a target is a deliberate line in this file, reviewed with the ASL change that needs it.",
+  "lambda_functions": {
+    "${DispatcherFunctionArn}": "CloudFormation Sub for the data-spot-dispatcher Lambda; called by data-collection.asl.json",
+    "alpha-engine-collection-readiness-probe": "called by step_function.json, step_function_daily.json, step_function_eod_reconcile.json",
+    "alpha-engine-eod-precondition-probe": "called by step_function_eod_reconcile.json",
+    "alpha-engine-evaluator": "called by step_function.json",
+    "alpha-engine-evaluator-director": "called by step_function.json",
+    "alpha-engine-predictor-inference": "called by step_function.json, step_function_daily.json, step_function_eod.json, step_function_eod_reconcile.json",
+    "alpha-engine-predictor-regime-retrospective-eval": "called by step_function.json",
+    "alpha-engine-predictor-regime-substrate": "called by step_function.json",
+    "alpha-engine-replay-counterfactual": "called by step_function.json",
+    "alpha-engine-research-aggregate-costs": "called by step_function.json",
+    "alpha-engine-research-eval-judge-spot-dispatcher": "called by step_function.json",
+    "alpha-engine-research-eval-judge-submit": "called by step_function.json",
+    "alpha-engine-research-eval-rolling-mean": "called by step_function.json",
+    "alpha-engine-research-rationale-clustering": "called by step_function.json",
+    "alpha-engine-research-runner": "called by step_function.json",
+    "alpha-engine-research-scanner": "called by step_function.json",
+    "alpha-engine-research-signals-envelope": "called by step_function.json",
+    "alpha-engine-scheduled-groom-dispatcher": "called by step_function_groom.json",
+    "alpha-engine-ssm-liveness-poller": "called by step_function_daily.json",
+    "alpha-engine-substrate-health-gate": "called by step_function.json",
+    "alpha-engine-thinktank-spot-dispatcher": "called by step_function.json",
+    "alpha-engine-weekly-coverage-sweep": "called by step_function.json",
+    "alpha-engine-weekly-freshness-spot-dispatcher": "called by step_function.json",
+    "alpha-engine-weekly-preflight": "called by step_function.json",
+    "alpha-engine-weekly-run-scope": "called by step_function.json"
+  },
+  "state_machines": {
+    "ne-data-collection-eod": "called by step_function_eod_reconcile.json",
+    "ne-weekly-freshness-pipeline": "called by step_function_eod_reconcile.json"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "schema_version": 1,
+  "guard": "sf-entrypoint-lint",
+  "tracker": "alpha-engine-config-I12533",
+  "note": "Shrink-only ceiling of S-46 findings per SF definition per rule. Never raise an entry; lower it with `python3 validators/sf_entrypoint_lint.py --update` when a finding is removed.",
+  "totals": {
+    "task-undeclared-entrypoint": 1,
+    "task-not-an-entrypoint": 140,
+    "task-inline-shell-logic": 13,
+    "choice-beyond-outcome": 163,
+    "files": 6
+  },
+  "files": {
+    "infrastructure/step-functions/data-collection.asl.json": {
+      "task-not-an-entrypoint": 3,
+      "choice-beyond-outcome": 6
+    },
+    "infrastructure/step_function.json": {
+      "task-not-an-entrypoint": 68,
+      "task-inline-shell-logic": 6,
+      "choice-beyond-outcome": 105
+    },
+    "infrastructure/step_function_daily.json": {
+      "task-not-an-entrypoint": 16,
+      "task-inline-shell-logic": 2,
+      "choice-beyond-outcome": 17
+    },
+    "infrastructure/step_function_eod.json": {
+      "task-not-an-entrypoint": 20,
+      "task-inline-shell-logic": 2,
+      "choice-beyond-outcome": 10
+    },
+    "infrastructure/step_function_eod_reconcile.json": {
+      "task-undeclared-entrypoint": 1,
+      "task-not-an-entrypoint": 29,
+      "task-inline-shell-logic": 3,
+      "choice-beyond-outcome": 18
+    },
+    "infrastructure/step_function_groom.json": {
+      "task-not-an-entrypoint": 4,
+      "choice-beyond-outcome": 7
+    }
+  }
+}
