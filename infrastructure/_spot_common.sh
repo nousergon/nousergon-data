@@ -650,6 +650,17 @@ print_banner() {
 }
 
 emit_heartbeat() {
+  # A `rehearsal-*` execution (the SF execution name in RUN_TOKEN, the same
+  # marker rag/pipelines/run_weekly_ingestion.sh and emailer.py read) must not
+  # tick a production liveness signal: Process=<stage> is what says production
+  # ran, and a rehearsal's tick would stand in for a run that never happened
+  # (alpha-engine-config-I12375). Any other token, or none, is unchanged.
+  case "${RUN_TOKEN:-}" in
+    rehearsal-*)
+      echo "REHEARSAL: production heartbeat (Process=${_PROCESS_NAME}) not emitted"
+      return 0
+      ;;
+  esac
   aws cloudwatch put-metric-data \
     --namespace "AlphaEngine" \
     --metric-name "Heartbeat" \
