@@ -92,9 +92,22 @@ class DataPreflight(BasePreflight):
 
     Mode determines which external services must be reachable:
 
-    - ``"daily"`` — weekday DailyData step. ArcticDB must be readable
-      and SPY must be ≤4 days stale (covers Fri→Tue long weekends +
-      1 day of buffer).
+    - ``"daily"`` — weekday CONSUMERS of the ArcticDB libraries (D48
+      index contributions, D49 NDX constituents, D50 settled regrade, D51
+      panel). ArcticDB must be readable and macro.SPY must be at most one
+      trading day stale: a consumer refuses to build on a stale input.
+    - ``"daily_write"`` — the weekday PRODUCERS of that freshness:
+      ``--daily`` (post-market data), ``--daily-arctic-append`` (D32) and
+      ``--daily-heal`` (D33). Same surface as ``"daily"``, but SPY
+      staleness is logged at ERROR, never raised: these runs are what
+      make SPY fresh, so a freshness gate at their entry is circular (the
+      ``morning_enrich`` reasoning below). As a hard gate it turned one
+      missed append into a stall: D32 did not run for 2026-10-21 (FRED
+      outage, alpha-engine-config-I12547), so at 09:02Z on 10-22 the
+      daily-heal that would have filled 10-21 was refused at SPY two
+      sessions stale, and that evening's EOD collection and append would
+      have been refused the same way, every day until the Saturday
+      backfill.
     - ``"morning_enrich"`` — Saturday MorningEnrich state (split out of
       DataPhase1 by the preflight-task-split 2026-05-16, plan
       alpha-engine-docs/private/preflight-task-split-260516.md). Its
@@ -113,7 +126,7 @@ class DataPreflight(BasePreflight):
       EDGAR needed.
     """
 
-    _MODES = ("daily", "morning_enrich", "phase1", "phase2")
+    _MODES = ("daily", "daily_write", "morning_enrich", "phase1", "phase2")
 
     def __init__(self, bucket: str, mode: str):
         super().__init__(bucket)
@@ -172,6 +185,21 @@ class DataPreflight(BasePreflight):
             self._check_arcticdb_libraries_present(("universe", "macro"))
         elif self.mode == "phase2":
             self._check_fmp_stable_reachable()
+
+        if self.mode == "daily_write":
+            # Producers: same surface as "daily" below, freshness reported
+            # but not enforced (see the class docstring). The libraries
+            # must still exist — a missing library is a deploy fault, not
+            # a gap these runs can fill.
+            try:
+                self._check_macro_spy_fresh_trading_days(max_stale=1)
+            except RuntimeError as exc:
+                log.error(
+                    "preflight: %s — not refusing this run: it is one of the "
+                    "runs that makes macro.SPY fresh (daily_write mode)",
+                    exc,
+                )
+            self._check_arcticdb_libraries_present(("universe", "macro"))
 
         if self.mode == "daily":
             # SPY lives in the `macro` library (market-wide series). The

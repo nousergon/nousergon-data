@@ -68,19 +68,29 @@ def test_morning_enrich_not_mapped_to_daily():
 
 
 def test_daily_mode_mapping_unchanged():
-    """The genuine --daily weekday path still maps to 'daily'. The EOD split
-    (2026-06-16) also routes --daily-arctic-append through the same 'daily'
-    preflight (it reads daily_closes + the ArcticDB universe — same surface).
-    alpha-engine-config-I2717 (2026-07-16): the standalone --daily-heal
-    entrypoint shares the same 'daily' preflight surface too (S3 + ArcticDB
-    reachability — what its fail-loud posture depends on catching before any
-    heal work starts)."""
+    """The weekday producers map to 'daily_write'; the consumers to 'daily'.
+
+    --daily, --daily-arctic-append (D32) and --daily-heal (D33,
+    alpha-engine-config-I2717) are what make macro.SPY fresh, so they take
+    the 'daily_write' preflight (same S3 + ArcticDB surface, staleness
+    logged not raised). Gating them on the freshness they produce stalled
+    the daily path on 2026-10-22 after one missed append
+    (alpha-engine-config-I12547). D48-D51 read the libraries and keep the
+    fatal 'daily' gate."""
     src = _main_source()
     assert "elif args.daily" in src
     after = src[src.index("elif args.daily"):]
-    branch = after.split("else:")[0]
-    assert 'mode = "daily"' in branch
-    # The split-out append state shares the daily preflight surface.
-    assert 'daily_arctic_append' in branch
-    # The standalone daily-heal entrypoint shares it too.
-    assert 'daily_heal' in branch
+    producer_branch, consumer_branch = after.split("elif ", 2)[1:3]
+    assert 'mode = "daily_write"' in producer_branch
+    for flag in ("daily_arctic_append", "daily_heal"):
+        assert flag in producer_branch
+    consumer_branch = consumer_branch.split("else:")[0]
+    assert 'mode = "daily"' in consumer_branch
+    for flag in (
+        "features_settled_regrade",
+        "daily_panel",
+        "index_contributions",
+        "nasdaq100_constituents",
+    ):
+        assert flag in consumer_branch
+        assert flag not in producer_branch
