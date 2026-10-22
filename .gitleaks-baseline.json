@@ -355,5 +355,26 @@
   "Message": "feat(data_gate): preserve every object version a graded parity breach cites, automatically (alpha-engine-config-I12023) (#2089)\n\n* feat(data_gate): preserve every object version a graded parity breach cites, automatically (alpha-engine-config-I12023)\n\nThe parity clause's frozen 09-28 report and its adjudication records cite S3\nobject VERSIONS that the bucket's 30-day noncurrent purge and 7-day staging\nexpiry delete. Until now a hand-run preserve_evidence.py --apply copied them.\n\n`python -m data_gate preserve-parity-evidence` takes the report the clause\ngrades (evidence.read_parity) plus every adjudication record for its day,\nderives every referenced version (v1 live by manifest version id, shadow and\nprior-day pairs resolved as of report generation, every input's and v1-later\nsettled read's source_key@source_version_id), copies each server-side to\nparity_adjudication/{day}/evidence/{key}@{version} with provenance metadata,\nadopts the hand copy (same layout and metadata), skips what is already\npreserved, records _manifest.json, and exits 2 naming any version it could not\nresolve, read, copy or verify. data-gate.yml runs it as the last step, after\nevery reading is published, without continue-on-error.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) \u003cnoreply@anthropic.com\u003e\nClaude-Session: https://claude.ai/code/session_01Szwv3KVpJTagJ7ZUvBezVA\n\n* test(artifact-registry): pin parity_evidence.py's one manifest PUT site\n\nCI's test_every_producer_file_is_pinned failed on the new module's\nput_object (the evidence _manifest.json); the copies are copy_object and\nare not counted by that scan.\n\nCo-Authored-By: Claude Opus 5.5 (1M context) \u003cnoreply@anthropic.com\u003e\nClaude-Session: https://claude.ai/code/session_01Szwv3KVpJTagJ7ZUvBezVA\n\n---------\n\nCo-authored-by: Claude \u003cnoreply@anthropic.com\u003e\nCo-authored-by: ne-groomer[bot] \u003c300654814+ne-groomer[bot]@users.noreply.github.com\u003e",
   "Tags": [],
   "Fingerprint": "fa1edc12dbd4cdccb0c98f4dbd6a54ca489005c1:tests/test_parity_evidence_preservation.py:generic-api-key:124"
+ },
+ {
+  "RuleID": "generic-api-key",
+  "Description": "Detected a Generic API Key, potentially exposing access to various services and sensitive operations.",
+  "StartLine": 22,
+  "EndLine": 22,
+  "StartColumn": 2,
+  "EndColumn": 41,
+  "Match": "KEY = \"REDACTED\"",
+  "Secret": "REDACTED",
+  "File": "tests/test_fred_nonjson_diagnostics_i12547.py",
+  "SymlinkFile": "",
+  "Commit": "5031e6cd50d1e5925e1508f5530541b9accb5807",
+  "Link": "https://github.com/nousergon/nousergon-data/blob/5031e6cd50d1e5925e1508f5530541b9accb5807/tests/test_fred_nonjson_diagnostics_i12547.py#L22",
+  "Entropy": 4,
+  "Author": "Brian McMahon",
+  "Email": "brian@nousergon.ai",
+  "Date": "2026-10-22T10:47:38Z",
+  "Message": "fix(d23): a non-JSON FRED response logs status, content-type and length (alpha-engine-config-I12547) (#2249)\n\nOn 2026-10-21 22:17-23:46Z every FRED call D23 (metron_macro_data) made\nreturned non-JSON. The warning carried only json's \"Expecting value: line 1\ncolumn 1 (char 0)\" seven times, so the log could not tell an outage page\nfrom a throttle from a truncated payload.\n\nBoth FRED fetch sites in collectors/metron_market_data.py now decode\nthrough _fred_json. On a decode failure it raises FredNonJsonResponse\ncarrying the HTTP status, Content-Type and body length. For a text/html or\ntext/plain body (a vendor error page) it also carries a body prefix of at\nmost 200 chars, with the API key redacted and whitespace collapsed. Any\nother or missing content type logs no body content, because a partial\nJSON/XML body could be vendor data and this repo is public. The request\nURL is never logged. The fail-soft per-series behaviour is unchanged.\n\nTracker: alpha-engine-config-I12547\n\nClaude-Session: https://claude.ai/code/session_01Szwv3KVpJTagJ7ZUvBezVA\n\nCo-authored-by: Claude \u003cnoreply@anthropic.com\u003e",
+  "Tags": [],
+  "Fingerprint": "5031e6cd50d1e5925e1508f5530541b9accb5807:tests/test_fred_nonjson_diagnostics_i12547.py:generic-api-key:22"
  }
 ]
