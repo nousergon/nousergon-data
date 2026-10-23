@@ -229,3 +229,122 @@ def test_chunked_reading_gives_the_same_rows() -> None:
     chunked, stats = m.parse_archive(_zip(), "01oct2022-28feb2023", chunk_rows=1)
     assert stats["infotable_rows"] == 3
     pd.testing.assert_frame_equal(whole, chunked)
+
+
+# -- memory: one archive per child process (2026-10-23 OOM, exit 137) ----------
+
+
+def test_the_parquet_is_the_v1_schema_sorted_one_row_group_at_a_time() -> None:
+    import pyarrow.parquet as pq
+
+    table, _ = m.parse_archive_table(_zip(), "01oct2022-28feb2023")
+    body = m.archive_parquet(table, row_group_rows=2)
+    parquet = pq.ParquetFile(io.BytesIO(body))
+    assert parquet.schema_arrow.remove_metadata().equals(m.ARROW_SCHEMA)
+    assert parquet.metadata.num_row_groups == 2
+    frame = pd.read_parquet(io.BytesIO(body))
+    keys = ["filing_date", "accession", "cusip"]
+    assert frame[keys].equals(frame.sort_values(keys)[keys].reset_index(drop=True))
+    whole, _ = m.parse_archive(_zip(), "01oct2022-28feb2023")
+    pd.testing.assert_frame_equal(
+        frame.astype(str), whole.astype(str).reset_index(drop=True)
+    )
+
+
+class _Done:
+    def __init__(self, returncode: int, stdout: str = "") -> None:
+        self.returncode, self.stdout = returncode, stdout
+
+
+def test_a_child_runs_this_module_on_one_archive_and_returns_its_stats(
+    monkeypatch,
+) -> None:
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _Done(0, 'progress\n{"rows": 7, "submissions": 2}\n')
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    stats = m.process_in_child("2023q1", "https://x/2023q1_form13f.zip", bucket="b")
+    assert stats == {"rows": 7, "submissions": 2}
+    (cmd, kwargs), = calls
+    assert cmd[1:] == [
+        "-m",
+        "collectors.holdings_13f_pit",
+        "--bucket",
+        "b",
+        "archive",
+        "--label",
+        "2023q1",
+        "--url",
+        "https://x/2023q1_form13f.zip",
+    ]
+    assert kwargs["cwd"] == _REPO and "stderr" not in kwargs, "child logs reach the box log"
+
+
+def test_the_child_command_line_is_one_this_module_accepts() -> None:
+    import subprocess
+    import sys
+
+    cmd = m.child_command("2023q1", "https://x/2023q1_form13f.zip", "b")
+    done = subprocess.run(
+        [*cmd, "--help"], cwd=_REPO, capture_output=True, text=True, check=False
+    )
+    assert done.returncode == 0, done.stderr
+    assert "--label" in done.stdout and cmd[0] == sys.executable
+
+
+def test_an_oom_killed_child_stops_the_run_and_leaves_a_run_record(
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr(m.subprocess, "run", lambda cmd, **_: _Done(-9))
+    store = _Store()
+    with pytest.raises(m.ArchiveProcessError, match="signal 9.*OOM"):
+        m.run(
+            store,
+            _Client({}),
+            [("2023q1", "u")],
+            run_date=dt.date(2026, 10, 23),
+            overwrite=False,
+            run_id="r9",
+            process=lambda label, url: m.process_in_child(label, url, bucket="b"),
+        )
+    record = json.loads(store.objects[m.RUN_LATEST_KEY])
+    assert record["failed_archive"] == "2023q1" and record["run_id"] == "r9"
+    assert record["failure"] == "ArchiveProcessError"
+
+
+def test_backfill_resumes_and_hands_each_archive_to_its_own_child(
+    monkeypatch,
+) -> None:
+    """The parent lists, skips what is written, and never downloads an archive."""
+
+    class _Listing:
+        def __init__(self) -> None:
+            self.urls = []
+
+        def get(self, url, **_):
+            self.urls.append(url)
+            response = _Response(b"")
+            response.text = _LISTING
+            return response
+
+    sec = _Listing()
+    store = _Store(keys=[m.archive_key("2022q4")])
+    children = []
+
+    def fake_child(label, url, *, bucket):
+        children.append((label, bucket))
+        return {"rows": 1, "submissions": 1}
+
+    monkeypatch.setattr(m, "SecClient", lambda: sec)
+    monkeypatch.setattr(m, "S3ObjectStore", lambda client, bucket: store)
+    monkeypatch.setattr("boto3.client", lambda *a, **k: None)
+    monkeypatch.setattr(m, "process_in_child", fake_child)
+    assert m.main(["--bucket", "bk", "backfill", "--start", "2016-01-01"]) == 0
+    assert children == [("2023q1", "bk"), ("01dec2024-28feb2025", "bk")]
+    assert sec.urls == [m.LISTING_URL], "archives are fetched by the child only"
+    record = json.loads(store.objects[m.RUN_LATEST_KEY])
+    assert record["archives_skipped_existing"] == 1
+    assert record["archives_written"] == 2

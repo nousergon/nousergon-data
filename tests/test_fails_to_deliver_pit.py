@@ -106,9 +106,47 @@ class TestParse:
         with pytest.raises(m.SourceFormatError, match="header"):
             m.parse_file("DATE|CUSIP|SYMBOL\n", _A)
 
-    def test_a_row_outside_the_half_month_stops_the_run(self) -> None:
-        with pytest.raises(m.SourceFormatError, match="outside"):
+    def test_a_row_far_outside_the_half_month_stops_the_run(self) -> None:
+        # 2024-02-01 is 15 days before 202402b's 16th: another period's file.
+        with pytest.raises(m.SourceFormatError, match="more than 5 days outside"):
             m.parse_file(_TEXT, (2024, 2, "b"))
+
+    def test_an_edge_settlement_day_is_kept_and_counted(self) -> None:
+        # The 2026-10-23 backfill's 201601b: 201601a ends on 2016-01-14 and the
+        # 15th is published in the b file. Kept with its real date, counted.
+        text = "\n".join(
+            [
+                "|".join(m.HEADER),
+                "20160115|037833100|AAPL|1500|APPLE INC|97.13",
+                "20160115|594918104|MSFT|900|MICROSOFT CORP|50.99",
+                "20160119|037833100|AAPL|1200|APPLE INC|96.66",
+                "20160201|037833100|AAPL|1100|APPLE INC|96.43",
+            ]
+        )
+        period = (2016, 1, "b")
+        frame, not_data = m.parse_file(text, period)
+        assert len(frame) == 4 and not_data == 0
+        assert frame["settlement_date"].min() == dt.date(2016, 1, 15)
+        assert (frame["known_at"] == dt.date(2016, 2, 22)).all()
+        assert m.outside_period(frame, period) == {"2016-01-15": 2, "2016-02-01": 1}
+
+    def test_the_edge_is_exactly_period_edge_days(self) -> None:
+        def one_row(day: str) -> str:
+            return "|".join(m.HEADER) + f"\n{day}|037833100|AAPL|1|APPLE INC|1.0\n"
+
+        period = (2016, 1, "b")  # 2016-01-16..2016-01-31, edge 5 days
+        assert len(m.parse_file(one_row("20160111"), period)[0]) == 1
+        assert len(m.parse_file(one_row("20160205"), period)[0]) == 1
+        for day in ("20160110", "20160206"):
+            with pytest.raises(m.SourceFormatError, match="outside"):
+                m.parse_file(one_row(day), period)
+
+    def test_unreadable_dates_still_stop_the_run(self) -> None:
+        text = "|".join(m.HEADER) + "\n" + "\n".join(
+            f"2016011{i}|037833100|AAPL|x{i}|APPLE INC|1.0" for i in range(5)
+        )
+        with pytest.raises(m.SourceFormatError, match="unreadable"):
+            m.parse_file(text, (2016, 1, "a"))
 
     def test_a_member_with_no_extension_is_read(self) -> None:
         assert m._member_text(_zip(name="cnsfails202402a")).startswith(
@@ -130,6 +168,8 @@ class TestRun:
         )
         record = summary["periods"]["202402a"]
         assert record["source_url"] == _url(1, _A) and record["rows"] == 3
+        assert record["rows_outside_period"] == 0
+        assert record["settlement_dates_outside_period"] == {}
         assert record["last_modified"].startswith("Thu")
         frame = pd.read_parquet(io.BytesIO(store.objects[m.period_key(_A)]))
         assert len(frame) == 3
@@ -196,3 +236,30 @@ def test_the_index_page_link_is_used_and_older_periods_are_recorded_as_not_offer
     )
     assert summary["periods_not_offered"] == ["201601a"]
     assert client.urls[0] == listing[b]
+
+
+def test_the_run_record_counts_edge_day_rows_per_period_and_in_total() -> None:
+    b = (2016, 1, "b")
+    text = "\n".join(
+        [
+            "|".join(m.HEADER),
+            "20160115|037833100|AAPL|1500|APPLE INC|97.13",
+            "20160119|037833100|AAPL|1200|APPLE INC|96.66",
+        ]
+    )
+    store = _Store()
+    summary = m.run(
+        store,
+        _Client({_url(0, b): _zip(text=text, name="cnsfails201601b.txt")}),
+        [b],
+        run_date=dt.date(2026, 10, 23),
+        overwrite=False,
+        newest_may_be_unpublished=False,
+    )
+    assert summary["periods"]["201601b"]["rows_outside_period"] == 1
+    assert summary["periods"]["201601b"]["settlement_dates_outside_period"] == {
+        "2016-01-15": 1
+    }
+    assert summary["rows_outside_period"] == 1 and summary["rows_written"] == 2
+    written = pd.read_parquet(io.BytesIO(store.objects[m.period_key(b)]))
+    assert written["settlement_date"].min() == dt.date(2016, 1, 15)
