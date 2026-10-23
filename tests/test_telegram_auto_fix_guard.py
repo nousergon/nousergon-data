@@ -10,9 +10,12 @@ skip it.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+# A Bot API send call site: the sendMessage endpoint URL.
+_BOT_API_SEND = re.compile(r"api\.telegram\.org/bot[^\s\"']*/sendMessage|api\.telegram\.org/bot")
 SCAN_DIRS = ("scripts", "infrastructure", "shadow", ".github/workflows")
 SUFFIXES = {".py", ".sh", ".yml", ".yaml"}
 # Files that mention the Bot API URL without sending a message.
@@ -31,7 +34,7 @@ def _raw_senders() -> list[Path]:
             if rel in NOT_SENDERS or Path(rel).name.startswith("test_"):
                 continue
             text = p.read_text(errors="ignore")
-            if "api.telegram.org" in text and "sendMessage" in text:
+            if _BOT_API_SEND.search(text) and "sendMessage" in text:
                 out.append(p)
     return out
 
