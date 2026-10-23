@@ -45,6 +45,14 @@
         "sns:Publish"
       ],
       "Resource": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts"
+    },
+    {
+      "Sid": "AlertTierRegistryRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/overseer/alert_tier_registry.json"
     }
   ]
 }
