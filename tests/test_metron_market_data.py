@@ -833,9 +833,103 @@ class TestTechnicals:
         )
         s3 = self._s3({})  # no close_history published for AAPL yet
         result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
-        assert result["status"] == "ok" and result["technicals"] == 0
-        art = _puts(s3)["market_data/technicals/latest.json"]
-        assert art["technicals"] == {}
+        # alpha-engine-config-I10886: an empty payload over a non-empty population is
+        # refused, so yesterday's latest.json stands instead of an empty map.
+        assert result["status"] == "error" and result["technicals"] == 0
+        assert "market_data/technicals/latest.json" not in _puts(s3)
+        assert result["coverage"]["excluded"] == [{"symbol": "AAPL", "reason": "no_close_history"}]
+
+
+class TestTechnicalsCoverage:
+    """alpha-engine-config-I10886: the coverage block says which population the ratings
+    were computed over, and a run whose universe sources did not all answer cannot read
+    as complete."""
+
+    _CONSTITUENTS = ["AAPL", "MSFT"]
+
+    def _run(self, monkeypatch, *, constituents=_CONSTITUENTS, constituents_error=None,
+             watchlist=None, close_history=None, run_date="2026-06-26"):
+        from collectors import constituents as constituents_mod
+
+        def _load(bucket):
+            if constituents_error is not None:
+                raise constituents_error
+            return {"tickers": list(constituents)}
+
+        monkeypatch.setattr(constituents_mod, "load_from_s3", _load)
+        s3 = _universe_s3(_UNIVERSE, watchlist=watchlist, close_history=close_history)
+        result = mmd.collect_technicals(bucket="b", run_date=run_date, s3_client=s3)
+        return result, _puts(s3).get("market_data/technicals/latest.json")
+
+    def _full_history(self):
+        closes = _close_history_closes(260, start_date="2025-10-09")  # last bar 2026-06-25
+        return {"AAPL": {"closes": closes}, "MSFT": {"closes": closes}}
+
+    def test_every_source_answered_and_floor_met_is_complete(self, monkeypatch):
+        result, art = self._run(
+            monkeypatch, watchlist={"holdings": []}, close_history=self._full_history(),
+        )
+        cov = art["coverage"]
+        # Population: AAPL, MSFT (constituents) U AAPL, 1299.HK (held). 1299.HK has no
+        # close history and is not a constituent: a declared exclusion, not a gap.
+        assert cov["denominator"] == 3 and cov["covered"] == 2
+        assert cov["excluded"] == [{"symbol": "1299.HK", "reason": "metron_unpriceable"}]
+        assert cov["declared_exclusions"] == 1
+        assert cov["floor_ratio"] == 1.0 and cov["meets_floor"] is True
+        assert cov["universe_sources"] == {
+            "constituents": {"status": "ok", "count": 2},
+            "holdings": {"status": "ok", "count": 2},
+            "watchlist": {"status": "ok", "count": 0},
+        }
+        assert cov["complete"] is True and result["complete"] is True
+        assert cov["bar_dates"] == {"AAPL": "2026-06-25", "MSFT": "2026-06-25"}
+        assert cov["stale"] == ["AAPL", "MSFT"]  # newest bar is before the run date
+
+    def test_denied_constituents_cannot_read_complete(self, monkeypatch):
+        # The 2026-10-16 shape: the constituent half failed to load and the union
+        # collapsed to the held names, which every one of them rated.
+        result, art = self._run(
+            monkeypatch, constituents_error=PermissionError("AccessDenied"),
+            watchlist={"holdings": []}, close_history=self._full_history(),
+        )
+        cov = art["coverage"]
+        assert cov["denominator"] == 2  # AAPL, 1299.HK: the held names only
+        assert cov["universe_sources"]["constituents"] == {
+            "status": "unavailable", "count": 0, "detail": "PermissionError",
+        }
+        assert cov["complete"] is False and result["status"] == "ok"
+        # With no constituent set, a missing history cannot be declared Metron-only.
+        assert cov["excluded"] == [{"symbol": "1299.HK", "reason": "no_close_history"}]
+
+    def test_missing_watchlist_artifact_cannot_read_complete(self, monkeypatch):
+        _, art = self._run(monkeypatch, watchlist=None, close_history=self._full_history())
+        assert art["coverage"]["universe_sources"]["watchlist"]["status"] == "unavailable"
+        assert art["coverage"]["complete"] is False
+
+    def test_empty_constituents_answer_is_not_ok(self, monkeypatch):
+        _, art = self._run(
+            monkeypatch, constituents=[], watchlist={"holdings": []},
+            close_history=self._full_history(),
+        )
+        assert art["coverage"]["universe_sources"]["constituents"] == {"status": "empty", "count": 0}
+        assert art["coverage"]["complete"] is False
+
+    def test_constituent_gap_counts_against_the_floor(self, monkeypatch):
+        history = self._full_history()
+        del history["MSFT"]  # a constituent with no close history is a gap
+        _, art = self._run(monkeypatch, watchlist={"holdings": []}, close_history=history)
+        cov = art["coverage"]
+        assert {"symbol": "MSFT", "reason": "no_close_history"} in cov["excluded"]
+        assert cov["floor_ratio"] == 0.5 and cov["meets_floor"] is False
+        assert cov["complete"] is False
+
+    def test_short_history_is_a_declared_exclusion(self, monkeypatch):
+        history = self._full_history()
+        history["MSFT"] = {"closes": _close_history_closes(mmd._TECH_MIN_OBS - 1)}
+        _, art = self._run(monkeypatch, watchlist={"holdings": []}, close_history=history)
+        cov = art["coverage"]
+        assert {"symbol": "MSFT", "reason": "short_history"} in cov["excluded"]
+        assert cov["declared_exclusions"] == 2 and cov["meets_floor"] is True
 
 
 class TestIntraday:
