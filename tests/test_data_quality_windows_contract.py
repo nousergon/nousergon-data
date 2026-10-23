@@ -164,3 +164,40 @@ def test_render_names_every_window():
     for window in WINDOWS:
         assert f"`{window.window_id}`" in rendered
         assert window.evidence in rendered
+
+
+def test_rag_rehearsal_ingest_timestamp_window_pins_the_ruled_rows():
+    """alpha-engine-config-I12375 'Keep' ruling (Brian, 2026-10-22).
+
+    rehearsal-2026-10-16-1 stored 15 documents / 103 chunks in the production
+    corpus. They stay; only their ingested_at is wrong. The window must name
+    exactly those 15 rows and only the 2026-10-16 ingestion date, so a reader
+    of per-date corpus counts can find them, and a later edit cannot quietly
+    widen or shrink the declared set.
+    """
+    import re
+
+    window = window_by_id("rag-rehearsal-ingest-timestamp-2026-10-16")
+    assert window.disposition == "no_remediation"
+    assert window.ruled_on == date(2026, 10, 22)
+    assert window.covers(date(2026, 10, 16))
+    assert not window.covers(date(2026, 10, 15))
+    assert not window.covers(date(2026, 10, 17))
+
+    rows = re.findall(
+        r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}) "
+        r"(\S+) (\S+) (\S+) (\d{4}-\d{2}-\d{2}) (\d+)",
+        " ".join(window.notes),
+    )
+    assert len(rows) == 15
+    assert len({r[0] for r in rows}) == 15
+    assert sum(int(r[5]) for r in rows) == 103
+    by_type: dict[str, int] = {}
+    for r in rows:
+        by_type[r[2]] = by_type.get(r[2], 0) + 1
+    assert by_type == {"10-Q": 2, "8-K": 11, "13F": 2}
+    assert window.measured["documents"] == "15"
+    assert window.measured["chunks"] == "103"
+
+    hits = overlapping("rag/manifest/{date}.json", date(2026, 10, 16), date(2026, 10, 16))
+    assert [w.window_id for w in hits] == ["rag-rehearsal-ingest-timestamp-2026-10-16"]

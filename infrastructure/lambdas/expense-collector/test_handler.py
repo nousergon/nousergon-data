@@ -1657,3 +1657,116 @@ class TestDailyBySystem:
         assert row["mtd_cost_usd"] == pytest.approx(12.34)
         assert "daily_by_system" not in row["detail"]
         assert "AccessDenied" in row["detail"]["daily_by_system_error"]
+
+
+class TestCostAllocation:
+    """``detail.cost_allocation`` (cost_allocation.v1, alpha-engine-config-I12026
+    slice 1): built from the ``daily_by_system`` series alone, it conserves
+    each day's account total, attributes only what the series can attribute,
+    and says what it cannot."""
+
+    SCHEMA = Path(__file__).parent / "fixtures" / "cost_allocation.v1.schema.json"
+
+    @staticmethod
+    def _series(*days):
+        return {"tag_key": "system", "untagged_key": "(untagged)", "days": [
+            {"date": d, "estimated": False, "by_system_usd": by} for d, by in days]}
+
+    def _validate(self, record):
+        jsonschema = pytest.importorskip("jsonschema")
+        jsonschema.validate(record, json.loads(self.SCHEMA.read_text()))
+
+    def test_members_conserve_each_days_account_total(self):
+        rec = index.build_cost_allocation(self._series(
+            ("2026-10-01", {"(untagged)": 1.1, "crucible-v2": 2.2, "alpha-engine": 0.3}),
+            ("2026-10-02", {"crucible-v2": 0.000001}),
+        ))
+        for day in rec["days"]:
+            assert sum(m["usd"] for m in day["members"]) == pytest.approx(day["account_usd"], abs=1e-9)
+        assert rec["days"][0]["account_usd"] == pytest.approx(3.6)
+        self._validate(rec)
+
+    def test_member_mapping(self):
+        rec = index.build_cost_allocation(self._series(
+            ("2026-10-01", {"(untagged)": 1.0, "crucible-v2": 2.0, "alpha-engine": 0.5})))
+        by_id = {m["id"]: m for m in rec["days"][0]["members"]}
+        assert by_id["harness:crucible-v2"] | {} == {
+            "id": "harness:crucible-v2", "scope": "crucible-and-trader", "component": "harness",
+            "kind": "direct", "usd": 2.0,
+            "evidence": "billing_export daily_by_system 2026-10-01 system=crucible-v2"}
+        assert (by_id["other:alpha-engine"]["scope"], by_id["other:alpha-engine"]["kind"]) == (
+            "system:alpha-engine", "direct")
+        un = by_id["unallocated:(untagged)"]
+        assert (un["scope"], un["component"], un["kind"]) == ("unallocated", "unallocated", "unallocated")
+        assert rec["declared_scopes"] == ["crucible-and-trader", "system:alpha-engine", "unallocated"]
+
+    def test_coverage_is_stated_not_implied(self):
+        """Trader and shared are not separable from the untagged remainder in
+        this series, so the record says the inventory is incomplete. The
+        consumer refuses it, which keeps phase 4 UNMEASURABLE rather than
+        grading a harness-only number as the whole scope."""
+        rec = index.build_cost_allocation(self._series(("2026-10-01", {"crucible-v2": 2.0})))
+        assert rec["schema_version"] == "cost_allocation.v1"
+        assert rec["inventory_complete"] is False
+        assert rec["covered_components"] == ["harness"]
+        assert "trader" in rec["inventory_evidence"] and "shared" in rec["inventory_evidence"]
+        assert not any(m["component"] in ("trader", "shared")
+                       for d in rec["days"] for m in d["members"])
+
+    def test_a_day_with_no_billed_rows_carries_an_evidenced_zero(self):
+        rec = index.build_cost_allocation(self._series(("2026-10-01", {})))
+        day = rec["days"][0]
+        assert day["account_usd"] == 0.0
+        assert [(m["kind"], m["usd"]) for m in day["members"]] == [("unallocated", 0.0)]
+        assert "no billed rows" in day["members"][0]["evidence"]
+        self._validate(rec)
+
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_a_non_finite_amount_is_refused(self, bad):
+        with pytest.raises(ValueError, match="non-finite"):
+            index.build_cost_allocation(self._series(("2026-10-01", {"crucible-v2": bad})))
+
+    def test_a_repeated_day_is_refused(self):
+        with pytest.raises(ValueError, match="repeats 2026-10-01"):
+            index.build_cost_allocation(self._series(
+                ("2026-10-01", {"crucible-v2": 1.0}), ("2026-10-01", {"crucible-v2": 1.0})))
+
+    def test_no_days_is_refused(self):
+        with pytest.raises(ValueError, match="no days"):
+            index.build_cost_allocation(self._series())
+
+    def test_the_aws_row_carries_the_record_beside_its_series(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+        row = index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(july_export())))
+        series = row["detail"]["daily_by_system"]
+        rec = row["detail"]["cost_allocation"]
+        assert "cost_allocation_error" not in row["detail"]
+        harness = [m for d in rec["days"] for m in d["members"] if m["component"] == "harness"]
+        assert [m["usd"] for m in harness] == [8.10, 8.10]  # 06-01 and 07-01
+        assert [d["date"] for d in rec["days"]] == [d["date"] for d in series["days"]]
+        for s_day, a_day in zip(series["days"], rec["days"]):
+            assert a_day["account_usd"] == pytest.approx(sum(s_day["by_system_usd"].values()))
+        self._validate(rec)
+
+    def test_a_failed_record_degrades_only_its_own_field(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+
+        def _boom(series):
+            raise ValueError("daily_by_system repeats 2026-09-01")
+
+        monkeypatch.setattr(index, "build_cost_allocation", _boom)
+        row = index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(july_export())))
+        assert row["detail"]["daily_by_system"]["days"]
+        assert "cost_allocation" not in row["detail"]
+        assert "repeats" in row["detail"]["cost_allocation_error"]
+
+    def test_a_failed_series_attaches_no_record(self, monkeypatch):
+        monkeypatch.setattr(index, "_now_utc", lambda: NOW)
+
+        def _denied(*a, **k):
+            raise RuntimeError("AccessDenied")
+
+        monkeypatch.setattr(index, "collect_aws_daily_by_system", _denied)
+        row = index.collect_aws(index._month_window(NOW), {}, FakeS3(cur_files(july_export())))
+        assert "cost_allocation" not in row["detail"]
+        assert "cost_allocation_error" not in row["detail"]

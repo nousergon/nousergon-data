@@ -2,8 +2,9 @@
 
 alpha-engine-config-I12533. The rule classification is tested on synthetic
 definitions. The committed baseline and declaration files are checked for
-SHAPE only: observe mode means the live tree's findings never fail CI, so no
-test here pins the live counts.
+SHAPE only, except for the definitions in ``ENFORCED_DEFINITIONS``, whose live
+counts must equal the baseline exactly (observe mode never fails CI on the
+others).
 """
 
 from __future__ import annotations
@@ -146,7 +147,12 @@ def test_committed_files_have_the_declared_shape() -> None:
     assert set(baseline) <= {p.relative_to(REPO).as_posix() for p in lint.definition_files(REPO)}
 
 
-def test_ci_runs_it_in_observe_mode_inside_an_existing_job() -> None:
+def test_ci_runs_it_inside_an_existing_job_and_lets_enforced_definitions_block() -> None:
+    """Observe for most definitions, but the step must be able to fail.
+
+    ``continue-on-error`` would swallow the exit 1 an ENFORCED definition
+    raises, turning enforcement back into observation without any signal.
+    """
     ci = yaml.safe_load((REPO / ".github/workflows/ci.yml").read_text())
     steps = [
         (job, step) for job, spec in ci["jobs"].items() for step in spec.get("steps", [])
@@ -155,5 +161,46 @@ def test_ci_runs_it_in_observe_mode_inside_an_existing_job() -> None:
     assert len(steps) == 1
     job, step = steps[0]
     assert job == "ssm-log-capture-contract-lint"
-    assert step.get("continue-on-error") is True
+    assert not step.get("continue-on-error")
     assert "--mode enforce" not in step["run"]
+
+
+def test_enforced_definitions_are_real_baselined_and_off_the_weekly_path() -> None:
+    real = {p.relative_to(REPO).as_posix() for p in lint.definition_files(REPO)}
+    assert lint.ENFORCED_DEFINITIONS, "the enforced set only grows; it may not empty"
+    assert lint.ENFORCED_DEFINITIONS <= real
+    # The weekly SF stays observe-only until it is reworked deliberately.
+    assert "infrastructure/step_function.json" not in lint.ENFORCED_DEFINITIONS
+    assert "infrastructure/step_function_groom.json" in lint.ENFORCED_DEFINITIONS
+
+
+def test_the_committed_tree_passes_the_enforced_definitions() -> None:
+    """Live counts for ENFORCED definitions must equal the baseline exactly."""
+    declared = lint.load_declared(lint.DECLARED_PATH)
+    current = lint.counts_of(lint.findings(REPO, declared))
+    new, stale = lint.compare(current, lint.load_baseline(lint.BASELINE_PATH))
+    blocking = [r for r in new + stale if r["path"] in lint.ENFORCED_DEFINITIONS]
+    assert blocking == []
+
+
+def test_observe_mode_blocks_only_on_an_enforced_definition(tmp_path: Path, monkeypatch, capsys) -> None:
+    repo = _write_repo(tmp_path, {"S": _task("arn:aws:states:::sns:publish")})
+    path = "infrastructure/step_function_x.json"
+    (repo / "baseline.json").write_text(lint.render_baseline({}))
+
+    monkeypatch.setattr(lint, "ENFORCED_DEFINITIONS", frozenset({"infrastructure/step_function_other.json"}))
+    assert _run(repo) == 0
+    assert "observe mode: reporting only." in capsys.readouterr().out
+
+    monkeypatch.setattr(lint, "ENFORCED_DEFINITIONS", frozenset({path}))
+    assert _run(repo) == 1
+    out = capsys.readouterr().out
+    assert "NEW (enforced) " + path in out
+    assert "failing" in out
+
+    # STALE blocks too: a removed finding must lower the ceiling in the same change.
+    (repo / "baseline.json").write_text(lint.render_baseline({path: {"task-not-an-entrypoint": 2}}))
+    assert _run(repo) == 1
+    assert "STALE (enforced) " + path in capsys.readouterr().out
+    assert _run(repo, "--update") == 0
+    assert _run(repo) == 0

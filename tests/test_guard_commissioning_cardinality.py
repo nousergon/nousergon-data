@@ -37,6 +37,17 @@ runs that collector function FOR REAL, and stubs only the vendor beneath it:
   refusal, and ``_record_phase_lineage`` raises it as ``_DegradedRun``. The
   staleness probe (``_find_stale_fast``, an S3 listing) is stubbed to call
   every ticker stale; it decides what is asked for, not what is checked.
+* **D06** (short interest, phase ``short_interest``) and **D07** (universe
+  classification, phase ``universe_classification``): the Saturday
+  ``weekly-phase-one`` workload (``_run_phase1``, ``reg.data_mode``
+  ``phase1``), walked on the deployed ``weekly`` schedule's own input with only
+  that workload faulted, as the ``empty_fresh`` weekly cases are. The real
+  ``short_interest.collect`` / ``universe_classification.collect`` run over 40
+  requested tickers with the vendor's ``.info`` (``yahoo_info``) answering for
+  10 (0.25). Each refuses below its ``_MIN_OK_RATIO`` (0.50) with
+  ``status: error`` and writes nothing. Both descriptors declare this guard
+  ``partial``: the record commissions the collapse half that exists (below
+  0.50), not the 0.50-0.90 / 0.50-1.0 band their notes name as remaining work.
 
 **What each record observes**, which is what its ``observed`` lines say:
 
@@ -60,10 +71,9 @@ Not here, and why:
   until a deliberate promotion PR writes one (`guard_promotion.data_cardinality`).
 * **D01, D02, D19**: the trader's feed and the executor's, held for every
   guard class.
-* **D06, D07, D17, D48, D49, D50, D51**: each runs on another workload or
-  schedule (the weekly phase-one run, the morning enrich, the standalone
-  index-contributions, ndx-constituents, settled-regrade and daily-panel
-  schedules), so each needs its own walk.
+* **D17, D48, D49, D50, D51**: each runs on another workload or schedule
+  (the morning enrich, the standalone index-contributions, ndx-constituents,
+  settled-regrade and daily-panel schedules), so each needs its own walk.
 * **D16**: its source-yield verdict is observe-only (`rag_source_yield`).
 """
 
@@ -84,7 +94,7 @@ import pytest
 
 import run_units
 import weekly_collector
-from collectors import metron_market_data, prices
+from collectors import metron_market_data, prices, short_interest, universe_classification
 from collectors import yahoo_session
 from data_gate import descriptors, evidence
 from data_gate import guard_commissioning as gc
@@ -145,6 +155,16 @@ class Case:
     auto_skip: bool = True
     #: The call-site source text that must appear in this phase's block.
     call_site: tuple[str, ...] = ()
+    #: The run mode the call site runs under (``reg.data_mode``, the
+    #: ``run_units.PHASE_UNITS`` key), the deployed workload that runs it, and the
+    #: schedule whose execution input names that workload. EOD defaults, as in
+    #: ``empty_fresh``'s ``Case``.
+    mode: str = "daily"
+    workload: str = ef.WORKLOAD
+    collection: str = "eod"
+    #: Whether the guard itself logs its refusal at ERROR. D06/D07 return it in
+    #: ``status: error`` without logging; the manifest reason still carries it.
+    logs_refusal: bool = True
 
 
 # ---------------------------------------------------------------------------
@@ -267,6 +287,54 @@ def _d03_healthy_writes() -> dict[str, int]:
     return prices.written_keys({"written": {t: _D03_ROWS for t in _d03_requested()}}, _D03_PREFIX)
 
 
+# ---------------------------------------------------------------------------
+# The weekly phase-one cases (D06, D07): the same vendor seam, on Saturday's run
+# ---------------------------------------------------------------------------
+
+#: ``_run_phase1``'s workload on the ``weekly`` schedule (``empty_fresh._PHASE_ONE``).
+_PHASE_ONE = {"mode": "phase1", "workload": "weekly-phase-one", "collection": "weekly"}
+_MARKET_PREFIX = "market_data/"
+
+
+def _weekly_vendor_info(covered: frozenset[str]):
+    """``yahoo_info`` for the weekly ``.info`` collectors: populated for a covered symbol, ``{}`` otherwise."""
+
+    def info(symbol: str, *, yf_module=None) -> dict:
+        if symbol not in covered:
+            return {}
+        return {
+            "shortPercentOfFloat": 0.031,
+            "shortRatio": 2.4,
+            "sharesShort": 1_200_000,
+            "sector": "Technology",
+            "country": "United States",
+            "industry": "Software",
+        }
+
+    return info
+
+
+def _weekly_collect(module):
+    """The call site's ``<module>.collect(...)`` for real, over the harness's S3 and a stubbed vendor."""
+
+    def collect(fake: ef.InMemoryS3, healthy: bool) -> dict:
+        with (
+            mock.patch.object(module, "boto3", types.SimpleNamespace(client=lambda *_a, **_k: fake)),
+            mock.patch.object(module, "yahoo_info", _weekly_vendor_info(_covered(healthy))),
+        ):
+            return module.collect(
+                bucket=BUCKET, tickers=list(HELD), s3_prefix=_MARKET_PREFIX,
+                run_date=TRADING_DAY, inter_request_delay=0, dry_run=False,
+            )
+
+    return collect
+
+
+_D06_KEY = f"{_MARKET_PREFIX}weekly/{TRADING_DAY}/short_interest.json"
+_D07_KEY = f"{_MARKET_PREFIX}universe_classification/{TRADING_DAY}.json"
+_D07_LATEST = f"{_MARKET_PREFIX}universe_classification/latest.json"
+
+
 CASES: tuple[Case, ...] = (
     Case(
         "D22", "metron_reference_data",
@@ -319,6 +387,43 @@ CASES: tuple[Case, ...] = (
         "extra_outputs=_prices_extra_outputs(",
     ),
     ),
+    Case(
+        "D06", "short_interest",
+        "truncated universe: the vendor's .info pass returns populated short-interest fields "
+        "for 10 of the 40 requested tickers (0.25), below the 0.50 _MIN_OK_RATIO",
+        _weekly_collect(short_interest),
+        refusal=(
+            f"only {TRUNCATED_TO}/{len(HELD)} tickers ({TRUNCATED_TO / len(HELD):.1%}) "
+            "had populated short-interest data"
+        ),
+        healthy_writes=lambda: {_D06_KEY: len(HELD)},
+        artifact_key=_D06_KEY,
+        call_site=('artifact_key=f"{market_prefix}weekly/{run_date}/short_interest.json"',),
+        logs_refusal=False,
+        **_PHASE_ONE,
+    ),
+    Case(
+        "D07", "universe_classification",
+        "truncated universe: the vendor's .info pass classifies 10 of the 40 requested "
+        "tickers (0.25), below the 0.50 _MIN_OK_RATIO",
+        _weekly_collect(universe_classification),
+        refusal=(
+            f"only {TRUNCATED_TO}/{len(HELD)} tickers ({TRUNCATED_TO / len(HELD):.1%}) "
+            "had populated classification data"
+        ),
+        healthy_writes=lambda: {_D07_KEY: len(HELD), _D07_LATEST: len(HELD)},
+        artifact_key=_D07_KEY,
+        extra_outputs=lambda: (
+            (_D07_LATEST, lambda r: r.get("status") == "ok", lambda r: r.get("ok_count") or 0),
+        ),
+        call_site=(
+            'artifact_key=f"{market_prefix}universe_classification/{run_date}.json"',
+            'f"{market_prefix}universe_classification/latest.json"',
+            'lambda r: r.get("ok_count") or 0',
+        ),
+        logs_refusal=False,
+        **_PHASE_ONE,
+    ),
 )
 CASE_IDS = [c.unit for c in CASES]
 
@@ -330,7 +435,7 @@ CASE_IDS = [c.unit for c in CASES]
 
 def _run_phase(fake: ef.InMemoryS3, case: Case, healthy: bool) -> dict:
     reg = RunStatePhaseRegistry(date=TRADING_DAY, bucket=BUCKET, marker_prefix="data", s3_client=fake)
-    reg.data_mode = "daily"
+    reg.data_mode = case.mode
     return weekly_collector._phase_collect(
         reg, case.phase, lambda: case.collect(fake, healthy),
         artifact_key=case.artifact_key,
@@ -352,7 +457,7 @@ class Execution(ef.Execution):
     """The ``empty_fresh`` walker, with the case's REAL collector behind ``PollWorkload``."""
 
     def tasks(self, name: str, state: dict, data: dict):
-        if name == "PollWorkload" and data["workload"] == ef.WORKLOAD:
+        if name == "PollWorkload" and data["workload"] == self.case.workload:
             healthy = self.rows_per_attempt[len(self.attempts)]
             result = _run_phase(self.s3, self.case, healthy)
             self.attempts.append(result)
@@ -416,8 +521,9 @@ def test_the_fault_record_truncated_universe_fails_pages_once_and_stands_down(ca
         assert manifests[0]["outputs"] == []
         assert s3.marker(case)["status"] == "error"
         # The guard's own ERROR line, at least once per attempt.
-        refusals = [r for r in caplog.records if case.refusal in r.getMessage()]
-        assert len(refusals) >= len(faulted.attempts), [r.getMessage() for r in caplog.records]
+        if case.logs_refusal:
+            refusals = [r for r in caplog.records if case.refusal in r.getMessage()]
+            assert len(refusals) >= len(faulted.attempts), [r.getMessage() for r in caplog.records]
 
     # ...and once the vendor answers in full, the next run is clean end to end.
     recovered = Execution(s3, case, rows_per_attempt=[True])
@@ -433,7 +539,7 @@ def test_the_fault_record_truncated_universe_fails_pages_once_and_stands_down(ca
 
     first = manifests[0]
     print(
-        f"\nFAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={ef.WORKLOAD}"
+        f"\nFAULT RECORD guard={GUARD_CLASS} unit={case.unit} phase={case.phase} workload={case.workload}"
         f"\n  fault:      {case.fault}"
         "\n  attempts:   " + ", ".join(a["status"] for a in faulted.attempts) + " (exit 1 each)"
         f"\n  manifests:  {', '.join(m['status'] for m in manifests)}: {first['reason'][:110]}..."
@@ -448,13 +554,17 @@ def test_the_fault_record_truncated_universe_fails_pages_once_and_stands_down(ca
 # ---------------------------------------------------------------------------
 
 
-def test_every_case_declares_the_guard_and_runs_on_the_eod_machine():
-    """A case is commissioned only where the descriptor names a halting check, on the machine it runs on."""
-    eod = ef._deployed_eod_input()
-    assert ef.WORKLOAD in eod["workloads"]
+def test_every_case_declares_the_guard_and_runs_on_the_machine_it_names():
+    """A case is commissioned only where the descriptor names a halting check, on the
+    schedule and workload it actually runs on (EOD ``post-market-data``, or the
+    ``weekly`` schedule's ``weekly-phase-one``)."""
+    mode_workload = {"daily": ef.WORKLOAD, "phase1": "weekly-phase-one"}
     for case in CASES:
-        assert run_units.PHASE_UNITS[("daily", case.phase)].unit_id == case.unit
-        assert case.unit in eod["verify_units"], case.unit
+        schedule = ef._deployed_input(case.collection)
+        assert case.workload == mode_workload[case.mode], case.unit
+        assert case.workload in schedule["workloads"], case.unit
+        assert run_units.PHASE_UNITS[(case.mode, case.phase)].unit_id == case.unit
+        assert case.unit in schedule["verify_units"], case.unit
         unit = next(u for u in descriptors.load_units() if u.unit_id == case.unit)
         block = unit.guards[GUARD_CLASS]
         assert block["state"] in ("present", "partial"), case.unit
@@ -468,6 +578,8 @@ def test_every_case_declares_the_guard_and_runs_on_the_eod_machine():
         ("D22", "collectors/metron_market_data.py::_yfinance_classification", "floor=METRON_YF_COVERAGE_FLOOR"),
         ("D29", "collectors/metron_market_data.py::_yfinance_analyst", "floor=METRON_YF_COVERAGE_FLOOR"),
         ("D03", "collectors/prices.py::collect", '"status": "ok" if not failed_tickers else "partial"'),
+        ("D06", "collectors/short_interest.py::collect", "ok_ratio < _MIN_OK_RATIO"),
+        ("D07", "collectors/universe_classification.py::collect", "ok_ratio < _MIN_OK_RATIO"),
     ],
 )
 def test_the_case_runs_the_code_the_descriptor_names(unit, code, evaluates):
@@ -483,6 +595,12 @@ def test_the_metron_floor_is_the_one_the_fault_crosses():
     assert len(HELD) >= _M.METRON_YF_COVERAGE_MIN_REQUESTED
 
 
+def test_the_weekly_floor_is_the_one_the_fault_crosses():
+    """10/40 is under each weekly collector's _MIN_OK_RATIO; 40/40 is over it."""
+    for module in (short_interest, universe_classification):
+        assert TRUNCATED_TO / len(HELD) < module._MIN_OK_RATIO <= 1.0, module.__name__
+
+
 def test_the_d03_fault_is_not_a_quarantinable_refusal():
     """A quarantined ticker leaves the stage `ok`; the induced cause must be one that fails it."""
     assert prices.FAIL_NO_DATA not in prices._QUARANTINABLE_REASONS
@@ -491,16 +609,17 @@ def test_the_d03_fault_is_not_a_quarantinable_refusal():
 def test_every_call_site_mirror_matches_weekly_collector():
     """The cases call `_phase_collect` with the call site's own arguments; a drift fails here."""
     source = (ef.REPO_ROOT / "weekly_collector.py").read_text()
-    # The daily mode's own body only: the Saturday phase-one run calls `prices` too.
-    daily = re.search(r"\ndef _run_daily\(.*?(?=\ndef )", source, flags=re.DOTALL)
-    assert daily, "weekly_collector._run_daily not found"
+    # Each mode's own body only: the Saturday phase-one run calls `prices` too.
+    runner = {"daily": "_run_daily", "phase1": "_run_phase1"}
     for case in CASES:
+        body = re.search(rf"\ndef {runner[case.mode]}\(.*?(?=\ndef )", source, flags=re.DOTALL)
+        assert body, f"weekly_collector.{runner[case.mode]} not found"
         match = re.search(
             rf'\n(?P<indent> +)results\["collectors"\]\["{case.phase}"\] = _phase_collect\(\n'
             rf'\s*reg, "{case.phase}",(?P<block>.*?)\n(?P=indent)\)',
-            daily.group(0), flags=re.DOTALL,
+            body.group(0), flags=re.DOTALL,
         )
-        assert match, f"no daily-mode _phase_collect call site for {case.phase}"
+        assert match, f"no {case.mode}-mode _phase_collect call site for {case.phase}"
         block = match.group("block")
         for text in case.call_site:
             assert text in block, f"{case.unit}: {text!r} not at the {case.phase} call site"
