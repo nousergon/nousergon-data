@@ -175,6 +175,17 @@ def _format_alarm_message(sns_message: dict) -> str:
     )
     lines.append(f"[AWS Console]({console_url})")
 
+    # Every Telegram message says what is being fixed automatically
+    # (nous-ergon-ops observability-policy § Notification — auto-fix line).
+    if new_state == "ALARM":
+        lines.append(
+            "*Auto-fix:* alpha-engine-overseer-backstop-responder makes one "
+            "bounded recovery attempt for this alarm and reports it in its own "
+            "message; tonight's nightly sweep (7pm PT) picks up what is left."
+        )
+    else:
+        lines.append("*Auto-fix:* none needed (resolved).")
+
     return "\n".join(lines)
 
 
