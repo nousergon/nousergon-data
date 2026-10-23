@@ -1377,10 +1377,10 @@
     },
     "PublishTraderReconcileDrainUnsettled": {
       "Type": "Task",
-      "Comment": "Best-effort immediate page for BOTH degraded outcomes of the trader-reconcile drain, before the box stop: the unit had not settled (SetTraderReconcileDrainDegraded, alpha-engine-config-I12020), or it settled FAILED (SetTraderReconcileUnitFailedDegraded, alpha-engine-config-I12292). Subject and Message are read from $.degraded_summary.page_subject / page_detail, which each setter writes, so one publish state serves both without a second substantive Task (the console registry keys on state names). Its own Catch routes to StopTradingInstance too, so an SNS failure cannot leave the box running.",
+      "Comment": "Best-effort immediate page for BOTH degraded outcomes of the trader-reconcile drain, before the box stop: the unit had not settled (SetTraderReconcileDrainDegraded, alpha-engine-config-I12020), or it settled FAILED (SetTraderReconcileUnitFailedDegraded, alpha-engine-config-I12292). Subject and Message are read from $.degraded_summary.page_subject / page_detail, which each setter writes, so one publish state serves both without a second substantive Task (the console registry keys on state names). Its own Catch routes to StopTradingInstance too, so an SNS failure cannot leave the box running. TopicArn is built from this machine's own ARN ($$.StateMachine.Id: region field 3, account field 4) rather than a literal account number (S-04, ENV-NO-LITERALS, alpha-engine-config-I12492): the context object is AWS-supplied, so it keeps the hardcoded-topic property (no execution-input field can malform or silence the page) and resolves to whichever account the machine is deployed in.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
-        "TopicArn": "arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts",
+        "TopicArn.$": "States.Format('arn:aws:sns:{}:{}:alpha-engine-alerts', States.ArrayGetItem(States.StringSplit($$.StateMachine.Id, ':'), 3), States.ArrayGetItem(States.StringSplit($$.StateMachine.Id, ':'), 4))",
         "Subject.$": "$.degraded_summary.page_subject",
         "Message.$": "States.Format('{} Run date {}. Detail: {}', $.degraded_summary.page_detail, $.run_date, States.JsonToString($.degraded_summary.stage_error))"
       },
