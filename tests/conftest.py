@@ -182,6 +182,26 @@ def _botocore_dispatch_is_restored():
         )
 
 
+@pytest.fixture(autouse=True)
+def _no_live_corporate_action_scan(request, monkeypatch):
+    """MorningEnrich's corporate-action scan queries Polygon and writes S3.
+
+    Tests of the enrich path must never reach either. The scan's own tests
+    (tests/test_corporate_actions_scan_manifest.py) opt out with the
+    ``live_ca_scan_hook`` marker and inject fakes instead.
+    """
+    if request.node.get_closest_marker("live_ca_scan_hook"):
+        yield
+        return
+    import corporate_actions.scan_manifest as _sm
+
+    monkeypatch.setattr(
+        _sm, "morning_scan",
+        lambda *a, **k: {"status": "skipped_in_tests", "per_day": {}},
+    )
+    yield
+
+
 def recent_trading_day_str() -> str:
     """Most recent NYSE trading day as of now, ISO ``YYYY-MM-DD``.
 

@@ -10,6 +10,7 @@ requires-python = ">=3.11"
 testpaths = ["tests"]
 markers = [
   "real_alarm_scan: opt out of the autouse CloudWatch stub in tests/test_automation_pause.py — for the one test whose subject IS the live-alarm scan",
+  "live_ca_scan_hook: opt out of the autouse stub of corporate_actions.scan_manifest.morning_scan in tests/conftest.py — for the scan manifest's own tests",
   "real_trigger_scan: opt out of the autouse live-trigger-enumeration stub in tests/test_automation_pause.py — for tests whose subject IS _live_triggers() itself",
 ]
 
