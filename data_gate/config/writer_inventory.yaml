@@ -288,6 +288,14 @@ shared_writers:
   - path: corporate_actions/registry.py
     parent_units: [D43]
     reason: D43 enumerates corporate_actions/ among the manual repair builders.
+  - path: corporate_actions/scan_manifest.py
+    parent_units: [D17]
+    reason: >-
+      The daily corporate-action scan (corporate_actions/scans/{date}.json), a
+      best-effort side output of D17's MorningEnrich (alpha-engine-config-I11076).
+      Deliberately NOT in D17's writes, which the completion, parity and readiness
+      gates treat as required; a missing scan is graded by its reader instead
+      (crucible-trader reports every holding unchecked).
   - path: rag/pipelines/emit_manifest.py
     parent_units: [D16]
     reason: A step of run_weekly_ingestion.sh, which D16 declares as its trigger.

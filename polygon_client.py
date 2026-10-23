@@ -496,6 +496,93 @@ class PolygonClient:
         results.sort(key=lambda r: (r["execution_date"], r["ticker"]))
         return results
 
+    def get_all_dividends_between(
+        self,
+        start_date: str,
+        end_date: str,
+        *,
+        date_field: str = "pay_date",
+        max_pages: int = 200,
+    ) -> list[dict]:
+        """Every cash dividend whose ``date_field`` is in ``[start_date, end_date]``.
+
+        The strict sibling of :meth:`get_recent_dividends`: follows ``next_url``
+        to the end and lets every error raise, ``PolygonForbiddenError``
+        included. The corporate-action scan manifest
+        (``corporate_actions/scan_manifest.py``, alpha-engine-config-I11076)
+        is read by a reconciler that must tell "no dividends today" from "the
+        feed did not answer", so it can never be handed a silent ``[]``.
+
+        ``date_field`` is one of ``pay_date``, ``ex_dividend_date`` or
+        ``record_date``. Rows keep every date and the currency, because a
+        holder is entitled on the record date and paid on the pay date, and
+        a non-USD dividend cannot be checked against a USD cash ledger.
+        Rows missing a ticker, the queried date or a positive cash amount are
+        skipped (counted in the log), never coerced.
+        """
+        from urllib.parse import parse_qsl, urlsplit
+
+        if date_field not in ("pay_date", "ex_dividend_date", "record_date"):
+            raise ValueError(f"unsupported dividend date field: {date_field!r}")
+        path = "/v3/reference/dividends"
+        params: dict = {
+            f"{date_field}.gte": start_date,
+            f"{date_field}.lte": end_date,
+            "limit": 1000,
+            "order": "asc",
+            "sort": date_field,
+        }
+        results: list[dict] = []
+        skipped = 0
+        for _ in range(max_pages):
+            data = self._get(path, params=params)
+            for r in data.get("results", []) or []:
+                ticker = r.get("ticker")
+                cash = r.get("cash_amount")
+                if not ticker or not r.get(date_field) or cash is None:
+                    skipped += 1
+                    continue
+                try:
+                    cash_f = float(cash)
+                except (TypeError, ValueError):
+                    skipped += 1
+                    continue
+                if cash_f <= 0:
+                    skipped += 1
+                    continue
+                results.append(
+                    {
+                        "ticker": str(ticker),
+                        "cash_amount": cash_f,
+                        "currency": str(r.get("currency") or ""),
+                        "dividend_type": str(r.get("dividend_type") or ""),
+                        "declaration_date": r.get("declaration_date"),
+                        "ex_dividend_date": r.get("ex_dividend_date"),
+                        "record_date": r.get("record_date"),
+                        "pay_date": r.get("pay_date"),
+                        "frequency": r.get("frequency"),
+                        "polygon_id": r.get("id"),
+                    }
+                )
+            next_url = data.get("next_url")
+            if not next_url:
+                break
+            parts = urlsplit(next_url)
+            path = parts.path
+            params = {k: v for k, v in parse_qsl(parts.query) if k.lower() != "apikey"}
+        else:
+            raise RuntimeError(
+                f"polygon dividends by {date_field} {start_date}..{end_date}: "
+                f"more than {max_pages} pages"
+            )
+        if skipped:
+            logger.warning(
+                "polygon dividends by %s %s..%s: skipped %d malformed rows",
+                date_field, start_date, end_date, skipped,
+            )
+        results.sort(key=lambda r: (str(r[date_field]), r["ticker"]))
+        return results
+
     def get_dividends(self, ticker: str) -> list[dict]:
         """Fetch the cash-dividend history for one ticker (authoritative).
 
