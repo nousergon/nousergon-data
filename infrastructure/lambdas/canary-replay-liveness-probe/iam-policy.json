@@ -65,6 +65,29 @@
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_BOT_TOKEN",
         "arn:aws:ssm:us-east-1:711398986525:parameter/alpha-engine/TELEGRAM_CHAT_ID"
       ]
+    },
+    {
+      "Sid": "AlertTierRegistryRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research/overseer/alert_tier_registry.json"
+    },
+    {
+      "Sid": "AlertTierRegistryList",
+      "Effect": "Allow",
+      "Action": [
+        "s3:ListBucket"
+      ],
+      "Resource": "arn:aws:s3:::alpha-engine-research",
+      "Condition": {
+        "StringLike": {
+          "s3:prefix": [
+            "overseer/alert_tier_registry.json"
+          ]
+        }
+      }
     }
   ]
 }
