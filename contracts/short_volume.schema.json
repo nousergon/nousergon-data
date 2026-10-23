@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/short_volume.schema.json",
+  "title": "FINRA Reg SHO daily short-sale volume, one row per (trade_date, symbol) (schema_version 1)",
+  "description": "One row of fundamentals_pit/short_volume/v1/months/{YYYY-MM}.parquet. Producer: collectors/short_volume_pit.py (collect_month). Short-sale VOLUME on TRF/ADF-reported trades, not short interest. PRODUCER TEST: tests/test_pit_dataset_contracts.py. alpha-engine-config-I12567 (DATA-01, second slice).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "trade_date",
+    "symbol",
+    "short_volume",
+    "short_exempt_volume",
+    "total_volume",
+    "markets",
+    "source",
+    "schema_version"
+  ],
+  "properties": {
+    "trade_date": {
+      "type": "string",
+      "format": "date",
+      "description": "The trade date the FINRA file covers; also the availability date under FINRA's publication rule."
+    },
+    "symbol": {
+      "type": "string",
+      "minLength": 1,
+      "description": "FINRA's symbol on the trade date (provider alias, alpha-engine-config-I12568)."
+    },
+    "short_volume": {
+      "type": "number",
+      "minimum": 0
+    },
+    "short_exempt_volume": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "minimum": 0,
+      "description": "null on a file whose layout carries no ShortExemptVolume column."
+    },
+    "total_volume": {
+      "type": "number",
+      "minimum": 0
+    },
+    "markets": {
+      "type": "string",
+      "description": "The facility union, e.g. 'B,Q,N'."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Which FINRA file served the day (consolidated or per-facility fallback)."
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "x-pit": {
+    "event_time": "trade_date",
+    "available_at_field": "trade_date",
+    "available_at_basis": "publication_calendar",
+    "admissible_when": "available_before_session",
+    "revisions": "final",
+    "rule": "FINRA publishes a trade date's file by 6 pm ET that day. That is a published rule; the per-file publication instant is not observed. So a row is admissible for session S only when trade_date < S. Declared final: FINRA's file for a past trade date is not a revised series, and a month already written is skipped on later runs unless --overwrite is passed. If FINRA re-issues a day's file, --overwrite replaces the row in place, and this declaration must then become 'overwritten'.",
+    "tracker": "alpha-engine-config-I12567"
+  }
+}
