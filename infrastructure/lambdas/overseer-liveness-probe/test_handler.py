@@ -746,6 +746,82 @@ def test_alarm_coverage_insufficient_data_initial_not_a_finding():
     assert not any("INSUFFICIENT_DATA" in p for p in problems)
 
 
+def test_alarm_coverage_insufficient_data_reconfigured_recently_not_a_finding():
+    """alpha-engine-config-I9241: 200 h in INSUFFICIENT_DATA by the transition
+    timestamp, but reconfigured 2 h ago. CloudWatch does not re-evaluate on a
+    config change, so the current sensor has been silent 2 h, not 200 h."""
+    cw = MagicMock()
+    repointed = dict(_ALARM_MATCHING,
+                     StateValue="INSUFFICIENT_DATA",
+                     StateTransitionedTimestamp=NOW - timedelta(hours=200),
+                     AlarmConfigurationUpdatedTimestamp=NOW - timedelta(hours=2),
+                     StateReason="No data for 200 hours")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [repointed],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert not any("INSUFFICIENT_DATA" in p for p in problems)
+
+
+def test_alarm_coverage_insufficient_data_reconfigured_long_ago_names_it():
+    """Reconfigured after entering the state but still past the threshold
+    under the new config: a finding, aged from the reconfiguration, and the
+    message says so instead of asserting the old sensor died."""
+    cw = MagicMock()
+    repointed = dict(_ALARM_MATCHING,
+                     StateValue="INSUFFICIENT_DATA",
+                     StateTransitionedTimestamp=NOW - timedelta(hours=400),
+                     AlarmConfigurationUpdatedTimestamp=NOW - timedelta(hours=190),
+                     StateReason="No data")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [repointed],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    found = [p for p in problems if "INSUFFICIENT_DATA" in p]
+    assert len(found) == 1
+    assert "190h" in found[0] and "reconfigured" in found[0]
+
+
+def test_alarm_coverage_insufficient_data_config_before_state_keeps_transition_age():
+    """A configuration change BEFORE the state was entered does not move the
+    clock: the 200 h finding stands with the dead-sensor wording."""
+    cw = MagicMock()
+    stale = dict(_ALARM_MATCHING,
+                 StateValue="INSUFFICIENT_DATA",
+                 StateTransitionedTimestamp=NOW - timedelta(hours=200),
+                 AlarmConfigurationUpdatedTimestamp=NOW - timedelta(hours=500),
+                 StateReason="No data")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [stale],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert any("INSUFFICIENT_DATA for 200h (> 168h" in p for p in problems)
+
+
+def test_alarm_coverage_insufficient_data_unparseable_config_ts_falls_back():
+    """Degrades one way: an unparseable configuration timestamp falls back to
+    the transition age (over-reports), never suppresses the finding."""
+    cw = MagicMock()
+    stale = dict(_ALARM_MATCHING,
+                 StateValue="INSUFFICIENT_DATA",
+                 StateTransitionedTimestamp=NOW - timedelta(hours=200),
+                 AlarmConfigurationUpdatedTimestamp="not-a-timestamp",
+                 StateReason="No data")
+    cw.describe_alarms.return_value = {
+        "MetricAlarms": [stale],
+        "CompositeAlarms": [],
+    }
+    with patch("index.boto3.client", side_effect=_client_factory(cloudwatch=cw)):
+        problems, _ = index._check_alarm_coverage(_ALARM_SPEC, NOW)
+    assert any("INSUFFICIENT_DATA for 200h" in p for p in problems)
+
+
 def test_alarm_coverage_wrong_alarm_action():
     cw = MagicMock()
     wrong_topic = dict(_ALARM_MATCHING,
