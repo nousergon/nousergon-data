@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Applies nousergon-data PR #2278: lets 7 alert-publishing Lambdas read
+# Applies nousergon-data PR #2278 (aws iam put-role-policy per role): lets 7 alert-publishing Lambdas read
 # s3://alpha-engine-research/overseer/alert_tier_registry.json, so their
 # alerts stop paging by default. IAM only: no code, env or alarm change.
 # Safe any time (no trading box involved). Run BEFORE merging PR #2278:
@@ -27,8 +27,16 @@ read -r -p "Type yes to continue: " ans; [ "$ans" = "yes" ] || { echo "Stopped."
 fail=0
 for d in "${LAMBDAS[@]}"; do
   echo "== $d"
-  bash "infrastructure/lambdas/$d/deploy.sh" --apply-iam
+  # Same call deploy.sh --apply-iam makes for an existing role, without its
+  # local handler-test preflight (which needs this Mac's venv to match CI).
   role=$(grep -m1 '^ROLE_NAME=' "infrastructure/lambdas/$d/deploy.sh" | cut -d'"' -f2)
+  pol=$(grep -m1 '^POLICY_NAME=' "infrastructure/lambdas/$d/deploy.sh" | cut -d'"' -f2)
+  [ -n "$role" ] && [ -n "$pol" ] || { echo "STOP: could not read ROLE_NAME/POLICY_NAME for $d"; exit 1; }
+  aws iam get-role --role-name "$role" --query Role.RoleName --output text >/dev/null \
+    || { echo "STOP: role $role does not exist (never bootstrapped)"; exit 1; }
+  aws iam put-role-policy --role-name "$role" --policy-name "$pol" \
+    --policy-document "file://infrastructure/lambdas/$d/iam-policy.json"
+  echo "   applied $pol to $role"
   verdict=$(aws iam simulate-principal-policy \
     --policy-source-arn "arn:aws:iam::711398986525:role/$role" \
     --action-names s3:GetObject --resource-arns "$OBJ" \
