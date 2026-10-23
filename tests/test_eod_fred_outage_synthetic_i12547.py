@@ -28,6 +28,7 @@ the same outage.
 from __future__ import annotations
 
 import io
+import urllib.parse
 import urllib.request
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -42,6 +43,11 @@ RUN_DATE = "2026-10-21"
 # FRED-key-looking literal in a fixture.
 SYNTHETIC_KEY = "synthetic-outage-not-a-key"
 OUTAGE_BODY = b"<html><body>503 Service Temporarily Unavailable</body></html>"
+FRED_HOST = "api.stlouisfed.org"
+
+
+def _host(url: str) -> str | None:
+    return urllib.parse.urlparse(url).hostname
 
 
 class _OutageResponse(io.BytesIO):
@@ -71,7 +77,7 @@ def fred_outage(monkeypatch):
     def fake_urlopen(url, *args, **kwargs):
         target = url if isinstance(url, str) else url.full_url
         calls.append(target)
-        if "api.stlouisfed.org" not in target:
+        if _host(target) != FRED_HOST:
             raise AssertionError(f"unexpected network call in the outage harness: {target}")
         return _OutageResponse(OUTAGE_BODY)
 
@@ -89,7 +95,7 @@ def test_d23_reports_skipped_and_writes_nothing_under_the_outage(fred_outage):
 
     assert result["status"] == "skipped", result
     assert fred_outage, "the harness never reached FRED -- the outage was not exercised"
-    assert all("api.stlouisfed.org" in u for u in fred_outage)
+    assert all(_host(u) == FRED_HOST for u in fred_outage)
     s3.put_object.assert_not_called()
 
 
