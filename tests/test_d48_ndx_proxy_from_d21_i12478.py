@@ -184,3 +184,118 @@ def test_d21_descriptor_lists_d48_as_a_close_history_consumer() -> None:
     d21 = yaml.safe_load((REPO / "registry.d/units/D21-metron-close-fx-history.yaml").read_text())
     consumers = d21.get("consumers") or []
     assert any("collectors/index_contributions.py" in str(c) for c in consumers)
+
+
+# ── The 10-21 missing-row case ──────────────────────────────────────────────
+#
+# 2026-10-21: the FRED outage failed post-market-data (alpha-engine-config-I12547),
+# so D32 never appended 10-21 to ArcticDB `universe`, and the 10-22 heal was
+# refused at preflight (alpha-engine-config-I12552). D21 had still run inside
+# that same post-market-data process and published close_history/QQQ.json
+# through 10-21 (23:45Z). So the next panel run saw the NDX proxy ONE SESSION
+# AHEAD of every member -- the inverse of `_refuse_proxy_behind_members`.
+#
+# The properties pinned: NDX never publishes a 10-21 decomposition built from
+# members that have no 10-21 close (no return is ever read as a zero
+# contribution, and no member return from another pair of dates is
+# substituted); SPX stays on its own library's pair; the run is `partial`, so
+# the panel pages; and once the heal lands the 10-21 row, the same run
+# publishes both legs for 10-21.
+
+MISSING_ROW_DATE = "2026-10-21"
+
+
+def _publish_d21_through(monkeypatch: pytest.MonkeyPatch, s3: _MemoryS3, run_date: str,
+                         closes: list[tuple[str, float]]) -> dict:
+    monkeypatch.setattr(
+        mmd, "load_price_derived_universe",
+        lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
+    )
+    return mmd.collect_history(
+        bucket=BUCKET, run_date=run_date, s3_client=s3,
+        close_history_source=lambda symbols: {s: list(closes) for s in symbols},
+        fx_history_source=lambda ccys: {},
+    )
+
+
+def _universe(series: dict[str, list[tuple[str, float]]]):
+    """An ArcticDB `universe` read: most recent first, at most ``limit`` rows at
+    or before ``through``, no QQQ (as measured 2026-10-21)."""
+
+    def source(symbols, through, limit):
+        out = {}
+        for s in symbols:
+            rows = sorted((r for r in series.get(s, []) if r[0] <= through), reverse=True)
+            if rows:
+                out[s] = rows[:limit]
+        return out
+
+    return source
+
+
+_D21_QQQ_THROUGH_1021 = [("2026-10-19", 100.0), ("2026-10-20", 101.5), ("2026-10-21", 99.0)]
+_UNIVERSE_WITHOUT_1021 = {
+    "AAPL": [("2026-10-19", 100.0), ("2026-10-20", 102.0)],
+    "SPY": [("2026-10-19", 100.0), ("2026-10-20", 101.0)],
+}
+_UNIVERSE_HEALED = {
+    "AAPL": _UNIVERSE_WITHOUT_1021["AAPL"] + [("2026-10-21", 98.0)],
+    "SPY": _UNIVERSE_WITHOUT_1021["SPY"] + [("2026-10-21", 99.5)],
+}
+
+
+def _wire(monkeypatch, s3: _MemoryS3, universe: dict) -> None:
+    monkeypatch.setattr(ic, "_default_closes_source", lambda bucket: _universe(universe))
+    monkeypatch.setattr(ic, "_default_weights_source", lambda bucket: _weights)
+    monkeypatch.setattr(ic.boto3, "client", lambda *a, **k: s3)
+
+
+def test_missing_1021_row_refuses_ndx_rather_than_publishing_it(monkeypatch) -> None:
+    s3 = _MemoryS3()
+    assert _publish_d21_through(monkeypatch, s3, MISSING_ROW_DATE, _D21_QQQ_THROUGH_1021)["status"] == "ok"
+    qqq = json.loads(s3.objects["market_data/close_history/QQQ.json"])
+    assert qqq["closes"][-1] == ["2026-10-21", 99.0], "fixture: D21 is a session ahead of universe"
+    _wire(monkeypatch, s3, _UNIVERSE_WITHOUT_1021)
+
+    result = ic.collect(bucket=BUCKET, run_date=MISSING_ROW_DATE)
+
+    # NDX's pair comes from QQQ (10-21/10-20); AAPL has no 10-21 close, so the
+    # leg is under the coverage floor and refused by name of its trading day.
+    assert result["status"] == "partial"
+    assert result["indexes"] == ["SPX"]
+    assert MISSING_ROW_DATE in result["errors"]["NDX"]
+    assert "members missing" in result["errors"]["NDX"]
+    assert not [k for k in s3.objects if k.startswith(f"{ic.INDEX_CONTRIBUTIONS_PREFIX}NDX/")], (
+        "an NDX artifact was written for a session no member has a close for"
+    )
+    # SPX stays on universe's own pair: it republishes 10-20, never a 10-21 it
+    # cannot compute, and never a mixed 10-21/10-19 return.
+    spx = json.loads(s3.objects[f"{ic.INDEX_CONTRIBUTIONS_PREFIX}SPX/latest.json"])
+    assert (spx["trading_day"], spx["prior_close_date"]) == ("2026-10-20", "2026-10-19")
+    assert spx["coverage"]["members_missing_return"] == 0
+
+
+def test_missing_1021_row_is_never_filled_from_another_session(monkeypatch) -> None:
+    """compute_contributions on the 10-21 state: AAPL's 10-20/10-19 return must
+    not stand in for the 10-21/10-20 one the proxy pair asks for."""
+    spec = {s.index: s for s in ic.INDEXES}["NDX"]
+    closes = _universe(_UNIVERSE_WITHOUT_1021)(["AAPL"], MISSING_ROW_DATE, 2)
+    proxy = sorted(_D21_QQQ_THROUGH_1021, reverse=True)[:2]
+
+    with pytest.raises(ic.IndexContributionsUnavailable, match="members missing"):
+        ic.compute_contributions(spec, _weights("NDX"), closes, proxy)
+
+
+def test_heal_landing_the_1021_row_publishes_both_legs_for_1021(monkeypatch) -> None:
+    s3 = _MemoryS3()
+    assert _publish_d21_through(monkeypatch, s3, MISSING_ROW_DATE, _D21_QQQ_THROUGH_1021)["status"] == "ok"
+    _wire(monkeypatch, s3, _UNIVERSE_HEALED)
+
+    result = ic.collect(bucket=BUCKET, run_date=MISSING_ROW_DATE)
+
+    assert result["status"] == "ok"
+    assert result["errors"] == {}
+    for index in ("NDX", "SPX"):
+        payload = json.loads(s3.objects[f"{ic.INDEX_CONTRIBUTIONS_PREFIX}{index}/{MISSING_ROW_DATE}.json"])
+        assert (payload["trading_day"], payload["prior_close_date"]) == ("2026-10-21", "2026-10-20")
+        assert payload["coverage"]["members_missing_return"] == 0
