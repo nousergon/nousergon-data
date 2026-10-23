@@ -42,9 +42,10 @@ import io
 import json
 import logging
 import os
+import re
 import uuid
 import zipfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Any
 
 import pandas as pd
@@ -59,6 +60,14 @@ PERIODS_PREFIX = f"{DATASET_PREFIX}/periods/"
 RUNS_PREFIX = f"{DATASET_PREFIX}/runs/"
 RUN_LATEST_KEY = f"{RUNS_PREFIX}latest.json"
 DEFAULT_BUCKET = "alpha-engine-research"
+
+# The SEC's own index page. Its links are tried first: the 2026-10-23 backfill
+# found 201601a at neither guessed URL (HTTP 404 from both), so the guessed
+# templates below are only the fallback for a period the page does not link.
+LISTING_URL = "https://www.sec.gov/data-research/sec-markets-data/fails-deliver-data"
+_LINK = re.compile(
+    r"""href=["']([^"']*?cnsfails(\d{4})(\d{2})([ab])[^"'/]*\.zip)["']""", re.I
+)
 
 DATASET_URLS: tuple[str, ...] = (
     "https://www.sec.gov/files/data/fails-deliver-data/cnsfails{yyyymm}{half}.zip",
@@ -229,12 +238,45 @@ def parse_file(text: str, period: Period) -> tuple[pd.DataFrame, int]:
 # -- run -----------------------------------------------------------------------
 
 
-def fetch_period(client: Any, period: Period) -> tuple[str, bytes, str | None]:
-    """(serving URL, zip bytes, Last-Modified) from the first URL that does not 404."""
+def parse_listing(html: str) -> dict[Period, str]:
+    """Period -> absolute zip URL for every fails file the index page links."""
+    out: dict[Period, str] = {}
+    for href, year, month, half in _LINK.findall(html):
+        url = href if href.startswith("http") else f"https://www.sec.gov{href}"
+        out.setdefault((int(year), int(month), half.lower()), url)
+    return out
+
+
+def fetch_listing(client: Any) -> dict[Period, str]:
+    """The index page's links; empty (guessed URLs only) if the page is gone."""
+    try:
+        response = client.get(LISTING_URL, timeout=120.0)
+    except SecFetchError as error:
+        if error.status != 404:
+            raise
+        logger.warning("index page %s answered 404; using guessed URLs", LISTING_URL)
+        return {}
+    text = getattr(response, "text", None)
+    if text is None:
+        text = response.content.decode("utf-8", "replace")
+    listed = parse_listing(text)
+    logger.info("index page links %d fails files", len(listed))
+    return listed
+
+
+def fetch_period(
+    client: Any, period: Period, listed_url: str | None = None
+) -> tuple[str, bytes, str | None]:
+    """(serving URL, zip bytes, Last-Modified) from the first URL that does not 404.
+
+    The URL the SEC's index page links comes first, then the guessed templates.
+    """
     year, month, half = period
+    urls = [t.format(yyyymm=f"{year:04d}{month:02d}", half=half) for t in DATASET_URLS]
+    if listed_url:
+        urls = [listed_url, *[u for u in urls if u != listed_url]]
     missing: SecFetchError | None = None
-    for template in DATASET_URLS:
-        url = template.format(yyyymm=f"{year:04d}{month:02d}", half=half)
+    for url in urls:
         try:
             response = client.get(url, timeout=300.0)
         except SecFetchError as error:
@@ -264,6 +306,7 @@ def run(
     run_date: dt.date,
     overwrite: bool,
     newest_may_be_unpublished: bool,
+    listing: Mapping[Period, str] | None = None,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     periods = list(periods)
@@ -278,15 +321,24 @@ def run(
         "periods_written": 0,
         "periods_skipped_existing": 0,
         "periods_unpublished": [],
+        "periods_not_offered": [],
         "rows_written": 0,
     }
+    listing = dict(listing or {})
+    earliest_listed = min(listing) if listing else None
     for period in periods:
         label, key = period_label(period), period_key(period)
+        if earliest_listed is not None and period < earliest_listed:
+            # The SEC no longer offers files this old; recorded, not guessed at.
+            summary["periods_not_offered"].append(label)
+            continue
         if key in existing and not overwrite:
             summary["periods_skipped_existing"] += 1
             continue
         try:
-            url, payload, last_modified = fetch_period(client, period)
+            url, payload, last_modified = fetch_period(
+                client, period, listing.get(period)
+            )
         except SecFetchError as error:
             if (
                 newest_may_be_unpublished
@@ -358,20 +410,23 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import boto3
 
+    client = SecClient()
     summary = run(
         S3ObjectStore(boto3.client("s3"), args.bucket),
-        SecClient(),
+        client,
         periods,
+        listing=fetch_listing(client),
         run_date=today,
         overwrite=overwrite,
         newest_may_be_unpublished=lenient,
     )
     logger.info(
-        "run %s: %d period(s) written, %d skipped, %d unpublished, %d rows",
+        "run %s: %d period(s) written, %d skipped, %d unpublished, %d not offered, %d rows",
         summary["run_id"],
         summary["periods_written"],
         summary["periods_skipped_existing"],
         len(summary["periods_unpublished"]),
+        len(summary["periods_not_offered"]),
         summary["rows_written"],
     )
     return 0

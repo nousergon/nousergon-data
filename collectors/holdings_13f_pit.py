@@ -52,7 +52,7 @@ import os
 import re
 import uuid
 import zipfile
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterator, Iterable, Sequence
 from typing import Any
 
 import pandas as pd
@@ -163,30 +163,49 @@ def list_archives(html: str) -> list[tuple[str, str]]:
 # -- parsing -------------------------------------------------------------------
 
 
-def _read_member(archive: zipfile.ZipFile, name: str) -> pd.DataFrame:
-    members = {
-        member.rsplit("/", 1)[-1].upper(): member for member in archive.namelist()
-    }
-    if name.upper() not in members:
-        raise SourceFormatError(f"archive has no {name} (members: {sorted(members)})")
-    with archive.open(members[name.upper()]) as handle:
-        # Only the needed columns: an INFOTABLE runs to millions of rows, and
-        # the box has 4 GB.
-        wanted = set(REQUIRED_COLUMNS[name])
-        frame = pd.read_csv(
-            handle,
-            sep="\t",
-            dtype=str,
-            keep_default_na=False,
-            na_values=[""],
-            quoting=3,
-            usecols=lambda column: column.strip().upper() in wanted,
-        )
+def _normalise(frame: pd.DataFrame, name: str) -> pd.DataFrame:
     frame.columns = [c.strip().upper() for c in frame.columns]
     missing = [c for c in REQUIRED_COLUMNS[name] if c not in frame.columns]
     if missing:
         raise SourceFormatError(f"{name} is missing required columns {missing}")
     return frame[list(REQUIRED_COLUMNS[name])]
+
+
+def _csv_options(name: str) -> dict[str, Any]:
+    wanted = set(REQUIRED_COLUMNS[name])
+    return {
+        "sep": "\t",
+        "dtype": str,
+        "keep_default_na": False,
+        "na_values": [""],
+        "quoting": 3,
+        "usecols": lambda column: column.strip().upper() in wanted,
+    }
+
+
+def _member(archive: zipfile.ZipFile, name: str) -> str:
+    members = {
+        member.rsplit("/", 1)[-1].upper(): member for member in archive.namelist()
+    }
+    if name.upper() not in members:
+        raise SourceFormatError(f"archive has no {name} (members: {sorted(members)})")
+    return members[name.upper()]
+
+
+def _read_member(archive: zipfile.ZipFile, name: str) -> pd.DataFrame:
+    with archive.open(_member(archive, name)) as handle:
+        return _normalise(pd.read_csv(handle, **_csv_options(name)), name)
+
+
+def _iter_member(
+    archive: zipfile.ZipFile, name: str, chunk_rows: int
+) -> Iterator[pd.DataFrame]:
+    """The member in chunks. An INFOTABLE runs to millions of rows, and the box
+    has 4 GB: read whole, as object strings, it was OOM-killed on 2017q3
+    (2026-10-23, exit 137)."""
+    with archive.open(_member(archive, name)) as handle:
+        for chunk in pd.read_csv(handle, chunksize=chunk_rows, **_csv_options(name)):
+            yield _normalise(chunk, name)
 
 
 def _dates(values: pd.Series) -> pd.Series:
@@ -200,49 +219,36 @@ def _dates(values: pd.Series) -> pd.Series:
     return parsed.dt.date
 
 
-def parse_archive(payload: bytes, label: str) -> tuple[pd.DataFrame, dict[str, Any]]:
-    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
-        submission = _read_member(archive, "SUBMISSION.tsv")
-        cover = _read_member(archive, "COVERPAGE.tsv")
-        info = _read_member(archive, "INFOTABLE.tsv")
-    submission = submission.assign(
-        filing_date=_dates(submission["FILING_DATE"]),
-        period_of_report=_dates(submission["PERIODOFREPORT"]),
-    )
-    bad = submission["filing_date"].isna() | submission["period_of_report"].isna()
-    if bad.sum() > max(1, MAX_BAD_DATE_FRACTION * len(submission)):
-        raise SourceFormatError(
-            f"{label}: {int(bad.sum())} submissions have an unreadable date"
-        )
-    submission = submission[~bad]
-    merged = info.merge(submission, on="ACCESSION_NUMBER", how="inner").merge(
-        cover.drop_duplicates("ACCESSION_NUMBER"), on="ACCESSION_NUMBER", how="left"
-    )
+_TEXT = "string[pyarrow]"
+CHUNK_ROWS = 250_000
+
+
+def _text(values: pd.Series, *, upper: bool = False) -> pd.Series:
+    out = values.fillna("").str.strip() if upper else values
+    if upper:
+        out = out.str.upper()
+    return out.astype(_TEXT)
+
+
+def _holdings(merged: pd.DataFrame, label: str) -> pd.DataFrame:
     value_raw = pd.to_numeric(merged["VALUE"], errors="coerce")
     in_thousands = merged["filing_date"] < VALUE_IN_DOLLARS_FROM
-    out = pd.DataFrame(
+    return pd.DataFrame(
         {
-            "accession": merged["ACCESSION_NUMBER"].astype("string"),
+            "accession": merged["ACCESSION_NUMBER"].astype(_TEXT),
             "filing_date": merged["filing_date"],
             "period_of_report": merged["period_of_report"],
             "filer_cik": pd.to_numeric(merged["CIK"], errors="coerce").astype("Int64"),
-            "submission_type": merged["SUBMISSIONTYPE"]
-            .str.strip()
-            .str.upper()
-            .astype("string"),
+            "submission_type": _text(merged["SUBMISSIONTYPE"], upper=True),
             "is_amendment": merged["ISAMENDMENT"]
             .fillna("")
             .str.strip()
             .str.upper()
             .eq("Y"),
-            "amendment_type": merged["AMENDMENTTYPE"]
-            .fillna("")
-            .str.strip()
-            .str.upper()
-            .astype("string"),
-            "cusip": merged["CUSIP"].str.strip().str.upper().astype("string"),
-            "issuer_name": merged["NAMEOFISSUER"].astype("string"),
-            "title_of_class": merged["TITLEOFCLASS"].astype("string"),
+            "amendment_type": _text(merged["AMENDMENTTYPE"], upper=True),
+            "cusip": _text(merged["CUSIP"], upper=True),
+            "issuer_name": merged["NAMEOFISSUER"].astype(_TEXT),
+            "title_of_class": merged["TITLEOFCLASS"].astype(_TEXT),
             "value_usd": (
                 value_raw * in_thousands.map({True: 1000.0, False: 1.0})
             ).astype("float64"),
@@ -250,39 +256,59 @@ def parse_archive(payload: bytes, label: str) -> tuple[pd.DataFrame, dict[str, A
             "shares": pd.to_numeric(merged["SSHPRNAMT"], errors="coerce").astype(
                 "float64"
             ),
-            "shares_type": merged["SSHPRNAMTTYPE"]
-            .fillna("")
-            .str.strip()
-            .str.upper()
-            .astype("string"),
-            "put_call": merged["PUTCALL"]
-            .fillna("")
-            .str.strip()
-            .str.upper()
-            .astype("string"),
-            "investment_discretion": merged["INVESTMENTDISCRETION"]
-            .fillna("")
-            .str.strip()
-            .str.upper()
-            .astype("string"),
-            "archive": label,
+            "shares_type": _text(merged["SSHPRNAMTTYPE"], upper=True),
+            "put_call": _text(merged["PUTCALL"], upper=True),
+            "investment_discretion": _text(merged["INVESTMENTDISCRETION"], upper=True),
+            "archive": pd.Series(label, index=merged.index, dtype=_TEXT),
             "schema_version": SCHEMA_VERSION,
         }
     )
+
+
+def parse_archive(
+    payload: bytes, label: str, *, chunk_rows: int = CHUNK_ROWS
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        submission = _read_member(archive, "SUBMISSION.tsv")
+        cover = _read_member(archive, "COVERPAGE.tsv")
+        submission = submission.assign(
+            filing_date=_dates(submission["FILING_DATE"]),
+            period_of_report=_dates(submission["PERIODOFREPORT"]),
+        )
+        bad = submission["filing_date"].isna() | submission["period_of_report"].isna()
+        if bad.sum() > max(1, MAX_BAD_DATE_FRACTION * len(submission)):
+            raise SourceFormatError(
+                f"{label}: {int(bad.sum())} submissions have an unreadable date"
+            )
+        submission = submission[~bad]
+        cover = cover.drop_duplicates("ACCESSION_NUMBER")
+        parts: list[pd.DataFrame] = []
+        info_rows = 0
+        for info in _iter_member(archive, "INFOTABLE.tsv", chunk_rows):
+            info_rows += len(info)
+            merged = info.merge(submission, on="ACCESSION_NUMBER", how="inner").merge(
+                cover, on="ACCESSION_NUMBER", how="left"
+            )
+            parts.append(_holdings(merged, label))
+            del info, merged
+    if not parts:
+        raise SourceFormatError(f"{label}: INFOTABLE has no rows")
+    out = pd.concat(parts, ignore_index=True)
+    del parts
     first, last = archive_span(label)
-    outside = out[(out["filing_date"] < first) | (out["filing_date"] > last)]
-    if len(outside) > MAX_BAD_DATE_FRACTION * max(len(out), 1):
+    outside = int(((out["filing_date"] < first) | (out["filing_date"] > last)).sum())
+    if outside > MAX_BAD_DATE_FRACTION * max(len(out), 1):
         raise SourceFormatError(
-            f"{label}: {len(outside)} rows filed outside {first}..{last}"
+            f"{label}: {outside} rows filed outside {first}..{last}"
         )
     out = out.sort_values(["filing_date", "accession", "cusip"]).reset_index(drop=True)
     stats = {
         "submissions": int(len(submission)),
         "submissions_bad_date": int(bad.sum()),
-        "infotable_rows": int(len(info)),
+        "infotable_rows": int(info_rows),
         "rows": int(len(out)),
-        "rows_unmatched": int(len(info) - len(out)),
-        "rows_outside_window": int(len(outside)),
+        "rows_unmatched": int(info_rows - len(out)),
+        "rows_outside_window": outside,
     }
     return out[list(ROW_COLUMNS)], stats
 
