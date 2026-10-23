@@ -140,7 +140,7 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # scheduled, like trigger_observation.py; REGISTERED once a run first writes.
     "data_gate/producers/pages_monthly.py": 1,
     # alpha-engine-config-I11076 (option A) — the daily corporate-action scan
-    # manifest, s3://alpha-engine-research/corporate_actions/scans/{D}.json,
+    # manifest, corporate_actions/scans/{D}.json in the research bucket,
     # written by MorningEnrich for today's session and the enriched one. Read
     # by crucible-trader's reconciler; its absence already degrades loud there
     # (every holding is reported unchecked). The ARTIFACT_REGISTRY row rides
