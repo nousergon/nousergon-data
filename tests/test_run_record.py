@@ -92,10 +92,10 @@ def test_write_run_record_rejects_an_unknown_status():
         )
 
 
-def test_write_run_record_keys_by_the_finished_date_not_started():
+def test_write_run_record_keys_by_the_started_date_not_finished():
     """A run that starts just before midnight UTC and finishes just after is
-    keyed by when it actually FINISHED — the terminal outcome is what a
-    reader wants for that day."""
+    keyed by when it STARTED — the key names the scheduled fire, and the
+    finish is a measurement of it (alpha-engine-config-I11077)."""
     s3 = _FakeS3()
     started = dt.datetime(2026, 9, 18, 23, 59, 0, tzinfo=UTC)
     finished = dt.datetime(2026, 9, 19, 0, 1, 0, tzinfo=UTC)
@@ -107,4 +107,34 @@ def test_write_run_record_keys_by_the_finished_date_not_started():
         started_at=started,
         finished_at=finished,
     )
-    assert key == "data_collection/runs/v1_data_stage/2026-09-19.json"
+    assert key == "data_collection/runs/v1_data_stage/2026-09-18.json"
+
+
+def test_two_jobs_of_one_run_share_a_key_when_one_crosses_midnight():
+    """The measured 2026-09-18 first scheduled run, replayed: both jobs
+    started within seconds of 23:57Z; `v1_data_stage` took 0.44 s and
+    `executor_profile` 747.5 s, finishing at 00:10Z the next day. Both
+    records must land under ONE date, so "both producers wrote {date}" is
+    checkable against a single key."""
+    s3 = _FakeS3()
+    k1 = m.write_run_record(
+        s3, bucket="alpha-engine-research", producer="v1_data_stage", status="ok",
+        started_at=dt.datetime(2026, 9, 18, 23, 57, 49, tzinfo=UTC),
+        finished_at=dt.datetime(2026, 9, 18, 23, 57, 50, tzinfo=UTC),
+    )
+    k2 = m.write_run_record(
+        s3, bucket="alpha-engine-research", producer="executor_profile", status="ok",
+        started_at=dt.datetime(2026, 9, 18, 23, 57, 45, tzinfo=UTC),
+        finished_at=dt.datetime(2026, 9, 19, 0, 10, 12, tzinfo=UTC),
+    )
+    assert k1.rsplit("/", 1)[1] == k2.rsplit("/", 1)[1] == "2026-09-18.json"
+
+
+def test_a_naive_started_at_is_read_as_utc_for_the_key():
+    s3 = _FakeS3()
+    key = m.write_run_record(
+        s3, bucket="alpha-engine-research", producer="v1_data_stage", status="ok",
+        started_at=dt.datetime(2026, 9, 18, 23, 59, 0),
+        finished_at=dt.datetime(2026, 9, 19, 0, 1, 0, tzinfo=UTC),
+    )
+    assert key == "data_collection/runs/v1_data_stage/2026-09-18.json"
