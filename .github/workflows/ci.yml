@@ -105,7 +105,13 @@ jobs:
             https://raw.githubusercontent.com/nousergon/nousergon-lib/main/scripts/hardcoded_env_refs.py
           python3 "$RUNNER_TEMP/hardcoded_env_refs.py" --repo .
 
-  test:
+  # config-I11309: the heavy suite and the lambda handler suites run as two
+  # PARALLEL jobs (they share no state: every handler suite installs its own
+  # deps into a private --target dir), and `test` below is the aggregator that
+  # keeps the single `test` status context every consumer already knows. The
+  # lambda glob step used to run serially after `Run tests` inside this job
+  # (~4m40s of a ~24m critical path, measured on main run 39926510529).
+  unit-tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -153,7 +159,38 @@ jobs:
         run: |
           python3 infrastructure/lambdas/_shared/test_terminate_coverage.py
 
-      # config#1759: the two suites above were the ONLY lambda handler tests
+      - name: Security audit
+        run: |
+          pip install pip-audit
+          IGNORE_ARGS=()
+          if [ -f .github/pip-audit-ignore.txt ]; then
+            while IFS= read -r vuln_id; do
+              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
+            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
+          fi
+          pip-audit "${IGNORE_ARGS[@]}"
+
+  lambda-handler-tests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7
+        with:
+          python-version: "3.12"
+
+      # Same interpreter environment the glob step had inside the old single
+      # `test` job, so a handler suite that leaned on a globally installed
+      # package (on top of its private --target deps) sees no difference.
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov pytest-xdist "moto[s3]"
+
+      # config#1759: the two suites in `unit-tests` (changelog lambda tests,
+      # shared lambda guard tests) were the ONLY lambda handler tests
       # that ran pre-merge — every other infrastructure/lambdas/*/test_handler.py
       # (groom-liveness-probe, freshness-monitor, scheduled-groom-dispatcher,
       # etc.) executed for the first time inside each deploy-*.yml's deploy.sh
@@ -209,16 +246,21 @@ jobs:
           done
           exit $fail
 
-      - name: Security audit
+  # The required `test` context. It passes only when BOTH halves passed: a
+  # skipped, cancelled or failed half fails it, so splitting the job cannot
+  # let a red handler suite merge under a green `test`.
+  test:
+    needs: [unit-tests, lambda-handler-tests]
+    if: ${{ always() }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Both halves succeeded
+        env:
+          UNIT: ${{ needs.unit-tests.result }}
+          LAMBDA: ${{ needs.lambda-handler-tests.result }}
         run: |
-          pip install pip-audit
-          IGNORE_ARGS=()
-          if [ -f .github/pip-audit-ignore.txt ]; then
-            while IFS= read -r vuln_id; do
-              IGNORE_ARGS+=(--ignore-vuln "$vuln_id")
-            done < <(grep -vE '^\s*#|^\s*$' .github/pip-audit-ignore.txt)
-          fi
-          pip-audit "${IGNORE_ARGS[@]}"
+          echo "unit-tests=$UNIT lambda-handler-tests=$LAMBDA"
+          [ "$UNIT" = success ] && [ "$LAMBDA" = success ]
 
   # Alert (Telegram) ONLY on genuine post-merge breakage of the default
   # branch. PR-branch reds (mid-fix commits, cross-repo lib-tag merge-order
