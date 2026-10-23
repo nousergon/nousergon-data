@@ -42,3 +42,26 @@ The trading day's bar was fetched ~16:06 ET, about 1.5 hours before the consolid
 - ArcticDB — and therefore crucible-predictor — is NOT affected beyond a single overnight. weekly_collector._should_skip_morning_enrich skips only when target_date < arctic_last_date, so the D+1 07:30 ET Polygon T+1 overwrite always runs and restores the settled row. Exposure is bounded at roughly 16:06 ET on D to 07:30 ET on D+1.
 - Known readers of the dated feature-store artifacts, measured 2026-09-22: crucible-research scoring/factor_scoring.py, scoring/universe_board.py, data/fetchers/feature_store_reader.py, data/scanner_orchestrator.py; crucible-dashboard views/13_Feature_Store.py (display only).
 - A remediation, if it is ever ruled, must rewrite the affected dated prefixes from the settled price cache AND write a backfilled_at marker beside each rewritten prefix — a re-derived artifact that is indistinguishable from an original one destroys the reproducibility of every run that read the original.
+
+## `rag-rehearsal-ingest-timestamp-2026-10-16`
+
+15 RAG documents (103 chunks) in the production pgvector corpus were stored by weekly-SF rehearsal rehearsal-2026-10-16-1, not by a production run, so their rag.documents.ingested_at names the rehearsal's window (2026-10-16 ~13:50-14:02Z) instead of a production ingestion. The content is genuine EDGAR data and filed_date is each filing's own date; only the ingest timestamp is misattributed.
+
+| | |
+|---|---|
+| **Affected dates** | 2026-10-16 through 2026-10-16 |
+| **Artifacts** | `rag/manifest/{date}.json`<br>`rag/parquet/doc_type={doc_type}/filed_date={filed_date}/{document_id}.parquet` |
+| **documents** | 15 |
+| **chunks** | 103 |
+| **by doc_type** | 10-Q 2, 8-K 11, 13F 2 |
+| **parquet mirror writes** | 2026-10-16 13:53-14:00Z |
+| **duplicates** | 0 (dedup key ticker, doc_type, filed_date, source) |
+| **manifest 2026-10-16 bucket, filings (docs/chunks)** | 10-Q 2/56, 8-K 11/45, 13F 2/2: exactly these 15 rows (re-read 2026-10-23 from rag/manifest/2026-10-16.json); the bucket's news rows are not affected |
+| **Evidence** | nousergon/alpha-engine-config#12375 comments of 2026-10-17 and 2026-10-18 (read-only measurement; doc ids, chunk counts and the 15 rag/parquet mirror objects' ETags and VersionIds), and the rag/manifest/2026-10-16.json by_date_source row for 2026-10-16 |
+| **Disposition** | `no_remediation` — ruled by Brian on 2026-10-22 |
+| **Re-exam trigger** | The first time a GRADED result or an alert depends on per-ingestion-date corpus counts (manifest by_date_source, RAG source yield or the weekly RAG verdict) over 2026-10-16, or the corpus is migrated or re-ingested into another store, at which point these rows can be re-stamped or tagged rather than copied with the rehearsal timestamp. |
+
+- Ruling: Brian, 2026-10-22 23:11Z, 'Keep' (nousergon/alpha-engine-config#12375): the 15 rows stay, with zero writes and no cleanup. The cleanup script (red line 4) was never run. Known and accepted: ingested_at names a rehearsal window, and the 2026-10-17 production manifest count includes the 15.
+- Forward fix: nousergon-data#2191 (merged 2026-10-18) forces --dry-run for every ingest step under RUN_TOKEN=rehearsal-*, and #2250 (merged 2026-10-22) stops the launcher heartbeat. Proven live on rehearsal-2026-10-22-1: RAGIngestion succeeded with the rag/manifest, rag/filing_changes and rag/corpus_freshness latest VersionIds unchanged. This window is the residue those fixes cannot reach.
+- No duplicates and no lost filings: Saturday 2026-10-17's production RAGIngestion found all 15 already held and skipped them, so the corpus holds each filing once. Only max(ingested_at) per doc_type and the per-date counts are affected: the 15 sit in the 2026-10-16 bucket rather than the 2026-10-17 one a production run would have given them.
+- The 15 rows (document id, ticker, doc_type, source, filed_date, chunks): a310ea26-1485-41a8-986b-d549dd08f761 CTAS 10-Q sec_edgar 2026-10-07 23; 4e44ae0d-4d70-418c-992f-5873d0fe1498 TRV 10-Q sec_edgar 2026-10-16 33; fd2c50e5-7b07-4778-a41d-2e4b93d0b209 BX 8-K sec_edgar 2026-10-15 2; ea99f3a0-5d9a-4af0-9e39-ba5540ff1f2f COST 8-K sec_edgar 2026-10-14 2; d86d67bb-241f-47d3-86b9-adeea40d5ff1 CTAS 8-K sec_edgar 2026-10-06 9; e5c966f6-a817-4154-8dc2-f55f4f93ddff CTAS 8-K sec_edgar 2026-09-23 2; c8052fce-9860-4188-ad29-b26012b38f63 IBKR 8-K sec_edgar 2026-10-15 2; 3c200691-6ac8-4bc0-b128-c97c0889f0f6 IONQ 8-K sec_edgar 2026-10-13 6; 295647b7-0fa6-4d94-bd27-fc9ea602e153 JPM 8-K sec_edgar 2026-10-13 4; 263fcf3f-36a0-46dd-8080-433b25ed7cc6 LNTH 8-K sec_edgar 2026-10-14 4; 1016dc33-66eb-4c8b-9d48-5ff1cb676746 RKLB 8-K sec_edgar 2026-10-14 3; 9dc5b366-8f2a-4b72-af8b-a4bec7060064 TRV 8-K sec_edgar 2026-10-16 3; a89ea365-b4b0-4694-a439-ea21afbe8325 VAL 8-K sec_edgar 2026-10-14 8; 7aa5801a-afd8-4bbb-b4ac-2154bece1ed4 NOW 13F sec_13f_bulk 2026-03-31 1; 6e007516-128f-4cdb-926d-36932b71e45f VLTO 13F sec_13f_bulk 2026-03-31 1.
