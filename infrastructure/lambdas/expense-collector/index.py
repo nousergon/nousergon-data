@@ -890,6 +890,120 @@ def collect_aws_daily_by_system(s3, now: datetime) -> dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# cost_allocation.v1 (alpha-engine-config-I12026, producer slice 1)
+# ---------------------------------------------------------------------------
+#
+# Consumer: crucible `crucible/cost_allocation.py::CostAllocation` and
+# `crucible/schemas/cost_allocation.v1.json` (pinned here as
+# fixtures/cost_allocation.v1.schema.json). Phase 4 grades the scope
+# COST_ALLOCATION_SCOPE = harness + trader + allocated shared services.
+#
+# This slice emits the record from the series above ONLY: no new billing read,
+# no Cost Explorer call. What that series can attribute, it attributes; what it
+# cannot, it says. Today that means:
+#
+# * harness: every `system` tag value in COST_ALLOCATION_HARNESS_SYSTEMS, as
+#   a direct member of the canonical scope;
+# * trader: NOT COVERED. The trader host carries no `system` tag and the
+#   billing export has no resource ids (INCLUDE_RESOURCES=FALSE), so its cost
+#   sits inside the untagged remainder and cannot be separated from it;
+# * shared (storage, logs, CloudTrail, commitments, tax, credits): NOT COVERED,
+#   for the same reason;
+# * every other tagged system: a direct `other` member under its own scope;
+# * the untagged remainder: `unallocated`, never assigned to anyone.
+#
+# So `inventory_complete` is false and `covered_components` is ["harness"],
+# and the consumer refuses the record exactly as it refuses an absent one:
+# phase 4 stays UNMEASURABLE, now with the reason on the record. Each day's
+# members still conserve that day's account total, so the record is already
+# the ledger the later slices refine.
+
+COST_ALLOCATION_SCHEMA = "cost_allocation.v1"
+COST_ALLOCATION_SCOPE = "crucible-and-trader"
+COST_ALLOCATION_HARNESS_SYSTEMS = ("crucible-v2",)
+COST_ALLOCATION_UNALLOCATED_SCOPE = "unallocated"
+COST_ALLOCATION_INVENTORY_EVIDENCE = (
+    "billing_export daily_by_system only (alpha-engine-config-I12026 slice 1): harness = "
+    "system tag in COST_ALLOCATION_HARNESS_SYSTEMS; trader host carries no system tag and the "
+    "export has no resource ids, so trader cost is inside the untagged remainder; shared "
+    "services (storage, logs, CloudTrail, commitments, tax, credits) are not yet allocated; "
+    "untagged remainder published as unallocated"
+)
+
+
+def _system_scope(system: str) -> str:
+    return f"system:{system}"
+
+
+def build_cost_allocation(series: dict) -> dict:
+    """The ``cost_allocation.v1`` record for one ``daily_by_system`` series.
+
+    One member per (day, system): the canonical-scope ``harness`` member for a
+    harness system, a ``direct`` ``other`` member for any other tagged system,
+    and an ``unallocated`` member for the untagged remainder. A day with no
+    billed rows carries one evidenced zero ``unallocated`` member, because a
+    day needs a member to state that it was read. Each day's ``account_usd``
+    is the exact sum of that day's series, so the members conserve it.
+
+    Raises ``ValueError`` on a non-finite amount or a repeated day: a
+    record that cannot reconcile is not published.
+    """
+    import math
+
+    tag_key = series.get("tag_key") or SPEND_TAG_KEY
+    untagged = series.get("untagged_key") or UNTAGGED_SYSTEM
+    days_out = []
+    scopes = {COST_ALLOCATION_SCOPE}
+    seen_days: set[str] = set()
+    for day in series.get("days") or []:
+        date_s = day["date"]
+        if date_s in seen_days:
+            raise ValueError(f"daily_by_system repeats {date_s}")
+        seen_days.add(date_s)
+        by_system = day.get("by_system_usd") or {}
+        members = []
+        for system, usd in sorted(by_system.items()):
+            usd = float(usd)
+            if not math.isfinite(usd):
+                raise ValueError(f"daily_by_system {date_s} carries a non-finite amount")
+            evidence = f"billing_export daily_by_system {date_s} {tag_key}={system}"
+            if system == untagged:
+                member = {"id": f"unallocated:{system}", "scope": COST_ALLOCATION_UNALLOCATED_SCOPE,
+                          "component": "unallocated", "kind": "unallocated"}
+            elif system in COST_ALLOCATION_HARNESS_SYSTEMS:
+                member = {"id": f"harness:{system}", "scope": COST_ALLOCATION_SCOPE,
+                          "component": "harness", "kind": "direct"}
+            else:
+                member = {"id": f"other:{system}", "scope": _system_scope(system),
+                          "component": "other", "kind": "direct"}
+            member.update({"usd": usd, "evidence": evidence})
+            scopes.add(member["scope"])
+            members.append(member)
+        if not members:
+            members.append({
+                "id": "unallocated:no-billed-rows", "scope": COST_ALLOCATION_UNALLOCATED_SCOPE,
+                "component": "unallocated", "kind": "unallocated", "usd": 0.0,
+                "evidence": f"billing_export daily_by_system {date_s}: no billed rows",
+            })
+            scopes.add(COST_ALLOCATION_UNALLOCATED_SCOPE)
+        days_out.append({
+            "date": date_s,
+            "account_usd": math.fsum(float(v) for v in by_system.values()),
+            "members": members,
+        })
+    if not days_out:
+        raise ValueError("daily_by_system has no days to allocate")
+    return {
+        "schema_version": COST_ALLOCATION_SCHEMA,
+        "inventory_complete": False,
+        "inventory_evidence": COST_ALLOCATION_INVENTORY_EVIDENCE,
+        "covered_components": ["harness"],
+        "declared_scopes": sorted(scopes),
+        "days": days_out,
+    }
+
+
 def _newest_posted_day(s3, now: datetime) -> str | None:
     """The newest usage day in the open period carrying real usage (line type
     ``Usage``), before today."""
@@ -940,6 +1054,16 @@ def _attach_daily_by_system(row: dict, s3, now: datetime) -> None:
     except Exception as exc:  # noqa: BLE001 — recorded on the row, see docstring
         logger.info("billing-export daily-by-system unavailable: %s", exc)
         row["detail"]["daily_by_system_error"] = f"{type(exc).__name__}: {exc}"[:300]
+        return
+    # alpha-engine-config-I12026: the allocation record rides the same row,
+    # so it is written atomically with the series it allocates. A failure
+    # degrades only this optional field; its consumer reads absence as
+    # UNMEASURABLE, never as a cheaper scope.
+    try:
+        row["detail"]["cost_allocation"] = build_cost_allocation(row["detail"]["daily_by_system"])
+    except Exception as exc:  # noqa: BLE001 — recorded on the row, see above
+        logger.info("cost_allocation unavailable: %s", exc)
+        row["detail"]["cost_allocation_error"] = f"{type(exc).__name__}: {exc}"[:300]
 
 
 def collect_aws(mw: dict, budgets: dict, s3=None) -> dict:
