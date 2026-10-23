@@ -222,3 +222,10 @@ def test_the_dispatcher_exposes_the_backfill_workload() -> None:
     ).read_text()
     assert '"institutional-holdings-pit-backfill"' in source
     assert "python -m collectors.holdings_13f_pit backfill --start 2016-01-01" in source
+
+
+def test_chunked_reading_gives_the_same_rows() -> None:
+    whole, _ = m.parse_archive(_zip(), "01oct2022-28feb2023")
+    chunked, stats = m.parse_archive(_zip(), "01oct2022-28feb2023", chunk_rows=1)
+    assert stats["infotable_rows"] == 3
+    pd.testing.assert_frame_equal(whole, chunked)

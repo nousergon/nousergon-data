@@ -165,3 +165,34 @@ def test_the_dispatcher_exposes_the_backfill_workload() -> None:
     assert (
         "python -m collectors.fails_to_deliver_pit backfill --start 201601a" in source
     )
+
+
+_LISTING = """
+<a href="/files/data/fails-deliver-data/cnsfails202402a.zip">Feb 2024 a</a>
+<a href="https://www.sec.gov/files/data/fails-deliver-data/cnsfails202402b_0.zip">b</a>
+<a href="/files/data/fails-deliver-data/cnsfails201707a.zip">Jul 2017 a</a>
+"""
+
+
+def test_the_index_page_link_is_used_and_older_periods_are_recorded_as_not_offered() -> (
+    None
+):
+    listing = m.parse_listing(_LISTING)
+    assert listing[(2024, 2, "b")].endswith("cnsfails202402b_0.zip")
+    assert listing[(2017, 7, "a")].startswith("https://www.sec.gov/files/")
+    b = (2024, 2, "b")
+    text_b = "\n".join(
+        ["|".join(m.HEADER), "20240220|037833100|AAPL|900|APPLE INC|182.00"]
+    )
+    client = _Client({listing[b]: _zip(text=text_b)})
+    summary = m.run(
+        _Store(),
+        client,
+        [(2016, 1, "a"), b],
+        run_date=dt.date(2026, 10, 23),
+        overwrite=False,
+        newest_may_be_unpublished=False,
+        listing=listing,
+    )
+    assert summary["periods_not_offered"] == ["201601a"]
+    assert client.urls[0] == listing[b]
