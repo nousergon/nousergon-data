@@ -18,6 +18,10 @@
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --smoke     # invoke once with a synthetic SUCCEEDED event
+#
+# iam-policy.json `WeeklyRunReportRead` (alpha-engine-config-I12630): read-only
+# GetObject on the weekly issue report's sources (Director plan/retro/ledger,
+# _stage_outputs, _stage_coverage, health, resolutions overlay). Goes live via --apply-iam.
 
 set -euo pipefail
 
