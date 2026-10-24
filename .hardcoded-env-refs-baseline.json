@@ -4,7 +4,7 @@
   "tracker": "alpha-engine-config-I12492",
   "note": "Shrink-only ceiling of hard-coded account/bucket literals per file. Never raise an entry; lower it with `python3 hardcoded_env_refs.py --repo . --update` when a literal is removed.",
   "totals": {
-    "account_hits": 791,
+    "account_hits": 790,
     "account_files": 204,
     "bucket_hits": 950,
     "bucket_files": 430,
@@ -912,7 +912,7 @@
       "bucket": 3
     },
     "infrastructure/step_function_eod_reconcile.json": {
-      "account": 20,
+      "account": 19,
       "bucket": 3
     },
     "infrastructure/step_function_groom.json": {

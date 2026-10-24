@@ -1,0 +1,145 @@
+{
+  "$defs": {
+    "AllocationDay": {
+      "additionalProperties": false,
+      "description": "Member amounts must reconcile to the account, not just to the scope.",
+      "properties": {
+        "date": {
+          "format": "date",
+          "title": "Date",
+          "type": "string"
+        },
+        "account_usd": {
+          "title": "Account Usd",
+          "type": "number"
+        },
+        "members": {
+          "items": {
+            "$ref": "#/$defs/AllocationMember"
+          },
+          "minItems": 1,
+          "title": "Members",
+          "type": "array"
+        }
+      },
+      "required": [
+        "date",
+        "account_usd",
+        "members"
+      ],
+      "title": "AllocationDay",
+      "type": "object"
+    },
+    "AllocationMember": {
+      "additionalProperties": false,
+      "description": "One accountable part of the provider ledger, including shared services.",
+      "properties": {
+        "id": {
+          "minLength": 1,
+          "title": "Id",
+          "type": "string"
+        },
+        "scope": {
+          "minLength": 1,
+          "title": "Scope",
+          "type": "string"
+        },
+        "component": {
+          "enum": [
+            "harness",
+            "trader",
+            "shared",
+            "other",
+            "unallocated"
+          ],
+          "title": "Component",
+          "type": "string"
+        },
+        "kind": {
+          "enum": [
+            "direct",
+            "shared",
+            "unallocated"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "usd": {
+          "title": "Usd",
+          "type": "number"
+        },
+        "evidence": {
+          "minLength": 1,
+          "title": "Evidence",
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "scope",
+        "component",
+        "kind",
+        "usd",
+        "evidence"
+      ],
+      "title": "AllocationMember",
+      "type": "object"
+    }
+  },
+  "additionalProperties": false,
+  "description": "Coverage is explicit; an unknown share never makes a component cheaper.",
+  "properties": {
+    "schema_version": {
+      "const": "cost_allocation.v1",
+      "title": "Schema Version",
+      "type": "string"
+    },
+    "inventory_complete": {
+      "title": "Inventory Complete",
+      "type": "boolean"
+    },
+    "inventory_evidence": {
+      "minLength": 1,
+      "title": "Inventory Evidence",
+      "type": "string"
+    },
+    "covered_components": {
+      "items": {
+        "enum": [
+          "harness",
+          "trader",
+          "shared"
+        ],
+        "type": "string"
+      },
+      "title": "Covered Components",
+      "type": "array"
+    },
+    "declared_scopes": {
+      "items": {
+        "type": "string"
+      },
+      "minItems": 1,
+      "title": "Declared Scopes",
+      "type": "array"
+    },
+    "days": {
+      "items": {
+        "$ref": "#/$defs/AllocationDay"
+      },
+      "minItems": 1,
+      "title": "Days",
+      "type": "array"
+    }
+  },
+  "required": [
+    "schema_version",
+    "inventory_complete",
+    "inventory_evidence",
+    "covered_components",
+    "declared_scopes",
+    "days"
+  ],
+  "title": "CostAllocation",
+  "type": "object"
+}

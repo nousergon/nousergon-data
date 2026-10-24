@@ -7,9 +7,29 @@ starts 2021-06. The SEC's fails-to-deliver files go back to 2004.
 
 Source: one zip per half month, published by the SEC's Division of Trading and
 Markets and served from `DATASET_URLS`, tried in order with a 404 moving on to
-the next. The `a` file covers settlement dates on the 1st to the 15th and the
-`b` file the 16th to month end. Each zip holds one pipe-delimited text file.
-Some zips name it with no `.txt` extension, so any single member is read.
+the next. The `a` file is the first half of the month and the `b` file the
+second. Each zip holds one pipe-delimited text file. Some zips name it with no
+`.txt` extension, so any single member is read.
+
+Which rows a half-month file holds (the declared edge rule). The SEC states
+the files' release schedule and that each row is the fails balance "as of a
+particular settlement date" in NSCC's CNS system. It does NOT say that a file
+holds exactly the settlement dates of its nominal half, and the files do not:
+a settlement day on the edge of a half can be published in the neighbouring
+file (the files are assembled from NSCC's daily CNS reports, not cut by the
+SETTLEMENT DATE column). Measured 2026-10-23:
+`201601a` holds 2016-01-04..2016-01-14 and no 2016-01-15, and `201601b` holds
+5,990 rows outside 2016-01-16..2016-01-31, one settlement day's worth (about
+5,900 per day in `201601a`). Such rows are KEPT with their real settlement
+date and counted per file in the run record (`rows_outside_period`,
+`settlement_dates_outside_period`). A row that settles more than
+`PERIOD_EDGE_DAYS` calendar days outside its nominal half is not an edge day:
+it means the SEC served a different period's file, and the run stops. Rows
+with an unreadable date or quantity still stop the run, as before. An edge
+day is stored in the file that published it, under that file's `period` and
+`known_at`; a consumer must read `known_at`, never the settlement date, as the
+knowledge time, and must not assume a settlement date lives in its nominal
+half's file.
 
 Layout: `SETTLEMENT DATE|CUSIP|SYMBOL|QUANTITY (FAILS)|DESCRIPTION|PRICE`,
 latin-1 text. The header comes first and trailer lines may follow. A PRICE of
@@ -87,6 +107,12 @@ HEADER = (
 #: Descriptions are known to carry a stray "|" (e.g. "BAM| ENTMT INC"), so a
 #: line with SEVEN fields is repaired by re-joining the description.
 MAX_MALFORMED_FRACTION = 0.001
+#: Calendar days a row may settle outside its file's nominal half (the
+#: declared edge rule in the module docstring). One business day across a
+#: weekend and a market holiday is at most four calendar days; the fifth is
+#: margin. Rows inside this edge are kept and counted, rows past it stop the
+#: run as a wrong file.
+PERIOD_EDGE_DAYS = 5
 #: Days after the SEC's stated schedule before a half month counts as known.
 KNOWN_AT_DAY = {"a": 7, "b": 22}
 
@@ -155,6 +181,14 @@ def period_bounds(period: Period) -> tuple[dt.date, dt.date]:
     return dt.date(year, month, 16), nxt - dt.timedelta(days=1)
 
 
+def outside_period(frame: pd.DataFrame, period: Period) -> dict[str, int]:
+    """{ISO settlement date: rows} for rows that settle outside the nominal half."""
+    first, last = period_bounds(period)
+    dates = frame["settlement_date"]
+    counts = dates[(dates < first) | (dates > last)].value_counts()
+    return {day.isoformat(): int(n) for day, n in sorted(counts.items())}
+
+
 def last_known_period(today: dt.date) -> Period:
     """The newest half month whose `known_at` is before today."""
     year, month = today.year, today.month
@@ -212,7 +246,6 @@ def parse_file(text: str, period: Period) -> tuple[pd.DataFrame, int]:
         raise SourceFormatError(
             f"{period_label(period)}: {int(bad.sum())} rows have an unreadable date or quantity"
         )
-    first, last = period_bounds(period)
     out = pd.DataFrame(
         {
             "settlement_date": settlement.dt.date,
@@ -226,10 +259,14 @@ def parse_file(text: str, period: Period) -> tuple[pd.DataFrame, int]:
             "schema_version": SCHEMA_VERSION,
         }
     )[~bad.to_numpy()]
-    outside = out[(out["settlement_date"] < first) | (out["settlement_date"] > last)]
-    if not outside.empty:
+    first, last = period_bounds(period)
+    edge = dt.timedelta(days=PERIOD_EDGE_DAYS)
+    far = (out["settlement_date"] < first - edge) | (out["settlement_date"] > last + edge)
+    if far.any():
         raise SourceFormatError(
-            f"{period_label(period)}: {len(outside)} row(s) settle outside {first}..{last}"
+            f"{period_label(period)}: {int(far.sum())} row(s) settle more than "
+            f"{PERIOD_EDGE_DAYS} days outside {first}..{last}; not an edge day, "
+            "so this is not that half month's file"
         )
     out = out.sort_values(["settlement_date", "cusip"]).reset_index(drop=True)
     return out[list(ROW_COLUMNS)], malformed + int(bad.sum())
@@ -323,6 +360,7 @@ def run(
         "periods_unpublished": [],
         "periods_not_offered": [],
         "rows_written": 0,
+        "rows_outside_period": 0,
     }
     listing = dict(listing or {})
     earliest_listed = min(listing) if listing else None
@@ -350,9 +388,12 @@ def run(
                 continue
             raise
         frame, malformed = parse_file(_member_text(payload), period)
+        edge_days = outside_period(frame, period)
         store.put_bytes(key, _to_parquet(frame), "application/octet-stream")
         summary["periods"][label] = {
             "rows": len(frame),
+            "rows_outside_period": sum(edge_days.values()),
+            "settlement_dates_outside_period": edge_days,
             "lines_not_data": malformed,
             "source_url": url,
             "last_modified": last_modified,
@@ -360,7 +401,13 @@ def run(
         }
         summary["periods_written"] += 1
         summary["rows_written"] += len(frame)
-        logger.info("%s: %d rows", label, len(frame))
+        summary["rows_outside_period"] += sum(edge_days.values())
+        logger.info(
+            "%s: %d rows, %d settling on an edge day outside the half",
+            label,
+            len(frame),
+            sum(edge_days.values()),
+        )
     summary["finished_at"] = dt.datetime.now(dt.UTC).isoformat()
     body = json.dumps(summary, indent=2, sort_keys=True).encode()
     store.put_bytes(

@@ -28,9 +28,19 @@ updates:
     # minor/patch releases still arrive. Remove this entry in the same change
     # that lifts requirements.txt's <26 cap; the collection-box root cause is
     # alpha-engine-config-I12318.
+    #
+    # pandas 3 is held by a version RANGE, not by update-types. The
+    # update-types semver-major form this entry carried since #1088 did not
+    # stop #2257 (pandas >=2.0 -> >=3.1.0): requirements.txt has a bare lower
+    # bound and no lockfile, so Dependabot has no current version to classify
+    # the bump against. And pandas 3 cannot install here at all: requirements.txt
+    # pins arcticdb>=6.28.1, and arcticdb 6.28.1 (latest, 2026-10-20) requires
+    # pandas<3, as has every release since 6.8.0 (verified on PyPI 2026-10-23).
+    # Re-examine when an arcticdb release lifts that cap, and no later than
+    # 2026-12-01.
     ignore:
       - dependency-name: "pandas"
-        update-types: ["version-update:semver-major"]
+        versions: [">=3"]
       - dependency-name: "pyarrow"
         versions: [">=26"]
     groups:
