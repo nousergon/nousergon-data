@@ -77,6 +77,19 @@ the same effective run_date — the actual double-writer hazard, independent
 of the mutex mechanics above) and starts the execution as
 ``operator-rerun-{run_date}-{HHMMSS}``.
 
+VACUITY GUARD (alpha-engine-config-I11081). ``--start`` refuses an input that
+can enter NONE of the pipeline's declared substantive stages
+(``nousergon_lib.pipeline_status.registry.vacuity_spine_for``, Brian's ruling
+2026-10-24 "(a) Declared stages"). Such a rerun boots the box, passes the
+freshness gate, does nothing and goes green, which is the skip-to-green shape
+``alpha-engine-config-I9693`` measured on the weekly path. ``--dry-run`` prints
+the verdict. ``--accept-vacuous-rerun REASON`` is the named escape hatch, and the
+reason rides into the execution input as ``vacuous_rerun_accepted_reason``. The
+reachability walk is IMPORTED from the run-scope Lambda module, never
+re-implemented, exactly as ``weekly_sf_rerun.py`` does. It is three-valued:
+anything undecidable stays UNKNOWN and both arms are followed, so an empty
+result proves vacuity and never refuses a legitimate recovery.
+
 Read-only by default; nothing is mutated without ``--start``.
 """
 
@@ -101,6 +114,26 @@ from sf_rerun_common import (  # noqa: E402 — see sys.path insertion above
     fetch_history,
     list_all_executions,
     verify_skip_flags_live,
+)
+
+# alpha-engine-config-I11081: the definition-derived vacuity analysis lives with
+# the other definition derivations, in the run-scope Lambda module, imported the
+# same way weekly_sf_rerun.py imports it (I11075). A second copy of a
+# reachability walk would be a second thing to keep true of the live definition.
+sys.path.insert(
+    0,
+    str(Path(__file__).resolve().parent.parent
+        / "infrastructure" / "lambdas" / "weekly-run-scope"),
+)
+from run_scope import (  # noqa: E402 — see sys.path insertion above
+    disabling_flags_for_input,
+    enabled_spine_stages,
+    flatten_states,
+)
+from nousergon_lib.pipeline_status.registry import (  # noqa: E402
+    pending_definition_stages_for,
+    retiring_definition_stages_for,
+    vacuity_spine_for,
 )
 
 ACCOUNT_REGION = "arn:aws:states:us-east-1:711398986525:stateMachine:{}"
@@ -303,6 +336,10 @@ class RerunPlan:
     # NYSE session is open. None on every other path, so a run that does not
     # need the override never silently carries one.
     market_hours_override: dict | None = None
+    # alpha-engine-config-I11081: set only when the operator accepted a vacuous
+    # rerun with --accept-vacuous-rerun REASON; emitted so describe-execution
+    # carries who decided to spend the dispatch and why.
+    accept_vacuous_reason: str = ""
 
     def rerun_input(self) -> dict:
         out = dict(self.original_input)
@@ -325,6 +362,8 @@ class RerunPlan:
         # DELIBERATE and AUDITABLE, not rare.
         if self.market_hours_override is not None:
             out["market_hours_override"] = self.market_hours_override
+        if self.accept_vacuous_reason:
+            out["vacuous_rerun_accepted_reason"] = self.accept_vacuous_reason
         return out
 
 
@@ -421,6 +460,79 @@ def derive_plan(pipeline: Pipeline, events: list, start_time: datetime | None = 
 def operator_rerun_name(run_date: str, now: datetime | None = None) -> str:
     now = now or datetime.now(timezone.utc)
     return f"operator-rerun-{run_date}-{now.strftime('%H%M%S')}"
+
+
+# ---------------------------------------------------------------------------
+# Vacuity guard (alpha-engine-config-I11081)
+# ---------------------------------------------------------------------------
+
+class VacuousRerunError(SystemExit):
+    """The rerun cannot be judged, or would do nothing. A SystemExit, so the CLI
+    stops with the message rather than a traceback."""
+
+
+def landed_vacuity_spine(pipeline: Pipeline, sm_def: dict) -> tuple[str, ...]:
+    """The declared substantive stages as they have LANDED in ``sm_def``.
+
+    The same transition rule as ``weekly_sf_rerun._landed_spine``. A stage the
+    pinned library marks pending or retiring counts only while the definition
+    carries it. A declared stage that is absent and carries neither marker stays
+    in: it is a defect, and the guard should see it. Raises when the pipeline
+    declares no substantive stages, because an undeclared pipeline cannot be
+    judged vacuous and treating that as "nothing was expected" is the defect
+    this guard exists for.
+    """
+    declared = vacuity_spine_for(pipeline.sm_name)
+    if not declared:
+        raise VacuousRerunError(
+            f"FATAL (alpha-engine-config-I11081): no declared substantive stages for "
+            f"{pipeline.sm_name!r} in nousergon_lib.pipeline_status.registry."
+            "VACUITY_SPINE. A pipeline whose substantive stages are undeclared "
+            "cannot be judged vacuous. Declare them before re-running it through "
+            "this script."
+        )
+    present = set(flatten_states(sm_def.get("States", {})))
+    in_transition = set(pending_definition_stages_for(pipeline.sm_name)) | set(
+        retiring_definition_stages_for(pipeline.sm_name))
+    return tuple(s for s in declared if s in present or s not in in_transition)
+
+
+def vacuity_verdict(pipeline: Pipeline, sm_def: dict, rerun_input: dict) -> tuple:
+    """``(spine, enterable, attribution)`` for the input that would be dispatched.
+
+    ``attribution`` maps each spine stage to the skip flags that disable it, and
+    is computed only when nothing is enterable.
+    """
+    spine = landed_vacuity_spine(pipeline, sm_def)
+    enterable = enabled_spine_stages(sm_def, rerun_input, spine)
+    attribution = {} if enterable else disabling_flags_for_input(sm_def, rerun_input, spine)
+    return spine, enterable, attribution
+
+
+def refuse_vacuous_rerun(pipeline: Pipeline, sm_def: dict, rerun_input: dict,
+                         accept_reason: str | None) -> tuple:
+    """Refuse (SystemExit) a ``--start`` whose input can enter no substantive stage.
+
+    Returns the enterable stages. Accepting does not make the run substantive; it
+    records who decided to spend the dispatch and why.
+    """
+    spine, enterable, attribution = vacuity_verdict(pipeline, sm_def, rerun_input)
+    if enterable or accept_reason:
+        return enterable
+    detail = "\n".join(
+        f"    {stage}: {', '.join(attribution.get(stage, ())) or 'the skip set as a whole'}"
+        for stage in spine)
+    raise VacuousRerunError(
+        "FATAL (vacuous rerun, alpha-engine-config-I11081): this input can enter "
+        f"NONE of the {len(spine)} declared substantive stages of {pipeline.sm_name}. "
+        "It would start the box, pass the gates, do nothing and go green.\n"
+        "  disabled by:\n"
+        f"{detail}\n"
+        "  Every stage the run exists for is already switched off, so the recovery "
+        "is FINISHED, not pending. Investigate what never completed (the plan "
+        "above names it), or, if an empty run really is what you want, re-run with "
+        "--accept-vacuous-rerun 'why this empty run is the right action'."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -539,6 +651,12 @@ def main(argv: list | None = None) -> int:
              "§3 makes the crossing auditable, not rare.",
     )
     ap.add_argument(
+        "--accept-vacuous-rerun", metavar="REASON", default="",
+        help="allow --start of an input that can enter NO declared substantive "
+             "stage (alpha-engine-config-I11081). The reason is emitted into the "
+             "execution input as vacuous_rerun_accepted_reason.",
+    )
+    ap.add_argument(
         "--market-hours-override-reason",
         help="override the generated reason line (defaults to one naming the "
              "source execution and the SFP-3 standing rule)",
@@ -609,11 +727,31 @@ def main(argv: list | None = None) -> int:
         script_path="scripts/weekday_sf_rerun.py",
     )
 
+    # Vacuity pre-flight (alpha-engine-config-I11081). Computed against the
+    # EMITTED input, so the verdict is about the document that would actually be
+    # dispatched. Reported here so --dry-run shows it, and ENFORCED below, after
+    # the plan is printed: a refusal an operator cannot read the plan behind is a
+    # refusal they will work around.
+    _spine, enterable, _attr = vacuity_verdict(pipeline, sm_def, plan.rerun_input())
+    if enterable:
+        plan.notes.append("substantive stages this input can still enter: " + ", ".join(enterable))
+    else:
+        plan.accept_vacuous_reason = args.accept_vacuous_rerun
+        plan.warnings.append(
+            "VACUOUS: this input can enter NO declared substantive stage "
+            "(alpha-engine-config-I11081)."
+            + (f" ACCEPTED: {args.accept_vacuous_rerun!r}, emitted as "
+               "vacuous_rerun_accepted_reason." if args.accept_vacuous_rerun else
+               " --start refuses it without --accept-vacuous-rerun REASON.")
+        )
+
     _print_plan(pipeline, plan, args.execution_arn, source_status, name)
 
     if not args.start:
         print("\n(dry-run — nothing mutated; re-run with --start to execute)")
         return 0
+
+    refuse_vacuous_rerun(pipeline, sm_def, plan.rerun_input(), args.accept_vacuous_rerun)
 
     # --- pre-start guard: no other execution of THIS pipeline is RUNNING
     # with the same effective run_date (the actual double-writer hazard;
