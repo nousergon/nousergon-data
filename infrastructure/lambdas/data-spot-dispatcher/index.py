@@ -279,6 +279,12 @@ _WORKLOAD_MAX_RUNTIME_SECONDS: dict[str, int] = {
     # so 6 h is about 1.7x. Archives already written are skipped, so a spot
     # interruption only means a re-dispatch.
     "institutional-holdings-pit-backfill": 21600,
+    # alpha-engine-config-I12436: the one-time `universe_crsp` build. Not yet
+    # measured at full size. Each of ~909 names takes one polygon splits call and
+    # one dividends call; at the free tier's 5 calls a minute that is ~6.1 h, before
+    # the yfinance fetch and the feature recompute. Its 16-name dry run on 07-14 took
+    # 213 s. 12 h is about 2x the polygon bound. A re-dispatch rebuilds every name.
+    "universe-crsp-basis-build": 43200,
 }
 
 
@@ -495,6 +501,15 @@ _WORKLOADS: dict[str, str] = {
     # keep the sessions built while the registry held only 2026 splits.
     "edgar-pit-fundamentals-rebuild": (
         "python -m collectors.edgar_pit_fundamentals backfill --start 2022-01-03 --overwrite"
+    ),
+    # alpha-engine-config-I12436 (option A, Brian 2026-10-23 15:05Z): build the
+    # split-only CRSP-basis `universe_crsp` library that the rebuild above reads
+    # `Close` from, and refuses to run without. It writes the SCRATCH library only
+    # (`store.arctic_store.get_scratch_universe_lib` refuses the live names) and
+    # fails loud on any unexplained reconciliation residual. The reconcile scope is
+    # the one its 2026-06-30 and 07-14 dry runs used. On-demand; not scheduled.
+    "universe-crsp-basis-build": (
+        "python -m builders.migrate_universe_crsp_basis --apply --reconcile-start 2020-06-30"
     ),
     # alpha-engine-config-I12461: point-in-time Form 4 insider transactions from
     # SEC's quarterly Form 3/4/5 data sets (`collectors/insider_transactions_pit.py`),
