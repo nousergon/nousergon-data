@@ -1739,24 +1739,66 @@ def _check_failed_day(
         )
 
     if marker_status == "SUCCEEDED":
-        # The day's own pipeline wrote a SUCCEEDED marker, which only its
-        # WriteCompletionMarker state on a SUCCEEDED terminal does — that is
-        # a real verdict, and §2.3a's rule is that a MISSING verdict is
-        # UNKNOWN, not that a present one may be overruled by this check's
-        # own execution walk. Clear, do not page.
+        # The execution walk found 0 SUCCEEDED and the day's marker says
+        # SUCCEEDED, so the two disagree and one of them is wrong. Until
+        # alpha-engine-config-I8223 this cleared silently with a log WARNING:
+        # the marker's raw ``status`` (written by any execution reaching
+        # WriteCompletionMarker, a 1-of-16-stage watch-rerun included,
+        # alpha-engine-config-I8186) overrode this check's own, stronger
+        # evidence. A log line is not a recording surface anybody reads, and
+        # a raw ``status`` is not a cycle verdict (sf-pipeline-policy §2.3a:
+        # an unknown verdict propagates as UNKNOWN, never as pass).
         #
-        # But the walk and the marker have now DISAGREED, and exactly one of
-        # them is wrong. Say so at warning severity rather than clearing
-        # quietly: a counting bug in the walk (which is what
-        # alpha-engine-config-I7440 was) is otherwise completely invisible
-        # from the moment the marker starts covering for it.
-        logger.warning(
-            "failed-day clear (marker SUCCEEDED) but the execution walk found "
-            "0 SUCCEEDED of %d on sf=%s day=%s — the walk and the completion "
-            "marker disagree; one of them is wrong. Not paging (the marker is "
-            "the authoritative verdict), but the walk's role/cycle-key "
-            "filtering needs checking (alpha-engine-config-I7440).",
-            total, sf_label, target_date,
+        # Now the disagreement is itself the finding and always reaches the
+        # alert surface. For a weekly cycle, the severity comes from the
+        # augmented marker's cycle verdict via ``marker_verdict()``: a defect
+        # verdict pages at error, and anything else (completed, unknown,
+        # in_flight, absent) at warning. ``completed`` still alerts, because a
+        # walk that counts 0 SUCCEEDED on a completed cycle has a counting
+        # bug (alpha-engine-config-I7440), and that bug is invisible from the
+        # moment a marker starts covering for it. Trading-day markers carry
+        # no cycle block, so their verdict is not consulted and the
+        # disagreement warns.
+        verdict: Optional[str] = None
+        cycle_key: Optional[str] = None
+        verdict_clause = ""
+        if cadence == "weekly":
+            cycle_marker, cycle_key, read_error = _cycle_marker(
+                s3_client, pipeline_name, target_date
+            )
+            verdict = (
+                VERDICT_UNKNOWN if cycle_marker is None else marker_verdict(cycle_marker)
+            )
+            verdict_clause = (
+                f" The cycle verdict is {verdict!r}"
+                + (f" (marker unreadable: {read_error})" if read_error else "")
+                + f" at s3://{MARKER_BUCKET}/{cycle_key}."
+            )
+        defect = verdict in _CYCLE_DEFECT_VERDICTS
+        message = (
+            f"{sf_label} ({pipeline_name}) {day_label} {target_date}: the "
+            f"watchdog's execution walk found 0 SUCCEEDED of {total} "
+            f"execution(s), but the completion marker's status is SUCCEEDED. "
+            f"The walk and the marker disagree, so one of them is wrong; a "
+            f"marker written by a partial rerun reads SUCCEEDED too "
+            f"(alpha-engine-config-I8186).{verdict_clause} Not cleared "
+            f"(alpha-engine-config-I8223). Check the walk's role/cycle-key "
+            f"filtering (alpha-engine-config-I7440) against `aws "
+            f"stepfunctions list-executions --state-machine-arn {sf_arn} "
+            f"--max-results 10`."
+        )
+        dedup_key = (
+            f"pipeline-watchdog-walk-marker-disagree-{pipeline_name}-"
+            f"{target_date.isoformat()}"
+        )
+        alert_detail = _publish_watchdog_alert(
+            message,
+            severity="error" if defect else "warning",
+            dedup_key=dedup_key,
+            context={"sf_label": sf_label, "sf_arn": sf_arn,
+                     "target_trading_day": target_date.isoformat(),
+                     "marker_status": marker_status,
+                     "cycle_verdict": verdict, "cycle_marker_key": cycle_key},
         )
         return FailedDayCheckResult(
             sf_label=sf_label,
@@ -1765,6 +1807,10 @@ def _check_failed_day(
             executions_on_day=total,
             succeeded_on_day=0,
             marker_status=marker_status,
+            cycle_verdict=verdict,
+            cycle_marker_key=cycle_key,
+            alert_emitted=True,
+            alert_detail=alert_detail,
         )
 
     marker_clause = {
