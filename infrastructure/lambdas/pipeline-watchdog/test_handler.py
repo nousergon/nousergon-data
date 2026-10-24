@@ -2074,10 +2074,14 @@ def test_weekly_cycle_with_only_failures_still_pages():
     assert "cycle day" in _alerts_mod.publish.call_args.kwargs["message"]
 
 
-def test_succeeded_marker_clears_instead_of_paging():
-    """Defect 4 in isolation. Only DEGRADED used to clear, so a marker
-    reading SUCCEEDED — the single most authoritative statement that the
-    cycle worked — fell through to the error page."""
+def test_succeeded_marker_with_zero_walked_successes_alerts_never_clears():
+    """Defect 4, re-ruled by alpha-engine-config-I8223. Paging at error on
+    this shape was wrong (the marker is real evidence), but clearing silently
+    was wrong too: a raw ``status: SUCCEEDED`` is written by any execution
+    reaching WriteCompletionMarker, a 1-of-16-stage rerun included (I8186),
+    and it is not a cycle verdict. The walk/marker disagreement is the
+    finding, so it reaches the alert surface at warning."""
+    _tc_mod.previous_trading_day.side_effect = _weekday_only_previous_trading_day
     client = _make_weekly_cycle_client([_cron_failure()])
     s3 = _make_s3_marker_client(marker={"status": "SUCCEEDED"})
     result = index._check_failed_day(
@@ -2085,9 +2089,80 @@ def test_succeeded_marker_clears_instead_of_paging():
         pipeline_name="ne-weekly-freshness-pipeline",
         target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
     )
-    assert result.alert_emitted is False
+    assert result.alert_emitted is True
     assert result.marker_status == "SUCCEEDED"
-    _alerts_mod.publish.assert_not_called()
+    assert result.succeeded_on_day == 0
+    assert result.cycle_verdict == "unknown"
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "warning"
+    assert "disagree" in kwargs["message"]
+    assert "I8223" in kwargs["message"]
+    assert kwargs["dedup_key"] == (
+        "pipeline-watchdog-walk-marker-disagree-ne-weekly-freshness-pipeline-2026-08-15"
+    )
+
+
+def test_succeeded_marker_over_an_incomplete_cycle_pages_at_error():
+    """THE I8223 shape: the walk found nothing, the weekly-day marker reads
+    SUCCEEDED (a partial rerun wrote it), and the augmented trading-day
+    marker says the cycle did not do the work. The weaker source used to
+    override the stronger one here and clear the page."""
+    _tc_mod.previous_trading_day.side_effect = _weekday_only_previous_trading_day
+    client = _make_weekly_cycle_client([_cron_failure()])
+    s3 = _make_s3_marker_by_key({
+        _CYCLE_TD_KEY: _augmented("incomplete", reason="partial_cycle"),
+        _CYCLE_CAL_KEY: {"status": "SUCCEEDED"},
+    })
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.cycle_verdict == "incomplete"
+    assert result.cycle_marker_key == _CYCLE_TD_KEY
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "error"
+    assert "'incomplete'" in kwargs["message"]
+
+
+def test_succeeded_marker_over_a_completed_cycle_still_reports_the_disagreement():
+    """A completed cycle verdict means the work happened, so this is not an
+    error page. But a walk that counted 0 SUCCEEDED on a completed cycle has
+    a counting bug (I7440), invisible from the moment a marker covers for
+    it, so it still warns."""
+    _tc_mod.previous_trading_day.side_effect = _weekday_only_previous_trading_day
+    client = _make_weekly_cycle_client([_cron_failure()])
+    s3 = _make_s3_marker_by_key({
+        _CYCLE_TD_KEY: _augmented("completed"),
+        _CYCLE_CAL_KEY: {"status": "SUCCEEDED"},
+    })
+    result = index._check_failed_day(
+        sf_label="Weekly SF", sf_arn=SAT_ARN,
+        pipeline_name="ne-weekly-freshness-pipeline",
+        target_date=_CYCLE, cadence="weekly", client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.cycle_verdict == "completed"
+    assert _alerts_mod.publish.call_args.kwargs["severity"] == "warning"
+
+
+def test_trading_day_succeeded_marker_with_zero_walked_successes_warns():
+    """Weekday/EOD markers carry no cycle block, so no verdict is consulted,
+    and the disagreement still reaches the alert surface rather than a log."""
+    client = _make_status_aware_sfn_client({"FAILED": [{"startDate": _TARGET_START}]})
+    s3 = _make_s3_marker_client(marker={"status": "SUCCEEDED"})
+    result = index._check_failed_day(
+        sf_label="Weekday SF", sf_arn=WKD_ARN,
+        pipeline_name="ne-preopen-trading-pipeline",
+        target_date=_TARGET, client=client, s3_client=s3,
+    )
+    assert result.alert_emitted is True
+    assert result.marker_status == "SUCCEEDED"
+    assert result.cycle_verdict is None
+    kwargs = _alerts_mod.publish.call_args.kwargs
+    assert kwargs["severity"] == "warning"
+    assert "disagree" in kwargs["message"]
 
 
 # ── alpha-engine-config-I11092: SUCCEEDED is not a completed CYCLE ─────────
