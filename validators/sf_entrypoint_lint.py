@@ -43,8 +43,16 @@ is NEW, and a count below it is STALE. Lower the ceiling with ``--update``,
 which never raises an entry.
 
 OBSERVE mode, the default, reports in the log, as ``::warning``
-annotations and in the job summary, and exits 0. ``--mode enforce`` exits 1
-on any NEW or STALE finding.
+annotations and in the job summary, and exits 0 -- except for a definition in
+``ENFORCED_DEFINITIONS``, whose NEW or STALE rows are ``::error`` and exit 1
+in either mode. ``--mode enforce`` exits 1 on any NEW or STALE finding in any
+definition.
+
+Definitions move from observe to enforce one at a time, by adding a path to
+``ENFORCED_DEFINITIONS``. That set only grows: removing a path loosens the
+guard. An enforced definition can still carry baselined findings; what is
+enforced is that its count never rises and that a removed finding lowers the
+ceiling in the same change (``--update``).
 
 Run locally from the repo root: ``python3 validators/sf_entrypoint_lint.py``
 (``--json`` lists every finding by state). Stdlib only.
@@ -69,6 +77,12 @@ DEFINITION_GLOBS = ("infrastructure/step_function*.json", "infrastructure/step-f
 GUARD = "sf-entrypoint-lint"
 TRACKER = "alpha-engine-config-I12533"
 SCHEMA_VERSION = 1
+# Definitions graduated from observe to enforce (grow-only; see the docstring).
+# step_function_groom.json (alpha-engine-groom-dispatch) first, 2026-10-23:
+# off the weekly and trading paths, and its baseline was exact (0 new, 0 stale).
+ENFORCED_DEFINITIONS: frozenset[str] = frozenset({
+    "infrastructure/step_function_groom.json",
+})
 RULES = (
     "task-undeclared-entrypoint",
     "task-not-an-entrypoint",
@@ -309,8 +323,12 @@ def _esc(s: str) -> str:
     return s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
 
 
+def is_enforced(path: str, mode: str) -> bool:
+    """A finding on ``path`` blocks in ``mode``."""
+    return mode == "enforce" or path in ENFORCED_DEFINITIONS
+
+
 def report(rows: list[dict], new: list[dict], stale: list[dict], mode: str) -> list[str]:
-    level = "error" if mode == "enforce" else "warning"
     t = totals(counts_of(rows))
     lines = [
         f"{GUARD} ({mode}): {len(rows)} finding(s) in {t['files']} definition(s) "
@@ -327,19 +345,28 @@ def report(rows: list[dict], new: list[dict], stale: list[dict], mode: str) -> l
             f"{row['path']}: {row['rule']} {row['baseline']} -> {row['current']}. "
             f"States: {'; '.join(states[:5])}"
         )
-        lines.append("NEW   " + msg)
+        lines.append(("NEW   " if not is_enforced(row["path"], mode) else "NEW (enforced) ") + msg)
         if in_actions:
+            level = "error" if is_enforced(row["path"], mode) else "warning"
             print(f"::{level} file={row['path']},title={GUARD}::{_esc(msg)}")
     for row in stale:
+        tag = "STALE (enforced)" if is_enforced(row["path"], mode) else "STALE"
         lines.append(
-            f"STALE {row['path']}: {row['rule']} baseline {row['baseline']} but {row['current']} "
+            f"{tag} {row['path']}: {row['rule']} baseline {row['baseline']} but {row['current']} "
             "now. Lower the ceiling: `python3 validators/sf_entrypoint_lint.py --update`"
         )
     if in_actions and stale:
+        level = "error" if any(is_enforced(r["path"], mode) for r in stale) else "warning"
         print(f"::{level} title={GUARD}::{len(stale)} baseline entr(y/ies) no longer reproduce; "
               "run --update to lower the baseline (shrink-only)")
     if mode == "observe" and (new or stale):
-        lines.append("observe mode: reporting only.")
+        if any(is_enforced(r["path"], mode) for r in new + stale):
+            lines.append(
+                "observe mode, but an ENFORCED definition changed its count: failing. "
+                f"Enforced: {', '.join(sorted(ENFORCED_DEFINITIONS))}"
+            )
+        else:
+            lines.append("observe mode: reporting only.")
     return lines
 
 
@@ -399,7 +426,7 @@ def main(argv: list[str] | None = None) -> int:
     lines = report(rows, new, stale, args.mode)
     print("\n".join(lines))
     write_summary(lines)
-    if args.mode == "enforce" and (new or stale):
+    if any(is_enforced(r["path"], args.mode) for r in new + stale):
         return 1
     return 0
 

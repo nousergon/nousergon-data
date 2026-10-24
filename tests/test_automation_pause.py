@@ -729,12 +729,16 @@ def test_the_expense_collector_is_kept_and_names_its_ruling(manifest, module):
     )
 
 
-def test_reconcile_monthly_is_paused_not_pending(manifest, module):
-    # It exists live (verified DISABLED 2026-08-11), and `pending` asserts
-    # neither existence nor state — only `paused` does.
+def test_reconcile_monthly_is_unpaused_with_its_ruling(manifest, module):
+    # Paused 2026-08-11; un-paused per Brian's 2026-10-23 ruling so the monthly
+    # budget review gets final non-AWS bills (alpha-engine-config-I11792).
     name = "alpha-engine-expense-collector-reconcile-monthly"
-    assert name in manifest["paused"]["scheduler_schedules"]
+    assert name not in manifest["paused"]["scheduler_schedules"]
     assert name not in module.pending_names(manifest)
+    reason = manifest["not_paused"][name]
+    assert "2026-10-23" in reason and "I11792" in reason, (
+        "an un-pause must name the ruling that authorised it"
+    )
 
 
 # ── alpha-engine-config-I7174: paused_alarms owns alarm-action state ─────────
