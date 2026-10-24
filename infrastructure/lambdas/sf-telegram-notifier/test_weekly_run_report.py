@@ -255,3 +255,85 @@ def test_no_run_date_is_reported_not_guessed():
     )
     assert any("run date unknown" in i.problem for i in report.issues)
     assert report.director is None
+
+
+# ── Resolutions (Brian 2026-10-24: every problem names the issue that fixes it) ──
+
+PLAN_WITH_ITEMS = dict(PLAN, action_items=[
+    {"id": "feature-drift-ks-investigation", "title": "Block retired features", "priority": "P1"},
+    {"id": "exit-rules-negative-lift-root-cause", "title": "Root-cause the exit-rules value destruction", "priority": "P0"},
+    {"id": "substrate-pipeline-reliability", "title": "Close the postclose miss cluster", "priority": "P0"},
+])
+LEDGER = {"items": [
+    {"id": "substrate-pipeline-reliability", "issue_number": 1059},
+    {"id": "exit-rules-negative-lift-root-cause", "issue_number": None},
+]}
+
+
+def test_bundled_registry_is_well_formed():
+    raw = json.loads(Path(wr.RESOLUTIONS_FILE).read_text())
+    parsed = wr.parse_resolutions(raw)
+    assert len(parsed) == len(raw["entries"]), "an entry has a malformed ref and would be dropped"
+
+
+def test_each_bullet_names_its_resolution_or_says_none():
+    lines = wr.format_report_lines(_report(_today_s3()))
+    text = "\n".join(lines)
+    assert "Resolution: [aec#7309](https://github.com/nousergon/alpha-engine-config/issues/7309)" in text
+    assert "[aec#12395]" in text  # model zoo
+    assert "[aec#10064]" in text  # executor_params
+    # Coverage finding on Backtester has no registry entry: says so, never invents one.
+    i = next(n for n, line in enumerate(lines) if line.startswith("• *Backtester:* stale"))
+    assert lines[i + 2] == f"  Resolution: {wr.NO_RESOLUTION}"
+
+
+def test_s3_overlay_wins_over_bundled_file():
+    s3 = _today_s3()
+    s3.objects[wr.RESOLUTIONS_S3_KEY] = ({"entries": [
+        {"match": "model_zoo_unservable", "ref": "alpha-engine-config#99999", "plan": "new plan"},
+    ]}, START)
+    text = "\n".join(wr.format_report_lines(_report(s3)))
+    assert "[aec#99999]" in text and "new plan" in text
+    assert "[aec#12395]" not in text
+
+
+def test_registry_with_bad_ref_is_ignored_not_rendered():
+    assert wr.parse_resolutions({"entries": [{"match": "x", "ref": "see the thread", "plan": "p"}]}) == {}
+
+
+def test_director_planned_fixes_come_from_the_ledger():
+    s3 = _today_s3()
+    s3.objects[f"director/{RUN_DATE}/action_plan.json"] = (PLAN_WITH_ITEMS, START)
+    s3.objects[wr.DIRECTOR_LEDGER_KEY] = (LEDGER, START)
+    report = _report(s3)
+    assert [p[0] for p in report.director.planned][:2] == [
+        "exit-rules-negative-lift-root-cause", "substrate-pipeline-reliability"]
+    text = "\n".join(wr.format_report_lines(report))
+    assert "Planned fixes (Director action items):" in text
+    assert "Close the postclose miss cluster: [aec#1059]" in text
+    assert "exit-rules value destruction: issue not in the ledger yet" in text
+
+
+def test_declared_skip_without_registry_entry_gets_no_resolution_line():
+    out = {"run_date": RUN_DATE, "skip_scanner": True}
+    report = wr.build_weekly_report(
+        s3_client=None, run_date=RUN_DATE, execution_arn=EXEC_ARN, execution_start=START,
+        exec_input={}, exec_output=out, bundled_resolutions={},
+    )
+    lines = wr.format_report_lines(report)
+    assert not any(line.startswith("  Resolution:") for line in lines)
+
+
+def test_section_fits_the_telegram_budget_and_announces_the_cut():
+    out = dict(EXEC_OUTPUT, **{f"degraded_summary": {"reasons": {f"fam{n}": "x" * 140 for n in range(12)}}})
+    report = wr.build_weekly_report(
+        s3_client=_today_s3(), run_date=RUN_DATE, execution_arn=EXEC_ARN, execution_start=START,
+        exec_input={}, exec_output=out,
+    )
+    lines = wr.format_report_lines(report, max_rendered=1500)
+    assert wr.rendered_len(lines) <= 1500 or sum(l.startswith("• ") for l in lines) == 1
+    assert any("not shown" in l for l in lines)
+
+
+def test_rendered_len_ignores_link_urls():
+    assert wr.rendered_len(["[aec#1](https://github.com/x/y/issues/1)"]) == len("aec#1]")
