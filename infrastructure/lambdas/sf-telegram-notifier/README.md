@@ -50,6 +50,31 @@ expanded, loud block naming what's missing — deliberately NOT one line, since
 a "SUCCESS" that did not write its ledger row reading as clean is the failure
 mode this check exists to catch. See `eod_artifact_verification.py`.
 
+### Weekly issue report and Director summary (Brian, 2026-10-24)
+
+A real weekly cadence terminal (`ne-weekly-freshness-pipeline`, SUCCEEDED or
+DEGRADED; not a preflight shell, not a partial run) also carries:
+
+- **`Issues (N)`**: one bullet per step that was less than perfect, each with
+  its own `Auto-fix:` line (observability-policy §7.4b). Sources, all read-only:
+  the execution's own final state (`skip_*` flags, degraded families,
+  `model_zoo_unservable`, preflight blind spot, spot relaunches),
+  `_stage_outputs/ne-weekly-freshness-pipeline/{run_date}.json` (defects only;
+  its "skipped" verdicts are timing artefacts), `_stage_coverage/{run_date}/*`,
+  `backtest/{run_date}/walk_forward_stability.json` and `self_test.json`,
+  `health/*.json` rewritten by this run, and the Director's plan and retro.
+- **`Director:`**: the overall status from `director/{run_date}/action_plan.json`
+  (`Overall RED/AMBER/GREEN`) and its top 3 risks.
+
+A source that cannot be read is its own bullet, never a clean step. The header
+gets `— N issues`, and a run with any bullet that needs triage is sent at
+`warning`, so it reaches the alert intake the nightly sweep reads (what the
+bullets' `Auto-fix:` lines promise). Logic: `weekly_run_report.py`.
+
+The S3 reads outside `backtest/*` need the `WeeklyRunReportRead` grant in
+`iam-policy.json`; until it is applied those sources render as
+"could not read ... (AccessDenied)".
+
 ## Architecture
 
 ```
