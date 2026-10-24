@@ -985,6 +985,32 @@ def test_every_armed_alarm_entry_carries_a_reason(manifest, module):
         assert reason.strip(), f"{name} is declared armed with no reason"
 
 
+#: alpha-engine-config-I8117. The three pipeline deadmen are one class: the
+#: ExecutionsSucceeded deadman on each pipeline the 2026-08-07 ruling KEPT. The
+#: weekly one was born undeclared on 2026-08-21 while its two siblings were
+#: armed, because the class was pinned one member at a time.
+PIPELINE_DEADMEN = frozenset({
+    "alpha-engine-pipeline-deadman-preopen-trading",
+    "alpha-engine-pipeline-deadman-postclose-trading",
+    "alpha-engine-pipeline-deadman-weekly-freshness",
+})
+
+
+def test_every_pipeline_deadman_is_declared_armed_and_none_is_paused(manifest, module):
+    """Pinned as a set. A deadman that loses its `armed_alarms` row is an
+    unclassified breaching alarm, and a deadman in `paused_alarms` would
+    silence a kept pipeline (with no justified `watches`, `enforce()` would
+    also re-arm it every run, so it would oscillate)."""
+    armed = set(module.armed_alarm_names(manifest))
+    assert PIPELINE_DEADMEN <= armed, (
+        f"pipeline deadman(s) missing from armed_alarms: {sorted(PIPELINE_DEADMEN - armed)}"
+    )
+    paused = {e["name"] for e in module.alarm_entries(manifest)}
+    assert not (PIPELINE_DEADMEN & paused), (
+        f"a kept pipeline's deadman is declared paused: {sorted(PIPELINE_DEADMEN & paused)}"
+    )
+
+
 def test_no_alarm_is_declared_both_paused_and_armed(manifest, module):
     """The two blocks are a partition, not two lists that may overlap.
 
