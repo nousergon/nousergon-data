@@ -416,3 +416,103 @@ def test_cost_gate_contract_rejects_a_drifted_pin(monkeypatch):
         assert "50 patch releases" in str(exc)
     else:
         raise AssertionError("a 50-release lag passed the cost-gate lag bound")
+
+
+# --------------------------------------------------------------------------- #
+# Discovery sweep (alpha-engine-config-I7623).
+#
+# The tests above name their surfaces. Every surface added after them drifted
+# first and was enumerated second: deploy-infrastructure.yml (#2999), then
+# pause-reconcile.yml (-I11383, 67 versions behind). This sweep finds every
+# tracked file that installs the lib from a git tag and holds it to the root
+# pin, so a new file is covered the day it lands.
+#
+# Each file the sweep does NOT hold to root is listed below with the contract
+# that governs it instead. A file outside that list is held to root.
+# --------------------------------------------------------------------------- #
+
+_GIT_PIN_RE = re.compile(
+    r"git\+https://github\.com/nousergon/nousergon-lib@(v[0-9]+\.[0-9]+\.[0-9]+)"
+)
+
+#: Path prefix -> the contract that governs pins under it instead of the sweep.
+_SWEEP_GOVERNED_ELSEWHERE: dict[str, str] = {
+    "tests/": "pins inside tests are fixture strings fed to parsers, not installs",
+    _COST_GATE_WORKFLOW: "deliberately isolated: floor + lag bound + re-exam (-I11410), tested above",
+}
+
+
+def _sweep_surfaces(root: Path) -> list[Path]:
+    """Every tracked file under `root` that carries a git-tag lib pin."""
+    import subprocess
+
+    listed = subprocess.run(
+        ["git", "ls-files", "-z"], cwd=root, capture_output=True, check=True
+    ).stdout.decode()
+    found = []
+    for rel in filter(None, listed.split("\0")):
+        path = root / rel
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (UnicodeDecodeError, IsADirectoryError, FileNotFoundError):
+            continue
+        if _GIT_PIN_RE.search(text):
+            found.append(path)
+    return found
+
+
+def _off_pin_surfaces(root: Path, root_pin: str) -> list[str]:
+    off = []
+    for path in _sweep_surfaces(root):
+        rel = path.relative_to(root).as_posix()
+        if any(rel.startswith(prefix) for prefix in _SWEEP_GOVERNED_ELSEWHERE):
+            continue
+        parts = rel.split("/")
+        if rel.startswith("infrastructure/lambdas/") and parts[2] in _LAMBDA_PIN_EXEMPTIONS:
+            continue  # governed by test_lambda_pins_match_or_are_explicitly_exempted
+        for pin in _GIT_PIN_RE.findall(path.read_text(encoding="utf-8")):
+            if pin != root_pin:
+                off.append(f"{rel}: {pin}")
+    return off
+
+
+def test_every_discovered_lib_pin_matches_the_root_pin():
+    root_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
+    off = _off_pin_surfaces(_REPO_ROOT, root_pin)
+    assert not off, (
+        f"nousergon-lib pins that differ from requirements.txt ({root_pin}): {off}. "
+        "Bump them, or, if the difference is deliberate, give the file a contract "
+        "and list it in _SWEEP_GOVERNED_ELSEWHERE (alpha-engine-config-I7623)."
+    )
+
+
+def test_the_sweep_sees_the_surfaces_the_named_tests_check():
+    rels = {p.relative_to(_REPO_ROOT).as_posix() for p in _sweep_surfaces(_REPO_ROOT)}
+    for named in (
+        "requirements.txt",
+        "requirements-daily-news.txt",
+        ".github/workflows/deploy-infrastructure.yml",
+        ".github/workflows/pause-reconcile.yml",
+        _COST_GATE_WORKFLOW,
+    ):
+        assert named in rels, f"the discovery sweep does not see {named}"
+
+
+def test_the_sweep_catches_a_stale_pin_in_a_new_workflow(tmp_path):
+    """Closes-when: a stale pin in a NEW file fails without editing this test."""
+    import subprocess
+
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    (tmp_path / ".github" / "workflows").mkdir(parents=True)
+    url = "git+https://github.com/nousergon/nousergon-lib"
+    (tmp_path / "requirements.txt").write_text(f"nousergon-lib[x] @ {url}@v0.124.180\n")
+    (tmp_path / ".github" / "workflows" / "brand-new.yml").write_text(
+        f'      - run: pip install "nousergon-lib @ {url}@v0.124.49"\n'
+    )
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_fixture.py").write_text(f'PIN = "{url}@v0.1.0"\n')
+    subprocess.run(["git", "add", "-A"], cwd=tmp_path, check=True)
+
+    assert _off_pin_surfaces(tmp_path, "v0.124.180") == [
+        ".github/workflows/brand-new.yml: v0.124.49"
+    ]
