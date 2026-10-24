@@ -46,7 +46,16 @@ def run_record_key(producer: str, as_of: dt.date) -> str:
     """``data_collection/runs/<producer>/<as_of>.json`` — one record per
     producer per calendar day, overwritten on same-day re-runs (a manual
     `workflow_dispatch` re-run reports the LAST attempt of the day, which is
-    the terminal outcome that matters)."""
+    the terminal outcome that matters).
+
+    ``as_of`` is the UTC date of the run's START (alpha-engine-config-I11077).
+    The key names WHICH scheduled fire this was; the finish is a measurement
+    of that fire, not its name. Keyed on the finish, two jobs of one
+    `phase-exit-metrics.yml` run that started in the same second landed under
+    different dates whenever the longer one crossed UTC midnight — measured
+    on the first scheduled run (2026-09-18 23:57Z): `v1_data_stage/2026-09-18`
+    beside `executor_profile/2026-09-19` — and GitHub's 3-5 h schedule
+    lateness makes that crossing the normal case."""
     return f"data_collection/runs/{producer}/{as_of:%Y-%m-%d}.json"
 
 
@@ -87,7 +96,8 @@ def write_run_record(
         "error": error,
         "detail": detail or {},
     }
-    key = run_record_key(producer, finished_utc.astimezone(dt.timezone.utc).date())
+    started_utc = started_at if started_at.tzinfo else started_at.replace(tzinfo=dt.timezone.utc)
+    key = run_record_key(producer, started_utc.astimezone(dt.timezone.utc).date())
     s3.put_object(
         Bucket=bucket,
         Key=key,

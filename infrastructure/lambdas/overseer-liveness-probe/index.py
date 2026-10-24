@@ -610,6 +610,48 @@ def _check_scheduler_schedule_exists(spec: dict, now: datetime) -> tuple[list[st
 # ── Check: alarm_coverage (alpha-engine-config-I4482) ─────────────────────────
 
 
+def _cw_timestamp(raw: object) -> datetime | None:
+    """A CloudWatch timestamp as an aware datetime, or None when absent or
+    unparseable. boto3 hands back ``datetime`` objects; strings are accepted
+    too so a hand-built fixture or a JSON round-trip reads the same."""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        parsed = raw
+    else:
+        try:
+            parsed = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def _insufficient_data_age_hours(alarm: dict, now: datetime) -> tuple[float | None, bool]:
+    """Hours this alarm has sat in its state UNDER ITS CURRENT CONFIGURATION,
+    and whether a reconfiguration moved the clock.
+
+    ``max(StateTransitionedTimestamp, AlarmConfigurationUpdatedTimestamp)``
+    (alpha-engine-config-I9241). CloudWatch does not re-evaluate an alarm when
+    its configuration changes, so an alarm repointed at a new metric keeps its
+    INSUFFICIENT_DATA state and its old transition timestamp; reading the
+    transition alone reports a dead sensor for one that was rewired hours ago.
+    Same rule as ``nous-ergon-ops/infrastructure/cloudwatch/check-alarm-age.py
+    ::alarm_age_days`` (alpha-engine-config-I9237, nous-ergon-ops-PR930).
+
+    Degrades one way only: a missing or unparseable configuration timestamp
+    falls back to the transition timestamp (the old, over-reporting reading),
+    never the reverse. No transition timestamp means no age, as before."""
+    transition = _cw_timestamp(alarm.get("StateTransitionedTimestamp"))
+    if transition is None:
+        return None, False
+    reconfigured_at = _cw_timestamp(alarm.get("AlarmConfigurationUpdatedTimestamp"))
+    reconfigured = reconfigured_at is not None and reconfigured_at > transition
+    since = reconfigured_at if reconfigured else transition
+    return (now - since).total_seconds() / 3600, reconfigured
+
+
 def _check_alarm_coverage(spec: dict, now: datetime) -> tuple[list[str], dict]:
     """For each registry-declared alarm spec, assert a live CloudWatch alarm
     exists matching a declared name pattern, is not indefinitely stuck in
@@ -656,21 +698,26 @@ def _check_alarm_coverage(spec: dict, now: datetime) -> tuple[list[str], dict]:
             # An indefinitely INSUFFICIENT_DATA alarm never fires AND never
             # clears — it is indistinguishable from a disconnected sensor.
             if state == "INSUFFICIENT_DATA":
-                transition = alarm.get("StateTransitionedTimestamp")
-                if transition is not None:
-                    id_hours = (now - transition).total_seconds() / 3600
-                else:
-                    id_hours = None
+                id_hours, reconfigured = _insufficient_data_age_hours(alarm, now)
                 # If state_reason is "Unchecked: Initial", the alarm was
                 # recently created and hasn't had time to evaluate — not a
                 # finding yet.
                 state_reason = alarm.get("StateReason", "")
                 if id_hours is not None and id_hours > max_idh and "Initial" not in state_reason:
-                    problems.append(
-                        f"alarm_coverage: '{alarm_name}' has been INSUFFICIENT_DATA for "
-                        f"{id_hours:.0f}h (> {max_idh}h threshold) — a sensor that neither "
-                        "fires nor clears is indistinguishable from a dead one"
-                    )
+                    if reconfigured:
+                        problems.append(
+                            f"alarm_coverage: '{alarm_name}' has been INSUFFICIENT_DATA for "
+                            f"{id_hours:.0f}h under its CURRENT configuration (> {max_idh}h "
+                            "threshold; it was reconfigured after entering the state, so the "
+                            "age is counted from the reconfiguration) — the repointed sensor "
+                            "has not evaluated a datapoint since"
+                        )
+                    else:
+                        problems.append(
+                            f"alarm_coverage: '{alarm_name}' has been INSUFFICIENT_DATA for "
+                            f"{id_hours:.0f}h (> {max_idh}h threshold) — a sensor that neither "
+                            "fires nor clears is indistinguishable from a dead one"
+                        )
 
             # Check the alarm action includes the expected target.
             alarm_actions = alarm.get("AlarmActions", [])
