@@ -66,13 +66,23 @@ DEGRADED; not a preflight shell, not a partial run) also carries:
 - **`Director:`**: the overall status from `director/{run_date}/action_plan.json`
   (`Overall RED/AMBER/GREEN`) and its top 3 risks.
 
+- **`Resolution:`** under each bullet (Brian, 2026-10-24: every problem names
+  the issue that will resolve it): the tracked item from the resolution
+  registry, as a link, with its one-line plan. The registry is
+  `weekly_issue_resolutions.json` (seed, bundled) overlaid by
+  `s3://alpha-engine-research/ops/daily-summaries/weekly-issue-resolutions.json`,
+  which the nightly sweep keeps current. A bullet with no entry says "none
+  tracked yet"; the nightly sweep then files an issue with the alternatives and
+  a recommended path, and adds the entry. The Director block also lists its top
+  action items with their issue numbers from `director/carryover_ledger.json`.
+
 A source that cannot be read is its own bullet, never a clean step. The header
 gets `— N issues`, and a run with any bullet that needs triage is sent at
 `warning`, so it reaches the alert intake the nightly sweep reads (what the
 bullets' `Auto-fix:` lines promise). Logic: `weekly_run_report.py`.
 
 The S3 reads outside `backtest/*` need the `WeeklyRunReportRead` grant in
-`iam-policy.json`; until it is applied those sources render as
+`iam-policy.json` (alpha-engine-config#12630); until it is applied those sources render as
 "could not read ... (AccessDenied)".
 
 ## Architecture

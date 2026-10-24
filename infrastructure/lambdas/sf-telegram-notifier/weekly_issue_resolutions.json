@@ -1,0 +1,19 @@
+{
+  "schema": "weekly-issue-resolutions-1",
+  "_doc": "Seed registry for weekly_run_report.py: maps a weekly-report bullet key (fnmatch pattern, first match wins) to the tracked item that resolves it. The live overlay is s3://alpha-engine-research/ops/daily-summaries/weekly-issue-resolutions.json, kept current by the nightly sweep; it wins over this file. Every entry names a real issue; a bullet with no entry renders 'none tracked yet' and the nightly sweep files one with alternatives and a recommendation (Brian 2026-10-24).",
+  "entries": [
+    {"match": "skip:skip_parity*", "ref": "alpha-engine-config#7309", "plan": "re-enable pit_parity on the weekly SF in phase 3"},
+    {"match": "skip:skip_pit_parity_*", "ref": "alpha-engine-config#7309", "plan": "re-enable pit_parity on the weekly SF in phase 3"},
+    {"match": "skip:skip_data_phase2", "ref": "alpha-engine-config#12271", "plan": "by design since the data cutover (the collector runs it); stop grading it here"},
+    {"match": "skip:skip_rag_ingestion", "ref": "alpha-engine-config#12271", "plan": "by design since the data cutover (the collector runs it); stop grading it here"},
+    {"match": "contamination:*", "ref": "alpha-engine-config#7309", "plan": "parity back on in phase 3 gives the run a contamination verdict"},
+    {"match": "degraded:parity_degraded", "ref": "alpha-engine-config#11103", "plan": "parity_degraded must be set when parity never ran"},
+    {"match": "model_zoo_unservable", "ref": "alpha-engine-config#12395", "plan": "M-slot rebuild: experiments toward a servable champion"},
+    {"match": "stage_output:EvaluatorOptimize:config_executor_params", "ref": "alpha-engine-config#10064", "plan": "root-cause the blocked alpha_floor auto-apply loop"},
+    {"match": "walk_forward:*", "ref": "alpha-engine-config#12627", "plan": "point the loader at the weekly weight history, or start writing it"},
+    {"match": "director_carryover_omitted", "ref": "alpha-engine-config#12628", "plan": "confirm digest vs drop; budget carryover into the prompt"},
+    {"match": "director_retro_latency", "ref": "alpha-engine-config#12470", "plan": "size the retro judge budget to measured latency"},
+    {"match": "health:predictor_training", "ref": "alpha-engine-config#12629", "plan": "write real duration and IC, or mark the health degraded"},
+    {"match": "unreadable:AccessDenied", "ref": "alpha-engine-config#12630", "plan": "read-only S3 grant for the notifier (Brian merges)"}
+  ]
+}
