@@ -18,12 +18,21 @@ semantic half and one decision per write:
   population, and is not empty when that population is not.
 
 ``admit()`` returns every problem it finds, so the caller sees all of them.
-``publish_admitted()`` is the boundary. In ``shadow`` mode, the default, it
-logs a refusal and writes anyway, so adopting it changes no output until an
-owner switches the mode. In ``enforce`` mode it raises ``AdmissionRefused``
-before anything is written. The mode is read from
-``NOUSERGON_ADMISSION_MODE`` (``shadow`` | ``enforce``); an unknown value is
+``publish_admitted()`` is the boundary. In ``shadow`` mode it logs a refusal
+and writes anyway. In ``enforce`` mode it raises ``AdmissionRefused`` before
+anything is written.
+
+The mode is PER ARTIFACT. Each ``AdmissionSpec`` declares its own default
+(``shadow`` unless stated), so adopting the boundary for a new artifact changes
+no output until its owner promotes that one spec, and promoting one spec never
+flips another. ``NOUSERGON_ADMISSION_MODE`` (``shadow`` | ``enforce``) is an
+override in either direction for every spec when it is set; an unknown value is
 ``enforce``, so a typo fails closed rather than open.
+
+``TECHNICALS`` defaults to ``enforce`` (Brian's ruling on
+alpha-engine-config-I12082, 2026-10-23, after 6 shadow runs 10-14..10-22 with
+0 would-be refusals). A refusal lands in the caller's existing ``except`` path:
+the phase reports ``error`` and Metron keeps yesterday's ``latest.json``.
 """
 
 from __future__ import annotations
@@ -41,6 +50,7 @@ from contracts import _validate
 logger = logging.getLogger(__name__)
 
 MODE_ENV = "NOUSERGON_ADMISSION_MODE"
+MODES = ("shadow", "enforce")
 
 
 class AdmissionRefused(RuntimeError):
@@ -86,6 +96,15 @@ class AdmissionSpec:
     member_units: dict[str, Range] = field(default_factory=dict)
     member_predicates: tuple[tuple[str, Callable[[dict], bool]], ...] = ()
     max_lineage_age_days: int = 5
+    #: Default publish mode for THIS artifact: ``shadow`` or ``enforce``.
+    #: ``NOUSERGON_ADMISSION_MODE`` overrides it when set; see ``mode()``.
+    mode: str = "shadow"
+
+    def __post_init__(self) -> None:
+        if self.mode not in MODES:
+            raise ValueError(
+                f"{self.artifact}: AdmissionSpec.mode {self.mode!r} not in {MODES}"
+            )
 
 
 def admit(
@@ -155,9 +174,19 @@ def admit(
     return problems
 
 
-def mode() -> str:
-    value = os.environ.get(MODE_ENV, "shadow").strip().lower()
-    return value if value in ("shadow", "enforce") else "enforce"
+def mode(spec: AdmissionSpec | None = None) -> str:
+    """The mode ``spec`` publishes under.
+
+    ``NOUSERGON_ADMISSION_MODE``, when set to anything (even blank), overrides
+    the spec in either direction; an unrecognised value is ``enforce`` (fail
+    closed). Unset, the spec's own ``mode`` decides. With no spec, the
+    fallback is ``shadow``, the default for an undeclared artifact.
+    """
+    raw = os.environ.get(MODE_ENV)
+    if raw is None:
+        return spec.mode if spec is not None else "shadow"
+    value = raw.strip().lower()
+    return value if value in MODES else "enforce"
 
 
 def publish_admitted(
@@ -174,7 +203,7 @@ def publish_admitted(
     problems = admit(
         document, spec, run_date=run_date, population=population, today=today
     )
-    m = mode()
+    m = mode(spec)
     decision = {
         "artifact": spec.artifact,
         "mode": m,
@@ -232,4 +261,6 @@ TECHNICALS = AdmissionSpec(
         ("ma_50/ma_200 inside [low_52w, high_52w] and low <= high", _within_52w),
     ),
     max_lineage_age_days=5,
+    # alpha-engine-config-I12082 ruling (Brian, 2026-10-23): enforce.
+    mode="enforce",
 )
