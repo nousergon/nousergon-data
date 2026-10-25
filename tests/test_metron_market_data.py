@@ -820,7 +820,9 @@ class TestTechnicals:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = self._s3({"AAPL": {"closes": _close_history_closes(260)}})
-        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        # A fresh run date: TECHNICALS enforces admission (I12082), and its
+        # lineage check refuses an as_of more than 5 days old.
+        result = mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         assert result["status"] == "ok" and result["technicals"] == 1
         art = _puts(s3)["market_data/technicals/latest.json"]
         assert art["schema_version"] == mmd.TECHNICALS_SCHEMA_VERSION == 4
@@ -832,10 +834,15 @@ class TestTechnicals:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = self._s3({})  # no close_history published for AAPL yet
-        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
-        assert result["status"] == "ok" and result["technicals"] == 0
-        art = _puts(s3)["market_data/technicals/latest.json"]
-        assert art["technicals"] == {}
+        result = mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
+        # Under TECHNICALS' enforced admission (I12082 ruling, 2026-10-23) an
+        # empty manifest over a non-empty universe is refused: the phase reports
+        # error and nothing is written, so Metron keeps yesterday's latest.json
+        # instead of an empty Holdings technicals column. Before the ruling
+        # (shadow) this wrote ``technicals: {}``.
+        assert result["status"] == "error"
+        assert "manifest: empty technicals over a population of 1" in result["error"]
+        assert "market_data/technicals/latest.json" not in _puts(s3)
 
 
 class TestIntraday:

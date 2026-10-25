@@ -893,6 +893,23 @@ alert_classes:
     response: drain-queue
     # derived: warning/info only, automated response declared
     tier: tracked-only
+  - class: executor_trading_window_merge
+    source: "crucible-executor/scripts/trading_window_merge_check.py"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # DECLARED page (alpha-engine-config-I12640). A trading-path merge
+    # (crucible-executor or crucible-trader main) landed inside the
+    # 13:30-20:30Z run-rule window on an NYSE trading day. Detector only;
+    # merge-time refusal is option 1 on the same issue.
+    tier: page
+    operator_reason: >-
+      A merge cannot be reverted by automation — whether the change must be
+      backed out before the trading box picks it up (deploy-on-merge or a
+      mid-day boot-pull) is a human judgement, and the window to make it is
+      the rest of the session. crucible-executor#621 merged at 20:12Z on
+      2026-10-23 and nothing flagged it; drain-queue triage alone would
+      surface it after the close.
 
   # ── backtester (crucible-backtester) ──
   - class: backtester_executor_opt_rejected

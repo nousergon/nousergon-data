@@ -1,0 +1,16 @@
+{
+  "ec2_instance_id": [
+    "i-09b539c844515d549"
+  ],
+  "market_hours_override": {
+    "authorized_by": "REDACTED",
+    "expires_at": "2026-09-17T20:00:00Z",
+    "reason": "REDACTED"
+  },
+  "pipeline_role": "daily",
+  "run_date": "2026-09-17",
+  "sns_topic_arn": "arn:aws:sns:us-east-1:000000000000:REDACTED",
+  "trading_instance_id": [
+    "i-018eb3307a21329bf"
+  ]
+}

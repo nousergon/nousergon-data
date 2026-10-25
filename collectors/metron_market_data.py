@@ -2576,8 +2576,9 @@ def collect_technicals(
         return {"status": "ok_dry_run", "technicals": len(technicals), "universe": len(yf_symbols)}
     try:
         # alpha-engine-config-I12082: semantic admission at the publish boundary.
-        # Shadow by default (logs, writes anyway); NOUSERGON_ADMISSION_MODE=enforce
-        # refuses before the write and lands in the except below.
+        # TECHNICALS enforces (Brian, 2026-10-23): a refusal raises before the
+        # write and lands in the except below, so the phase reports error and
+        # latest.json stays yesterday's. NOUSERGON_ADMISSION_MODE=shadow overrides.
         from contracts.admission import TECHNICALS, publish_admitted
 
         publish_admitted(
