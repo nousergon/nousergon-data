@@ -336,6 +336,21 @@ def _scrub(exc: BaseException) -> str:
         return type(exc).__name__
 
 
+def _describe_fetch_error(exc: BaseException) -> str:
+    """A FIXED description of a fetch failure: class name plus, for an HTTP
+    error, its status code. Never the exception's message: a requests error
+    message embeds the effective URL, and the polygon URL carries ``apiKey``.
+    Redacting with a regex is not enough to rely on here, so the text is
+    simply not used (CodeQL py/clear-text-logging-sensitive-data on #2298)."""
+    import requests
+
+    name = type(exc).__name__
+    if isinstance(exc, requests.HTTPError):
+        code = getattr(getattr(exc, "response", None), "status_code", None)
+        return f"{name} (HTTP {code})" if code is not None else name
+    return name
+
+
 def fetch_corporate_actions(
     ticker: str,
     *,
@@ -368,8 +383,8 @@ def fetch_corporate_actions(
                 ):
                     raise CorporateActionFetchError(
                         f"{ticker}: polygon {kind} fetch failed after "
-                        f"{attempt + 1} attempt(s) ({type(exc).__name__}: "
-                        f"{_scrub(exc)}) — the name cannot be built without its "
+                        f"{attempt + 1} attempt(s) ({_describe_fetch_error(exc)})"
+                        f" — the name cannot be built without its "
                         f"full {kind} history"
                     ) from None
                 wait = min(
@@ -377,9 +392,9 @@ def fetch_corporate_actions(
                     CA_FETCH_BACKOFF_CAP_SECONDS,
                 )
                 log.warning(
-                    "%s: polygon %s fetch failed (%s: %s) — waiting %.0fs, "
+                    "%s: polygon %s fetch failed (%s) — waiting %.0fs, "
                     "attempt %d/%d",
-                    ticker, kind, type(exc).__name__, _scrub(exc), wait,
+                    ticker, kind, _describe_fetch_error(exc), wait,
                     attempt + 1, attempts,
                 )
                 sleep(wait)
