@@ -18,6 +18,10 @@
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --apply-iam # re-apply iam-policy.json only (no bootstrap side effects, config#2825)
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --dry-run   # show actions, do not apply
 #   bash infrastructure/lambdas/sf-telegram-notifier/deploy.sh --smoke     # invoke once with a synthetic SUCCEEDED event
+#
+# iam-policy.json `WeeklyRunReportRead` (alpha-engine-config-I12630): read-only
+# GetObject on the weekly issue report's sources (Director plan/retro/ledger,
+# _stage_outputs, _stage_coverage, health, resolutions overlay). Goes live via --apply-iam.
 
 set -euo pipefail
 
@@ -101,6 +105,8 @@ HANDLER_TEST_PYTHONPATH="${LAMBDAS_DIR}" \
 
 cp "${SCRIPT_DIR}/index.py" "${PKG}/index.py"
 cp "${SCRIPT_DIR}/execution_digest.py" "${PKG}/execution_digest.py"
+cp "${SCRIPT_DIR}/weekly_run_report.py" "${PKG}/weekly_run_report.py"
+cp "${SCRIPT_DIR}/weekly_issue_resolutions.json" "${PKG}/weekly_issue_resolutions.json"
 # Moved up to LAMBDAS_DIR (alpha-engine-config-I7582): eod-backstop now reads the
 # same artifact definition, and two copies of "did the EOD do its job" is the
 # §2.3 one-owner-per-config-fact defect.

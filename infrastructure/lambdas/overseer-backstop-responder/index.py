@@ -592,6 +592,8 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict,
             f"State is now {state}. No action taken and none needed.",
             "",
             f"Reason: {reason or '(none given)'}",
+            "",
+            "Auto-fix: none needed (recovered).",
         ])
 
     lines = [
@@ -627,7 +629,26 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict,
             f"  result:    {'OK' if res.get('ok') else 'FAILED'}",
             f"  detail:    {json.dumps({k: v for k, v in res.items() if k not in ('attempted', 'ok')})[:600]}",
         ]
+    # Every Telegram message says what is being fixed automatically
+    # (nous-ergon-ops observability-policy § Notification — auto-fix line).
+    lines += ["", _auto_fix_line(outcome)]
     return "\n".join(lines)
+
+
+def _auto_fix_line(outcome: dict) -> str:
+    """The ``Auto-fix:`` line, from what this responder actually did."""
+    if outcome.get("escalated"):
+        return ("Auto-fix: none left. The automatic recovery already ran once "
+                "and did not fix it, so it is not retried; tonight's nightly "
+                "sweep (7pm PT) takes it.")
+    if outcome.get("skipped"):
+        return (f"Auto-fix: none ({outcome['skipped']}); tonight's nightly "
+                "sweep (7pm PT) picks it up.")
+    res = outcome.get("result") or {}
+    verdict = "succeeded" if res.get("ok") else "failed"
+    return (f"Auto-fix: this responder ran one bounded recovery "
+            f"({res.get('attempted')}) and it {verdict}. If the alarm fires "
+            "again inside the cooldown it escalates instead of retrying.")
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract

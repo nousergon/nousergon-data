@@ -1,4 +1,4 @@
-boto3>=1.43.117
+boto3>=1.43.118
 pandas>=2.0
 openpyxl>=3.1.5
 # <26: pyarrow 26.0.0 (2026-10-09) refuses to import under NumPy 1.x, and every
@@ -22,7 +22,7 @@ numpy>=2.4.6
 feedparser>=6.0.14
 beautifulsoup4>=4.15.0
 lxml>=6.1.3
-edgartools>=5.62.0
+edgartools>=5.62.1
 voyageai>=0.5.0
 jsonschema>=4.26.0
 arcticdb>=6.28.1
@@ -151,7 +151,7 @@ arcticdb>=6.28.1
 # `contracts` already pulled the same package, but naming the extra the
 # module actually belongs to is what keeps that true if either moves.
 # `crucible` pins the same pair for the same reason: nousergon-lib[github-app,gates].
-nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.180
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.186
 # krepis floor: sf_preflight.py reads the operator pricing override
 # (cost/model_pricing.yaml) via nousergon_lib.cost -> krepis.cost.PriceCard,
 # which is extra="forbid". config#1332 adds the cache_create_1h_per_1m field,

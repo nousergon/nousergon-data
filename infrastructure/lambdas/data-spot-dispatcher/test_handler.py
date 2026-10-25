@@ -644,6 +644,10 @@ def test_shadow_weekday_runtime_cap_covers_the_chained_legs(monkeypatch):
         elif workload == "institutional-holdings-pit-backfill":
             # The one-time 13F backfill, ~40 archives at an estimated ~5 min each.
             expected = 21600
+        elif workload == "universe-crsp-basis-build":
+            # alpha-engine-config-I12436: the one-time universe_crsp build, ~909
+            # names x 2 polygon calls at 5/min (~6.1 h) before fetch and features.
+            expected = 43200
         else:
             expected = index.MAX_RUNTIME_SECONDS
         assert index._max_runtime_seconds(workload) == expected
