@@ -1,0 +1,77 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/filing_8k_items.schema.json",
+  "title": "EDGAR 8-K item codes, one row per (filing, item) (schema_version 1)",
+  "description": "One row of fundamentals_pit/filing_8k_items/v1/quarters/{YYYY}q{N}.parquet. Producer: collectors/filing_8k_items_pit.py (rows_in_block, then run() adds schema_version). A filing with no item codes is one row with item ''. PRODUCER TEST: tests/test_pit_dataset_contracts.py. The x-pit declaration states the collector's own knowledge rule (filing_date < S); acceptance_datetime is carried as EDGAR reports it but is not the rule, because its clock is not verified here. alpha-engine-config-I12567 (DATA-01, second slice).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "cik",
+    "ticker",
+    "accession",
+    "form",
+    "filing_date",
+    "acceptance_datetime",
+    "report_date",
+    "item",
+    "items_all",
+    "schema_version"
+  ],
+  "properties": {
+    "cik": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "ticker": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The issuer's CURRENT ticker from the EDGAR PIT facts run, not the ticker on the filing date (alpha-engine-config-I12568)."
+    },
+    "accession": {
+      "type": "string",
+      "pattern": "^\\d{10}-\\d{2}-\\d{6}$"
+    },
+    "form": {
+      "enum": [
+        "8-K",
+        "8-K/A"
+      ]
+    },
+    "filing_date": {
+      "type": "string",
+      "format": "date",
+      "description": "EDGAR filingDate. The availability date: admissible for session S only when filing_date < S."
+    },
+    "acceptance_datetime": {
+      "type": "string",
+      "description": "EDGAR acceptanceDateTime verbatim, or '' when EDGAR reports none."
+    },
+    "report_date": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date",
+      "description": "EDGAR reportDate, the date of the earliest event reported; null when EDGAR reports none."
+    },
+    "item": {
+      "type": "string",
+      "description": "One item code (e.g. '2.02'); '' for a filing with no codes."
+    },
+    "items_all": {
+      "type": "string"
+    },
+    "schema_version": {
+      "const": 1
+    }
+  },
+  "x-pit": {
+    "event_time": "report_date",
+    "available_at_field": "filing_date",
+    "available_at_basis": "source_date_rule",
+    "admissible_when": "available_before_session",
+    "revisions": "final",
+    "rule": "EDGAR stamps each filing with its filing date (a filing accepted after 17:30 ET carries the next business day), so a row is admissible for session S only when filing_date < S. An amendment is a separate 8-K/A accession with its own filing date and never rewrites the original row, so a published row is final.",
+    "tracker": "alpha-engine-config-I12567"
+  }
+}

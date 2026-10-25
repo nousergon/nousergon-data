@@ -45,24 +45,35 @@ class TestTechnicalsContract:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": _closes(260)}})
-        mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        # Fresh run date: TECHNICALS enforces admission (I12082) and refuses an
+        # as_of more than 5 days old.
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         art = _puts(s3)["market_data/technicals/latest.json"]
         assert "rating" in art["technicals"]["AAPL"]
         assert validate_technicals(art) == []
 
     def test_producer_refuses_an_empty_payload(self, monkeypatch):
         """No close_history published for any symbol: the write is refused, so the
-        previous artifact stands (alpha-engine-config-I10886). An empty `technicals`
-        map is still schema-valid for a hand-built document; the producer just never
-        publishes one over a non-empty population."""
+        previous artifact stands (alpha-engine-config-I10886; TECHNICALS' enforced
+        admission, I12082, would refuse it too). An empty `technicals` map is still
+        schema-valid for a hand-built document; the producer just never publishes one
+        over a non-empty population."""
         monkeypatch.setattr(
             mmd, "load_price_derived_universe",
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = _universe_s3(_UNIVERSE, close_history={})
-        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        run_date = str(date.today())
+        result = mmd.collect_technicals(bucket="b", run_date=run_date, s3_client=s3)
         assert result["status"] == "error"
         assert "market_data/technicals/latest.json" not in _puts(s3)
+        empty = {
+            "schema_version": mmd.TECHNICALS_SCHEMA_VERSION,
+            "as_of": run_date,
+            "source": "computed",
+            "technicals": {},
+        }
+        assert validate_technicals(empty) == []
 
     def test_producer_coverage_block_validates(self, monkeypatch):
         from collectors import constituents as constituents_mod
@@ -70,7 +81,7 @@ class TestTechnicalsContract:
         monkeypatch.setattr(constituents_mod, "load_from_s3", lambda bucket: {"tickers": ["AAPL"]})
         s3 = _universe_s3(_UNIVERSE, watchlist={"holdings": []},
                           close_history={"AAPL": {"closes": _closes(260)}})
-        mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         art = _puts(s3)["market_data/technicals/latest.json"]
         assert art["coverage"]["universe_sources"]["constituents"]["status"] == "ok"
         assert validate_technicals(art) == []
@@ -81,7 +92,7 @@ class TestTechnicalsContract:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": _closes(260)}})
-        mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         art = _puts(s3)["market_data/technicals/latest.json"]
         # Loader patched out: no source reported, so the run cannot read complete.
         assert art["coverage"]["universe_sources"]["constituents"]["status"] == "not_reported"

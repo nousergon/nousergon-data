@@ -67,6 +67,7 @@ from zoneinfo import ZoneInfo
 __all__ = [
     "ADMISSIBLE_WHEN",
     "AVAILABILITY_BASES",
+    "CONTRACTED_PIT_DATASETS",
     "DECLARATION_KEY",
     "PENDING_DECLARATIONS",
     "REVISION_POLICIES",
@@ -147,11 +148,6 @@ UNCONTRACTED_PIT_DATASETS: dict[str, dict[str, str]] = {
         "revisions": "overwritten",
         "gap": "known_at is calendar-derived (7th / 22nd of the next month); the publication instant is unobserved",
     },
-    "collectors/short_volume_pit.py": {
-        "basis": "publication_calendar",
-        "revisions": "final",
-        "gap": "FINRA's 6 pm ET same-day publication rule, not an observed instant",
-    },
     "collectors/insider_transactions_pit.py": {
         "basis": "source_date_rule",
         "revisions": "superseding",
@@ -161,11 +157,6 @@ UNCONTRACTED_PIT_DATASETS: dict[str, dict[str, str]] = {
         "basis": "source_date_rule",
         "revisions": "superseding",
         "gap": "amendments supersede by amendment_type; no contract names the vintage field",
-    },
-    "collectors/filing_8k_items_pit.py": {
-        "basis": "source_timestamp",
-        "revisions": "final",
-        "gap": "acceptance_datetime is kept but no contract declares it as available_at",
     },
     "collectors/filing_text_pit.py": {
         "basis": "source_date_rule",
@@ -177,6 +168,17 @@ UNCONTRACTED_PIT_DATASETS: dict[str, dict[str, str]] = {
         "revisions": "final",
         "gap": "known_at = view_date + 2 days by rule",
     },
+}
+
+#: PIT datasets that HAVE left :data:`UNCONTRACTED_PIT_DATASETS`: the collector,
+#: and the contract schema in `contracts/` whose ``x-pit`` declares its
+#: availability rule. `tests/test_pit_dataset_contracts.py` builds rows with
+#: each collector's own row builder and validates them against the schema, so
+#: a declaration cannot name a column the producer does not write.
+CONTRACTED_PIT_DATASETS: dict[str, str] = {
+    "collectors/edgar_pit_fundamentals.py": "edgar_pit_fundamentals_session.schema.json",
+    "collectors/filing_8k_items_pit.py": "filing_8k_items.schema.json",
+    "collectors/short_volume_pit.py": "short_volume.schema.json",
 }
 
 _REQUIRED = ("event_time", "available_at_basis", "admissible_when", "revisions", "rule")

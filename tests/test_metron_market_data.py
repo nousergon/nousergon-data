@@ -820,7 +820,9 @@ class TestTechnicals:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = self._s3({"AAPL": {"closes": _close_history_closes(260)}})
-        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        # A fresh run date: TECHNICALS enforces admission (I12082), and its
+        # lineage check refuses an as_of more than 5 days old.
+        result = mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         assert result["status"] == "ok" and result["technicals"] == 1
         art = _puts(s3)["market_data/technicals/latest.json"]
         assert art["schema_version"] == mmd.TECHNICALS_SCHEMA_VERSION == 4
@@ -832,7 +834,7 @@ class TestTechnicals:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = self._s3({})  # no close_history published for AAPL yet
-        result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        result = mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         # alpha-engine-config-I10886: an empty payload over a non-empty population is
         # refused, so yesterday's latest.json stands instead of an empty map.
         assert result["status"] == "error" and result["technicals"] == 0
@@ -848,7 +850,7 @@ class TestTechnicalsCoverage:
     _CONSTITUENTS = ["AAPL", "MSFT"]
 
     def _run(self, monkeypatch, *, constituents=_CONSTITUENTS, constituents_error=None,
-             watchlist=None, close_history=None, run_date="2026-06-26"):
+             watchlist=None, close_history=None, run_date=None):
         from collectors import constituents as constituents_mod
 
         def _load(bucket):
@@ -858,11 +860,15 @@ class TestTechnicalsCoverage:
 
         monkeypatch.setattr(constituents_mod, "load_from_s3", _load)
         s3 = _universe_s3(_UNIVERSE, watchlist=watchlist, close_history=close_history)
+        # A fresh run date: TECHNICALS enforces admission (I12082), whose lineage
+        # check refuses an as_of more than 5 days old.
+        run_date = run_date or str(date.today())
         result = mmd.collect_technicals(bucket="b", run_date=run_date, s3_client=s3)
         return result, _puts(s3).get("market_data/technicals/latest.json")
 
     def _full_history(self):
-        closes = _close_history_closes(260, start_date="2025-10-09")  # last bar 2026-06-25
+        start = date.today() - timedelta(days=260)  # last bar: yesterday
+        closes = _close_history_closes(260, start_date=str(start))
         return {"AAPL": {"closes": closes}, "MSFT": {"closes": closes}}
 
     def test_every_source_answered_and_floor_met_is_complete(self, monkeypatch):
@@ -882,7 +888,8 @@ class TestTechnicalsCoverage:
             "watchlist": {"status": "ok", "count": 0},
         }
         assert cov["complete"] is True and result["complete"] is True
-        assert cov["bar_dates"] == {"AAPL": "2026-06-25", "MSFT": "2026-06-25"}
+        yesterday = str(date.today() - timedelta(days=1))
+        assert cov["bar_dates"] == {"AAPL": yesterday, "MSFT": yesterday}
         assert cov["stale"] == ["AAPL", "MSFT"]  # newest bar is before the run date
 
     def test_denied_constituents_cannot_read_complete(self, monkeypatch):
