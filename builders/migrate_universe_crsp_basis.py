@@ -107,6 +107,9 @@ import argparse
 import json
 import logging
 import os
+import shutil
+import tempfile
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -129,7 +132,24 @@ log = logging.getLogger(__name__)
 
 AUDIT_PREFIX = "builders/migrate_universe_crsp_basis_audit/"
 DEFAULT_SCRATCH_LIB = "universe_crsp"
-DEFAULT_WORKERS = 8
+# 2, not 8 (alpha-engine-config-I12436). Each name costs two polygon reference
+# calls against a 5-calls/minute key the fleet shares, so the polygon budget —
+# not CPU — sets the build's pace (~909 names x 2 calls / 5 per min ~= 6 h) and
+# more workers buy no speed. What they did buy on 2026-10-25 was 2,230 429s and
+# 478 corporate-action fetches abandoned. Two keeps one name's yfinance pull and
+# feature recompute overlapping the other's polygon wait.
+DEFAULT_WORKERS = 2
+
+# Corporate-action fetch patience (alpha-engine-config-I12436). The polygon
+# client already retries a 429 four times over ~105 s, which is one rate-limit
+# window; on a key other fleet jobs share, that is not enough. These are OUTER
+# retries around a whole get_splits/get_dividends call, after the client gave
+# up: waits 60, 120, 240 s (capped at 300) — ~7 min more per call before the
+# name is declared incomplete and the build stops. The build NEVER proceeds on
+# an empty action list it could not confirm is empty.
+CA_FETCH_ATTEMPTS = 4
+CA_FETCH_BACKOFF_BASE_SECONDS = 60.0
+CA_FETCH_BACKOFF_CAP_SECONDS = 300.0
 
 # Both the derived total_return_close and the retiring yfinance Close are
 # TOTAL-RETURN series anchored at the latest (post-action) split-adjusted
@@ -208,7 +228,11 @@ class TickerOutcome:
     n_dividends: int = 0
     error: str | None = None
     written: bool = False
-    new_df: pd.DataFrame | None = field(default=None, repr=False)
+    # --apply: the featured frame is SPILLED to local disk (``spill_path``),
+    # never held in this outcome. Holding ~909 full-history 60-column frames
+    # until the write pass is what OOM-killed the 2026-10-25 build on a 4 GiB
+    # box (exit 137 two-thirds through the alphabet, alpha-engine-config-I12436).
+    spill_path: str | None = None
     # Splits the feed reported but ``corporate_actions.apply`` declined to
     # apply because the raw close shows no corroborating price move
     # (config#1455 price-evidence gate) — human-readable ``"TICKER ratio
@@ -270,6 +294,96 @@ def fetch_raw_prices(ticker: str, *, period: str = "max") -> pd.DataFrame:
 
     keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in raw.columns]
     return raw[keep]
+
+
+# ── corporate actions: strict, patient fetch ─────────────────────────────────
+
+
+class CorporateActionFetchError(RuntimeError):
+    """A ticker's polygon split/dividend history could not be fetched.
+
+    Raised instead of building the name on an empty action list: "could not
+    fetch" is not "never split / never paid", and a series reconstructed from
+    the second when the truth was the first is silently wrong in every row
+    before the missed action (alpha-engine-config-I12436)."""
+
+
+def _is_retryable_fetch_error(exc: BaseException) -> bool:
+    """Rate-limit exhaustion, a 5xx, or a network error: worth waiting out.
+    Anything else (a malformed ratio, a programming error) is not."""
+    import requests
+
+    try:
+        from polygon_client import PolygonRateLimitError
+    except Exception:  # noqa: BLE001 - client module unimportable
+        PolygonRateLimitError = ()  # type: ignore[assignment]
+    if PolygonRateLimitError and isinstance(exc, PolygonRateLimitError):
+        return True
+    if isinstance(exc, (requests.ConnectionError, requests.Timeout)):
+        return True
+    if isinstance(exc, requests.HTTPError):
+        resp = getattr(exc, "response", None)
+        return resp is not None and getattr(resp, "status_code", 0) >= 500
+    return False
+
+
+def _scrub(exc: BaseException) -> str:
+    try:
+        from polygon_client import _scrub_api_key
+
+        return _scrub_api_key(exc)
+    except Exception:  # noqa: BLE001 - scrubber unavailable; drop the text
+        return type(exc).__name__
+
+
+def fetch_corporate_actions(
+    ticker: str,
+    *,
+    client=None,
+    attempts: int = CA_FETCH_ATTEMPTS,
+    sleep=None,
+    abort: threading.Event | None = None,
+) -> tuple[list, list]:
+    """Fetch ``(split_actions, dividend_actions)`` for one ticker, STRICTLY.
+
+    ``corporate_actions.get_splits`` / ``get_dividends`` are called with
+    ``strict=True`` so a failed fetch raises rather than returning ``[]``. A
+    retryable failure (429 the client could not clear, 5xx, network) is retried
+    up to ``attempts`` times with exponential backoff; when that is exhausted,
+    or on a non-retryable failure, :class:`CorporateActionFetchError` is raised
+    and the caller must not build the name. ``abort`` (set once any name has
+    failed this way) cuts the wait short: the build is already lost.
+    """
+    sleep = sleep or time.sleep
+    results = []
+    for kind, fn in (("splits", ca.get_splits), ("dividends", ca.get_dividends)):
+        for attempt in range(attempts):
+            try:
+                results.append(fn(ticker, client=client, strict=True))
+                break
+            except Exception as exc:  # noqa: BLE001 - classified below
+                last = attempt == attempts - 1
+                if not _is_retryable_fetch_error(exc) or last or (
+                    abort is not None and abort.is_set()
+                ):
+                    raise CorporateActionFetchError(
+                        f"{ticker}: polygon {kind} fetch failed after "
+                        f"{attempt + 1} attempt(s) ({type(exc).__name__}: "
+                        f"{_scrub(exc)}) — the name cannot be built without its "
+                        f"full {kind} history"
+                    ) from None
+                wait = min(
+                    CA_FETCH_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                    CA_FETCH_BACKOFF_CAP_SECONDS,
+                )
+                log.warning(
+                    "%s: polygon %s fetch failed (%s: %s) — waiting %.0fs, "
+                    "attempt %d/%d",
+                    ticker, kind, type(exc).__name__, _scrub(exc), wait,
+                    attempt + 1, attempts,
+                )
+                sleep(wait)
+    return results[0], results[1]
 
 
 # ── core: per-ticker basis reconstruction (pure, network-free) ────────────────
@@ -637,6 +751,7 @@ def migrate_universe_crsp_basis(
     workers: int | None = None,
     raw_fetch=None,
     client=None,
+    spill_dir: str | None = None,
     macro: dict | None = None,
     sector_map: dict | None = None,
     fundamentals: dict | None = None,
@@ -672,6 +787,12 @@ def migrate_universe_crsp_basis(
         polygon coverage sparse); in-window residuals STILL fail loud. The full
         history is still WRITTEN to scratch regardless. Default ``None``:
         full-history reconciliation (UNCHANGED, conservative — operator opts in).
+    spill_dir
+        ``--apply`` only: where each ticker's featured frame is spilled until
+        the write pass (one pickle per name, deleted once written). Default:
+        ``$MIGRATE_UNIVERSE_CRSP_SPILL_DIR``, else a fresh directory under the
+        CWD — deliberately NOT ``/tmp``, which is RAM-backed tmpfs on AL2023 and
+        would put the frames straight back in memory.
     raw_fetch / client
         Injectable RAW-price fetcher ``(ticker) -> DataFrame`` and polygon client
         (for tests / alternate sources). Default: yfinance ``auto_adjust=False``
@@ -734,7 +855,25 @@ def migrate_universe_crsp_basis(
     fundamentals = fundamentals or {}
     alt_data = alt_data or {}
 
+    own_spill_dir = False
+    if apply and spill_dir is None:
+        spill_dir = os.environ.get("MIGRATE_UNIVERSE_CRSP_SPILL_DIR") or None
+        if spill_dir is None:
+            spill_dir = tempfile.mkdtemp(prefix=".crsp_basis_spill_", dir=os.getcwd())
+            own_spill_dir = True
+    if apply:
+        os.makedirs(spill_dir, exist_ok=True)
+        log.info("Spilling featured frames to %s until the write pass", spill_dir)
+    slot_of = {t: i for i, t in enumerate(targets)}
+
+    # Set when any name's corporate actions could not be fetched: the build can
+    # no longer pass (the audit gate needs zero errors), so the remaining names
+    # are skipped instead of spending hours of polygon budget on a lost run.
+    abort = threading.Event()
+
     def _process_one(ticker: str) -> TickerOutcome:
+        if abort.is_set():
+            return TickerOutcome(ticker, "aborted")
         try:
             old_close = _read_old_close(universe_lib, ticker)
             if old_close is None:
@@ -744,8 +883,20 @@ def migrate_universe_crsp_basis(
             if raw_df is None or raw_df.empty:
                 return TickerOutcome(ticker, "fetch_empty")
 
-            split_actions = ca.get_splits(ticker, client=client)
-            dividend_actions = ca.get_dividends(ticker, client=client)
+            try:
+                split_actions, dividend_actions = fetch_corporate_actions(
+                    ticker, client=client, abort=abort,
+                )
+            except CorporateActionFetchError as exc:
+                abort.set()
+                log.error(
+                    "%s — STOPPING the build: no name is built on corporate "
+                    "actions it could not fetch (alpha-engine-config-I12436)",
+                    exc,
+                )
+                return TickerOutcome(
+                    ticker, "error", error=f"corporate_actions: {exc}",
+                )
 
             new_df, applied = reconstruct_basis(
                 ticker, raw_df, split_actions, dividend_actions,
@@ -802,14 +953,48 @@ def migrate_universe_crsp_basis(
                     options_data=(alt_data.get(ticker, {}) or {}).get("options"),
                     fundamental_data=fundamentals.get(ticker),
                 )
-                out.new_df = featured
+                if featured is not None and not featured.empty:
+                    path = os.path.join(spill_dir, f"{slot_of[ticker]:05d}.pkl")
+                    featured.to_pickle(path)
+                    out.spill_path = path
+                del featured
             return out
         except Exception as exc:  # noqa: BLE001 - capture per-ticker, surface in report
-            return TickerOutcome(ticker, "error", error=str(exc))
+            return TickerOutcome(ticker, "error", error=_scrub(exc))
 
+    try:
+        summary = _run_and_report(
+            targets=targets, workers=workers, process_one=_process_one,
+            apply=apply, scratch=scratch, scratch_lib=scratch_lib, s3=s3,
+            bucket=bucket, rel_tol=rel_tol, reconcile_start=reconcile_start,
+            arctic_symbols=arctic_symbols,
+            known_divergence_tickers=known_divergence_tickers,
+        )
+    finally:
+        if own_spill_dir:
+            shutil.rmtree(spill_dir, ignore_errors=True)
+    return summary
+
+
+def _run_and_report(
+    *,
+    targets: list[str],
+    workers: int,
+    process_one,
+    apply: bool,
+    scratch,
+    scratch_lib: str,
+    s3,
+    bucket: str,
+    rel_tol: float,
+    reconcile_start: str | None,
+    arctic_symbols: list[str],
+    known_divergence_tickers: frozenset[str],
+) -> dict:
+    """Run every target, write the scratch library, emit the audit, fail loud."""
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
-        outcomes = list(pool.map(_process_one, targets))
+        outcomes = list(pool.map(process_one, targets))
     elapsed = time.time() - t0
 
     # ── partition outcomes ────────────────────────────────────────────────────
@@ -818,6 +1003,7 @@ def migrate_universe_crsp_basis(
     no_old_close: list[str] = []
     fetch_empty: list[str] = []
     unconfirmed_splits: list[str] = []
+    aborted: list[str] = []
     written = 0
 
     for o in outcomes:
@@ -827,6 +1013,8 @@ def migrate_universe_crsp_basis(
             no_old_close.append(o.ticker)
         elif o.outcome == "fetch_empty":
             fetch_empty.append(o.ticker)
+        elif o.outcome == "aborted":
+            aborted.append(o.ticker)
         elif o.outcome == "error":
             errors.append({"ticker": o.ticker, "error": o.error})
             log.error("CRSP migration error for %s: %s", o.ticker, o.error)
@@ -835,16 +1023,24 @@ def migrate_universe_crsp_basis(
 
     # ── WRITE scratch (apply) — only after all reconciliations computed ───────
     if apply:
+        # One frame in memory at a time: read the spill, write, delete it.
         for o in outcomes:
-            if o.outcome == "ok" and o.new_df is not None and not o.new_df.empty:
+            if o.outcome == "ok" and o.spill_path is not None:
                 try:
-                    scratch.write(o.ticker, to_arctic_canonical(o.new_df))
+                    frame = pd.read_pickle(o.spill_path)
+                    scratch.write(o.ticker, to_arctic_canonical(frame))
+                    del frame
                     o.written = True
                     written += 1
                 except Exception as exc:  # noqa: BLE001
                     errors.append({"ticker": o.ticker, "stage": "scratch_write",
                                    "error": str(exc)})
                     log.error("Scratch write failed for %s: %s", o.ticker, exc)
+                finally:
+                    try:
+                        os.remove(o.spill_path)
+                    except OSError:
+                        pass
 
     within_tol = [r for r in records if r.status == "within_tol"]
     out_of_tol = [r for r in records if r.status == "out_of_tol"]
@@ -865,7 +1061,7 @@ def migrate_universe_crsp_basis(
     tickers_with_excluded = sum(1 for r in records if r.n_common_excluded > 0)
 
     summary = {
-        "status": "ok" if (not unexplained and not errors) else "fail",
+        "status": "ok" if (not unexplained and not errors and not aborted) else "fail",
         "applied": apply,
         "scratch_lib": scratch_lib,
         "rel_tol": rel_tol,
@@ -887,6 +1083,7 @@ def migrate_universe_crsp_basis(
         "no_old_close_count": len(no_old_close),
         "fetch_empty_count": len(fetch_empty),
         "errors_count": len(errors),
+        "aborted_count": len(aborted),
         "unconfirmed_splits_count": len(unconfirmed_splits),
         "written_count": written,
         "elapsed_seconds": round(elapsed, 1),
@@ -905,6 +1102,9 @@ def migrate_universe_crsp_basis(
         # was correctly withheld may still reconcile within_tol).
         "unconfirmed_splits": unconfirmed_splits,
         "errors": errors,
+        # Names skipped after another name's corporate actions could not be
+        # fetched (the build was already lost; alpha-engine-config-I12436).
+        "aborted": aborted,
         "known_divergence_tickers": sorted(known_divergence_tickers),
     }
 
@@ -914,10 +1114,10 @@ def migrate_universe_crsp_basis(
     log.info(
         "migrate_universe_crsp_basis: applied=%s reconcile_start=%s targets=%d "
         "reconciled=%d within_tol=%d out_of_tol=%d no_overlap=%d unexplained=%d "
-        "errors=%d unconfirmed_splits=%d written=%d in_window_dates=%d "
+        "errors=%d aborted=%d unconfirmed_splits=%d written=%d in_window_dates=%d "
         "excluded_pre_window_dates=%d elapsed=%.1fs",
         apply, reconcile_start, len(targets), len(records), len(within_tol),
-        len(out_of_tol), len(no_overlap), len(unexplained), len(errors),
+        len(out_of_tol), len(no_overlap), len(unexplained), len(errors), len(aborted),
         len(unconfirmed_splits), written, total_in_window, total_excluded, elapsed,
     )
 
@@ -936,10 +1136,11 @@ def migrate_universe_crsp_basis(
             f"--known-divergence) before trusting the scratch basis. First 20: "
             f"{[r.to_dict() for r in unexplained[:20]]}"
         )
-    if errors:
+    if errors or aborted:
         raise RuntimeError(
-            f"CRSP migration had {len(errors)} per-ticker error(s) — see audit. "
-            f"First 20: {errors[:20]}"
+            f"CRSP migration had {len(errors)} per-ticker error(s) and "
+            f"{len(aborted)} name(s) skipped after the build was stopped — see "
+            f"audit. First 20 errors: {errors[:20]}"
         )
 
     return summary
