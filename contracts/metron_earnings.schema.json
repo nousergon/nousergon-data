@@ -35,5 +35,13 @@
       "absolute": 0.0
     },
     "coverage_floor": 0.98
+  },
+  "x-pit": {
+    "event_time": "as_of",
+    "available_at_basis": "collection_time",
+    "admissible_when": "available_at_or_before_decision",
+    "revisions": "overwritten",
+    "rule": "Earnings calendar as read by the run; available_at is that run's data_pit stamp. latest.json is rewritten each run.",
+    "tracker": "alpha-engine-config-I12567"
   }
 }
