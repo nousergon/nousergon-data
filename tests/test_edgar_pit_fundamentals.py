@@ -657,6 +657,14 @@ class TestRun:
         assert e.facts_key(dt.date(2026, 9, 14), "fixture") in store.objects
         recorded = json.loads(store.objects[e.run_summary_key(dt.date(2026, 9, 14), "fixture")])
         assert recorded["coverage_newest_session"]["ratio"] == 1.0
+        assert "close_source" not in recorded
+
+    def test_the_run_record_names_the_close_library(self, tmp_path) -> None:
+        store = _Store()
+        source = {"close_library": "universe_crsp", "newest_session": "2026-09-11", "names_absent": 0}
+        _run(store, crosscheck_disabled_reason="fixture", work_dir=str(tmp_path), close_source=source)
+        recorded = json.loads(store.objects[e.run_summary_key(dt.date(2026, 9, 14), "fixture")])
+        assert recorded["close_source"] == source
 
     def test_writes_a_fixed_key_freshness_sentinel_every_run(self, tmp_path) -> None:
         # alpha-engine-config-I10750: the freshness monitor cannot probe a

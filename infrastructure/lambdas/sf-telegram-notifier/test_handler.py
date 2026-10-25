@@ -510,7 +510,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
             "skip_evaluator": True,
             "skip_post_eval": False,
         })}
-        text, silent, _hollow, is_partial = index._build_message(
+        text, silent, _hollow, is_partial, _triage = index._build_message(
             self._detail(), describe
         )
         assert is_partial is True
@@ -525,7 +525,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
             "run_date": "2026-08-03",
             "skip_data_phase1": True,
         })}
-        text, silent, _hollow, is_partial = index._build_message(
+        text, silent, _hollow, is_partial, _triage = index._build_message(
             self._detail("weekly-2026-08-03"), describe
         )
         assert is_partial is False
@@ -534,7 +534,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
 
     def test_full_run_with_no_skips_is_not_partial(self):
         describe = {"input": json.dumps({"run_date": "2026-08-03"})}
-        _text, silent, _hollow, is_partial = index._build_message(
+        _text, silent, _hollow, is_partial, _triage = index._build_message(
             self._detail("abc-123"), describe
         )
         assert is_partial is False
@@ -542,7 +542,7 @@ class TestPartialRunsDoNotPageAsCadenceFailures:
 
     def test_unparseable_input_is_not_treated_as_partial(self):
         """Absence of evidence is never evidence of a narrowed run."""
-        _text, silent, _hollow, is_partial = index._build_message(
+        _text, silent, _hollow, is_partial, _triage = index._build_message(
             self._detail("abc-123"), {"input": "not json"}
         )
         assert is_partial is False
@@ -832,3 +832,69 @@ class TestVacuousRunMapping:
         assert index._is_vacuous_run({"error": "DegradedRun"}) is False
         assert index._is_vacuous_run({"error": ""}) is False
         assert index._is_vacuous_run(None) is False
+
+
+class TestWeeklyIssueReport:
+    """Brian, 2026-10-24: the weekly terminal lists every imperfect step with
+    its auto-fix, plus the Director's status and top 3 concerns."""
+
+    PLAN = {
+        "system_summary": "Overall RED. Live outcomes are adverse.",
+        "top_risks": ["Exit rules destroy alpha", "SF success 75%", "Direction skill negative", "Fourth"],
+        "attestation": {"contamination_verdict": "UNKNOWN"},
+    }
+
+    def _wire(self, monkeypatch, plan=None):
+        output = {"run_date": "2026-10-23", "skip_parity": True, "model_zoo_unservable": True}
+        sf = _fake_sf_client({
+            "input": json.dumps({"pipeline_role": "weekly"}),
+            "output": json.dumps(output),
+            "error": "",
+            "cause": "",
+        })
+        objects = {"director/2026-10-23/action_plan.json": plan or self.PLAN}
+        s3 = MagicMock()
+
+        def get_object(Bucket, Key):
+            if Key in objects:
+                return {"Body": io.BytesIO(json.dumps(objects[Key]).encode())}
+            raise _NotFoundS3Error()
+
+        s3.get_object.side_effect = get_object
+        s3.list_objects_v2.return_value = {"Contents": []}
+
+        def client(name, region_name=None):
+            return {"stepfunctions": sf, "s3": s3}.get(name, MagicMock())
+
+        monkeypatch.setattr(index.boto3, "client", client)
+        sent = {}
+
+        def fake_notify(text, **kwargs):
+            sent["text"] = text
+            sent.update(kwargs)
+            return True
+
+        monkeypatch.setattr(index, "notify_via_flow_doctor", fake_notify)
+        return sent
+
+    def test_succeeded_weekly_carries_issues_director_and_auto_fix(self, monkeypatch):
+        sent = self._wire(monkeypatch)
+        index.handler(_event("SUCCEEDED"), None)
+        text = sent["text"]
+        first = text.splitlines()[0]
+        assert "SUCCEEDED" in first and "issues" in first
+        assert "*Issues (3):*" in text
+        assert "`skip_parity`" in text
+        assert "Model zoo" in text
+        assert "contamination verdict UNKNOWN" in text
+        assert "*Director:* 🔴 overall RED" in text
+        assert "3. Direction skill negative" in text and "Fourth" not in text
+        assert text.count("Auto-fix:") >= 5  # 3 bullets + Director + overall
+        assert sent["severity"] == "warning"
+
+    def test_weekday_terminal_has_no_weekly_report(self, monkeypatch):
+        sent = self._wire(monkeypatch)
+        index.handler(_event("SUCCEEDED", sm_arn=WEEKDAY_ARN), None)
+        assert "*Issues" not in sent["text"]
+        assert "*Director:*" not in sent["text"]
+        assert sent["severity"] == "info"

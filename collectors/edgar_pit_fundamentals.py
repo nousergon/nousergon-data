@@ -83,7 +83,16 @@ not used (a filer that stopped filing is not frozen onto later sessions).
 Price basis
 ===========
 
-Market cap = ArcticDB `universe` Close on session L (adjusted to the current
+Which `Close`: a backfill or rebuild reads the split-only CRSP-basis
+`universe_crsp` library and refuses to run unless it is current with `universe`;
+the daily run reads `universe`, whose newest `Close` is the raw close
+(`DEFAULT_CLOSE_LIBRARY`, alpha-engine-config-I12436 option A). `universe`'s
+history is dividend back-adjusted, so a rebuild from it read market cap low by
+the cumulative dividend factor (AAPL 2022-01-03 x0.977, MO and VZ about x0.70).
+On the split-only basis every price factor is the share factor
+(`split_only_price_factors`), so the correction below is 1.0 there.
+
+Market cap = ArcticDB Close on session L (adjusted to the current
 basis, `features/SCHEMA.md` §2a) x shares outstanding reported at date d /
 (product of split factors with execution date after d), when every factor that
 restated Close is a share split (otherwise see below). The split
@@ -1595,13 +1604,45 @@ class PriceReader(Protocol):
     def closes(self, symbols: Sequence[str], start: dt.date, end: dt.date) -> pd.DataFrame: ...
 
 
+#: The ArcticDB library each mode reads `Close` from for market cap
+#: (alpha-engine-config-I12436, option A, Brian 2026-10-23 15:05Z).
+#:
+#: `universe` `Close` is a yfinance ``auto_adjust=True`` series: every full refresh
+#: back-adjusts the whole history for dividends, so a rebuilt 2022 session reads
+#: AAPL at 177.79 against a raw close of 182.01 and MO or VZ about 30% low. Market
+#: cap needs the price the share count traded at, which is the split-only close of
+#: `features/SCHEMA.md` §2a: the CRSP-basis `universe_crsp` library
+#: (`builders/migrate_universe_crsp_basis.py`, config#1434 PR7-7a), whose `Close`
+#: is the raw close restated by share splits only.
+#:
+#: The daily run keeps `universe`. It writes the newest sessions, and the newest
+#: `Close` in `universe` is the raw close (rows appended since the last full refresh
+#: are raw: 901 of 901 names on 2026-10-05), so it is already on the split-only
+#: basis for the session it writes. `universe_crsp` has no daily writer.
+CLOSE_LIBRARY_LIVE = "universe"
+CLOSE_LIBRARY_SPLIT_ONLY = "universe_crsp"
+DEFAULT_CLOSE_LIBRARY = {"backfill": CLOSE_LIBRARY_SPLIT_ONLY, "incremental": CLOSE_LIBRARY_LIVE}
+#: How far back the currency gate looks for the live library's newest session.
+_CURRENCY_REFERENCE_DAYS = 45
+
+
 class ArcticPriceReader:
-    """Split-adjusted `Close` from the ArcticDB `universe` library (in-region only)."""
+    """`Close` from one ArcticDB library (in-region only); `universe` by default.
 
-    def __init__(self, bucket: str) -> None:
-        from store.arctic_store import get_universe_lib
+    A symbol the library does not hold is skipped and listed in ``missing``, so the
+    currency gate can name every one rather than failing on the first.
+    """
 
-        self._lib = get_universe_lib(bucket)
+    def __init__(self, bucket: str, library: str = CLOSE_LIBRARY_LIVE) -> None:
+        from store.arctic_store import get_scratch_universe_lib, get_universe_lib
+
+        self.library = library
+        self._lib = (
+            get_universe_lib(bucket)
+            if library == CLOSE_LIBRARY_LIVE
+            else get_scratch_universe_lib(library, bucket)
+        )
+        self.missing: list[str] = []
 
     def symbols(self) -> list[str]:
         return sorted(self._lib.list_symbols())
@@ -1609,6 +1650,10 @@ class ArcticPriceReader:
     def closes(self, symbols: Sequence[str], start: dt.date, end: dt.date) -> pd.DataFrame:
         series = {}
         for symbol in symbols:
+            if self.library != CLOSE_LIBRARY_LIVE and not self._lib.has_symbol(symbol):
+                if symbol not in self.missing:
+                    self.missing.append(symbol)
+                continue
             data = self._lib.read(
                 symbol,
                 columns=["Close"],
@@ -1618,6 +1663,75 @@ class ArcticPriceReader:
         frame = pd.DataFrame(series)
         frame.index = pd.DatetimeIndex(frame.index).normalize()
         return frame.sort_index()
+
+
+def split_only_price_factors(
+    splits: Mapping[str, SplitEvents],
+) -> tuple[dict[str, list[tuple[int, float]]], dict[str, Any]]:
+    """The price factors of a split-only `Close`: exactly the share splits.
+
+    `price_factor_events` describes the `universe` store, whose `Close` also carries
+    a declaration's own ``price_factor`` (HON 2026-06-29, 1.04563) and the declared
+    spin-offs (CTVA 0.1555). A split-only `Close` carries neither: it is the raw close
+    restated by share splits alone, so every price factor is the share factor and
+    `close_basis` is 1.0 on every session (alpha-engine-config-I12436, option A).
+    """
+    return (
+        {ticker: list(events) for ticker, events in splits.items()},
+        {"price_factor_overrides": [], "declared_spinoffs": [], "close_basis": "split_only"},
+    )
+
+
+def assert_close_library_current(
+    closes: pd.DataFrame,
+    reference: pd.DataFrame,
+    *,
+    library: str,
+    missing: Sequence[str] = (),
+) -> dict[str, Any]:
+    """Refuse a non-live `Close` library that is not current with `universe`.
+
+    ``reference`` is the live library's recent closes. The library must reach the
+    live library's newest session, and hold a close there for every name the live
+    library prices there. A partial or stale `universe_crsp` would otherwise write
+    sessions for the names it holds and silently drop or freeze the rest.
+    """
+    if reference.empty:
+        raise GateFailed(f"no {CLOSE_LIBRARY_LIVE} closes to check {library} against")
+    reference_newest = max(pd.DatetimeIndex(reference.index).date)
+    newest = max(pd.DatetimeIndex(closes.index).date) if not closes.empty else None
+    live_row = reference.loc[pd.Timestamp(reference_newest)]
+    priced = sorted(str(t) for t in reference.columns if pd.notna(live_row[t]))
+    held_row = (
+        closes.loc[pd.Timestamp(reference_newest)]
+        if newest is not None and pd.Timestamp(reference_newest) in closes.index
+        else None
+    )
+    absent = sorted(
+        set(missing)
+        | {
+            t
+            for t in priced
+            if held_row is None or t not in closes.columns or pd.isna(held_row[t])
+        }
+    )
+    reading = {
+        "close_library": library,
+        "newest_session": newest.isoformat() if newest else None,
+        "reference_newest_session": reference_newest.isoformat(),
+        "names_priced_by_reference": len(priced),
+        "names_absent": len(absent),
+    }
+    if newest is None or newest < reference_newest or absent:
+        raise GateFailed(
+            f"{library} is not current with {CLOSE_LIBRARY_LIVE}: its newest session is "
+            f"{reading['newest_session']} against {reference_newest.isoformat()}, and "
+            f"{len(absent)} of {len(priced)} priced names have no close there "
+            f"(first 20: {absent[:20]}). Build it with "
+            "`python -m builders.migrate_universe_crsp_basis --apply` (dispatcher workload "
+            "`universe-crsp-basis-build`) before a rebuild reads it (alpha-engine-config-I12436)."
+        )
+    return reading
 
 
 def registry_split_events(s3_client: Any, bucket: str) -> dict[str, list[tuple[int, float]]]:
@@ -2132,8 +2246,13 @@ def run(
     run_id: str | None = None,
     work_dir: str | None = None,
     price_factors: Mapping[str, SplitEvents] | None = None,
+    close_source: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Build, gate, then write. A failed gate raises before any object is written."""
+    """Build, gate, then write. A failed gate raises before any object is written.
+
+    ``close_source`` (the library `Close` came from, and its currency reading) is
+    recorded in the run summary as given.
+    """
     run_date = run_date or dt.datetime.now(dt.UTC).date()
     run_id = run_id or uuid.uuid4().hex[:12]
     started = dt.datetime.now(dt.UTC).isoformat()
@@ -2162,6 +2281,8 @@ def run(
         "range": {"start": start.isoformat(), "end": end.isoformat()},
         **result.summary,
     }
+    if close_source is not None:
+        summary["close_source"] = dict(close_source)
     summary["coverage_newest_session"] = {
         "session": newest.isoformat(),
         **{k: v for k, v in assert_coverage(result.sessions[newest], eligible, label=newest).items()},
@@ -2261,6 +2382,14 @@ def _parser() -> argparse.ArgumentParser:
             help="disable the v1 P/E cross-check; the reason is recorded in the run summary",
         )
         p.add_argument("--end", type=dt.date.fromisoformat, default=None)
+        p.add_argument(
+            "--close-library",
+            default=DEFAULT_CLOSE_LIBRARY[mode],
+            help=(
+                "ArcticDB library market cap reads `Close` from (default "
+                f"{DEFAULT_CLOSE_LIBRARY[mode]}; alpha-engine-config-I12436)"
+            ),
+        )
         if mode == "backfill":
             p.add_argument("--start", type=dt.date.fromisoformat, required=True)
         else:
@@ -2285,6 +2414,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     s3 = boto3.client("s3")
     store = S3ObjectStore(s3, bucket)
     prices = ArcticPriceReader(bucket)
+    close_reader = (
+        prices
+        if args.close_library == CLOSE_LIBRARY_LIVE
+        else ArcticPriceReader(bucket, library=args.close_library)
+    )
     proxies = {normalize_ticker(t) for t in UNIVERSE_BENCHMARK_PROXIES}
     universe = (
         sorted({t.strip().upper() for t in args.tickers.split(",") if t.strip()})
@@ -2297,14 +2431,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     end = args.end or dt.datetime.now(dt.UTC).date()
     if args.mode == "backfill":
         start = args.start
-        closes = prices.closes(universe, start, end)
+        closes = close_reader.closes(universe, start, end)
     else:
-        window = prices.closes(universe, end - dt.timedelta(days=45), end)
+        window = close_reader.closes(universe, end - dt.timedelta(days=45), end)
         recent = sorted(set(pd.DatetimeIndex(window.index).date))[-args.lookback_sessions :]
         if not recent:
             raise SystemExit(f"no price sessions in the 45 days before {end}")
         start = recent[0]
         closes = window
+    close_reading: dict[str, Any] = {"close_library": args.close_library}
+    if args.close_library != CLOSE_LIBRARY_LIVE:
+        reference = prices.closes(universe, end - dt.timedelta(days=_CURRENCY_REFERENCE_DAYS), end)
+        close_reading = assert_close_library_current(
+            closes, reference, library=args.close_library, missing=close_reader.missing
+        )
     newest_session = max(pd.DatetimeIndex(closes.index).date)
     eligible = [t for t in universe if t in closes.columns and pd.notna(closes[t].iloc[-1])]
     logger.info(
@@ -2326,7 +2466,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     splits, split_summary = resolve_split_events(
         s3, bucket, universe=universe, start=start, end=end
     )
-    price_factors, price_summary = price_factor_events(splits, through=end)
+    if args.close_library == CLOSE_LIBRARY_LIVE:
+        price_factors, price_summary = price_factor_events(splits, through=end)
+    else:
+        price_factors, price_summary = split_only_price_factors(splits)
     split_summary.update(price_summary)
     summary = run(
         store=store,
@@ -2343,6 +2486,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         crosscheck_disabled_reason=args.no_crosscheck,
         work_dir=work_dir,
         price_factors=price_factors,
+        close_source=close_reading,
     )
     summary["sec_requests"] = client.request_count
     summary["splits"] = split_summary
