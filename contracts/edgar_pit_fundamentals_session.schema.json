@@ -45,5 +45,15 @@
     "liabilities_total_raw": {"type": ["number", "null"], "description": "USD"},
     "fcf_ttm_raw": {"type": ["number", "null"], "description": "USD"},
     "dividends_ttm_raw": {"type": ["number", "null"], "description": "USD"}
+  },
+  "x-pit": {
+    "event_time": "knowledge_date",
+    "available_at_field": "knowledge_date",
+    "available_at_basis": "source_date_rule",
+    "admissible_when": "available_before_session",
+    "vintage_field": "latest_accession",
+    "revisions": "superseding",
+    "rule": "The file labelled L uses only facts with EDGAR filed <= L (a filing accepted after 17:30 ET carries the next business day as its filing date), so it is admissible for session S only when L < S. A restatement is a new accession from its own filing date on and never reaches back into an earlier L.",
+    "tracker": "alpha-engine-config-I12567"
   }
 }
