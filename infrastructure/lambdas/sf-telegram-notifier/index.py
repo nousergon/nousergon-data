@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+from datetime import datetime, timezone
 
 import boto3
 
@@ -31,6 +32,13 @@ from eod_artifact_verification import (
     verify_eod_artifacts,
 )
 from flow_doctor_telegram import build_flow_doctor_config, notify_via_flow_doctor
+from weekly_run_report import (
+    WEEKLY_PIPELINE_NAME,
+    build_weekly_report,
+    format_report_lines,
+    overall_auto_fix_line,
+    report_needs_triage,
+)
 from nousergon_lib.flow_doctor_fleet import (
     FleetTelegramTopic,
     PIPELINE_OBSERVER_TELEGRAM_TOPICS,
@@ -168,6 +176,23 @@ def _execution_input(describe_resp: dict | None) -> dict:
     return payload if isinstance(payload, dict) else {}
 
 
+def _parse_output(describe_resp: dict | None) -> dict:
+    """Parsed execution output (the final state record), or ``{}``."""
+    if not describe_resp:
+        return {}
+    try:
+        payload = json.loads(describe_resp.get("output") or "{}")
+    except (ValueError, TypeError):
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _start_datetime(started_ms: int | None) -> datetime:
+    if started_ms is None:
+        return datetime.now(tz=timezone.utc)
+    return datetime.fromtimestamp(int(started_ms) / 1000, tz=timezone.utc)
+
+
 def _is_preflight_execution(describe_resp: dict | None) -> bool:
     return bool(_execution_input(describe_resp).get("shell_run"))
 
@@ -288,8 +313,13 @@ def _build_message(
     *,
     sf_client=None,
     s3_client=None,
-) -> tuple[str, bool, bool]:
-    """Return ``(text, silent, hollow_suspect, is_partial)``.
+) -> tuple[str, bool, bool, bool, bool]:
+    """Return ``(text, silent, hollow_suspect, is_partial, needs_triage)``.
+
+    ``needs_triage`` is True when a weekly terminal carries issue bullets or a
+    non-green Director verdict (see weekly_run_report.py). The handler then
+    sends at warning severity so the report reaches the alert intake the
+    nightly sweep reads, which is what its ``Auto-fix:`` lines promise.
 
     ``text`` may render the raw AWS ``FAILED`` status as ``DEGRADED`` (the
     eod SF's deliberate ``DegradedRun`` Fail terminal) — the returned tuple's
@@ -323,12 +353,13 @@ def _build_message(
     exec_name = detail.get("name", "") or "(unknown execution)"
     hollow_suspect = False
     detailed_failure_cause: str | None = None
+    needs_triage = False
 
     lines = [f"{emoji} *{label} — {display_status}*"]
 
     if status == "RUNNING":
         lines.append(f"Execution: {exec_name}")
-        return "\n".join(lines), True, False, is_partial
+        return "\n".join(lines), True, False, is_partial, False
 
     duration = _format_duration(detail.get("startDate"), detail.get("stopDate"))
     if duration:
@@ -372,6 +403,33 @@ def _build_message(
             artifact_status = verify_eod_artifacts(s3_client, run_date)
             lines.extend(format_eod_artifact_lines(artifact_status))
 
+        # Brian, 2026-10-24: a weekly "SUCCEEDED" must also list every step
+        # that was less than perfect, each with its auto-fix, and the
+        # Director's overall status and top 3 concerns. Real cadence runs
+        # only: a preflight shell or a narrowed partial run is not the week.
+        if (
+            sm_name == WEEKLY_PIPELINE_NAME
+            and not is_preflight
+            and not is_partial
+            and (status == "SUCCEEDED" or is_degraded)
+        ):
+            exec_output = _parse_output(describe_resp)
+            report = build_weekly_report(
+                s3_client=s3_client,
+                # The definition normalizes run_date to the cycle's trading
+                # day; the scheduled input usually carries none.
+                run_date=str(exec_output.get("run_date") or run_date or "") or None,
+                execution_arn=execution_arn,
+                execution_start=_start_datetime(detail.get("startDate")),
+                exec_input=_execution_input(describe_resp),
+                exec_output=exec_output,
+            )
+            needs_triage = report_needs_triage(report)
+            if report.issues:
+                lines[0] = f"{lines[0]} — {len(report.issues)} issue{'s' if len(report.issues) != 1 else ''}"
+            lines.extend(format_report_lines(report))
+            lines.append(overall_auto_fix_line(report))
+
     if status == "FAILED":
         # sf-pipeline-policy §2.3 corollary: the terminal failure message must
         # carry the actual error, not the shared Fail state's boilerplate
@@ -397,7 +455,7 @@ def _build_message(
     # the cadence cycle it is named after did not fail.
     if is_partial:
         silent = True
-    return "\n".join(lines), silent, hollow_suspect, is_partial
+    return "\n".join(lines), silent, hollow_suspect, is_partial, needs_triage
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001
@@ -406,7 +464,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
     sm_name = (detail.get("stateMachineArn") or "").rsplit(":", 1)[-1]
     logger.info("SF status change: sf=%s status=%s", sm_name, status)
 
-    text, silent, hollow_suspect, is_partial = _build_message(detail)
+    text, silent, hollow_suspect, is_partial, needs_triage = _build_message(detail)
     ok = notify_via_flow_doctor(
         text,
         silent=silent,
@@ -415,7 +473,7 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001
         # verification run failing does not breach the cadence cycle's.
         severity=(
             "info" if is_partial
-            else "warning" if hollow_suspect and status == "SUCCEEDED"
+            else "warning" if (hollow_suspect or needs_triage) and status == "SUCCEEDED"
             else _severity_for_status(status)
         ),
         dedup_key=_dedup_key(detail),

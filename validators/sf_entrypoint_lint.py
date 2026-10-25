@@ -80,8 +80,12 @@ SCHEMA_VERSION = 1
 # Definitions graduated from observe to enforce (grow-only; see the docstring).
 # step_function_groom.json (alpha-engine-groom-dispatch) first, 2026-10-23:
 # off the weekly and trading paths, and its baseline was exact (0 new, 0 stale).
+# step-functions/data-collection.asl.json (the four ne-data-collection-* state
+# machines) second, 2026-10-24: the smallest remaining baseline (3 + 6), exact
+# on main. Enforcing changes no definition; it only stops the count rising.
 ENFORCED_DEFINITIONS: frozenset[str] = frozenset({
     "infrastructure/step_function_groom.json",
+    "infrastructure/step-functions/data-collection.asl.json",
 })
 RULES = (
     "task-undeclared-entrypoint",

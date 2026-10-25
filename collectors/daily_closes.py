@@ -1552,8 +1552,19 @@ def collect(
             prior_by_ticker = {
                 r["ticker"]: r for r in existing_rows_for_merge if r.get("ticker")
             }
+            # Only this run's POLYGON closes are the challenger side.
+            # `closes_df` also holds FRED index rows (VIX, VIX3M, TNX, IRX…)
+            # and prior rows the coalesce retained. Neither is a polygon close,
+            # and on a T+1 morning a FRED row can be the on-or-before T-1
+            # observation stamped T: trading day 2026-10-21's record compared
+            # FRED's 10-20 VIX (17.31) against D19's yfinance 10-21 close
+            # (16.68) and reported three "vendor" breaches that were a date
+            # carry. It surfaced the one day the FRED outage (I12547) left
+            # those prior rows yfinance-sourced. A retained yfinance row would
+            # be compared with itself.
+            polygon_index = closes_df.index[closes_df["source"] == "polygon"]
             new_closes_by_ticker = {
-                str(t): closes_df.loc[t, "Close"] for t in closes_df.index
+                str(t): closes_df.loc[t, "Close"] for t in polygon_index
             }
             vendor_divergence_record = write_vendor_divergence_metric(
                 bucket, new_closes_by_ticker, prior_by_ticker, run_date, s3_client=s3,

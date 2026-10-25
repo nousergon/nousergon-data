@@ -362,3 +362,39 @@ def test_no_record_is_unmeasurable_never_ok():
     assert vendor_crosscheck_guard_entry(
         {"status": "unmeasurable", "reason": "no pair"}, DAY
     )["verdict"] == "unmeasurable"
+
+
+# ── only polygon closes are the challenger side ─────────────────────────────
+
+
+def test_a_fred_index_row_is_never_compared_as_a_polygon_close():
+    """Trading day 2026-10-21, replayed on the slice's shape.
+
+    The FRED outage (alpha-engine-config-I12547) left D19's index rows
+    yfinance-sourced (VIX 16.68). The next morning's D17 run filled VIX from
+    FRED's on-or-before observation, which was still 10-20's 17.31, stamped
+    10-21. The record then reported VIX as a 377.7 bps polygon-vs-yfinance
+    breach. FRED is not polygon, so the row must not be paired at all.
+    """
+    fx = _fixture()
+    prior = dict(fx["d19_prior"])
+    prior["VIX"] = {**prior["VIX"], "Close": 16.68, "Adj_Close": 16.68, "source": "yfinance"}
+    s3 = _FakeS3({DC_KEY: _parquet_bytes(prior)})
+
+    def _stale_fred(tickers, date_str, records, window_cache=None):
+        records.append(daily_closes._fred_record("VIX", date_str, 17.31))
+        return 1
+
+    tickers = sorted(set(prior) | set(fx["d17_polygon"]))
+    with patch("collectors.daily_closes.boto3.client", return_value=s3), \
+            patch.object(daily_closes, "_fetch_polygon_closes", side_effect=_polygon_side(fx["d17_polygon"])), \
+            patch.object(daily_closes, "_fetch_yfinance_closes", return_value=0), \
+            patch.object(daily_closes, "_fetch_fred_closes", side_effect=_stale_fred), \
+            patch.object(daily_closes, "_POLYGON_MIN_COVERAGE", 0.0):
+        daily_closes.collect(bucket=BUCKET, tickers=tickers, run_date=DAY, source="polygon_only")
+
+    written = pd.read_parquet(io.BytesIO(s3.objects[DC_KEY]))
+    assert written.loc["VIX", "source"] == "fred"  # the stale FRED row did land
+    record = s3.record()
+    assert record["breaching_symbols"] == []
+    assert record["n"] == 12  # the 12 equity pairs, as on the clean slice

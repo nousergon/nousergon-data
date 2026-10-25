@@ -10,6 +10,7 @@ guard on the medians pass.
 from __future__ import annotations
 
 import json
+from datetime import date
 from unittest.mock import MagicMock
 
 from collectors import metron_market_data as mmd
@@ -62,6 +63,11 @@ def test_fundamentals_schema_v5_includes_multiples_balance_sheet_eps_and_valuati
 
 # ── Technicals: derived from close_history, no new fetch ──────────────────────
 
+# Technicals enforce semantic admission (contracts/admission.py, I12082): the
+# lineage check refuses an ``as_of`` more than 5 days before today, so a run
+# date frozen in the past would now be refused rather than written.
+_TECH_RUN = str(date.today())
+
 def _technicals_s3(series_by_sym: dict[str, list[list]]) -> MagicMock:
     """S3 mock: the held universe at HU_KEY, a close_history artifact per symbol key, else NoSuchKey."""
     s3 = MagicMock()
@@ -90,7 +96,7 @@ def _ramp(n: int, start: float = 100.0, step: float = 0.5) -> list[list]:
 def test_technicals_artifact_shape_and_keys():
     s3 = _technicals_s3({"AAPL": _ramp(260), "MSFT": _ramp(260, start=50.0)})
 
-    result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+    result = mmd.collect_technicals(bucket="b", run_date=_TECH_RUN, s3_client=s3)
 
     assert result["status"] == "ok" and result["technicals"] == 2
     art = _puts(s3)[f"{mmd.TECHNICALS_PREFIX}latest.json"]
@@ -110,7 +116,7 @@ def test_technicals_omits_symbol_with_too_short_history():
     # AAPL has a usable series; MSFT's is below the minimum-observation gate → omitted (no zeros).
     s3 = _technicals_s3({"AAPL": _ramp(260), "MSFT": _ramp(10)})
 
-    result = mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+    result = mmd.collect_technicals(bucket="b", run_date=_TECH_RUN, s3_client=s3)
 
     art = _puts(s3)[f"{mmd.TECHNICALS_PREFIX}latest.json"]
     assert set(art["technicals"]) == {"AAPL"}
