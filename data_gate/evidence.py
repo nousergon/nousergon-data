@@ -26,6 +26,7 @@ something.
 from __future__ import annotations
 
 import datetime as dt
+import json
 import pathlib
 from dataclasses import dataclass, field
 from zoneinfo import ZoneInfo
@@ -39,7 +40,7 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
 )
 
 import run_units
-from contracts import pit
+from contracts import pit, vintage
 from data_gate.cadence import (
     Cadence,
     due_fire,
@@ -1277,7 +1278,18 @@ def read_pit(store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.date
             f"; statuses {sorted({str(m.get('status')) for m in cycle.manifests})} published no "
             "output, so nothing was graded — and nothing graded is not graded clean"
         )
-    met = (graded > 0 or bool(exempt)) and not unstamped and not failing
+    declared, invalid, undeclared = _vintage_declarations(unit)
+    if declared:
+        detail += f"; decision-time/vintage declared ({vintage.DECLARATION_KEY}): {declared[:_PIT_NAMED]}"
+    if invalid:
+        detail += f"; {len(invalid)} {vintage.DECLARATION_KEY} declaration(s) INVALID: {invalid[:_PIT_NAMED]}"
+    if undeclared:
+        detail += (
+            f"; {vintage.VINTAGE_MODE}: {undeclared[:_PIT_NAMED]} declare(s) no {vintage.DECLARATION_KEY} "
+            "decision-time/vintage contract yet (contracts/vintage.py, alpha-engine-config-I12567) — "
+            "reported, not graded"
+        )
+    met = (graded > 0 or bool(exempt)) and not unstamped and not failing and not invalid
     return Reading(
         met=met,
         detail=detail,
@@ -1285,6 +1297,45 @@ def read_pit(store: GateStore, unit: Unit, *, trading_day: dt.date, now: dt.date
         source="data_collection store",
         as_of=pit.format_available_at(max(finishes)) if finishes else None,
     )
+
+
+def _vintage_declarations(unit: Unit) -> tuple[list[str], list[str], list[str]]:
+    """The unit's contract schemas split by their ``x-pit`` declaration.
+
+    `alpha-engine-config-I12567` (audit DATA-01), first slice. Returns
+    ``(declared, invalid, undeclared)``: a SOUND declaration is named with its
+    availability basis and revision policy (and whether a replay at a past T
+    is reproducible); an UNSOUND one — a field its own schema does not define,
+    a vintage-keeping policy with no vintage field — is enforced by
+    :func:`read_pit` (the clause fails); an ABSENT one is observe mode
+    (`contracts/vintage.py::VINTAGE_MODE`), reported and not graded until each
+    producer declares one. Read from the repository tree, like
+    :func:`_read_schema_contract`; no store read.
+    """
+    declared: list[str] = []
+    invalid: list[str] = []
+    undeclared: list[str] = []
+    for name in _declared_schema_files(unit):
+        if not name.endswith(".schema.json"):
+            continue
+        path = REPO_ROOT / name
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue  # the schema_contract clause owns a missing or unreadable schema
+        if not isinstance(document, dict):
+            continue
+        errors = vintage.declaration_errors(document)
+        if errors:
+            invalid.append(f"{name}: {'; '.join(errors)}")
+            continue
+        found = vintage.load_declaration(document)
+        if found is None:
+            undeclared.append(name)
+            continue
+        replay = "" if vintage.replay_supported(found) else ", replay at a past T not reproducible"
+        declared.append(f"{name}: {found.available_at_basis}/{found.revisions}{replay}")
+    return declared, invalid, undeclared
 
 
 def completeness_due_day(unit: Unit, *, trading_day: dt.date, now: dt.datetime | None = None) -> dt.date:

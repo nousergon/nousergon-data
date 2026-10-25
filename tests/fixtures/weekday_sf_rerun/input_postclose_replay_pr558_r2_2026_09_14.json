@@ -1,0 +1,13 @@
+{
+  "ec2_instance_id": [
+    "i-09b539c844515d549"
+  ],
+  "pipeline_role": "operator-replay",
+  "run_date": "2026-09-14",
+  "skip_post_market_data": true,
+  "sns_topic_arn": "arn:aws:sns:us-east-1:000000000000:REDACTED",
+  "trading_instance_id": [
+    "i-018eb3307a21329bf"
+  ],
+  "triggered_by": "operator-replay-i10824-pr558-r2-deploy-race"
+}
