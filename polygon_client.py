@@ -23,6 +23,7 @@ from __future__ import annotations
 import logging
 import random
 import re
+import threading
 import time
 from collections import deque
 from datetime import date, datetime, timedelta, timezone
@@ -182,6 +183,14 @@ class PolygonClient:
             raise ValueError("POLYGON_API_KEY not set")
         self._calls_per_min = calls_per_min
         self._call_times: deque[float] = deque()
+        # The limiter's window is shared state and the client is a process
+        # singleton (`polygon_client()`), so threaded callers — the offline
+        # CRSP-basis build runs a ThreadPool over ~900 names — must not race
+        # it. Unlocked, N threads each read "4 calls in the window" and all
+        # fire: the 2026-10-25 universe-crsp-basis-build drew 2,230 429s that
+        # way (alpha-engine-config-I12436). Held across the wait, so threads
+        # queue for slots instead of bursting past the budget together.
+        self._slot_lock = threading.Lock()
         self._session = requests.Session()
         self._session.params = {"apiKey": self._api_key}  # type: ignore[assignment]
         # Per-process cache for grouped-daily responses. Historical grouped-daily
@@ -194,7 +203,11 @@ class PolygonClient:
     # -- Rate limiter --------------------------------------------------------
 
     def _wait_for_slot(self) -> None:
-        """Block until a rate limit slot is available."""
+        """Block until a rate limit slot is available (thread-safe)."""
+        with self._slot_lock:
+            self._wait_for_slot_locked()
+
+    def _wait_for_slot_locked(self) -> None:
         now = time.monotonic()
         window = 60.0  # 1 minute window
         # Purge old timestamps
@@ -247,7 +260,8 @@ class PolygonClient:
                     path, wait, attempt + 1, _POLYGON_MAX_ATTEMPTS,
                 )
                 time.sleep(wait)
-                self._call_times.clear()  # Reset window after forced wait
+                with self._slot_lock:
+                    self._call_times.clear()  # Reset window after forced wait
                 continue
             if resp.status_code == 403:
                 # Free tier returns 403 for same-day grouped-daily ("before end
