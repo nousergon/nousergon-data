@@ -45,23 +45,35 @@ class TestTechnicalsContract:
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": _closes(260)}})
-        mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
+        # Fresh run date: TECHNICALS enforces admission (I12082) and refuses an
+        # as_of more than 5 days old.
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
         art = _puts(s3)["market_data/technicals/latest.json"]
         assert "rating" in art["technicals"]["AAPL"]
         assert validate_technicals(art) == []
 
-    def test_producer_write_without_any_symbol_validates(self, monkeypatch):
-        """No close_history published for any symbol -- an empty `technicals` map is a
-        legitimate (if degenerate) run, not a contract violation."""
+    def test_producer_without_any_symbol_is_schema_valid_but_not_admitted(self, monkeypatch):
+        """No close_history published for any symbol. An empty `technicals` map is
+        still not a SCHEMA violation (the advisory contract), but since the I12082
+        ruling (2026-10-23) TECHNICALS enforces semantic admission, which refuses an
+        empty manifest over a non-empty universe: nothing is written and the phase
+        reports error, so the previous latest.json stands."""
         monkeypatch.setattr(
             mmd, "load_price_derived_universe",
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
         )
         s3 = _universe_s3(_UNIVERSE, close_history={})
-        mmd.collect_technicals(bucket="b", run_date="2026-06-26", s3_client=s3)
-        art = _puts(s3)["market_data/technicals/latest.json"]
-        assert art["technicals"] == {}
-        assert validate_technicals(art) == []
+        run_date = str(date.today())
+        result = mmd.collect_technicals(bucket="b", run_date=run_date, s3_client=s3)
+        assert result["status"] == "error"
+        assert "market_data/technicals/latest.json" not in _puts(s3)
+        empty = {
+            "schema_version": mmd.TECHNICALS_SCHEMA_VERSION,
+            "as_of": run_date,
+            "source": "computed",
+            "technicals": {},
+        }
+        assert validate_technicals(empty) == []
 
     def test_minimal_hand_built_fixture_validates(self):
         """Independent of the producer: a schema-conformant fixture must pass on its
