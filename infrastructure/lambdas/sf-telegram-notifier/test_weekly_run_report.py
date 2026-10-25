@@ -147,7 +147,7 @@ def test_todays_run_lists_every_imperfect_step():
     assert "skip_scanner" not in text  # false flags are not skips
     assert "Model zoo" in steps
     assert "look-ahead contamination verdict UNKNOWN" in text
-    assert "20 of 20 carryover items" in text
+    assert "20 more active carryover items were elided by the prompt cap (20 shown in full" in text
     assert "Director retro" in steps
     assert "EvaluatorOptimize" in steps  # the stale executor_params defect
     assert "insufficient" in text  # walk-forward
