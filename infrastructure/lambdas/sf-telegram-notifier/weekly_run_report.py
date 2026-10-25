@@ -505,7 +505,14 @@ def director_from_plan(plan: Mapping[str, Any], key: str) -> Tuple[DirectorSumma
     if isinstance(omitted, (int, float)) and omitted > 0:
         issues.append(Issue(
             step="Director",
-            problem=f"{int(omitted)} of {int(tel.get('DirectorPlanCarryoverItems') or omitted)} carryover items were left out of the plan prompt",
+            # `DirectorPlanCarryoverItems` counts the rows the prompt CARRIES, not
+            # the ledger size (crucible-evaluator director/agent.py, I8163), so
+            # "N of <items>" read 20-shown/20-elided as "20 of 20 dropped"
+            # (alpha-engine-config-I12628).
+            problem=(
+                f"{int(omitted)} more active carryover items were elided by the prompt cap "
+                f"({int(tel.get('DirectorPlanCarryoverItems') or 0)} shown in full; the elided rows stay open in the ledger)"
+            ),
             auto_fix=AUTO_FIX_SWEEP,
             keys=("director_carryover_omitted",),
         ))

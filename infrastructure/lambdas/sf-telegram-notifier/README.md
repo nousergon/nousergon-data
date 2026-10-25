@@ -81,9 +81,11 @@ gets `— N issues`, and a run with any bullet that needs triage is sent at
 `warning`, so it reaches the alert intake the nightly sweep reads (what the
 bullets' `Auto-fix:` lines promise). Logic: `weekly_run_report.py`.
 
-The S3 reads outside `backtest/*` need the `WeeklyRunReportRead` grant in
-`iam-policy.json` (alpha-engine-config#12630); until it is applied those sources render as
-"could not read ... (AccessDenied)".
+The S3 reads outside `backtest/*` use the `WeeklyRunReportRead` grant in
+`iam-policy.json` (alpha-engine-config#12630; live since 2026-10-24, data#2292). If a read
+is denied, the source renders as "could not read ... (AccessDenied)". That bullet has no
+seeded resolution, because the grant it pointed at is applied: a new denial is a new
+problem for the nightly sweep to file.
 
 ## Architecture
 
