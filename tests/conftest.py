@@ -193,7 +193,14 @@ def _no_live_corporate_action_scan(request, monkeypatch):
     if request.node.get_closest_marker("live_ca_scan_hook"):
         yield
         return
-    import corporate_actions.scan_manifest as _sm
+    try:
+        import corporate_actions.scan_manifest as _sm
+    except ModuleNotFoundError:
+        # A lean job (the weekly fault-injection guard installs only pytest
+        # and boto3) cannot import corporate_actions, so nothing in it can
+        # reach the scan either. Nothing to stub.
+        yield
+        return
 
     monkeypatch.setattr(
         _sm, "morning_scan",
