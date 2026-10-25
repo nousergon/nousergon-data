@@ -1,0 +1,95 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "nousergon-data/contracts/security_master.schema.json",
+  "title": "Effective-dated security identity: one alias interval (schema_version 1)",
+  "description": "One row of the collector's security master. Producer: collectors/security_master.py::build_master (STUB: no S3 product, no unit, no consumer yet). Resolution (collectors/security_master.py::resolve) returns exactly one security_id for an alias on a date or refuses: unresolved and ambiguous are explicit, never a fallback to the current ticker. alpha-engine-config-I12568 (audit DATA-02).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "master_version",
+    "security_id",
+    "alias_type",
+    "alias_value",
+    "share_class",
+    "effective_from",
+    "effective_to",
+    "source",
+    "as_of",
+    "available_at"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "master_version": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The build this row belongs to. A master is published whole per version and never edited in place, so each version is a vintage of the identity table."
+    },
+    "security_id": {
+      "type": "string",
+      "pattern": "^NES[A-Z2-7]{13}$",
+      "description": "Permanent security id, minted once from the security's first listing (ticker, date, CIK, share class); never re-used. collectors/security_master.py::mint_security_id."
+    },
+    "alias_type": {
+      "enum": [
+        "ticker",
+        "cik"
+      ],
+      "description": "What alias_value is. A ticker is a provider/display alias; CUSIP/FIGI/exchange are a later slice (alpha-engine-config-I12568)."
+    },
+    "alias_value": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Ticker in the fleet's class-suffix form (BRK-B), or the decimal CIK."
+    },
+    "share_class": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Share class when the issuer lists more than one (BRK-A / BRK-B are distinct securities sharing a CIK)."
+    },
+    "effective_from": {
+      "type": "string",
+      "format": "date",
+      "description": "First NYSE session date the alias means this security (inclusive)."
+    },
+    "effective_to": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date",
+      "description": "First session date it no longer does (exclusive); null while in effect. Intervals of different securities never overlap for one alias."
+    },
+    "source": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The event source the interval was built from."
+    },
+    "as_of": {
+      "type": "string",
+      "format": "date",
+      "description": "Point-in-time: the trading day this record describes (ISO date, NYSE calendar). data_collection_plan_260914.md \u00a72 objective 4; contracts/pit.py."
+    },
+    "available_at": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?Z$",
+      "description": "Point-in-time: the UTC instant the producer could first have known this record (RFC 3339, Z suffix). Never before the as_of day begins, never after the publishing run's manifest `finished`. contracts/pit.py.",
+      "x-provenance": true
+    }
+  },
+  "x-pit": {
+    "event_time": "effective_from",
+    "available_at_field": "available_at",
+    "available_at_basis": "collection_time",
+    "admissible_when": "available_at_or_before_decision",
+    "vintage_field": "master_version",
+    "revisions": "preserved",
+    "rule": "Each build publishes the whole table as a new master_version and never edits an earlier one, so a replay reads the newest version available by its decision. available_at is the build's data_pit stamp: when the identity was established, not when the alias took effect.",
+    "tracker": "alpha-engine-config-I12568"
+  }
+}

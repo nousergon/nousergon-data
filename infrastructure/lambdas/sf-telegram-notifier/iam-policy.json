@@ -51,6 +51,24 @@
       ]
     },
     {
+      "Sid": "WeeklyRunReportRead",
+      "Effect": "Allow",
+      "Action": [
+        "s3:GetObject",
+        "s3:ListBucket"
+      ],
+      "Resource": [
+        "arn:aws:s3:::alpha-engine-research",
+        "arn:aws:s3:::alpha-engine-research/director/*/action_plan.json",
+        "arn:aws:s3:::alpha-engine-research/director/*/retro.json",
+        "arn:aws:s3:::alpha-engine-research/director/carryover_ledger.json",
+        "arn:aws:s3:::alpha-engine-research/_stage_outputs/ne-weekly-freshness-pipeline/*",
+        "arn:aws:s3:::alpha-engine-research/_stage_coverage/*",
+        "arn:aws:s3:::alpha-engine-research/health/*",
+        "arn:aws:s3:::alpha-engine-research/ops/daily-summaries/weekly-issue-resolutions.json"
+      ]
+    },
+    {
       "Sid": "EodCompletionMarkerRead",
       "Effect": "Allow",
       "Action": [
