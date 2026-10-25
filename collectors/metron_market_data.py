@@ -67,6 +67,8 @@ HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 # data — every per-ticker collector fetches strictly over the held union above, so a
 # never-held ticker was never in scope for any of them).
 WATCHLIST_UNIVERSE_KEY = "metron/watchlist_universe.json"
+#: Universe source key -> the name its status is recorded under (alpha-engine-config-I10886).
+_UNIVERSE_SOURCE_NAMES = {HOLDINGS_UNIVERSE_KEY: "holdings", WATCHLIST_UNIVERSE_KEY: "watchlist"}
 CLOSES_PREFIX = "market_data/eod_closes/"
 FX_PREFIX = "market_data/fx/"
 # History artifacts (per-symbol / per-currency) — power Metron's Performance NAV
@@ -298,6 +300,26 @@ MediansUniverseSource = Callable[[], list[str]]
 UNIVERSE_PIN_UNIT_ID = "D22"
 
 
+#: What each universe source answered on the most recent universe load
+#: (alpha-engine-config-I10886). The loaders below are fail-soft by design, so a
+#: denied or missing source contributes nothing and the union still looks whole;
+#: this record is how a publisher tells "the population was 65" from "the 903
+#: constituents never loaded". Reset by ``load_price_derived_universe``; read by
+#: ``collect_technicals``. Single-threaded collector, so a module record is safe.
+_UNIVERSE_SOURCES: dict[str, dict] = {}
+#: The constituent half of the most recent price-derived universe, so a publisher can
+#: tell a constituent gap (counts against the floor) from a Metron-only instrument that
+#: never prices (config#1029, a declared exclusion).
+_LAST_SP1500_SYMBOLS: set[str] = set()
+
+
+def _record_universe_source(name: str, status: str, count: int, detail: str = "") -> None:
+    entry: dict[str, Any] = {"status": status, "count": count}
+    if detail:
+        entry["detail"] = detail[:200]
+    _UNIVERSE_SOURCES[name] = entry
+
+
 def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> list[dict]:
     """Read one Metron universe artifact's ``holdings`` list. Fail-soft per artifact: a
     missing object / no creds / parse error contributes nothing (logged) rather than
@@ -348,13 +370,18 @@ def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> lis
             )
         obj = s3_client.get_object(**kwargs)
         data = json.loads(obj["Body"].read())
-        return [
+        rows = [
             {"yf_symbol": str(h["yf_symbol"]).strip(), "currency": str(h.get("currency", "USD")).strip()}
             for h in data.get("holdings", [])
             if str(h.get("yf_symbol", "")).strip()
         ]
+        _record_universe_source(_UNIVERSE_SOURCE_NAMES.get(key, key), "ok", len(rows))
+        return rows
     except Exception as e:  # missing object, no creds, parse error, etc.
         logger.warning("[metron_market_data] %s unavailable (%s) — no contribution", key, e)
+        _record_universe_source(
+            _UNIVERSE_SOURCE_NAMES.get(key, key), "unavailable", 0, type(e).__name__
+        )
         return []
 
 
@@ -396,6 +423,10 @@ def _load_sp1500_symbols(bucket: str) -> set[str]:
                 symbols.add(str(t).strip())
     except Exception as e:
         logger.warning("[metron_market_data] constituents universe unavailable (%s)", e)
+        _record_universe_source("constituents", "unavailable", 0, type(e).__name__)
+        return symbols
+    # An answer with no tickers is not a population of zero (alpha-engine-config-I10886).
+    _record_universe_source("constituents", "ok" if symbols else "empty", len(symbols))
     return symbols
 
 
@@ -406,9 +437,12 @@ def load_price_derived_universe(bucket: str, s3_client: Any) -> tuple[list[dict]
     delta so overlap tickers (AAPL, MU, …) share a single close_history + derived-metrics
     spine. SP1500-only symbols default to USD; held-universe currency wins on conflict.
     Fundamentals/analyst/sentiment stay on ``load_metron_universe()`` (held-scoped)."""
+    _UNIVERSE_SOURCES.clear()
     metron_holdings, _ = load_metron_universe(bucket, s3_client)
     ccy_by_yf = {h["yf_symbol"]: h["currency"] for h in metron_holdings}
     sp1500 = _load_sp1500_symbols(bucket)
+    _LAST_SP1500_SYMBOLS.clear()
+    _LAST_SP1500_SYMBOLS.update(sp1500)
     all_yf = sorted(sp1500 | set(ccy_by_yf))
     if not all_yf:
         return [], []
@@ -2550,26 +2584,62 @@ def collect_technicals(
     if s3_client is None:
         import boto3
         s3_client = boto3.client("s3")
+    _UNIVERSE_SOURCES.clear()
+    _LAST_SP1500_SYMBOLS.clear()
     holdings, _ = load_price_derived_universe(bucket, s3_client)
+    sources = {k: dict(v) for k, v in sorted(_UNIVERSE_SOURCES.items())}
+    constituents_set = set(_LAST_SP1500_SYMBOLS)
     if not holdings:
-        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0}
+        return {"status": "skipped", "reason": "empty price-derived universe", "universe": 0,
+                "universe_sources": sources}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     technicals: dict[str, dict] = {}
+    excluded: dict[str, str] = {}
+    bar_dates: dict[str, str] = {}
     for yf_sym in yf_symbols:
         hist = _read_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
         if not hist or not hist.get("closes"):
+            excluded[yf_sym] = "no_close_history"
             continue
         try:
             tech = _compute_technicals(hist["closes"])
         except Exception as e:  # one bad series must not sink the whole artifact
             logger.warning("[metron_market_data] technicals compute failed for %s: %s", yf_sym, e)
+            excluded[yf_sym] = "compute_error"
             continue
         if tech is not None:
             technicals[yf_sym] = tech
+            bar_date = _last_bar_date(hist["closes"])
+            if bar_date:
+                bar_dates[yf_sym] = bar_date
+        else:
+            excluded[yf_sym] = "short_history"
+    coverage = technicals_coverage(
+        yf_symbols, technicals, excluded, bar_dates,
+        sources=sources, constituents=constituents_set, run_date=run_date,
+    )
     artifact = {
         "schema_version": TECHNICALS_SCHEMA_VERSION, "as_of": run_date,
         "source": "computed", "technicals": dict(sorted(technicals.items())),
+        "coverage": coverage,
     }
+    if not coverage["complete"]:
+        logger.warning(
+            "[metron_market_data] technicals incomplete (observe, written anyway): "
+            "covered %d of %d, floor ratio %s vs %.2f, sources %s",
+            coverage["covered"], coverage["denominator"], coverage["floor_ratio"],
+            TECHNICALS_COVERAGE_FLOOR, coverage["universe_sources"],
+        )
+    if not technicals:
+        # alpha-engine-config-I10886: an empty payload over a non-empty population is
+        # refused, so the previous latest.json stands rather than an empty map that
+        # reads as "no technicals exist".
+        logger.error(
+            "[metron_market_data] technicals: 0 of %d symbols computed — refusing to "
+            "publish an empty payload", len(yf_symbols),
+        )
+        return {"status": "error", "error": "empty technicals payload refused",
+                "universe": len(yf_symbols), "technicals": 0, "coverage": coverage}
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN technicals: %d/%d symbols (not written)",
                     len(technicals), len(yf_symbols))
@@ -2589,7 +2659,79 @@ def collect_technicals(
         logger.error("[metron_market_data] technicals write failed: %s", e)
         return {"status": "error", "error": str(e)}
     logger.info("[metron_market_data] wrote technicals for %d/%d symbols", len(technicals), len(yf_symbols))
-    return {"status": "ok", "universe": len(yf_symbols), "technicals": len(technicals)}
+    return {"status": "ok", "universe": len(yf_symbols), "technicals": len(technicals),
+            "complete": coverage["complete"]}
+
+
+#: covered / (denominator - declared exclusions) a complete technicals publish meets
+#: (`data_collection_plan_260914.md` §2 row 2, alpha-engine-config-I10886). OBSERVE:
+#: recorded in the artifact and logged, never a refusal, until the owner promotes it.
+TECHNICALS_COVERAGE_FLOOR = 0.99
+
+#: Exclusion reasons that are declared, not gaps. ``short_history``: the rating's own
+#: vote-skipping rule (too few sessions for any indicator; never a fabricated row).
+#: ``metron_unpriceable``: a Metron-only instrument with no close history (401(k) CITs,
+#: CUSIPs, CVRs), broker-snapshot-priced in Metron (config#1029). Every other reason
+#: counts against the floor.
+TECHNICALS_DECLARED_EXCLUSIONS = frozenset({"short_history", "metron_unpriceable"})
+
+
+def _last_bar_date(closes: list) -> str | None:
+    """The date of the newest usable ``[date_iso, close]`` row, or ``None``."""
+    for row in reversed(closes or []):
+        if isinstance(row, (list, tuple)) and len(row) == 2 and row[1] is not None:
+            return str(row[0])[:10]
+    return None
+
+
+def technicals_coverage(
+    population: list[str],
+    technicals: dict[str, dict],
+    excluded: dict[str, str],
+    bar_dates: dict[str, str],
+    *,
+    sources: dict[str, dict],
+    constituents: set[str],
+    run_date: str,
+) -> dict:
+    """The ``coverage`` block of ``market_data/technicals/latest.json`` (alpha-engine-config-I10886).
+
+    Says what population the ratings were computed over and whether it was the whole
+    one: which universe sources answered, every member that has no rating and why,
+    each rated member's newest bar date, and the floor reading. ``complete`` is true
+    only when every source answered with members and the floor holds, so a run whose
+    constituents never loaded cannot read as complete however many symbols it rated.
+    """
+    reasons: dict[str, str] = {}
+    for sym, reason in excluded.items():
+        if reason == "no_close_history" and constituents and sym not in constituents:
+            reason = "metron_unpriceable"
+        reasons[sym] = reason
+    declared = sum(1 for r in reasons.values() if r in TECHNICALS_DECLARED_EXCLUSIONS)
+    eligible = len(population) - declared
+    covered = len(technicals)
+    floor_ratio = round(covered / eligible, 4) if eligible > 0 else None
+    expected_sources = ("constituents", "holdings", "watchlist")
+    sources_ok = bool(sources) and all(
+        (sources.get(name) or {}).get("status") == "ok" for name in expected_sources
+    )
+    meets_floor = floor_ratio is not None and floor_ratio >= TECHNICALS_COVERAGE_FLOOR
+    stale = sorted(sym for sym, d in bar_dates.items() if d < run_date)
+    return {
+        "available_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "denominator": len(population),
+        "covered": covered,
+        "declared_exclusions": declared,
+        "floor": TECHNICALS_COVERAGE_FLOOR,
+        "floor_ratio": floor_ratio,
+        "meets_floor": meets_floor,
+        "universe_sources": {name: sources.get(name, {"status": "not_reported", "count": 0})
+                             for name in expected_sources},
+        "complete": sources_ok and meets_floor,
+        "excluded": [{"symbol": sym, "reason": reasons[sym]} for sym in sorted(reasons)],
+        "bar_dates": dict(sorted(bar_dates.items())),
+        "stale": stale,
+    }
 
 
 # ── Security performance (period returns + risk stats — derived from close_history) ──
