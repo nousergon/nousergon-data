@@ -85,5 +85,13 @@
     },
     "coverage_floor": 1.0,
     "note": "FRED series are revised and extended between fetches. The band covers a revised level; it deliberately does NOT cover a series whose LENGTH differs, which is a different as-of window and is graded exactly."
+  },
+  "x-pit": {
+    "event_time": "as_of",
+    "available_at_basis": "collection_time",
+    "admissible_when": "available_at_or_before_decision",
+    "revisions": "overwritten",
+    "rule": "FRED observations are read when the EOD run collects them; available_at is that run's data_pit stamp. FRED revises past observations in place and this producer requests no realtime/vintage window, so a correction overwrites: replay at a past T is not reproducible from this key.",
+    "tracker": "alpha-engine-config-I12567"
   }
 }
