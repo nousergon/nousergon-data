@@ -172,6 +172,7 @@ def test_enforced_definitions_are_real_baselined_and_off_the_weekly_path() -> No
     # The weekly SF stays observe-only until it is reworked deliberately.
     assert "infrastructure/step_function.json" not in lint.ENFORCED_DEFINITIONS
     assert "infrastructure/step_function_groom.json" in lint.ENFORCED_DEFINITIONS
+    assert "infrastructure/step-functions/data-collection.asl.json" in lint.ENFORCED_DEFINITIONS
 
 
 def test_the_committed_tree_passes_the_enforced_definitions() -> None:
