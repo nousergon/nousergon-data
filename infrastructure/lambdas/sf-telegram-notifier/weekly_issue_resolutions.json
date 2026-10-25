@@ -11,9 +11,8 @@
     {"match": "model_zoo_unservable", "ref": "alpha-engine-config#12395", "plan": "M-slot rebuild: experiments toward a servable champion"},
     {"match": "stage_output:EvaluatorOptimize:config_executor_params", "ref": "alpha-engine-config#10064", "plan": "root-cause the blocked alpha_floor auto-apply loop"},
     {"match": "walk_forward:*", "ref": "alpha-engine-config#12627", "plan": "point the loader at the weekly weight history, or start writing it"},
-    {"match": "director_carryover_omitted", "ref": "alpha-engine-config#12628", "plan": "confirm digest vs drop; budget carryover into the prompt"},
+    {"match": "director_carryover_omitted", "ref": "alpha-engine-config#12628", "plan": "cap-elided, not dropped; retire stale rows so the active set fits the cap"},
     {"match": "director_retro_latency", "ref": "alpha-engine-config#12470", "plan": "size the retro judge budget to measured latency"},
-    {"match": "health:predictor_training", "ref": "alpha-engine-config#12629", "plan": "write real duration and IC, or mark the health degraded"},
-    {"match": "unreadable:AccessDenied", "ref": "alpha-engine-config#12630", "plan": "read-only S3 grant for the notifier (Brian merges)"}
+    {"match": "health:predictor_training", "ref": "alpha-engine-config#12629", "plan": "write real duration and IC, or mark the health degraded"}
   ]
 }
