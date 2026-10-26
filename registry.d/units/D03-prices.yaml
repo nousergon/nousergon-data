@@ -77,8 +77,18 @@ detectors:
     via: "artifact-registry-row"
     state: PRESENT
 freshness:
-  family: weekly
-  deadline: "Sat 13:00 America/New_York"
+  # alpha-engine-config-I11832, decision 2 (Brian 2026-10-25 triage: "D03
+  # follows nousergon-data-PR2016"). PR2016 took D03 out of the weekly
+  # completion check and left it "graded by data-collection-eod"; this unit's
+  # SLO family now says the same thing as its trigger. It used to stay `weekly`
+  # (Sat 13:00), which graded a weekday-collected price cache once a week, off
+  # the Friday EOD run, and let four of every five sessions go ungraded.
+  # Deadline is the eod-spine family's derived worst-case write bound: D03 is
+  # already one of the EodSchedule verify_units that bound is computed over
+  # (tests/test_eod_units_declare_the_measured_trigger_time.py::
+  # test_the_eod_spine_deadline_is_the_derived_worst_case_write_bound).
+  family: "eod-spine"
+  deadline: "20:55 America/New_York"
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:

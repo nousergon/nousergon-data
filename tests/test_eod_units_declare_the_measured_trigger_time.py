@@ -58,10 +58,21 @@ MEASURED_SCHEDULE = "weekdays 18:15 America/New_York"
 #: check, graded only there (alpha-engine-config-I11832).
 EOD_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03"}
 
-#: The family whose `freshness.deadline` is the EOD fire plus its writers' caps.
-#: D03 keeps its own `weekly` freshness family: that axis is the freshness SLO's
-#: grouping, not `trigger.owner`, and is deliberately not changed with the owner.
-EOD_SPINE_UNITS = {f"D{i}" for i in range(19, 33)}
+#: The family whose `freshness.deadline` is the EOD fire plus its writers' caps:
+#: every unit the EOD machine verifies. D03 joined it under
+#: alpha-engine-config-I11832 decision 2 ("D03 follows nousergon-data-PR2016"):
+#: it is graded only by the EOD run, so a `weekly` (Sat 13:00) family graded one
+#: session in five. Asserted equal to EOD_UNITS below, so the two cannot drift.
+EOD_SPINE_UNITS = {f"D{i}" for i in range(19, 33)} | {"D03"}
+
+
+def test_every_eod_unit_is_graded_in_the_eod_spine_family():
+    """A unit the EOD machine verifies is graded on the EOD deadline, not a
+    family that grades a different trigger's cadence (alpha-engine-config-I11832)."""
+    assert EOD_SPINE_UNITS == EOD_UNITS
+    family = {u.unit_id: (u.raw.get("freshness") or {}).get("family") for u in _eod_units()}
+    wrong = {uid: f for uid, f in family.items() if f != "eod-spine"}
+    assert not wrong, f"EOD-verified units outside the eod-spine freshness family: {wrong}"
 
 
 def _eod_units():
