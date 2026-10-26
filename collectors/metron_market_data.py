@@ -1842,6 +1842,16 @@ def _is_missing_object(exc: Exception) -> bool:
 def read_published_close_history(s3_client: Any, bucket: str) -> tuple[dict[str, Any] | None, str]:
     """The previously published consolidated ``series`` map → ``(series, basis)``.
 
+    A thin view over :func:`read_published_consolidated`, which returns the whole
+    document (the ``currency`` map and ``carried_series`` marks ride with it).
+    """
+    doc, basis = read_published_consolidated(s3_client, bucket)
+    return (doc["series"] if doc else None), basis
+
+
+def read_published_consolidated(s3_client: Any, bucket: str) -> tuple[dict[str, Any] | None, str]:
+    """The previously published consolidated document → ``(doc, basis)``.
+
     ``basis`` is ``"read"``, ``"absent"`` or ``"unreadable"``.
 
     **This read is RUN STATE, not an input** (`alpha-engine-config-I10891`): the run
@@ -1883,7 +1893,7 @@ def read_published_close_history(s3_client: Any, bucket: str) -> tuple[dict[str,
             CONSOLIDATED_CLOSE_HISTORY_KEY, type(exc).__name__, exc,
         )
         return None, "unreadable"
-    return series, "read"
+    return doc, "read"
 
 
 def _log_carry(carried: list[dict], refused: list[dict]) -> None:
@@ -1906,6 +1916,140 @@ def _log_carry(carried: list[dict], refused: list[dict]) -> None:
             "omitted — those sessions are missing from this publish (alpha-engine-config-I11556): %s",
             len(refused),
             ", ".join(f"{r['symbol']}@{r['date']}:{r['reason']}" for r in refused),
+        )
+
+
+# ── Absent-series carry + shrink guard (alpha-engine-config-I12688) ──────────
+#
+# The interior carry above keeps a bar inside a series the run DID answer. It
+# keeps nothing for a series the run did not answer at all. On 2026-10-16 a D21
+# run answered 80 of the ~953 series the previous publish carried, and
+# ``consolidated.json`` was overwritten with those 80 (4.4 MB against ~56.9 MB).
+# The header was well-formed, so Metron accepted it. 13 of the Demo household's 25
+# reference symbols then kept their 10-15 bars for two days, unmarked, and moved
+# its served TWR by -41 bp. The publish now cannot shrink silently, in two parts:
+#
+# * **Carry, marked.** A series the previous publish carried and this run omits is
+#   republished as it was, and named in the artifact's ``carried_series`` map with
+#   its last bar date. A consumer reading the artifact can see which series are an
+#   estimate (the last published value), rather than infer it from a date.
+# * **Fail loud.** When the run answered fewer than
+#   ``1 - SERIES_SHRINK_FAIL_FRACTION`` of the previously published series, the unit
+#   still publishes the carried artifact (the best estimate available) but returns
+#   ``status: "error"``, so the phase marker, the run manifest and the EOD run all go
+#   red. A shrink of that size is a source or universe fault, not churn.
+
+#: Most NYSE sessions an absent series is carried past its last bar. A symbol that
+#: legitimately leaves the universe (a sold holding, an index deletion) stops being
+#: carried after this many sessions and drops from the artifact, logged. One week:
+#: long enough to outlast a source outage across a weekend, short enough that a
+#: carried series never passes for a live one.
+ABSENT_SERIES_MAX_CARRY_SESSIONS = 5
+
+#: Largest fraction of the previously published series a run may fail to answer
+#: before the unit fails loud. Day-to-day universe churn is a handful of symbols out
+#: of ~950 (well under 1%); 2026-10-16 was 92%.
+SERIES_SHRINK_FAIL_FRACTION = 0.10
+
+
+def carry_forward_absent_series(
+    fresh: dict[str, list[tuple[str, float]]],
+    previous: dict[str, Any],
+    trading_day: date,
+    *,
+    max_sessions: int = ABSENT_SERIES_MAX_CARRY_SESSIONS,
+) -> tuple[dict[str, list[tuple[str, float]]], list[dict], list[dict]]:
+    """Republish each previously published series this run's source omitted entirely.
+
+    Returns ``(series, carried, dropped)``. ``series`` is ``fresh`` plus the carried
+    series (a symbol the run answered keeps its fresh list object unchanged).
+    ``carried`` / ``dropped`` hold one record per symbol, sorted by symbol.
+
+    A symbol is *absent* when it is missing from ``fresh`` or its fresh series is
+    empty. It is carried, unchanged, when its previous series is well-formed, its
+    last bar is on or before ``trading_day`` (a bar after the run date is never
+    published, alpha-engine-config-I10893), and that bar is at most ``max_sessions``
+    NYSE sessions behind ``trading_day``. Otherwise it is dropped, with the reason.
+    Deterministic: the same ``fresh`` and ``previous`` give the same output.
+    """
+    from nousergon_lib.dates import count_trading_days
+
+    series: dict[str, list[tuple[str, float]]] = dict(fresh)
+    carried: list[dict] = []
+    dropped: list[dict] = []
+    for sym in sorted(previous):
+        if fresh.get(sym):
+            continue
+        prev = _coerce_series(previous[sym]) if previous[sym] else None
+        if not prev:
+            dropped.append({"symbol": sym, "last_date": None, "reason": "previous_series_malformed"})
+            continue
+        last = max(prev)
+        try:
+            last_day = date.fromisoformat(last)
+        except ValueError:
+            dropped.append({"symbol": sym, "last_date": last, "reason": "previous_series_malformed"})
+            continue
+        if last_day > trading_day:
+            dropped.append({"symbol": sym, "last_date": last, "reason": "bar_after_run_date"})
+            continue
+        stale = count_trading_days(last_day, trading_day)
+        if stale > max_sessions:
+            dropped.append({
+                "symbol": sym, "last_date": last, "reason": "carry_expired", "sessions_stale": stale,
+            })
+            continue
+        series[sym] = sorted(prev.items())
+        carried.append({"symbol": sym, "last_date": last, "sessions_stale": stale})
+    return series, carried, dropped
+
+
+def series_shrink_verdict(
+    fresh: dict[str, list[tuple[str, float]]],
+    previous: dict[str, Any] | None,
+    *,
+    fail_fraction: float = SERIES_SHRINK_FAIL_FRACTION,
+) -> dict:
+    """How many of the previously published series this run's source answered.
+
+    ``verdict`` is ``"ok"``, ``"shrunk"`` (more than ``fail_fraction`` of them
+    unanswered) or ``"unmeasurable"`` (no previous publish to measure against: a
+    first publish, a fresh shadow root, or an unreadable previous object, which
+    :func:`read_published_consolidated` already records at ERROR).
+    """
+    if not previous:
+        return {"verdict": "unmeasurable", "previous_series": 0, "answered": 0, "missing": 0}
+    answered = sum(1 for sym in previous if fresh.get(sym))
+    missing = len(previous) - answered
+    verdict = "shrunk" if missing > fail_fraction * len(previous) else "ok"
+    return {
+        "verdict": verdict, "previous_series": len(previous), "answered": answered,
+        "missing": missing, "fail_fraction": fail_fraction,
+    }
+
+
+def _log_absent_carry(carried: list[dict], dropped: list[dict], shrink: dict) -> None:
+    """One line each for carried and dropped series; ERROR when the shrink guard trips."""
+    if carried:
+        logger.warning(
+            "[metron_market_data] close_history CARRIED %d series this run's source omitted "
+            "entirely, republished unchanged and marked in `carried_series` "
+            "(alpha-engine-config-I12688): %s",
+            len(carried), ", ".join(f"{c['symbol']}@{c['last_date']}" for c in carried),
+        )
+    if dropped:
+        logger.warning(
+            "[metron_market_data] close_history DROPPED %d series the previous publish carried "
+            "and this run omitted (alpha-engine-config-I12688): %s",
+            len(dropped), ", ".join(f"{d['symbol']}:{d['reason']}" for d in dropped),
+        )
+    if shrink["verdict"] == "shrunk":
+        logger.error(
+            "[metron_market_data] close_history SHRINK GUARD: this run answered %d of the %d "
+            "series the previous %s carried (%d missing, limit %.0f%%). The missing series are "
+            "carried, marked, and the unit fails loud (alpha-engine-config-I12688)",
+            shrink["answered"], shrink["previous_series"], CONSOLIDATED_CLOSE_HISTORY_KEY,
+            shrink["missing"], 100 * shrink["fail_fraction"],
         )
 
 
@@ -1951,6 +2095,14 @@ def collect_history(
     basis (:func:`carry_forward_interior_bars`); a fresh bar always wins. That read is
     run state under a shadow root (:func:`read_published_close_history`).
 
+    No silent shrink (alpha-engine-config-I12688): a series the previous publish carried
+    and this run's source omitted entirely is republished unchanged and named, with its
+    last bar date, in the consolidated artifact's ``carried_series`` map, for at most
+    ``ABSENT_SERIES_MAX_CARRY_SESSIONS`` sessions (:func:`carry_forward_absent_series`).
+    When the source answered fewer than ``1 - SERIES_SHRINK_FAIL_FRACTION`` of the
+    previously published series, the carried artifact is still published but the unit
+    returns ``status: "error"`` (:func:`series_shrink_verdict`).
+
     Idempotent (full-series overwrite each run). Injectable sources/S3 for tests."""
     from datetime import date as _date
 
@@ -1986,18 +2138,40 @@ def collect_history(
     )(currencies)
     # alpha-engine-config-I11556: a session the previous publish carried inside a
     # series, and this run's source omitted, is carried forward rather than dropped.
-    previous, carry_base = read_published_close_history(s3_client, bucket)
+    previous_doc, carry_base = read_published_consolidated(s3_client, bucket)
+    previous = previous_doc["series"] if previous_doc else None
     carried: list[dict] = []
     refused: list[dict] = []
+    absent_carried: list[dict] = []
+    absent_dropped: list[dict] = []
+    # alpha-engine-config-I12688: measured on what the SOURCE answered, before any carry.
+    shrink = series_shrink_verdict(closes, previous)
     if previous:
         closes, carried, refused = carry_forward_interior_bars(closes, previous)
         _log_carry(carried, refused)
+        closes, absent_carried, absent_dropped = carry_forward_absent_series(closes, previous, trading_day)
+    _log_absent_carry(absent_carried, absent_dropped, shrink)
+    previous_ccy = (previous_doc or {}).get("currency") or {}
+    carried_ccy = {
+        c["symbol"]: previous_ccy.get(c["symbol"]) or ccy_by_yf.get(c["symbol"], "USD")
+        for c in absent_carried
+    }
+    carried_marks = {c["symbol"]: c["last_date"] for c in absent_carried}
     carry_result = {
         "carry_base": carry_base, "carried_bars": len(carried), "carry_refused": len(refused),
+        "carried_series": len(absent_carried), "dropped_series": len(absent_dropped),
+        "series_shrink": shrink,
         "stale_series": _log_stale_bars(
             "close_history", {s: series[-1][0] for s, series in closes.items() if series}, trading_day,
         ),
     }
+    # A shrink this size is a source or universe fault: the carried artifact is still
+    # the best estimate to publish, but the unit must not report success.
+    shrink_error = (
+        f"close_history shrink guard: source answered {shrink['answered']} of "
+        f"{shrink['previous_series']} previously published series (alpha-engine-config-I12688)"
+        if shrink["verdict"] == "shrunk" else None
+    )
     for yf_sym, series in closes.items():
         assert_no_bar_after([d for d, _c in series], trading_day,
                             artifact=f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json")
@@ -2007,10 +2181,14 @@ def collect_history(
     if dry_run:
         logger.info("[metron_market_data] DRY-RUN history: %d close series, %d fx series", len(closes), len(fx))
         return {
-            "status": "ok_dry_run", "close_series": len(closes), "fx_series": len(fx), **carry_result,
+            "status": "error" if shrink_error else "ok_dry_run",
+            **({"error": shrink_error} if shrink_error else {}),
+            "close_series": len(closes), "fx_series": len(fx), **carry_result,
         }
     try:
         for yf_sym, series in sorted(closes.items()):
+            if yf_sym in carried_marks:
+                continue  # unchanged since the previous publish; its per-symbol file already says so
             _write_json(s3_client, bucket, f"{CLOSE_HISTORY_PREFIX}{yf_sym}.json", {
                 "schema_version": CLOSE_HISTORY_SCHEMA_VERSION, "yf_symbol": yf_sym,
                 "currency": ccy_by_yf.get(yf_sym, "USD"),
@@ -2027,7 +2205,11 @@ def collect_history(
             "schema_version": CLOSE_HISTORY_SCHEMA_VERSION,
             "adjustment_basis": CLOSE_HISTORY_ADJUSTMENT_BASIS,
             "series": {sym: [list(p) for p in series] for sym, series in closes.items()},
-            "currency": {sym: ccy_by_yf.get(sym, "USD") for sym in closes},
+            "currency": {sym: carried_ccy.get(sym) or ccy_by_yf.get(sym, "USD") for sym in closes},
+            # alpha-engine-config-I12688: every series republished unchanged because this
+            # run's source omitted it, with its last bar date. Always present ({} when none),
+            # so a reader never has to tell "none carried" from "not reported".
+            "carried_series": carried_marks,
         })
     except Exception as e:  # fail loud to the phase registry
         logger.error("[metron_market_data] history write failed: %s", e)
@@ -2037,6 +2219,11 @@ def collect_history(
     # site needs the actual currency codes written this run (fx_history/{ccy}.json
     # has no consolidated companion file the way close_history does), never a
     # guessed/static list.
+    if shrink_error:
+        return {
+            "status": "error", "error": shrink_error, "close_series": len(closes),
+            "fx_series": len(fx), "fx_currencies": sorted(fx.keys()), **carry_result,
+        }
     return {
         "status": "ok", "close_series": len(closes), "fx_series": len(fx),
         "fx_currencies": sorted(fx.keys()), **carry_result,
