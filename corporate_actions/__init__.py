@@ -1624,7 +1624,9 @@ def splits_from_events(events: list[dict]) -> list["CorporateAction"]:
     return actions
 
 
-def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
+def get_splits(
+    ticker: str, *, client=None, strict: bool = False,
+) -> list["CorporateAction"]:
     """Per-ticker, FULL-history split events for ``ticker`` as
     ``CorporateAction``s (type="split", ex_date = polygon execution_date).
 
@@ -1639,6 +1641,15 @@ def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
     construction/fetch failure DEGRADES GRACEFULLY to ``[]`` (apiKey scrubbed)
     — never hard-fails the caller; the migration's reconciliation backstop is
     what catches a genuinely missing split.
+
+    ``strict=True`` (alpha-engine-config-I12436) RAISES instead of degrading:
+    a client that cannot be built, or a fetch that fails after the client's
+    own retries (``PolygonRateLimitError`` on a 429 that would not clear, a
+    5xx, a network error), propagates to the caller. A caller that WRITES a
+    series built from these events — the CRSP-basis build — must not read
+    "could not fetch" as "this name never split/paid": the 2026-10-25 build
+    logged 478 such degrades under 429s and kept going. Default ``False``
+    keeps the degrade for any caller that only wants a best-effort read.
     """
     if client is None:
         try:
@@ -1646,6 +1657,8 @@ def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
 
             client = polygon_client()
         except Exception as exc:  # import / construction failure — degrade
+            if strict:
+                raise
             from polygon_client import _scrub_api_key
 
             log.warning(
@@ -1657,6 +1670,8 @@ def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
     try:
         events = client.get_splits(ticker)
     except Exception as exc:
+        if strict:
+            raise
         from polygon_client import _scrub_api_key
 
         log.warning(
@@ -1670,7 +1685,9 @@ def get_splits(ticker: str, *, client=None) -> list["CorporateAction"]:
     return splits_from_events([{**ev, "ticker": ticker} for ev in events])
 
 
-def get_dividends(ticker: str, *, client=None) -> list["CorporateAction"]:
+def get_dividends(
+    ticker: str, *, client=None, strict: bool = False,
+) -> list["CorporateAction"]:
     """Per-ticker, FULL-history cash-dividend events for ``ticker`` as
     ``CorporateAction``s (type="dividend", ex_date = polygon ex_dividend_date,
     cash_amount + dividend_kind populated).
@@ -1685,6 +1702,15 @@ def get_dividends(ticker: str, *, client=None) -> list["CorporateAction"]:
     "cash_amount", "dividend_type"}`` dicts WITHOUT a ticker key); injects the
     ticker, constructs the client lazily, and DEGRADES GRACEFULLY to ``[]`` on
     any failure (apiKey scrubbed).
+
+    ``strict=True`` (alpha-engine-config-I12436) RAISES instead of degrading:
+    a client that cannot be built, or a fetch that fails after the client's
+    own retries (``PolygonRateLimitError`` on a 429 that would not clear, a
+    5xx, a network error), propagates to the caller. A caller that WRITES a
+    series built from these events — the CRSP-basis build — must not read
+    "could not fetch" as "this name never split/paid": the 2026-10-25 build
+    logged 478 such degrades under 429s and kept going. Default ``False``
+    keeps the degrade for any caller that only wants a best-effort read.
     """
     if client is None:
         try:
@@ -1692,6 +1718,8 @@ def get_dividends(ticker: str, *, client=None) -> list["CorporateAction"]:
 
             client = polygon_client()
         except Exception as exc:  # import / construction failure — degrade
+            if strict:
+                raise
             from polygon_client import _scrub_api_key
 
             log.warning(
@@ -1703,6 +1731,8 @@ def get_dividends(ticker: str, *, client=None) -> list["CorporateAction"]:
     try:
         events = client.get_dividends(ticker)
     except Exception as exc:
+        if strict:
+            raise
         from polygon_client import _scrub_api_key
 
         log.warning(
