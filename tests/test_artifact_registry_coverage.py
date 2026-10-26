@@ -300,7 +300,10 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # EVENT-DRIVEN operator-run artifact, NOT a periodic freshness-SLA artifact:
     # there is no cadence to monitor and the migration is a manual spot run, so it
     # is grandfathered out of ARTIFACT_REGISTRY.yaml (no freshness row) — pinned
-    # here only to force operator review of the new PUT site.
+    # here only to force operator review of the new PUT site. Since
+    # alpha-engine-config-I12684 the same one site (`_put_json`) also writes the
+    # per-library pass receipt `..._audit/verified/<library>.json`, under the
+    # same prefix and on the same event (a passing --apply build).
     "builders/migrate_universe_crsp_basis.py": 1,
     "builders/migrate_universe_feature_order.py": 1,
     # overseer/_control/completed/arctic-migration-<head>.json — the migration
