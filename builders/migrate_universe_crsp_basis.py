@@ -24,8 +24,12 @@ Target representation (per ticker), per the approved plan §7a:
                          for the scratch build only.
 
 Per ticker the script:
-  1. Re-pulls RAW (unadjusted) prices over the full history — yfinance
-     ``auto_adjust=False`` (mirrors ``collectors/prices.py`` but raw).
+  1. Re-pulls RAW (unadjusted) prices over the full history — polygon
+     ``adjusted=false`` aggregates over polygon's reach (~2 years, free tier),
+     and before that yfinance ``auto_adjust=False`` UN-adjusted for the splits
+     on/after polygon's first bar (yfinance's ``Close`` is split-adjusted, so
+     it is not raw on its own; alpha-engine-config-I12674). Splits yfinance
+     folded in before that bar are marked in-basis and never applied again.
   2. Applies polygon SPLITS to get the split-adjusted ``Close`` LEVEL
      (``corporate_actions.apply`` → ``_split_math.restate_series_for_splits``).
   3. Derives ``total_return_close`` from polygon DIVIDENDS
@@ -132,9 +136,10 @@ log = logging.getLogger(__name__)
 
 AUDIT_PREFIX = "builders/migrate_universe_crsp_basis_audit/"
 DEFAULT_SCRATCH_LIB = "universe_crsp"
-# 2, not 8 (alpha-engine-config-I12436). Each name costs two polygon reference
-# calls against a 5-calls/minute key the fleet shares, so the polygon budget —
-# not CPU — sets the build's pace (~909 names x 2 calls / 5 per min ~= 6 h) and
+# 2, not 8 (alpha-engine-config-I12436). Each name costs three polygon calls
+# (splits, dividends, and since alpha-engine-config-I12674 its raw daily bars)
+# against a 5-calls/minute key the fleet shares, so the polygon budget — not
+# CPU — sets the build's pace (~909 names x 3 calls / 5 per min ~= 9 h) and
 # more workers buy no speed. What they did buy on 2026-10-25 was 2,230 429s and
 # 478 corporate-action fetches abandoned. Two keeps one name's yfinance pull and
 # feature recompute overlapping the other's polygon wait.
@@ -243,34 +248,68 @@ class TickerOutcome:
     unconfirmed_splits: list[str] = field(default_factory=list)
 
 
-# ── raw price fetch (yfinance auto_adjust=False) ──────────────────────────────
+# ── raw price fetch (polygon adjusted=false, yfinance before polygon's reach) ──
+
+# Free-tier polygon serves ~2 years of daily aggregates; asking further back
+# risks a plan refusal for the whole call. 720 days stays inside it with a
+# margin. Before polygon's first bar the history comes from yfinance, un-adjusted
+# for every split on/after that bar (alpha-engine-config-I12674).
+POLYGON_RAW_LOOKBACK_DAYS = 720
+
+# How the yfinance and polygon halves are joined. Over the first
+# ``_SEAM_CHECK_SESSIONS`` sessions both feeds price, the median ratio of the
+# un-adjusted yfinance close to polygon's raw close must sit within
+# ``_SEAM_REL_TOL`` of 1.0. A split yfinance folded in but did not list (or listed
+# with another ratio) moves that ratio by the split factor (>= 1.45x), so it fails
+# here instead of silently shifting every pre-seam row.
+_SEAM_CHECK_SESSIONS = 10
+_SEAM_REL_TOL = 0.02
+
+# yfinance's own split events, matched to a feed-reported split when deciding
+# that the split is ALREADY in the returned frame's basis. Same window/tolerance
+# as the price-evidence gate (config#1455).
+_IN_BASIS_WINDOW_DAYS = 4
+_IN_BASIS_REL_TOL = 0.15
+
+#: ``DataFrame.attrs`` key: ``[(ex_date: Timestamp, multiplier: float), ...]`` —
+#: splits ALREADY folded into the frame ``fetch_raw_prices`` returned (yfinance
+#: splits before polygon's first bar), as the multiplier yfinance applied to the
+#: rows before ``ex_date``. ``reconstruct_basis`` never applies these again.
+SPLITS_IN_BASIS_ATTR = "splits_in_basis"
+#: ``DataFrame.attrs`` key: ISO date of polygon's first raw bar (the seam).
+POLYGON_RAW_FROM_ATTR = "polygon_raw_from"
+
+_PRICE_COLS = ("Open", "High", "Low", "Close")
+_OHLCV = ("Open", "High", "Low", "Close", "Volume")
 
 
-def fetch_raw_prices(ticker: str, *, period: str = "max") -> pd.DataFrame:
-    """Re-pull RAW (unadjusted) daily OHLCV for one ticker via yfinance
-    ``auto_adjust=False`` — so polygon is the SINGLE corporate-action authority
-    (we apply polygon splits/dividends to this raw series ourselves).
+class RawPriceFetchError(RuntimeError):
+    """A ticker's raw daily bars could not be fetched or joined.
 
-    Mirrors ``collectors/prices.py`` (same index normalization) but with
-    ``auto_adjust=False`` and drops the yfinance ``Adj Close`` column (we do not
-    use yfinance's adjustment — that is exactly the basis we are retiring).
-    Returns a DatetimeIndex-sorted frame with ``Open/High/Low/Close/Volume``;
-    raises on an empty/failed pull (fail-loud — a silent empty would corrupt the
-    reconstruction).
-    """
+    Raised instead of falling back to a split-adjusted close: that fallback is
+    the defect this fetch exists to remove (alpha-engine-config-I12674)."""
+
+
+def _yfinance_frame(ticker: str, period: str) -> pd.DataFrame:
+    """yfinance ``auto_adjust=False`` OHLCV plus its ``Stock Splits`` column.
+
+    ``auto_adjust=False`` turns off the DIVIDEND adjustment only: yfinance's
+    ``Close`` is still SPLIT-adjusted over the whole history, which is why it is
+    not raw and why ``Stock Splits`` is pulled alongside it."""
     import yfinance as yf
 
     raw = yf.download(
         tickers=ticker,
         period=period,
         interval="1d",
-        auto_adjust=False,  # RAW: do NOT let yfinance adjust — polygon is authority
+        auto_adjust=False,
+        actions=True,  # the split events yfinance folded into Close
         progress=False,
         group_by="ticker",
         threads=False,
     )
     if raw is None or len(raw) == 0:
-        raise RuntimeError(f"yfinance returned no rows for {ticker} (auto_adjust=False)")
+        raise RawPriceFetchError(f"yfinance returned no rows for {ticker} (auto_adjust=False)")
 
     # yfinance returns a MultiIndex (ticker, field) when group_by="ticker".
     if isinstance(raw.columns, pd.MultiIndex):
@@ -280,20 +319,190 @@ def fetch_raw_prices(ticker: str, *, period: str = "max") -> pd.DataFrame:
             raw = raw.droplevel(0, axis=1).copy()
 
     if "Close" not in raw.columns:
-        raise RuntimeError(f"yfinance frame for {ticker} missing Close column")
-
+        raise RawPriceFetchError(f"yfinance frame for {ticker} missing Close column")
     raw = raw.dropna(subset=["Close"])
     if raw.empty:
-        raise RuntimeError(f"yfinance frame for {ticker} empty after dropna(Close)")
+        raise RawPriceFetchError(f"yfinance frame for {ticker} empty after dropna(Close)")
 
     idx = pd.to_datetime(raw.index)
     if idx.tz is not None:
         idx = idx.tz_convert("UTC").tz_localize(None)
-    raw.index = idx
-    raw = raw.sort_index()
+    raw.index = idx.normalize()
+    return raw.sort_index()
 
-    keep = [c for c in ("Open", "High", "Low", "Close", "Volume") if c in raw.columns]
-    return raw[keep]
+
+def _yfinance_splits(frame: pd.DataFrame) -> list[tuple[pd.Timestamp, float]]:
+    """``[(date, ratio)]`` from yfinance's ``Stock Splits`` (2.0 = 2-for-1)."""
+    if "Stock Splits" not in frame.columns:
+        return []
+    s = pd.to_numeric(frame["Stock Splits"], errors="coerce").fillna(0.0)
+    return [(pd.Timestamp(d), float(r)) for d, r in s[s > 0].items()]
+
+
+def _polygon_raw_bars(
+    ticker: str,
+    *,
+    client,
+    start: str,
+    end: str,
+    attempts: int,
+    sleep,
+) -> pd.DataFrame:
+    """polygon daily aggregates with ``adjusted=false`` — genuinely raw.
+
+    Goes through the client's shared, locked rate limiter (data#2298) and the
+    same patient, strict retry the corporate-action fetch uses."""
+    from collectors.daily_closes import _polygon_symbol
+
+    symbol = _polygon_symbol(ticker)
+    for attempt in range(attempts):
+        try:
+            return client.get_daily_bars(symbol, start, end, adjusted=False)
+        except Exception as exc:  # noqa: BLE001 - classified below
+            if not _is_retryable_fetch_error(exc) or attempt == attempts - 1:
+                raise RawPriceFetchError(
+                    f"{ticker}: polygon raw-bars fetch failed after "
+                    f"{attempt + 1} attempt(s) ({_describe_fetch_error(exc)})"
+                    " — refusing to fall back to a split-adjusted close"
+                ) from None
+            wait = min(
+                CA_FETCH_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                CA_FETCH_BACKOFF_CAP_SECONDS,
+            )
+            log.warning(
+                "%s: polygon raw-bars fetch failed (%s) — waiting %.0fs, attempt %d/%d",
+                ticker, _describe_fetch_error(exc), wait, attempt + 1, attempts,
+            )
+            sleep(wait)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+def fetch_raw_prices(
+    ticker: str,
+    *,
+    period: str = "max",
+    client=None,
+    today: str | None = None,
+    polygon_lookback_days: int | None = None,
+    attempts: int = CA_FETCH_ATTEMPTS,
+    sleep=None,
+) -> pd.DataFrame:
+    """RAW (unadjusted) daily OHLCV for one ticker, so polygon's splits are
+    applied to it exactly once (alpha-engine-config-I12674).
+
+    yfinance ``auto_adjust=False`` is NOT raw: its ``Close`` is split-adjusted,
+    so the price-evidence gate judged splits on a series that already carried
+    them and could "confirm" one off a coincident move and apply it twice. So:
+
+    * **polygon window** (its first bar onward, ~2 years on the free tier):
+      polygon aggregates with ``adjusted=false``.
+    * **before polygon's first bar** (the seam): yfinance, UN-adjusted for every
+      split it lists on/after the seam, so it joins polygon's raw basis. The join
+      is checked on the first overlapping sessions and fails loud on a mismatch.
+      Splits yfinance lists BEFORE the seam stay folded into those rows and are
+      recorded in ``df.attrs[SPLITS_IN_BASIS_ATTR]``; ``reconstruct_basis``
+      never applies them again.
+    * after polygon's last bar (its close is T+1): yfinance, likewise un-adjusted.
+
+    Contract unchanged: a tz-naive, sorted ``DatetimeIndex`` with
+    ``Open/High/Low/Close`` (float64) and ``Volume`` (int64). Raises
+    :class:`RawPriceFetchError` on any empty/failed pull or a bad join — a
+    silent fallback would corrupt the reconstruction.
+    """
+    sleep = sleep or time.sleep
+    if client is None:
+        from polygon_client import polygon_client
+
+        client = polygon_client()
+    lookback = polygon_lookback_days or int(
+        os.environ.get("MIGRATE_UNIVERSE_CRSP_POLYGON_RAW_DAYS", POLYGON_RAW_LOOKBACK_DAYS)
+    )
+    end_ts = pd.Timestamp(today) if today else pd.Timestamp(datetime.now(timezone.utc).date())
+    start_ts = end_ts - pd.Timedelta(days=lookback)
+
+    yf_frame = _yfinance_frame(ticker, period)
+    poly = _polygon_raw_bars(
+        ticker, client=client,
+        start=start_ts.strftime("%Y-%m-%d"), end=end_ts.strftime("%Y-%m-%d"),
+        attempts=attempts, sleep=sleep,
+    )
+    if poly is None or poly.empty:
+        raise RawPriceFetchError(
+            f"{ticker}: polygon returned no raw bars for "
+            f"{start_ts.date()}..{end_ts.date()} — refusing to fall back to a "
+            "split-adjusted close"
+        )
+    poly = poly.copy()
+    poly.index = pd.to_datetime(poly.index).normalize()
+    poly = poly.sort_index()
+    seam = poly.index.min()
+
+    splits = _yfinance_splits(yf_frame)
+    yf_unadj = yf_frame[[c for c in _OHLCV if c in yf_frame.columns]].astype("float64")
+    for when, ratio in splits:
+        if when < seam:
+            continue  # stays in the basis; recorded below, never re-applied
+        before = yf_unadj.index < when
+        cols = [c for c in _PRICE_COLS if c in yf_unadj.columns]
+        yf_unadj.loc[before, cols] *= ratio
+        if "Volume" in yf_unadj.columns:
+            yf_unadj.loc[before, "Volume"] /= ratio
+
+    common = yf_unadj.index.intersection(poly.index)
+    if (yf_unadj.index < seam).any():
+        if len(common) == 0:
+            raise RawPriceFetchError(
+                f"{ticker}: yfinance and polygon share no session, so the "
+                "pre-polygon history cannot be joined to the raw basis"
+            )
+        head = common[:_SEAM_CHECK_SESSIONS]
+        ratio = float((yf_unadj.loc[head, "Close"] / poly.loc[head, "Close"]).median())
+        if not abs(ratio - 1.0) <= _SEAM_REL_TOL:
+            raise RawPriceFetchError(
+                f"{ticker}: un-adjusted yfinance close is {ratio:.4f}x polygon's "
+                f"raw close at the seam ({seam.date()}) — a split yfinance folded "
+                "in is missing from its split list or mis-ratio'd; refusing to "
+                "join the pre-polygon history"
+            )
+
+    out = poly[list(_OHLCV)].combine_first(yf_unadj[[c for c in _OHLCV if c in yf_unadj.columns]])
+    out = out.dropna(subset=["Close"]).sort_index()
+    for c in _PRICE_COLS:
+        out[c] = out[c].astype("float64")
+    out["Volume"] = out["Volume"].fillna(0).round().astype("int64")
+    out = out[list(_OHLCV)]
+    out.attrs[SPLITS_IN_BASIS_ATTR] = [(when, 1.0 / ratio) for when, ratio in splits if when < seam]
+    out.attrs[POLYGON_RAW_FROM_ATTR] = seam.strftime("%Y-%m-%d")
+    return out
+
+
+def split_actions_in_source_basis(raw_df: pd.DataFrame, split_actions: list) -> set:
+    """``action_id``s of feed splits ALREADY folded into ``raw_df``.
+
+    Matches each split in ``raw_df.attrs[SPLITS_IN_BASIS_ATTR]`` (set by
+    :func:`fetch_raw_prices`) to a feed split within ±4 days whose factor, or its
+    inverse (an inverted feed record is the same event), agrees within 15%. A
+    frame without the attribute (an injected fetcher) has nothing in basis."""
+    in_basis = list((getattr(raw_df, "attrs", None) or {}).get(SPLITS_IN_BASIS_ATTR) or [])
+    if not in_basis:
+        return set()
+    out: set = set()
+    window = pd.Timedelta(days=_IN_BASIS_WINDOW_DAYS)
+    for a in split_actions:
+        try:
+            factor = ca.expected_factor(a)
+        except Exception:  # noqa: BLE001 - malformed ratio: let apply() guard it
+            continue
+        if factor <= 0:
+            continue
+        ex = pd.Timestamp(a.ex_date).normalize()
+        for when, mult in in_basis:
+            if abs(pd.Timestamp(when) - ex) > window:
+                continue
+            if any(abs(f - mult) <= _IN_BASIS_REL_TOL * mult for f in (factor, 1.0 / factor)):
+                out.add(a.action_id)
+                break
+    return out
 
 
 # ── corporate actions: strict, patient fetch ─────────────────────────────────
@@ -435,13 +644,28 @@ def reconstruct_basis(
         return raw_df, []
 
     # 1. SPLIT-adjusted Close LEVEL. apply() filters to splits, raises on a
-    #    stray dividend/rename, and delegates the factor math.
+    #    stray dividend/rename, and delegates the factor math. A split the RAW
+    #    fetch reports as already folded into its rows (yfinance history before
+    #    polygon's first raw bar) is never applied a second time
+    #    (alpha-engine-config-I12674).
+    in_basis = split_actions_in_source_basis(raw_df, split_actions)
     split_adj, applied = ca.apply(
         raw_df,
-        split_actions,
+        [a for a in split_actions if a.action_id not in in_basis],
         store=SCRATCH_RESTATE_STORE,
         registry=None,
     )
+    applied = list(applied) + [
+        {
+            "action_id": a.action_id,
+            "store": SCRATCH_RESTATE_STORE,
+            "n_rows_adjusted": 0,
+            "factor": ca.expected_factor(a),
+            "status": "in_source_basis",
+        }
+        for a in split_actions
+        if a.action_id in in_basis
+    ]
 
     # 2. SEPARATE total-return axis (does NOT mutate split_adj["Close"]).
     # split_actions is passed through so a dividend declared BEFORE a later
@@ -810,8 +1034,9 @@ def migrate_universe_crsp_basis(
         would put the frames straight back in memory.
     raw_fetch / client
         Injectable RAW-price fetcher ``(ticker) -> DataFrame`` and polygon client
-        (for tests / alternate sources). Default: yfinance ``auto_adjust=False``
-        + the polygon singleton.
+        (for tests / alternate sources). Default: :func:`fetch_raw_prices`
+        (polygon ``adjusted=false`` joined to un-adjusted yfinance history) on
+        ``client``, else the polygon singleton.
     macro / sector_map / fundamentals / alt_data
         Feature-recompute inputs (apply path only). Loaded from S3/ArcticDB when
         not injected.
@@ -824,7 +1049,11 @@ def migrate_universe_crsp_basis(
     workers = workers or int(
         os.environ.get("MIGRATE_UNIVERSE_CRSP_WORKERS", str(DEFAULT_WORKERS))
     )
-    raw_fetch = raw_fetch or fetch_raw_prices
+    if raw_fetch is None:
+        # Same polygon client (and so the same locked limiter) as the
+        # corporate-action fetch: the raw bars are one more call per name.
+        def raw_fetch(ticker: str) -> pd.DataFrame:
+            return fetch_raw_prices(ticker, client=client)
 
     s3 = boto3.client("s3")
     universe_lib = get_universe_lib(bucket)  # READ-ONLY baseline source
@@ -894,7 +1123,16 @@ def migrate_universe_crsp_basis(
             if old_close is None:
                 return TickerOutcome(ticker, "no_old_close")
 
-            raw_df = raw_fetch(ticker)
+            try:
+                raw_df = raw_fetch(ticker)
+            except RawPriceFetchError as exc:
+                abort.set()
+                log.error(
+                    "%s — STOPPING the build: no name is built on a close that is "
+                    "not raw (alpha-engine-config-I12674)",
+                    exc,
+                )
+                return TickerOutcome(ticker, "error", error=f"raw_prices: {exc}")
             if raw_df is None or raw_df.empty:
                 return TickerOutcome(ticker, "fetch_empty")
 
