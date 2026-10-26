@@ -31,6 +31,7 @@ Three things are graded:
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
@@ -178,3 +179,47 @@ def test_every_declared_write_site_resolves_to_a_unit_with_a_row():
     assert not uncovered, (
         f"write site(s) resolve to unit(s) with no observability row: {uncovered}"
     )
+
+
+def _declared_state_machines() -> set[str]:
+    """Every `StateMachineName` this repo's CloudFormation templates declare."""
+    names: set[str] = set()
+    for path in sorted((REPO_ROOT / "infrastructure" / "cloudformation").glob("*.y*ml")):
+        names.update(
+            re.findall(r"^\s*StateMachineName:\s*['\"]?([A-Za-z0-9._-]+)", path.read_text(encoding="utf-8"), re.M)
+        )
+    return names
+
+
+def test_step_function_units_name_their_state_machine():
+    """A unit running inside a state machine declares it as `parent_component`.
+
+    alpha-engine-config-I12664: the ops reconciler's discoverers see the state
+    machine, never the unit inside it, so judging a unit row's ABSENT side
+    without a parent reports every step-functions unit ABSENT (33 of the 40
+    measured 2026-10-25). The parent must be a state machine this repo
+    actually declares — a typo here would exclude the row from ABSENT while
+    pointing at nothing. Units on any other trigger kind are components in
+    their own right and must carry no parent.
+    """
+    machines = _declared_state_machines()
+    assert machines, "no StateMachineName found under infrastructure/cloudformation/ — parser broke"
+    problems: list[str] = []
+    for unit in load_units():
+        if unit.unit_id in gen.EXTERNALLY_OWNED_ROWS:
+            continue
+        trigger = unit.raw.get("trigger") or {}
+        row = yaml.safe_load((REGISTRY_D / f"{unit.raw['component_id']}.yaml").read_text(encoding="utf-8"))
+        parent = row.get("parent_component")
+        if trigger.get("kind") != "step-functions":
+            if parent:
+                problems.append(f"{unit.unit_id}: {trigger.get('kind')} unit carries parent {parent!r}")
+            continue
+        expected = str(trigger.get("owner") or "").split(":", 1)[0]
+        if parent != expected:
+            problems.append(f"{unit.unit_id}: parent_component {parent!r}, expected {expected!r}")
+        elif parent not in machines:
+            problems.append(f"{unit.unit_id}: parent {parent!r} is not a declared StateMachineName")
+        elif not row.get("parent_component_reason"):
+            problems.append(f"{unit.unit_id}: parent_component carries no reason")
+    assert not problems, problems

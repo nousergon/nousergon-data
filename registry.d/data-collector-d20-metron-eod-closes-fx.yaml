@@ -14,6 +14,10 @@ substrate: step-functions
 origin: ne-data-collection-eod
 owner: brian
 lifecycle: in-service
+parent_component: ne-data-collection-eod
+parent_component_reason: D20 runs as states inside the 'ne-data-collection-eod' state machine, so no discoverer
+  can see this unit's own id; presence is judged on the state machine, never on the unit (alpha-engine-config-I12664).
+  Derived from the unit descriptor's trigger.owner.
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D20''s own code path (collectors/metron_market_data.py:973)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no

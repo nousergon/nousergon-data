@@ -14,6 +14,10 @@ substrate: step-functions
 origin: ne-data-collection-panel
 owner: brian
 lifecycle: pending
+parent_component: ne-data-collection-panel
+parent_component_reason: D49 runs as states inside the 'ne-data-collection-panel' state machine, so no
+  discoverer can see this unit's own id; presence is judged on the state machine, never on the unit (alpha-engine-config-I12664).
+  Derived from the unit descriptor's trigger.owner.
 lifecycle_owner: brian
 lifecycle_reexam: '2026-10-28'
 pending_since: '2026-10-14'
