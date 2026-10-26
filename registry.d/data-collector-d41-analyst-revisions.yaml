@@ -14,6 +14,10 @@ substrate: step-functions
 origin: ne-weekly-freshness-pipeline:RAGIngestion
 owner: brian
 lifecycle: retired
+parent_component: ne-weekly-freshness-pipeline
+parent_component_reason: D41 runs as states inside the 'ne-weekly-freshness-pipeline' state machine, so
+  no discoverer can see this unit's own id; presence is judged on the state machine, never on the unit
+  (alpha-engine-config-I12664). Derived from the unit descriptor's trigger.owner.
 lifecycle_owner: brian
 lifecycle_reexam: '2026-09-28'
 lifecycle_reason: 'Generated from registry.d/units/D41-*.yaml (P-08): the unit descriptor declares lifecycle:

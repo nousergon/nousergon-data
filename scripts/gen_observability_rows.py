@@ -41,6 +41,14 @@ describing the same schedule; P-08's job for D39 is to flip that EXISTING row's
   `audit.cells.run_record` / `.detector` — `PRESENT` maps to `emitted`,
   anything else to `unknown` naming the exact audit state, so this row cannot
   claim a signal the audit itself found missing.
+- `parent_component` (alpha-engine-config-I12664): for a `step-functions`
+  unit, the state machine named by `trigger.owner` (any `:<State>` suffix
+  dropped). A unit runs as states INSIDE that machine, so no discoverer can
+  ever see the unit's own id; the ops reconciler excludes `parent_component`
+  rows from ABSENT and judges the parent instead. Without it, judging these
+  rows' row side would report every one ABSENT (measured 2026-10-25: 33 of
+  the 40). Every parent named must be a `StateMachineName` this repo's
+  CloudFormation declares (`test_step_function_units_name_their_state_machine`).
 - Everything else (`authority_tier`, `signals.execution/cost/resource`,
   `log_location`, `alert_channel`, `severity_source`, `console_surface`,
   `retention`): derived from `trigger.kind` with a written, generic reason —
@@ -142,6 +150,19 @@ def _origin(trigger: dict[str, Any]) -> str:
     return owner or detail or "undeclared"
 
 
+def _parent_component(trigger: dict[str, Any]) -> str | None:
+    """The state machine a `step-functions` unit runs inside, or None.
+
+    `trigger.owner` names it, optionally with the state the unit runs in
+    (`ne-weekly-freshness-pipeline:DataPhase1`); the component is the machine.
+    Other trigger kinds are components in their own right and get no parent.
+    """
+    if trigger.get("kind") != "step-functions":
+        return None
+    machine = str(trigger.get("owner") or "").split(":", 1)[0].strip()
+    return machine or None
+
+
 def _lifecycle(unit_id: str, unit_lifecycle: str) -> str:
     try:
         return LIFECYCLE_BY_UNIT_LIFECYCLE[unit_lifecycle]
@@ -238,6 +259,16 @@ def build_row(unit) -> dict[str, Any]:
         "owner": data.get("owner", "brian"),
         "lifecycle": lifecycle,
     }
+
+    parent = _parent_component(trigger)
+    if parent:
+        row["parent_component"] = parent
+        row["parent_component_reason"] = (
+            f"{unit.unit_id} runs as states inside the {parent!r} state machine, so no "
+            "discoverer can see this unit's own id; presence is judged on the state machine, "
+            "never on the unit (alpha-engine-config-I12664). Derived from the unit "
+            "descriptor's trigger.owner."
+        )
 
     if lifecycle in LIFECYCLE_NEEDS_REASON:
         row["lifecycle_owner"] = data.get("owner", "brian")
