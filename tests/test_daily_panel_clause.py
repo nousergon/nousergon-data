@@ -350,3 +350,73 @@ def test_the_latest_receipt_is_the_one_graded():
     reading = _read(store, trading_day=later)
     assert _leg(reading, "parity") == "UNMET"
     assert "2026-10-05" in reading.detail
+
+
+# -- a missing panel day behind the latest one (alpha-engine-config-I12652) ---
+
+OCT = [dt.date(2026, 10, d) for d in (14, 15, 16, 19, 20, 21, 22, 23)]  # NYSE sessions
+
+
+def _published(days) -> EmptyStore:
+    store = _store(manifest=_manifest(days[-1]), receipt=_receipt(days[-1]))
+    for day in days[:-1]:
+        store.objects[_rel(dp.manifest_key(day))] = json.dumps(_manifest(day)).encode()
+        store.objects[_rel(dp.panel_key(day))] = b"PAR1"
+    return store
+
+
+def test_every_session_since_the_first_scheduled_one_published_is_met():
+    reading = _read(_published(OCT), trading_day=OCT[-1])
+    assert _leg(reading, "published") == "MET", reading.detail
+    assert reading.met, reading.detail
+
+
+def test_a_missing_day_behind_the_latest_panel_is_unmet():
+    """The 2026-10-21 hole: its EOD failed, so nothing started the panel machine."""
+    reading = _read(_published([d for d in OCT if d != dt.date(2026, 10, 21)]), trading_day=OCT[-1])
+    assert _leg(reading, "published") == "UNMET", reading.detail
+    assert not reading.met and not reading.unmeasurable
+    assert "['2026-10-21']" in reading.detail
+    assert "DECLARED_GAPS" in reading.detail
+
+
+def test_a_declared_gap_is_not_a_hole(monkeypatch):
+    monkeypatch.setattr(panel, "DECLARED_GAPS", {"2026-10-21": "decision recorded on the issue"})
+    reading = _read(_published([d for d in OCT if d != dt.date(2026, 10, 21)]), trading_day=OCT[-1])
+    assert _leg(reading, "published") == "MET", reading.detail
+
+
+def test_today_not_yet_published_is_not_a_hole():
+    """Read on Monday before its panel publishes: Friday's panel is current, Monday is not missing."""
+    reading = _read(_published(OCT), trading_day=dt.date(2026, 10, 26))
+    assert _leg(reading, "published") == "MET", reading.detail
+
+
+def test_sessions_before_the_first_scheduled_publish_are_not_holes():
+    assert panel.FIRST_SCHEDULED_SESSION == OCT[0]
+    reading = _read(_published(OCT[:2]), trading_day=OCT[1])
+    assert _leg(reading, "published") == "MET", reading.detail
+
+
+def test_a_hole_older_than_the_window_is_not_graded(monkeypatch):
+    monkeypatch.setattr(panel, "GAP_WINDOW_SESSIONS", 2)
+    reading = _read(_published([d for d in OCT if d != dt.date(2026, 10, 20)]), trading_day=OCT[-1])
+    assert _leg(reading, "published") == "MET", reading.detail
+    monkeypatch.setattr(panel, "GAP_WINDOW_SESSIONS", 3)
+    reading = _read(_published([d for d in OCT if d != dt.date(2026, 10, 20)]), trading_day=OCT[-1])
+    assert _leg(reading, "published") == "UNMET", reading.detail
+
+
+def test_an_unlistable_prefix_is_unmeasurable_not_gapless():
+    store = _published(OCT)
+    listing = store.list_keys
+
+    def denied(prefix: str = ""):
+        if prefix == _rel(dp.KEY_PREFIX):
+            raise PermissionError(f"AccessDenied: {prefix}")
+        return listing(prefix)
+
+    store.list_keys = denied
+    reading = _read(store, trading_day=OCT[-1])
+    assert _leg(reading, "published") == "UNMEASURABLE", reading.detail
+    assert not reading.met
