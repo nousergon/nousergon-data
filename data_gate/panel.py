@@ -12,7 +12,10 @@ lands, and the clause is their conjunction:
 
 1. ``contract``  — the three schemas and the producer test are in this tree.
 2. ``published`` — the panel for the latest due trading day is in the store,
-   with a manifest that validates and names the parquet beside it.
+   with a manifest that validates and names the parquet beside it, and no
+   session in the last :data:`GAP_WINDOW_SESSIONS` before it (back to
+   :data:`FIRST_SCHEDULED_SESSION`) is missing its manifest, unless it is a
+   :data:`DECLARED_GAPS` entry (alpha-engine-config-I12652).
 3. ``consumer_pin`` — the consumer pins the row schema (same validation shape)
    on its default branch, and the read site that reads the panel exists there.
 4. ``parity`` — the latest parity receipt is ``equivalent`` under exactly
@@ -50,6 +53,9 @@ from data_gate.evidence import Reading
 from data_gate.sources import GITHUB_TOKEN_ENV, SourceUnavailable
 
 __all__ = [
+    "DECLARED_GAPS",
+    "FIRST_SCHEDULED_SESSION",
+    "GAP_WINDOW_SESSIONS",
     "PANEL_CLAUSE",
     "PANEL_REQUIREMENT",
     "PRODUCER_TEST",
@@ -70,6 +76,21 @@ PANEL_REQUIREMENT = (
     "panel actually published that day; and the duplicate direct-ArcticDB compile removed from "
     f"{dp.CONSUMER.entrypoint}, not left as a silent second implementation"
 )
+
+#: The first session the scheduled publisher (``ne-data-collection-panel``)
+#: published. Sessions before it never had a panel and are not holes.
+FIRST_SCHEDULED_SESSION = dt.date(2026, 10, 14)
+
+#: How many sessions behind the latest published panel the ``published`` leg
+#: looks for a missing day. Before alpha-engine-config-I12652 the leg read only
+#: the latest due day, so 2026-10-21 (its EOD failed, so the panel machine was
+#: never started) went unseen, and after the reader switch (-I10791 step 3) a
+#: missing panel day is a D47 refusal for that session.
+GAP_WINDOW_SESSIONS = 20
+
+#: Sessions deliberately left without a panel, each with the decision that
+#: left it so. Add-by-PR only; an entry is a recorded decision, never a mute.
+DECLARED_GAPS: dict[str, str] = {}
 
 _SOURCE = (
     "data_collection store (panel/) + nousergon-data tree + GitHub contents API "
@@ -144,6 +165,43 @@ def _grade_manifest(store: GateStore, key: str, document: dict, day: dt.date) ->
     return None
 
 
+def _window(latest: dt.date) -> list[dt.date]:
+    """The sessions before ``latest`` the gap check covers, oldest first."""
+    days: list[dt.date] = []
+    day = previous_trading_day(latest)
+    while day >= FIRST_SCHEDULED_SESSION and len(days) < GAP_WINDOW_SESSIONS:
+        days.append(day)
+        day = previous_trading_day(day)
+    return sorted(days)
+
+
+def _window_start(latest: dt.date) -> dt.date:
+    days = _window(latest)
+    return days[0] if days else latest
+
+
+def _missing_sessions(store: GateStore, latest: dt.date) -> tuple[list[dt.date], str | None]:
+    """``(sessions with no manifest, problem)`` for the window behind ``latest``.
+
+    One listing of the panel prefix, not a read per day. A listing we could
+    not make is a problem (UNMEASURABLE), never an empty answer.
+    """
+    days = _window(latest)
+    if not days:
+        return [], None
+    prefix = _rel(dp.KEY_PREFIX)
+    try:
+        published = set(store.list_keys(prefix))
+    except Exception as exc:  # noqa: BLE001 - an unlistable prefix is a reading, not a crash
+        return [], f"could not list {prefix} for the gap check: {type(exc).__name__}: {exc}"
+    missing = [
+        day
+        for day in days
+        if _rel(dp.manifest_key(day)) not in published and day.isoformat() not in DECLARED_GAPS
+    ]
+    return missing, None
+
+
 def _leg_published(store: GateStore, trading_day: dt.date) -> tuple[_Leg, dict[str, dict]]:
     due, previous = _due_days(trading_day)
     manifests: dict[str, dict] = {}
@@ -163,16 +221,28 @@ def _leg_published(store: GateStore, trading_day: dt.date) -> tuple[_Leg, dict[s
         if finding is not None:
             return _Leg("published", _UNMET, finding, tuple(evidence)), manifests
         manifests[day.isoformat()] = document
-        return (
-            _Leg(
-                "published",
-                _MET,
-                f"{key}: {document['row_count']} rows, {document['symbols_on_trading_day']} tickers on "
-                f"{day}, {document['session_count']} sessions, sha256 {document['panel_sha256'][:12]}",
-                tuple(evidence),
-            ),
-            manifests,
+        summary = (
+            f"{key}: {document['row_count']} rows, {document['symbols_on_trading_day']} tickers on "
+            f"{day}, {document['session_count']} sessions, sha256 {document['panel_sha256'][:12]}"
         )
+        evidence.append(_rel(dp.KEY_PREFIX))
+        missing, problem = _missing_sessions(store, day)
+        if problem is not None:
+            return _Leg("published", _UNMEASURABLE, f"{summary}; {problem}", tuple(evidence)), manifests
+        if missing:
+            return (
+                _Leg(
+                    "published",
+                    _UNMET,
+                    f"{summary}; but {len(missing)} earlier session(s) have no panel: "
+                    f"{[d.isoformat() for d in missing]} — a missing panel day is a refusal for its "
+                    "consumer; backfill it (python -m builders.daily_panel publish --date DAY) or "
+                    "record the decision in data_gate/panel.py::DECLARED_GAPS",
+                    tuple(evidence),
+                ),
+                manifests,
+            )
+        return _Leg("published", _MET, f"{summary}; no gap since {_window_start(day)}", tuple(evidence)), manifests
     if unreadable:
         return _Leg("published", _UNMEASURABLE, "; ".join(unreadable), tuple(evidence)), manifests
     return (
