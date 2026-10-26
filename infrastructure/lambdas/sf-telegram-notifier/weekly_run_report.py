@@ -140,8 +140,9 @@ class DirectorSummary:
     status: Optional[str]  # RED / AMBER / YELLOW / GREEN, or None if unstated
     concerns: Tuple[str, ...]
     source_key: str
-    #: (action item id, title, tracked issue number or None), P0 first.
-    planned: Tuple[Tuple[str, str, Optional[int]], ...] = ()
+    #: (action item id, title, tracked issue number or None, whether that
+    #: issue is closed with no open follow-up), P0 first.
+    planned: Tuple[Tuple[str, str, Optional[int], bool], ...] = ()
 
 
 @dataclass
@@ -524,7 +525,7 @@ def director_from_plan(plan: Mapping[str, Any], key: str) -> Tuple[DirectorSumma
             keys=("director_plan_latency",),
         ))
     planned = tuple(
-        (str(a.get("id") or ""), str(a.get("title") or ""), None)
+        (str(a.get("id") or ""), str(a.get("title") or ""), None, False)
         for a in sorted(
             (a for a in (plan.get("action_items") or []) if isinstance(a, dict)),
             key=lambda a: str(a.get("priority") or "P9"),
@@ -533,14 +534,32 @@ def director_from_plan(plan: Mapping[str, Any], key: str) -> Tuple[DirectorSumma
     return DirectorSummary(status=status, concerns=concerns, source_key=key, planned=planned), issues
 
 
+def _ledger_issue(item: Mapping[str, Any]) -> Tuple[Optional[int], bool]:
+    """(issue to link, closed-with-no-open-follow-up) for one ledger row.
+
+    ``issue_number`` is the row's FIRST issue and is kept that way after the
+    Director files a re-track, so linking it sent readers to closed #1059 and
+    #11095 (alpha-engine-config-I12644). The Director's backfill stamps
+    ``current_issue_number``, the open issue that now tracks the row, every
+    run; a stamped ``None`` means every issue on its chain is closed. A row
+    the Director has not stamped yet falls back to ``issue_number``."""
+    first = item.get("issue_number") if isinstance(item.get("issue_number"), int) else None
+    if "current_issue_number" not in item:
+        return first, False
+    current = item.get("current_issue_number")
+    if isinstance(current, int):
+        return current, False
+    return first, first is not None
+
+
 def _with_ledger_issues(d: DirectorSummary, ledger: Any) -> DirectorSummary:
-    """Fill each planned item's issue number from the Director's own ledger."""
+    """Fill each planned item's issue from the Director's own ledger."""
     numbers: dict = {}
     if isinstance(ledger, dict):
         for item in ledger.get("items") or []:
-            if isinstance(item, dict) and isinstance(item.get("issue_number"), int):
-                numbers[item.get("id")] = item["issue_number"]
-    planned = tuple((i, t, numbers.get(i)) for i, t, _ in d.planned)
+            if isinstance(item, dict):
+                numbers[item.get("id")] = _ledger_issue(item)
+    planned = tuple((i, t, *numbers.get(i, (None, False))) for i, t, _, _ in d.planned)
     return DirectorSummary(status=d.status, concerns=d.concerns, source_key=d.source_key, planned=planned)
 
 
@@ -686,8 +705,10 @@ def _format_report_lines(report: WeeklyReport, shown: int) -> List[str]:
             lines.append(f"  Auto-fix: {AUTO_FIX_DIRECTOR}")
         if d.planned:
             lines.append("  Planned fixes (Director action items):")
-            for item_id, title, number in d.planned:
+            for item_id, title, number, closed in d.planned:
                 ref = ref_link(f"alpha-engine-config#{number}") if number else "issue not in the ledger yet"
+                if number and closed:
+                    ref += " (closed; no open follow-up yet)"
                 lines.append(f"  – {md_escape(_clip(title or item_id, _PLAN_MAX_CHARS))}: {ref}")
     return lines
 
