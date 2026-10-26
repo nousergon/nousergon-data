@@ -700,7 +700,7 @@ def _yfinance_closes(
     A symbol whose daily series ends before D takes D's close from its completed
     intraday session when the vendor has one (:func:`_yfinance_session_closes`,
     alpha-engine-config-I11548); otherwise it keeps its truthful earlier bar_date."""
-    from dates import clip_to_trading_day, default_run_date, history_window
+    from dates import FutureBarError, clip_to_trading_day, default_run_date, history_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
     start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
@@ -733,8 +733,12 @@ def _yfinance_closes(
                     last = df.iloc[-1]
                     bar_date = df.index[-1].date().isoformat()
                     out[sym] = (round(float(last["Close"]), 4), bar_date)
+                except FutureBarError:
+                    raise  # I10794: a refused future bar fails the read, never a per-symbol miss
                 except Exception as e:
                     logger.warning("[metron_market_data] close extract failed for %s: %s", sym, e)
+        except FutureBarError:
+            raise  # I10794
         except Exception as e:
             logger.warning("[metron_market_data] yfinance close batch failed: %s", e)
     behind = sorted(s for s, (_c, d) in out.items() if _lagging_by_one_session(d, trading_day))
@@ -755,7 +759,7 @@ def _yfinance_fx(
     (alpha-engine-config-I10893)."""
     if not currencies:
         return {}
-    from dates import clip_to_trading_day, default_run_date, history_window
+    from dates import FutureBarError, clip_to_trading_day, default_run_date, history_window
 
     trading_day = str(trading_day) if trading_day is not None else default_run_date()
     start, end_excl = history_window(trading_day, LATEST_BAR_LOOKBACK)
@@ -784,8 +788,12 @@ def _yfinance_fx(
                 if df.empty:
                     continue
                 out[ccy] = round(float(df.iloc[-1]["Close"]), 6)
+            except FutureBarError:
+                raise  # I10794: a refused future bar fails the read, never a per-pair miss
             except Exception as e:
                 logger.warning("[metron_market_data] FX extract failed for %s: %s", pair, e)
+    except FutureBarError:
+        raise  # I10794
     except Exception as e:
         logger.warning("[metron_market_data] yfinance FX batch failed: %s", e)
     logger.info("[metron_market_data] fx: %d/%d currencies resolved", len(out), len(pairs))
@@ -816,7 +824,7 @@ def _yf_history(
         logger.warning("[metron_market_data] yfinance/pandas unavailable for history")
         return {}
 
-    from dates import clip_to_trading_day, history_window
+    from dates import FutureBarError, clip_to_trading_day, history_window
 
     targets = {f"{c}{base}=X": c for c in symbols if c and c != base} if is_fx else {s: s for s in symbols if s}
     if not targets:
@@ -841,8 +849,12 @@ def _yf_history(
                     if df.empty:
                         continue
                     out[targets[key]] = [(d.date().isoformat(), round(float(c), 6)) for d, c in df["Close"].items()]
+                except FutureBarError:
+                    raise  # I10794: a refused future bar fails the read, never a per-series miss
                 except Exception as e:
                     logger.warning("[metron_market_data] history extract failed for %s: %s", key, e)
+        except FutureBarError:
+            raise  # I10794
         except Exception as e:
             logger.warning("[metron_market_data] yfinance history batch failed: %s", e)
     if not is_fx:
