@@ -44,7 +44,9 @@ __all__ = [
     "CARDINALITY_OBSERVED",
     "EMPTY_FRESH_OBSERVED",
     "HARNESSES",
+    "PIT_FUTURE_BAR_OBSERVED",
     "PIT_OBSERVED",
+    "PIT_OBSERVED_BY_UNIT",
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
     "UNITS_OBSERVED",
     "Harness",
@@ -131,6 +133,31 @@ PIT_OBSERVED: tuple[str, ...] = (
     "recovery: once the missing bars land, the next run reaches CollectionSucceeded with 0 "
     "pages and an all-fresh receipt",
 )
+
+#: What D03's ``pit`` walk observes (alpha-engine-config-I10794, ruling (a)): the
+#: fetch-boundary refusal ``dates.refuse_bars_after`` (``FutureBarRefused``), which
+#: ``collectors/prices.py`` reaches through ``clip_to_trading_day``. A different
+#: check from the append-time freshness scan :data:`PIT_OBSERVED` describes, so
+#: the record names it per unit (:data:`PIT_OBSERVED_BY_UNIT`), never class-wide.
+#: Taken by ``tests/test_pit_future_bar_refusal_i10794.py``; publishable once D03
+#: declares ``pit: present`` and joins the ``pit`` harness's ``CASES``.
+PIT_FUTURE_BAR_OBSERVED: tuple[str, ...] = (
+    "the fetch-boundary point-in-time bound refused a vendor answer carrying a bar dated after "
+    "the run's as-of date (FutureBarRefused, finding pit_future_bar naming dataset, ticker, "
+    "as_of and bar_date); nothing was trimmed",
+    "manifest status failed naming the finding, on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL; the process exited 1 "
+    "on both attempts",
+    "stand-down: terminal CollectionFailed, phase marker error; no price-cache key was "
+    "overwritten past the refusal",
+    "recovery: once the vendor answers within the requested end, the next run reaches "
+    "CollectionSucceeded with 0 pages",
+)
+
+#: guard class -> unit -> its observed lines, where a unit's check is not the
+#: class-wide one its harness's default ``observed`` describes.
+PIT_OBSERVED_BY_UNIT: dict[str, tuple[str, ...]] = {"D03": PIT_FUTURE_BAR_OBSERVED}
+_OBSERVED_BY_UNIT: dict[str, dict[str, tuple[str, ...]]] = {"pit": PIT_OBSERVED_BY_UNIT}
 
 
 
@@ -234,7 +261,7 @@ def record_document(
         "guard": guard,
         "outcome": "induced",
         "fault": fault,
-        "observed": list(observed if observed is not None else _observed_for(guard)),
+        "observed": list(observed if observed is not None else _observed_for(guard, unit)),
         "mode_under_test": mode_under_test,
         "test": test,
         "code_sha": code_sha,
@@ -243,10 +270,13 @@ def record_document(
     }
 
 
-def _observed_for(guard: str) -> tuple[str, ...]:
+def _observed_for(guard: str, unit: str | None = None) -> tuple[str, ...]:
     harness = HARNESSES.get(guard)
     if harness is None:
         raise ValueError(f"{guard!r} has no induced-fault harness; there is nothing it observed")
+    per_unit = _OBSERVED_BY_UNIT.get(guard, {})
+    if unit is not None and unit in per_unit:
+        return per_unit[unit]
     return harness.observed
 
 
@@ -339,7 +369,7 @@ def main(argv: list[str] | None = None) -> int:
     for unit in units:
         document = record_document(
             unit, args.guard, fault=faults[unit], test=harness.nodeid(unit), code_sha=code_sha,
-            mode_under_test=harness.mode_under_test, as_of=as_of, observed=harness.observed,
+            mode_under_test=harness.mode_under_test, as_of=as_of, observed=_observed_for(args.guard, unit),
         )
         key = record_key(unit, args.guard)
         if args.write:

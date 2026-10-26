@@ -31,7 +31,10 @@ calendar ``now()``. No historical artifact is re-keyed or orphaned.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from nousergon_lib.guard_mode import GuardMode, GuardStaging
@@ -145,6 +148,14 @@ def default_session_date(now: datetime | None = None) -> str:
 # ``[D − window, D]`` (``end`` exclusive at D + 1 calendar day), and every
 # writer publishing such a series calls :func:`assert_no_bar_after` first,
 # which RAISES — never trims — on a bar dated after D.
+#
+# alpha-engine-config-I10794 (ruling (a), 2026-10-25) extends "never trims" to
+# the FETCH boundary: a vendor answer that runs past ``end`` used to be clipped
+# there with a WARNING, so the run went on ``ok`` and the write-site raise was
+# unreachable for an over-answering vendor. The fetch bound now refuses too,
+# with a typed :class:`FutureBarFinding` (dataset, ticker, as-of, bar date).
+# Measured before the change (2026-10-26, ``/alpha-engine/data-spot``, 30
+# days): the old clip WARNING fired 0 times, so refusing changes no observed run.
 # ---------------------------------------------------------------------------
 
 
@@ -154,6 +165,117 @@ class FutureBarError(ValueError):
     deliberately re-raised through per-ticker ``except Exception`` blocks by
     every writer: it is a contract violation of the run, not a one-ticker
     vendor hiccup."""
+
+
+#: The finding's name on every surface it reaches (the exception, the ERROR
+#: log line, a manifest reason). Closed: one value, one meaning.
+FUTURE_BAR_FINDING = "pit_future_bar"
+
+
+@dataclass(frozen=True)
+class FutureBarFinding:
+    """WHAT a point-in-time read refused, as data (alpha-engine-config-I10794).
+
+    Brian's ruling on I10794 (option (a), 2026-10-25): a point-in-time read
+    that finds a bar dated after its as-of date FAILS with a finding; the bar
+    is never silently dropped. This is that finding. Every field is a plain
+    string or int, so :meth:`to_record` is JSON as it stands and a reader
+    never parses the exception message to learn which bar was refused.
+
+    ``dataset``
+        The read the bar arrived on: the label's stem
+        (``price_cache_refresh`` for ``price_cache_refresh[AAPL]``), or the
+        artifact key for a write-site refusal.
+    ``ticker``
+        The symbol whose series carried it, when the read is per-symbol;
+        ``None`` for a frame that is not (``macro_market_prices``).
+    ``as_of``
+        The trading day the read serves (ISO date).
+    ``bar_date``
+        The FIRST bar dated after ``as_of`` (ISO date): the offending bar.
+    ``last_bar_date``
+        The series' last bar (ISO date); equal to ``bar_date`` for one stray.
+    ``bars_after``
+        How many bars fall after ``as_of``.
+    """
+
+    dataset: str
+    ticker: str | None
+    as_of: str
+    bar_date: str
+    last_bar_date: str
+    bars_after: int
+
+    def to_record(self) -> dict:
+        return {
+            "finding": FUTURE_BAR_FINDING,
+            "guard": "pit",
+            "dataset": self.dataset,
+            "ticker": self.ticker,
+            "as_of": self.as_of,
+            "bar_date": self.bar_date,
+            "last_bar_date": self.last_bar_date,
+            "bars_after": self.bars_after,
+            "tracked_issue": "alpha-engine-config-I10794",
+        }
+
+    def describe(self) -> str:
+        who = f"{self.dataset}[{self.ticker}]" if self.ticker else self.dataset
+        return (
+            f"{FUTURE_BAR_FINDING}: {who} answered a bar dated {self.bar_date} "
+            f"({self.bars_after} bar(s) after as_of {self.as_of}, last {self.last_bar_date})"
+        )
+
+
+class FutureBarRefused(FutureBarError):
+    """A :class:`FutureBarError` that carries its :class:`FutureBarFinding`.
+
+    Raised by both point-in-time bounds: the fetch-boundary refusal
+    (:func:`refuse_bars_after`, and :func:`clip_to_trading_day`, which now
+    delegates to it) and the write-site guard (:func:`assert_no_bar_after`).
+    A subclass, so every existing ``except FutureBarError: raise`` handler
+    already propagates it run-level; ``.finding`` is what a recorder reads.
+    """
+
+    def __init__(self, message: str, finding: FutureBarFinding) -> None:
+        super().__init__(message)
+        self.finding = finding
+
+
+#: ``price_cache_refresh[AAPL]`` -> (``price_cache_refresh``, ``AAPL``). The
+#: label convention every fetch-boundary call site already uses.
+_LABEL_RE = re.compile(r"^(?P<dataset>[^\[\]]+)\[(?P<ticker>[^\[\]]+)\]$")
+
+
+def _split_label(label: str) -> "tuple[str, str | None]":
+    m = _LABEL_RE.match(str(label))
+    if m is None:
+        return str(label), None
+    return m.group("dataset"), m.group("ticker")
+
+
+def _bars_after(index, trading_day: "date | datetime | str"):
+    """``(d, normalized_index, mask_after_d)`` for any date-like index."""
+    import pandas as pd
+
+    d = as_trading_day(trading_day)
+    idx = pd.to_datetime(pd.Index(index))
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert("UTC").tz_localize(None)
+    after = idx.normalize() > pd.Timestamp(d)
+    return d, idx, after
+
+
+def _finding(idx, after, d, *, dataset: str, ticker: str | None) -> FutureBarFinding:
+    offending = idx[after]
+    return FutureBarFinding(
+        dataset=dataset,
+        ticker=ticker,
+        as_of=d.isoformat(),
+        bar_date=offending.min().date().isoformat(),
+        last_bar_date=idx.max().date().isoformat(),
+        bars_after=int(after.sum()),
+    )
 
 
 def as_trading_day(trading_day: "date | datetime | str") -> "date":
@@ -203,32 +325,53 @@ def history_window(
     return start.date(), (d + pd.Timedelta(days=1)).date()
 
 
-def clip_to_trading_day(frame, trading_day: "date | datetime | str", *, label: str):
-    """Drop rows dated after D from a FETCHED frame at the fetch boundary.
+def refuse_bars_after(
+    frame, trading_day: "date | datetime | str", *, dataset: str, ticker: str | None = None,
+):
+    """Fetch-boundary point-in-time bound: REFUSE a fetched frame that carries
+    any bar dated after D (alpha-engine-config-I10794, ruling (a)).
 
     The fetch already asks for ``end = D + 1`` (exclusive); a vendor that
-    answers beyond the requested end is out of contract, so rows past D are
-    removed here and the count is logged at WARNING (the recording surface).
-    This is the request bound, applied to the response — it is NOT the write
-    guard: writers still call :func:`assert_no_bar_after`, which raises.
-    """
-    import pandas as pd
+    answers beyond the requested end is out of contract. Until I10794 those
+    rows were dropped here with a WARNING and the run went on ``ok``, so an
+    induced vendor future bar never reached the write-site raise and the
+    ``pit`` guard could not be commissioned on the units this bound serves
+    (D03 among them). Now the read fails: :class:`FutureBarRefused`, carrying
+    a :class:`FutureBarFinding` that names the dataset, the ticker, the as-of
+    date and the offending bar date, and one ERROR line with the finding as
+    JSON (the recording surface). Nothing is trimmed, ever.
 
+    Returns ``frame`` unchanged when every bar is on or before D (including an
+    empty or ``None`` frame), so a call site keeps its ``frame = ...`` shape.
+    """
     if frame is None or len(frame) == 0:
         return frame
-    cutoff = pd.Timestamp(as_trading_day(trading_day))
-    idx = pd.to_datetime(frame.index)
-    if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
-    keep = idx.normalize() <= cutoff
-    dropped = int((~keep).sum())
-    if dropped:
-        log.warning(
-            "%s: vendor returned %d row(s) dated after trading_day %s despite "
-            "end-bound — dropped at the fetch boundary (alpha-engine-config-I10893)",
-            label, dropped, cutoff.date().isoformat(),
-        )
-    return frame[keep]
+    d, idx, after = _bars_after(frame.index, trading_day)
+    if not after.any():
+        return frame
+    finding = _finding(idx, after, d, dataset=dataset, ticker=ticker)
+    log.error("PIT_FUTURE_BAR %s", json.dumps(finding.to_record(), sort_keys=True))
+    raise FutureBarRefused(
+        f"{finding.describe()}; refusing the read, never trimming it: a vendor "
+        "that answers past the requested end is out of contract (alpha-engine-config-I10794)",
+        finding,
+    )
+
+
+def clip_to_trading_day(frame, trading_day: "date | datetime | str", *, label: str):
+    """The fetch-boundary bound every fetch site calls, under its I10893 name.
+
+    **It no longer clips.** Brian's ruling on alpha-engine-config-I10794
+    (option (a), 2026-10-25): a point-in-time read that finds a bar dated after
+    its as-of date fails with a finding and the bar is never silently dropped.
+    This delegates to :func:`refuse_bars_after`, splitting the call site's
+    ``label`` (``dataset[TICKER]``) into the finding's ``dataset`` and
+    ``ticker``. The name is kept so the call sites (some of them on paths held
+    from edits tonight) pick the ruling up without a rename; a frame with no
+    bar after D is returned unchanged, exactly as before.
+    """
+    dataset, ticker = _split_label(label)
+    return refuse_bars_after(frame, trading_day, dataset=dataset, ticker=ticker)
 
 
 def assert_no_bar_after(
@@ -237,26 +380,29 @@ def assert_no_bar_after(
     """Write-site guard: raise :class:`FutureBarError` when any bar in
     ``bar_dates`` (a DatetimeIndex, or an iterable of ISO strings / dates /
     timestamps) is dated after ``trading_day``. Raises, never trims — a
-    publisher that reaches this with a future bar bypassed the fetch bound."""
+    publisher that reaches this with a future bar bypassed the fetch bound.
+
+    The raise is a :class:`FutureBarRefused` carrying a
+    :class:`FutureBarFinding` whose ``dataset`` is ``artifact``
+    (alpha-engine-config-I10794)."""
     import pandas as pd
 
-    d = as_trading_day(trading_day)
     values = list(bar_dates) if not isinstance(bar_dates, pd.Index) else bar_dates
     if len(values) == 0:
         return
-    idx = pd.to_datetime(pd.Index(values))
-    if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
+    d, idx, after = _bars_after(values, trading_day)
     last = idx.max()
     if pd.isna(last) or last.date() <= d:
         return
-    n_after = int((idx.normalize() > pd.Timestamp(d)).sum())
-    raise FutureBarError(
+    finding = _finding(idx, after, d, dataset=artifact, ticker=None)
+    log.error("PIT_FUTURE_BAR %s", json.dumps(finding.to_record(), sort_keys=True))
+    raise FutureBarRefused(
         f"{artifact}: refusing to publish a series whose last bar "
         f"{last.date().isoformat()} is after the run's trading_day "
-        f"{d.isoformat()} ({n_after} bar(s) after D). A run for D must never "
+        f"{d.isoformat()} ({finding.bars_after} bar(s) after D). A run for D must never "
         "publish a later (possibly pre-close) session — see "
-        "alpha-engine-config-I10893."
+        "alpha-engine-config-I10893.",
+        finding,
     )
 
 

@@ -93,6 +93,53 @@ jobs:
           pip install -r requirements.txt
           pip install pytest
 
+      # WHICH nousergon-lib grades this PR (alpha-engine-config-I8229 §2).
+      # The registry the drift test reads (STATE_TO_ARCHIVE_PAGE /
+      # SUBSTANTIVE_RESOURCES / WAIT_GROUPING) ships in nousergon-lib, so the
+      # lib version decides the verdict. Two pins could answer, and they ask
+      # different questions:
+      #   - crucible-dashboard's pin: "has the dashboard picked it up yet".
+      #     Grading by it alone made the dashboard's pin a silent merge gate
+      #     on THIS repo: nousergon-data-PR1516 stayed red until
+      #     crucible-dashboard-PR765 bumped that repo's pin, and bumping this
+      #     repo's own pin changed nothing.
+      #   - this repo's own pin (requirements.txt): "does the registry this PR
+      #     declares cover this SF change". The author controls it and can
+      #     bump it in the same PR, so a red here is always actionable here.
+      # Decision: grade by the HIGHER of the two. That is this repo's pin in
+      # every normal case (the producer adopts a registry entry first); it
+      # falls back to the dashboard's pin only when ours is older, so the
+      # dashboard's code is never run against a lib older than it declares
+      # (that would fail on imports, not on the registry). The reverse
+      # direction — the dashboard's pin lagging the registry — stays
+      # crucible-dashboard's own `test` job (I8229 §3). Both pins and the
+      # chosen one are printed below, because a lag and a genuine drift read
+      # identically in the test output.
+      - name: Install the nousergon-lib that grades this PR
+        run: |
+          set -euo pipefail
+          pin_re='nousergon-lib(\[[^]]*\])? *@ *git\+https://github\.com/nousergon/nousergon-lib@v[0-9]+\.[0-9]+\.[0-9]+'
+          data_line="$(grep -E "^${pin_re}" requirements.txt | head -1)"
+          dash_line="$(grep -E "^${pin_re}" .dashboard-consumer/requirements.txt | head -1)"
+          data_v="${data_line##*@v}"; data_v="${data_v%% *}"
+          dash_v="${dash_line##*@v}"; dash_v="${dash_v%% *}"
+          if [ -z "$data_v" ] || [ -z "$dash_v" ]; then
+            echo "::error::could not read a nousergon-lib vX.Y.Z pin (nousergon-data='${data_v}', crucible-dashboard='${dash_v}')"
+            exit 1
+          fi
+          chosen="$(printf '%s\n%s\n' "$data_v" "$dash_v" | sort -V | tail -1)"
+          echo "nousergon-lib pins: nousergon-data v${data_v}, crucible-dashboard v${dash_v}; grading with v${chosen}"
+          {
+            echo "### nousergon-lib grading this PR"
+            echo "- nousergon-data pin: \`v${data_v}\`"
+            echo "- crucible-dashboard pin: \`v${dash_v}\`"
+            echo "- installed (higher of the two, alpha-engine-config-I8229): \`v${chosen}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$chosen" != "$dash_v" ]; then
+            pip install "nousergon-lib[flow-doctor,github-app] @ git+https://github.com/nousergon/nousergon-lib@v${chosen}"
+          fi
+          python -c "import importlib.metadata as m; print('installed nousergon-lib', m.version('nousergon-lib'))"
+
       # SF_DEFS_DIR points crucible-dashboard's own tests at THIS checkout
       # (github.workspace = the nousergon-data PR branch), not at whatever
       # crucible-dashboard's CI last saw. Only the two tests that actually

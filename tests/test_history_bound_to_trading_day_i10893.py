@@ -86,11 +86,13 @@ def test_guard_raises_on_a_bar_after_the_trading_day_and_accepts_d():
         assert_no_bar_after(["2026-09-11", D_PLUS_1], D, artifact="x")
 
 
-def test_clip_drops_only_rows_after_d():
+def test_the_fetch_bound_refuses_rows_after_d_and_never_trims():
+    """alpha-engine-config-I10794 ruling (a): the fetch boundary used to drop rows
+    after D; it now fails the read (tests/test_pit_future_bar_refusal_i10794.py)."""
     frame = _ohlcv("2026-09-10", D_PLUS_1)
-    clipped = clip_to_trading_day(frame, D, label="t")
-    assert clipped.index.max() == pd.Timestamp(D)
-    assert len(clipped) == len(frame) - 1
+    with pytest.raises(FutureBarError, match=D_PLUS_1):
+        clip_to_trading_day(frame, D, label="t")
+    assert clip_to_trading_day(frame.iloc[:-1], D, label="t") is not None
 
 
 # ── reference/price_cache refresh (collectors/prices.py::_refresh_stale) ────
@@ -105,24 +107,21 @@ def _recording_download(frame: pd.DataFrame, calls: list[dict]):
 
 def test_price_cache_refresh_requests_d_bounded_window_and_publishes_no_d_plus_1(monkeypatch):
     """A --date D run on D+1: the vendor stub answers through D+1 (the partial
-    session); the published parquet ends at D and the request never says period=."""
+    session). The request never says period=, and the D+1 bar is never published:
+    since alpha-engine-config-I10794 the run fails on it rather than trimming it."""
     calls: list[dict] = []
     monkeypatch.setattr(prices.yf, "download",
                         _recording_download(_ohlcv("2016-09-14", D_PLUS_1), calls))
     s3 = _FakeS3()
 
-    refreshed, failed, written = prices._refresh_stale(
-        s3, "b", "predictor/price_cache/", ["A"], "10y", 50, trading_day=D,
-    )
+    with pytest.raises(FutureBarError, match=D_PLUS_1):
+        prices._refresh_stale(s3, "b", "predictor/price_cache/", ["A"], "10y", 50, trading_day=D)
 
-    assert (refreshed, failed) == (1, [])
     assert len(calls) == 1
     assert "period" not in calls[0]
     assert calls[0]["start"] == "2016-09-14"
     assert calls[0]["end"] == "2026-09-15"  # exclusive
-    written = pd.read_parquet(io.BytesIO(s3.uploads["reference/price_cache/A.parquet"]))
-    assert written.index.max() == pd.Timestamp(D)
-    assert written.index.min() == pd.Timestamp("2016-09-14")
+    assert s3.uploads == {}
 
 
 def test_price_cache_refresh_same_day_run_content_is_unchanged(monkeypatch):
@@ -212,7 +211,7 @@ def test_yf_history_fx_is_bounded_and_ends_at_d(monkeypatch):
     import yfinance
 
     calls: list[dict] = []
-    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D_PLUS_1), calls))
+    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D), calls))
     monkeypatch.setattr(mmd.time, "sleep", lambda *_: None)
 
     out = mmd._yfinance_fx_history(["CHF"], "10y", trading_day=D)
@@ -226,7 +225,7 @@ def test_yf_history_dividend_adjusted_gap_fill_is_bounded(monkeypatch):
     import yfinance
 
     calls: list[dict] = []
-    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D_PLUS_1), calls))
+    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D), calls))
     out = mmd._yfinance_close_history_dividend_adjusted(["A"], "10y", trading_day=D)
     assert calls[0]["auto_adjust"] is True and "period" not in calls[0]
     assert out["A"][-1][0] == D
@@ -236,12 +235,14 @@ def test_latest_closes_and_fx_are_bounded(monkeypatch):
     import yfinance
 
     calls: list[dict] = []
-    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D_PLUS_1), calls))
+    monkeypatch.setattr(yfinance, "download", _recording_download(_yf_frame(D), calls))
     closes = mmd._yfinance_closes(["A"], trading_day=D)
     fx = mmd._yfinance_fx(["CHF"], trading_day=D)
     assert all("period" not in c and c["end"] == "2026-09-15" for c in calls)
     assert closes["A"][1] == D
-    assert fx["CHF"] == round(float(_yf_frame(D_PLUS_1)["Close"].loc[D]), 6)
+    assert fx["CHF"] == round(float(_yf_frame(D)["Close"].loc[D]), 6)
+    # An over-answering vendor (through D+1) fails the read since I10794,
+    # never a trimmed series: tests/test_pit_future_bar_refusal_i10794.py.
 
 
 def _history_s3() -> MagicMock:
