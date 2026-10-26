@@ -1,0 +1,53 @@
+# Dependency set for this repo's checkout on the TRADING box
+# (/home/ec2-user/alpha-engine-data/.venv). crucible-executor's
+# infrastructure/boot-pull.sh installs this file instead of requirements.txt
+# whenever it exists (alpha-engine-config-I12657). Until this file existed the
+# box installed the full requirements.txt on every boot, so every weekly
+# Dependabot bump of a weekly-only or RAG-only package landed on the box that
+# trades at its next start.
+#
+# What the trading box runs from this checkout:
+#   - infrastructure/systemd/check-systemd-unit-drift.py
+#     (systemd-unit-drift-check.service; boto3, nousergon_lib, krepis)
+#   - a manual/emergency fallback of `weekly_collector.py --morning-enrich`
+#     and builders/daily_append (both normally run on the data spot box)
+# Nothing else: metron-intraday and daily-news are excluded from this box's
+# unit sync in boot-pull.sh, and CodeFreshnessGate runs git plus the
+# executor's own venv, not this one. collectors.daily_news.collect (anyio,
+# tenacity) is the daily-news unit's job and does not run here either.
+#
+# Left out, because nothing in the import closure of those entry points
+# imports them (tests/test_data_trading_requirements.py walks that closure,
+# function-local imports included, and fails if one starts to):
+#   edgartools      SEC filing ingest (rag/pipelines/*)
+#   voyageai        RAG embeddings (rag/pipelines/*, daily-news corpus ingest)
+#   beautifulsoup4  filing markup parsing (rag/pipelines/_markup.py); yfinance
+#                   still installs it transitively, it is just not declared
+#   embit           crypto-balances producer (collectors/crypto_balances.py)
+#   krepis          no direct pin here: it arrives through nousergon-lib's own
+#                   krepis floor. An exact `==` pin copied from
+#                   requirements.txt would lag every Dependabot bump there and
+#                   then conflict with the next lib pin's floor at boot, where
+#                   nothing in CI would see it (the test refuses `==` pins).
+#
+# Rules (enforced by tests/test_data_trading_requirements.py):
+#   - every package here also appears in requirements.txt;
+#   - the nousergon-lib pin moves in lockstep with requirements.txt
+#     (tests/test_lib_pin_lockstep.py lists this file as a surface);
+#   - no exact `==` pins.
+# The entries below are copied from requirements.txt; see that file for why
+# each floor or cap is where it is.
+boto3>=1.43.118
+pandas>=2.0
+openpyxl>=3.1.5
+pyarrow>=25.0.1,<26
+yfinance>=1.7.0
+requests>=2.34.2
+pyyaml>=6.0.3
+setuptools>=84.2.1
+numpy>=2.4.6
+feedparser>=6.0.14
+lxml>=6.1.3
+jsonschema>=4.26.0
+arcticdb>=6.28.1
+nousergon-lib[arcticdb,flow-doctor,rag,contracts,github-app,gates] @ git+https://github.com/nousergon/nousergon-lib@v0.124.189
