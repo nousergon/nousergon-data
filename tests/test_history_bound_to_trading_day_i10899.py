@@ -69,17 +69,27 @@ def test_macro_market_prices_requests_d_bounded_window_never_period(monkeypatch)
 
     monkeypatch.setattr(macro.yf, "download", _download)
 
-    result = macro._fetch_market_prices(D)
+    # alpha-engine-config-I10794 ruling (a): an over-answering vendor fails the
+    # read at the fetch boundary (never trimmed), so no field is derived from it.
+    with pytest.raises(FutureBarError, match=D_PLUS_1):
+        macro._fetch_market_prices(D)
 
     assert len(calls) == 1
     assert "period" not in calls[0]
     assert calls[0]["start"] == "2026-08-10"  # D - 35d
     assert calls[0]["end"] == "2026-09-15"  # D + 1, exclusive
-    # The frame is clipped at the fetch boundary before any field is derived —
-    # sp500_close must reflect D's bar, not D+1's.
-    full = _ohlcv("2026-08-01", D_PLUS_1)
-    clipped_last_close = round(float(full[full.index <= pd.Timestamp(D)]["Close"].iloc[-1]), 2)
-    assert result["sp500_close"] == pytest.approx(clipped_last_close)
+
+
+def test_macro_market_prices_derives_fields_from_an_in_bounds_answer(monkeypatch):
+    from collectors import macro
+
+    monkeypatch.setattr(
+        macro.yf, "download",
+        lambda *_a, **_kw: _multi_ticker_ohlcv(_MACRO_TICKERS, "2026-08-01", D),
+    )
+    result = macro._fetch_market_prices(D)
+    last_close = round(float(_ohlcv("2026-08-01", D)["Close"].iloc[-1]), 2)
+    assert result["sp500_close"] == pytest.approx(last_close)
 
 
 def test_macro_market_prices_guard_raises_when_clip_bypassed(monkeypatch):
@@ -215,13 +225,20 @@ def test_metron_supplemental_ohlcv_requests_d_bounded_window(monkeypatch):
 
     monkeypatch.setitem(sys.modules, "yfinance", SimpleNamespace(download=_download))
 
-    df = ms._fetch_ticker_ohlcv("MARUY", D, period="2y")
+    # alpha-engine-config-I10794 ruling (a): refused at the fetch boundary, never trimmed.
+    with pytest.raises(FutureBarError, match=D_PLUS_1):
+        ms._fetch_ticker_ohlcv("MARUY", D, period="2y")
 
     assert len(calls) == 1
     assert "period" not in calls[0]
     assert calls[0]["end"] == D_PLUS_1
+
+    monkeypatch.setitem(
+        sys.modules, "yfinance", SimpleNamespace(download=lambda *_a, **_kw: _ohlcv("2024-09-14", D)),
+    )
+    df = ms._fetch_ticker_ohlcv("MARUY", D, period="2y")
     assert df is not None
-    assert df.index.max() == pd.Timestamp(D)  # clipped at the fetch boundary
+    assert df.index.max() == pd.Timestamp(D)
 
 
 def test_metron_supplemental_ohlcv_guard_raises_when_clip_bypassed(monkeypatch):
