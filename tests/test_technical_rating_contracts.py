@@ -52,12 +52,12 @@ class TestTechnicalsContract:
         assert "rating" in art["technicals"]["AAPL"]
         assert validate_technicals(art) == []
 
-    def test_producer_without_any_symbol_is_schema_valid_but_not_admitted(self, monkeypatch):
-        """No close_history published for any symbol. An empty `technicals` map is
-        still not a SCHEMA violation (the advisory contract), but since the I12082
-        ruling (2026-10-23) TECHNICALS enforces semantic admission, which refuses an
-        empty manifest over a non-empty universe: nothing is written and the phase
-        reports error, so the previous latest.json stands."""
+    def test_producer_refuses_an_empty_payload(self, monkeypatch):
+        """No close_history published for any symbol: the write is refused, so the
+        previous artifact stands (alpha-engine-config-I10886; TECHNICALS' enforced
+        admission, I12082, would refuse it too). An empty `technicals` map is still
+        schema-valid for a hand-built document; the producer just never publishes one
+        over a non-empty population."""
         monkeypatch.setattr(
             mmd, "load_price_derived_universe",
             lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
@@ -74,6 +74,31 @@ class TestTechnicalsContract:
             "technicals": {},
         }
         assert validate_technicals(empty) == []
+
+    def test_producer_coverage_block_validates(self, monkeypatch):
+        from collectors import constituents as constituents_mod
+
+        monkeypatch.setattr(constituents_mod, "load_from_s3", lambda bucket: {"tickers": ["AAPL"]})
+        s3 = _universe_s3(_UNIVERSE, watchlist={"holdings": []},
+                          close_history={"AAPL": {"closes": _closes(260)}})
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
+        art = _puts(s3)["market_data/technicals/latest.json"]
+        assert art["coverage"]["universe_sources"]["constituents"]["status"] == "ok"
+        assert validate_technicals(art) == []
+
+    def test_coverage_block_with_an_unknown_reason_is_refused(self, monkeypatch):
+        monkeypatch.setattr(
+            mmd, "load_price_derived_universe",
+            lambda bucket, s3_client: ([{"yf_symbol": "AAPL", "currency": "USD"}], []),
+        )
+        s3 = _universe_s3(_UNIVERSE, close_history={"AAPL": {"closes": _closes(260)}})
+        mmd.collect_technicals(bucket="b", run_date=str(date.today()), s3_client=s3)
+        art = _puts(s3)["market_data/technicals/latest.json"]
+        # Loader patched out: no source reported, so the run cannot read complete.
+        assert art["coverage"]["universe_sources"]["constituents"]["status"] == "not_reported"
+        assert art["coverage"]["complete"] is False
+        art["coverage"]["excluded"] = [{"symbol": "AAPL", "reason": "vendor_hiccup"}]
+        assert validate_technicals(art) != []
 
     def test_minimal_hand_built_fixture_validates(self):
         """Independent of the producer: a schema-conformant fixture must pass on its
