@@ -172,22 +172,38 @@ def test_requirements_and_dockerfile_pins_match():
     which is the known blind spot alpha-engine-config-I7623 reports. A guard
     that has missed a surface for 67 versions is the defect, not the drift it
     failed to catch; it is enumerated below rather than left for the next
-    audit to rediscover."""
+    audit to rediscover.
+
+    ``infrastructure/data-trading-requirements.txt`` (alpha-engine-config-I12657)
+    is the trading box's install set for this checkout — crucible-executor's
+    boot-pull.sh installs it in place of requirements.txt — so it is a fifth
+    surface."""
     req_pin = _read_pin("requirements.txt", _REQUIREMENTS_PIN_RE)
     daily_news_pin = _read_pin("requirements-daily-news.txt", _REQUIREMENTS_PIN_RE)
+    trading_pin = _read_pin(
+        "infrastructure/data-trading-requirements.txt", _REQUIREMENTS_PIN_RE
+    )
     deploy_infra_pin = _read_pin(
         ".github/workflows/deploy-infrastructure.yml", _LAMBDA_PIN_RE
     )
     pause_reconcile_pin = _read_pin(
         ".github/workflows/pause-reconcile.yml", _LAMBDA_PIN_RE
     )
-    assert req_pin == daily_news_pin == deploy_infra_pin == pause_reconcile_pin, (
+    assert (
+        req_pin
+        == daily_news_pin
+        == trading_pin
+        == deploy_infra_pin
+        == pause_reconcile_pin
+    ), (
         f"nousergon-lib pin drift: requirements.txt={req_pin!r}, "
         f"requirements-daily-news.txt={daily_news_pin!r}, "
+        f"infrastructure/data-trading-requirements.txt={trading_pin!r}, "
         f".github/workflows/deploy-infrastructure.yml={deploy_infra_pin!r}, "
         f".github/workflows/pause-reconcile.yml={pause_reconcile_pin!r}. "
-        f"All four must move in lockstep — the slim daily-news file "
-        f"carries an independent copy of the pin, and the deploy-infrastructure "
+        f"All five must move in lockstep — the slim daily-news and "
+        f"trading-box files carry independent copies of the pin, and the "
+        f"deploy-infrastructure "
         f"and pause-reconcile workflows each install their own copy directly."
     )
 
