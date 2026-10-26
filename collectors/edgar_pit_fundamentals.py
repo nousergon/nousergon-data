@@ -84,7 +84,8 @@ Price basis
 ===========
 
 Which `Close`: a backfill or rebuild reads the split-only CRSP-basis
-`universe_crsp` library and refuses to run unless it is current with `universe`;
+`universe_crsp` library and refuses to run unless it is current with `universe`
+and carries a passing build's receipt (`assert_close_library_verified`, I12684);
 the daily run reads `universe`, whose newest `Close` is the raw close
 (`DEFAULT_CLOSE_LIBRARY`, alpha-engine-config-I12436 option A). `universe`'s
 history is dividend back-adjusted, so a rebuild from it read market cap low by
@@ -1734,6 +1735,116 @@ def assert_close_library_current(
     return reading
 
 
+#: Where `builders/migrate_universe_crsp_basis.py` writes its reconcile audits and
+#: the pass receipt for each scratch library it builds (alpha-engine-config-I12684).
+#: Kept literal here, not imported, so this collector does not pull in the build's
+#: dependencies; `tests/test_crsp_basis_verified_receipt_i12684.py` pins the two
+#: modules to the same keys.
+CRSP_BUILD_AUDIT_PREFIX = "builders/migrate_universe_crsp_basis_audit/"
+CRSP_BUILD_RECEIPT_PREFIX = f"{CRSP_BUILD_AUDIT_PREFIX}verified/"
+
+
+def close_library_receipt_key(library: str) -> str:
+    """The S3 key of a non-live `Close` library's pass receipt."""
+    return f"{CRSP_BUILD_RECEIPT_PREFIX}{library}.json"
+
+
+def _build_audit_keys(store: Any) -> list[str]:
+    """The build's audit keys, oldest first (timestamped names sort by time)."""
+    return sorted(
+        key
+        for key in store.list_keys(CRSP_BUILD_AUDIT_PREFIX)
+        if key.endswith(".json") and "/" not in key[len(CRSP_BUILD_AUDIT_PREFIX) :]
+    )
+
+
+def assert_close_library_verified(store: Any, *, library: str, newest_session: dt.date) -> dict[str, Any]:
+    """Refuse a non-live `Close` library that no passing build vouches for.
+
+    The currency gate proves a library is CURRENT, not that it passed
+    reconciliation: on 2026-10-26 the CRSP-basis build failed with 46 unexplained
+    names and still left a library current with `universe` (alpha-engine-config-I12684).
+    So a non-live library needs the build's pass receipt, and the receipt must:
+
+    - exist and read ``status: verified`` (a build stamps ``writing`` before it
+      touches the library, so a build killed mid-write leaves one that refuses);
+    - name this library, carry zero unexplained, errored and aborted names, and come
+      from a whole-universe build;
+    - name an audit that exists, with no later ``--apply`` audit for this library
+      after it (a later build, passing or failing, supersedes the receipt);
+    - cover the library's newest session (a later write to the library is not
+      covered by an older receipt).
+    """
+    key = close_library_receipt_key(library)
+    rebuild_hint = (
+        "Rebuild it with `python -m builders.migrate_universe_crsp_basis --apply` (dispatcher "
+        "workload `universe-crsp-basis-build`) and let it pass before a rebuild reads it "
+        "(alpha-engine-config-I12684)."
+    )
+    try:
+        receipt = json.loads(store.get_bytes(key))
+    except Exception as exc:  # noqa: BLE001 - absent, unreadable or malformed: all refuse
+        raise GateFailed(
+            f"{library} has no readable pass receipt at {key} ({type(exc).__name__}): no build "
+            f"is known to have passed reconciliation for it. {rebuild_hint}"
+        ) from exc
+    if not isinstance(receipt, dict):
+        raise GateFailed(f"{library} pass receipt at {key} is not a JSON object. {rebuild_hint}")
+
+    problems: list[str] = []
+    if receipt.get("status") != "verified":
+        problems.append(f"status is {receipt.get('status')!r}, not 'verified'")
+    if receipt.get("scratch_lib") != library:
+        problems.append(f"it names library {receipt.get('scratch_lib')!r}")
+    for count in ("unexplained_count", "errors_count", "aborted_count"):
+        if receipt.get(count) != 0:
+            problems.append(f"{count} is {receipt.get(count)!r}, not 0")
+    if receipt.get("full_universe") is not True:
+        problems.append("it is not from a whole-universe build")
+    if problems:
+        raise GateFailed(f"{library} pass receipt {key} does not vouch for it: {'; '.join(problems)}. {rebuild_hint}")
+
+    audit_key = str(receipt.get("audit_key") or "")
+    audits = _build_audit_keys(store)
+    if audit_key not in audits:
+        raise GateFailed(
+            f"{library} pass receipt {key} names audit {audit_key!r}, which is not under "
+            f"{CRSP_BUILD_AUDIT_PREFIX}. {rebuild_hint}"
+        )
+    for later in (k for k in audits if k > audit_key):
+        try:
+            audit = json.loads(store.get_bytes(later))
+        except Exception as exc:  # noqa: BLE001 - an unreadable later audit cannot be ruled out
+            raise GateFailed(
+                f"{library}: build audit {later} post-dates the pass receipt and cannot be read "
+                f"({type(exc).__name__}). {rebuild_hint}"
+            ) from exc
+        if audit.get("applied") and audit.get("scratch_lib") == library:
+            raise GateFailed(
+                f"{library}: a later --apply build ({later}, status {audit.get('status')!r}) "
+                f"post-dates the pass receipt's audit {audit_key}. {rebuild_hint}"
+            )
+
+    covered = receipt.get("newest_session")
+    try:
+        covered_date = dt.date.fromisoformat(str(covered))
+    except ValueError as exc:
+        raise GateFailed(f"{library} pass receipt {key} carries no newest_session. {rebuild_hint}") from exc
+    if newest_session > covered_date:
+        raise GateFailed(
+            f"{library} holds session {newest_session.isoformat()}, after the "
+            f"{covered_date.isoformat()} its pass receipt covers: the library was written after "
+            f"the verified build. {rebuild_hint}"
+        )
+    return {
+        "receipt_key": key,
+        "audit_key": audit_key,
+        "verified_at": receipt.get("verified_at"),
+        "written_count": receipt.get("written_count"),
+        "newest_session": covered_date.isoformat(),
+    }
+
+
 def registry_split_events(s3_client: Any, bucket: str) -> dict[str, list[tuple[int, float]]]:
     """Every registered split, per ticker, from the registry that restated `Close`."""
     from corporate_actions.registry import CorporateActionRegistry
@@ -2444,6 +2555,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         reference = prices.closes(universe, end - dt.timedelta(days=_CURRENCY_REFERENCE_DAYS), end)
         close_reading = assert_close_library_current(
             closes, reference, library=args.close_library, missing=close_reader.missing
+        )
+        # Current is not verified: the library must also carry a passing build's
+        # receipt (alpha-engine-config-I12684).
+        close_reading["receipt"] = assert_close_library_verified(
+            store,
+            library=args.close_library,
+            newest_session=max(pd.DatetimeIndex(closes.index).date),
         )
     newest_session = max(pd.DatetimeIndex(closes.index).date)
     eligible = [t for t in universe if t in closes.columns and pd.notna(closes[t].iloc[-1])]

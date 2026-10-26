@@ -131,6 +131,22 @@ from store.arctic_store import (
 log = logging.getLogger(__name__)
 
 AUDIT_PREFIX = "builders/migrate_universe_crsp_basis_audit/"
+#: The pass receipt for one scratch library (alpha-engine-config-I12684). Written
+#: only by an ``--apply`` build that passed the reconcile gate AND wrote every name;
+#: a consumer of a non-live library (``collectors/edgar_pit_fundamentals.py
+#: backfill``) refuses the library without it. It sits under ``AUDIT_PREFIX``
+#: because that is the one prefix the build box may PUT under (nous-ergon-ops#1842).
+VERIFIED_RECEIPT_PREFIX = f"{AUDIT_PREFIX}verified/"
+#: ``status`` values a receipt can carry. ``writing`` is stamped BEFORE the write
+#: pass touches the library, so a build killed mid-write leaves a receipt that
+#: refuses rather than a stale ``verified`` one vouching for half a library.
+RECEIPT_VERIFIED = "verified"
+RECEIPT_WRITING = "writing"
+
+
+def verified_receipt_key(scratch_lib: str) -> str:
+    """The S3 key of ``scratch_lib``'s pass receipt."""
+    return f"{VERIFIED_RECEIPT_PREFIX}{scratch_lib}.json"
 DEFAULT_SCRATCH_LIB = "universe_crsp"
 # 2, not 8 (alpha-engine-config-I12436). Each name costs two polygon reference
 # calls against a 5-calls/minute key the fleet shares, so the polygon budget —
@@ -742,16 +758,30 @@ def _read_old_close(universe_lib, ticker: str) -> pd.Series | None:
     return s
 
 
-def _write_audit(s3, bucket: str, summary: dict) -> None:
-    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    key = f"{AUDIT_PREFIX}{ts}.json"
+def _put_json(s3, bucket: str, key: str, payload: dict) -> None:
+    """The build's one S3 PUT site: the audit and the pass receipt, both under
+    ``AUDIT_PREFIX`` (alpha-engine-config-I12684)."""
     s3.put_object(
         Bucket=bucket,
         Key=key,
-        Body=json.dumps(summary, indent=2, default=str).encode("utf-8"),
+        Body=json.dumps(payload, indent=2, default=str).encode("utf-8"),
         ContentType="application/json",
     )
+
+
+def _write_audit(s3, bucket: str, summary: dict) -> str:
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    key = f"{AUDIT_PREFIX}{ts}.json"
+    _put_json(s3, bucket, key, summary)
     log.info("Wrote reconciliation audit to s3://%s/%s", bucket, key)
+    return key
+
+
+def _write_receipt(s3, bucket: str, scratch_lib: str, receipt: dict) -> None:
+    key = verified_receipt_key(scratch_lib)
+    _put_json(s3, bucket, key, receipt)
+    log.info("Wrote %s receipt for %s to s3://%s/%s",
+             receipt.get("status"), scratch_lib, bucket, key)
 
 
 def migrate_universe_crsp_basis(
@@ -1006,7 +1036,8 @@ def _run_and_report(
     arctic_symbols: list[str],
     known_divergence_tickers: frozenset[str],
 ) -> dict:
-    """Run every target, write the scratch library, emit the audit, fail loud."""
+    """Run every target, gate, write the scratch library only on a pass, emit the
+    audit (and on a pass the receipt), fail loud."""
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=workers) as pool:
         outcomes = list(pool.map(process_one, targets))
@@ -1036,13 +1067,38 @@ def _run_and_report(
         if o.unconfirmed_splits:
             unconfirmed_splits.extend(o.unconfirmed_splits)
 
-    # ── WRITE scratch (apply) — only after all reconciliations computed ───────
-    if apply:
+    within_tol = [r for r in records if r.status == "within_tol"]
+    out_of_tol = [r for r in records if r.status == "out_of_tol"]
+    no_overlap = [r for r in records if r.status == "no_overlap"]
+    # FAIL-LOUD set: every out-of-tol or no-overlap record not explained.
+    unexplained = [r for r in records if not r.explained]
+
+    # ── WRITE scratch (apply) — only when the reconcile gate PASSED ───────────
+    # alpha-engine-config-I12684: this pass used to run before the gate, so the
+    # 2026-10-26 build that failed with 46 unexplained names still wrote all 909
+    # into `universe_crsp`, and the library a rebuild reads became exactly the
+    # failed build's output. A build that is going to raise below writes NOTHING
+    # to the scratch library; it still writes its audit, and still removes every
+    # spill file.
+    passed_gate = not unexplained and not errors and not aborted
+    newest_session: str | None = None
+    if apply and passed_gate:
+        # Invalidate the previous receipt BEFORE the library changes: a build
+        # killed mid-write must leave a receipt that refuses, not one vouching
+        # for a library it no longer describes.
+        _write_receipt(s3, bucket, scratch_lib, {
+            "status": RECEIPT_WRITING,
+            "scratch_lib": scratch_lib,
+            "started_at": datetime.now(timezone.utc).isoformat(),
+        })
         # One frame in memory at a time: read the spill, write, delete it.
         for o in outcomes:
             if o.outcome == "ok" and o.spill_path is not None:
                 try:
                     frame = pd.read_pickle(o.spill_path)
+                    if len(frame.index):
+                        last = pd.Timestamp(pd.DatetimeIndex(frame.index).max()).date().isoformat()
+                        newest_session = max(newest_session or last, last)
                     scratch.write(o.ticker, to_arctic_canonical(frame))
                     del frame
                     o.written = True
@@ -1051,17 +1107,19 @@ def _run_and_report(
                     errors.append({"ticker": o.ticker, "stage": "scratch_write",
                                    "error": str(exc)})
                     log.error("Scratch write failed for %s: %s", o.ticker, exc)
-                finally:
-                    try:
-                        os.remove(o.spill_path)
-                    except OSError:
-                        pass
-
-    within_tol = [r for r in records if r.status == "within_tol"]
-    out_of_tol = [r for r in records if r.status == "out_of_tol"]
-    no_overlap = [r for r in records if r.status == "no_overlap"]
-    # FAIL-LOUD set: every out-of-tol or no-overlap record not explained.
-    unexplained = [r for r in records if not r.explained]
+    elif apply:
+        log.error(
+            "Reconcile gate FAILED (unexplained=%d errors=%d aborted=%d): writing "
+            "NOTHING to scratch library %s (alpha-engine-config-I12684)",
+            len(unexplained), len(errors), len(aborted), scratch_lib,
+        )
+    # Every spill file goes, on every path (a written one is already consumed).
+    for o in outcomes:
+        if o.spill_path is not None:
+            try:
+                os.remove(o.spill_path)
+            except OSError:
+                pass
 
     for r in out_of_tol + no_overlap:
         lvl = log.warning if r.explained else log.error
@@ -1124,7 +1182,27 @@ def _run_and_report(
     }
 
     # Persist the report BEFORE raising so the evidence survives a fail-loud.
-    _write_audit(s3, bucket, summary)
+    audit_key = _write_audit(s3, bucket, summary)
+
+    # The pass receipt: only a build that passed the gate AND wrote every name.
+    # A scratch-write error above turns the status to "fail", so the receipt
+    # stays at "writing" and the library is refused until a clean rebuild.
+    if apply and summary["status"] == "ok":
+        _write_receipt(s3, bucket, scratch_lib, {
+            "status": RECEIPT_VERIFIED,
+            "scratch_lib": scratch_lib,
+            "audit_key": audit_key,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "unexplained_count": len(unexplained),
+            "errors_count": len(errors),
+            "aborted_count": len(aborted),
+            "written_count": written,
+            "targets_count": len(targets),
+            "live_universe_size": len(arctic_symbols),
+            "full_universe": len(targets) == len(arctic_symbols),
+            "reconcile_start": reconcile_start,
+            "newest_session": newest_session,
+        })
 
     log.info(
         "migrate_universe_crsp_basis: applied=%s reconcile_start=%s targets=%d "
