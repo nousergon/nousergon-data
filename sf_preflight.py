@@ -2195,6 +2195,22 @@ def _lambda_base_name(function_name: str) -> str:
     return function_name.split(":")[0]
 
 
+#: Retry policy for the IAM client ``check_sf_iam_reachability`` simulates
+#: with. ``SimulatePrincipalPolicy`` draws on one ACCOUNT-WIDE IAM rate limit,
+#: shared with every other caller simulating at the same moment (the data gate's
+#: identity column issues hundreds of these per run). botocore's default
+#: ``legacy`` mode gave each call five quick attempts; on 2026-10-26 08:33Z a
+#: concurrent burst throttled 22 of this check's 45 attempts, one call exhausted its
+#: attempts, ``_simulate`` read that as "not allowed", and the gate reported
+#: has_violation=true for a role that held the grant. ``adaptive`` rate-limits
+#: this client once IAM pushes back, so the calls behind a throttle back off
+#: instead of re-colliding, and six attempts (botocore's capped jittered backoff,
+#: ~15 s expected added sleep per call at the worst) absorbs a transient burst
+#: inside the WeeklyPreflight Task's 60 s budget. A call still throttled after
+#: that is UNCHANGED: ``_simulate`` reports it as not allowed, fail-closed.
+_IAM_SIMULATE_RETRIES = {"mode": "adaptive", "max_attempts": 6}
+
+
 def _simulate(
     iam: Any,
     role_arn: str,
@@ -2261,10 +2277,13 @@ def check_sf_iam_reachability(ctx: PreflightContext) -> CheckResult:
     import time
 
     import boto3
+    from botocore.config import Config
 
     t0 = time.time()
     sfn = boto3.client("stepfunctions", region_name=_REGION)
-    iam = boto3.client("iam", region_name=_REGION)
+    iam = boto3.client(
+        "iam", region_name=_REGION, config=Config(retries=dict(_IAM_SIMULATE_RETRIES))
+    )
     lam = boto3.client("lambda", region_name=_REGION)
 
     failures: list[str] = []

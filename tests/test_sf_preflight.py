@@ -930,6 +930,44 @@ def test_simulate_requires_every_result_allowed():
     assert sfp._simulate(iam, "arn:role", "ssm:SendCommand", "arn:inst") is False
 
 
+def test_iam_reachability_simulates_through_a_throttle_tolerant_client():
+    """The IAM client absorbs a transient account-wide throttle burst.
+
+    2026-10-26 08:33Z: a concurrent caller's SimulatePrincipalPolicy burst
+    throttled 22 of this check's 45 attempts under botocore's default `legacy`
+    retries; one call ran out, `_simulate` read it as "not allowed", and the
+    WeeklyPreflight gate reported has_violation=true for a role holding the
+    grant. The client must use adaptive retries with more attempts. A call that
+    still fails after them stays not-allowed (see the test above).
+    """
+    import json
+
+    built: dict[str, dict] = {}
+
+    def fake_client(service, **kwargs):
+        built[service] = kwargs
+        client = MagicMock()
+        if service == "stepfunctions":
+            client.describe_state_machine.return_value = {
+                "definition": json.dumps(
+                    {"States": {"T": {"Parameters": {"FunctionName": "fn-a:live"}}}}
+                )
+            }
+        if service == "iam":
+            client.simulate_principal_policy.return_value = {
+                "EvaluationResults": [{"EvalDecision": "allowed"}]
+            }
+        return client
+
+    with patch("boto3.client", side_effect=fake_client):
+        result = sfp.check_sf_iam_reachability(_ctx())
+
+    assert result.status == "ok", result.message
+    retries = built["iam"]["config"].retries
+    assert retries["mode"] == "adaptive"
+    assert retries["max_attempts"] >= 6
+
+
 # ── Environment capability profile (the 2026-08-10 WeeklyPreflight outage) ────
 #
 # ne-weekly-freshness-pipeline halted on its first real WeeklyPreflightGate
