@@ -314,6 +314,33 @@ def test_director_planned_fixes_come_from_the_ledger():
     assert "exit-rules value destruction: issue not in the ledger yet" in text
 
 
+def test_director_planned_fix_links_the_open_issue_not_the_closed_first_one():
+    """alpha-engine-config-I12644: the ledger keeps a row's FIRST issue after a
+    re-track, so the 10-23 report sent readers to closed #1059 and #11095. The
+    Director now stamps ``current_issue_number``; the report links that."""
+    plan = dict(PLAN, action_items=[
+        {"id": "substrate-pipeline-reliability", "title": "Close the postclose miss cluster", "priority": "P0"},
+        {"id": "attractiveness-pillar-reweight-validation", "title": "Validate the pillar-IC decomposition", "priority": "P1"},
+        {"id": "halt-or-derisk-live-deployment", "title": "Keep live sizing de-risked", "priority": "P1"},
+    ])
+    ledger = {"items": [
+        {"id": "substrate-pipeline-reliability", "issue_number": 1059,
+         "ruled_unrecovered_issue": 11494, "current_issue_number": 11087},
+        {"id": "attractiveness-pillar-reweight-validation", "issue_number": 11095,
+         "ruled_unrecovered_issue": 12623, "current_issue_number": 12623},
+        {"id": "halt-or-derisk-live-deployment", "issue_number": 964, "current_issue_number": None},
+    ]}
+    s3 = _today_s3()
+    s3.objects[f"director/{RUN_DATE}/action_plan.json"] = (plan, START)
+    s3.objects[wr.DIRECTOR_LEDGER_KEY] = (ledger, START)
+    text = "\n".join(wr.format_report_lines(_report(s3)))
+    assert "Close the postclose miss cluster: [aec#11087]" in text
+    assert "Validate the pillar-IC decomposition: [aec#12623]" in text
+    assert "[aec#1059]" not in text and "[aec#11095]" not in text
+    # Every issue on the chain closed: say so rather than present it as live work.
+    assert "Keep live sizing de-risked: [aec#964](https://github.com/nousergon/alpha-engine-config/issues/964) (closed; no open follow-up yet)" in text
+
+
 def test_declared_skip_without_registry_entry_gets_no_resolution_line():
     out = {"run_date": RUN_DATE, "skip_scanner": True}
     report = wr.build_weekly_report(
