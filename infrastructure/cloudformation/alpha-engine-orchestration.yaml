@@ -664,6 +664,11 @@ Resources:
   # --------------------------------------------------------------------------
   HealthCheckAlarm:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: AlphaEngine-HealthCheckFailures
       AlarmDescription: Alert when any data health check fails
@@ -685,6 +690,11 @@ Resources:
 
   ResearchRunnerErrors:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-research-runner-errors
       AlarmDescription: Research Lambda errors
@@ -704,6 +714,11 @@ Resources:
 
   ResearchRunnerNoInvocations:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-research-runner-no-invocations
       AlarmDescription: Research Lambda not invoked (expected weekly)
@@ -735,6 +750,11 @@ Resources:
   # resource from the stack and leaves nous-ergon-ops as sole owner.
   PredictorInferenceErrors:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-predictor-inference-errors
       AlarmDescription: "alpha-engine-predictor-inference reported >=1 invocation error in a 5-minute window. This function answers the FIRST state of both trading pipelines (MarketHoursGate) and DeployDriftCheck, so an error here is a safety gate that did not answer, not only a failed job — the pipelines degrade past an unanswered gate rather than halting. WHAT TO DO: search the log group for INIT_REPORT lines with `Status: error` first. If there are any, the module did not IMPORT and every invocation is failing, which no retry fixes (Lambda counts an init failure in Errors); if there are none, the failure is inside the handler and the action is named by the newest [ERROR] in the log group. This description was literally 'Predictor Lambda errors' until 2026-08-24, when the alarm fired for 16 minutes on an import crash, paged, self-cleared, and told nobody what had happened — while the Metadata below said to diagnose 'the condition named in AlarmDescription' (alpha-engine-config-I8298)."
@@ -754,6 +774,11 @@ Resources:
 
   PredictorNoInvocations:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-predictor-inference-no-invocations
       # Kept byte-identical to nous-ergon-ops
@@ -803,6 +828,11 @@ Resources:
   # veto bypass on 2026-04-20 (4 of 5 entries bypassed the GBM veto).
   UnscoredBuyCandidatesGap:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-predictor-unscored-buy-candidates
       AlarmDescription: Executor saw buy_candidates without a prediction row — Step Function coverage-gap self-heal may have regressed
@@ -820,6 +850,11 @@ Resources:
   # Heartbeat alarms for EC2-based processes
   ExecutorMorningHeartbeat:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-executor-morning-no-heartbeat
       AlarmDescription: Executor morning planner did not emit heartbeat
@@ -845,6 +880,11 @@ Resources:
 
   PredictorTrainingHeartbeat:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-predictor-training-no-heartbeat
       AlarmDescription: Predictor training did not emit heartbeat (expected weekly)
@@ -864,6 +904,11 @@ Resources:
 
   BacktesterHeartbeat:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-backtester-no-heartbeat
       AlarmDescription: Backtester did not emit heartbeat (expected weekly)
@@ -883,6 +928,11 @@ Resources:
 
   EvaluatorHeartbeat:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-evaluator-no-heartbeat
       AlarmDescription: Evaluator did not emit heartbeat (expected weekly — split from Backtester 2026-05-07)
@@ -902,6 +952,11 @@ Resources:
 
   RAGIngestionHeartbeat:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-rag-ingestion-no-heartbeat
       AlarmDescription: RAG ingestion did not emit heartbeat (expected weekly)
@@ -987,6 +1042,11 @@ Resources:
 
   SnsPublishFailedAlarm:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: ne-weekly-freshness-sns-publish-failed
       AlarmDescription: >-
@@ -1052,6 +1112,11 @@ Resources:
 
   PreflightSweepDeadman:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-preflight-sweep-no-run
       AlarmDescription: >-
@@ -1082,6 +1147,11 @@ Resources:
 
   PreflightSweepDispatcherErrors:
     Type: AWS::CloudWatch::Alarm
+    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
+    # from the stack (step 2) leaves the live alarm to its codified owner,
+    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
     Properties:
       AlarmName: alpha-engine-preflight-sweep-dispatcher-errors
       AlarmDescription: >-
