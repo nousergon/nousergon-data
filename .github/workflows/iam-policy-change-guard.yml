@@ -62,9 +62,24 @@ name: IAM Policy Change Guard
 # job body already early-exits when no `iam-policy.json` changed — that path
 # was always reachable (a `paths:` match fires the whole workflow, not just
 # the matching file), so no guard logic changes here.
+#
+# ── merge_group (alpha-engine-config-I11310) ─────────────────────────────────
+#
+# This is a REQUIRED context, so it must also report on `merge_group` before a
+# merge queue can be enabled here (auto-merge-policy §7; the 2026-07-24 fleet
+# deadlock was required contexts that never posted on a queue entry). A
+# merge_group payload carries no `pull_request` object, so on that event the
+# step re-derives everything rather than passing blind: the changed files are
+# the queue entry's own diff (`merge_group.base_sha`..`head_sha`), and the PR
+# number is parsed from `merge_group.head_ref`
+# (`refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>`) so the `gate:operator`
+# label is read LIVE — the same resolution nousergon-lib's gate-label-guard
+# uses. An unparseable head_ref fails CLOSED.
 on:
   pull_request:
     types: [opened, synchronize, reopened, labeled, unlabeled]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -106,12 +121,30 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          PR_EVENT_NUMBER: ${{ github.event.pull_request.number }}
+          PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
         run: |
           set -euo pipefail
 
-          PR_NUMBER="${{ github.event.pull_request.number }}"
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
-          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            PR_NUMBER=$(printf '%s' "$MG_HEAD_REF" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p')
+            if [ -z "$PR_NUMBER" ]; then
+              echo "::error::Could not extract a PR number from merge_group.head_ref ('$MG_HEAD_REF'). Failing closed: the gate:operator label cannot be read."
+              exit 1
+            fi
+            BASE_SHA="$MG_BASE_SHA"
+            HEAD_SHA="$MG_HEAD_SHA"
+            echo "merge_group entry for PR #${PR_NUMBER}: ${BASE_SHA}..${HEAD_SHA}"
+          else
+            PR_NUMBER="$PR_EVENT_NUMBER"
+            BASE_SHA="$PR_BASE_SHA"
+            HEAD_SHA="$PR_HEAD_SHA"
+          fi
 
           # Get all changed iam-policy.json files in this PR
           CHANGED_POLICIES=$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
