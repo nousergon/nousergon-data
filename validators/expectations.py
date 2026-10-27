@@ -744,12 +744,22 @@ def publish_completeness_metric(
 #: sessions old (e.g. FNILX/FTIHX/FZILX on 09-23, ATAI on 09-15) while the
 #: per-day reading counted them covered.
 #:
-#: **Promotion criterion: 10 consecutive clean trading days**, the same count
-#: and the same `unmeasurable`-is-not-clean rule as `CARDINALITY_GUARD`, on the
-#: same tracker.
+#: **Promotion criterion:** the codified per-guard entry in
+#: `data_gate/guard_promotion.py` (``data_spine_window``, moderate risk), which
+#: replaced the ten-day count on Brian's 2026-10-04 option (c)
+#: (alpha-engine-config-I11973); `unmeasurable` is not clean.
+#:
+#: **PROMOTED to ENFORCE** (alpha-engine-config-I10780) on that criterion: the
+#: gate row ``data.guard_promotion.data_spine_window`` read READY TO PROMOTE on
+#: every data-phase2 read 2026-10-20..2026-10-26, and every scheduled D20 run
+#: 2026-10-07..2026-10-26 (14 sessions) recorded verdict `ok`. ENFORCE makes a
+#: non-clean window turn D20's own run DEGRADED
+#: (`collectors/metron_market_data.py::collect`): its manifest records `failed`
+#: and its phase marker is not `ok`, while the EOD process still exits 0, so the
+#: ArcticDB append and EODReconcile are not withheld by this guard.
 SPINE_WINDOW_GUARD = GuardStaging(
     name="data_spine_window",
-    mode=GuardMode.OBSERVE,
+    mode=GuardMode.ENFORCE,
     promotion_criterion=(
         "enforce once the codified per-guard risk-based criterion holds "
         "(data_gate/guard_promotion.py, data_spine_window: moderate risk) — the EOD spine-window "

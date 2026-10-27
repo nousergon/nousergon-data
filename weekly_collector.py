@@ -213,6 +213,19 @@ _DEGRADED_DEFECT_REGISTRY: dict[str, dict[str, str]] = {
             "(FRED reachable; market_data/macro/latest.json rewritten for that date)"
         ),
     },
+    # alpha-engine-config-I10780: the D20 spine-window guard is ENFORCING, so a
+    # window verdict other than `ok` makes metron_market_data degraded. The
+    # collector's own detail names the missing, empty or misdated session, or
+    # the symbol whose bar is older than the declared lag.
+    "metron_market_data": {
+        "tracked_issue": "alpha-engine-config-I10780",
+        "clears_when": (
+            "the next EOD run's data_spine_window verdict is ok: each of the last "
+            "D20_SPINE_WINDOW_SESSIONS market_data/eod_closes/{session}.json documents "
+            "is published, non-empty and dated to its session, and every undeclared "
+            "symbol's bar is within D20_MAX_BAR_LAG_SESSIONS of the run's session"
+        ),
+    },
     "historical_constituents": {
         "tracked_issue": "alpha-engine-config-I11470",
         "clears_when": (

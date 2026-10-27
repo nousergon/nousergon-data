@@ -125,8 +125,10 @@ guards:
         OBSERVE mode, staged on validators/expectations.py::CARDINALITY_GUARD
         (alpha-engine-config-I10780, I10827). FX pairs are not graded by it. The session axis
         rides beside it as guard `data_spine_window` (collectors/metron_market_data.py::
-        _grade_spine_window, also OBSERVE): the last 5 published sessions read back and graded
-        for a missing, empty or misdated session and for a bar older than 1 session. Not in
+        _grade_spine_window, ENFORCE since alpha-engine-config-I10780): the last 5 published
+        sessions read back and graded for a missing, empty or misdated session and for a bar
+        older than 1 session; a verdict other than ok makes D20's run degraded (manifest
+        failed, EOD exit code unchanged). Not in
         service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: absent
