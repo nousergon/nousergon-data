@@ -15,6 +15,7 @@ into being a description of what someone intended.
 from __future__ import annotations
 
 import json
+import math
 import pathlib
 
 import pytest
@@ -26,7 +27,6 @@ CFN_PATH = REPO / "infrastructure" / "cloudformation" / "alpha-engine-orchestrat
 DESCRIPTOR_PATH = REPO / "registry.d" / "ae-preflight-sweep.yaml"
 
 RULE = "PreflightSweepDailyTrigger"
-ALARM = "PreflightSweepDeadman"
 
 
 @pytest.fixture(scope="module")
@@ -90,35 +90,33 @@ def test_a_daily_declaration_means_the_rule_is_enabled(cadence, template):
         assert rule["State"] == "ENABLED"
 
 
-def test_the_deadman_window_is_derived_from_the_declared_cadence(cadence, template):
-    alarm = template["Resources"][ALARM]["Properties"]
-    assert alarm["Period"] == cadence["cadence_minutes"] * 60
+# The deadman alarm (alpha-engine-preflight-sweep-no-run) left this stack for
+# its codified owner, nous-ergon-ops/infrastructure/cloudwatch/alarms/
+# alpha-engine-preflight-sweep-no-run.json (alpha-engine-config-I9009). This
+# public repo cannot read that file in CI, so the window it encodes is pinned
+# here: a cadence change that fails this test needs the matching edit to that
+# file in the same arc. Its other properties (TreatMissingData: breaching, the
+# PreflightSweepRunCompleted subject, OKActions) are asserted on the file in
+# nous-ergon-ops.
+CODIFIED_DEADMAN_PERIOD_S = 86400
+CODIFIED_DEADMAN_EVALUATION_PERIODS = 2
+
+
+def test_the_codified_deadman_window_is_derived_from_the_declared_cadence(cadence):
+    assert cadence["cadence_minutes"] * 60 == CODIFIED_DEADMAN_PERIOD_S, (
+        "cadence_minutes changed: update Period in nous-ergon-ops "
+        "infrastructure/cloudwatch/alarms/alpha-engine-preflight-sweep-no-run.json "
+        "to match, then this constant"
+    )
     # staleness_factor 1.5 rounded up to whole periods = 2. A single late run
     # must not page; a dead sweep must.
-    assert alarm["EvaluationPeriods"] == 2
+    assert math.ceil(cadence["staleness_factor"]) == CODIFIED_DEADMAN_EVALUATION_PERIODS
 
 
-def test_the_deadman_treats_missing_data_as_breaching(template):
-    """An absence alarm set to notBreaching is blind in the exact direction it
-    exists to watch, and its green is the dangerous reading
-    (observability-policy §9.2a)."""
-    alarm = template["Resources"][ALARM]["Properties"]
-    assert alarm["TreatMissingData"] == "breaching"
-
-
-def test_the_deadman_watches_the_metric_emitted_on_every_terminal_path(template):
-    alarm = template["Resources"][ALARM]["Properties"]
-    assert alarm["Namespace"] == "AlphaEngine"
-    assert alarm["MetricName"] == "PreflightSweepRunCompleted"
-    assert {"Name": "Component", "Value": "ae-preflight-sweep"} in alarm["Dimensions"]
-
-
-def test_recovery_notifies_symmetrically_with_failure(template):
-    """observability-policy §7.2: recovery notifies symmetrically. An alarm
-    that pages on break and goes quiet on repair leaves the operator unable to
-    tell 'fixed' from 'still broken, nobody looked'."""
-    alarm = template["Resources"][ALARM]["Properties"]
-    assert alarm.get("OKActions"), "the deadman must announce its own recovery"
+def test_the_stack_no_longer_declares_the_deadman(template):
+    """The deadman's definition has one home. A copy here would be reasserted
+    over the codified one on every push (alpha-engine-config-I9009)."""
+    assert "PreflightSweepDeadman" not in template["Resources"]
 
 
 def test_the_console_descriptor_declares_the_same_cadence(cadence):

@@ -25,7 +25,9 @@ one spot-hour rather than over days of live weekly runs.
 
 Cadence is declared in ONE file, `infrastructure/preflight_sweep_cadence.json`
 (`sf-pipeline-policy` §2.6) — the EventBridge schedule and the deadman
-alarm's evaluation window both derive from it, and the Lambda itself
+alarm's evaluation window both derive from it (the alarm itself is codified in
+`nous-ergon-ops/infrastructure/cloudwatch/alarms/alpha-engine-preflight-sweep-no-run.json`
+since alpha-engine-config-I9009), and the Lambda itself
 re-reads it at invoke time so a cadence of `off` reports itself as a declared
 skip rather than as a dead component.
 
