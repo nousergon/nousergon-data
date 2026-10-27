@@ -6,9 +6,9 @@
   "totals": {
     "account_hits": 790,
     "account_files": 204,
-    "bucket_hits": 950,
-    "bucket_files": 430,
-    "files": 539
+    "bucket_hits": 949,
+    "bucket_files": 429,
+    "files": 538
   },
   "files": {
     ".github/workflows/alert-class-pr-guard.yml": {
@@ -260,9 +260,6 @@
     },
     "flow-doctor.yaml": {
       "bucket": 2
-    },
-    "infrastructure/apply_s3_lifecycle.sh": {
-      "bucket": 1
     },
     "infrastructure/apply_sf_correlation_id_fix.py": {
       "account": 1

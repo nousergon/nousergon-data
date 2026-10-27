@@ -5,7 +5,8 @@ The path was renamed from ``predictor/daily_closes/{date}.parquet`` to
 parquet out of the ``predictor/`` namespace where it lived alongside
 authoritative artifacts (it's actually intermediate state between API
 fetch and ArcticDB ingest), and (2) make it eligible for an S3 lifecycle
-expiration (``infrastructure/s3_lifecycle_staging.json``).
+expiration (bucket rule ``expire-staging-after-7-days``, declared and
+applied by the nous-ergon-ops repo's bucket-config lane).
 
 These tests lock the prefix in place across the writer + both readers
 so a future PR can't silently regress one of the call sites without
@@ -119,21 +120,22 @@ def test_weekly_collector_default_prefix_is_staging():
 
 
 def test_lifecycle_policy_artifact_exists_and_is_valid_json():
-    import json
-    path = Path(__file__).parent.parent / "infrastructure/s3_lifecycle_staging.json"
-    assert path.exists(), (
-        f"{path} missing. The lifecycle policy artifact is what makes the "
-        f"'7-day expiration' invariant in the README + module docstrings real "
-        f"in production. Operator must run apply_s3_lifecycle.sh after merge."
-    )
-    payload = json.loads(path.read_text())
-    rules = payload.get("Rules", [])
-    assert len(rules) >= 1
-    rule = rules[0]
-    assert rule["Status"] == "Enabled"
-    assert rule["Filter"]["Prefix"] == "staging/", (
-        f"Lifecycle rule must scope to the staging/ prefix; got "
-        f"{rule['Filter'].get('Prefix')!r}. A wider scope (e.g. '/') would "
-        f"silently expire authoritative artifacts."
-    )
-    assert rule["Expiration"]["Days"] == 7
+    """The bucket's lifecycle is NOT owned here (alpha-engine-config-I10897).
+
+    This repo used to carry a lifecycle JSON plus a script that applied it
+    with a whole-document replace. The bucket's versioning and lifecycle are
+    now declared, applied on merge and drift-checked by the nous-ergon-ops
+    repo's bucket-config lane, which carries the ``staging/`` 7-day rule this
+    test used to pin. Running the old script would have replaced that
+    document and dropped every rule it did not list, including the
+    noncurrent-version expiry. Neither file may come back.
+    """
+    infra = Path(__file__).parent.parent / "infrastructure"
+    for name in ("s3_lifecycle_staging.json", "apply_s3_lifecycle.sh"):
+        path = infra / name
+        assert not path.exists(), (
+            f"{path} is back. The research bucket's lifecycle is owned by "
+            f"the nous-ergon-ops repo's declared bucket-config lane "
+            f"(alpha-engine-config-I10897); a second writer here replaces its "
+            f"whole document. Change the rule there, not here."
+        )
