@@ -220,6 +220,133 @@ def test_run_sweep_reads_the_published_observability_floor():
     assert report["grades"][0]["substrate"] == "laptop-launchd"
 
 
+# ── declared_off: tombstoned rows never page (alpha-engine-config-I12689) ──────
+
+
+_RETIRED_ROW = b"""\
+component_id: tombstoned
+alias_ids: [tombstoned_old]
+substrate: github-actions
+lifecycle: retired
+lifecycle_reason: >-
+  Retired 2026-09-14. The workflow was deleted by
+  crucible-predictor-PR626.
+lifecycle_owner: brian
+lifecycle_reexam: 2027-09-14
+"""
+
+_DISABLED_ROW = b"""\
+component_id: paused
+substrate: ec2-spot
+lifecycle: disabled
+lifecycle_reason: Disabled pending the v2 cutover.
+lifecycle_owner: brian
+lifecycle_reexam: 2026-12-01
+"""
+
+
+def _decl_rows():
+    import yaml
+    return [yaml.safe_load(_RETIRED_ROW), yaml.safe_load(_DISABLED_ROW)]
+
+
+def test_a_tombstoned_envelope_grades_declared_off_and_a_live_stale_one_still_pages():
+    """The I12689 regression: a retired/disabled row's frozen envelope is
+    ``declared_off`` and leaves the stale set, and a live stale envelope beside
+    it still makes the verdict stale."""
+    grades = ue.grade(
+        [_env("tombstoned_old", age_h=24 * 42), _env("paused", age_h=24 * 9),
+         _env("live_but_stale", age_h=13)],
+        registered=set(), substrates={}, now=NOW,
+        declared_off=ue.declared_off_map(_decl_rows()),
+    )
+    by_id = {g.check_id: g for g in grades}
+    assert by_id["tombstoned_old"].state == ue.STATE_DECLARED_OFF  # via alias_ids
+    assert by_id["tombstoned_old"].lifecycle == "retired"
+    assert "crucible-predictor-PR626" in by_id["tombstoned_old"].lifecycle_reason
+    assert by_id["paused"].state == ue.STATE_DECLARED_OFF
+    assert by_id["paused"].lifecycle == "disabled"
+    assert by_id["live_but_stale"].state == ue.STATE_STALE
+
+    result = ue.verdict(grades, NOW)
+    assert result.state == "stale"
+    assert "live_but_stale (" in result.reason
+    assert "tombstoned" not in result.reason.split(". ")[0]
+    assert "paused (" not in result.reason
+    assert "2 declared_off" in result.reason
+
+
+def test_only_declared_off_envelopes_leave_the_verdict_fresh():
+    grades = ue.grade([_env("tombstoned", age_h=24 * 42)], registered=set(),
+                      substrates={}, now=NOW,
+                      declared_off=ue.declared_off_map(_decl_rows()))
+    assert ue.verdict(grades, NOW).state == "fresh"
+
+
+def test_an_incomplete_lifecycle_declaration_is_not_declared_off():
+    """§2.2/§8.3: off is DECLARED, never inferred. A bare ``lifecycle: retired``
+    with no reason or re-exam is not a declaration, so it grades on its clock."""
+    rows = [
+        {"component_id": "no_reason", "lifecycle": "retired",
+         "lifecycle_reexam": "2027-01-01"},
+        {"component_id": "no_reexam", "lifecycle": "disabled",
+         "lifecycle_reason": "off"},
+        {"component_id": "deprecated_one", "lifecycle": "deprecated",
+         "lifecycle_reason": "successor x", "lifecycle_reexam": "2027-01-01"},
+    ]
+    assert ue.declared_off_map(rows) == {}
+    grades = ue.grade([_env("no_reason", age_h=13)], registered=set(),
+                      substrates={}, now=NOW, declared_off=ue.declared_off_map(rows))
+    assert grades[0].state == ue.STATE_STALE
+
+
+def test_an_in_service_row_naming_the_same_id_wins():
+    import yaml
+    live = {"component_id": "renamed_live", "alias_ids": ["tombstoned_old"],
+            "lifecycle": "in-service", "substrate": "lambda"}
+    off = ue.declared_off_map([yaml.safe_load(_RETIRED_ROW), live])
+    assert "tombstoned_old" not in off
+    assert "tombstoned" in off
+
+
+def test_run_sweep_grades_a_published_tombstone_declared_off():
+    s3 = _FakeS3({
+        "ops/checks/tombstoned/latest.json": _envelope_obj(24 * 42),
+        "ops/checks/live_but_stale/latest.json": _envelope_obj(13),
+        "ops/registry/observability.d/tombstoned.yaml": (NOW, _RETIRED_ROW),
+    })
+    _, result, report = ue.run_sweep(s3, BUCKET, [], NOW)
+    graded = {g["check_id"]: g for g in report["grades"]}
+    assert graded["tombstoned"]["state"] == ue.STATE_DECLARED_OFF
+    assert graded["tombstoned"]["lifecycle"] == "retired"
+    assert graded["tombstoned"]["lifecycle_reason"].startswith("Retired 2026-09-14.")
+    assert graded["live_but_stale"]["state"] == ue.STATE_STALE
+    assert result.state == "stale"
+
+
+def test_an_unreadable_registry_fails_toward_paging_not_declared_off():
+    class _RegistryDown(_FakeS3):
+        def get_paginator(self, name):
+            inner = super().get_paginator(name)
+
+            class _P:
+                def paginate(self, *, Bucket=None, Prefix="", **kw):  # noqa: N803
+                    if Prefix == ue.OBSERVABILITY_PREFIX:
+                        raise RuntimeError("AccessDenied")
+                    return inner.paginate(Bucket=Bucket, Prefix=Prefix, **kw)
+
+            return _P()
+
+    s3 = _RegistryDown({
+        "ops/checks/tombstoned/latest.json": _envelope_obj(24 * 42),
+        "ops/registry/observability.d/tombstoned.yaml": (NOW, _RETIRED_ROW),
+    })
+    _, result, report = ue.run_sweep(s3, BUCKET, [], NOW)
+    assert report["grades"][0]["state"] == ue.STATE_STALE
+    assert result.state == "stale"
+    assert any("declared_off" in n for n in report["notes"])
+
+
 # ── through the handler (the I11840 closes-when) ─────────────────────────────
 
 
@@ -323,6 +450,22 @@ def test_handler_does_not_page_when_every_unregistered_envelope_is_fresh(monkeyp
     })
     assert _row(rows, ue.SWEEP_ARTIFACT_ID)["state"] == "fresh"
     assert not publish_mock.called
+
+
+def test_handler_does_not_page_on_a_tombstoned_envelope(monkeypatch):
+    """The I12689 closes-when, end to end: the report grades the retired row's
+    envelope ``declared_off`` and the synthetic row does not page."""
+    s3, publish_mock, rows = _run_handler(monkeypatch, {
+        "ops/checks/registered_check/latest.json": _envelope_obj(1),
+        "ops/checks/tombstoned/latest.json": _envelope_obj(24 * 42),
+        "ops/checks/healthy/latest.json": _envelope_obj(1),
+        "ops/registry/observability.d/tombstoned.yaml": (NOW, _RETIRED_ROW),
+    })
+    assert _row(rows, ue.SWEEP_ARTIFACT_ID)["state"] == "fresh"
+    assert not publish_mock.called
+    report = json.loads(next(b for k, b in s3.put_calls if k == ue.REPORT_KEY))
+    graded = {g["check_id"]: g["state"] for g in report["grades"]}
+    assert graded == {"tombstoned": "declared_off", "healthy": "fresh"}
 
 
 def test_handler_sweep_can_be_disabled_by_env(monkeypatch):
