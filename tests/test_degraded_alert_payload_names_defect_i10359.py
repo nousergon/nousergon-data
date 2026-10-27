@@ -74,3 +74,22 @@ def test_features_registry_entry_points_at_i7572():
     """Pins the current live tracked issue so a rename/retarget is a visible
     diff here, not a silent drift between the code and the tracker."""
     assert _DEGRADED_DEFECT_REGISTRY["features"]["tracked_issue"] == "alpha-engine-config-I7572"
+
+
+def test_a_degraded_d20_spine_window_names_its_tracker_and_the_window():
+    """alpha-engine-config-I10780: the ENFORCING spine-window guard degrades
+    metron_market_data; the page names the tracker and the collector's own
+    detail, never `UNTRACKED`."""
+    results = {
+        "degraded_collectors": ["metron_market_data"],
+        "collectors": {
+            "metron_market_data": {
+                "status": "degraded",
+                "detail": "data_spine_window below_floor (ENFORCE): MISSING session(s): 2026-09-29",
+            }
+        },
+    }
+    detail = _describe_degraded_defects(results)
+    assert "tracked=alpha-engine-config-I10780" in detail
+    assert "MISSING session(s): 2026-09-29" in detail
+    assert "UNTRACKED" not in detail

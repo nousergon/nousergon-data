@@ -147,11 +147,14 @@ GUARD_PROMOTIONS: tuple[GuardPromotion, ...] = (
     GuardPromotion(
         name="data_spine_window",
         staging="validators/expectations.py::SPINE_WINDOW_GUARD",
-        mode="observe",
+        mode="enforce",
         risk="moderate",
         blast_radius=(
-            "the EOD spine's (D20) own run; no ENFORCE raise site exists yet, so promotion also "
-            "writes one — the window verdict is recorded on the manifest and never acted on, today"
+            "the EOD spine's (D20) own run: collectors/metron_market_data.py::collect returns "
+            "status `degraded` on a window verdict other than `ok`, so D20's run manifest records "
+            "`failed` naming the window and its phase marker is not `ok` (a retry recomputes it); "
+            "the EOD process still exits 0, so no other unit's phase, the ArcticDB append or "
+            "EODReconcile is withheld by this guard"
         ),
         guard_class=None,
         units=("D20",),

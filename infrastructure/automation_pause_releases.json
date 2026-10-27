@@ -1,0 +1,198 @@
+{
+  "_why": "alpha-engine-config-I8981. Every `paused` trigger in automation_pause.json names the OPEN tracker issue that owns switching it back on, the date past which the pause is no longer justified by anything, and the condition that releases it - the trigger-side mirror of `paused_alarms`' `issue`/`re_exam` (alpha-engine-config-I8047). Measured 2026-10-27: 22 of the 39 paused triggers carried a machine-readable owner (a `Pause-owner:` line on alpha-engine-config-I6984) and 13 named no open issue at all; the 2026-08-07 ruling's own issue, I6617, closed the day it was filed. Keys are `<surface>:<name>`, the grammar of the `Pause-owner:` line and of _freshness_monitor/disabled_producers.json. Kept in its own file, not in automation_pause.json, because several deploy workflows (data-collection stack, crypto-balances, overseer-backstop-responder) run on any edit to that file and a release declaration changes no live state. automation_pause.py `release_findings()` asserts every paused trigger has a well-formed entry here and that no entry outlives its trigger; it does NOT resolve the issue's state or compare the date to today - that needs a tracker credential this repo does not hold, and is graded in alpha-engine-config. Never edit an entry to re-enable a trigger: re-enabling is Brian's ruling (principles.md 2.5).",
+  "events:alpha-engine-canary-replay-liveness-probe-tick": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. Overseer canary-replay probe."
+  },
+  "events:alpha-engine-canary-replay-thursday": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. Overseer canary-replay drill."
+  },
+  "events:alpha-engine-ci-watch-instance-terminated": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. ci-watch mirror of the sf-watch reclaim legs."
+  },
+  "events:alpha-engine-ci-watch-spot-interruption": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. ci-watch mirror of the sf-watch reclaim legs."
+  },
+  "events:alpha-engine-daily-heal": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-engine-eod-success-friday-shell-trigger": {
+    "issue": "alpha-engine-config-I9751",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian's 2026-09-01 ruling (alpha-engine-config-I9751 item 3) holds the old weekly to one run a week for the duration of the v2 build. Re-enabling needs a fresh ruling; otherwise it is deleted with the v1 path."
+  },
+  "events:alpha-engine-predictor-drift-check": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-engine-saturday-integrity-monday": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-engine-saturday-sf-watch-failed": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. sf-watch dispatch leg of the response plane."
+  },
+  "events:alpha-engine-sf-watch-instance-terminated": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "events:alpha-engine-sf-watch-spot-interruption": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "events:alpha-engine-spot-interruption-recorder-tick": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-engine-ssm-reachability-probe-5min": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-engine-sweep-artifact-monitor": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:alpha-research-alerts": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
+  },
+  "events:overseer-intake-cw-alarm-state": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-alert-drain-0400utc": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-alert-drain-1000utc": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-alert-drain-1600utc": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-alert-drain-2200utc": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-ci-watch-canary-drill-weekly": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps. ci-watch canary drill."
+  },
+  "scheduler:alpha-engine-config-runner-reconcile": {
+    "issue": "alpha-engine-config-I6618",
+    "re_exam": "2026-12-01",
+    "release_when": "Its target Lambda alpha-engine-config-runner-dispatcher does not exist, so re-enabling it as-is fails every minute. Released by deleting the schedule or re-targeting it at a function that exists, under alpha-engine-config-I6618."
+  },
+  "scheduler:alpha-engine-groom-lane-reconciler-5min": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-groom-sweep-0000-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-groom-sweep-0800-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-groom-sweep-1600-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-overseer-liveness-0650-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-overseer-liveness-1450-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-scheduled-groom-0400-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-scheduled-groom-1200-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-scheduled-groom-2000-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-scheduled-groom-sun0900-weekly": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-sf-watch-canary-drill-weekly": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-sf-watch-liveness-0645-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-sf-watch-liveness-1445-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-sf-watch-reclaim-sweep-0645-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:alpha-engine-sf-watch-reclaim-sweep-1445-daily": {
+    "issue": "alpha-engine-config-I6984",
+    "re_exam": "2026-12-01",
+    "release_when": "Brian rules the groomer/Overseer response plane back on. His 2026-09-13 ruling on alpha-engine-config-I6984: not until he refocuses on the software-factory concept. That issue's restore table lists the exact enable steps."
+  },
+  "scheduler:nousergon-data-collection/data-collection-shadow-morning": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715; deletion recommended. The decoupled data cutover (I11269, closed) froze data.cutover_ready.parity, so a re-enabled parity run would compare the collector with itself."
+  },
+  "scheduler:nousergon-data-collection/data-collection-shadow-sameday": {
+    "issue": "alpha-engine-config-I12715",
+    "re_exam": "2026-12-02",
+    "release_when": "Brian rules on alpha-engine-config-I12715; deletion recommended. The decoupled data cutover (I11269, closed) froze data.cutover_ready.parity, so a re-enabled parity run would compare the collector with itself."
+  }
+}

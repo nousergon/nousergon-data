@@ -5,8 +5,14 @@ name: Merge-group required-check guard
 # Without this, the merge queue permanently deadlocks — the required
 # context never reports on merge_group events.
 #
-# This guard is NOT a required check itself (self-referential).
-# It runs advisory on PRs/pushes touching .github/workflows/.
+# REQUIREABLE (alpha-engine-config-I11310): auto-merge-policy §7 says no
+# repo gets a merge queue before this guard is a REQUIRED check, as it is on
+# alpha-engine-config (context `guard / merge-group required-check guard`).
+# A required context must report on EVERY pull_request and on every
+# merge_group entry, so the `pull_request` trigger is unfiltered (a `paths:`
+# filter would leave non-workflow PRs blocked on a context that never posts)
+# and `merge_group` is declared. Making it required is a ruleset change for
+# an admin; until then it stays advisory.
 #
 # Logic lives in the fleet chokepoint:
 #   nousergon-lib merge-group-required-check-guard.yml
@@ -15,8 +21,8 @@ name: Merge-group required-check guard
 on:
   pull_request:
     branches: [main]
-    paths:
-      - ".github/workflows/**"
+  merge_group:
+    types: [checks_requested]
   push:
     branches: [main]
     paths:

@@ -62,8 +62,8 @@ version id, so ``aws s3api copy-object --copy-source
 back.
 
 **Lifetime.** ``staging/`` expires 7 days after an object's last write
-(bucket rule ``expire-staging-after-7-days``, mirrored in
-``infrastructure/s3_lifecycle_staging.json``). The pipeline stops rewriting a
+(bucket rule ``expire-staging-after-7-days``, declared in the nous-ergon-ops
+repo's bucket-config lane). The pipeline stops rewriting a
 date after ~10 trading days. So these files age out at about 00:00 UTC on
 10-20 (09-28), 10-21, 10-22, 10-23 and 10-24 (10-02). A file already gone is
 reported ``AGED-OUT`` (moot). Writing a restated version restarts that file's
