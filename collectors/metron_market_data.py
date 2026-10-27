@@ -1527,13 +1527,24 @@ def collect(
         s3_client, bucket, run_date,
         denominator=yf_symbols, covered=closes.keys(), closes_key=closes_key,
     )
-    graded["guards"].append(_grade_spine_window(s3_client, bucket, run_date, denominator=yf_symbols))
-    return {
+    spine = _grade_spine_window(s3_client, bucket, run_date, denominator=yf_symbols)
+    graded["guards"].append(spine)
+    result = {
         "status": "ok", "universe": len(holdings),
         "closes": len(closes), "fx": len(rates), "stale_bars": stale,
         "closes_key": closes_key, "fx_key": fx_key,
         **graded,
     }
+    # ENFORCE (alpha-engine-config-I10780): a window verdict other than `ok` —
+    # `unmeasurable` included, since a guard that could not look did not pass —
+    # makes THIS unit's run degraded, never the process's. `_phase_collect`
+    # files the manifest as `failed` naming the window and withholds the `ok`
+    # marker; the EOD exit code, the ArcticDB append and EODReconcile do not
+    # move (the codified blast radius in data_gate/guard_promotion.py).
+    if expectations.SPINE_WINDOW_GUARD.enforcing and spine["verdict"] != "ok":
+        result["status"] = "degraded"
+        result["detail"] = f"{spine['guard']} {spine['verdict']} (ENFORCE): {spine['detail']}"
+    return result
 
 
 #: D20's declared completeness floor, from
@@ -1666,10 +1677,12 @@ def _grade_spine_window(s3_client: Any, bucket: str, run_date: str, *, denominat
     :data:`D20_MAX_BAR_LAG_SESSIONS`, are each named. Runs on the failure path
     too, so a run whose write failed still records which sessions the spine has.
 
-    OBSERVE mode (`sf-pipeline-policy` §7a), staged on
-    ``expectations.SPINE_WINDOW_GUARD``: logged at ERROR when not clean, filed on
-    the run manifest, no exit code moves. It NEVER raises — a measurement must not
-    gate the thing it measures; a failure to read is graded ``unmeasurable``.
+    Staged on ``expectations.SPINE_WINDOW_GUARD`` (`sf-pipeline-policy` §7a),
+    ENFORCE since alpha-engine-config-I10780: logged at ERROR when not clean and
+    filed on the run manifest. This function still NEVER raises — a failure to
+    read is graded ``unmeasurable`` — and the enforcement is :func:`collect`
+    turning a non-``ok`` verdict into a ``degraded`` run; the write-failure path
+    is already ``error`` and is left as it is.
     """
     staging = expectations.SPINE_WINDOW_GUARD
     try:
