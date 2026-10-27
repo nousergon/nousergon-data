@@ -161,6 +161,11 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 MANIFEST = Path(__file__).parent.resolve() / "automation_pause.json"
+
+#: Release declarations for every ``paused`` trigger (alpha-engine-config-I8981).
+#: A separate file because several deploy workflows run on ANY edit to
+#: ``automation_pause.json``, and a release declaration changes no live state.
+RELEASES = Path(__file__).parent.resolve() / "automation_pause_releases.json"
 REGION = "us-east-1"
 
 #: SCOPE, made explicit (alpha-engine-config-I9959). The 2026-08-07 ruling's own
@@ -760,6 +765,9 @@ def check() -> list[dict]:
     # ── completeness: every live trigger CLASSIFIED, not merely every
     # declared one (alpha-engine-config-I9959) ─────────────────────────────
     findings.extend(trigger_coverage_findings())
+
+    # ── every paused trigger names its release owner (alpha-engine-config-I8981)
+    findings.extend(release_findings())
     return findings
 
 
@@ -891,6 +899,109 @@ def declaration_findings(manifest: dict | None = None) -> list[dict]:
                 "detail": f"re_exam={re_exam!r} is not a real calendar date.",
             })
     out.extend(retirement_findings(manifest))
+    return out
+
+
+def load_releases(path: Path = RELEASES) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def release_key(surface: str, name: str) -> str:
+    """``<surface>:<name>`` — the grammar of the ``Pause-owner:`` line and of
+    ``disabled_producers.json``'s ``trigger`` field, so one string names a
+    paused trigger on every surface that tracks it."""
+    return f"{surface}:{name}"
+
+
+def release_findings(manifest: dict | None = None,
+                     releases: dict | None = None) -> list[dict]:
+    """Does every paused TRIGGER name the open issue that owns switching it back on?
+
+    alpha-engine-config-I8981. ``declaration_findings()`` made every silenced
+    ALARM carry an owning issue and a re-exam date; the triggers those alarms
+    watch carried only a free-text reason. Measured 2026-10-27: 22 of 39 paused
+    triggers had a machine-readable owner (a ``Pause-owner:`` line on
+    alpha-engine-config-I6984), and 13 named no open issue at all — the
+    2026-08-07 ruling's own issue, I6617, closed the day it was filed. A pause
+    whose owner is closed is a latch: switched off, with nothing that will
+    ever ask whether it should come back.
+
+    Offline and shape-only, exactly like ``declaration_findings()``: it never
+    resolves the issue's state or compares ``re_exam`` to today (that needs a
+    tracker credential this repo does not hold, and is graded in
+    alpha-engine-config). Both directions are findings: a paused trigger with
+    no entry, and an entry whose trigger is no longer paused — a release
+    declaration that outlives its pause would read as an owner for nothing.
+    """
+    m = manifest if manifest is not None else load_manifest()
+    try:
+        rel = releases if releases is not None else load_releases()
+    except (OSError, ValueError) as exc:
+        return [{
+            "trigger": RELEASES.name, "surface": "manifest",
+            "kind": "trigger-release-unreadable",
+            "detail": f"release declarations unreadable ({type(exc).__name__}: {exc}).",
+        }]
+    declared = {k: v for k, v in rel.items() if not k.startswith("_")}
+    out: list[dict] = []
+    paused_keys = set()
+    for surface, name, _reason in paused_entries(m):
+        key = release_key(surface, name)
+        paused_keys.add(key)
+        entry = declared.get(key)
+        if not isinstance(entry, dict):
+            out.append({
+                "trigger": name, "surface": surface,
+                "kind": "trigger-release-undeclared",
+                "detail": (
+                    f"paused, but {RELEASES.name} has no {key!r} entry. Add one with "
+                    f"`issue` (the OPEN alpha-engine-config issue that owns switching "
+                    f"it back on), `re_exam` (YYYY-MM-DD) and `release_when` (the "
+                    f"condition that ends the pause). A pause with no owner is a latch."
+                ),
+            })
+            continue
+        issue = str(entry.get("issue", ""))
+        re_exam = str(entry.get("re_exam", ""))
+        if not DECLARATION_ISSUE_RE.match(issue):
+            out.append({
+                "trigger": name, "surface": surface,
+                "kind": "trigger-release-unowned",
+                "detail": (
+                    f"release entry carries issue={issue!r}, not a resolvable tracker "
+                    f"reference (expected e.g. 'alpha-engine-config-I6984')."
+                ),
+            })
+        try:
+            if not DECLARATION_DATE_RE.match(re_exam):
+                raise ValueError(re_exam)
+            date.fromisoformat(re_exam)
+        except ValueError:
+            out.append({
+                "trigger": name, "surface": surface,
+                "kind": "trigger-release-undated",
+                "detail": (
+                    f"release entry carries re_exam={re_exam!r}, not a real ISO date "
+                    f"(YYYY-MM-DD). Without one the pause has no expiry."
+                ),
+            })
+        if not str(entry.get("release_when", "")).strip():
+            out.append({
+                "trigger": name, "surface": surface,
+                "kind": "trigger-release-unconditioned",
+                "detail": "release entry has no `release_when`: nothing says what ends the pause.",
+            })
+    for key in sorted(set(declared) - paused_keys):
+        surface, _, name = key.partition(":")
+        out.append({
+            "trigger": name or key, "surface": surface if name else "unknown",
+            "kind": "trigger-release-orphaned",
+            "detail": (
+                f"{RELEASES.name} declares {key!r}, which is not a `paused` trigger in "
+                f"automation_pause.json. Remove the entry in the change that unpaused, "
+                f"deleted or renamed the trigger."
+            ),
+        })
     return out
 
 
@@ -1147,6 +1258,8 @@ def main() -> int:
                   "or the other")
             print("  ✓ every live ENABLED trigger in the account is declared paused or "
                   "kept, or is out of scope")
+            print("  ✓ every paused trigger declares its owning issue, re-exam date "
+                  "and release condition")
         for f in findings:
             print(f"  ✗ [{f['kind']}] {f['surface']}:{f['trigger']}")
             print(f"      {f['detail']}")

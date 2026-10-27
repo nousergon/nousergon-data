@@ -1725,3 +1725,82 @@ def test_retired_alarms_are_never_enforced(module, monkeypatch):
                         lambda name, enabled: acted.append(name))
     module.enforce(alarms_only=True)
     assert not (set(acted) & module.retired_alarm_names()), acted
+
+
+# ── release declarations for paused TRIGGERS (alpha-engine-config-I8981) ────
+
+RELEASES_PATH = INFRA / "automation_pause_releases.json"
+
+
+def _releases() -> dict:
+    return json.loads(RELEASES_PATH.read_text(encoding="utf-8"))
+
+
+def _kinds(findings: list[dict]) -> set[tuple[str, str]]:
+    return {(f["trigger"], f["kind"]) for f in findings}
+
+
+def test_every_paused_trigger_declares_a_release_on_main(module, manifest):
+    """GREEN direction: all paused triggers carry an owner, a date and a
+    condition today, and no declaration outlives its trigger."""
+    assert module.release_findings(manifest, _releases()) == []
+    assert module.release_findings() == []
+
+
+def test_release_keys_cover_exactly_the_paused_set(module, manifest):
+    keys = {k for k in _releases() if not k.startswith("_")}
+    paused = {module.release_key(s, n) for s, n, _ in module.paused_entries(manifest)}
+    assert keys == paused
+
+
+def test_a_paused_trigger_with_no_release_is_a_finding(module, manifest):
+    """RED proof — a newly paused trigger cannot land without an owner."""
+    rel = _releases()
+    rel.pop("events:alpha-engine-predictor-drift-check")
+    assert ("alpha-engine-predictor-drift-check", "trigger-release-undeclared") in \
+        _kinds(module.release_findings(manifest, rel))
+
+
+@pytest.mark.parametrize("field,value,kind", [
+    ("issue", "", "trigger-release-unowned"),
+    ("issue", "tracked by Brian", "trigger-release-unowned"),
+    ("re_exam", "", "trigger-release-undated"),
+    ("re_exam", "2026-02-31", "trigger-release-undated"),
+    ("release_when", " ", "trigger-release-unconditioned"),
+])
+def test_a_malformed_release_is_a_finding(module, manifest, field, value, kind):
+    rel = _releases()
+    rel["events:alpha-engine-daily-heal"][field] = value
+    assert ("alpha-engine-daily-heal", kind) in _kinds(module.release_findings(manifest, rel))
+
+
+def test_a_release_for_a_trigger_no_longer_paused_is_a_finding(module, manifest):
+    """An entry that outlives its pause reads as an owner for nothing."""
+    m = json.loads(json.dumps(manifest))
+    del m["paused"]["events_rules"]["alpha-engine-daily-heal"]
+    assert ("alpha-engine-daily-heal", "trigger-release-orphaned") in \
+        _kinds(module.release_findings(m, _releases()))
+
+
+def test_scheduler_group_names_key_with_the_group(module, manifest):
+    assert "scheduler:nousergon-data-collection/data-collection-shadow-sameday" in _releases()
+
+
+def test_check_reports_release_findings(module, monkeypatch):
+    """Wired into --check, so the 4-hourly pause-check-alert pages on a gap."""
+    sentinel = {"trigger": "x", "surface": "events",
+                "kind": "trigger-release-undeclared", "detail": "x"}
+    monkeypatch.setattr(module, "release_findings", lambda: [sentinel])
+    monkeypatch.setattr(module, "_live_state", lambda surface, name: (
+        "DISABLED" if name in module.paused_names() else "ENABLED"))
+    assert sentinel in module.check()
+
+
+def test_release_findings_never_move_live_state(module, monkeypatch):
+    def boom(*_a, **_k):
+        raise AssertionError("release_findings must not touch AWS")
+    monkeypatch.setattr(module, "_aws", boom)
+    monkeypatch.setattr(module, "_disable", boom)
+    rel = _releases()
+    rel["events:alpha-engine-daily-heal"]["issue"] = ""
+    module.release_findings(None, rel)
