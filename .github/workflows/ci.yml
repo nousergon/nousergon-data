@@ -7,7 +7,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Explicit types (alpha-engine-config-I11310): behaviour-identical to the bare
+  # key, and the shape the fleet's merge-group required-check guard recognises.
   merge_group:
+    types: [checks_requested]
 
 jobs:
   # config#2949: nousergon-data-PR936 shipped a `set -u` unbound-variable bug

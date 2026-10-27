@@ -43,9 +43,21 @@ name: Rehearsal Path Guard
 # action to local `git diff` against the supplied base SHA instead, which needs
 # no outbound API call at all and so cannot hit this failure class.
 
+# merge_group (alpha-engine-config-I11310): `rehearsal-path-guard` is a
+# REQUIRED context, so it must also report on a queue entry before a merge
+# queue can be enabled here (auto-merge-policy §7). A merge_group payload has
+# no `pull_request` object, so on that event: the `filter` step is skipped
+# and `mg_filter` diffs the entry's own `merge_group.base_sha`..`head_sha`
+# through check_rehearsal_path.weekly_critical_paths_touched (the same glob
+# list, pinned in lockstep with `filter`); and the guard reads the PR BODY
+# live by the PR number parsed from `merge_group.head_ref`. Both fail CLOSED:
+# an unreadable diff counts as weekly-critical, an unparseable head_ref or an
+# unreadable body fails the check.
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened]
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -56,11 +68,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 5
     outputs:
-      weekly_critical: ${{ steps.filter.outputs.weekly_critical }}
+      weekly_critical: ${{ steps.filter.outputs.weekly_critical || steps.mg_filter.outputs.weekly_critical }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
         id: filter
+        if: github.event_name == 'pull_request'
         with:
           token: ''
           base: ${{ github.event.pull_request.base.sha }}
@@ -78,6 +91,28 @@ jobs:
               - 'infrastructure/lambdas/collection-readiness-probe/**'
               - 'data_gate/run_manifest_predicate.py'
 
+      - name: Weekly-critical paths in this merge-group entry
+        id: mg_filter
+        if: github.event_name == 'merge_group'
+        env:
+          MG_BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD_SHA: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -uo pipefail
+          if git fetch --quiet --depth=1 origin "$MG_BASE_SHA" \
+             && changed=$(git diff --name-only "$MG_BASE_SHA" "$MG_HEAD_SHA"); then
+            hits=$(printf '%s\n' "$changed" | python3 -c 'import sys; sys.path.insert(0, "scripts"); from check_rehearsal_path import weekly_critical_paths_touched as w; print("\n".join(w([l for l in sys.stdin.read().splitlines() if l])))') || hits="(matcher failed)"
+          else
+            hits="(diff unreadable)"
+          fi
+          if [ -n "$hits" ]; then
+            printf 'weekly-critical in this entry:\n%s\n' "$hits"
+            echo "weekly_critical=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "No weekly-critical paths in this merge-group entry."
+            echo "weekly_critical=false" >> "$GITHUB_OUTPUT"
+          fi
+
   rehearsal-path-guard:
     needs: label
     if: needs.label.outputs.weekly_critical == 'true'
@@ -92,5 +127,20 @@ jobs:
 
       - name: Check Rehearsal-path trailer / exemption (weekly-sf-policy §7)
         env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          MG_HEAD_REF: ${{ github.event.merge_group.head_ref }}
           PR_BODY: ${{ github.event.pull_request.body }}
-        run: python3 scripts/check_rehearsal_path.py "${{ github.workspace }}"
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            pr=$(printf '%s' "$MG_HEAD_REF" | sed -nE 's#^refs/heads/gh-readonly-queue/.+/pr-([0-9]+)-[0-9a-f]+$#\1#p')
+            if [ -z "$pr" ]; then
+              echo "::error::Could not extract a PR number from merge_group.head_ref ('$MG_HEAD_REF'). Failing closed: the PR body cannot be read."
+              exit 1
+            fi
+            PR_BODY=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${pr}" --jq '.body // ""')
+            export PR_BODY
+            echo "merge_group entry for PR #${pr}: body read live."
+          fi
+          python3 scripts/check_rehearsal_path.py "$GITHUB_WORKSPACE"
