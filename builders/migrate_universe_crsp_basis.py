@@ -33,7 +33,12 @@ Per ticker the script:
   2. Applies polygon SPLITS to get the split-adjusted ``Close`` LEVEL
      (``corporate_actions.apply`` → ``_split_math.restate_series_for_splits``).
   3. Derives ``total_return_close`` from polygon DIVIDENDS
-     (``corporate_actions.get_dividends`` + ``total_return_series``).
+     (``corporate_actions.get_dividends`` + ``total_return_series``), queried
+     under polygon's own symbol for a class share (``BF-B`` -> ``BF.B``). When
+     the current symbol's dividends do not reach back to the window start, the
+     dividends the entity paid under its PRIOR tickers (polygon ticker events
+     plus ``collectors/data/sp500_known_retickers.json``) are folded in
+     (``fetch_prior_ticker_dividends``; alpha-engine-config-I12436).
   4. **Reconciles** the derived ``total_return_close`` against the retiring
      yfinance total-return ``Close`` (read from the LIVE ``universe`` library)
      per ticker: max relative deviation, classify within-tol vs OUT-OF-TOL.
@@ -262,6 +267,13 @@ class TickerOutcome:
     # unconfirmed split is diagnosed as exactly that, not a generic
     # "missing/doubled/mis-ratio'd" guess.
     unconfirmed_splits: list[str] = field(default_factory=list)
+    # Prior symbols whose dividends were folded in (alpha-engine-config-I12436):
+    # ``[{"symbol", "start", "end", "source", "dividends_added"}]``. Empty when
+    # the current symbol's dividend history had no gap.
+    prior_tickers: list[dict] = field(default_factory=list)
+    # True when the dividend history showed a gap and polygon was asked for the
+    # name's prior tickers (one ticker-events call, plus one per prior symbol).
+    prior_ticker_lookup: bool = False
 
 
 # ── raw price fetch (polygon adjusted=false, yfinance before polygon's reach) ──
@@ -576,6 +588,96 @@ def _describe_fetch_error(exc: BaseException) -> str:
     return name
 
 
+def _strict_call(
+    ticker: str,
+    kind: str,
+    fn,
+    *,
+    attempts: int,
+    sleep,
+    abort: threading.Event | None,
+):
+    """Call ``fn()`` STRICTLY: retry a retryable failure (429 the client could
+    not clear, 5xx, network) up to ``attempts`` times with exponential backoff,
+    and raise :class:`CorporateActionFetchError` when that is exhausted, on a
+    non-retryable failure, or once ``abort`` is set. Never returns a degraded
+    empty answer."""
+    for attempt in range(attempts):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001 - classified below
+            last = attempt == attempts - 1
+            if not _is_retryable_fetch_error(exc) or last or (
+                abort is not None and abort.is_set()
+            ):
+                raise CorporateActionFetchError(
+                    f"{ticker}: polygon {kind} fetch failed after "
+                    f"{attempt + 1} attempt(s) ({_describe_fetch_error(exc)})"
+                    f" — the name cannot be built without its "
+                    f"full {kind} history"
+                ) from None
+            wait = min(
+                CA_FETCH_BACKOFF_BASE_SECONDS * (2 ** attempt),
+                CA_FETCH_BACKOFF_CAP_SECONDS,
+            )
+            log.warning(
+                "%s: polygon %s fetch failed (%s) — waiting %.0fs, "
+                "attempt %d/%d",
+                ticker, kind, _describe_fetch_error(exc), wait,
+                attempt + 1, attempts,
+            )
+            sleep(wait)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
+class _PolygonSymbolClient:
+    """Sends polygon ITS symbol for a class-share store ticker.
+
+    The store keys class shares with a dash (``BF-B``, ``MOG-A``); polygon's
+    reference endpoints key them with a dot (``BF.B``). The raw-bars fetch
+    already maps through ``collectors.daily_closes._polygon_symbol``; the split,
+    dividend and ticker-event queries did not, so the 2026-10-26 build asked
+    polygon for ``BF-B`` dividends, got none, and BF-B and MOG-A drifted out of
+    tolerance by their whole cumulative yield (alpha-engine-config-I12436,
+    class 3). Every event is still keyed back to the STORE ticker by the
+    caller."""
+
+    def __init__(self, client):
+        self._client = client
+
+    def get_splits(self, ticker: str):
+        from collectors.daily_closes import _polygon_symbol
+
+        return self._client.get_splits(_polygon_symbol(ticker))
+
+    def get_dividends(self, ticker: str):
+        from collectors.daily_closes import _polygon_symbol
+
+        return self._client.get_dividends(_polygon_symbol(ticker))
+
+    def get_ticker_events(self, ticker: str):
+        from collectors.daily_closes import _polygon_symbol
+
+        return self._client.get_ticker_events(_polygon_symbol(ticker))
+
+
+def _strict_client(ticker: str, client):
+    """The polygon client to fetch with, built lazily; a client that cannot be
+    built fails the name (strict), never yields an empty history."""
+    if client is not None:
+        return client
+    try:
+        from polygon_client import polygon_client
+
+        return polygon_client()
+    except Exception as exc:  # noqa: BLE001 - construction failure: strict
+        raise CorporateActionFetchError(
+            f"{ticker}: polygon client could not be built "
+            f"({_describe_fetch_error(exc)}) — the name cannot be built without "
+            "its corporate-action history"
+        ) from None
+
+
 def fetch_corporate_actions(
     ticker: str,
     *,
@@ -593,37 +695,213 @@ def fetch_corporate_actions(
     or on a non-retryable failure, :class:`CorporateActionFetchError` is raised
     and the caller must not build the name. ``abort`` (set once any name has
     failed this way) cuts the wait short: the build is already lost.
+
+    Polygon is queried with its own symbol for a class-share ticker
+    (:class:`_PolygonSymbolClient`); the actions are keyed to ``ticker``.
     """
     sleep = sleep or time.sleep
+    query = _PolygonSymbolClient(_strict_client(ticker, client))
     results = []
     for kind, fn in (("splits", ca.get_splits), ("dividends", ca.get_dividends)):
-        for attempt in range(attempts):
-            try:
-                results.append(fn(ticker, client=client, strict=True))
-                break
-            except Exception as exc:  # noqa: BLE001 - classified below
-                last = attempt == attempts - 1
-                if not _is_retryable_fetch_error(exc) or last or (
-                    abort is not None and abort.is_set()
-                ):
-                    raise CorporateActionFetchError(
-                        f"{ticker}: polygon {kind} fetch failed after "
-                        f"{attempt + 1} attempt(s) ({_describe_fetch_error(exc)})"
-                        f" — the name cannot be built without its "
-                        f"full {kind} history"
-                    ) from None
-                wait = min(
-                    CA_FETCH_BACKOFF_BASE_SECONDS * (2 ** attempt),
-                    CA_FETCH_BACKOFF_CAP_SECONDS,
-                )
-                log.warning(
-                    "%s: polygon %s fetch failed (%s) — waiting %.0fs, "
-                    "attempt %d/%d",
-                    ticker, kind, _describe_fetch_error(exc), wait,
-                    attempt + 1, attempts,
-                )
-                sleep(wait)
+        results.append(_strict_call(
+            ticker, kind,
+            lambda fn=fn: fn(ticker, client=query, strict=True),
+            attempts=attempts, sleep=sleep, abort=abort,
+        ))
     return results[0], results[1]
+
+
+# ── prior tickers: dividends paid under an earlier symbol ─────────────────────
+#
+# alpha-engine-config-I12436, class 1 of the 2026-10-26 build (24 of its 46
+# out-of-tolerance names): polygon's ``/v3/reference/dividends?ticker=`` answers
+# for the symbol asked, so a name that changed ticker (EQR -> VMRK, BK -> BNY,
+# PSKY -> SKYD, a holdco reorg) loses every dividend paid before the change and
+# its total-return series drifts by the old symbol's cumulative yield. The build
+# now also asks polygon for the name's PRIOR tickers and folds in the dividends
+# each one paid while the entity held it.
+#
+# Budget: the free tier is 5 calls/min and the build already spends three per
+# name (splits, dividends, raw bars): ~9.4 h of the dispatcher's 12 h cap. A
+# fourth call for all ~909 names (~3 h) would not fit, so the prior-ticker
+# lookup runs only where the dividend history shows the gap a rename leaves:
+# no dividends at all, or a first ex-date more than ``PRIOR_TICKER_GAP_DAYS``
+# after the start of the window that matters (the later of the first price row
+# and ``--reconcile-start``). A name that has paid under one symbol through the
+# whole window is never queried, and a rename always opens such a gap.
+
+#: The curated renames polygon does not report as ``ticker_change`` (it returns
+#: no events for BK, verified 2026-08-12): consulted beside polygon's events.
+KNOWN_RETICKERS_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "collectors", "data", "sp500_known_retickers.json",
+)
+#: Longer than any regular payer's gap between ex-dates (annual: ~365 days).
+PRIOR_TICKER_GAP_DAYS = 400
+
+
+@dataclass(frozen=True)
+class PriorTicker:
+    """A symbol the entity traded under before ``end``, its rename date.
+
+    Dividends polygon lists under ``symbol`` count only when they went ex in
+    ``[start, end)``: before ``start`` (or on/after ``end``) the symbol belonged
+    to someone else, or the entity already traded under its next symbol.
+    ``start`` is ``None`` when the source does not say when the entity took
+    the symbol."""
+
+    symbol: str
+    start: str | None
+    end: str
+    source: str  # "polygon_ticker_events" | "known_retickers"
+
+
+def load_known_retickers(path: str = KNOWN_RETICKERS_PATH) -> list[dict]:
+    """The curated ``{"old", "new", "effective"}`` rename rows. A file that is
+    missing or malformed RAISES: silently reading it as "no renames" would put
+    the dividend gap it exists to close back into the build."""
+    with open(path, encoding="utf-8") as fh:
+        rows = json.load(fh)["retickers"]
+    out = []
+    for r in rows:
+        old, new, eff = r["old"], r["new"], r["effective"]
+        pd.Timestamp(eff)  # a malformed date fails here, loudly
+        out.append({"old": str(old), "new": str(new), "effective": str(eff)})
+    return out
+
+
+def _known_prior_tickers(ticker: str, retickers: list[dict]) -> list[PriorTicker]:
+    """Walk the curated renames backward from ``ticker`` (A -> B -> ticker)."""
+    by_new: dict[str, dict] = {}
+    for r in retickers:
+        by_new.setdefault(r["new"], r)
+    out: list[PriorTicker] = []
+    seen = {ticker}
+    cur = ticker
+    while cur in by_new:
+        row = by_new[cur]
+        old = row["old"]
+        if old in seen:
+            break  # a cycle in the curated file: stop, do not loop
+        seen.add(old)
+        prev = by_new.get(old)
+        out.append(PriorTicker(
+            symbol=old,
+            start=prev["effective"] if prev is not None else None,
+            end=row["effective"],
+            source="known_retickers",
+        ))
+        cur = old
+    return out
+
+
+def _polygon_prior_tickers(ticker: str, pairs: list[dict]) -> list[PriorTicker]:
+    """Prior symbols from ``PolygonClient.get_ticker_events`` rename pairs
+    (``[{"date", "old_ticker", "new_ticker"}]`` ascending): the entity held
+    pair i's ``old_ticker`` from pair i-1's date until pair i's date."""
+    ordered = sorted(pairs or [], key=lambda p: str(p.get("date") or ""))
+    out: list[PriorTicker] = []
+    prev_date: str | None = None
+    for p in ordered:
+        old, date = p.get("old_ticker"), p.get("date")
+        if not old or not date:
+            continue
+        if old != ticker:
+            out.append(PriorTicker(
+                symbol=str(old), start=prev_date, end=str(date),
+                source="polygon_ticker_events",
+            ))
+        prev_date = str(date)
+    return out
+
+
+def dividend_history_gap(
+    dividend_actions: list, *, window_start: pd.Timestamp | None,
+) -> bool:
+    """True when the dividends under the current symbol do not reach back to
+    ``window_start``: none at all, or a first ex-date more than
+    ``PRIOR_TICKER_GAP_DAYS`` after it. ``window_start`` ``None`` (no price
+    history to measure from) reads only "none at all" as a gap."""
+    if not dividend_actions:
+        return True
+    if window_start is None:
+        return False
+    first = min(pd.Timestamp(a.ex_date).normalize() for a in dividend_actions)
+    return (first - pd.Timestamp(window_start).normalize()).days > PRIOR_TICKER_GAP_DAYS
+
+
+def fetch_prior_ticker_dividends(
+    ticker: str,
+    dividend_actions: list,
+    *,
+    client=None,
+    window_start: pd.Timestamp | None = None,
+    retickers: list[dict] | None = None,
+    attempts: int = CA_FETCH_ATTEMPTS,
+    sleep=None,
+    abort: threading.Event | None = None,
+) -> tuple[list, list[dict]]:
+    """Fold in the dividends ``ticker``'s entity paid under its PRIOR symbols.
+
+    Returns ``(dividend_actions, prior_report)``. When the current symbol's
+    dividend history has no gap (:func:`dividend_history_gap`) nothing is
+    fetched and the input comes back unchanged with an empty report. Otherwise
+    polygon's ticker events for ``ticker`` and the curated renames name the
+    prior symbols; each one's dividends inside its ``[start, end)`` span are
+    added, keyed to ``ticker``, skipping any ex-date the list already has (so a
+    dividend polygon already files under the new symbol is never counted
+    twice). Every polygon call is STRICT (:func:`_strict_call`): a lookup that
+    cannot be answered fails the name, never reads as "no prior tickers".
+    """
+    if not dividend_history_gap(dividend_actions, window_start=window_start):
+        return list(dividend_actions), []
+    sleep = sleep or time.sleep
+    query = _PolygonSymbolClient(_strict_client(ticker, client))
+    retickers = load_known_retickers() if retickers is None else retickers
+
+    pairs = _strict_call(
+        ticker, "ticker-events", lambda: query.get_ticker_events(ticker),
+        attempts=attempts, sleep=sleep, abort=abort,
+    )
+    priors: dict[str, PriorTicker] = {}
+    # The curated file first, then polygon's events, which win for a symbol
+    # both name: polygon dates the span the entity held it at both ends.
+    for pt in _known_prior_tickers(ticker, retickers) + _polygon_prior_tickers(ticker, pairs):
+        priors[pt.symbol] = pt
+
+    merged = list(dividend_actions)
+    have = {pd.Timestamp(a.ex_date).normalize() for a in merged}
+    report: list[dict] = []
+    for pt in sorted(priors.values(), key=lambda p: p.end):
+        events = _strict_call(
+            ticker, f"dividends (prior ticker {pt.symbol})",
+            lambda pt=pt: query.get_dividends(pt.symbol),
+            attempts=attempts, sleep=sleep, abort=abort,
+        )
+        lo = pd.Timestamp(pt.start).normalize() if pt.start else None
+        hi = pd.Timestamp(pt.end).normalize()
+        keep = []
+        for ev in events or []:
+            ex = pd.Timestamp(ev["ex_dividend_date"]).normalize()
+            if ex >= hi or (lo is not None and ex < lo) or ex in have:
+                continue
+            have.add(ex)
+            keep.append({**ev, "ticker": ticker})
+        added = ca.dividends_from_events(keep)
+        merged.extend(added)
+        report.append({
+            "symbol": pt.symbol, "start": pt.start, "end": pt.end,
+            "source": pt.source, "dividends_added": len(added),
+        })
+    merged.sort(key=lambda a: pd.Timestamp(a.ex_date))
+    if report:
+        log.info(
+            "%s: dividend history gap — folded in %d dividend(s) from prior "
+            "ticker(s) %s",
+            ticker, sum(r["dividends_added"] for r in report),
+            [r["symbol"] for r in report],
+        )
+    return merged, report
 
 
 # ── core: per-ticker basis reconstruction (pure, network-free) ────────────────
@@ -965,6 +1243,171 @@ def reconcile_total_return(
     )
 
 
+# ── declared classes of known total-return divergence ────────────────────────
+#
+# alpha-engine-config-I12436, classes 2, 4 and 5 of the 2026-10-26 build: names
+# whose total-return residual is a real difference in how the two sides treat
+# an event, not a fetch bug (classes 1 and 3, prior tickers and class-share
+# symbols, are FIXED above instead of declared). Each row says what the event
+# was, when, and the largest deviation it can explain; it expires so it is
+# re-read rather than carried.
+#
+# CLASSIFICATION ONLY. A declared row does NOT make a residual "explained" and
+# does NOT pass the gate: ``explained`` still comes only from the operator's
+# ``--known-divergence``. The audit records each out-of-tolerance name's class
+# (or that it has none), whether its deviation is inside the declared bound, and
+# whether the row has expired, so a residual that outgrows its event, or a name
+# with no event at all, is told apart from the ones already understood.
+
+DIVERGENCE_CLASSES = ("spin_off", "stock_dividend", "special_distribution")
+
+
+@dataclass(frozen=True)
+class DeclaredDivergence:
+    """One name whose total-return residual an identified event explains."""
+
+    ticker: str
+    divergence_class: str  # one of DIVERGENCE_CLASSES
+    event: str
+    event_when: str  # ISO date, or its YYYY-MM / YYYY prefix when only that is sourced
+    max_rel_dev_bound: float  # the largest residual the event explains
+    evidence: str
+    expires: str  # YYYY-MM-DD: re-read on or after this date
+
+    def __post_init__(self):
+        if self.divergence_class not in DIVERGENCE_CLASSES:
+            raise ValueError(f"{self.ticker}: unknown class {self.divergence_class!r}")
+        if not 0.0 < self.max_rel_dev_bound < 1.0:
+            raise ValueError(f"{self.ticker}: bound {self.max_rel_dev_bound!r} not in (0, 1)")
+        if not self.event.strip() or not self.evidence.strip():
+            raise ValueError(f"{self.ticker}: event and evidence are required")
+        pd.Timestamp(self.expires)
+        if len(self.event_when) not in (4, 7, 10):
+            raise ValueError(f"{self.ticker}: event_when {self.event_when!r} is not YYYY[-MM[-DD]]")
+        pd.Timestamp(self.event_when)
+
+
+_I12436 = (
+    "alpha-engine-config-I12436, classification of the 2026-10-26 "
+    "universe-crsp-basis-build residuals"
+)
+# The event is public corporate history and the build log puts the name's
+# worst deviation on it; the filing itself has not been re-read for the row.
+_PUBLIC = f"public corporate-event history, max deviation on the event; {_I12436}"
+
+DECLARED_RECONCILE_DIVERGENCES: tuple[DeclaredDivergence, ...] = (
+    # ── class 2: spin-offs the dividend feed carries no record of ──────────────
+    DeclaredDivergence(
+        "CTVA", "spin_off", "VYLR spin-off, 1 VYLR per CTVA share", "2026-10-01", 0.60,
+        f"corporate_actions.declared.DECLARED_SPINOFFS (alpha-engine-config-I11806); {_I12436}",
+        "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "HON", "spin_off", "Solstice Advanced Materials spin-off", "2025-10-30", 0.08,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "IBM", "spin_off", "Kyndryl spin-off", "2021-11", 0.06,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "LEN", "spin_off", "Millrose Properties spin-off", "2025-02", 0.05,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "BDX", "spin_off",
+        "Biosciences & Diagnostic Solutions separation (Waters Reverse Morris Trust)",
+        "2026", 0.04,
+        _PUBLIC, "2027-01-31",
+    ),
+    # ── class 4: a stock dividend is a share distribution, not cash ────────────
+    DeclaredDivergence(
+        "CBSH", "stock_dividend", "annual 5% stock dividend, each December", "2020-12", 0.40,
+        f"Commerce Bancshares' annual 5% stock dividend: 1.05^6 = 1.34 over six "
+        f"Decembers matches the residual; {_I12436}", "2027-01-31",
+    ),
+    # ── class 5: a special or merger distribution one side carries ─────────────
+    DeclaredDivergence(
+        "HR", "special_distribution", "special cash distribution with the HTA merger",
+        "2022-07", 0.10,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "PSA", "special_distribution", "special cash dividend", "2023-01", 0.15,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "RRX", "special_distribution",
+        "distribution recorded around the Rexnord PMC combination", "2021-10", 0.06,
+        f"the build log's nearest action is a dividend-feed record at the deal; {_I12436}", "2027-01-31",
+    ),
+)
+
+
+def _declared_by_ticker() -> dict[str, DeclaredDivergence]:
+    out: dict[str, DeclaredDivergence] = {}
+    for d in DECLARED_RECONCILE_DIVERGENCES:
+        if d.ticker in out:
+            raise ValueError(f"{d.ticker} is declared twice")
+        out[d.ticker] = d
+    return out
+
+
+def classify_divergences(
+    records: list[ReconcileRecord],
+    *,
+    today: str | pd.Timestamp | None = None,
+    declared: tuple[DeclaredDivergence, ...] | None = None,
+) -> dict:
+    """Classify every out-of-tolerance / no-overlap record against the declared
+    rows. Report only: nothing here changes a record's ``explained``.
+
+    Returns ``{"classified": [...], "unclassified": [tickers],
+    "exceeds_bound": [tickers], "expired": [tickers]}``. A classified row
+    carries the record's ``max_rel_dev`` beside its declared bound."""
+    table = (
+        _declared_by_ticker() if declared is None
+        else {d.ticker: d for d in declared}
+    )
+    now = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp(
+        datetime.now(timezone.utc).date()
+    )
+    classified: list[dict] = []
+    unclassified: list[str] = []
+    exceeds: list[str] = []
+    expired: list[str] = []
+    for r in records:
+        if r.status == "within_tol":
+            continue
+        d = table.get(r.ticker)
+        if d is None:
+            unclassified.append(r.ticker)
+            continue
+        inside = bool(np.isfinite(r.max_rel_dev) and r.max_rel_dev <= d.max_rel_dev_bound)
+        is_expired = now >= pd.Timestamp(d.expires).normalize()
+        if not inside:
+            exceeds.append(r.ticker)
+        if is_expired:
+            expired.append(r.ticker)
+        classified.append({
+            "ticker": r.ticker,
+            "class": d.divergence_class,
+            "event": d.event,
+            "event_when": d.event_when,
+            "max_rel_dev": r.max_rel_dev,
+            "max_rel_dev_bound": d.max_rel_dev_bound,
+            "within_bound": inside,
+            "expired": is_expired,
+            "explained": r.explained,
+        })
+    return {
+        "classified": classified,
+        "unclassified": unclassified,
+        "exceeds_bound": exceeds,
+        "expired": expired,
+    }
+
+
 # ── orchestration ─────────────────────────────────────────────────────────────
 
 
@@ -1140,6 +1583,10 @@ def migrate_universe_crsp_basis(
         log.info("Spilling featured frames to %s until the write pass", spill_dir)
     slot_of = {t: i for i, t in enumerate(targets)}
 
+    # The curated renames, read once; a missing or malformed file fails the
+    # build here, before any polygon budget is spent.
+    retickers = load_known_retickers()
+
     # Set when any name's corporate actions could not be fetched: the build can
     # no longer pass (the audit gate needs zero errors), so the remaining names
     # are skipped instead of spending hours of polygon budget on a lost run.
@@ -1175,6 +1622,29 @@ def migrate_universe_crsp_basis(
                 log.error(
                     "%s — STOPPING the build: no name is built on corporate "
                     "actions it could not fetch (alpha-engine-config-I12436)",
+                    exc,
+                )
+                return TickerOutcome(
+                    ticker, "error", error=f"corporate_actions: {exc}",
+                )
+
+            # Dividends paid under an earlier symbol (alpha-engine-config-I12436,
+            # class 1). Asked only when the history shows a rename's gap.
+            window_start = pd.Timestamp(raw_df.index.min()).normalize()
+            if reconcile_start is not None:
+                window_start = max(window_start, pd.Timestamp(reconcile_start).normalize())
+            lookup = dividend_history_gap(dividend_actions, window_start=window_start)
+            try:
+                dividend_actions, prior_tickers = fetch_prior_ticker_dividends(
+                    ticker, dividend_actions, client=client,
+                    window_start=window_start, retickers=retickers, abort=abort,
+                )
+            except CorporateActionFetchError as exc:
+                abort.set()
+                log.error(
+                    "%s — STOPPING the build: no name is built on a dividend "
+                    "history whose prior tickers could not be read "
+                    "(alpha-engine-config-I12436)",
                     exc,
                 )
                 return TickerOutcome(
@@ -1217,6 +1687,8 @@ def migrate_universe_crsp_basis(
                 n_splits=len(split_actions),
                 n_dividends=len(dividend_actions),
                 unconfirmed_splits=unconfirmed_splits,
+                prior_tickers=prior_tickers,
+                prior_ticker_lookup=lookup,
             )
 
             if apply:
@@ -1288,6 +1760,8 @@ def _run_and_report(
     fetch_empty: list[str] = []
     unconfirmed_splits: list[str] = []
     aborted: list[str] = []
+    prior_ticker_dividends: list[dict] = []
+    prior_ticker_lookups = 0
     written = 0
 
     for o in outcomes:
@@ -1304,12 +1778,18 @@ def _run_and_report(
             log.error("CRSP migration error for %s: %s", o.ticker, o.error)
         if o.unconfirmed_splits:
             unconfirmed_splits.extend(o.unconfirmed_splits)
+        if o.prior_ticker_lookup:
+            prior_ticker_lookups += 1
+        if o.prior_tickers:
+            prior_ticker_dividends.append({"ticker": o.ticker, "prior": o.prior_tickers})
 
     within_tol = [r for r in records if r.status == "within_tol"]
     out_of_tol = [r for r in records if r.status == "out_of_tol"]
     no_overlap = [r for r in records if r.status == "no_overlap"]
     # FAIL-LOUD set: every out-of-tol or no-overlap record not explained.
     unexplained = [r for r in records if not r.explained]
+    # Report-only classification of those residuals (alpha-engine-config-I12436).
+    divergence_classes = classify_divergences(records)
 
     # ── WRITE scratch (apply) — only when the reconcile gate PASSED ───────────
     # alpha-engine-config-I12684: this pass used to run before the gate, so the
@@ -1396,6 +1876,14 @@ def _run_and_report(
         "errors_count": len(errors),
         "aborted_count": len(aborted),
         "unconfirmed_splits_count": len(unconfirmed_splits),
+        # Names whose dividend history showed a rename's gap, so polygon was
+        # asked for their prior tickers; and what each prior symbol added
+        # (alpha-engine-config-I12436).
+        "prior_ticker_lookups_count": prior_ticker_lookups,
+        "prior_ticker_dividends_count": sum(
+            p["dividends_added"] for d in prior_ticker_dividends for p in d["prior"]
+        ),
+        "prior_ticker_dividends": prior_ticker_dividends,
         "written_count": written,
         "elapsed_seconds": round(elapsed, 1),
         "workers": workers,
@@ -1417,6 +1905,12 @@ def _run_and_report(
         # fetched (the build was already lost; alpha-engine-config-I12436).
         "aborted": aborted,
         "known_divergence_tickers": sorted(known_divergence_tickers),
+        # Each out-of-tolerance name's declared event class, or none
+        # (DECLARED_RECONCILE_DIVERGENCES). Report only: it never passes the
+        # gate; ``unexplained_count`` above is unchanged by it.
+        "divergence_classes": divergence_classes,
+        "classified_out_of_tol_count": len(divergence_classes["classified"]),
+        "unclassified_out_of_tol_count": len(divergence_classes["unclassified"]),
     }
 
     # Persist the report BEFORE raising so the evidence survives a fail-loud.

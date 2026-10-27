@@ -286,15 +286,21 @@ class _FakePolygon:
     """Per-ticker polygon double: get_splits / get_dividends return the raw
     polygon event-dict shapes corporate_actions.get_splits/get_dividends parse."""
 
-    def __init__(self, splits: dict, dividends: dict):
+    def __init__(self, splits: dict, dividends: dict, ticker_events: dict | None = None):
         self._splits = splits
         self._dividends = dividends
+        self._ticker_events = ticker_events or {}
 
     def get_splits(self, ticker):
         return self._splits.get(ticker, [])
 
     def get_dividends(self, ticker):
         return self._dividends.get(ticker, [])
+
+    def get_ticker_events(self, ticker):
+        # PolygonClient.get_ticker_events rename pairs; none unless given
+        # (alpha-engine-config-I12436 prior-ticker dividends).
+        return self._ticker_events.get(ticker, [])
 
 
 def _patch_orchestration(monkeypatch, *, old_closes: dict, scratch_lib=None):
