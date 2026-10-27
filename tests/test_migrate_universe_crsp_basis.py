@@ -303,9 +303,15 @@ class _FakePolygon:
         return self._ticker_events.get(ticker, [])
 
 
-def _patch_orchestration(monkeypatch, *, old_closes: dict, scratch_lib=None):
+def _patch_orchestration(monkeypatch, *, old_closes: dict, scratch_lib=None,
+                         gate_axis: str = "total_return"):
     """Wire the migration's live (read-only) universe lib, scratch lib, and s3
-    audit so the orchestration runs fully in-memory."""
+    audit so the orchestration runs fully in-memory.
+
+    ``gate_axis`` pins which reconcile axis gates the build. The tests written
+    for the total-return gate keep it; ``tests/test_crsp_basis_gate_on_close_i12436.py``
+    covers the ``close`` gate the build defaults to (alpha-engine-config-I12436)."""
+    monkeypatch.setattr(m, "DEFAULT_GATE_AXIS", gate_axis)
     live_lib = MagicMock()
     live_lib.list_symbols.return_value = list(old_closes.keys())
 
