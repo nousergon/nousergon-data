@@ -489,6 +489,113 @@ def test_default_build_is_d31s_code_with_arcticdb_read_before_and_to_d_minus_1(m
     assert kw["registry_client"] == "RAW" and kw["recorder"] is recorder
     assert seen["arctic"]["end"] == pd.Timestamp(D) == seen["arctic"]["before"]
     assert seen["arctic"]["recorder"] is recorder
+    # No pins: the library as it is now, the reader D31 itself uses.
+    assert seen["arctic"]["library_reader"] is None
+
+
+def test_default_build_reads_arcticdb_as_of_the_moment_d31_recorded(monkeypatch):
+    """alpha-engine-config-I12728: the read is pinned to D31's ``as_of``, not read live."""
+    from features import compute
+    from features.input_record import parse_refs
+
+    seen: dict = {}
+
+    def fake_build_feature_frame(date_str, bucket, **kw):
+        kw["price_source_loader"]("S3", bucket)
+        return "BUILD"
+
+    def fake_load_price_source(s3, bucket, **kw):
+        seen["arctic"] = kw
+
+    def fake_reader(bucket, pins):
+        seen["reader_for"] = (bucket, pins)
+        return "AS_OF_READER"
+
+    monkeypatch.setattr(compute, "build_feature_frame", fake_build_feature_frame)
+    monkeypatch.setattr(compute, "_load_price_source", fake_load_price_source)
+    monkeypatch.setattr(sr, "as_of_library_reader", fake_reader)
+    pins = parse_refs(_arctic_refs(_history(0.0)))
+    recorder = InputRecorder(BUCKET)
+    assert sr._default_build(D, BUCKET, s3="S3", registry_client="RAW", recorder=recorder, pins=pins) == "BUILD"
+    assert seen["reader_for"] == (BUCKET, pins)
+    assert seen["arctic"]["library_reader"] == "AS_OF_READER"
+    assert seen["arctic"]["end"] == pd.Timestamp(D) == seen["arctic"]["before"]
+
+
+# ---------------------------------------------------------------------------
+# Guard 6: the ArcticDB history D31 read (alpha-engine-config-I12728)
+# ---------------------------------------------------------------------------
+
+D31_AS_OF = "2026-10-02T22:29:34.000000Z"
+
+
+def _history(shift: float) -> dict[str, pd.DataFrame]:
+    """The universe history before D; ``shift`` != 0 is a rewritten history."""
+    idx = pd.date_range("2026-09-28", periods=4, freq="B")
+    return {t: pd.DataFrame({"Close": [100.0 + i + shift + n for n in range(4)]}, index=idx) for i, t in enumerate(TICKERS[:3])}
+
+
+def _arctic_refs(frames, library: str = "universe", as_of: str = D31_AS_OF) -> list[dict]:
+    recorder = InputRecorder(BUCKET)
+    recorder.arctic_loaded(library, frames, end=D, lookback_days=1000, before=D, as_of=as_of)
+    return recorder.freeze()
+
+
+def _d31_records_arctic(s3, frames) -> None:
+    key = _manifest_key("D31", "01K6D31AAAAAAAAAAAAAAAAAAA")
+    doc = json.loads(_read(s3, key))
+    doc["inputs"] = doc["inputs"] + _arctic_refs(frames)
+    _put(s3, key, json.dumps(doc).encode())
+
+
+def _build_reading(frames, library: str = "universe"):
+    def build(trading_day, bucket, *, recorder, **kw):
+        out = _fake_build(trading_day, bucket, recorder=recorder, **kw)
+        recorder.arctic_loaded(library, frames, end=D, lookback_days=1000, before=D, as_of="2026-10-05T12:20:00.000000Z")
+        return out
+
+    return build
+
+
+def _regrade_with(world, build):
+    s3 = world["s3"]
+    before = _versions(s3)
+    result = sr.regrade(D, bucket=BUCKET, client=s3, now=NOW, build=build, code_sha="c" * 40)
+    return result, before
+
+
+def test_the_same_arcticdb_history_rebuilds_and_the_marker_names_d31s_moment(world):
+    _d31_records_arctic(world["s3"], _history(0.0))
+    result, _ = _regrade_with(world, _build_reading(_history(0.0)))
+    assert result["status"] == "ok", result
+    marker = json.loads(_read(world["s3"], f"features/{D}/settlement.json"))
+    assert marker["inputs"]["arcticdb_as_of_d31"] == {"universe": D31_AS_OF}
+
+
+def test_refused_when_the_arcticdb_history_before_d_was_rewritten(world):
+    """The 10-23 case: a weekly rewrote the history, and D31's version could not be read back."""
+    _d31_records_arctic(world["s3"], _history(0.0))
+    result, before = _regrade_with(world, _build_reading(_history(0.5)))
+    assert result["status"] == "error", result
+    assert "ArcticDB read could not be reproduced" in result["error"]
+    assert "arcticdb/universe" in result["error"] and D31_AS_OF in result["error"]
+    assert _versions(world["s3"]) == before
+
+
+def test_refused_when_the_rebuild_never_reads_a_library_d31_recorded(world):
+    _d31_records_arctic(world["s3"], _history(0.0))
+    result, before = _regrade_with(world, _fake_build)
+    assert result["status"] == "error", result
+    assert "never read the library D31 recorded" in result["error"]
+    assert _versions(world["s3"]) == before
+
+
+def test_refused_when_the_rebuild_reads_a_library_d31_did_not_record(world):
+    _d31_records_arctic(world["s3"], _history(0.0))
+    result, before = _regrade_with(world, _build_reading(_history(0.0), library="macro"))
+    assert result["status"] == "error", result
+    assert "arcticdb/macro: the rebuild read a library D31 did not record" in result["error"]
+    assert _versions(world["s3"]) == before
 
 
 def test_the_d17_freshness_bound_covers_this_morning_and_excludes_saturday():
