@@ -558,16 +558,23 @@ Resources:
   # SF (ARCHITECTURE §36: "adding redundant scheduled paths 'for safety' is
   # the wrong fix"). Both are non-blocking observability producers, never
   # trading gates, so a plain scheduled invoke (no SF Catch/fail-soft
-  # plumbing needed) is the correct-weight mechanism. 13:40 UTC = after the
-  # preopen SF's observed ~13:15 P99 completion, so both checks observe the
+  # plumbing needed) is the correct-weight mechanism. 14:40 UTC = after the
+  # preopen SF has finished in BOTH DST regimes, so both checks observe the
   # SAME predictions/{trading_day}.json artifact they scored against when
-  # they ran inside the SF.
+  # they ran inside the SF. The preopen trigger is 05:15 America/Los_Angeles
+  # (DST-aware), i.e. 12:15Z under PDT and 13:15Z under PST, and runs 15-50
+  # min (measured 10-08..10-28, worst SUCCEEDED 48 min). The old 13:40Z sat
+  # after it under PDT only; under PST it fired mid-run. A fixed UTC time
+  # that is safe in both regimes needs no edit at either changeover; moving
+  # these to AWS::Scheduler::Schedule would rename the resource type that
+  # automation_pause.json, the freshness registry and the observability
+  # rows key on, for no behavioural gain.
   PredictorHealthCheckTrigger:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-predictor-health-check
-      Description: Weekday 13:40 UTC — daily predictor model health (IC, hit rate, calibration, retrain triggers), re-homed off the preopen SF (alpha-engine-config-I2722)
-      ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
+      Description: Weekday 14:40 UTC — daily predictor model health (IC, hit rate, calibration, retrain triggers), re-homed off the preopen SF (alpha-engine-config-I2722)
+      ScheduleExpression: 'cron(40 14 ? * MON-FRI *)'
       # UN-PAUSED 2026-08-26 (Brian ruling, alpha-engine-config-I8704). Paused
       # 2026-08-07 with the rest of the response plane (config-I6617); restored
       # per-entry, the same shape as alpha-engine-pipeline-watchdog-daily
@@ -589,6 +596,11 @@ Resources:
         - Id: predictor-health-check
           Arn: !Ref PredictorHealthCheckLambdaArn
           Input: '{"action": "check"}'
+          # Bounded retry: a once-a-day check needs at most a couple of
+          # re-deliveries, not the AWS default of 185 (cost gate).
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
 
   PredictorHealthCheckTriggerPermission:
     Type: AWS::Lambda::Permission
@@ -610,8 +622,8 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: alpha-engine-predictor-drift-check
-      Description: Weekday 13:40 UTC — daily prediction-drift producer (config#1853), re-homed off the preopen SF (alpha-engine-config-I2722)
-      ScheduleExpression: 'cron(40 13 ? * MON-FRI *)'
+      Description: Weekday 14:40 UTC — daily prediction-drift producer (config#1853), re-homed off the preopen SF (alpha-engine-config-I2722)
+      ScheduleExpression: 'cron(40 14 ? * MON-FRI *)'
       # PAUSED 2026-08-07 (Brian ruling — see infrastructure/automation_pause.json).
       # State lives here, not only live in AWS: deploy-infrastructure.yml re-applies
       # this stack on EVERY push to main, so a console-only disable comes back on the
@@ -621,6 +633,11 @@ Resources:
         - Id: predictor-drift-check
           Arn: !Ref PredictorLambdaArn
           Input: '{"action": "check_drift"}'
+          # Bounded retry: a once-a-day check needs at most a couple of
+          # re-deliveries, not the AWS default of 185 (cost gate).
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
 
   PredictorDriftCheckTriggerPermission:
     Type: AWS::Lambda::Permission
