@@ -25,10 +25,14 @@ except the settled bar:
   features from the NEXT week's alternative partition;
 * ``staging/daily_closes/*`` is read LIVE. That is the settled object D17 has
   just written, and it is the one input whose change is the point;
-* ArcticDB is read live with ``before = end = D-1``, as D31 reads it
-  (``exclude_trading_day_arctic_rows``), so day D-1's row always comes from
-  the daily_closes delta. The read is recorded (content digest plus ``as_of``)
-  like D31's.
+* ArcticDB is read AS OF the moment D31 recorded, with ``before = end = D-1``
+  as D31 reads it (``exclude_trading_day_arctic_rows``), so day D-1's row
+  always comes from the daily_closes delta. The read is recorded (content
+  digest plus ``as_of``) like D31's, and guard 6 requires its digest to equal
+  D31's. Read live, a Saturday weekly (D13) or a D18 append that rewrote the
+  history before D-1 rebuilt Friday on a different history without saying so:
+  ``features/2026-10-23`` moved 7 factor loadings by up to 0.33 sigma with
+  every close identical (alpha-engine-config-I12728).
 
 The corporate-action registry is built from the unpinned client, exactly as
 D31 builds it: it keeps its own state and applies a split exactly once.
@@ -50,6 +54,13 @@ GUARDS, each a refusal that writes nothing:
    snapshot with a known-defective one.
 5. The rebuild produces every feature group D31 published, so no group is
    left provisional beside rebuilt ones.
+6. Every ArcticDB library D31 recorded is read back to D31's digest, and the
+   rebuild reads no library D31 did not record. The ``as_of`` read is how the
+   version is FOUND; the digest is what proves it. A version pruned since
+   (alpha-engine-config-I12115) cannot be read back, and a D31 record with no
+   ``as_of`` is read as the library is now; either way a changed history
+   refuses here, and the snapshot stays provisional, as guard 3 leaves it when
+   an S3 set changed.
 
 IDEMPOTENT. A run that finds ``features/{D-1}/settlement.json`` naming the
 current daily_closes VersionId, with every key it rebuilt still at the version
@@ -79,6 +90,7 @@ exactly which rows stayed provisional.
 from __future__ import annotations
 
 import datetime as dt
+import functools
 import hashlib
 import json
 import logging
@@ -86,8 +98,13 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from typing import Any
 
-from features.input_record import InputRecorder, RecordedInputs, parse_refs
-from shadow.recompute_lineage import PinnedS3, ReadOnlyViolation
+from features.input_record import (
+    ARCTIC_SCHEME,
+    InputRecorder,
+    RecordedInputs,
+    parse_refs,
+)
+from shadow.recompute_lineage import PinnedS3, ReadOnlyViolation, as_of_library_reader
 
 log = logging.getLogger(__name__)
 
@@ -427,18 +444,56 @@ class SettledInputsS3(PinnedS3):
 # ---------------------------------------------------------------------------
 
 
-def _live_price_source(trading_day: str, recorder: InputRecorder) -> Callable[[Any, str], Any]:
-    """ArcticDB read live, ``before = end = D-1``, recorded like D31's read."""
+def _pinned_price_source(
+    trading_day: str,
+    recorder: InputRecorder,
+    *,
+    bucket: str,
+    pins: RecordedInputs | None,
+) -> Callable[[Any, str], Any]:
+    """ArcticDB read AS OF D31's recorded moment, ``before = end = D-1``, recorded like D31's read.
+
+    ``pins`` None reads the library as it is now (the reader D31 itself uses).
+    Either way guard 6 (:func:`arctic_problems`) checks the digest.
+    """
     import pandas as pd
 
     from features import compute
 
     day = pd.Timestamp(trading_day)
+    reader = as_of_library_reader(bucket, pins) if pins is not None and pins.arctic else None
 
-    def load(s3: Any, bucket: str) -> Any:
-        return compute._load_price_source(s3, bucket, end=day, before=day, recorder=recorder)
+    def load(s3: Any, bucket_arg: str) -> Any:
+        return compute._load_price_source(
+            s3, bucket_arg, end=day, before=day, recorder=recorder, library_reader=reader,
+        )
 
     return load
+
+
+def arctic_problems(pins: RecordedInputs, refs: Iterable[Mapping[str, Any]]) -> list[str]:
+    """Guard 6: every ArcticDB library D31 recorded reads back to D31's digest.
+
+    ``refs`` is the rebuild's own recorded inputs. A library on one side only is
+    a finding too: a rebuild that skipped a library D31 read, or read one D31
+    did not, did not rebuild from D31's inputs.
+    """
+    rebuilt = parse_refs([r for r in refs if str(r.get("key") or "").startswith(ARCTIC_SCHEME)]).arctic
+    out: list[str] = []
+    for library in sorted(set(pins.arctic) | set(rebuilt)):
+        recorded, read = pins.arctic.get(library), rebuilt.get(library)
+        if recorded is None:
+            out.append(f"arcticdb/{library}: the rebuild read a library D31 did not record")
+        elif read is None:
+            out.append(f"arcticdb/{library}: the rebuild never read the library D31 recorded")
+        elif read.digest != recorded.digest:
+            out.append(
+                f"arcticdb/{library}: read as of {recorded.as_of or 'now (D31 recorded no as_of)'} it digests "
+                f"to sha256:{read.digest[:12]}, but D31 recorded sha256:{recorded.digest[:12]}: the history "
+                "before the settled bar changed since D31 and D31's version could not be read back "
+                "(alpha-engine-config-I12728)"
+            )
+    return out
 
 
 def _default_build(
@@ -448,6 +503,7 @@ def _default_build(
     s3: Any,
     registry_client: Any,
     recorder: InputRecorder,
+    pins: RecordedInputs | None = None,
 ) -> Any:
     from features import compute
 
@@ -458,7 +514,7 @@ def _default_build(
         registry_client=registry_client,
         recorder=recorder,
         exclude_trading_day_arctic_rows=True,
-        price_source_loader=_live_price_source(trading_day, recorder),
+        price_source_loader=_pinned_price_source(trading_day, recorder, bucket=bucket, pins=pins),
     )
 
 
@@ -583,7 +639,7 @@ def regrade(
         facade = SettledInputsS3(client, pins)
         s3 = recorder.wrap(facade)
         try:
-            frame_build = (build or _default_build)(
+            frame_build = (build or functools.partial(_default_build, pins=pins))(
                 trading_day,
                 bucket,
                 s3=s3,
@@ -609,6 +665,11 @@ def regrade(
         if frame_build.features_df is None:
             raise RegradeRefused("the rebuild loaded no price data")
         input_refs = recorder.freeze()
+        arctic = arctic_problems(pins, input_refs)
+        if arctic:
+            raise RegradeRefused(
+                "the D31-recorded ArcticDB read could not be reproduced: " + "; ".join(arctic)
+            )
         features_df = frame_build.features_df
 
         # Guard 4: the dead-column postflight is fatal on a rebuild.
@@ -686,6 +747,9 @@ def regrade(
                 "read_live": dict(sorted(facade.live_reads.items())),
                 "unrecorded_requests": sorted(set(facade.unrecorded))[:50],
                 "recorded": input_refs,
+                "arcticdb_as_of_d31": {
+                    library: pin.as_of for library, pin in sorted(pins.arctic.items())
+                },
             },
             "provisional_tickers": d17["provisional_tickers"],
             "provisional_note": (
@@ -713,7 +777,8 @@ def regrade(
                     f"D17 {d17['run_id']} ok and settled at {d17['key']} VersionId {d17['version_id']}; "
                     f"D31 {d31.get('run_id')} inputs pinned ({len(facade.served)} object(s) served at the "
                     f"recorded version, {len(pins.sets)} set(s) digest-checked); "
-                    f"{len(facade.live_reads)} daily_closes object(s) read live; dead-column postflight fatal "
+                    f"{len(facade.live_reads)} daily_closes object(s) read live; {len(pins.arctic)} ArcticDB "
+                    "library read(s) digest-equal to D31's; dead-column postflight fatal "
                     "and passed; every group D31 published was rebuilt"
                 ),
                 "key": marker_key(trading_day),
