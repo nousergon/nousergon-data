@@ -13,18 +13,11 @@ owning_repo: nousergon-data
 substrate: step-functions
 origin: ne-data-collection-panel
 owner: brian
-lifecycle: pending
+lifecycle: in-service
 parent_component: ne-data-collection-panel
 parent_component_reason: D51 runs as states inside the 'ne-data-collection-panel' state machine, so no
   discoverer can see this unit's own id; presence is judged on the state machine, never on the unit (alpha-engine-config-I12664).
   Derived from the unit descriptor's trigger.owner.
-lifecycle_owner: brian
-lifecycle_reexam: '2026-10-27'
-pending_since: '2026-10-13'
-promotes_when: the D51 unit descriptor's own successor (ne-data-collection-panel (alpha-engine-config-I10791);
-  no v1 predecessor, because v1 never published a panel) goes live
-lifecycle_reason: 'Generated from registry.d/units/D51-*.yaml (P-08): the unit descriptor itself declares
-  lifecycle: pending.'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D51''s own code path (builders/daily_panel.py:174)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no
