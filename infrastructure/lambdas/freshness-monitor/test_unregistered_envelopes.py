@@ -498,3 +498,152 @@ def test_a_sweep_that_raises_becomes_probe_failed(monkeypatch):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+# ── dispatch-triggered: the drain is graded against its trigger (I12762) ──────
+
+
+_DRAIN_ROW = b"""\
+component_id: overseer-alert-drain
+substrate: ec2-spot
+lifecycle: in-service
+cadence: event_driven
+"""
+
+_DRAIN_IDS = ("overseer-alert-drain", "t1-freshness-critical-auto-verify",
+              "t1-groom-lifecycle-digest-fold")
+
+
+def _drain_envs(age_h: float) -> list[ue.Envelope]:
+    # The live envelopes still declare 1440 (alpha-engine-config-I12386).
+    return [_env(c, age_h=age_h, cadence=1440) for c in _DRAIN_IDS]
+
+
+def _states(grades):
+    return {g.check_id: g.state for g in grades}
+
+
+def test_an_idle_drain_with_every_dispatch_answered_is_not_stale():
+    """The I12762 closes-when: 48h+ after the last drain, with no dispatch since,
+    the three rows do not grade stale although their 1440 clock says so."""
+    grades = ue.grade(
+        _drain_envs(age_h=72), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(True, NOW - timedelta(hours=72, minutes=15)),
+        event_driven={"overseer-alert-drain"},
+    )
+    assert set(_states(grades).values()) == {"fresh"}
+    assert all("trigger-graded" in g.detail for g in grades)
+    assert ue.verdict(grades, NOW).state == "fresh"
+
+
+def test_no_dispatch_on_record_is_not_stale_either():
+    grades = ue.grade(
+        _drain_envs(age_h=400), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(True, None), event_driven={"overseer-alert-drain"},
+    )
+    assert set(_states(grades).values()) == {"fresh"}
+
+
+def test_an_unanswered_dispatch_past_the_grace_pages():
+    """A real drain stoppage still pages: the monitor dispatched and no envelope
+    followed within the grace."""
+    grades = ue.grade(
+        _drain_envs(age_h=30), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(True, NOW - timedelta(hours=24)),
+        event_driven={"overseer-alert-drain"},
+    )
+    assert set(_states(grades).values()) == {"stale"}
+    assert all("no envelope followed" in g.detail for g in grades)
+    assert ue.verdict(grades, NOW).state == "stale"
+
+
+def test_a_dispatch_inside_the_grace_is_in_flight_not_stale():
+    grades = ue.grade(
+        _drain_envs(age_h=30), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(
+            True, NOW - timedelta(minutes=ue.DISPATCH_ANSWER_GRACE_MINUTES - 1)),
+        event_driven={"overseer-alert-drain"},
+    )
+    assert set(_states(grades).values()) == {"fresh"}
+
+
+def test_the_clock_returns_when_the_lane_declares_a_cadence_again():
+    """Re-arming the schedules re-declares the cadence in the registry row; with
+    no ``event_driven`` declaration the 1440 clock grades as before."""
+    grades = ue.grade(
+        _drain_envs(age_h=72), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(True, NOW - timedelta(hours=73)),
+        event_driven=set(),
+    )
+    assert set(_states(grades).values()) == {"stale"}
+
+
+def test_an_unreadable_dispatch_record_falls_back_to_the_clock():
+    grades = ue.grade(
+        _drain_envs(age_h=72), registered=set(), substrates={}, now=NOW,
+        dispatch=ue.DispatchRecord(False), event_driven={"overseer-alert-drain"},
+    )
+    assert set(_states(grades).values()) == {"stale"}
+
+
+def test_trigger_grading_touches_only_the_dispatch_triggered_ids():
+    grades = ue.grade(
+        [_env("other_daily", age_h=72, cadence=1440)], registered=set(),
+        substrates={}, now=NOW, dispatch=ue.DispatchRecord(True, None),
+        event_driven={"other_daily"},
+    )
+    assert _states(grades) == {"other_daily": "stale"}
+
+
+def test_event_driven_ids_reads_the_cadence_declaration():
+    import yaml
+    rows = [yaml.safe_load(_DRAIN_ROW), {"component_id": "x", "cadence": 60}]
+    assert ue.event_driven_ids(rows) == {"overseer-alert-drain"}
+
+
+class _ErrS3(_FakeS3):
+    def get_object(self, *, Bucket, Key):  # noqa: N803
+        if Key == ue.DRAIN_DISPATCH_MARKER_KEY:
+            err = Exception("AccessDenied")
+            err.response = {"Error": {"Code": "AccessDenied"}}  # type: ignore[attr-defined]
+            raise err
+        return super().get_object(Bucket=Bucket, Key=Key)
+
+
+def test_read_dispatch_classifies_missing_present_and_unreadable():
+    at = NOW - timedelta(hours=5)
+    present = _FakeS3({ue.DRAIN_DISPATCH_MARKER_KEY: (
+        NOW, json.dumps({"dispatched_at": at.isoformat()}).encode())})
+    assert ue.read_dispatch(present, BUCKET) == ue.DispatchRecord(True, at)
+    assert ue.read_dispatch(_FakeS3({}), BUCKET) == ue.DispatchRecord(True, None)
+    assert ue.read_dispatch(_ErrS3({}), BUCKET).readable is False
+
+
+def test_run_sweep_grades_the_idle_drain_fresh_from_the_published_registry():
+    objects = {f"ops/checks/{c}/latest.json": _envelope_obj(72, cadence=1440)
+               for c in _DRAIN_IDS}
+    objects["ops/registry/observability.d/overseer-alert-drain.yaml"] = (NOW, _DRAIN_ROW)
+    objects[ue.DRAIN_DISPATCH_MARKER_KEY] = (NOW, json.dumps(
+        {"dispatched_at": (NOW - timedelta(hours=72, minutes=15)).isoformat()}).encode())
+    _, result, report = ue.run_sweep(_FakeS3(objects), BUCKET, [], NOW)
+    assert result.state == "fresh"
+    assert report["last_drain_dispatch"] is not None
+    assert {g["state"] for g in report["grades"]} == {"fresh"}
+
+
+def test_index_reads_the_same_marker_key_the_sweep_grades():
+    import index
+    assert index.DRAIN_DISPATCH_MARKER_KEY == ue.DRAIN_DISPATCH_MARKER_KEY
+
+
+def test_handler_does_not_page_on_an_idle_drain(monkeypatch):
+    """I12762 end to end: an idle day 72h after the last drain does not page."""
+    objects = {f"ops/checks/{c}/latest.json": _envelope_obj(72, cadence=1440)
+               for c in _DRAIN_IDS}
+    objects["ops/checks/registered_check/latest.json"] = _envelope_obj(1)
+    objects["ops/registry/observability.d/overseer-alert-drain.yaml"] = (NOW, _DRAIN_ROW)
+    objects[ue.DRAIN_DISPATCH_MARKER_KEY] = (NOW - timedelta(hours=72, minutes=15),
+        json.dumps({"dispatched_at": (NOW - timedelta(hours=72, minutes=15)).isoformat()}).encode())
+    _, publish_mock, rows = _run_handler(monkeypatch, objects)
+    assert _row(rows, ue.SWEEP_ARTIFACT_ID)["state"] == "fresh"
+    assert not publish_mock.called
