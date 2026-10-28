@@ -7,8 +7,8 @@ scheduled paths 'for safety' is the wrong fix"). Both states were non-blocking
 observability producers (config#1853 for the drift check), never trading
 gates, so a plain scheduled Lambda invoke is the correct-weight mechanism —
 see ``PredictorHealthCheckTrigger`` / ``PredictorDriftCheckTrigger`` in
-``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` (13:40 UTC
-weekdays, after the preopen SF's observed ~13:15 P99 completion).
+``infrastructure/cloudformation/alpha-engine-orchestration.yaml`` (14:40 UTC
+weekdays, after the preopen SF finishes under both PDT and PST).
 
 This file previously pinned PredictorDriftCheck's wiring immediately after
 PredictorHealthCheck inside this SF (see git history for that version,
@@ -91,10 +91,12 @@ class TestReHomedOntoDirectEventBridgeTriggers:
         assert '"action": "check_drift"' in cfn_text
 
     def test_both_triggers_fire_after_preopen_p99(self, cfn_text):
-        # 13:40 UTC — after the preopen SF's observed ~13:15 UTC P99
-        # completion, so both checks observe the same trading_day artifacts
-        # they used to score inside the SF.
-        assert cfn_text.count("cron(40 13 ? * MON-FRI *)") == 2
+        # 14:40 UTC — after the preopen SF (05:15 America/Los_Angeles,
+        # i.e. 12:15Z PDT / 13:15Z PST, 15-50 min) has finished in BOTH
+        # DST regimes, so both checks observe the same trading_day
+        # artifacts they used to score inside the SF.
+        assert cfn_text.count("cron(40 14 ? * MON-FRI *)") == 2
+        assert "cron(40 13 ? * MON-FRI *)" not in cfn_text
 
     def test_both_triggers_grant_lambda_permission(self, cfn_text):
         assert "PredictorHealthCheckTriggerPermission:" in cfn_text
