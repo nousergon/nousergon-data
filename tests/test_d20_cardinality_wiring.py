@@ -18,7 +18,10 @@ What is asserted here:
    and a trading day with no document must read red rather than absent.
 3. A failed write grades `unmeasurable`, never zero coverage — different claims.
 4. The mirrored floor constant equals the descriptor's declared floor.
-5. OBSERVE mode: no verdict moves an exit code.
+5. The cardinality guard is OBSERVE: its own verdict moves no exit code. The
+   ENFORCING spine-window guard, graded beside it, degrades D20's run (never
+   the process) on a non-ok window, which includes the same session's symbol
+   axis (alpha-engine-config-I10780).
 """
 
 from __future__ import annotations
@@ -39,9 +42,31 @@ TRADING_DAY = "2026-09-14"
 
 
 class FakeS3:
-    def __init__(self, fail_puts_matching: str | None = None):
+    """Records every PUT. GETs serve what this run wrote, else a HEALTHY earlier
+    spine (`market_data/eod_closes/{day}.json` dated to its day, every holding on
+    that day's bar), so the ENFORCING spine-window guard
+    (`tests/test_spine_window_guard.py`) reads a clean history here and this
+    file grades the cardinality axis alone. ``spine_missing`` names earlier
+    sessions to serve as a 404 instead."""
+
+    def __init__(self, fail_puts_matching: str | None = None, spine_missing: tuple[str, ...] = ()):
         self.puts: list[tuple[str, dict]] = []
         self.fail_puts_matching = fail_puts_matching
+        self.spine_missing = set(spine_missing)
+
+    def get_object(self, Bucket, Key):  # noqa: N803
+        import io
+
+        for key, body in reversed(self.puts):
+            if key == Key:
+                return {"Body": io.BytesIO(json.dumps(body).encode("utf-8"))}
+        prefix = metron_market_data.CLOSES_PREFIX
+        day = Key[len(prefix):-len(".json")] if Key.startswith(prefix) else None
+        if day is None or day in self.spine_missing:
+            raise ClientError({"Error": {"Code": "NoSuchKey"}}, "GetObject")
+        closes = {h["yf_symbol"]: {"close": 1.0, "currency": "USD", "bar_date": day} for h in HOLDINGS}
+        doc = {"as_of": day, "closes": closes}
+        return {"Body": io.BytesIO(json.dumps(doc).encode("utf-8"))}
 
     def put_object(self, Bucket, Key, Body, ContentType=None, **kw):  # noqa: N803
         if self.fail_puts_matching and self.fail_puts_matching in Key:
@@ -113,9 +138,13 @@ def test_an_undeclared_miss_is_below_floor_and_names_the_symbol(universe):
     s3 = FakeS3()
     result = _collect(s3, priced=["AAPL", "MSFT"])
 
-    # OBSERVE mode: the run is still `ok`; the verdict is the finding.
-    assert result["status"] == "ok"
+    # The cardinality guard itself is OBSERVE: its verdict moves nothing. The
+    # run is `degraded` because the ENFORCING spine-window guard grades the same
+    # session's symbol axis (alpha-engine-config-I10780), and names the miss too.
+    assert result["status"] == "degraded"
+    assert "NVDA" in result["detail"]
     assert [g["verdict"] for g in _cardinality(result)] == ["below_floor"]
+    assert _cardinality(result)[0]["mode"] == "observe"
     assert "NVDA" in _cardinality(result)[0]["detail"]
     assert _metric_docs(s3)[0]["status"] == "RED"
 
@@ -203,14 +232,16 @@ def test_the_cardinality_verdict_lands_on_the_run_manifest(universe):
     result = weekly_collector._phase_collect(
         FakeRegistry(s3),
         "metron_market_data",
-        lambda: _collect(s3, priced=["AAPL", "MSFT"]),
+        lambda: _collect(s3, priced=["AAPL", "MSFT", "NVDA"]),
         artifact_key=f"market_data/metron/closes/{TRADING_DAY}.json",
     )
     assert result["status"] == "ok"
     m = _manifests(s3)[0]
     assert m["unit_id"] == "D20"
+    assert m["status"] == "ok"
     verdicts = {g["guard"]: g["verdict"] for g in m["guards"]}
-    assert verdicts[expectations.CARDINALITY_GUARD.name] == "below_floor"
+    assert verdicts[expectations.CARDINALITY_GUARD.name] == "ok"
+    assert verdicts[expectations.SPINE_WINDOW_GUARD.name] == "ok"
     assert expectations.EMPTY_FRESH_GUARD.name in verdicts
     assert any(x["name"] == "data.D20.completeness" for x in m["metrics"])
 
@@ -230,3 +261,26 @@ def test_a_failed_collector_still_carries_its_verdict_onto_the_failure_manifest(
     assert m["status"] == "failed"
     verdicts = {g["guard"]: g["verdict"] for g in m["guards"]}
     assert verdicts[expectations.CARDINALITY_GUARD.name] == "unmeasurable"
+
+
+def test_an_enforcing_spine_window_degrades_d20_and_never_the_process(universe):
+    """alpha-engine-config-I10780: through the real `_phase_collect`, a missing
+    earlier session makes D20's manifest `failed` and its result `degraded`, and
+    the EOD aggregate reads `degraded` (exit 0: the ArcticDB append and
+    EODReconcile still run), never `failed`."""
+    s3 = FakeS3(spine_missing=("2026-09-10",))
+    result = weekly_collector._phase_collect(
+        FakeRegistry(s3),
+        "metron_market_data",
+        lambda: _collect(s3, priced=["AAPL", "MSFT", "NVDA"]),
+        artifact_key=f"market_data/metron/closes/{TRADING_DAY}.json",
+    )
+    assert result["status"] == "degraded"
+    assert "MISSING session(s): 2026-09-10" in result["detail"]
+    m = _manifests(s3)[0]
+    assert m["status"] == "failed"
+    verdicts = {g["guard"]: g["verdict"] for g in m["guards"]}
+    assert verdicts[expectations.SPINE_WINDOW_GUARD.name] == "below_floor"
+    assert verdicts[expectations.CARDINALITY_GUARD.name] == "ok"
+    status, degraded = weekly_collector._aggregate_daily_status({"metron_market_data": result})
+    assert (status, degraded) == ("degraded", ["metron_market_data"])

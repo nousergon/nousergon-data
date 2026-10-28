@@ -1,8 +1,8 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Description: >
   Alpha Engine orchestration infrastructure — Step Functions, EventBridge rules,
-  SNS topics, and CloudWatch alarms. Does NOT manage Lambda functions, EC2
-  instances, or IAM roles (those are managed separately via deploy scripts
+  SNS topics, and log metric filters. Does NOT manage Lambda functions, EC2
+  instances, IAM roles or CloudWatch alarms (those are managed separately via deploy scripts
   and console). This template captures the "glue" that connects modules.
 
 # ============================================================================
@@ -660,324 +660,20 @@ Resources:
         Input: !Sub '{"InstanceIds": ["${TradingInstanceId}"]}'
 
   # --------------------------------------------------------------------------
-  # CloudWatch Alarms
+  # CloudWatch Alarms: none. This stack owns no AWS::CloudWatch::Alarm.
   # --------------------------------------------------------------------------
-  HealthCheckAlarm:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: AlphaEngine-HealthCheckFailures
-      AlarmDescription: Alert when any data health check fails
-      Namespace: AlphaEngine
-      MetricName: HealthChecksFailed
-      Statistic: Maximum
-      Period: 21600  # 6 hours
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # DailyHealDaysHealedAlarm (alpha-engine-daily-heal-days-healed) RETIRED 2026-10-09
-  # (alpha-engine-config-I11792 Tier 2): it alarmed on a data-quality event, not a
-  # failure; heal FAILURE stays covered by ne-data-collection-daily-heal-failed. The
-  # healer still emits daily_heal_days_healed. Restore from git history.
-
-  ResearchRunnerErrors:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-research-runner-errors
-      AlarmDescription: Research Lambda errors
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-research-runner
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  ResearchRunnerNoInvocations:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-research-runner-no-invocations
-      AlarmDescription: Research Lambda not invoked (expected weekly)
-      Namespace: AWS/Lambda
-      MetricName: Invocations
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-research-runner
-      Statistic: Sum
-      Period: 604800  # 7 days
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # alpha-engine-config-I7996: this alarm is ALSO codified in
-  # nous-ergon-ops/infrastructure/cloudwatch/alarms/alpha-engine-predictor-inference-errors.json,
-  # which owns it going forward (I7339: a file is the only way an alarm comes
-  # into existence). This stack still deploys it on EVERY push to main
-  # (deploy-infrastructure.yml has no path filter), so a description edited
-  # only in nous-ergon-ops gets silently reverted here within the hour —
-  # exactly what happened to nous-ergon-ops-PR858's rewrite of this field on
-  # 2026-08-24, which stayed live for ~13 hours before this stack's next
-  # deploy put the old text back and pinned cloudwatch-alarm-drift.yml red
-  # for 26 straight graded runs. Keep this AlarmDescription byte-identical to
-  # the codified file until alpha-engine-config-I9009 removes this
-  # resource from the stack and leaves nous-ergon-ops as sole owner.
-  PredictorInferenceErrors:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-predictor-inference-errors
-      AlarmDescription: "alpha-engine-predictor-inference reported >=1 invocation error in a 5-minute window. This function answers the FIRST state of both trading pipelines (MarketHoursGate) and DeployDriftCheck, so an error here is a safety gate that did not answer, not only a failed job — the pipelines degrade past an unanswered gate rather than halting. WHAT TO DO: search the log group for INIT_REPORT lines with `Status: error` first. If there are any, the module did not IMPORT and every invocation is failing, which no retry fixes (Lambda counts an init failure in Errors); if there are none, the failure is inside the handler and the action is named by the newest [ERROR] in the log group. This description was literally 'Predictor Lambda errors' until 2026-08-24, when the alarm fired for 16 minutes on an import crash, paged, self-cleared, and told nobody what had happened — while the Metadata below said to diagnose 'the condition named in AlarmDescription' (alpha-engine-config-I8298)."
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-predictor-inference
-      Statistic: Sum
-      Period: 300
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  PredictorNoInvocations:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-predictor-inference-no-invocations
-      # Kept byte-identical to nous-ergon-ops
-      # infrastructure/cloudwatch/alarms/alpha-engine-predictor-inference-no-invocations.json.
-      # This alarm is one of the 21 dual-owned by this stack AND that tree
-      # (alpha-engine-config-I9009): any push to this repo's main re-stamps the
-      # stack's git-sha tag, which forces CloudFormation to reissue
-      # PutMetricAlarm from THESE literal values even when the template body did
-      # not change. So a divergence here silently reverts that tree, with no
-      # CloudFormation-side signal. Change both or neither.
-      AlarmDescription: >-
-        Predictor Lambda not invoked (expected daily). ABSENCE IS THE SIGNAL:
-        TreatMissingData is `breaching` (alpha-engine-config-I9467) because this
-        alarm's entire job is detecting that the predictor stopped running, and
-        `notBreaching` made the one condition it exists to catch render as green
-        (principles.md 2.7; observability-policy.md OB-9.2a). Replayed over the
-        30 days to 2026-08-31 via get-metric-data: all 30 daily buckets carried
-        Invocations >= 2, so this flip would have fired ZERO times — it adds
-        detection without adding pages. Declared armed in
-        nousergon-data/infrastructure/automation_pause.json:armed_alarms.
-      Namespace: AWS/Lambda
-      MetricName: Invocations
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-predictor-inference
-      Statistic: Sum
-      Period: 86400  # 1 day
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      # WAS `notBreaching  # weekends/holidays`. That rationale was measured
-      # false: replayed over the 30 days to 2026-08-31, ALL 30 daily buckets
-      # carried Invocations >= 2 (minimum 2 on 2026-08-04), weekends included —
-      # the predictor is invoked every day, so there was never a weekend gap for
-      # notBreaching to protect. What it did instead was render the one
-      # condition this alarm exists to catch as green (alpha-engine-config-I9467).
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # Research↔Predictor coverage gap. Emitted by the executor's signal_reader
-  # on every run (value 0 on success, >0 when buy_candidates have no
-  # prediction row). A positive value means the weekday Step Function's
-  # coverage-gap self-heal (CheckPredictorCoverage → ReinvokePredictor) also
-  # failed to close the gap before the executor read predictions.json —
-  # indicates a regression of that orchestration. First observed as a silent
-  # veto bypass on 2026-04-20 (4 of 5 entries bypassed the GBM veto).
-  UnscoredBuyCandidatesGap:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-predictor-unscored-buy-candidates
-      AlarmDescription: Executor saw buy_candidates without a prediction row — Step Function coverage-gap self-heal may have regressed
-      Namespace: AlphaEngine/Predictor
-      MetricName: unscored_buy_candidates_count
-      Statistic: Maximum
-      Period: 3600  # 1 hour
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching  # executor not running off-hours is expected
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # Heartbeat alarms for EC2-based processes
-  ExecutorMorningHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-executor-morning-no-heartbeat
-      AlarmDescription: Executor morning planner did not emit heartbeat
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: executor-morning
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # ExecutorDaemonHeartbeat / ExecutorEodHeartbeat (alpha-engine-executor-{daemon,eod}-
-  # no-heartbeat) RETIRED 2026-10-09 (alpha-engine-config-I11792 Tier 1): both could never
-  # fire - notBreaching on Heartbeat{executor-daemon,executor-eod}, which had 0 datapoints in
-  # 63 days (the daemon now emits executor-daemon-start). EOD stays covered by
-  # alpha-engine-eod-sf-failed and the postclose deadman. Restore from git history.
-
-  PredictorTrainingHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-predictor-training-no-heartbeat
-      AlarmDescription: Predictor training did not emit heartbeat (expected weekly)
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: predictor-training
-      Statistic: Sum
-      Period: 604800
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  BacktesterHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-backtester-no-heartbeat
-      AlarmDescription: Backtester did not emit heartbeat (expected weekly)
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: backtester
-      Statistic: Sum
-      Period: 604800
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  EvaluatorHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-evaluator-no-heartbeat
-      AlarmDescription: Evaluator did not emit heartbeat (expected weekly — split from Backtester 2026-05-07)
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: evaluator
-      Statistic: Sum
-      Period: 604800
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  RAGIngestionHeartbeat:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-rag-ingestion-no-heartbeat
-      AlarmDescription: RAG ingestion did not emit heartbeat (expected weekly)
-      Namespace: AlphaEngine
-      MetricName: Heartbeat
-      Dimensions:
-        - Name: Process
-          Value: rag-ingestion
-      Statistic: Sum
-      Period: 604800
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
-  # ResearchAlertsErrors (alpha-engine-research-alerts-errors) RETIRED 2026-10-09
-  # (alpha-engine-config-I11792 Tier 1): its trigger alpha-research-alerts is DISABLED
-  # under the automation pause (0 invocations in 14 days). Restore from git history.
-
+  # alpha-engine-config-I9009 step 2: the 14 alarms this stack used to declare
+  # were handed to their codified owner,
+  # nous-ergon-ops/infrastructure/cloudwatch/alarms/<AlarmName>.json, which is
+  # the only applier (alpha-engine-config-I7339). Step 1 (nousergon-data#2288)
+  # deployed DeletionPolicy/UpdateReplacePolicy: Retain on all 14 first, so the
+  # stack update that dropped them released the live alarms without calling
+  # DeleteAlarms. Before this, every push to main re-stamped the stack and
+  # reasserted this file's copy of each alarm over the codified one.
+  # A new alarm goes in nous-ergon-ops, not here:
+  # tests/test_orchestration_stack_owns_no_alarms.py fails on one.
+  # The alarms retired here earlier (alpha-engine-config-I11792) are in git
+  # history.
   WeeklyFreshnessLogGroup:
     Type: AWS::Logs::LogGroup
     Properties:
@@ -1003,8 +699,10 @@ Resources:
   # Their codified copies leave nous-ergon-ops/infrastructure/cloudwatch/alarms/
   # in the same arc.
 
-  # config#1819 (2026-07-06/07): SNS-publish TaskFailed alarm on the weekly
-  # SF. Motivating incident (2026-06-12): NotifyComplete (a SUCCESS-path
+  # config#1819 (2026-07-06/07): SNS-publish TaskFailed metric on the weekly
+  # SF. Its alarm, ne-weekly-freshness-sns-publish-failed, is codified in
+  # nous-ergon-ops (alpha-engine-config-I9009); this filter stays here because
+  # it is what emits the metric that alarm reads. Motivating incident (2026-06-12): NotifyComplete (a SUCCESS-path
   # notifier) threw SNS.InvalidParameterException (Subject >100 chars / a
   # newline / empty), failing an otherwise-succeeded pipeline. The SF fix
   # (step_function.json) wraps NotifyComplete + NotifyShellRunComplete in
@@ -1040,35 +738,6 @@ Resources:
           MetricName: WeeklyFreshnessSnsPublishFails
           MetricValue: '1'
 
-  SnsPublishFailedAlarm:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: ne-weekly-freshness-sns-publish-failed
-      AlarmDescription: >-
-        config#1819: an sns:publish Task failed on the weekly-freshness
-        (Saturday) pipeline (caught or uncaught). If this fires with the
-        execution otherwise SUCCEEDED, NotifyComplete/NotifyShellRunComplete
-        caught a publish failure (best-effort, per config#1819) — check
-        CloudWatch Logs for the TaskFailed cause (commonly
-        SNS.InvalidParameterException) and the SNS delivery status; the
-        pipeline result itself is NOT in question. If the execution FAILED,
-        this fired alongside the existing HandleFailure email.
-      Namespace: AlphaEngine/StepFunctions
-      MetricName: WeeklyFreshnessSnsPublishFails
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
-
 # ============================================================================
 # Outputs
 # ============================================================================
@@ -1076,15 +745,14 @@ Resources:
   # --------------------------------------------------------------------------
   # Preflight sweep — daily all-stage --preflight-only check (config-I7249)
   # --------------------------------------------------------------------------
-  # WHY these three resources are shaped as they are — schedule declared HERE
-  # rather than baked into deploy.sh; deliberately NO AWS::Lambda::Permission
-  # (the dispatcher Lambda's resource-based policy is granted out-of-band by
-  # deploy.sh --bootstrap, mirroring the other scheduled dispatchers in this
-  # template); the deadman alarm as the operator-facing "did this even run"
-  # detector, distinct from the dispatcher-errors alarm below which only
-  # catches the Lambda itself erroring; Period/EvaluationPeriods on the
-  # deadman derived from the declared daily cadence rather than picked ad
-  # hoc — is documented in infrastructure/preflight_sweep_stages.py,
+  # WHY this schedule is shaped as it is — declared HERE rather than baked
+  # into deploy.sh; deliberately NO AWS::Lambda::Permission (the dispatcher
+  # Lambda's resource-based policy is granted out-of-band by deploy.sh
+  # --bootstrap, mirroring the other scheduled dispatchers in this template).
+  # Its two alarms — the deadman alpha-engine-preflight-sweep-no-run, whose
+  # Period/EvaluationPeriods derive from the declared daily cadence, and
+  # alpha-engine-preflight-sweep-dispatcher-errors — are codified in
+  # nous-ergon-ops (alpha-engine-config-I9009). The design is documented in infrastructure/preflight_sweep_stages.py,
   # infrastructure/preflight_sweep_cadence.json and the dispatcher README.
   # tests/test_preflight_sweep_cadence.py fails if any of it drifts from the
   # manifest (the single declared source per sf-pipeline-policy §2.6).
@@ -1109,72 +777,6 @@ Resources:
         - Id: preflight-sweep
           Arn: !Ref PreflightSweepDispatcherLambdaArn
           Input: '{"mode": "scheduled"}'
-
-  PreflightSweepDeadman:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-preflight-sweep-no-run
-      AlarmDescription: >-
-        Daily all-stage preflight sweep did not report AT ALL (config-I7249).
-        PreflightSweepRunCompleted is emitted on every terminal path,
-        including could-not-measure, so this fires ONLY on total silence —
-        distinct from a sweep that ran and reported a bad result, which is a
-        separate, non-deadman alarm. Also stays red (TreatMissingData:
-        breaching) until deploy.sh --bootstrap creates the dispatcher Lambda,
-        which is the intended fail-closed posture for a component that has
-        not yet been onboarded rather than a false green.
-      Namespace: AlphaEngine
-      MetricName: PreflightSweepRunCompleted
-      Dimensions:
-        - Name: Component
-          Value: ae-preflight-sweep
-      Statistic: Sum
-      Period: 86400
-      EvaluationPeriods: 2
-      DatapointsToAlarm: 2
-      Threshold: 1
-      ComparisonOperator: LessThanThreshold
-      TreatMissingData: breaching
-      AlarmActions:
-        - !Ref AlertsTopic
-      OKActions:
-        - !Ref AlertsTopic
-
-  PreflightSweepDispatcherErrors:
-    Type: AWS::CloudWatch::Alarm
-    # alpha-engine-config-I9009 step 1: Retain, so removing this resource
-    # from the stack (step 2) leaves the live alarm to its codified owner,
-    # nous-ergon-ops/infrastructure/cloudwatch/alarms/, instead of deleting it.
-    DeletionPolicy: Retain
-    UpdateReplacePolicy: Retain
-    Properties:
-      AlarmName: alpha-engine-preflight-sweep-dispatcher-errors
-      AlarmDescription: >-
-        preflight-sweep dispatcher Lambda errored — the launcher box or the
-        SSM command it issues never happened (config-I7249). Complements
-        PreflightSweepDeadman above: this fires FAST on a Lambda-level
-        exception (Period 3600s vs the deadman's 86400s), while the deadman
-        is the backstop that still catches a silent failure this alarm's
-        Lambda-Errors metric cannot see (e.g. the Lambda invokes cleanly but
-        the downstream SSM command never runs).
-      Namespace: AWS/Lambda
-      MetricName: Errors
-      Dimensions:
-        - Name: FunctionName
-          Value: alpha-engine-preflight-sweep-dispatcher
-      Statistic: Sum
-      Period: 3600
-      EvaluationPeriods: 1
-      Threshold: 1
-      ComparisonOperator: GreaterThanOrEqualToThreshold
-      TreatMissingData: notBreaching
-      AlarmActions:
-        - !Ref AlertsTopic
 
   # --------------------------------------------------------------------------
   # Durable alert log (alpha-engine-config-I12323, Director plan C41)

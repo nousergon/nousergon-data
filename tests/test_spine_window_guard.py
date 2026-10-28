@@ -166,9 +166,10 @@ def test_documents_must_include_the_graded_session():
         _check({d: _doc(d) for d in WINDOW[:-1]})
 
 
-def test_the_staging_is_observe_with_a_tracker():
+def test_the_staging_is_enforce_with_a_tracker():
+    """Promoted on its codified criterion (alpha-engine-config-I10780)."""
     staging = expectations.SPINE_WINDOW_GUARD
-    assert staging.mode is GuardMode.OBSERVE
+    assert staging.mode is GuardMode.ENFORCE
     assert staging.tracked_issue == "alpha-engine-config-I10780"
     assert staging.name != expectations.CARDINALITY_GUARD.name
 
@@ -219,7 +220,7 @@ def test_the_reader_raises_on_anything_but_a_404():
         expectations.read_spine_window(s3, "b", ["2026-10-01"])
 
 
-# ── Wiring at the D20 collector (observe mode) ──────────────────────────────
+# ── Wiring at the D20 collector (ENFORCE: a non-ok window degrades D20's run) ──
 
 HOLDINGS = [
     {"yf_symbol": "AAPL", "currency": "USD"},
@@ -264,25 +265,61 @@ def test_the_collector_files_an_ok_spine_window_reading(universe):
     assert result["status"] == "ok"
     entry = _spine_entry(result)
     assert entry["verdict"] == "ok", entry["detail"]
-    assert entry["mode"] == "observe"
+    assert entry["mode"] == "enforce"
+    assert "detail" not in result, "a clean window adds no defect detail"
     assert entry["key"] == _key(SESSION)
     # It read BACK this run's own write, not the in-memory artifact.
     assert "5/5 session(s)" in entry["detail"]
 
 
-def test_the_collector_names_a_missing_earlier_session_without_failing_the_run(universe):
+def test_a_missing_earlier_session_degrades_the_run_and_names_it(universe):
     s3 = FakeS3(_prior_spines(skip="2026-09-29"))
     result = _collect(s3, priced=["AAPL", "MSFT"])
-    assert result["status"] == "ok", "OBSERVE mode: no verdict moves the run's status"
+    assert result["status"] == "degraded", "ENFORCE: a non-ok window degrades D20's own run"
     entry = _spine_entry(result)
     assert entry["verdict"] == "below_floor"
     assert "MISSING session(s): 2026-09-29" in entry["detail"]
+    assert result["detail"].startswith("data_spine_window below_floor (ENFORCE): ")
+    assert "MISSING session(s): 2026-09-29" in result["detail"]
+    # The day's closes are still published: enforcement degrades the run, it
+    # never withholds the spine consumers read.
+    assert _key(SESSION) in s3.objects
 
 
-def test_a_read_failure_is_unmeasurable_and_never_fails_the_run(universe, caplog):
-    s3 = FakeS3(_prior_spines(), error_on="2026-09-30")
+def test_a_stale_bar_on_the_graded_session_degrades_the_run(universe):
+    s3 = FakeS3(_prior_spines())
+    result = metron_market_data.collect(
+        bucket="b",
+        run_date=SESSION,
+        s3_client=s3,
+        close_source=lambda symbols: {"AAPL": (100.0, SESSION), "MSFT": (100.0, WINDOW[0])},
+        fx_source=lambda ccys: {c: 1.0 for c in ccys},
+    )
+    assert result["status"] == "degraded"
+    assert _spine_entry(result)["verdict"] == "below_floor"
+    assert "MSFT" in result["detail"]
+
+
+def test_observe_mode_leaves_the_run_ok(universe, monkeypatch):
+    """The enforcement is the staging's mode and nothing else: rolled back to
+    OBSERVE, the same missing session leaves the run's status alone."""
+    import dataclasses
+
+    monkeypatch.setattr(
+        expectations,
+        "SPINE_WINDOW_GUARD",
+        dataclasses.replace(expectations.SPINE_WINDOW_GUARD, mode=GuardMode.OBSERVE),
+    )
+    s3 = FakeS3(_prior_spines(skip="2026-09-29"))
     result = _collect(s3, priced=["AAPL", "MSFT"])
     assert result["status"] == "ok"
+    assert _spine_entry(result)["mode"] == "observe"
+
+
+def test_a_read_failure_is_unmeasurable_and_degrades_never_errors_the_run(universe, caplog):
+    s3 = FakeS3(_prior_spines(), error_on="2026-09-30")
+    result = _collect(s3, priced=["AAPL", "MSFT"])
+    assert result["status"] == "degraded", "unmeasurable is not clean, and never a process failure"
     entry = _spine_entry(result)
     assert entry["verdict"] == "unmeasurable"
     assert "AccessDenied" in entry["detail"]

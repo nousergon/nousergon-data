@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -1161,15 +1162,36 @@ class SyncResult:
     dividends: list = field(default_factory=list)
 
 
-def _scrub(exc: object) -> str:
-    """Scrub a polygon apiKey from an exception/text before logging (lazy import
-    so ``corporate_actions`` stays free of a hard ``polygon_client`` dep)."""
-    try:
-        from polygon_client import _scrub_api_key
+def _describe_error(exc: BaseException) -> str:
+    """A FIXED description of a failure for the log: the exception class plus,
+    when present, an HTTP status code or an AWS error code. NEVER the
+    exception's message text (alpha-engine-config-I12704).
 
-        return _scrub_api_key(exc)
-    except Exception:  # noqa: BLE001 - logging-path fallback, never raise
-        return str(exc)
+    A ``requests`` error's message embeds the effective request URL, and the
+    polygon URL carries ``apiKey`` in its querystring. This module used to log
+    that text through ``polygon_client._scrub_api_key`` (a regex mask), and its
+    own ``_scrub`` fallback returned the RAW ``str(exc)`` whenever that import
+    failed -- so the one path that could not mask was the path that logged the
+    most. CodeQL ``py/clear-text-logging-sensitive-data`` flagged the module.
+    The fix is to stop logging the text at all rather than to trust a regex:
+    nothing in the returned string is derived from the message, so there is
+    nothing for a mask to miss. Same rule as
+    ``builders/migrate_universe_crsp_basis._describe_fetch_error``.
+
+    Do not reintroduce ``str(exc)``, ``repr(exc)``, ``exc.args`` or a call to
+    any ``_scrub_api_key`` here; ``tests/test_corporate_actions_log_no_exc_text_i12704.py``
+    asserts it.
+    """
+    name = type(exc).__name__
+    response = getattr(exc, "response", None)
+    status = getattr(response, "status_code", None)
+    if isinstance(status, int):
+        return f"{name} (HTTP {status})"
+    if isinstance(response, dict):  # botocore ClientError
+        code = (response.get("Error") or {}).get("Code")
+        if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9.]{1,64}", code):
+            return f"{name} ({code})"
+    return name
 
 
 def _sync_arcticdb_universe(
@@ -1199,7 +1221,7 @@ def _sync_arcticdb_universe(
     except Exception as exc:  # noqa: BLE001 - symbol absent ⇒ nothing to restate
         log.info(
             "corporate_actions.sync: %s not in ArcticDB universe — no arctic "
-            "restate (%s)", ticker, _scrub(exc),
+            "restate (%s)", ticker, _describe_error(exc),
         )
         return []
 
@@ -1259,7 +1281,7 @@ def _read_archive_parquet(s3, bucket: str, prefix: str, date: str):
     except Exception as exc:  # noqa: BLE001 - corrupt parquet ⇒ skip, never crash
         log.warning(
             "corporate_actions.sync: could not read %s (%s) — skipping date",
-            key, _scrub(exc),
+            key, _describe_error(exc),
         )
         return None
 
@@ -1478,7 +1500,7 @@ def sync(
         except Exception as exc:  # noqa: BLE001 - provenance write best-effort
             log.warning(
                 "corporate_actions.sync: record_detected failed for %s (%s)",
-                a.action_id, _scrub(exc),
+                a.action_id, _describe_error(exc),
             )
         detected.append(a)
 
@@ -1496,7 +1518,7 @@ def sync(
         except Exception as exc:  # noqa: BLE001 - detection best-effort
             log.warning(
                 "corporate_actions.sync: dividend detection failed (%s) — "
-                "recording no dividends this run", _scrub(exc),
+                "recording no dividends this run", _describe_error(exc),
             )
             dividend_actions = []
     dividends: list = []
@@ -1508,7 +1530,7 @@ def sync(
         except Exception as exc:  # noqa: BLE001 - provenance write best-effort
             log.warning(
                 "corporate_actions.sync: record_detected failed for dividend "
-                "%s (%s)", a.action_id, _scrub(exc),
+                "%s (%s)", a.action_id, _describe_error(exc),
             )
         dividends.append(a)
 
@@ -1542,7 +1564,7 @@ def sync(
                 log.warning(
                     "corporate_actions.sync: restate failed for store=%s "
                     "ticker=%s (%s) — continuing; backfill audit remains the "
-                    "correctness gate", store, ticker, _scrub(exc),
+                    "correctness gate", store, ticker, _describe_error(exc),
                 )
                 continue
             applied[store].extend(res)
@@ -1659,12 +1681,11 @@ def get_splits(
         except Exception as exc:  # import / construction failure — degrade
             if strict:
                 raise
-            from polygon_client import _scrub_api_key
 
             log.warning(
                 "corporate_actions.get_splits: could not obtain polygon client "
                 "(%s) — returning no splits for %s",
-                _scrub_api_key(exc), ticker,
+                _describe_error(exc), ticker,
             )
             return []
     try:
@@ -1672,12 +1693,11 @@ def get_splits(
     except Exception as exc:
         if strict:
             raise
-        from polygon_client import _scrub_api_key
 
         log.warning(
             "corporate_actions.get_splits: polygon split fetch failed for %s "
             "(%s) — returning no splits",
-            ticker, _scrub_api_key(exc),
+            ticker, _describe_error(exc),
         )
         return []
     # client.get_splits omits the ticker key; inject it so splits_from_events
@@ -1720,12 +1740,11 @@ def get_dividends(
         except Exception as exc:  # import / construction failure — degrade
             if strict:
                 raise
-            from polygon_client import _scrub_api_key
 
             log.warning(
                 "corporate_actions.get_dividends: could not obtain polygon "
                 "client (%s) — returning no dividends for %s",
-                _scrub_api_key(exc), ticker,
+                _describe_error(exc), ticker,
             )
             return []
     try:
@@ -1733,12 +1752,11 @@ def get_dividends(
     except Exception as exc:
         if strict:
             raise
-        from polygon_client import _scrub_api_key
 
         log.warning(
             "corporate_actions.get_dividends: polygon dividend fetch failed "
             "for %s (%s) — returning no dividends",
-            ticker, _scrub_api_key(exc),
+            ticker, _describe_error(exc),
         )
         return []
     return dividends_from_events([{**ev, "ticker": ticker} for ev in events])
@@ -1767,23 +1785,21 @@ def detect_splits(
 
             client = polygon_client()
         except Exception as exc:  # import / construction failure — degrade
-            from polygon_client import _scrub_api_key
 
             log.warning(
                 "corporate_actions.detect_splits: could not obtain polygon "
                 "client (%s) — returning no detected splits",
-                _scrub_api_key(exc),
+                _describe_error(exc),
             )
             return []
     try:
         events = client.get_recent_splits(start_date, end_date)
     except Exception as exc:
-        from polygon_client import _scrub_api_key
 
         log.warning(
             "corporate_actions.detect_splits: polygon split scan failed (%s) "
             "— returning no detected splits",
-            _scrub_api_key(exc),
+            _describe_error(exc),
         )
         return []
     return splits_from_events(events)
@@ -1848,23 +1864,21 @@ def detect_dividends(
 
             client = polygon_client()
         except Exception as exc:  # import / construction failure — degrade
-            from polygon_client import _scrub_api_key
 
             log.warning(
                 "corporate_actions.detect_dividends: could not obtain polygon "
                 "client (%s) — returning no detected dividends",
-                _scrub_api_key(exc),
+                _describe_error(exc),
             )
             return []
     try:
         events = client.get_recent_dividends(start_date, end_date)
     except Exception as exc:
-        from polygon_client import _scrub_api_key
 
         log.warning(
             "corporate_actions.detect_dividends: polygon dividend scan failed "
             "(%s) — returning no detected dividends",
-            _scrub_api_key(exc),
+            _describe_error(exc),
         )
         return []
     return dividends_from_events(events)
@@ -1966,7 +1980,7 @@ def detect_renames(candidate_tickers, *, client=None) -> "RenameDetection":
                 "corporate_actions.detect_renames: could not obtain polygon "
                 "client (%s) — skipping rename detection for %d candidate(s); "
                 "none confirmed safe to prune this pass (history-safety)",
-                _scrub(exc), len(candidates),
+                _describe_error(exc), len(candidates),
             )
             result.failed_candidates.update(candidates)
             return result
@@ -1977,7 +1991,7 @@ def detect_renames(candidate_tickers, *, client=None) -> "RenameDetection":
             log.warning(
                 "corporate_actions.detect_renames: ticker-events query failed "
                 "for %s (%s) — NOT pruning this candidate this pass "
-                "(history-safety)", cand, _scrub(exc),
+                "(history-safety)", cand, _describe_error(exc),
             )
             result.failed_candidates.add(cand)
             continue
@@ -2044,7 +2058,7 @@ def migrate_symbol(
         except Exception as exc:  # noqa: BLE001 - provenance best-effort
             log.warning(
                 "corporate_actions.migrate_symbol: record_detected failed for "
-                "%s (%s)", action.action_id, _scrub(exc),
+                "%s (%s)", action.action_id, _describe_error(exc),
             )
 
     # Source must exist to migrate. If the old key is gone, there is nothing to

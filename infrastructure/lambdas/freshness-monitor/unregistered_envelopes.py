@@ -30,6 +30,19 @@ the envelope's age against the cadence the envelope declares about itself:
   (``SUBSTRATE_FLOOR_MINUTES``; a closed laptop gets 72h).
 * ``cadence_minutes: null`` is how an EVENT-DRIVEN producer declares itself, so
   there is no clock to grade. It is reported as ``unclocked`` and never pages.
+* A component whose PUBLISHED observability row DECLARES it ``retired`` or
+  ``disabled`` is reported as ``declared_off`` and never pages
+  (alpha-engine-config-I12689). A tombstoned producer keeps its last envelope
+  forever, so before this every tombstone read ``stale`` on every sweep and held
+  the synthetic row CRITICAL with nothing anyone could do. observability-policy
+  §8.3: ``DISABLED`` / ``RETIRED`` are declared, never inferred, and removal has
+  exactly two outcomes, ``retired`` with a declared removal date or ``ABSENT``
+  plus a finding. So the state is granted only on a COMPLETE declaration
+  (``lifecycle_reason`` and ``lifecycle_reexam`` both present, the registry's own
+  rule for those lifecycles), an in-service row naming the same id wins, and an
+  unreadable registry grades every envelope as before. Each of those failures
+  leans toward paging, never toward silence. ``deprecated`` is not off (the
+  component still runs), so it is graded on its clock.
 
 The whole set becomes ONE synthetic row, :data:`SWEEP_ARTIFACT_ID`, which
 ``_run_probe_pass`` treats like any registry row. That gives one line on the
@@ -83,6 +96,14 @@ _FETCH_WORKERS = 10
 STATE_FRESH = "fresh"
 STATE_STALE = "stale"
 STATE_UNCLOCKED = "unclocked"
+STATE_DECLARED_OFF = "declared_off"
+
+#: observability-policy §2.2 ``lifecycle`` values meaning "deliberately not
+#: producing". ``deprecated`` still runs; ``pending`` has not started.
+DECLARED_OFF_LIFECYCLES = frozenset({"retired", "disabled"})
+#: What makes a ``retired``/``disabled`` row a DECLARATION rather than a bare
+#: value: the same fields ``observability_registry.py validate`` requires.
+_DECLARATION_FIELDS = ("lifecycle_reason", "lifecycle_reexam")
 
 
 @dataclass(frozen=True)
@@ -107,6 +128,17 @@ class Grade:
     substrate: str | None
     last_seen: str
     detail: str
+    lifecycle: str | None = None
+    lifecycle_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class Declaration:
+    """A registry row's declared-off lifecycle, as the sweep carries it."""
+
+    lifecycle: str
+    reason: str
+    reexam: str
 
 
 def _utc(value: datetime) -> datetime:
@@ -167,6 +199,40 @@ def substrate_map(rows: Iterable[Any]) -> dict[str, str]:
     return out
 
 
+def _row_ids(row: dict) -> list[str]:
+    return [str(c) for c in [row.get("component_id"), *(row.get("alias_ids") or [])] if c]
+
+
+def declared_off_map(rows: Iterable[Any]) -> dict[str, Declaration]:
+    """``component_id`` and every ``alias_ids`` entry -> its declared-off lifecycle.
+
+    Only a COMPLETE ``retired``/``disabled`` declaration counts. A row naming the
+    lifecycle without its reason and re-exam is not a declaration (§2.2: a blank
+    required field reads as declared when it is not), so its envelope is graded
+    on its clock as before. An id that any ``in-service`` (or other non-off) row
+    also names is dropped: the live claim wins, because the cost of the wrong
+    choice is a page in one direction and a hidden gap in the other.
+    """
+    off: dict[str, Declaration] = {}
+    live: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        lifecycle = row.get("lifecycle")
+        ids = _row_ids(row)
+        if lifecycle not in DECLARED_OFF_LIFECYCLES:
+            live.update(ids)
+            continue
+        fields = [str(row.get(f) or "").strip() for f in _DECLARATION_FIELDS]
+        if not all(fields):
+            live.update(ids)
+            continue
+        decl = Declaration(str(lifecycle), " ".join(fields[0].split()), fields[1])
+        for cid in ids:
+            off[cid] = decl
+    return {cid: d for cid, d in off.items() if cid not in live}
+
+
 def threshold_minutes(cadence: float, substrate: str | None) -> int:
     floor = SUBSTRATE_FLOOR_MINUTES.get(substrate or "", DEFAULT_FLOOR_MINUTES)
     return int(max(STALE_FACTOR * cadence, floor))
@@ -178,8 +244,10 @@ def grade(
     registered: set[str],
     substrates: dict[str, str],
     now: datetime,
+    declared_off: dict[str, Declaration] | None = None,
 ) -> list[Grade]:
     """Grade every UNREGISTERED envelope. Pure; the tests drive this."""
+    declared_off = declared_off or {}
     grades: list[Grade] = []
     for env in sorted(envelopes, key=lambda e: e.check_id):
         if env.key in registered:
@@ -187,6 +255,16 @@ def grade(
         seen = env.ran_at or env.last_modified
         age = int((now - seen).total_seconds() // 60)
         substrate = substrates.get(env.check_id)
+        decl = declared_off.get(env.check_id)
+        if decl is not None:
+            grades.append(Grade(
+                env.check_id, STATE_DECLARED_OFF, age, None, env.cadence_minutes,
+                substrate, seen.isoformat(),
+                f"registry declares lifecycle {decl.lifecycle!r} (re-exam "
+                f"{decl.reexam}); last written {age // 60}h ago, never pages",
+                lifecycle=decl.lifecycle, lifecycle_reason=decl.reason,
+            ))
+            continue
         if env.cadence_minutes is None:
             grades.append(Grade(
                 env.check_id, STATE_UNCLOCKED, age, None, None, substrate,
@@ -239,8 +317,9 @@ def verdict(grades: list[Grade], now: datetime) -> CheckResult:
     """Fold the grades into the one result the synthetic row carries."""
     stale = [g for g in grades if g.state == STATE_STALE]
     unclocked = sum(1 for g in grades if g.state == STATE_UNCLOCKED)
+    off = sum(1 for g in grades if g.state == STATE_DECLARED_OFF)
     counts = (f"{len(grades)} unregistered envelope(s): {len(stale)} stale, "
-              f"{unclocked} unclocked")
+              f"{unclocked} unclocked, {off} declared_off")
     if not stale:
         return CheckResult(
             state="fresh", last_modified=now, reason=counts,
@@ -320,9 +399,9 @@ def run_sweep(
     """Sweep, and return ``(spec, result, report)``. Never raises.
 
     A failed listing is ``probe_failed`` (it pages, and has no grace). An
-    unreadable observability registry downgrades only the floors: every
-    envelope gets the default floor, which leans toward paging, and the
-    report says so.
+    unreadable observability registry downgrades the floors and the lifecycle
+    declarations: every envelope gets the default floor and none is
+    ``declared_off``, which leans toward paging, and the report says so.
     """
     spec = sweep_spec(bucket)
     notes: list[str] = []
@@ -339,14 +418,17 @@ def run_sweep(
             "state": result.state, "summary": reason, "grades": [], "notes": [],
         }
     try:
-        substrates = substrate_map(load_observability_rows(s3, bucket))
-    except Exception as exc:  # noqa: BLE001 — fail toward paging: default floor for every row
-        substrates = {}
+        rows = load_observability_rows(s3, bucket)
+        substrates = substrate_map(rows)
+        declared_off = declared_off_map(rows)
+    except Exception as exc:  # noqa: BLE001 — fail toward paging: default floor, no declared_off
+        substrates, declared_off = {}, {}
         notes.append(f"observability registry unreadable ({type(exc).__name__}); "
-                     "every envelope graded on the default floor")
+                     "every envelope graded on the default floor and none as "
+                     "declared_off")
 
     grades = grade(envelopes, registered=registered_keys(specs),
-                   substrates=substrates, now=now)
+                   substrates=substrates, now=now, declared_off=declared_off)
     result = verdict(grades, now)
     report = {
         "schema_version": 1,

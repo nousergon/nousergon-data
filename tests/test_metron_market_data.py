@@ -93,7 +93,12 @@ def test_builds_and_writes_closes_and_fx_artifacts():
         bucket="b", run_date="2026-06-11", s3_client=s3, close_source=closes, fx_source=fx
     )
 
-    assert result["status"] == "ok"
+    # This mock cannot serve the published spine back (its GETs raise), so the
+    # ENFORCING spine-window guard grades the window `unmeasurable` and degrades
+    # the run (alpha-engine-config-I10780; graded in tests/test_spine_window_guard.py).
+    # Every artifact below is still written: enforcement never withholds them.
+    assert result["status"] == "degraded"
+    assert result["detail"].startswith("data_spine_window unmeasurable (ENFORCE): ")
     assert result["universe"] == 2 and result["closes"] == 2 and result["fx"] == 1
     puts = _puts(s3)
     # Dated + latest for both artifacts.
