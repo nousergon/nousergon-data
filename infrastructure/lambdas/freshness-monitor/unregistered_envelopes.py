@@ -43,6 +43,23 @@ the envelope's age against the cadence the envelope declares about itself:
   unreadable registry grades every envelope as before. Each of those failures
   leans toward paging, never toward silence. ``deprecated`` is not off (the
   component still runs), so it is graded on its clock.
+* A component in :data:`DISPATCH_TRIGGERED` is graded against the dispatch that
+  launches it, not only against a clock (alpha-engine-config-I12762). The
+  alert-drain lane and the two T1 steps that run inside it are launched, while
+  the four ``alpha-engine-alert-drain-*utc`` schedules are paused, ONLY by this
+  monitor's own drain dispatch on a CRITICAL. On an idle day nothing dispatches
+  and nothing should run, so a fixed cadence grades a healthy idle drain
+  ``stale`` and its own page dispatches the drain that clears it: a
+  self-referential page every ~48h that reads "drain dark" when the drain was
+  simply not needed. So the question asked of these envelopes is the one an
+  event-driven lane can answer: did every dispatch get a run? ``stale`` iff the
+  monitor's last dispatch (:data:`DRAIN_DISPATCH_MARKER_KEY`) is newer than the
+  envelope and older than :data:`DISPATCH_ANSWER_GRACE_MINUTES`. The envelope's
+  clock is ALSO graded unless the published observability row of the lane
+  declares ``cadence: event_driven`` (it does while the schedules are paused;
+  whoever re-arms them re-declares the cadence there, and the clock comes back
+  with no code change). Every failure to read the marker or the registry falls
+  back to the clock, which leans toward paging.
 
 The whole set becomes ONE synthetic row, :data:`SWEEP_ARTIFACT_ID`, which
 ``_run_probe_pass`` treats like any registry row. That gives one line on the
@@ -98,6 +115,27 @@ STATE_STALE = "stale"
 STATE_UNCLOCKED = "unclocked"
 STATE_DECLARED_OFF = "declared_off"
 
+#: Components launched by this monitor's own drain dispatch
+#: (``index._maybe_dispatch_drain``), each mapped to the observability row whose
+#: ``cadence:`` declares whether a clock exists besides the trigger. The two
+#: ``t1-*`` steps execute INSIDE the alert-drain run, so they answer the same
+#: dispatch and inherit the lane's cadence declaration
+#: (``alpha-engine-config/scripts/publish_lane_result.py::LANE_CADENCE_MINUTES``).
+DISPATCH_TRIGGERED = {
+    "overseer-alert-drain": "overseer-alert-drain",
+    "t1-freshness-critical-auto-verify": "overseer-alert-drain",
+    "t1-groom-lifecycle-digest-fold": "overseer-alert-drain",
+}
+#: The record the monitor writes BEFORE each drain dispatch. ``index.py`` reads
+#: this constant, so the writer and this reader cannot name two keys.
+DRAIN_DISPATCH_MARKER_KEY = "_freshness_monitor/_dispatch/last_drain_dispatch.json"
+#: How long a dispatch may go unanswered: the drain's 3h runtime watchdog plus
+#: an hour for the dispatcher and the spot launch. Measured 2026-10-26: dispatch
+#: 12:00:17Z, all three envelopes 12:15Z.
+DISPATCH_ANSWER_GRACE_MINUTES = 240
+#: The observability registry's ``cadence:`` value for a component with no clock.
+EVENT_DRIVEN_CADENCE = "event_driven"
+
 #: observability-policy §2.2 ``lifecycle`` values meaning "deliberately not
 #: producing". ``deprecated`` still runs; ``pending`` has not started.
 DECLARED_OFF_LIFECYCLES = frozenset({"retired", "disabled"})
@@ -130,6 +168,18 @@ class Grade:
     detail: str
     lifecycle: str | None = None
     lifecycle_reason: str | None = None
+
+
+@dataclass(frozen=True)
+class DispatchRecord:
+    """The monitor's last drain dispatch, as read for this sweep.
+
+    ``at is None`` with ``readable`` True means no dispatch is on record.
+    ``readable`` False means the marker could not be read, and the trigger
+    grade is skipped (the clock still applies)."""
+
+    readable: bool
+    at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -233,6 +283,36 @@ def declared_off_map(rows: Iterable[Any]) -> dict[str, Declaration]:
     return {cid: d for cid, d in off.items() if cid not in live}
 
 
+def event_driven_ids(rows: Iterable[Any]) -> set[str]:
+    """``component_id`` and aliases of every row declaring ``cadence: event_driven``."""
+    out: set[str] = set()
+    for row in rows:
+        if isinstance(row, dict) and row.get("cadence") == EVENT_DRIVEN_CADENCE:
+            out.update(_row_ids(row))
+    return out
+
+
+def _trigger_grade(
+    env: Envelope, seen: datetime, age: int, substrate: str | None,
+    dispatch: DispatchRecord, now: datetime,
+) -> Grade | None:
+    """The I12762 grade: ``stale`` iff a dispatch went unanswered past the
+    grace. Returns None when the trigger says nothing against the envelope."""
+    at = dispatch.at
+    if at is None or seen >= at:
+        return None
+    waited = int((now - at).total_seconds() // 60)
+    if waited <= DISPATCH_ANSWER_GRACE_MINUTES:
+        return None
+    return Grade(
+        env.check_id, STATE_STALE, age, DISPATCH_ANSWER_GRACE_MINUTES,
+        env.cadence_minutes, substrate, seen.isoformat(),
+        f"drain dispatched {at.isoformat()} and no envelope followed within "
+        f"{DISPATCH_ANSWER_GRACE_MINUTES // 60}h (waited {waited // 60}h); "
+        f"last written {age // 60}h ago, last status {env.status!r}",
+    )
+
+
 def threshold_minutes(cadence: float, substrate: str | None) -> int:
     floor = SUBSTRATE_FLOOR_MINUTES.get(substrate or "", DEFAULT_FLOOR_MINUTES)
     return int(max(STALE_FACTOR * cadence, floor))
@@ -245,9 +325,16 @@ def grade(
     substrates: dict[str, str],
     now: datetime,
     declared_off: dict[str, Declaration] | None = None,
+    dispatch: DispatchRecord | None = None,
+    event_driven: set[str] | None = None,
 ) -> list[Grade]:
-    """Grade every UNREGISTERED envelope. Pure; the tests drive this."""
+    """Grade every UNREGISTERED envelope. Pure; the tests drive this.
+
+    ``dispatch`` None means the trigger grade was not attempted, so every
+    :data:`DISPATCH_TRIGGERED` envelope is graded on its clock as before.
+    """
     declared_off = declared_off or {}
+    event_driven = event_driven or set()
     grades: list[Grade] = []
     for env in sorted(envelopes, key=lambda e: e.check_id):
         if env.key in registered:
@@ -265,6 +352,22 @@ def grade(
                 lifecycle=decl.lifecycle, lifecycle_reason=decl.reason,
             ))
             continue
+        lane = DISPATCH_TRIGGERED.get(env.check_id)
+        if lane is not None and dispatch is not None and dispatch.readable:
+            missed = _trigger_grade(env, seen, age, substrate, dispatch, now)
+            if missed is not None:
+                grades.append(missed)
+                continue
+            if lane in event_driven:
+                last = dispatch.at.isoformat() if dispatch.at else "none on record"
+                grades.append(Grade(
+                    env.check_id, STATE_FRESH, age, None, env.cadence_minutes,
+                    substrate, seen.isoformat(),
+                    f"trigger-graded: every drain dispatch answered (last "
+                    f"dispatch {last}); {lane!r} declares cadence "
+                    f"{EVENT_DRIVEN_CADENCE!r}, so there is no clock",
+                ))
+                continue
         if env.cadence_minutes is None:
             grades.append(Grade(
                 env.check_id, STATE_UNCLOCKED, age, None, None, substrate,
@@ -341,6 +444,34 @@ def verdict(grades: list[Grade], now: datetime) -> CheckResult:
 
 
 # ── I/O ─────────────────────────────────────────────────────────────────────
+
+
+def read_dispatch(s3: Any, bucket: str) -> DispatchRecord:
+    """The monitor's last drain dispatch. Never raises.
+
+    No marker is a readable "none on record". Any other failure, or a body with
+    no parseable ``dispatched_at`` and no ``LastModified``, is unreadable, which
+    drops the trigger grade and leaves the clock (toward paging)."""
+    try:
+        resp = s3.get_object(Bucket=bucket, Key=DRAIN_DISPATCH_MARKER_KEY)
+    except Exception as exc:  # noqa: BLE001 — classify by error code
+        code = str(getattr(exc, "response", {}).get("Error", {}).get("Code", ""))
+        if code in {"404", "NoSuchKey", "NotFound"} or isinstance(exc, KeyError):
+            return DispatchRecord(readable=True, at=None)
+        logger.warning("could not read %s (%s); drain envelopes graded on the "
+                       "clock only", DRAIN_DISPATCH_MARKER_KEY, exc)
+        return DispatchRecord(readable=False)
+    at = None
+    try:
+        doc = json.loads(resp["Body"].read())
+        at = _parse_ts(doc.get("dispatched_at")) if isinstance(doc, dict) else None
+    except Exception:  # noqa: BLE001 — fall back to LastModified below
+        at = None
+    if at is None and isinstance(resp.get("LastModified"), datetime):
+        at = _utc(resp["LastModified"])
+    if at is None:
+        return DispatchRecord(readable=False)
+    return DispatchRecord(readable=True, at=at)
 
 
 def list_envelopes(s3: Any, bucket: str) -> list[Envelope]:
@@ -421,14 +552,20 @@ def run_sweep(
         rows = load_observability_rows(s3, bucket)
         substrates = substrate_map(rows)
         declared_off = declared_off_map(rows)
+        event_driven = event_driven_ids(rows)
     except Exception as exc:  # noqa: BLE001 — fail toward paging: default floor, no declared_off
-        substrates, declared_off = {}, {}
+        substrates, declared_off, event_driven = {}, {}, set()
         notes.append(f"observability registry unreadable ({type(exc).__name__}); "
                      "every envelope graded on the default floor and none as "
                      "declared_off")
 
+    dispatch = read_dispatch(s3, bucket)
+    if not dispatch.readable:
+        notes.append("drain dispatch record unreadable; the dispatch-triggered "
+                     "envelopes were graded on their clock only")
     grades = grade(envelopes, registered=registered_keys(specs),
-                   substrates=substrates, now=now, declared_off=declared_off)
+                   substrates=substrates, now=now, declared_off=declared_off,
+                   dispatch=dispatch, event_driven=event_driven)
     result = verdict(grades, now)
     report = {
         "schema_version": 1,
@@ -438,6 +575,8 @@ def run_sweep(
         "stale_factor": STALE_FACTOR,
         "default_floor_minutes": DEFAULT_FLOOR_MINUTES,
         "substrate_floor_minutes": SUBSTRATE_FLOOR_MINUTES,
+        "last_drain_dispatch": dispatch.at.isoformat() if dispatch.at else None,
+        "dispatch_answer_grace_minutes": DISPATCH_ANSWER_GRACE_MINUTES,
         "grades": [asdict(g) for g in grades],
         "notes": notes,
     }

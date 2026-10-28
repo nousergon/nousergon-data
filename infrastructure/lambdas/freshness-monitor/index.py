@@ -209,9 +209,9 @@ DRAIN_DISPATCH_ENABLED = (
     os.environ.get("FRESHNESS_MONITOR_DRAIN_DISPATCH_ENABLED", "false").lower()
     == "true"
 )
-DRAIN_DISPATCH_MARKER_KEY = (
-    "_freshness_monitor/_dispatch/last_drain_dispatch.json"
-)
+# Single-sourced: the unregistered-envelope sweep reads this marker to grade the
+# drain against its trigger (alpha-engine-config-I12762).
+DRAIN_DISPATCH_MARKER_KEY = unregistered_envelopes.DRAIN_DISPATCH_MARKER_KEY
 # One drain covers every critical in the queue at launch; the cooldown only
 # bounds how often a PERSISTENTLY-critical sweep can relaunch one. Sized to
 # the drain's own runtime ceiling (3h watchdog) would starve genuinely new
