@@ -596,6 +596,11 @@ Resources:
         - Id: predictor-health-check
           Arn: !Ref PredictorHealthCheckLambdaArn
           Input: '{"action": "check"}'
+          # Bounded retry: a once-a-day check needs at most a couple of
+          # re-deliveries, not the AWS default of 185 (cost gate).
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
 
   PredictorHealthCheckTriggerPermission:
     Type: AWS::Lambda::Permission
@@ -628,6 +633,11 @@ Resources:
         - Id: predictor-drift-check
           Arn: !Ref PredictorLambdaArn
           Input: '{"action": "check_drift"}'
+          # Bounded retry: a once-a-day check needs at most a couple of
+          # re-deliveries, not the AWS default of 185 (cost gate).
+          RetryPolicy:
+            MaximumRetryAttempts: 2
+            MaximumEventAgeInSeconds: 3600
 
   PredictorDriftCheckTriggerPermission:
     Type: AWS::Lambda::Permission
