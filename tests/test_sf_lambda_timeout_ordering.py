@@ -98,7 +98,18 @@ _FUNCTION_TIMEOUTS_SEC = CODIFIED_FUNCTION_TIMEOUTS_SEC
 # again and the budgets get chosen then. The two step_function_eod_reconcile
 # entries survived v1 and were FIXED, not re-dated (alpha-engine-config-I6897,
 # 2026-10-03): see the note where they used to sit in the set below.
-_KNOWN_UNBOUND_EXPIRY = "2026-10-31"
+#
+# Deadline moved 2026-10-31 -> 2026-11-08 (alpha-engine-config-I12772).
+# Reason: the 10-30 cutover is a pointer cutover and does NOT delete the v1
+# machines. The decommission manifest (nous-ergon-ops
+# governance/decommission.d/crucible-v1-cutover.yaml, v1_pipeline_deletions)
+# assigns their deletion to alpha-engine-config-I10655 deliverable 3, which is
+# gated on one full trading week on the M champion beside v1. The first such
+# week after the cutover is Mon 11-02..Fri 11-06, so the earliest deletion is
+# after the 11-06 close; 11-08 is the Sunday of that window. If the two v1
+# definitions still exist on Mon 11-09, this fails again and the budgets are
+# chosen then. All nine remaining entries are v1 states; none was removed here.
+_KNOWN_UNBOUND_EXPIRY = "2026-11-08"
 
 _KNOWN_UNBOUND: frozenset[tuple[str, str]] = frozenset(
     {
