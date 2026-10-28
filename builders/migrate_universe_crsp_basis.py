@@ -121,6 +121,7 @@ import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+import dataclasses
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
@@ -184,6 +185,25 @@ CA_FETCH_BACKOFF_CAP_SECONDS = 300.0
 # masking a missing/doubled action (which moves the boundary by the action
 # factor — a dividend ~0.5–3%/event compounding, a split 50%+).
 DEFAULT_RECONCILE_REL_TOL = 0.02
+
+# ── which axis GATES the build (alpha-engine-config-I12436, "Gate on close") ──
+#
+# The build reconciles two axes per name:
+#   * ``close``: the split-only ``Close`` LEVEL against yfinance's
+#     ``auto_adjust=False`` ``Close`` (split-adjusted, NOT dividend-adjusted),
+#     kept by ``fetch_raw_prices`` as ``REFERENCE_CLOSE_ATTR``. This is the
+#     column the EDGAR PIT rebuild reads (option A, Brian 2026-10-23).
+#   * ``total_return``: ``total_return_close`` against the live ``universe``
+#     ``Close`` (dividend back-adjusted yfinance).
+# The GATE axis decides pass/fail, the scratch write and the receipt. The other
+# axis is still reconciled, still logged at ERROR for every unexplained name,
+# and recorded in the audit and the receipt (``total_return_axis_trusted``), so
+# a consumer of ``total_return_close`` or the features on it can refuse an
+# untrusted build. Gating on ``close`` checks what the rebuild uses; it does not
+# loosen the ``close`` check, which had no gate before.
+GATE_AXES = ("close", "total_return")
+DEFAULT_GATE_AXIS = "close"
+REFERENCE_CLOSE_ATTR = "reference_split_adjusted_close"
 
 # Window (calendar days) for attributing an out-of-tol residual's worst date
 # to the nearest registered corporate action — diagnostic only (the report
@@ -249,6 +269,8 @@ class TickerOutcome:
     ticker: str
     outcome: str  # "ok" | "fetch_empty" | "no_old_close" | "error"
     reconcile: ReconcileRecord | None = None
+    # The split-only Close against its reference (gate on close).
+    close_reconcile: ReconcileRecord | None = None
     n_rows: int = 0
     n_splits: int = 0
     n_dividends: int = 0
@@ -501,6 +523,11 @@ def fetch_raw_prices(
     out = out[list(_OHLCV)]
     out.attrs[SPLITS_IN_BASIS_ATTR] = [(when, 1.0 / ratio) for when, ratio in splits if when < seam]
     out.attrs[POLYGON_RAW_FROM_ATTR] = seam.strftime("%Y-%m-%d")
+    # The close axis's reference: yfinance's own split-adjusted, dividend-
+    # unadjusted Close, untouched (alpha-engine-config-I12436, gate on close).
+    # A Series in ``attrs`` must not ride into pandas ops: the build pops it
+    # before reconstructing (see ``_process_one``).
+    out.attrs[REFERENCE_CLOSE_ATTR] = yf_frame["Close"].astype("float64").copy()
     return out
 
 
@@ -1243,6 +1270,53 @@ def reconcile_total_return(
     )
 
 
+def reconcile_close(
+    ticker: str,
+    new_close: pd.Series,
+    reference_close: pd.Series | None,
+    *,
+    split_actions: list | None = None,
+    rel_tol: float = DEFAULT_RECONCILE_REL_TOL,
+    known_divergence: bool = False,
+    reconcile_start: str | pd.Timestamp | None = None,
+) -> ReconcileRecord:
+    """The CLOSE axis: the reconstructed split-only ``Close`` against yfinance's
+    split-adjusted, dividend-unadjusted ``Close`` (``REFERENCE_CLOSE_ATTR``).
+
+    Same comparison as :func:`reconcile_total_return` (common dates, scoped to
+    ``reconcile_start``, anchor-rebased, max relative deviation), so a missing,
+    doubled or mis-ratio'd SPLIT surfaces here. Dividends play no part on this
+    axis. A name with no reference is ``no_overlap`` and UNEXPLAINED: a close
+    that cannot be checked is never passed."""
+    if reference_close is None or len(reference_close) == 0:
+        return ReconcileRecord(
+            ticker=ticker,
+            status="no_overlap",
+            n_common_dates=0,
+            max_rel_dev=float("inf"),
+            max_dev_date=None,
+            explained=False,
+            explanation=(
+                "CLOSE axis: no split-adjusted reference close for this name "
+                "(fetch_raw_prices keeps yfinance auto_adjust=False Close) — "
+                "cannot reconcile (fail-loud, not skipped)"
+            ),
+            reconcile_start=(
+                pd.Timestamp(reconcile_start).strftime("%Y-%m-%d")
+                if reconcile_start is not None else None
+            ),
+        )
+    ref = reference_close.copy()
+    ref.index = pd.to_datetime(ref.index).normalize()
+    rec = reconcile_total_return(
+        ticker, new_close, ref,
+        split_actions=split_actions, dividend_actions=[],
+        rel_tol=rel_tol, known_divergence=known_divergence,
+        reconcile_start=reconcile_start,
+    )
+    return dataclasses.replace(rec, explanation=f"CLOSE axis: {rec.explanation}")
+
+
 # ── declared classes of known total-return divergence ────────────────────────
 #
 # alpha-engine-config-I12436, classes 2, 4 and 5 of the 2026-10-26 build: names
@@ -1460,6 +1534,7 @@ def migrate_universe_crsp_basis(
     rel_tol: float = DEFAULT_RECONCILE_REL_TOL,
     known_divergence_tickers: frozenset[str] | None = None,
     reconcile_start: str | None = None,
+    gate_axis: str | None = None,
     workers: int | None = None,
     raw_fetch=None,
     client=None,
@@ -1519,6 +1594,9 @@ def migrate_universe_crsp_basis(
     summary dict with the reconciliation report + write outcome.
     """
     known_divergence_tickers = known_divergence_tickers or frozenset()
+    gate_axis = gate_axis or DEFAULT_GATE_AXIS
+    if gate_axis not in GATE_AXES:
+        raise ValueError(f"gate_axis must be one of {GATE_AXES}, got {gate_axis!r}")
     workers = workers or int(
         os.environ.get("MIGRATE_UNIVERSE_CRSP_WORKERS", str(DEFAULT_WORKERS))
     )
@@ -1612,6 +1690,12 @@ def migrate_universe_crsp_basis(
                 return TickerOutcome(ticker, "error", error=f"raw_prices: {exc}")
             if raw_df is None or raw_df.empty:
                 return TickerOutcome(ticker, "fetch_empty")
+            # Take the close axis's reference off the frame before any pandas
+            # op sees it: a Series in ``attrs`` breaks attrs propagation
+            # ("truth value of a Series is ambiguous") in the feature path.
+            reference_close = (getattr(raw_df, "attrs", None) or {}).pop(
+                REFERENCE_CLOSE_ATTR, None,
+            )
 
             try:
                 split_actions, dividend_actions = fetch_corporate_actions(
@@ -1680,9 +1764,20 @@ def migrate_universe_crsp_basis(
                 reconcile_start=reconcile_start,
             )
 
+            close_rec = reconcile_close(
+                ticker,
+                new_df["Close"],
+                reference_close,
+                split_actions=split_actions,
+                rel_tol=rel_tol,
+                known_divergence=ticker in known_divergence_tickers,
+                reconcile_start=reconcile_start,
+            )
+
             out = TickerOutcome(
                 ticker, "ok",
                 reconcile=rec,
+                close_reconcile=close_rec,
                 n_rows=len(new_df),
                 n_splits=len(split_actions),
                 n_dividends=len(dividend_actions),
@@ -1724,6 +1819,7 @@ def migrate_universe_crsp_basis(
             bucket=bucket, rel_tol=rel_tol, reconcile_start=reconcile_start,
             arctic_symbols=arctic_symbols,
             known_divergence_tickers=known_divergence_tickers,
+            gate_axis=gate_axis,
         )
     finally:
         if own_spill_dir:
@@ -1745,6 +1841,7 @@ def _run_and_report(
     reconcile_start: str | None,
     arctic_symbols: list[str],
     known_divergence_tickers: frozenset[str],
+    gate_axis: str = DEFAULT_GATE_AXIS,
 ) -> dict:
     """Run every target, gate, write the scratch library only on a pass, emit the
     audit (and on a pass the receipt), fail loud."""
@@ -1754,7 +1851,8 @@ def _run_and_report(
     elapsed = time.time() - t0
 
     # ── partition outcomes ────────────────────────────────────────────────────
-    records: list[ReconcileRecord] = []
+    records: list[ReconcileRecord] = []  # total-return axis
+    close_records: list[ReconcileRecord] = []
     errors: list[dict] = []
     no_old_close: list[str] = []
     fetch_empty: list[str] = []
@@ -1767,6 +1865,14 @@ def _run_and_report(
     for o in outcomes:
         if o.outcome == "ok" and o.reconcile is not None:
             records.append(o.reconcile)
+            if o.close_reconcile is not None:
+                close_records.append(o.close_reconcile)
+            else:  # an outcome built without its close check is never passed
+                close_records.append(ReconcileRecord(
+                    ticker=o.ticker, status="no_overlap", n_common_dates=0,
+                    max_rel_dev=float("inf"), max_dev_date=None, explained=False,
+                    explanation="CLOSE axis: not reconciled (fail-loud, not skipped)",
+                ))
         elif o.outcome == "no_old_close":
             no_old_close.append(o.ticker)
         elif o.outcome == "fetch_empty":
@@ -1783,13 +1889,20 @@ def _run_and_report(
         if o.prior_tickers:
             prior_ticker_dividends.append({"ticker": o.ticker, "prior": o.prior_tickers})
 
+    tr_records = records
+    tr_unexplained = [r for r in tr_records if not r.explained]
+    close_unexplained = [r for r in close_records if not r.explained]
+    # The GATE axis's records drive pass/fail, the scratch write, the receipt
+    # and every top-level count below (alpha-engine-config-I12436).
+    records = close_records if gate_axis == "close" else tr_records
     within_tol = [r for r in records if r.status == "within_tol"]
     out_of_tol = [r for r in records if r.status == "out_of_tol"]
     no_overlap = [r for r in records if r.status == "no_overlap"]
     # FAIL-LOUD set: every out-of-tol or no-overlap record not explained.
     unexplained = [r for r in records if not r.explained]
-    # Report-only classification of those residuals (alpha-engine-config-I12436).
-    divergence_classes = classify_divergences(records)
+    # Report-only classification of the total-return residuals (I12436).
+    divergence_classes = classify_divergences(tr_records)
+    total_return_axis_trusted = not tr_unexplained
 
     # ── WRITE scratch (apply) — only when the reconcile gate PASSED ───────────
     # alpha-engine-config-I12684: this pass used to run before the gate, so the
@@ -1839,10 +1952,16 @@ def _run_and_report(
             except OSError:
                 pass
 
-    for r in out_of_tol + no_overlap:
-        lvl = log.warning if r.explained else log.error
-        lvl("RECONCILE %s status=%s max_rel_dev=%.4f date=%s — %s",
-            r.ticker, r.status, r.max_rel_dev, r.max_dev_date, r.explanation)
+    # BOTH axes log every out-of-tolerance name; an unexplained one at ERROR,
+    # whether or not its axis gates (the non-gating axis still fails loudly).
+    for axis, axis_records in (("close", close_records), ("total_return", tr_records)):
+        for r in axis_records:
+            if r.status == "within_tol":
+                continue
+            lvl = log.warning if r.explained else log.error
+            lvl("RECONCILE[%s%s] %s status=%s max_rel_dev=%.4f date=%s — %s",
+                axis, " gate" if axis == gate_axis else "", r.ticker, r.status,
+                r.max_rel_dev, r.max_dev_date, r.explanation)
 
     # Reconcile-window scope summary: make the gate scope EXPLICIT in the audit —
     # the start used, aggregate in-window vs excluded date counts, and a flag that
@@ -1851,8 +1970,28 @@ def _run_and_report(
     total_excluded = sum(r.n_common_excluded for r in records)
     tickers_with_excluded = sum(1 for r in records if r.n_common_excluded > 0)
 
+    def _axis_report(axis_records: list[ReconcileRecord]) -> dict:
+        return {
+            "reconciled_count": len(axis_records),
+            "within_tol_count": sum(r.status == "within_tol" for r in axis_records),
+            "out_of_tol_count": sum(r.status == "out_of_tol" for r in axis_records),
+            "no_overlap_count": sum(r.status == "no_overlap" for r in axis_records),
+            "unexplained_count": sum(not r.explained for r in axis_records),
+            "unexplained": [r.to_dict() for r in axis_records if not r.explained],
+        }
+
     summary = {
         "status": "ok" if (not unexplained and not errors and not aborted) else "fail",
+        # alpha-engine-config-I12436 ("Gate on close"): the axis whose records
+        # the top-level counts, ``unexplained`` and ``status`` describe.
+        "gate_axis": gate_axis,
+        "total_return_axis_trusted": total_return_axis_trusted,
+        "close_unexplained_count": len(close_unexplained),
+        "tr_unexplained_count": len(tr_unexplained),
+        "axes": {
+            "close": _axis_report(close_records),
+            "total_return": _axis_report(tr_records),
+        },
         "applied": apply,
         "scratch_lib": scratch_lib,
         "rel_tol": rel_tol,
@@ -1925,6 +2064,12 @@ def _run_and_report(
             "scratch_lib": scratch_lib,
             "audit_key": audit_key,
             "verified_at": datetime.now(timezone.utc).isoformat(),
+            "gate_axis": gate_axis,
+            # A consumer of total_return_close (or the features on it) must
+            # refuse this library while this is false (I12436).
+            "total_return_axis_trusted": total_return_axis_trusted,
+            "tr_unexplained_count": len(tr_unexplained),
+            "close_unexplained_count": len(close_unexplained),
             "unexplained_count": len(unexplained),
             "errors_count": len(errors),
             "aborted_count": len(aborted),
@@ -1946,6 +2091,15 @@ def _run_and_report(
         len(unconfirmed_splits), written, total_in_window, total_excluded, elapsed,
     )
 
+    if tr_unexplained and gate_axis != "total_return":
+        log.error(
+            "TOTAL-RETURN AXIS UNTRUSTED: %d name(s) carry an unexplained "
+            "total-return residual (gate_axis=%s; first 20: %s). total_return_close "
+            "and the features on it are NOT trusted; the receipt says "
+            "total_return_axis_trusted=false (alpha-engine-config-I12436)",
+            len(tr_unexplained), gate_axis, [r.ticker for r in tr_unexplained[:20]],
+        )
+
     # ── FAIL LOUD ─────────────────────────────────────────────────────────────
     # No silent skip, no "unscoreable" sentinel (Brian standing feedback): an
     # unexplained out-of-tol / no-overlap residual means a missing/doubled
@@ -1954,7 +2108,8 @@ def _run_and_report(
     if unexplained:
         raise RuntimeError(
             f"CRSP reconciliation FAILED LOUD: {len(unexplained)} ticker(s) "
-            f"carry an unexplained out-of-tolerance residual (rel_tol={rel_tol:.2%}). "
+            f"carry an unexplained out-of-tolerance residual on the "
+            f"{gate_axis} axis (rel_tol={rel_tol:.2%}). "
             f"Each is a missing/doubled/mis-ratio'd split or dividend, an "
             f"un-reconcilable ticker, or a real polygon-vs-yfinance divergence — "
             f"localize and fix the action (or acknowledge via "
@@ -2036,6 +2191,12 @@ def main():
              "reconciliation (UNCHANGED; operator opts in to scoping).",
     )
     parser.add_argument(
+        "--gate-axis", choices=GATE_AXES, default=DEFAULT_GATE_AXIS,
+        help="Which reconcile axis GATES the build (default: close, the split-only "
+             "Close the EDGAR rebuild reads; alpha-engine-config-I12436). The other "
+             "axis is still reconciled, logged at ERROR and recorded in the receipt.",
+    )
+    parser.add_argument(
         "--bucket", default=DEFAULT_BUCKET,
         help=f"S3 bucket (default: {DEFAULT_BUCKET})",
     )
@@ -2058,6 +2219,7 @@ def main():
         rel_tol=args.rel_tol,
         known_divergence_tickers=known,
         reconcile_start=args.reconcile_start,
+        gate_axis=args.gate_axis,
     )
     print(json.dumps(result, indent=2, default=str))
 
