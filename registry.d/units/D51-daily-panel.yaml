@@ -16,41 +16,18 @@ component_id: "data-collector-d51-daily-panel"
 owning_repo: "nousergon-data"
 title: "Daily panel: one long OHLCV panel per session, compiled once from ArcticDB universe"
 component: 1
-lifecycle: pending
+lifecycle: in-service
 owner: brian
 code_path: "builders/daily_panel.py:174"
-# RE-EXAMINED 2026-10-13, re-declared pending with a NEW reason. The blocker
-# the 2026-10-06 declaration named has cleared: nous-ergon-ops-PR1668 merged
-# 2026-10-12 15:45Z granting the collection-box role PutObject/GetObject on
-# data_collection/panel/*, its iam-apply-on-merge `apply` job succeeded, and
-# the live inline policy nousergon-data-collection-box-s3 carries the
-# data_collection/panel/* ARN (read 2026-10-13). What remains is the schedule
-# itself, and the promotion condition is unmet: no object exists under
-# data_collection/panel/ or data_collection/runs/D51/ (aws s3 ls, 2026-10-13).
-pending_since: "2026-10-13"
-lifecycle_reexam: "2026-10-27"
-lifecycle_reason: >-
-    The producer module, its contract, an operator-run CLI and the collector's
-    whole-mode entry `weekly_collector.py --daily-panel` (run-manifest-wrapped,
-    alpha-engine-config-I10791). SCHEDULED by alpha-engine-config-I10791's
-    schedule step: `daily-panel` runs on its own machine,
-    ne-data-collection-panel, which the rule ne-data-collection-panel-on-eod
-    starts when ne-data-collection-eod SUCCEEDS. D51 is that machine's only
-    verify_unit. The
-    collection-box write grant on data_collection/panel/ is
-    nous-ergon-ops-PR1668, applied 2026-10-12. The unit stays pending until a
-    scheduled run has published data_collection/panel/{trading_day}/manifest.json
-    for the latest session (promotes_when). Re-declared pending 2026-10-13 ->
-    re-exam 2026-10-27 (pending_since + 14 days, the PENDING_MAX_DAYS
-    ceiling); the previous window (2026-10-06 -> 2026-10-20) named the grant
-    as the blocker.
-lifecycle_owner: brian
-promotes_when: >-
-    The EOD collection runs `weekly_collector.py --daily-panel` after the
-    ArcticDB append and data_collection/panel/{trading_day}/manifest.json is
-    current for the latest session. The cadence is already declared (trigger
-    below), so the promotion PR flips lifecycle to in-service and drops the
-    pending dates.
+# PROMOTED 2026-10-28 (nous-ergon-ops-I1884: the pending row expired on its
+# 2026-10-27 re-exam and turned the ops registry reconciler red). The
+# promotes_when condition is met, read-only, on 2026-10-28:
+# data_collection/panel/2026-10-27/manifest.json (909 symbols, 374,080 rows,
+# generated_at 2026-10-28T00:32Z) and its scheduled run record
+# data_collection/runs/D51/2026-10-27/ (status ok, trigger scheduled) exist;
+# panel/ holds every session 2026-10-14..2026-10-27 and runs/D51/ every one
+# but 2026-10-21; ne-data-collection-panel's last five starts (2026-10-23 ..
+# 2026-10-28) SUCCEEDED. Per promotes_when, the pending dates are dropped.
 trigger:
   kind: "step-functions"
   # Its own machine, ne-data-collection-panel, started by the EventBridge rule
