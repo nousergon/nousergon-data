@@ -26,6 +26,14 @@ the `-violation` count is published on every tick, so `-violation` became
 ``breaching`` and carries silence itself, and `-dead` was deleted. For those the
 rule inverts: the `-violation` half MUST be declared armed and the `-dead` half
 MUST sit in ``retired_alarms`` (never ``armed_alarms``), naming its restore point.
+
+RETIRED SPLIT PAIRS (alpha-engine-config-I11792, 2026-10-28). The Director's
+silence half, `alpha-engine-director-plan-no-datapoint`, was retired as
+REDUNDANT: the Director stage is terminal for the weekly SF, so a missing run
+pages through sf-telegram-notifier, and the freshness monitor's
+`director_action_plan` row catches a plan never written. Its condition half
+still must never be declared armed, and the retired half must sit in
+``retired_alarms``, never ``armed_alarms``.
 """
 
 from __future__ import annotations
@@ -43,7 +51,11 @@ MANIFEST_PATH = REPO / "infrastructure" / "automation_pause.json"
 #: must not be)``. Every treatment here was read off live CloudWatch on
 #: 2026-08-28 with ``aws cloudwatch describe-alarms``, and each alarm's own
 #: AlarmDescription states the same split in prose.
-I8118_PAIRS = [
+I8118_PAIRS: list[tuple[str, str]] = []
+
+#: ``(retired silence half, condition half — notBreaching, must not be
+#: declared)`` — see the module docstring's RETIRED SPLIT PAIRS paragraph.
+RETIRED_SPLIT_PAIRS = [
     (
         "alpha-engine-director-plan-no-datapoint",
         "alpha-engine-director-plan-latency",
@@ -100,6 +112,19 @@ def classification_findings(manifest: dict, module) -> list[str]:
                 "breaching population, so declaring it here can only produce "
                 "[armed-missing-in-aws] forever"
             )
+    retired_names = set(module.retired_alarm_names(manifest))
+    for silence, not_breaching in RETIRED_SPLIT_PAIRS:
+        if silence in declared or silence not in retired_names:
+            findings.append(
+                f"{silence} was retired as redundant on 2026-10-28; it belongs in "
+                "retired_alarms, never armed_alarms"
+            )
+        if not_breaching in declared:
+            findings.append(
+                f"{not_breaching} is notBreaching live and can never appear in the "
+                "breaching population, so declaring it here can only produce "
+                "[armed-missing-in-aws] forever"
+            )
     for name in STANDALONE_BREACHING:
         if name not in declared:
             findings.append(f"{name} is breaching live and is not classified")
@@ -130,7 +155,7 @@ def test_the_condition_half_prose_is_kept_under_the_underscore_marker(manifest):
     `_alpha-engine-watch-plane-overseer-intake-dlq-age` already uses for
     exactly this reason. Reconstructing WHY an entry left is the whole point.
     """
-    for _, not_breaching in I8118_PAIRS:
+    for _, not_breaching in I8118_PAIRS + RETIRED_SPLIT_PAIRS:
         key = "_" + not_breaching
         assert key in manifest["armed_alarms"], (
             f"{not_breaching} was removed without keeping its record; re-add it "
