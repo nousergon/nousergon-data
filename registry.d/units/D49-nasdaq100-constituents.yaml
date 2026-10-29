@@ -34,24 +34,33 @@ component: 1
 lifecycle: pending
 owner: brian
 code_path: "collectors/nasdaq100.py:328"
-# RE-EXAMINED 2026-10-14 on a CHANGED reason: the trigger is in this change.
+# RE-EXAMINED 2026-10-29 on a CHANGED reason (alpha-engine-config-I11306).
 # History: declared pending 2026-09-21 (re-exam 2026-10-05); re-declared
-# 2026-10-06 (re-exam 2026-10-20) because nothing scheduled it. This window
-# no longer waits on scheduling. It waits on the first scheduled run's
-# artifact, which promotes_when names. pending_since + 14 days is the ops
-# ceiling (PENDING_MAX_DAYS); the window spans two Saturday weekly runs.
-pending_since: "2026-10-14"
-lifecycle_reexam: "2026-10-28"
+# 2026-10-06 (re-exam 2026-10-20) because nothing scheduled it; re-declared
+# 2026-10-14 (re-exam 2026-10-28) when the trigger landed, to wait on the
+# first scheduled run. That wait is OVER: promotes_when is met (see
+# lifecycle_reason). This window waits only on the coordinated promotion,
+# whose alpha-engine-config half has to land first or with it.
+# pending_since + 14 days is the ops ceiling (PENDING_MAX_DAYS); the window
+# spans two Saturday weekly collections.
+pending_since: "2026-10-29"
+lifecycle_reexam: "2026-11-12"
 lifecycle_reason: >-
-    SCHEDULED by alpha-engine-config-I11306: `weekly_collector.py
-    --nasdaq100-constituents` (run-manifest-wrapped) runs on
-    ne-data-collection-panel, started by the rule
-    ne-data-collection-ndx-constituents-on-weekly when
-    ne-data-collection-weekly SUCCEEDS, after D10 has written the
-    fundamentals archive its weights read. D49 is that execution's only
-    verify_unit. The unit stays pending until a scheduled run has published
-    market_data/index_constituents/NDX.json with a current date
-    (promotes_when).
+    SCHEDULED by alpha-engine-config-I11306 and PRODUCING: `weekly_collector.py
+    --nasdaq100-constituents` runs on ne-data-collection-panel, started by the
+    rule ne-data-collection-ndx-constituents-on-weekly when
+    ne-data-collection-weekly SUCCEEDS. Measured read-only 2026-10-29:
+    status-ok scheduled D49 run manifests for 2026-10-16 and 2026-10-23 under
+    data_collection/runs/D49/, and market_data/index_constituents/NDX.json at
+    date 2026-10-23 (written 2026-10-24 11:50Z). So promotes_when is met. The
+    unit stays pending only because the promotion is cross-repo and is not yet
+    ready on the alpha-engine-config side (blocker, tracked on
+    alpha-engine-config-I11306): its two ARTIFACT_REGISTRY rows are still
+    declared_off against I11306 with no `produced_by`, because a saturday_sf
+    row may only name a Saturday pipeline and D49 runs on
+    ne-data-collection-panel; their cadence and 60-minute SLA predate the
+    trigger, while the run has landed 07:15-07:50 ET on Saturday. Flipping this
+    unit to in-service before those land reads artifact_registry as parked.
 lifecycle_owner: brian
 promotes_when: >-
     A scheduled ne-data-collection-panel execution has filed an ok D49 run
@@ -59,6 +68,12 @@ promotes_when: >-
     `date`. The cadence is already declared (trigger below), so the promotion
     PR flips lifecycle to in-service, drops the pending dates, and clears the
     two registry rows' declared-off block (see registry_rows below).
+    Measured MET on 2026-10-29 (see lifecycle_reason). What is still
+    outstanding is the alpha-engine-config half (alpha-engine-config-I11306):
+    the two ARTIFACT_REGISTRY rows lose `declared_off`, name
+    ne-data-collection-panel as producer, and carry a cadence and SLA
+    re-checked against the landed trigger. The promotion PR here lands with
+    or after that change.
 trigger:
   kind: "step-functions"
   # Its own execution on ne-data-collection-panel, started by the EventBridge
