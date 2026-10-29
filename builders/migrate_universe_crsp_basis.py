@@ -340,6 +340,18 @@ class RawPriceFetchError(RuntimeError):
     the defect this fetch exists to remove (alpha-engine-config-I12674)."""
 
 
+class RawPriceJoinError(RawPriceFetchError):
+    """The bars were fetched, but the yfinance history does not join polygon's
+    raw basis at the seam.
+
+    A property of ONE name's data (a split yfinance folded in but does not list,
+    or a symbol polygon prices for someone else), not of the fetch path, so it
+    fails that name and the gate without stopping the build: every other name is
+    still reconciled, and one run names every such name rather than the first
+    (alpha-engine-config-I12436, 2026-10-29: BNY stopped the build with 793 of
+    909 names unread)."""
+
+
 def _yfinance_frame(ticker: str, period: str) -> pd.DataFrame:
     """yfinance ``auto_adjust=False`` OHLCV plus its ``Stock Splits`` column.
 
@@ -436,6 +448,7 @@ def fetch_raw_prices(
     polygon_lookback_days: int | None = None,
     attempts: int = CA_FETCH_ATTEMPTS,
     sleep=None,
+    retickers: list[dict] | None = None,
 ) -> pd.DataFrame:
     """RAW (unadjusted) daily OHLCV for one ticker, so polygon's splits are
     applied to it exactly once (alpha-engine-config-I12674).
@@ -453,6 +466,13 @@ def fetch_raw_prices(
       recorded in ``df.attrs[SPLITS_IN_BASIS_ATTR]``; ``reconstruct_basis``
       never applies them again.
     * after polygon's last bar (its close is T+1): yfinance, likewise un-adjusted.
+    * a name that took its symbol in a curated rename (``retickers``, default
+      ``collectors/data/sp500_known_retickers.json``) inside polygon's window:
+      polygon is asked only from the rename date, because its aggregates are
+      keyed by symbol and the bars before it belong to the symbol's previous
+      holder (BK -> BNY 2026-05-22). yfinance carries the entity's own history
+      under the new symbol, so the seam moves to the rename date and is checked
+      there like any other.
 
     Contract unchanged: a tz-naive, sorted ``DatetimeIndex`` with
     ``Open/High/Low/Close`` (float64) and ``Volume`` (int64). Raises
@@ -469,6 +489,13 @@ def fetch_raw_prices(
     )
     end_ts = pd.Timestamp(today) if today else pd.Timestamp(datetime.now(timezone.utc).date())
     start_ts = end_ts - pd.Timedelta(days=lookback)
+    held_from = symbol_held_from(
+        ticker, load_known_retickers() if retickers is None else retickers,
+    )
+    if not (held_from is not None and start_ts < held_from <= end_ts):
+        held_from = None  # no rename inside polygon's window: nothing to clip
+    if held_from is not None:
+        start_ts = held_from
 
     yf_frame = _yfinance_frame(ticker, period)
     poly = _polygon_raw_bars(
@@ -485,6 +512,16 @@ def fetch_raw_prices(
     poly = poly.copy()
     poly.index = pd.to_datetime(poly.index).normalize()
     poly = poly.sort_index()
+    if held_from is not None:
+        # Belt and braces: a client that ignores ``start`` must not hand back
+        # the previous holder's bars either.
+        poly = poly[poly.index >= held_from]
+        if poly.empty:
+            raise RawPriceFetchError(
+                f"{ticker}: polygon returned no raw bars on or after the "
+                f"{held_from.date()} rename — refusing to fall back to a "
+                "split-adjusted close"
+            )
     seam = poly.index.min()
 
     splits = _yfinance_splits(yf_frame)
@@ -501,14 +538,14 @@ def fetch_raw_prices(
     common = yf_unadj.index.intersection(poly.index)
     if (yf_unadj.index < seam).any():
         if len(common) == 0:
-            raise RawPriceFetchError(
+            raise RawPriceJoinError(
                 f"{ticker}: yfinance and polygon share no session, so the "
                 "pre-polygon history cannot be joined to the raw basis"
             )
         head = common[:_SEAM_CHECK_SESSIONS]
         ratio = float((yf_unadj.loc[head, "Close"] / poly.loc[head, "Close"]).median())
         if not abs(ratio - 1.0) <= _SEAM_REL_TOL:
-            raise RawPriceFetchError(
+            raise RawPriceJoinError(
                 f"{ticker}: un-adjusted yfinance close is {ratio:.4f}x polygon's "
                 f"raw close at the seam ({seam.date()}) — a split yfinance folded "
                 "in is missing from its split list or mis-ratio'd; refusing to "
@@ -820,6 +857,14 @@ def _known_prior_tickers(ticker: str, retickers: list[dict]) -> list[PriorTicker
         ))
         cur = old
     return out
+
+
+def symbol_held_from(ticker: str, retickers: list[dict]) -> pd.Timestamp | None:
+    """The date ``ticker``'s entity took the symbol in its latest curated rename
+    (``None`` when the file names no rename into it). Polygon's per-symbol bars
+    before that date are the previous holder's (``fetch_raw_prices``)."""
+    dates = [pd.Timestamp(r["effective"]).normalize() for r in retickers if r["new"] == ticker]
+    return max(dates) if dates else None
 
 
 def _polygon_prior_tickers(ticker: str, pairs: list[dict]) -> list[PriorTicker]:
@@ -1600,11 +1645,15 @@ def migrate_universe_crsp_basis(
     workers = workers or int(
         os.environ.get("MIGRATE_UNIVERSE_CRSP_WORKERS", str(DEFAULT_WORKERS))
     )
+    # The curated renames, read once; a missing or malformed file fails the
+    # build here, before any polygon budget is spent.
+    retickers = load_known_retickers()
+
     if raw_fetch is None:
         # Same polygon client (and so the same locked limiter) as the
         # corporate-action fetch: the raw bars are one more call per name.
         def raw_fetch(ticker: str) -> pd.DataFrame:
-            return fetch_raw_prices(ticker, client=client)
+            return fetch_raw_prices(ticker, client=client, retickers=retickers)
 
     s3 = boto3.client("s3")
     universe_lib = get_universe_lib(bucket)  # READ-ONLY baseline source
@@ -1661,10 +1710,6 @@ def migrate_universe_crsp_basis(
         log.info("Spilling featured frames to %s until the write pass", spill_dir)
     slot_of = {t: i for i, t in enumerate(targets)}
 
-    # The curated renames, read once; a missing or malformed file fails the
-    # build here, before any polygon budget is spent.
-    retickers = load_known_retickers()
-
     # Set when any name's corporate actions could not be fetched: the build can
     # no longer pass (the audit gate needs zero errors), so the remaining names
     # are skipped instead of spending hours of polygon budget on a lost run.
@@ -1680,6 +1725,16 @@ def migrate_universe_crsp_basis(
 
             try:
                 raw_df = raw_fetch(ticker)
+            except RawPriceJoinError as exc:
+                # One name's data, not the fetch path: fail the name (and so the
+                # gate: nothing is written) and keep reconciling the rest.
+                log.error(
+                    "%s — this name fails and the gate with it; the build "
+                    "continues so the audit names every such name "
+                    "(alpha-engine-config-I12436)",
+                    exc,
+                )
+                return TickerOutcome(ticker, "error", error=f"raw_prices: {exc}")
             except RawPriceFetchError as exc:
                 abort.set()
                 log.error(
