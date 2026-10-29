@@ -99,6 +99,13 @@ CLOSE_LOOKBACK_DAYS = 7
 
 REASON_FLOWS = "external_flows_not_journaled"
 REASON_QQQ_BASIS = "qqq_not_polygon_settled"
+#: A trading day (a date in the SPY close history) with no NAV row inside a
+#: window: the chain links across it, so the return holds but the day's own
+#: factor and its beta observation are lost (S1 backfill, 2026-10-29).
+REASON_NAV_ROW_MISSING = "nav_row_missing"
+#: A NAV row on a date the SPY close history has no close for, inside that
+#: history's span: a market-closed day the export recorded anyway.
+REASON_NAV_ROW_CLOSED_DAY = "nav_row_on_market_closed_day"
 
 WINDOWS: tuple[tuple[str, str], ...] = (
     ("day", "Day"),
@@ -364,6 +371,23 @@ def build(
     days = [r.day for r in rows]
     index = {r.day: i for i, r in enumerate(rows)}
     flow_by_day = {f.day: f.amount for f in flows}
+    # The SPY close history doubles as the trading calendar (stdlib only; the
+    # workflow installs boto3 alone). Outside its span nothing is inferred.
+    calendar = sorted(spy_history)
+    cal_lo, cal_hi = (calendar[0], calendar[-1]) if calendar else (None, None)
+    cal_set = set(calendar)
+
+    def calendar_gaps(prev_day: date, cur_day: date) -> list[str]:
+        if cal_lo is None:
+            return []
+        out = [
+            f"{REASON_NAV_ROW_MISSING}:{d.isoformat()}"
+            for d in calendar
+            if prev_day < d < cur_day
+        ]
+        if cal_lo <= cur_day <= cal_hi and cur_day not in cal_set:
+            out.append(f"{REASON_NAV_ROW_CLOSED_DAY}:{cur_day.isoformat()}")
+        return out
 
     def interval_flow(i: int) -> float:
         lo, hi = rows[i - 1].day, rows[i].day
@@ -380,6 +404,7 @@ def build(
         for i in range(lo + 1, hi + 1):
             prev, cur = rows[i - 1], rows[i]
             p_f.append((cur.nav - interval_flow(i)) / prev.nav)
+            p_reasons.extend(calendar_gaps(prev.day, cur.day))
             if cur.spy_return_pct is not None:
                 s_f.append(1.0 + cur.spy_return_pct / 100.0)
             elif cur.spy_close and prev.spy_close:
@@ -538,13 +563,38 @@ def encode(doc: Mapping[str, Any]) -> bytes:
     return (json.dumps(doc, indent=2, sort_keys=True) + "\n").encode()
 
 
-def publish(s3: Any, bucket: str, doc: Mapping[str, Any]) -> list[str]:
-    """Dated copy first, then ``latest.json``. Returns the keys written."""
+def publish(
+    s3: Any, bucket: str, doc: Mapping[str, Any], *, include_latest: bool = True
+) -> list[str]:
+    """Dated copy first, then ``latest.json``. Returns the keys written.
+
+    ``include_latest=False`` writes the dated copy only (the backfill)."""
     body = encode(doc)
-    keys = [DATED_KEY.format(as_of=doc["as_of"]), LATEST_KEY]
+    keys = [DATED_KEY.format(as_of=doc["as_of"])] + ([LATEST_KEY] if include_latest else [])
     for key in keys:
         s3.put_object(Bucket=bucket, Key=key, Body=body, ContentType="application/json")
     return keys
+
+
+def load_and_backfill(s3: Any, bucket: str, *, now: datetime) -> list[dict[str, Any]]:
+    """One document per NAV row from the second on, each as of that row.
+
+    The S1 backfill (alpha-engine-config-I12798): every window since inception,
+    recomputed from TODAY's inputs. A NAV row restated since its own day is
+    read as restated, so a backfilled document is the current view of that
+    day, not a replay of what was published then; it says so in
+    ``backfill``."""
+    nav_rows = parse_nav_csv(_get(s3, bucket, NAV_KEY).decode())
+    flows, summary = flows_from_journal(_journal_entries(s3, bucket))
+    spy = parse_close_history(json.loads(_get(s3, bucket, CLOSE_HISTORY_KEY.format(symbol="SPY"))))
+    qqq = parse_close_history(json.loads(_get(s3, bucket, CLOSE_HISTORY_KEY.format(symbol="QQQ"))))
+    latest = nav_rows[-1].day.isoformat()
+    docs = []
+    for row in nav_rows[1:]:
+        doc = build(nav_rows, flows, summary, spy, qqq, now=now, as_of=row.day)
+        doc["backfill"] = {"recomputed_from_inputs_as_of": latest}
+        docs.append(doc)
+    return docs
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -553,12 +603,33 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--as-of", type=date.fromisoformat, default=None)
     parser.add_argument("--dry-run", action="store_true", help="build and validate, write nothing")
     parser.add_argument("--out", default=None, help="also write the document to this local path")
+    parser.add_argument(
+        "--backfill",
+        action="store_true",
+        help="write ops/perf/dated/{as_of}.json for EVERY NAV row (never latest.json)",
+    )
+    parser.add_argument("--out-dir", default=None, help="with --backfill: also write each document here")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 
     import boto3
 
     s3 = boto3.client("s3")
+    if args.backfill:
+        docs = load_and_backfill(s3, args.bucket, now=datetime.now(UTC))
+        estimated = sum(d["status_counts"][STATUS_ESTIMATED] for d in docs)
+        logger.info(
+            "perf_tracker backfill documents=%d first_as_of=%s last_as_of=%s estimated_cells=%d",
+            len(docs), docs[0]["as_of"] if docs else None, docs[-1]["as_of"] if docs else None, estimated,
+        )
+        for doc in docs:
+            if args.out_dir:
+                with open(f"{args.out_dir}/{doc['as_of']}.json", "wb") as fh:
+                    fh.write(encode(doc))
+            if not args.dry_run:
+                publish(s3, args.bucket, doc, include_latest=False)
+        logger.info("backfill: %s", "dry run, nothing written" if args.dry_run else f"wrote {len(docs)} dated keys")
+        return 0
     doc = load_and_build(s3, args.bucket, now=datetime.now(UTC), as_of=args.as_of)
     if args.out:
         with open(args.out, "wb") as fh:

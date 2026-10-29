@@ -41,6 +41,14 @@ on:
   schedule:
     - cron: '0 2 * * *'
   workflow_dispatch:
+    inputs:
+      backfill:
+        # S1 (alpha-engine-config-I12798): one dated document per NAV row
+        # since inception, recomputed from today's inputs. Writes only
+        # ops/perf/dated/*.json; the daily step below still writes latest.json.
+        description: "Also write ops/perf/dated/{as_of}.json for every NAV row since inception"
+        type: boolean
+        default: false
 
 concurrency:
   group: perf-tracker-main
@@ -76,6 +84,12 @@ jobs:
 
       - name: Install dependencies
         run: python -m pip install --quiet "$(grep -i '^boto3' requirements.txt)"
+
+      - name: Backfill dated documents (dispatch input)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
+        run: python -m data.derived.perf_tracker --bucket "${STORE_URI#s3://}" --backfill
+        env:
+          STORE_URI: ${{ vars.DATA_STORE_URI }}
 
       - name: Build + publish
         run: python -m data.derived.perf_tracker --bucket "${STORE_URI#s3://}"

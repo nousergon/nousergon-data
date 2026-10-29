@@ -364,3 +364,50 @@ def test_load_publish_writes_only_its_own_prefix_dated_first():
     assert keys == s3.puts == [f"ops/perf/dated/{SHORT[-1].isoformat()}.json", "ops/perf/latest.json"]
     assert all(k.startswith(pt.OUTPUT_PREFIX) for k in s3.puts)
     assert json.loads(s3.objects[pt.LATEST_KEY]) == json.loads(s3.objects[keys[0]])
+
+
+# ── S1: calendar gaps and the backfill ──────────────────────────────────────
+
+
+def test_a_missing_trading_day_and_a_closed_day_row_are_marked(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    gone = rows.pop(4)[0]                       # a trading day with no NAV row
+    saturday = SHORT[6] - timedelta(days=SHORT[6].weekday() + 2)  # inside the span
+    rows.append((saturday, rows[-1][1], rows[-1][2], 0.0, "settled_close"))
+    doc = build(sorted(rows), spy_hist=history(SHORT[:10], 100.0, 0.0005))
+    reasons = window(doc, "inception")["cells"]["absolute"]["reasons"]
+    assert f"{pt.REASON_NAV_ROW_MISSING}:{gone.isoformat()}" in reasons
+    assert f"{pt.REASON_NAV_ROW_CLOSED_DAY}:{saturday.isoformat()}" in reasons
+    assert window(doc, "inception")["cells"]["absolute"]["status"] == pt.STATUS_ESTIMATED
+    # A window that does not span either gap stays clean.
+    day = window(doc, "day")["cells"]["absolute"]
+    assert day["status"] == pt.STATUS_OK and day["reasons"] == []
+
+
+def test_no_calendar_inference_outside_the_close_history_span(monkeypatch):
+    monkeypatch.setattr(pt, "FLOWS_JOURNALED_FROM", SHORT[0])
+    rows = ledger(SHORT[:10])
+    doc = build(rows, spy_hist=history(SHORT[:5], 100.0, 0.0005))
+    reasons = window(doc, "inception")["cells"]["absolute"]["reasons"]
+    assert not [r for r in reasons if r.startswith("nav_row_")]
+
+
+def test_backfill_writes_one_dated_document_per_row_and_never_latest():
+    rows = ledger(SHORT)
+    closes = {"closes": [[d.isoformat(), 100.0 + i] for i, d in enumerate(SHORT)]}
+    s3 = FakeS3({
+        pt.NAV_KEY: nav_csv(rows).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="SPY"): json.dumps(closes).encode(),
+        pt.CLOSE_HISTORY_KEY.format(symbol="QQQ"): json.dumps(closes).encode(),
+    })
+    docs = pt.load_and_backfill(s3, "bucket", now=NOW)
+    assert [d["as_of"] for d in docs] == [d.isoformat() for d in SHORT[1:]]
+    assert all(d["backfill"] == {"recomputed_from_inputs_as_of": SHORT[-1].isoformat()} for d in docs)
+    # The last backfilled document is the daily one plus the backfill marker.
+    daily = pt.load_and_build(s3, "bucket", now=NOW)
+    assert {k: v for k, v in docs[-1].items() if k != "backfill"} == daily
+    for doc in docs:
+        pt.publish(s3, "bucket", doc, include_latest=False)
+    assert pt.LATEST_KEY not in s3.puts
+    assert s3.puts == [f"ops/perf/dated/{d.isoformat()}.json" for d in SHORT[1:]]
