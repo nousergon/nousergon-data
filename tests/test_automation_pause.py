@@ -13,9 +13,11 @@ tests assert the properties that make it findable and self-checking:
 
   1. The manifest parses, and every paused entry carries a reason. An entry with
      an empty reason is a name nobody can evaluate for un-pausing.
-  2. Nothing is both kept and paused, and the kept set still names the three
-     pipelines the ruling preserved. A pause that quietly swallowed the weekly
-     SF trigger would read identically to a correct one in every other surface.
+  2. Nothing is both kept and paused, and the kept set still names the
+     pipelines the ruling preserved; a kept pipeline trigger leaves it only by
+     a dated later ruling (``RULED_PAUSED_PIPELINE_TRIGGERS``). A pause that
+     quietly swallowed the weekly SF trigger would read identically to a
+     correct one in every other surface.
   3. The four CloudFormation-owned rules that the manifest lists are ALSO pinned
      ``State: DISABLED`` in the template. deploy-infrastructure.yml re-applies
      the stack on every push to main, so a manifest entry alone would be undone
@@ -47,9 +49,18 @@ DRIFT_CHECKER = INFRA / "scheduler" / "check-schedule-drift.py"
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "sf-arn-drift-check.yml"
 
 KEPT_TRIGGERS = {
-    "alpha-engine-saturday",           # weekly SF
     "alpha-engine-weekday",            # preopen SF
     "alpha-engine-eod-backstop-daily",  # postclose SF backstop
+}
+
+#: Triggers the 2026-08-07 ruling KEPT that a LATER Brian ruling paused. Each is
+#: pinned here, not merely dropped from ``KEPT_TRIGGERS``: a kept pipeline
+#: trigger that leaves the kept set without a named ruling is the "pause that
+#: quietly swallowed the weekly SF trigger" property 2 exists to catch.
+#: ``alpha-engine-saturday`` (the v1 weekly SF): Brian 2026-10-28, recorded by
+#: alpha-engine-config-I12801; it retires with v1 under alpha-engine-config-I10655.
+RULED_PAUSED_PIPELINE_TRIGGERS = {
+    "alpha-engine-saturday": ("2026-10-28", "alpha-engine-config-I10655"),
 }
 
 
@@ -114,6 +125,23 @@ def test_kept_triggers_are_never_paused(manifest, module):
     paused = module.paused_names(manifest)
     overlap = KEPT_TRIGGERS & paused
     assert not overlap, f"the ruling keeps these but the manifest pauses them: {sorted(overlap)}"
+
+
+def test_ruled_paused_pipeline_triggers_are_paused_with_their_ruling(manifest, module):
+    """A kept pipeline trigger leaves the kept set only by a dated ruling.
+
+    The paused entry must cite the ruling's date, and its release declaration
+    must name the owning issue, so the move reads as a decision and not as a
+    trigger that slipped out of `not_paused`.
+    """
+    releases = module.load_releases()
+    for name, (ruling_date, owner) in RULED_PAUSED_PIPELINE_TRIGGERS.items():
+        assert name not in manifest["not_paused"], f"{name} is both ruled paused and kept"
+        reason = manifest["paused"]["events_rules"].get(name, "")
+        assert ruling_date in reason, f"{name}: paused entry does not cite the {ruling_date} ruling"
+        assert releases.get(f"events:{name}", {}).get("issue") == owner, (
+            f"{name}: release declaration does not name {owner}"
+        )
 
 
 def test_kept_set_is_documented(manifest):
@@ -458,9 +486,10 @@ def test_pause_helper_resolves_both_surfaces():
 
     assert _state(paused_rule) == "DISABLED", paused_rule
     assert _state(paused_sched) == "DISABLED", paused_sched
-    for kept in ("alpha-engine-saturday", "alpha-engine-weekday",
-                 "alpha-engine-eod-backstop-daily"):
+    for kept in ("alpha-engine-weekday", "alpha-engine-eod-backstop-daily"):
         assert _state(kept) == "ENABLED", f"{kept} is kept by the ruling"
+    # Brian 2026-10-28: the v1 weekly trigger is paused (alpha-engine-config-I12801).
+    assert _state("alpha-engine-saturday") == "DISABLED"
     assert _state("a-rule-nobody-has-heard-of") == "ENABLED"
 
 
@@ -1363,13 +1392,13 @@ def test_trigger_coverage_is_silent_when_live_matches_the_manifest_exactly(
 
 def test_an_undeclared_enabled_trigger_is_a_finding(module, manifest):
     """The defect this check exists for: a new trigger nobody classified."""
-    live = [{"surface": "events", "name": "alpha-engine-saturday", "state": "ENABLED"},
+    live = [{"surface": "events", "name": "alpha-engine-weekday", "state": "ENABLED"},
             {"surface": "events", "name": "alpha-engine-brand-new-undeclared-rule",
              "state": "ENABLED"}]
     findings = module.trigger_coverage_findings(manifest, triggers=live)
     kinds = {(f["trigger"], f["kind"]) for f in findings}
     assert ("alpha-engine-brand-new-undeclared-rule", "trigger-undeclared") in kinds
-    assert not any(f["trigger"] == "alpha-engine-saturday" for f in findings)
+    assert not any(f["trigger"] == "alpha-engine-weekday" for f in findings)
 
 
 def test_an_undeclared_disabled_trigger_is_not_a_finding(module, manifest):

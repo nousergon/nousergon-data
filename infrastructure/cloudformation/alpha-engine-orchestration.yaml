@@ -272,7 +272,13 @@ Resources:
       # holiday week.
       Description: Thu-Sat 09:00 UTC — weekly pipeline fires day after last trading session (WeeklyRunDayGate self-selects; config#1824)
       ScheduleExpression: 'cron(0 9 ? * THU-SAT *)'
-      State: ENABLED
+      State: DISABLED
+      # DISABLED by Brian's ruling 2026-10-28 (v1 Saturday weekly off; the v2
+      # weekly and the data-collection weekly are separate triggers and still
+      # run). Set DISABLED live 2026-10-28 15:08Z; pinned here so the next edit
+      # to this resource cannot re-enable it. Declared in
+      # infrastructure/automation_pause.json `paused` (alpha-engine-config-I12801);
+      # retires with v1 under alpha-engine-config-I10655.
       Targets:
         # SINGLE TARGET PER RULE. EventBridge dispatches the cron event
         # to every target on a rule; a duplicate target ID fans the
