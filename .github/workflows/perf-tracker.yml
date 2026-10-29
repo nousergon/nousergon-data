@@ -1,0 +1,113 @@
+name: Performance tracker (daily)
+
+# alpha-engine-config-I12798 (epic), slice C11. Writes the window x comparison
+# performance document the console page (C12) and the Sunday report (C13)
+# render: s3://<store>/ops/perf/dated/{as_of}.json, then ops/perf/latest.json.
+# The producer is data/derived/perf_tracker.py; its docstring is normative for
+# the return, benchmark and alpha definitions and for every input's basis.
+#
+# WHY A GITHUB ACTIONS CRON. The job reads four S3 objects (the eod_pnl
+# export, the ledger journal copies, two close_history files) and writes two.
+# No ArcticDB, no box, no vendor call: the same shape as
+# inst-ownership-weekly.yml, so the same answer, a GitHub-hosted runner under
+# a dedicated least-privilege OIDC role.
+#
+# NOT THE TRADING PATH. It reads what the EOD reconcile already exported and
+# writes only under ops/perf/. Nothing the trader or the executor reads is
+# touched, and no AWS trigger is started, so the automation-pause manifest
+# (infrastructure/automation_pause.json) does not list it.
+#
+# CADENCE. `0 2 * * *` (02:00 UTC). The eod_pnl export lands ~00:30 UTC after
+# the post-close reconcile, and close_history ~22:30 UTC. Scheduled workflows
+# on this account fire 3-5 h late (alpha-engine-config-I9966), so the object
+# is normally written 05:00-07:00 UTC, ahead of the Sunday report's 06:20 PT.
+# It runs every day, weekends included: a weekend run rewrites Friday's as_of,
+# which is what keeps the registry's daily freshness SLA meaningful.
+#
+# IAM. `github-actions-perf-publish` (nous-ergon-ops): s3:GetObject on exactly
+# the inputs above, s3:PutObject on ops/perf/* only, s3:ListBucket on those
+# prefixes. Its trust pins this file on main. Until an operator creates the
+# role, the OIDC step below fails on every run and notify-main-failure pages:
+# that is the detector, not a defect in this file.
+#
+# REGISTRY. observability.d + authority.d rows land FIRST as `pending` in
+# nous-ergon-ops; the ARTIFACT_REGISTRY row (`ops_perf_latest`) is in
+# alpha-engine-config private-docs.
+#
+# PUBLIC LOGS. This repository and its run logs are public: the producer logs
+# dates, counts and keys only, never a return or a NAV.
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  workflow_dispatch:
+
+concurrency:
+  group: perf-tracker-main
+  cancel-in-progress: false
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  publish:
+    name: Build + publish ops/perf/latest.json
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout data repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+        # GitHub masks SECRETS, not repository VARIABLES (alpha-engine-config-I10973).
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/github-actions-perf-publish
+          aws-region: us-east-1
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet "$(grep -i '^boto3' requirements.txt)"
+
+      - name: Build + publish
+        run: python -m data.derived.perf_tracker --bucket "${STORE_URI#s3://}"
+        env:
+          # Repository VARIABLE, not a literal (public repo). The bucket is
+          # the store URI's host segment.
+          STORE_URI: ${{ vars.DATA_STORE_URI }}
+
+      - name: Verify the write landed
+        run: |
+          python3 - <<'PY'
+          import json, os, sys
+          import boto3
+
+          bucket = os.environ["STORE_URI"].removeprefix("s3://").split("/", 1)[0]
+          key = "ops/perf/latest.json"
+          try:
+              doc = json.loads(boto3.client("s3").get_object(Bucket=bucket, Key=key)["Body"].read())
+          except Exception as e:  # noqa: BLE001 - the verdict is the exit code
+              print(f"::error::{key} unreadable after a run that reported success: {type(e).__name__}")
+              sys.exit(1)
+          print(f"schema={doc.get('schema_version')} as_of={doc.get('as_of')} "
+                f"status_counts={doc.get('status_counts')}")
+          if doc.get("schema_version") != "perf_tracker.v1" or not doc.get("as_of"):
+              print(f"::error::{key} is not a perf_tracker.v1 document")
+              sys.exit(1)
+          PY
+        env:
+          STORE_URI: ${{ vars.DATA_STORE_URI }}
+
+  notify-main-failure:
+    needs: [publish]
+    if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
+    uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
+    secrets: inherit
