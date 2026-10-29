@@ -19,8 +19,8 @@ parent_component_reason: D49 runs as states inside the 'ne-data-collection-panel
   discoverer can see this unit's own id; presence is judged on the state machine, never on the unit (alpha-engine-config-I12664).
   Derived from the unit descriptor's trigger.owner.
 lifecycle_owner: brian
-lifecycle_reexam: '2026-10-28'
-pending_since: '2026-10-14'
+lifecycle_reexam: '2026-11-12'
+pending_since: '2026-10-29'
 promotes_when: the D49 unit descriptor's own successor (ne-data-collection-panel (alpha-engine-config-I11306);
   no v1 predecessor, because v1 never published NDX membership) goes live
 lifecycle_reason: 'Generated from registry.d/units/D49-*.yaml (P-08): the unit descriptor itself declares
