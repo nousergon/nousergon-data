@@ -38,7 +38,7 @@
 # The entries below are copied from requirements.txt; see that file for why
 # each floor or cap is where it is.
 boto3>=1.43.118
-pandas>=2.0
+pandas>=2.3.3
 openpyxl>=3.1.5
 pyarrow>=25.0.1,<26
 yfinance>=1.7.0
