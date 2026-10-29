@@ -1015,29 +1015,94 @@ def test_every_armed_alarm_entry_carries_a_reason(manifest, module):
 
 
 #: alpha-engine-config-I8117. The three pipeline deadmen are one class: the
-#: ExecutionsSucceeded deadman on each pipeline the 2026-08-07 ruling KEPT. The
-#: weekly one was born undeclared on 2026-08-21 while its two siblings were
-#: armed, because the class was pinned one member at a time.
-PIPELINE_DEADMEN = frozenset({
-    "alpha-engine-pipeline-deadman-preopen-trading",
-    "alpha-engine-pipeline-deadman-postclose-trading",
-    "alpha-engine-pipeline-deadman-weekly-freshness",
-})
+#: deadman on each pipeline the 2026-08-07 ruling KEPT. The weekly one was born
+#: undeclared on 2026-08-21 while its two siblings were armed, because the class
+#: was pinned one member at a time. Each is keyed to the scheduled trigger whose
+#: KEPT status is the reason it is armed (alpha-engine-config-I12801): a deadman
+#: on a pipeline whose trigger a later ruling paused can only page on the
+#: silence that ruling declared.
+PIPELINE_DEADMEN = {
+    "alpha-engine-pipeline-deadman-preopen-trading": "alpha-engine-weekday",
+    "alpha-engine-pipeline-deadman-postclose-trading": "alpha-engine-eod-backstop-daily",
+    "alpha-engine-pipeline-deadman-weekly-freshness": "alpha-engine-saturday",
+}
 
 
-def test_every_pipeline_deadman_is_declared_armed_and_none_is_paused(manifest, module):
-    """Pinned as a set. A deadman that loses its `armed_alarms` row is an
-    unclassified breaching alarm, and a deadman in `paused_alarms` would
-    silence a kept pipeline (with no justified `watches`, `enforce()` would
-    also re-arm it every run, so it would oscillate)."""
+def deadman_findings(manifest: dict, module) -> list[str]:
+    """A deadman is ARMED iff its trigger is kept, and PAUSED only with that
+    trigger in ``watches`` while the trigger is paused. Pure, so the seeded
+    regressions below can grade a mutated manifest.
+
+    Armed-while-kept: a deadman that loses its ``armed_alarms`` row is an
+    unclassified breaching alarm, and one in ``paused_alarms`` while its
+    trigger is kept silences a running pipeline (and, with no justified
+    ``watches``, ``enforce()`` re-arms it every run, so it would oscillate).
+    Paused-while-paused: the ``watches`` row is what re-arms it on the very
+    next read if the trigger ever moves back to ``not_paused``; a deadman
+    paused on any other justification would outlive the ruling that paused
+    its pipeline.
+    """
     armed = set(module.armed_alarm_names(manifest))
-    assert PIPELINE_DEADMEN <= armed, (
-        f"pipeline deadman(s) missing from armed_alarms: {sorted(PIPELINE_DEADMEN - armed)}"
-    )
-    paused = {e["name"] for e in module.alarm_entries(manifest)}
-    assert not (PIPELINE_DEADMEN & paused), (
-        f"a kept pipeline's deadman is declared paused: {sorted(PIPELINE_DEADMEN & paused)}"
-    )
+    paused = {e["name"]: e for e in module.alarm_entries(manifest)}
+    kept = module.kept_names(manifest)
+    paused_triggers = module.paused_names(manifest)
+    out: list[str] = []
+    for alarm, trigger in sorted(PIPELINE_DEADMEN.items()):
+        if trigger in kept:
+            if alarm not in armed:
+                out.append(f"{alarm}: its trigger {trigger} is kept, but it is not in armed_alarms")
+            if alarm in paused:
+                out.append(f"{alarm}: its trigger {trigger} is kept, but it is declared paused")
+            continue
+        if trigger not in paused_triggers:
+            out.append(f"{alarm}: its trigger {trigger} is neither kept nor paused")
+            continue
+        if alarm in armed:
+            out.append(f"{alarm}: its trigger {trigger} is paused, but it is still declared armed")
+        entry = paused.get(alarm)
+        if entry is None:
+            out.append(f"{alarm}: its trigger {trigger} is paused, but it is not in paused_alarms")
+        elif trigger not in entry["watches"] or not module.alarm_justified(entry, manifest):
+            out.append(f"{alarm}: paused, but its watches {entry['watches']} do not name "
+                       f"its paused trigger {trigger}")
+    return out
+
+
+def test_every_pipeline_deadman_is_armed_iff_its_trigger_is_kept(manifest, module):
+    """Pinned as a set; the classification follows the trigger, never a free choice."""
+    assert deadman_findings(manifest, module) == []
+
+
+def test_a_kept_pipelines_deadman_declared_paused_is_rejected(manifest, module):
+    """Seeded regression: the original pin's property still holds for a kept trigger."""
+    seeded = json.loads(json.dumps(manifest))
+    seeded["paused_alarms"]["alpha-engine-pipeline-deadman-preopen-trading"] = {
+        "reason": "x", "watches": ["alpha-engine-weekday"],
+        "issue": "alpha-engine-config-I1", "re_exam": "2099-01-01"}
+    del seeded["armed_alarms"]["alpha-engine-pipeline-deadman-preopen-trading"]
+    findings = deadman_findings(seeded, module)
+    assert any("preopen-trading" in f and "is kept" in f for f in findings), findings
+
+
+def test_a_deadman_whose_trigger_returns_to_kept_must_be_rearmed(manifest, module):
+    """Seeded regression: moving the weekly trigger back to `not_paused` without
+    re-arming its deadman is a finding, not a silent pause."""
+    seeded = json.loads(json.dumps(manifest))
+    seeded["paused"]["events_rules"].pop("alpha-engine-saturday", None)
+    seeded["not_paused"]["alpha-engine-saturday"] = "kept again"
+    findings = deadman_findings(seeded, module)
+    assert any("weekly-freshness" in f and "is kept" in f for f in findings), findings
+
+
+def test_a_paused_deadman_must_watch_its_own_trigger(manifest, module):
+    """Seeded regression: a deadman paused on someone else's trigger is rejected."""
+    seeded = json.loads(json.dumps(manifest))
+    entry = seeded["paused_alarms"].get("alpha-engine-pipeline-deadman-weekly-freshness")
+    if entry is None:
+        pytest.skip("weekly deadman is not paused in this manifest")
+    entry["watches"] = ["alpha-engine-alert-drain-0400utc"]
+    findings = deadman_findings(seeded, module)
+    assert any("do not name its paused trigger" in f for f in findings), findings
 
 
 def test_no_alarm_is_declared_both_paused_and_armed(manifest, module):
