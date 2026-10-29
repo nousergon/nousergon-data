@@ -106,7 +106,14 @@ def _run_git_retry(
         "#!/bin/bash\nshift 3\nexec \"$@\"\n"
     )
     (bindir / "git").write_text(git_script)
-    for f in ("sudo", "flock", "git"):
+    # `git_retry()` backs off with the external `sleep` (5s/10s/20s transient,
+    # 5s lock). A shim earlier on PATH records each requested backoff instead
+    # of waiting it out, so the schedule is asserted rather than slept through
+    # (an exhausted transient budget used to cost each test the real ~35s).
+    (bindir / "sleep").write_text(
+        f"#!/bin/bash\necho \"$1\" >> {tmp_path / 'sleep_calls.log'}\n"
+    )
+    for f in ("sudo", "flock", "git", "sleep"):
         (bindir / f).chmod(0o755)
 
     if credential_present:
@@ -142,6 +149,12 @@ def _run_git_retry(
         text=True,
         timeout=90,
     )
+
+
+def _sleeps(tmp_path: Path) -> list[str]:
+    """The backoffs `git_retry()` requested, in order, via the `sleep` shim."""
+    log = tmp_path / "sleep_calls.log"
+    return log.read_text().split() if log.exists() else []
 
 
 class TestGitRetryDefinesBothClasses:
@@ -210,6 +223,7 @@ class TestTransientRemoteRetryBehavior:
         assert "RC=0" in result.stdout, result.stdout + result.stderr
         assert "fetch-succeeded" in result.stdout
         assert result.stdout.count("class=transient-remote") == 2
+        assert _sleeps(tmp_path) == ["5", "10"]
 
     def test_transient_failure_exhausting_budget_fails_loud(
         self, tmp_path: Path
@@ -240,6 +254,9 @@ class TestTransientRemoteRetryBehavior:
             "4 total attempts means 3 retries logged before giving up."
         )
         assert "Repository not found" in result.stderr
+        assert _sleeps(tmp_path) == ["5", "10", "20"], (
+            "the transient class backs off 5s/10s/20s (35s) and no further."
+        )
 
     def test_lock_class_is_still_retried_unaffected(self, tmp_path: Path) -> None:
         """The pre-existing lock class must keep working exactly as before."""
@@ -269,6 +286,7 @@ class TestTransientRemoteRetryBehavior:
         assert "checkout-ok" in result.stdout
         assert "lock contention" in result.stdout
         assert "class=transient-remote" not in result.stdout
+        assert _sleeps(tmp_path) == ["5", "5"]
 
     def test_non_matching_failure_is_not_retried(self, tmp_path: Path) -> None:
         """A failure matching neither class must fail loud on the FIRST
@@ -297,6 +315,7 @@ class TestTransientRemoteRetryBehavior:
         assert "class=transient-remote" not in result.stdout
         assert "lock contention" not in result.stdout
         assert not (tmp_path / "erase_calls.log").exists()
+        assert _sleeps(tmp_path) == []
 
     def test_erase_derives_repo_from_origin_url_not_directory_name(
         self, tmp_path: Path
@@ -333,6 +352,7 @@ class TestTransientRemoteRetryBehavior:
             "crucible-executor.git", ""
         ), "must not fall back to the checkout directory name"
         assert "repo=nousergon/crucible-executor.git" in result.stdout
+        assert _sleeps(tmp_path) == ["5", "10", "20"]
 
     def test_erase_skipped_when_helper_binary_absent(self, tmp_path: Path) -> None:
         """A missing credential-helper binary must not turn a retryable
@@ -367,6 +387,7 @@ class TestTransientRemoteRetryBehavior:
         )
         assert "RC=0" in result.stdout, result.stdout + result.stderr
         assert "fetch-succeeded" in result.stdout
+        assert _sleeps(tmp_path) == ["5"]
 
 
 class TestRetryBudgetFitsInsideStateTimeout:

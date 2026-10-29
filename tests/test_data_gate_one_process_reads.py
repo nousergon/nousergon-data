@@ -32,6 +32,7 @@ import re
 import pytest
 
 import data_gate.__main__ as main_module
+from data_gate import unit_readers
 from data_gate.read import BOARD_KEY, GATES
 from data_gate.store import S3Store
 from tests import test_parity_adjudication_i12023 as adjudication_fixture
@@ -118,6 +119,20 @@ def _bucket() -> _FakeS3:
     return _FakeS3({f"{PREFIX}/{key}": body for key, body in store.raw.items()})
 
 
+def _no_pacing(monkeypatch) -> None:
+    """The identity column paces IAM simulate calls (`unit_readers._pace`,
+    `SIMULATE_MIN_INTERVAL_S` between calls) through the `_sleep` seam, which
+    is there so tests never sleep. Every IAM call here is refused at once, so
+    the floor protects nothing and only cost ~4 s of wall clock per board
+    evaluation. The pacing itself is pinned in `test_simulate_plan.py`."""
+    monkeypatch.setattr(unit_readers, "_sleep", lambda _seconds: None)
+
+
+@pytest.fixture(autouse=True)
+def _unpaced(monkeypatch):
+    _no_pacing(monkeypatch)
+
+
 def _cli(monkeypatch, s3: _FakeS3, gates: list[str], *extra: str) -> int:
     """`python -m data_gate read --gate ...` against ``s3``, a fresh store per process."""
 
@@ -176,6 +191,7 @@ def replays():
     """The same run, both shapes: six processes, and one. Module-scoped: each
     replay evaluates the whole board seven times over."""
     with pytest.MonkeyPatch.context() as monkeypatch:
+        _no_pacing(monkeypatch)
         before = _bucket()
         codes = [_cli(monkeypatch, before, [gate]) for gate in WORKFLOW_ORDER]
         after = _bucket()
