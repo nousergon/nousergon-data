@@ -70,7 +70,13 @@ contract:
       producer: "contracts/daily_panel.schema.json"
       read_site: "crucible/data/sources.py::PublishedPanelSource"
       note: "contracts/daily_panel.py::CONSUMER; pending the crucible consumer PR"
-registry_rows: []
+registry_rows:
+  - data_collector_daily_panel_manifest
+  - data_collector_daily_panel_parquet
+  - data_collector_daily_panel_parity
+# alpha-engine-config-PR12777 (ee9979d6, 2026-10-28) registered the three
+# per-session keys above in ARTIFACT_REGISTRY; parity is event_driven with
+# absence_expected (operator write).
 run_manifest_prefix: data_collection/runs/D51
 detectors:
   - kind: "sf-execution"
@@ -80,7 +86,7 @@ detectors:
   - kind: "crucible-gate"
     via: "data.phase3.daily_panel_adopted (published leg)"
     state: ABSENT
-    note: "no freshness-monitor row yet; the ARTIFACT_REGISTRY row is an alpha-engine-config companion"
+    note: "the ARTIFACT_REGISTRY rows exist (registry_rows above, alpha-engine-config-PR12777); no freshness-monitor detector is declared for this unit yet"
 freshness:
   status: proposed
   ratified_at: "alpha-engine-config-I10791 (with the schedule)"
