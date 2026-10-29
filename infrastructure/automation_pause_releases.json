@@ -35,6 +35,11 @@
     "re_exam": "2026-12-02",
     "release_when": "Brian rules on alpha-engine-config-I12715: delete with the v1 path at Crucible v2 phase 4 (alpha-engine-config-I9760), re-enable, or keep paused with a new re-exam. The issue that paused it (I6617, the 2026-08-07 ruling) is closed, so nothing else owns the switch back on."
   },
+  "events:alpha-engine-saturday": {
+    "issue": "alpha-engine-config-I10655",
+    "re_exam": "2026-11-30",
+    "release_when": "Not released by re-enable. Brian's 2026-10-28 ruling disabled the v1 Saturday weekly (alpha-engine-config-I12801 records it). The pause ends when the v1 decommission deletes the rule (alpha-engine-config-I10655 deliverable 3, evidence-gated; the crucible-v1-cutover manifest's pre-declaration of this trigger is alpha-engine-config-I12758), and that change removes this entry and the `paused` one together. Only a new Brian ruling re-enables it, and that ruling moves the manifest entry back to `not_paused` in the same change. v1 weekly SF trigger."
+  },
   "events:alpha-engine-saturday-integrity-monday": {
     "issue": "alpha-engine-config-I12715",
     "re_exam": "2026-12-02",
