@@ -382,6 +382,50 @@ def _connection_summary(units) -> tuple[dict[str, dict], dict]:
     return per_unit, counts
 
 
+#: The unit states an OBSERVATION may carry onto the console. RETIRED and
+#: DISABLED are declared-only there (`observability-policy` §8.3; the console's
+#: merge supersedes them from any non-declaration), so a unit whose run record
+#: reads one of them is left to its descriptor's own declaration.
+_OBSERVED_UNIT_STATES = frozenset({"HEALTHY", "DEGRADED", "UNREPORTED"})
+
+
+def _unit_states(rows: list[dict], units, generated_utc: str) -> list[dict]:
+    """Each unit's observed run state, keyed by its `component_id`
+    (alpha-engine-config-I12855).
+
+    The console gathers every `registry.d/data-collector-*.yaml` descriptor
+    from this repo as a DECLARATION, and until this list nothing OBSERVED any
+    of them, so all 43 rendered UNREPORTED/ABSENT on the exceptions list. The
+    observation is the unit's own `data.<unit>.run_record` clause — "did this
+    unit's recent runs record ok", windowed by the clause itself — so the
+    console reads the gate's verdict rather than re-deriving one. `as_of` is
+    this board's `generated_utc`: the claim is "as of this read", and the
+    clause's own run time stays in `run_as_of`.
+
+    A unit with no run_record row, or whose row is RETIRED/UNCONNECTED, is
+    omitted rather than invented.
+    """
+    by_clause = {r["clause"]: r for r in rows}
+    out: list[dict] = []
+    for unit in sorted(units, key=lambda u: u.unit_id):
+        row = by_clause.get(f"data.{unit.unit_id}.run_record")
+        if row is None or row["console_state"] not in _OBSERVED_UNIT_STATES:
+            continue
+        out.append({
+            "component_id": unit.component_id,
+            "unit_id": unit.unit_id,
+            "clause": row["clause"],
+            "state": row["state"],
+            "console_state": row["console_state"],
+            "detail": row["detail"],
+            "source": row["source"],
+            "evidence": row["evidence"],
+            "run_as_of": row["as_of"],
+            "as_of": generated_utc,
+        })
+    return out
+
+
 def _board_document(
     clauses, *, trading_day: dt.date, generated_utc: str, store_uri: str | None, units=None
 ) -> dict:
@@ -397,7 +441,8 @@ def _board_document(
     the board to what is connected and what is not (`alpha-engine-config-I10873`).
     Non-unit rows carry none of them: connection is not a fact about them.
     """
-    per_unit, connection_counts = _connection_summary(units if units is not None else load_units())
+    units = list(units if units is not None else load_units())
+    per_unit, connection_counts = _connection_summary(units)
     rows = []
     for clause in clauses:
         standing = clause_module.is_standing(clause)
@@ -469,6 +514,7 @@ def _board_document(
         if unit_id in per_unit:
             row.update(per_unit[unit_id])
         rows.append(row)
+    unit_states = _unit_states(rows, units, generated_utc)
     unmeasurable = sum(1 for r in rows if r["state"] == "UNMEASURABLE" and not r["standing"])
     retired = sum(1 for r in rows if r["state"] == "RETIRED")
     unconnected = sum(1 for r in rows if r["state"] == "UNCONNECTED")
@@ -495,6 +541,9 @@ def _board_document(
         # is graded by no gate, so it cannot widen a gap no gate is reading.
         "transparency_gap": unmeasurable,
         "rows": rows,
+        # One row per unit: its observed run state, keyed by the unit's
+        # `component_id` (alpha-engine-config-I12855). See `_unit_states`.
+        "units": unit_states,
     }
 
 
