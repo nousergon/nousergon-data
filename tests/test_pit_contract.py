@@ -248,10 +248,19 @@ def test_no_manifest_is_unmet_and_a_denied_store_is_unmeasurable(tmp_path, units
     assert denied.met is False and denied.unmeasurable is True
 
 
+def _declared_present(unit: descriptors.Unit, guard: str) -> descriptors.Unit:
+    """A copy of `unit` declaring `guard` present. D01 declares its pit guard
+    `absent`, and an absent guard is UNMET whatever the store holds
+    (alpha-engine-config-I12319), so the pit clause's two halves are graded on a
+    copy whose guard is declared to exist."""
+    guards = {**unit.raw["guards"], guard: {**unit.raw["guards"][guard], "state": "present"}}
+    return dataclasses.replace(unit, raw={**unit.raw, "guards": guards})
+
+
 def test_the_pit_clause_keeps_commissioning_as_its_second_half(units):
     """Stamps alone do not make the guard clause MET: phase 2 exits on guards
     enforcing AND commissioned. The detail names both halves."""
-    unit = units["D01"]
+    unit = _declared_present(units["D01"], "pit")
     clause = clauses._clause_guard(EmptyStore(), unit, "pit", trading_day=TUESDAY)
     assert clause.name == "data.D01.guard.pit"
     assert "available_at" in clause.requirement and "COMMISSIONED" in clause.requirement
@@ -260,7 +269,7 @@ def test_the_pit_clause_keeps_commissioning_as_its_second_half(units):
 
 
 def test_the_pit_clause_reads_met_only_with_stamps_and_an_induced_fault(tmp_path, units, monkeypatch):
-    unit = units["D01"]
+    unit = _declared_present(units["D01"], "pit")
     _write_manifest(tmp_path, outputs=[KEY], guards=[pit.pit_guard_entry(KEY, _stamped())])
     real = evidence.read_pit
     monkeypatch.setattr(
@@ -276,6 +285,20 @@ def test_the_pit_clause_reads_met_only_with_stamps_and_an_induced_fault(tmp_path
     fault.write_text(json.dumps({"outcome": "induced", "as_of": "2026-09-14"}))
     both = clauses._clause_guard(store, unit, "pit", trading_day=TUESDAY)
     assert both.met is True, both.detail
+
+
+def test_a_declared_absent_guard_is_unmet_even_with_an_induced_record(tmp_path, units):
+    """alpha-engine-config-I12319: the record cannot stand in for a guard that is
+    declared not to exist. D01's pit guard is declared `absent`."""
+    unit = units["D01"]
+    assert unit.guards["pit"]["state"] == "absent"
+    fault = tmp_path / "faults" / "D01" / "pit" / "latest.json"
+    fault.parent.mkdir(parents=True)
+    fault.write_text(json.dumps({"outcome": "induced", "as_of": "2026-09-14"}))
+    clause = clauses._clause_guard(LocalStore(tmp_path), unit, "pit", trading_day=TUESDAY)
+    assert clause.met is False
+    assert "declared state 'absent'" in clause.detail
+    assert "faults/D01/pit/latest.json" in clause.evidence
 
 
 def test_other_guard_clauses_are_unchanged(units):
