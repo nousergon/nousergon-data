@@ -19,7 +19,7 @@ import pytest
 import yaml
 
 from data_gate import clauses as clause_module
-from data_gate import descriptors, evidence
+from data_gate import descriptors, evidence, read
 from data_gate import exit_criteria as xc
 from data_gate.descriptors import REPO_ROOT, DescriptorError, load_units
 from data_gate.inventory import load_inventory_scope, scan
@@ -1644,3 +1644,45 @@ def test_a_denied_completeness_read_is_unmeasurable():
     unit = next(u for u in load_units() if u.unit_id == "D20")
     reading = evidence.read_completeness_metric(DeniedStore(), unit, trading_day=TRADING_DAY)
     assert reading.unmeasurable is True
+
+
+# ---------------------------------------------------------------------------
+# Per-unit observed state (alpha-engine-config-I12855): the console's only
+# OBSERVATION of a gathered `registry.d/data-collector-*` descriptor.
+# ---------------------------------------------------------------------------
+
+
+def _run_record_row(unit_id, state, console_state):
+    return {"clause": f"data.{unit_id}.run_record", "state": state, "console_state": console_state,
+            "detail": "d", "source": "s", "evidence": ["e"], "as_of": "2026-10-24T09:09:08Z"}
+
+
+def test_unit_states_carry_the_run_record_verdict_keyed_by_component_id(units):
+    by_id = {u.unit_id: u for u in units}
+    rows = [_run_record_row("D01", "MET", "HEALTHY"), _run_record_row("D03", "UNMET", "DEGRADED")]
+    out = read._unit_states(rows, [by_id["D01"], by_id["D03"]], "2026-10-30T00:00:00Z")
+    assert [u["component_id"] for u in out] == [by_id["D01"].component_id, by_id["D03"].component_id]
+    assert [u["console_state"] for u in out] == ["HEALTHY", "DEGRADED"]
+    assert all(u["as_of"] == "2026-10-30T00:00:00Z" for u in out)
+    assert out[0]["run_as_of"] == "2026-10-24T09:09:08Z"
+
+
+def test_unit_states_never_carry_a_declared_only_state_or_invent_a_row(units):
+    """RETIRED/DISABLED are declared-only on the console; a unit with no
+    run_record row has no observation at all. Both are omitted."""
+    by_id = {u.unit_id: u for u in units}
+    rows = [_run_record_row("D01", "RETIRED", "RETIRED"), _run_record_row("D03", "UNCONNECTED", "DISABLED")]
+    assert read._unit_states(rows, [by_id["D01"], by_id["D03"], by_id["D05"]], "t") == []
+
+
+def test_the_board_document_publishes_one_unit_state_per_observable_unit(units, board):
+    document = _board_document(board, trading_day=TRADING_DAY, generated_utc="g", store_uri=None, units=units)
+    states = document["units"]
+    ids = [u["component_id"] for u in states]
+    assert len(ids) == len(set(ids))
+    assert set(ids) <= {u.component_id for u in units}
+    rows = {r["clause"]: r for r in document["rows"]}
+    for u in states:
+        assert u["console_state"] == rows[u["clause"]]["console_state"]
+        assert u["console_state"] in {"HEALTHY", "DEGRADED", "UNREPORTED"}
+        assert u["as_of"] == "g"
