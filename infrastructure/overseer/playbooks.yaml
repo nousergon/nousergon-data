@@ -1934,6 +1934,47 @@ alert_classes:
     # floor), so its own next run precedes any human action: PAGE only when the
     # condition survives two consecutive runs.
     page_after_consecutive: 2
+  # ── on-box lane runners: provider_unfunded (alpha-engine-config-I6765 / -I6768) ──
+  # alpha-engine-config/scripts/{sf_watch,ci_watch,alert_drain,overseer}_run.sh
+  # each emit ONE CLI-shaped `krepis.alerts publish --severity error` when the
+  # model route answers 401/402 (account has no credit). Unregistered, they
+  # already resolved to PAGE via krepis.alert_tiers' unknown-source rule and
+  # recorded registry drift on every emission. These rows keep that delivery
+  # unchanged and remove the drift. `response: operator`, not drain-queue: the
+  # remedy is a human topping up the provider account, and every lane on that
+  # account fails identically, so no drain lane can act on it.
+  - class: sf_watch_run_provider_unfunded
+    source: "sf-watch-run"
+    severities: [error]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: Model route account has no credit; only an operator top-up clears it.
+  - class: ci_watch_run_provider_unfunded
+    source: "ci-watch-run"
+    severities: [error]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: Model route account has no credit; only an operator top-up clears it.
+  - class: alert_drain_run_provider_unfunded
+    source: "alert-drain-run"
+    severities: [error]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: Model route account has no credit; only an operator top-up clears it.
+  - class: overseer_run_provider_unfunded
+    source: "overseer-run"
+    severities: [error]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: Model route account has no credit; only an operator top-up clears it.
   - class: deploy_on_merge
     source: "deploy-on-merge"
     severities: [critical]
