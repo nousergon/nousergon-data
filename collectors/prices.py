@@ -970,7 +970,9 @@ def _retry_short_fetch_ticker(
     Never raises: a download error on a retry attempt is logged and treated
     as "this attempt found nothing", identically to a short/empty answer —
     the caller (the short-fetch guard) reports the persistent refusal
-    exactly as it did before this change if every attempt fails.
+    exactly as it did before this change if every attempt fails. The one
+    exception is a point-in-time refusal: :class:`dates.FutureBarError`
+    propagates, as it does from the first attempt (alpha-engine-config-I12676).
 
     Returns ``(best_df, attempts_made)``. ``best_df`` is the LONGEST clean
     frame seen across attempts (never worse than giving up after one try),
@@ -1028,6 +1030,11 @@ def _retry_short_fetch_ticker(
             df = clip_to_trading_day(
                 df.sort_index(), trading_day, label=f"price_cache_refresh_retry[{ticker}]",
             )
+        except FutureBarError:
+            # A point-in-time refusal is a finding about the vendor, not an unusable
+            # frame: it fails the run like the first attempt's refusal does, never a
+            # discarded retry with a WARNING (alpha-engine-config-I12676).
+            raise
         except Exception as exc:  # noqa: BLE001 - the docstring's never-raises contract
             logger.warning(
                 "Short-fetch retry %d/%d for %s returned an unusable frame: %s",

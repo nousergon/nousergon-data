@@ -73,6 +73,7 @@ import dataclasses
 import datetime as dt
 import functools
 import inspect
+import io
 import json
 import logging
 import re
@@ -95,6 +96,7 @@ from data_gate.store import LocalStore
 from features.compute import UNIVERSE_BENCHMARK_PROXIES, admits_universe_write
 from shadow.run_state import RunStatePhaseRegistry
 from tests import test_guard_commissioning_empty_fresh as ef
+from tests import test_pit_future_bar_refusal_i10794 as fb
 from tests.test_guard_commissioning_empty_fresh import (  # noqa: F401 -- fixtures, used by name
     _environment,
     clock,
@@ -236,7 +238,12 @@ class Case:
     outputs: tuple[str, ...]
     #: Whether the call site passes ``run_date`` (and so writes the run-date sentinel).
     writes_sentinel: bool
-    run: Callable[..., dict] = dataclasses.field(repr=False, compare=False)
+    run: Callable[..., dict] | None = dataclasses.field(default=None, repr=False, compare=False)
+    #: The check the unit's descriptor names in its ``pit`` block.
+    guard_token: str = "UniverseFreshnessViolation"
+    #: A unit whose ``pit`` guard is NOT the shared freshness scan takes its record
+    #: through its own walk, ``record(s3, caplog)``, on the same deployed ASL.
+    record: Callable[..., None] | None = dataclasses.field(default=None, repr=False, compare=False)
 
 
 def _run_mode(mode: str, fn_name: str):
@@ -268,6 +275,72 @@ _FAULT = (
     "ceiling of UNIVERSE_FRESHNESS_MAX_STALE_TRADING_DAYS"
 )
 
+def _record_d03(s3, caplog) -> None:
+    """D03's ``pit`` record: the fetch-boundary future-bar refusal (alpha-engine-config-I12676).
+
+    Not the freshness scan: ``collectors/prices.py::_refresh_stale`` reads each
+    vendor frame through ``dates.clip_to_trading_day``, whose ``refuse_bars_after``
+    fails the read on a bar dated after the run's as-of date. ``prices.collect``
+    and ``_refresh_stale`` run for real; only the vendor is stubbed
+    (``tests/test_pit_future_bar_refusal_i10794.py`` holds the vendor and the
+    cardinality-harness ``Case`` this walk runs through).
+    """
+    caplog.set_level(logging.ERROR)
+    prior = {key: fb.card._PRIOR for key in fb._published_keys()}
+    s3.objects.update(prior)
+
+    faulted = fb.card.Execution(s3, fb.CASE, rows_per_attempt=[False, False])
+    terminal = faulted.run()
+
+    # 1. A failed manifest naming the finding, on the attempt and on the retry.
+    manifests = s3.manifests(fb.CASE)
+    assert [m["status"] for m in manifests] == ["failed", "failed"], manifests
+    for m in manifests:
+        assert fb.CASE.refusal in m["reason"], m["reason"]
+        assert f"as_of {fb.TRADING_DAY}" in m["reason"], m["reason"]
+    assert [a["status"] for a in faulted.attempts] == ["error", "error"], faulted.attempts
+
+    # 2. Exactly one page, after the on-demand retry.
+    assert faulted.pages == ["NotifyFailure"], faulted.path
+    assert faulted.path.count("RetryOnDemand") == 1
+
+    # 3. Stand-down: terminal fail, phase marker error, nothing the vendor
+    # answered was published (the previous cycle's objects are untouched).
+    assert terminal == "Fail" and faulted.path[-1] == "CollectionFailed"
+    assert s3.marker(fb.CASE)["status"] == "error"
+    for key, body in prior.items():
+        assert s3.objects[key] == body, f"{key} was overwritten past the refusal"
+    assert manifests[0]["outputs"] == []
+    findings = [
+        json.loads(r.getMessage().removeprefix("PIT_FUTURE_BAR "))
+        for r in caplog.records if r.getMessage().startswith("PIT_FUTURE_BAR ")
+    ]
+    assert len(findings) >= 2, [r.getMessage() for r in caplog.records]
+    assert {(f["dataset"], f["ticker"], f["as_of"], f["bar_date"]) for f in findings} == {
+        ("price_cache_refresh", fb._TICKER, fb.TRADING_DAY, fb._NEXT_DAY),
+    }
+
+    # ...and once the vendor answers in bounds, the next run is clean end to end.
+    recovered = fb.card.Execution(s3, fb.CASE, rows_per_attempt=[True])
+    assert recovered.run() == "Succeed", recovered.path
+    assert recovered.path[-1] == "CollectionSucceeded"
+    assert recovered.pages == []
+    assert [m["status"] for m in s3.manifests(fb.CASE)] == ["failed", "failed", "ok"]
+    for key in prior:
+        published = pd.read_parquet(io.BytesIO(s3.objects[key]))
+        assert published.index.max() == pd.Timestamp(fb.TRADING_DAY), key
+
+    print(
+        f"\nFAULT RECORD guard={GUARD_CLASS} unit=D03 phase={fb.CASE.phase} workload={fb.CASE.workload}"
+        f"\n  fault:      {fb.CASE.fault}"
+        "\n  attempts:   " + ", ".join(a["status"] for a in faulted.attempts) + " (exit 1 each)"
+        f"\n  manifests:  {', '.join(m['status'] for m in manifests)}: {manifests[0]['reason'][:110]}..."
+        f"\n  pages:      {len(faulted.pages)} {faulted.pages}"
+        "\n  path:       " + " > ".join(faulted.path)
+        + "\n  recovery:   " + " > ".join(recovered.path) + f" (pages={len(recovered.pages)})"
+    )
+
+
 CASES: tuple[Case, ...] = (
     Case(
         "D13", "arcticdb", "weekly-phase-one", "weekly", _FAULT,
@@ -282,6 +355,11 @@ CASES: tuple[Case, ...] = (
         "D32", "arcticdb", "post-market-arctic-append", "eod", _FAULT,
         outputs=("arcticdb/universe",), writes_sentinel=True,
         run=_run_mode("daily_arctic_append", "_run_daily_arctic_append"),
+    ),
+    Case(
+        "D03", fb.CASE.phase, fb.CASE.workload, fb.CASE.collection, fb.CASE.fault,
+        outputs=(), writes_sentinel=False,
+        guard_token="dates.py::refuse_bars_after", record=_record_d03,
     ),
 )
 CASE_IDS = [c.unit for c in CASES]
@@ -396,7 +474,11 @@ def _seed_prior_cycle(fake: ef.InMemoryS3) -> None:
 
 @pytest.mark.parametrize("case", CASES, ids=CASE_IDS)
 def test_the_fault_record_stale_as_of_fails_pages_once_and_stands_down(case, s3, caplog):  # noqa: F811
-    """The commissioning record for ``pit``, on the shared append-time freshness guard."""
+    """The commissioning record for ``pit``, on the shared append-time freshness guard
+    (D13, D18, D32) or, for a unit with its own ``pit`` check, through its own walk."""
+    if case.record is not None:
+        case.record(s3, caplog)
+        return
     caplog.set_level(logging.ERROR)
     _seed_prior_cycle(s3)
     lib = UniverseLib()
@@ -479,7 +561,7 @@ def test_every_case_declares_this_guard_and_runs_on_its_schedule(case):
     unit = next(u for u in descriptors.load_units() if u.unit_id == case.unit)
     block = unit.guards[GUARD_CLASS]
     assert block["state"] == "present", block
-    assert "UniverseFreshnessViolation" in block["note"], block
+    assert case.guard_token in (block["note"] + " ".join(block.get("code") or [])), block
     schedule = _deployed_input(case.collection)
     assert case.workload in schedule["workloads"]
     assert case.unit in schedule["verify_units"]
@@ -489,6 +571,7 @@ def test_the_units_are_the_ones_the_runner_maps():
     assert run_units.PHASE_UNITS[("phase1", "arcticdb")].unit_id == "D13"
     assert run_units.MODE_UNITS["morning_arctic_append"] == "D18"
     assert run_units.MODE_UNITS["daily_arctic_append"] == "D32"
+    assert run_units.PHASE_UNITS[(fb.CASE.mode, "prices")].unit_id == "D03"
 
 
 def test_the_guard_call_sites_are_what_the_model_calls():
@@ -541,7 +624,7 @@ def test_the_record_shape_is_what_the_phase_two_gate_reads(unit, tmp_path):
     document = gc.record_document(
         unit, GUARD_CLASS, fault=case.fault, test=harness.nodeid(unit), code_sha="c" * 40,
     )
-    assert document["observed"] == list(gc.PIT_OBSERVED)
+    assert document["observed"] == list(gc._observed_for(GUARD_CLASS, unit))
     store.put_bytes(gc.record_key(unit, GUARD_CLASS), json.dumps(document).encode("utf-8"))
     after = evidence.read_guard_commissioning(store, descriptor, GUARD_CLASS, trading_day=day)
     assert after.met is True, after.detail

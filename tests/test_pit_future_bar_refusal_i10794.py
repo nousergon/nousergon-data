@@ -198,6 +198,20 @@ def test_d03_refresh_fails_on_a_vendor_future_bar_and_uploads_nothing(monkeypatc
     assert (calls[0]["start"], calls[0]["end"]) == ("2016-09-14", D_PLUS_1)
 
 
+def test_d03_short_fetch_retry_re_raises_a_future_bar(monkeypatch):
+    """The short-fetch retry's never-raises contract does not cover a refusal
+    (alpha-engine-config-I12676): a retry attempt that answers a bar after D
+    fails the run like the first attempt, never a discarded WARNING."""
+    monkeypatch.setattr(prices, "_sleep_seconds", lambda _s: None)
+    monkeypatch.setattr(prices.yf, "download", lambda *_a, **_k: _ohlcv("2016-09-14", D_PLUS_1))
+    with pytest.raises(FutureBarError) as raised:
+        prices._retry_short_fetch_ticker(
+            "A", "A", date(2016, 9, 14), date.fromisoformat(D_PLUS_1), D,
+        )
+    f = raised.value.finding
+    assert (f.dataset, f.ticker, f.as_of, f.bar_date) == ("price_cache_refresh_retry", "A", D, D_PLUS_1)
+
+
 def test_d03_refresh_publishes_a_clean_answer_unchanged(monkeypatch):
     frame = _ohlcv("2016-09-14", D)
     monkeypatch.setattr(prices.yf, "download", _vendor(frame, []))
@@ -265,55 +279,16 @@ CASE = card.Case(
 )
 
 
-def test_d03_future_bar_fails_pages_once_and_stands_down(s3, caplog):  # noqa: F811
-    caplog.set_level(logging.ERROR)
-    prior = {key: card._PRIOR for key in _published_keys()}
-    s3.objects.update(prior)
-
-    faulted = card.Execution(s3, CASE, rows_per_attempt=[False, False])
-    terminal = faulted.run()
-
-    # 1. A failed manifest naming the finding, on the attempt and on the retry.
-    manifests = s3.manifests(CASE)
-    assert [m["status"] for m in manifests] == ["failed", "failed"], manifests
-    for m in manifests:
-        assert CASE.refusal in m["reason"], m["reason"]
-        assert f"as_of {TRADING_DAY}" in m["reason"], m["reason"]
-    assert [a["status"] for a in faulted.attempts] == ["error", "error"], faulted.attempts
-
-    # 2. Exactly one page, after the on-demand retry.
-    assert faulted.pages == ["NotifyFailure"], faulted.path
-    assert faulted.path.count("RetryOnDemand") == 1
-
-    # 3. Stand-down: terminal fail, phase marker error, nothing the vendor
-    # answered was published (the previous cycle's objects are untouched).
-    assert terminal == "Fail" and faulted.path[-1] == "CollectionFailed"
-    assert s3.marker(CASE)["status"] == "error"
-    for key, body in prior.items():
-        assert s3.objects[key] == body, f"{key} was overwritten past the refusal"
-    assert manifests[0]["outputs"] == []
-    findings = [
-        json.loads(r.getMessage().removeprefix("PIT_FUTURE_BAR "))
-        for r in caplog.records if r.getMessage().startswith("PIT_FUTURE_BAR ")
-    ]
-    assert len(findings) >= 2, [r.getMessage() for r in caplog.records]
-    assert {(f["dataset"], f["ticker"], f["as_of"], f["bar_date"]) for f in findings} == {
-        ("price_cache_refresh", _TICKER, TRADING_DAY, _NEXT_DAY),
-    }
-
-    # ...and once the vendor answers in bounds, the next run is clean end to end.
-    recovered = card.Execution(s3, CASE, rows_per_attempt=[True])
-    assert recovered.run() == "Succeed", recovered.path
-    assert recovered.path[-1] == "CollectionSucceeded"
-    assert recovered.pages == []
-    assert [m["status"] for m in s3.manifests(CASE)] == ["failed", "failed", "ok"]
-    for key in prior:
-        published = pd.read_parquet(io.BytesIO(s3.objects[key]))
-        assert published.index.max() == pd.Timestamp(TRADING_DAY), key
+# The end-to-end walk above this point's CASE lives in the pit harness, as
+# ``tests/test_guard_commissioning_pit.py::_record_d03``, so
+# ``guard_commissioning --guard pit --units D03`` publishes the node it runs
+# (``test_the_fault_record_stale_as_of_fails_pages_once_and_stands_down[D03]``,
+# alpha-engine-config-I12676).
 
 
 def test_the_d03_record_lines_are_the_ones_this_walk_proves():
-    """``PIT_OBSERVED_BY_UNIT['D03']`` is what the walk above asserts, line for line."""
+    """``PIT_OBSERVED_BY_UNIT['D03']`` is what the pit harness's D03 walk
+    (``test_guard_commissioning_pit.py::_record_d03``) asserts, line for line."""
     observed = gc.PIT_OBSERVED_BY_UNIT["D03"]
     assert observed == gc.PIT_FUTURE_BAR_OBSERVED
     assert gc._observed_for("pit", "D03") == observed
