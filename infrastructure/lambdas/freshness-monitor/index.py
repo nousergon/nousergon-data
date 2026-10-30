@@ -1174,6 +1174,54 @@ def resolve_declared_off(
     return out
 
 
+def lift_declared_off_on_live_producer(
+    declared_off_by_id: dict[str, dict[str, Any]],
+    producer_trigger_by_id: dict[str, str | tuple[str, ...]],
+    suppression_by_id: dict[str, dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Grade each declared-off row's premise against its producer
+    (alpha-engine-config-I10928).
+
+    A `declared_off:` block asserts "this producer is deliberately off". When
+    the row ALSO declares a ``producer_trigger``, that assertion is checkable,
+    and :func:`apply_producer_suppression` has already checked it this sweep:
+    an artifact appears in ``suppression_by_id`` only when EVERY one of its
+    triggers is live-confirmed disabled. So a declared-off row that declares
+    triggers but is ABSENT from ``suppression_by_id`` has at least one producer
+    that is running (or could not be resolved, which is treated as running,
+    the fail-toward-paging direction this module uses everywhere).
+
+    That row's suppression is lifted and it carries ``producer_live: True``,
+    so it pages like any other row and the console does not render it
+    DISABLED. Measured 2026-09-16: `merge-drain.yml` came back on while
+    `pr_resting_state_trend` kept its block, and a real miss would have read
+    "declared off, N days".
+
+    A declared-off row with NO producer_trigger is unchanged: nothing can grade
+    its premise, and alpha-engine-config's `check_declared_off_producers.py`
+    lists it as ungradeable by name. No AWS call is made here.
+    """
+    out: dict[str, dict[str, Any]] = {}
+    for aid, row in declared_off_by_id.items():
+        declared = producer_trigger_by_id.get(aid)
+        if not declared or aid in suppression_by_id:
+            out[aid] = row
+            continue
+        triggers = ", ".join(_declared_triggers(declared))
+        if row.get("suppressed"):
+            logger.warning(
+                "declared-off LIFTED for %s: its producer_trigger (%s) is not "
+                "confirmed disabled this sweep, so the block's premise — the "
+                "producer is deliberately off — is false. The row pages until "
+                "the block is removed or the producer is switched off again "
+                "(alpha-engine-config-I10928)",
+                aid, triggers,
+            )
+        out[aid] = {**row, "suppressed": False, "producer_live": True,
+                    "producer_trigger": triggers}
+    return out
+
+
 def _declared_triggers(value: Any) -> tuple[str, ...]:
     """Normalise a row's ``producer_trigger`` map value to a tuple. The loader
     already stores tuples; a bare string is accepted so every existing caller
@@ -4546,14 +4594,18 @@ def _handle_intraday(s3_client: Any, now: datetime, started_at: float) -> dict:
     # trigger suppression is: this path runs every 30min and must not do work
     # for rows it will not probe. No AWS call either way — the declaration and
     # its resolution both came from the registry object already read.
-    declared_off_by_id = {
-        aid: v for aid, v in resolve_declared_off(
-            declared_off_input.get("rows") or {},
-            declared_off_input.get("resolution"),
-            now,
-        ).items()
-        if aid in INTRADAY_ARTIFACT_IDS
-    }
+    declared_off_by_id = lift_declared_off_on_live_producer(
+        {
+            aid: v for aid, v in resolve_declared_off(
+                declared_off_input.get("rows") or {},
+                declared_off_input.get("resolution"),
+                now,
+            ).items()
+            if aid in INTRADAY_ARTIFACT_IDS
+        },
+        intraday_triggers,
+        suppression_by_id,
+    )
 
     (pairs, alerted, dispatched, per_spec_exceptions, _miss_counts,
      _telemetry) = _run_probe_pass(
@@ -5076,6 +5128,11 @@ def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract
         declared_off_input.get("rows") or {},
         declared_off_input.get("resolution"),
         now,
+    )
+    # config-I10928 — a declared-off row whose declared producer is live is a
+    # false declaration; it pages instead of rendering DISABLED.
+    declared_off_by_id = lift_declared_off_on_live_producer(
+        declared_off_by_id, producer_trigger_by_id, suppression_by_id,
     )
     # Emit zero rather than nothing. A sweep with no declared-off rows says so,
     # and a sweep whose declared-off rows are NOT suppressed says that too —
