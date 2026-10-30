@@ -1,5 +1,5 @@
 """Class guard: no new `s3.get_object` load whose failure is swallowed into `None`
-(alpha-engine-config-I11069).
+or an empty container (alpha-engine-config-I11069).
 
 I10923 fixed the severe instance: `features/compute.py` swallowed a failed
 reference-map load into a neutral `{}`, and every surface read `ok`. Its class
@@ -16,7 +16,9 @@ This test pins that shape in `features/`, `builders/` and `collectors/`:
 * A handler that catches only a not-found type (`NoSuchKey`, `NotFound`,
   `FileNotFoundError`, `KeyError`) is not flagged: "absent" is an answer, not a
   swallowed failure.
-* Every other handler that returns `None` is flagged.
+* Every other handler that returns `None`, or an empty `{}` / `[]` / `set()`,
+  is flagged. The empty container is the I10923 shape and the worse one,
+  because downstream code reads it as valid, neutral data.
 
 The sites present when this guard landed are grandfathered by
 `(path, function)` so a line shift does not churn the list. The set may only
@@ -35,6 +37,7 @@ _TREES = ("features", "builders", "collectors")
 _NOT_FOUND_TYPES = ("NoSuchKey", "NotFound", "FileNotFoundError", "KeyError")
 
 # Measured 2026-10-30 against main 4994b1eb. Shrink-only; see the module docstring.
+# The first fourteen return None.
 GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
     {
         ("features/compute.py", "_expected_alternative_count"),
@@ -51,6 +54,12 @@ GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
         ("collectors/price_cache_holes.py", "_read_daily_closes"),
         ("collectors/price_cache_holes.py", "_read_cached"),
         ("collectors/universe_returns.py", "_load_sector_map"),
+        # The five below return an EMPTY CONTAINER, the severe I10923 shape.
+        ("features/compute.py", "_load_cached_alternative"),
+        ("collectors/alternative.py", "_load_promoted_tickers"),
+        ("collectors/daily_news.py", "_load_holdings_universe"),
+        ("collectors/metron_market_data.py", "_read_metron_universe_holdings"),
+        ("collectors/signal_returns.py", "_load_stance_lookup_for_date"),
     }
 )
 
@@ -72,24 +81,37 @@ def _only_not_found(handler: ast.ExceptHandler) -> bool:
     return all(any(k in ast.unparse(t) for k in _NOT_FOUND_TYPES) for t in types)
 
 
-def _swallows_to_none(handler: ast.ExceptHandler) -> bool:
+def _swallows_to_default(handler: ast.ExceptHandler) -> bool:
     if _only_not_found(handler):
         return False
     nodes = list(ast.walk(handler))
     if any(isinstance(n, ast.Raise) for n in nodes):
         return False
-    return any(
-        isinstance(n, ast.Return)
-        and (
-            n.value is None
-            or (isinstance(n.value, ast.Constant) and n.value.value is None)
+    return any(isinstance(n, ast.Return) and _is_empty_default(n.value) for n in nodes)
+
+
+def _is_empty_default(value: ast.expr | None) -> bool:
+    """`return`, `return None`, or an empty container. `{}` is the I10923 shape and
+    the more dangerous one, because downstream code reads it as valid data."""
+    if value is None:
+        return True
+    if isinstance(value, ast.Constant):
+        return value.value is None
+    if isinstance(value, ast.Dict):
+        return not value.keys
+    if isinstance(value, (ast.List, ast.Tuple, ast.Set)):
+        return not value.elts
+    if isinstance(value, ast.Call) and isinstance(value.func, ast.Name):
+        return (
+            value.func.id in ("dict", "list", "set", "tuple")
+            and not value.args
+            and not value.keywords
         )
-        for n in nodes
-    )
+    return False
 
 
 def find_sites(source: str, rel: str) -> set[tuple[str, str]]:
-    """`(rel, innermost function)` for every get_object swallow-to-None in `source`."""
+    """`(rel, innermost function)` for every get_object swallow-to-default in `source`."""
     found: set[tuple[str, str]] = set()
     funcs = (ast.FunctionDef, ast.AsyncFunctionDef)
     for fn in ast.walk(ast.parse(source)):
@@ -105,7 +127,7 @@ def find_sites(source: str, rel: str) -> set[tuple[str, str]]:
             if id(node) in nested or not isinstance(node, ast.Try):
                 continue
             if _calls_get_object(node.body) and any(
-                _swallows_to_none(h) for h in node.handlers
+                _swallows_to_default(h) for h in node.handlers
             ):
                 found.add((rel, fn.name))
     return found
@@ -120,10 +142,11 @@ def _repo_sites() -> set[tuple[str, str]]:
     return sites
 
 
-def test_no_new_get_object_swallow_to_none():
+def test_no_new_get_object_load_swallow():
     new = sorted(_repo_sites() - GRANDFATHERED)
     assert not new, (
-        "s3.get_object load failure swallowed into None (alpha-engine-config-I11069). "
+        "s3.get_object load failure swallowed into None or an empty container "
+        "(alpha-engine-config-I11069). "
         "Raise, re-raise everything but a genuine not-found, or catch only the "
         f"not-found type: {new}"
     )
@@ -164,6 +187,18 @@ def not_found_only(s3):
     except s3.exceptions.NoSuchKey:
         return None
 
+def empty_dict(s3):
+    try:
+        return s3.get_object(Bucket="b", Key="k")
+    except Exception:
+        return {}
+
+def populated_default(s3):
+    try:
+        return s3.get_object(Bucket="b", Key="k")
+    except Exception:
+        return {"fallback": True}
+
 def outer(s3):
     def inner():
         try:
@@ -175,5 +210,6 @@ def outer(s3):
     assert find_sites(src, "x.py") == {
         ("x.py", "swallow"),
         ("x.py", "bare_return"),
+        ("x.py", "empty_dict"),
         ("x.py", "inner"),
     }
