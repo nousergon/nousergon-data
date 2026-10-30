@@ -135,7 +135,17 @@ jobs:
       # locally 3x that the combined TOTAL matches a serial run within
       # 0.1pt. `-ra` keeps failure/skip summaries; `-v`'s 8,540 interleaved
       # per-test lines added noise with parallel workers reordering output.
+      #
+      # alpha-engine-config-I11310: COVERAGE_CORE=sysmon measures the same
+      # statement coverage through PEP 669 sys.monitoring instead of a
+      # per-line trace function (coverage >= 7.4 on Python 3.12; no branch
+      # coverage is configured, so nothing falls back). Measured 2026-10-30 on
+      # 4 workers: 407s -> 255s for the whole suite, identical TOTAL (52,310
+      # statements, 8,944 missed, 83%). The coverage the step reports is
+      # unchanged; only its overhead (~+70% over an uncovered run, 234s) shrinks.
       - name: Run tests
+        env:
+          COVERAGE_CORE: sysmon
         run: pytest tests/ -n auto --dist loadfile -ra --cov=. --cov-report=term-missing
 
       # Changelog mirror Lambdas live outside tests/ (pytest testpaths) and each
