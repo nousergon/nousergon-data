@@ -1,0 +1,19 @@
+name: CLAUDE.md guard
+
+# Fails CI if an agent-instruction file (AGENTS.md, the canonical one, or its
+# CLAUDE.md symlink) is committed to this public repo, or is not gitignored.
+# Both carry infra/IP-structure detail that must not be public (2026-03-22
+# decision). Logic lives in the fleet chokepoint: nousergon-lib
+# claude-md-guard.yml. Wired here by alpha-engine-config-I8049.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  claude-md-untracked:
+    uses: nousergon/nousergon-lib/.github/workflows/claude-md-guard.yml@8606fe9d6e4856ebc9fc2fecd868e5d297f93d62

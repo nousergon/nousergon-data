@@ -53,6 +53,11 @@ contract:
       pins: "key_template"
       read_site: "health_checker.py::_find_latest_prefix"
       note: "KEY-TEMPLATE pin, not the body schema: health_checker.py's `fundamentals` freshness check reads only the object key's embedded date, never the body"
+    - repo: "crucible-research"
+      path: "tests/contracts/fundamentals_snapshot.schema.json"
+      pins: "body_schema"
+      producer: "contracts/fundamentals_snapshot.schema.json"
+      read_site: "agents/sector_teams/quant_tools.py::read_fundamentals_from_s3"
   # P-07 (alpha-engine-config-I10873, I10934): D10 is CONNECTED
   # (crucible-dashboard health_checker.py's `fundamentals` freshness check
   # genuinely reads `archive/fundamentals/` — verified 2026-09-16, NOT the
@@ -79,8 +84,9 @@ contract:
   # against that repo's origin/main 2026-09-21) — but pinning it is out
   # of scope for this PR (a crucible-research change, not a
   # nousergon-data or crucible-dashboard one); filed as
-  # alpha-engine-config-I11276. `consumer_pins` above will gain a second
-  # entry once that PR lands — the list is additive, not exclusive.
+  # alpha-engine-config-I11276, now the second `consumer_pins` entry above:
+  # a byte-copy of this schema plus a test driving that reader on both its
+  # run_date and prefix-scan paths. The list is additive, not exclusive.
 registry_rows:
   - fundamentals_snapshot
 run_manifest_prefix: data_collection/runs/D10

@@ -1661,7 +1661,7 @@ class TestDailyBySystem:
 
 class TestCostAllocation:
     """``detail.cost_allocation`` (cost_allocation.v1, alpha-engine-config-I12026
-    slice 1): built from the ``daily_by_system`` series alone, it conserves
+    slices 1-2): built from the ``daily_by_system`` series alone, it conserves
     each day's account total, attributes only what the series can attribute,
     and says what it cannot."""
 
@@ -1712,6 +1712,54 @@ class TestCostAllocation:
         assert "trader" in rec["inventory_evidence"] and "shared" in rec["inventory_evidence"]
         assert not any(m["component"] in ("trader", "shared")
                        for d in rec["days"] for m in d["members"])
+        assert "slice 2" in rec["inventory_evidence"]
+
+    def test_trader_is_a_canonical_direct_member_and_shared_stays_in_its_own_scope(self):
+        """Slice 2: the trader host's `system=crucible-trader` tag puts its cost
+        in the canonical scope; the fleet-wide `shared` tag is identified as a
+        shared member but not apportioned to Crucible."""
+        rec = index.build_cost_allocation(self._series(
+            ("2026-10-25", {"(untagged)": 1.0, "crucible-v2": 2.0, "crucible-trader": 0.7,
+                            "shared": 0.4, "vires": 0.1})))
+        by_id = {m["id"]: m for m in rec["days"][0]["members"]}
+        assert by_id["trader:crucible-trader"] == {
+            "id": "trader:crucible-trader", "scope": "crucible-and-trader", "component": "trader",
+            "kind": "direct", "usd": 0.7,
+            "evidence": "billing_export daily_by_system 2026-10-25 system=crucible-trader"}
+        sh = by_id["shared:shared"]
+        assert (sh["scope"], sh["component"], sh["kind"]) == ("system:shared", "shared", "shared")
+        canonical = sum(m["usd"] for m in rec["days"][0]["members"]
+                        if m["scope"] == "crucible-and-trader")
+        assert canonical == pytest.approx(2.7)
+        assert "system:crucible-trader" not in rec["declared_scopes"]
+        assert rec["covered_components"] == ["harness", "trader"]
+        assert rec["inventory_complete"] is False
+        self._validate(rec)
+
+    def test_a_component_is_covered_only_when_every_day_carries_it(self):
+        """Trader cost before the tag date is inside the untagged remainder, so
+        a window that starts before it must not claim trader coverage; the same
+        rule applies to harness on days before its own tag."""
+        rec = index.build_cost_allocation(self._series(
+            ("2026-10-24", {"(untagged)": 3.0, "crucible-v2": 2.0}),
+            ("2026-10-25", {"(untagged)": 1.0, "crucible-v2": 2.0, "crucible-trader": 0.7}),
+        ))
+        assert rec["covered_components"] == ["harness"]
+        assert {m["component"] for m in rec["days"][0]["members"]} == {"harness", "unallocated"}
+        rec = index.build_cost_allocation(self._series(
+            ("2026-09-05", {"(untagged)": 3.0}),
+            ("2026-09-06", {"(untagged)": 1.0, "crucible-v2": 2.0}),
+        ))
+        assert rec["covered_components"] == []
+        self._validate(rec)
+
+    def test_shared_is_never_covered_until_it_is_apportioned(self):
+        rec = index.build_cost_allocation(self._series(
+            ("2026-10-25", {"crucible-v2": 2.0, "crucible-trader": 0.7, "shared": 0.4}),
+            ("2026-10-26", {"crucible-v2": 2.0, "crucible-trader": 0.7, "shared": 0.4}),
+        ))
+        assert "shared" not in rec["covered_components"]
+        assert "shared" in rec["inventory_evidence"]
 
     def test_a_day_with_no_billed_rows_carries_an_evidenced_zero(self):
         rec = index.build_cost_allocation(self._series(("2026-10-01", {})))
