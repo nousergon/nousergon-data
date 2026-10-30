@@ -6486,3 +6486,63 @@ def test_probe_pass_replaces_the_suppression_the_serializer_reads(
     assert suppression_by_id["with_evidence"]["run_evidence"]["verdict"] == (
         "ran_without_artifact"
     )
+
+
+# ── a declared-off row whose producer is live pages (alpha-engine-config-I10928)
+#
+# The block's premise is "the producer is deliberately off". When the row also
+# declares a producer_trigger, apply_producer_suppression has already checked
+# that premise this sweep; a row it did not confirm all-disabled is lifted.
+
+
+def _suppressed_do(index, fixed_now):
+    return index.resolve_declared_off(
+        {"champion_feed": dict(_DO_BLOCK)}, _resolution(index, fixed_now), fixed_now)
+
+
+def test_a_declared_off_row_whose_producer_is_live_is_lifted(monkeypatch, fixed_now):
+    """The I10928 incident shape: merge-drain.yml active, row still declared off."""
+    index = _fresh_index(monkeypatch)
+    declared = _suppressed_do(index, fixed_now)
+    assert declared["champion_feed"]["suppressed"] is True
+    out = index.lift_declared_off_on_live_producer(
+        declared, {"champion_feed": ("gha:nousergon/alpha-engine-config/merge-drain.yml",)}, {})
+    assert out["champion_feed"]["suppressed"] is False
+    assert out["champion_feed"]["producer_live"] is True
+    assert "merge-drain.yml" in out["champion_feed"]["producer_trigger"]
+
+
+def test_a_declared_off_row_whose_producers_are_all_off_stays_suppressed(monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    declared = _suppressed_do(index, fixed_now)
+    out = index.lift_declared_off_on_live_producer(
+        declared, {"champion_feed": ("events:r",)},
+        {"champion_feed": {"trigger": "events:r", "suppressed": False}})
+    # Membership is the signal (every trigger confirmed disabled), not the
+    # producer clock: a lapsed producer pause does not lift a declared-off row.
+    assert out["champion_feed"]["suppressed"] is True
+    assert "producer_live" not in out["champion_feed"]
+
+
+def test_a_declared_off_row_without_a_producer_trigger_is_unchanged(monkeypatch, fixed_now):
+    index = _fresh_index(monkeypatch)
+    declared = _suppressed_do(index, fixed_now)
+    assert index.lift_declared_off_on_live_producer(declared, {}, {}) == declared
+
+
+def test_the_lift_composes_with_live_trigger_resolution(monkeypatch, fake_s3, fixed_now):
+    """End to end over the real resolver: one of two schedules ENABLED means the
+    artifact is absent from suppression, so its declared-off block is lifted."""
+    index = _fresh_index(monkeypatch)
+
+    class _Sched:
+        def get_schedule(self, GroupName, Name):
+            return {"State": "ENABLED" if Name == "live" else "DISABLED"}
+
+    triggers = {"champion_feed": ("scheduler:off", "scheduler:live")}
+    suppression = index.apply_producer_suppression(
+        fake_s3, triggers, fixed_now, scheduler_client=_Sched())
+    assert "champion_feed" not in suppression
+    out = index.lift_declared_off_on_live_producer(
+        _suppressed_do(index, fixed_now), triggers, suppression)
+    assert out["champion_feed"]["suppressed"] is False

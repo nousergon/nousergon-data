@@ -1,4 +1,5 @@
-"""Every direct Telegram sender in this repo carries an ``Auto-fix:`` line.
+"""Every direct Telegram sender in this repo carries ``Auto-fix:`` and
+``Resolution:`` lines.
 
 Brian, 2026-10-23: every alert or error posted to Telegram says what fix is
 being applied automatically. Rule: nous-ergon-ops observability-policy.md
@@ -55,4 +56,21 @@ def test_every_raw_telegram_sender_carries_an_auto_fix_line():
         "what is fixed automatically, who owns it and when (or route the send "
         "through krepis.telegram.send_message, which appends it): "
         + ", ".join(missing)
+    )
+
+
+def test_every_raw_telegram_sender_carries_a_resolution_line():
+    # The resolution half of §7.4b (Brian, 2026-10-24): say what will END the
+    # problem, the tracked item or "none tracked yet" and who files one, or
+    # "none needed" for an informational message (alpha-engine-config-I12811).
+    # Markdown senders write it as "*Resolution:*", which still contains it.
+    missing = [
+        p.relative_to(ROOT).as_posix()
+        for p in _raw_senders()
+        if "Resolution:" not in p.read_text(errors="ignore")
+    ]
+    assert not missing, (
+        "These files post to Telegram directly with no 'Resolution:' line. Say "
+        "what will END the problem (krepis.telegram.DEFAULT_RESOLUTION's wording "
+        "when nothing is tracked): " + ", ".join(missing)
     )
