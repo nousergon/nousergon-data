@@ -853,6 +853,24 @@ def _clause_guard(store: ev.GateStore, unit: Unit, guard: str, *, trading_day: d
             source="registry.d/units",
             as_of=str(unit.raw["audit"]["baseline_date"]),
         )
+    if state == "absent":
+        # A declared-absent guard is UNMET whatever the store holds
+        # (alpha-engine-config-I12319). The commissioning publisher refuses to
+        # write a record for one, but a record written any other way (by hand,
+        # by an older publisher) must not flip this clause with no guard
+        # behind it: the declaration, not the record, says whether code exists.
+        key = f"faults/{unit.unit_id}/{guard}/latest.json"
+        return Clause(
+            name,
+            requirement,
+            False,
+            f"declared state 'absent' ({note}); no guard exists to commission, so any record "
+            f"at {key} is not evidence",
+            (unit.path.relative_to(unit.path.parents[2]).as_posix(), key),
+            phase="data-phase2",
+            source="registry.d/units",
+            as_of=str(unit.raw["audit"]["baseline_date"]),
+        )
     reading = ev.read_guard_commissioning(store, unit, guard, trading_day=trading_day)
     if guard == "pit":
         reading = _pit_and_commissioning(ev.read_pit(store, unit, trading_day=trading_day), reading)
