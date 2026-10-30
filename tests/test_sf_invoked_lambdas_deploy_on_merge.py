@@ -136,3 +136,66 @@ def test_grandfathered_entries_are_still_needed():
     invoked = _sf_invoked_in_repo_dirs()
     stale = sorted(d for d in GRANDFATHERED if d in covered or d not in invoked)
     assert not stale, f"remove from GRANDFATHERED: {stale}"
+
+
+# ── The class, not only the SF-invoked instance (alpha-engine-config-I8985) ──
+#
+# Every in-repo Lambda with a ``deploy.sh`` deploys on merge, SF-invoked or
+# not: an EventBridge- or alarm-driven Lambda whose fix merges inert is the
+# same codified-but-not-live defect, and nothing else reports it. Measured
+# 2026-10-30 against main 4994b1eb: 44 directories carry a ``deploy.sh``, and
+# these ten (beyond the SF-invoked GRANDFATHERED above) have no
+# ``deploy-*.yml`` push-triggered on their path. This set may only SHRINK:
+# a directory leaves it in the PR that adds its deploy workflow, and the
+# stale-entry test below fails if one is left behind. A NEW Lambda ships with
+# its deploy workflow.
+NOT_SF_INVOKED_GRANDFATHERED: frozenset[str] = frozenset(
+    {
+        "alpha-engine-alerts-forwarder",
+        "backstop-telegram-notifier",
+        "canary-replay-liveness-probe",
+        "changelog-cloudwatch-mirror",
+        "changelog-incident-mirror",
+        "eod-success-friday-shell-trigger",
+        "friday-shell-run-report",
+        "groom-inject-mock",
+        "saturday-integrity-sentinel",
+        "sweep-artifact-monitor",
+    }
+)
+
+
+def _dirs_with_deploy_sh() -> set[str]:
+    return {p.parent.name for p in LAMBDAS.glob("*/deploy.sh")}
+
+
+def test_every_lambda_with_a_deploy_sh_deploys_on_merge():
+    covered = _dirs_with_deploy_workflow()
+    exempt = GRANDFATHERED | NOT_SF_INVOKED_GRANDFATHERED
+    missing = sorted(
+        d for d in _dirs_with_deploy_sh() if d not in covered and d not in exempt
+    )
+    assert not missing, (
+        "Lambda(s) with a deploy.sh and no deploy-on-merge workflow — a merged "
+        "fix would never reach the account (alpha-engine-config-I8985). Add a "
+        ".github/workflows/deploy-<dir>.yml modelled on "
+        f"deploy-weekly-run-scope.yml for: {missing}"
+    )
+
+
+def test_not_sf_invoked_grandfathered_entries_are_still_needed():
+    covered = _dirs_with_deploy_workflow()
+    present = _dirs_with_deploy_sh()
+    stale = sorted(
+        d for d in NOT_SF_INVOKED_GRANDFATHERED if d in covered or d not in present
+    )
+    assert not stale, f"remove from NOT_SF_INVOKED_GRANDFATHERED: {stale}"
+    assert not (NOT_SF_INVOKED_GRANDFATHERED & GRANDFATHERED)
+
+
+def test_weekly_run_scope_deploys_on_merge():
+    """The specific regression I8985 was filed on."""
+    workflows = _dirs_with_deploy_workflow().get("weekly-run-scope", [])
+    assert "deploy-weekly-run-scope.yml" in workflows
+    text = (WORKFLOWS / "deploy-weekly-run-scope.yml").read_text()
+    assert "bash infrastructure/lambdas/weekly-run-scope/deploy.sh" in text
