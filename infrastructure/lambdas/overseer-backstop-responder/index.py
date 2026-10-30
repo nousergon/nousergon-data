@@ -594,6 +594,7 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict,
             f"Reason: {reason or '(none given)'}",
             "",
             "Auto-fix: none needed (recovered).",
+            "Resolution: none needed (informational, nothing is broken).",
         ])
 
     lines = [
@@ -631,7 +632,7 @@ def _render(alarm: str, reason: str, evidence: dict, outcome: dict,
         ]
     # Every Telegram message says what is being fixed automatically
     # (nous-ergon-ops observability-policy § Notification — auto-fix line).
-    lines += ["", _auto_fix_line(outcome)]
+    lines += ["", _auto_fix_line(outcome), _resolution_line(outcome)]
     return "\n".join(lines)
 
 
@@ -649,6 +650,23 @@ def _auto_fix_line(outcome: dict) -> str:
     return (f"Auto-fix: this responder ran one bounded recovery "
             f"({res.get('attempted')}) and it {verdict}. If the alarm fires "
             "again inside the cooldown it escalates instead of retrying.")
+
+
+#: krepis.telegram.DEFAULT_RESOLUTION's wording (this Lambda has no krepis).
+DEFAULT_RESOLUTION = ("Resolution: none tracked yet. Tonight's nightly sweep (7pm PT) files "
+                      "an issue that lists the options and a recommended fix, and later "
+                      "alerts name it.")
+
+
+def _resolution_line(outcome: dict) -> str:
+    """The ``Resolution:`` line (observability-policy §7.4b, the resolution
+    half; Brian, 2026-10-24): what will END the problem, from what this
+    responder actually did. Pairs with :func:`_auto_fix_line`."""
+    res = outcome.get("result") or {}
+    if outcome.get("escalated") or outcome.get("skipped") or not res.get("ok"):
+        return DEFAULT_RESOLUTION
+    return ("Resolution: the recovery above should end it; the alarm returns to OK, "
+            "and a second firing inside the cooldown escalates to a person.")
 
 
 def handler(event: dict, context) -> dict:  # noqa: ARG001 — Lambda contract

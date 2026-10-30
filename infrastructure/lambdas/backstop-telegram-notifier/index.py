@@ -186,6 +186,19 @@ def _format_alarm_message(sns_message: dict) -> str:
     else:
         lines.append("*Auto-fix:* none needed (resolved).")
 
+    # The resolution half (observability-policy §7.4b; Brian, 2026-10-24): what
+    # will END the problem. This Lambda posts to the Bot API directly, so it
+    # writes the line itself, in krepis.telegram.DEFAULT_RESOLUTION's wording.
+    if new_state == "ALARM":
+        lines.append(
+            "*Resolution:* the responder's own message says whether its recovery "
+            "ended it. If not, none is tracked yet: tonight's nightly sweep (7pm PT) "
+            "files an issue that lists the options and a recommended fix, and later "
+            "alerts name it."
+        )
+    else:
+        lines.append("*Resolution:* none needed (resolved).")
+
     return "\n".join(lines)
 
 
