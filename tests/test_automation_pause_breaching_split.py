@@ -125,8 +125,12 @@ def classification_findings(manifest: dict, module) -> list[str]:
                 "breaching population, so declaring it here can only produce "
                 "[armed-missing-in-aws] forever"
             )
+    # Classified means armed OR paused with a justified `watches`: since
+    # alpha-engine-config-I12801 the stage-coverage sweep's alarm is paused
+    # with its trigger (alpha-engine-saturday), which is still a declaration.
+    paused_alarm_names = {e["name"] for e in module.alarm_entries(manifest)}
     for name in STANDALONE_BREACHING:
-        if name not in declared:
+        if name not in declared and name not in paused_alarm_names:
             findings.append(f"{name} is breaching live and is not classified")
     retired = set(module.retired_alarm_names(manifest))
     for dead, folded in FOLDED_PAIRS:
@@ -185,6 +189,7 @@ def test_dropping_a_breaching_half_is_rejected(manifest, module):
     """Seeded regression in the other direction: an undeclared breaching alarm
     is the `[alarm-undeclared]` finding that started this."""
     seeded = json.loads(json.dumps(manifest))
-    del seeded["armed_alarms"]["alpha-engine-stage-coverage-sweep-dead"]
+    for block in ("armed_alarms", "paused_alarms"):
+        seeded[block].pop("alpha-engine-stage-coverage-sweep-dead", None)
     findings = classification_findings(seeded, module)
     assert any("is breaching live and is not classified" in f for f in findings), findings

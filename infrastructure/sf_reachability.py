@@ -73,6 +73,8 @@ here, and every defect in the recorded history was a missing top-level field.
 
 from __future__ import annotations
 
+import heapq
+import itertools
 import json
 import re
 from pathlib import Path
@@ -428,6 +430,36 @@ def _successors(name: str, state: dict, bools: dict[str, bool], present: frozens
         yield catch["Next"], ({caught} if caught else set()), {}
 
 
+def _topological_rank(states: dict, start: str) -> dict[str, int]:
+    """Reverse-postorder index of every state reachable from ``start``.
+
+    The walk's worklist pops in this order (alpha-engine-config-I11309). It used
+    to pop last-in-first-out, so a state was first processed on whichever path
+    arrived first and then re-processed, with its whole downstream re-propagated,
+    every time another predecessor narrowed its fields. Popping in reverse
+    postorder processes a state after its forward predecessors, so on the
+    acyclic bulk of a definition each (state, context) settles in one pass. The
+    result is the same fixpoint either way: availability only ever narrows, and
+    narrowing only ever adds feasible edges, so the order changes the work done,
+    and the arbitrary ``<N>`` index a Parallel branch variant is labelled with,
+    but never which fields are available where or which defects are reported.
+    """
+    order: list[str] = []
+    seen = {start}
+    stack = [(start, iter(_edges(states[start])))]
+    while stack:
+        name, edges = stack[-1]
+        for nxt in edges:
+            if nxt not in seen and nxt in states:
+                seen.add(nxt)
+                stack.append((nxt, iter(_edges(states[nxt]))))
+                break
+        else:
+            stack.pop()
+            order.append(name)
+    return {name: index for index, name in enumerate(reversed(order))}
+
+
 def walk(
     states: dict,
     start: str,
@@ -449,13 +481,33 @@ def walk(
     entry_fs = frozenset(entry)
     live = live_bool_vars(states)
     available: dict[tuple[str, tuple], set[str]] = {}
-    queue: list[tuple[str, frozenset[str], tuple[tuple[str, bool], ...]]] = [
-        (
-            start,
-            frozenset(seed),
-            tuple(f for f in context if f[0] in live.get(start, frozenset())),
-        )
-    ]
+    # Worklist in reverse postorder, with every not-yet-processed arrival at a
+    # (state, context) key folded into ONE pending entry (alpha-engine-config-I11309).
+    # Popping last-in-first-out, one entry per arrival, processed a key once per
+    # narrowing predecessor and re-propagated its whole downstream each time. Once
+    # the rehearsal marker (#2176) doubled the weekly SF's contexts, one weekly
+    # analysis took ~160 s locally and the test file runs six, which is what
+    # doubled the CI ``Run tests`` step. See _topological_rank for why the order
+    # cannot change the result.
+    rank = _topological_rank(states, start)
+    unranked = len(rank)
+    ticket = itertools.count()
+    pending: dict[tuple[str, tuple], frozenset[str]] = {}
+    queue: list[tuple[int, int, str, tuple[tuple[str, bool], ...]]] = []
+
+    def arrive(name: str, fields: frozenset[str], bool_items: tuple) -> None:
+        key = (name, bool_items)
+        if key in pending:
+            pending[key] = pending[key] & fields
+            return
+        pending[key] = fields
+        heapq.heappush(queue, (rank.get(name, unranked), next(ticket), name, bool_items))
+
+    arrive(
+        start,
+        frozenset(seed),
+        tuple(f for f in context if f[0] in live.get(start, frozenset())),
+    )
 
     while queue:
         if len(available) > _MAX_CONTEXTS:
@@ -464,8 +516,9 @@ def walk(
                 f"from {start!r} — a definition grew a boolean fan-out this analysis "
                 f"cannot enumerate; bound it or narrow the tracked facts"
             )
-        name, incoming, bool_items = queue.pop()
+        _, _, name, bool_items = heapq.heappop(queue)
         key = (name, bool_items)
+        incoming = pending.pop(key)
         state = states[name]
         bools = dict(bool_items)
 
@@ -491,7 +544,7 @@ def walk(
             forward.update(edge_bools)
             still_live = live.get(nxt, frozenset())
             forward = {k: v for k, v in forward.items() if k in still_live}
-            queue.append((nxt, frozenset(base | extra), tuple(sorted(forward.items()))))
+            arrive(nxt, frozenset(base | extra), tuple(sorted(forward.items())))
 
     return available
 
@@ -514,12 +567,14 @@ def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
     on every path that actually runs it, and only an intersection with a path
     that skips the whole branch makes it look absent inside.
     """
-    reached: dict[str, list[tuple[frozenset[str], tuple]]] = {}
+    # An insertion-ordered dict, not a list (alpha-engine-config-I11309): an
+    # ``if pair not in list`` check made this quadratic in a state's context
+    # count, which the weekly SF puts near two thousand on many states. (name,
+    # context) is already unique in ``available``, so this keeps every pair in
+    # first-seen order, exactly as the list did.
+    reached: dict[str, dict[tuple[frozenset[str], tuple], None]] = {}
     for (name, context), fields in available.items():
-        reached.setdefault(name, [])
-        entry_pair = (frozenset(fields), context)
-        if entry_pair not in reached[name]:
-            reached[name].append(entry_pair)
+        reached.setdefault(name, {})[(frozenset(fields), context)] = None
 
     for name, state in states.items():
         if not isinstance(state, dict) or name not in reached:
@@ -530,10 +585,11 @@ def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
                 selector = state.get("ItemSelector") or state.get("Parameters") or {}
                 seed = {k[:-2] if k.endswith(".$") else k for k in selector}
                 yield f"{scope}/{name}", nested["States"], nested["StartAt"], seed, ()
+        variants = list(reached[name])
         for index, branch in enumerate(state.get("Branches", []) or []):
-            for variant, (fields, context) in enumerate(reached[name]):
+            for variant, (fields, context) in enumerate(variants):
                 label = f"{scope}/{name}[{index}]"
-                if len(reached[name]) > 1:
+                if len(variants) > 1:
                     label = f"{label}<{variant}>"
                 yield label, branch["States"], branch["StartAt"], set(fields), context
 
@@ -542,18 +598,23 @@ def _scopes(states: dict, available: dict, scope: str, entry: set[str]):
 #: Tests call it repeatedly on the same document, so memoise on the document's
 #: exact content — never on identity, which would go stale under an in-memory
 #: mutation, and mutating a copy is precisely what the detector self-checks do.
-_ANALYSIS_CACHE: dict[tuple[str, frozenset, str], list[str]] = {}
+#:
+#: The scope is NOT part of the key (alpha-engine-config-I11309): every problem
+#: string starts with its label and every label starts with ``scope``, so one
+#: unscoped analysis serves every scope by prefixing. Keying on it made
+#: ``item_selector_problems`` (scope ``""``) and the per-file test (scope = file
+#: name) run the whole weekly analysis twice.
+_ANALYSIS_CACHE: dict[tuple[str, frozenset], list[str]] = {}
 
 
 def analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
     """Every field-reachability problem in a definition, including nested scopes."""
-    cache_key = (json.dumps(definition, sort_keys=True), frozenset(entry), scope)
-    cached = _ANALYSIS_CACHE.get(cache_key)
-    if cached is not None:
-        return list(cached)
-    problems = _analyse(definition, entry, scope)
-    _ANALYSIS_CACHE[cache_key] = list(problems)
-    return problems
+    cache_key = (json.dumps(definition, sort_keys=True), frozenset(entry))
+    unscoped = _ANALYSIS_CACHE.get(cache_key)
+    if unscoped is None:
+        unscoped = _analyse(definition, entry, "")
+        _ANALYSIS_CACHE[cache_key] = unscoped
+    return [f"{scope}{problem}" for problem in unscoped]
 
 
 def _analyse(definition: dict, entry: set[str], scope: str) -> list[str]:
