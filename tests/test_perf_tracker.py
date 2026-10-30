@@ -411,3 +411,24 @@ def test_backfill_writes_one_dated_document_per_row_and_never_latest():
         pt.publish(s3, "bucket", doc, include_latest=False)
     assert pt.LATEST_KEY not in s3.puts
     assert s3.puts == [f"ops/perf/dated/{d.isoformat()}.json" for d in SHORT[1:]]
+
+
+def test_workflow_passes_the_store_uri_host_segment_as_the_bucket():
+    """The first dispatch (run 40997750814) failed with `--bucket alpha-engine-research/data_collection`:
+    DATA_STORE_URI carries a path, and `${STORE_URI#s3://}` kept it. Run each producer
+    step's own shell with `python` stubbed and a pathed URI, and read the --bucket it passes."""
+    import pathlib
+    import subprocess
+
+    import yaml
+
+    wf = yaml.safe_load((pathlib.Path(__file__).resolve().parent.parent / ".github/workflows/perf-tracker.yml").read_text())
+    steps = [s for job in wf["jobs"].values() for s in job.get("steps", []) if "data.derived.perf_tracker" in s.get("run", "")]
+    assert len(steps) == 2
+    for step in steps:
+        out = subprocess.run(
+            ["bash", "-c", 'python() { printf "%s\\n" "$@"; }\n' + step["run"]],
+            env={"STORE_URI": "s3://alpha-engine-research/data_collection", "PATH": "/usr/bin:/bin"},
+            capture_output=True, text=True, check=True,
+        ).stdout.splitlines()
+        assert out[out.index("--bucket") + 1] == "alpha-engine-research", step["name"]

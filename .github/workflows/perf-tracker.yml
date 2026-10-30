@@ -87,12 +87,19 @@ jobs:
 
       - name: Backfill dated documents (dispatch input)
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.backfill }}
-        run: python -m data.derived.perf_tracker --bucket "${STORE_URI#s3://}" --backfill
+        # The bucket is the store URI's HOST segment: DATA_STORE_URI carries a
+        # path (s3://<bucket>/data_collection), and every key this producer
+        # reads or writes is at the bucket root (perf_tracker.py NAV_KEY etc.).
+        run: |
+          b="${STORE_URI#s3://}"
+          python -m data.derived.perf_tracker --bucket "${b%%/*}" --backfill
         env:
           STORE_URI: ${{ vars.DATA_STORE_URI }}
 
       - name: Build + publish
-        run: python -m data.derived.perf_tracker --bucket "${STORE_URI#s3://}"
+        run: |
+          b="${STORE_URI#s3://}"
+          python -m data.derived.perf_tracker --bucket "${b%%/*}"
         env:
           # Repository VARIABLE, not a literal (public repo). The bucket is
           # the store URI's host segment.
