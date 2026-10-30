@@ -905,30 +905,45 @@ def collect_aws_daily_by_system(s3, now: datetime) -> dict:
 #
 # * harness: every `system` tag value in COST_ALLOCATION_HARNESS_SYSTEMS, as
 #   a direct member of the canonical scope;
-# * trader: NOT COVERED. The trader host carries no `system` tag and the
-#   billing export has no resource ids (INCLUDE_RESOURCES=FALSE), so its cost
-#   sits inside the untagged remainder and cannot be separated from it;
-# * shared (storage, logs, CloudTrail, commitments, tax, credits): NOT COVERED,
-#   for the same reason;
+# * trader: every `system` tag value in COST_ALLOCATION_TRADER_SYSTEMS, as a
+#   direct member of the canonical scope (slice 2). The trader host and its
+#   volumes were tagged `system=crucible-trader` on 2026-10-25, so the export
+#   separates trader cost from that day on. Before it, trader cost sits inside
+#   the untagged remainder and is NOT backfilled -- tags are never fabricated
+#   for history, so those days carry no trader member;
+# * shared: every `system` tag value in COST_ALLOCATION_SHARED_SYSTEMS is
+#   IDENTIFIED as a `shared` member, but stays in its own scope. Those
+#   resources serve the whole fleet, and moving any of their cost into the
+#   canonical scope needs a declared usage-based apportionment that does not
+#   exist yet. Untagged shared services (storage, logs, CloudTrail,
+#   commitments, tax, credits) remain in the untagged remainder;
 # * every other tagged system: a direct `other` member under its own scope;
 # * the untagged remainder: `unallocated`, never assigned to anyone.
 #
-# So `inventory_complete` is false and `covered_components` is ["harness"],
-# and the consumer refuses the record exactly as it refuses an absent one:
-# phase 4 stays UNMEASURABLE, now with the reason on the record. Each day's
-# members still conserve that day's account total, so the record is already
-# the ledger the later slices refine.
+# A component is listed in `covered_components` only when EVERY emitted day
+# carries a canonical-scope member for it, because the consumer requires daily
+# coverage and a partial window must not read as a covered one. So today
+# `covered_components` is ["harness"], `inventory_complete` is false, and the
+# consumer refuses the record exactly as it refuses an absent one: phase 4
+# stays UNMEASURABLE, now with the reason on the record. Each day's members
+# still conserve that day's account total, so the record is already the
+# ledger the later slices refine.
 
 COST_ALLOCATION_SCHEMA = "cost_allocation.v1"
 COST_ALLOCATION_SCOPE = "crucible-and-trader"
 COST_ALLOCATION_HARNESS_SYSTEMS = ("crucible-v2",)
+COST_ALLOCATION_TRADER_SYSTEMS = ("crucible-trader",)
+COST_ALLOCATION_SHARED_SYSTEMS = ("shared",)
 COST_ALLOCATION_UNALLOCATED_SCOPE = "unallocated"
 COST_ALLOCATION_INVENTORY_EVIDENCE = (
-    "billing_export daily_by_system only (alpha-engine-config-I12026 slice 1): harness = "
-    "system tag in COST_ALLOCATION_HARNESS_SYSTEMS; trader host carries no system tag and the "
-    "export has no resource ids, so trader cost is inside the untagged remainder; shared "
-    "services (storage, logs, CloudTrail, commitments, tax, credits) are not yet allocated; "
-    "untagged remainder published as unallocated"
+    "billing_export daily_by_system only (alpha-engine-config-I12026 slice 2): harness = "
+    "system tag in COST_ALLOCATION_HARNESS_SYSTEMS; trader = system tag in "
+    "COST_ALLOCATION_TRADER_SYSTEMS, present only from the day the trader host was tagged "
+    "(earlier trader cost is inside the untagged remainder, not backfilled); shared = system "
+    "tag in COST_ALLOCATION_SHARED_SYSTEMS, identified but not apportioned to the canonical "
+    "scope (no declared usage-based method yet); untagged shared services (storage, logs, "
+    "CloudTrail, commitments, tax, credits) are not yet allocated; untagged remainder "
+    "published as unallocated; a component is covered only when every day carries it"
 )
 
 
@@ -939,9 +954,12 @@ def _system_scope(system: str) -> str:
 def build_cost_allocation(series: dict) -> dict:
     """The ``cost_allocation.v1`` record for one ``daily_by_system`` series.
 
-    One member per (day, system): the canonical-scope ``harness`` member for a
-    harness system, a ``direct`` ``other`` member for any other tagged system,
-    and an ``unallocated`` member for the untagged remainder. A day with no
+    One member per (day, system): a canonical-scope ``direct`` member for a
+    harness or trader system, a ``shared`` member in its own scope for a
+    shared system, a ``direct`` ``other`` member for any other tagged system,
+    and an ``unallocated`` member for the untagged remainder. A component is
+    in ``covered_components`` only when every day carries a canonical-scope
+    member for it. A day with no
     billed rows carries one evidenced zero ``unallocated`` member, because a
     day needs a member to state that it was read. Each day's ``account_usd``
     is the exact sum of that day's series, so the members conserve it.
@@ -974,6 +992,12 @@ def build_cost_allocation(series: dict) -> dict:
             elif system in COST_ALLOCATION_HARNESS_SYSTEMS:
                 member = {"id": f"harness:{system}", "scope": COST_ALLOCATION_SCOPE,
                           "component": "harness", "kind": "direct"}
+            elif system in COST_ALLOCATION_TRADER_SYSTEMS:
+                member = {"id": f"trader:{system}", "scope": COST_ALLOCATION_SCOPE,
+                          "component": "trader", "kind": "direct"}
+            elif system in COST_ALLOCATION_SHARED_SYSTEMS:
+                member = {"id": f"shared:{system}", "scope": _system_scope(system),
+                          "component": "shared", "kind": "shared"}
             else:
                 member = {"id": f"other:{system}", "scope": _system_scope(system),
                           "component": "other", "kind": "direct"}
@@ -994,11 +1018,16 @@ def build_cost_allocation(series: dict) -> dict:
         })
     if not days_out:
         raise ValueError("daily_by_system has no days to allocate")
+    covered = [
+        component for component in ("harness", "trader", "shared")
+        if all(any(m["scope"] == COST_ALLOCATION_SCOPE and m["component"] == component
+                   for m in day["members"]) for day in days_out)
+    ]
     return {
         "schema_version": COST_ALLOCATION_SCHEMA,
         "inventory_complete": False,
         "inventory_evidence": COST_ALLOCATION_INVENTORY_EVIDENCE,
-        "covered_components": ["harness"],
+        "covered_components": covered,
         "declared_scopes": sorted(scopes),
         "days": days_out,
     }

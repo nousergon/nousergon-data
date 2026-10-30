@@ -30,8 +30,11 @@ jobs:
           python-version: "3.12"
 
       - name: Install dependencies
-        # requirements.txt pins alpha-engine-lib@v0.56.0, which installs
-        # flow-doctor[diagnosis,s3]==0.6.0rc2 (the soak version + the fix CLI).
+        # flow-doctor (and its fix CLI) arrives transitively through the
+        # nousergon-lib[...,flow-doctor,...] pin in requirements.txt. The
+        # versions are deliberately not restated here: this comment used to
+        # name alpha-engine-lib@v0.56.0 long after the pin had moved
+        # (alpha-engine-config-I10368).
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
