@@ -638,6 +638,15 @@ PRODUCER_DISABLED_SINCE_KEY = "_freshness_monitor/producer_disabled_since.json"
 # whether a given pause has a release item needs the backlog, which this Lambda
 # has no credential for and should not. The join is a separate sweep's job.
 DISABLED_PRODUCER_INVENTORY_KEY = "_freshness_monitor/disabled_producers.json"
+# alpha-engine-config-I12716. `producer_disabled_since` is written only by the
+# suppression path, i.e. only for triggers some artifact row names. Every other
+# inventory row used to be stamped `today`, so an UNREFERENCED disabled rule —
+# the kind nothing else in the fleet sees — restarted at age 0 on every sweep
+# and could never cross the latch sweep's age gate. This key persists the first
+# observation for EVERY inventory row, pruned only when a complete walk no
+# longer lists the trigger (seen enabled, or gone). The suppression map's
+# semantics are untouched; this is a separate key.
+DISABLED_INVENTORY_SINCE_KEY = "_freshness_monitor/disabled_inventory_since.json"
 
 # alpha-engine-config-I7509. AWS is not the only place a producer is switched
 # off. Brian's 2026-08-12 groomer/Overseer deactivation (config-I6984) disabled
@@ -1564,6 +1573,48 @@ def dangling_producer_triggers(
     return out
 
 
+def _load_disabled_inventory_since(s3_client: Any) -> tuple[dict[str, str], bool]:
+    """(first-observed dates for inventory rows, whether the read is trustworthy).
+
+    Absent (first run) is ``({}, True)``. Any other failure is ``({}, False)``,
+    and the caller then must NOT write the key back: persisting a map built from
+    an unreadable one would restamp every trigger's age to today, which is the
+    defect this key exists to remove.
+    """
+    try:
+        obj = s3_client.get_object(Bucket=REGISTRY_BUCKET, Key=DISABLED_INVENTORY_SINCE_KEY)
+        data = json.loads(obj["Body"].read())
+    except Exception as exc:  # noqa: BLE001 — classified below; never fatal
+        code = ""
+        response = getattr(exc, "response", None)
+        if isinstance(response, dict):
+            code = str((response.get("Error") or {}).get("Code") or "")
+        if code in ("NoSuchKey", "404"):
+            return {}, True
+        logger.warning(
+            "disabled_inventory_since unreadable (%s) — inventory ages fall back to "
+            "producer_disabled_since or today this pass, and the key is NOT rewritten",
+            type(exc).__name__,
+        )
+        return {}, False
+    if not isinstance(data, dict):
+        logger.warning("disabled_inventory_since is not a mapping — not rewritten this pass")
+        return {}, False
+    return {str(k): str(v) for k, v in data.items() if isinstance(v, str)}, True
+
+
+def _earliest_iso(*dates: str | None) -> str | None:
+    valid = []
+    for d in dates:
+        if not d:
+            continue
+        try:
+            valid.append(date.fromisoformat(d))
+        except ValueError:
+            continue
+    return min(valid).isoformat() if valid else None
+
+
 def write_disabled_producer_inventory(
     s3_client: Any,
     now: datetime,
@@ -1573,8 +1624,11 @@ def write_disabled_producer_inventory(
 ) -> dict[str, Any]:
     """Write the account-wide disabled-schedule inventory (config-I6817 D4).
 
-    Reuses ``producer_disabled_since`` for the age of triggers the suppression
-    path already tracks, and stamps today for the rest. ``referenced`` says
+    A row's age is its EARLIEST first observation across
+    ``producer_disabled_since`` (the suppression path's map) and
+    ``disabled_inventory_since`` (this function's own, for every row,
+    alpha-engine-config-I12716); only a trigger seen for the first time is
+    stamped today. ``referenced`` says
     whether ANY artifact row names the trigger — an unreferenced disabled rule
     is invisible to every other surface in the fleet, which is why the flag is
     on the row rather than left to the consumer to derive.
@@ -1586,6 +1640,7 @@ def write_disabled_producer_inventory(
     existing: set[str] = set()
     rows = enumerate_disabled_schedules(events_client, scheduler_client, existing)
     since = _load_producer_disabled_since(s3_client)
+    inv_since, inv_since_ok = _load_disabled_inventory_since(s3_client)
     incomplete = any(r.get("error") for r in rows)
     # A partial walk cannot prove absence, so it reports none (I12296).
     dangling = (
@@ -1603,7 +1658,9 @@ def write_disabled_producer_inventory(
     for row in rows:
         if row.get("error"):
             continue
-        first_seen = since.get(row["trigger"], today)
+        first_seen = _earliest_iso(
+            since.get(row["trigger"]), inv_since.get(row["trigger"])
+        ) or today
         row["disabled_since"] = first_seen
         try:
             row["days_disabled"] = (
@@ -1612,6 +1669,26 @@ def write_disabled_producer_inventory(
         except ValueError:
             row["days_disabled"] = 0
         row["referenced_by_registry"] = row["trigger"] in referenced_triggers
+    if inv_since_ok:
+        seen = {
+            r["trigger"]: r["disabled_since"] for r in rows if not r.get("error")
+        }
+        # A partial walk cannot prove a trigger is no longer disabled, so it
+        # prunes nothing; a complete one drops every trigger it did not list.
+        next_inv_since = seen if not incomplete else {**inv_since, **seen}
+        try:
+            s3_client.put_object(
+                Bucket=REGISTRY_BUCKET,
+                Key=DISABLED_INVENTORY_SINCE_KEY,
+                Body=json.dumps(next_inv_since, indent=2, sort_keys=True).encode(),
+                ContentType="application/json",
+            )
+        except Exception as exc:  # noqa: BLE001 — bookkeeping; the inventory still writes
+            logger.warning(
+                "could not persist disabled_inventory_since (%s: %s) — unreferenced "
+                "rows age from today on the next pass",
+                type(exc).__name__, exc,
+            )
     payload = {
         "generated_at": now.isoformat(),
         "complete": not incomplete,

@@ -6486,3 +6486,109 @@ def test_probe_pass_replaces_the_suppression_the_serializer_reads(
     assert suppression_by_id["with_evidence"]["run_evidence"]["verdict"] == (
         "ran_without_artifact"
     )
+
+
+# ── alpha-engine-config-I12716: every inventory row keeps its first observation ──
+
+
+class _InvS3:
+    """S3 fake holding objects by key; a missing key raises NoSuchKey."""
+
+    def __init__(self, objects=None, get_raises=None):
+        self.objects = dict(objects or {})
+        self.get_raises = get_raises
+
+    def get_object(self, Bucket, Key):
+        if self.get_raises is not None:
+            raise self.get_raises
+        if Key not in self.objects:
+            exc = Exception("NoSuchKey")
+            exc.response = {"Error": {"Code": "NoSuchKey"}}
+            raise exc
+        body = self.objects[Key]
+        return {"Body": type("B", (), {"read": lambda _self: body})()}
+
+    def put_object(self, Bucket, Key, Body, **_kw):
+        self.objects[Key] = Body
+
+
+def _unreferenced_inventory(s3, now, events=None):
+    import index
+    return index.write_disabled_producer_inventory(
+        s3, now, set(),
+        events or _FakeEvents([
+            {"Name": "alpha-engine-daily-heal", "State": "DISABLED",
+             "ScheduleExpression": "cron(0 9 * * ? *)"},
+        ]),
+        _FakeScheduler(),
+    )
+
+
+def test_an_unreferenced_disabled_rule_ages_across_sweeps(monkeypatch):
+    """It used to read `days_disabled: 0` every day (38 of 47 rows, 2026-10-27)."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+    s3 = _InvS3()
+    first = _unreferenced_inventory(s3, datetime(2026, 10, 1, 12, tzinfo=timezone.utc))
+    assert first["rows"][0]["days_disabled"] == 0
+    later = _unreferenced_inventory(s3, datetime(2026, 10, 20, 12, tzinfo=timezone.utc))
+    row = later["rows"][0]
+    assert row["disabled_since"] == "2026-10-01"
+    assert row["days_disabled"] == 19
+    assert row["days_disabled"] > index.PRODUCER_SUPPRESSION_MAX_DAYS
+
+
+def test_the_earlier_of_the_two_first_observations_wins(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(
+        index, "_load_producer_disabled_since",
+        lambda _s: {"events:alpha-engine-daily-heal": "2026-09-01"},
+    )
+    s3 = _InvS3({index.DISABLED_INVENTORY_SINCE_KEY: json.dumps(
+        {"events:alpha-engine-daily-heal": "2026-08-07"}).encode()})
+    payload = _unreferenced_inventory(s3, datetime(2026, 10, 1, tzinfo=timezone.utc))
+    assert payload["rows"][0]["disabled_since"] == "2026-08-07"
+
+
+def test_a_trigger_no_longer_listed_is_pruned_after_a_complete_walk(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+    s3 = _InvS3({index.DISABLED_INVENTORY_SINCE_KEY: json.dumps(
+        {"events:re-enabled-rule": "2026-08-07"}).encode()})
+    _unreferenced_inventory(s3, datetime(2026, 10, 1, tzinfo=timezone.utc))
+    stored = json.loads(s3.objects[index.DISABLED_INVENTORY_SINCE_KEY])
+    assert stored == {"events:alpha-engine-daily-heal": "2026-10-01"}
+
+
+def test_a_partial_walk_prunes_nothing(monkeypatch):
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+    s3 = _InvS3({index.DISABLED_INVENTORY_SINCE_KEY: json.dumps(
+        {"scheduler:paused-schedule": "2026-08-07"}).encode()})
+    payload = _unreferenced_inventory(
+        s3, datetime(2026, 10, 1, tzinfo=timezone.utc), _FakeEvents([], raises=True),
+    )
+    assert payload["complete"] is False
+    stored = json.loads(s3.objects[index.DISABLED_INVENTORY_SINCE_KEY])
+    assert stored["scheduler:paused-schedule"] == "2026-08-07"
+
+
+def test_an_unreadable_since_map_is_never_overwritten(monkeypatch):
+    """Rewriting it from an empty read would restamp every age to today."""
+    import importlib
+    import index
+    importlib.reload(index)
+    monkeypatch.setattr(index, "_load_producer_disabled_since", lambda _s: {})
+    s3 = _InvS3(get_raises=RuntimeError("throttled"))
+    payload = _unreferenced_inventory(s3, datetime(2026, 10, 1, tzinfo=timezone.utc))
+    assert index.DISABLED_INVENTORY_SINCE_KEY not in s3.objects
+    assert index.DISABLED_PRODUCER_INVENTORY_KEY in s3.objects  # inventory still written
+    assert payload["rows"][0]["days_disabled"] == 0
