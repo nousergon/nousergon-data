@@ -900,7 +900,9 @@ alert_classes:
     response: drain-queue
     # DECLARED page (alpha-engine-config-I12640). A trading-path merge
     # (crucible-executor or crucible-trader main) landed inside the
-    # 13:30-20:30Z run-rule window on an NYSE trading day. Detector only;
+    # 09:00-16:30 America/New_York window on an NYSE trading day (the
+    # detector's WINDOW_*_ET; 13:00-20:30Z in EDT, 14:00-21:30Z in EST, so
+    # never a fixed UTC span — alpha-engine-config-I12769). Detector only;
     # merge-time refusal is option 1 on the same issue.
     tier: page
     operator_reason: >-
