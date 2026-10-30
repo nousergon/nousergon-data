@@ -162,17 +162,42 @@ def test_a_directory_is_not_a_pinned_contract(units):
     assert not reading.met and "resolves to a dir" in reading.detail
 
 
+#: D10's second pin (alpha-engine-config-I11276): crucible-research reads the BODY.
+D10_RESEARCH_BODY = ("crucible-research", "tests/contracts/fundamentals_snapshot.schema.json")
+D10_REPOS = {"crucible-dashboard", "crucible-research"}
+
+
 def test_a_key_template_pin_is_compared_with_the_units_writes(units):
     """D10 — the case that motivated the issue: the consumer reads the KEY."""
     path = ("crucible-dashboard", "tests/contracts/fundamentals_snapshot_s3_key_template.json")
-    good, _ = _opener({"crucible-dashboard"}, {path: {"object_key_template": "archive/fundamentals/{date}.json"}})
+    research = {D10_RESEARCH_BODY: _producer("fundamentals_snapshot.schema.json")}
+    good, _ = _opener(D10_REPOS, {path: {"object_key_template": "archive/fundamentals/{date}.json"}, **research})
     assert _read(_store(good), _unit(units, "D10")).met
-    bad, _ = _opener({"crucible-dashboard"}, {path: {"object_key_template": "archive/fundamentals/{date}.parquet"}})
+    bad, _ = _opener(D10_REPOS, {path: {"object_key_template": "archive/fundamentals/{date}.parquet"}, **research})
     reading = _read(_store(bad), _unit(units, "D10"))
     assert not reading.met and "STALE" in reading.detail
-    body, _ = _opener({"crucible-dashboard"}, {path: _producer("fundamentals_snapshot.schema.json")})
+    body, _ = _opener(D10_REPOS, {path: _producer("fundamentals_snapshot.schema.json"), **research})
     reading = _read(_store(body), _unit(units, "D10"))
     assert not reading.met and "object_key_template" in reading.detail
+
+
+def test_d10s_body_reader_pin_is_graded_against_the_producer_schema(units):
+    """The crucible-research copy is a BODY pin: a shape change stales it."""
+    dashboard = {
+        ("crucible-dashboard", "tests/contracts/fundamentals_snapshot_s3_key_template.json"): {
+            "object_key_template": "archive/fundamentals/{date}.json"
+        }
+    }
+    pins = _unit(units, "D10").raw["contract"]["consumer_pins"]
+    assert {(p["repo"], p["pins"]) for p in pins} == {
+        ("crucible-dashboard", "key_template"),
+        ("crucible-research", "body_schema"),
+    }
+    stale = _producer("fundamentals_snapshot.schema.json")
+    stale["additionalProperties"]["required"] = stale["additionalProperties"]["required"][:-1]
+    opener, _ = _opener(D10_REPOS, {**dashboard, D10_RESEARCH_BODY: stale})
+    reading = _read(_store(opener), _unit(units, "D10"))
+    assert not reading.met and "STALE" in reading.detail
 
 
 def test_an_in_repo_reader_pin_is_graded_in_this_tree(units):
