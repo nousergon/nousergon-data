@@ -536,6 +536,11 @@ EXPECTED_PER_FILE_PUT_COUNTS: dict[str, int] = {
     # data/crosswalks/cusip_to_ticker.json (CUSIP→ticker cache).
     # ARTIFACT_REGISTRY.yaml row: thinktank_inst_ownership.
     "data/derived/inst_ownership.py": 4,
+    # alpha-engine-config-I12798 (C11): the console performance tracker. ONE
+    # put_object site in publish(), looped over ops/perf/dated/{as_of}.json then
+    # ops/perf/latest.json. ARTIFACT_REGISTRY.yaml row: ops_perf_latest (the
+    # dated copies are not probed).
+    "data/derived/perf_tracker.py": 1,
     # 5 -> 6 on alpha-engine-config#2672 (2026-07-16, Brian-ratified binding
     # design): _data_quality/pending_upgrades.json — the durable
     # desired-state ledger so a fallback-quality (yfinance-basis) universe

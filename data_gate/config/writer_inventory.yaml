@@ -394,6 +394,13 @@ excluded_paths:
       delete markers the 2026-10-07 daily-heal prune left on ArcticDB objects.
       It writes no data and never publishes a key; it only makes existing
       object versions current again.
+  - glob: "data/derived/perf_tracker.py"
+    reason: >-
+      alpha-engine-config-I12798 (C11): the console performance tracker. It
+      writes only ops/perf/* (a report over the ledger NAV export, not a
+      published data key no collector unit owns), under its own OIDC role, with
+      its own ARTIFACT_REGISTRY row (ops_perf_latest) and observability row
+      (nousergon-data-perf-tracker).
 
 # Descriptors whose `code_path` names no in-repo Python file, so the REVERSE
 # direction (descriptor -> write site) cannot be checked by an AST scan. Named
