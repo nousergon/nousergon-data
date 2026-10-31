@@ -467,3 +467,20 @@ def test_no_line_claims_wikipedia_is_the_membership_source():
         "these lines still present Wikipedia as the membership source "
         f"(it moved to the SSGA holdings files in I2812): {offenders}"
     )
+
+
+def test_an_empty_membership_is_an_error_not_no_drift():
+    """alpha-engine-config-I9708: an empty membership made missing_from_arctic
+    empty and fell through to ``ok`` with nothing compared."""
+    from validators.constituents_drift_check import check_drift
+
+    fake_fetch = MagicMock(return_value=([], {}, {}, {}, 0, 0, SsgaWeights()))
+    fake_lib = MagicMock()
+    fake_lib.list_symbols.return_value = ["AAPL", "MSFT"]
+
+    with patch("validators.constituents_drift_check._fetch_constituents", fake_fetch), \
+         patch("validators.constituents_drift_check._open_universe_lib",
+               return_value=fake_lib):
+        result = check_drift(alert=False)
+    assert result["status"] == "error"
+    assert result["stage"] == "empty_membership"

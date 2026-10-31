@@ -125,11 +125,14 @@ def test_collect_skips_on_empty_universe():
     assert out["tickers"] == 0
 
 
-def _fake_aggregator():
+def _fake_aggregator(articles=None):
     # AsyncNewsAggregator.fetch is a coroutine — collect() drives it via
-    # anyio.run, so the fetch seam must be awaitable.
+    # anyio.run, so the fetch seam must be awaitable. One article by default:
+    # zero articles is its own failure (alpha-engine-config-I9708).
     agg = MagicMock()
-    agg.fetch = AsyncMock(return_value=[])
+    agg.fetch = AsyncMock(
+        return_value=[{"ticker": "AAPL", "title": "t"}] if articles is None else articles
+    )
     return agg
 
 
@@ -566,3 +569,34 @@ def test_topic_digest_anchor_defaults_to_wall_clock_on_live_run(
     daily_news.collect("b", s3_client=s3)  # no run_date
 
     assert mock_topics.call_args.kwargs["as_of"] is None
+
+
+@patch("collectors.daily_news.ensure_lm_master_dict")
+@patch("data.derived.news_digest.write_digest")
+@patch("data.derived.news_digest.build_digest")
+@patch("collectors.topic_news.fetch_topics")
+@patch("data.derived.news_articles.articles_build_and_write")
+@patch("data.derived.news_aggregates.aggregate_and_write")
+@patch("collectors.daily_news._build_nlp_pipeline")
+@patch("collectors.daily_news._build_aggregator")
+def test_zero_articles_for_a_nonempty_universe_is_not_ok(
+    mock_agg, mock_nlp, mock_write, mock_articles, mock_topics,
+    mock_build, mock_write_digest, mock_ensure,
+):
+    """alpha-engine-config-I9708: every vendor returning nothing used to write
+    an empty aggregate and report ``ok``. An empty population is not a pull."""
+    mock_agg.return_value = _fake_aggregator(articles=[])
+    agg_df = MagicMock(); agg_df.__len__ = lambda self: 0
+    mock_write.return_value = ("k/result.parquet", agg_df)
+    art_df = MagicMock(); art_df.__len__ = lambda self: 0
+    mock_articles.return_value = ("k/articles.parquet", art_df)
+    mock_topics.return_value = {"macro": [{"title": "m"}], "tech": []}
+    mock_build.return_value = {"sections": {"portfolio": [], "macro": [{"title": "m"}], "tech": []}}
+    mock_write_digest.return_value = "data/news_digest_daily/run/digest.json"
+
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=["MSFT"])
+    out = daily_news.collect("b", s3_client=s3)
+
+    assert out["status"] == "error"
+    assert out["reason"] == "zero_articles"
+    assert out["articles"] == 0

@@ -501,6 +501,17 @@ def collect(
     # article artifacts already wrote to S3 above, so the dashboard's Daily
     # News page is unaffected by this exit code.
     status = "ok"
+    if not articles:
+        # alpha-engine-config-I9708: a non-empty universe and ZERO articles
+        # from every vendor over the window wrote an empty aggregate and
+        # reported `ok`. Hundreds of tickers with no news at all is a vendor
+        # or credential outage, not a quiet day, so the run says so.
+        status = "error"
+        logger.error(
+            "[daily_news] 0 articles fetched for %d tickers over %dh — an empty "
+            "population is not a successful pull",
+            len(universe), hours,
+        )
     if require_digest and (digest_status != "ok" or digest_total == 0):
         status = "error"
         logger.error(
@@ -513,6 +524,7 @@ def collect(
 
     return {
         "status": status,
+        **({"reason": "zero_articles"} if not articles else {}),
         "tickers": len(universe),
         "articles": len(articles),
         "rows": int(len(df)),

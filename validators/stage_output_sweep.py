@@ -1081,6 +1081,11 @@ def evaluate(
     return findings
 
 
+#: Document status for a sweep whose registry declares nothing for the
+#: pipeline (alpha-engine-config-I9708). Exits 2, like an unreadable registry.
+NOTHING_DECLARED = "nothing_declared"
+
+
 def summarise(findings: Sequence[dict]) -> dict:
     """Reduce findings to counts plus the two lists that decide the exit code."""
     counts: dict[str, int] = {}
@@ -1178,6 +1183,33 @@ def sweep(
         s3_client = boto3.client("s3")
 
     declarations = declared_outputs(rows, pipeline=pipeline, default_bucket=bucket)
+    if not declarations:
+        # alpha-engine-config-I9708: a readable registry that declares no
+        # output for this pipeline (a renamed pipeline, rows that lost their
+        # `produced_by`) used to evaluate zero findings and summarise to
+        # `ok`: "every declared artifact was written" over an empty set. A
+        # sweep with nothing to check could not run, exactly like an
+        # unreadable registry, so it reports the same way.
+        msg = (
+            f"the registry declares no output for pipeline {pipeline!r}, so "
+            "nothing was checked; an empty population is not a clean run"
+        )
+        logger.error("Stage-output sweep has nothing to check: %s", msg)
+        return {
+            "schema": "stage_output_sweep-1.0.0",
+            "status": NOTHING_DECLARED,
+            "pipeline": pipeline,
+            "run_date": run_date,
+            "enforce": enforce,
+            "run_mode": run_mode,
+            "error": msg,
+            "checked": 0,
+            "counts": {},
+            "findings": [],
+            "defects": [],
+            "unmeasured": [],
+            "gated": [],
+        }
     findings = evaluate(
         declarations,
         run_date=run_date,
@@ -1470,7 +1502,7 @@ def exit_code(document: dict) -> int:
     a fault in the sweep itself, and a sweep that cannot run must not report
     the same exit status as a sweep that ran and found nothing.
     """
-    if document["status"] == "registry_unreadable":
+    if document["status"] in ("registry_unreadable", NOTHING_DECLARED):
         return 2
     if not document["enforce"]:
         return 0
@@ -1574,7 +1606,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     )
 
     code = exit_code(document)
-    if document["status"] == "registry_unreadable":
+    if document["status"] in ("registry_unreadable", NOTHING_DECLARED):
         logger.error("Stage-output sweep COULD NOT RUN: %s", document["error"])
     elif document["defects"]:
         logger.error(

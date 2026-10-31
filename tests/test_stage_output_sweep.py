@@ -1207,6 +1207,21 @@ class TestSweep:
         assert doc["status"] == "registry_unreadable"
         assert sos.exit_code(doc) == 2
 
+    def test_a_registry_declaring_nothing_for_the_pipeline_is_not_ok(self, registry_file):
+        """alpha-engine-config-I9708: zero declarations used to evaluate zero
+        findings and summarise to ``ok`` -- "all written" over an empty set.
+        It is a sweep that could not run, reported like an unreadable registry."""
+        s3 = _FakeS3()
+        doc = sos.sweep(
+            run_date=RUN_DATE, cycle_date=RUN_DATE, registry_path=registry_file,
+            pipeline="no-such-pipeline", s3_client=s3, alert=False,
+        )
+        assert doc["status"] == sos.NOTHING_DECLARED
+        assert doc["checked"] == 0
+        assert sos.exit_code(doc) == 2
+        assert sos.exit_code({**doc, "enforce": True}) == 2
+        assert s3.puts == []  # nothing measured, so no verdict is published
+
     def test_no_publish_writes_nothing(self, registry_file):
         s3 = _FakeS3()
         sos.sweep(

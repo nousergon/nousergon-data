@@ -195,6 +195,24 @@ def check_drift(
         if t not in _SKIP_TICKERS and not _is_sector_etf(t)
     }
 
+    if not comparable_wiki:
+        # alpha-engine-config-I9708: an empty membership makes
+        # `missing_from_arctic` empty and fell through to `ok` ("no drift")
+        # with nothing compared. A fetch that returned no members is a broken
+        # fetch, never a clean comparison.
+        logger.error(
+            "Index-membership fetch returned no comparable members (%d raw) — "
+            "nothing to compare", len(membership_set),
+        )
+        return {
+            "status": "error",
+            "error": (
+                f"index membership has 0 comparable members ({len(membership_set)} "
+                "raw); the drift comparison had nothing to compare"
+            ),
+            "stage": "empty_membership",
+        }
+
     missing_from_arctic = sorted(comparable_wiki - comparable_arctic)
     only_in_arctic = sorted(comparable_arctic - comparable_wiki)
 
