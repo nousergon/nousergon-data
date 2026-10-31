@@ -1995,6 +1995,21 @@ alert_classes:
     # DECLARED: the epic's Phase-0 trigger example. Hygiene finding; the drain's
     # disposition issue IS the remediation path (observability-policy.md §7.4).
     tier: tracked-only
+  - class: tracked_only_digest
+    # alpha-engine-config/scripts/notification_actionability.py `digest` arm
+    # (alpha-engine-config-I6751 Phase 4): the weekly roll-up of everything
+    # the tracked-only tier suppressed, published `severity="info"`. Surfaced
+    # unregistered (so routed PAGE with registry drift) by the fleet drift
+    # sweep's first scan of alpha-engine-config itself (alpha-engine-config-I6768).
+    source: "tracked-only-digest"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED notify-silent, deliberately NOT tracked-only: the digest exists
+    # to keep the suppressed tier VISIBLE without paging, and tracked-only
+    # would suppress the very message that carries it. A weekly lifecycle
+    # notice, not an incident.
+    tier: notify-silent
 
   # ── CLI-shaped emitters the config-I6753 chokepoint extension surfaced ──
   # These predate the extension; every one emitted through the krepis CLI,
