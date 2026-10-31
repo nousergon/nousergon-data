@@ -261,7 +261,13 @@ def _bars_after(index, trading_day: "date | datetime | str"):
     d = as_trading_day(trading_day)
     idx = pd.to_datetime(pd.Index(index))
     if getattr(idx, "tz", None) is not None:
-        idx = idx.tz_convert("UTC").tz_localize(None)
+        # alpha-engine-config-I11552: a bar's trading day is its WALL date in
+        # the timezone it is stamped in, not its UTC date. Converting to UTC
+        # first moved a daily bar stamped at local midnight east of UTC
+        # (Asia/Tokyo, Europe/Zurich) onto the previous day, so a D+1 bar
+        # passed both this fetch bound and the write-site guard. Dropping the
+        # tz keeps the wall clock; a UTC-stamped index is unchanged.
+        idx = idx.tz_localize(None)
     after = idx.normalize() > pd.Timestamp(d)
     return d, idx, after
 
