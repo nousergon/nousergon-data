@@ -68,6 +68,11 @@ FUNCTION_NAME="alpha-engine-data-spot-dispatcher"
 ROLE_NAME="alpha-engine-data-spot-dispatcher-role"
 POLICY_NAME="alpha-engine-data-spot-dispatcher-policy"
 REGION="${AWS_REGION:-us-east-1}"
+# Cost-allocation tag (alpha-engine-config-I10788; key `system` per
+# alpha-engine-config-I10905). Same value the boxes this function launches
+# carry (index.py COST_TAG_KEY/COST_TAG_VALUE), so the launcher's own spend
+# lands in the same bucket as the spend it causes.
+COST_TAG="system=data-collection"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
 
 # Canonical function env — defined ONCE so the create / update paths can never
@@ -220,6 +225,7 @@ if $BOOTSTRAP; then
       --timeout "${FN_TIMEOUT}" \
       --memory-size "${FN_MEMORY}" \
       --environment "${PROD_ENV}" \
+      --tags "${COST_TAG}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -268,6 +274,19 @@ if ! $DRY_RUN; then
     --region "${REGION}"
 fi
 echo "✓ Env converged: ${PROD_ENV}"
+
+# ----- 5. Converge the cost-allocation tag (always) ---------------------------
+# create-function tags a NEW function; this converges the one that already
+# exists (measured untagged 2026-10-31 via `aws lambda list-tags`). TagResource
+# is idempotent, and github-actions-lambda-deploy already holds
+# lambda:TagResource on function:alpha-engine-* (InfraDeployTagOps).
+FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+echo "Converging cost-allocation tag ${COST_TAG}..."
+run aws lambda tag-resource \
+  --resource "${FN_ARN}" \
+  --tags "${COST_TAG}" \
+  --region "${REGION}"
+echo "✓ Tagged: ${COST_TAG}"
 
 echo ""
 echo "Done. Next (operator): re-run the affected pipeline once to validate end to"

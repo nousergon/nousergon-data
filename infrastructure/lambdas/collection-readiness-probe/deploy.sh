@@ -35,6 +35,10 @@ ROLE_NAME="alpha-engine-collection-readiness-probe-role"
 POLICY_NAME="alpha-engine-collection-readiness-probe-policy"
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
+# Cost-allocation tag (alpha-engine-config-I10788; key `system` per
+# alpha-engine-config-I10905): this probe answers readiness over the
+# standalone collector's run manifests, so it is data-collection spend.
+COST_TAG="system=data-collection"
 TRUST_POLICY='{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"lambda.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
 
 case "${DRY_RUN:-false}" in
@@ -130,6 +134,7 @@ if $BOOTSTRAP; then
       --timeout 90 \
       --memory-size 256 \
       --environment 'Variables={LOG_LEVEL=INFO}' \
+      --tags "${COST_TAG}" \
       --region "${REGION}" \
       --query 'FunctionArn' --output text
   else
@@ -155,3 +160,16 @@ fi
 verify_code_deployed "${FUNCTION_NAME}" "${REGION}" "${ZIP}"
 
 echo "Code deployed."
+
+# ----- 5. Converge the cost-allocation tag (always) ---------------------------
+# create-function tags a NEW function; this converges the one that already
+# exists (measured untagged 2026-10-31 via `aws lambda list-tags`). TagResource
+# is idempotent, and github-actions-lambda-deploy already holds
+# lambda:TagResource on function:alpha-engine-* (InfraDeployTagOps).
+FN_ARN="arn:aws:lambda:${REGION}:${ACCOUNT_ID}:function:${FUNCTION_NAME}"
+echo "Converging cost-allocation tag ${COST_TAG}..."
+run aws lambda tag-resource \
+  --resource "${FN_ARN}" \
+  --tags "${COST_TAG}" \
+  --region "${REGION}"
+echo "Tagged: ${COST_TAG}"
