@@ -1516,8 +1516,6 @@ python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
-# numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
-pip install -q 'numpy<2' || fail "numpy pin failed"
 # gitleaks + DLP preflight boot gate, for EVERY workload (alpha-engine-config-I10370,
 # I10866). Same pin, same asset, same gate as _spot_common.sh::install_gitleaks_dlp.
 # Without it, flow-doctor's diagnosis fails closed with "gitleaks binary not found

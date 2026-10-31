@@ -19,16 +19,6 @@ updates:
     # PURPOSE: a blanket "*" major ignore would also suppress future
     # security-relevant majors. REMOVING THIS ENTRY IS PART OF alpha-engine-config-I5213's closes-when.
     #
-    # pyarrow 26 is held by ruling, not by resolution. pyarrow 26.0.0
-    # (2026-10-09) refuses to import under NumPy 1.x, and every spot box runs
-    # `pip install 'numpy<2'` after requirements.txt; it broke D17
-    # morning_enrich on 2026-10-09 and #2128 capped it below 26. Dependabot's
-    # #2165 lifted that cap anyway and auto-merged on 2026-10-16, against
-    # Brian's ruling #25 (2026-10-14: Dependabot ignore pyarrow >=26). 25.x
-    # minor/patch releases still arrive. Remove this entry in the same change
-    # that lifts requirements.txt's <26 cap; the collection-box root cause is
-    # alpha-engine-config-I12318.
-    #
     # pandas 3 is held by a version RANGE, not by update-types. The
     # update-types semver-major form this entry carried since #1088 did not
     # stop #2257 (pandas >=2.0 -> >=3.1.0): requirements.txt has a bare lower
@@ -41,8 +31,6 @@ updates:
     ignore:
       - dependency-name: "pandas"
         versions: [">=3"]
-      - dependency-name: "pyarrow"
-        versions: [">=26"]
     groups:
       minor-and-patch:
         update-types:
