@@ -14,6 +14,10 @@ substrate: eventbridge
 origin: crucible-v2/data-daily
 owner: brian
 lifecycle: in-service
+parent_component: crucible-v2-dispatcher
+parent_component_reason: 'D47 is the data.daily run of the crucible-v2-dispatcher Lambda, which the Scheduler
+  entry in trigger.owner targets (read 2026-10-31: crucible-v2/data-daily -> function:crucible-v2-dispatcher).
+  Declared in the unit descriptor''s trigger.parent_component (alpha-engine-config-I12664).'
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D47''s own code path (crucible:crucible/track_a.py:702-705,
   crucible/data/daily.py:172) writes only the key templates its unit descriptor names in writes[]. No

@@ -14,6 +14,10 @@ substrate: eventbridge
 origin: alpha-engine-crypto-balances-15min
 owner: brian
 lifecycle: in-service
+parent_component: alpha-engine-crypto-balances
+parent_component_reason: D38 is the alpha-engine-crypto-balances Lambda's run, fired by the Scheduler
+  entry in trigger.owner; presence is the Lambda's, not the unit's. Declared in the unit descriptor's
+  trigger.parent_component (alpha-engine-config-I12664).
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D38''s own code path (collectors/crypto_balances.py:270;
   infrastructure/lambdas/crypto-balances/index.py:40) writes only the key templates its unit descriptor

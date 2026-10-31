@@ -28,6 +28,10 @@ owner: brian
 code_path: "collectors/crypto_balances.py:270; infrastructure/lambdas/crypto-balances/index.py:40"
 trigger:
   kind: "eventbridge-scheduler"
+  # alpha-engine-config-I12664: the component this unit runs inside, so the
+  # ops reconciler judges presence on it rather than on the unit's own id.
+  parent_component: "alpha-engine-crypto-balances"
+  parent_component_reason: "D38 is the alpha-engine-crypto-balances Lambda's run, fired by the Scheduler entry in trigger.owner; presence is the Lambda's, not the unit's."
   owner: "alpha-engine-crypto-balances-15min"
   successor: unchanged by v2 phase 4
   # alpha-engine-config-I11812 (R2 (a), re-enable decision PR, 2026-10-02):
