@@ -14,6 +14,9 @@ substrate: github-actions
 origin: .github/workflows/run-arctic-migrations.yml, on push to migrations/** and workflow_dispatch
 owner: brian
 lifecycle: in-service
+parent_component: nousergon-data-run-arctic-migrations
+parent_component_reason: D42 runs as the .github/workflows/run-arctic-migrations.yml workflow, which the
+  repos discoverer sees under this id. Declared in the unit descriptor's trigger.parent_component (alpha-engine-config-I12664).
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D42''s own code path (scripts/run_arctic_migrations.py;
   infrastructure/lambdas/arctic-migration-dispatcher/index.py:603) writes only the key templates its unit

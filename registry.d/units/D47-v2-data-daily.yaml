@@ -29,6 +29,10 @@ owner: brian
 code_path: "crucible:crucible/track_a.py:702-705, crucible/data/daily.py:172"
 trigger:
   kind: "eventbridge-scheduler"
+  # alpha-engine-config-I12664: the component this unit runs inside, so the
+  # ops reconciler judges presence on it rather than on the unit's own id.
+  parent_component: "crucible-v2-dispatcher"
+  parent_component_reason: "D47 is the data.daily run of the crucible-v2-dispatcher Lambda, which the Scheduler entry in trigger.owner targets (read 2026-10-31: crucible-v2/data-daily -> function:crucible-v2-dispatcher)."
   # The Scheduler entry that fires data.daily, not the dispatcher Lambda it
   # targets (`crucible-v2-dispatcher` named no schedule, so the gate read
   # UNRECONCILABLE: ResourceNotFoundException). 21:15 ET since
