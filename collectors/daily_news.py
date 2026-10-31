@@ -50,6 +50,7 @@ from datetime import datetime, time as _time, timezone
 from typing import Any
 
 import run_units
+from collectors import universe_contract
 from collectors.nlp.loughran_mcdonald import (
     LmDictUnavailable,
     ensure_lm_master_dict,
@@ -71,6 +72,13 @@ DIGEST_PREFIX = "data/news_digest_daily"
 HOLDINGS_UNIVERSE_KEY = "metron/holdings_universe.json"
 DEFAULT_LOOKBACK_HOURS = 24
 DEFAULT_BUCKET = "alpha-engine-research"
+#: The forbidden symbols the most recent `_load_holdings_universe` rejected
+#: (alpha-engine-config-I10937). `collect` copies it onto its result and
+#: `_record_run` counts it on the D36 manifest as a `reject`. Single-threaded
+#: collector, so a module record is safe (same pattern as metron_market_data's
+#: `_UNIVERSE_SOURCES`).
+HOLDINGS_CONTRACT_REJECTIONS: list[str] = []
+HOLDINGS_CONTRACT_REJECT_REASON = "holdings_universe_forbidden_symbol"
 
 
 def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
@@ -80,6 +88,7 @@ def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
     (config#1506) — the robodashboard successor. Same ``{"tickers": [...]}`` contract
     the retired ``robodashboard/holdings_universe.json`` had, so the parse is unchanged.
     """
+    HOLDINGS_CONTRACT_REJECTIONS.clear()
     try:
         obj = s3_client.get_object(Bucket=bucket, Key=HOLDINGS_UNIVERSE_KEY)
         data = json.loads(obj["Body"].read())
@@ -102,6 +111,18 @@ def _load_holdings_universe(bucket: str, s3_client: Any) -> list[str]:
                 len(foreign), sorted(foreign),
             )
             tickers = [t for t in tickers if t not in foreign]
+        # A symbol in a declared synthetic namespace (DEMO-) is a producer contract
+        # violation (alpha-engine-config-I10937): kept out of the fan-out, never
+        # silently. The ERROR names every symbol and the count lands on the run
+        # record via `HOLDINGS_CONTRACT_REJECTIONS`.
+        rejected = universe_contract.forbidden_symbols(tickers)
+        HOLDINGS_CONTRACT_REJECTIONS[:] = rejected
+        if rejected:
+            logger.error(
+                "[daily_news] producer contract violation — %s",
+                universe_contract.describe_rejection(HOLDINGS_UNIVERSE_KEY, rejected),
+            )
+            tickers = [t for t in tickers if not universe_contract.is_forbidden_symbol(t)]
         logger.info("[daily_news] loaded %d Metron holdings tickers", len(tickers))
         return tickers
     except Exception as e:  # missing object, no creds, parse error, etc.
@@ -514,6 +535,7 @@ def collect(
     return {
         "status": status,
         "tickers": len(universe),
+        "holdings_contract_rejected": list(HOLDINGS_CONTRACT_REJECTIONS),
         "articles": len(articles),
         "rows": int(len(df)),
         "key": key,
@@ -564,6 +586,11 @@ def _record_run(ctx, bucket: str, result: dict) -> None:
     """
     ctx.record_input(f"s3://{bucket}/{HOLDINGS_UNIVERSE_KEY}")
     ctx.rows_in = int(result.get("articles", 0))
+    rejected = result.get("holdings_contract_rejected") or []
+    if rejected:
+        # A producer contract violation is counted on the manifest, never only
+        # logged (alpha-engine-config-I10937).
+        ctx.reject(HOLDINGS_CONTRACT_REJECT_REASON, len(rejected))
 
     published: list[str] = []
     for key, rows_key in (

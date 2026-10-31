@@ -166,6 +166,57 @@ def test_load_universe_parses_holdings_and_currencies():
     assert currencies == ["HKD"]
 
 
+class TestForbiddenSymbolContract:
+    """alpha-engine-config-I10937: a DEMO- synthetic that reaches the universe loader
+    is a producer contract violation. It must be kept out AND counted and surfaced,
+    never silently dropped and never silently priced."""
+
+    _CONTAMINATED = {
+        "schema_version": 1, "as_of": "2026-09-17", "source": "metron",
+        "holdings": [
+            {"yf_symbol": "AAPL", "currency": "USD"},
+            {"yf_symbol": "DEMO-AAPL", "currency": "USD"},
+            {"yf_symbol": "demo-bnd", "currency": "USD"},
+        ],
+        "currencies": [],
+    }
+
+    def test_forbidden_symbol_is_kept_out_of_the_universe(self):
+        s3 = _universe_s3(self._CONTAMINATED)
+        holdings, _ = mmd.load_metron_universe("b", s3)
+        assert {h["yf_symbol"] for h in holdings} == {"AAPL"}
+
+    def test_rejection_is_counted_and_named_on_the_source_record(self, caplog):
+        s3 = _universe_s3(self._CONTAMINATED)
+        mmd._UNIVERSE_SOURCES.clear()
+        with caplog.at_level("ERROR"):
+            mmd.load_metron_universe("b", s3)
+        held = mmd._UNIVERSE_SOURCES["holdings"]
+        assert held["status"] == "contract_violation"
+        assert held["count"] == 1
+        assert held["rejected_count"] == 2
+        assert held["rejected"] == ["DEMO-AAPL", "DEMO-BND"]
+        assert "DEMO-AAPL" in caplog.text and "contract violation" in caplog.text
+
+    def test_a_violating_source_makes_technicals_coverage_incomplete(self):
+        mmd._UNIVERSE_SOURCES.clear()
+        mmd._read_metron_universe_holdings("b", _universe_s3(self._CONTAMINATED), mmd.HOLDINGS_UNIVERSE_KEY)
+        sources = dict(mmd._UNIVERSE_SOURCES)
+        sources.update({"constituents": {"status": "ok", "count": 1},
+                        "watchlist": {"status": "ok", "count": 0}})
+        cov = mmd.technicals_coverage(
+            ["AAPL"], {"AAPL": {}}, {}, {"AAPL": "2026-09-17"},
+            sources=sources, constituents={"AAPL"}, run_date="2026-09-17",
+        )
+        assert cov["complete"] is False
+        assert cov["universe_sources"]["holdings"]["status"] == "contract_violation"
+
+    def test_clean_universe_records_ok_with_no_rejection_fields(self):
+        mmd._UNIVERSE_SOURCES.clear()
+        mmd._read_metron_universe_holdings("b", _universe_s3(_UNIVERSE), mmd.HOLDINGS_UNIVERSE_KEY)
+        assert mmd._UNIVERSE_SOURCES["holdings"] == {"status": "ok", "count": 2}
+
+
 class TestWatchlistUniverseUnion:
     """metron-ops#132: a watchlist-only ticker (tracked but never bought) must get the
     SAME per-ticker collector coverage a held position does — load_metron_universe unions

@@ -105,6 +105,42 @@ def test_load_holdings_drops_symbols_held_only_on_a_foreign_exchange():
     assert daily_news._load_holdings_universe("b", s3) == ["AAPL"]
 
 
+def test_load_holdings_rejects_and_counts_forbidden_synthetic_symbols(caplog):
+    # alpha-engine-config-I10937: 25 DEMO- synthetics once reached this loader from
+    # a Metron demo fixture. They are a producer contract violation: kept out of
+    # the news fan-out, named in an ERROR, and recorded for the manifest.
+    s3 = _mock_s3(holdings=["AAPL", "DEMO-AAPL", "demo-cvx"], signals_universe=[])
+    with caplog.at_level("ERROR"):
+        assert daily_news._load_holdings_universe("b", s3) == ["AAPL"]
+    assert daily_news.HOLDINGS_CONTRACT_REJECTIONS == ["DEMO-AAPL", "DEMO-CVX"]
+    assert "DEMO-AAPL" in caplog.text and "contract violation" in caplog.text
+
+
+def test_load_holdings_clean_universe_leaves_no_rejection_record():
+    daily_news.HOLDINGS_CONTRACT_REJECTIONS[:] = ["STALE-FROM-AN-EARLIER-CALL"]
+    s3 = _mock_s3(holdings=["AAPL"], signals_universe=[])
+    assert daily_news._load_holdings_universe("b", s3) == ["AAPL"]
+    assert daily_news.HOLDINGS_CONTRACT_REJECTIONS == []
+
+
+def test_record_run_counts_a_holdings_contract_rejection_on_the_manifest():
+    ctx = MagicMock()
+    ctx.rows_out = 0
+    daily_news._record_run(
+        ctx, "b",
+        {"status": "ok", "articles": 0,
+         "holdings_contract_rejected": ["DEMO-AAPL", "DEMO-CVX"]},
+    )
+    ctx.reject.assert_called_once_with(daily_news.HOLDINGS_CONTRACT_REJECT_REASON, 2)
+
+
+def test_record_run_without_rejections_records_none():
+    ctx = MagicMock()
+    ctx.rows_out = 0
+    daily_news._record_run(ctx, "b", {"status": "ok", "articles": 0})
+    ctx.reject.assert_not_called()
+
+
 def test_assemble_universe_keeps_a_foreign_held_symbol_the_decision_set_carries():
     # Held only as SU.PA, but the scanner's own cut carries SU (Suncor, a US
     # listing): the AE slice keeps it — only the HELD slice's bare symbol is wrong.

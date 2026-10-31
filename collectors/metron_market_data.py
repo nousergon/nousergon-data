@@ -52,6 +52,7 @@ import run_units
 from dates import default_run_date, default_session_date
 from nousergon_lib import run_manifest
 from nousergon_lib.yfinance_quiet import log_yf_coverage, quiet_yfinance, yf_quiet
+from collectors import universe_contract
 from collectors.yahoo_session import YahooAuthError, call_yahoo, yahoo_info
 from validators import expectations
 
@@ -313,10 +314,15 @@ _UNIVERSE_SOURCES: dict[str, dict] = {}
 _LAST_SP1500_SYMBOLS: set[str] = set()
 
 
-def _record_universe_source(name: str, status: str, count: int, detail: str = "") -> None:
+def _record_universe_source(
+    name: str, status: str, count: int, detail: str = "", rejected: list[str] | None = None
+) -> None:
     entry: dict[str, Any] = {"status": status, "count": count}
     if detail:
         entry["detail"] = detail[:200]
+    if rejected:
+        entry["rejected_count"] = len(rejected)
+        entry["rejected"] = list(rejected)
     _UNIVERSE_SOURCES[name] = entry
 
 
@@ -375,14 +381,26 @@ def _read_metron_universe_holdings(bucket: str, s3_client: Any, key: str) -> lis
             for h in data.get("holdings", [])
             if str(h.get("yf_symbol", "")).strip()
         ]
-        _record_universe_source(_UNIVERSE_SOURCE_NAMES.get(key, key), "ok", len(rows))
-        return rows
     except Exception as e:  # missing object, no creds, parse error, etc.
         logger.warning("[metron_market_data] %s unavailable (%s) — no contribution", key, e)
         _record_universe_source(
             _UNIVERSE_SOURCE_NAMES.get(key, key), "unavailable", 0, type(e).__name__
         )
         return []
+    # A symbol in a declared synthetic namespace (DEMO-) is a producer contract
+    # violation (alpha-engine-config-I10937). It is kept out of the universe and
+    # COUNTED: an ERROR naming it, and a `contract_violation` status on this
+    # source's record, which `technicals_coverage` already reads as not complete.
+    name = _UNIVERSE_SOURCE_NAMES.get(key, key)
+    rejected = universe_contract.forbidden_symbols(r["yf_symbol"] for r in rows)
+    if rejected:
+        rows = [r for r in rows if not universe_contract.is_forbidden_symbol(r["yf_symbol"])]
+        line = universe_contract.describe_rejection(key, rejected)
+        logger.error("[metron_market_data] producer contract violation — %s", line)
+        _record_universe_source(name, "contract_violation", len(rows), line, rejected=rejected)
+        return rows
+    _record_universe_source(name, "ok", len(rows))
+    return rows
 
 
 def load_metron_universe(bucket: str, s3_client: Any) -> tuple[list[dict], list[str]]:
