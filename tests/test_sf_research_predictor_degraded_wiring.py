@@ -53,7 +53,7 @@ import json
 import pathlib
 
 import pytest
-from tests.sf_degraded_summary_helpers import assert_degraded_continuation
+from tests.sf_degraded_summary_helpers import assert_degraded_continuation, notify_target
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
 
@@ -427,40 +427,6 @@ def test_only_set_research_predictor_degraded_writes_the_flag(states):
 # ---------------------------------------------------------------------------
 
 
-def _notify_target(states, data: dict) -> str:
-    """Evaluate the CheckShellRunNotify -> CheckGateDegradedNotify selection
-    with ASL short-circuit semantics against a partial payload. Mirrors
-    tests/test_sf_parity_gate_notify_wiring.py::_notify_target exactly."""
-    def eval_rule(rule):
-        if "And" in rule:
-            return all(eval_rule(op) for op in rule["And"])
-        var = rule["Variable"].lstrip("$.")
-        present = var in data
-        if "IsPresent" in rule:
-            return present == rule["IsPresent"]
-        assert present, f"unguarded dereference of {var} in drill payload {data}"
-        return data[var] == rule["BooleanEquals"]
-
-    cur = "CheckShellRunNotify"
-    while states[cur]["Type"] in ("Choice", "Pass"):
-        if states[cur]["Type"] == "Pass":
-            # alpha-engine-config#5950: a normalizer Pass may sit between the
-            # gate and its notifier, flooring the optional diagnostic fields the
-            # notifier dereferences. It has no Choices, so it cannot change WHICH
-            # notifier is reached — walk through it rather than widening the
-            # allowed-target list, which would let a future Pass hide a wrong
-            # destination from this test.
-            cur = states[cur]["Next"]
-            continue
-        for rule in states[cur]["Choices"]:
-            if eval_rule(rule):
-                cur = rule["Next"]
-                break
-        else:
-            cur = states[cur]["Default"]
-    return cur
-
-
 _FLAGS = (
     "gate_degraded",
     "health_check_degraded",
@@ -484,7 +450,7 @@ _FLAG_COMBOS = [dict(zip(_FLAGS, bits)) for bits in itertools.product([True, Fal
 )
 def test_research_predictor_degraded_never_reaches_plain_notify_complete(states, combo):
     payload = {k: True for k, v in combo.items() if v}
-    target = _notify_target(states, payload)
+    target = notify_target(states, payload)
     if combo["research_predictor_degraded"]:
         assert target != "NotifyComplete", (
             f"payload {payload} reached plain NotifyComplete — a "

@@ -43,6 +43,7 @@ from tests.sf_command_utils import extract_commands
 from tests.sf_degraded_summary_helpers import (
     assert_completion_notifier_chain,
     assert_degraded_continuation,
+    notify_target,
 )
 
 _WEEKLY = pathlib.Path(__file__).parent.parent / "infrastructure" / "step_function.json"
@@ -190,28 +191,6 @@ def test_poll_resolves_to_terminal_status(
 # degraded flag threads into the completion-email selection
 # ---------------------------------------------------------------------------
 
-def _notify_target(states, data: dict) -> str:
-    """Evaluate the CheckShellRunNotify → CheckGateDegradedNotify selection
-    with ASL short-circuit semantics against a partial payload."""
-    def eval_rule(rule):
-        if "And" in rule:
-            return all(eval_rule(op) for op in rule["And"])
-        var, present = rule["Variable"].lstrip("$."), rule["Variable"].lstrip("$.") in data
-        if "IsPresent" in rule:
-            return present == rule["IsPresent"]
-        assert present, f"unguarded dereference of {var} in drill payload {data}"
-        return data[var] == rule["BooleanEquals"]
-
-    cur = "CheckShellRunNotify"
-    while states[cur]["Type"] == "Choice":
-        for rule in states[cur]["Choices"]:
-            if eval_rule(rule):
-                cur = rule["Next"]
-                break
-        else:
-            cur = states[cur]["Default"]
-    return cur
-
 
 @pytest.mark.parametrize(("payload", "expected"), [
     # both flag families set → subject reflects both
@@ -227,7 +206,7 @@ def _notify_target(states, data: dict) -> str:
 def test_degraded_flags_select_the_right_completion_notifier(
     states, payload, expected
 ):
-    assert _notify_target(states, payload) == expected
+    assert notify_target(states, payload) == expected
 
 
 @pytest.mark.parametrize("notifier", [
