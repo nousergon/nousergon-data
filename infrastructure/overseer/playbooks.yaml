@@ -2114,6 +2114,38 @@ alert_classes:
     # DECLARED: started-degraded is a degraded-results condition; the router's
     # own health class pages when routing actually fails.
     tier: notify-silent
+  # claude-code-config-PR282 (alpha-engine-config-I12780): the egress shims page
+  # once a day while the frozen binary is missing. reload-on-change rebuilds it
+  # on the next source change and pages llm-router-reload if that fails, so the
+  # drain owns this, not a human.
+  - class: egress_proxy_binary_missing
+    source: "egress-proxy-shim"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: the proxy still serves on the shared python; only LuLu's
+    # per-process identity is lost, which is degraded, not down.
+    tier: notify-silent
+  # claude-code-config-PR290 (alpha-engine-config-I12884): daily laptop checks.
+  # Both remedies need Brian at the laptop -- a LuLu upgrade replaces a system
+  # extension that macOS makes him approve, and the checkout is pulled by hand
+  # per his 2026-10-30 ruling (no background pulls) -- so no lane can act.
+  - class: lulu_version_behind
+    source: "lulu-version-check"
+    severities: [warning, error]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: A LuLu upgrade needs macOS approval of its system extension on the laptop.
+  - class: laptop_checkout_behind
+    source: "checkout-behind"
+    severities: [warning]
+    intake: bus
+    response: operator
+    # derived: response=operator (no automated path exists, §7.4)
+    tier: page
+    operator_reason: The laptop checkout is pulled by hand per Brian's ruling; background pulls are ruled out.
   - class: router_degraded_mode_drill
     # alpha-engine-config-I7740 (operator ruling 2026-08-21): new registry
     # row for a previously-undeclared source.

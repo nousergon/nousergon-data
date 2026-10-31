@@ -66,12 +66,16 @@ def _manifest(paused: dict | None = None, kept: dict | None = None) -> dict:
 
 
 def _reconcile(mod, *, manifest, rows, triggers, targets=None, sf=None, ran=None,
-                alarm_actions_of=None, alarm_breaching_of=None):
+                alarm_actions_of=None, alarm_breaching_of=None, executed=None):
     return mod.reconcile(
         manifest=manifest, rows=rows, triggers=triggers,
         targets_of=(lambda t: (targets or {}).get(t["name"], [])),
         sf_invoked=sf or set(),
         invocations_of=(lambda cid: (ran or {}).get(cid, 0)),
+        # state-machine targets are graded by ARN on AWS/States, never by the
+        # Lambda metric — keyed here by the full ARN so a test cannot pass by
+        # accident through the Lambda path.
+        executions_of=(lambda arn: (executed or {}).get(arn, 0)),
         alarm_actions_of=alarm_actions_of,
         # alpha-engine-config-I8712: every alarm-direction test below predates
         # the notBreaching distinction and asserts the `breaching` behaviour,
@@ -181,6 +185,59 @@ def test_enabled_trigger_silent_target_fires_when_the_live_target_never_runs(mod
     )
     assert [(f["kind"], f["trigger"]) for f in findings] == \
         [("enabled-trigger-silent-target", "daily")]
+
+
+_SM_ARN = "arn:aws:states:us-east-1:1:stateMachine:ne-data-collection-eod"
+
+
+def test_enabled_trigger_silent_target_grades_a_state_machine_on_its_executions(mod):
+    """Regression, run 41049515080 (2026-10-30): a Scheduler schedule targeting
+    a state machine was graded on AWS/Lambda Invocations for a FunctionName that
+    does not exist, so it read 0 forever and both data-collection schedules went
+    red while their machines SUCCEEDED every weekday. A machine that executed is
+    not a silent target, whatever the Lambda metric says."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"data-collection-eod": _row("data-collection-eod"),
+              "ne-data-collection-eod":
+              _row("ne-data-collection-eod", "in-service", substrate="step-functions")},
+        triggers=[{"surface": "scheduler", "name": "data-collection-eod", "state": "ENABLED"}],
+        targets={"data-collection-eod": [_SM_ARN]},
+        ran={"ne-data-collection-eod": 0}, executed={_SM_ARN: 9},
+    )
+    assert findings == []
+
+
+def test_enabled_trigger_silent_target_still_fires_for_a_silent_state_machine(mod):
+    """The fix changes the metric, not the rule: a state machine with zero
+    executions behind an ENABLED schedule is still the I9469 finding."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"data-collection-eod": _row("data-collection-eod"),
+              "ne-data-collection-eod":
+              _row("ne-data-collection-eod", "in-service", substrate="step-functions")},
+        triggers=[{"surface": "scheduler", "name": "data-collection-eod", "state": "ENABLED"}],
+        targets={"data-collection-eod": [_SM_ARN]},
+        ran={"ne-data-collection-eod": 5}, executed={_SM_ARN: 0},
+    )
+    assert [(f["kind"], f["trigger"]) for f in findings] == \
+        [("enabled-trigger-silent-target", "data-collection-eod")]
+
+
+def test_dark_component_grades_a_state_machine_on_its_executions(mod):
+    """Direction C carries the same join, so it grades a state-machine row on
+    AWS/States too: an in-service machine behind a dark trigger that still
+    executed (heal, manual start) is telling the truth."""
+    findings = _reconcile(
+        mod, manifest=_manifest(),
+        rows={"data-collection-eod": _row("data-collection-eod"),
+              "ne-data-collection-eod":
+              _row("ne-data-collection-eod", "in-service", substrate="step-functions")},
+        triggers=[{"surface": "scheduler", "name": "data-collection-eod", "state": "DISABLED"}],
+        targets={"data-collection-eod": [_SM_ARN]},
+        executed={_SM_ARN: 2},
+    )
+    assert "dark-and-undeclared-component" not in [f["kind"] for f in findings]
 
 
 def test_enabled_trigger_silent_target_does_not_reproduce_the_i9469_false_positive(mod):
