@@ -1241,6 +1241,17 @@ artifacts:
     owner_repo: alpha-engine-data
     created_at: "2025-01-01"
     run_calendar: all_days
+  - artifact_id: claude_plan_usage_latest
+    s3_key_template: "claude_code_usage/plan/last_measured.json"
+    cadence: continuous
+    interval_minutes: 5
+    sla_minutes_after_cron: 15
+    severity: critical
+    remediation: operator
+    owner_repo: claude-code-config
+    created_at: "2025-01-01"
+    calendar_aware: false
+    run_calendar: all_days
   - artifact_id: probe_missing
     s3_key_template: "path/{date}/missing.json"
     cadence: saturday_sf
@@ -1269,7 +1280,60 @@ def test_handle_intraday_scopes_to_intraday_artifact_ids_only(
     result = index.handler({"mode": "intraday"}, None)
 
     assert result["mode"] == "intraday"
-    assert result["n_entries_checked"] == 2  # open_orders_latest + heartbeat only
+    # open_orders_latest + heartbeat + the Claude plan meter; never probe_missing
+    assert result["n_entries_checked"] == 3
+
+
+def test_intraday_pass_pages_a_blind_claude_plan_meter_overnight_on_a_weekend(
+    monkeypatch, intraday_registry_body, fake_s3
+):
+    """alpha-engine-config-I11823. The plan meter's last_measured.json is
+    written only by a poll that measured, so its age is the time the meter
+    has been blind. Reproduces 2026-10-31: blind from 06:00Z Saturday (refresh
+    token expired), probed at 07:30Z. Before this change no probe ran between
+    the 04:00Z historical pass and the 12:00Z daily sweep, so the 20-minute
+    SLA was checked six hours late. The intraday pass now pages it."""
+    monkeypatch.setenv("FRESHNESS_MONITOR_ENABLED", "true")
+    fake_s3._registry_body = intraday_registry_body
+    now = datetime(2026, 10, 31, 7, 30, tzinfo=timezone.utc)  # Saturday
+    fake_s3._head_returns["claude_code_usage/plan/last_measured.json"] = {
+        "LastModified": datetime(2026, 10, 31, 6, 0, 5, tzinfo=timezone.utc),
+    }
+    fake_s3._head_returns["_freshness_monitor/heartbeat.json"] = {
+        "LastModified": datetime(2026, 10, 31, 4, 0, tzinfo=timezone.utc),
+    }
+
+    import importlib
+    import index
+    importlib.reload(index)
+    _patch_now(monkeypatch, now)
+    monkeypatch.setattr(index, "boto3", mock.Mock(client=lambda *a, **kw: fake_s3))
+    publish = mock.Mock(return_value=mock.Mock(dedup_skipped=False))
+    monkeypatch.setattr(index, "publish", publish)
+
+    result = index.handler({"mode": "intraday"}, None)
+
+    assert result["mode"] == "intraday"
+    assert result["alerted"] == 1  # the meter only: heartbeat fresh, open_orders idle
+    body = publish.call_args.args[0]
+    assert "claude_plan_usage_latest" in body
+    assert publish.call_args.kwargs["severity"] == "critical"
+
+
+def test_intraday_rule_fires_every_hour_of_every_day():
+    """The intraday rule must cover every hour the meter's all_days, 20-minute
+    SLA applies. A weekday-hours window here is what left the meter unprobed
+    from 21:30Z to 12:00Z (alpha-engine-config-I11823)."""
+    import re
+    deploy = (Path(__file__).parent / "deploy.sh").read_text()
+    crons = re.search(r"RECONCILE_CRONS=\(\n(.*?)\n\)", deploy, re.S).group(1)
+    names = re.search(
+        r"RECONCILE_DESCRIPTION_TRIGGERS=\(\n(.*?)\n\)", deploy, re.S
+    ).group(1)
+    by_name = dict(zip(
+        re.findall(r'"events:([^"]+)"', names), re.findall(r'"(cron\([^"]+\))"', crons)
+    ))
+    assert by_name["alpha-engine-freshness-monitor-intraday-cron"] == "cron(0/30 * * * ? *)"
 
 
 def test_handle_intraday_does_not_write_shared_dashboard_surfaces(

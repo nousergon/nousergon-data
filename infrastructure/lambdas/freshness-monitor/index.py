@@ -146,7 +146,22 @@ EXECUTION_LOOP_KEY = "_freshness_monitor/execution_loop.json"
 # `freshness_monitor_heartbeat` (the monitor's OWN dead-man's-switch artifact
 # — its whole purpose is fast detection of a monitor outage, which a daily
 # cadence would defeat).
-INTRADAY_ARTIFACT_IDS = frozenset({"open_orders_latest", "freshness_monitor_heartbeat"})
+#
+# alpha-engine-config-I11823 adds `claude_plan_usage_latest` (the Claude plan
+# meter's last_measured.json, a 20-minute critical SLA) and widens the rule to
+# every 30 minutes on every day. Measured 2026-10-31: the meter went blind at
+# 06:05Z Saturday on an expired refresh token, and the first probe that could
+# see it was the 12:00Z daily sweep, six hours later; on a weekday the gap from
+# 21:30Z to 12:00Z is fourteen and a half hours. That window is exactly when
+# the nightly agent run spends the quota this meter measures. The meter's own
+# `auth_expired` page runs inside the failing process on the box; this probe is
+# the off-box detector. `open_orders_latest` is unaffected by the wider window:
+# its market_hours run_calendar returns "absence is correct" off-session.
+INTRADAY_ARTIFACT_IDS = frozenset({
+    "open_orders_latest",
+    "freshness_monitor_heartbeat",
+    "claude_plan_usage_latest",
+})
 
 # config#1240 — auto-remediation dispatch. The confirmed-miss path reads the
 # per-artifact `recovery:` spec from the registry and DISPATCHES the named
