@@ -51,6 +51,7 @@ __all__ = [
     "UNITS_OBSERVED",
     "VENDOR_FALLBACK_OBSERVED",
     "PIT_PANEL_WINDOW_OBSERVED",
+    "PIT_STALE_PROXY_OBSERVED",
     "UNIT_HARNESSES",
     "harness_for",
     "Harness",
@@ -193,6 +194,23 @@ PIT_PANEL_WINDOW_OBSERVED: tuple[str, ...] = (
     "trading_day and reaches CollectionSucceeded with 0 pages",
 )
 
+#: What D48's ``pit`` walk observes: the refusal of an index proxy read from a
+#: second source that lags the members
+#: (``collectors/index_contributions.py::_refuse_proxy_behind_members``), so the
+#: trading-day pair is never one session behind. Its own harness (:data:`UNIT_HARNESSES`).
+PIT_STALE_PROXY_OBSERVED: tuple[str, ...] = (
+    "the NDX leg refused a proxy whose newest close is older than the members' newest "
+    "(IndexContributionsUnavailable); the run returned partial and the healthy SPX leg "
+    "still published",
+    "manifest status failed naming the stale proxy, on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL, walked on the "
+    "unit's own schedule input; the process exited 1 on both attempts",
+    "stand-down: terminal CollectionFailed; no NDX decomposition was written for the session "
+    "and the previous NDX latest.json stands",
+    "recovery: once the proxy is refreshed, the next run publishes both legs and reaches "
+    "CollectionSucceeded with 0 pages",
+)
+
 #: guard class -> unit -> its observed lines, where a unit's check is not the
 #: class-wide one its harness's default ``observed`` describes.
 PIT_OBSERVED_BY_UNIT: dict[str, tuple[str, ...]] = {"D03": PIT_FUTURE_BAR_OBSERVED}
@@ -288,9 +306,10 @@ HARNESSES: dict[str, Harness] = {
 
 #: guard class -> unit -> the harness that unit's record is taken in, where the
 #: unit's check is not the one the class harness walks. D51's ``pit`` check is the
-#: panel's window-end refusal on the panel schedule, not the append-time freshness
-#: scan :data:`HARNESSES` ``["pit"]`` walks, so it gets its own record test rather
-#: than a case bent to fit another check's assertions.
+#: panel's window-end refusal and D48's the stale-proxy refusal, each on its own
+#: schedule, not the append-time freshness scan :data:`HARNESSES` ``["pit"]``
+#: walks, so each gets its own record test rather than a case bent to fit another
+#: check's assertions.
 UNIT_HARNESSES: dict[str, dict[str, Harness]] = {
     "pit": {
         "D51": Harness(
@@ -299,6 +318,13 @@ UNIT_HARNESSES: dict[str, dict[str, Harness]] = {
             mode_under_test="enforce",
             cases_module="test_guard_commissioning_pit_d51",
             observed=PIT_PANEL_WINDOW_OBSERVED,
+        ),
+        "D48": Harness(
+            "tests/test_guard_commissioning_pit_d48.py",
+            "test_the_fault_record_stale_proxy_fails_pages_once_and_stands_down",
+            mode_under_test="enforce",
+            cases_module="test_guard_commissioning_pit_d48",
+            observed=PIT_STALE_PROXY_OBSERVED,
         ),
     },
 }

@@ -188,10 +188,18 @@ guards:
         tests/test_index_contributions.py.
   pit:
     state: present
+    code:
+      - "collectors/index_contributions.py::collect"
+    evaluates: "_refuse_proxy_behind_members(spec, proxy_series, closes)"
     note: >-
         Weights are taken as of the PRIOR close and the trading-day pair is read off
         the proxy's own observed series rather than a calendar, so a multi-day return
-        cannot be labelled as one day (a proxy with fewer than two closes raises).
+        cannot be labelled as one day (a proxy with fewer than two closes raises). A
+        proxy read from a second source (NDX's QQQ, from the close_history spine) whose
+        newest close is older than the members' is refused
+        (_refuse_proxy_behind_members): that leg errors, the run is partial and pages.
+        Induced-fault record: tests/test_guard_commissioning_pit_d48.py (P-19,
+        alpha-engine-config-I10786).
   vendor_fallback:
     state: absent
     note: >-
