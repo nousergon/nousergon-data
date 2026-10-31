@@ -49,6 +49,7 @@ __all__ = [
     "PIT_OBSERVED_BY_UNIT",
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
     "UNITS_OBSERVED",
+    "VENDOR_FALLBACK_OBSERVED",
     "Harness",
     "main",
     "record_document",
@@ -117,6 +118,23 @@ UNITS_OBSERVED: tuple[str, ...] = (
     "recovery: the next correctly scaled file publishes ok with every weight normalised to "
     "1.0 within its index",
 )
+
+#: What the ``vendor_fallback`` harness observes. The guard is the unit's refusal to
+#: substitute a source: D51 compiles from one store and declares no fallback, so a
+#: withheld read raises (``builders.daily_panel.compile_panel``) as shipped; no staged
+#: mode. The unit runs on its own schedule input (``ne-data-collection-panel``).
+VENDOR_FALLBACK_OBSERVED: tuple[str, ...] = (
+    "the one store the unit reads answered nothing and the unit refused to compile "
+    "(PanelCompileError); no second source was read and nothing was substituted",
+    "manifest status failed naming the empty read, on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL, walked on the "
+    "unit's own schedule input; the process exited 1 on both attempts",
+    "stand-down: terminal CollectionFailed; nothing under the session's panel prefix was "
+    "written (no parquet, no manifest)",
+    "recovery: once the store answers, the next run publishes both keys and reaches "
+    "CollectionSucceeded with 0 pages",
+)
+
 
 #: What the ``pit`` harness observes. The guard is the append-time freshness scan
 #: ``builders/daily_append.py::_scan_universe_and_emit_freshness_receipt``
@@ -234,6 +252,16 @@ HARNESSES: dict[str, Harness] = {
         mode_under_test="enforce",
         cases_module="test_guard_commissioning_pit",
         observed=PIT_OBSERVED,
+    ),
+    # No staged mode flip: D51's compile refuses an empty read as shipped, and its
+    # descriptor declares no fallback path, so the withheld vendor is refused, never
+    # absorbed.
+    "vendor_fallback": Harness(
+        "tests/test_guard_commissioning_vendor_fallback.py",
+        "test_the_fault_record_withheld_vendor_fails_pages_once_and_stands_down",
+        mode_under_test="enforce",
+        cases_module="test_guard_commissioning_vendor_fallback",
+        observed=VENDOR_FALLBACK_OBSERVED,
     ),
 }
 

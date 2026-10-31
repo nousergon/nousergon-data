@@ -196,3 +196,30 @@ def test_pit_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
 def test_the_harness_runner_reads_a_real_pit_outcome():
     node = gc.HARNESSES["pit"].nodeid("D32")
     assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_vendor_fallback_publishes_its_own_observed_lines(tmp_path, monkeypatch, clean_tree):
+    """The sixth harness (`tests/test_guard_commissioning_vendor_fallback.py`), on D51's
+    refusal to substitute a withheld store."""
+    monkeypatch.setattr(gc, "_run_harness", _passed)
+    argv = ["--guard", "vendor_fallback", "--unit", "D51", "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    document = json.loads((tmp_path / "faults/D51/vendor_fallback/latest.json").read_text())
+    assert document["observed"] == list(gc.VENDOR_FALLBACK_OBSERVED)
+    assert document["test"] == gc.HARNESSES["vendor_fallback"].nodeid("D51")
+    unit = next(u for u in descriptors.load_units() if u.unit_id == "D51")
+    reading = evidence.read_guard_commissioning(
+        LocalStore(tmp_path), unit, "vendor_fallback", trading_day=dt.date(2026, 10, 2)
+    )
+    assert reading.met is True, reading.detail
+
+
+def test_vendor_fallback_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree):
+    """D20's yfinance gap-fill absorbs a withheld primary: no induced case here."""
+    with pytest.raises(SystemExit, match="no induced-fault case"):
+        gc.main(["--guard", "vendor_fallback", "--unit", "D20", "--store", str(tmp_path)])
+
+
+def test_the_harness_runner_reads_a_real_vendor_fallback_outcome():
+    node = gc.HARNESSES["vendor_fallback"].nodeid("D51")
+    assert gc._run_harness([node]) == {node: "passed"}
