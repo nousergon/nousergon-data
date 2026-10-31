@@ -1,0 +1,127 @@
+# Suppression registry for nousergon-data (alpha-engine-config-I9727).
+#
+# A suppression is a collection that makes a check skip a KNOWN DEFECT. Each
+# row names one collection, the owning OPEN alpha-engine-config issue, and an
+# expiry. scripts/check_suppression_registry.py (a verbatim copy of
+# alpha-engine-config's; only REGISTRY differs) reads this file: offline
+# (tests/test_check_suppression_registry.py, merge-blocking) the collection
+# exists, holds the declared keys, a `keys: all` ledger is not empty, and no
+# row has expired; --live requires every owning issue OPEN. Schema and
+# rationale: alpha-engine-config private-docs/SUPPRESSION_REGISTRY.yaml.
+#
+# First slice, 2026-10-31: the nine largest deferred-defect collections.
+# Graded and NOT listed (permanent allowances or pins, not deferred defects):
+# test_every_audit_cell_is_a_clause BASELINE_/POST_BASELINE_UNIT_IDS (an audit
+# population pin), test_daily_append_no_raw_now_date_str FILES_ALLOWED_RAW_NOW
+# (files whose purpose is fixed dates), test_telegram_raw_send_message_burndown
+# _guard _ALLOWLIST (documented permanent bypasses), features/postflight
+# ZERO_VARIANCE_EXEMPT (binary features), test_sf_structural_contract
+# _*_EXEMPT (per-state reasons), and the empty sets (_LAMBDA_PIN_EXEMPTIONS,
+# _KNOWN_SAFE, GRANDFATHERED_NO_CRASH_CHECK, _ALLOWED_FILES, ...).
+# Not yet graded: contracts/vintage.py PENDING_DECLARATIONS, contracts/pit.py
+# _EXEMPT_PREFIXES, test_data_gate _KNOWN_OPS_PLANE_WRITE_SITES,
+# test_writer_template_reachability _KNOWN_FLAGGED, test_freshness_uses_
+# trading_days ALLOWLIST, test_workflow_account_id_literal_guard ALLOWLIST,
+# .debug-swallow-allowlist.yaml (a list of carve-out objects this reader does
+# not model) and .gitleaks-baseline.json (express lane).
+
+suppressions:
+  - collection: features/registry.py::GRANDFATHERED_BARE_FIELDS
+    keys: all
+    exhaustive: true
+    issue: alpha-engine-config-I12927
+    expires: 2027-01-31
+    reason: >-
+      72 feature columns with no units suffix, grandfathered 2026-05-25; the
+      cited owners (config#934, I10781) closed.
+  - collection: infrastructure/overseer/alert_class_response_gap.py::GRANDFATHERED_CLASSES
+    keys: all
+    exhaustive: true
+    issue: alpha-engine-config-I8996
+    expires: 2027-01-31
+    reason: >-
+      43 pageable alert classes with no operator_reason or migration_issue
+      (I8991 sweep); the stale-entry test removes fixed rows.
+  - collection: tests/test_no_get_object_load_swallow.py::GRANDFATHERED
+    keys: all
+    exhaustive: true
+    issue: alpha-engine-config-I12927
+    expires: 2027-01-31
+    reason: >-
+      19 loaders that swallow a failed GetObject (measured 2026-10-30); the
+      cited owner I10923 closed.
+  - collection: tests/test_sf_lambda_timeout_ordering.py::_KNOWN_UNBOUND
+    keys:
+      - "('step_function.json', 'SignalsEnvelope')"
+      - "('step_function.json', 'ChallengerShadow')"
+      - "('step_function.json', 'EvalJudgeSubmitFirstSaturday')"
+      - "('step_function.json', 'EvalJudgeSubmitWeekly')"
+      - "('step_function.json', 'RationaleClustering')"
+      - "('step_function.json', 'Counterfactual')"
+      - "('step_function.json', 'DispatchWeeklyFreshnessSpot')"
+      - "('step_function_daily.json', 'PredictorInference')"
+      - "('step_function_daily.json', 'ReinvokePredictor')"
+    exhaustive: true
+    issue: alpha-engine-config-I10655
+    expires: 2026-11-09
+    reason: >-
+      Nine v1 SF states with unbound Lambda timeouts, deleted by the v1
+      decommission (I10655 deliverable 3); the test's own date check fires
+      again 11-09.
+  - collection: tests/test_sf_invoked_lambdas_deploy_on_merge.py::GRANDFATHERED
+    keys:
+      - "'ssm-liveness-poller'"
+      - "'eod-precondition-probe'"
+    exhaustive: true
+    issue: alpha-engine-config-I12927
+    expires: 2027-01-31
+    reason: >-
+      Two SF-invoked Lambdas still deployed only by an operator; the cited
+      owner I10172 closed.
+  - collection: tests/test_sf_invoked_lambdas_deploy_on_merge.py::NOT_SF_INVOKED_GRANDFATHERED
+    keys:
+      - "'alpha-engine-alerts-forwarder'"
+      - "'backstop-telegram-notifier'"
+      - "'canary-replay-liveness-probe'"
+      - "'changelog-cloudwatch-mirror'"
+      - "'changelog-incident-mirror'"
+      - "'eod-success-friday-shell-trigger'"
+      - "'friday-shell-run-report'"
+      - "'groom-inject-mock'"
+      - "'saturday-integrity-sentinel'"
+      - "'sweep-artifact-monitor'"
+    exhaustive: true
+    issue: alpha-engine-config-I8985
+    expires: 2027-01-31
+    reason: >-
+      Ten non-SF Lambdas with a deploy.sh and no push-triggered deploy
+      workflow.
+  - collection: tests/test_apply_iam_is_iam_only.py::GRANDFATHERED_INLINE_APPLY
+    keys:
+      - "'alpha-engine-alerts-forwarder'"
+      - "'changelog-incident-mirror'"
+    exhaustive: true
+    issue: alpha-engine-config-I12927
+    expires: 2027-01-31
+    reason: >-
+      Two deploy scripts with their own inline IAM apply (they also attach
+      AWSLambdaBasicExecutionRole); the cited owner I7444 closed.
+  - collection: tests/test_sf_definitions_resolve_the_declared_krepis_guard.py::KNOWN_UNGUARDED_SITES
+    keys:
+      - "('step_function.json', '/home/ec2-user/alpha-engine-dashboard/.venv/bin/python')"
+      - "('step_function_daily.json', '/home/ec2-user/alpha-engine/.venv/bin/python')"
+      - "('step_function.json', '/home/ec2-user/crucible-research/.venv/bin/python')"
+    exhaustive: true
+    issue: alpha-engine-config-I7383
+    expires: 2027-01-31
+    reason: >-
+      Three SF sites whose interpreter lacks the ops-owned krepis guard (spot
+      launchers, I7383; the executor venv entry is I7365, also open).
+  - collection: .hardcoded-env-refs-baseline.json::files
+    keys: all
+    exhaustive: true
+    issue: alpha-engine-config-I12924
+    expires: 2027-03-31
+    reason: >-
+      538 files with hard-coded account IDs or bucket names, held shrink-only
+      by the S-04 guard; its tracker (I12492) closed when the guard shipped.
