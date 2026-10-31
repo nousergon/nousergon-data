@@ -202,24 +202,56 @@ jobs:
           # construction. Matches the region used fleet-wide (REGION default
           # in every lambda's deploy.sh).
           AWS_DEFAULT_REGION: us-east-1
+        #
+        # alpha-engine-config-I11310: the suites run CONCURRENTLY, one per core,
+        # inside this same job. They were serial and, after data#2333/#2345,
+        # this step (230-350s on 10-31 main pushes) cost as much as `Run tests`.
+        # Each suite already had its own interpreter and its own mktemp --target
+        # dir from run_handler_tests, so running them side by side shares
+        # nothing but pip's download cache. A separate job (data#2274) was ruled
+        # out on 10-23 because it ADDS billed minutes; this shortens the one job,
+        # so it cuts billed minutes and wall-clock together. Logs are buffered
+        # per lambda and printed in glob order, so the output reads as before.
+        # A lambda whose runner dies without writing its rc counts as failed.
         run: |
           set -uo pipefail
           shopt -s nullglob
-          source infrastructure/lambdas/_shared/run_handler_tests.sh
-          fail=0
+          logs="$(mktemp -d)"
+          run_one() {
+            local d="$1" name rc=0
+            name="$(basename "$d")"
+            # shellcheck source=/dev/null
+            source infrastructure/lambdas/_shared/run_handler_tests.sh
+            if [ -f "$d/requirements.txt" ]; then
+              run_handler_tests "$d" -r "$d/requirements.txt" >"$logs/$name.log" 2>&1 || rc=$?
+            else
+              run_handler_tests "$d" >"$logs/$name.log" 2>&1 || rc=$?
+            fi
+            echo "$rc" >"$logs/$name.rc"
+          }
+          export -f run_one
+          export logs
+          dirs=()
           for t in infrastructure/lambdas/*/test_handler.py; do
             d="$(dirname "$t")"
             case "$d" in
               */changelog-incident-mirror|*/changelog-cloudwatch-mirror)
                 continue ;;
             esac
-            echo "::group::$t"
-            if [ -f "$d/requirements.txt" ]; then
-              run_handler_tests "$d" -r "$d/requirements.txt" || fail=1
-            else
-              run_handler_tests "$d" || fail=1
-            fi
+            dirs+=("$d")
+          done
+          printf '%s\0' "${dirs[@]}" | xargs -0 -n1 -P "$(nproc)" bash -c 'run_one "$1"' _
+          fail=0
+          for d in "${dirs[@]}"; do
+            name="$(basename "$d")"
+            echo "::group::$d/test_handler.py"
+            cat "$logs/$name.log" 2>/dev/null
             echo "::endgroup::"
+            rc="$(cat "$logs/$name.rc" 2>/dev/null || echo missing)"
+            if [ "$rc" != "0" ]; then
+              echo "::error::$d handler tests failed (rc=$rc)"
+              fail=1
+            fi
           done
           exit $fail
 
