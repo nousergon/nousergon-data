@@ -121,6 +121,45 @@ def test_residual_and_factor_momentum_carry_real_variance(monkeypatch):
         assert non_null.std() > 0.0, f"{col}: still zero cross-sectional variance"
 
 
+def test_every_factor_contributes_at_the_live_warmup_row_count(monkeypatch):
+    """alpha-engine-config-I10359 deliverable 3. The variance test above runs
+    400 rows, under _FEATURE_WARMUP_ROWS, so it passes on the shorter-warmup
+    factors alone while dist_from_52w_high never warms up: the row-wise mean
+    over "factors with both loading and momentum finite" hides one dead
+    factor. Here the universe has exactly the live row count, read off the
+    constant rather than hardcoded, and EVERY DEFAULT_FACTOR_LOADINGS member
+    must carry a finite factor-momentum value on the snapshot date."""
+    from features import factor_momentum
+
+    price_data, macro = _synthetic_universe(n_rows=compute._FEATURE_WARMUP_ROWS)
+    _patch_loaders(monkeypatch, price_data, macro)
+    monkeypatch.setattr(compute, "assert_no_dead_feature_columns", lambda *a, **k: None)
+
+    captured = {}
+    real_series = factor_momentum.compute_factor_momentum_series
+
+    def _capture_series(factor_returns, **kwargs):
+        out = real_series(factor_returns, **kwargs)
+        captured["factor_mom"] = out
+        return out
+
+    monkeypatch.setattr(factor_momentum, "compute_factor_momentum_series", _capture_series)
+
+    result = compute.compute_and_write(
+        date_str="2026-08-14", bucket="test-bucket", dry_run=True
+    )
+
+    assert result["status"] == "ok"
+    factor_mom = captured["factor_mom"]
+    latest = factor_mom.iloc[-1]
+    dead = [f for f in factor_momentum.DEFAULT_FACTOR_LOADINGS
+            if f not in factor_mom.columns or not np.isfinite(latest.get(f, np.nan))]
+    assert not dead, (
+        f"factor momentum is NaN on the snapshot date for {dead} at "
+        f"{compute._FEATURE_WARMUP_ROWS} rows"
+    )
+
+
 def test_an_uncomputed_factor_momentum_stays_nan_never_a_fabricated_zero(monkeypatch):
     """0.0 is a LEGAL factor-momentum reading, so back-filling it makes an
     uncomputed ticker indistinguishable from one whose tilt really is zero
