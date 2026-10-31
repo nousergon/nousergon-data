@@ -181,6 +181,15 @@ shared_writers:
       Daily English Wikipedia pageviews per issuer, an alternative-data attention
       series beside D15's (model zoo free-data request). On-demand dispatcher
       backfill only; it earns a unit of its own when a schedule runs it.
+  - path: collectors/ib_flex.py
+    parent_units: [D38]
+    reason: >-
+      The IB Flex statement collector for the perf tracker (alpha-engine-config-I12806):
+      trades/ib_statements/{raw,dated}/. Attributed to D38, the other producer of
+      custodian account state, only while nothing runs it: no workflow or schedule
+      calls it until its IAM read grant on the Flex token lands. It earns a unit of
+      its own (descriptor, ARTIFACT_REGISTRY row, observability row) in the PR that
+      schedules it.
   - path: collectors/news_aggregator.py
     parent_units: [D36]
     reason: Audit §2 folds it into daily-news.
