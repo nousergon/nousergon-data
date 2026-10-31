@@ -316,8 +316,16 @@ def test_the_drill_rides_an_existing_scheduled_job():
     assert steps.index(step) == len(steps) - 1
 
 
-#: The four producers that are not the drill's host job.
-_OTHER_PRODUCER_JOBS = ("v1_data_stage", "executor_profile", "cloudtrail_evidence", "cost_monthly")
+#: The six producers that are not the drill's host job (`slo` and
+#: `pages_monthly` added by alpha-engine-config-I10789).
+_OTHER_PRODUCER_JOBS = (
+    "v1_data_stage",
+    "executor_profile",
+    "cloudtrail_evidence",
+    "cost_monthly",
+    "slo",
+    "pages_monthly",
+)
 
 
 def test_a_drill_only_dispatch_runs_the_drill_and_nothing_else():

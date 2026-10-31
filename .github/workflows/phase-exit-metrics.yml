@@ -42,6 +42,23 @@ name: Data-collection phase-exit metrics
 # do, this job fails loud on AccessDenied at its first read — the clause it
 # feeds reads UNMEASURABLE meanwhile, never MET.
 #
+# ── `slo` and `pages_monthly` are the FIFTH and SIXTH jobs ────────────────
+#
+# `alpha-engine-config-I10789` (plan P-22): `data_gate.producers.slo`
+# (nousergon-data-PR2055) writes the sixteen
+# `data_collection/metrics/slo/{freshness,completeness}/<family>/latest.json`
+# documents the `data.slo.*` clauses read, and `data_gate.producers.
+# pages_monthly` (nousergon-data-PR2104) writes `data_collection/metrics/
+# pages/monthly/latest.json` for `data.pages.monthly`. Both landed CLI-only;
+# until these jobs nothing invoked them, so all 17 documents were absent
+# (measured 2026-10-31). Jobs here, not a new workflow, for the reason the
+# jobs above give: the role's trust policy pins THIS file. Their grants
+# (`nous-ergon-ops-PR1970`: reads on `data_collection/runs/*` and
+# `changelog/{entries,quarantine}/*`, writes on their own metric and run-
+# record prefixes only) must be applied BEFORE this lands, or both jobs
+# fail on AccessDenied and page through notify-main-failure every day.
+# Independent jobs, no `needs:` between them (`alpha-engine-config-I11261`).
+#
 # ── Cadence: mirrors the collector's own daily cadence ─────────────────────
 #
 # `data-gate.yml` (this repo) evaluates the whole ladder at `30 23 * * *`
@@ -90,7 +107,7 @@ on:
     - cron: '0 22 * * *'
   # `drill_only` (alpha-engine-config-I10795): a manual run of ONLY the
   # freshness-monitor commissioning drill. Without it a dispatch re-runs all
-  # five producers just to write the drill's receipts, which is why the
+  # seven producers just to write the drill's receipts, which is why the
   # drill's receipts otherwise wait for its first due day. Off by default,
   # and absent on a `schedule` event (`inputs.drill_only` is null there, so
   # `!inputs.drill_only` is true and every job runs exactly as before). It
@@ -374,11 +391,95 @@ jobs:
         if: ${{ !cancelled() }}
         run: python -m data_gate.producers.freshness_commissioning ${{ github.event_name == 'schedule' && '--only-if-due' || '' }}
 
+  slo:
+    name: slo metric (freshness and completeness SLO per family)
+    if: ${{ !inputs.drill_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}."; exit 1 ;; esac
+
+      - name: Run slo producer
+        run: python -m data_gate.producers.slo
+
+  pages_monthly:
+    name: pages_monthly metric (monthly page count)
+    if: ${{ !inputs.drill_only }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write   # OIDC only; no long-lived AWS keys in this repository
+    steps:
+      - name: Repository variables are set
+        run: |
+          if [ -z "$AWS_ACCOUNT_ID" ]; then echo "::error::repository variable AWS_ACCOUNT_ID is not set - set it with: gh variable set AWS_ACCOUNT_ID --repo nousergon/nousergon-data --body '<12-digit-account-id>'"; exit 1; fi
+
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Mask the account id in this public log
+        run: echo "::add-mask::${{ vars.AWS_ACCOUNT_ID }}"
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@e6de054238d6b7531b4efff3b6587d9aade6a06c # v6
+        with:
+          role-to-assume: ${{ env.PHASE_EXIT_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Confirm the identity this job actually assumed
+        run: |
+          assumed="$(aws sts get-caller-identity --query Arn --output text)"
+          expected="${PHASE_EXIT_ROLE_ARN##*/}"
+          case "${assumed}" in *":assumed-role/${expected}/"*) echo "identity: ${assumed}" ;; *) echo "::error::this job assumed ${assumed}, not ${expected}."; exit 1 ;; esac
+
+      - name: Run pages_monthly producer
+        run: python -m data_gate.producers.pages_monthly
+
   # Required of every scheduled workflow in this repo by
   # tests/test_scheduled_workflow_reachability.py, by job NAME, with `needs:`
   # naming every other job and an `if` gated to the default branch.
   notify-main-failure:
-    needs: [v1_data_stage, executor_profile, cloudtrail_evidence, cost_monthly, trigger_observation]
+    needs: [v1_data_stage, executor_profile, cloudtrail_evidence, cost_monthly, trigger_observation, slo, pages_monthly]
     if: ${{ always() && github.ref == 'refs/heads/main' && (failure() || (contains(needs.*.result, 'cancelled') && !cancelled())) }}
     uses: nousergon/nousergon-lib/.github/workflows/notify-ci-failure.yml@5a434a599a4fba3e6201db43d6453c3ecffbba29 # main
     secrets: inherit
