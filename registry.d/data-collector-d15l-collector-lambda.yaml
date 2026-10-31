@@ -11,7 +11,7 @@
 component_id: data-collector-d15l-collector-lambda
 owning_repo: nousergon-data
 substrate: ec2-spot
-origin: aws lambda invoke
+origin: manual:aws lambda invoke
 owner: brian
 lifecycle: retired
 lifecycle_owner: brian

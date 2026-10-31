@@ -451,7 +451,7 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         del pend_patterns  # coverage is decided per-source below, via pend_origin
         for src in list(newly):
-            if src == scan.MISSING_SOURCE_SENTINEL:
+            if src in (scan.MISSING_SOURCE_SENTINEL, scan.UNRESOLVABLE_SOURCE_SENTINEL):
                 continue
             matched_pr = next(
                 (n for pat, n in sorted(pend_origin.items())
@@ -497,6 +497,21 @@ def _report(newly: dict[str, set[str]], _tolerated: dict[str, int], repo_root: P
                 "unknown-source\n"
                 "  finding. The fix is to ADD `--source <literal>` at the call site, then "
                 "register it.",
+                file=out,
+            )
+            continue
+
+        if src == scan.UNRESOLVABLE_SOURCE_SENTINEL:
+            print(
+                "\n  This is a `python -m krepis.alerts publish` invocation whose "
+                "--source is\n"
+                "  COMPUTED (`--source \"$VAR\"` / `{var}`), so no static check can say "
+                "whether a\n"
+                "  row covers it (alpha-engine-config-I10380). Use a literal source, or "
+                "declare the\n"
+                "  file in alert_class_registry_drift.DECLARED_DYNAMIC_SOURCES with the "
+                "values it\n"
+                "  takes and the row that covers them.",
                 file=out,
             )
             continue

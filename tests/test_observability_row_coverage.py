@@ -199,8 +199,9 @@ def test_step_function_units_name_their_state_machine():
     without a parent reports every step-functions unit ABSENT (33 of the 40
     measured 2026-10-25). The parent must be a state machine this repo
     actually declares — a typo here would exclude the row from ABSENT while
-    pointing at nothing. Units on any other trigger kind are components in
-    their own right and must carry no parent.
+    pointing at nothing. A unit on any other trigger kind carries a parent
+    only when its descriptor DECLARES `trigger.parent_component` with a
+    reason, and then exactly that one; otherwise it carries none.
     """
     machines = _declared_state_machines()
     assert machines, "no StateMachineName found under infrastructure/cloudformation/ — parser broke"
@@ -212,8 +213,14 @@ def test_step_function_units_name_their_state_machine():
         row = yaml.safe_load((REGISTRY_D / f"{unit.raw['component_id']}.yaml").read_text(encoding="utf-8"))
         parent = row.get("parent_component")
         if trigger.get("kind") != "step-functions":
-            if parent:
-                problems.append(f"{unit.unit_id}: {trigger.get('kind')} unit carries parent {parent!r}")
+            declared = trigger.get("parent_component")
+            if parent != declared:
+                problems.append(
+                    f"{unit.unit_id}: {trigger.get('kind')} unit carries parent {parent!r}, "
+                    f"declared {declared!r}"
+                )
+            elif declared and not trigger.get("parent_component_reason"):
+                problems.append(f"{unit.unit_id}: declared parent {declared!r} carries no reason")
             continue
         expected = str(trigger.get("owner") or "").split(":", 1)[0]
         if parent != expected:
@@ -223,3 +230,26 @@ def test_step_function_units_name_their_state_machine():
         elif not row.get("parent_component_reason"):
             problems.append(f"{unit.unit_id}: parent_component carries no reason")
     assert not problems, problems
+
+
+def test_declared_parent_is_refused_on_a_step_functions_unit():
+    """A step-functions parent is derived; a hand-declared one is a second source."""
+    with pytest.raises(ValueError, match="derived from trigger.owner"):
+        gen._parent_component(
+            "DX", {"kind": "step-functions", "owner": "ne-data-collection-eod", "parent_component": "x"}
+        )
+
+
+def test_declared_parent_needs_a_reason():
+    with pytest.raises(ValueError, match="parent_component_reason"):
+        gen._parent_component("DX", {"kind": "on-demand-dispatch", "parent_component": "some-dispatcher"})
+
+
+def test_routable_origins_for_timer_and_manual_units():
+    """alpha-engine-config-I12664: free text routes to the `repos` discoverer and
+    reads ABSENT, so these two kinds carry the forms the ops reconciler routes on."""
+    assert gen._origin("DX", {"kind": "systemd-timer", "owner": "dashboard box",
+                              "detail": "daily-news.timer, 04:00 America/Los_Angeles"}) == "systemd:daily-news.timer"
+    assert gen._origin("DX", {"kind": "manual", "owner": "operator CLI"}) == "manual:operator CLI"
+    with pytest.raises(ValueError, match="systemd unit name"):
+        gen._origin("DX", {"kind": "systemd-timer", "owner": "dashboard box", "detail": "every day at 4"})

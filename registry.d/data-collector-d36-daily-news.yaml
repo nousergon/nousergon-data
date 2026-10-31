@@ -11,7 +11,7 @@
 component_id: data-collector-d36-daily-news
 owning_repo: nousergon-data
 substrate: shared-box
-origin: dashboard box (daily-news.timer, 04:00 America/Los_Angeles)
+origin: systemd:daily-news.timer
 owner: brian
 lifecycle: in-service
 authority_tier: t1
