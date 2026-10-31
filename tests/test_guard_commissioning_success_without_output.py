@@ -108,11 +108,14 @@ def _d26_shape() -> ef.Shape:
     a declared ``not_applicable``, which is not this fault.
     """
     manifest = technical_rating_ledger.RATING_LEDGER_MANIFEST_KEY
+    # alpha-engine-config-I11554: a live write also records the dated live entry.
+    live_entry = f"{technical_rating_ledger.RATING_LEDGER_PREFIX}{ef.TRADING_DAY}.json"
     return ef.Shape(
         result=lambda rows: {
-            "status": "ok", "backfill_written": 0, "live_written": bool(rows), "total_dates": rows,
+            "status": "ok", "backfill_written": 0, "live_written": bool(rows),
+            "live_rated": rows, "total_dates": rows,
         },
-        written=lambda rows: {manifest: rows} if rows else {},
+        written=lambda rows: {manifest: rows, live_entry: rows} if rows else {},
         extra_outputs=ef._d26_shape().extra_outputs,
         auto_skip=False,
     )

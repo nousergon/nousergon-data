@@ -340,6 +340,10 @@ def collect_rating_ledger(
         # backfill's candidate window is strictly before run_date, so this is the only
         # path that ever writes today's date.
         live_written = False
+        # alpha-engine-config-I11554: how many symbols the live entry rates, so the
+        # run manifest can record rating_history/{run_date}.json with its real
+        # row count (0 when no live entry was written this run).
+        live_rated = 0
         live_skipped_reason = None
         already_live = existing_by_date.get(run_date, {}).get("basis") == "live"
         if ref_calendar[-1] != run_date:
@@ -373,6 +377,7 @@ def collect_rating_ledger(
                 "date": run_date, "basis": "live", "rating_version": RATING_VERSION,
             }
             live_written = True
+            live_rated = len(entry["ratings"])
 
         if not dry_run and (backfill_written or live_written):
             manifest_out = {
@@ -386,6 +391,7 @@ def collect_rating_ledger(
 
     result = {
         "status": "ok", "backfill_written": backfill_written, "live_written": live_written,
+        "live_rated": live_rated,
         "live_skipped_reason": live_skipped_reason, "total_dates": len(existing_by_date),
         # alpha-engine-config-I11231: the ledger version this run built on, folded onto
         # the run manifest's `inputs` by `weekly_collector._record_phase_lineage` —
