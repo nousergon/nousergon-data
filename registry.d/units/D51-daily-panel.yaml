@@ -121,7 +121,16 @@ guards:
     note: "columns carry the _raw unit suffix; values are copied from ArcticDB unconverted"
   pit:
     state: present
-    note: "the manifest records generated_at and the session; the panel is keyed by session and never overwritten in place by a later session"
+    code:
+      - "builders/daily_panel.py::compile_panel"
+    evaluates: "problems = dp.validate_panel_frame(panel, trading_day=trading_day)"
+    note: >-
+        the manifest records generated_at and the session; the panel is keyed by session
+        and never overwritten in place by a later session; and a store whose newest row is
+        not the session's own trading_day is refused (validate_panel_frame, raised by
+        builders.daily_panel.compile_panel as PanelCompileError), so a session's key never
+        carries an earlier session's prices. Induced-fault record:
+        tests/test_guard_commissioning_pit_d51.py (P-19, alpha-engine-config-I10786).
   vendor_fallback:
     state: present
     note: "one store (ArcticDB universe) and no fallback path: a failed or empty read raises, it is never substituted"

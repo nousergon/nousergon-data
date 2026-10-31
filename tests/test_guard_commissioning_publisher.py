@@ -223,3 +223,18 @@ def test_vendor_fallback_refuses_a_unit_it_has_no_case_for(tmp_path, clean_tree)
 def test_the_harness_runner_reads_a_real_vendor_fallback_outcome():
     node = gc.HARNESSES["vendor_fallback"].nodeid("D51")
     assert gc._run_harness([node]) == {node: "passed"}
+
+
+def test_pit_routes_d51_to_its_own_harness_in_one_call(tmp_path, monkeypatch, clean_tree):
+    """`UNIT_HARNESSES`: D51's pit record is taken on the panel's window-end refusal,
+    D32's on the shared append-time scan, and one call publishes both honestly."""
+    ran: list[str] = []
+    monkeypatch.setattr(gc, "_run_harness", lambda nodeids: ran.extend(nodeids) or _passed(nodeids))
+    argv = ["--guard", "pit", "--unit", "D32", "--unit", "D51", "--store", str(tmp_path), "--write"]
+    assert gc.main(argv) == 0
+    assert ran == [gc.HARNESSES["pit"].nodeid("D32"), gc.UNIT_HARNESSES["pit"]["D51"].nodeid("D51")]
+    d51 = json.loads((tmp_path / "faults/D51/pit/latest.json").read_text())
+    assert d51["observed"] == list(gc.PIT_PANEL_WINDOW_OBSERVED)
+    assert d51["test"].startswith("tests/test_guard_commissioning_pit_d51.py::")
+    d32 = json.loads((tmp_path / "faults/D32/pit/latest.json").read_text())
+    assert d32["observed"] == list(gc.PIT_OBSERVED)

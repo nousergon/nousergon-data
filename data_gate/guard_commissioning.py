@@ -50,6 +50,9 @@ __all__ = [
     "SUCCESS_WITHOUT_OUTPUT_OBSERVED",
     "UNITS_OBSERVED",
     "VENDOR_FALLBACK_OBSERVED",
+    "PIT_PANEL_WINDOW_OBSERVED",
+    "UNIT_HARNESSES",
+    "harness_for",
     "Harness",
     "main",
     "record_document",
@@ -172,6 +175,24 @@ PIT_FUTURE_BAR_OBSERVED: tuple[str, ...] = (
     "CollectionSucceeded with 0 pages",
 )
 
+#: What D51's ``pit`` walk observes: the daily panel's own window-end check
+#: (``contracts/daily_panel.py::validate_panel_frame``, raised as
+#: ``PanelCompileError`` by ``builders.daily_panel.compile_panel``). A different
+#: check from the append-time freshness scan, on a different workload, so it has
+#: its own harness (:data:`UNIT_HARNESSES`).
+PIT_PANEL_WINDOW_OBSERVED: tuple[str, ...] = (
+    "the panel compile refused a store whose newest row is the prior session: the window "
+    "ends before the panel's trading_day (PanelCompileError); no earlier session was "
+    "published under the later session's key",
+    "manifest status failed naming the window end, on the attempt and on the on-demand retry",
+    "exactly one page (NotifyFailure) on the deployed data-collection ASL, walked on the "
+    "unit's own schedule input; the process exited 1 on both attempts",
+    "stand-down: terminal CollectionFailed; nothing under the session's panel prefix was "
+    "written (no parquet, no manifest)",
+    "recovery: once the session's rows land, the next run publishes a panel ending on its "
+    "trading_day and reaches CollectionSucceeded with 0 pages",
+)
+
 #: guard class -> unit -> its observed lines, where a unit's check is not the
 #: class-wide one its harness's default ``observed`` describes.
 PIT_OBSERVED_BY_UNIT: dict[str, tuple[str, ...]] = {"D03": PIT_FUTURE_BAR_OBSERVED}
@@ -265,6 +286,31 @@ HARNESSES: dict[str, Harness] = {
     ),
 }
 
+#: guard class -> unit -> the harness that unit's record is taken in, where the
+#: unit's check is not the one the class harness walks. D51's ``pit`` check is the
+#: panel's window-end refusal on the panel schedule, not the append-time freshness
+#: scan :data:`HARNESSES` ``["pit"]`` walks, so it gets its own record test rather
+#: than a case bent to fit another check's assertions.
+UNIT_HARNESSES: dict[str, dict[str, Harness]] = {
+    "pit": {
+        "D51": Harness(
+            "tests/test_guard_commissioning_pit_d51.py",
+            "test_the_fault_record_stale_store_fails_pages_once_and_stands_down",
+            mode_under_test="enforce",
+            cases_module="test_guard_commissioning_pit_d51",
+            observed=PIT_PANEL_WINDOW_OBSERVED,
+        ),
+    },
+}
+
+
+def harness_for(guard: str, unit: str) -> Harness:
+    """The harness ``unit``'s ``guard`` record is taken in: its own, else the class's."""
+    per_unit = UNIT_HARNESSES.get(guard, {})
+    if unit in per_unit:
+        return per_unit[unit]
+    return HARNESSES[guard]
+
 
 def record_key(unit: str, guard: str) -> str:
     """The key `read_guard_commissioning` reads, relative to the store root."""
@@ -305,6 +351,8 @@ def _observed_for(guard: str, unit: str | None = None) -> tuple[str, ...]:
     per_unit = _OBSERVED_BY_UNIT.get(guard, {})
     if unit is not None and unit in per_unit:
         return per_unit[unit]
+    if unit is not None:
+        return harness_for(guard, unit).observed
     return harness.observed
 
 
@@ -350,7 +398,7 @@ def _fault_for(unit: str, guard: str) -> str:
         import importlib
 
         sys.path.insert(0, str(REPO_ROOT))
-        harness = importlib.import_module(f"tests.{HARNESSES[guard].cases_module}")
+        harness = importlib.import_module(f"tests.{harness_for(guard, unit).cases_module}")
 
         for case in harness.CASES:
             if case.unit == unit:
@@ -372,7 +420,6 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    harness = HARNESSES[args.guard]
     units = sorted(set(args.unit))
     faults = {u: _fault_for(u, args.guard) for u in units}
 
@@ -382,7 +429,7 @@ def main(argv: list[str] | None = None) -> int:
               file=sys.stderr)
         return 2
 
-    nodeids = [harness.nodeid(u) for u in units]
+    nodeids = [harness_for(args.guard, u).nodeid(u) for u in units]
     outcomes = _run_harness(nodeids)
     for nodeid, state in outcomes.items():
         print(f"{state:>13}  {nodeid}")
@@ -396,8 +443,8 @@ def main(argv: list[str] | None = None) -> int:
     as_of = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     for unit in units:
         document = record_document(
-            unit, args.guard, fault=faults[unit], test=harness.nodeid(unit), code_sha=code_sha,
-            mode_under_test=harness.mode_under_test, as_of=as_of, observed=_observed_for(args.guard, unit),
+            unit, args.guard, fault=faults[unit], test=harness_for(args.guard, unit).nodeid(unit),
+            code_sha=code_sha, mode_under_test=harness_for(args.guard, unit).mode_under_test, as_of=as_of, observed=_observed_for(args.guard, unit),
         )
         key = record_key(unit, args.guard)
         if args.write:
