@@ -51,6 +51,17 @@ contract:
       read_site: "crucible/data/sources.py::ArcticPriceSource.load_panel"
 registry_rows: []
 run_manifest_prefix: data_collection/runs/D35
+# alpha-engine-config-I12931: the guard-promotion criterion reads cycles from the
+# eod, morning and weekly collection machines, none of which runs this unit, so
+# this declares where its cycles come from instead (exit_criteria.collect_own_cycles).
+promotion_cycle:
+  source: per_invocation
+  trigger: on_demand
+  reason: >-
+    D35 is an on-demand backfill the alpha-engine-data-spot-dispatcher Lambda launches;
+    no eod, morning or weekly machine verifies it and it has no schedule to be due on,
+    so its guard evidence is its most recent invocation
+    (scripts/backfill_benchmark_proxies.py records trigger on_demand).
 detectors: []
 freshness:
   na_code: "N/A-NOT-RUN"

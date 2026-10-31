@@ -2123,10 +2123,14 @@ def generate(store: ev.GateStore, units: list[Unit], phases, *, trading_day: dt.
     clauses.append(_clause_phase2_executor_collection_writes_zero(store))
     clauses.append(_clause_phase3_sustained_window(store, weekly, trading_day=trading_day))
     clauses.append(_clause_phase3_daily_panel_adopted(store, trading_day=trading_day))
+    # alpha-engine-config-I12931: units none of those three machines verifies
+    # are graded on the cycle source their own descriptor declares.
+    promotion_sets = [eod, morning, weekly]
+    promotion_sets += xc.own_cycle_sets(store, units, promotion_sets, trading_day=trading_day)
     for promotion in gp.GUARD_PROMOTIONS:
         clauses.append(
             _clause_guard_promotion(
-                store, units, [eod, morning, weekly], promotion, trading_day=trading_day
+                store, units, promotion_sets, promotion, trading_day=trading_day
             )
         )
     return clauses

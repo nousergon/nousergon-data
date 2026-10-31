@@ -28,6 +28,8 @@ __all__ = [
     "GUARD_CLASSES",
     "GUARD_RECORDED_NAMES",
     "NA_TAXONOMY",
+    "OWN_CYCLE_SOURCES",
+    "OWN_CYCLE_TRIGGERS",
     "OWN_REPO",
     "PIN_KINDS",
     "UNITS_DIR",
@@ -150,6 +152,18 @@ NA_TAXONOMY: frozenset[str] = frozenset(
 #: days (`alpha-engine-config-I10831` deliverable 3; precedent: D37's
 #: `run_manifest_retention: 400 days`). A free-text value is exactly the kind
 #: of undeclared knob the field exists to end.
+#: alpha-engine-config-I12931: what a unit no promotion state machine (eod,
+#: morning, weekly) verifies may declare in ``promotion_cycle.source``, so the
+#: guard-promotion criterion can grade it at all. ``own_schedule`` grades the
+#: latest due fire of the unit's own ``trigger.schedule`` (a Scheduler-fired
+#: Lambda, a GHA cron); ``per_invocation`` grades its most recent invocation (an
+#: on-demand tool). Read by `exit_criteria.collect_own_cycles`.
+OWN_CYCLE_SOURCES: tuple[str, ...] = ("own_schedule", "per_invocation")
+
+#: The manifest ``trigger`` values such a cycle counts (``promotion_cycle.trigger``).
+#: Never ``manual``: a hand run is not a cycle.
+OWN_CYCLE_TRIGGERS = frozenset({"scheduled", "gha", "on_demand"})
+
 _RETENTION_PATTERN = re.compile(r"^\d+\s+days$")
 
 #: A unit firing more than once an hour takes one manifest per tick, not one
@@ -719,6 +733,37 @@ def _validate(unit_id: str, document: dict[str, Any], path: pathlib.Path) -> Non
             )
 
     _check_retention(unit_id, document, path)
+    _check_promotion_cycle(document, path)
+
+
+def _check_promotion_cycle(document: dict[str, Any], path: pathlib.Path) -> None:
+    """``promotion_cycle`` is all-or-nothing: a source, a trigger and a reason.
+
+    A half-declared block would be graded on a guess, so it fails the load.
+    Which units may declare one (only those no promotion state machine
+    verifies) and whether the source matches the unit's trigger are pinned in
+    `tests/test_promotion_cycle_source_i12931.py`, which can read the stack.
+    """
+    block = document.get("promotion_cycle")
+    if block is None:
+        return
+    if not isinstance(block, dict):
+        raise DescriptorError(f"{path.name}: promotion_cycle is not a mapping")
+    if block.get("source") not in OWN_CYCLE_SOURCES:
+        raise DescriptorError(
+            f"{path.name}: promotion_cycle.source is {block.get('source')!r}, not one of "
+            f"{list(OWN_CYCLE_SOURCES)}"
+        )
+    if block.get("trigger") not in OWN_CYCLE_TRIGGERS:
+        raise DescriptorError(
+            f"{path.name}: promotion_cycle.trigger is {block.get('trigger')!r}, not one of "
+            f"{sorted(OWN_CYCLE_TRIGGERS)}. A manual run is never a cycle."
+        )
+    if not str(block.get("reason") or "").strip():
+        raise DescriptorError(
+            f"{path.name}: promotion_cycle has no `reason`. A cycle source is a declaration "
+            "the promotion criterion grades on, and an unexplained one is a claim."
+        )
 
 
 def load_units(directory: pathlib.Path | None = None) -> list[Unit]:

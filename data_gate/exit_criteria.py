@@ -36,8 +36,15 @@ from nousergon_lib.trading_calendar import (  # pyright: ignore[reportAttributeA
     subtract_trading_days,
 )
 
-from data_gate.cadence import COMPLETION_GRACE, Cadence, fire_selection_moment, latest_due_fire, parse_cron
-from data_gate.descriptors import GUARD_RECORDED_NAMES, Unit
+from data_gate.cadence import (
+    COMPLETION_GRACE,
+    Cadence,
+    fire_selection_moment,
+    latest_due_fire,
+    parse_cron,
+    unit_cadence,
+)
+from data_gate.descriptors import GUARD_RECORDED_NAMES, OWN_CYCLE_SOURCES, OWN_CYCLE_TRIGGERS, Unit
 from data_gate.evidence import (
     EMPTY_FRESH_VERDICT,
     CurrentEvidence,
@@ -46,6 +53,9 @@ from data_gate.evidence import (
     Reading,
     combine_current,
     current_evidence,
+    _day_folder,
+    _read_keys,
+    _store_relative,
     empty_fresh_runs,
     manifests_since,
 )
@@ -55,6 +65,8 @@ __all__ = [
     "CYCLE_COUNTS",
     "CycleSet",
     "EXECUTOR_WRITES_KEY",
+    "OWN_CYCLE_SOURCES",
+    "OWN_CYCLE_TRIGGERS",
     "PHASE1_COST_BASELINE_KEY",
     "PHASE1_COST_BASELINE_WEEKS",
     "PHASE1_EXIT_CONSECUTIVE",
@@ -63,6 +75,7 @@ __all__ = [
     "PHASE2_VENDOR_CYCLES",
     "PHASE3_SATURDAYS",
     "PHASE3_TRADING_DAYS",
+    "PROMOTION_SCHEDULES",
     "RELIABILITY_STREAK_TARGET",
     "SCHEDULE_EOD",
     "SCHEDULE_MORNING",
@@ -71,6 +84,8 @@ __all__ = [
     "VENDOR_DIVERGENCE_DAILY_DAYS",
     "VENDOR_DIVERGENCE_METRIC_KEY",
     "collect_cycles",
+    "collect_own_cycles",
+    "own_cycle_sets",
     "read_code_identity_delta",
     "read_consecutive_cycles",
     "read_cost_baseline_measured",
@@ -304,6 +319,10 @@ class CycleSet:
     problems: list[str] = field(default_factory=list)
     unreadable: str | None = None
     where: str = ""
+    #: The manifest ``trigger`` values a run of this source records. A state
+    #: machine's runs are ``scheduled``; a unit graded on its own declared cycle
+    #: source (:func:`collect_own_cycles`) names its own, e.g. ``gha``.
+    triggers: frozenset[str] = frozenset({"scheduled"})
 
     @property
     def unmeasurable(self) -> bool:
@@ -453,6 +472,154 @@ def _require_own_fire(cycle: Cycle) -> None:
             for key, d in docs
             if (started := _parse_utc(d.get("started"))) is not None and started <= deadline
         ]
+
+
+#: The three collection state machines the guard-promotion criterion reads
+#: cycles of (`clauses.generate`). A unit none of them verifies declares its own
+#: cycle source instead (`collect_own_cycles`).
+PROMOTION_SCHEDULES: tuple[str, ...] = (SCHEDULE_EOD, SCHEDULE_MORNING, SCHEDULE_WEEKLY)
+
+
+def collect_own_cycles(
+    store: GateStore,
+    unit: Unit,
+    *,
+    trading_day: dt.date,
+    now: dt.datetime | None = None,
+) -> CycleSet:
+    """The latest cycle of ``unit``'s own declared cycle source (alpha-engine-config-I12931).
+
+    For a unit no promotion schedule verifies — D38's Scheduler-fired Lambda,
+    D39's GHA cron, D35's on-demand backfill — the promotion criterion used to
+    read "no declared schedule verifies it" however healthy the unit was. The
+    descriptor's ``promotion_cycle`` block declares where its cycles come from
+    instead, and this builds a one-cycle set from it, counting only manifests
+    whose ``trigger`` is the declared one.
+
+    Never looser than a state machine's cycle: a fire with no manifest, or a
+    unit with no invocation, is a set with an empty manifest list or no cycle at
+    all, which `guard_promotion.read_promotion` reads as missing; a listing or
+    read failure is UNMEASURABLE; a declaration this reader cannot honour (an
+    unknown source, or ``own_schedule`` on a unit with no fixed schedule) is
+    UNMEASURABLE, never skipped.
+    """
+    block = unit.raw.get("promotion_cycle") or {}
+    source = str(block.get("source") or "")
+    trigger = str(block.get("trigger") or "")
+    result = CycleSet(
+        schedule=f"{unit.unit_id}:{source or '?'}",
+        units=[unit],
+        triggers=frozenset({trigger}),
+    )
+    if source not in OWN_CYCLE_SOURCES or trigger not in OWN_CYCLE_TRIGGERS:
+        result.unreadable = (
+            f"{unit.unit_id} declares promotion_cycle source {source!r} / trigger {trigger!r}; "
+            f"the reader grades sources {list(OWN_CYCLE_SOURCES)} with triggers "
+            f"{sorted(OWN_CYCLE_TRIGGERS)}"
+        )
+        return result
+    as_of = fire_selection_moment(trading_day, now)
+    base = f"{_store_relative(unit.run_manifest_prefix)}/"
+    if source == "own_schedule":
+        try:
+            cadence = unit_cadence(unit.raw)
+        except Exception as exc:  # noqa: BLE001 - an unparseable schedule is UNMEASURABLE, never skipped
+            result.unreadable = f"{unit.unit_id} trigger.schedule does not parse: {type(exc).__name__}: {exc}"
+            return result
+        result.schedule = f"{unit.unit_id} own schedule ({cadence.source})"
+        if cadence.kind != "scheduled":
+            result.unreadable = (
+                f"{unit.unit_id} declares promotion_cycle source own_schedule but its trigger "
+                f"declares no fixed schedule ({cadence.kind}: {cadence.source})"
+            )
+            return result
+        fires = due_fires(cadence, as_of=as_of, count=1)
+        if not fires:
+            return result
+        fire = fires[0]
+        cycle = Cycle(fire=fire)
+        cycle.manifests[unit.unit_id] = []
+        result.cycles = [cycle]
+        try:
+            docs, problems, where = manifests_since(
+                store, unit, since=fire, as_of=fire + COMPLETION_GRACE
+            )
+        except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+            result.unreadable = (
+                f"could not list {unit.run_manifest_prefix} for the fire at {cycle.label}: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return result
+        result.problems.extend(problems)
+        result.where = where
+        for key, doc in docs:
+            if _parse_utc(doc.get("started")) is None:
+                result.problems.append(f"{key}: `started` does not parse ({doc.get('started')!r})")
+                continue
+            cycle.manifests[unit.unit_id].append((key, doc))
+        return result
+    # per_invocation: the most recent invocation, whenever it was — the same
+    # selection `evidence._cycle` makes for an on-demand unit's run record.
+    result.schedule = f"{unit.unit_id} per invocation"
+    try:
+        keys = [k for k in store.list_keys(base) if k.endswith(".json")]
+        days = sorted({d for k in keys if (d := _day_folder(k)) is not None and d <= trading_day})
+        if not days:
+            result.where = base
+            return result
+        latest = f"{base}{days[-1].isoformat()}/"
+        docs, problems = _read_keys(store, sorted(k for k in keys if k.startswith(latest)))
+    except Exception as exc:  # noqa: BLE001 - classified as UNMEASURABLE, which is red
+        result.unreadable = f"could not list {unit.run_manifest_prefix}: {type(exc).__name__}: {exc}"
+        return result
+    result.problems.extend(problems)
+    result.where = latest
+    stamped = [(started, key, doc) for key, doc in docs if (started := _parse_utc(doc.get("started"))) is not None]
+    result.problems.extend(
+        f"{key}: `started` does not parse ({doc.get('started')!r})"
+        for key, doc in docs
+        if _parse_utc(doc.get("started")) is None
+    )
+    if not stamped:
+        return result
+    started, key, doc = max(stamped, key=lambda row: (row[0], row[1]))
+    cycle = Cycle(fire=started)
+    cycle.manifests[unit.unit_id] = [(key, doc)]
+    result.cycles = [cycle]
+    return result
+
+
+def own_cycle_sets(
+    store: GateStore,
+    units: list[Unit],
+    cycle_sets: list[CycleSet],
+    *,
+    trading_day: dt.date,
+    now: dt.datetime | None = None,
+) -> list[CycleSet]:
+    """One :func:`collect_own_cycles` set per unit that declares ``promotion_cycle``.
+
+    A unit one of ``cycle_sets`` already verifies is skipped: its state
+    machine's cycles stay its only evidence, so declaring a cycle source can
+    never replace or soften an in-machine unit's grading.
+    """
+    covered = {uid for cs in cycle_sets for uid in cs.unit_ids}
+    sets: list[CycleSet] = []
+    for unit in units:
+        if unit.retired or not unit.raw.get("promotion_cycle") or unit.unit_id in covered:
+            continue
+        try:
+            sets.append(collect_own_cycles(store, unit, trading_day=trading_day, now=now))
+        except Exception as exc:  # noqa: BLE001 - built outside any contained clause: one unit's
+            # failure is that unit's UNMEASURABLE set, never a darkened board.
+            sets.append(
+                CycleSet(
+                    schedule=f"{unit.unit_id}:promotion_cycle",
+                    units=[unit],
+                    unreadable=f"{type(exc).__name__}: {exc}",
+                )
+            )
+    return sets
 
 
 def _cycle_verdict(cycles: CycleSet) -> list[tuple[Cycle, set[str], list[str]]]:

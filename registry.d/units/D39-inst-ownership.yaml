@@ -64,6 +64,17 @@ contract:
 registry_rows:
   - thinktank_inst_ownership
 run_manifest_prefix: data_collection/runs/D39
+# alpha-engine-config-I12931: the guard-promotion criterion reads cycles from the
+# eod, morning and weekly collection machines, none of which runs this unit, so
+# this declares where its cycles come from instead (exit_criteria.collect_own_cycles).
+promotion_cycle:
+  source: own_schedule
+  trigger: gha
+  reason: >-
+    D39 runs from .github/workflows/inst-ownership-weekly.yml on the cron in
+    trigger.schedule; no eod, morning or weekly machine verifies it, so its guard
+    evidence is the latest due fire of that cron (data/derived/inst_ownership.py records
+    trigger gha).
 detectors:
   - kind: "freshness-monitor"
     via: "artifact-registry-row"

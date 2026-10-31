@@ -25,6 +25,15 @@ is coverage, not elapsed time:
   (``records_as``), across every schedule — no sampling.
 * **moderate** risk (one unit's own output): the declared units only.
 
+**Where a unit's cycles come from.** The eod, morning and weekly collection
+state machines, for every unit they verify. A unit none of them verifies — a
+Scheduler-fired Lambda, a GHA cron, an on-demand tool — declares its own source
+in its descriptor's ``promotion_cycle`` block (`exit_criteria.collect_own_cycles`,
+alpha-engine-config-I12931): ``own_schedule`` grades the latest due fire of its
+``trigger.schedule``, ``per_invocation`` its most recent invocation, each
+counting only manifests with the declared ``trigger``. A unit that declares
+neither still reads missing, as before.
+
 No count above the ruling's own floor of one is set here. Raising one for a
 specific guard is a threshold decision, reserved to Brian with every other
 threshold — it is an edit to that guard's entry below, with the ruling cited.
@@ -241,7 +250,10 @@ def read_promotion(
     for unit_id in needed:
         sets = [cs for cs in cycle_sets if unit_id in cs.unit_ids]
         if not sets:
-            missing.append(f"{unit_id}: no declared schedule verifies it, so no scheduled run exists")
+            missing.append(
+                f"{unit_id}: no declared schedule verifies it and its descriptor declares no "
+                "promotion_cycle, so no scheduled run exists"
+            )
             continue
         for cs in sets:
             if cs.unmeasurable:
@@ -259,13 +271,14 @@ def read_promotion(
             verdicts = [
                 str(g.get("verdict"))
                 for _key, doc in latest.manifests.get(unit_id, [])
-                if doc.get("trigger") == "scheduled"
+                if doc.get("trigger") in cs.triggers
                 for g in (doc.get("guards") or [])
                 if str(g.get("guard") or g.get("name") or "") == promotion.name
             ]
             where = f"{unit_id}@{cs.schedule} latest due cycle {latest.label}"
             if not verdicts:
-                missing.append(f"{where}: no scheduled {promotion.name} verdict recorded")
+                trigger = "/".join(sorted(cs.triggers))
+                missing.append(f"{where}: no {trigger} {promotion.name} verdict recorded")
             elif not set(verdicts) <= promotion.clean_verdicts:
                 missing.append(f"{where}: verdict(s) {sorted(set(verdicts))} not clean")
             else:

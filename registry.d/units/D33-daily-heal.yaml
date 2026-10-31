@@ -70,6 +70,17 @@ contract:
 registry_rows:
   - daily_heal_summary
 run_manifest_prefix: data_collection/runs/D33
+# alpha-engine-config-I12931: the guard-promotion criterion reads cycles from the
+# eod, morning and weekly collection machines, none of which runs this unit, so
+# this declares where its cycles come from instead (exit_criteria.collect_own_cycles).
+promotion_cycle:
+  source: own_schedule
+  trigger: scheduled
+  reason: >-
+    D33 runs in the standalone stack's daily-heal machine, which the promotion criterion
+    does not read (it reads eod, morning and weekly); its guard evidence is the latest
+    due fire of trigger.schedule, the same 05:00 ET weekday fire as that machine's
+    Scheduler entry.
 # The one detector this row carried, alarm `alpha-engine-daily-heal-days-healed`
 # (state BROKEN: an alarm on a data-quality event, not a failure), was DELETED
 # 2026-10-09 under alpha-engine-config-I11792 Tier 2. Heal FAILURE is announced by
