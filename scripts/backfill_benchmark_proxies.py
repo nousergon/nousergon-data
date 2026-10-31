@@ -144,6 +144,20 @@ def verify(symbols: list[str], bucket: str = DEFAULT_BUCKET) -> dict:
     present = set(universe_lib.list_symbols())
     missing = sorted(s for s in symbols if s not in present)
     spans = {}
+    # Row count per loaded symbol, for the empty-but-fresh grade
+    # (`_grade_published`). Metadata only, the same `get_description_batch`
+    # read `collectors/arctic_probe.py` uses. A failed read leaves the counts
+    # out, which the grade files as `unmeasurable` — never as a pass.
+    loaded = [s for s in symbols if s not in missing]
+    rows: dict[str, int] = {}
+    if loaded:
+        try:
+            for sym, desc in zip(loaded, universe_lib.get_description_batch(loaded)):
+                rows[sym] = int(desc.row_count)
+        except Exception as exc:  # noqa: BLE001 - recorded as `unmeasurable` by the grade
+            log.error("readback: universe.get_description_batch(%s) failed: %s: %s",
+                      loaded, type(exc).__name__, exc)
+            rows = {}
     for sym in symbols:
         if sym in missing:
             continue
@@ -153,7 +167,101 @@ def verify(symbols: list[str], bucket: str = DEFAULT_BUCKET) -> dict:
             "first_date": str(head.index.min().date()) if len(head) else None,
             "last_date": str(df.index.max().date()) if len(df) else None,
         }
-    return {"present": sorted(set(symbols) - set(missing)), "missing": missing, "spans": spans}
+    return {
+        "present": sorted(set(symbols) - set(missing)),
+        "missing": missing,
+        "spans": spans,
+        "rows": rows,
+    }
+
+
+def _proxy_reading(symbol: str, result: dict, readback: dict, floor: int | None):
+    """The empty-but-fresh verdict for ONE declared proxy this run loaded."""
+    from validators import expectations
+
+    key = f"arcticdb/universe/{symbol}"
+    baseline = None if floor is None else float(floor)
+    if symbol in readback.get("missing", []):
+        return expectations.GuardReading(
+            "empty_fresh", f"D35: {symbol} is absent from `universe` after the run",
+            key=key, value=0.0, baseline=baseline,
+        )
+    written = (result.get("universe") or {}).get("tickers_written")
+    if written is not None and int(written) <= 0:
+        return expectations.GuardReading(
+            "empty_fresh",
+            f"D35: the load of {symbol} wrote 0 tickers, so the `universe` series is "
+            "whatever an earlier run left — a run that claims the proxy and refreshed nothing",
+            key=key, value=0.0, baseline=baseline,
+        )
+    rows = (readback.get("rows") or {}).get(symbol)
+    if rows is None:
+        return expectations.GuardReading(
+            "unmeasurable", f"D35: the readback could not count {symbol}'s rows in `universe`",
+            key=key, value=None, baseline=baseline,
+        )
+    if rows <= 0:
+        return expectations.GuardReading(
+            "empty_fresh", f"D35: {symbol} is in `universe` with ZERO rows",
+            key=key, value=0.0, baseline=baseline,
+        )
+    if floor is not None and rows < floor:
+        return expectations.GuardReading(
+            "below_floor",
+            f"D35: {symbol} holds {rows} row(s) in `universe`, under the declared "
+            f"completeness.rows_out_floor {floor}",
+            key=key, value=float(rows), baseline=baseline,
+        )
+    return expectations.GuardReading(
+        "ok", f"D35: {symbol} holds {rows} row(s) in `universe`",
+        key=key, value=float(rows), baseline=baseline,
+    )
+
+
+def _grade_published(ctx: run_manifest.UnitRun, symbols: list[str], results: list[dict],
+                     readback: dict) -> str | None:
+    """Grade every proxy this run published: present, non-empty, above its floor.
+
+    `alpha-engine-config-I10785` (P-18): every published key passes a non-empty
+    + floor check. D35 writes ArcticDB, so the S3 HEAD in
+    ``validators/expectations.py::check_empty_fresh`` cannot apply; this grades
+    each symbol on the readback's measured row count instead, as
+    ``weekly_collector.py::_check_arctic_library_output`` does for the phase
+    units. Each verdict is logged and filed on the manifest as guard
+    ``data_empty_fresh``; the WORST becomes the run's one
+    ``data.D35.guard.empty_fresh`` MetricRecord.
+
+    OBSERVE mode follows ``expectations.EMPTY_FRESH_GUARD``: the verdicts are on
+    the record and the exit code does not move. Once that guard is promoted, a
+    non-clean worst verdict is returned so the caller fails the run.
+    """
+    from validators import expectations
+
+    floor = run_units.rows_out_floor_for(UNIT_ID)
+    by_symbol = {r.get("symbol"): r for r in results}
+    readings = [
+        _proxy_reading(sym, by_symbol.get(sym) or {}, readback, floor) for sym in symbols
+    ]
+    for reading in readings:
+        expectations.report(reading, unit_id=UNIT_ID)
+        ctx.record_guard(
+            expectations.EMPTY_FRESH_GUARD.name,
+            mode=expectations.EMPTY_FRESH_GUARD.mode.value,
+            verdict=reading.verdict,
+            detail=reading.detail,
+            key=reading.key,
+            value=reading.value,
+            baseline=reading.baseline,
+        )
+    if not readings:
+        return None
+    worst = max(readings, key=lambda r: run_units.EMPTY_FRESH_SEVERITY.get(r.verdict, 2))
+    ctx.record_metric(expectations.verdict_metric(
+        UNIT_ID, worst, source_path="scripts/backfill_benchmark_proxies.py::_grade_published",
+    ))
+    if expectations.EMPTY_FRESH_GUARD.enforcing and not worst.clean:
+        return f"empty_fresh guard: {worst.detail}"
+    return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -244,6 +352,9 @@ def _execute(args: argparse.Namespace, ctx: run_manifest.UnitRun) -> int:
                 f"readback: declared proxies still absent from `universe`: "
                 f"{summary['verify']['missing']}"
             )
+        refused = _grade_published(ctx, symbols, results, summary["verify"])
+        if refused:
+            failures.append(refused)
 
     print(json.dumps(summary, indent=2, default=str))
 

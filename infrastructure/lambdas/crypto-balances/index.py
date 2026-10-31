@@ -98,10 +98,46 @@ def _record_run(ctx, result: dict) -> None:
             value=0.0,
         )
         return
-    ctx.record_output(
-        crypto_balances.HOLDINGS_KEY,
-        rows_out=int(result.get("n_balances") or 0),
+    raw_rows = result.get("n_balances")
+    rows = None if raw_rows is None else int(raw_rows)
+    ctx.record_output(crypto_balances.HOLDINGS_KEY, rows_out=rows or 0)
+    # alpha-engine-config-I10785 (P-18): the PUBLISH path is graded too, not just
+    # the skip path above, so every D38 run files one `data_empty_fresh` verdict
+    # and the guard's promotion reading can see it ran. Graded on the count
+    # collect() measured from the rows it wrote, the way
+    # weekly_collector.py::_check_arctic_library_output grades a measured count:
+    # this Lambda vendors run_units.py flat without `validators/`, and HEADing
+    # the key would need a read grant it does not hold. collect() refuses an
+    # empty `balances` list before writing, so `empty_fresh` here means that
+    # refusal regressed. An unreported count is `unmeasurable`, never a pass.
+    if rows is None:
+        verdict, detail = (
+            "unmeasurable",
+            "D38 reported status='ok' with no n_balances, so the rows behind "
+            f"s3://{BUCKET}/{crypto_balances.HOLDINGS_KEY} cannot be counted.",
+        )
+    elif rows <= 0:
+        verdict, detail = (
+            "empty_fresh",
+            f"D38 published s3://{BUCKET}/{crypto_balances.HOLDINGS_KEY} with ZERO "
+            "balance rows: a fresh, empty write.",
+        )
+    else:
+        verdict, detail = (
+            "ok",
+            f"D38 published {rows} balance row(s) to "
+            f"s3://{BUCKET}/{crypto_balances.HOLDINGS_KEY}.",
+        )
+    ctx.record_guard(
+        "data_empty_fresh",
+        mode="observe",
+        verdict=verdict,
+        detail=detail,
+        key=crypto_balances.HOLDINGS_KEY,
+        value=None if rows is None else float(rows),
     )
+    if verdict != "ok":
+        logger.error("guard=data_empty_fresh unit=D38 verdict=%s mode=observe %s", verdict, detail)
 
 
 def handler(event, context):  # noqa: ARG001 - Lambda signature; event/context unused

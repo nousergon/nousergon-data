@@ -86,3 +86,45 @@ def test_kill_switch_short_circuits(monkeypatch):
     monkeypatch.setattr(index.crypto_balances, "collect", _boom)
     out = index.handler({}, None)
     assert out["statusCode"] == 200 and out["body"]["status"] == "disabled"
+
+
+# ── alpha-engine-config-I10785: the publish path files an empty_fresh verdict ──
+
+
+def _empty_fresh_verdicts(written) -> list[str]:
+    import json
+
+    assert len(written) == 1, "exactly one run manifest per invocation"
+    manifest = json.loads(written[0][1])
+    return [g["verdict"] for g in manifest.get("guards") or [] if g.get("guard") == "data_empty_fresh"]
+
+
+def test_ok_run_files_an_ok_empty_fresh_verdict(monkeypatch, fake_manifest_sink):
+    index = _load(monkeypatch, CRYPTO_BALANCES_ENABLED="true")
+    monkeypatch.setattr(index.crypto_balances, "collect", lambda **kw: {"status": "ok", "n_balances": 2})
+    index.handler({}, None)
+    assert _empty_fresh_verdicts(fake_manifest_sink) == ["ok"]
+
+
+def test_ok_run_with_zero_rows_is_empty_fresh(monkeypatch, fake_manifest_sink):
+    index = _load(monkeypatch, CRYPTO_BALANCES_ENABLED="true")
+    monkeypatch.setattr(index.crypto_balances, "collect", lambda **kw: {"status": "ok", "n_balances": 0})
+    out = index.handler({}, None)
+    # Observe mode: the verdict is on the record, the handler's contract is unchanged.
+    assert out["statusCode"] == 200
+    assert "empty_fresh" in _empty_fresh_verdicts(fake_manifest_sink)
+
+
+def test_ok_run_with_no_count_is_unmeasurable_never_ok(monkeypatch, fake_manifest_sink):
+    index = _load(monkeypatch, CRYPTO_BALANCES_ENABLED="true")
+    monkeypatch.setattr(index.crypto_balances, "collect", lambda **kw: {"status": "ok"})
+    index.handler({}, None)
+    verdicts = _empty_fresh_verdicts(fake_manifest_sink)
+    assert "unmeasurable" in verdicts and "ok" not in verdicts
+
+
+def test_skipped_run_still_files_empty_fresh(monkeypatch, fake_manifest_sink):
+    index = _load(monkeypatch, CRYPTO_BALANCES_ENABLED="true")
+    monkeypatch.setattr(index.crypto_balances, "collect", lambda **kw: {"status": "skipped", "reason": "no addresses"})
+    index.handler({}, None)
+    assert "empty_fresh" in _empty_fresh_verdicts(fake_manifest_sink)

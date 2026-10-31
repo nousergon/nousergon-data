@@ -86,16 +86,20 @@ completeness:
       (`address_fetch_failed` rejects) against the published wallet list
 guards:
   empty_fresh:
-    state: partial
+    state: present
     code:
       - "infrastructure/lambdas/crypto-balances/index.py::_record_run"
     records_as: data_empty_fresh
     note: >-
-        SKIP path only: infrastructure/lambdas/crypto-balances/index.py::_record_run files
-        guard `data_empty_fresh` `empty_fresh` when collect() returns status=skipped and the
-        holdings key is not refreshed. On the ok path the key is recorded with
-        rows_out=n_balances but a zero-balance write is not graded — the remaining half. Not in
-        service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
+        Both paths are graded. SKIP path: infrastructure/lambdas/crypto-balances/index.py::_record_run
+        files guard `data_empty_fresh` `empty_fresh` when collect() returns status=skipped and the
+        holdings key is not refreshed. PUBLISH path (alpha-engine-config-I10785): the same function
+        grades the write on collect()'s measured `n_balances` — zero rows is `empty_fresh`, an
+        unreported count is `unmeasurable`, otherwise `ok` — so every run files one verdict. Graded
+        on the measured count, not a HEAD, because the Lambda vendors run_units.py without
+        `validators/` and holds no read grant on the key; collect() already refuses to write an
+        empty balances list. Observe mode, matching validators/expectations.py::EMPTY_FRESH_GUARD.
+        Not in service until commissioned by an induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: absent
     note: >-

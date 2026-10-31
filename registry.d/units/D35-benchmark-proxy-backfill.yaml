@@ -66,11 +66,21 @@ completeness:
   note: "on-demand"
 guards:
   empty_fresh:
-    state: absent
+    state: present
+    code:
+      - "scripts/backfill_benchmark_proxies.py::_grade_published"
+    records_as: data_empty_fresh
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        Every declared proxy a non-dry run loads is graded after the readback by
+        scripts/backfill_benchmark_proxies.py::_grade_published (alpha-engine-config-I10785):
+        absent from `universe`, a load that wrote 0 tickers, or zero rows is `empty_fresh`;
+        under a declared completeness.rows_out_floor, `below_floor`; a row count the
+        `get_description_batch` readback could not read, `unmeasurable`. Graded on the measured
+        ArcticDB row count rather than an S3 HEAD, as weekly_collector.py::_check_arctic_library_output
+        does. Filed as guard `data_empty_fresh` plus the data.D35.guard.empty_fresh MetricRecord
+        (worst symbol wins). Observe/enforce staging is declared once, in
+        validators/expectations.py::EMPTY_FRESH_GUARD. Not in service until commissioned by an
+        induced fault (P-19, alpha-engine-config-I10786).
   cardinality:
     state: not_applicable
     na_code: "N/A-NOT-RUN"

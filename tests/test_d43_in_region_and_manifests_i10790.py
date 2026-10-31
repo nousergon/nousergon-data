@@ -427,3 +427,91 @@ def test_d35_failure_writes_failed_and_reraises(in_region, d35, monkeypatch):
     manifest = in_region.only
     assert manifest["status"] == "failed"
     assert "upstream fetch failed for IWM" in manifest["reason"]
+
+
+# ── D35 empty-but-fresh grade (alpha-engine-config-I10785) ─────────────────
+
+
+def _d35_guard_verdicts(manifest: dict) -> dict[str, str]:
+    return {
+        g["key"]: g["verdict"]
+        for g in manifest.get("guards") or []
+        if g.get("guard") == "data_empty_fresh"
+    }
+
+
+def _d35_run(d35, monkeypatch, *, written: int, rows: dict, missing=()):
+    monkeypatch.setattr(
+        d35, "load_proxy",
+        lambda symbol, **kw: {  # noqa: ARG005
+            "symbol": symbol, "universe": {"status": "ok", "tickers_written": written},
+        },
+    )
+    monkeypatch.setattr(
+        d35, "verify",
+        lambda symbols, **kw: {  # noqa: ARG005
+            "present": [s for s in symbols if s not in missing],
+            "missing": list(missing), "spans": {}, "rows": rows,
+        },
+    )
+    return d35.main()
+
+
+def test_d35_grades_a_loaded_proxy_ok_on_its_row_count(in_region, d35, monkeypatch):
+    assert _d35_run(d35, monkeypatch, written=1, rows={"IWM": 2514}) == 0
+    manifest = in_region.only
+    assert manifest["status"] == "ok"
+    assert _d35_guard_verdicts(manifest) == {"arcticdb/universe/IWM": "ok"}
+    metric = [m for m in manifest.get("metrics") or [] if m.get("name") == "data.D35.guard.empty_fresh"]
+    assert len(metric) == 1 and metric[0]["status"] == "GREEN"
+
+
+@pytest.mark.parametrize(
+    "written,rows,missing",
+    [
+        pytest.param(1, {"IWM": 0}, (), id="zero-rows"),
+        pytest.param(0, {"IWM": 2514}, (), id="load-wrote-nothing-over-an-old-series"),
+    ],
+)
+def test_d35_empty_but_fresh_is_recorded_not_ok(in_region, d35, monkeypatch, written, rows, missing):
+    # Observe mode: the verdict is on the manifest and the exit code does not move.
+    assert _d35_run(d35, monkeypatch, written=written, rows=rows, missing=missing) == 0
+    manifest = in_region.only
+    assert _d35_guard_verdicts(manifest) == {"arcticdb/universe/IWM": "empty_fresh"}
+    metric = [m for m in manifest.get("metrics") or [] if m.get("name") == "data.D35.guard.empty_fresh"]
+    assert len(metric) == 1 and metric[0]["status"] == "RED"
+
+
+def test_d35_uncountable_readback_is_unmeasurable_never_ok(in_region, d35, monkeypatch):
+    assert _d35_run(d35, monkeypatch, written=1, rows={}) == 0
+    assert _d35_guard_verdicts(in_region.only) == {"arcticdb/universe/IWM": "unmeasurable"}
+
+
+def test_d35_absent_after_the_run_is_empty_fresh_and_fails(in_region, d35, monkeypatch):
+    assert _d35_run(d35, monkeypatch, written=1, rows={}, missing=("IWM",)) == 1
+    manifest = in_region.only
+    assert manifest["status"] == "failed"
+    assert _d35_guard_verdicts(manifest) == {"arcticdb/universe/IWM": "empty_fresh"}
+
+
+def test_d35_below_a_declared_floor(in_region, d35, monkeypatch):
+    import run_units
+
+    monkeypatch.setattr(run_units, "rows_out_floor_for", lambda unit_id: 1000)  # noqa: ARG005
+    assert _d35_run(d35, monkeypatch, written=1, rows={"IWM": 10}) == 0
+    assert _d35_guard_verdicts(in_region.only) == {"arcticdb/universe/IWM": "below_floor"}
+
+
+def test_d35_enforcing_guard_fails_the_run(in_region, d35, monkeypatch):
+    import dataclasses
+
+    from validators import expectations
+
+    monkeypatch.setattr(
+        expectations, "EMPTY_FRESH_GUARD",
+        dataclasses.replace(expectations.EMPTY_FRESH_GUARD, mode=expectations.GuardMode.ENFORCE),
+    )
+    assert _d35_run(d35, monkeypatch, written=1, rows={"IWM": 0}) == 1
+    manifest = in_region.only
+    assert manifest["status"] == "failed"
+    assert "empty_fresh guard" in manifest["reason"]
