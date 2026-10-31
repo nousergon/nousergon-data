@@ -1709,6 +1709,17 @@ alert_classes:
     # DECLARED: same condition as data_spot_quota_fallback, from the shared-lib
     # dispatcher.
     tier: tracked-only
+  - class: krepis_spot_quota_fallback
+    # alpha-engine-config-I10381 audit (2026-10-31): krepis/ec2_spot.py's
+    # `_page_quota` emits this source and had no row, so it PAGED through
+    # resolve_tier's no-row branch. Its own docstring calls it the same page
+    # `nousergon_lib.spot_dispatch` sends, so it takes that row's tier.
+    source: "krepis.ec2_spot.launch_self_starting"
+    severities: [warning]
+    intake: bus
+    response: drain-queue
+    # DECLARED: same condition as lib_spot_quota_fallback, from krepis.
+    tier: tracked-only
   - class: canary_replay_liveness
     source: "canary-replay-liveness-probe"
     severities: [critical]
@@ -2065,6 +2076,37 @@ alert_classes:
     response: drain-queue
     # derived: error-capable, automated response declared
     tier: notify-silent
+  - class: tracked_only_digest
+    # alpha-engine-config-I10381 audit (2026-10-31): the weekly roll-up from
+    # alpha-engine-config scripts/notification_actionability.py `digest`
+    # (notification-actionability.yml, Mondays 14:00Z) had no row, so it
+    # PAGED. Its module docstring says it exists so the suppressed tier
+    # "stays VISIBLE without paging". It is the reader for tracked-only, so
+    # it cannot be tracked-only itself: that would hide the thing that keeps
+    # the quiet tier visible.
+    source: "tracked-only-digest"
+    severities: [info]
+    intake: bus
+    response: drain-queue
+    # DECLARED: delivered, never buzzes (the digest's stated intent).
+    tier: notify-silent
+  - class: v1_module_health_checker
+    # alpha-engine-config-I10381 audit (2026-10-31): nous-ergon-ops
+    # alpha-engine/infrastructure/health_checker.sh publishes through the
+    # krepis CLI with this source and had no row, so every stale-module
+    # alert PAGED. That repo is outside the fleet-wide drift step's --repos
+    # list, which is why the static check never saw it.
+    source: "alpha-engine/infrastructure/health_checker.sh"
+    severities: [error]
+    intake: bus
+    response: drain-queue
+    # derived: error-capable, automated response declared
+    tier: notify-silent
+    operator_reason: >-
+      A v1 module's health/<module>.json is older than its max-hours budget.
+      No responder re-runs a v1 module, so the alert-drain triages it and an
+      operator decides; it is not an outage page. The tier is the derived
+      one, recorded on alpha-engine-config-I10381 for ruling.
 
   # ── laptop LLM-routing plane (claude-code-config, config-I6753) ──
   # All four call sites previously omitted the REQUIRED `publish` subcommand,
