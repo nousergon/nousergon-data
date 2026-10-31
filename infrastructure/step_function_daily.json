@@ -10,7 +10,11 @@
         "merged.$": "States.JsonMerge(States.JsonMerge(States.StringToJson('{\"sns_topic_arn\":\"arn:aws:sns:us-east-1:711398986525:alpha-engine-alerts\"}'),States.StringToJson(States.Format('\\{\"run_date\":\"{}\"\\}',States.ArrayGetItem(States.StringSplit($$.Execution.StartTime,'T'),0))),false),$$.Execution.Input,false)"
       },
       "OutputPath": "$.merged",
-      "Next": "MarketHoursGate"
+      "Next": "MarketHoursGate",
+      "Assign": {
+        "failed_state": "unrecorded",
+        "failed_cause": "no failing edge recorded a cause (alpha-engine-config-I10974: every edge into HandleFailure is meant to assign one; this floor means one did not)"
+      }
     },
     "MarketHoursGate": {
       "Type": "Task",
@@ -88,7 +92,11 @@
           "Next": "NotifyMarketHoursOverrideMalformed"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "HandleFailure",
+      "Assign": {
+        "failed_state": "MarketHoursGateChoice",
+        "failed_cause": "MarketHoursGateChoice took its Default edge (no rule matched)"
+      }
     },
     "StampMarketHoursVerdictMissing": {
       "Type": "Pass",
@@ -339,7 +347,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "DeployDriftCheck",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.drift_result",
@@ -361,7 +373,11 @@
             }
           ],
           "Comment": "sf_drift=true is a drifted SF definition — the deployed state machine no longer matches alpha-engine-data@main HEAD. Trading-correctness-critical per sf-pipeline-policy §3: halts, never degrades, regardless of cf_drift.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "DeployDriftGate",
+            "failed_cause": "DeployDriftGate rule matched: {\"And\": [{\"Variable\": \"$.drift_result.Payload.sf_drift\", \"IsPresent\": true}, {\"Variable\": \"$.drift_result.Payload.sf_drift\", \"BooleanEquals\": true}]} -- sf_drift=true is a drifted SF definition — the deployed state machine no longer matches alpha-engine-data@main HEAD. Trading-correctness-critical per sf-pipeline-policy §3: halts, never degrades, regardless of cf_drift."
+          }
         },
         {
           "Not": {
@@ -369,7 +385,11 @@
             "IsPresent": true
           },
           "Comment": "config-I2767, preserved post-split: sf_drift missing means the gate cannot verify SF-definition freshness — fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "DeployDriftGate",
+            "failed_cause": "DeployDriftGate rule matched: {\"Not\": {\"Variable\": \"$.drift_result.Payload.sf_drift\", \"IsPresent\": true}} -- config-I2767, preserved post-split: sf_drift missing means the gate cannot verify SF-definition freshness — fail CLOSED and loud (HandleFailure) rather than trading on unverifiable deploy freshness."
+          }
         },
         {
           "Not": {
@@ -377,7 +397,11 @@
             "IsPresent": true
           },
           "Comment": "config-I2767, preserved post-split: cf_drift missing means the gate cannot classify a drift signal as halt-vs-degrade — fail CLOSED rather than silently defaulting to either a pass or a degrade.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "DeployDriftGate",
+            "failed_cause": "DeployDriftGate rule matched: {\"Not\": {\"Variable\": \"$.drift_result.Payload.cf_drift\", \"IsPresent\": true}} -- config-I2767, preserved post-split: cf_drift missing means the gate cannot classify a drift signal as halt-vs-degrade — fail CLOSED rather than silently defaulting to either a pass or a degrade."
+          }
         },
         {
           "And": [
@@ -505,7 +529,11 @@
             "IsPresent": true
           },
           "Comment": "config-I2767: a gate payload WITHOUT is_trading_day is a contract violation from our own Lambda — fail CLOSED and loud (HandleFailure) rather than silently proceeding to trade (or silently skipping) on an unverifiable trading-day verdict.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "TradingDayGateChoice",
+            "failed_cause": "TradingDayGateChoice rule matched: {\"Not\": {\"Variable\": \"$.trading_day_gate.Payload.is_trading_day\", \"IsPresent\": true}} -- config-I2767: a gate payload WITHOUT is_trading_day is a contract violation from our own Lambda — fail CLOSED and loud (HandleFailure) rather than silently proceeding to trade (or silently skipping) on an unverifiable trading-day verdict."
+          }
         }
       ],
       "Default": "StartExecutorEC2"
@@ -560,7 +588,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "StartExecutorEC2",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.ec2_start_result",
@@ -611,7 +643,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "DescribeInstanceInfo",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.ssm_describe_result",
@@ -637,7 +673,11 @@
         {
           "Variable": "$.ssm_poll.attempts",
           "NumericGreaterThanEquals": 12,
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "SSMReadyChoice",
+            "failed_cause": "SSMReadyChoice rule matched: {\"Variable\": \"$.ssm_poll.attempts\", \"NumericGreaterThanEquals\": 12}"
+          }
         }
       ],
       "Default": "WaitSSMPoll"
@@ -705,7 +745,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "CodeFreshnessGate",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.code_freshness_result",
@@ -759,7 +803,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "WaitForCodeFreshness",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultSelector": {
@@ -801,7 +849,11 @@
           "Next": "CodeFreshnessPollTimeout"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "HandleFailure",
+      "Assign": {
+        "failed_state": "CheckCodeFreshnessStatus",
+        "failed_cause.$": "States.JsonToString($.code_freshness_poll)"
+      }
     },
     "CodeFreshnessWait": {
       "Type": "Wait",
@@ -816,7 +868,11 @@
         "Cause.$": "$.code_freshness_poll.detail"
       },
       "ResultPath": "$.error",
-      "Next": "ForceStopUnresponsiveInstance"
+      "Next": "ForceStopUnresponsiveInstance",
+      "Assign": {
+        "failed_state": "StampCodeFreshnessUnresponsive",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "CodeFreshnessPollTimeout": {
       "Type": "Pass",
@@ -826,7 +882,11 @@
         "Cause": "CodeFreshnessGate SSM command did not reach a terminal status within the bounded poll budget (~36 iterations / ~6 min, past the 300s executionTimeout) while the SSM agent stayed Online."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "CodeFreshnessPollTimeout",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "CorrectnessVerdictGate": {
       "Type": "Task",
@@ -866,7 +926,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "CorrectnessVerdictGate",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.correctness_verdict_result",
@@ -920,7 +984,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "WaitForCorrectnessVerdict",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultSelector": {
@@ -1001,7 +1069,11 @@
           "Next": "StampCorrectnessVerdictStaleBinding"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "HandleFailure",
+      "Assign": {
+        "failed_state": "CheckCorrectnessVerdictStatus",
+        "failed_cause.$": "States.JsonToString($.correctness_verdict_poll)"
+      }
     },
     "StampCorrectnessVerdictFail": {
       "Type": "Pass",
@@ -1011,7 +1083,11 @@
         "Cause": "The weekly backtester's known-answer battery FAILED, so the simulation arithmetic that produced config/executor_params.json is not trustworthy and NEW ENTRIES are withheld. Exits, stops, time-decay exits, urgent exits and order cancels are NOT gated — the book is managed as normal. UNBLOCK: roll config/executor_params.json back to the last cycle whose attestation PASSed, then re-run today's preopen (weekday_sf_rerun.py). Do NOT clear this by re-running the backtester until the failing known-answer check is understood."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "StampCorrectnessVerdictFail",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "StampCorrectnessVerdictUnknown": {
       "Type": "Pass",
@@ -1021,7 +1097,11 @@
         "Cause": "Nobody checked this cycle's arithmetic — backtest/latest/attestation.json is absent, unreadable, or carries a verdict outside the closed vocabulary. sf-pipeline-policy §2.3a rule 2: a missing verdict is UNKNOWN, never a pass, and there is no older verdict to fall back to. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so it writes backtest/{run_date}/attestation.json and the latest/ pointer, then re-run today's preopen."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "StampCorrectnessVerdictUnknown",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "StampCorrectnessVerdictStaleBinding": {
       "Type": "Pass",
@@ -1031,7 +1111,11 @@
         "Cause": "backtest/latest/attestation.json and config/executor_params.json were written by DIFFERENT weekly cycles, so the parameters in use this session are unattested. This is a pipeline-ordering defect, not a numbers defect — one of the two artifacts was written without the other. A verdict is never inherited across cycles. NEW ENTRIES are withheld; exits, stops, urgent exits and cancels are NOT gated. UNBLOCK: re-run the weekly Backtester stage so both artifacts are written by one execution, then re-run today's preopen."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "StampCorrectnessVerdictStaleBinding",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "CorrectnessVerdictWait": {
       "Type": "Wait",
@@ -1046,7 +1130,11 @@
         "Cause.$": "$.correctness_verdict_poll.detail"
       },
       "ResultPath": "$.error",
-      "Next": "ForceStopUnresponsiveInstance"
+      "Next": "ForceStopUnresponsiveInstance",
+      "Assign": {
+        "failed_state": "StampCorrectnessVerdictUnresponsive",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "CorrectnessVerdictPollTimeout": {
       "Type": "Pass",
@@ -1056,7 +1144,11 @@
         "Cause": "CorrectnessVerdictGate SSM command did not reach a terminal status within the bounded poll budget (~18 iterations / ~3 min, past the 120s executionTimeout) while the SSM agent stayed Online."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "CorrectnessVerdictPollTimeout",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "ForceStopUnresponsiveInstance": {
       "Type": "Task",
@@ -1107,7 +1199,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "PredictorInference",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.predictor_result",
@@ -1141,7 +1237,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "CheckPredictorCoverage",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.coverage_result",
@@ -1171,7 +1271,11 @@
             "IsPresent": true
           },
           "Comment": "config-I2767: a coverage payload WITHOUT has_gap means prediction coverage is unverifiable — fail CLOSED and loud (HandleFailure) rather than trading on unknown coverage.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "CoverageGapChoice",
+            "failed_cause": "CoverageGapChoice rule matched: {\"Not\": {\"Variable\": \"$.coverage_result.Payload.has_gap\", \"IsPresent\": true}} -- config-I2767: a coverage payload WITHOUT has_gap means prediction coverage is unverifiable — fail CLOSED and loud (HandleFailure) rather than trading on unknown coverage."
+          }
         }
       ],
       "Default": "CheckSkipMorningPlanner"
@@ -1205,7 +1309,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "ReinvokePredictor",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.reinvoke_result",
@@ -1239,7 +1347,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "RecheckCoverage",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.coverage_recheck_result",
@@ -1261,7 +1373,11 @@
             }
           ],
           "Comment": "config-I2767: IsPresent-guarded (config#2275 incident class).",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "FinalCoverageGate",
+            "failed_cause": "FinalCoverageGate rule matched: {\"And\": [{\"Variable\": \"$.coverage_recheck_result.Payload.has_gap\", \"IsPresent\": true}, {\"Variable\": \"$.coverage_recheck_result.Payload.has_gap\", \"BooleanEquals\": true}]} -- config-I2767: IsPresent-guarded (config#2275 incident class)."
+          }
         },
         {
           "Not": {
@@ -1269,7 +1385,11 @@
             "IsPresent": true
           },
           "Comment": "config-I2767: recheck payload WITHOUT has_gap — same fail-closed routing as a confirmed gap.",
-          "Next": "HandleFailure"
+          "Next": "HandleFailure",
+          "Assign": {
+            "failed_state": "FinalCoverageGate",
+            "failed_cause": "FinalCoverageGate rule matched: {\"Not\": {\"Variable\": \"$.coverage_recheck_result.Payload.has_gap\", \"IsPresent\": true}} -- config-I2767: recheck payload WITHOUT has_gap — same fail-closed routing as a confirmed gap."
+          }
         }
       ],
       "Default": "CheckSkipMorningPlanner"
@@ -1306,7 +1426,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "RunMorningPlanner",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultPath": "$.planner_result",
@@ -1360,7 +1484,11 @@
             "States.ALL"
           ],
           "Next": "HandleFailure",
-          "ResultPath": "$.error"
+          "ResultPath": "$.error",
+          "Assign": {
+            "failed_state": "WaitForMorningPlanner",
+            "failed_cause.$": "States.JsonToString($)"
+          }
         }
       ],
       "ResultSelector": {
@@ -1402,7 +1530,11 @@
           "Next": "MorningPlannerPollTimeout"
         }
       ],
-      "Default": "HandleFailure"
+      "Default": "HandleFailure",
+      "Assign": {
+        "failed_state": "CheckMorningPlannerStatus",
+        "failed_cause.$": "States.JsonToString($.planner_poll)"
+      }
     },
     "StampMorningPlannerUnresponsive": {
       "Type": "Pass",
@@ -1412,7 +1544,11 @@
         "Cause.$": "$.planner_poll.detail"
       },
       "ResultPath": "$.error",
-      "Next": "ForceStopUnresponsiveInstance"
+      "Next": "ForceStopUnresponsiveInstance",
+      "Assign": {
+        "failed_state": "StampMorningPlannerUnresponsive",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "MorningPlannerPollTimeout": {
       "Type": "Pass",
@@ -1422,7 +1558,11 @@
         "Cause": "RunMorningPlanner SSM command did not reach a terminal status within the bounded poll budget (~30 iterations / ~7.5 min, past the 600s executionTimeout) while the SSM agent stayed Online. See /var/log/executor.log on ae-trading."
       },
       "ResultPath": "$.error",
-      "Next": "HandleFailure"
+      "Next": "HandleFailure",
+      "Assign": {
+        "failed_state": "MorningPlannerPollTimeout",
+        "failed_cause.$": "States.JsonToString($)"
+      }
     },
     "MorningPlannerWait": {
       "Type": "Wait",
@@ -1671,12 +1811,12 @@
     },
     "HandleFailure": {
       "Type": "Task",
-      "Comment": "Failure alert via SNS",
+      "Comment": "Failure alert via SNS | alpha-engine-config-I10974: Subject and Message name the failing state and its cause FIRST, from the $failed_state/$failed_cause variables every edge into this state assigns (InitializeInput sets a floor so a reference can never throw). The whole state object still follows the link, unchanged, for the per-field diagnostics alpha-engine-config-I8685 relies on.",
       "Resource": "arn:aws:states:::sns:publish",
       "Parameters": {
         "TopicArn.$": "$.sns_topic_arn",
-        "Subject": "Alpha Engine Weekday Pipeline — FAILED",
-        "Message.$": "States.Format('Weekday pipeline failed. State: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status', States.JsonToString($))"
+        "Message.$": "States.Format('Weekday pipeline failed at state {}. Cause: {}. View the failing state + per-state detail at https://dashboard.nousergon.ai/pipeline-status. State: {}', $failed_state, $failed_cause, States.JsonToString($))",
+        "Subject.$": "States.Format('Alpha Engine Weekday Pipeline — FAILED at {}', $failed_state)"
       },
       "TimeoutSeconds": 60,
       "ResultPath": "$.failure_notify",
@@ -1684,8 +1824,9 @@
     },
     "FailExecution": {
       "Type": "Fail",
+      "Comment": "alpha-engine-config-I10974: the terminal Cause names the failing state and its real error instead of a static literal, so a status-keyed watcher reading only DescribeExecution can name the cause. Error stays the static DailyPipelineFailure label consumers key on (same rule as the weekly SF's config#5601). CausePath reads only variables InitializeInput assigns a floor for, so it cannot throw States.Runtime and mask the real failure.",
       "Error": "DailyPipelineFailure",
-      "Cause": "One or more weekday pipeline steps failed."
+      "CausePath": "States.Format('Weekday pipeline failed at state {}: {}', $failed_state, $failed_cause)"
     },
     "ExtractDataSpotError": {
       "Type": "Pass",

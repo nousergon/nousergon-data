@@ -463,10 +463,18 @@ class TestDailyAndEodAudited:
         daily = _load(_DAILY)["States"]
         hf = daily["HandleFailure"]
         assert hf["Resource"] == "arn:aws:states:::sns:publish"
-        # Hardcoded Subject — cannot violate the SNS Subject contract.
-        subject = hf["Parameters"]["Subject"]
-        assert 0 < len(subject) <= 100
-        assert "\n" not in subject
+        # alpha-engine-config-I10974: the Subject names the failing state
+        # from $failed_state. It still cannot violate the SNS Subject
+        # contract: the only values ever assigned are InitializeInput's floor
+        # and state NAMES (pinned in test_sf_weekday_failure_names_state.py),
+        # so the longest possible Subject is bounded here, newline-free.
+        assert "Subject" not in hf["Parameters"]
+        subject_fmt = hf["Parameters"]["Subject.$"]
+        assert subject_fmt.endswith(", $failed_state)")
+        template = subject_fmt.split("'")[1].replace("{}", "")
+        longest = max(len(n) for n in daily)
+        assert 0 < len(template) + max(longest, len("unrecorded")) <= 100
+        assert "\n" not in template
         # Message.$ formats on $ (the whole state), not a possibly-absent
         # named field — structurally cannot raise a missing-JSONPath error.
         message_fmt = hf["Parameters"]["Message.$"]
