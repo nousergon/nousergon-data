@@ -2076,20 +2076,6 @@ alert_classes:
     response: drain-queue
     # derived: error-capable, automated response declared
     tier: notify-silent
-  - class: tracked_only_digest
-    # alpha-engine-config-I10381 audit (2026-10-31): the weekly roll-up from
-    # alpha-engine-config scripts/notification_actionability.py `digest`
-    # (notification-actionability.yml, Mondays 14:00Z) had no row, so it
-    # PAGED. Its module docstring says it exists so the suppressed tier
-    # "stays VISIBLE without paging". It is the reader for tracked-only, so
-    # it cannot be tracked-only itself: that would hide the thing that keeps
-    # the quiet tier visible.
-    source: "tracked-only-digest"
-    severities: [info]
-    intake: bus
-    response: drain-queue
-    # DECLARED: delivered, never buzzes (the digest's stated intent).
-    tier: notify-silent
   - class: v1_module_health_checker
     # alpha-engine-config-I10381 audit (2026-10-31): nous-ergon-ops
     # alpha-engine/infrastructure/health_checker.sh publishes through the
