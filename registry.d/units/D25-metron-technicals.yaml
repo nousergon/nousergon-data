@@ -77,8 +77,17 @@ freshness:
   status: proposed
   ratified_at: "phase-3 exit (plan §2 row 1)"
 completeness:
-  denominator: metron/holdings_universe.json
-  floor: 0.9
+  # alpha-engine-config-I10886 (nousergon-data-PR2262, merged 2026-10-25): the rating is
+  # computed over constituents ∪ Metron holdings ∪ watchlist, not the held symbols alone,
+  # and latest.json's `coverage` block states that population, every unrated member with
+  # its reason, and the floor reading on every run (measured live 2026-10-29: 928 of 937,
+  # 0.9904). The holdings-only 0.9 this block carried until 2026-10-31 described the
+  # producer before that change.
+  denominator: >-
+      constituents (market_data/weekly/{date}/constituents.json) ∪
+      metron/holdings_universe.json holdings ∪ its watchlist, less declared exclusions
+      (short_history, metron_unpriceable)
+  floor: 0.99
   status: proposed
 guards:
   empty_fresh:
@@ -97,11 +106,19 @@ guards:
         (alpha-engine-config-I10785). Not in service until commissioned by an induced fault
         (P-19, alpha-engine-config-I10786).
   cardinality:
-    state: absent
+    state: partial
+    code:
+      - "collectors/metron_market_data.py::collect_technicals"
+    evaluates: '"empty technicals payload refused"'
     note: >-
-        no code halts or refuses on this class for this unit (audit §4.1). The guard is
-        phase-2 work; the clause is UNMET until it exists and is commissioned by an
-        induced fault (P-19).
+        HALF: collect_technicals refuses to publish an empty technicals map over a
+        non-empty population (the previous latest.json stands), and the TECHNICALS
+        admission spec (contracts/admission.py, enforce since 2026-10-23) refuses members
+        outside the declared population. The 0.99 floor (TECHNICALS_COVERAGE_FLOOR) is
+        computed by technicals_coverage and recorded as coverage.meets_floor, but a run
+        under it is still written (observe); refusing below the floor is the remaining
+        half and waits on the owner's promotion. Not in service until commissioned by an
+        induced fault (P-19, alpha-engine-config-I10786).
   units:
     state: present
     note: contracts/technicals.schema.json
