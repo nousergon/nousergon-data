@@ -1680,9 +1680,59 @@ def test_the_board_document_publishes_one_unit_state_per_observable_unit(units, 
     states = document["units"]
     ids = [u["component_id"] for u in states]
     assert len(ids) == len(set(ids))
-    assert set(ids) <= {u.component_id for u in units}
+    machines = {
+        str((u.raw.get("trigger") or {}).get("owner") or "").split(":", 1)[0]
+        for u in units if (u.raw.get("trigger") or {}).get("kind") == "step-functions"
+    }
+    assert set(ids) <= {u.component_id for u in units} | machines
     rows = {r["clause"]: r for r in document["rows"]}
     for u in states:
         assert u["console_state"] == rows[u["clause"]]["console_state"]
         assert u["console_state"] in {"HEALTHY", "DEGRADED", "UNREPORTED"}
         assert u["as_of"] == "g"
+
+
+def test_an_externally_owned_unit_publishes_no_state_under_its_own_id(units):
+    """D39's row lives in nous-ergon-ops under another id (I10870), so nothing
+    declares `data-collector-d39-inst-ownership`: an observation keyed there
+    renders UNREGISTERED on the console (alpha-engine-config-I12911)."""
+    by_id = {u.unit_id: u for u in units}
+    assert "D39" in read.EXTERNALLY_OWNED_OBSERVABILITY_ROWS
+    rows = [_run_record_row("D39", "MET", "HEALTHY"), _run_record_row("D01", "MET", "HEALTHY")]
+    out = read._unit_states(rows, [by_id["D39"], by_id["D01"]], "t")
+    assert [u["component_id"] for u in out] == [by_id["D01"].component_id]
+
+
+def _cycle_row(clause, state, console_state):
+    return {"clause": clause, "state": state, "console_state": console_state,
+            "detail": "d", "source": "s", "evidence": ["e"], "as_of": "2026-10-30T22:40:00Z"}
+
+
+def test_each_collection_state_machine_carries_its_schedules_cycle_verdict(units):
+    """`ne-data-collection-eod`/`-weekly` are declared in service and nothing
+    observed them (UNREPORTED, alpha-engine-config-I12911). The machine is
+    read off the unit descriptors' own `trigger.owner`/`started_by`, never a
+    hand list, and carries its schedule's one-complete-cycle clause."""
+    rows = [
+        _cycle_row("data.phase1.consecutive_eod_cycles", "MET", "HEALTHY"),
+        _cycle_row("data.phase1.consecutive_weekly_cycles", "UNMET", "DEGRADED"),
+    ]
+    out = {u["component_id"]: u for u in read._unit_states(rows, units, "g")}
+    assert out["ne-data-collection-eod"]["console_state"] == "HEALTHY"
+    assert out["ne-data-collection-eod"]["clause"] == "data.phase1.consecutive_eod_cycles"
+    assert out["ne-data-collection-eod"]["run_as_of"] == "2026-10-30T22:40:00Z"
+    assert out["ne-data-collection-eod"]["as_of"] == "g"
+    assert out["ne-data-collection-weekly"]["console_state"] == "DEGRADED"
+    assert out["ne-data-collection-weekly"]["unit_id"] is None
+    # no clause row read -> no observation invented for the morning machine
+    assert "ne-data-collection-morning" not in out
+    # started by an EventBridge rule, or with no cycle clause -> omitted, never guessed
+    assert "ne-data-collection-panel" not in out
+    assert "ne-data-collection-daily-heal" not in out
+    assert "ne-weekly-freshness-pipeline" not in out
+
+
+def test_a_state_machine_in_a_declared_only_state_is_left_to_its_declaration(units):
+    rows = [_cycle_row("data.phase1.consecutive_eod_cycles", "RETIRED", "RETIRED")]
+    ids = {u["component_id"] for u in read._unit_states(rows, units, "g")}
+    assert "ne-data-collection-eod" not in ids
