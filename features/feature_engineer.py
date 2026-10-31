@@ -278,7 +278,8 @@ FEATURES = [
     # named DISTINCT from crucible-predictor's regime_predictor.py
     # ``hy_oas_level`` / ``hy_oas_change_21d`` (a SEPARATE market-wide
     # regime-substrate feature family sourced from its own HYOAS.parquet
-    # cache, consumed only via cfg.MACRO_NORM_FEATURES) — same underlying
+    # cache; dropped from cfg.MACRO_NORM_FEATURES on 2026-09-24,
+    # alpha-engine-config-I11523, though still emitted) — same underlying
     # FRED series, different namespace/consumer/compute path, so the names
     # must not collide.
     "hy_oas_credit_spread_pct",
