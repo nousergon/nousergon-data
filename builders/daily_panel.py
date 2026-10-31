@@ -505,6 +505,26 @@ def _sectors(get: Callable[[str], bytes]) -> dict[str, str | None]:
 # -- CLI --------------------------------------------------------------------
 
 
+def published_manifest_keys(bucket: str, *, s3: Any = None) -> set[str]:
+    """Every ``panel/{day}/manifest.json`` key on the bucket, from one listing.
+
+    The catch-up in ``weekly_collector.py --daily-panel`` (alpha-engine-config-
+    I12652) reads this to find the sessions with no published panel. A listing
+    that fails RAISES: an unreadable prefix must never read as "nothing is
+    missing", nor as "everything is missing" and trigger a burst of compiles.
+    """
+    if s3 is None:
+        import boto3
+
+        s3 = boto3.client("s3")
+    keys: set[str] = set()
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=dp.KEY_PREFIX):
+        for obj in page.get("Contents") or []:
+            if obj["Key"].endswith("/manifest.json"):
+                keys.add(obj["Key"])
+    return keys
+
+
 def _s3_io(bucket: str, dry_run_dir: Path | None):
     """``(get, put)`` over the bucket; ``put`` writes under ``dry_run_dir`` when set."""
     import boto3

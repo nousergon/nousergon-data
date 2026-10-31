@@ -35,6 +35,7 @@ if __name__ == "__main__":
     _numeric_pin.apply()
 
 import argparse
+import copy
 import json
 import logging
 import os
@@ -2065,7 +2066,8 @@ def run_weekly(config: dict, args: argparse.Namespace) -> dict:
         )
 
     if getattr(args, "daily_panel", False):
-        return _run_whole_mode_unit("daily_panel", _run_daily_panel, config, args)
+        result = _run_whole_mode_unit("daily_panel", _run_daily_panel, config, args)
+        return _catch_up_daily_panels(config, args, result)
 
     if getattr(args, "index_contributions", False):
         return _run_whole_mode_unit(
@@ -6217,6 +6219,100 @@ def _run_daily_panel(config: dict, args: argparse.Namespace) -> dict:
     if status == "error":
         result["error"] = collector.get("error")
     return result
+
+
+#: The most missed sessions one ``--daily-panel`` run publishes besides its own.
+#: A D51 compile measured 2m17s (2026-10-29 run); five more keep the run well
+#: inside the dispatcher's 3600s ``daily-panel`` cap. A longer hole closes over
+#: consecutive runs, oldest first, and stays red on the ``published`` leg of
+#: ``data.phase3.daily_panel_adopted`` until it does.
+MAX_PANEL_CATCH_UP_PER_RUN = 5
+
+
+@contextmanager
+def _trigger_override(trigger: str):
+    """Set ``$NE_DATA_TRIGGER`` for the run manifests written inside the block."""
+    previous = os.environ.get(run_units.TRIGGER_ENV)
+    os.environ[run_units.TRIGGER_ENV] = trigger
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop(run_units.TRIGGER_ENV, None)
+        else:
+            os.environ[run_units.TRIGGER_ENV] = previous
+
+
+def _catch_up_daily_panels(config: dict, args: argparse.Namespace, result: dict) -> dict:
+    """Publish D51 for every recent session that has no panel (alpha-engine-config-I12652).
+
+    ``ne-data-collection-panel`` starts only when ``ne-data-collection-eod``
+    SUCCEEDS, so a session whose EOD failed and was healed some other way
+    (2026-10-21: the FRED outage, then an ArcticDB heal) never got its panel or
+    its D51 run record, and after the reader switch (-I10791 step 3) that hole
+    is a D47 refusal. This runs after the scheduled session's own unit: it
+    lists the published manifests once, takes the sessions in the window
+    ``data.phase3.daily_panel_adopted`` grades (:func:`data_gate.panel.gap_window`,
+    which also honours ``DECLARED_GAPS``), and publishes each missing one,
+    oldest first, through the same whole-mode wrapper, so each gets its own
+    D51 run manifest, marked ``trigger: backfill``.
+
+    It runs only on the scheduled path: not on ``--date`` (an operator
+    replaying one day asked for that day) and not on ``--dry-run``. A failed
+    catch-up makes the run ``error``, so the panel execution fails and pages:
+    the session's own panel is already published by then, and a hole that
+    cannot be filled must not pass as a clean run.
+    """
+    if getattr(args, "date", None) or getattr(args, "dry_run", False):
+        return result
+    if (result or {}).get("status") not in ("ok", None):
+        return result
+    from builders import daily_panel
+    from data_gate import panel as panel_gate
+
+    latest = datetime.fromisoformat(str(result.get("date") or default_run_date())).date()
+    window = panel_gate.gap_window(latest)
+    if not window:
+        return result
+    published = daily_panel.published_manifest_keys(config["bucket"])
+    missing = [
+        day
+        for day in window
+        if daily_panel.dp.manifest_key(day) not in published
+        and day.isoformat() not in panel_gate.DECLARED_GAPS
+    ]
+    if not missing:
+        return result
+    todo, deferred = missing[:MAX_PANEL_CATCH_UP_PER_RUN], missing[MAX_PANEL_CATCH_UP_PER_RUN:]
+    logger.warning(
+        "D51 catch-up: %d session(s) behind %s have no panel %s; publishing %s now%s",
+        len(missing), latest, [d.isoformat() for d in missing], [d.isoformat() for d in todo],
+        f", {len(deferred)} deferred to the next run" if deferred else "",
+    )
+    caught_up: list[dict] = []
+    for day in todo:
+        day_args = copy.copy(args)
+        day_args.date = day.isoformat()
+        with _trigger_override("backfill"):
+            day_result = _run_whole_mode_unit("daily_panel", _run_daily_panel, config, day_args)
+        caught_up.append(
+            {"date": day.isoformat(), "status": day_result.get("status"), "error": day_result.get("error")}
+        )
+    out = dict(result)
+    out["catch_up"] = {
+        "missing": [d.isoformat() for d in missing],
+        "published": caught_up,
+        "deferred": [d.isoformat() for d in deferred],
+    }
+    failed = [c for c in caught_up if c["status"] != "ok"]
+    if failed:
+        out["status"] = "error"
+        out["error"] = (
+            f"D51 catch-up: the session's own panel for {latest} published, but "
+            f"{len(failed)} missed session(s) could not be: "
+            + "; ".join(f"{c['date']}: {c['error']}" for c in failed)
+        )
+    return out
 
 
 def _run_index_contributions(config: dict, args: argparse.Namespace) -> dict:
