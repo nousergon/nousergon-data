@@ -22,10 +22,6 @@
       "arn": "arn:aws:iam::711398986525:role/alpha-engine-dashboard-role"
     },
     {
-      "role": "alpha-engine-executor-role",
-      "arn": "arn:aws:iam::711398986525:role/alpha-engine-executor-role"
-    },
-    {
       "role": "nousergon-data-collection-box-role",
       "arn": "arn:aws:iam::711398986525:role/nousergon-data-collection-box-role"
     },

@@ -48,14 +48,17 @@ by_unit:
   # alpha-engine-arctic-migration-dispatcher, which launches the in-region spot
   # box under ARCTIC_MIGRATION_IAM_PROFILE. The box is what writes ArcticDB.
   #
-  # alpha-engine-config-I11019: the dispatcher's default now names
-  # nousergon-data-collection-box-profile -> nousergon-data-collection-box-role
-  # (nousergon-data-PR<THIS>). Declaration follows deployment, not code: this
-  # row still names the role the box actually ran under LAST, and stays
-  # alpha-engine-executor-role until (1) the operator applies the dispatcher's
-  # updated iam-policy.json (`deploy.sh --apply-iam`, IAM is never CI-applied
-  # here) AND (2) a subsequent migrations/** push launches a box and that box
-  # is observed writing ArcticDB under the new role. Flip this row in that
-  # follow-up PR, not here — changing the row without changing what the
-  # dispatcher launches (or vice versa) makes the column lie (I11019 itself).
-  D42: alpha-engine-executor-role  # PENDING flip to nousergon-data-collection-box-role, see above
+  # alpha-engine-config-I11019: flipped from alpha-engine-executor-role, read
+  # off the live deployment on 2026-10-31. The deployed dispatcher defaults
+  # ARCTIC_MIGRATION_IAM_PROFILE (unset on the function) to
+  # nousergon-data-collection-box-profile; its role's only EC2 iam:PassRole is
+  # nousergon-data-collection-box-role, so it cannot launch the box as anything
+  # else; and the last box (i-00747a7e54055ec43, 2026-10-07, RunInstances
+  # iamInstanceProfile=nousergon-data-collection-box-profile) logged
+  # "Found credentials from IAM Role: nousergon-data-collection-box-role",
+  # connected to s3://alpha-engine-research/arcticdb and wrote D42's run record.
+  # It had nothing pending, so it wrote no ArcticDB; the role's Put/Delete on
+  # the three arcticdb/* targets is proven by simulation instead. Changing the
+  # row without changing what the dispatcher launches (or vice versa) makes the
+  # column lie (I11019 itself).
+  D42: nousergon-data-collection-box-role
