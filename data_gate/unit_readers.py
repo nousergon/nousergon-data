@@ -23,6 +23,7 @@ import pathlib
 import random
 import re
 import time
+from collections.abc import Collection
 from typing import Any
 
 import yaml
@@ -712,6 +713,34 @@ class IdentityPlan:
     ungradable: tuple[str, ...]
     probe: str
     rows: tuple[SimulateRow, ...]
+    #: Keys the unit writes ABOUT its run rather than as its product: a probe
+    #: under ``run_manifest_prefix`` and, for an ArcticDB writer, the in-region
+    #: arctic probe record (alpha-engine-config-I11278). A role that can write
+    #: its product and not these fails the unit after its work succeeded.
+    records: tuple[str, ...] = ()
+
+
+#: The concrete key simulated under a unit's ``run_manifest_prefix``.
+RECORD_PROBE_LEAF = "gate-probe/gate-probe.json"
+#: The in-region ArcticDB probe record an ArcticDB writer files
+#: (``data_collection/probes/arctic/{trading_day}.json``).
+ARCTIC_PROBE_RECORD = "data_collection/probes/arctic/gate-probe.json"
+
+
+def record_targets(unit: Unit, libraries: Collection[str]) -> tuple[str, ...]:
+    """The bookkeeping keys a unit must be able to write besides its declared product.
+
+    Not declared `writes:` (they are the run's record, not its output), which is
+    why the identity column could read MET for a role that could not file a single
+    run manifest: D39 did exactly that for a week (alpha-engine-config-I11278).
+    """
+    keys: list[str] = []
+    prefix = str(unit.raw.get("run_manifest_prefix") or "").strip("/")
+    if prefix:
+        keys.append(f"{prefix}/{RECORD_PROBE_LEAF}")
+    if libraries:
+        keys.append(ARCTIC_PROBE_RECORD)
+    return tuple(keys)
 
 
 def load_identities(path: pathlib.Path | None = None) -> dict[str, Any]:
@@ -730,17 +759,22 @@ def identity_plan(unit: Unit, config: dict[str, Any]) -> IdentityPlan:
     bucket = str(config["bucket"])
     keys, libraries, ungradable = s3_write_targets(unit)
     targets = tuple(sorted({_concrete(k) for k in keys} | {f"arcticdb/{lib}/gate-probe" for lib in libraries}))
+    records = tuple(r for r in record_targets(unit, libraries) if r not in targets)
     probe = f"arn:aws:s3:::{bucket}/{config['undeclared_probe_key']}"
     role_arn = f"arn:aws:iam::{config['account_id']}:role/{role}" if role else None
     rows: tuple[SimulateRow, ...] = ()
     if role and targets:
-        rows = tuple(
-            SimulateRow(unit.unit_id, role, "s3:PutObject", f"arn:aws:s3:::{bucket}/{t}", "allowed") for t in targets
-        ) + (
-            SimulateRow(unit.unit_id, role, "s3:PutObject", probe, "denied"),
-            SimulateRow(unit.unit_id, role, "s3:DeleteObject", probe, "denied"),
+        rows = (
+            tuple(
+                SimulateRow(unit.unit_id, role, "s3:PutObject", f"arn:aws:s3:::{bucket}/{t}", "allowed")
+                for t in (*targets, *records)
+            )
+            + (
+                SimulateRow(unit.unit_id, role, "s3:PutObject", probe, "denied"),
+                SimulateRow(unit.unit_id, role, "s3:DeleteObject", probe, "denied"),
+            )
         )
-    return IdentityPlan(unit.unit_id, role, role_arn, bucket, targets, tuple(ungradable), probe, rows)
+    return IdentityPlan(unit.unit_id, role, role_arn, bucket, targets, tuple(ungradable), probe, rows, records)
 
 
 def _simulate_one(client, role_arn: str, action: str, resource: str) -> str:
@@ -859,7 +893,8 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
             source="iam:SimulatePrincipalPolicy",
         )
     probe = plan.probe
-    declared_arns = [row.resource for row in plan.rows if row.expect == "allowed"]
+    record_arns = {f"arn:aws:s3:::{bucket}/{r}" for r in plan.records}
+    declared_arns = [row.resource for row in plan.rows if row.expect == "allowed" and row.resource not in record_arns]
     try:
         verdicts = {(row.action, row.resource): _simulate_one(client, role_arn, row.action, row.resource) for row in plan.rows}
     except UnattributableSimulation as exc:
@@ -917,15 +952,24 @@ def read_identity(store: GateStore, unit: Unit, *, identities_path: pathlib.Path
     denied = sorted(
         arn.split(":::", 1)[1] for arn in declared_arns if verdicts.get(("s3:PutObject", arn)) != "allowed"
     )
+    record_denied = sorted(
+        arn.split(":::", 1)[1] for arn in sorted(record_arns) if verdicts.get(("s3:PutObject", arn)) != "allowed"
+    )
     problems: list[str] = []
     if denied:
         problems.append(f"{role} may NOT PutObject on declared key(s) {denied}")
+    if record_denied:
+        problems.append(
+            f"{role} may write its product but NOT its run record {record_denied}: the unit would fail after "
+            "its work succeeded (alpha-engine-config-I11278)"
+        )
     if probe_put == "allowed":
         problems.append(f"{role} may PutObject on the undeclared probe {config['undeclared_probe_key']} (a whole-bucket wildcard)")
     if probe_delete == "allowed":
         problems.append(f"{role} may DeleteObject on the undeclared probe (bucket-wide Delete)")
     summary = (
-        f"simulated {role} for s3:PutObject on {len(targets)} declared target(s); undeclared probe "
+        f"simulated {role} for s3:PutObject on {len(targets)} declared target(s) and "
+        f"{len(record_arns)} run-record key(s); undeclared probe "
         f"PutObject={probe_put}, DeleteObject={probe_delete}"
     )
     if ungradable:
