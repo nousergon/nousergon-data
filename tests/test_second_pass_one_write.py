@@ -146,3 +146,5 @@ def test_a_failed_write_is_reported_per_pass_and_never_raises():
     fm, flz = update_cross_sectional_latest(lib, list(frames), as_of)
     assert fm["tickers_written"] == 0 and fm["write_fail"] == len(frames)
     assert flz["tickers_written"] == 0 and flz["write_fail"] == len(frames)
+    # alpha-engine-config-I9708: nothing written is not `ok`.
+    assert fm["status"] == "write_failed" and flz["status"] == "write_failed"

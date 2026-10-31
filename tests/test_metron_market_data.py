@@ -13,6 +13,8 @@ from datetime import date, datetime, timedelta, timezone
 from unittest import mock
 from unittest.mock import MagicMock
 
+import pytest
+
 from collectors import metron_market_data as mmd
 
 
@@ -1465,3 +1467,27 @@ class TestEafeUniverse:
         assert result["8035.T"]["sector"] == "Technology"
         assert result["8035.T"]["country"] == "Japan"
         assert result["8035.T"]["trailingPE"] == 15.2
+
+
+class TestEmptyPayloadOverAPopulationIsNotOk:
+    """alpha-engine-config-I9708: a non-empty universe whose every lookup came
+    back empty wrote ``{}`` over latest.json and returned ``ok``. It is now
+    ``degraded`` (not ``error``: that would halt the EOD run over product
+    data) and nothing is written, so yesterday's latest.json stands."""
+
+    @pytest.mark.parametrize("collect, source_kw, kind", [
+        (mmd.collect_fundamentals, "fundamentals_source", "fundamentals"),
+        (mmd.collect_analyst, "analyst_source", "analyst"),
+        (mmd.collect_sentiment, "sentiment_source", "sentiment"),
+    ])
+    def test_empty_payload_is_degraded_and_unwritten(self, collect, source_kw, kind):
+        s3 = _universe_s3(_UNIVERSE)
+        result = collect(bucket="b", s3_client=s3, **{source_kw: lambda syms: {}})
+        assert result["status"] == "degraded"
+        assert result[kind] == 0 and result["universe"] > 0
+        assert not s3.put_object.called
+
+    def test_the_refusal_helper_passes_a_payload_and_an_empty_population(self):
+        assert mmd._refuse_empty_payload("performance", {"AAPL": {}}, 3) is None
+        assert mmd._refuse_empty_payload("performance", {}, 0) is None
+        assert mmd._refuse_empty_payload("performance", {}, 3)["status"] == "degraded"

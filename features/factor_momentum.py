@@ -468,8 +468,11 @@ def finish_factor_momentum_result(
         "%d write-fail (of %d computed)",
         pd.Timestamp(as_of_ts).date(), n_written, n_all_nan, read_fail, write_fail, n_computed,
     )
+    # alpha-engine-config-I9708: every write failing used to return `ok`, so
+    # daily_append's cross_sectional_coverage recorded a clean pass and only a
+    # log line carried the count. Nothing written is not a pass.
     return {
-        "status": "ok",
+        "status": "write_failed" if write_fail and not n_written else "ok",
         "tickers_written": n_written,
         "tickers_all_nan": n_all_nan,
         "read_fail": read_fail,

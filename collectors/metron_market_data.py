@@ -2066,6 +2066,28 @@ def _log_absent_carry(carried: list[dict], dropped: list[dict], shrink: dict) ->
         )
 
 
+def _refuse_empty_payload(kind: str, payload: dict, population: int) -> dict | None:
+    """``degraded`` when a non-empty population produced an EMPTY payload.
+
+    alpha-engine-config-I9708: fundamentals, analyst, sentiment and
+    security_performance wrote ``{}`` over ``latest.json`` and returned ``ok``
+    when every lookup came back empty (a vendor or source outage), so the
+    consumer read "no data exists" and the run reported success. Technicals
+    already refuses (I10886) with ``error``; these return ``degraded`` instead,
+    because an ``error`` here would halt the EOD run (``_aggregate_daily_status``)
+    over product data the trading path does not read. Nothing is written, so
+    yesterday's ``latest.json`` stands. Returns None when there is a payload.
+    """
+    if payload or not population:
+        return None
+    logger.error(
+        "[metron_market_data] %s: 0 of %d symbols returned data — refusing to "
+        "publish an empty payload over latest.json", kind, population,
+    )
+    return {"status": "degraded", "reason": f"empty {kind} payload refused",
+            "universe": population, kind: 0}
+
+
 def collect_history(
     *, bucket: str = DEFAULT_BUCKET, run_date: str | None = None, dry_run: bool = False,
     s3_client: Any = None,
@@ -2540,6 +2562,9 @@ def collect_fundamentals(
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     fundamentals = (fundamentals_source or _yfinance_fundamentals)(yf_symbols)
+    refused = _refuse_empty_payload("fundamentals", fundamentals, len(yf_symbols))
+    if refused is not None:
+        return refused
     artifact = {
         "schema_version": FUNDAMENTALS_SCHEMA_VERSION, "as_of": run_date,
         "source": "yfinance", "fundamentals": dict(sorted(fundamentals.items())),
@@ -2585,6 +2610,9 @@ def collect_analyst(
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     analyst = (analyst_source or _yfinance_analyst)(yf_symbols)
+    refused = _refuse_empty_payload("analyst", analyst, len(yf_symbols))
+    if refused is not None:
+        return refused
     artifact = {
         "schema_version": ANALYST_SCHEMA_VERSION, "as_of": run_date,
         "source": "yfinance+finnhub", "analyst": dict(sorted(analyst.items())),
@@ -2677,6 +2705,9 @@ def collect_sentiment(
         return {"status": "skipped", "reason": "empty metron universe", "universe": 0}
     yf_symbols = sorted({h["yf_symbol"] for h in holdings})
     sentiment = (sentiment_source or _news_sentiment)(yf_symbols)
+    refused = _refuse_empty_payload("sentiment", sentiment, len(yf_symbols))
+    if refused is not None:
+        return refused
     artifact = {
         "schema_version": SENTIMENT_SCHEMA_VERSION, "as_of": run_date,
         "source": "news_aggregates_daily(LM)", "sentiment": dict(sorted(sentiment.items())),
@@ -3125,6 +3156,9 @@ def collect_security_performance(
             continue
         if perf is not None:
             performance[yf_sym] = perf
+    refused = _refuse_empty_payload("performance", performance, len(yf_symbols))
+    if refused is not None:
+        return refused
     artifact = {
         "schema_version": SECURITY_PERFORMANCE_SCHEMA_VERSION,
         "as_of": run_date,
