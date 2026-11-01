@@ -278,13 +278,13 @@ def _rec(ticker: str, dev: float, status: str = "out_of_tol") -> m.ReconcileReco
     )
 
 
-def test_declared_table_covers_the_nine_classified_names():
+def test_declared_table_covers_the_classified_names():
     table = m._declared_by_ticker()
     by_class: dict[str, set[str]] = {}
     for d in table.values():
         by_class.setdefault(d.divergence_class, set()).add(d.ticker)
     assert by_class == {
-        "spin_off": {"CTVA", "HON", "IBM", "LEN", "BDX"},
+        "spin_off": {"CTVA", "HON", "IBM", "LEN", "BDX", "CMCSA", "FDX", "WDC"},
         "stock_dividend": {"CBSH"},
         "special_distribution": {"HR", "PSA", "RRX"},
     }
