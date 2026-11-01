@@ -278,14 +278,23 @@ def _d26_shape() -> Shape:
     Mirrors the inline ``extra_outputs`` of ``metron_rating_ledger``'s call site.
     """
     manifest = technical_rating_ledger.RATING_LEDGER_MANIFEST_KEY
+    # alpha-engine-config-I11554: the dated live entry, recorded when written.
+    live_entry = f"{technical_rating_ledger.RATING_LEDGER_PREFIX}{TRADING_DAY}.json"
     return Shape(
-        result=lambda rows: {"status": "ok", "total_dates": rows, "live_written": True},
-        written=lambda rows: {manifest: rows},
+        result=lambda rows: {
+            "status": "ok", "total_dates": rows, "live_written": True, "live_rated": rows,
+        },
+        written=lambda rows: {manifest: rows, live_entry: rows},
         extra_outputs=lambda: (
             (
                 manifest,
                 lambda r: bool(r.get("backfill_written") or r.get("live_written")),
                 lambda r: r.get("total_dates") or 0,
+            ),
+            (
+                live_entry,
+                lambda r: bool(r.get("live_written")),
+                lambda r: r.get("live_rated") or 0,
             ),
         ),
         auto_skip=False,
@@ -390,8 +399,8 @@ EOD_CASES: tuple[Case, ...] = (
     ),
     Case(
         "D26", "metron_rating_ledger", None,
-        "empty ledger: a zero-date rating-history manifest PUT under status ok, reporting "
-        "total_dates 0",
+        "empty ledger: a zero-date rating-history manifest and a zero-symbol live entry PUT under "
+        "status ok, reporting total_dates 0 and live_rated 0",
         shape=_d26_shape(),
     ),
     Case(
