@@ -344,6 +344,39 @@ def lambda_invocations(function_name: str, since=None) -> float:
     return sum(float(d.get("Sum") or 0) for d in got.get("Datapoints", []))
 
 
+def _is_state_machine(arn: str) -> bool:
+    """Is this target ARN a Step Functions state machine, not a Lambda?"""
+    return bool(arn) and arn.startswith("arn:aws:states:") and ":stateMachine:" in arn
+
+
+def states_executions(state_machine_arn: str, since=None) -> float:
+    """AWS/States ExecutionsStarted for a state machine over the trailing window.
+
+    The Step Functions counterpart of `lambda_invocations`. A Scheduler schedule
+    can target a state machine directly (`nousergon-data-collection/data-
+    collection-eod` -> `ne-data-collection-eod`), and `_rows_for_target` joins
+    such a target to its registry row by the ARN's tail exactly as it does a
+    function. Grading that row with the AWS/Lambda `Invocations` metric reads a
+    FunctionName that does not exist and returns 0 forever — measured
+    2026-10-30, run 41049515080: both data-collection schedules reported
+    `enabled-trigger-silent-target` while their machines had SUCCEEDED every
+    weekday, the moment their rows were promoted to in-service
+    (alpha-engine-config-I12852). The metric must match the target's service.
+    """
+    import datetime
+    end = datetime.datetime.now(UTC)
+    start = since or (end - datetime.timedelta(days=INVOCATION_WINDOW_DAYS))
+    got = _aws_json([
+        "cloudwatch", "get-metric-statistics",
+        "--namespace", "AWS/States", "--metric-name", "ExecutionsStarted",
+        "--dimensions", f"Name=StateMachineArn,Value={state_machine_arn}",
+        "--start-time", start.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--end-time", end.strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "--period", "86400", "--statistics", "Sum",
+    ])
+    return sum(float(d.get("Sum") or 0) for d in got.get("Datapoints", []))
+
+
 def is_ephemeral_one_shot(name: str, group: str = DEFAULT_SCHEDULE_GROUP) -> bool:
     """Does this Scheduler schedule delete itself the moment it fires?
 
@@ -495,6 +528,7 @@ def reconcile(
     alarm_breaching_of=None,
     is_ephemeral=None,
     noted: list[dict] | None = None,
+    executions_of=None,
 ) -> list[dict]:
     """Every disagreement between the three registers.
 
@@ -532,6 +566,12 @@ def reconcile(
     sf_live = sf_invoked if sf_invoked is not None else sf_invoked_functions()
     since = window_start(m)
     invocations_of = invocations_of or (lambda cid: lambda_invocations(cid, since=since))
+    # A state-machine target is graded on AWS/States, never AWS/Lambda — see
+    # `states_executions`. `executions_of` is `state_machine_arn -> float`.
+    executions_of = executions_of or (lambda arn: states_executions(arn, since=since))
+
+    def _ran(cid: str, arn: str) -> float:
+        return executions_of(arn) if _is_state_machine(arn) else invocations_of(cid)
     alarm_actions_of = alarm_actions_of or ap._alarm_actions_enabled
     if alarm_breaching_of is None:
         # One bulk read, cached for every entry this call grades — not one
@@ -676,12 +716,14 @@ def reconcile(
     # the live target map rather than from a hand-built table of five, so it
     # holds for every component that acquires the property later.
     target_rows: dict[str, set[str]] = {}
+    target_arn: dict[str, str] = {}
     for t in trigs:
         if t["name"].startswith(_AWS_MANAGED_PREFIX):
             continue
         for arn in targets_of(t):
             for row in _rows_for_target(reg, arn):
                 target_rows.setdefault(row["component_id"], set()).add(t["name"])
+                target_arn.setdefault(row["component_id"], arn)
     live_states = {t["name"]: t["state"] for t in trigs}
     for cid, trigger_names in sorted(target_rows.items()):
         row = reg[cid]
@@ -692,7 +734,7 @@ def reconcile(
             continue
         # The measured half. A row's lifecycle claim is graded against whether
         # the component RAN, never against the trigger map alone.
-        ran = invocations_of(cid)
+        ran = _ran(cid, target_arn[cid])
         if _declares_off(row):
             # NOT a finding, however many times it ran. Brian's ruling is
             # explicit that a paused component keeps its manual path — "everything
@@ -785,7 +827,7 @@ def reconcile(
                     # it again here off a single trigger's silence would just
                     # be a second, weaker copy of those.
                     continue
-                if invocations_of(cid) > 0:
+                if _ran(cid, arn) > 0:
                     continue
                 findings.append({
                     "kind": "enabled-trigger-silent-target", "trigger": name,

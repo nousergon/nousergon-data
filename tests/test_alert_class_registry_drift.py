@@ -397,8 +397,10 @@ class TestCliShapedEmission:
         assert "router-canary" in uncovered  # not registered in _CLI_CLASSES
         assert d.MISSING_SOURCE_SENTINEL not in uncovered
 
-    def test_dynamic_source_skipped(self, tmp_path):
-        """`--source "$SRC"`: statically unverifiable, skipped — not sourceless."""
+    def test_dynamic_source_is_reported_unresolvable(self, tmp_path):
+        """`--source "$SRC"`: statically unverifiable, so it is a FINDING named by
+        file — never skipped, and never mistaken for a sourceless invocation
+        (alpha-engine-config-I10380)."""
         patterns = d._build_registry_patterns(_CLI_CLASSES)
         repo = _make_repo(tmp_path, "test-repo", {
             "infra/generic.sh": (
@@ -406,20 +408,30 @@ class TestCliShapedEmission:
                 '--severity "$sev" --source "$SRC"\n'
             ),
         })
-        assert d._scan_repo(repo, patterns) == {}
+        assert d._scan_repo(repo, patterns) == {
+            d.UNRESOLVABLE_SOURCE_SENTINEL: {"infra/generic.sh"},
+        }
 
-    def test_prose_mention_not_an_invocation(self, tmp_path):
-        """A comment naming the channel is not an invocation (box_health.sh
-        false-positived on `krepis.alerts publish` prose in the first run —
-        only the `-m krepis.alerts` module shape counts)."""
+    def test_declared_dynamic_source_is_not_a_finding(self, tmp_path):
+        declared = next(iter(d.DECLARED_DYNAMIC_SOURCES))
+        assert d.DECLARED_DYNAMIC_SOURCES[declared].strip(), "a declaration needs a reason"
         patterns = d._build_registry_patterns(_CLI_CLASSES)
         repo = _make_repo(tmp_path, "test-repo", {
-            "infra/notes.sh": (
-                "# the verdict travelled ONLY via `krepis.alerts publish` "
-                "(SNS + Telegram).\n"
-            ),
+            declared: '"$PY" -m krepis.alerts publish --source "${UNIT%.service}-onfailure"\n',
         })
         assert d._scan_repo(repo, patterns) == {}
+
+    def test_every_declaration_carries_a_reason(self):
+        for path, reason in d.DECLARED_DYNAMIC_SOURCES.items():
+            assert len(reason.strip()) > 40, f"{path}: a declaration must say why"
+
+    def test_check_fails_on_an_undeclared_dynamic_source(self, tmp_path):
+        playbooks = _make_playbooks(tmp_path, _CLI_CLASSES)
+        repo = _make_repo(tmp_path, "test-repo", {
+            "infra/generic.sh": 'python -m krepis.alerts publish --source "$SRC"\n',
+        })
+        assert d.check(playbooks, [repo]) == 1
+
 
     def test_check_end_to_end_cli_drift(self, tmp_path):
         playbooks = _make_playbooks(tmp_path, _CLI_CLASSES)

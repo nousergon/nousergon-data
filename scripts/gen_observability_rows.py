@@ -32,7 +32,9 @@ describing the same schedule; P-08's job for D39 is to flip that EXISTING row's
   closed `SUBSTRATES` vocabulary (`SUBSTRATE_BY_TRIGGER_KIND` below).
 - `origin`: `trigger.owner` (the owning pipeline/workflow/rule) plus
   `trigger.detail` when present — the same pair `ne-data-collection-eod`'s own
-  row derives its `origin` from.
+  row derives its `origin` from. Two kinds take a routable form instead
+  (alpha-engine-config-I12664): `systemd-timer` is `systemd:<unit>` and
+  `manual` is `manual:<owner>` (see `_origin`).
 - `lifecycle`: the unit descriptor's own `lifecycle`, translated into the
   registry's five-value vocabulary (`LIFECYCLE_BY_UNIT_LIFECYCLE`) —
   `proposed-retirement` (R7, plan §7) becomes `deprecated`, since nothing has
@@ -49,6 +51,9 @@ describing the same schedule; P-08's job for D39 is to flip that EXISTING row's
   rows' row side would report every one ABSENT (measured 2026-10-25: 33 of
   the 40). Every parent named must be a `StateMachineName` this repo's
   CloudFormation declares (`test_step_function_units_name_their_state_machine`).
+  A unit on any other kind carries a parent only when its descriptor DECLARES
+  `trigger.parent_component` with a `trigger.parent_component_reason` (the
+  dispatcher, workflow or Scheduler target it runs inside).
 - Everything else (`authority_tier`, `signals.execution/cost/resource`,
   `log_location`, `alert_channel`, `severity_source`, `console_surface`,
   `retention`): derived from `trigger.kind` with a written, generic reason —
@@ -65,6 +70,7 @@ from __future__ import annotations
 
 import argparse
 import io
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -142,25 +148,87 @@ def _substrate(unit_id: str, trigger: dict[str, Any]) -> str:
         ) from exc
 
 
-def _origin(trigger: dict[str, Any]) -> str:
+#: The systemd unit a `systemd-timer` unit's `trigger.detail` names first
+#: (`daily-news.timer, 04:00 America/Los_Angeles`).
+_SYSTEMD_UNIT_RE = re.compile(r"^\s*([A-Za-z0-9_.@-]+\.(?:timer|service))\b")
+
+
+def _origin(unit_id: str, trigger: dict[str, Any]) -> str:
+    """The row's `origin`, in the form the ops reconciler routes on.
+
+    `observability_registry.py::discoverer_for_origin` decides which discoverer
+    can attest to a row from its origin alone, and anything it does not
+    recognise falls to `repos` (alpha-engine-config-I12664). Free text such as
+    `dashboard box (daily-news.timer, ...)` therefore read as a repo component
+    no repo can ever show, i.e. a manufactured ABSENT. Two kinds need a
+    machine-readable form:
+
+    - `systemd-timer`: `systemd:<unit>`, the form every shared-box row uses.
+    - `manual`: `manual:<owner>`. Nothing schedules a manual unit, so no
+      discoverer can confirm or refute it; the prefix says so instead of
+      leaving the row to read as a missing repo component.
+    """
+    kind = trigger.get("kind")
     owner = str(trigger.get("owner") or "").strip()
     detail = str(trigger.get("detail") or "").strip()
+    if kind == "systemd-timer":
+        match = _SYSTEMD_UNIT_RE.match(detail)
+        if not match:
+            raise ValueError(
+                f"{unit_id}: systemd-timer trigger.detail {detail!r} does not start with a "
+                "systemd unit name (`<name>.timer`) — the origin must name the unit"
+            )
+        return f"systemd:{match.group(1)}"
+    if kind == "manual":
+        return f"manual:{owner or detail or 'undeclared'}"
     if owner and detail:
         return f"{owner} ({detail})"
     return owner or detail or "undeclared"
 
 
-def _parent_component(trigger: dict[str, Any]) -> str | None:
-    """The state machine a `step-functions` unit runs inside, or None.
+def _parent_component(unit_id: str, trigger: dict[str, Any]) -> tuple[str | None, str]:
+    """(the component this unit runs inside, or None; the reason).
 
-    `trigger.owner` names it, optionally with the state the unit runs in
+    A `step-functions` unit's parent is DERIVED: `trigger.owner` names the
+    state machine, optionally with the state the unit runs in
     (`ne-weekly-freshness-pipeline:DataPhase1`); the component is the machine.
-    Other trigger kinds are components in their own right and get no parent.
+    Declaring one by hand there is refused, because two sources would drift.
+
+    Any other kind may DECLARE one as `trigger.parent_component`, with a
+    `trigger.parent_component_reason` (alpha-engine-config-I12664): a unit run
+    by a dispatcher Lambda, a GitHub workflow or a Scheduler target is a stage
+    of that component, and no discoverer ever sees the unit's own id. The ops
+    reconciler judges the parent instead and reports a parent that names no
+    row. Without a declaration the unit is a component in its own right.
     """
-    if trigger.get("kind") != "step-functions":
-        return None
-    machine = str(trigger.get("owner") or "").split(":", 1)[0].strip()
-    return machine or None
+    declared = str(trigger.get("parent_component") or "").strip()
+    declared_reason = str(trigger.get("parent_component_reason") or "").strip()
+    if trigger.get("kind") == "step-functions":
+        if declared:
+            raise ValueError(
+                f"{unit_id}: a step-functions unit's parent is derived from trigger.owner; "
+                "a declared trigger.parent_component would be a second source"
+            )
+        machine = str(trigger.get("owner") or "").split(":", 1)[0].strip()
+        if not machine:
+            return None, ""
+        return machine, (
+            f"{unit_id} runs as states inside the {machine!r} state machine, so no "
+            "discoverer can see this unit's own id; presence is judged on the state machine, "
+            "never on the unit (alpha-engine-config-I12664). Derived from the unit "
+            "descriptor's trigger.owner."
+        )
+    if not declared:
+        return None, ""
+    if not declared_reason:
+        raise ValueError(
+            f"{unit_id}: trigger.parent_component {declared!r} needs a "
+            "trigger.parent_component_reason — an unexplained parent is an unexplained exclusion"
+        )
+    return declared, (
+        f"{declared_reason} Declared in the unit descriptor's trigger.parent_component "
+        "(alpha-engine-config-I12664)."
+    )
 
 
 def _lifecycle(unit_id: str, unit_lifecycle: str) -> str:
@@ -255,20 +323,15 @@ def build_row(unit) -> dict[str, Any]:
         "component_id": data["component_id"],
         "owning_repo": "nousergon-data",
         "substrate": _substrate(unit.unit_id, trigger),
-        "origin": _origin(trigger),
+        "origin": _origin(unit.unit_id, trigger),
         "owner": data.get("owner", "brian"),
         "lifecycle": lifecycle,
     }
 
-    parent = _parent_component(trigger)
+    parent, parent_reason = _parent_component(unit.unit_id, trigger)
     if parent:
         row["parent_component"] = parent
-        row["parent_component_reason"] = (
-            f"{unit.unit_id} runs as states inside the {parent!r} state machine, so no "
-            "discoverer can see this unit's own id; presence is judged on the state machine, "
-            "never on the unit (alpha-engine-config-I12664). Derived from the unit "
-            "descriptor's trigger.owner."
-        )
+        row["parent_component_reason"] = parent_reason
 
     if lifecycle in LIFECYCLE_NEEDS_REASON:
         row["lifecycle_owner"] = data.get("owner", "brian")

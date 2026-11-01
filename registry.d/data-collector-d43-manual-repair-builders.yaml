@@ -11,7 +11,7 @@
 component_id: data-collector-d43-manual-repair-builders
 owning_repo: nousergon-data
 substrate: ec2-spot
-origin: operator CLI
+origin: manual:operator CLI
 owner: brian
 lifecycle: in-service
 authority_tier: t1

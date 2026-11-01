@@ -30,6 +30,10 @@ code_path: >-
     infrastructure/lambdas/arctic-migration-dispatcher/index.py:603
 trigger:
   kind: "github-actions"
+  # alpha-engine-config-I12664: the component this unit runs inside, so the
+  # ops reconciler judges presence on it rather than on the unit's own id.
+  parent_component: "nousergon-data-run-arctic-migrations"
+  parent_component_reason: "D42 runs as the .github/workflows/run-arctic-migrations.yml workflow, which the repos discoverer sees under this id."
   on_demand: true
   successor: unchanged by v2 phase 4
   runs_on: "github-hosted"
