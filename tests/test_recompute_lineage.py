@@ -315,6 +315,14 @@ class Day:
         self.s3 = VersionedS3()
         self.s3.put("data/sector_map.json", json.dumps({t: "XLK" for t in TICKERS}).encode())
         self.s3.put("data/sub_sector_etf_map.json", b"{}")
+        # D31 reads the weekly alternative partition; a missing pointer now
+        # raises (alpha-engine-config-I12879) instead of zeroing every row.
+        self.s3.put("market_data/latest_weekly.json", json.dumps({"date": "2026-09-19"}).encode())
+        alt_prefix = "market_data/weekly/2026-09-19/alternative/"
+        for t in TICKERS:
+            self.s3.put(f"{alt_prefix}{t}.json", json.dumps({"ticker": t}).encode())
+        self.s3.put(f"{alt_prefix}manifest.json",
+                    json.dumps({"tickers_succeeded": len(TICKERS)}).encode())
         self.v1_closes = self.s3.put(CLOSES_KEY, _closes(1.000))  # v1's D19, 16:04 ET
         self.shadow_closes = self.s3.put(ROOT.key(CLOSES_KEY), _closes(1.004))  # shadow's D19, 18:45 ET
         self.v1_library = v1_library or _library()

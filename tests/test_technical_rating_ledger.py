@@ -177,6 +177,9 @@ class TestCollectRatingLedger:
         assert live_entry["basis"] == "live"
         assert live_entry["rating_version"] == RATING_VERSION
         assert "AAPL" in live_entry["ratings"]
+        # alpha-engine-config-I11554: the run manifest records the dated live entry
+        # with this count, so it must be the symbols the entry actually rates.
+        assert result["live_rated"] == len(live_entry["ratings"]) > 0
 
     def test_live_date_is_immutable_on_rerun(self, monkeypatch):
         monkeypatch.setattr(trl, "LEDGER_BACKFILL_MIN_DATES", 3)
