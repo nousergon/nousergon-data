@@ -1,11 +1,10 @@
 boto3>=1.43.121
 pandas>=2.0
 openpyxl>=3.1.5
-# <26: pyarrow 26.0.0 (2026-10-09) refuses to import under NumPy 1.x, and every
-# spot box runs `pip install 'numpy<2'` after this file (data-spot-dispatcher,
-# spot_data_weekly.sh, weekly-freshness, arctic-migration). Lift the cap only in
-# the same change that removes those numpy<2 pins.
-pyarrow>=25.0.1,<26
+# >=26 needs NumPy 2 (26.0.0 refuses to import under 1.x). No venv built from
+# this file pins numpy<2 any more (alpha-engine-config-I12318): never add one back
+# after `pip install -r requirements.txt` -- it broke D17 on 2026-10-09.
+pyarrow>=26
 yfinance>=1.7.0
 requests>=2.34.2
 pyyaml>=6.0.3
