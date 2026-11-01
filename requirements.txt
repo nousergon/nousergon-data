@@ -1,4 +1,4 @@
-boto3>=1.43.121
+boto3>=1.43.123
 pandas>=2.0
 openpyxl>=3.1.5
 # >=26 needs NumPy 2 (26.0.0 refuses to import under 1.x). No venv built from
