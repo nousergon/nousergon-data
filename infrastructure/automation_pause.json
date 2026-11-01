@@ -329,6 +329,9 @@
     },
     "alpha-engine-box-power-sensor-selftest-stale": {
       "reason": "alpha-engine-config-I12722, nous-ergon-ops-PR1890. The liveness floor of alpha-engine-box-power-sensor: no box_power_sensor_selftest heartbeat on any of 7 daily periods (TreatMissingData=breaching). An event-driven sensor cannot carry an invocations floor, so this is its only silence detector, and it is red by design until the operator bootstrap has run."
+    },
+    "alpha-engine-alert-log-intake-absent": {
+      "reason": "alpha-engine-config-I12323, nous-ergon-ops batch/alert-log-delivery-health. End-to-end absence detector for the durable alert log: AWS/Firehose IncomingRecords on nousergon-alert-log, Sum < 1 for 12 consecutive 1-hour periods, TreatMissingData=breaching, routed to alpha-engine-alarm-backstop. ARMED: the rule nousergon-alert-log (bus nousergon-alerts) and the Firehose stream are live, kept infrastructure outside the 2026-08-07 v1 pause, and the 6-hourly nous-ergon-ops alert-transport-liveness.yml probe puts a nousergon.alert.v1 event on that bus every run, so a healthy stream gets at least two records in any 12h (measured 2026-10-18..31: 17-81 a day, longest gap 8h). Silence is this alarm's condition, so breaching is deliberate. It re-classifies to paused_alarms only if alert-transport-liveness.yml's schedule is paused AND fleet alert traffic stops."
     }
   }
 }

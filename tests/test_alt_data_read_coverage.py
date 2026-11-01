@@ -224,3 +224,47 @@ def test_null_subsection_does_not_drop_the_ticker():
     assert "AAA0000" in alt
     assert alt["AAA0000"]["earnings"]["surprise_pct"] == 0.0
     assert alt["AAA0000"]["options"]["iv_rank"] is None
+
+
+# ── alpha-engine-config-I12879: a failed pointer load is not "no alt data" ──
+
+
+class _PointerFailS3(FakeS3):
+    def __init__(self, tickers, *, pointer):
+        super().__init__(tickers)
+        self.pointer = pointer
+
+    def get_object(self, Bucket: str, Key: str):  # noqa: N803 - boto3 kwarg casing
+        if Key == "market_data/latest_weekly.json":
+            if isinstance(self.pointer, Exception):
+                raise self.pointer
+            return {"Body": _Body(self.pointer)}
+        return super().get_object(Bucket=Bucket, Key=Key)
+
+
+@pytest.mark.parametrize(
+    "pointer",
+    [
+        RuntimeError("simulated S3 read failure"),
+        b"{not json",
+        json.dumps({}).encode(),
+        json.dumps({"date": ""}).encode(),
+    ],
+    ids=["unreadable", "unparseable", "no-date", "empty-date"],
+)
+def test_failed_latest_weekly_load_raises_instead_of_zeroing(pointer):
+    """Was `return {}` with a WARNING: every alternative feature read 0.0 for
+    the whole universe, indistinguishable from a genuine zero."""
+    s3 = _PointerFailS3(_universe(10), pointer=pointer)
+    with pytest.raises(AlternativeCoverageError):
+        _load_cached_alternative(s3, "alpha-engine-research")
+
+
+def test_failed_listing_raises_instead_of_zeroing():
+    class _ListFail(FakeS3):
+        def get_paginator(self, name):
+            raise RuntimeError("simulated ListObjectsV2 failure")
+
+    with pytest.raises(AlternativeCoverageError) as exc:
+        _load_cached_alternative(_ListFail(_universe(10)), "alpha-engine-research")
+    assert "ListObjectsV2" in str(exc.value)

@@ -883,9 +883,6 @@ PIP="\$PYTHON_BIN -m pip"
 \$PIP install --upgrade pip -q
 \$PIP install -q -r requirements.txt
 
-# numpy<2 pin to match other spot workloads (pyarrow compiled against 1.x).
-\$PIP install -q 'numpy<2'
-
 echo "Dependencies installed."
 DEPS
 

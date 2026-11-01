@@ -1375,8 +1375,10 @@ def _load_cached_fundamentals(s3, bucket: str, date_str: str) -> dict[str, dict]
 class AlternativeCoverageError(RuntimeError):
     """DataPhase2 published alternative data that this reader could not read.
 
-    Raised only for the unambiguous case: the manifest states N>0 tickers were
-    written and we loaded ZERO. Every alternative feature would silently become
+    Raised only for the unambiguous cases: the manifest states N>0 tickers were
+    written and we loaded ZERO, or nothing could be loaded at all (the
+    ``latest_weekly.json`` pointer unreadable, dateless, or the listing failed;
+    alpha-engine-config-I12879). Every alternative feature would silently become
     0.0 for the whole universe, which is indistinguishable from a genuine zero
     (see ``compute_and_write``'s ``val ... else 0.0``) — a red run is the honest
     outcome. A PARTIAL shortfall is logged at ERROR rather than raised, so the
@@ -1456,6 +1458,13 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
         obj = s3.get_object(Bucket=bucket, Key="market_data/latest_weekly.json")
         latest = json.loads(obj["Body"].read())
         latest_date = latest.get("date", "")
+        if not latest_date:
+            # An empty date reads the bare ``market_data/weekly//alternative/``
+            # prefix, which holds nothing: the same whole-universe zero.
+            raise AlternativeCoverageError(
+                "Alternative data: market_data/latest_weekly.json has no 'date'; "
+                "every alternative feature would be 0.0 for the whole universe."
+            )
         prefix = f"market_data/weekly/{latest_date}/alternative/"
 
         # Paginate. The producer writes one object per ticker; a single
@@ -1525,8 +1534,17 @@ def _load_cached_alternative(s3, bucket: str) -> dict[str, dict]:
     except AlternativeCoverageError:
         raise
     except Exception as exc:
-        log.warning("No cached alternative data loaded — alternative features will use defaults: %s", exc)
-        return {}
+        # alpha-engine-config-I12879. Was `log.warning(...); return {}`. Every
+        # exception that reaches here — the ``latest_weekly.json`` pointer
+        # unreadable or unparseable, or the partition listing failing — means
+        # NOTHING was loaded, so returning ``{}`` gave every ticker 0.0 for all
+        # seven alternative features with only a WARNING: the same
+        # whole-universe zero the manifest branch above already refuses.
+        raise AlternativeCoverageError(
+            "Alternative data could not be loaded "
+            f"({type(exc).__name__}: {exc}). Every alternative feature would be "
+            "0.0 for the whole universe and indistinguishable from a genuine zero."
+        ) from exc
 
 
 def _expected_alternative_count(s3, bucket: str, prefix: str) -> int | None:
