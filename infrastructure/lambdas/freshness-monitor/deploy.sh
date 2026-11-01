@@ -72,12 +72,12 @@ RECONCILE_DESCRIPTION_TRIGGERS=(
 RECONCILE_CRONS=(
   "cron(0 12 * * ? *)"
   "cron(0 4 * * ? *)"
-  "cron(0/30 14-21 ? * MON-FRI *)"
+  "cron(0/30 * * * ? *)"
 )
 RECONCILE_PROSE=(
   "Daily 12:00 UTC probe of the artifact freshness registry"
   "Daily 04:00 UTC historical-cycle probe (mode=historical)"
-  "30-min weekday 14-21 UTC intraday probe (mode=intraday)"
+  "30-min every-day probe of the intraday-tier rows (mode=intraday)"
 )
 REGION="${AWS_REGION:-us-east-1}"
 ACCOUNT_ID="${ACCOUNT_ID:-711398986525}"
@@ -370,11 +370,12 @@ EOF
     --source-arn "${HIST_RULE_ARN}" \
     --region "${REGION}"
 
-  # Intraday mini-rule (config#1297): 30-min, weekdays 14-21 UTC (covers US
-  # market hours 13:30-20:00 UTC with a buffer either side). Fires the same
-  # Lambda with event={"mode": "intraday"} so it probes ONLY the two
-  # genuinely-intraday artifacts (open_orders_latest,
-  # freshness_monitor_heartbeat) without touching the shared
+  # Intraday mini-rule (config#1297): every 30 min, every day since
+  # alpha-engine-config-I11823 (it was weekdays 14-21 UTC, which left the Claude
+  # plan meter's 20-minute SLA unprobed for 14.5 h every night). Fires the same
+  # Lambda with event={"mode": "intraday"} so it probes ONLY the
+  # INTRADAY_ARTIFACT_IDS rows (open_orders_latest,
+  # freshness_monitor_heartbeat, claude_plan_usage_latest) without touching the shared
   # check_results/heartbeat/cycle_verdict surfaces the daily sweep owns.
   # Same file:// dodge as the historical target above (embedded-quote JSON
   # doesn't survive the put-targets shorthand form).
