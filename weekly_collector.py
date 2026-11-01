@@ -5106,6 +5106,15 @@ def _run_daily(config: dict, args: argparse.Namespace) -> dict:
                 lambda r: bool(r.get("backfill_written") or r.get("live_written")),
                 lambda r: r.get("total_dates") or 0,
             ),
+            # alpha-engine-config-I11554: the dated LIVE entry is D26's day-D
+            # deliverable, but only the manifest was recorded, so the gate's
+            # empty_fresh/pit readings never saw it. Recorded only when this run
+            # wrote it (`live_written`), counted as the symbols it rates.
+            (
+                f"{technical_rating_ledger.RATING_LEDGER_PREFIX}{run_date}.json",
+                lambda r: bool(r.get("live_written")),
+                lambda r: r.get("live_rated") or 0,
+            ),
         ),
     )
     # Realized near-term performance of the rating ledger (metron-ops#297 part 2) —

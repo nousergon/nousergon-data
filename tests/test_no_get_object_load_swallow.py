@@ -54,8 +54,9 @@ GRANDFATHERED: frozenset[tuple[str, str]] = frozenset(
         ("collectors/price_cache_holes.py", "_read_daily_closes"),
         ("collectors/price_cache_holes.py", "_read_cached"),
         ("collectors/universe_returns.py", "_load_sector_map"),
-        # The five below return an EMPTY CONTAINER, the severe I10923 shape.
-        ("features/compute.py", "_load_cached_alternative"),
+        # The four below return an EMPTY CONTAINER, the severe I10923 shape.
+        # features/compute.py::_load_cached_alternative left in
+        # alpha-engine-config-I12879: it now raises AlternativeCoverageError.
         ("collectors/alternative.py", "_load_promoted_tickers"),
         ("collectors/daily_news.py", "_load_holdings_universe"),
         ("collectors/metron_market_data.py", "_read_metron_universe_holdings"),

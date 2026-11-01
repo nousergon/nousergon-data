@@ -133,7 +133,13 @@ def test_the_console_descriptor_declares_the_same_cadence(cadence):
 def test_the_descriptor_names_the_component_id_every_surface_uses(cadence):
     descriptor = yaml.safe_load(DESCRIPTOR_PATH.read_text())
     assert descriptor["component_id"] == "ae-preflight-sweep"
-    assert descriptor["lifecycle"] == "in-service"
+    # `deprecated` since 2026-10-31 (alpha-engine-config-I12842): the sweep
+    # still runs, over the v1 weekly SF whose trigger is disabled. A declared
+    # decision must carry its reason and re-exam; it never goes quietly.
+    assert descriptor["lifecycle"] in ("in-service", "deprecated")
+    if descriptor["lifecycle"] != "in-service":
+        assert descriptor["lifecycle_reason"]
+        assert descriptor["lifecycle_reexam"]
     assert descriptor["owner"]
 
 
