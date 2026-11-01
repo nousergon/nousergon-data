@@ -29,7 +29,19 @@ owning_repo: nousergon-data
 substrate: eventbridge
 origin: aws:events:alpha-engine-preflight-sweep-daily
 owner: brian
-lifecycle: in-service
+lifecycle: deprecated
+lifecycle_reason: >-
+  Deprecated 2026-10-31 (alpha-engine-config-I12842 / -I12908). The sweep
+  derives its stage list from infrastructure/step_function.json, the v1 weekly
+  Step Function ne-weekly-freshness-pipeline, whose only trigger
+  `alpha-engine-saturday` is DISABLED by Brian's 2026-10-28 ruling; the Crucible
+  v2 weekly replaced it. It still runs daily, so `deprecated` (still produces,
+  decision taken), not `disabled`: its rollup is ATTENTION by design while any
+  acknowledged no_dry_path / dedicated-box gap exists, which made it a standing
+  DEGRADED row for a pipeline nothing fires. Retire it, or repoint it at the v2
+  weekly, with the v1 decommission (alpha-engine-config-I10655).
+lifecycle_owner: brian
+lifecycle_reexam: 2026-11-30
 
 # ── Registry claims (observability-policy.md §2.2) ──────────────────────────
 # This file is now gathered into the fleet observability registry by
