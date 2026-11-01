@@ -489,10 +489,19 @@ Resources:
         # pipeline_role="daily" (Option-D 2026-05-25): identifies this as
         # the canonical weekday trading-cadence run. Page 25 filters to
         # role="daily" by default for the Weekday section.
+        #
+        # v1 TRADING STEPS SKIPPED (Brian's ruling 2026-11-01, Crucible v2
+        # phase 4: paper orders move to crucible-trader). The three skip
+        # flags route past PredictorInference, RunMorningPlanner and
+        # RunDaemon using the SF's own per-task gates, so v1 writes no
+        # order book and its daemon idles. The run itself is KEPT: it is
+        # what starts the trading box the v2 trader's session, reconcile
+        # and shadow-book timers run on. Disabling this schedule would
+        # stop v2 trading too.
         Input: !Sub |
           {
             "StateMachineArn": "${WeekdayPipeline}",
-            "Input": "{\"ec2_instance_id\": [\"${MicroInstanceId}\"], \"trading_instance_id\": [\"${TradingInstanceId}\"], \"sns_topic_arn\": \"${AlertsTopic}\", \"pipeline_role\": \"daily\"}"
+            "Input": "{\"ec2_instance_id\": [\"${MicroInstanceId}\"], \"trading_instance_id\": [\"${TradingInstanceId}\"], \"sns_topic_arn\": \"${AlertsTopic}\", \"pipeline_role\": \"daily\", \"skip_predictor_inference\": true, \"skip_morning_planner\": true, \"skip_run_daemon\": true}"
           }
 
   # --------------------------------------------------------------------------
