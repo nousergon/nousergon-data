@@ -214,6 +214,7 @@ def _coalesce_by_source_priority(
     run_date: str,
     *,
     carried: "list[str] | None" = None,
+    stale_new: "set[str] | frozenset[str]" = frozenset(),
 ) -> tuple[list[dict], dict]:
     """Merge this-run records with the prior parquet by source priority.
 
@@ -244,6 +245,16 @@ def _coalesce_by_source_priority(
     the existing object's row rather than this run's (retained or
     downgrade-blocked). Their settlement is that object's,
     not this fetch's (`_settlement_guards`, alpha-engine-config-I11563).
+
+    ``stale_new`` names the tickers whose fresh row is a CARRY: a FRED value
+    whose observation predates ``run_date`` (FRED had not yet published the
+    trading day). Precedence ranks vendors, not observation dates, so without
+    this a T-1 FRED carry outranked an existing same-day yfinance close for a
+    past trading day and the cell held yesterday's value under today's date
+    (2026-10-21 VIX/VIX3M/TNX, alpha-engine-config-I12866). A carry therefore
+    never replaces an existing non-FRED row holding a real close; it counts as
+    ``downgrade_blocked``. Against no row, or a prior FRED row, it lands as
+    before — the same-day morning file still carries yesterday's FRED value.
     """
     def _prio(row: dict | None) -> int:
         if row is None:
@@ -275,6 +286,15 @@ def _coalesce_by_source_priority(
         elif new_p < 0:  # ticker absent from this run → retain prior
             merged[ticker] = old_row
             stats["retained"] += 1
+            if carried is not None:
+                carried.append(str(ticker))
+        elif (
+            ticker in stale_new
+            and old_p > 0
+            and old_row.get("source") != "fred"
+        ):  # I12866: a dated-earlier carry never displaces a real existing close
+            merged[ticker] = old_row
+            stats["downgrade_blocked"] += 1
             if carried is not None:
                 carried.append(str(ticker))
         elif new_p >= old_p:  # equal-or-higher source wins (tie → restatement)
@@ -1294,6 +1314,10 @@ def collect(
         fred_count = get_adapter(index_source).fetch_into(
             records, fred_missing, run_date, window_cache=fred_window_cache,
         )
+    # I12866: which FRED rows this run stamped onto run_date from an earlier
+    # observation. Knowable only from the window cache (the per-date legacy
+    # path is the same-day call, where a carry is the intended semantic).
+    fred_carry_tickers = _fred_carry_tickers(records, run_date, fred_window_cache)
 
     # ── Step 3: yfinance ─────────────────────────────────────────────────────
     # polygon_only refuses yfinance fallback for the EQUITY universe per
@@ -1379,6 +1403,7 @@ def collect(
     if source != "polygon_only" and existing_rows_for_merge:
         records, canon_merge_stats = _coalesce_by_source_priority(
             records, existing_rows_for_merge, run_date, carried=carried_tickers,
+            stale_new=fred_carry_tickers,
         )
         logger.info(
             "[skip_if_canonical] %s: coalesce retained %d preserved canonical "
@@ -1433,6 +1458,7 @@ def collect(
     if source == "polygon_only" and existing_rows_for_merge:
         records, merge_stats = _coalesce_by_source_priority(
             records, existing_rows_for_merge, run_date, carried=carried_tickers,
+            stale_new=fred_carry_tickers,
         )
         if merge_stats["retained"] or merge_stats["downgrade_blocked"]:
             logger.warning(
@@ -2590,6 +2616,41 @@ def _fred_value_on_or_before(
         else:
             break
     return candidate
+
+
+def _fred_observation_on_or_before(
+    series: list[tuple[str, float]], date_str: str,
+) -> str | None:
+    """Date of the observation :func:`_fred_value_on_or_before` would return."""
+    candidate: str | None = None
+    for d, _v in series:
+        if d <= date_str:
+            candidate = d
+        else:
+            break
+    return candidate
+
+
+def _fred_carry_tickers(
+    records: list[dict],
+    run_date: str,
+    window_cache: dict[str, list[tuple[str, float]]] | None,
+) -> set[str]:
+    """FRED records stamped ``run_date`` whose cached observation is earlier.
+
+    alpha-engine-config-I12866. Empty without a window cache.
+    """
+    if not window_cache:
+        return set()
+    carries: set[str] = set()
+    for r in records:
+        if r.get("source") != "fred":
+            continue
+        ticker = str(r.get("ticker"))
+        obs = _fred_observation_on_or_before(window_cache.get(ticker) or [], run_date)
+        if obs is not None and obs < run_date:
+            carries.add(ticker)
+    return carries
 
 
 def _fetch_fred_window(
