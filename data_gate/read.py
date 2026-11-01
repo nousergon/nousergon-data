@@ -34,7 +34,13 @@ from nousergon_lib.gates import (
 )
 
 from data_gate import clauses as clause_module
-from data_gate.descriptors import CONNECTION_STATES, REPO_ROOT, load_units
+from data_gate import exit_criteria as xc
+from data_gate.descriptors import (
+    CONNECTION_STATES,
+    EXTERNALLY_OWNED_OBSERVABILITY_ROWS,
+    REPO_ROOT,
+    load_units,
+)
 
 __all__ = [
     "BOARD_KEY",
@@ -391,7 +397,8 @@ _OBSERVED_UNIT_STATES = frozenset({"HEALTHY", "DEGRADED", "UNREPORTED"})
 
 def _unit_states(rows: list[dict], units, generated_utc: str) -> list[dict]:
     """Each unit's observed run state, keyed by its `component_id`
-    (alpha-engine-config-I12855).
+    (alpha-engine-config-I12855), followed by each collection state
+    machine's (`_pipeline_states`, alpha-engine-config-I12911).
 
     The console gathers every `registry.d/data-collector-*.yaml` descriptor
     from this repo as a DECLARATION, and until this list nothing OBSERVED any
@@ -408,12 +415,86 @@ def _unit_states(rows: list[dict], units, generated_utc: str) -> list[dict]:
     by_clause = {r["clause"]: r for r in rows}
     out: list[dict] = []
     for unit in sorted(units, key=lambda u: u.unit_id):
+        # A unit whose observability row is hand-authored in nous-ergon-ops
+        # under a DIFFERENT id (alpha-engine-config-I10870) has no declaration
+        # under its own `component_id`, so publishing it there minted an
+        # UNREGISTERED console entity (D39, alpha-engine-config-I12911). Its
+        # runtime is observed under the external row's own id by that row's
+        # own publisher; a second observation keyed there would contest it.
+        if unit.unit_id in EXTERNALLY_OWNED_OBSERVABILITY_ROWS:
+            continue
         row = by_clause.get(f"data.{unit.unit_id}.run_record")
         if row is None or row["console_state"] not in _OBSERVED_UNIT_STATES:
             continue
         out.append({
             "component_id": unit.component_id,
             "unit_id": unit.unit_id,
+            "clause": row["clause"],
+            "state": row["state"],
+            "console_state": row["console_state"],
+            "detail": row["detail"],
+            "source": row["source"],
+            "evidence": row["evidence"],
+            "run_as_of": row["as_of"],
+            "as_of": generated_utc,
+        })
+    return out + _pipeline_states(by_clause, units, generated_utc)
+
+
+#: The clause that answers "did this schedule's latest due fire complete end to
+#: end": one complete cycle ending at the latest due fire, every unit the
+#: schedule verifies recording an ok scheduled-trigger manifest inside it
+#: (`clauses._clause_phase1_consecutive_*_cycles`). Keyed by the schedule name
+#: `exit_criteria` already owns, so the two cannot name a schedule differently.
+_CYCLE_CLAUSE_BY_SCHEDULE: dict[str, str] = {
+    xc.SCHEDULE_EOD: "data.phase1.consecutive_eod_cycles",
+    xc.SCHEDULE_MORNING: "data.phase1.consecutive_morning_cycles",
+    xc.SCHEDULE_WEEKLY: "data.phase1.consecutive_weekly_cycles",
+}
+
+_SCHEDULER_PREFIX = "eventbridge-scheduler:"
+
+
+def _pipeline_states(by_clause: dict[str, dict], units, generated_utc: str) -> list[dict]:
+    """Each collection STATE MACHINE's observed run state, keyed by its own
+    component id (alpha-engine-config-I12911).
+
+    `nous-ergon-ops/governance/observability.d/` declares `ne-data-collection-eod`
+    and `ne-data-collection-weekly` in service, and nothing observed either id:
+    the console's state-machine adapter lists only the trading pipelines, and
+    the unit rows above carry Dxx ids. Both rendered UNREPORTED although they
+    run and the gate grades every cycle.
+
+    Nothing here is hand-listed. Each step-functions unit descriptor already
+    names its state machine (`trigger.owner`, the same field the generator
+    derives `parent_component` from) and the schedule that starts it
+    (`trigger.started_by`); a machine whose units name exactly one schedule
+    with a cycle clause gets that clause's verdict. A machine started by
+    anything else, or by more than one schedule, is omitted rather than
+    guessed at, as is a clause row in a declared-only state.
+    """
+    schedules: dict[str, set[str]] = {}
+    for unit in units:
+        trigger = unit.raw.get("trigger") or {}
+        if trigger.get("kind") != "step-functions":
+            continue
+        machine = str(trigger.get("owner") or "").split(":", 1)[0].strip()
+        started_by = str(trigger.get("started_by") or "")
+        if not machine or not started_by.startswith(_SCHEDULER_PREFIX):
+            continue
+        schedule = started_by[len(_SCHEDULER_PREFIX):].rsplit("/", 1)[-1]
+        schedules.setdefault(machine, set()).add(schedule)
+    out: list[dict] = []
+    for machine, names in sorted(schedules.items()):
+        if len(names) != 1:
+            continue
+        clause = _CYCLE_CLAUSE_BY_SCHEDULE.get(next(iter(names)))
+        row = by_clause.get(clause) if clause else None
+        if row is None or row["console_state"] not in _OBSERVED_UNIT_STATES:
+            continue
+        out.append({
+            "component_id": machine,
+            "unit_id": None,
             "clause": row["clause"],
             "state": row["state"],
             "console_state": row["console_state"],

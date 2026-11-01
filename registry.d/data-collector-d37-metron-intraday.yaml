@@ -11,7 +11,7 @@
 component_id: data-collector-d37-metron-intraday
 owning_repo: nousergon-data
 substrate: shared-box
-origin: dashboard box (metron-intraday.timer, *:00/5:00, NYSE-session gated)
+origin: systemd:metron-intraday.timer
 owner: brian
 lifecycle: in-service
 authority_tier: t1

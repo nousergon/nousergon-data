@@ -514,7 +514,6 @@ python3.12 -m venv .venv || fail "venv create failed"
 source .venv/bin/activate
 pip install --upgrade pip -q || fail "pip upgrade failed"
 pip install -q -r requirements.txt || fail "deps install failed"
-pip install -q 'numpy<2' || fail "numpy pin failed"
 export GH_TOKEN="$PAT"
 mkdir -p "$(dirname {log})"
 python scripts/run_arctic_migrations.py --merged-sha {merged_sha} \\

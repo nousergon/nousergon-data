@@ -131,8 +131,12 @@ _CLI_WINDOW_CHARS = 600
 _CLI_SOURCE_LITERAL = re.compile(r"--source[\s'\",]+([A-Za-z0-9][\w.\-/:]*)")
 
 # A dynamic --source (`--source "$SRC"` / `--source {var}`): statically
-# unverifiable, skipped — mirroring the in-process scanner, which only
-# matches string literals and ignores source=<variable>.
+# unverifiable. Until alpha-engine-config-I10380 these were SKIPPED, which made
+# an emitter whose source is computed invisible to the one chokepoint that
+# exists to see emitters — and since krepis-PR214 a source with no
+# `alert_classes` row pages by default. An unresolvable source is now a
+# FINDING, reported under UNRESOLVABLE_SOURCE_SENTINEL, unless its file is
+# declared in DECLARED_DYNAMIC_SOURCES with a reason.
 _CLI_SOURCE_DYNAMIC = re.compile(r"""--source[\s'\",]+[{$]""")
 
 # Sentinel reported when a CLI invocation carries no --source at all. Such an
@@ -141,6 +145,29 @@ _CLI_SOURCE_DYNAMIC = re.compile(r"""--source[\s'\",]+[{$]""")
 # claude-code-config call sites also missing the `publish` subcommand, so
 # every invocation died on an argparse error the callers swallowed.
 MISSING_SOURCE_SENTINEL = "<missing --source>"
+
+# Sentinel reported when a CLI invocation's --source is computed at run time
+# (alpha-engine-config-I10380). No static check can say whether a row covers
+# it, so it is reported by file rather than skipped. The fix is a literal
+# source, or a declaration below naming the registry row that covers every
+# value it can take.
+UNRESOLVABLE_SOURCE_SENTINEL = "<unresolvable --source>"
+
+#: Files whose CLI invocation computes its --source, each with the reason it is
+#: accepted as declared. Keyed by REPO-RELATIVE path (the scanner sees one repo
+#: at a time). Adding a row here is a reviewed decision, not a way to quiet the
+#: check: the reason must say which values the source takes and what covers
+#: them, or name the issue tracking the gap.
+DECLARED_DYNAMIC_SOURCES: dict[str, str] = {
+    "infrastructure/alert_on_failure.sh": (
+        "crucible-dashboard's systemd OnFailure= handler publishes as "
+        "`<unit>-onfailure` for whichever unit failed. The value set is the "
+        "dashboard box's OnFailure= units; no alert_classes row covers that "
+        "suffix shape today, so each publish routes by krepis's fail-upward "
+        "default (page, registry_drift=true). Declared so the gap is named "
+        "here rather than skipped; tracked on alpha-engine-config-I10380."
+    ),
+}
 
 # THE SCANNER MUST NOT SCAN ITSELF (alpha-engine-config-I7896, caught by this
 # guard on its OWN first CI run — nousergon-data-PR1479, run 32436244797).
@@ -168,8 +195,8 @@ SELF_EXCLUDED_RELPATHS: frozenset[str] = frozenset({
 def _find_cli_source_literals(file_text: str) -> tuple[set[str], int]:
     """CLI-shaped invocations: (literal sources found, count with no --source).
 
-    Dynamic sources (env vars, format interpolation) are skipped, consistent
-    with `_find_publish_source_literals` ignoring non-literal `source=`.
+    Dynamic sources (env vars, format interpolation) are not literals; they
+    are counted by `_count_cli_dynamic_sources` and reported by `_scan_repo`.
     """
     sources: set[str] = set()
     missing = 0
@@ -181,6 +208,17 @@ def _find_cli_source_literals(file_text: str) -> tuple[set[str], int]:
         elif not _CLI_SOURCE_DYNAMIC.search(window):
             missing += 1
     return sources, missing
+
+
+def _count_cli_dynamic_sources(file_text: str) -> int:
+    """CLI-shaped invocations whose --source is computed, not a literal."""
+    count = 0
+    for match in _CLI_CALL_PATTERN.finditer(file_text):
+        window = file_text[match.start(): match.start() + _CLI_WINDOW_CHARS]
+        if not _CLI_SOURCE_LITERAL.search(window) and _CLI_SOURCE_DYNAMIC.search(window):
+            count += 1
+    return count
+
 
 
 def _load_alert_classes(playbooks_path: Path) -> list[dict]:
@@ -321,9 +359,11 @@ def _scan_repo(repo_root: Path, patterns: list[tuple[str, str, bool]]) -> dict[s
         cli_sources, cli_missing = _find_cli_source_literals(text)
         sources |= cli_sources
 
-        rel_path = str(scan_file.relative_to(repo_root))
+        rel_path = scan_file.relative_to(repo_root).as_posix()
         if cli_missing:
             uncovered.setdefault(MISSING_SOURCE_SENTINEL, set()).add(rel_path)
+        if _count_cli_dynamic_sources(text) and rel_path not in DECLARED_DYNAMIC_SOURCES:
+            uncovered.setdefault(UNRESOLVABLE_SOURCE_SENTINEL, set()).add(rel_path)
         for source in sources:
             if not _source_matches_registry(source, patterns):
                 uncovered.setdefault(source, set()).add(rel_path)

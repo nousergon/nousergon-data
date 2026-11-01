@@ -28,6 +28,10 @@ owner: brian
 code_path: scripts/backfill_benchmark_proxies.py
 trigger:
   kind: "on-demand-dispatch"
+  # alpha-engine-config-I12664: the component this unit runs inside, so the
+  # ops reconciler judges presence on it rather than on the unit's own id.
+  parent_component: "alpha-engine-data-spot-dispatcher"
+  parent_component_reason: "D35 runs on a spot instance the alpha-engine-data-spot-dispatcher Lambda launches on demand; no discoverer sees the unit, only the dispatcher."
   owner: "alpha-engine-data-spot-dispatcher"
   successor: "dispatcher survives (deploy.sh-managed)"
   runs_on: "ec2-spot"

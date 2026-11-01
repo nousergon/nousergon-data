@@ -14,6 +14,10 @@ substrate: ec2-spot
 origin: alpha-engine-data-spot-dispatcher
 owner: brian
 lifecycle: in-service
+parent_component: alpha-engine-data-spot-dispatcher
+parent_component_reason: D35 runs on a spot instance the alpha-engine-data-spot-dispatcher Lambda launches
+  on demand; no discoverer sees the unit, only the dispatcher. Declared in the unit descriptor's trigger.parent_component
+  (alpha-engine-config-I12664).
 authority_tier: t1
 authority_tier_reason: 'A deterministic collector with no judgment: D35''s own code path (scripts/backfill_benchmark_proxies.py)
   writes only the key templates its unit descriptor names in writes[]. No branching on model output; no
