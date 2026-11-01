@@ -485,7 +485,7 @@ def test_a_partial_exclusion_column_reads_met_not_unmeasurable(units):
 
 def test_a_role_scoped_to_the_declared_prefixes_reads_met(units):
     store = EmptyStore()
-    store.iam_client = _Simulator(("staging/",))
+    store.iam_client = _Simulator(("staging/", "data_collection/runs/"))
     reading = unit_readers.read_identity(store, _unit(units, "D19"))
     assert reading.met, reading.detail
     assert all(c["PolicySourceArn"].endswith("role/nousergon-data-collection-box-role") for c in store.iam_client.calls)
@@ -496,6 +496,29 @@ def test_withholding_the_grant_on_a_declared_key_is_unmet_naming_it(units):
     store.iam_client = _Simulator(("market_data/",))
     reading = unit_readers.read_identity(store, _unit(units, "D19"))
     assert not reading.met and "staging/daily_closes/gate-probe.parquet" in reading.detail
+
+
+def test_a_role_that_cannot_write_its_run_record_is_unmet_naming_the_key(units):
+    """alpha-engine-config-I11278: product grant alone is not enough — the
+    harness writes the run manifest after the work, so a role scoped to the
+    product prefix only fails AFTER its work succeeded."""
+    store = EmptyStore()
+    store.iam_client = _Simulator(("staging/",))
+    reading = unit_readers.read_identity(store, _unit(units, "D19"))
+    assert not reading.met and not reading.unmeasurable
+    assert "NOT its run record" in reading.detail
+    assert "data_collection/runs/D19/gate-probe/gate-probe.json" in reading.detail
+
+
+def test_the_plan_carries_the_run_record_key_from_the_manifest_prefix(units):
+    plan = unit_readers.identity_plan(_unit(units, "D19"), unit_readers.load_identities())
+    assert plan.records == ("data_collection/runs/D19/gate-probe/gate-probe.json",)
+
+
+def test_record_targets_add_the_arctic_record_only_for_arctic_writers(units):
+    unit = _unit(units, "D19")
+    assert unit_readers.ARCTIC_PROBE_RECORD not in unit_readers.record_targets(unit, ())
+    assert unit_readers.ARCTIC_PROBE_RECORD in unit_readers.record_targets(unit, ("universe",))
 
 
 def test_a_whole_bucket_wildcard_is_unmet(units):
@@ -530,7 +553,7 @@ def test_a_per_unit_identity_overrides_the_runs_on_class(units, tmp_path):
     config["by_unit"] = {"D19": "a-per-unit-role"}
     path.write_text(yaml.safe_dump(config), encoding="utf-8")
     store = EmptyStore()
-    store.iam_client = _Simulator(("staging/",))
+    store.iam_client = _Simulator(("staging/", "data_collection/runs/"))
     reading = unit_readers.read_identity(store, _unit(units, "D19"), identities_path=path)
     assert all(c["PolicySourceArn"].endswith("role/a-per-unit-role") for c in store.iam_client.calls)
     assert reading.met, reading.detail
