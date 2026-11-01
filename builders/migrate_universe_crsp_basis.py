@@ -1371,9 +1371,12 @@ def reconcile_close(
 # was, when, and the largest deviation it can explain; it expires so it is
 # re-read rather than carried.
 #
-# CLASSIFICATION ONLY. A declared row does NOT make a residual "explained" and
-# does NOT pass the gate: ``explained`` still comes only from the operator's
-# ``--known-divergence``. The audit records each out-of-tolerance name's class
+# On the TOTAL-RETURN axis this is CLASSIFICATION ONLY: a declared row does NOT
+# make a residual "explained" there. On the CLOSE axis, which gates, a row of a
+# share-distribution class (``CLOSE_EXPLAINING_CLASSES``) explains a residual
+# that is inside its bound and unexpired (``explain_close_by_declared``,
+# alpha-engine-config-I12436); everything else is explained only by the
+# operator's ``--known-divergence``. The audit records each out-of-tolerance name's class
 # (or that it has none), whether its deviation is inside the declared bound, and
 # whether the row has expired, so a residual that outgrows its event, or a name
 # with no event at all, is told apart from the ones already understood.
@@ -1417,7 +1420,7 @@ _PUBLIC = f"public corporate-event history, max deviation on the event; {_I12436
 DECLARED_RECONCILE_DIVERGENCES: tuple[DeclaredDivergence, ...] = (
     # ── class 2: spin-offs the dividend feed carries no record of ──────────────
     DeclaredDivergence(
-        "CTVA", "spin_off", "VYLR spin-off, 1 VYLR per CTVA share", "2026-10-01", 0.60,
+        "CTVA", "spin_off", "VYLR spin-off, 1 VYLR per CTVA share", "2026-10-01", 0.90,
         f"corporate_actions.declared.DECLARED_SPINOFFS (alpha-engine-config-I11806); {_I12436}",
         "2027-01-31",
     ),
@@ -1436,14 +1439,29 @@ DECLARED_RECONCILE_DIVERGENCES: tuple[DeclaredDivergence, ...] = (
     DeclaredDivergence(
         "BDX", "spin_off",
         "Biosciences & Diagnostic Solutions separation (Waters Reverse Morris Trust)",
-        "2026", 0.04,
+        "2026-02", 0.25,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "CMCSA", "spin_off", "Versant Media Group spin-off, 1 VSNT per 25 CMCSA shares",
+        "2026-01", 0.08,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "FDX", "spin_off", "FedEx Freight (FDXF) separation", "2026-06", 0.25,
+        _PUBLIC, "2027-01-31",
+    ),
+    DeclaredDivergence(
+        "WDC", "spin_off", "Sandisk (SNDK) spin-off, 1 SNDK per WDC share", "2025-02", 0.30,
         _PUBLIC, "2027-01-31",
     ),
     # ── class 4: a stock dividend is a share distribution, not cash ────────────
     DeclaredDivergence(
-        "CBSH", "stock_dividend", "annual 5% stock dividend, each December", "2020-12", 0.40,
-        f"Commerce Bancshares' annual 5% stock dividend: 1.05^6 = 1.34 over six "
-        f"Decembers matches the residual; {_I12436}", "2027-01-31",
+        "CBSH", "stock_dividend", "annual 5% stock dividend, each December", "2020-12", 0.12,
+        f"Commerce Bancshares' annual 5% stock dividend, which the polygon split "
+        f"feed does not register: the two Decembers inside the polygon window "
+        f"(2024, 2025) compound to 1.05^2 = 1.1025, which is the close-axis "
+        f"residual; {_I12436}", "2027-01-31",
     ),
     # ── class 5: a special or merger distribution one side carries ─────────────
     DeclaredDivergence(
@@ -1525,6 +1543,70 @@ def classify_divergences(
         "exceeds_bound": exceeds,
         "expired": expired,
     }
+
+
+# Classes whose CLOSE-axis residual is a difference in how the two sides treat a
+# share distribution, not a missing split: yfinance folds a spin-off or a stock
+# dividend into its adjusted ``Close`` and the polygon raw ``Close`` the EDGAR
+# rebuild reads keeps the real ex-date price. A cash class never reaches this
+# axis (dividends play no part in the split-only ``Close``).
+CLOSE_EXPLAINING_CLASSES = ("spin_off", "stock_dividend")
+
+
+def explain_close_by_declared(
+    records: list[ReconcileRecord],
+    *,
+    today: str | pd.Timestamp | None = None,
+    declared: tuple[DeclaredDivergence, ...] | None = None,
+) -> tuple[list[ReconcileRecord], list[dict]]:
+    """Mark a CLOSE-axis residual explained when a reviewed, unexpired declared
+    row of a share-distribution class covers it and the residual is inside the
+    row's bound (alpha-engine-config-I12436, option (a) of the 2026-10-29 card).
+
+    A residual outside the bound, past the row's expiry, with no row, or on a
+    class that does not act on the split-only ``Close`` stays unexplained and
+    fails the gate. The operator's ``--known-divergence`` is untouched: a record
+    that is already explained is returned as it came. Returns the records and
+    one audit row per name this call explained."""
+    table = (
+        _declared_by_ticker() if declared is None
+        else {d.ticker: d for d in declared}
+    )
+    now = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp(
+        datetime.now(timezone.utc).date()
+    )
+    out: list[ReconcileRecord] = []
+    explained_rows: list[dict] = []
+    for r in records:
+        d = table.get(r.ticker)
+        if (
+            r.status != "out_of_tol" or r.explained or d is None
+            or d.divergence_class not in CLOSE_EXPLAINING_CLASSES
+            or not np.isfinite(r.max_rel_dev)
+            or r.max_rel_dev > d.max_rel_dev_bound
+            or now >= pd.Timestamp(d.expires).normalize()
+        ):
+            out.append(r)
+            continue
+        out.append(dataclasses.replace(
+            r,
+            explained=True,
+            explanation=(
+                f"{r.explanation} [explained by declared {d.divergence_class} "
+                f"row: {d.event}, {d.event_when}; inside the declared bound, "
+                f"expires {d.expires}]"
+            ),
+        ))
+        explained_rows.append({
+            "ticker": r.ticker,
+            "class": d.divergence_class,
+            "event": d.event,
+            "event_when": d.event_when,
+            "max_rel_dev": r.max_rel_dev,
+            "max_rel_dev_bound": d.max_rel_dev_bound,
+            "expires": d.expires,
+        })
+    return out, explained_rows
 
 
 # ── orchestration ─────────────────────────────────────────────────────────────
@@ -1944,6 +2026,7 @@ def _run_and_report(
         if o.prior_tickers:
             prior_ticker_dividends.append({"ticker": o.ticker, "prior": o.prior_tickers})
 
+    close_records, close_declared_explained = explain_close_by_declared(close_records)
     tr_records = records
     tr_unexplained = [r for r in tr_records if not r.explained]
     close_unexplained = [r for r in close_records if not r.explained]
@@ -2103,6 +2186,10 @@ def _run_and_report(
         # (DECLARED_RECONCILE_DIVERGENCES). Report only: it never passes the
         # gate; ``unexplained_count`` above is unchanged by it.
         "divergence_classes": divergence_classes,
+        # Close-axis names a reviewed declared row explained (I12436); each is
+        # inside its bound and unexpired, and is named here so the gate's
+        # pass is never silent about why.
+        "close_declared_explained": close_declared_explained,
         "classified_out_of_tol_count": len(divergence_classes["classified"]),
         "unclassified_out_of_tol_count": len(divergence_classes["unclassified"]),
     }
