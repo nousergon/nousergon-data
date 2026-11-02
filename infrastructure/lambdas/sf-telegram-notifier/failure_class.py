@@ -64,8 +64,10 @@ _LINES = {
         "the same way until the grant or token is fixed."
     ),
     TRANSIENT: (
-        "Auto-fix: none yet. This looks like a glitch a rerun would likely clear; "
-        "an agent can rerun it through the recovery dispatcher outside market hours."
+        "Auto-fix: looks like a glitch. A failed preopen that never reached the "
+        "order step is retried once automatically before 09:15 ET (a separate "
+        "'Preopen auto-retry' alert names the run); anything else is rerun by an "
+        "agent through the recovery dispatcher outside market hours."
     ),
     UNKNOWN: (
         "Auto-fix: none. Unclassified failure; the nightly sweep triages it from "
